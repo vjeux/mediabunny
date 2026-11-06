@@ -479,6 +479,12 @@ export abstract class BaseMediaSampleSink<
 	abstract _createPacketSink(): EncodedPacketSink;
 	/** @internal */
 	abstract _getPreRollDuration(): Promise<number>;
+	/**
+	 * How far apart, in seconds, a decoded sample's timestamp and its packet's timestamp can be. Timestamps within
+	 * this tolerance count as equal when looking up samples.
+	 * @internal
+	 */
+	abstract _getTimestampTolerance(): Promise<number>;
 
 	/** @internal */
 	protected mediaSamplesInRange(
@@ -498,6 +504,7 @@ export abstract class BaseMediaSampleSink<
 		let ended = false;
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
+		let tolerance = 0;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -513,9 +520,12 @@ export abstract class BaseMediaSampleSink<
 
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
+			tolerance = await this._getTimestampTolerance();
+
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
-				if (sample.timestamp >= endTimestamp) {
+				// The sample at the start timestamp is yielded even if the range is shorter than the tolerance
+				if (sample.timestamp >= endTimestamp - tolerance && sample.timestamp > startTimestamp + tolerance) {
 					ended = true;
 				}
 
@@ -525,7 +535,7 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				if (lastSample) {
-					if (sample.timestamp > startTimestamp) {
+					if (sample.timestamp > startTimestamp + tolerance) {
 						// We don't know ahead of time what the first first is. This is because the first first is the
 						// last first whose timestamp is less than or equal to the start timestamp. Therefore we need to
 						// wait for the first first after the start timestamp, and then we'll know that the previous
@@ -537,7 +547,7 @@ export abstract class BaseMediaSampleSink<
 					}
 				}
 
-				if (sample.timestamp >= startTimestamp) {
+				if (sample.timestamp >= startTimestamp - tolerance) {
 					sampleQueue.push(sample);
 					firstSampleQueued = true;
 				}
@@ -560,7 +570,7 @@ export abstract class BaseMediaSampleSink<
 			const packetSink = this._createPacketSink();
 			const preRollDuration = await this._getPreRollDuration();
 
-			const startPacket = await packetSink.getPacket(startTimestamp, packetRetrievalOptions);
+			const startPacket = await packetSink.getPacket(startTimestamp + tolerance, packetRetrievalOptions);
 			const keyPacket = await packetSink.getKeyPacket(
 				(startPacket?.timestamp ?? startTimestamp) - preRollDuration,
 				packetRetrievalOptions,
@@ -689,6 +699,7 @@ export abstract class BaseMediaSampleSink<
 		let decoderIsFlushed = false;
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
+		let tolerance = 0;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -727,6 +738,8 @@ export abstract class BaseMediaSampleSink<
 
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
+			tolerance = await this._getTimestampTolerance();
+
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
 
@@ -735,11 +748,12 @@ export abstract class BaseMediaSampleSink<
 					return;
 				}
 
-				// Every query timestamp this sample starts after is answered by the sample before it
+				// Every query timestamp this sample starts after (by more than the tolerance, or at least a little
+				// epsilon) is answered by the sample before it
 				let heldSampleUses = 0;
 				while (
 					timestampsOfInterest.length > 0
-					&& sample.timestamp - timestampsOfInterest[0]! > 1e-10 // Give it a little epsilon
+					&& sample.timestamp - timestampsOfInterest[0]! > Math.max(tolerance, 1e-10)
 				) {
 					heldSampleUses++;
 					timestampsOfInterest.shift();
@@ -816,7 +830,7 @@ export abstract class BaseMediaSampleSink<
 					break;
 				}
 
-				const targetPacket = await packetSink.getPacket(timestamp, retrievalOptions);
+				const targetPacket = await packetSink.getPacket(timestamp + tolerance, retrievalOptions);
 				let keyPacket = targetPacket && await packetSink.getKeyPacket(
 					targetPacket.timestamp - preRollDuration,
 					retrievalOptions,
@@ -1953,6 +1967,11 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		return 0;
 	}
 
+	/** @internal */
+	async _getTimestampTolerance() {
+		return 0; // Frames carry their packet's timestamp
+	}
+
 	/**
 	 * Retrieves the video sample (frame) corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last video sample (in presentation order) with a start timestamp less than or equal to the given timestamp.
@@ -2764,10 +2783,21 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		return preRollDuration;
 	}
 
+	/** @internal */
+	async _getTimestampTolerance() {
+		// Decoded audio is timed by its sample count (on the sample grid), while the container rounds packet
+		// timestamps to its own resolution (a millisecond in Matroska, for example). So the two can be up to a tick
+		// and a sample apart.
+		return 1 / await this._track.getTimeResolution() + 1 / await this._track.getSampleRate();
+	}
+
 	/**
 	 * Retrieves the audio sample corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last audio sample (in presentation order) with a start timestamp less than or equal to the given timestamp.
 	 * Returns null if the timestamp is before the track's first timestamp.
+	 *
+	 * Decoded audio is timed by its sample count, while containers round packet timestamps to their own precision
+	 * (a millisecond in Matroska, for example), so timestamps are compared within that precision.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
