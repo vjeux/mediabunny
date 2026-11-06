@@ -357,9 +357,12 @@ export class EncodedPacketSink {
 		let outOfBandError = null as unknown;
 		let hasOutOfBandError = false;
 
+		// When packets were dequeued during the last second, starting at index timestampsStart. Old entries are dropped
+		// in bulk since shift() is O(n) for large arrays, and fast consumers dequeue over 100k packets per second.
 		const timestamps: number[] = [];
+		let timestampsStart = 0;
 		// The queue should always be big enough to hold 1 second worth of packets
-		const maxQueueSize = () => Math.max(2, timestamps.length);
+		const maxQueueSize = () => Math.max(2, timestamps.length - timestampsStart);
 
 		// The following is the "pump" process that keeps pumping packets into the queue
 		(async () => {
@@ -410,8 +413,12 @@ export class EncodedPacketSink {
 						const now = performance.now();
 						timestamps.push(now);
 
-						while (timestamps.length > 0 && now - timestamps[0]! >= 1000) {
-							timestamps.shift();
+						while (timestampsStart < timestamps.length && now - timestamps[timestampsStart]! >= 1000) {
+							timestampsStart++;
+						}
+						if (timestampsStart >= timestamps.length / 2) {
+							timestamps.splice(0, timestampsStart);
+							timestampsStart = 0;
 						}
 
 						onQueueDequeue();
