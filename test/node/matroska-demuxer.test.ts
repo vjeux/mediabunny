@@ -105,12 +105,19 @@ test('getPacket finds B-frames that straddle a cluster boundary', async () => {
 		...element(EBMLId.Segment, segmentChildren.flat()),
 	]);
 
-	const block = (timestamp: number, key = false) => element(
+	const simpleBlock = (timestamp: number, key = false) => element(
 		EBMLId.SimpleBlock,
 		[0x81, (timestamp >> 8) & 0xff, timestamp & 0xff, key ? 0x80 : 0, 1],
 	);
-	// With and without a DefaultDuration (40 ms), which is optional
-	const files = [[element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00])], []].map(defaultDuration => matroskaFile(
+	// A BlockGroup declaring a 40 ms BlockDuration; non-key frames reference another frame
+	const blockGroup = (timestamp: number, key = false) => element(
+		EBMLId.BlockGroup,
+		element(EBMLId.Block, [0x81, (timestamp >> 8) & 0xff, timestamp & 0xff, 0, 1]),
+		element(EBMLId.BlockDuration, [40]),
+		key ? [] : element(EBMLId.ReferenceBlock, [0xd8]), // -40
+	);
+
+	const makeFile = (defaultDuration: number[][], block: typeof simpleBlock) => matroskaFile(
 		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
 		element(EBMLId.Tracks, element(
 			EBMLId.TrackEntry,
@@ -126,7 +133,14 @@ test('getPacket finds B-frames that straddle a cluster boundary', async () => {
 			element(EBMLId.Timestamp, [40]),
 			block(0), block(40), block(200), block(120), block(160),
 		),
-	));
+	);
+
+	const files = [
+		makeFile([element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00])], simpleBlock), // 40 ms
+		makeFile([], simpleBlock), // DefaultDuration is optional
+		// A nominal DefaultDuration of 120 ms, which the blocks' own BlockDurations of 40 ms override
+		makeFile([element(EBMLId.DefaultDuration, [0x07, 0x27, 0x0e, 0x00])], blockGroup),
+	];
 
 	const checkLookups = async (file: Uint8Array, order: number[]) => {
 		using input = new Input({

@@ -148,6 +148,11 @@ type ClusterTrackData = {
 		timestamp: number;
 		blockIndex: number;
 	}[];
+	/**
+	 * The shortest BlockDuration the file declares for the track's blocks in this cluster, as the block durations
+	 * themselves get replaced by the gaps between the blocks.
+	 */
+	minDeclaredDuration: number | null;
 };
 
 enum BlockLacing {
@@ -745,6 +750,11 @@ export class MatroskaDemuxer extends Demuxer {
 				block.timestamp += cluster.timestamp;
 
 				hasLacedBlocks ||= block.lacing !== BlockLacing.None;
+
+				if (block.lacing === BlockLacing.None && block.duration > 0) {
+					// Only BlockDuration has set the duration so far
+					trackData.minDeclaredDuration = Math.min(trackData.minDeclaredDuration ?? Infinity, block.duration);
+				}
 			}
 
 			trackData.presentationTimestamps = trackData.blocks
@@ -838,6 +848,7 @@ export class MatroskaDemuxer extends Demuxer {
 				firstKeyFrameTimestamp: null,
 				blocks: [],
 				presentationTimestamps: [],
+				minDeclaredDuration: null,
 			};
 			cluster.trackData.set(trackNumber, trackData);
 		}
@@ -2303,7 +2314,11 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				// presented between two frames of this cluster can sit in the next cluster, and a cluster that doesn't
 				// begin with a key frame can continue a GOP whose frames are presented after its first ones. A gap
 				// after the match (longer than the cluster's frames) hints at the former.
-				let frameDuration = this.internalTrack.defaultDuration ?? Infinity;
+				// DefaultDuration is only nominal: shorter durations declared for the blocks themselves take precedence
+				let frameDuration = Math.min(
+					this.internalTrack.defaultDuration ?? Infinity,
+					trackData.minDeclaredDuration ?? Infinity,
+				);
 				for (let i = 1; i < trackData.presentationTimestamps.length; i++) {
 					const delta = trackData.presentationTimestamps[i]!.timestamp
 						- trackData.presentationTimestamps[i - 1]!.timestamp;
