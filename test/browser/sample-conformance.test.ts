@@ -84,7 +84,10 @@ class PlanesResource extends VideoSampleResource {
 	close() {}
 }
 
-/** Builds pixel data for the format with every plane padded by `padding` bytes per row and gaps between planes. */
+/**
+ * Builds pixel data for the format with every plane padded by `padding` bytes per row and gaps between planes. The
+ * unused X byte of RGBX/BGRX pixels is 255, as browsers differ in whether they copy it or write 255 (Firefox).
+ */
 const makePlanes = (format: VideoSamplePixelFormat, width: number, height: number, padding: number, seed: number) => {
 	let offset = padding;
 	const layout = tightLayout(format, width, height).map((plane) => {
@@ -93,6 +96,13 @@ const makePlanes = (format: VideoSamplePixelFormat, width: number, height: numbe
 		return geometry;
 	});
 	const data = seededBytes(layoutSize(layout) + padding, seed);
+	if (format === 'RGBX' || format === 'BGRX') {
+		for (let row = 0; row < height; row++) {
+			for (let x = 0; x < width; x++) {
+				data[layout[0]!.offset + row * layout[0]!.stride + 4 * x + 3] = 255;
+			}
+		}
+	}
 	return { data, layout };
 };
 
