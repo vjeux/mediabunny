@@ -210,11 +210,12 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 	return false;
 };
 
-test('Opus without a decoder description still gets its identification header as CodecPrivate', async () => {
-	// The Matroska Opus mapping requires the OpusHead in CodecPrivate, e.g. for packets remuxed from MPEG-TS. Its
-	// pre-skip and the CodecDelay both hold the negative start, in 48 kHz samples and nanoseconds.
-	const muxAndRead = async (firstTimestamp: number, configBeforeStart = false) => {
-		const decoderConfig = { codec: 'opus', numberOfChannels: 2, sampleRate: 44100 };
+test('Opus gets an identification header as CodecPrivate, with the CodecDelay as its pre-skip', async () => {
+	// The Matroska Opus mapping requires the OpusHead in CodecPrivate (packets remuxed from MPEG-TS, say, come without
+	// one), and a CodecDelay equal to its pre-skip, which holds the negative start (in 48 kHz samples)
+	type Options = { configBeforeStart?: boolean; description?: Uint8Array };
+	const muxAndRead = async (firstTimestamp: number, { configBeforeStart, description }: Options) => {
+		const decoderConfig = { codec: 'opus', numberOfChannels: 2, sampleRate: 44100, description };
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
 		const source = new EncodedAudioPacketSource('opus');
 		output.addAudioTrack(source, configBeforeStart ? { decoderConfig } : {});
@@ -254,17 +255,24 @@ test('Opus without a decoder description still gets its identification header as
 		1, 2, preSkip & 0xff, preSkip >> 8, 0x44, 0xac, 0, 0, 0, 0, 0,
 	];
 
-	const check = async (firstTimestamp: number, configBeforeStart: boolean, preSkip: number) => {
-		const result = await muxAndRead(firstTimestamp, configBeforeStart);
+	const check = async (firstTimestamp: number, preSkip: number, options: Options = {}) => {
+		const result = await muxAndRead(firstTimestamp, options);
 		expect(result.description).toEqual(opusHead(preSkip));
 		expect(result.codecDelay).toBe(Math.round(preSkip * 1e9 / 48000));
 		// Read back within a tick (1 ms), as readers round CodecDelay to whole ticks
-		expect(Math.abs(result.firstTimestamp - firstTimestamp)).toBeLessThan(0.001);
+		expect(Math.abs(result.firstTimestamp - firstTimestamp)).toBeLessThan(0.0015);
 	};
 
-	await check(0, false, 0);
-	await check(-0.0065, false, 312);
-	await check(-0.0065, true, 312); // The decoder config is known before the first packet
+	await check(0, 0);
+	await check(-0.0065, 312);
+	await check(-0.0065, 312, { configBeforeStart: true }); // The decoder config is known before the first packet
 	// The pre-skip can't hold more than 65535 samples; the rest of a longer delay stays in the block timestamps
-	await check(-2, false, 65535);
+	await check(-2, 65535);
+
+	// A given header keeps its pre-skip, which only grows to cover an earlier start (in a copy of the header)
+	const description = new Uint8Array(opusHead(312));
+	await check(0.1, 312, { description });
+	await check(-0.0065, 312, { description });
+	await check(-0.1, 4800, { description });
+	expect([...description]).toEqual(opusHead(312));
 });

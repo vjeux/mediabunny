@@ -130,8 +130,11 @@ type MatroskaTrackData = {
 		 */
 		requiresAdtsStripping: boolean;
 		codecDelay: number | null; // in seconds
-		/** The Opus identification header Mediabunny generated, whose pre-skip is filled in once it's known. */
-		generatedOpusHeader: Uint8Array | null;
+		/**
+		 * The Opus identification header written as CodecPrivate (generated, or a copy of the given one), whose
+		 * pre-skip is set to the codec delay once that's known.
+		 */
+		opusHeader: Uint8Array | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -357,9 +360,9 @@ export class MatroskaMuxer extends Muxer {
 				}
 			}
 
-			if (trackData.type === 'audio' && trackData.info.generatedOpusHeader) {
-				const preSkip = Math.round((trackData.info.codecDelay ?? 0) * OPUS_SAMPLE_RATE);
-				new DataView(trackData.info.generatedOpusHeader.buffer).setUint16(10, preSkip, true);
+			if (trackData.type === 'audio' && trackData.info.opusHeader && trackData.info.codecDelay !== null) {
+				const preSkip = Math.round(trackData.info.codecDelay * OPUS_SAMPLE_RATE);
+				new DataView(trackData.info.opusHeader.buffer).setUint16(10, preSkip, true);
 			}
 
 			let seekPreRollNs = 0; // In "Matroska ticks" (nanoseconds)
@@ -952,13 +955,20 @@ export class MatroskaMuxer extends Muxer {
 			requiresAdtsStripping = true;
 		}
 
-		let generatedOpusHeader: Uint8Array | null = null;
-		if (track.source._codec === 'opus' && !decoderConfig.description && decoderConfig.numberOfChannels <= 2) {
-			// Matroska requires the Opus identification header as CodecPrivate. With up to two channels (channel
-			// mapping family 0), it can be built from the config. Its pre-skip must match the CodecDelay, which is
-			// only known once the first packet arrives, so it's filled in when the header gets written.
-			generatedOpusHeader = new Uint8Array(19);
-			const view = new DataView(generatedOpusHeader.buffer);
+		// Matroska requires the Opus identification header as CodecPrivate, and a CodecDelay equal to its pre-skip.
+		// That pre-skip may have to grow to cover an earlier start (see below), so a given header is copied rather
+		// than changed.
+		let opusHeader: Uint8Array | null = null;
+		if (track.source._codec === 'opus' && decoderConfig.description) {
+			const description = toUint8Array(decoderConfig.description);
+			if (description.length >= 19 && String.fromCharCode(...description.subarray(0, 8)) === 'OpusHead') {
+				opusHeader = description.slice();
+				decoderConfig.description = opusHeader;
+			}
+		} else if (track.source._codec === 'opus' && decoderConfig.numberOfChannels <= 2) {
+			// With up to two channels (channel mapping family 0), the header can be built from the config
+			opusHeader = new Uint8Array(19);
+			const view = new DataView(opusHeader.buffer);
 			view.setUint32(0, 0x4f707573, false); // 'Opus'
 			view.setUint32(4, 0x48656164, false); // 'Head'
 			view.setUint8(8, 1); // Version
@@ -967,7 +977,7 @@ export class MatroskaMuxer extends Muxer {
 			view.setUint32(12, decoderConfig.sampleRate, true); // Input sample rate
 			view.setInt16(16, 0, true); // Output gain
 			view.setUint8(18, 0); // Channel mapping family
-			decoderConfig.description = generatedOpusHeader;
+			decoderConfig.description = opusHeader;
 		}
 
 		const newTrackData: MatroskaAudioTrackData = {
@@ -979,7 +989,7 @@ export class MatroskaMuxer extends Muxer {
 				decoderConfig,
 				requiresAdtsStripping,
 				codecDelay: null,
-				generatedOpusHeader,
+				opusHeader,
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
@@ -1096,10 +1106,13 @@ export class MatroskaMuxer extends Muxer {
 			const isKeyFrame = packet.type === 'key';
 			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
 
-			if (trackData.info.codecDelay === null && trackData.info.generatedOpusHeader) {
-				// The generated header holds the delay as its pre-skip, a 16-bit count of 48 kHz samples. Whatever of a
-				// longer delay it can't hold stays in the (then negative) block timestamps.
-				const preSkip = Math.min(Math.round(Math.max(-packet.timestamp, 0) * OPUS_SAMPLE_RATE), 0xffff);
+			if (trackData.info.codecDelay === null && trackData.info.opusHeader) {
+				// The header's pre-skip (a 16-bit count of 48 kHz samples) grows to cover an earlier start, as far as
+				// it can, and is the codec delay. Whatever of an earlier start it can't hold stays in the (then
+				// negative) block timestamps.
+				const headerPreSkip = new DataView(trackData.info.opusHeader.buffer).getUint16(10, true);
+				const startSamples = Math.round(Math.max(-packet.timestamp, 0) * OPUS_SAMPLE_RATE);
+				const preSkip = Math.min(Math.max(headerPreSkip, startSamples), 0xffff);
 				trackData.info.codecDelay = preSkip / OPUS_SAMPLE_RATE;
 			}
 
