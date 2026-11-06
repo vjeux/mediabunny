@@ -303,7 +303,9 @@ export class OggDemuxer extends Demuxer {
 		let result = this.pageIntactness.get(page.headerStartPos);
 		if (result === undefined) {
 			let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			result = !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
 			this.pageIntactness.set(page.headerStartPos, result);
 		}
@@ -330,7 +332,9 @@ export class OggDemuxer extends Demuxer {
 			}
 
 			let slice = this.reader.requestSliceRange(endPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			const nextPage = slice && readPageHeader(slice);
 			if (!nextPage || nextPage.serialNumber !== bitstream.serialNumber) {
 				return null;
@@ -346,7 +350,9 @@ export class OggDemuxer extends Demuxer {
 	 */
 	async readChainedLink(pos: number): Promise<LogicalBitstream | null> {
 		let slice = this.reader.requestSliceRange(pos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		const bosPage = slice && readPageHeader(slice);
 		if (!bosPage || !(bosPage.headerType & 0x02)) {
 			return null;
@@ -357,7 +363,9 @@ export class OggDemuxer extends Demuxer {
 			MIN_PAGE_HEADER_SIZE,
 			MAX_PAGE_HEADER_SIZE,
 		);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		const nextPage = slice && readPageHeader(slice);
 		if (nextPage && (nextPage.headerType & 0x02)) {
 			return null; // A link with multiple logical bitstreams
