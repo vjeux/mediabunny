@@ -700,6 +700,25 @@ test('Read and write metadata, ADTS', async () => {
 	expect(readTags.raw!['TXXY']).toBe('ID3v2 goated');
 });
 
+test('Read an ID3v1 tag, ADTS', async () => {
+	// Three AAC-LC frames (44.1 kHz, stereo, 100 bytes each) followed by an ID3v1 tag, which MP3 files get read too
+	const frame = new Uint8Array(100);
+	frame.set([0xff, 0xf1, 0x50, 0x80, 100 >> 3, ((100 & 7) << 5) | 0x1f, 0xfc]);
+
+	const id3V1Tag = new Uint8Array(128);
+	id3V1Tag.set([...'TAGSample title'].map(char => char.charCodeAt(0)));
+	id3V1Tag[127] = 12; // Genre: Other
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...frame, ...frame, ...frame, ...id3V1Tag])),
+		formats: ALL_FORMATS,
+	});
+
+	const tags = await input.getMetadataTags();
+	expect(tags.title).toBe('Sample title');
+	expect(tags.genre).toBe('Other');
+});
+
 test('Read and write metadata, WAVE', async () => {
 	const output = new Output({
 		format: new WavOutputFormat(),
