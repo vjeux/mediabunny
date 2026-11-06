@@ -133,13 +133,22 @@ const vp8Track = (packets = videoPackets(50), metadata?: VideoTrackSpec['metadat
 	metadata,
 });
 
-const opusTrack = (packets = audioPackets(100), metadata?: AudioTrackSpec['metadata']): AudioTrackSpec => ({
-	type: 'audio',
-	codec: 'opus',
-	decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000, description: new Uint8Array(opusHead()) },
-	packets,
-	metadata,
-});
+const opusTrack = (packets = audioPackets(100), metadata?: AudioTrackSpec['metadata']): AudioTrackSpec => {
+	// Like an encoder's output, whose header's pre-skip is the negative start (if any)
+	const preSkip = Math.round(Math.max(-(packets[0]?.timestamp ?? 0), 0) * 48000);
+	return {
+		type: 'audio',
+		codec: 'opus',
+		decoderConfig: {
+			codec: 'opus',
+			numberOfChannels: 2,
+			sampleRate: 48000,
+			description: new Uint8Array(opusHead(2, preSkip)),
+		},
+		packets,
+		metadata,
+	};
+};
 
 const open = (bytes: Uint8Array) => new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 
