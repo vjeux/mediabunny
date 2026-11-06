@@ -165,6 +165,10 @@ type InternalTrack = {
 	hasEditList: boolean;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
+	/** The codec info read from each sample description, of which the one the samples refer to is used. */
+	sampleDescriptionStates: SampleDescriptionState[];
+	/** The sample description index of the first chunk in the sample table, if there is one. */
+	firstChunkSampleDescriptionIndex: number | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
@@ -262,6 +266,8 @@ type FragmentLookupTableEntry = {
 	trunNumber: number; // 1-indexed
 	sampleNumber: number; // 1-indexed
 };
+
+type SampleDescriptionState = Pick<InternalTrack, 'info' | 'internalCodecId' | 'maxBitrate' | 'avgBitrate'>;
 
 type FragmentTrackState = {
 	baseDataOffset: number;
@@ -483,6 +489,8 @@ export class IsobmffDemuxer extends Demuxer {
 						}
 					}
 
+					await this.applyReferencedSampleDescriptions(startPos + boxInfo.totalSize);
+
 					lookForMfraBox = this.isFragmented
 						&& this.reader.fileSize !== null
 						&& this.reader.fileSize > startPos + boxInfo.totalSize; // There's more after the moov box
@@ -566,6 +574,102 @@ export class IsobmffDemuxer extends Demuxer {
 		})();
 	}
 
+	/**
+	 * For tracks with several sample descriptions, takes the codec info from the one the first samples refer to:
+	 * through the sample table's first chunk, or for fragmented files through the first fragment's tfhd or trex. FFmpeg
+	 * switches between descriptions per sample, and Chromium picks the one trex refers to. Without either, the last
+	 * description is kept.
+	 */
+	private async applyReferencedSampleDescriptions(moovEndPos: number) {
+		const tracks = this.tracks.filter(track => track.sampleDescriptionStates.length > 1);
+		if (tracks.length === 0) {
+			return;
+		}
+
+		let firstFragmentIndices: Map<number, number> | null = null;
+		if (this.isFragmented && tracks.some(track => track.firstChunkSampleDescriptionIndex === null)) {
+			firstFragmentIndices = await this.readFirstFragmentSampleDescriptionIndices(moovEndPos);
+		}
+
+		for (const track of tracks) {
+			const candidates = [
+				track.firstChunkSampleDescriptionIndex,
+				...(this.isFragmented
+					? [
+							firstFragmentIndices?.get(track.id),
+							this.fragmentTrackDefaults.get(track.id)?.defaultSampleDescriptionIndex,
+						]
+					: []),
+			];
+			const index = candidates.find(x => x != null && x >= 1 && x <= track.sampleDescriptionStates.length);
+
+			if (index != null) {
+				Object.assign(track, track.sampleDescriptionStates[index - 1]!);
+			}
+		}
+	}
+
+	/** Reads which sample description each track fragment of the first moof box refers to, by track ID. */
+	private async readFirstFragmentSampleDescriptionIndices(pos: number) {
+		const indices = new Map<number, number>();
+
+		for (let i = 0; i < 8; i++) { // Some boxes (like sidx, styp, emsg or free) may come before the first moof box
+			let slice = this.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				break;
+			}
+
+			const boxInfo = readBoxHeader(slice);
+			if (!boxInfo || boxInfo.totalSize === 0) {
+				break;
+			}
+
+			if (boxInfo.name === 'moof') {
+				let moofSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
+				if (isThenable(moofSlice)) {
+					moofSlice = await moofSlice;
+				}
+				if (!moofSlice) {
+					break;
+				}
+
+				for (const { boxInfo: trafInfo, slice: trafSlice } of this.iterateContiguousBoxes(moofSlice)) {
+					if (trafInfo.name !== 'traf') {
+						continue;
+					}
+
+					const trafContentSlice = trafSlice.slice(trafSlice.filePos, trafInfo.contentSize);
+					const children = this.iterateContiguousBoxes(trafContentSlice);
+					for (const { boxInfo: childInfo, slice: childSlice } of children) {
+						if (childInfo.name !== 'tfhd') {
+							continue;
+						}
+
+						childSlice.skip(1); // Version
+						const flags = readU24Be(childSlice);
+						const trackId = readU32Be(childSlice);
+						const hasBaseDataOffset = Boolean(flags & 0x000001);
+						if (flags & 0x000002 && childInfo.contentSize >= (hasBaseDataOffset ? 20 : 12)) {
+							childSlice.skip(hasBaseDataOffset ? 8 : 0);
+							indices.set(trackId, readU32Be(childSlice));
+						}
+
+						break;
+					}
+				}
+
+				break;
+			}
+
+			pos += boxInfo.totalSize;
+		}
+
+		return indices;
+	}
+
 	private async copyMetadataFromInitInput(initInput: Input) {
 		const initDemuxer = (await initInput._getDemuxer()) as IsobmffDemuxer;
 		if (initDemuxer.constructor !== IsobmffDemuxer) {
@@ -606,6 +710,8 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentCompositionOffsetRange: null,
 				hasEditList: foreignTrack.hasEditList,
 				encryptionInfo: foreignTrack.encryptionInfo,
+				sampleDescriptionStates: [],
+				firstChunkSampleDescriptionIndex: null,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
 				encryptedSampleDescriptions: foreignTrack.encryptedSampleDescriptions,
@@ -1244,6 +1350,8 @@ export class IsobmffDemuxer extends Demuxer {
 					fragmentCompositionOffsetRange: null,
 					hasEditList: false,
 					encryptionInfo: null,
+					sampleDescriptionStates: [],
+					firstChunkSampleDescriptionIndex: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
 					encryptedSampleDescriptions: [],
@@ -1729,6 +1837,16 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
+
+					// Every description is read for what applies to the whole track (like the encryption info of a
+					// clear lead's copy), but the codec info comes from the one the samples use; see
+					// applyReferencedSampleDescriptions
+					track.sampleDescriptionStates.push({
+						info: { ...track.info },
+						internalCodecId: track.internalCodecId,
+						maxBitrate: track.maxBitrate,
+						avgBitrate: track.avgBitrate,
+					});
 				}
 			}; break;
 
@@ -2430,6 +2548,13 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (!track.sampleTable) {
+					// While reading the moov box, only note which sample description the first chunk uses
+					slice.skip(4); // Version + flags
+					if (readU32Be(slice) > 0 && boxInfo.contentSize >= 20) {
+						slice.skip(8); // First chunk + samples per chunk
+						track.firstChunkSampleDescriptionIndex = readU32Be(slice);
+					}
+
 					break;
 				}
 
