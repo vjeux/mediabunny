@@ -7,6 +7,7 @@ import {
 	VideoSampleResource,
 } from '../../src/sample.js';
 import { SetRequired } from '../../src/misc.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 test('VideoSample creation from bytes', async () => {
 	const bytes = new Uint8Array(1280 * 720 * 4);
@@ -128,4 +129,19 @@ test('Converting raw RGB data into another color space needs VideoFrame', async 
 		.rejects.toThrow('requires VideoFrame');
 	// sRGB data copied as sRGB needs no conversion
 	await sample.copyTo(new Uint8Array(8), { format: 'BGRA', colorSpace: 'srgb' });
+});
+
+test('Missing data is rejected with the intended TypeError', () => {
+	for (const data of [undefined, null]) {
+		expect(() => new EncodedPacket(data as never, 'key', 0, 0)).toThrow(
+			new TypeError('data must be a Uint8Array.'),
+		);
+		expect(() => new AudioSample({
+			data: data as never,
+			format: 's16',
+			numberOfChannels: 2,
+			sampleRate: 48000,
+			timestamp: 0,
+		})).toThrow(new TypeError('Invalid AudioDataInit: data is not a BufferSource.'));
+	}
 });
