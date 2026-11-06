@@ -728,11 +728,10 @@ export class FilePathTarget extends Target {
 
 		// Let's back this target with a StreamTarget, makes the implementation very simple
 		const writable = new WritableStream<StreamTargetChunk>({
-			start: async () => {
-				this._fileHandle = await node.fs.open(filePath, 'w');
-			},
 			write: async (chunk) => {
-				assert(this._fileHandle);
+				// Opened by the first write rather than in start(), which runs right away: constructing the target
+				// (even with options that are then rejected) must not truncate the file or leave a handle open
+				this._fileHandle ??= await node.fs.open(filePath, 'w');
 				await this._fileHandle.write(chunk.data, 0, chunk.data.byteLength, chunk.position);
 			},
 			close: async () => {
