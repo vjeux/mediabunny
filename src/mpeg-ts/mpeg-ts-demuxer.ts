@@ -241,7 +241,8 @@ export class MpegTsDemuxer extends Demuxer {
 			this.minReferencePointByteDistance = MIN_REFERENCE_POINT_PACKET_DISTANCE * this.packetStride;
 
 			let currentPos = this.packetOffset;
-			let programMapPid: number | null = null;
+			// The PIDs of the PMTs of all programs, as listed by the PAT
+			const programMapPids = new Set<number>();
 			// Some files contain these multiple times, but we only care about their first appearance
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
@@ -332,20 +333,18 @@ export class MpegTsDemuxer extends Demuxer {
 						const id = bitstream.readBits(13);
 
 						if (programNumber !== 0) {
-							if (programMapPid !== null) {
-								throw new Error('Only files with a single program are supported.');
-							} else {
-								programMapPid = id;
-							}
+							programMapPids.add(id);
 						}
 					}
 
-					if (programMapPid === null) {
+					if (programMapPids.size === 0) {
 						throw new Error('Program Association Table must link to a Program Map Table.');
 					}
 
 					hasProgramAssociationTable = true;
-				} else if ((section.pid === programMapPid || isProbablyProgramMap) && !hasProgramMap) {
+				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap) {
+					// Broadcast captures often carry several programs. We present just one, so let's use the first one
+					// whose PMT shows up (some programs listed in the PAT may not even be in the capture).
 					const bitstream = new Bitstream(section.payload);
 					const pointerField = bitstream.readAlignedByte();
 
