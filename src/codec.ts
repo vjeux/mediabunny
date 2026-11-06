@@ -613,6 +613,20 @@ export const extractVideoCodecString = (trackInfo: {
 	throw new TypeError(`Unhandled codec '${codec}'.`);
 };
 
+/**
+ * Chromium only accepts AVC codec strings whose level is a level number from Table A-1 of ITU-T H.264 (see
+ * IsValidH264Level in media/base/mime_util_internal.cc), so it rejects level_idc 9, which is how the High profiles
+ * signal level 1b. Level 1b's limits are within those of level 1.1, so naming level 1.1 instead keeps such streams
+ * decodable.
+ */
+export const toChromiumCompatibleAvcCodecString = (codecString: string) => {
+	if (/^avc[13]\.[0-9a-fA-F]{4}09$/.test(codecString)) {
+		return codecString.slice(0, -2) + '0b';
+	}
+
+	return codecString;
+};
+
 export const extractColorSpace = (info: {
 	codec: VideoCodec | null;
 	codecDescription: Uint8Array | null;
