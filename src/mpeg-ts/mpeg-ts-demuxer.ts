@@ -100,6 +100,9 @@ import { Bitstream } from '../../shared/bitstream';
 // Resources:
 // ISO/IEC 13818-1
 
+/** How many PES packets of the same PTS key packet lookups look back over to find the start of a key frame. */
+const MAX_KEY_FRAME_PES_PACKET_COUNT = 64;
+
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
@@ -1618,6 +1621,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const retrieveEncodedPacket = async (
 			sectionStartPos: number,
 			predicate: (packet: TimedSuppliedPacket) => boolean,
+			// Whether to also read the packets that share searchPts with the first one reaching it. Data of another
+			// access unit that begins a PES packet takes that PES packet's PTS too, ahead of the key frame.
+			readPacketsAtSearchPts = false,
 		) => {
 			if (!firstTimedPesPacket || sectionStartPos === firstTimedPesPacket.header.sectionStartPos) {
 				// The packets before the track's first PES packet with a PTS take their timestamps from it, so read
@@ -1638,7 +1644,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			// Advance until the top-most presentation timestamp crosses or equals searchPts
 			while (true) {
 				const topPts = last(buffer.presentationOrderPackets)?.pts ?? -Infinity;
-				if (topPts >= searchPts) {
+				if (readPacketsAtSearchPts ? topPts > searchPts : topPts >= searchPts) {
 					break;
 				}
 
@@ -1680,6 +1686,34 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		}
 
 		const firstPesPacketHeader = firstTimedPesPacket.header;
+
+		// Finds the PES packet with a PTS that comes before the given one, never before the track's first PES packet
+		// with a PTS
+		const findPreviousTimestampedPesPacketHeader = async (pesPacketHeader: TimestampedPesPacketHeader) => {
+			const readSectionsInFull = !this.elementaryStream.canBeTrustedWithKeyPackets;
+			let pos = pesPacketHeader.sectionStartPos - demuxer.packetStride;
+
+			while (pos >= firstPesPacketHeader.sectionStartPos) {
+				const packetHeader = await demuxer.readPacketHeader(pos);
+				if (!packetHeader) {
+					return null;
+				}
+
+				if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
+					const section = await demuxer.readSection(pos, readSectionsInFull);
+					if (section) {
+						const header = readPesPacketHeader(demuxer, section);
+						if (header && header.pts !== null) {
+							return header as TimestampedPesPacketHeader;
+						}
+					}
+				}
+
+				pos -= demuxer.packetStride;
+			}
+
+			return null;
+		};
 
 		let scanStartPos: number;
 
@@ -1859,8 +1893,25 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 								}
 							}
 
-							isKeyPacket = context.suppliedPacket?.ptsSectionStartPos === pesHeader.sectionStartPos
-								&& context.suppliedPacket.randomAccessIndicator === 1;
+							// Any packet starting in this PES packet, or taking its timestamp from it, may be the key
+							// frame: the PES packet may begin with data of another access unit, and the key frame may
+							// begin before it (parameter sets in a PES packet of their own)
+							isKeyPacket = false;
+							while (
+								context.suppliedPacket
+								&& (
+									context.suppliedPacket.sectionStartPos === pesHeader.sectionStartPos
+									|| context.suppliedPacket.ptsSectionStartPos === pesHeader.sectionStartPos
+								)
+							) {
+								if (context.suppliedPacket.randomAccessIndicator === 1) {
+									isKeyPacket = true;
+									break;
+								}
+
+								context.suppliedPacket = null;
+								await context.markNextPacket();
+							}
 						}
 
 						if (isKeyPacket) {
@@ -1910,16 +1961,34 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				}
 
 				if (bestKeyPesHeader) {
-					// Start reading one PES packet with a PTS early: the key packet may begin before its own PES
-					// packet (parameter sets in a PES packet of their own), and packets without a PTS may need the
-					// time between the two to get theirs. At the end of the stream, rewind a little more to obtain
-					// the correct packet duration.
-					const startPos = await this.findTimedPesPacketBefore(
-						bestKeyPesHeader.sectionStartPos,
-						2 + (lookaheadCount === 0 ? reorderSize : 0),
-					);
+					// The key frame's access unit may be split over several PES packets, which all have its PTS (when
+					// the parameter sets come in PES packets of their own, say), so let's start reading at the first of
+					// them; only it may carry the random access flag. Then one more PES packet with a PTS: packets
+					// without a PTS may need the time between the two to get theirs. At the end of the stream, rewind
+					// a little more to obtain the correct packet duration.
+					let startPesHeader = bestKeyPesHeader;
+					let extraRewindCount = 1 + (lookaheadCount === 0 ? reorderSize : 0);
+					for (let i = 0; i < MAX_KEY_FRAME_PES_PACKET_COUNT + extraRewindCount; i++) {
+						const previous = await findPreviousTimestampedPesPacketHeader(startPesHeader);
+						if (!previous) {
+							break;
+						}
 
-					const encodedPacket = await retrieveEncodedPacket(startPos, isTargetPacket);
+						if (previous.pts === bestKeyPesHeader.pts) {
+							startPesHeader = previous;
+						} else if (extraRewindCount > 0) {
+							startPesHeader = previous;
+							extraRewindCount--;
+						} else {
+							break;
+						}
+					}
+
+					const encodedPacket = await retrieveEncodedPacket(
+						startPesHeader.sectionStartPos,
+						isTargetPacket,
+						true,
+					);
 					if (encodedPacket) {
 						return encodedPacket;
 					} else {
