@@ -787,3 +787,102 @@ export const mp4MdtaMeta = (entries: [key: string, type: number, payload: Uint8A
 	const hdlr = mp4FullBox('hdlr', 0, 0, u32be(0), ascii('mdta'), new Uint8Array(12), [0]);
 	return mp4Box('meta', hdlr, keys, ilst);
 };
+
+const MPEG2_CRC_TABLE = (() => {
+	const table = new Uint32Array(256);
+	for (let i = 0; i < 256; i++) {
+		let crc = i << 24;
+		for (let j = 0; j < 8; j++) {
+			crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
+		}
+		table[i] = crc >>> 0;
+	}
+	return table;
+})();
+
+/** The MPEG-2 CRC-32 used by PSI sections. */
+export const mpeg2Crc32 = (bytes: Uint8Array | number[]) => {
+	let crc = 0xffffffff;
+	for (const byte of bytes) {
+		crc = ((crc << 8) ^ MPEG2_CRC_TABLE[((crc >>> 24) ^ byte) & 0xff]!) >>> 0;
+	}
+	return crc;
+};
+
+/** A PSI section (PAT: table 0, PMT: table 2) with syntax header and CRC, prefixed by a zero pointer field. */
+export const tsPsiSection = (tableId: number, tableIdExtension: number, body: (Uint8Array | number[])[]) => {
+	const content = concatBytes(u16be(tableIdExtension), [0xc1, 0x00, 0x00], ...body);
+	const sectionLength = content.length + 4;
+	const section = concatBytes([tableId, 0xb0 | (sectionLength >> 8), sectionLength & 0xff], content);
+	return concatBytes([0x00], section, u32be(mpeg2Crc32(section)));
+};
+
+export const tsPat = (programs: [programNumber: number, pid: number][]) => tsPsiSection(
+	0x00, 1, programs.map(([programNumber, pid]) => [...u16be(programNumber), 0xe0 | (pid >> 8), pid & 0xff]),
+);
+
+export const tsPmt = (programNumber: number, streams: [streamType: number, pid: number, descriptors?: number[]][]) => {
+	return tsPsiSection(0x02, programNumber, [
+		[0xe1, 0x00], // PCR PID 0x100
+		[0xf0, 0x00], // program_info_length 0
+		...streams.map(([streamType, pid, descriptors = []]) => [
+			streamType, 0xe0 | (pid >> 8), pid & 0xff, 0xf0 | (descriptors.length >> 8), descriptors.length & 0xff,
+			...descriptors,
+		]),
+	]);
+};
+
+const tsTimestamp = (marker: number, value: number) => [
+	(marker << 4) | (((value / 2 ** 30) & 0x7) << 1) | 1,
+	(value >> 22) & 0xff,
+	(((value >> 15) & 0x7f) << 1) | 1,
+	(value >> 7) & 0xff,
+	((value & 0x7f) << 1) | 1,
+];
+
+/** A PES packet with a PTS (and a DTS when given), both in 90 kHz units. */
+export const tsPes = (streamId: number, payload: Uint8Array | number[], pts: number, dts?: number) => {
+	const header = dts === undefined
+		? [0x80, 0x80, 5, ...tsTimestamp(0b0010, pts)]
+		: [0x80, 0xc0, 10, ...tsTimestamp(0b0011, pts), ...tsTimestamp(0b0001, dts)];
+	const length = header.length + payload.length;
+	return concatBytes([0, 0, 1, streamId], u16be(length > 0xffff ? 0 : length), header, payload);
+};
+
+/**
+ * Splits a payload into 188-byte transport packets on one PID, padding the last one with an adaptation field.
+ * `prefix` and `suffix` add the 4-byte M2TS header or a 16-byte FEC trailer around every packet.
+ */
+export const tsPackets = (
+	pid: number,
+	payload: Uint8Array,
+	options: { prefix?: number; suffix?: number; counter?: { value: number } } = {},
+) => {
+	const packets: Uint8Array[] = [];
+	const counter = options.counter ?? { value: 0 };
+	for (let offset = 0; offset < payload.length || offset === 0; offset += 184) {
+		const chunk = payload.subarray(offset, offset + 184);
+		const start = offset === 0 ? 0x40 : 0x00;
+		let header: number[];
+		if (chunk.length === 184) {
+			header = [0x47, start | (pid >> 8), pid & 0xff, 0x10 | (counter.value++ & 0xf)];
+		} else {
+			// Adaptation field (stuffing) followed by the payload
+			const adaptationLength = 183 - chunk.length;
+			const stuffing = new Array<number>(Math.max(adaptationLength - 1, 0)).fill(0xff);
+			const adaptation = adaptationLength === 0 ? [] : [0x00, ...stuffing];
+			const continuity = 0x30 | (counter.value++ & 0xf);
+			header = [0x47, start | (pid >> 8), pid & 0xff, continuity, adaptationLength, ...adaptation];
+		}
+		packets.push(concatBytes(
+			new Uint8Array(options.prefix ?? 0),
+			header,
+			chunk,
+			new Uint8Array(options.suffix ?? 0),
+		));
+		if (payload.length === 0) {
+			break;
+		}
+	}
+	return concatBytes(...packets);
+};

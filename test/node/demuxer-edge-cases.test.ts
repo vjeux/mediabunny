@@ -25,6 +25,10 @@ import {
 	mp4SoundEntry,
 	mp4SoundEntryV2,
 	mp4VisualEntry,
+	tsPackets,
+	tsPat,
+	tsPes,
+	tsPmt,
 	u16be,
 	u32be,
 } from './helpers/mutation-bytes.js';
@@ -675,5 +679,82 @@ describe('Matroska cue-based lookups', () => {
 			all.push(at(packet)!);
 		}
 		expect(all).toEqual([0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750]);
+	});
+});
+
+describe('MPEG-TS demuxing', () => {
+	const aacFrames = [0, 1, 2, 3].map((i) => {
+		return adtsFrame(20 + i, { samplingFrequencyIndex: 3, channelConfiguration: 1, fill: i });
+	});
+
+	const buildTs = (options: {
+		prefix?: number;
+		suffix?: number;
+		programs?: [number, number][];
+		streams?: [number, number, number[]?][];
+		pes?: Uint8Array[];
+	} = {}) => {
+		const { prefix, suffix } = options;
+		const counter = { value: 0 };
+		const pes = options.pes ?? [
+			tsPes(0xc0, concatBytes(aacFrames[0]!, aacFrames[1]!), 90000),
+			tsPes(0xc0, concatBytes(aacFrames[2]!, aacFrames[3]!), 90000 + 3840, 90000 + 3840),
+		];
+		return concatBytes(
+			tsPackets(0, tsPat(options.programs ?? [[1, 0x1000]]), { prefix, suffix }),
+			tsPackets(0x1000, tsPmt(1, options.streams ?? [[0x0f, 0x101]]), { prefix, suffix }),
+			...pes.map(packet => tsPackets(0x101, packet, { prefix, suffix, counter })),
+		);
+	};
+
+	const describeTrack = async (bytes: Uint8Array) => {
+		using input = openBytes(bytes);
+		const tracks = await input.getTracks();
+		const track = (await input.getPrimaryAudioTrack())!;
+		const packets: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(`${Math.round(packet.timestamp * 1e5) / 1e5}:${packet.byteLength}`);
+		}
+		return {
+			mimeType: await input.getMimeType(),
+			trackCount: tracks.length,
+			codec: await track.getCodec(),
+			sampleRate: await track.getSampleRate(),
+			channels: await track.getNumberOfChannels(),
+			packets,
+		};
+	};
+
+	const expected = {
+		mimeType: 'video/MP2T; codecs="mp4a.40.2"',
+		trackCount: 1,
+		codec: 'aac',
+		sampleRate: 48000,
+		channels: 1,
+		packets: ['1:27', '1.02133:28', '1.04267:29', '1.064:30'],
+	};
+
+	test.each([
+		['188-byte packets', 0, 0],
+		['192-byte M2TS packets', 4, 0],
+		['204-byte packets with FEC trailers', 0, 16],
+	])('reads %s', async (_, prefix, suffix) => {
+		expect(await describeTrack(buildTs({ prefix, suffix }))).toEqual(expected);
+	});
+
+	test('a PES packet spread over several transport packets is reassembled', async () => {
+		const frames = Array.from({ length: 12 }, (_, i) => {
+			return adtsFrame(60, { samplingFrequencyIndex: 3, channelConfiguration: 1, fill: i });
+		});
+		const info = await describeTrack(buildTs({ pes: [tsPes(0xc0, concatBytes(...frames), 0)] }));
+		expect(info.packets).toEqual(frames.map((_, i) => `${Math.round(i * 1024 / 48000 * 1e5) / 1e5}:67`));
+	});
+
+	test('the network PID entry in the PAT and unknown stream types are skipped', async () => {
+		const bytes = buildTs({
+			programs: [[0, 0x10], [1, 0x1000]],
+			streams: [[0x15, 0x102], [0x0f, 0x101]],
+		});
+		expect(await describeTrack(bytes)).toEqual(expected);
 	});
 });
