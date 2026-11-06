@@ -301,12 +301,13 @@ test('UrlSource reads the full decoded body of a compressed 206 response', async
 
 test('UrlSource places 206 bodies at the range their Content-Range states', async () => {
 	const data = new Uint8Array(3_000_000).map((_, i) => Math.imul(i, 2654435761) >>> 24); // Not periodic
+	let rangeUnit = 'bytes';
 	const server = http.createServer((req, res) => {
 		// Answer with a range that starts at the MiB boundary before the requested position
 		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
 		const start = requested - (requested % 2 ** 20);
 		res.writeHead(206, {
-			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Range': `${rangeUnit} ${start}-${data.length - 1}/${data.length}`,
 			'Content-Length': data.length - start,
 		});
 		res.end(data.subarray(start));
@@ -314,16 +315,25 @@ test('UrlSource places 206 bodies at the range their Content-Range states', asyn
 
 	await new Promise<void>(resolve => server.listen(0, resolve));
 
-	try {
-		const address = server.address();
-		assert(address && typeof address !== 'string');
-		using ref = new UrlSource(`http://localhost:${address.port}/data.bin`).ref();
+	const readAt = async (url: string, starts: number[]) => {
+		using ref = new UrlSource(url).ref();
 		const reader = new Reader(ref.source);
 
-		for (const start of [0, 2_500_123]) {
+		for (const start of starts) {
 			const slice = await reader.requestSlice(start, 16);
 			expect(slice).not.toBeNull();
 			expect([...readBytes(slice!, 16)]).toEqual([...data.subarray(start, start + 16)]);
+		}
+	};
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+
+		// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+		for (const unit of ['bytes', 'Bytes']) {
+			rangeUnit = unit;
+			await readAt(`http://localhost:${address.port}/data.bin`, [0, 2_500_123]);
 		}
 	} finally {
 		server.closeAllConnections();
