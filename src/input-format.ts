@@ -22,9 +22,8 @@ import {
 } from './matroska/ebml';
 import { MatroskaDemuxer } from './matroska/matroska-demuxer';
 import { Mp3Demuxer } from './mp3/mp3-demuxer';
-import { MP3_FRAME_HEADER_SIZE, getXingOffset, INFO, XING } from '../shared/mp3-misc';
 import { ID3_V2_HEADER_SIZE, readId3V2Header } from './id3';
-import { readNextMp3FrameHeader } from './mp3/mp3-reader';
+import { readFirstMp3FrameHeader } from './mp3/mp3-reader';
 import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from './adts/adts-reader';
@@ -384,48 +383,9 @@ export class Mp3InputFormat extends InputFormat {
 		// out in place. Zeros can't form a frame header; FFmpeg's mp3_read_probe skips them the same way.
 		currentPos = await skipZeroBytes(input._reader, currentPos, 2 ** 20);
 
-		const firstResult = await readNextMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
-		if (!firstResult) {
-			return false;
-		}
-
-		const firstHeader = firstResult.header;
-		const xingOffset = getXingOffset(firstHeader.mpegVersionId, firstHeader.channel);
-
-		let slice = input._reader.requestSlice(firstResult.startPos + xingOffset, 4);
-		if (isThenable(slice)) slice = await slice;
-		if (!slice) return false;
-
-		const word = readU32Be(slice);
-		const isXing = word === XING || word === INFO;
-
-		if (isXing) {
-			// Gotta be MP3
-			return true;
-		}
-
-		currentPos = firstResult.startPos + firstResult.header.totalSize;
-
-		// Fine, we found one frame header, but we're still not entirely sure this is MP3. Let's check if we can find
-		// another header right after it:
-		const secondResult = await readNextMp3FrameHeader(
-			input._reader,
-			currentPos,
-			currentPos + MP3_FRAME_HEADER_SIZE,
-		);
-		if (!secondResult) {
-			return false;
-		}
-
-		const secondHeader = secondResult.header;
-
-		// In a well-formed MP3 file, we'd expect these two frames to share some similarities:
-		if (firstHeader.channel !== secondHeader.channel || firstHeader.sampleRate !== secondHeader.sampleRate) {
-			return false;
-		}
-
-		// We have found two matching consecutive MP3 frames, a strong indicator that this is an MP3 file
-		return true;
+		// A Xing tag or two matching consecutive frames are a strong indicator that this is an MP3 file
+		const firstResult = await readFirstMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
+		return firstResult !== null;
 	}
 
 	/** @internal */
