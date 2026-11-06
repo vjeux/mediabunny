@@ -97,7 +97,7 @@ export type PacketRetrievalOptions = {
 	skipLiveWait?: boolean;
 };
 
-const validatePacketRetrievalOptions = (options: PacketRetrievalOptions) => {
+export const validatePacketRetrievalOptions = (options: PacketRetrievalOptions) => {
 	if (!options || typeof options !== 'object') {
 		throw new TypeError('options must be an object.');
 	}
