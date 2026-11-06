@@ -163,6 +163,26 @@ test('Annex B', async () => {
 	expect([...firstPacket.data.slice(0, 4)]).toEqual([0, 0, 0, 1]);
 });
 
+test('HEVC codec strings start with the sample entry type', async () => {
+	// The first file stores its track as 'hev1', the second one as 'hvc1'
+	const expected = [
+		['video-h265.mp4', 'hev1.1.6.L120.90'],
+		['sps-only-sar-hevc.mp4', 'hvc1.1.6.L30.90'],
+	];
+
+	for (const [fileName, codecString] of expected) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public', fileName!)),
+			formats: ALL_FORMATS,
+		});
+
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect(await track.getCodecParameterString()).toBe(codecString);
+		expect((await track.getDecoderConfig())!.codec).toBe(codecString);
+		expect(await input.getMimeType()).toContain(codecString);
+	}
+});
+
 test('HE-AAC v2 audio config is parsed correctly', async () => {
 	const filePath = path.join(__dirname, '..', 'public/he-aac-v2.mp4');
 	using input = new Input({
