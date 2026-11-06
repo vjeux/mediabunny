@@ -1467,6 +1467,29 @@ test('Ogg: Garbage between pages', async () => {
 	await expectGracefulRead(concatList(pages.flatMap((page, i) => i >= 2 ? [page, zeros(8)] : [page])));
 });
 
+test('Ogg: Reading goes on past garbage and empty pages between pages', async () => {
+	// Like libogg and FFmpeg, skip whatever sits between two pages instead of ending the stream there
+	const pages = opusPages({ pageCount: 10 });
+	const file = concatList([
+		...pages.slice(0, 2), // The header pages
+		new Uint8Array(100).fill(0x4f), // Garbage made of 'O's
+		...pages.slice(2, 6),
+		oggPage({ granule: -1, sequence: 99, lacing: [], data: [] }), // A page without segments
+		...pages.slice(6),
+	]);
+
+	for (const source of [new BufferSource(file), streamedSource(file)]) {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(Math.round(packet.timestamp * 48000));
+		}
+		expect(timestamps).toEqual(Array.from({ length: 100 }, (_, i) => 960 * i - 312));
+	}
+});
+
 test('Ogg: Pages without granule positions at the start', async () => {
 	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
 	for (let i = 0; i < 20; i++) {
