@@ -989,20 +989,25 @@ export const getAudioPreRollDuration = (codec: AudioCodec, decoderConfig: AudioD
 		}
 
 		case 'vorbis': {
-			assert(decoderConfig.description);
+			// Without a readable identification header, assume the largest long window Vorbis allows
+			let longBlockSize = 8192;
 
-			// Skip the Xiph lacing to get to the identification header
-			const bytes = toUint8Array(decoderConfig.description);
-			let pos = 1;
-			let lacedLengthsLeft = 2;
-			while (lacedLengthsLeft > 0) {
-				if (bytes[pos++]! < 255) {
-					lacedLengthsLeft--;
+			if (decoderConfig.description) {
+				// Skip the Xiph lacing to get to the identification header
+				const bytes = toUint8Array(decoderConfig.description);
+				let pos = 1;
+				let lacedLengthsLeft = 2;
+				while (lacedLengthsLeft > 0 && pos < bytes.length) {
+					if (bytes[pos++]! < 255) {
+						lacedLengthsLeft--;
+					}
+				}
+
+				const blockSizeByte = bytes[pos + 28];
+				if (lacedLengthsLeft === 0 && blockSizeByte !== undefined) {
+					longBlockSize = 1 << (blockSizeByte >> 4); // blocksize_1
 				}
 			}
-
-			const blockSizeByte = bytes[pos + 28]!;
-			const longBlockSize = 1 << (blockSizeByte >> 4); // blocksize_1
 
 			// The previous packet's long window overlaps by up to half its size
 			return (longBlockSize / 2) / decoderConfig.sampleRate;
