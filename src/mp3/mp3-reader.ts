@@ -80,7 +80,9 @@ export const readNextMp3FrameHeader = async (
 /** Whether the frame at pos holds a Xing/Info tag, or a frame header with the same parameters follows it. */
 const isConfirmedMp3Frame = async (reader: Reader, pos: number, header: Mp3FrameHeader) => {
 	let slice = reader.requestSlice(pos + getXingOffset(header.mpegVersionId, header.channel), 4);
-	if (isThenable(slice)) slice = await slice;
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
 	if (slice) {
 		const word = readU32Be(slice);
 		if (word === XING || word === INFO) {
@@ -89,7 +91,9 @@ const isConfirmedMp3Frame = async (reader: Reader, pos: number, header: Mp3Frame
 	}
 
 	slice = reader.requestSlice(pos + header.totalSize, MP3_FRAME_HEADER_SIZE);
-	if (isThenable(slice)) slice = await slice;
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
 	if (!slice) {
 		return false;
 	}
