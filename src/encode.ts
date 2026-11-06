@@ -401,6 +401,7 @@ export const buildVideoEncoderConfigs = (options: {
 			options.height,
 			bitrateEstimate,
 			options.alpha === 'keep',
+			options.framerate,
 		),
 		width: options.width,
 		height: options.height,
