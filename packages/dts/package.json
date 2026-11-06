@@ -3,13 +3,13 @@
   "author": "Vanilagy",
   "version": "1.65.2",
   "description": "DTS decoder and encoder extension for Mediabunny, based on libavcodec.",
-  "main": "./dist/bundles/mediabunny-dts.mjs",
+  "main": "./dist/bundles/mediabunny-dts.cjs",
   "module": "./dist/bundles/mediabunny-dts.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
     "types": "./dist/modules/src/index.d.ts",
     "import": "./dist/bundles/mediabunny-dts.mjs",
-    "require": "./dist/bundles/mediabunny-dts.mjs"
+    "require": "./dist/bundles/mediabunny-dts.cjs"
   },
   "files": [
     "README.md",
