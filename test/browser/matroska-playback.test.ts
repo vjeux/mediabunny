@@ -14,6 +14,8 @@ import {
 	MATROSKA,
 	Output,
 	Quality,
+	StreamTarget,
+	StreamTargetChunk,
 	VideoSample,
 	VideoSampleSink,
 	VideoSampleSource,
@@ -29,15 +31,19 @@ import { isFirefox, isWebKit } from '../../src/misc.js';
 const encodeWebM = async (options: {
 	codec: 'vp8' | 'vp9' | 'av1';
 	audio?: boolean;
-	appendOnly?: boolean;
 	rotation?: 0 | 90 | 180 | 270;
 	frames?: number;
+	keyFrameInterval?: number;
 }) => {
 	const output = new Output({
-		format: new WebMOutputFormat({ appendOnly: options.appendOnly }),
+		format: new WebMOutputFormat(),
 		target: new BufferTarget(),
 	});
-	const videoSource = new VideoSampleSource({ codec: options.codec, bitrate: new Quality('low') });
+	const videoSource = new VideoSampleSource({
+		codec: options.codec,
+		bitrate: new Quality('low'),
+		keyFrameInterval: options.keyFrameInterval,
+	});
 	output.addVideoTrack(videoSource, { rotation: options.rotation ?? 0, frameRate: 30 });
 	let audioSource: AudioSampleSource | null = null;
 	if (options.audio) {
@@ -76,37 +82,124 @@ const encodeWebM = async (options: {
 
 const toArrayBuffer = (bytes: Uint8Array) => bytes.slice().buffer;
 
-/** Appends the file to a SourceBuffer in small pieces, like a stream would, and reports what Chrome made of it. */
-const playThroughMse = async (bytes: Uint8Array, mimeType: string) => {
+/** A <video> element fed through Media Source Extensions, which use the browser's own WebM parser. */
+const openMse = async (mimeType: string) => {
 	expect(MediaSource.isTypeSupported(mimeType)).toBe(true);
 
 	const video = document.createElement('video');
-	video.muted = true;
+	video.muted = true; // Muted media may play without a user gesture
 	const mediaSource = new MediaSource();
 	const url = URL.createObjectURL(mediaSource);
 	video.src = url;
+	await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve, { once: true }));
 
-	try {
-		await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve, { once: true }));
-		const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
-		const errors: string[] = [];
-		sourceBuffer.addEventListener('error', () => errors.push('SourceBuffer error'));
-		video.addEventListener('error', () => errors.push(`video error: ${video.error?.message}`));
+	const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+	const errors: string[] = [];
+	sourceBuffer.addEventListener('error', () => errors.push('SourceBuffer error'));
+	video.addEventListener('error', () => errors.push(`video error: ${video.error?.message}`));
 
-		const chunkSize = 4096;
-		for (let i = 0; i < bytes.length && errors.length === 0; i += chunkSize) {
-			sourceBuffer.appendBuffer(toArrayBuffer(bytes.subarray(i, i + chunkSize)));
+	return {
+		errors,
+		buffered: () => {
+			const ranges: number[][] = [];
+			for (let i = 0; i < sourceBuffer.buffered.length; i++) {
+				ranges.push([sourceBuffer.buffered.start(i), sourceBuffer.buffered.end(i)]);
+			}
+			return ranges;
+		},
+		append: async (bytes: Uint8Array) => {
+			sourceBuffer.appendBuffer(toArrayBuffer(bytes));
 			await new Promise(resolve => sourceBuffer.addEventListener('updateend', resolve, { once: true }));
-		}
+		},
+		/** Ends the stream and plays it from the start until the element reports its end. */
+		playToEnd: async () => {
+			try {
+				mediaSource.endOfStream();
+				await video.play();
+				await new Promise<void>((resolve, reject) => {
+					if (video.ended) {
+						resolve();
+						return;
+					}
 
-		const buffered: number[][] = [];
-		for (let i = 0; i < sourceBuffer.buffered.length; i++) {
-			buffered.push([sourceBuffer.buffered.start(i), sourceBuffer.buffered.end(i)]);
-		}
+					const timeout = setTimeout(() => {
+						reject(new Error(`Playback stalled at ${video.currentTime} s`));
+					}, 15_000);
+					video.addEventListener('ended', () => {
+						clearTimeout(timeout);
+						resolve();
+					}, { once: true });
+					video.addEventListener('error', () => {
+						clearTimeout(timeout);
+						reject(new Error(`video error: ${video.error?.message}`));
+					}, { once: true });
+				});
 
-		return { errors, buffered, width: video.videoWidth, height: video.videoHeight };
-	} finally {
-		URL.revokeObjectURL(url);
+				const quality = video.getVideoPlaybackQuality();
+				return {
+					currentTime: video.currentTime,
+					presentedFrames: quality.totalVideoFrames - quality.droppedVideoFrames,
+					width: video.videoWidth,
+					height: video.videoHeight,
+				};
+			} finally {
+				// Release the media player
+				video.removeAttribute('src');
+				video.load();
+				URL.revokeObjectURL(url);
+			}
+		},
+	};
+};
+
+/** Appends the file to a SourceBuffer in small pieces, like a stream would, then plays it to its end. */
+const playThroughMse = async (bytes: Uint8Array, mimeType: string) => {
+	const mse = await openMse(mimeType);
+	const chunkSize = 4096;
+	for (let i = 0; i < bytes.length && mse.errors.length === 0; i += chunkSize) {
+		await mse.append(bytes.subarray(i, i + chunkSize));
+	}
+	expect(mse.errors).toEqual([]);
+
+	const buffered = mse.buffered();
+	return { buffered, ...await mse.playToEnd() };
+};
+
+/** Copies the video and Opus audio packets of a WebM file into the output, interleaved, but doesn't finalize it. */
+const copyPackets = async (bytes: Uint8Array, output: Output) => {
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const videoTrack = (await input.getVideoTracks())[0]!;
+	const audioTrack = (await input.getAudioTracks())[0]!;
+
+	const videoSource = new EncodedVideoPacketSource((await videoTrack.getCodec())!);
+	const audioSource = new EncodedAudioPacketSource('opus');
+	output.addVideoTrack(videoSource);
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const videoPackets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		videoPackets.push(packet);
+	}
+	const audioPackets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+		audioPackets.push(packet);
+	}
+
+	const videoConfig = (await videoTrack.getDecoderConfig())!;
+	const audioConfig = (await audioTrack.getDecoderConfig())!;
+	let v = 0;
+	let a = 0;
+	while (v < videoPackets.length || a < audioPackets.length) {
+		const videoIsNext = a >= audioPackets.length
+			|| (v < videoPackets.length && videoPackets[v]!.timestamp <= audioPackets[a]!.timestamp);
+		if (videoIsNext) {
+			await videoSource.add(videoPackets[v]!, v === 0 ? { decoderConfig: videoConfig } : undefined);
+			v++;
+		} else {
+			await audioSource.add(audioPackets[a]!, a === 0 ? { decoderConfig: audioConfig } : undefined);
+			a++;
+		}
 	}
 };
 
@@ -136,19 +229,49 @@ describe('Mediabunny WebM in Chrome', () => {
 	])('$codec + Opus plays through Media Source Extensions', async ({ codec, mimeType }) => {
 		const bytes = await encodeWebM({ codec, audio: true });
 		const result = await playThroughMse(bytes, mimeType);
-		expect(result.errors).toEqual([]);
 		expect(result.buffered.length).toBe(1);
 		expect(result.buffered[0]![0]).toBeLessThanOrEqual(0.01);
 		expect(result.buffered[0]![1]).toBeCloseTo(1.5, 1);
+		expect(result.currentTime).toBeCloseTo(1.5, 1);
+		expect(result.presentedFrames).toBeGreaterThan(0);
 		expect([result.width, result.height]).toEqual([160, 120]);
 	});
 
 	test('append-only output plays through Media Source Extensions while it is being written', async () => {
-		const bytes = await encodeWebM({ codec: 'vp9', audio: true, appendOnly: true });
-		const result = await playThroughMse(bytes, 'video/webm; codecs="vp9, opus"');
-		expect(result.errors).toEqual([]);
-		expect(result.buffered.length).toBe(1);
-		expect(result.buffered[0]![1]).toBeCloseTo(1.5, 1);
+		// Every write goes to the SourceBuffer right away, so the media must become playable before finalize()
+		const source = await encodeWebM({ codec: 'vp9', audio: true, frames: 90, keyFrameInterval: 0.5 });
+		const mse = await openMse('video/webm; codecs="vp9, opus"');
+
+		// The writes are taken as they come and appended in order; waiting for the appends before taking the next write
+		// would hold the writes back in the stream's queue
+		let writtenBytes = 0;
+		let appends = Promise.resolve();
+		const output = new Output({
+			format: new WebMOutputFormat({ appendOnly: true }),
+			target: new StreamTarget(new WritableStream<StreamTargetChunk>({
+				write: (chunk) => {
+					expect(chunk.position).toBe(writtenBytes); // Each write continues where the last one ended
+					writtenBytes += chunk.data.length;
+					const data = chunk.data.slice();
+					appends = appends.then(() => mse.append(data));
+				},
+			})),
+		});
+
+		await copyPackets(source, output);
+		await appends;
+		const bufferedBeforeFinalize = mse.buffered();
+		await output.finalize();
+		await appends;
+
+		expect(mse.errors).toEqual([]);
+		expect(bufferedBeforeFinalize.length).toBe(1);
+		expect(bufferedBeforeFinalize[0]![1]).toBeGreaterThan(1); // Over a second of the three was already playable
+		expect(mse.buffered()[0]![1]).toBeCloseTo(3, 1);
+
+		const result = await mse.playToEnd();
+		expect(result.currentTime).toBeCloseTo(3, 1);
+		expect(result.presentedFrames).toBeGreaterThan(0);
 	});
 
 	test('the <video> element reads the duration, size and rotation', async () => {
@@ -166,63 +289,71 @@ describe('Mediabunny WebM in Chrome', () => {
 
 	test('a packet copy of a WebM file keeps playing in Chrome', async () => {
 		const source = await encodeWebM({ codec: 'vp8', audio: true });
-		using input = new Input({ source: new BufferSource(source), formats: ALL_FORMATS });
-		const [videoTrack, audioTrack] = [(await input.getVideoTracks())[0]!, (await input.getAudioTracks())[0]!];
-
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-		const videoSource = new EncodedVideoPacketSource('vp8');
-		const audioSource = new EncodedAudioPacketSource('opus');
-		output.addVideoTrack(videoSource);
-		output.addAudioTrack(audioSource);
-		await output.start();
-
-		const videoPackets: EncodedPacket[] = [];
-		for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
-			videoPackets.push(packet);
-		}
-		const audioPackets: EncodedPacket[] = [];
-		for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
-			audioPackets.push(packet);
-		}
-
-		const videoConfig = (await videoTrack.getDecoderConfig())!;
-		const audioConfig = (await audioTrack.getDecoderConfig())!;
-		let v = 0;
-		let a = 0;
-		while (v < videoPackets.length || a < audioPackets.length) {
-			const videoIsNext = a >= audioPackets.length
-				|| (v < videoPackets.length && videoPackets[v]!.timestamp <= audioPackets[a]!.timestamp);
-			if (videoIsNext) {
-				await videoSource.add(videoPackets[v]!, v === 0 ? { decoderConfig: videoConfig } : undefined);
-				v++;
-			} else {
-				await audioSource.add(audioPackets[a]!, a === 0 ? { decoderConfig: audioConfig } : undefined);
-				a++;
-			}
-		}
+		await copyPackets(source, output);
 		await output.finalize();
 
 		const result = await playThroughMse(new Uint8Array(output.target.buffer!), 'video/webm; codecs="vp8, opus"');
-		expect(result.errors).toEqual([]);
 		expect(result.buffered[0]![1]).toBeCloseTo(1.5, 1);
+		expect(result.currentTime).toBeCloseTo(1.5, 1);
+		expect(result.presentedFrames).toBeGreaterThan(0);
 	});
 });
 
-const record = async (mimeType: string, durationMs: number) => {
-	const canvas = document.createElement('canvas');
-	canvas.width = 160;
-	canvas.height = 120;
-	const context = canvas.getContext('2d')!;
-	const stream = canvas.captureStream(30);
+type AudioTrackGenerator = MediaStreamTrack & { writable: WritableStream<AudioData> };
+
+/**
+ * A live audio track. Chrome can generate one from AudioData. Elsewhere, an oscillator plays into one, which needs the
+ * page to be allowed to play audio: without a user gesture, an AudioContext stays suspended and records nothing.
+ */
+const createLiveAudioTrack = () => {
+	const TrackGenerator = (globalThis as unknown as {
+		MediaStreamTrackGenerator?: new (init: { kind: 'audio' }) => AudioTrackGenerator;
+	}).MediaStreamTrackGenerator;
+
+	if (TrackGenerator) {
+		const generator = new TrackGenerator({ kind: 'audio' });
+		const writer = generator.writable.getWriter();
+		let timestamp = 0; // In microseconds
+		const interval = setInterval(() => {
+			const data = new Float32Array(960).map((_, i) => 0.1 * Math.sin((0.048 * timestamp + i) / 20));
+			void writer.write(new AudioData({
+				format: 'f32-planar',
+				sampleRate: 48000,
+				numberOfFrames: 960,
+				numberOfChannels: 1,
+				timestamp,
+				data,
+			}));
+			timestamp += 20_000;
+		}, 20);
+
+		return {
+			track: generator as MediaStreamTrack,
+			stop: async () => {
+				clearInterval(interval);
+				await writer.close();
+			},
+		};
+	}
 
 	const audioContext = new AudioContext({ sampleRate: 48000 });
 	const oscillator = audioContext.createOscillator();
 	const destination = audioContext.createMediaStreamDestination();
 	oscillator.connect(destination);
 	oscillator.start();
-	for (const track of destination.stream.getAudioTracks()) {
-		stream.addTrack(track);
-	}
+	return { track: destination.stream.getAudioTracks()[0]!, stop: () => audioContext.close() };
+};
+
+/** Records a canvas animation with a tone. */
+const record = async (mimeType: string, durationMs: number) => {
+	const canvas = document.createElement('canvas');
+	canvas.width = 160;
+	canvas.height = 120;
+	const context = canvas.getContext('2d')!;
+	const stream = canvas.captureStream(30);
+	const audio = createLiveAudioTrack();
+	stream.addTrack(audio.track);
 
 	const recorder = new MediaRecorder(stream, { mimeType });
 	const chunks: Blob[] = [];
@@ -234,14 +365,23 @@ const record = async (mimeType: string, durationMs: number) => {
 		context.fillRect(0, 0, 160, 120);
 	}, 33);
 
-	recorder.start(250); // Several chunks, like a live upload
-	await new Promise(resolve => setTimeout(resolve, durationMs));
-	recorder.stop();
-	await new Promise(resolve => recorder.addEventListener('stop', resolve, { once: true }));
-	clearInterval(interval);
-	await audioContext.close();
+	try {
+		// Asks for several chunks, like a live upload. (Chrome may still hold everything back until the end.)
+		recorder.start(250);
+		await new Promise(resolve => setTimeout(resolve, durationMs));
+		recorder.stop();
+		await new Promise(resolve => recorder.addEventListener('stop', resolve, { once: true }));
+	} finally {
+		clearInterval(interval);
+		await audio.stop();
+		for (const track of stream.getTracks()) {
+			track.stop();
+		}
+	}
 
-	return new Uint8Array(await new Blob(chunks).arrayBuffer());
+	const bytes = new Uint8Array(await new Blob(chunks).arrayBuffer());
+	expect(bytes.length, 'MediaRecorder wrote no data').toBeGreaterThan(0);
+	return bytes;
 };
 
 describe('MediaRecorder files', () => {
@@ -257,7 +397,7 @@ describe('MediaRecorder files', () => {
 			`MediaRecorder can't record ${mimeType} here`,
 		);
 
-		const bytes = await record(mimeType, 1200);
+		const bytes = await record(mimeType, 1500);
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 		expect(await input.getFormat()).toBe(format);
 		expect(await input.getDurationFromMetadata()).toBe(null); // Unknown-size live file without Duration
