@@ -5,6 +5,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import {
 	CmafOutputFormat,
+	HlsOutputFormat,
 	MkvOutputFormat,
 	MovOutputFormat,
 	Mp4OutputFormat,
@@ -14,8 +15,8 @@ import {
 } from '../../src/output-format.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { BufferTarget } from '../../src/target.js';
-import { BufferSource, ReadableStreamSource } from '../../src/source.js';
+import { BufferTarget, PathedTarget } from '../../src/target.js';
+import { BufferSource, CustomPathedSource, ReadableStreamSource } from '../../src/source.js';
 import { VirtualFile, VirtualFileTarget } from './helpers/l38-virtual-file.js';
 
 // Payloads of 256 MiB that are all views into one buffer: frame i is the view starting at byte i, so its first byte is
@@ -365,6 +366,57 @@ describe('Matroska past 4 GiB', () => {
 	});
 });
 
+describe('HLS past 4 GiB', () => {
+	test('one segment file per playlist gets byte ranges past 4 GiB', async () => {
+		const files = new Map<string, VirtualFile>();
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new CmafOutputFormat(),
+				targetDuration: 2,
+				singleFilePerPlaylist: true,
+			}),
+			target: new PathedTarget('index.m3u8', ({ path }) => {
+				const target = new VirtualFileTarget();
+				files.set(path, target.file);
+				return target;
+			}),
+		});
+		const video = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(video, { frameRate: 1 });
+		await output.start();
+		for (let i = 0; i < 18; i++) {
+			await video.add(new EncodedPacket(bigFrame(i), 'key', i, 1), vp9Config);
+		}
+		await video.add(new EncodedPacket(markerFrame(0x77), 'key', 18, 1));
+		await output.finalize();
+
+		const playlist = files.get('playlist-1.m3u8')!;
+		const byteRanges = new TextDecoder().decode(playlist.read(0, playlist.size))
+			.split('\n')
+			.filter(line => line.startsWith('#EXT-X-BYTERANGE:'))
+			.map((line) => {
+				const [length, offset] = line.slice('#EXT-X-BYTERANGE:'.length).split('@').map(Number);
+				return { length: length!, offset: offset! };
+			});
+
+		// Two frames per segment, so the last of the ten segments holds only the marker frame
+		expect(byteRanges).toHaveLength(10);
+		expect(byteRanges.at(-1)!.offset).toBeGreaterThan(2 ** 32);
+		for (let i = 1; i < byteRanges.length; i++) {
+			expect(byteRanges[i]!.offset).toBe(byteRanges[i - 1]!.offset + byteRanges[i - 1]!.length);
+		}
+		expect(byteRanges.at(-1)!.offset + byteRanges.at(-1)!.length).toBe(files.get('segments-1.m4s')!.size);
+
+		using input = new Input({
+			source: new CustomPathedSource('index.m3u8', ({ path }) => files.get(path)!.toSource()),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect((await new EncodedPacketSink(track).getPacket(18.5))!.data).toEqual(markerFrame(0x77));
+		expect(await input.computeDuration()).toBe(19);
+	});
+});
+
 describe('WAVE past 4 GiB', () => {
 	const muxRf64 = async () => {
 		// 18 packets of 256 MiB of 16-bit stereo at 48 kHz (each 23.3 minutes long), then a marker packet
@@ -426,6 +478,47 @@ describe('WAVE past 4 GiB', () => {
 			}
 		};
 		await expect(mux()).rejects.toThrow(/maximum RIFF size of 4 GiB/);
+	});
+});
+
+describe('MP3 past 4 GiB', () => {
+	// MPEG-1 Layer III at 44.1 kHz and 128 kbit/s, stereo: frames of 417 bytes without padding
+	const mp3Frame = () => {
+		const frame = new Uint8Array(417);
+		frame.set([0xff, 0xfb, 0x90, 0x00]);
+		return frame;
+	};
+
+	test('CBR durations are estimated from file sizes past 4 GiB', async () => {
+		// A few frames, then zeros up to 5 GiB
+		const file = new VirtualFile();
+		for (let i = 0; i < 4; i++) {
+			file.write(mp3Frame(), 417 * i);
+		}
+		file.size = 5 * 2 ** 30;
+
+		using input = new Input({ source: file.toSource(), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		const averageFrameSize = 144 * 128000 / 44100;
+		const frameCount = Math.round(5 * 2 ** 30 / averageFrameSize);
+		expect(await track.getDurationFromMetadata()).toBeCloseTo(frameCount * 1152 / 44100, 9); // 93 hours
+	});
+
+	test('Xing frame counts past 2^32 samples give the full duration', async () => {
+		// A Xing frame claiming 4 million frames (4.6e9 samples), then a few frames
+		const xingFrame = mp3Frame();
+		xingFrame.set([0x58, 0x69, 0x6e, 0x67, 0, 0, 0, 1], 36); // 'Xing', frame count present
+		new DataView(xingFrame.buffer).setUint32(44, 4_000_000);
+
+		const bytes = new Uint8Array(417 * 5);
+		bytes.set(xingFrame);
+		for (let i = 1; i < 5; i++) {
+			bytes.set(mp3Frame(), 417 * i);
+		}
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getDurationFromMetadata()).toBeCloseTo(4_000_000 * 1152 / 44100, 9); // 29 hours
 	});
 });
 
