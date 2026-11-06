@@ -61,6 +61,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	lastBuffer: Buffer | null = null;
 	packetEmitted = false;
 	quantizer: number | null = null;
+	/** The software encoder to switch to should the chosen hardware encoder fail to open. */
+	softwareFallbackCodec: NodeAv.Codec | null = null;
 
 	// Bookkeeping to restore the original timing information
 	preciseTimings: {
@@ -118,6 +120,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 
 			codec = hardwareCodec ?? getSoftwareCodec();
+
+			if (hardwareCodec) {
+				// A listed hardware encoder can still fail to open, like av1_nvenc on NVIDIA GPUs without AV1 encoding
+				// or once all of the GPU's encoder sessions are taken, so keep a software encoder at hand
+				this.softwareFallbackCodec = getSoftwareCodec();
+			}
 		}
 
 		if (!codec) {
@@ -312,6 +320,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.colorRange = range;
 
 		const ret = await codecContext.open2();
+		if (ret < 0 && this.softwareFallbackCodec) {
+			codecContext.freeContext();
+			this.avCodec = this.softwareFallbackCodec;
+			this.softwareFallbackCodec = null;
+
+			await this.createCodecContext();
+			return;
+		}
 		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
 
 		this.codecContext = codecContext;
