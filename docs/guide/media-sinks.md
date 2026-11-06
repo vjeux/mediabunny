@@ -558,13 +558,16 @@ For example, let's use this sink to play the last 10 seconds of an audio track:
 const sink = new AudioBufferSink(audioTrack);
 const audioContext = new AudioContext();
 const lastTimestamp = await audioTrack.computeDuration();
-const startTimestamp = lastTimestamp - 10;
+const startTimestamp = Math.max(lastTimestamp - 10, 0);
 const baseTime = audioContext.currentTime;
 
 for await (const { buffer, timestamp } of sink.buffers(startTimestamp)) {
 	const source = audioContext.createBufferSource();
 	source.buffer = buffer;
 	source.connect(audioContext.destination);
-	source.start(baseTime + timestamp - startTimestamp);
+
+	// The first buffer can begin before startTimestamp; skip that part of it
+	const offset = Math.max(startTimestamp - timestamp, 0);
+	source.start(baseTime + Math.max(timestamp - startTimestamp, 0), offset);
 }
 ```
