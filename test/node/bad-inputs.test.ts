@@ -588,6 +588,29 @@ test('MP4: Encryption subsamples exceeding the sample', async () => {
 	await expect(new EncodedPacketSink(track).getFirstPacket()).rejects.toThrow(/subsamples exceed/);
 });
 
+test('MP4: Sample auxiliary information larger than its saiz size', async () => {
+	// A subsample count that doesn't fit into its entry used to read past the auxiliary information with an internal
+	// error. Chromium parses each entry within its saiz size.
+	const sinf = box('sinf',
+		box('frma', ascii('avc1')),
+		fullBox('schm', 0, 0, ascii('cenc'), u32(0x10000)),
+		box('schi', fullBox('tenc', 0, 0, u8(0), u8(0), u8(1), u8(8), zeros(16))),
+	);
+	const stbl = (dataOffset: number) => [
+		stsd(videoSampleEntry('encv', sinf)),
+		...singleChunkStbl(1, dataOffset).slice(1),
+		fullBox('saiz', 0, 0, u8(16), u32(1)),
+		fullBox('saio', 0, 0, u32(1), u32(dataOffset + 4)),
+	];
+	const header = mp4([trak({ handler: 'vide', stbl: stbl(0) })]);
+	const auxInfo = [...zeros(8), ...u16(0xffff), ...zeros(6)]; // IV, then far more subsamples than fit
+
+	await expectGracefulRead(
+		mp4([trak({ handler: 'vide', stbl: stbl(header.length + 8) })], [box('mdat', zeros(4), auxInfo)]),
+		/saiz/,
+	);
+});
+
 test('MP4: Sample table failing to parse', async () => {
 	// A failed parse used to leave a half-built sample table behind, which later calls then tripped over
 	const truncatedStco = fullBox('stco', 0, 0, u32(1000), u32(0));
