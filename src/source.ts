@@ -835,7 +835,8 @@ export class UrlSource extends PathedSource {
 
 		super(
 			urlString,
-			request => new UrlSource(request.path, this._options),
+			// Sub-requests share this request's configuration, minus the byte range
+			request => new UrlSource(request.path, { ...this._options, requestInit: this._requestInit }),
 		);
 
 		this._url = url;
@@ -868,6 +869,16 @@ export class UrlSource extends PathedSource {
 				strippedRequest.headers.delete('Range');
 				this._url = strippedRequest;
 			}
+
+			// fetch(request, init) replaces the request's headers with init.headers, and our requests always carry
+			// init.headers (for the Range header). So, the request's own headers need to be carried over, with
+			// the ones from requestInit taking precedence.
+			const requestHeaders = normalizeHeaders(url.headers);
+			delete requestHeaders['range']; // Headers instances use lowercase names
+			this._requestInit.headers = mergeRequestInit(
+				{ headers: requestHeaders },
+				{ headers: this._requestInit.headers ?? {} },
+			).headers;
 		}
 
 		if (rangeHeaderValue !== null) {

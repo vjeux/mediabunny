@@ -299,6 +299,40 @@ test('UrlSource reads the full decoded body of a compressed 206 response', async
 	}
 });
 
+test('UrlSource sends the headers of a Request passed as url, also on sub-requests', async () => {
+	const seen: { url: string | undefined; authorization: string | undefined; custom: unknown }[] = [];
+	const server = http.createServer((req, res) => {
+		seen.push({ url: req.url, authorization: req.headers.authorization, custom: req.headers['x-custom'] });
+		res.writeHead(206, { 'Content-Range': 'bytes 0-15/16', 'Content-Length': 16 });
+		res.end(Buffer.alloc(16));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const request = new Request(`http://localhost:${address.port}/a.bin`, {
+			headers: { 'Authorization': 'Bearer token', 'X-Custom': 'from request' },
+		});
+		const source = new UrlSource(request, { requestInit: { headers: { 'X-Custom': 'from requestInit' } } });
+		using ref = source.ref();
+		expect(await new Reader(ref.source).requestSlice(0, 4)).not.toBeNull();
+
+		const childPath = `http://localhost:${address.port}/b.bin`;
+		using childRef = await source._resolveRequest({ path: childPath, isRoot: false });
+		expect(await new Reader(childRef.source).requestSlice(0, 4)).not.toBeNull();
+
+		expect(seen).toEqual([
+			{ url: '/a.bin', authorization: 'Bearer token', custom: 'from requestInit' },
+			{ url: '/b.bin', authorization: 'Bearer token', custom: 'from requestInit' },
+		]);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
 ) => {
