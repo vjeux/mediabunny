@@ -419,7 +419,7 @@ test('Codec info from the sample description the samples use', async () => {
 	const aac = mp4a(0x40, [0x12, 0x08]);
 	const mp3 = mp4a(0x6b, []);
 
-	const read = async (entries: number[][], trexIndex: number, tfhdIndex: number | null) => {
+	const read = async (entries: number[][], trexIndex: number, tfhdIndex: number | null, freeBoxCount = 0) => {
 		const moov = box('moov',
 			box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
 			box('trak',
@@ -447,6 +447,7 @@ test('Codec info from the sample description the samples use', async () => {
 				...box('ftyp', ascii('iso6'), u32(0)),
 				...moov,
 				...box('sidx', zeros(24)),
+				...Array.from({ length: freeBoxCount }, () => box('free')).flat(),
 				...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
 				...box('mdat', [0xff, 0xfb, 0x50, 0xc4]),
 			])),
@@ -461,4 +462,6 @@ test('Codec info from the sample description the samples use', async () => {
 	expect(await read([mp3, aac], 1024, 1)).toBe('mp3');
 	expect(await read([aac, mp3], 2, null)).toBe('mp3'); // trex
 	expect(await read([mp3, aac], 1, null)).toBe('mp3');
+	// tfhd wins over a valid trex index, however many boxes come before the first moof box
+	expect(await read([aac, mp3], 1, 2, 8)).toBe('mp3');
 });

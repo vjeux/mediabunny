@@ -568,7 +568,9 @@ export class IsobmffDemuxer extends Demuxer {
 	private async readFirstFragmentSampleDescriptionIndices(pos: number) {
 		const indices = new Map<number, number>();
 
-		for (let i = 0; i < 8; i++) { // Some boxes (like sidx, styp, emsg or free) may come before the first moof box
+		// Any number of boxes (like sidx, styp, emsg or free) may come before the first moof box. Every box moves the
+		// position forward by at least its header, so this ends at the first moof box or the end of the file.
+		while (true) {
 			let slice = this.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 			if (isThenable(slice)) {
 				slice = await slice;
