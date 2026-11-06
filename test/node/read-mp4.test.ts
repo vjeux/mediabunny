@@ -643,3 +643,66 @@ test('Fragmented video frames that depend on others are not key frames, even if 
 	expect(types).toEqual(['key', 'delta', 'delta', 'key', 'delta']);
 	expect((await sink.getKeyPacket(0.25))?.timestamp).toBe(0);
 });
+
+test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async () => {
+	// Like iTunes/QuickTime X output: the 2112 priming samples are only declared in iTunSMPB, without an edts box
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	// ES_Descriptor > DecoderConfigDescriptor (AAC) > AudioSpecificConfig (AAC-LC, 44100 Hz, stereo), SLConfig
+	const esds = box(
+		'esds',
+		zeros(4),
+		[3, 25, 0, 1, 0],
+		[4, 17, 0x40, 0x15, ...zeros(11)],
+		[5, 2, 0x12, 0x10],
+		[6, 1, 2],
+	);
+	const smpb = ' 00000000 00000840 00000338 0000000000015888 00000000 00000000 00000000 00000000';
+	const itunes = box('udta', box('meta', zeros(4), box('hdlr', zeros(8), ascii('mdir'), zeros(13)), box('ilst',
+		box('----', box('mean', zeros(4), ascii('com.apple.iTunes')), box('name', zeros(4), ascii('iTunSMPB')),
+			box('data', u32(1), u32(0), ascii(smpb))),
+	)));
+
+	const build = (edts: number[]) => {
+		const moov = (chunkOffset: number) => box('moov',
+			box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+				edts,
+				box('mdia',
+					box('mdhd', zeros(12), u32(44100), u32(4096), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(1), box('mp4a', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4),
+							u32(44100 * 0x10000), esds)),
+						box('stts', u32(0), u32(1), u32(4), u32(1024)),
+						box('stsc', u32(0), u32(1), u32(1), u32(4), u32(1)),
+						box('stsz', u32(0), u32(10), u32(4)),
+						box('stco', u32(0), u32(1), u32(chunkOffset)),
+					)),
+				),
+			),
+			itunes,
+		);
+		const ftyp = box('ftyp', ascii('M4A '), u32(0), ascii('M4A '));
+		const moovSize = moov(0).length;
+		return new Uint8Array([...ftyp, ...moov(ftyp.length + moovSize + 8), ...box('mdat', zeros(40))]);
+	};
+
+	const firstTimestamp = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return (await input.getPrimaryAudioTrack())!.getFirstTimestamp();
+	};
+
+	expect(await firstTimestamp(build([]))).toBeCloseTo(-2112 / 44100, 12);
+
+	// An edit list takes precedence over iTunSMPB
+	const edts = box('edts', box('elst', zeros(4), u32(1), u32(4096 - 1024), u32(1024), u32(0x10000)));
+	expect(await firstTimestamp(build(edts))).toBeCloseTo(-1024 / 44100, 12);
+});
