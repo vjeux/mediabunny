@@ -22,6 +22,7 @@ import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
 import { CustomPathedSource, FilePathSource } from '../../src/source.js';
 import { createAes128CbcDecryptStream } from '../../src/aes.js';
 import { Reader } from '../../src/reader.js';
+import { HlsSegmentedInput } from '../../src/hls/hls-segmented-input.js';
 
 // A lot of test cases taken from:
 // https://github.com/video-dev/hls.js/blob/master/tests/test-streams.js
@@ -1522,7 +1523,9 @@ test.concurrent('Packets at segment boundaries can be looked up by their own tim
 
 test.concurrent('Packet lookups at segment boundaries settle when the media offset is large', async () => {
 	// After 2^33 / 90 kHz = 95443.7 s, MPEG-TS timestamps wrap, so these segments get a media offset of about 95433 s.
-	// Before the fix, getPacket(95440) bounced between two segments forever without yielding to the event loop.
+	// Before the fix, getPacket(95440) bounced between two segments forever. Every step resolved from cache, so the
+	// event loop never got another turn and not even the test timeout could fire. Counting the segments the lookups
+	// visit turns that into a quick failure.
 	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
 	const sourceTrack = await sourceInput.getPrimaryVideoTrack();
 	assert(sourceTrack);
@@ -1555,9 +1558,28 @@ test.concurrent('Packet lookups at segment boundaries settle when the media offs
 	const videoTrack = await input.getPrimaryVideoTrack();
 	assert(videoTrack);
 
-	const sink = new EncodedPacketSink(videoTrack);
-	for (const timestamp of timestamps) {
-		expect((await sink.getPacket(timestamp))?.timestamp).toBe(timestamp);
+	const maxSegmentVisits = 1000; // A settling lookup visits a handful
+	let segmentVisits = 0;
+	// eslint-disable-next-line @typescript-eslint/unbound-method -- Called with the right `this` below
+	const getInputForSegment = HlsSegmentedInput.prototype.getInputForSegment;
+	const spy = vi.spyOn(HlsSegmentedInput.prototype, 'getInputForSegment').mockImplementation(function (
+		this: HlsSegmentedInput,
+		...args: Parameters<HlsSegmentedInput['getInputForSegment']>
+	) {
+		if (this.input === input && ++segmentVisits > maxSegmentVisits) {
+			throw new Error(`Packet lookups visited segments more than ${maxSegmentVisits} times without settling.`);
+		}
+
+		return getInputForSegment.apply(this, args);
+	});
+
+	try {
+		const sink = new EncodedPacketSink(videoTrack);
+		for (const timestamp of timestamps) {
+			expect((await sink.getPacket(timestamp))?.timestamp).toBe(timestamp);
+		}
+	} finally {
+		spy.mockRestore();
 	}
 });
 
