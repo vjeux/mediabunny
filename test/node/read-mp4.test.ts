@@ -1256,3 +1256,91 @@ test('Vorbis with length-prefixed headers in esds', async () => {
 	expect(config.numberOfChannels).toBe(oggConfig.numberOfChannels);
 	expect(config.sampleRate).toBe(oggConfig.sampleRate);
 });
+
+test('Key rotation through CENC sample groups in fragments', async () => {
+	// Like Shaka Packager with key rotation: each fragment declares its key in a 'seig' sample group description
+	// that all of its samples map to, overriding the key (and here the IV size) of the tenc box
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const keys = [Buffer.alloc(16, 0x11), Buffer.alloc(16, 0x22)];
+	const keyIds = [zeros(16).fill(0xa1), zeros(16).fill(0xb2)];
+	const ivs = [zeros(8).fill(1), zeros(16).fill(2)];
+
+	const plaintext = Array.from({ length: 40 }, (_, i) => i);
+	const encrypt = (fragment: number) => {
+		const counter = Buffer.alloc(16);
+		counter.set(ivs[fragment]!);
+		return [...createCipheriv('aes-128-ctr', keys[fragment]!, counter).update(Buffer.from(plaintext))];
+	};
+
+	const tenc = box('tenc', zeros(4), [0, 0, 1, 8], keyIds[0]!);
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), box('sinf', box('frma', ascii('avc1')),
+		box('schm', zeros(4), ascii('cenc'), u32(0x10000)), box('schi', tenc)));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	const fragment = (index: number) => {
+		const groups = index === 1
+			? [
+					box('sbgp', zeros(4), ascii('seig'), u32(1), u32(1), u32(0x10001)),
+					box('sgpd', [1, 0, 0, 0], ascii('seig'), u32(20), u32(1), [0, 0, 1, 16], keyIds[1]!),
+				]
+			: [];
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(index)),
+			box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(plaintext.length)),
+			box('senc', u32(0), u32(1), ivs[index]!),
+			...groups,
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(index + 1)), traf(0)).length;
+		return [
+			...box('moof', box('mfhd', u32(0), u32(index + 1)), traf(moofSize + 8)),
+			...box('mdat', encrypt(index)),
+		];
+	};
+
+	const bytes = new Uint8Array([...box('ftyp', ascii('iso6'), u32(0)), ...moov, ...fragment(0), ...fragment(1)]);
+
+	const requestedKeyIds: string[] = [];
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+		formatOptions: {
+			isobmff: {
+				resolveKeyId: ({ keyId }) => {
+					requestedKeyIds.push(keyId);
+					return keys[keyId === Buffer.from(keyIds[0]!).toString('hex') ? 0 : 1]!;
+				},
+			},
+		},
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual([plaintext, plaintext]);
+	expect(requestedKeyIds).toEqual(keyIds.map(x => Buffer.from(x).toString('hex')));
+});
