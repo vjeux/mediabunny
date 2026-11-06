@@ -68,6 +68,7 @@ import {
 	validateAudioChunkMetadata,
 	validateSubtitleMetadata,
 	validateVideoChunkMetadata,
+	OPUS_SAMPLE_RATE,
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
 import { FileSlice } from '../reader';
@@ -130,6 +131,8 @@ type MatroskaTrackData = {
 		 */
 		requiresAdtsStripping: boolean;
 		codecDelay: number | null; // in seconds
+		/** The Opus identification header Mediabunny generated, whose pre-skip is filled in once it's known. */
+		generatedOpusHeader: Uint8Array | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -353,6 +356,11 @@ export class MatroskaMuxer extends Muxer {
 				} else if (trackData.info.decoderConfig.codec === 'dtsl') {
 					codecId = 'A_DTS/LOSSLESS';
 				}
+			}
+
+			if (trackData.type === 'audio' && trackData.info.generatedOpusHeader) {
+				const preSkip = Math.round((trackData.info.codecDelay ?? 0) * OPUS_SAMPLE_RATE);
+				new DataView(trackData.info.generatedOpusHeader.buffer).setUint16(10, preSkip, true);
 			}
 
 			let seekPreRollNs = 0; // In "Matroska ticks" (nanoseconds)
@@ -974,6 +982,24 @@ export class MatroskaMuxer extends Muxer {
 			requiresAdtsStripping = true;
 		}
 
+		let generatedOpusHeader: Uint8Array | null = null;
+		if (track.source._codec === 'opus' && !decoderConfig.description && decoderConfig.numberOfChannels <= 2) {
+			// Matroska requires the Opus identification header as CodecPrivate. With up to two channels (channel
+			// mapping family 0), it can be built from the config. Its pre-skip must match the CodecDelay, which is
+			// only known once the first packet arrives, so it's filled in when the header gets written.
+			generatedOpusHeader = new Uint8Array(19);
+			const view = new DataView(generatedOpusHeader.buffer);
+			view.setUint32(0, 0x4f707573, false); // 'Opus'
+			view.setUint32(4, 0x48656164, false); // 'Head'
+			view.setUint8(8, 1); // Version
+			view.setUint8(9, decoderConfig.numberOfChannels);
+			view.setUint16(10, 0, true); // Pre-skip
+			view.setUint32(12, decoderConfig.sampleRate, true); // Input sample rate
+			view.setInt16(16, 0, true); // Output gain
+			view.setUint8(18, 0); // Channel mapping family
+			decoderConfig.description = generatedOpusHeader;
+		}
+
 		const newTrackData: MatroskaAudioTrackData = {
 			track,
 			type: 'audio',
@@ -983,6 +1009,7 @@ export class MatroskaMuxer extends Muxer {
 				decoderConfig,
 				requiresAdtsStripping,
 				codecDelay: null,
+				generatedOpusHeader,
 			},
 			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
@@ -1098,6 +1125,13 @@ export class MatroskaMuxer extends Muxer {
 
 			const isKeyFrame = packet.type === 'key';
 			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
+
+			if (trackData.info.codecDelay === null && trackData.info.generatedOpusHeader) {
+				// The generated header holds the delay as its pre-skip, a 16-bit count of 48 kHz samples. Whatever of a
+				// longer delay it can't hold stays in the (then negative) block timestamps.
+				const preSkip = Math.min(Math.round(Math.max(-packet.timestamp, 0) * OPUS_SAMPLE_RATE), 0xffff);
+				trackData.info.codecDelay = preSkip / OPUS_SAMPLE_RATE;
+			}
 
 			// A negative start (like from encoder priming) is expressed this way. Readers (like FFmpeg) convert
 			// CodecDelay to whole timestamp ticks before subtracting it, so the blocks are shifted by that same rounded
