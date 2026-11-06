@@ -133,80 +133,142 @@ const negativeTimestampsDecodeCorrectly = await (async () => {
 	return timestamps.join() === '-20000,0,20000';
 })();
 
-/**
- * Why the browser's decoder can't be checked on this track, if it can't. Besides the timestamps, WebKitGTK says it
- * can decode AV1 and FLAC but then fails to, and scales anamorphic frames to square pixels. This decodes the first
- * packets with its own decoder, so that one that hangs can be closed again.
- */
-const decodeLimitation = async (track: InputVideoTrack | InputAudioTrack) => {
-	if (!negativeTimestampsDecodeCorrectly && await track.getFirstTimestamp() < 0) {
-		return 'the decoder scrambles negative timestamps here';
+// Whether the platform can decode something is decided with WebCodecs alone, never with Mediabunny, so that a
+// Mediabunny failure on a capable platform fails instead of skipping. isConfigSupported() isn't enough: WebKitGTK says
+// it decodes codecs that its GStreamer decoders then fail on or hang on. Each probe is a decoder config and the first
+// packets of a tiny stream made by FFmpeg (0.4 s of black 64x64 video or 0.1 s of silence), read with
+// ffprobe -show_streams -show_packets -show_data:
+//   av1       -c:v libaom-av1 -cpu-used 8 -crf 50 (-f obu, with its sequence header)
+//   flac      -c:a flac (16 kHz mono; "fLaC" + the STREAMINFO block)
+//   avcSar2   -vf setsar=2/1 -c:v libx264 (64x64 with a 2:1 pixel aspect ratio in its SPS; the IDR without its SEI)
+type Probe = { codec: string; sampleRate?: number; numberOfChannels?: number; description?: string; chunks: string[] };
+const PROBES = {
+	av1: {
+		codec: 'av01.0.00M.08',
+		chunks: ['EgAKCgAAAAKv/5tfIAgyDRAAuoAAAkAAAAPOF7o='],
+	},
+	flac: {
+		codec: 'flac',
+		sampleRate: 16000,
+		description: 'ZkxhQ4AAACIEgASAAAALAAANA+gA8AAABkCfCt/b50DLnNgYijV2HiR2',
+		chunks: ['//g1CAADAAAAakQ=', '//h1CAEBv70AAAAGlg=='],
+	},
+	avcSar2: {
+		codec: 'avc1.64000a',
+		description: 'AWQACv/hABhnZAAKrLIITYgIAAADAAgAAAMAoHiRMkABAAZo68PLIsD9+PgA',
+		chunks: ['AAAAH2WIhA7//vdOvwKbVMIqA5JXCuqDugrYp08qbQaN+7k='],
+	},
+} satisfies Record<string, Probe>;
+type ProbeName = keyof typeof PROBES;
+
+const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+
+// A hung WebKitGTK decoder stalls every later decode on the page, even once closed
+let decodingStalled = false;
+
+/** Decodes a probe with WebCodecs; tells whether it decoded and the visible size of each video frame. */
+const runProbe = async (probe: Probe) => {
+	const isVideo = probe.sampleRate === undefined;
+	const description = probe.description !== undefined ? fromBase64(probe.description) : undefined;
+	const videoConfig: VideoDecoderConfig = { codec: probe.codec, codedWidth: 64, codedHeight: 64, description };
+	const audioConfig: AudioDecoderConfig = {
+		codec: probe.codec,
+		sampleRate: probe.sampleRate!,
+		numberOfChannels: probe.numberOfChannels ?? 1,
+		description,
+	};
+	const result = { decodes: false, visibleSizes: [] as string[] };
+	try {
+		const support = isVideo
+			? await VideoDecoder.isConfigSupported(videoConfig)
+			: await AudioDecoder.isConfigSupported(audioConfig);
+		if (!support.supported) {
+			return result;
+		}
+	} catch {
+		return result;
 	}
 
+	let outputs = 0;
 	let failed = false;
-	const frameSizes: string[] = [];
-	const output = (data: VideoFrame | AudioData) => {
-		if (data instanceof VideoFrame) {
-			frameSizes.push(`${data.visibleRect!.width}x${data.visibleRect!.height}`);
-		}
-		data.close();
-	};
-	const error = () => {
-		failed = true;
-	};
-
-	let decoder: VideoDecoder | AudioDecoder;
-	if (track instanceof InputVideoTrack) {
-		const videoDecoder = new VideoDecoder({ output, error });
-		videoDecoder.configure((await track.getDecoderConfig())!);
-		decoder = videoDecoder;
-	} else {
-		const audioDecoder = new AudioDecoder({ output, error });
-		audioDecoder.configure((await track.getDecoderConfig())!);
-		decoder = audioDecoder;
-	}
-
-	const sink = new EncodedPacketSink(track);
-	let packet = await sink.getFirstPacket();
-	for (let i = 0; packet && i < 8 && !failed; i++) {
-		try {
-			if (decoder instanceof VideoDecoder) {
-				decoder.decode(packet.toEncodedVideoChunk());
-			} else {
-				decoder.decode(packet.toEncodedAudioChunk());
+	const init = {
+		output: (data: VideoFrame | AudioData) => {
+			outputs++;
+			if (data instanceof VideoFrame) {
+				result.visibleSizes.push(`${data.visibleRect!.width}x${data.visibleRect!.height}`);
 			}
-		} catch {
+			data.close();
+		},
+		error: () => {
 			failed = true;
+		},
+	};
+	const decoder = isVideo ? new VideoDecoder(init) : new AudioDecoder(init);
+	let flushed = false;
+	try {
+		if (decoder instanceof VideoDecoder) {
+			decoder.configure(videoConfig);
+			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedVideoChunk({
+				type: i === 0 ? 'key' : 'delta',
+				timestamp: i * 33_333,
+				data: fromBase64(chunk),
+			})));
+		} else {
+			decoder.configure(audioConfig);
+			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+				type: 'key',
+				timestamp: i * 20_000,
+				data: fromBase64(chunk),
+			})));
 		}
-		packet = await sink.getNextPacket(packet);
+		flushed = await Promise.race([
+			decoder.flush().then(() => true, () => false),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
+		]);
+	} catch {
+		failed = true;
 	}
-	const flushed = await Promise.race([
-		decoder.flush().then(() => true, () => false),
-		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
-	]);
 	if (decoder.state !== 'closed') {
 		decoder.close();
 	}
+	decodingStalled ||= !flushed && !failed;
 
-	if (failed || !flushed) {
-		return `${await track.getCodec()} doesn't really decode here`;
-	}
-	if (track instanceof InputVideoTrack) {
-		const size = `${await track.getCodedWidth()}x${await track.getCodedHeight()}`;
-		if (frameSizes.some(x => x !== size)) {
-			return 'the decoder rescales the frames here';
-		}
-	}
-
-	return null;
+	result.decodes = flushed && !failed && outputs > 0;
+	return result;
 };
 
-const skipIfDecodeLimited = async (
-	track: InputVideoTrack | InputAudioTrack,
-	skip: (condition: boolean, note?: string) => void,
-) => {
-	const limitation = await decodeLimitation(track);
-	skip(limitation !== null, limitation ?? undefined);
+const probeResults = new Map<ProbeName, ReturnType<typeof runProbe>>();
+/** Runs each probe once, when first needed, so that one that hangs runs as late as possible. */
+const probe = (name: ProbeName) => {
+	if (!probeResults.has(name)) {
+		probeResults.set(name, runProbe(PROBES[name]));
+	}
+	return probeResults.get(name)!;
+};
+
+type Needs = { probe?: ProbeName; negativeStart?: boolean; anamorphic?: boolean };
+/** What each fixture needs from the platform, as facts about the file (never asked of Mediabunny). */
+const NEEDS: Record<string, Needs> = {
+	'frame-index-av1.mp4': { probe: 'av1' },
+	'quadrants-sar2.mp4': { anamorphic: true },
+	'clicks-aac.m4a': { negativeStart: true }, // The priming, cut by the edit list
+	'clicks-opus.ogg': { negativeStart: true }, // The pre-skip
+	'clicks-mp3.mp3': { negativeStart: true }, // The encoder delay of the LAME tag
+	'clicks-flac.flac': { probe: 'flac' },
+};
+
+/** Skips a fixture the platform can't decode as it needs to; Mediabunny must then manage the rest. */
+const skipIfIncapable = async (file: string, skip: (condition: boolean, note?: string) => void) => {
+	const needs = NEEDS[file] ?? {};
+	skip(decodingStalled, 'an earlier decoder hang stalled decoding on this page');
+	skip(!!needs.negativeStart && !negativeTimestampsDecodeCorrectly, 'the decoder scrambles negative timestamps here');
+	if (needs.probe) {
+		skip(!(await probe(needs.probe)).decodes, `${needs.probe} can't be decoded here (native probe)`);
+	}
+	if (needs.anamorphic) {
+		const { visibleSizes } = await probe('avcSar2');
+		skip(visibleSizes.some(x => x !== '64x64'), 'the decoder rescales anamorphic frames here (native probe)');
+	}
 };
 
 const indexCanvas = new OffscreenCanvas(64, 64);
@@ -271,7 +333,7 @@ describe('VideoSampleSink', () => {
 		async (fixture, { skip }) => {
 			using input = openInput(fixture.file);
 			const track = await videoTrackOf(input);
-			await skipIfDecodeLimited(track, skip);
+			await skipIfIncapable(fixture.file, skip);
 
 			const sink = new VideoSampleSink(track);
 			let i = 0;
@@ -290,7 +352,7 @@ describe('VideoSampleSink', () => {
 	test.for(VIDEO_FIXTURES)('$file: getSample(t) returns the frame displayed at t', async (fixture, { skip }) => {
 		using input = openInput(fixture.file);
 		const track = await videoTrackOf(input);
-		await skipIfDecodeLimited(track, skip);
+		await skipIfIncapable(fixture.file, skip);
 
 		const sink = new VideoSampleSink(track);
 		for (const timestamp of probeTimestamps(fixture)) {
@@ -314,7 +376,7 @@ describe('VideoSampleSink', () => {
 		async (fixture, { skip }) => {
 			using input = openInput(fixture.file);
 			const track = await videoTrackOf(input);
-			await skipIfDecodeLimited(track, skip);
+			await skipIfIncapable(fixture.file, skip);
 
 			const sink = new VideoSampleSink(track);
 			const probes = probeTimestamps(fixture).filter(x => Number.isFinite(x));
@@ -344,7 +406,7 @@ describe('VideoSampleSink', () => {
 		async (fixture, { skip }) => {
 			using input = openInput(fixture.file);
 			const track = await videoTrackOf(input);
-			await skipIfDecodeLimited(track, skip);
+			await skipIfIncapable(fixture.file, skip);
 
 			const sink = new VideoSampleSink(track);
 			const at = fixture.frameTimestamp;
@@ -593,7 +655,7 @@ describe('CanvasSink', () => {
 		async ([file, rotation, flip, squarePixelWidth, squarePixelHeight], { skip }) => {
 			using input = openInput(file);
 			const track = await videoTrackOf(input);
-			await skipIfDecodeLimited(track, skip);
+			await skipIfIncapable(file, skip);
 
 			expect(await track.getRotation()).toBe(rotation);
 			expect(await track.getFlip()).toBe(flip);
@@ -716,11 +778,12 @@ const findBurst = async (sink: AudioSampleSink, startTimestamp?: number) => {
 	return null;
 };
 
-describe('AudioSampleSink', () => {
-	test.for(AUDIO_FIXTURES)('%s: audio lands at its source time, also after seeking', async (file, { skip }) => {
+/** The tests run on every audio fixture. */
+const defineFixtureAudioTests = (fixtures: string[]) => {
+	test.for(fixtures)('%s: audio lands at its source time, also after seeking', async (file, { skip }) => {
 		using input = openInput(file);
 		const track = await audioTrackOf(input);
-		await skipIfDecodeLimited(track, skip);
+		await skipIfIncapable(file, skip);
 
 		const sink = new AudioSampleSink(track);
 
@@ -734,12 +797,12 @@ describe('AudioSampleSink', () => {
 		await expectNoLeaks();
 	});
 
-	test.for(AUDIO_FIXTURES)(
+	test.for(fixtures)(
 		'%s: samples are contiguous and getSample(t) agrees with samples()',
 		async (file, { skip }) => {
 			using input = openInput(file);
 			const track = await audioTrackOf(input);
-			await skipIfDecodeLimited(track, skip);
+			await skipIfIncapable(file, skip);
 
 			const sink = new AudioSampleSink(track);
 			const samples: { timestamp: number; numberOfFrames: number }[] = [];
@@ -772,6 +835,11 @@ describe('AudioSampleSink', () => {
 			await expectNoLeaks();
 		},
 	);
+};
+
+describe('AudioSampleSink', () => {
+	// Not FLAC, which comes last: on WebKitGTK, a FLAC decode that fails stalls every later audio decode on the page
+	defineFixtureAudioTests(AUDIO_FIXTURES.filter(file => file !== 'clicks-flac.flac'));
 
 	test('AudioBufferSink yields the samples as AudioBuffers', async () => {
 		using input = openInput('clicks-aac.m4a');
@@ -826,6 +894,10 @@ describe('AudioSampleSink', () => {
 			expect(await track.getFirstTimestamp()).toBe(firstPacket.timestamp);
 		}
 	});
+});
+
+describe('AudioSampleSink, FLAC', () => {
+	defineFixtureAudioTests(['clicks-flac.flac']);
 });
 
 void InputAudioTrack;
