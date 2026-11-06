@@ -750,3 +750,34 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
+
+test('getMimeType names the hvc1 sample entry when remuxing an hev1 HEVC track', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video-h265.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const inputTrack = await input.getPrimaryVideoTrack();
+	assert(inputTrack);
+	const decoderConfig = await inputTrack.getDecoderConfig();
+	assert(decoderConfig);
+	expect(decoderConfig.codec).toBe('hev1.1.6.L120.90'); // The source uses an 'hev1' sample entry
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('hevc');
+	output.addVideoTrack(source);
+	await output.start();
+	const packet = await new EncodedPacketSink(inputTrack).getFirstPacket();
+	assert(packet);
+	await source.add(packet, { decoderConfig });
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const contains = (fourCc: string) => bytes.some(
+		(_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === fourCc,
+	);
+	expect(contains('hvc1')).toBe(true);
+	expect(contains('hev1')).toBe(false);
+
+	// The codec string's first element is the sample entry's four-character code (RFC 6381)
+	expect(await output.getMimeType()).toBe('video/mp4; codecs="hvc1.1.6.L120.90"');
+});
