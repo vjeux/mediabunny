@@ -549,6 +549,8 @@ export type Vp9Fixture = {
 		matrixCoefficients: number;
 		level: number;
 	};
+	/** Primaries and transfer that are just as correct when the color space only determines the matrix */
+	alsoAcceptedPrimariesAndTransfer?: [number, number];
 };
 
 export const VP9_FIXTURES: Vp9Fixture[] = [
@@ -575,11 +577,14 @@ export const VP9_FIXTURES: Vp9Fixture[] = [
 		name: 'vp9_profile0_bt601_full_range',
 		args: 'size=176x144: -pix_fmt yuv420p -colorspace bt470bg -color_range pc',
 		keyFrameStart: '82498342300af008f60038241c184a00',
-		// color_space = CS_BT_601, color_range = 1
+		// color_space = CS_BT_601, color_range = 1. BT.601 has both 625-line (BT.470BG) and 525-line (SMPTE 170M)
+		// systems, so only the matrix is certain: primaries and transfer may be either of them or unspecified (2, as
+		// in FFmpeg).
 		expected: {
 			profile: 0, bitDepth: 8, chromaSubsampling: 1, videoFullRangeFlag: 1,
 			colourPrimaries: 5, transferCharacteristics: 6, matrixCoefficients: 5, level: 10,
 		},
+		alsoAcceptedPrimariesAndTransfer: [2, 2],
 	},
 	{
 		name: 'vp9_profile0_1080p_smpte170m',

@@ -344,7 +344,21 @@ describe('VP9, VP8 and AV1 headers', () => {
 	test('VP9 uncompressed headers written by libvpx', () => {
 		for (const fixture of VP9_FIXTURES) {
 			const keyFrameStart = hexToBytes(fixture.keyFrameStart);
-			expect(extractVp9CodecInfoFromPacket(keyFrameStart), fixture.name).toEqual(fixture.expected);
+			const { colourPrimaries, transferCharacteristics, ...info } = extractVp9CodecInfoFromPacket(keyFrameStart)!;
+			const {
+				colourPrimaries: expectedPrimaries,
+				transferCharacteristics: expectedTransfer,
+				...expectedInfo
+			} = fixture.expected;
+			expect(info, fixture.name).toEqual(expectedInfo);
+
+			// The color space determines the primaries and transfer only for some values (not for CS_BT_601)
+			const accepted = [[expectedPrimaries, expectedTransfer]];
+			if (fixture.alsoAcceptedPrimariesAndTransfer) {
+				accepted.push(fixture.alsoAcceptedPrimariesAndTransfer);
+			}
+			expect(accepted, fixture.name).toContainEqual([colourPrimaries, transferCharacteristics]);
+
 			expect(determineVideoPacketType('vp9', { codec: 'vp09.00.10.08' }, keyFrameStart)).toBe('key');
 		}
 
