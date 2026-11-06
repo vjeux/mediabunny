@@ -937,8 +937,13 @@ export class MatroskaDemuxer extends Demuxer {
 				default: assert(false);
 			}
 
-			// Every frame must hold actual data; this also catches frame sizes that exceed the block
-			if (frameSizes.length !== frameCount || frameSizes.some(x => x <= 0)) {
+			// Every frame must hold actual data; this also catches frame sizes that exceed the block. Header stripping
+			// removes the same leading bytes from every frame though, which may leave nothing of a frame stored.
+			const hasStrippedHeader = track.decodingInstructions.some((instruction) => {
+				return instruction.data?.type === 'decompress' && (instruction.data.settings?.length ?? 0) > 0;
+			});
+			const minFrameSize = hasStrippedHeader ? 0 : 1;
+			if (frameSizes.length !== frameCount || frameSizes.some(x => x < minFrameSize)) {
 				throw new Error('Invalid block lacing: frame sizes don\'t match the block.');
 			}
 
