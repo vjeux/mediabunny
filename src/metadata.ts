@@ -218,6 +218,10 @@ export const validateMetadataTags = (tags: MetadataTags) => {
 	if (tags.date !== undefined && (!(tags.date instanceof Date) || Number.isNaN(tags.date.getTime()))) {
 		throw new TypeError('tags.date, when provided, must be a valid Date.');
 	}
+	if (tags.date !== undefined && (tags.date.getUTCFullYear() < 0 || tags.date.getUTCFullYear() > 9999)) {
+		// Every format stores the date as YYYY-MM-DD; toISOString uses the expanded ±YYYYYY form for other years
+		throw new TypeError('tags.date, when provided, must lie within the years 0 to 9999.');
+	}
 	if (
 		tags.creationTime !== undefined
 		&& tags.creationTime !== null

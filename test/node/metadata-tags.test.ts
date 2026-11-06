@@ -1086,3 +1086,20 @@ test('Creation time override in conversion', async () => {
 
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
+
+test('Metadata dates must have a year every format can store', () => {
+	const setDate = (date: Date) => {
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		output.setMetadataTags({ date });
+	};
+
+	// toISOString().slice(0, 10) would give '+010000-01' and '-000001-01'
+	for (const date of [new Date(Date.UTC(10000, 0, 15)), new Date(Date.UTC(-1, 0, 15))]) {
+		expect(() => setDate(date)).toThrow(
+			new TypeError('tags.date, when provided, must lie within the years 0 to 9999.'),
+		);
+	}
+
+	expect(() => setDate(new Date(Date.UTC(9999, 11, 31)))).not.toThrow();
+	expect(() => setDate(new Date('0001-01-01T00:00:00Z'))).not.toThrow();
+});
