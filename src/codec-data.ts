@@ -535,6 +535,20 @@ export type AvcSpsInfo = {
 	vuiParametersFlagBitOffset: number;
 	bitstreamRestrictionFlagBitOffset: number | null;
 	bitstreamRestrictionFlag: number | null;
+	timingInfo: VuiTimingInfo | null;
+};
+
+/** The clock of the VUI: a tick is `numUnitsInTick / timeScale` seconds. */
+export type VuiTimingInfo = {
+	numUnitsInTick: number;
+	timeScale: number;
+};
+
+const readVuiTimingInfo = (bitstream: Bitstream): VuiTimingInfo => {
+	// Both are 32 bits, which readBits can't do without overflowing
+	const numUnitsInTick = bitstream.readBits(16) * 2 ** 16 + bitstream.readBits(16);
+	const timeScale = bitstream.readBits(16) * 2 ** 16 + bitstream.readBits(16);
+	return { numUnitsInTick, timeScale };
 };
 
 const AVC_HEVC_ASPECT_RATIO_IDC_TABLE: Partial<Record<number, Rational>> = {
@@ -699,6 +713,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 		let maxDecFrameBuffering: number | null = null;
 		let bitstreamRestrictionFlagBitOffset: number | null = null;
 		let bitstreamRestrictionFlag: number | null = null;
+		let timingInfo: VuiTimingInfo | null = null;
 
 		const vuiParametersFlagBitOffset = bitstream.pos;
 		const vuiParametersPresentFlag = bitstream.readBits(1);
@@ -745,8 +760,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 
 			const timingInfoPresentFlag = bitstream.readBits(1);
 			if (timingInfoPresentFlag) {
-				bitstream.skipBits(32); // num_units_in_tick
-				bitstream.skipBits(32); // time_scale
+				timingInfo = readVuiTimingInfo(bitstream);
 				bitstream.skipBits(1); // fixed_frame_rate_flag
 			}
 
@@ -841,6 +855,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			vuiParametersFlagBitOffset,
 			bitstreamRestrictionFlagBitOffset,
 			bitstreamRestrictionFlag,
+			timingInfo,
 		};
 	} catch (error) {
 		Logging._error('Error parsing AVC SPS:', error);
@@ -963,6 +978,7 @@ export type HevcSpsInfo = {
 	bitDepthLumaMinus8: number;
 	bitDepthChromaMinus8: number;
 	minSpatialSegmentationIdc: number;
+	timingInfo: VuiTimingInfo | null;
 };
 
 export const concatHevcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDecoderConfig) => {
@@ -1113,9 +1129,11 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 		let fullRangeFlag = 0;
 		let minSpatialSegmentationIdc = 0;
 		let pixelAspectRatio: Rational = { num: 1, den: 1 };
+		let timingInfo: VuiTimingInfo | null = null;
 
 		if (bitstream.readBits(1)) { // vui_parameters_present_flag
 			const vui = parseHevcVui(bitstream, spsMaxSubLayersMinus1);
+			timingInfo = vui.timingInfo;
 			pixelAspectRatio = vui.pixelAspectRatio;
 			colourPrimaries = vui.colourPrimaries;
 			transferCharacteristics = vui.transferCharacteristics;
@@ -1147,6 +1165,7 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 			bitDepthLumaMinus8,
 			bitDepthChromaMinus8,
 			minSpatialSegmentationIdc,
+			timingInfo,
 		};
 	} catch (error) {
 		Logging._error('Error parsing HEVC SPS:', error);
@@ -1421,6 +1440,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 	let fullRangeFlag = 0;
 	let minSpatialSegmentationIdc = 0;
 	let pixelAspectRatio: Rational = { num: 1, den: 1 };
+	let timingInfo: VuiTimingInfo | null = null;
 
 	if (bitstream.readBits(1)) { // aspect_ratio_info_present_flag
 		const aspect_ratio_idc = bitstream.readBits(8);
@@ -1462,8 +1482,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 		readExpGolomb(bitstream); // def_disp_win_bottom_offset
 	}
 	if (bitstream.readBits(1)) { // vui_timing_info_present_flag
-		bitstream.readBits(32); // vui_num_units_in_tick
-		bitstream.readBits(32); // vui_time_scale
+		timingInfo = readVuiTimingInfo(bitstream);
 		if (bitstream.readBits(1)) { // vui_poc_proportional_to_timing_flag
 			readExpGolomb(bitstream); // vui_num_ticks_poc_diff_one_minus1
 		}
@@ -1489,6 +1508,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 		matrixCoefficients,
 		fullRangeFlag,
 		minSpatialSegmentationIdc,
+		timingInfo,
 	};
 };
 
