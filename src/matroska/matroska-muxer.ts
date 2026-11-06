@@ -461,11 +461,12 @@ export class MatroskaMuxer extends Muxer {
 
 			if (this.format instanceof WebMOutputFormat) {
 				// WebM only allows pixels as the DisplayUnit, and WebKit and Gecko take the display dimensions as the
-				// video's pixel size. So, like FFmpeg, we scale the width and keep the height.
+				// video's pixel size. So, like FFmpeg, we scale the width and keep the height. (A width of 0 isn't
+				// allowed, which extreme aspect ratios would otherwise round to.)
 				displayElements = [
 					{
 						id: EBMLId.DisplayWidth,
-						data: Math.round(trackData.info.height * aspectRatio.num / aspectRatio.den),
+						data: Math.max(Math.round(trackData.info.height * aspectRatio.num / aspectRatio.den), 1),
 					},
 					{ id: EBMLId.DisplayHeight, data: trackData.info.height },
 				];
