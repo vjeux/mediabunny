@@ -12,6 +12,7 @@ import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { IsobmffMuxer } from '../../src/isobmff/isobmff-muxer.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -749,4 +750,35 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
+});
+
+test('Fragmented MP4 does not keep the samples of fragments it already wrote', async () => {
+	const target = new BufferTarget();
+	const output = new Output({ target, format: new Mp4OutputFormat({ fastStart: 'fragmented' }) });
+
+	const source = new EncodedVideoPacketSource('vp8');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// 100 s at 30 fps with a key frame every second, so roughly one fragment per second
+	const meta = { decoderConfig: { codec: 'vp8', codedWidth: 320, codedHeight: 180 } };
+	for (let i = 0; i < 3000; i++) {
+		await source.add(new EncodedPacket(new Uint8Array(1), i % 30 === 0 ? 'key' : 'delta', i / 30, 1 / 30), meta);
+	}
+
+	// A written fragment is only needed for its tfra entry: at most its first key sample should stay in memory, not
+	// all of them (which grows without bound for long live streams)
+	const trackData = (output._muxer as IsobmffMuxer).trackDatas[0]!;
+	expect(trackData.finalizedChunks.length).toBeGreaterThan(90);
+	const retainedSampleCount = trackData.finalizedChunks.reduce((sum, chunk) => sum + chunk.samples.length, 0);
+	expect(retainedSampleCount).toBe(trackData.finalizedChunks.length);
+
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	expect((await sink.getKeyPacket(50.5, { metadataOnly: true }))?.timestamp).toBe(50);
+	expect((await sink.getPacket(Infinity, { metadataOnly: true }))?.timestamp).toBeCloseTo(2999 / 30);
 });
