@@ -1443,13 +1443,14 @@ const colorAlphaSplitterWorkerCode = () => {
 
 		const alphaFormat = (is10 ? 'I420P10' : (is12 ? 'I420P12' : 'I420')) as VideoPixelFormat;
 
-		// Color frame is simply a prefix of the combined bytes
+		// Color frame is simply a prefix of the combined bytes, so it keeps the source's color space
 		const colorFrame = new VideoFrame(source.subarray(0, colorBytes), {
 			format: colorFormat,
 			codedWidth: width,
 			codedHeight: height,
 			timestamp: sourceFrame.timestamp,
 			duration: sourceFrame.duration ?? undefined,
+			colorSpace: sourceFrame.colorSpace.toJSON(),
 		});
 		const alphaInit = {
 			format: alphaFormat,
