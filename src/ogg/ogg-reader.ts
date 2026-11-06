@@ -7,7 +7,7 @@
  */
 
 import { FileSlice, readI64Le, readU32Le, readU8 } from '../reader';
-import { OGGS } from './ogg-misc';
+import { computeOggPageCrc, OGGS } from './ogg-misc';
 
 export const MIN_PAGE_HEADER_SIZE = 27;
 export const MAX_PAGE_HEADER_SIZE = 27 + 255;
@@ -122,4 +122,9 @@ export const findNextPageHeader = (slice: FileSlice, until: number, serialNumber
 	}
 
 	return false;
+};
+
+/** Whether the page's checksum matches its bytes (the page's header and data). */
+export const pageChecksumMatches = (page: Page, pageBytes: Uint8Array) => {
+	return computeOggPageCrc(pageBytes) === page.checksum;
 };
