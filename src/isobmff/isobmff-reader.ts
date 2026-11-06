@@ -118,6 +118,20 @@ export const readEsDescriptor = (slice: FileSlice) => {
 const MAC_ROMAN_HIGH_CHARACTERS = 'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»…'
 	+ '\u00a0ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔ\uf8ffÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ';
 
+const isValidUtf8 = (bytes: Uint8Array) => {
+	if (typeof globalThis.TextDecoder === 'undefined') {
+		// The polyfill can't tell invalid UTF-8 from text that contains U+FFFD
+		return !textDecoder.decode(bytes).includes('\ufffd');
+	}
+
+	try {
+		new globalThis.TextDecoder('utf-8', { fatal: true }).decode(bytes);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
 export const readMetadataStringShort = (slice: FileSlice) => {
 	let stringLength = readU16Be(slice);
 	const languageCode = readU16Be(slice);
@@ -132,12 +146,10 @@ export const readMetadataStringShort = (slice: FileSlice) => {
 	}
 	bytes = bytes.subarray(0, end);
 
-	const text = textDecoder.decode(bytes);
-
 	// Language codes below 0x400 are Macintosh language codes (0x7fff: unspecified), whose text is in a Mac encoding
 	// (Mac Roman for the Western languages) rather than UTF-8. Text that is valid UTF-8 anyway is kept as is.
 	const isMacLanguage = languageCode < 0x400 || languageCode === 0x7fff;
-	if (isMacLanguage && text.includes('\ufffd')) {
+	if (isMacLanguage && !isValidUtf8(bytes)) {
 		let macRomanText = '';
 		for (const byte of bytes) {
 			macRomanText += byte < 0x80 ? String.fromCharCode(byte) : MAC_ROMAN_HIGH_CHARACTERS[byte - 0x80]!;
@@ -146,7 +158,7 @@ export const readMetadataStringShort = (slice: FileSlice) => {
 		return macRomanText;
 	}
 
-	return text;
+	return textDecoder.decode(bytes);
 };
 
 export const readDataBox = (slice: FileSlice) => {

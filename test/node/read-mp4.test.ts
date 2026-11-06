@@ -276,25 +276,39 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 test('QuickTime text in Mac Roman with a trailing NUL', async () => {
 	// QuickTime-era files tag their udta text with a Macintosh language code, which means Mac Roman, and often count a
 	// terminating NUL into the length (e.g. samples.ffmpeg.org V-codecs/SVQ1/audi_a4.mov, SVQ3/shrek2_tsr_qt_240.mov)
-	const output = new Output({ format: new MovOutputFormat(), target: new BufferTarget() });
-	const source = new EncodedVideoPacketSource('vp8');
-	output.addVideoTrack(source);
-	output.setMetadataTags({ title: 'Az új Audi A4' });
-	await output.start();
-	await source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 0.1), {
-		decoderConfig: { codec: 'vp8', codedWidth: 16, codedHeight: 16 },
-	});
-	await output.finalize();
+	const writeMovWithTitle = async (title: string) => {
+		const output = new Output({ format: new MovOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source);
+		output.setMetadataTags({ title });
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 0.1), {
+			decoderConfig: { codec: 'vp8', codedWidth: 16, codedHeight: 16 },
+		});
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const titlePos = bytes.findIndex((_, i) => bytes[i] === 0xa9 && bytes[i + 1] === 0x6e && bytes[i + 2] === 0x61
+			&& bytes[i + 3] === 0x6d); // ©nam, followed by the text's u16 length and u16 language code
+		expect(titlePos).toBeGreaterThan(0);
+		return { bytes, titlePos };
+	};
+	const readTitle = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return (await input.getMetadataTags()).title;
+	};
 
 	// Rewrite the title in place with language code 0 (English): Mac Roman text plus a NUL takes the same 14 bytes as
 	// the UTF-8 text
-	const bytes = new Uint8Array(output.target.buffer!);
-	const titlePos = bytes.findIndex((_, i) => bytes[i] === 0xa9 && bytes[i + 1] === 0x6e && bytes[i + 2] === 0x61
-		&& bytes[i + 3] === 0x6d); // ©nam
-	expect(titlePos).toBeGreaterThan(0);
+	const audi = await writeMovWithTitle('Az új Audi A4');
 	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
-	bytes.set([0, 14, 0, 0, ...ascii('Az '), 0x9c, ...ascii('j Audi A4'), 0], titlePos + 4);
+	audi.bytes.set([0, 14, 0, 0, ...ascii('Az '), 0x9c, ...ascii('j Audi A4'), 0], audi.titlePos + 4);
+	expect(await readTitle(audi.bytes)).toBe('Az új Audi A4');
 
-	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-	expect((await input.getMetadataTags()).title).toBe('Az új Audi A4');
+	// Text that is valid UTF-8 stays UTF-8 under a Mac language code, even when it contains U+FFFD
+	for (const title of ['Café é', 'Café \ufffd']) {
+		const { bytes, titlePos } = await writeMovWithTitle(title);
+		bytes.set([0, 0], titlePos + 6); // Language code 0
+		expect(await readTitle(bytes)).toBe(title);
+	}
 });
