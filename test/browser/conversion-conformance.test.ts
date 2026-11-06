@@ -54,7 +54,10 @@ const createQuadrantVideo = async (width: number, height: number, rotation: Rota
 	return output.target.buffer!;
 };
 
-/** A video whose frames encode their index in their red channel, at multiples of 32. */
+/**
+ * A video whose frames encode their index (modulo 8) as gray levels 32 apart. Gray has the same luma under every YUV
+ * matrix, so this survives encoders that convert with one matrix but signal another.
+ */
 const createCountingVideo = async (frameCount: number, frameRate: number) => {
 	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
 	const canvas = new OffscreenCanvas(64, 64);
@@ -64,7 +67,8 @@ const createCountingVideo = async (frameCount: number, frameRate: number) => {
 	output.addVideoTrack(source, { frameRate });
 	await output.start();
 	for (let i = 0; i < frameCount; i++) {
-		context.fillStyle = `rgb(${(i % 8) * 32}, 0, 0)`;
+		const level = (i % 8) * 32 + 16;
+		context.fillStyle = `rgb(${level}, ${level}, ${level})`;
 		context.fillRect(0, 0, 64, 64);
 		await source.add(i / frameRate, 1 / frameRate);
 	}
@@ -147,7 +151,7 @@ const readFrameIndices = async (track: InputTrack) => {
 
 	for await (using sample of new VideoSampleSink(track).samples()) {
 		sample.draw(context, 0, 0, 8, 8);
-		indices.push(Math.round(context.getImageData(4, 4, 1, 1).data[0]! / 32));
+		indices.push(Math.floor(context.getImageData(4, 4, 1, 1).data[0]! / 32));
 	}
 
 	return indices;
