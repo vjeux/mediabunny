@@ -691,25 +691,25 @@ test('Conversion copies tags of an input whose date lies past the year 9999', as
 	expect(tags.date).toBeUndefined();
 });
 
-test('A same-format conversion leaves out an unrepresentable date instead of copying its raw tag back', async () => {
-	const writeWithDummyTrack = async (format: OutputFormat, codec: AudioCodec, tags: MetadataTags) => {
-		const output = new Output({ format, target: new BufferTarget() });
-		output.setMetadataTags(tags);
-		const dummyTrack = createDummyAudioTrack(codec, output);
-		await output.start();
-		await dummyTrack.addPacket();
-		await output.finalize();
-		return output.target.buffer!;
-	};
-	const writeFlac = async (tags: MetadataTags) => {
-		const fixturePath = path.join(__dirname, '../public/sample.flac');
-		using fixture = new Input({ source: new FilePathSource(fixturePath), formats: ALL_FORMATS });
-		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
-		const conversion = await Conversion.init({ input: fixture, output, tags });
-		await conversion.execute();
-		return output.target.buffer!;
-	};
+const writeWithDummyTrack = async (format: OutputFormat, codec: AudioCodec, tags: MetadataTags) => {
+	const output = new Output({ format, target: new BufferTarget() });
+	output.setMetadataTags(tags);
+	const dummyTrack = createDummyAudioTrack(codec, output);
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+	return output.target.buffer!;
+};
+const writeFlacFromFixture = async (tags: MetadataTags) => {
+	const fixturePath = path.join(__dirname, '../public/sample.flac');
+	using fixture = new Input({ source: new FilePathSource(fixturePath), formats: ALL_FORMATS });
+	const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input: fixture, output, tags });
+	await conversion.execute();
+	return output.target.buffer!;
+};
 
+test('A same-format conversion leaves out an unrepresentable date instead of copying its raw tag back', async () => {
 	// Converting to the same format keeps the raw tags, which hold the date in its original form
 	const convertToSameFormat = async (bytes: ArrayBuffer, format: OutputFormat) => {
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
@@ -736,13 +736,36 @@ test('A same-format conversion leaves out an unrepresentable date instead of cop
 		// A date tag such as Mediabunny itself wrote for years past 9999 before
 		const writtenTags: MetadataTags = { title: 'Title', raw: { [dateKey]: '+010000-01' } };
 		const bytes = codec === null
-			? await writeFlac(writtenTags)
+			? await writeFlacFromFixture(writtenTags)
 			: await writeWithDummyTrack(format(), codec, writtenTags);
 		const { inputYear, tags } = await convertToSameFormat(bytes, format());
 		expect(inputYear, name).toBe(10000);
 		expect(tags.title, name).toBe('Title');
 		expect(tags.date, name).toBeUndefined();
 		expect(tags.raw?.[dateKey], name).toBeUndefined();
+	}
+});
+
+test('A left-out date can\'t come back through a raw date tag in another letter case', async () => {
+	// Vorbis comment field names are case-insensitive, and Mediabunny reads Matroska tag names that way too
+	const writers: [string, (tags: MetadataTags) => Promise<ArrayBuffer>][] = [
+		['MKV', tags => writeWithDummyTrack(new MkvOutputFormat(), 'opus', tags)],
+		['FLAC', writeFlacFromFixture],
+	];
+	for (const [name, write] of writers) {
+		const readBack = async (tags: MetadataTags) => {
+			using input = new Input({ source: new BufferSource(await write(tags)), formats: ALL_FORMATS });
+			return await input.getMetadataTags();
+		};
+
+		const date = new Date(Date.UTC(10000, 0, 15));
+		const omitted = await readBack({ title: 'Title', date, raw: { date: '+010000-01' } });
+		expect(omitted.title, name).toBe('Title');
+		expect(omitted.date, name).toBeUndefined();
+
+		// Without a date to leave out, the raw tag is still written as it is
+		const rawOnly = await readBack({ title: 'Title', raw: { date: '2021-04-23' } });
+		expect(rawOnly.date, name).toEqual(new Date('2021-04-23T00:00:00Z'));
 	}
 });
 

@@ -3028,7 +3028,12 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	if (tags.raw) {
 		for (const key in tags.raw) {
 			const value = tags.raw[key] ?? tags.raw[key.toLowerCase()];
-			if (key === 'vendor' || value == null || writtenTags.includes(key) || omittedTags.includes(key)) {
+			if (
+				key === 'vendor'
+				|| value == null
+				|| writtenTags.includes(key)
+				|| omittedTags.includes(key.toUpperCase()) // Field names are case-insensitive
+			) {
 				continue;
 			}
 

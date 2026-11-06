@@ -557,6 +557,8 @@ export class MatroskaMuxer extends Muxer {
 
 		const metadataTags = this.output._metadataTags;
 		const writtenTags = new Set<string>();
+		// Keys left out on purpose, which a raw tag may not fill in
+		const omittedTags = new Set<string>();
 
 		for (const { key, value } of keyValueIterator(metadataTags)) {
 			switch (key) {
@@ -609,9 +611,10 @@ export class MatroskaMuxer extends Muxer {
 					const dateString = formatMetadataDate(value);
 					if (dateString !== null) {
 						addSimpleTag('DATE', dateString);
+						writtenTags.add('DATE');
+					} else {
+						omittedTags.add('DATE');
 					}
-					// Marked as written even when left out, so that a raw tag can't bring the date back
-					writtenTags.add('DATE');
 				}; break;
 
 				case 'trackNumber': {
@@ -650,7 +653,8 @@ export class MatroskaMuxer extends Muxer {
 		if (metadataTags.raw) {
 			for (const key in metadataTags.raw) {
 				const value = metadataTags.raw[key]!;
-				if (value == null || writtenTags.has(key)) {
+				// Tag names are read case-insensitively, so compare them that way for the keys left out
+				if (value == null || writtenTags.has(key) || omittedTags.has(key.toUpperCase())) {
 					continue;
 				}
 
