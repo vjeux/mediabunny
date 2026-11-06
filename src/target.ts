@@ -342,7 +342,7 @@ export class StreamTarget extends Target {
 		if (!(writable instanceof WritableStream)) {
 			throw new TypeError('StreamTarget requires a WritableStream instance.');
 		}
-		if (options != null && typeof options !== 'object') {
+		if (!options || typeof options !== 'object') {
 			throw new TypeError('StreamTarget options, when provided, must be an object.');
 		}
 		if (options.chunked !== undefined && typeof options.chunked !== 'boolean') {
@@ -628,6 +628,10 @@ export class AppendOnlyStreamTarget extends Target {
 	_nextWritePos = 0;
 
 	constructor(writable: WritableStream<Uint8Array>) {
+		if (!(writable instanceof WritableStream)) {
+			throw new TypeError('AppendOnlyStreamTarget requires a WritableStream instance.');
+		}
+
 		super();
 
 		this._writable = writable;
