@@ -13,7 +13,6 @@ import {
 	AudioCodec,
 	MediaCodec,
 	NON_PCM_AUDIO_CODECS,
-	OPUS_SAMPLE_RATE,
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
@@ -32,10 +31,9 @@ import { MpegTsMuxer } from './mpeg-ts/mpeg-ts-muxer';
 import { WaveMuxer } from './wave/wave-muxer';
 import { HlsMuxer } from './hls/hls-muxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
-import { MaybePromise, FilePath, isNumber, toArray, toUint8Array } from './misc';
+import { MaybePromise, FilePath, isNumber, toArray } from './misc';
 import { Target } from './target';
 import { MP3_DECODER_DELAY } from '../shared/mp3-misc';
-import { parseOpusIdentificationHeader } from './codec-data';
 
 /**
  * Specifies an inclusive range of integers.
@@ -148,7 +146,7 @@ export abstract class OutputFormat {
 	 * @internal
 	 */
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
-	_canSignalAudioPriming(codec: AudioCodec, primingDuration: number, decoderConfig: AudioDecoderConfig) {
+	_canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
 		return false;
 	}
 }
@@ -628,11 +626,6 @@ export class MkvOutputFormat extends OutputFormat {
 	get negativeTimestampSupport() {
 		return 'prefer-non-negative' as const;
 	}
-
-	/** @internal */
-	override _canSignalAudioPriming() {
-		return true; // The muxer turns a negative start of an audio track into its CodecDelay
-	}
 }
 
 /**
@@ -779,10 +772,10 @@ export class Mp3OutputFormat extends OutputFormat {
 	}
 
 	/** @internal */
-	override _canSignalAudioPriming(codec: AudioCodec, primingDuration: number, decoderConfig: AudioDecoderConfig) {
+	override _canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
 		// The muxer writes the priming into the LAME header's 12-bit encoder delay field, which excludes the decoder
 		// delay
-		const encoderDelay = Math.round(primingDuration * decoderConfig.sampleRate) - MP3_DECODER_DELAY;
+		const encoderDelay = Math.round(primingDuration * sampleRate) - MP3_DECODER_DELAY;
 		return codec === 'mp3' && this._options.xingHeader !== false && encoderDelay >= 0 && encoderDelay <= 0xfff;
 	}
 }
@@ -989,18 +982,6 @@ export class OggOutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return 'none' as const;
-	}
-
-	/** @internal */
-	override _canSignalAudioPriming(codec: AudioCodec, primingDuration: number, decoderConfig: AudioDecoderConfig) {
-		if (codec !== 'opus' || !decoderConfig.description) {
-			return false;
-		}
-
-		// The muxer lets the first packet start as early as the pre-skip from the OpusHead. Matroska timestamps are
-		// rounded to the millisecond, so allow for that.
-		const preSkip = parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip;
-		return primingDuration <= preSkip / OPUS_SAMPLE_RATE + 0.001;
 	}
 }
 
