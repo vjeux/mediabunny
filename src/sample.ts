@@ -442,6 +442,7 @@ export class VideoSample implements Disposable {
 			this.duration = init.duration ?? 0;
 
 			const layout = init.layout ?? createDefaultPlaneLayout(init.format, init.codedWidth!, init.codedHeight!);
+			validatePlaneLayout(init.format, init.codedWidth!, init.codedHeight!, layout, data.byteLength);
 
 			let colorSpaceInit = init.colorSpace ?? null;
 			if (colorSpaceInit === null) {
@@ -2083,6 +2084,45 @@ const validateVideoFrameCopyToOptions = (options: VideoFrameCopyToOptions) => {
 		if (options.rect.height !== undefined && (!Number.isInteger(options.rect.height) || options.rect.height < 0)) {
 			throw new TypeError('options.rect.height, when provided, must be a non-negative integer.');
 		}
+	}
+};
+
+/**
+ * Checks raw frame data against its plane layout like VideoFrame's constructor does (see Chromium's VideoFrameLayout):
+ * each row must fit in its stride, planes must not overlap, and the data must hold every plane.
+ */
+const validatePlaneLayout = (
+	format: VideoSamplePixelFormat,
+	codedWidth: number,
+	codedHeight: number,
+	layout: PlaneLayout[],
+	byteLength: number,
+) => {
+	const planes = getPlaneConfigs(format);
+	if (layout.length !== planes.length) {
+		throw new TypeError(`init.layout must have ${planes.length} entries for format ${format}.`);
+	}
+
+	const planeEnds: number[] = [];
+	for (let i = 0; i < planes.length; i++) {
+		const { offset, stride } = layout[i]!;
+		const minStride = Math.ceil(codedWidth / planes[i]!.widthDivisor) * planes[i]!.sampleBytes;
+		if (stride < minStride) {
+			throw new TypeError(`init.layout[${i}].stride must be at least ${minStride}, got ${stride}.`);
+		}
+
+		const end = offset + stride * Math.ceil(codedHeight / planes[i]!.heightDivisor);
+		for (let j = 0; j < i; j++) {
+			if (offset < planeEnds[j]! && layout[j]!.offset < end) {
+				throw new TypeError(`Planes ${j} and ${i} of init.layout overlap.`);
+			}
+		}
+		planeEnds.push(end);
+	}
+
+	const requiredSize = Math.max(...planeEnds);
+	if (byteLength < requiredSize) {
+		throw new TypeError(`data is too small: ${requiredSize} bytes are required, got ${byteLength}.`);
 	}
 };
 
