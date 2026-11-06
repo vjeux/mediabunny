@@ -178,6 +178,16 @@ type Section = {
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
+/**
+ * Checks the current_next_indicator of the PSI section starting after the pointer_field of the given packet payload.
+ * A section with 0 is the next version of its table, sent ahead of the switch, which isn't in effect yet.
+ */
+const psiSectionIsInEffect = (payload: Uint8Array) => {
+	// table_id, section_length, and the table_id_extension (transport_stream_id or program_number) come before it
+	const sectionStart = 1 + (payload[0] ?? 0);
+	return ((payload[sectionStart + 5] ?? 1) & 0x01) === 1;
+};
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -284,7 +294,8 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 				}
 
-				if (section.pid === 0 && !hasProgramAssociationTable) {
+				// Tables that only apply later are skipped (like FFmpeg does), the current ones follow
+				if (section.pid === 0 && !hasProgramAssociationTable && psiSectionIsInEffect(section.payload)) {
 					const bitstream = new Bitstream(section.payload);
 					const pointerField = bitstream.readAlignedByte();
 
@@ -314,7 +325,11 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					hasProgramAssociationTable = true;
-				} else if ((section.pid === programMapPid || isProbablyProgramMap) && !hasProgramMap) {
+				} else if (
+					(section.pid === programMapPid || isProbablyProgramMap)
+					&& !hasProgramMap
+					&& psiSectionIsInEffect(section.payload)
+				) {
 					const bitstream = new Bitstream(section.payload);
 					const pointerField = bitstream.readAlignedByte();
 
