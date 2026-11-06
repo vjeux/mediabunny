@@ -28,7 +28,6 @@ const FILES = [
 	'ffmpeg-mkv-small-clusters.mkv',
 	'ffmpeg-mkv-live.mkv',
 	'ffmpeg-webm-vp9-opus.webm',
-	'ffmpeg-webm-vp8-vorbis.webm',
 	'ffmpeg-ts-default.ts',
 	'ffmpeg-m2ts.m2ts',
 	'ffmpeg-ts-mp3-ac3.ts',
@@ -37,14 +36,16 @@ const FILES = [
 	'ffmpeg-mp3-cbr.mp3',
 	'ffmpeg-mp3-vbr.mp3',
 	'ffmpeg-ogg-opus.opus',
-	'ffmpeg-ogg-vorbis.ogg',
-	'ffmpeg-flac-16.flac',
-	'ffmpeg-flac-24.flac',
 	'ffmpeg-wav-s24.wav',
 	'ffmpeg-wav-f32.wav',
 	'ffmpeg-wav-alaw.wav',
 	'ffmpeg-wav-mulaw.wav',
+	// Last, as WebKitGTK fails on or hangs on these, and a hang stalls every later decode on the page
+	'ffmpeg-flac-16.flac',
+	'ffmpeg-flac-24.flac',
 	'ffmpeg-wav-extensible-51.wav',
+	'ffmpeg-webm-vp8-vorbis.webm',
+	'ffmpeg-ogg-vorbis.ogg',
 ];
 
 const expectVideoDecodes = async (track: InputVideoTrack) => {
@@ -90,6 +91,8 @@ const expectAudioDecodes = async (track: InputAudioTrack, sourceDuration: number
  * Whether the browser really decodes the first packets of the track: WebKitGTK says it can decode some codecs (FLAC,
  * Vorbis, 5.1 PCM) that its GStreamer decoders then fail on or hang. This uses its own decoder, with a time limit.
  */
+let decodingStalled = false; // A hung WebKitGTK decoder stalls every later decode on the page, even once closed
+
 const reallyDecodes = async (track: InputVideoTrack | InputAudioTrack) => {
 	let failed = false;
 	const output = (data: VideoFrame | AudioData) => data.close();
@@ -129,6 +132,7 @@ const reallyDecodes = async (track: InputVideoTrack | InputAudioTrack) => {
 	if (decoder.state !== 'closed') {
 		decoder.close();
 	}
+	decodingStalled ||= !flushed && !failed;
 
 	return flushed && !failed;
 };
@@ -136,6 +140,7 @@ const reallyDecodes = async (track: InputVideoTrack | InputAudioTrack) => {
 describe('Decoding files written by FFmpeg', () => {
 	for (const file of FILES) {
 		test(`decodes ${file}`, async ({ skip }) => {
+			skip(decodingStalled, 'an earlier decoder hang stalled decoding on this page');
 			using input = new Input({ source: new UrlSource(`/${file}`), formats: ALL_FORMATS });
 			let decodedTracks = 0;
 			const undecodable: string[] = [];
