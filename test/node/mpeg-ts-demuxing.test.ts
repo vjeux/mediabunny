@@ -967,6 +967,67 @@ test('MPEG-TS key packet lookup finds key frames sharing their PTS with the fram
 	}
 });
 
+test('MPEG-TS key packet lookup returns key frames split over several PES packets whole', async () => {
+	// The first access unit comes in three PES packets with PTS 0: AUD + SPS, PPS, and SEI + IDR. The first and last
+	// are flagged with random_access_indicator, the middle one isn't, or all three are.
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const aud = [0x09, 0xf0];
+	const sei = [0x06, 0x05, 0x01, 0x00, 0x80];
+	const idr = [0x65, 0x88, 0x84, 0x00, 0x33, ...new Array<number>(30).fill(0xaa)];
+	const slice = [0x41, 0x9a, 0x02, 0x04, ...new Array<number>(20).fill(0xaa)];
+	const nal = (nalUnit: number[]) => [0, 0, 0, 1, ...nalUnit];
+
+	const buildFile = (flagMiddle: boolean) => {
+		const packets: Uint8Array[] = [];
+		const pushPes = (pid: number, payload: number[], randomAccess: boolean) => {
+			// One TS packet per PES packet: adaptation field (flags + stuffing), then the payload
+			const packet = new Uint8Array(188).fill(0xff);
+			const adaptationLength = 184 - payload.length;
+			const flags = randomAccess ? 0x40 : 0x00;
+			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, 0x30, adaptationLength - 1, flags], 0);
+			packet.set(payload, 4 + adaptationLength);
+			packets.push(packet);
+		};
+		const pes = (pts: number, nalUnits: number[][]) => [
+			0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+			...nalUnits.flatMap(nal),
+		];
+
+		pushPes(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0], false);
+		pushPes(0x1000, [
+			0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+		], false);
+		pushPes(0x100, pes(0, [aud, sps]), true);
+		pushPes(0x100, pes(0, [pps]), flagMiddle);
+		pushPes(0x100, pes(0, [sei, idr]), true);
+		for (let i = 1; i < 4; i++) {
+			pushPes(0x100, pes(3000 * i, [aud, slice]), false);
+		}
+
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+		return bytes;
+	};
+
+	for (const flagMiddle of [false, true]) {
+		using input = new Input({
+			source: new BufferSource(buildFile(flagMiddle)),
+			formats: ALL_FORMATS,
+		});
+
+		const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+		const firstPacket = await sink.getFirstPacket();
+		expect(firstPacket!.byteLength).toBe([aud, sps, pps, sei, idr].flatMap(nal).length);
+
+		const keyPacket = await sink.getKeyPacket(0);
+		expect(keyPacket?.type).toBe('key');
+		expect(keyPacket?.sequenceNumber).toBe(firstPacket!.sequenceNumber);
+		expect(keyPacket?.data).toEqual(firstPacket!.data);
+	}
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({

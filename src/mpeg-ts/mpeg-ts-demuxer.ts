@@ -99,6 +99,9 @@ import { Bitstream } from '../../shared/bitstream';
 const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expected. PES packets without PTS are not'
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
+/** How many PES packets of the same PTS key packet lookups look back over to find the start of a key frame. */
+const MAX_KEY_FRAME_PES_PACKET_COUNT = 64;
+
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
@@ -1449,6 +1452,34 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const firstPesPacketHeader = readPesPacketHeader(demuxer, firstSection, true);
 		assert(firstPesPacketHeader);
 
+		// Finds the PES packet with a PTS that comes before the given one, never before the track's first PES packet
+		// (which may come before the PMT)
+		const findPreviousTimestampedPesPacketHeader = async (pesPacketHeader: TimestampedPesPacketHeader) => {
+			const readSectionsInFull = !this.elementaryStream.canBeTrustedWithKeyPackets;
+			let pos = pesPacketHeader.sectionStartPos - demuxer.packetStride;
+
+			while (pos >= firstPesPacketHeader.sectionStartPos) {
+				const packetHeader = await demuxer.readPacketHeader(pos);
+				if (!packetHeader) {
+					return null;
+				}
+
+				if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
+					const section = await demuxer.readSection(pos, readSectionsInFull);
+					if (section) {
+						const header = readPesPacketHeader(demuxer, section, false);
+						if (header && header.pts !== null) {
+							return header as TimestampedPesPacketHeader;
+						}
+					}
+				}
+
+				pos -= demuxer.packetStride;
+			}
+
+			return null;
+		};
+
 		if (searchPts < firstPesPacketHeader.pts) {
 			// We're before the first packet, definitely nothing here
 			return null;
@@ -1774,38 +1805,24 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				if (bestKeyPesHeader) {
 					let startPesHeader = bestKeyPesHeader;
 
-					// Let's start reading one PES packet early: the key packet's PES packet may begin with the end of
-					// the previous access unit, which would otherwise pass for a packet of its own and hide the key
-					// packet. At the end of the stream, rewind a little more to obtain the correct packet duration.
-					const rewindCount = 1 + (lookaheadCount === 0 ? reorderSize : 0);
-
-					outer:
-					for (let i = 0; i < rewindCount; i++) {
-						let pos = startPesHeader.sectionStartPos - demuxer.packetStride;
-
-						// Never before the track's first PES packet, which may come before the PMT
-						while (pos >= firstPesPacketHeader.sectionStartPos) {
-							const packetHeader = await demuxer.readPacketHeader(pos);
-							if (!packetHeader) {
-								break outer;
-							}
-
-							if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
-								const section = await demuxer.readSection(pos, readSectionsInFull);
-								if (section) {
-									const header = readPesPacketHeader(demuxer, section, false);
-									if (header && header.pts !== null) {
-										startPesHeader = header as TimestampedPesPacketHeader;
-										break;
-									}
-								}
-							}
-
-							pos -= demuxer.packetStride;
+					// The key frame's access unit may be split over several PES packets, which all have its PTS (when
+					// the parameter sets come in PES packets of their own, say), so let's start reading at the first of
+					// them; only it may carry the random access flag. At the end of the stream, rewind a little more to
+					// obtain the correct packet duration.
+					let extraRewindCount = lookaheadCount === 0 ? reorderSize : 0;
+					for (let i = 0; i < MAX_KEY_FRAME_PES_PACKET_COUNT + extraRewindCount; i++) {
+						const previous = await findPreviousTimestampedPesPacketHeader(startPesHeader);
+						if (!previous) {
+							break;
 						}
 
-						if (pos < firstPesPacketHeader.sectionStartPos) {
-							break; // We've hit the track's start, there's nothing more to rewind
+						if (previous.pts === bestKeyPesHeader.pts) {
+							startPesHeader = previous;
+						} else if (extraRewindCount > 0) {
+							startPesHeader = previous;
+							extraRewindCount--;
+						} else {
+							break;
 						}
 					}
 
