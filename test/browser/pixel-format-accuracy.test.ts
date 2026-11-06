@@ -99,13 +99,13 @@ const makeSample = (format: string, matrix: MatrixName, fullRange: boolean) => {
 };
 
 /**
- * Checks the patch centers of an RGBA image of a frame made by makeSample. Allows 2 LSB per channel and a mean bias
+ * Measures the patch centers of an RGBA image of a frame made by makeSample. Allows 2 LSB per channel and a mean bias
  * below 1 LSB, with two exceptions coming from Chrome's conversion: blue with the limited-range BT.709 and BT.2020
  * matrices may be off by up to 8 LSB (libyuv can't represent their Cb -> B coefficient in its 8-bit fixed-point tables
  * and clamps it), and colors under alpha may be off by another 127.5 / alpha (Chrome converts through premultiplied
  * colors).
  */
-const expectMatchingColors = (
+const measureColors = (
 	rgba: Uint8ClampedArray | Uint8Array,
 	format: string,
 	matrix: MatrixName,
@@ -142,8 +142,24 @@ const expectMatchingColors = (
 	}
 
 	const { meanSigned } = errors.result();
-	const message = `${format} ${matrix} ${fullRange ? 'full' : 'limited'}: max errors ${maxErrors.join('/')}, `
-		+ `mean errors ${meanSigned.map(x => x.toFixed(2)).join('/')}, max alpha error ${maxAlphaError}`;
+	return {
+		maxExcess,
+		meanSigned,
+		maxAlphaError,
+		withinTolerances: maxExcess <= 0 && meanSigned.every(mean => Math.abs(mean) < 1) && maxAlphaError <= 1,
+		message: `${format} ${matrix} ${fullRange ? 'full' : 'limited'}: max errors ${maxErrors.join('/')}, `
+			+ `mean errors ${meanSigned.map(x => x.toFixed(2)).join('/')}, max alpha error ${maxAlphaError}`,
+	};
+};
+
+const expectMatchingColors = (
+	rgba: Uint8ClampedArray | Uint8Array,
+	format: string,
+	matrix: MatrixName,
+	fullRange: boolean,
+	hasAlpha: boolean,
+) => {
+	const { maxExcess, meanSigned, maxAlphaError, message } = measureColors(rgba, format, matrix, fullRange, hasAlpha);
 	expect(maxExcess, message).toBeLessThanOrEqual(0);
 	for (const mean of meanSigned) {
 		expect(Math.abs(mean), message).toBeLessThan(1);
@@ -152,7 +168,8 @@ const expectMatchingColors = (
 };
 
 // WebKitGTK's VideoFrame.copyTo() doesn't convert YUV frames to RGBA, and its drawImage() converts them a few LSB off
-// (beyond the tolerances above, which are Chrome's), so there, the browser can't be the reference
+// (beyond the tolerances above, which are Chrome's), so there, the browser can't be the reference. Both probes use the
+// browser's own APIs only, never Mediabunny, so that a broken Mediabunny can't turn its tests into skips.
 const nativeYuvToRgbaWorks = await (async () => {
 	const frame = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
 		format: 'I420', codedWidth: 2, codedHeight: 2, timestamp: 0,
@@ -162,16 +179,21 @@ const nativeYuvToRgbaWorks = await (async () => {
 	frame.close();
 	return rgba[3] === 255 && rgba[7] === 255;
 })();
-const drawConvertsYuvPrecisely = (() => {
-	using sample = makeSample('I420', 'bt709', false);
+const nativeDrawIsPrecise = (() => {
+	const { data, layout } = buildYuvFrame('I420', WIDTH, HEIGHT, (x, y) => patchValues('I420', x, y));
+	const frame = new VideoFrame(data, {
+		format: 'I420',
+		codedWidth: WIDTH,
+		codedHeight: HEIGHT,
+		timestamp: 0,
+		layout,
+		colorSpace: { matrix: 'bt709', primaries: 'bt709', transfer: 'bt709', fullRange: false },
+	});
 	const context = new OffscreenCanvas(WIDTH, HEIGHT).getContext('2d', { willReadFrequently: true })!;
-	sample.draw(context, 0, 0);
-	try {
-		expectMatchingColors(context.getImageData(0, 0, WIDTH, HEIGHT).data, 'I420', 'bt709', false, false);
-		return true;
-	} catch {
-		return false;
-	}
+	context.drawImage(frame, 0, 0);
+	frame.close();
+	return measureColors(context.getImageData(0, 0, WIDTH, HEIGHT).data, 'I420', 'bt709', false, false)
+		.withinTolerances;
 })();
 
 describe('YUV to RGB conversion', () => {
@@ -194,7 +216,7 @@ describe('YUV to RGB conversion', () => {
 		},
 	);
 
-	test.skipIf(!drawConvertsYuvPrecisely)('draw() follows the same matrices and ranges', async () => {
+	test.skipIf(!nativeDrawIsPrecise)('draw() follows the same matrices and ranges', async () => {
 		const canvas = new OffscreenCanvas(WIDTH, HEIGHT);
 		const context = canvas.getContext('2d', { willReadFrequently: true })!;
 
