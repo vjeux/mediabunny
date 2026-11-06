@@ -57,3 +57,11 @@ test('joinPaths', () => {
 	expect(joinPaths('file:///path/to/entry.m3u8', 'https://example.com/other.m3u8'))
 		.toBe('https://example.com/other.m3u8');
 });
+
+test('joinPaths keeps the leading ../ segments of relative paths', () => {
+	expect(joinPaths('../master.m3u8', 'media.m3u8')).toBe('../media.m3u8');
+	expect(joinPaths('../../hls/master.m3u8', 'media.m3u8')).toBe('../../hls/media.m3u8');
+	expect(joinPaths('hls/master.m3u8', '../../media.m3u8')).toBe('../media.m3u8');
+	expect(joinPaths('master.m3u8', '../media.m3u8')).toBe('../media.m3u8');
+	expect(joinPaths('../a/master.m3u8', '../b/./media.m3u8')).toBe('../b/media.m3u8');
+});
