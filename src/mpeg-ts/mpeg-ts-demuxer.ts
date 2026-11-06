@@ -41,6 +41,7 @@ import {
 	extractNalUnitTypeForHevc,
 	parseDtsFrame,
 	parseDtsCoreFrameHeader,
+	removeEmulationPreventionBytes,
 	parseDtsExssHeader,
 	DTS_CORE_FRAME_HEADER_SIZE,
 	DTS_EXSS_HEADER_PREFIX_SIZE,
@@ -138,6 +139,8 @@ type ElementaryStream = {
 		squarePixelWidth: number;
 		squarePixelHeight: number;
 		reorderSize: number;
+		/** How to find the field of a slice, for AVC streams that may contain field pictures. */
+		avcFieldCoding: AvcFieldCoding | null;
 	} | {
 		type: 'audio';
 		codec: AudioCodec;
@@ -177,6 +180,47 @@ type Section = {
 
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
+
+type AvcFieldCoding = {
+	log2MaxFrameNum: number;
+	separateColourPlane: boolean;
+};
+
+type AvcSliceField = {
+	frameNum: number;
+	bottomField: number;
+};
+
+// Covers an AVC slice header up to bottom_field_flag, with room for emulation prevention bytes
+const AVC_SLICE_FIELD_PEEK_SIZE = 16;
+
+/** Reads which field a slice belongs to from the start of its header, or null for a frame or unreadable header. */
+const readAvcSliceField = (bytes: Uint8Array, fieldCoding: AvcFieldCoding): AvcSliceField | null => {
+	const unescaped = removeEmulationPreventionBytes(bytes);
+	const bitstream = new Bitstream(unescaped);
+
+	try {
+		readExpGolomb(bitstream); // first_mb_in_slice
+		readExpGolomb(bitstream); // slice_type
+		readExpGolomb(bitstream); // pic_parameter_set_id
+	} catch {
+		return null;
+	}
+
+	if (fieldCoding.separateColourPlane) {
+		bitstream.skipBits(2); // colour_plane_id
+	}
+
+	const frameNum = bitstream.readBits(fieldCoding.log2MaxFrameNum);
+	const fieldPicFlag = bitstream.readBits(1);
+	const bottomField = bitstream.readBits(1);
+
+	if (bitstream.pos > 8 * unescaped.length || !fieldPicFlag) {
+		return null;
+	}
+
+	return { frameNum, bottomField };
+};
 
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
@@ -417,6 +461,7 @@ export class MpegTsDemuxer extends Demuxer {
 									squarePixelWidth: -1,
 									squarePixelHeight: -1,
 									reorderSize: -1,
+									avcFieldCoding: null,
 								};
 							}; break;
 
@@ -607,6 +652,12 @@ export class MpegTsDemuxer extends Demuxer {
 										fullRange: !!spsInfo.fullRangeFlag,
 									};
 									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+									elementaryStream.info.avcFieldCoding = spsInfo.frameMbsOnlyFlag
+										? null
+										: {
+												log2MaxFrameNum: spsInfo.log2MaxFrameNumMinus4 + 4,
+												separateColourPlane: spsInfo.separateColourPlaneFlag === 1,
+											};
 
 									break;
 								} else if (elementaryStream.info.codec === 'hevc') {
@@ -1318,14 +1369,14 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		let buffer = this.packetBuffers.get(packet);
 
 		if (buffer) {
-			// Fast path
+			// Remove PacketBuffer access from the old packet, it belongs to the next packet now. Remove it before any
+			// async to prevent races
+			this.packetBuffers.delete(packet);
+
 			const result = await buffer.readNext();
 			if (!result) {
 				return null;
 			}
-
-			// Remove PacketBuffer access from the old packet, it belongs to the next packet now
-			this.packetBuffers.delete(packet);
 
 			const newPacket = this.createEncodedPacket(result.packet, result.duration, options);
 			this.packetBuffers.set(newPacket, buffer);
@@ -2141,6 +2192,30 @@ class PacketReadingContext {
 		this.currentPesPacketIndex++;
 	}
 
+	/** Returns the index of the buffered PES packet containing the given position, which mustn't lie ahead. */
+	getPesPacketIndexAt(pos: number) {
+		let index = this.currentPesPacketIndex;
+		let pesPacketPos = this.currentPesPacketPos;
+		while (index > 0 && pos < pesPacketPos) {
+			index--;
+			pesPacketPos -= this.pesPackets[index]!.data.byteLength;
+		}
+
+		return index;
+	}
+
+	/** Whether a PES packet with a PTS begins after the one containing `startPos`, up to the one holding `endPos`. */
+	hasTimestampedPesPacketIn(startPos: number, endPos: number) {
+		const endIndex = this.getPesPacketIndexAt(endPos);
+		for (let i = this.getPesPacketIndexAt(startPos) + 1; i <= endIndex; i++) {
+			if (this.pesPackets[i]!.pts !== null) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	async markNextPacket() {
 		assert(!this.suppliedPacket);
 
@@ -2161,6 +2236,20 @@ class PacketReadingContext {
 			let packetStartPos: number | null = null;
 			let frameStartFound = false;
 			let lastFirstMacroblockInSlice = 0;
+
+			// Field-coded AVC (PAFF) codes the two fields of a frame as separate pictures, each with its own access
+			// unit. Like MP4 samples, packets should hold whole frames, so we keep a complementary field pair together.
+			const avcFieldCoding = elementaryStream.info.avcFieldCoding;
+			// The current picture's field, as long as its second field may still follow
+			let firstField: AvcSliceField | null = null;
+			// Where the packet ends unless the next picture turns out to be the second field
+			let pendingBoundaryPos: number | null = null;
+			// Where the AUD beginning the second field's access unit ends, if it begins with one
+			let pendingAudEndPos: number | null = null;
+			let pendingBoundaryIsAud = false;
+			// AUDs of second fields, which we leave out of the packet (Chromium's decoder workaround in the sink cuts a
+			// packet at an AUD that follows picture data). Mediabunny's MPEG-TS muxer writes field pairs without them.
+			const droppedRanges: { start: number; end: number }[] = [];
 
 			while (true) {
 				let remaining = this.ensureBuffered(CHUNK_SIZE);
@@ -2216,6 +2305,10 @@ class PacketReadingContext {
 					// The packet only really begins at the first NAL unit; anything before it isn't usable
 					packetStartPos ??= startCodePos;
 
+					if (pendingBoundaryIsAud && pendingAudEndPos === null && startCodePos > pendingBoundaryPos!) {
+						pendingAudEndPos = startCodePos;
+					}
+
 					const nalHeaderStart = i + startCodeLength;
 					const payloadStart = nalHeaderStart + nalHeaderSize;
 
@@ -2224,8 +2317,12 @@ class PacketReadingContext {
 					const AVC_SLICE_HEADER_PEEK_SIZE = 6;
 
 					// We read the NAL header plus, for slices, the start of the slice header to decode the
-					// first_mb_in_slice / first_slice_segment_in_pic_flag. Make sure all of it is buffered.
-					const bytesNeeded = payloadStart + (codec === 'avc' ? AVC_SLICE_HEADER_PEEK_SIZE : 1);
+					// first_mb_in_slice / first_slice_segment_in_pic_flag (and the field). Make sure all of it is
+					// buffered.
+					const slicePeekSize = codec === 'avc'
+						? (avcFieldCoding ? AVC_SLICE_FIELD_PEEK_SIZE : AVC_SLICE_HEADER_PEEK_SIZE)
+						: 1;
+					const bytesNeeded = payloadStart + slicePeekSize;
 					if (bytesNeeded > length) {
 						this.seekTo(posBeforeZero);
 						break;
@@ -2278,6 +2375,41 @@ class PacketReadingContext {
 							const firstMacroblockInSlice = readExpGolomb(new Bitstream(headerBytes));
 							startsNewPicture = !frameStartFound || firstMacroblockInSlice <= lastFirstMacroblockInSlice;
 							lastFirstMacroblockInSlice = firstMacroblockInSlice;
+
+							if (startsNewPicture && avcFieldCoding) {
+								const field = readAvcSliceField(
+									chunk.subarray(payloadStart, payloadStart + AVC_SLICE_FIELD_PEEK_SIZE),
+									avcFieldCoding,
+								);
+
+								if (!frameStartFound) {
+									firstField = field;
+								} else if (
+									firstField
+									&& field
+									&& field.bottomField !== firstField.bottomField
+									&& field.frameNum === firstField.frameNum
+									// When the second field comes in a PES packet with its own PTS, it's timed and
+									// looked up on its own, so it stays a packet of its own then
+									&& !this.hasTimestampedPesPacketIn(
+										packetStartPos,
+										pendingBoundaryPos ?? startCodePos,
+									)
+								) {
+									// The second field of the frame, so the packet goes on
+									startsNewPicture = false;
+									if (pendingBoundaryIsAud) {
+										droppedRanges.push({
+											start: pendingBoundaryPos!,
+											end: pendingAudEndPos ?? startCodePos,
+										});
+									}
+									firstField = null;
+									pendingBoundaryPos = null;
+									pendingAudEndPos = null;
+									pendingBoundaryIsAud = false;
+								}
+							}
 						} else {
 							startsNewPicture = (chunk[payloadStart]! >> 7) === 1;
 						}
@@ -2290,7 +2422,15 @@ class PacketReadingContext {
 							}
 						}
 					} else if (isAccessUnitStart && frameStartFound) {
-						isFrameBoundary = true;
+						if (firstField) {
+							// This might begin the second field; the next slice will tell
+							if (pendingBoundaryPos === null) {
+								pendingBoundaryPos = startCodePos;
+								pendingBoundaryIsAud = isAccessUnitDelimiter;
+							}
+						} else {
+							isFrameBoundary = true;
+						}
 					} else if (isAccessUnitDelimiter) {
 						// An AUD always begins a new access unit. We haven't seen a slice yet, so whatever came before
 						// it holds no picture; let's drop it
@@ -2299,9 +2439,9 @@ class PacketReadingContext {
 
 					if (isFrameBoundary) {
 						// End the packet at this start code (the next frame begins here)
-						const packetLength = startCodePos - packetStartPos;
+						const packetLength = (pendingBoundaryPos ?? startCodePos) - packetStartPos;
 						this.seekTo(packetStartPos);
-						return this.supplyPacket(packetLength, 0);
+						return this.supplyPacket(packetLength, 0, droppedRanges);
 					}
 
 					i += startCodeLength;
@@ -2317,9 +2457,9 @@ class PacketReadingContext {
 			if (frameStartFound) {
 				assert(packetStartPos !== null);
 
-				const packetLength = this.endPos - packetStartPos;
+				const packetLength = (pendingBoundaryPos ?? this.endPos) - packetStartPos;
 				this.seekTo(packetStartPos);
-				return this.supplyPacket(packetLength, 0);
+				return this.supplyPacket(packetLength, 0, droppedRanges);
 			}
 		} else {
 			const codec = elementaryStream.info.codec;
@@ -2579,7 +2719,12 @@ class PacketReadingContext {
 	}
 
 	/** Supplies the context with a new encoded packet, beginning at the current position. */
-	supplyPacket(packetLength: number, intrinsicDuration: number) {
+	supplyPacket(
+		packetLength: number,
+		intrinsicDuration: number,
+		// Ranges (in context positions) to leave out of the packet's data
+		droppedRanges: { start: number; end: number }[] = [],
+	) {
 		const currentPesPacket = this.getCurrentPesPacket();
 
 		let pts: number;
@@ -2603,7 +2748,26 @@ class PacketReadingContext {
 		// The sequence number is the starting position of the section the PES packet is in, PLUS the offset within the
 		// PES packet where the packet starts.
 		const sequenceNumber = sectionStartPos + (this.currentPos - this.currentPesPacketPos);
-		const data = this.readBytes(packetLength);
+		const packetStartPos = this.currentPos;
+		let data = this.readBytes(packetLength);
+
+		if (droppedRanges.length > 0) {
+			const parts: Uint8Array[] = [];
+			let offset = 0;
+			for (const range of droppedRanges) {
+				parts.push(data.subarray(offset, range.start - packetStartPos));
+				offset = range.end - packetStartPos;
+			}
+			parts.push(data.subarray(offset));
+
+			const filtered = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+			let pos = 0;
+			for (const part of parts) {
+				filtered.set(part, pos);
+				pos += part.length;
+			}
+			data = filtered;
+		}
 
 		let randomAccessIndicator = currentPesPacket.randomAccessIndicator;
 
