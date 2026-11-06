@@ -578,17 +578,19 @@ export class HlsMuxer extends Muxer {
 
 	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
-		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			trackData.closed = true;
-		}
-
 		const playlist = this.playlists.find(x => x.tracks.includes(track));
 		assert(playlist); // If there isn't one then the assignment algo failed innit
 
 		const release = await playlist.mutex.acquire();
 
 		try {
+			// Mark the track as closed only now, once the packets queued on the mutex before the close are in. Else,
+			// those would see it as closed and finish the playlist without the packets queued behind them.
+			const trackData = this.trackDatas.find(x => x.track === track);
+			if (trackData) {
+				trackData.closed = true;
+			}
+
 			await this.advancePlaylist(playlist);
 		} finally {
 			release();
