@@ -287,6 +287,8 @@ export const fullBox = (
 export const ftyp = (details: {
 	isQuickTime: boolean;
 	holdsAvc: boolean;
+	holdsAv1: boolean;
+	usesSampleGroups: boolean;
 	fragmented: boolean;
 	cmaf: boolean;
 }) => {
@@ -316,6 +318,7 @@ export const ftyp = (details: {
 				ascii('mp41'),
 				ascii('cmfc'),
 				ascii('dash'),
+				details.holdsAv1 ? ascii('av01') : [], // Required by AV1-ISOBMFF
 			]);
 		} else {
 			return box('ftyp', [
@@ -325,6 +328,7 @@ export const ftyp = (details: {
 				ascii('iso5'),
 				ascii('iso6'),
 				ascii('mp41'),
+				details.holdsAv1 ? ascii('av01') : [], // Required by AV1-ISOBMFF
 			]);
 		}
 	}
@@ -334,7 +338,10 @@ export const ftyp = (details: {
 		u32(minorVersion), // Minor version
 		// Compatible brands
 		ascii('isom'),
+		// Sample groups (our 'roll' groups) need a brand that supports them, which 'isom' doesn't
+		details.usesSampleGroups ? ascii('iso2') : [],
 		details.holdsAvc ? ascii('avc1') : [],
+		details.holdsAv1 ? ascii('av01') : [], // Required by AV1-ISOBMFF
 		ascii('mp41'),
 	]);
 };
