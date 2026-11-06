@@ -707,7 +707,9 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		const tick = Math.floor(roundIfAlmostInteger(timestamp * timeResolution));
 		let packet = await getPacket((tick + 0.5) / timeResolution - mediaOffset);
 
-		if (packet && roundToDivisor(packet.timestamp + mediaOffset, timeResolution) > timestamp) {
+		// Compared in ticks, since the timestamp may be a reported timestamp computed along another path, off in its
+		// last bit
+		if (packet && Math.round((packet.timestamp + mediaOffset) * timeResolution) > tick) {
 			// The packet lies exactly on the rounding boundary and is reported a tick later, so take the one before it
 			packet = await getPacket(packet.timestamp - 1 / (2 * timeResolution));
 		}

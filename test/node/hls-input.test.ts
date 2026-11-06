@@ -1779,6 +1779,45 @@ test.concurrent('Leading frames of an open GOP can be looked up when the previou
 	expect((await sink.getPacket(23 / fps))?.timestamp).toBe(23 / fps);
 });
 
+test.concurrent('Packet lookups treat timestamps within floating-point noise of a packet\'s timestamp as that timestamp', async () => {
+	// Like the demuxers of the segments themselves, which snap timestamps that are almost a whole tick to that tick.
+	// Timestamps computed along different paths can differ in their last bit.
+	const nextFloat = (x: number, direction: 1 | -1) => {
+		const view = new DataView(new ArrayBuffer(8));
+		view.setFloat64(0, x);
+		view.setBigInt64(0, view.getBigInt64(0) + BigInt(direction)); // For x > 0
+		return view.getFloat64(0);
+	};
+
+	const frameDuration = 1001 / 30000;
+	const video = Array.from({ length: 90 }, (_, i) => ({
+		timestamp: i * frameDuration,
+		duration: frameDuration,
+		type: i % 30 === 0 ? 'key' as const : 'delta' as const,
+	}));
+
+	for (const segmentFormat of [new MpegTsOutputFormat(), new CmafOutputFormat()]) {
+		using input = await writeHlsFromPackets(segmentFormat, video, []);
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+
+		const sink = new EncodedPacketSink(videoTrack);
+		for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+			if (packet.timestamp <= 0) {
+				continue;
+			}
+
+			for (const direction of [-1, 1] as const) {
+				const timestamp = nextFloat(packet.timestamp, direction);
+				expect((await sink.getPacket(timestamp))?.timestamp).toBe(packet.timestamp);
+				if (packet.type === 'key') {
+					expect((await sink.getKeyPacket(timestamp))?.timestamp).toBe(packet.timestamp);
+				}
+			}
+		}
+	}
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
