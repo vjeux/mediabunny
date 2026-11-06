@@ -44,7 +44,9 @@ import {
 	readId3V2Header,
 } from '../id3';
 import { readNextMp3FrameHeader, readFirstMp3FrameHeader } from './mp3-reader';
-import { readAscii, readBytes, Reader, readU32Be, readU8 } from '../reader';
+import { readAscii, readBytes, Reader, readU32Be, readU32Le, readU8 } from '../reader';
+
+const APE_TAG_FOOTER_SIZE = 32;
 
 type Sample = {
 	timestamp: number;
@@ -77,6 +79,7 @@ export class Mp3Demuxer extends Demuxer {
 	nextTimestampInSamples = 0;
 	primingDelay = 0;
 	itunesPriming: number | null = null;
+	audioEndPos: number | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -86,6 +89,8 @@ export class Mp3Demuxer extends Demuxer {
 
 	async readMetadata() {
 		return this.metadataPromise ??= (async () => {
+			this.audioEndPos = await this.computeAudioEndPos();
+
 			// Keep loading until we find the first frame header
 			while (!this.firstFrameHeader && !this.lastSampleLoaded) {
 				await this.advanceReader();
@@ -129,15 +134,31 @@ export class Mp3Demuxer extends Demuxer {
 			}
 		}
 
-		const result = this.firstFrameHeader
+		let result = this.firstFrameHeader
 			? await readNextMp3FrameHeader(
 				this.reader,
 				this.lastLoadedPos,
-				this.reader.fileSize,
+				this.audioEndPos,
 				this.firstFrameHeader,
 			)
 			// Nothing to compare against yet, so make sure we don't start off with a false sync
-			: await readFirstMp3FrameHeader(this.reader, this.lastLoadedPos, this.reader.fileSize);
+			: await readFirstMp3FrameHeader(this.reader, this.lastLoadedPos, this.audioEndPos);
+
+		if (this.firstFrameHeader && (!result || result.startPos > this.lastLoadedPos + 1)) {
+			// No frame follows the previous one directly. If ID3v2 tags do (like in concatenated files), skip them
+			// instead of searching them for frames, since bytes inside them (like cover art) can look like frames.
+			const tagsEnd = await this.skipId3V2Tags(this.lastLoadedPos);
+			if (tagsEnd !== null) {
+				this.lastLoadedPos = tagsEnd;
+				result = await readNextMp3FrameHeader(
+					this.reader,
+					this.lastLoadedPos,
+					this.audioEndPos,
+					this.firstFrameHeader,
+				);
+			}
+		}
+
 		if (!result) {
 			this.lastSampleLoaded = true;
 			return;
@@ -319,6 +340,85 @@ export class Mp3Demuxer extends Demuxer {
 
 			return;
 		}
+	}
+
+	/** Skips the ID3v2 tags following the frame that ended at lastLoadedPos, returning where they end. */
+	async skipId3V2Tags(lastLoadedPos: number) {
+		let tagsEnd: number | null = null;
+		// The previous frame ended right after lastLoadedPos, or at it if it was a byte short
+		let positions = [lastLoadedPos + 1, lastLoadedPos];
+
+		while (true) {
+			let foundTag = false;
+
+			for (const pos of positions) {
+				let slice = this.reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					continue;
+				}
+
+				const id3V2Header = readId3V2Header(slice);
+				if (id3V2Header) {
+					tagsEnd = slice.filePos + id3V2Header.size;
+					positions = [tagsEnd];
+					foundTag = true;
+					break;
+				}
+			}
+
+			if (!foundTag) {
+				return tagsEnd;
+			}
+		}
+	}
+
+	/**
+	 * Returns where the audio ends, before any APEv2 and ID3v1 tags at the end of the file, so that the bytes inside
+	 * them (like cover art in an APEv2 tag) aren't mistaken for frames.
+	 */
+	async computeAudioEndPos() {
+		if (this.reader.fileSize === null) {
+			return null;
+		}
+
+		let endPos = this.reader.fileSize;
+
+		if (endPos >= ID3_V1_TAG_SIZE) {
+			let slice = this.reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+
+			if (slice && readAscii(slice, 3) === 'TAG') {
+				endPos -= ID3_V1_TAG_SIZE;
+			}
+		}
+
+		// APEv2 tags end with a 32-byte footer and sit in front of any ID3v1 tag
+		if (endPos >= APE_TAG_FOOTER_SIZE) {
+			let slice = this.reader.requestSlice(endPos - APE_TAG_FOOTER_SIZE, APE_TAG_FOOTER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+
+			if (slice && readAscii(slice, 8) === 'APETAGEX') {
+				slice.skip(4); // Version
+				const tagSize = readU32Le(slice); // Includes the footer, but not the header
+				slice.skip(4); // Item count
+				const flags = readU32Le(slice);
+				const hasHeader = (flags & (1 << 31)) !== 0;
+
+				const tagStartPos = endPos - tagSize - (hasHeader ? APE_TAG_FOOTER_SIZE : 0);
+				if (tagStartPos >= 0) {
+					endPos = tagStartPos;
+				}
+			}
+		}
+
+		return endPos;
 	}
 
 	async getMimeType() {
