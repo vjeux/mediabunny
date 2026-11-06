@@ -838,6 +838,25 @@ export class HlsMuxer extends Muxer {
 						const packet = videoTrack.packets[i]!;
 
 						if (bestKeyPacket !== null && packet.timestamp > currentSegmentEndTimestamp) {
+							// In live mode, the segment may still end at this first packet past its end, if it's a
+							// key packet nearer to the end than the last one before it. With jittery frame timestamps
+							// (such as those of live capture), the key frame meant for this boundary often lands a bit
+							// late; ending at an earlier key frame instead, like one an encoder inserted at a scene
+							// cut, would put the boundaries of variants encoded from the same frames in different
+							// places. The overshoot is kept small enough for the duration to round to the target
+							// duration, which live playlists announce as is. (VOD playlists announce the ceiling of
+							// their longest segment, which any overshoot would raise.)
+							const overshoot = packet.timestamp - currentSegmentEndTimestamp;
+							if (
+								this.isLive
+								&& packet.type === 'key'
+								&& overshoot < currentSegmentEndTimestamp - bestKeyPacket.timestamp
+								&& overshoot < Math.ceil(this.targetSegmentDuration) + 0.5 - this.targetSegmentDuration
+							) {
+								bestKeyPacket = packet;
+								bestKeyPacketIndex = i;
+							}
+
 							break;
 						}
 
