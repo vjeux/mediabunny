@@ -272,3 +272,149 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Packet lookup by timestamp with B-frames spread over fragments', async () => {
+	// One frame per fragment (like FFmpeg's frag_every_frame), so the fragments interleave in presentation order
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...[...type].map(char => char.charCodeAt(0)), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), [...'vide'].map(char => char.charCodeAt(0)), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)),
+					box('stsc', zeros(8)),
+					box('stsz', zeros(12)),
+					box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	// Decode order I P B B P B B, presented as I B B P B B P
+	const compositionOffsets = [1, 3, 0, 0, 3, 0, 0];
+	const fragments = compositionOffsets.flatMap((offset, i) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(i)),
+			box('trun', u32(0xf01), u32(1), u32(dataOffset), u32(1), u32(1), u32(i === 0 ? 0 : 0x10000), u32(offset)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)), ...box('mdat', [i])];
+	});
+
+	const ftyp = box('ftyp', [...'iso5'].map(char => char.charCodeAt(0)), u32(0));
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...ftyp, ...moov, ...fragments])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sink = new EncodedPacketSink(track);
+	expect((await sink.getPacket(0.65))?.timestamp).toBe(0.6); // The last fragment's B-frame
+	expect((await sink.getPacket(0.45))?.timestamp).toBe(0.4); // The P-frame decoded before it
+	expect((await sink.getPacket(Infinity))?.timestamp).toBe(0.7); // Not the frame decoded last
+	expect(await track.computeDuration()).toBe(0.8);
+});
+
+test('Packet lookup by timestamp is the same however many fragments were read before', async () => {
+	// One frame per fragment, so that the fragments interleave in presentation order; only the first frame is a sync
+	// sample. What the first fragments show of the composition offsets says nothing about the later ones.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const build = (compositionOffsets: number[], trunVersion: number) => new Uint8Array([
+		...box('ftyp', ascii('iso6'), u32(0)),
+		...moov,
+		...compositionOffsets.flatMap((offset, i) => {
+			const traf = (dataOffset: number) => box('traf',
+				box('tfhd', u32(0x020000), u32(1)),
+				box('tfdt', u32(0), u32(i)),
+				box('trun', [trunVersion, 0, 0x0f, 0x01], u32(1), u32(dataOffset), u32(1), u32(1),
+					u32(i === 0 ? 0 : 0x10000), u32(offset >>> 0)),
+			);
+			const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+			return [...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)), ...box('mdat', [i])];
+		}),
+	]);
+	const withSink = async <T>(bytes: Uint8Array, use: (sink: EncodedPacketSink) => Promise<T>) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return await use(new EncodedPacketSink(track));
+	};
+	const lookUp = async (sink: EncodedPacketSink, timestamps: number[]) => {
+		const result = new Map<number, number | null>();
+		for (const timestamp of timestamps) {
+			result.set(timestamp, (await sink.getPacket(timestamp))?.timestamp ?? null);
+		}
+		return timestamps.map(timestamp => result.get(timestamp));
+	};
+
+	const sequences: [compositionOffsets: number[], trunVersion: number][] = [
+		[[1, 3, 0, 0, 3, 0, 0], 0], // Decode order I P B B P B B
+		[[0, 2, -1, -1, 2, -1, -1], 1], // The same with negative offsets, which the first two fragments don't show
+		[[1, 1, 1, 5, 0, 0, 0, 0], 0], // Reordering that gets deeper after the first fragments
+	];
+	for (const [compositionOffsets, trunVersion] of sequences) {
+		const bytes = build(compositionOffsets, trunVersion);
+		const presentationTimestamps = compositionOffsets.map((offset, i) => i + offset);
+
+		// Between every two presentation timestamps: the latest one presented at or before it
+		const timestamps = Array.from({ length: Math.max(...presentationTimestamps) + 3 }, (_, i) => (i - 0.5) / 10);
+		const expected = timestamps.map((timestamp) => {
+			const presented = presentationTimestamps.filter(x => x / 10 <= timestamp);
+			return presented.length > 0 ? Math.max(...presented) / 10 : null;
+		});
+
+		const cold: (number | null | undefined)[] = [];
+		for (const timestamp of timestamps) {
+			cold.push((await withSink(bytes, sink => lookUp(sink, [timestamp])))[0]);
+		}
+		expect(cold).toEqual(expected);
+
+		// After the other lookups, in reverse order
+		const reversed = await withSink(bytes, sink => lookUp(sink, [...timestamps].reverse()));
+		expect(reversed.reverse()).toEqual(expected);
+
+		// After reading every packet
+		expect(await withSink(bytes, async (sink) => {
+			for await (const packet of sink.packets()) {
+				expect(packet.timestamp).toBeGreaterThanOrEqual(0);
+			}
+			return lookUp(sink, timestamps);
+		})).toEqual(expected);
+	}
+});
