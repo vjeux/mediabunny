@@ -664,8 +664,8 @@ export class MatroskaMuxer extends Muxer {
 			id: EBMLId.Tags,
 			data: [{ id: EBMLId.Tag, data: [
 				{ id: EBMLId.Targets, data: [
+					// No TargetType string: FFmpeg prefixes every tag name with it (MOVIE/TITLE instead of title)
 					{ id: EBMLId.TargetTypeValue, data: 50 },
-					{ id: EBMLId.TargetType, data: 'MOVIE' },
 				] },
 				...simpleTags,
 			] }],
