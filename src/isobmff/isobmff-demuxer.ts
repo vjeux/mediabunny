@@ -1366,6 +1366,9 @@ export class IsobmffDemuxer extends Demuxer {
 						// developer.apple.com/documentation/quicktime-file-format/sound_sample_descriptions/
 						if (codecName === 'mp4a') {
 							// The codec is set by the esds box
+						} else if (codecName === '.mp3' || codecName === 'ms\u0000u') {
+							// QuickTime's MP3 sample entries: kFullMPEGLay3Format and the older kMPEGLayer3Format
+							track.info.codec = 'mp3';
 						} else if (codecName === 'opus') {
 							track.info.codec = 'opus';
 							track.info.sampleRate = OPUS_SAMPLE_RATE; // Always the same
