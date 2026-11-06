@@ -15,6 +15,7 @@ import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { Input } from '../../src/input.js';
+import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AttachedFile, MetadataTags } from '../../src/metadata.js';
@@ -1369,4 +1370,37 @@ test('MP4 with mdta format writes cover art under the QuickTime artwork key', as
 
 	// 'covr' is an ilst atom name; in a keys box, the artwork key is com.apple.quicktime.artwork (also read by FFmpeg)
 	expect(Object.keys(readTags.raw!)).toEqual(['com.apple.quicktime.artwork']);
+});
+
+test('Getters return copies that callers can modify without affecting the input', async () => {
+	for (const file of ['video.mp4', 'demo.webm', 'Toothsome-Meme.VBRv2.mp3']) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public', file)),
+			formats: ALL_FORMATS,
+		});
+		const mimeType = await input.getMimeType();
+		const track = (await input.getTracks())[0] as InputVideoTrack | InputAudioTrack;
+		const codecString = await track.getCodecParameterString();
+
+		const tags = await input.getMetadataTags();
+		const title = tags.title;
+		tags.title = 'Changed';
+		tags.raw = {};
+		const config = (await track.getDecoderConfig())!;
+		config.codec = 'vp8';
+		const disposition = await track.getDisposition();
+		disposition.default = !disposition.default;
+
+		expect((await input.getMetadataTags()).title, file).toBe(title);
+		expect((await track.getDecoderConfig())!.codec, file).toBe(codecString);
+		expect(await track.getCodecParameterString(), file).toBe(codecString);
+		expect(await input.getMimeType(), file).toBe(mimeType);
+		expect((await track.getDisposition()).default, file).toBe(!disposition.default);
+
+		if (track.isVideoTrack()) {
+			const ratio = await track.getPixelAspectRatio();
+			ratio.num = 99;
+			expect((await track.getPixelAspectRatio()).num, file).not.toBe(99);
+		}
+	}
 });
