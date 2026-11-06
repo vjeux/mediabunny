@@ -78,11 +78,21 @@ const createCountingVideo = async (frameCount: number, frameRate: number) => {
 };
 
 const classifyColor = (r: number, g: number, b: number): Quadrants => {
-	if (r > 200 && g > 200 && b > 200) return 'W';
-	if (r > 150 && g < 100 && b < 100) return 'R';
-	if (g > 150 && r < 100 && b < 100) return 'G';
-	if (b > 150 && r < 100 && g < 100) return 'B';
-	if (r < 50 && g < 50 && b < 50) return 'K';
+	if (r > 200 && g > 200 && b > 200) {
+		return 'W';
+	}
+	if (r > 150 && g < 100 && b < 100) {
+		return 'R';
+	}
+	if (g > 150 && r < 100 && b < 100) {
+		return 'G';
+	}
+	if (b > 150 && r < 100 && g < 100) {
+		return 'B';
+	}
+	if (r < 50 && g < 50 && b < 50) {
+		return 'K';
+	}
 	return '?';
 };
 
