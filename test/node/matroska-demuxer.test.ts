@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
@@ -81,4 +82,47 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('Deprecated A_AAC codec IDs without CodecPrivate', async () => {
+	// Old mkvmerge versions named the AAC profile in the codec ID and wrote no AudioSpecificConfig
+	const element = (id: number[], ...parts: ArrayLike<number>[]) => {
+		const content = parts.flatMap(part => Array.from(part));
+		const size = [0x01, 0, 0, 0, 0, 0, content.length >> 8, content.length & 0xff]; // 8-byte vint
+		return [...id, ...size, ...content];
+	};
+	const float64 = (value: number) => {
+		const bytes = new Uint8Array(8);
+		new DataView(bytes.buffer).setFloat64(0, value);
+		return bytes;
+	};
+	const file = (codecId: string) => new Uint8Array([
+		...element([0x1a, 0x45, 0xdf, 0xa3], element([0x42, 0x82], [...'matroska'].map(char => char.charCodeAt(0)))),
+		...element([0x18, 0x53, 0x80, 0x67],
+			element([0x16, 0x54, 0xae, 0x6b], element([0xae],
+				element([0xd7], [1]), // TrackNumber
+				element([0x83], [2]), // TrackType: audio
+				element([0x86], [...codecId].map(char => char.charCodeAt(0))),
+				element([0xe1], element([0xb5], float64(22050)), element([0x9f], [2])), // 22.05 kHz, stereo
+			)),
+			element([0x1f, 0x43, 0xb6, 0x75], element([0xe7], [0]), element([0xa3], [0x81, 0, 0, 0x80, 0x21, 0x10])),
+		),
+	]);
+
+	const expectations = [
+		['A_AAC/MPEG4/LC/SBR', 'mp4a.40.5'],
+		['A_AAC/MPEG4/LC', 'mp4a.40.2'],
+		['A_AAC/MPEG4/MAIN', 'mp4a.40.1'],
+		['A_AAC/MPEG4/LTP', 'mp4a.40.4'],
+		['A_AAC/MPEG2/LC', 'mp4a.67'],
+	];
+	for (const [codecId, codecString] of expectations) {
+		using input = new Input({ source: new BufferSource(file(codecId!)), formats: ALL_FORMATS });
+		const track = (await input.getAudioTracks())[0];
+		assert(track);
+
+		expect(await track.getCodec()).toBe('aac');
+		expect(await track.getCodecParameterString()).toBe(codecString);
+		expect(await input.getMimeType()).toBe(`audio/x-matroska; codecs="${codecString}"`);
+	}
 });
