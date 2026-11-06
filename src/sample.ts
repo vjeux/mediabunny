@@ -33,6 +33,7 @@ import {
 	arrayArgmin,
 	MaybePromise,
 	DeepReadonly,
+	missingWebCodecsClassMessage,
 } from './misc';
 import { Logging } from './logging';
 
@@ -3379,6 +3380,9 @@ export class AudioSample implements Disposable {
 		if (this._closed) {
 			throw new Error('AudioSample is closed.');
 		}
+		if (typeof AudioData === 'undefined') {
+			throw new Error(missingWebCodecsClassMessage('AudioData'));
+		}
 
 		if (this._data instanceof AudioSampleResource) {
 			return this._createAudioDataFromData();
@@ -3443,6 +3447,9 @@ export class AudioSample implements Disposable {
 		if (this._closed) {
 			throw new Error('AudioSample is closed.');
 		}
+		if (typeof AudioBuffer === 'undefined') {
+			throw new Error('AudioBuffer is not available in this environment.');
+		}
 
 		const audioBuffer = new AudioBuffer({
 			numberOfChannels: this.numberOfChannels,
@@ -3477,7 +3484,7 @@ export class AudioSample implements Disposable {
 
 	/** @internal */
 	static* _fromAudioBuffer(audioBuffer: AudioBuffer, timestamp: number) {
-		if (!(audioBuffer instanceof AudioBuffer)) {
+		if (typeof AudioBuffer === 'undefined' || !(audioBuffer instanceof AudioBuffer)) {
 			throw new TypeError('audioBuffer must be an AudioBuffer.');
 		}
 
@@ -3523,7 +3530,7 @@ export class AudioSample implements Disposable {
 	 * one sample, but may create multiple if the AudioBuffer is exceedingly large.
 	 */
 	static fromAudioBuffer(audioBuffer: AudioBuffer, timestamp: number) {
-		if (!(audioBuffer instanceof AudioBuffer)) {
+		if (typeof AudioBuffer === 'undefined' || !(audioBuffer instanceof AudioBuffer)) {
 			throw new TypeError('audioBuffer must be an AudioBuffer.');
 		}
 

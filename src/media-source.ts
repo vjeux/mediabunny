@@ -1794,7 +1794,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		encodingConfig: VideoEncodingConfig,
 		options: MediaStreamVideoTrackSourceOptions = {},
 	) {
-		if (!(track instanceof MediaStreamTrack) || track.kind !== 'video') {
+		if (typeof MediaStreamTrack === 'undefined' || !(track instanceof MediaStreamTrack) || track.kind !== 'video') {
 			throw new TypeError('track must be a video MediaStreamTrack.');
 		}
 		validateVideoEncodingConfig(encodingConfig);
@@ -3197,7 +3197,7 @@ export class AudioBufferSource extends AudioSource {
 	 * to respect writer and encoder backpressure.
 	 */
 	async add(audioBuffer: AudioBuffer) {
-		if (!(audioBuffer instanceof AudioBuffer)) {
+		if (typeof AudioBuffer === 'undefined' || !(audioBuffer instanceof AudioBuffer)) {
 			throw new TypeError('audioBuffer must be an AudioBuffer.');
 		}
 
@@ -3288,7 +3288,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		encodingConfig: AudioEncodingConfig,
 		options: MediaStreamAudioTrackSourceOptions = {},
 	) {
-		if (!(track instanceof MediaStreamTrack) || track.kind !== 'audio') {
+		if (typeof MediaStreamTrack === 'undefined' || !(track instanceof MediaStreamTrack) || track.kind !== 'audio') {
 			throw new TypeError('track must be an audio MediaStreamTrack.');
 		}
 		validateAudioEncodingConfig(encodingConfig);
