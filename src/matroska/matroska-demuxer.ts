@@ -2312,10 +2312,18 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					}
 				}
 
+				// Without a DefaultDuration, though, the frame period is only estimated from the cluster's own frames,
+				// and in a short cluster the smallest gap may itself be such a hole. For codecs with B-frames, the next
+				// cluster is then always checked (the lookup reads on until a cluster that starts after the timestamp).
+				const { info } = this.internalTrack;
+				const periodIsUncertain = this.internalTrack.defaultDuration == null
+					&& info?.type === 'video'
+					&& (info.codec === 'avc' || info.codec === 'hevc' || info.codec === null);
+
 				const nextTimestamp = trackData.presentationTimestamps[index + 1]?.timestamp;
 				const hasGapAfterMatch = !isExactMatch
 					&& nextTimestamp !== undefined
-					&& nextTimestamp - matchTimestamp > 1.5 * frameDuration;
+					&& (periodIsUncertain || nextTimestamp - matchTimestamp > 1.5 * frameDuration);
 
 				const correctBlockFound = timestampInTimescale < trackData.endTimestamp && !hasGapAfterMatch;
 				const checkPreviousCluster = !isExactMatch && !trackData.blocks[0]!.isKeyFrame;

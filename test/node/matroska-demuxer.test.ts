@@ -109,14 +109,15 @@ test('getPacket finds B-frames that straddle a cluster boundary', async () => {
 		EBMLId.SimpleBlock,
 		[0x81, (timestamp >> 8) & 0xff, timestamp & 0xff, key ? 0x80 : 0, 1],
 	);
-	const file = matroskaFile(
+	// With and without a DefaultDuration (40 ms), which is optional
+	const files = [[element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00])], []].map(defaultDuration => matroskaFile(
 		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
 		element(EBMLId.Tracks, element(
 			EBMLId.TrackEntry,
 			element(EBMLId.TrackNumber, [1]),
 			element(EBMLId.TrackType, [1]),
-			element(EBMLId.CodecID, [...'V_VP8'].map(x => x.charCodeAt(0))),
-			element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00]), // 40 ms
+			element(EBMLId.CodecID, [...'V_MPEG4/ISO/AVC'].map(x => x.charCodeAt(0))),
+			...defaultDuration,
 			element(EBMLId.Video, element(EBMLId.PixelWidth, [16]), element(EBMLId.PixelHeight, [16])),
 		)),
 		element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), block(0, true), block(120)),
@@ -125,10 +126,9 @@ test('getPacket finds B-frames that straddle a cluster boundary', async () => {
 			element(EBMLId.Timestamp, [40]),
 			block(0), block(40), block(200), block(120), block(160),
 		),
-	);
+	));
 
-	const timestamps = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24];
-	for (const order of [timestamps, [...timestamps].reverse()]) {
+	const checkLookups = async (file: Uint8Array, order: number[]) => {
 		using input = new Input({
 			source: new BufferSource(file),
 			formats: ALL_FORMATS,
@@ -141,5 +141,11 @@ test('getPacket finds B-frames that straddle a cluster boundary', async () => {
 		for (const timestamp of order) {
 			expect((await sink.getPacket(timestamp))!.timestamp).toBe(timestamp);
 		}
+	};
+
+	const timestamps = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24];
+	for (const file of files) {
+		await checkLookups(file, timestamps);
+		await checkLookups(file, [...timestamps].reverse());
 	}
 });
