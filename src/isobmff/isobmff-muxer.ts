@@ -305,6 +305,11 @@ export class IsobmffMuxer extends Muxer {
 		}
 
 		const holdsAvc = this.output.tracks.some(x => x.isVideoTrack() && x.source._codec === 'avc');
+		const holdsAv1 = this.output.tracks.some(x => x.isVideoTrack() && x.source._codec === 'av1');
+		// These codecs get 'roll' sample groups (see prerollSamples)
+		const usesSampleGroups = this.output.tracks.some(
+			x => x.isAudioTrack() && (['aac', 'vorbis', 'mp3', 'opus'] as string[]).includes(x.source._codec),
+		);
 
 		// Write the header
 		{
@@ -317,7 +322,9 @@ export class IsobmffMuxer extends Muxer {
 
 			boxWriter.writeBox(ftyp({
 				isQuickTime: this.isQuickTime,
-				holdsAvc: holdsAvc,
+				holdsAvc,
+				holdsAv1,
+				usesSampleGroups,
 				fragmented: this.isFragmented,
 				cmaf: this.isCmaf,
 			}));
