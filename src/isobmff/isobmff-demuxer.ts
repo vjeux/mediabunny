@@ -408,9 +408,22 @@ export class IsobmffDemuxer extends Demuxer {
 				if (!slice) break;
 
 				const startPos = currentPos;
-				const boxInfo = readBoxHeader(slice);
+				let boxInfo = readBoxHeader(slice);
 				if (!boxInfo) {
-					break;
+					// A size of 0 means that the box extends to the end of the file, which the last top-level box may
+					// do (ISO/IEC 14496-12 4.2; FFmpeg and Chromium read it so). Only a moov box there matters here.
+					slice.filePos = startPos;
+					if (readU32Be(slice) !== 0 || readAscii(slice, 4) !== 'moov') {
+						break;
+					}
+
+					const fileSize = await this.readUntilFileSizeIsKnown(startPos);
+					if (fileSize === null) {
+						break;
+					}
+
+					const totalSize = fileSize - startPos;
+					boxInfo = { name: 'moov', totalSize, headerSize: 8, contentSize: totalSize - 8 };
 				}
 
 				if ((boxInfo.name === 'ftyp' || boxInfo.name === 'styp') && slice.remainingLength >= 4) {
@@ -519,6 +532,23 @@ export class IsobmffDemuxer extends Demuxer {
 				table.length = writeIndex;
 			}
 		})();
+	}
+
+	/** The file size, reading on from the given position until the end of the file if the source doesn't know it. */
+	private async readUntilFileSizeIsKnown(pos: number) {
+		while (this.reader.fileSizeNonStrict === null) {
+			let slice = this.reader.requestSliceRange(pos, 0, 2 ** 16);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice || slice.length === 0) {
+				break;
+			}
+
+			pos += slice.length;
+		}
+
+		return this.reader.fileSizeNonStrict;
 	}
 
 	private async copyMetadataFromInitInput(initInput: Input) {

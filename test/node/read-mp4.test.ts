@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
 	ALL_FORMATS,
@@ -14,6 +15,7 @@ import {
 	MovOutputFormat,
 	Mp4OutputFormat,
 	Output,
+	ReadableStreamSource,
 } from '../../src/index.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
@@ -271,4 +273,31 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('A moov box at the end of the file with a size of 0', async () => {
+	// A size of 0 means that the last top-level box extends to the end of the file (ISO/IEC 14496-12 4.2, QuickTime)
+	const file = readFileSync(path.join(__dirname, '../public/sps-only-sar-h264.mp4'));
+	const moovStart = file.indexOf('moov') - 4;
+	assert(moovStart + file.readUInt32BE(moovStart) === file.length);
+	file.writeUInt32BE(0, moovStart);
+
+	// Also from a source whose size is only known once it ends
+	const sources = [
+		new BufferSource(file),
+		new ReadableStreamSource(new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array(file));
+				controller.close();
+			},
+		})),
+	];
+	for (const source of sources) {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const tracks = await input.getVideoTracks();
+		expect(tracks).toHaveLength(1);
+
+		const packet = await new EncodedPacketSink(tracks[0]!).getFirstPacket();
+		expect([packet?.timestamp, packet?.byteLength]).toEqual([0, 645]);
+	}
 });
