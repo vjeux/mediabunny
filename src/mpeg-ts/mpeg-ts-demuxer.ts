@@ -39,6 +39,7 @@ import {
 	AC3_FRAME_SIZES,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
+	iterateNalUnitsInAnnexB,
 	parseDtsFrame,
 	parseDtsCoreFrameHeader,
 	parseDtsExssHeader,
@@ -1647,7 +1648,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			let currentChunkStartPos = scanStartPos;
 			let nextChunkStartPos: number | null = null; // "next" as in later in the file, even tho we scan backwards
 
-			const readSectionsInFull = !this.elementaryStream.canBeTrustedWithKeyPackets;
+			// Captured once, since reading packets can revoke the trust while we're searching
+			const trustKeyPackets = this.elementaryStream.canBeTrustedWithKeyPackets;
+			const readSectionsInFull = !trustKeyPackets;
 
 			while (true) {
 				let bestKeyPesHeader: TimestampedPesPacketHeader | null = null;
@@ -1684,7 +1687,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 					if (pesHeader.pts <= searchPts) {
 						let isKeyPacket: boolean;
-						if (this.elementaryStream.canBeTrustedWithKeyPackets) {
+						if (trustKeyPackets) {
 							isKeyPacket = pesHeader.randomAccessIndicator === 1;
 						} else {
 							if (!context) {
@@ -1799,6 +1802,10 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					);
 					if (encodedPacket) {
 						return encodedPacket;
+					} else if (trustKeyPackets && !this.elementaryStream.canBeTrustedWithKeyPackets) {
+						// The candidate wasn't a key frame after all, so random_access_indicator can't be trusted.
+						// Start over using the bitstream.
+						return this.doPacketLookup(timestamp, keyframesOnly, options);
 					} else {
 						// The key packet didn't materialize (can happen with odd packetization where packets take their
 						// timestamp from a later PES packet), so let's keep looking further back
@@ -1965,6 +1972,20 @@ type SuppliedPacket = {
 	sequenceNumber: number;
 	sectionStartPos: number;
 	randomAccessIndicator: number;
+};
+
+const containsSeiNalUnit = (codec: VideoCodec, data: Uint8Array) => {
+	for (const loc of iterateNalUnitsInAnnexB(data)) {
+		const isSei = codec === 'avc'
+			? extractNalUnitTypeForAvc(data[loc.offset]!) === AvcNalUnitType.SEI
+			: extractNalUnitTypeForHevc(data[loc.offset]!) === HevcNalUnitType.PREFIX_SEI_NUT;
+
+		if (isSei) {
+			return true;
+		}
+	}
+
+	return false;
 };
 
 /** Stateful context used to extract exact encoded packets from the underlying data stream. */
@@ -2607,22 +2628,30 @@ class PacketReadingContext {
 
 		let randomAccessIndicator = currentPesPacket.randomAccessIndicator;
 
-		if (randomAccessIndicator === 0 && !this.elementaryStream.canBeTrustedWithKeyPackets) {
-			if (this.elementaryStream.info.type === 'audio') {
+		if (this.elementaryStream.info.type === 'audio') {
+			if (randomAccessIndicator === 0 && !this.elementaryStream.canBeTrustedWithKeyPackets) {
 				randomAccessIndicator = 1;
-			} else {
-				if (this.elementaryStream.info.decoderConfig) {
-					const isKey = determineVideoPacketType(
-						this.elementaryStream.info.codec,
-						this.elementaryStream.info.decoderConfig,
-						data,
-					) === 'key';
-
-					randomAccessIndicator = Number(isKey);
-				} else {
-					// We're reading packets before the decoder config is determined
-				}
 			}
+		} else if (this.elementaryStream.info.decoderConfig) {
+			const { codec, decoderConfig } = this.elementaryStream.info;
+
+			if (randomAccessIndicator === 1) {
+				// Some muxers set random_access_indicator on packets that aren't key frames (on every PES packet, or on
+				// the ones carrying a PCR). A picture that is neither IDR/IRAP nor comes with an SEI message (which a
+				// recovery point would need) can't be a random access point, so the flag lied and can't be trusted
+				// from here on.
+				if (
+					determineVideoPacketType(codec, decoderConfig, data) !== 'key'
+					&& !containsSeiNalUnit(codec, data)
+				) {
+					randomAccessIndicator = 0;
+					this.elementaryStream.canBeTrustedWithKeyPackets = false;
+				}
+			} else if (!this.elementaryStream.canBeTrustedWithKeyPackets) {
+				randomAccessIndicator = Number(determineVideoPacketType(codec, decoderConfig, data) === 'key');
+			}
+		} else {
+			// We're reading packets before the decoder config is determined
 		}
 
 		this.suppliedPacket = {

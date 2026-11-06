@@ -922,3 +922,33 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
 });
+
+test('MPEG-TS random_access_indicator on non-key frames does not make them key packets', async () => {
+	// no-aud.ts sets random_access_indicator on every video PES packet, entry24-segment3.ts sets it on its second one
+	// (a TRAIL_R picture). Only the bitstream can tell (ffprobe agrees: one key packet each, the first).
+	const cases = [['no-aud.ts', 0.292], ['entry24-segment3.ts', 20.728088888888887]] as const;
+	for (const [fileName, lastTimestamp] of cases) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public', fileName)),
+			formats: ALL_FORMATS,
+		});
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+
+		const sink = new EncodedPacketSink(videoTrack);
+
+		// Looked up first, before reading any packets
+		const keyPacket = await sink.getKeyPacket(lastTimestamp);
+		assert(keyPacket);
+		expect(keyPacket.timestamp).toBe(await videoTrack.getFirstTimestamp());
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of sink.packets()) {
+			packets.push(packet);
+		}
+
+		expect(packets.map(packet => packet.type)).toEqual(packets.map((_, i) => i === 0 ? 'key' : 'delta'));
+		expect(keyPacket.sequenceNumber).toBe(packets[0]!.sequenceNumber);
+	}
+});
