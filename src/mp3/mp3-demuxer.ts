@@ -443,7 +443,6 @@ export class Mp3Demuxer extends Demuxer {
 
 			this.metadataTags = {};
 			let currentPos = 0;
-			let id3V2HeaderFound = false;
 
 			while (true) {
 				let headerSlice = this.reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
@@ -455,8 +454,6 @@ export class Mp3Demuxer extends Demuxer {
 					break;
 				}
 
-				id3V2HeaderFound = true;
-
 				let contentSlice = this.reader.requestSlice(headerSlice.filePos, id3V2Header.size);
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				if (!contentSlice) break;
@@ -466,8 +463,10 @@ export class Mp3Demuxer extends Demuxer {
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
-			if (!id3V2HeaderFound && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
-				// Try reading an ID3v1 tag at the end of the file
+			// Fall back to an ID3v1 tag at the end of the file when the ID3v2 tags gave us no text fields, like ones
+			// holding nothing but PRIV frames or cover art, like FFmpeg
+			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
+			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
 				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) slice = await slice;
 				assert(slice);
