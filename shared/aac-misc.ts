@@ -136,12 +136,14 @@ export const buildAacAudioSpecificConfig = (config: {
 	objectType: number;
 	outputSampleRate: number;
 	outputNumberOfChannels: number;
+	/** The rate of the core coder, when it's known separately from the output rate. */
+	coreSampleRate?: number;
 }) => {
 	const usesSbr = config.objectType === 5 || config.objectType === 29;
 	const usesPs = config.objectType === 29;
 
-	// SBR runs the core coder at half the output rate, and PS upmixes a mono core to stereo
-	const coreSampleRate = usesSbr ? config.outputSampleRate / 2 : config.outputSampleRate;
+	// SBR usually runs the core coder at half the output rate, and PS upmixes a mono core to stereo
+	const coreSampleRate = config.coreSampleRate ?? (usesSbr ? config.outputSampleRate / 2 : config.outputSampleRate);
 	const coreNumberOfChannels = usesPs ? 1 : config.outputNumberOfChannels;
 
 	const channelConfiguration = aacChannelMap.indexOf(coreNumberOfChannels);
