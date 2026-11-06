@@ -634,7 +634,10 @@ test('MPEG-TS muxing writes track languages and audio types into the PMT', async
 	const pmtPacket = bytes.subarray(188, 2 * 188); // PAT first, then the PMT
 	expect(((pmtPacket[1]! & 0x1f) << 8) | pmtPacket[2]!).toBe(0x1000);
 
-	const section = pmtPacket.subarray(5); // Skip the header and pointer_field
+	// Skip the header, any adaptation field and the pointer_field
+	const adaptationFieldLength = pmtPacket[3]! & 0x20 ? 1 + pmtPacket[4]! : 0;
+	const payload = pmtPacket.subarray(4 + adaptationFieldLength);
+	const section = payload.subarray(1 + payload[0]!);
 	const sectionLength = ((section[1]! & 0x0f) << 8) | section[2]!;
 	const esInfo = new Map<number, number[]>();
 	let pos = 12 + (((section[10]! & 0x0f) << 8) | section[11]!);
