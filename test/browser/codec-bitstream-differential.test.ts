@@ -2,8 +2,7 @@ import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
 import { UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
-import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 
 // Chrome's decoders as the oracle for the decoder configurations Mediabunny derives from the bitstream: each
 // FFmpeg-encoded fixture (see public/codec-bitstream/README.md) must decode with the derived config, and what comes out
@@ -65,71 +64,233 @@ const decodesProfile = async (codecString: string) => {
 	return !!support.supported;
 };
 
-/**
- * Why the browser's decoder, having accepted the config, can't be checked on this track, if it can't: WebKitGTK fails
- * to decode AV1 and FLAC, hangs on Vorbis and multichannel Opus, and scales anamorphic frames to square pixels. This
- * decodes the first packets with its own decoder, with a time limit.
- */
-let decodingStalled = false; // A hung WebKitGTK decoder stalls every later decode on the page, even once closed
+// Whether the platform can decode something is decided with WebCodecs alone, never with Mediabunny, so that a
+// Mediabunny failure on a capable platform fails instead of skipping. isConfigSupported() isn't enough: WebKitGTK says
+// it decodes codecs that its GStreamer decoders then fail on or hang on. Each probe is a decoder config and the first
+// packets of a tiny stream made by FFmpeg (0.4 s of black 64x64 video or 0.1 s of silence), read with
+// ffprobe -show_streams -show_packets -show_data:
+//   av1       -c:v libaom-av1 -cpu-used 8 -crf 50 (-f obu, with its sequence header)
+//   avcSar2   -vf setsar=2/1 -c:v libx264 (64x64 with a 2:1 pixel aspect ratio in its SPS; the IDR without its SEI)
+//   flac      -c:a flac (16 kHz mono; "fLaC" + the STREAMINFO block)
+//   vorbis    -c:a libvorbis -q:a -1 (16 kHz mono; the Xiph-laced headers)
+//   opus51    -c:a libopus -b:a 64k (5.1, channel mapping family 1)
+//   opusQuad  -c:a libopus -b:a 48k -mapping_family 255 (4 channels)
+type Probe = { codec: string; sampleRate?: number; numberOfChannels?: number; description?: string; chunks: string[] };
+const PROBES = {
+	av1: {
+		codec: 'av01.0.00M.08',
+		chunks: ['EgAKCgAAAAKv/5tfIAgyDRAAuoAAAkAAAAPOF7o='],
+	},
+	avcSar2: {
+		codec: 'avc1.64000a',
+		description: 'AWQACv/hABhnZAAKrLIITYgIAAADAAgAAAMAoHiRMkABAAZo68PLIsD9+PgA',
+		chunks: ['AAAAH2WIhA7//vdOvwKbVMIqA5JXCuqDugrYp08qbQaN+7k='],
+	},
+	flac: {
+		codec: 'flac',
+		sampleRate: 16000,
+		description: 'ZkxhQ4AAACIEgASAAAALAAANA+gA8AAABkCfCt/b50DLnNgYijV2HiR2',
+		chunks: ['//g1CAADAAAAakQ=', '//h1CAEBv70AAAAGlg=='],
+	},
+	vorbis: {
+		codec: 'vorbis',
+		sampleRate: 16000,
+		description:
+			'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'
+			+ 'QgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQuicc84555xzzjnnnHPOOeecc845JwDIt8IBwP/B'
+			+ 'xhlWks4KR4MLDVkJAIQDAAAKQSilYhBKKSWSTjopnZNQSimRg1JK6aSUUkoJpZRSSgillFJKCB2UUkIppZRSSimllFJKKaWUUjop'
+			+ 'pZRSSimllMo5KaWTUkoppUTOSSkhlFJKKaWEUkoppZRSSimllFJKKaWUUkoppYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEII'
+			+ 'IYQQQgghhAIAuBscACASbJxhJemscDS40JCVAEBIAACgFHOOSggplJBSqJiijkIpKaRSSgoRY85J6hyFUFIoqYPKOQilpJRCKiF1'
+			+ 'zkEHJYWQUgkhlY466CiUUFIqJZTSOSilhBRKSimVkEJIqXSUUigllZRCKiGVUkpIJZUQSgqdpFRKCqmkVFIInXSQQiclpJJKCqmT'
+			+ 'lFIqJaWUSkoldFJCKimlEEJKqZQQSkgppU5SSamkFEIoIYWUUkolpZJKSiGVVEIJpaSUUiihpFRSSimlklIpAADgwAEAIMAIOsmo'
+			+ 'sggbTbjwABQashIAIAMAQJR01mmnSSIIMUWZJw0pxiC1pCzDEFOSifEUY4w5KEZDDjHklBgXSgihg2I8JpVDylBRubfUOQXFFmN8'
+			+ '77EXAQAACAIABIQEABggKJgBAAYHCCMHAh0BBA5tAICBCJkJDAqhwUEmADxAREgFAIkJitKFLgghgnQRZPHAhRM3nrjhhA5tEAAA'
+			+ 'AAAAEADwAQCQUAAREdHMVVhcYGRobHB0eHyAhAQAAAAAAAgAfAAAJCJAREQ0cxUWFxgZGhscHR4fICEBAAAAAAAAAABAQEAAAAAA'
+			+ 'ACAAAABAQA==',
+		chunks: ['AA==', 'Cg==', 'Dg=='],
+	},
+	opus51: {
+		codec: 'opus',
+		sampleRate: 48000,
+		numberOfChannels: 6,
+		description: 'T3B1c0hlYWQBBjgBgLsAAAAAAQQCAAQBAgMF',
+		chunks: [
+			'/AL//vwC//5oDQvkwTbsxY2MSUhCbNBoC+TBNuzFjYxJSEJs0A==',
+			'/AL//vwC//5oDwfJcifhROpV8fDA0TIpMGgHyXIn4UTqVfHwwNEyKTA=',
+			'/AL//vwC//5oDgfJecjJV8CiEiP6WSBwaAfJecjJV8CiEiP6WSBw',
+		],
+	},
+	opusQuad: {
+		codec: 'opus',
+		sampleRate: 48000,
+		numberOfChannels: 4,
+		description: 'T3B1c0hlYWQBBDgBgLsAAAAA/wQAAAECAw==',
+		chunks: [
+			'aA0L5ME27MWNjElIQmzQaA0L5ME27MWNjElIQmzQaA0L5ME27MWNjElIQmzQaAvkwTbsxY2MSUhCbNA=',
+			'aA8HyXIn4UTqVfHwwNEyKTBoDwfJcifhROpV8fDA0TIpMGgPB8lyJ+FE6lXx8MDRMikwaAfJcifhROpV8fDA0TIpMA==',
+			'aA4HyXnIyVfAohIj+lkgcGgOB8l5yMlXwKISI/pZIHBoDgfJecjJV8CiEiP6WSBwaAfJecjJV8CiEiP6WSBw',
+		],
+	},
+} satisfies Record<string, Probe>;
+type ProbeName = keyof typeof PROBES;
 
-const decodeLimitation = async (track: InputVideoTrack | InputAudioTrack) => {
+const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+
+// Set once the page's decoders stall: then every later decode on the page would hang
+let decodingStalled = false;
+
+/** Decodes a probe with WebCodecs; tells whether it decoded and the visible size of each video frame. */
+const runProbe = async (probe: Probe) => {
+	const isVideo = probe.sampleRate === undefined;
+	const description = probe.description !== undefined ? fromBase64(probe.description) : undefined;
+	const videoConfig: VideoDecoderConfig = { codec: probe.codec, codedWidth: 64, codedHeight: 64, description };
+	const audioConfig: AudioDecoderConfig = {
+		codec: probe.codec,
+		sampleRate: probe.sampleRate!,
+		numberOfChannels: probe.numberOfChannels ?? 1,
+		description,
+	};
+	const result = { decodes: false, visibleSizes: [] as string[] };
+	try {
+		const support = isVideo
+			? await VideoDecoder.isConfigSupported(videoConfig)
+			: await AudioDecoder.isConfigSupported(audioConfig);
+		if (!support.supported) {
+			return result;
+		}
+	} catch {
+		return result;
+	}
+
+	let outputs = 0;
 	let failed = false;
-	const frameSizes: string[] = [];
-	const output = (data: VideoFrame | AudioData) => {
-		if (data instanceof VideoFrame) {
-			frameSizes.push(`${data.visibleRect!.width}x${data.visibleRect!.height}`);
-		}
-		data.close();
-	};
-	const error = () => {
-		failed = true;
-	};
-
-	let decoder: VideoDecoder | AudioDecoder;
-	if (track instanceof InputVideoTrack) {
-		const videoDecoder = new VideoDecoder({ output, error });
-		videoDecoder.configure((await track.getDecoderConfig())!);
-		decoder = videoDecoder;
-	} else {
-		const audioDecoder = new AudioDecoder({ output, error });
-		audioDecoder.configure((await track.getDecoderConfig())!);
-		decoder = audioDecoder;
-	}
-
-	const sink = new EncodedPacketSink(track);
-	let packet = await sink.getFirstPacket();
-	for (let i = 0; packet && i < 8 && !failed; i++) {
-		try {
-			if (decoder instanceof VideoDecoder) {
-				decoder.decode(packet.toEncodedVideoChunk());
-			} else {
-				decoder.decode(packet.toEncodedAudioChunk());
+	const init = {
+		output: (data: VideoFrame | AudioData) => {
+			outputs++;
+			if (data instanceof VideoFrame) {
+				result.visibleSizes.push(`${data.visibleRect!.width}x${data.visibleRect!.height}`);
 			}
-		} catch {
+			data.close();
+		},
+		error: () => {
 			failed = true;
+		},
+	};
+	const decoder = isVideo ? new VideoDecoder(init) : new AudioDecoder(init);
+	let flushed = false;
+	try {
+		if (decoder instanceof VideoDecoder) {
+			decoder.configure(videoConfig);
+			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedVideoChunk({
+				type: i === 0 ? 'key' : 'delta',
+				timestamp: i * 33_333,
+				data: fromBase64(chunk),
+			})));
+		} else {
+			decoder.configure(audioConfig);
+			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+				type: 'key',
+				timestamp: i * 20_000,
+				data: fromBase64(chunk),
+			})));
 		}
-		packet = await sink.getNextPacket(packet);
+		flushed = await Promise.race([
+			decoder.flush().then(() => true, () => false),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
+		]);
+	} catch {
+		failed = true;
 	}
-	const flushed = await Promise.race([
-		decoder.flush().then(() => true, () => false),
-		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
-	]);
 	if (decoder.state !== 'closed') {
 		decoder.close();
 	}
-	decodingStalled ||= !flushed && !failed;
 
-	if (failed || !flushed) {
-		return `${await track.getCodec()} doesn't really decode here`;
-	}
-	if (track instanceof InputVideoTrack) {
-		const size = `${await track.getCodedWidth()}x${await track.getCodedHeight()}`;
-		if (frameSizes.some(x => x !== size)) {
-			return 'the decoder rescales the frames here';
-		}
+	result.decodes = flushed && !failed && outputs > 0;
+	if (!result.decodes) {
+		// A decoder that hung, or one that failed (WebKitGTK's FLAC decoder), can leave the page's other decoders of
+		// that kind stalled. Then even isConfigSupported() never settles.
+		const stillAnswers = isVideo
+			? VideoDecoder.isConfigSupported({ codec: 'vp8', codedWidth: 64, codedHeight: 64 })
+			: AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+		decodingStalled ||= !await Promise.race([
+			stillAnswers.then(() => true, () => true),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1000)),
+		]);
 	}
 
-	return null;
+	return result;
+};
+
+const probeResults = new Map<ProbeName, ReturnType<typeof runProbe>>();
+/** Runs each probe once, when first needed, so that one that hangs runs as late as possible. */
+const probe = (name: ProbeName) => {
+	if (!probeResults.has(name)) {
+		probeResults.set(name, runProbe(PROBES[name]));
+	}
+	return probeResults.get(name)!;
+};
+
+type Needs = { probe?: ProbeName; anamorphic?: boolean };
+/** What each fixture needs from the platform's decoder, as facts about the file (never asked of Mediabunny). */
+const NEEDS: Record<string, Needs> = {
+	'h264-sar-16-11.mp4': { anamorphic: true },
+	'av1-main-10bit.mp4': { probe: 'av1' },
+	'av1-high-444.webm': { probe: 'av1' },
+	'av1-professional-422-10bit.webm': { probe: 'av1' },
+	'av1-bt709-full.mp4': { probe: 'av1' },
+	'av1-monochrome.webm': { probe: 'av1' },
+	'flac-5.1-24bit.mkv': { probe: 'flac' },
+	'vorbis.webm': { probe: 'vorbis' },
+	'opus-5.1.webm': { probe: 'opus51' },
+	'opus-family255-quad.webm': { probe: 'opusQuad' },
+};
+
+/** Skips a fixture whose decoding the platform can't do (WebKitGTK fails on AV1, FLAC and multichannel Opus, hangs on
+ * Vorbis, and scales anamorphic frames to square pixels). */
+const skipIfIncapable = async (fileName: string, skip: (condition: boolean, note?: string) => void) => {
+	const needs = NEEDS[fileName] ?? {};
+	if (needs.probe) {
+		skip(!(await probe(needs.probe)).decodes, `${needs.probe} can't be decoded here (native probe)`);
+	}
+	if (needs.anamorphic) {
+		const { visibleSizes } = await probe('avcSar2');
+		skip(visibleSizes.some(x => x !== '64x64'), 'the decoder rescales anamorphic frames here (native probe)');
+	}
 };
 
 test.for(VIDEO_FIXTURES)('Derived video decoder config: %s', async ([fileName, codecString], { skip }) => {
@@ -143,8 +304,7 @@ test.for(VIDEO_FIXTURES)('Derived video decoder config: %s', async ([fileName, c
 	expect(acceptedCodecStrings).toContain(await track.getCodecParameterString());
 	skip(!(await decodesProfile(codecString)), 'the browser can\'t decode this profile at all');
 	expect(await track.canDecode()).toBe(true);
-	const limitation = await decodeLimitation(track);
-	skip(limitation !== null, limitation ?? undefined);
+	await skipIfIncapable(fileName, skip);
 
 	// The color space fields the track specifies must reach the decoded frames
 	const colorSpace = Object.fromEntries(
@@ -172,14 +332,13 @@ test.for(AUDIO_FIXTURES)(
 			formats: ALL_FORMATS,
 		});
 
-		skip(decodingStalled, 'an earlier decoder hang stalled decoding on this page');
+		skip(decodingStalled, 'an earlier decoder failure stalled decoding on this page');
 		const track = (await input.getPrimaryAudioTrack())!;
 		expect(await track.getCodecParameterString()).toBe(codecString);
 		expect(await track.getSampleRate()).toBe(sampleRate);
 		expect(await track.getNumberOfChannels()).toBe(numberOfChannels);
 		expect(await track.canDecode()).toBe(true);
-		const limitation = await decodeLimitation(track);
-		skip(limitation !== null, limitation ?? undefined);
+		await skipIfIncapable(fileName, skip);
 
 		let count = 0;
 		for await (using sample of new AudioSampleSink(track).samples()) {
