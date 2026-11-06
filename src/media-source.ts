@@ -85,6 +85,7 @@ import {
 	extractVp9CodecInfoFromPacket,
 	parseOpusIdentificationHeader,
 	serializeAvcDecoderConfigurationRecord,
+	Vp9CodecInfo,
 } from './codec-data';
 import { Logging } from './logging';
 import { readEsDescriptor } from './isobmff/isobmff-reader';
@@ -979,6 +980,18 @@ class VideoEncoderWrapper {
 		assert(encoderConfig);
 
 		if (meta?.decoderConfig) {
+			let vp9CodecInfo: Vp9CodecInfo | null = null;
+			if (this.encodingConfig.codec === 'vp9') {
+				vp9CodecInfo = extractVp9CodecInfoFromPacket(packet.data);
+
+				// VP9 bitstreams don't signal a level, so the one derived from the frame size is only a lower bound.
+				// Keep the configured level, which also accounts for frame rate and bitrate, if it's higher.
+				const configuredLevel = Number(encoderConfig.codec.split('.')[2]);
+				if (vp9CodecInfo && Number.isInteger(configuredLevel) && configuredLevel > vp9CodecInfo.level) {
+					vp9CodecInfo.level = configuredLevel;
+				}
+			}
+
 			// Let's correct the codec string based on the actual bitstream data, rather than leaving it on the default
 			// value (which is just what was in the encoder config). This provides better consistency.
 			meta.decoderConfig.codec = extractVideoCodecString({
@@ -1000,9 +1013,7 @@ class VideoEncoderWrapper {
 				hevcCodecInfo: this.encodingConfig.codec === 'hevc' && !meta.decoderConfig.description
 					? extractHevcDecoderConfigurationRecord(packet.data)
 					: null,
-				vp9CodecInfo: this.encodingConfig.codec === 'vp9'
-					? extractVp9CodecInfoFromPacket(packet.data)
-					: null,
+				vp9CodecInfo,
 				av1CodecInfo: this.encodingConfig.codec === 'av1'
 					? extractAv1CodecInfoFromPacket(packet.data)
 					: null,
