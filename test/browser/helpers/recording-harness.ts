@@ -337,3 +337,83 @@ export const installFakeTrackProcessor = () => {
 		},
 	};
 };
+
+/**
+ * Hands chunks to a stream's consumer one at a time, telling when the consumer has taken them. Chunks pushed once the
+ * consumer has canceled the stream are closed and dropped.
+ */
+export class ConsumptionGate<T extends { close(): void }> {
+	private controller!: ReadableStreamDefaultController<T>;
+	private demand: (() => void) | null = null;
+	private demandListeners: (() => void)[] = [];
+	private canceled = false;
+
+	readonly readable = new ReadableStream<T>({
+		start: (controller) => {
+			this.controller = controller;
+		},
+		// Called when the consumer reads, which it only does once it's done with the previous chunk
+		pull: () => new Promise<void>((resolve) => {
+			this.demand = resolve;
+			this.notify();
+		}),
+		cancel: () => {
+			this.canceled = true;
+			this.notify();
+		},
+	}, { highWaterMark: 0 });
+
+	/** Hands over the chunk once the consumer asks for one, and resolves once it asks for the next one. */
+	async push(chunk: T) {
+		await this.waitForDemand();
+		if (this.canceled) {
+			chunk.close();
+			return;
+		}
+
+		const fulfill = this.demand!;
+		this.demand = null;
+		this.controller.enqueue(chunk);
+		fulfill();
+		await this.waitForDemand();
+	}
+
+	private async waitForDemand() {
+		while (!this.demand && !this.canceled) {
+			await new Promise<void>(resolve => this.demandListeners.push(resolve));
+		}
+	}
+
+	private notify() {
+		for (const listener of this.demandListeners.splice(0)) {
+			listener();
+		}
+	}
+}
+
+/**
+ * Replaces MediaStreamTrackProcessor with one that hands over chunks through a ConsumptionGate, so tests know exactly
+ * when a source has taken each chunk, independently of timing. Call `restore()` once the sources have started.
+ */
+export const installGatedTrackProcessor = () => {
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const realProcessor = globals.MediaStreamTrackProcessor;
+	const gates = new Map<MediaStreamTrack, ConsumptionGate<VideoFrame | AudioData>>();
+
+	globals.MediaStreamTrackProcessor = class {
+		readable: ReadableStream<VideoFrame | AudioData>;
+
+		constructor({ track }: { track: MediaStreamTrack }) {
+			const gate = new ConsumptionGate<VideoFrame | AudioData>();
+			gates.set(track, gate);
+			this.readable = gate.readable;
+		}
+	};
+
+	return {
+		gate: (track: MediaStreamTrack) => gates.get(track)!,
+		restore: () => {
+			globals.MediaStreamTrackProcessor = realProcessor;
+		},
+	};
+};

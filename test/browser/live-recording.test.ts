@@ -26,6 +26,7 @@ import {
 	createMarkerSource,
 	getBeepOffsets,
 	installFakeTrackProcessor,
+	installGatedTrackProcessor,
 	mean,
 	MarkerSourceOptions,
 	sleep,
@@ -95,8 +96,8 @@ const recordMarkers = async (options: {
 
 /**
  * Feeds generator tracks in real time, in timestamp order: audio in 10 ms chunks, video frames every `frameIntervalMs`.
- * `beforeWrite` is awaited before each chunk or frame with its time, so tests can act at exact points of the media
- * (unlike `onTick`, which runs on wall-clock ticks).
+ * After a scheduling delay, the rest of the media is written later rather than in a burst, which the real
+ * MediaStreamTrackProcessor would partly drop.
  */
 const feedInRealTime = async (
 	tracks: ReturnType<typeof createGeneratorTracks>,
@@ -107,47 +108,126 @@ const feedInRealTime = async (
 		frameIntervalMs?: number;
 		sampleRate?: number;
 		onTick?: (elapsedMs: number) => unknown;
-		beforeWrite?: (timeMs: number) => unknown;
+		delayBeforeMs?: number;
 	},
 ) => {
 	const canvas = new OffscreenCanvas(64, 48);
 	const sampleRate = options.sampleRate ?? 48000;
 	const frameIntervalMs = options.frameIntervalMs ?? 40;
-	const start = performance.now();
+	if (options.delayBeforeMs) {
+		await sleep(options.delayBeforeMs);
+	}
+	const startDate = Date.now() / 1000;
+	const timestampBase = performance.now(); // Media time 0
+	let scheduleBase = timestampBase; // When media time 0 is due
 	let audioChunks = 0;
 	let videoFrames = 0;
 
-	// Runs until all media is written, even if it fell behind the clock
 	while (true) {
-		await options.onTick?.(performance.now() - start);
+		await options.onTick?.(performance.now() - scheduleBase);
 
 		while (true) {
 			const audioTime = (options.audioStartMs ?? 0) + 10 * audioChunks;
 			const videoTime = (options.videoStartMs ?? 0) + frameIntervalMs * videoFrames;
 			const time = Math.min(audioTime, videoTime);
 			if (time >= options.durationMs) {
-				return;
-			}
-			if (time > performance.now() - start) {
-				break;
+				return { startDate };
 			}
 
-			await options.beforeWrite?.(time);
+			const lateness = performance.now() - (scheduleBase + time);
+			if (lateness < 0) {
+				break;
+			}
+			if (lateness > 20) {
+				scheduleBase += lateness; // Delayed: shift the rest of the schedule
+			}
+
 			if (audioTime <= videoTime) {
 				await writeAudioChunk(tracks.audioWriter, {
-					timestamp: (start + audioTime) / 1000,
+					timestamp: (timestampBase + audioTime) / 1000,
 					numberOfFrames: sampleRate / 100,
 					sampleRate,
 				});
 				audioChunks++;
 			} else {
 				const color = `rgb(${videoFrames % 256}, 0, 0)`;
-				await writeVideoFrame(tracks.videoWriter, canvas, (start + videoTime) / 1000, color);
+				await writeVideoFrame(tracks.videoWriter, canvas, (timestampBase + videoTime) / 1000, color);
 				videoFrames++;
 			}
 		}
 
 		await sleep(4);
+	}
+};
+
+/**
+ * Feeds sources through a gated track processor: audio in 10 ms chunks and a video frame every 40 ms, in timestamp
+ * order, each one only once the source has taken the previous one and its encoder has room (sources drop media their
+ * encoder can't take). So whatever the scheduling, every chunk reaches the source, and the test knows when it has.
+ * Once a source has stopped reading (closed), its chunks are discarded.
+ */
+const createGatedFeed = (
+	processor: ReturnType<typeof installGatedTrackProcessor>,
+	tracks: ReturnType<typeof createGeneratorTracks>,
+	sources: { video: MediaStreamVideoTrackSource; audio: MediaStreamAudioTrackSource },
+) => {
+	const videoGate = processor.gate(tracks.videoTrack);
+	const audioGate = processor.gate(tracks.audioTrack);
+	const waitForEncoderRoom = async (source: MediaStreamVideoTrackSource | MediaStreamAudioTrackSource) => {
+		const encoder = (source as unknown as { _encoder: { getQueueSize(): number } })._encoder;
+		while (encoder.getQueueSize() >= 4 && !source._closingPromise) {
+			await sleep(1);
+		}
+	};
+	const canvas = new OffscreenCanvas(64, 48);
+	const context = canvas.getContext('2d')!;
+	const timestampBase = performance.now() * 1000; // In microseconds
+	let audioChunks = 0;
+	let videoFrames = 0;
+
+	const feed = {
+		/** Media time of the next chunk or frame, in milliseconds. */
+		get time() {
+			return Math.min(10 * audioChunks, 40 * videoFrames);
+		},
+		writeNext: async () => {
+			if (10 * audioChunks <= 40 * videoFrames) {
+				await waitForEncoderRoom(sources.audio);
+				await audioGate.push(new AudioData({
+					format: 'f32-planar',
+					sampleRate: 48000,
+					numberOfChannels: 1,
+					numberOfFrames: 480,
+					timestamp: timestampBase + 10000 * audioChunks,
+					data: new Float32Array(480),
+				}));
+				audioChunks++;
+			} else {
+				await waitForEncoderRoom(sources.video);
+				context.fillStyle = `rgb(${videoFrames % 256}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+				await videoGate.push(new VideoFrame(canvas, {
+					timestamp: timestampBase + 40000 * videoFrames,
+					duration: 40000,
+				}));
+				videoFrames++;
+			}
+		},
+		writeUntil: async (timeMs: number) => {
+			while (feed.time < timeMs) {
+				await feed.writeNext();
+			}
+		},
+	};
+
+	return feed;
+};
+
+/** Blocks the main thread, like a long task would. */
+const blockMainThread = (ms: number) => {
+	const start = performance.now();
+	while (performance.now() - start < ms) {
+		// Busy
 	}
 };
 
@@ -179,8 +259,7 @@ const recordGenerated = async (options: {
 	output.addAudioTrack(audioSource);
 
 	await output.start();
-	const startTime = Date.now() / 1000;
-	await feedInRealTime(tracks, options);
+	const { startDate: startTime } = await feedInRealTime(tracks, options);
 	await sleep(100);
 	await output.finalize();
 	await tracks.videoWriter.close();
@@ -402,6 +481,25 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 		return { tracks, output, videoSource, audioSource, errors };
 	};
 
+	/** A recording whose sources are fed through a gated track processor (see createGatedFeed). */
+	const createGatedRecording = async () => {
+		const recording = createRecording(new WebMOutputFormat());
+		const processor = installGatedTrackProcessor();
+		try {
+			await recording.output.start();
+		} finally {
+			processor.restore();
+		}
+
+		const sources = { video: recording.videoSource, audio: recording.audioSource };
+		return { ...recording, feed: createGatedFeed(processor, recording.tracks, sources) };
+	};
+
+	const schedulingCases = [
+		{ name: 'on time', delayBeforeMs: 0, stallMs: 0 },
+		{ name: 'after scheduling delays', delayBeforeMs: 800, stallMs: 300 },
+	];
+
 	test('finalize() right after start() writes a valid file', async () => {
 		for (const format of [new WebMOutputFormat(), new Mp4OutputFormat()]) {
 			const { output, errors, tracks } = createRecording(format);
@@ -439,10 +537,12 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 		expect(errors).toEqual([]);
 	});
 
-	test('stopping the tracks right before finalize() keeps everything captured', async () => {
+	test.for(schedulingCases)('stopping the tracks right before finalize() keeps everything captured, $name', async ({
+		delayBeforeMs,
+	}) => {
 		const { output, errors, tracks } = createRecording(new WebMOutputFormat());
 		await output.start();
-		await feedInRealTime(tracks, { durationMs: 800 });
+		await feedInRealTime(tracks, { durationMs: 800, delayBeforeMs });
 		await sleep(50);
 		await tracks.videoWriter.close();
 		await tracks.audioWriter.close();
@@ -454,58 +554,60 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 		expect(analysis.audioEnd).toBeGreaterThan(0.75);
 	});
 
-	test('closing one source mid-recording keeps the other one recording', async () => {
-		const { output, errors, tracks, videoSource } = createRecording(new WebMOutputFormat());
-		await output.start();
-		await feedInRealTime(tracks, {
-			durationMs: 1000,
-			beforeWrite: async (time) => {
-				if (time >= 500 && !videoSource._closingPromise) {
-					await sleep(30); // Lets what was written so far arrive at the source
-					void videoSource.close();
-				}
-			},
-		});
-		await sleep(50);
+	test.for(schedulingCases)('closing one source mid-recording keeps the other one recording, $name', async ({
+		delayBeforeMs,
+		stallMs,
+	}) => {
+		const { output, errors, videoSource, feed } = await createGatedRecording();
+		await sleep(delayBeforeMs);
+		await feed.writeUntil(500);
+		blockMainThread(stallMs);
+		videoSource.close();
+		await feed.writeUntil(1000); // Video included, which the closed source must not record
 		await output.finalize();
 
 		expect(errors).toEqual([]);
 		const analysis = await analyzeRecording((output.target as BufferTarget).buffer!);
-		expect(analysis.videoEnd).toBeGreaterThan(0.4);
-		expect(analysis.videoEnd).toBeLessThan(0.6);
-		expect(analysis.audioEnd).toBeGreaterThan(0.95);
+		// The last frame starts at 480 ms and lasts 40 ms
+		expect(analysis.videoEnd!).toBeGreaterThan(0.51);
+		expect(analysis.videoEnd!).toBeLessThan(0.53);
+		expect(analysis.audioEnd!).toBeGreaterThan(0.98);
 	});
 
-	test('pausing both sources removes the paused time from both tracks', async () => {
-		const { output, errors, tracks, videoSource, audioSource } = createRecording(new WebMOutputFormat());
-		await output.start();
-		// The media from 300 to 700 ms is written while paused
-		let pauseTime = 0;
-		await feedInRealTime(tracks, {
-			durationMs: 1000,
-			beforeWrite: async (time) => {
-				if (time >= 300 && time < 700 && !videoSource.paused) {
-					await sleep(30); // Lets what was written so far arrive at the sources
-					videoSource.pause();
-					audioSource.pause();
-					pauseTime = performance.now();
-				} else if (time >= 700 && videoSource.paused) {
-					// Resume as long after the pause as the media it skips, even if the feed had to catch up
-					await sleep(Math.max(30, 400 - (performance.now() - pauseTime)));
-					videoSource.resume();
-					audioSource.resume();
-				}
-			},
-		});
-		await sleep(50);
+	test.for(schedulingCases)('pausing both sources removes the paused time from both tracks, $name', async ({
+		delayBeforeMs,
+		stallMs,
+	}) => {
+		const { output, errors, videoSource, audioSource, feed } = await createGatedRecording();
+		await sleep(delayBeforeMs);
+		await feed.writeUntil(300);
+		videoSource.pause();
+		audioSource.pause();
+
+		// While paused, keep feeding media in real time for at least 400 ms, and for as long as the pause really lasts
+		// if the test gets held up: a source may go by the media's timestamps or by the clock
+		const pauseStart = performance.now();
+		while (feed.time - 300 < Math.max(400, performance.now() - pauseStart)) {
+			const mediaAhead = feed.time - 300 - (performance.now() - pauseStart);
+			if (mediaAhead > 0) {
+				await sleep(mediaAhead);
+			}
+			if (feed.time === 500) {
+				blockMainThread(stallMs);
+			}
+			await feed.writeNext();
+		}
+		videoSource.resume();
+		audioSource.resume();
+		await feed.writeUntil(feed.time + 300);
 		await output.finalize();
 
+		// 300 ms before the pause and 300 ms after it, in both tracks
 		expect(errors).toEqual([]);
 		const analysis = await analyzeRecording((output.target as BufferTarget).buffer!);
-		// 1 s of media minus the 0.4 s pause, in both tracks (a track that kept the paused time would end at 1 s)
-		expect(analysis.audioEnd!).toBeGreaterThan(0.5);
-		expect(analysis.audioEnd!).toBeLessThan(0.7);
-		expect(Math.abs(analysis.videoEnd! - analysis.audioEnd!)).toBeLessThan(0.1);
+		expect(analysis.audioEnd!).toBeGreaterThan(0.58);
+		expect(analysis.audioEnd!).toBeLessThan(0.62);
+		expect(Math.abs(analysis.videoEnd! - analysis.audioEnd!)).toBeLessThan(0.045);
 	});
 
 	test('an audio configuration the encoder rejects surfaces through errorPromise', async () => {
