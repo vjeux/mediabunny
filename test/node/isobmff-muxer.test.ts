@@ -1425,3 +1425,26 @@ test('Gaps between PCM packets are filled with silence a second at a time', asyn
 	const track = (await input.getPrimaryAudioTrack())!;
 	expect(await track.computeDuration()).toBe(602);
 });
+
+test('CMAF segments too long for the sidx subsegment duration are rejected instead of wrapping around', async () => {
+	// The sidx box counts the segment's duration in 32 bits of its 57600 Hz timescale, which ends after ~20.7 hours.
+	// This is 21 hours of 1-second video frames.
+	const output = new Output({
+		format: new CmafOutputFormat(),
+		target: new BufferTarget(),
+		initTarget: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const mux = async () => {
+		const decoderConfig = { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 };
+		for (let i = 0; i < 21 * 3600; i++) {
+			await source.add(new EncodedPacket(new Uint8Array(1), i === 0 ? 'key' : 'delta', i, 1), { decoderConfig });
+		}
+		await output.finalize();
+	};
+
+	await expect(mux()).rejects.toThrow(/sidx/);
+});
