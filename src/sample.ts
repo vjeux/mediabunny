@@ -517,6 +517,42 @@ export class VideoSample implements Disposable {
 			if (init?.visibleRect !== undefined) {
 				validateRectangle(init.visibleRect, 'init.visibleRect');
 			}
+			if (
+				init?.displayWidth !== undefined
+				&& (!Number.isInteger(init.displayWidth) || init.displayWidth <= 0)
+			) {
+				throw new TypeError('init.displayWidth, when provided, must be a positive integer.');
+			}
+			if (
+				init?.displayHeight !== undefined
+				&& (!Number.isInteger(init.displayHeight) || init.displayHeight <= 0)
+			) {
+				throw new TypeError('init.displayHeight, when provided, must be a positive integer.');
+			}
+			if ((init?.displayWidth !== undefined) !== (init?.displayHeight !== undefined)) {
+				throw new TypeError(
+					'init.displayWidth and init.displayHeight must be either both provided or both omitted.',
+				);
+			}
+
+			if (init?.visibleRect !== undefined || init?.displayWidth !== undefined) {
+				// Crop and/or rescale the frame, like the VideoFrame constructor does. The display size in init is the
+				// one after rotation, which isn't passed on to the frame, so undo it.
+				const quarterTurn = (init.rotation ?? 0) % 180 !== 0;
+				const refinedFrame = new VideoFrame(data, {
+					visibleRect: init.visibleRect && {
+						x: init.visibleRect.left,
+						y: init.visibleRect.top,
+						width: init.visibleRect.width,
+						height: init.visibleRect.height,
+					},
+					displayWidth: quarterTurn ? init.displayHeight : init.displayWidth,
+					displayHeight: quarterTurn ? init.displayWidth : init.displayHeight,
+				});
+				// Keep the caller's frame open for as long as the sample, as if the sample held it directly
+				this._passedFrame = data;
+				data = refinedFrame;
+			}
 
 			// Browsers put an image's orientation into the frame's rotation and flip when it isn't baked into the
 			// pixels, e.g. for JPEGs with an EXIF orientation. VideoSample keeps orientation in its own metadata, so
@@ -614,7 +650,8 @@ export class VideoSample implements Disposable {
 							height: init.visibleRect.height,
 						},
 					}),
-					init,
+					// The frame is already cropped
+					{ ...init, visibleRect: undefined },
 				);
 			}
 
