@@ -1,0 +1,221 @@
+import { describe, expect, test } from 'vitest';
+import { Input } from '../../src/input.js';
+import { BufferSource } from '../../src/source.js';
+import { ALL_FORMATS } from '../../src/input-format.js';
+import { Output, OutputTrackGroup } from '../../src/output.js';
+import { Mp4OutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { Conversion } from '../../src/conversion.js';
+import { Quality } from '../../src/encode.js';
+
+const QUALITY = new Quality('high');
+import { EBMLId } from '../../src/matroska/ebml.js';
+import { ebml, ebmlFloat, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/mutation-bytes.js';
+
+const VP8_KEY_FRAME = [0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x00, 0x30, 0x00];
+
+// A small WebM with one VP8 video track and one 16-bit PCM audio track
+const inputBytes = mkvFile({
+	trackEntries: [
+		ebml(
+			EBMLId.TrackEntry,
+			ebmlUint(EBMLId.TrackNumber, 1),
+			ebmlUint(EBMLId.TrackUID, 1),
+			ebmlUint(EBMLId.TrackType, 1),
+			ebmlString(EBMLId.CodecID, 'V_VP8'),
+			ebml(EBMLId.Video, ebmlUint(EBMLId.PixelWidth, 64), ebmlUint(EBMLId.PixelHeight, 48)),
+		),
+		ebml(
+			EBMLId.TrackEntry,
+			ebmlUint(EBMLId.TrackNumber, 2),
+			ebmlUint(EBMLId.TrackUID, 2),
+			ebmlUint(EBMLId.TrackType, 2),
+			ebmlString(EBMLId.CodecID, 'A_PCM/INT/LIT'),
+			ebml(
+				EBMLId.Audio,
+				ebmlFloat(EBMLId.SamplingFrequency, 8000),
+				ebmlUint(EBMLId.Channels, 1),
+				ebmlUint(EBMLId.BitDepth, 16),
+			),
+		),
+	],
+	rest: [ebml(
+		EBMLId.Cluster,
+		ebmlUint(EBMLId.Timestamp, 0),
+		ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 0, 0x80, VP8_KEY_FRAME)),
+		ebml(EBMLId.SimpleBlock, mkvSimpleBlock(2, 0, 0x80, new Array(160).fill(0))),
+	)],
+});
+
+const init = (options: Record<string, unknown>) => {
+	const input = new Input({ source: new BufferSource(inputBytes), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	return Conversion.init({ input, output, ...options } as never);
+};
+
+describe('Conversion video options validation', () => {
+	test.each([
+		['a non-object', 3, 'options.video, when provided, must be an object'],
+		['discard as a string', { discard: 'yes' }, 'options.video.discard'],
+		['forceTranscode as a number', { forceTranscode: 1 }, 'options.video.forceTranscode'],
+		['an unknown codec', { codec: 'h266' }, 'options.video.codec'],
+		['quality that is not a Quality', { quality: 0.5 }, 'options.video.quality, when provided, must be a Quality'],
+		['both quality and bitrate', { quality: QUALITY, bitrate: 1e6 }, 'cannot both be provided'],
+		['a fractional bitrate', { bitrate: 1.5 }, 'options.video.bitrate'],
+		['a zero bitrate', { bitrate: 0 }, 'options.video.bitrate'],
+		['a zero width', { width: 0 }, 'options.video.width'],
+		['a fractional height', { height: 10.5 }, 'options.video.height'],
+		['an unknown fit', { width: 10, height: 10, fit: 'stretch' }, 'options.video.fit, when provided'],
+		['width and height without fit', { width: 10, height: 10 }, 'options.video.fit must also be provided'],
+		['a rotation of 45', { rotate: 45 }, 'options.video.rotate'],
+		['flip as a number', { flip: 1 }, 'options.video.flip'],
+		['allowTransformationMetadata as a string', { allowTransformationMetadata: 'no' }, 'TransformationMetadata'],
+		['allowRotationMetadata as a number', { allowRotationMetadata: 0 }, 'allowRotationMetadata'],
+		['a zero frame rate', { frameRate: 0 }, 'options.video.frameRate'],
+		['an infinite frame rate', { frameRate: Infinity }, 'options.video.frameRate'],
+		['an unknown alpha mode', { alpha: 'premultiply' }, 'options.video.alpha'],
+		['a negative key frame interval', { keyFrameInterval: -1 }, 'options.video.keyFrameInterval'],
+		['an infinite key frame interval', { keyFrameInterval: Infinity }, 'options.video.keyFrameInterval'],
+		['process that is not a function', { process: {} }, 'options.video.process'],
+		['a zero processedWidth', { processedWidth: 0 }, 'options.video.processedWidth'],
+		['a fractional processedHeight', { processedHeight: 1.5 }, 'options.video.processedHeight'],
+		['an unknown hardwareAcceleration', { hardwareAcceleration: 'gpu' }, 'options.video.hardwareAcceleration'],
+		['group that is not an OutputTrackGroup', { group: {} }, 'options.video.group'],
+		['group with a non-group entry', { group: [new OutputTrackGroup(), {}] }, 'options.video.group'],
+		['a negative maximumPacketCount', { maximumPacketCount: -1 }, 'options.video.maximumPacketCount'],
+		['a fractional maximumPacketCount', { maximumPacketCount: 0.5 }, 'options.video.maximumPacketCount'],
+	])('rejects %s', async (_, video, message) => {
+		await expect(init({ video })).rejects.toThrow(TypeError);
+		await expect(init({ video })).rejects.toThrow(message);
+	});
+
+	test('options returned from a per-track function are validated too', async () => {
+		await expect(init({ video: () => ({ rotate: 45 }) })).rejects.toThrow('options.video.rotate');
+		await expect(init({ video: () => [{ discard: true }, { flip: 'x' }] })).rejects.toThrow('options.video.flip');
+	});
+
+	test('accepts the boundary values', async () => {
+		const conversion = await init({
+			video: {
+				width: 32,
+				height: 32,
+				fit: 'contain',
+				rotate: 270,
+				flip: false,
+				frameRate: 0.5,
+				keyFrameInterval: 0,
+				bitrate: QUALITY,
+				processedWidth: 1,
+				processedHeight: 1,
+				hardwareAcceleration: 'prefer-software',
+				group: [new OutputTrackGroup()],
+				maximumPacketCount: 0,
+				alpha: 'keep',
+			},
+		});
+		expect(conversion).toBeInstanceOf(Conversion);
+	});
+});
+
+describe('Conversion audio options validation', () => {
+	test.each([
+		['a non-object', 'loud', 'options.audio, when provided, must be an object'],
+		['discard as a number', { discard: 0 }, 'options.audio.discard'],
+		['forceTranscode as a string', { forceTranscode: 'yes' }, 'options.audio.forceTranscode'],
+		['an unknown codec', { codec: 'wma' }, 'options.audio.codec'],
+		['quality that is not a Quality', { quality: 'high' }, 'options.audio.quality, when provided'],
+		['both quality and bitrate', { quality: QUALITY, bitrate: 128000 }, 'cannot both be provided'],
+		['a negative bitrate', { bitrate: -1 }, 'options.audio.bitrate'],
+		['a zero channel count', { numberOfChannels: 0 }, 'options.audio.numberOfChannels'],
+		['a fractional sample rate', { sampleRate: 44100.5 }, 'options.audio.sampleRate'],
+		['an unknown sample format', { sampleFormat: 'f64' }, 'options.audio.sampleFormat'],
+		['process that is not a function', { process: 'fn' }, 'options.audio.process'],
+		['a zero processedNumberOfChannels', { processedNumberOfChannels: 0 }, 'processedNumberOfChannels'],
+		['a fractional processedSampleRate', { processedSampleRate: 0.5 }, 'options.audio.processedSampleRate'],
+		['group with a non-group entry', { group: [{}] }, 'options.audio.group'],
+		['a negative maximumPacketCount', { maximumPacketCount: -2 }, 'options.audio.maximumPacketCount'],
+	])('rejects %s', async (_, audio, message) => {
+		await expect(init({ audio })).rejects.toThrow(TypeError);
+		await expect(init({ audio })).rejects.toThrow(message);
+	});
+
+	test('options returned from a per-track function are validated too', async () => {
+		await expect(init({ audio: () => ({ sampleRate: -1 }) })).rejects.toThrow('options.audio.sampleRate');
+	});
+
+	test('accepts the boundary values', async () => {
+		const conversion = await init({
+			audio: {
+				numberOfChannels: 1,
+				sampleRate: 8000,
+				sampleFormat: 'u8',
+				processedNumberOfChannels: 1,
+				processedSampleRate: 1,
+				group: new OutputTrackGroup(),
+				maximumPacketCount: 0,
+			},
+		});
+		expect(conversion).toBeInstanceOf(Conversion);
+	});
+});
+
+describe('Conversion top-level options validation', () => {
+	test.each([
+		['tracks set to something else', { tracks: 'video' }, 'options.tracks'],
+		['composable as a string', { composable: 'yes' }, 'options.composable'],
+		['copy as a number', { copy: 1 }, 'options.copy, when provided, must be an object or false'],
+		['copy as true', { copy: true }, 'options.copy, when provided, must be an object or false'],
+		['an unknown copy mode', { copy: { mode: 'always' } }, 'options.copy.mode'],
+		['a negative copy shiftTolerance', { copy: { shiftTolerance: -0.1 } }, 'options.copy.shiftTolerance'],
+		['a string copy shiftTolerance', { copy: { shiftTolerance: '1' } }, 'options.copy.shiftTolerance'],
+		['an unknown copy boundaryPolicy', { copy: { boundaryPolicy: 'nearest' } }, 'options.copy.boundaryPolicy'],
+		['a negative copy boundaryTolerance', { copy: { boundaryTolerance: -1 } }, 'copy.boundaryTolerance'],
+		['trim as a number', { trim: 5 }, 'options.trim, when provided, must be an object'],
+		['trim as null', { trim: null }, 'options.trim, when provided, must be an object'],
+		['an infinite trim start', { trim: { start: -Infinity } }, 'options.trim.start'],
+		['a string trim end', { trim: { end: '2' } }, 'options.trim.end'],
+		['a trim start equal to the end', { trim: { start: 1, end: 1 } }, 'options.trim.start must be less than'],
+		['a trim start after the end', { trim: { start: 2, end: 1 } }, 'options.trim.start must be less than'],
+		['tags as a string', { tags: 'title' }, 'options.tags, when provided, must be an object or a function'],
+		['tags as null', { tags: null }, 'options.tags, when provided, must be an object or a function'],
+		['tags with an invalid title', { tags: { title: 5 } }, 'title'],
+		['showWarnings as a number', { showWarnings: 0 }, 'options.showWarnings'],
+	])('rejects %s', async (_, options, message) => {
+		await expect(init(options)).rejects.toThrow(TypeError);
+		await expect(init(options)).rejects.toThrow(message);
+	});
+
+	test('requires an Input and an Output', async () => {
+		const input = new Input({ source: new BufferSource(inputBytes), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		await expect(Conversion.init(null as never)).rejects.toThrow('options must be an object');
+		await expect(Conversion.init({ input: {}, output } as never)).rejects.toThrow('input must be an Input');
+		await expect(Conversion.init({ input, output: {} } as never)).rejects.toThrow('output must be an Output');
+	});
+
+	test('a non-composable conversion needs a fresh output; a composable one only an unstarted one', async () => {
+		const input = new Input({ source: new BufferSource(inputBytes), formats: ALL_FORMATS });
+
+		const withTags = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		withTags.setMetadataTags({ title: 'Existing' });
+		await expect(Conversion.init({ input, output: withTags })).rejects.toThrow('options.output must be fresh');
+		const composableWithTags = await Conversion.init({ input, output: withTags, composable: true });
+		expect(composableWithTags).toBeInstanceOf(Conversion);
+
+		const target = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		await expect(Conversion.init({ input, output: target, composable: true, tags: { title: 'x' } }))
+			.rejects.toThrow('options.tags cannot be set by a composable conversion');
+	});
+
+	test('accepts copy: false, copy objects with boundary values, a tags function and tracks: primary', async () => {
+		for (const options of [
+			{ copy: false },
+			{ copy: { mode: 'forced', shiftTolerance: 0, boundaryPolicy: 'shrink', boundaryTolerance: 0 } },
+			{ copy: { mode: 'preferred', boundaryPolicy: 'expand' } },
+			{ tags: () => ({ title: 'From a function' }) },
+			{ tracks: 'primary', showWarnings: false, trim: { start: 0, end: Infinity } },
+		]) {
+			expect(await init(options)).toBeInstanceOf(Conversion);
+		}
+	});
+});
