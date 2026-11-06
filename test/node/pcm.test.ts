@@ -5,7 +5,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { WavOutputFormat } from '../../src/output-format.js';
-import { AudioSampleSource, PCM_ENCODER_PACKET_SIZE } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource, PCM_ENCODER_PACKET_SIZE } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
 import { AudioSample } from '../../src/sample.js';
@@ -282,3 +282,27 @@ const expectG711FileRoundtrip = async (codec: 'ulaw' | 'alaw', decodeCodeword: (
 	expect(frameOffset).toBe(data.length);
 	expect(decoded).toEqual(data);
 };
+
+test('RF64 sample count goes by the data, not the packet durations', async () => {
+	const output = new Output({
+		format: new WavOutputFormat({ large: true }),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// 1000 stereo frames per packet at 48 kHz, with durations rounded to milliseconds, as in a Matroska file
+	for (let i = 0; i < 3; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(4000), 'key', i * 0.021, 0.021),
+			{ decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 48000 } },
+		);
+	}
+	await output.finalize();
+
+	const view = new DataView(output.target.buffer!);
+	expect(String.fromCharCode(...new Uint8Array(output.target.buffer!, 12, 4))).toBe('ds64');
+	expect(view.getBigUint64(28, true)).toBe(12000n); // Data size
+	expect(view.getBigUint64(36, true)).toBe(3000n); // Sample count
+});
