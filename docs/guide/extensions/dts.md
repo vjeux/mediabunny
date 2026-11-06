@@ -20,7 +20,7 @@ npm install mediabunny @mediabunny/dts
 
 Alternatively, directly include them using a script tag:
 ```html
-<script src="mediabunny.js"></script>
+<script src="mediabunny.cjs"></script>
 <script src="mediabunny-dts.js"></script>
 ```
 

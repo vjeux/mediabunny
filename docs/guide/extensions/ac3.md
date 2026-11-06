@@ -20,7 +20,7 @@ npm install mediabunny @mediabunny/ac3
 
 Alternatively, directly include them using a script tag:
 ```html
-<script src="mediabunny.js"></script>
+<script src="mediabunny.cjs"></script>
 <script src="mediabunny-ac3.js"></script>
 ```
 

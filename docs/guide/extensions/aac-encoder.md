@@ -20,7 +20,7 @@ npm install mediabunny @mediabunny/aac-encoder
 
 Alternatively, directly include them using a script tag:
 ```html
-<script src="mediabunny.js"></script>
+<script src="mediabunny.cjs"></script>
 <script src="mediabunny-aac-encoder.js"></script>
 ```
 
