@@ -400,7 +400,9 @@ export class Mp3InputFormat extends InputFormat {
 		// Frame syncs are easily found in the data of other containers (in their sample tables, say), so a file that
 		// starts like one of them isn't taken for MP3, even when that format isn't among the input's formats
 		let signatureSlice = input._reader.requestSliceRange(currentPos, 0, MPEG_TS_SIGNATURE_LENGTH);
-		if (isThenable(signatureSlice)) signatureSlice = await signatureSlice;
+		if (isThenable(signatureSlice)) {
+			signatureSlice = await signatureSlice;
+		}
 		if (signatureSlice && startsWithOtherContainerSignature(readBytes(signatureSlice, signatureSlice.length))) {
 			return false;
 		}
