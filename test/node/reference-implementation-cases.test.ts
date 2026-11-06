@@ -40,6 +40,7 @@ import {
 	audioSampleEntry,
 	blockPayload,
 	box,
+	buildFragmentedMp4,
 	buildSingleTrackMp4,
 	buildWebm,
 	ebml,
@@ -48,6 +49,7 @@ import {
 	escapeRbsp,
 	esds,
 	hexBytes,
+	sampleFlags,
 	toHex,
 	visualSampleEntry,
 	vp8Frame,
@@ -1418,5 +1420,139 @@ describe('Chromium media/formats/webm/opus_packet_builder.cc (Opus packet durati
 				}
 			}
 		}
+	});
+});
+
+describe('Chromium media/formats/mp4/track_run_iterator_unittest.cc', () => {
+	// The fragment Chromium's tests build: a 25 Hz video track whose samples have durations and sizes 1, 2, ..., 10,
+	// a sync first sample and non-sync others, and a 48 kHz audio track. The movie timescale is 1000.
+	const avcEntry = visualSampleEntry('avc1', { width: 320, height: 240 }, box('avcC', hexBytes(
+		'01 64 00 0c ff e1 00 19 67 64 00 0c ac d9 41 41 fb 01 10 00 00 03 00 10 00 00 03 01 40 f1 42 99 60 01 00 06'
+		+ ' 68 eb e3 cb 22 c0 fd f8 f8 00',
+	)));
+	const aacEntry = audioSampleEntry(
+		'mp4a',
+		{ channels: 2, sampleRate: 48000 },
+		esds({ objectTypeIndication: 0x40, decoderSpecificInfo: new Uint8Array([0x11, 0x90]) }),
+	);
+	const US = sampleFlags({ dependsOn: 0, nonSync: false });
+	const UN = sampleFlags({ dependsOn: 0, nonSync: true });
+	const ascending = Array.from({ length: 10 }, (_, i) => i + 1);
+	const videoSamples = (compositionTimeOffsets?: number[]) => ascending.map((value, i) => ({
+		duration: value,
+		size: value,
+		flags: i === 0 ? US : UN,
+		...(compositionTimeOffsets ? { compositionTimeOffset: compositionTimeOffsets[i] ?? 0 } : {}),
+	}));
+
+	// Packets as [timestamp, duration, size, isKey], with times in the given timescale
+	const readPackets = async (bytes: Uint8Array, timescale: number) => {
+		using input = openBytes(bytes);
+		const track = (await input.getTracks())[0]!;
+		const packets: [number, number, number, boolean][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([
+				Math.round(packet.timestamp * timescale),
+				Math.round(packet.duration * timescale),
+				packet.data.length,
+				packet.type === 'key',
+			]);
+		}
+		return packets;
+	};
+
+	test('BasicOperationTest: decode times continue from tfdt', async () => {
+		const bytes = buildFragmentedMp4({
+			type: 'video',
+			sampleEntry: avcEntry,
+			timescale: 25,
+			fragments: [{ baseDecodeTime: 10, samples: videoSamples() }],
+		});
+		expect((await readPackets(bytes, 25)).slice(0, 3)).toEqual([
+			[10, 1, 1, true],
+			[11, 2, 2, false],
+			[13, 3, 3, false],
+		]);
+	});
+
+	test('TrackExtendsDefaultsTest: trex defaults apply when tfhd and trun give none', async () => {
+		const bytes = buildFragmentedMp4({
+			type: 'audio',
+			sampleEntry: aacEntry,
+			timescale: 48000,
+			trex: { duration: 50, size: 3, flags: UN },
+			fragments: [{ baseDecodeTime: 0, samples: ascending.map(() => ({})) }],
+		});
+		// Chromium also reports the non-sync audio samples as non-key
+		expect((await readPackets(bytes, 48000)).slice(0, 2)).toEqual([
+			[0, 50, 3, false],
+			[50, 50, 3, false],
+		]);
+	});
+
+	test('FirstSampleFlagTest: first_sample_flags override the defaults for the first sample only', async () => {
+		const video = buildFragmentedMp4({
+			type: 'video',
+			sampleEntry: avcEntry,
+			timescale: 25,
+			fragments: [{
+				baseDecodeTime: 10,
+				defaults: { flags: UN },
+				firstSampleFlags: US,
+				samples: ascending.map(value => ({ duration: value, size: value })),
+			}],
+		});
+		expect((await readPackets(video, 25)).map(packet => packet[3])).toEqual(ascending.map(value => value === 1));
+
+		const audio = buildFragmentedMp4({
+			type: 'audio',
+			sampleEntry: aacEntry,
+			timescale: 48000,
+			fragments: [{
+				baseDecodeTime: 0,
+				defaults: { flags: US, duration: 1024, size: 4 },
+				samples: ascending.map(value => ({ size: value })),
+			}],
+		});
+		const audioPackets = await readPackets(audio, 48000);
+		expect(audioPackets.map(packet => packet[3])).toEqual(ascending.map(() => true));
+		expect(audioPackets.map(packet => packet[0])).toEqual(ascending.map(value => (value - 1) * 1024));
+	});
+
+	test('ReorderingTest: composition offsets and an edit list starting at media time 2', async () => {
+		const bytes = buildFragmentedMp4({
+			type: 'video',
+			sampleEntry: avcEntry,
+			timescale: 25,
+			edits: [[0, 2]],
+			fragments: [{ baseDecodeTime: 0, samples: videoSamples([2, 5, 0]) }],
+		});
+		expect((await readPackets(bytes, 25)).slice(0, 3).map(packet => packet[0])).toEqual([0, 4, 1]);
+	});
+
+	test('LeadingEmptyEditListTest: an 80 ms empty edit delays the track by 2 ticks of 25 Hz', async () => {
+		const bytes = buildFragmentedMp4({
+			type: 'video',
+			sampleEntry: avcEntry,
+			timescale: 25,
+			edits: [[80, -1], [0, 0]],
+			fragments: [{ baseDecodeTime: 0, samples: videoSamples() }],
+		});
+		expect((await readPackets(bytes, 25)).slice(0, 3)).toEqual([
+			[2, 1, 1, true],
+			[3, 2, 2, false],
+			[5, 3, 3, false],
+		]);
+	});
+
+	test('LeadingEmptyEditWithMediaOffsetTest: a 120 ms empty edit plus a media time of 2', async () => {
+		const bytes = buildFragmentedMp4({
+			type: 'video',
+			sampleEntry: avcEntry,
+			timescale: 25,
+			edits: [[120, -1], [0, 2]],
+			fragments: [{ baseDecodeTime: 0, samples: videoSamples([2, 5, 0]) }],
+		});
+		expect((await readPackets(bytes, 25)).slice(0, 3).map(packet => packet[0])).toEqual([3, 7, 4]);
 	});
 });

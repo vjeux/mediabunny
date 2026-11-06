@@ -361,3 +361,116 @@ export const buildWebm = (options: { docType?: string; tracks: Uint8Array[]; bod
 		...options.body,
 	),
 );
+
+/** Sample flags of a trun/tfhd/trex, from ISO 14496-12 8.8.3.1. */
+export const sampleFlags = (options: { dependsOn: 0 | 1 | 2 | 3; nonSync: boolean }) => {
+	return (options.dependsOn << 24) | (options.nonSync ? 0x10000 : 0);
+};
+
+/** A fragmented MP4 with one track (ID 1): an empty sample table in moov, then one moof+mdat per fragment. */
+export const buildFragmentedMp4 = (options: {
+	type: 'audio' | 'video';
+	sampleEntry: Uint8Array;
+	timescale: number;
+	movieTimescale?: number;
+	edits?: [segmentDuration: number, mediaTime: number][];
+	trex?: { duration: number; size: number; flags: number };
+	fragments: {
+		baseDecodeTime: number;
+		defaults?: { duration?: number; size?: number; flags?: number };
+		firstSampleFlags?: number;
+		samples: { duration?: number; size?: number; flags?: number; compositionTimeOffset?: number }[];
+	}[];
+}) => {
+	const { type, sampleEntry, timescale } = options;
+	const movieTimescale = options.movieTimescale ?? 1000;
+	const ftyp = box('ftyp', ascii('iso6'), u32(0), ascii('iso6mp41'));
+	const elst = options.edits && box('edts', fullBox(
+		'elst',
+		0,
+		0,
+		u32(options.edits.length),
+		...options.edits.map(([segmentDuration, mediaTime]) => [
+			...u32(segmentDuration),
+			...u32(mediaTime >>> 0),
+			...u32(0x10000), // media_rate
+		]),
+	));
+	const moov = box(
+		'moov',
+		fullBox('mvhd', 0, 0, u32(0), u32(0), u32(movieTimescale), u32(0), u32(0x10000), u16(0x100), u16(0),
+			u32(0), u32(0), ...MATRIX.map(u32), new Array<number>(24).fill(0), u32(2)),
+		box(
+			'trak',
+			fullBox('tkhd', 0, 3, u32(0), u32(0), u32(1), u32(0), u32(0), u32(0), u32(0), u16(0), u16(0),
+				u16(type === 'audio' ? 0x100 : 0), u16(0), ...MATRIX.map(u32), u32(320 * 0x10000), u32(240 * 0x10000)),
+			...(elst ? [elst] : []),
+			box(
+				'mdia',
+				fullBox('mdhd', 0, 0, u32(0), u32(0), u32(timescale), u32(0), u16(0x55c4), u16(0)),
+				fullBox('hdlr', 0, 0, u32(0), ascii(type === 'audio' ? 'soun' : 'vide'), u32(0), u32(0), u32(0), [0]),
+				box(
+					'minf',
+					type === 'audio'
+						? fullBox('smhd', 0, 0, u16(0), u16(0))
+						: fullBox('vmhd', 0, 1, u16(0), u16(0), u16(0), u16(0)),
+					box('dinf', fullBox('dref', 0, 0, u32(1), fullBox('url ', 0, 1))),
+					box(
+						'stbl',
+						fullBox('stsd', 0, 0, u32(1), sampleEntry),
+						fullBox('stts', 0, 0, u32(0)),
+						fullBox('stsc', 0, 0, u32(0)),
+						fullBox('stsz', 0, 0, u32(0), u32(0)),
+						fullBox('stco', 0, 0, u32(0)),
+					),
+				),
+			),
+		),
+		box('mvex', fullBox('trex', 0, 0, u32(1), u32(1), u32(options.trex?.duration ?? 0),
+			u32(options.trex?.size ?? 0), u32(options.trex?.flags ?? 0))),
+	);
+
+	const fragments = options.fragments.map((fragment, index) => {
+		const { defaults, samples } = fragment;
+		const sizes = samples.map(sample => sample.size ?? defaults?.size ?? options.trex?.size ?? 0);
+		const tfhdFlags = 0x20000 // default-base-is-moof
+			| (defaults?.duration !== undefined ? 0x8 : 0)
+			| (defaults?.size !== undefined ? 0x10 : 0)
+			| (defaults?.flags !== undefined ? 0x20 : 0);
+		type SampleField = 'duration' | 'size' | 'flags' | 'compositionTimeOffset';
+		const has = (key: SampleField) => samples.some(sample => sample[key] !== undefined);
+		const trunFlags = 0x1 // data-offset-present
+			| (fragment.firstSampleFlags !== undefined ? 0x4 : 0)
+			| (has('duration') ? 0x100 : 0)
+			| (has('size') ? 0x200 : 0)
+			| (has('flags') ? 0x400 : 0)
+			| (has('compositionTimeOffset') ? 0x800 : 0);
+		const buildMoof = (dataOffset: number) => box(
+			'moof',
+			fullBox('mfhd', 0, 0, u32(index + 1)),
+			box(
+				'traf',
+				fullBox('tfhd', 0, tfhdFlags, u32(1),
+					...(defaults?.duration !== undefined ? [u32(defaults.duration)] : []),
+					...(defaults?.size !== undefined ? [u32(defaults.size)] : []),
+					...(defaults?.flags !== undefined ? [u32(defaults.flags)] : [])),
+				fullBox('tfdt', 1, 0, u32(0), u32(fragment.baseDecodeTime)),
+				fullBox('trun', 1, trunFlags, u32(samples.length), u32(dataOffset),
+					...(fragment.firstSampleFlags !== undefined ? [u32(fragment.firstSampleFlags)] : []),
+					...samples.map(sample => [
+						...(has('duration') ? u32(sample.duration ?? 0) : []),
+						...(has('size') ? u32(sample.size ?? 0) : []),
+						...(has('flags') ? u32(sample.flags ?? 0) : []),
+						...(has('compositionTimeOffset') ? u32((sample.compositionTimeOffset ?? 0) >>> 0) : []),
+					])),
+			),
+		);
+		const moofSize = buildMoof(0).length;
+		return concatBytes(
+			buildMoof(moofSize + 8),
+			box('mdat', ...sizes.map(size => new Uint8Array(size))),
+		);
+	});
+
+	return concatBytes(ftyp, moov, ...fragments);
+};
