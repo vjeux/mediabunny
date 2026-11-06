@@ -284,7 +284,7 @@ test('24 and 32-bit PCM in twos and sowt sample entries', async () => {
 	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
 
 	// A QuickTime sound sample description (version 0), stereo, 48 kHz, 4 PCM frames in one chunk
-	const read = async (fourCc: string, sampleSize: number) => {
+	const read = async (fourCc: string, sampleSize: number, littleEndian = false) => {
 		const frameSize = 2 * sampleSize / 8;
 		const pcm = Array.from({ length: 4 * frameSize }, (_, i) => i);
 		const moov = (chunkOffset: number) => box('moov',
@@ -296,7 +296,9 @@ test('24 and 32-bit PCM in twos and sowt sample entries', async () => {
 					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
 					box('minf', box('stbl',
 						box('stsd', u32(0), u32(1), box(fourCc, zeros(6), [0, 1], zeros(8), [0, 2, 0, sampleSize],
-							zeros(4), u32(48000 * 0x10000))),
+							zeros(4), u32(48000 * 0x10000), littleEndian
+								? box('wave', box('frma', ascii(fourCc)), box('enda', [0, 1]), zeros(8))
+								: [])),
 						box('stts', u32(0), u32(1), u32(4), u32(1)),
 						box('stsc', u32(0), u32(1), u32(1), u32(4), u32(1)),
 						box('stsz', u32(0), u32(frameSize), u32(4)),
@@ -323,13 +325,15 @@ test('24 and 32-bit PCM in twos and sowt sample entries', async () => {
 		return { codec: await track.getCodec(), data: [...packet!.data], expected: pcm };
 	};
 
-	for (const [fourCc, sampleSize, codec] of [
-		['twos', 24, 'pcm-s24be'],
-		['twos', 32, 'pcm-s32be'],
-		['sowt', 24, 'pcm-s24'],
-		['sowt', 32, 'pcm-s32'],
+	for (const [fourCc, sampleSize, littleEndian, codec] of [
+		['twos', 24, false, 'pcm-s24be'],
+		['twos', 32, false, 'pcm-s32be'],
+		['twos', 24, true, 'pcm-s24'], // enda = 1, like for 16-bit twos
+		['twos', 32, true, 'pcm-s32'],
+		['sowt', 24, false, 'pcm-s24'],
+		['sowt', 32, false, 'pcm-s32'],
 	] as const) {
-		const result = await read(fourCc, sampleSize);
+		const result = await read(fourCc, sampleSize, littleEndian);
 		expect(result.codec).toBe(codec);
 		expect(result.data).toEqual(result.expected);
 	}
