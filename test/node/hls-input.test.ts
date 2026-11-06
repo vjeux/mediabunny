@@ -1407,6 +1407,45 @@ b.ts
 	expect(types.every(type => type === 'key')).toBe(true);
 });
 
+test.concurrent('Packets can be looked up by their own timestamp when the media offset is a fraction of a tick', async () => {
+	// The segment's media gets placed at the program date time, which isn't a whole number of 1/44100 s ticks
+	const text = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00.123Z
+#EXTINF:10,
+sample3.aac
+#EXT-X-ENDLIST
+`;
+
+	using input = new Input({
+		source: new CustomPathedSource('playlist.m3u8', ({ path }) => {
+			if (path === 'playlist.m3u8') {
+				return new BufferSource(new TextEncoder().encode(text));
+			}
+
+			return new FilePathSource('./test/public/sample3.aac');
+		}),
+		formats: HLS_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+
+	const sink = new EncodedPacketSink(audioTrack);
+	const firstPacket = await sink.getFirstPacket();
+	assert(firstPacket);
+
+	// Starting from the second packet, since the first one starts before the segment's playlist timestamp after rounding
+	let packet = await sink.getNextPacket(firstPacket);
+	for (let i = 0; i < 20; i++) {
+		assert(packet);
+		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+
+		packet = await sink.getNextPacket(packet);
+	}
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
