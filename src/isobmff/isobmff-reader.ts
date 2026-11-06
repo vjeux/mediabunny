@@ -114,12 +114,31 @@ export const readEsDescriptor = (slice: FileSlice) => {
 	};
 };
 
+// Mac OS Roman characters for the bytes 0x80 to 0xff
+const MAC_ROMAN_HIGH_CHARACTERS = 'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü'
+	+ '†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø'
+	+ '¿¡¬√ƒ≈∆«»…\u00a0ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ'
+	+ '‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔ\uf8ffÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ';
+
+const decodeMacRoman = (bytes: Uint8Array) => {
+	let result = '';
+	for (const byte of bytes) {
+		result += byte < 0x80 ? String.fromCharCode(byte) : MAC_ROMAN_HIGH_CHARACTERS[byte - 0x80]!;
+	}
+
+	return result;
+};
+
 export const readMetadataStringShort = (slice: FileSlice) => {
 	let stringLength = readU16Be(slice);
-	slice.skip(2); // Language
+	const languageCode = readU16Be(slice);
 
 	stringLength = Math.min(stringLength, slice.remainingLength);
-	return textDecoder.decode(readBytes(slice, stringLength));
+	const bytes = readBytes(slice, stringLength);
+
+	// Codes below 0x400 (and 0x7fff, unspecified) are Macintosh language codes, whose text is in a Mac encoding
+	// (QTFF). Like FFmpeg, decode it as Mac OS Roman.
+	return languageCode < 0x400 || languageCode === 0x7fff ? decodeMacRoman(bytes) : textDecoder.decode(bytes);
 };
 
 export const readDataBox = (slice: FileSlice) => {

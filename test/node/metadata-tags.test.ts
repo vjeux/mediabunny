@@ -292,6 +292,62 @@ test('FFmpeg-unsafe raw udta tags, MP4', async () => {
 	}
 });
 
+test('Read QuickTime udta text in Mac OS Roman when it has a Macintosh language code', async () => {
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const text = (type: string, language: number, bytes: number[]) => {
+		return box(type, u16(bytes.length), u16(language), bytes);
+	};
+	const highBytes = Array.from({ length: 128 }, (_, i) => 0x80 + i);
+
+	const moov = (chunkOffset: number) => box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(8000), u32(1), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('twos', zeros(6), [0, 1], zeros(8), [0, 1, 0, 16], zeros(4),
+						u32(8000 * 0x10000))),
+					box('stts', u32(0), u32(1), u32(1), u32(1)),
+					box('stsc', u32(0), u32(1), u32(1), u32(1), u32(1)),
+					box('stsz', u32(0), u32(2), u32(1)),
+					box('stco', u32(0), u32(1), u32(chunkOffset)),
+				)),
+			),
+		),
+		box('udta',
+			text('©nam', 0, [0x83, 0x74, 0x8e]), // "Été" in Mac OS Roman, language 0 (English)
+			text('©ART', 0x55c4, [0xc3, 0x89, 0x74, 0xc3, 0xa9]), // "Été" in UTF-8, ISO language code
+			text('©cmt', 0x7fff, highBytes), // Unspecified Macintosh language
+		),
+	);
+	const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+	const moovSize = moov(0).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...ftyp,
+			...moov(ftyp.length + moovSize + 8),
+			...box('mdat', [0, 0]),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const tags = await input.getMetadataTags();
+
+	expect(tags.title).toBe('Été');
+	expect(tags.artist).toBe('Été');
+	expect(tags.comment).toBe(new TextDecoder('macintosh').decode(new Uint8Array(highBytes)));
+});
+
 test('Read and write metadata, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
