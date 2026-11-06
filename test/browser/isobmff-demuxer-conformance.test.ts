@@ -13,6 +13,49 @@ import { assert } from '../../src/misc.js';
 
 // Real-world producer: the browser's own MediaRecorder MP4 output (fragmented, written by Chrome's MP4 muxer)
 
+type AudioTrackGenerator = MediaStreamTrack & { writable: WritableStream<AudioData> };
+// Chrome's insertable streams; unlike an AudioContext, a generator doesn't wait for a user gesture under the autoplay
+// policy, which would leave the recording without audio
+const AudioTrackGenerator = (globalThis as {
+	MediaStreamTrackGenerator?: new (init: { kind: 'audio' }) => AudioTrackGenerator;
+}).MediaStreamTrackGenerator;
+
+/** A 440 Hz tone, and a function that stops it. */
+const createAudioTrack = (): [MediaStreamTrack, () => Promise<void>] => {
+	if (AudioTrackGenerator) {
+		const generator = new AudioTrackGenerator({ kind: 'audio' });
+		const writer = generator.writable.getWriter();
+		let sampleIndex = 0;
+		const interval = setInterval(() => {
+			const data = new Float32Array(960); // 20 ms
+			for (let i = 0; i < data.length; i++) {
+				data[i] = 0.5 * Math.sin(2 * Math.PI * 440 * (sampleIndex + i) / 48000);
+			}
+			void writer.write(new AudioData({
+				format: 'f32-planar',
+				sampleRate: 48000,
+				numberOfFrames: data.length,
+				numberOfChannels: 1,
+				timestamp: sampleIndex * 1e6 / 48000,
+				data,
+			}));
+			sampleIndex += data.length;
+		}, 20);
+
+		return [generator, async () => {
+			clearInterval(interval);
+			generator.stop();
+		}];
+	}
+
+	const audioContext = new AudioContext();
+	const oscillator = audioContext.createOscillator();
+	const destination = audioContext.createMediaStreamDestination();
+	oscillator.connect(destination);
+	oscillator.start();
+	return [destination.stream.getAudioTracks()[0]!, () => audioContext.close()];
+};
+
 const record = async (mimeType: string, durationMs: number) => {
 	const stream = new MediaStream();
 	const hasVideo = mimeType.startsWith('video/');
@@ -31,13 +74,11 @@ const record = async (mimeType: string, durationMs: number) => {
 		stream.addTrack(canvas.captureStream(30).getVideoTracks()[0]!);
 	}
 
-	const audioContext = new AudioContext();
+	let stopAudio: (() => Promise<void>) | null = null;
 	if (!hasVideo || mimeType.includes('opus')) {
-		const oscillator = audioContext.createOscillator();
-		const destination = audioContext.createMediaStreamDestination();
-		oscillator.connect(destination);
-		oscillator.start();
-		stream.addTrack(destination.stream.getAudioTracks()[0]!);
+		const [audioTrack, stop] = createAudioTrack();
+		stream.addTrack(audioTrack);
+		stopAudio = stop;
 	}
 
 	const recorder = new MediaRecorder(stream, { mimeType });
@@ -52,7 +93,7 @@ const record = async (mimeType: string, durationMs: number) => {
 	if (interval) {
 		clearInterval(interval);
 	}
-	await audioContext.close();
+	await stopAudio?.();
 
 	return new Blob(chunks);
 };
@@ -62,7 +103,9 @@ const checkRecording = async (mimeType: string, expectedCodecs: string[], decoda
 	expect(await input.getFormat()).toBe(MP4);
 
 	const tracks = await input.getTracks();
-	expect(await Promise.all(tracks.map(x => x.getCodec()))).toEqual(expectedCodecs);
+	// In whichever order the recorder got their first data
+	const codecs = await Promise.all(tracks.map(x => x.getCodec()));
+	expect(codecs.sort()).toEqual([...expectedCodecs].sort());
 
 	for (const track of tracks) {
 		const packets: EncodedPacket[] = [];
