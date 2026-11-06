@@ -18,6 +18,8 @@ import {
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
+	validateCheckedCodecIterable,
+	validateCheckedCodecs,
 	VIDEO_CODECS,
 	VideoCodec,
 } from './codec';
@@ -1068,6 +1070,10 @@ export const canEncodeVideo = async (
 		frameRate?: number;
 	} & VideoEncodingAdditionalOptions = {},
 ) => {
+	if (!options || typeof options !== 'object') {
+		throw new TypeError('options must be an object.');
+	}
+
 	const {
 		width = 1280,
 		height = 720,
@@ -1230,6 +1236,10 @@ export const canEncodeAudio = async (
 		bitrate?: number | Quality;
 	} & AudioEncodingAdditionalOptions = {},
 ) => {
+	if (!options || typeof options !== 'object') {
+		throw new TypeError('options must be an object.');
+	}
+
 	const {
 		numberOfChannels = 2,
 		sampleRate = 48000,
@@ -1450,6 +1460,8 @@ export const getEncodableVideoCodecs = async (
 		frameRate?: number;
 	},
 ): Promise<VideoCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(codec => canEncodeVideo(codec, options)));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
@@ -1476,6 +1488,8 @@ export const getEncodableAudioCodecs = async (
 		bitrate?: number | Quality;
 	},
 ): Promise<AudioCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(codec => canEncodeAudio(codec, options)));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
@@ -1488,6 +1502,8 @@ export const getEncodableAudioCodecs = async (
 export const getEncodableSubtitleCodecs = async (
 	checkedCodecs: SubtitleCodec[] = SUBTITLE_CODECS as unknown as SubtitleCodec[],
 ): Promise<SubtitleCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(canEncodeSubtitles));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
@@ -1516,6 +1532,8 @@ export const getFirstEncodableVideoCodec = async (
 		frameRate?: number;
 	},
 ): Promise<VideoCodec | null> => {
+	validateCheckedCodecIterable(checkedCodecs);
+
 	for (const codec of checkedCodecs) {
 		if (await canEncodeVideo(codec, options)) {
 			return codec;
@@ -1547,6 +1565,8 @@ export const getFirstEncodableAudioCodec = async (
 		bitrate?: number | Quality;
 	},
 ): Promise<AudioCodec | null> => {
+	validateCheckedCodecIterable(checkedCodecs);
+
 	for (const codec of checkedCodecs) {
 		if (await canEncodeAudio(codec, options)) {
 			return codec;
@@ -1564,6 +1584,8 @@ export const getFirstEncodableAudioCodec = async (
 export const getFirstEncodableSubtitleCodec = async (
 	checkedCodecs: SubtitleCodec[],
 ): Promise<SubtitleCodec | null> => {
+	validateCheckedCodecIterable(checkedCodecs);
+
 	for (const codec of checkedCodecs) {
 		if (await canEncodeSubtitles(codec)) {
 			return codec;
