@@ -1936,6 +1936,11 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 				continue;
 			}
 
+			if (isMdta && key === 'covr' && pairs.some(x => x.key === 'com.apple.quicktime.artwork')) {
+				// The same cover, read from mdta metadata that used the iTunes key; it's already written as artwork
+				continue;
+			}
+
 			if (typeof value === 'string') {
 				pairs.push({ key, value: dataStringBoxLong(value) });
 			} else if (value instanceof Uint8Array) {
