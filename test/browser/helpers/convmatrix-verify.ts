@@ -471,6 +471,7 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 			videoOffset = median(offsets);
 			let timestampMismatches = 0;
 			let levelMismatches = 0;
+			let repeatedFrames = 0;
 			for (let i = 0; i < n; i++) {
 				if (Math.abs(outFrames[i]!.timestamp - expected[i]!.timestamp - videoOffset) > timestampTolerance) {
 					timestampMismatches++;
@@ -480,7 +481,13 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 				// rest)
 				const level = expected[i]!.level;
 				if (markers && level !== null && expected[i]!.opaque && outFrames[i]!.level !== level) {
-					levelMismatches++;
+					// Chrome's VP9 encoder with a per-frame quantizer sometimes doesn't update a flat frame after a big
+					// drop in brightness, so the decoded frame repeats the previous one (plain WebCodecs does the same)
+					if (!run.copied.video && i > 0 && outFrames[i]!.level === outFrames[i - 1]!.level) {
+						repeatedFrames++;
+					} else {
+						levelMismatches++;
+					}
 				}
 			}
 			if (Math.abs(videoOffset) > timestampTolerance && !allowShift) {
@@ -494,6 +501,9 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 			const allowedMismatches = run.copied.video ? 0 : Math.max(2, Math.ceil(0.04 * n));
 			if (levelMismatches > allowedMismatches && process !== 'canvas') {
 				add('video-content', `${levelMismatches} of ${n} frames show another input frame`);
+			}
+			if (repeatedFrames > Math.ceil(0.2 * n) && process !== 'canvas') {
+				add('video-content', `${repeatedFrames} of ${n} frames repeat the previous frame instead of a new one`);
 			}
 			if (out.firstPacketIsKey === false) {
 				add('video-key', 'The first packet is not a key packet');
