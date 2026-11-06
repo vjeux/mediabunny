@@ -1764,6 +1764,12 @@ export class ReadableStreamSource extends Source {
 	_reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	/** @internal */
 	_cache: CacheEntry[] = [];
+	/**
+	 * Entries before this index have been evicted. They're dropped from the array in bulk, since shift() is O(n) for
+	 * large arrays and small stream chunks make for many entries.
+	 * @internal
+	 */
+	_cacheStart = 0;
 	/** @internal */
 	_maxCacheSize: number;
 	/** @internal */
@@ -1825,7 +1831,10 @@ export class ReadableStreamSource extends Source {
 
 		this._maxRequestedIndex = Math.max(this._maxRequestedIndex, end);
 
-		const cacheStartIndex = binarySearchLessOrEqual(this._cache, start, x => x.start);
+		let cacheStartIndex = binarySearchLessOrEqual(this._cache, start, x => x.start);
+		if (cacheStartIndex < this._cacheStart) {
+			cacheStartIndex = -1; // Evicted
+		}
 		const cacheStartEntry = cacheStartIndex !== -1 ? this._cache[cacheStartIndex]! : null;
 
 		if (cacheStartEntry && cacheStartEntry.start <= start && end <= cacheStartEntry.end) {
@@ -1972,15 +1981,23 @@ export class ReadableStreamSource extends Source {
 			// Do cache eviction, based on the distance from the last-requested index. It's important that we do it like
 			// this and not based on how far we've pulled the stream, because if the stream supplies data faster than it
 			// is being requested, we'd unnecessarily evict data that we still might need.
-			while (this._cache.length > 0) {
-				const firstEntry = this._cache[0]!;
+			while (this._cacheStart < this._cache.length) {
+				const firstEntry = this._cache[this._cacheStart]!;
 				const distance = this._maxRequestedIndex - firstEntry.end;
 
 				if (distance <= this._maxCacheSize) {
 					break;
 				}
 
-				this._cache.shift();
+				// Release the data right away; the entry itself stays in the array (for now) to keep it sorted
+				firstEntry.bytes = EMPTY_BYTES;
+				firstEntry.view = EMPTY_VIEW;
+				this._cacheStart++;
+			}
+
+			if (this._cacheStart > 0 && this._cacheStart >= this._cache.length / 2) {
+				this._cache.splice(0, this._cacheStart);
+				this._cacheStart = 0;
 			}
 
 			this._currentIndex += value.byteLength;
@@ -1997,9 +2014,13 @@ export class ReadableStreamSource extends Source {
 
 		this._pendingSlices.length = 0;
 		this._cache.length = 0;
+		this._cacheStart = 0;
 		void this._reader?.cancel().catch(() => {});
 	}
 }
+
+const EMPTY_BYTES = new Uint8Array(0);
+const EMPTY_VIEW = toDataView(EMPTY_BYTES);
 
 const assembleSlice = (start: number, end: number, parts: SlicePart[]): ReadResult => {
 	const bytes = new Uint8Array(end - start);
