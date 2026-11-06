@@ -7,7 +7,13 @@ import { Input } from '../../src/input.js';
 import { FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { AppendOnlyStreamTarget, BufferTarget, StreamTarget, FilePathTarget } from '../../src/target.js';
+import {
+	AppendOnlyStreamTarget,
+	BufferTarget,
+	StreamTarget,
+	FilePathTarget,
+	StreamTargetChunk,
+} from '../../src/target.js';
 import type { FileHandle } from 'node:fs/promises';
 import { rm } from 'node:fs/promises';
 import { Mp4OutputFormat } from '../../src/output-format.js';
@@ -136,4 +142,31 @@ test('FilePathTarget writes of 2 GiB or more are split into writes Node accepts'
 	} finally {
 		await rm(filePath);
 	}
+});
+
+test('StreamTarget in chunked mode handles a write spanning many chunks', async () => {
+	const writes: StreamTargetChunk[] = [];
+	const target = new StreamTarget(new WritableStream<StreamTargetChunk>({
+		write: (chunk) => {
+			writes.push({ ...chunk, data: chunk.data.slice() });
+		},
+	}), { chunked: true, chunkSize: 1024 });
+
+	// Like the media data of an in-memory fast start MP4, written in one go: 32 MiB, so 32768 chunks
+	const data = new Uint8Array(2 ** 25);
+	for (let i = 0; i < data.length; i += 4096) {
+		data[i] = (i / 4096) & 0xff;
+	}
+
+	target._start();
+	target._write(data, 0);
+	await target._flush();
+	await target._finalize();
+
+	const result = new Uint8Array(data.length);
+	for (const write of writes) {
+		expect(write.data.byteLength).toBeLessThanOrEqual(1024);
+		result.set(write.data, write.position);
+	}
+	expect(result.every((byte, i) => byte === data[i])).toBe(true);
 });
