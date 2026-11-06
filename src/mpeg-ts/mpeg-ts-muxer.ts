@@ -24,7 +24,7 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../codec-data';
 import { Bitstream } from '../../shared/bitstream';
-import { assert, promiseWithResolvers, setUint24, toDataView, toUint8Array } from '../misc';
+import { assert, promiseWithResolvers, roundToDivisor, setUint24, toDataView, toUint8Array } from '../misc';
 import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputTrack, OutputVideoTrack } from '../output';
 import { MpegTsOutputFormat } from '../output-format';
@@ -253,7 +253,10 @@ export class MpegTsMuxer extends Muxer {
 
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
-				presentationTimestamp: packet.timestamp,
+				// Constrain the timestamp to the frame rate
+				presentationTimestamp: track.metadata.frameRate !== undefined
+					? roundToDivisor(packet.timestamp, track.metadata.frameRate)
+					: packet.timestamp,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
