@@ -167,6 +167,75 @@ describe('VideoSample from raw pixels: copyTo', () => {
 	});
 });
 
+describe('AudioSample trim', () => {
+	const interleaved = () => new AudioSample({
+		data: new Int16Array([0, 100, 1, 101, 2, 102, 3, 103]),
+		format: 's16',
+		numberOfChannels: 2,
+		sampleRate: 1000,
+		timestamp: 5,
+	});
+
+	test('keeps the frames in [start, end) and shifts the timestamp', () => {
+		using sample = interleaved();
+		using middle = sample.trim(1, 3);
+		expect([middle.numberOfFrames, middle.numberOfChannels, middle.format, middle.timestamp])
+			.toEqual([2, 2, 's16', 5.001]);
+		const data = new Int16Array(4);
+		middle.copyTo(data, { planeIndex: 0, format: 's16' });
+		expect([...data]).toEqual([1, 101, 2, 102]);
+
+		using tail = sample.trim(3);
+		expect([tail.numberOfFrames, tail.timestamp]).toEqual([1, 5.003]);
+		using empty = sample.trim(4, 4);
+		expect([empty.numberOfFrames, empty.timestamp]).toEqual([0, 5.004]);
+	});
+
+	test('trims every plane of planar audio', () => {
+		using sample = new AudioSample({
+			data: new Float32Array([0, 0.25, 0.5, 0.75, -0, -0.25, -0.5, -0.75]),
+			format: 'f32-planar',
+			numberOfChannels: 2,
+			sampleRate: 4,
+			timestamp: 0,
+		});
+		using trimmed = sample.trim(2);
+		expect([trimmed.numberOfFrames, trimmed.timestamp, trimmed.format]).toEqual([2, 0.5, 'f32-planar']);
+		const right = new Float32Array(2);
+		trimmed.copyTo(right, { planeIndex: 1, format: 'f32-planar' });
+		expect([...right]).toEqual([-0.5, -0.75]);
+	});
+
+	test('rejects bounds outside the sample and closed samples', () => {
+		using sample = interleaved();
+		expect(() => sample.trim(-1)).toThrow(TypeError);
+		expect(() => sample.trim(0.5)).toThrow(TypeError);
+		expect(() => sample.trim(0, -1)).toThrow(TypeError);
+		expect(() => sample.trim(0, 1.5)).toThrow(TypeError);
+		expect(() => sample.trim(5)).toThrow(RangeError);
+		expect(() => sample.trim(0, 5)).toThrow(RangeError);
+		expect(() => sample.trim(3, 2)).toThrow(RangeError);
+		sample.close();
+		expect(() => sample.trim(0)).toThrow('AudioSample is closed.');
+	});
+
+	test('the data must hold whole frames; clones keep frames, timestamp and data', () => {
+		const init = { format: 's16' as const, numberOfChannels: 2, sampleRate: 1000, timestamp: 0 };
+		expect(() => new AudioSample({ ...init, data: new Int16Array(7) })).toThrow(TypeError);
+
+		using sample = interleaved();
+		sample.setTimestamp(7);
+		using clone = sample.clone();
+		const { numberOfFrames, numberOfChannels, sampleRate, timestamp } = clone;
+		expect([numberOfFrames, numberOfChannels, sampleRate, timestamp]).toEqual([4, 2, 1000, 7]);
+		const data = new Int16Array(8);
+		clone.copyTo(data, { planeIndex: 0, format: 's16' });
+		expect([...data]).toEqual([0, 100, 1, 101, 2, 102, 3, 103]);
+		sample.close();
+		expect(() => sample.clone()).toThrow('AudioSample is closed.');
+	});
+});
+
 describe('AudioSample copyTo and allocationSize validation', () => {
 	// 4 frames of stereo f32 (interleaved): L0 R0 L1 R1 ...
 	const makeSample = () => new AudioSample({
