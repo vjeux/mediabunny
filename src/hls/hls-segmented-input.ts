@@ -38,6 +38,7 @@ import {
 	TAG_ENDLIST,
 	TAG_EXTINF,
 	TAG_GAP,
+	TAG_I_FRAMES_ONLY,
 	TAG_KEY,
 	TAG_MAP,
 	TAG_MEDIA_SEQUENCE,
@@ -196,6 +197,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let lastByteRangeEnd: number | null = null;
 		let nextByteRange: { offset: number; length: number } | null = null;
 		let lastProgramDateTimeSeconds: number | null = null;
+		let iFramesOnly = false;
 
 		// Used for repeated parses where our job it is to only add the new segments
 		let prevLastSegment = last(this.segments) ?? null;
@@ -280,6 +282,28 @@ export class HlsSegmentedInput extends SegmentedInput {
 						length: nextByteRange?.length ?? null,
 					};
 
+					let initSegment = currentInitSegment;
+					if (!initSegment && !currentFirstSegment && iFramesOnly && !currentKey && location.offset > 0) {
+						// "The byte range of an I-frame segment with an EXT-X-BYTERANGE tag applied to it MUST NOT
+						// include its Media Initialization Section; clients can assume that the Media Initialization
+						// Section is defined by the EXT-X-MAP tag, or is located between the start of the resource and
+						// the offset of the first I-frame segment in that resource."
+						// The following segments get it through this first one, like they get stream info from it.
+						initSegment = {
+							index: -1,
+							timestamp: accumulatedTime,
+							unixEpochTimestamp: accumulatedUnixTime,
+							discontinuityNumber: nextDiscontinuityNumber,
+							firstSegment: null,
+							sequenceNumber: null,
+							location: { path: fullPath, offset: 0, length: location.offset },
+							duration: 0,
+							encryption: null,
+							initSegment: null,
+							lastProgramDateTimeSeconds,
+						};
+					}
+
 					const segment: HlsSegment = {
 						index: this.segments.length,
 						timestamp: accumulatedTime,
@@ -290,7 +314,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						location,
 						duration: nextSegmentDuration,
 						encryption: key,
-						initSegment: currentInitSegment,
+						initSegment,
 						lastProgramDateTimeSeconds,
 					};
 
@@ -547,6 +571,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 			} else if (line === TAG_GAP) {
 				nextSegmentIsGap = true;
+			} else if (line === TAG_I_FRAMES_ONLY) {
+				iFramesOnly = true;
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
 				// Counted even for known segments since the discontinuity number is absolute, derived from the
