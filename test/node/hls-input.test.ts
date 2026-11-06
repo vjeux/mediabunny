@@ -2180,6 +2180,177 @@ main.m3u8
 	expect(metadataPackets).toEqual([0, 1, 2]);
 });
 
+test.concurrent('AES-128 I-frame playlists point into resources encrypted as a whole', async () => {
+	// Fragmented MP4 with one fragment per GOP; each I-frame's bytes are filled with its index
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration: 0 }),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source, { frameRate: 30 });
+	await output.start();
+	for (let i = 0; i < 90; i++) {
+		const isKey = i % 30 === 0;
+		await source.add(
+			new EncodedPacket(new Uint8Array(isKey ? 1000 : 100).fill(i / 30 + 1), isKey ? 'key' : 'delta', i / 30, 1 / 30),
+			{ decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } },
+		);
+	}
+	await output.finalize();
+
+	const file = new Uint8Array(output.target.buffer!);
+	const view = new DataView(file.buffer);
+	let initSize = 0;
+	const fragments: { offset: number; moofSize: number; size: number }[] = [];
+	for (let offset = 0; offset < file.length; offset += view.getUint32(offset)) {
+		const type = new TextDecoder().decode(file.subarray(offset + 4, offset + 8));
+		if (type === 'moov') {
+			initSize = offset + view.getUint32(offset);
+		} else if (type === 'moof') {
+			const moofSize = view.getUint32(offset);
+			fragments.push({ offset, moofSize, size: moofSize + view.getUint32(offset + moofSize) });
+		}
+	}
+	expect(fragments).toHaveLength(3);
+	expect(fragments.every(x => x.offset % 16 !== 0)).toBe(true);
+
+	// With AES-128, an I-frame playlist's resource is encrypted as a whole (RFC 8216bis, 5.2), so its byte ranges
+	// don't start on their own cipher blocks
+	const key = new Uint8Array(16).map((_, i) => i * 7 + 1);
+	const iv = new Uint8Array(16).map((_, i) => 255 - i);
+	const algorithm = { name: 'AES-CBC', iv };
+	const cryptoKey = await crypto.subtle.importKey('raw', key, algorithm, false, ['encrypt']);
+	const encrypted = new Uint8Array(await crypto.subtle.encrypt(algorithm, cryptoKey, file));
+
+	const createPlaylist = (iFramesOnly: boolean) => [
+		'#EXTM3U',
+		'#EXT-X-TARGETDURATION:1',
+		'#EXT-X-VERSION:7',
+		'#EXT-X-PLAYLIST-TYPE:VOD',
+		...(iFramesOnly
+			? ['#EXT-X-I-FRAMES-ONLY', `#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x${[...iv].map(x => x.toString(16).padStart(2, '0')).join('')}`]
+			: []),
+		`#EXT-X-MAP:URI="${iFramesOnly ? 'encrypted.mp4' : 'clear.mp4'}",BYTERANGE="${initSize}@0"`,
+		...fragments.flatMap(fragment => [
+			'#EXTINF:1,',
+			`#EXT-X-BYTERANGE:${iFramesOnly ? fragment.moofSize + 8 + 1000 : fragment.size}@${fragment.offset}`,
+			iFramesOnly ? 'encrypted.mp4' : 'clear.mp4',
+		]),
+		'#EXT-X-ENDLIST',
+	].join('\n');
+	const files: Record<string, Uint8Array> = {
+		'master.m3u8': new TextEncoder().encode(`#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=100000,CODECS="vp09.00.10.08"
+main.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=30000,CODECS="vp09.00.10.08",URI="iframes.m3u8"
+`),
+		'main.m3u8': new TextEncoder().encode(createPlaylist(false)),
+		'iframes.m3u8': new TextEncoder().encode(createPlaylist(true)),
+		'clear.mp4': file,
+		'encrypted.mp4': encrypted,
+		'key.bin': key,
+	};
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files[path]!)),
+		formats: ALL_FORMATS,
+	});
+
+	const iFrameTrack = (await input.getVideoTracks())[1];
+	assert(iFrameTrack);
+	expect(await iFrameTrack.hasOnlyKeyPackets()).toBe(true);
+
+	const sink = new EncodedPacketSink(iFrameTrack);
+	const packets: string[] = [];
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextKeyPacket(packet)) {
+		packets.push(`${packet.timestamp} ${packet.type} ${packet.byteLength} ${new Set(packet.data).size === 1 ? packet.data[0] : 'garbage'}`);
+	}
+	expect(packets).toEqual(['0 key 1000 1', '1 key 1000 2', '2 key 1000 3']);
+});
+
+test.concurrent('AES-128 TS I-frame playlist relying on the implicit init section', async () => {
+	// One TS resource encrypted as a whole, like Apple's and Bento4's packagers write it; the I-frame playlist points at
+	// each key frame's PES, so the PAT and PMT come from the bytes before the first I-frame
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceTrack = (await sourceInput.getPrimaryVideoTrack())!;
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource);
+	await output.start();
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		await videoSource.add(packet, { decoderConfig });
+	}
+	await output.finalize();
+	const ts = new Uint8Array(output.target.buffer!);
+
+	// The video PES starts (PID 0x100, payload_unit_start_indicator), key frames flagged by random_access_indicator
+	const pesStarts: { offset: number; key: boolean }[] = [];
+	for (let offset = 0; offset < ts.length; offset += 188) {
+		const pid = ((ts[offset + 1]! & 0x1f) << 8) | ts[offset + 2]!;
+		if (pid === 0x100 && (ts[offset + 1]! & 0x40)) {
+			const hasAdaptationField = (ts[offset + 3]! & 0x20) !== 0;
+			pesStarts.push({ offset, key: hasAdaptationField && ts[offset + 4]! > 0 && (ts[offset + 5]! & 0x40) !== 0 });
+		}
+	}
+	const iFrameRanges = pesStarts.flatMap((pes, i) => (pes.key
+		? [{ offset: pes.offset, length: (pesStarts[i + 1]?.offset ?? ts.length) - pes.offset }]
+		: []));
+	expect(iFrameRanges.length).toBe(5);
+	expect(iFrameRanges[0]!.offset).toBeGreaterThan(0);
+
+	const key = new Uint8Array(16).map((_, i) => i * 7 + 1);
+	const iv = new Uint8Array(16).map((_, i) => 255 - i);
+	const algorithm = { name: 'AES-CBC', iv };
+	const cryptoKey = await crypto.subtle.importKey('raw', key, algorithm, false, ['encrypt']);
+	const encrypted = new Uint8Array(await crypto.subtle.encrypt(algorithm, cryptoKey, ts));
+	const keyTag = `#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x${[...iv].map(x => x.toString(16).padStart(2, '0')).join('')}`;
+
+	const files: Record<string, Uint8Array> = {
+		'master.m3u8': new TextEncoder().encode(`#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=100000,CODECS="avc1.64001e"
+main.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=30000,CODECS="avc1.64001e",URI="iframes.m3u8"
+`),
+		'main.m3u8': new TextEncoder().encode(['#EXTM3U', '#EXT-X-TARGETDURATION:10', '#EXT-X-PLAYLIST-TYPE:VOD', keyTag, '#EXTINF:9,', 'main.ts', '#EXT-X-ENDLIST'].join('\n')),
+		'iframes.m3u8': new TextEncoder().encode([
+			'#EXTM3U',
+			'#EXT-X-VERSION:4',
+			'#EXT-X-TARGETDURATION:2',
+			'#EXT-X-PLAYLIST-TYPE:VOD',
+			'#EXT-X-I-FRAMES-ONLY',
+			keyTag,
+			...iFrameRanges.flatMap(range => ['#EXTINF:1.92,', `#EXT-X-BYTERANGE:${range.length}@${range.offset}`, 'main.ts']),
+			'#EXT-X-ENDLIST',
+		].join('\n')),
+		'main.ts': encrypted,
+		'key.bin': key,
+	};
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files[path]!)),
+		formats: ALL_FORMATS,
+	});
+	const iFrameTrack = (await input.getVideoTracks())[1];
+	assert(iFrameTrack);
+	expect(await iFrameTrack.hasOnlyKeyPackets()).toBe(true);
+
+	// The I-frames are the clear TS's key frames
+	using clearInput = new Input({ source: new BufferSource(ts), formats: ALL_FORMATS });
+	const expected: string[] = [];
+	for await (const packet of new EncodedPacketSink((await clearInput.getPrimaryVideoTrack())!).packets()) {
+		if (packet.type === 'key') {
+			expected.push(`${packet.type} ${packet.byteLength} ${packet.data.slice(-8).join(',')}`);
+		}
+	}
+	const iFrames: string[] = [];
+	for await (const packet of new EncodedPacketSink(iFrameTrack).packets()) {
+		iFrames.push(`${packet.type} ${packet.byteLength} ${packet.data.slice(-8).join(',')}`);
+	}
+	expect(iFrames).toEqual(expected);
+	expect(iFrames).toHaveLength(5);
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
