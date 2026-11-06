@@ -872,10 +872,16 @@ export class UrlSource extends PathedSource {
 
 		if (rangeHeaderValue !== null) {
 			const parsed = parseByteRangeHeader(rangeHeaderValue);
-			if (parsed) {
-				this._offset = parsed.offset;
-				this._length = parsed.length;
+			if (!parsed) {
+				// Silently reading the whole resource instead would ignore what the caller asked for
+				throw new TypeError(
+					`Unsupported Range header '${rangeHeaderValue}': only 'bytes=<start>-' and 'bytes=<start>-<end>'`
+					+ ` (with end >= start) can be mapped onto the resource.`,
+				);
 			}
+
+			this._offset = parsed.offset;
+			this._length = parsed.length;
 		}
 
 		// Most files in the real-world have a single sequential access pattern, but having two in parallel can
@@ -1383,7 +1389,8 @@ export class UrlSource extends PathedSource {
 	}
 }
 
-const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/;
+// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/i;
 const parseByteRangeHeader = (value: string) => {
 	const match = BYTE_RANGE_REGEX.exec(value.trim());
 	if (!match) {
