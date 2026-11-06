@@ -951,6 +951,11 @@ test('MPEG-TS uses an intact copy of a damaged PAT or PMT', async () => {
 	damagedPmt[findFirstSection(0x1000) + 12] = 0x13; // stream_type 0x03 (MPEG-1 audio) -> 0x13
 	expect(await readTracks(damagedPmt)).toEqual(['mp3']);
 
+	// A bit error in the first PAT's pointer_field, so its section (and table_id) is looked for in the wrong place
+	const damagedPointerField = bytes.slice();
+	damagedPointerField[findFirstSection(0) - 1]! ^= 0x80; // pointer_field 0 -> 128
+	expect(await readTracks(damagedPointerField)).toEqual(['mp3']);
+
 	// Some muxers write bad CRCs throughout, so without an intact copy, the damaged one is still used
 	const allBad = bytes.slice();
 	for (let pos = 0; pos < allBad.length; pos += 188) {

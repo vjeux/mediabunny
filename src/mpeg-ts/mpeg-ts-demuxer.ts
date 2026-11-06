@@ -188,6 +188,9 @@ const MAX_DAMAGED_PSI_SECTION_COPY_COUNT = 2;
 
 const getPsiTableId = (payload: Uint8Array) => payload[1 + (payload[0] ?? 0)] ?? null;
 
+const PROGRAM_ASSOCIATION_TABLE_ID = 0x00;
+const PROGRAM_MAP_TABLE_ID = 0x02;
+
 /** Returns the PTS of the PES packet starting in the given TS packet, as it is in the stream. */
 const getRawPesPacketPts = (packet: TsPacket) => {
 	let offset = 0;
@@ -339,7 +342,8 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 
 				if (section.pid === 0 && !hasProgramAssociationTable) {
-					const bitstream = new Bitstream((await this.findIntactPsiSection(section)).payload);
+					const intactSection = await this.findIntactPsiSection(section, PROGRAM_ASSOCIATION_TABLE_ID);
+					const bitstream = new Bitstream(intactSection.payload);
 					const pointerField = bitstream.readAlignedByte();
 
 					bitstream.skipBits(8 * pointerField);
@@ -369,7 +373,8 @@ export class MpegTsDemuxer extends Demuxer {
 
 					hasProgramAssociationTable = true;
 				} else if ((section.pid === programMapPid || isProbablyProgramMap) && !hasProgramMap) {
-					const bitstream = new Bitstream((await this.findIntactPsiSection(section)).payload);
+					const intactSection = await this.findIntactPsiSection(section, PROGRAM_MAP_TABLE_ID);
+					const bitstream = new Bitstream(intactSection.payload);
 					const pointerField = bitstream.readAlignedByte();
 
 					bitstream.skipBits(8 * pointerField);
@@ -1029,12 +1034,13 @@ export class MpegTsDemuxer extends Demuxer {
 	 * check if the given one doesn't, like FFmpeg skips damaged sections. Some muxers write bad CRCs though, so if
 	 * there's no intact copy, we go with the given one.
 	 */
-	async findIntactPsiSection(section: Section): Promise<Section> {
-		if (psiSectionIsIntact(section.payload)) {
+	async findIntactPsiSection(section: Section, tableId: number): Promise<Section> {
+		// The table ID to look for comes from the PID, since the damage may well be in the first copy's pointer_field
+		// or table_id
+		if (psiSectionIsIntact(section.payload) && getPsiTableId(section.payload) === tableId) {
 			return section;
 		}
 
-		const tableId = getPsiTableId(section.payload);
 		const endPos = section.startPos + MAX_PSI_SECTION_REPETITION_DISTANCE;
 		const firstPtsByPid = new Map<number, number>();
 		let damagedCopyCount = 0;
