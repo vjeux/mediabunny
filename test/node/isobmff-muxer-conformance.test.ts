@@ -105,7 +105,7 @@ const mux = async (
 	tracks: TrackSpec[],
 	options: {
 		format?: IsobmffOutputFormat;
-		target?: 'buffer' | 'stream';
+		target?: 'buffer' | 'stream' | 'chunked';
 		tags?: MetadataTags;
 	} = {},
 ) => {
@@ -114,8 +114,11 @@ const mux = async (
 	const chunks: StreamTargetChunk[] = [];
 	const output = new Output({
 		format,
-		target: options.target === 'stream'
-			? new StreamTarget(new WritableStream({ write: chunk => void chunks.push(chunk) }))
+		target: options.target === 'stream' || options.target === 'chunked'
+			? new StreamTarget(
+				new WritableStream({ write: chunk => void chunks.push({ ...chunk, data: chunk.data.slice() }) }),
+				{ chunked: options.target === 'chunked', chunkSize: 4096 },
+			)
 			: new BufferTarget(),
 		initTarget,
 	});
@@ -179,7 +182,7 @@ const mux = async (
 	await output.finalize();
 
 	let bytes: Uint8Array;
-	if (options.target === 'stream') {
+	if (options.target === 'stream' || options.target === 'chunked') {
 		const size = Math.max(...chunks.map(chunk => chunk.position + chunk.data.byteLength));
 		bytes = new Uint8Array(size);
 		for (const chunk of chunks) {
@@ -282,6 +285,21 @@ describe('File layout', () => {
 		const stream = await mux(twoTracks(), { format: new Mp4OutputFormat(), target: 'stream' });
 		expect(topLevelTypes(stream.boxes)).toEqual(['ftyp', 'mdat', 'moov']);
 		expectSamplesAtTheirData(stream.bytes, stream.boxes, [60, 94]);
+	});
+
+	test('the written bytes are the same for BufferTarget and (chunked) StreamTarget', async () => {
+		const tracks = (): TrackSpec[] => [
+			{ kind: 'video', packets: videoPackets(150, { size: 700 }), metadata: { maximumPacketCount: 150 } },
+			{ kind: 'audio', packets: audioPackets(235, { size: 150 }), metadata: { maximumPacketCount: 235 } },
+		];
+		for (const fastStart of [false, 'in-memory', 'reserve', 'fragmented'] as const) {
+			const options = { tags: { creationTime: null } };
+			const reference = await mux(tracks(), { ...options, format: new Mp4OutputFormat({ fastStart }) });
+			for (const target of ['stream', 'chunked'] as const) {
+				const file = await mux(tracks(), { ...options, format: new Mp4OutputFormat({ fastStart }), target });
+				expect(file.bytes).toEqual(reference.bytes);
+			}
+		}
 	});
 
 	test('fastStart: false reserves a large mdat header and shrinks it when the data stays below 4 GiB', async () => {
