@@ -24,6 +24,7 @@ import {
 	PRORES_FOURCCS,
 	ProresFourCc,
 	VideoCodec,
+	VP9_LEVEL_TABLE,
 } from '../codec';
 import {
 	Av1CodecInfo,
@@ -2064,7 +2065,15 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(3); // Flags
 
 				const profile = readU8(slice);
-				const level = readU8(slice);
+				let level = readU8(slice);
+				if (level === 0) {
+					// Not a VP9 level, but Chrome's MediaRecorder writes it into MP4 recordings, and browsers reject
+					// codec strings containing it. Derive the level from the dimensions, like when vpcC is missing.
+					const pictureSize = track.info.width * track.info.height;
+					const levelInfo = VP9_LEVEL_TABLE.find(x => pictureSize <= x.maxPictureSize);
+					level = (levelInfo ?? last(VP9_LEVEL_TABLE)!).level;
+				}
+
 				const thirdByte = readU8(slice);
 				const bitDepth = thirdByte >> 4;
 				const chromaSubsampling = (thirdByte >> 1) & 0b111;

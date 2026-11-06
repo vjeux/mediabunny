@@ -1414,3 +1414,51 @@ test('Key rotation through CENC sample groups in fragments', async () => {
 	expect(packets).toEqual([plaintext, plaintext]);
 	expect(requestedKeyIds).toEqual(keyIds.map(x => Buffer.from(x).toString('hex')));
 });
+
+test('VP9 whose vpcC box has level 0', async () => {
+	// The vpcC box of Chrome's MediaRecorder MP4 recordings, at 320x240: profile 0, level 0, 8-bit 4:2:0, full range,
+	// BT.709 primaries and matrix, sRGB transfer
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const vpcC = box('vpcC', [1, 0, 0, 0], [0x00, 0x00, 0x81, 0x01, 0x0d, 0x01, 0x00, 0x00]);
+	const moov = (chunkOffset: number) => box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(320 << 16), u32(240 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(30), u32(1), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('vp09', zeros(6), [0, 1], zeros(16), [1, 64, 0, 240], zeros(50),
+						vpcC)),
+					box('stts', u32(0), u32(1), u32(1), u32(1)),
+					box('stsc', u32(0), u32(1), u32(1), u32(1), u32(1)),
+					box('stsz', u32(0), u32(4), u32(1)),
+					box('stco', u32(0), u32(1), u32(chunkOffset)),
+				)),
+			),
+		),
+	);
+	const ftyp = box('ftyp', ascii('isom'), u32(0), ascii('isom'));
+	const moovSize = moov(0).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...ftyp,
+			...moov(ftyp.length + moovSize + 8),
+			...box('mdat', zeros(4)),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// Level 2 is the lowest that fits 320x240
+	expect((await track.getDecoderConfig())?.codec).toBe('vp09.00.20.08.00.01.13.01.01');
+});
