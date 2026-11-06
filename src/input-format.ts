@@ -251,13 +251,9 @@ export class MatroskaInputFormat extends InputFormat {
 				return false; // The element overruns the header or is an integer of impossible size
 			}
 
+			// Whether we can read the file is decided by the read versions alone: EBMLVersion and DocTypeVersion may
+			// be higher, since newer elements are skipped (RFC 8794, Section 11.2.3; RFC 9559, Section 7)
 			switch (id) {
-				case EBMLId.EBMLVersion: {
-					const ebmlVersion = readUnsignedInt(dataSlice, size);
-					if (ebmlVersion !== 1) {
-						return false;
-					}
-				}; break;
 				case EBMLId.EBMLReadVersion: {
 					const ebmlReadVersion = readUnsignedInt(dataSlice, size);
 					if (ebmlReadVersion !== 1) {
@@ -270,9 +266,9 @@ export class MatroskaInputFormat extends InputFormat {
 						return false;
 					}
 				}; break;
-				case EBMLId.DocTypeVersion: {
-					const docTypeVersion = readUnsignedInt(dataSlice, size);
-					if (docTypeVersion > 4) { // Support up to Matroska v4
+				case EBMLId.DocTypeReadVersion: {
+					const docTypeReadVersion = readUnsignedInt(dataSlice, size);
+					if (docTypeReadVersion > 4) { // Support up to Matroska v4
 						return false;
 					}
 				}; break;
