@@ -45,7 +45,7 @@ import {
 import { Logging, LogLevel } from '../../src/index.js';
 import { createRandom, createRandomBytes } from './helpers/io-random.js';
 
-/** Reference bit reader using BigInt arithmetic. */
+/** Reference bit reader using BigInt arithmetic; results stay BigInt so that wide reads compare exactly. */
 const referenceReadBits = (bytes: Uint8Array, bitOffset: number, width: number) => {
 	let value = 0n;
 	for (let i = 0; i < width; i++) {
@@ -54,7 +54,7 @@ const referenceReadBits = (bytes: Uint8Array, bitOffset: number, width: number) 
 		const bit = (byte >> (7 - (position & 7))) & 1;
 		value = (value << 1n) | BigInt(bit);
 	}
-	return Number(value);
+	return value;
 };
 
 describe('Bitstream', () => {
@@ -67,7 +67,7 @@ describe('Bitstream', () => {
 			const offset = (random() * (bytes.length * 8 - width)) | 0;
 			const bitstream = new Bitstream(bytes);
 			bitstream.skipBits(offset);
-			expect(bitstream.readBits(width)).toBe(referenceReadBits(bytes, offset, width));
+			expect(BigInt(bitstream.readBits(width))).toBe(referenceReadBits(bytes, offset, width));
 			expect(bitstream.pos).toBe(offset + width);
 		}
 	});
@@ -93,7 +93,7 @@ describe('Bitstream', () => {
 			bitstream.skipBits(offset);
 			bitstream.writeBits(width, value);
 
-			expect(referenceReadBits(bytes, offset, width)).toBe(value);
+			expect(referenceReadBits(bytes, offset, width)).toBe(BigInt(value));
 			expect(referenceReadBits(bytes, 0, offset)).toBe(referenceReadBits(original, 0, offset));
 			const after = bytes.length * 8 - offset - width;
 			const end = offset + width;
