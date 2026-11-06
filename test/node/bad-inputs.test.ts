@@ -659,7 +659,7 @@ test('MP4: Box fields running past the end of the parent box', async () => {
 		expect((await track.getDisposition()).default).toBe(true);
 	}
 
-	// ...and a damaged udta mustn't leave its items in the raw tags of an earlier one
+	// ...and a damaged udta mustn't break an earlier one, or leave raw tags that disagree with the parsed ones
 	const quickTimeText = (name: string, text: string) => box(name, u16(text.length), u16(0), ascii(text));
 	const damagedUdta = box('udta', quickTimeText('\u00a9cmt', 'Stale'), u32(200), ascii('XYZW'), zeros(4));
 	{
@@ -668,8 +668,9 @@ test('MP4: Box fields running past the end of the parent box', async () => {
 			formats: ALL_FORMATS,
 		});
 		const tags = await input.getMetadataTags();
-		expect(tags.comment).toBeUndefined();
-		expect(tags.raw).toEqual({ '\u00a9nam': 'Good' });
+		expect(tags.title).toBe('Good');
+		expect(tags.raw!['\u00a9nam']).toBe('Good');
+		expect(tags.raw!['\u00a9cmt']).toBe(tags.comment);
 	}
 });
 
