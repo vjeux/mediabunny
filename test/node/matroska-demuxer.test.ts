@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +83,71 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('Nested SimpleTags', async () => {
+	// Nested SimpleTags describe their parent, as in the Matroska tagging examples
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const utf8 = (text: string) => [...new TextEncoder().encode(text)];
+	const simpleTag = (...children: number[][]) => element(EBMLId.SimpleTag, ...children);
+	const tagName = (name: string) => element(EBMLId.TagName, utf8(name));
+	const tagString = (value: string) => element(EBMLId.TagString, utf8(value));
+
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, utf8('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, utf8('A_AC3')),
+			)),
+			element(EBMLId.Tags, element(
+				EBMLId.Tag,
+				element(EBMLId.Targets, element(EBMLId.TargetTypeValue, [50])),
+				simpleTag(
+					tagName('ARTIST'),
+					simpleTag(tagName('SORT_WITH'), tagString('Beatles, The')),
+					tagString('The Beatles'),
+				),
+				simpleTag(tagName('ORIGINAL'), simpleTag(tagName('TITLE'), tagString('Original title'))),
+				simpleTag(tagName('TITLE'), tagString('Title')),
+				// Element order within a SimpleTag is free: the nested tag and the value may come before the name
+				simpleTag(
+					simpleTag(tagName('SORT_WITH'), tagString('Brel, Jacques')),
+					tagString('Jacques Brel'),
+					tagName('COMPOSER'),
+				),
+				simpleTag(tagString('Some album'), tagName('ALBUM')),
+			)),
+		),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const tags = await input.getMetadataTags();
+	expect(tags.artist).toBe('The Beatles');
+	expect(tags.title).toBe('Title');
+	expect(tags.album).toBe('Some album');
+	expect(tags.raw).toMatchObject({
+		'ARTIST/SORT_WITH': 'Beatles, The',
+		'ORIGINAL/TITLE': 'Original title',
+		'COMPOSER': 'Jacques Brel',
+		'COMPOSER/SORT_WITH': 'Brel, Jacques',
+	});
 });
