@@ -617,20 +617,29 @@ export class FlacInputFormat extends InputFormat {
 export class AdtsInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
-		let currentPos = 0;
+		/** Returns the position after the ID3v2 tags starting at the given position, if any. */
+		const skipId3V2Tags = async (pos: number) => {
+			while (true) {
+				let slice = input._reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					break;
+				}
 
-		while (true) {
-			let slice = input._reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
-			if (!slice) break;
+				const id3V2Header = readId3V2Header(slice);
+				if (!id3V2Header) {
+					break;
+				}
 
-			const id3V2Header = readId3V2Header(slice);
-			if (!id3V2Header) {
-				break;
+				pos = slice.filePos + id3V2Header.size;
 			}
 
-			currentPos = slice.filePos + id3V2Header.size;
-		}
+			return pos;
+		};
+
+		let currentPos = await skipId3V2Tags(0);
 
 		let slice = input._reader.requestSliceRange(
 			currentPos,
@@ -645,7 +654,8 @@ export class AdtsInputFormat extends InputFormat {
 			return false;
 		}
 
-		currentPos += firstHeader.frameLength;
+		// Packed audio, like HLS segments, may carry timed ID3v2 tags between frames
+		currentPos = await skipId3V2Tags(currentPos + firstHeader.frameLength);
 
 		slice = input._reader.requestSliceRange(
 			currentPos,
