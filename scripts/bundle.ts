@@ -311,12 +311,13 @@ const serverVariants = await createVariants(
 	{
 		platform: 'node',
 		packages: 'external',
-		external: ['mediabunny'],
+		// Listed explicitly because the tsconfig paths would otherwise resolve them to their sources and inline them
+		external: ['mediabunny', '@mediabunny/prores'],
 	},
 	{
 		platform: 'node',
 		packages: 'external',
-		external: ['mediabunny'],
+		external: ['mediabunny', '@mediabunny/prores'],
 	},
 );
 
