@@ -278,7 +278,9 @@ describe('MPEG-TS muxer: PES packetization', () => {
 	test('writes video PES packets unbounded with PTS and DTS, audio ones bounded with PTS', async () => {
 		const { packets } = await mux([avcTrack(6), aacTrack(6)]);
 
-		for (const pes of parsePesPackets(packets, 0x100)) {
+		const video = parsePesPackets(packets, 0x100);
+		expect(video).toHaveLength(6);
+		for (const pes of video) {
 			expect(pes).toMatchObject({
 				pesPacketLength: 0,
 				dataAlignment: true,
@@ -289,7 +291,9 @@ describe('MPEG-TS muxer: PES packetization', () => {
 			expect(pes.headerDataLength).toBe(10);
 		}
 
-		for (const pes of parsePesPackets(packets, 0x101)) {
+		const audio = parsePesPackets(packets, 0x101);
+		expect(audio).toHaveLength(6);
+		for (const pes of audio) {
 			expect(pes).toMatchObject({ dataAlignment: true, ptsMarker: 0b0010, dts: null, headerDataLength: 5 });
 			expect(pes.markerBitsOk).toBe(true);
 			expect(pes.pesPacketLength).toBe(3 + 5 + pes.data.length);
@@ -300,7 +304,9 @@ describe('MPEG-TS muxer: PES packetization', () => {
 		const { packets } = await mux([avcTrack(8), aacTrack(8)]);
 
 		for (const pid of [0x100, 0x101]) {
+			expect(parsePesPackets(packets, pid)).toHaveLength(8);
 			const tsPackets = packets.filter(packet => packet.pid === pid);
+			expect(tsPackets.length).toBeGreaterThanOrEqual(8);
 			for (const packet of tsPackets) {
 				const adaptationLength = packet.adaptation ? 1 + packet.adaptation.length : 0;
 				expect(adaptationLength + packet.payload.length).toBe(184);
@@ -338,6 +344,7 @@ describe('MPEG-TS muxer: PES packetization', () => {
 	test('keeps DTS increasing for video in decode order', async () => {
 		const { packets } = await mux([avcTrack(15, { gop: 5 })]);
 		const dts = parsePesPackets(packets, 0x100).map(pes => pes.dts!);
+		expect(dts).toHaveLength(15);
 		for (let i = 1; i < dts.length; i++) {
 			expect(dts[i]!).toBeGreaterThan(dts[i - 1]!);
 		}
@@ -354,6 +361,7 @@ describe('MPEG-TS muxer: PES packetization', () => {
 			...parsePesPackets(packets, 0x101).map(pes => ({ index: pes.firstPacketIndex, pts: pes.pts! })),
 		].sort((a, b) => a.index - b.index);
 
+		expect(timestamps).toHaveLength(25);
 		expect(timestamps.map(entry => entry.index)).toEqual(pesStarts);
 		for (let i = 1; i < timestamps.length; i++) {
 			expect(timestamps[i]!.pts).toBeGreaterThanOrEqual(timestamps[i - 1]!.pts);
@@ -427,14 +435,10 @@ describe('MPEG-TS muxer: elementary stream conversion', () => {
 		const { packets } = await mux([raw]);
 		const expected = adtsFrame({ payloadSize: 20 });
 
-		for (const pes of parsePesPackets(packets, 0x100)) {
-			expect(pes.data).toEqual(expected);
-		}
+		expect(parsePesPackets(packets, 0x100).map(pes => pes.data)).toEqual([expected, expected, expected]);
 
 		const { packets: adtsPackets } = await mux([aacTrack(3)]);
-		for (const pes of parsePesPackets(adtsPackets, 0x100)) {
-			expect(pes.data).toEqual(expected);
-		}
+		expect(parsePesPackets(adtsPackets, 0x100).map(pes => pes.data)).toEqual([expected, expected, expected]);
 	});
 
 	test('passes MP3, AC-3 and E-AC-3 frames through unchanged', async () => {
