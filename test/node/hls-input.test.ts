@@ -1,5 +1,5 @@
-import fs from 'node:fs';
 /* eslint-disable @stylistic/max-len */
+import fs from 'node:fs';
 import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
