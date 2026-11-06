@@ -44,6 +44,7 @@ import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
 import { HLS_MIME_TYPE, TIMESTAMP_PRIV_OWNER } from './hls-misc';
 import { secondsToMpegTsTimestamp } from '../mpeg-ts/mpeg-ts-misc';
 import type { IsobmffMuxer } from '../isobmff/isobmff-muxer';
+import { MpegTsMuxer } from '../mpeg-ts/mpeg-ts-muxer';
 
 // Maps from WebCodecs to what HLS wants
 const toHlsCodecString = (codecString: string) => {
@@ -108,6 +109,8 @@ type Playlist = {
 		 * segments file which is also a perfectly valid standalone fMP4 valid.
 		 */
 		fragmentedIsobmffOutput: FragmentedIsobmffOutput | null;
+		/** The MPEG-TS continuity counters, which go on from one segment to the next in the file */
+		continuityCounters: Map<number, number>;
 	} | null;
 
 	// For HLS, having a single mutex is too coarse. Every playlist is basically independent and therefore we can have
@@ -994,6 +997,7 @@ export class HlsMuxer extends Muxer {
 						nextOffset: 0,
 						info: segmentInfo,
 						fragmentedIsobmffOutput,
+						continuityCounters: new Map(),
 					};
 				} else {
 					relativeSegmentPath = playlist.singleFile.path;
@@ -1157,6 +1161,11 @@ export class HlsMuxer extends Muxer {
 
 							output.setMetadataTags({ raw: { PRIV: priv } });
 						}
+					}
+
+					if (playlist.singleFile && output._muxer instanceof MpegTsMuxer) {
+						// The segments make up one transport stream, so its continuity counters must not start over
+						output._muxer.continuityCounters = playlist.singleFile.continuityCounters;
 					}
 
 					await output.start();

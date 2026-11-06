@@ -82,7 +82,8 @@ export class MpegTsMuxer extends Muxer {
 
 	private trackDatas: MpegTsTrackData[] = [];
 	private tablesWritten = false;
-	private continuityCounters = new Map<number, number>();
+	/** Per PID. The segments of single-file HLS output share them, since together they make one transport stream. */
+	continuityCounters = new Map<number, number>();
 	private packetBuffer = new Uint8Array(TS_PACKET_SIZE);
 	private packetView = toDataView(this.packetBuffer);
 	private allTracksKnown = promiseWithResolvers();
@@ -552,16 +553,10 @@ export class MpegTsMuxer extends Muxer {
 		let offset = 0;
 		let isFirst = true;
 
-		// Each muxer writes its tables once, with continuity counters starting at 0, so like for the media PIDs, mark
-		// that as a discontinuity. Otherwise, the segments of single-file HLS (one muxer each) repeat the counters.
-		const adaptationField = this.adaptationFieldBuffer.subarray(0, 2);
-		adaptationField[0] = 1; // adaptation_field_length
-		adaptationField[1] = 0x80; // discontinuity_indicator
-
 		// Long PSI sections might span more than one TS packet
 		while (offset < section.length) {
 			const pointerFieldSize = isFirst ? 1 : 0;
-			const availablePayload = 184 - pointerFieldSize - (isFirst ? adaptationField.length : 0);
+			const availablePayload = 184 - pointerFieldSize;
 			const remainingData = section.length - offset;
 			const chunkSize = Math.min(availablePayload, remainingData);
 
@@ -574,7 +569,7 @@ export class MpegTsMuxer extends Muxer {
 				payload = section.subarray(offset, offset + chunkSize);
 			}
 
-			this.writeTsPacket(pid, isFirst, isFirst ? adaptationField : null, payload);
+			this.writeTsPacket(pid, isFirst, null, payload);
 
 			offset += chunkSize;
 			isFirst = false;
