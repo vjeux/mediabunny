@@ -15,13 +15,24 @@ import {
 	WavOutputFormat,
 } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { Conversion } from '../../src/conversion.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Conversion, ConversionAudioOptions } from '../../src/conversion.js';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 
 const QUALITY = new Quality('high');
 import { EBMLId } from '../../src/matroska/ebml.js';
-import { ebml, ebmlFloat, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/mutation-bytes.js';
+import {
+	ebml,
+	ebmlFloat,
+	ebmlString,
+	ebmlUint,
+	mkvFile,
+	mkvSimpleBlock,
+	riffChunk,
+	waveFile,
+	waveFmt,
+} from './helpers/mutation-bytes.js';
 
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
 
@@ -522,5 +533,101 @@ describe('Audio-only remuxing', () => {
 		expect([count, mismatches]).toEqual([original.length, 0]);
 		expect(shift).toBeGreaterThanOrEqual(0);
 		input.dispose();
+	});
+});
+
+describe('PCM audio transcoding options', () => {
+	// 100 ms of 8 kHz stereo s16: L = 0.25, R = -0.125 for the first half, then L = 0, R = 0.5
+	const frames = Array.from({ length: 800 }, (_, i) => (i < 400 ? [8192, -4096] : [0, 16384]));
+	const wav = waveFile([
+		riffChunk('fmt ', waveFmt({ formatTag: 1, channels: 2, sampleRate: 8000, bitsPerSample: 16 })),
+		riffChunk('data', new Uint8Array(new Int16Array(frames.flat()).buffer)),
+	]);
+
+	const convert = async (audio: ConversionAudioOptions) => {
+		const input = new Input({ source: new BufferSource(wav), formats: ALL_FORMATS });
+		const target = new BufferTarget();
+		const output = new Output({ format: new WavOutputFormat(), target });
+		const conversion = await Conversion.init({ input, output, audio, showWarnings: false });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		const track = (await result.getPrimaryAudioTrack())!;
+		// The first frame of the first and second half
+		const picks: number[][] = [];
+		let frameCount = 0;
+		for await (const sample of new AudioSampleSink(track).samples()) {
+			const data = new Float32Array(sample.numberOfFrames * sample.numberOfChannels);
+			sample.copyTo(data, { planeIndex: 0, format: 'f32' });
+			for (let i = 0; i < sample.numberOfFrames; i++) {
+				const frame = frameCount + i;
+				if (frame === 0 || frame === sample.sampleRate / 20) {
+					picks.push([...data.subarray(i * sample.numberOfChannels, (i + 1) * sample.numberOfChannels)]);
+				}
+			}
+			frameCount += sample.numberOfFrames;
+			sample.close();
+		}
+		return {
+			codec: await track.getCodec(),
+			channels: await track.getNumberOfChannels(),
+			sampleRate: await track.getSampleRate(),
+			frameCount,
+			picks,
+		};
+	};
+
+	test.each([
+		['downmixing to mono averages the channels', { numberOfChannels: 1 }, 'pcm-s16', 8000, [[0.0625], [0.25]]],
+		['upmixing to quad leaves the surround channels silent', { numberOfChannels: 4 },
+			'pcm-s16', 8000, [[0.25, -0.125, 0, 0], [0, 0.5, 0, 0]]],
+		['upmixing to 5.1 leaves center, LFE and surrounds silent', { numberOfChannels: 6 },
+			'pcm-s16', 8000, [[0.25, -0.125, 0, 0, 0, 0], [0, 0.5, 0, 0, 0, 0]]],
+		['halving the sample rate halves the frames', { sampleRate: 4000 },
+			'pcm-s16', 4000, [[0.25, -0.125], [0, 0.5]]],
+		['pcm-f32 output', { codec: 'pcm-f32' }, 'pcm-f32', 8000, [[0.25, -0.125], [0, 0.5]]],
+		['pcm-u8 output', { codec: 'pcm-u8' }, 'pcm-u8', 8000, [[0.25, -0.125], [0, 0.5]]],
+		['forced transcoding keeps the samples', { forceTranscode: true }, 'pcm-s16', 8000, [[0.25, -0.125], [0, 0.5]]],
+	] as [string, ConversionAudioOptions, string, number, number[][]][])(
+		'%s',
+		async (_, audio, codec, sampleRate, picks) => {
+			const result = await convert(audio);
+			expect(result).toEqual({
+				codec,
+				channels: picks[0]!.length,
+				sampleRate,
+				frameCount: sampleRate / 10,
+				picks,
+			});
+		},
+	);
+
+	test('process can transform samples, and change the channel count when it says so', async () => {
+		const halved = await convert({
+			process: (sample) => {
+				const data = new Float32Array(sample.numberOfFrames * sample.numberOfChannels);
+				sample.copyTo(data, { planeIndex: 0, format: 'f32' });
+				return new AudioSample({
+					data: data.map(value => value / 2),
+					format: 'f32',
+					numberOfChannels: sample.numberOfChannels,
+					sampleRate: sample.sampleRate,
+					timestamp: sample.timestamp,
+				});
+			},
+		});
+		expect(halved.picks).toEqual([[0.125, -0.0625], [0, 0.25]]);
+
+		const mono = await convert({
+			process: sample => new AudioSample({
+				data: new Float32Array(sample.numberOfFrames).fill(0.25),
+				format: 'f32',
+				numberOfChannels: 1,
+				sampleRate: sample.sampleRate,
+				timestamp: sample.timestamp,
+			}),
+			processedNumberOfChannels: 1,
+		});
+		expect([mono.channels, mono.frameCount, mono.picks]).toEqual([1, 800, [[0.25], [0.25]]]);
 	});
 });
