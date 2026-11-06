@@ -67,3 +67,46 @@ test('Exact output frame count across chunks', async () => {
 
 	expect(outputFrames).toBe(343 * 1152 * 48000 / 22050);
 });
+
+test('Downmixing 7.1 folds the center and surround channels in', async () => {
+	// L, R, C, LFE, BL, BR, SL, SR (WAVE / FFmpeg / Chromium 7.1 order)
+	const [L, R, C, LFE, BL, BR, SL, SR] = [0.1, 0.2, 0.3, 0.4, 0.05, 0.06, 0.07, 0.08];
+
+	const downmix = async (targetNumberOfChannels: number) => {
+		let frame: number[] = [];
+		const resampler = new AudioResampler({
+			targetSampleRate: 48000,
+			targetNumberOfChannels,
+			onSample: async (sample) => {
+				const data = new Float32Array(sample.numberOfFrames * targetNumberOfChannels);
+				sample.copyTo(data, { planeIndex: 0, format: 'f32' });
+				frame = [...data.subarray(0, targetNumberOfChannels)];
+				sample.close();
+			},
+		});
+
+		const sample = new AudioSample({
+			format: 'f32',
+			sampleRate: 48000,
+			numberOfChannels: 8,
+			timestamp: 0,
+			data: new Float32Array(8 * 10).map((_, i) => [L, R, C, LFE, BL, BR, SL, SR][i % 8]!),
+		});
+		await resampler.add(sample);
+		sample.close();
+		await resampler.finalize();
+
+		return frame;
+	};
+
+	const h = Math.SQRT1_2;
+	const expectClose = (actual: number[], expected: number[]) => {
+		expect(actual).toHaveLength(expected.length);
+		actual.forEach((value, i) => expect(value).toBeCloseTo(expected[i]!, 6));
+	};
+
+	expectClose(await downmix(2), [L + h * (C + BL + SL), R + h * (C + BR + SR)]);
+	expectClose(await downmix(1), [h * (L + R) + C + 0.5 * (BL + BR + SL + SR)]);
+	expectClose(await downmix(4), [L + h * C, R + h * C, BL + h * SL, BR + h * SR]);
+	expectClose(await downmix(6), [L, R, C, LFE, SL + h * BL, SR + h * BR]);
+});

@@ -58,7 +58,9 @@ export class AudioResampler {
 
 		// Logic taken from
 		// https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API/Basic_concepts_behind_Web_Audio_API
-		// Most of the mapping functions are branchless.
+		// Most of the mapping functions are branchless. Web Audio doesn't define 7.1, so for it, we assume the channel
+		// order used by WAVE, FFmpeg and Chromium (L, R, C, LFE, BL, BR, SL, SR) and fold its extra surround pair in
+		// like Chromium's ChannelMixingMatrix does, while dropping LFE like Web Audio does for 5.1.
 
 		if (sourceNum === 1 && targetNum === 2) {
 			// Mono to Stereo: M -> L, M -> R
@@ -148,6 +150,50 @@ export class AudioResampler {
 					return sourceData[baseIdx + targetChannelIndex]! + Math.SQRT1_2 * sourceData[baseIdx + 2]!;
 				}
 				return sourceData[baseIdx + targetChannelIndex + 2]!; // SL, SR
+			};
+		} else if (sourceNum === 8 && targetNum === 1) {
+			// 7.1 to Mono: sqrt(1/2) * (L + R) + C + 0.5 * (BL + BR + SL + SR)
+			this.channelMixer = (sourceData: Float32Array, sourceFrameIndex: number) => {
+				const baseIdx = sourceFrameIndex * sourceNum;
+				return Math.SQRT1_2 * (sourceData[baseIdx]! + sourceData[baseIdx + 1]!)
+					+ sourceData[baseIdx + 2]!
+					+ 0.5 * (
+						sourceData[baseIdx + 4]! + sourceData[baseIdx + 5]!
+						+ sourceData[baseIdx + 6]! + sourceData[baseIdx + 7]!
+					);
+			};
+		} else if (sourceNum === 8 && targetNum === 2) {
+			// 7.1 to Stereo: L + sqrt(1/2) * (C + BL + SL), R + sqrt(1/2) * (C + BR + SR)
+			this.channelMixer = (sourceData: Float32Array, sourceFrameIndex: number, targetChannelIndex: number) => {
+				const baseIdx = sourceFrameIndex * sourceNum;
+				return sourceData[baseIdx + targetChannelIndex]!
+					+ Math.SQRT1_2 * (
+						sourceData[baseIdx + 2]!
+						+ sourceData[baseIdx + targetChannelIndex + 4]!
+						+ sourceData[baseIdx + targetChannelIndex + 6]!
+					);
+			};
+		} else if (sourceNum === 8 && targetNum === 4) {
+			// 7.1 to Quad: L + sqrt(1/2) * C, R + sqrt(1/2) * C, BL + sqrt(1/2) * SL, BR + sqrt(1/2) * SR
+			this.channelMixer = (sourceData: Float32Array, sourceFrameIndex: number, targetChannelIndex: number) => {
+				const baseIdx = sourceFrameIndex * sourceNum;
+
+				if (targetChannelIndex < 2) {
+					return sourceData[baseIdx + targetChannelIndex]! + Math.SQRT1_2 * sourceData[baseIdx + 2]!;
+				}
+				return sourceData[baseIdx + targetChannelIndex + 2]! // BL, BR
+					+ Math.SQRT1_2 * sourceData[baseIdx + targetChannelIndex + 4]!; // SL, SR
+			};
+		} else if (sourceNum === 8 && targetNum === 6) {
+			// 7.1 to 5.1: L, R, C, LFE, SL + sqrt(1/2) * BL, SR + sqrt(1/2) * BR
+			this.channelMixer = (sourceData: Float32Array, sourceFrameIndex: number, targetChannelIndex: number) => {
+				const baseIdx = sourceFrameIndex * sourceNum;
+
+				if (targetChannelIndex < 4) {
+					return sourceData[baseIdx + targetChannelIndex]!; // L, R, C, LFE
+				}
+				return sourceData[baseIdx + targetChannelIndex + 2]! // SL, SR
+					+ Math.SQRT1_2 * sourceData[baseIdx + targetChannelIndex]!; // BL, BR
 			};
 		} else {
 			// Discrete fallback: direct mapping with zero-fill or drop
