@@ -585,3 +585,70 @@ test('Nested SimpleTags', async () => {
 		'ORIGINAL/TITLE': 'Original title',
 	});
 });
+
+test('BlockGroup children before the Block', async () => {
+	// Element order within a BlockGroup is free
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [1]),
+				element(EBMLId.CodecID, ascii('V_VP8')),
+				element(
+					EBMLId.Video,
+					element(EBMLId.PixelWidth, [16]),
+					element(EBMLId.PixelHeight, [16]),
+					element(EBMLId.AlphaMode, [1]),
+				),
+			)),
+			element(
+				EBMLId.Cluster,
+				element(EBMLId.Timestamp, [0]),
+				element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 1]),
+				element(
+					EBMLId.BlockGroup,
+					element(EBMLId.BlockDuration, [25]),
+					element(EBMLId.ReferenceBlock, [0xd8]), // -40
+					element(EBMLId.BlockAdditions, element(
+						EBMLId.BlockMore,
+						element(EBMLId.BlockAddID, [1]),
+						element(EBMLId.BlockAdditional, [9, 9]),
+					)),
+					element(EBMLId.Block, [0x81, 0, 40, 0, 2]),
+				),
+			),
+		),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	expect(packets.map(x => [x.timestamp, x.duration, x.type])).toEqual([[0, 0.04, 'key'], [0.04, 0.025, 'delta']]);
+	expect([...packets[1]!.sideData.alpha!]).toEqual([9, 9]);
+});
