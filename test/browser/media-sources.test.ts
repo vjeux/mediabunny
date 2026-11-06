@@ -8,7 +8,7 @@ import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
-import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink, AudioSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -700,6 +700,29 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 
 	expect(await track.getFirstTimestamp()).toBe(1);
 	expect(await track.computeDuration()).toBe(2);
+	input.dispose();
+});
+
+test('AudioSampleSource, Opus encoding of 44.1 kHz audio keeps its last milliseconds', async () => {
+	// The encoder resamples to 48 kHz internally. A click 0.5 ms before the end of 1 s of audio must survive.
+	const sampleRate = 44100;
+	const data = new Float32Array(sampleRate);
+	data[sampleRate - 22] = 1;
+
+	const buffer = await encodeAudio(
+		{ codec: 'opus', quality: new Quality('high') },
+		new AudioSample({ data, format: 'f32', numberOfChannels: 1, sampleRate, timestamp: 0 }),
+	);
+
+	const { input, track } = await readBackAudioTrack(buffer);
+	let peak = 0;
+	for await (using sample of new AudioSampleSink(track).samples(0.9)) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+		peak = Math.max(peak, ...values.map(Math.abs));
+	}
+
+	expect(peak).toBeGreaterThan(0.5);
 	input.dispose();
 });
 
