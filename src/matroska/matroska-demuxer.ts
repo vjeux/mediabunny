@@ -253,6 +253,7 @@ type InternalTrack = {
 			type: 'audio';
 			numberOfChannels: number;
 			sampleRate: number;
+			outputSampleRate: number | null;
 			bitDepth: number;
 			codec: AudioCodec | null;
 			codecDescription: Uint8Array | null;
@@ -277,7 +278,12 @@ const MAX_ELEMENT_NESTING_DEPTH = 64;
  * AAC profile in the codec ID and come without CodecPrivate (written by old versions of mkvmerge, among others). Like
  * FFmpeg's Matroska demuxer, the config is derived from the codec ID and the audio settings.
  */
-const buildLegacyAacAudioSpecificConfig = (codecId: string, sampleRate: number, numberOfChannels: number) => {
+const buildLegacyAacAudioSpecificConfig = (
+	codecId: string,
+	sampleRate: number,
+	outputSampleRate: number,
+	numberOfChannels: number,
+) => {
 	if (!/^A_AAC\/MPEG[24]\//.test(codecId)) {
 		return null;
 	}
@@ -298,8 +304,10 @@ const buildLegacyAacAudioSpecificConfig = (codecId: string, sampleRate: number, 
 	try {
 		return buildAacAudioSpecificConfig({
 			objectType,
-			// The sampling frequency is the core coder's, and SBR doubles it
-			outputSampleRate: objectType === 5 ? 2 * sampleRate : sampleRate,
+			// SamplingFrequency is the core coder's rate and OutputSamplingFrequency the rate after SBR (usually twice
+			// as high). Signaling SBR explicitly with that output rate covers downsampled SBR (equal rates) as well.
+			coreSampleRate: sampleRate,
+			outputSampleRate: objectType === 5 ? outputSampleRate : sampleRate,
 			outputNumberOfChannels: numberOfChannels,
 		});
 	} catch {
@@ -1290,13 +1298,24 @@ export class MatroskaDemuxer extends Demuxer {
 								isMpeg2: this.currentTrack.codecId.includes('MPEG2'),
 								objectType: null,
 							};
-							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate?.byteLength
-								? this.currentTrack.codecPrivate
-								: buildLegacyAacAudioSpecificConfig(
-										this.currentTrack.codecId,
-										this.currentTrack.info.sampleRate,
-										this.currentTrack.info.numberOfChannels,
-									);
+							if (this.currentTrack.codecPrivate?.byteLength) {
+								this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
+							} else {
+								const outputSampleRate = this.currentTrack.info.outputSampleRate
+									?? this.currentTrack.info.sampleRate;
+								const description = buildLegacyAacAudioSpecificConfig(
+									this.currentTrack.codecId,
+									this.currentTrack.info.sampleRate,
+									outputSampleRate,
+									this.currentTrack.info.numberOfChannels,
+								);
+
+								this.currentTrack.info.codecDescription = description;
+								if (description && this.currentTrack.codecId.includes('SBR')) {
+									// What the decoder outputs
+									this.currentTrack.info.sampleRate = outputSampleRate;
+								}
+							}
 						} else if (this.currentTrack.codecId === CODEC_STRING_MAP.mp3) {
 							this.currentTrack.info.codec = 'mp3';
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.opus) {
@@ -1397,6 +1416,7 @@ export class MatroskaDemuxer extends Demuxer {
 						type: 'audio',
 						numberOfChannels: 1, // Default value
 						sampleRate: 8000, // Default value
+						outputSampleRate: null, // Defaults to sampleRate
 						bitDepth: -1,
 						codec: null,
 						codecDescription: null,
@@ -1655,6 +1675,15 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 
 				this.currentTrack.info.sampleRate = sampleRate;
+			}; break;
+
+			case EBMLId.OutputSamplingFrequency: {
+				if (this.currentTrack?.info?.type !== 'audio') break;
+
+				const outputSampleRate = readFloat(slice, size);
+				if (outputSampleRate > 0 && Number.isFinite(outputSampleRate)) {
+					this.currentTrack.info.outputSampleRate = outputSampleRate;
+				}
 			}; break;
 
 			case EBMLId.Channels: {

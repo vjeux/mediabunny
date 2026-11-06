@@ -10,7 +10,8 @@ import {
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
-import { assert } from '../../src/misc.js';
+import { assert, toUint8Array } from '../../src/misc.js';
+import { parseAacAudioSpecificConfig } from '../../shared/aac-misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -96,14 +97,20 @@ test('Deprecated A_AAC codec IDs without CodecPrivate', async () => {
 		new DataView(bytes.buffer).setFloat64(0, value);
 		return bytes;
 	};
-	const file = (codecId: string) => new Uint8Array([
+	const file = (codecId: string, outputSamplingFrequency: number | null = null) => new Uint8Array([
 		...element([0x1a, 0x45, 0xdf, 0xa3], element([0x42, 0x82], [...'matroska'].map(char => char.charCodeAt(0)))),
 		...element([0x18, 0x53, 0x80, 0x67],
 			element([0x16, 0x54, 0xae, 0x6b], element([0xae],
 				element([0xd7], [1]), // TrackNumber
 				element([0x83], [2]), // TrackType: audio
 				element([0x86], [...codecId].map(char => char.charCodeAt(0))),
-				element([0xe1], element([0xb5], float64(22050)), element([0x9f], [2])), // 22.05 kHz, stereo
+				element([0xe1],
+					element([0xb5], float64(22050)), // SamplingFrequency
+					...(outputSamplingFrequency === null
+						? []
+						: [element([0x78, 0xb5], float64(outputSamplingFrequency))]), // OutputSamplingFrequency
+					element([0x9f], [2]), // Channels: stereo
+				),
 			)),
 			element([0x1f, 0x43, 0xb6, 0x75], element([0xe7], [0]), element([0xa3], [0x81, 0, 0, 0x80, 0x21, 0x10])),
 		),
@@ -124,5 +131,30 @@ test('Deprecated A_AAC codec IDs without CodecPrivate', async () => {
 		expect(await track.getCodec()).toBe('aac');
 		expect(await track.getCodecParameterString()).toBe(codecString);
 		expect(await input.getMimeType()).toBe(`audio/x-matroska; codecs="${codecString}"`);
+	}
+
+	// SamplingFrequency is the core coder's rate, and OutputSamplingFrequency (defaulting to it) the rate after SBR
+	const rates = [
+		// Codec ID, OutputSamplingFrequency, expected core rate, expected output rate
+		['A_AAC/MPEG4/LC', 22050, 22050, 22050],
+		['A_AAC/MPEG4/LC/SBR', 44100, 22050, 44100],
+		['A_AAC/MPEG4/LC/SBR', 22050, 22050, 22050], // Downsampled SBR
+		['A_AAC/MPEG4/LC/SBR', null, 22050, 22050],
+	] as const;
+	for (const [codecId, outputSamplingFrequency, coreSampleRate, outputSampleRate] of rates) {
+		using input = new Input({
+			source: new BufferSource(file(codecId, outputSamplingFrequency)),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getAudioTracks())[0];
+		assert(track);
+
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig?.description);
+		const audioSpecificConfig = parseAacAudioSpecificConfig(toUint8Array(decoderConfig.description));
+		expect(audioSpecificConfig.coreSampleRate).toBe(coreSampleRate);
+		expect(audioSpecificConfig.outputSampleRate).toBe(outputSampleRate);
+		expect(decoderConfig.sampleRate).toBe(outputSampleRate);
+		expect(await track.getSampleRate()).toBe(outputSampleRate);
 	}
 });
