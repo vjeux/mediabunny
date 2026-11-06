@@ -39,7 +39,7 @@ import {
 	concatBytes,
 	lengthPrefixed,
 	u32le,
-} from './helpers/mutation-bytes.js';
+} from './helpers/bitstream-builders.js';
 
 // MaxDpbMbs from H.264 Table A-1, keyed by level_idc
 const MAX_DPB_MBS: Record<number, number> = {

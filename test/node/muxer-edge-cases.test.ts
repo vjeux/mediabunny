@@ -14,7 +14,7 @@ import {
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
-import { adtsFrame, annexB, buildAvcSps } from './helpers/mutation-bytes.js';
+import { adtsFrame, annexB, buildAvcSps } from './helpers/bitstream-builders.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 

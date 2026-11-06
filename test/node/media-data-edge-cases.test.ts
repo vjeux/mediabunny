@@ -10,7 +10,7 @@ import { BufferSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
-import { ebml, ebmlFloat, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/mutation-bytes.js';
+import { ebml, ebmlFloat, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/bitstream-builders.js';
 
 describe('EncodedPacketSink verifyKeyPackets', () => {
 	const vp9Frame = (frameType: number, showExisting = false) => {

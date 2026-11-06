@@ -46,7 +46,7 @@ import {
 	u32le,
 	waveFile,
 	waveFmt,
-} from './helpers/mutation-bytes.js';
+} from './helpers/bitstream-builders.js';
 
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
 const openBytes = (bytes: Uint8Array) => new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
