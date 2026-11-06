@@ -3,6 +3,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { CustomSource } from '../../src/source.js';
+import { countMovedArrayElements } from './array-moves.js';
 
 test('Cached sources evict their least recently used entry in constant time', async () => {
 	// 60k ADTS frames of 8 bytes each; without prefetching, every frame header becomes its own cache entry
@@ -31,15 +32,23 @@ test('Cached sources evict their least recently used entry in constant time', as
 	let halfStart = performance.now();
 	let firstHalfDuration = 0;
 	const options = { metadataOnly: true };
-	for (let packet = await sink.getFirstPacket(options); packet; packet = await sink.getNextPacket(packet, options)) {
-		packetCount++;
-		if (packetCount === frameCount / 2) {
-			firstHalfDuration = performance.now() - halfStart;
-			halfStart = performance.now();
+	const movedElements = await countMovedArrayElements(async () => {
+		let packet = await sink.getFirstPacket(options);
+		while (packet) {
+			packetCount++;
+			if (packetCount === frameCount / 2) {
+				firstHalfDuration = performance.now() - halfStart;
+				halfStart = performance.now();
+			}
+			packet = await sink.getNextPacket(packet, options);
 		}
-	}
+	});
 	const secondHalfDuration = performance.now() - halfStart;
 
 	expect(packetCount).toBe(frameCount);
-	expect(secondHalfDuration).toBeLessThan(2 * firstHalfDuration + 100);
+	// Linear: evictions don't splice the cache array one entry at a time (main moved ~9e8 elements)
+	expect(movedElements).toBeLessThan(frameCount);
+	// Finding the entry to evict used to scan the whole cache, which leaves no count to check, hence a timing check
+	// with a generous margin (main: ~4.5 s vs ~0.15 s)
+	expect(secondHalfDuration).toBeLessThan(4 * firstHalfDuration + 500);
 });
