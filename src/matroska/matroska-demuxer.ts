@@ -924,7 +924,9 @@ export class MatroskaDemuxer extends Demuxer {
 		}
 
 		let slice = this.reader.requestSliceRange(pos, MIN_HEADER_SIZE, 64);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		if (!slice || slice.remainingLength < MIN_HEADER_SIZE || readElementHeader(slice)?.id !== EBMLId.Cluster) {
 			return null;
 		}
