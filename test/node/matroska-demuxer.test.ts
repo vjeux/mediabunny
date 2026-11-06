@@ -86,7 +86,7 @@ test('Key packet lookup past position cache entries', async () => {
 });
 
 test('EBML lacing with frame size differences of any width', async () => {
-	// The size differences are signed VINTs of up to 8 bytes; here a difference of 0 takes 1 or 5 bytes
+	// The size differences are signed VINTs of up to 8 bytes
 
 	const element = (id: number, ...parts: number[][]) => {
 		const data = parts.flat();
@@ -107,7 +107,7 @@ test('EBML lacing with frame size differences of any width', async () => {
 	};
 
 	const readFrameSizes = async (sizeDifference: number[]) => {
-		// Three frames of 320 bytes: frame count minus one, the first size (320 as a 2-byte VINT), one difference
+		// Three frames: frame count minus one, the first size (320 as a 2-byte VINT), one difference, 960 bytes in all
 		const lace = [2, 0x41, 0x40, ...sizeDifference];
 		const file = new Uint8Array([
 			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
@@ -150,6 +150,11 @@ test('EBML lacing with frame size differences of any width', async () => {
 		return sizes;
 	};
 
-	expect(await readFrameSizes([0xbf])).toEqual([320, 320, 320]); // 63, minus the bias of 2^6 - 1
-	expect(await readFrameSizes([0x0b, 0xff, 0xff, 0xff, 0xff])).toEqual([320, 320, 320]); // Bias 2^34 - 1
+	// Frames of 320, 322 and (implied) 318 bytes: a difference of +2
+	expect(await readFrameSizes([0xc1])).toEqual([320, 322, 318]); // 65, minus the bias of 2^6 - 1
+	expect(await readFrameSizes([0x0c, 0, 0, 0, 1])).toEqual([320, 322, 318]); // 2^34 + 1, bias 2^34 - 1
+	expect(await readFrameSizes([0x01, 0x80, 0, 0, 0, 0, 0, 1])).toEqual([320, 322, 318]); // 2^55 + 1, bias 2^55 - 1
+	// And -2
+	expect(await readFrameSizes([0xbd])).toEqual([320, 318, 322]);
+	expect(await readFrameSizes([0x01, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd])).toEqual([320, 318, 322]);
 });

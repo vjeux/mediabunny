@@ -914,16 +914,19 @@ export class MatroskaDemuxer extends Demuxer {
 
 					for (let i = 1; i < frameCount - 1; i++) {
 						const startPos = slice.bufferPos;
-						const diffResult = readVarInt(slice);
-						if (diffResult === null) {
+						if (readVarInt(slice) === null) {
 							throw new Error('Invalid EBML lacing: bad frame size.');
 						}
 
-						const unsignedDiff = diffResult;
+						// A signed VINT: its value minus a bias of 2^(7n - 1) - 1 (RFC 9559, 10.3.3). Computed with
+						// BigInt, since an 8-byte VINT holds more bits than a number does exactly.
 						const width = slice.bufferPos - startPos;
-						// 2^(7n - 1) - 1 (RFC 9559, 10.3.3), not with a bit shift, which wraps around past 4 bytes
-						const bias = 2 ** (width * 7 - 1) - 1;
-						const diff = unsignedDiff - bias;
+						slice.bufferPos = startPos;
+						let value = BigInt(readU8(slice) & (0xff >> width)); // Without the width marker
+						for (let j = 1; j < width; j++) {
+							value = (value << 8n) | BigInt(readU8(slice));
+						}
+						const diff = Number(value - ((1n << BigInt(7 * width - 1)) - 1n));
 
 						currentSize += diff;
 						frameSizes.push(currentSize);
