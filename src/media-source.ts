@@ -3395,7 +3395,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let timestampOffset = 0;
 		let lastEndTimestamp: number | null = null;
 
-		const onAudioSample = (audioSample: AudioSample) => {
+		// `captureTime` is when the sample's first audio frame was captured (in seconds, performance.now() time base)
+		const onAudioSample = (audioSample: AudioSample, captureTime = performance.now() / 1000) => {
 			if (errored) {
 				audioSample.close();
 				return;
@@ -3410,7 +3411,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			if (firstAudioDataTimestamp === null) {
 				firstAudioDataTimestamp = audioSample.timestamp;
-				this._firstSampleTime = performance.now() / 1000;
+				this._firstSampleTime = captureTime;
 
 				let target: number;
 				const timestampBase = this._options.timestampBase ?? 'synced-zero';
@@ -3421,10 +3422,10 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 				} else {
 					const output = this._connectedTrack!.output;
 					if (output._firstMediaStreamTimestamp === null) {
-						output._firstMediaStreamTimestamp = performance.now() / 1000;
+						output._firstMediaStreamTimestamp = captureTime;
 						target = 0;
 					} else {
-						target = performance.now() / 1000 - output._firstMediaStreamTimestamp;
+						target = captureTime - output._firstMediaStreamTimestamp;
 					}
 				}
 
@@ -3524,13 +3525,20 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			this._scriptProcessorNode.onaudioprocess = (event) => {
+				// The event only fires once the whole buffer has been captured, so its start was captured a buffer's
+				// duration ago (~93 ms for 4096 frames at 44.1 kHz). Placing it by the time of the event would put the
+				// audio that much too late relative to the other tracks.
+				// eslint-disable-next-line @typescript-eslint/no-deprecated
+				const bufferCaptureTime = performance.now() / 1000 - event.inputBuffer.duration;
+				const bufferTimestamp = totalDuration;
+
 				// eslint-disable-next-line @typescript-eslint/no-deprecated
 				const iterator = AudioSample._fromAudioBuffer(event.inputBuffer, totalDuration);
 				// eslint-disable-next-line @typescript-eslint/no-deprecated
 				totalDuration += event.inputBuffer.duration;
 
 				for (const audioSample of iterator) {
-					onAudioSample(audioSample);
+					onAudioSample(audioSample, bufferCaptureTime + audioSample.timestamp - bufferTimestamp);
 				}
 			};
 		}
