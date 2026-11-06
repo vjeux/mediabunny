@@ -1524,6 +1524,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const retrieveEncodedPacket = async (
 			sectionStartPos: number,
 			predicate: (packet: SuppliedPacket) => boolean,
+			// Whether to also read the packets that share searchPts with the first one reaching it. Data of another
+			// access unit that begins a PES packet takes that PES packet's PTS too, ahead of the key frame.
+			readPacketsAtSearchPts = false,
 		) => {
 			// Load the relevant section in full
 			const section = await demuxer.readSection(sectionStartPos, true);
@@ -1538,7 +1541,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			// Advance until the top-most presentation timestamp crosses or equals searchPts
 			while (true) {
 				const topPts = last(buffer.presentationOrderPackets)?.pts ?? -Infinity;
-				if (topPts >= searchPts) {
+				if (readPacketsAtSearchPts ? topPts > searchPts : topPts >= searchPts) {
 					break;
 				}
 
@@ -1708,8 +1711,18 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 								}
 							}
 
-							isKeyPacket = context.suppliedPacket?.sectionStartPos === pesHeader.sectionStartPos
-								&& context.suppliedPacket.randomAccessIndicator === 1;
+							// Any packet starting in this PES packet may be the key frame: it may begin with data of
+							// another access unit
+							isKeyPacket = false;
+							while (context.suppliedPacket?.sectionStartPos === pesHeader.sectionStartPos) {
+								if (context.suppliedPacket.randomAccessIndicator === 1) {
+									isKeyPacket = true;
+									break;
+								}
+
+								context.suppliedPacket = null;
+								await context.markNextPacket();
+							}
 						}
 
 						if (isKeyPacket) {
@@ -1799,6 +1812,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					const encodedPacket = await retrieveEncodedPacket(
 						startPesHeader.sectionStartPos,
 						p => p.pts <= searchPts && p.randomAccessIndicator === 1,
+						true,
 					);
 					if (encodedPacket) {
 						return encodedPacket;

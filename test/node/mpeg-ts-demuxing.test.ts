@@ -821,7 +821,8 @@ test('MPEG-TS key packet lookup returns the same packet as reading in order', as
 
 test('MPEG-TS key packet lookup finds key frames whose PES packet starts with the previous frame', async () => {
 	// Like Apple's bipbop HLS sample: pictures have two slices, and each PES packet begins with the second slice of
-	// the previous picture before its own AUD. There are no random_access_indicator flags.
+	// the previous picture before its own AUD, the first one too (the file was cut from a longer stream). There are no
+	// random_access_indicator flags.
 	const packets: Uint8Array[] = [];
 	const pushPackets = (pid: number, payload: number[]) => {
 		for (let i = 0; i < payload.length; i += 184) {
@@ -855,7 +856,7 @@ test('MPEG-TS key packet lookup finds key frames whose PES packet starts with th
 	]);
 	for (let i = 0; i < frameCount; i++) {
 		const isKey = i % 4 === 0;
-		const previousTail = i > 0 ? nal(slice((i - 1) % 4 === 0, true)) : [];
+		const previousTail = nal(slice(i > 0 && (i - 1) % 4 === 0, true));
 		const head = [
 			...nal(aud),
 			...(isKey ? [...nal(sps), ...nal(pps)] : []),
@@ -891,6 +892,8 @@ test('MPEG-TS key packet lookup finds key frames whose PES packet starts with th
 	for (const keyPacket of keyPackets) {
 		const found = await sink.getKeyPacket(keyPacket.timestamp);
 		expect(found?.sequenceNumber).toBe(keyPacket.sequenceNumber);
+		const foundLater = await sink.getKeyPacket(keyPacket.timestamp + 1 / 30);
+		expect(foundLater?.sequenceNumber).toBe(keyPacket.sequenceNumber);
 	}
 });
 
