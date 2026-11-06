@@ -306,3 +306,35 @@ test('Decoded audio samples can be looked up by their own timestamps (Matroska)'
 		}
 	}
 });
+
+test('Audio lookups stay sample-exact where packets sit on the sample grid', async () => {
+	// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet
+	// before it
+	for (const file of ['/Toothsome-Meme.VBRv2.mp3', '/sample.flac']) {
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sampleRate = await track.getSampleRate();
+
+		const packetSink = new EncodedPacketSink(track);
+		const packet = await packetSink.getPacket(1);
+		assert(packet);
+		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
+		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
+
+		const sink = new AudioSampleSink(track);
+		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
+		using sampleAt = await sink.getSample(packet.timestamp);
+		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
+
+		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
+			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+			break;
+		}
+	}
+});

@@ -2739,10 +2739,19 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 
 	/** @internal */
 	async _getTimestampTolerance() {
-		// Decoded audio is timed by its sample count (on the sample grid), while the container rounds packet
-		// timestamps to its own resolution (a millisecond in Matroska, for example). So the two can be up to a tick
-		// and a sample apart.
-		return 1 / await this._track.getTimeResolution() + 1 / await this._track.getSampleRate();
+		const timeResolution = await this._track.getTimeResolution();
+		const sampleRate = await this._track.getSampleRate();
+
+		if (Number.isInteger(timeResolution / sampleRate)) {
+			// The container can place a packet on any sample, so decoded audio, timed by its sample count, starts
+			// exactly at its packet's timestamp
+			return 0;
+		}
+
+		// The container rounds packet timestamps to its own resolution (a millisecond in Matroska, for example), so
+		// decoded audio, timed by its sample count, can start up to a tick away from its packet's timestamp. The
+		// epsilon keeps a difference of exactly one tick within the tolerance despite rounding errors.
+		return 1 / timeResolution + 1e-10;
 	}
 
 	/**
@@ -2750,8 +2759,8 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 	 * the last audio sample (in presentation order) with a start timestamp less than or equal to the given timestamp.
 	 * Returns null if the timestamp is before the track's first timestamp.
 	 *
-	 * Decoded audio is timed by its sample count, while containers round packet timestamps to their own precision
-	 * (a millisecond in Matroska, for example), so timestamps are compared within that precision.
+	 * Decoded audio is timed by its sample count, so in containers that round packet timestamps to a coarser
+	 * resolution (a millisecond in Matroska, for example), timestamps are compared within one such tick.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
