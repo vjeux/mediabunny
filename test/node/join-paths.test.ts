@@ -96,3 +96,11 @@ test('joinPaths with Windows paths', () => {
 		expect(joinPaths('/media/hls\\files/master.m3u8', 'playlist-1.m3u8')).toBe('/media/hls\\files/playlist-1.m3u8');
 	});
 });
+
+test('joinPaths keeps the leading ../ segments of relative paths', () => {
+	expect(joinPaths('../master.m3u8', 'media.m3u8')).toBe('../media.m3u8');
+	expect(joinPaths('../../hls/master.m3u8', 'media.m3u8')).toBe('../../hls/media.m3u8');
+	expect(joinPaths('hls/master.m3u8', '../../media.m3u8')).toBe('../media.m3u8');
+	expect(joinPaths('master.m3u8', '../media.m3u8')).toBe('../media.m3u8');
+	expect(joinPaths('../a/master.m3u8', '../b/./media.m3u8')).toBe('../b/media.m3u8');
+});

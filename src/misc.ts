@@ -1277,7 +1277,12 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 	const normalized: string[] = [];
 	for (const segment of segments) {
 		if (segment === '..') {
-			normalized.pop();
+			if (!result.startsWith('/') && (normalized.length === 0 || normalized[normalized.length - 1] === '..')) {
+				// A relative path that climbs above its starting point has to keep its leading '..' segments
+				normalized.push(segment);
+			} else {
+				normalized.pop();
+			}
 		} else if (segment !== '.') {
 			normalized.push(segment);
 		}
