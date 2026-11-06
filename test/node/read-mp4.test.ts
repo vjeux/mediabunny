@@ -1,3 +1,4 @@
+import { createCipheriv } from 'node:crypto';
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -271,4 +272,83 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('Pattern encryption whose last pattern ends inside the encrypted blocks', async () => {
+	// With a 2:8 pattern over 184 protected bytes, the last pattern holds one complete block, which is encrypted,
+	// and 8 bytes that stay clear (ISO/IEC 23001-7 10.4.2)
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const key = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+	const iv = Buffer.from('a0a1a2a3a4a5a6a7a8a9aaabacadaeaf', 'hex');
+	const keyId = zeros(16).map((_, i) => 0x10 + i);
+
+	const plaintext = Array.from({ length: 5 + 184 }, (_, i) => (i * 7) & 0xff);
+	const cryptBlocks = [[5, 32], [5 + 160, 16]]; // [offset, length] of the encrypted parts
+
+	const build = (scheme: 'cens' | 'cbcs') => {
+		const cipher = scheme === 'cens'
+			? createCipheriv('aes-128-ctr', key, iv)
+			: createCipheriv('aes-128-cbc', key, iv).setAutoPadding(false);
+		const ciphertext = [...plaintext];
+		for (const [offset, length] of cryptBlocks) {
+			const encrypted = cipher.update(Buffer.from(plaintext.slice(offset, offset! + length!)));
+			ciphertext.splice(offset!, length!, ...encrypted);
+		}
+
+		const tenc = box('tenc', [1, 0, 0, 0], [0, 0x28, 1, scheme === 'cens' ? 16 : 0], keyId,
+			scheme === 'cbcs' ? [16, ...iv] : []);
+		const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), box('sinf', box('frma', ascii('avc1')),
+			box('schm', zeros(4), ascii(scheme), u32(0x10000)), box('schi', tenc)));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(1), encv),
+						box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+					)),
+				),
+			),
+			box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+		);
+		const senc = box('senc', u32(2), u32(1), scheme === 'cens' ? [...iv] : [], u16(1), u16(5), u32(184));
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(0)),
+			box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(ciphertext.length)),
+			senc,
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+
+		return new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', ciphertext),
+		]);
+	};
+
+	for (const scheme of ['cens', 'cbcs'] as const) {
+		using input = new Input({
+			source: new BufferSource(build(scheme)),
+			formats: ALL_FORMATS,
+			formatOptions: { isobmff: { resolveKeyId: () => key } },
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		expect([...packet!.data]).toEqual(plaintext);
+	}
 });
