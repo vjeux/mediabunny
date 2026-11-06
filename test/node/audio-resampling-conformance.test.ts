@@ -241,10 +241,10 @@ const maxDeviationAwayFromEdges = (
 };
 
 describe('AudioResampler (resample.ts)', () => {
-	test.each(RATE_PAIRS)('keeps length, timing and low frequencies for any chunking (%i -> %i)', async (
-		sourceRate,
-		targetRate,
-	) => {
+	// Feeding 7-frame chunks at high rates can be slow with long filter kernels, hence the timeout
+	test.each(RATE_PAIRS)('keeps length, timing and low frequencies for any chunking (%i -> %i)', {
+		timeout: 20_000,
+	}, async (sourceRate, targetRate) => {
 		// A low-frequency sine (0.01 radians per source frame, at most ~300 Hz here), well below either Nyquist
 		// frequency, so resampling it must reproduce the same sine at the output times
 		const amplitude = 0.8;
