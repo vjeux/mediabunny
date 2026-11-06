@@ -967,7 +967,13 @@ export class IsobmffDemuxer extends Demuxer {
 		try {
 			return this.parseBox(slice);
 		} catch (error) {
-			if (!(error instanceof SliceRangeError)) {
+			slice.filePos = startPos;
+			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
+			const name = size > 0 ? readAscii(slice, 4) : '';
+
+			// Sample tables are read as a whole: a failure discards the partial table (see getSampleTableForTrack)
+			const sampleTableBoxes = ['stbl', 'stts', 'ctts', 'stss', 'stsc', 'stsz', 'stz2', 'stco', 'co64'];
+			if (!(error instanceof SliceRangeError) || sampleTableBoxes.includes(name)) {
 				throw error;
 			}
 
@@ -978,8 +984,6 @@ export class IsobmffDemuxer extends Demuxer {
 			this.isReadingTraf = isReadingTraf;
 			this.currentMetadataKeys = currentMetadataKeys;
 
-			slice.filePos = startPos;
-			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
 			if (size < MIN_BOX_HEADER_SIZE) {
 				return false; // Nothing to skip to (size 0 runs to the end, size 1 is a 64-bit size)
 			}

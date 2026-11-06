@@ -590,11 +590,11 @@ test('MP4: Encryption subsamples exceeding the sample', async () => {
 
 test('MP4: Sample table failing to parse', async () => {
 	// A failed parse used to leave a half-built sample table behind, which later calls then tripped over
-	const invalidStz2 = fullBox('stz2', 0, 0, zeros(3), u8(3), u32(3)); // 3-bit field size doesn't exist
+	const truncatedStco = fullBox('stco', 0, 0, u32(1000), u32(0));
 	using input = new Input({
 		source: new BufferSource(mp4([trak({
 			handler: 'vide',
-			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), invalidStz2, stco([0])],
+			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), stsz([4, 4, 4]), truncatedStco],
 		})])),
 		formats: ALL_FORMATS,
 	});
@@ -603,8 +603,7 @@ test('MP4: Sample table failing to parse', async () => {
 	const firstError = await sink.getFirstPacket().catch((error: unknown) => error);
 	const secondError = await sink.getFirstPacket().catch((error: unknown) => error);
 
-	expect(firstError).toBeInstanceOf(Error);
-	expect(String(firstError)).toMatch(/stz2/);
+	expect(firstError).toBeInstanceOf(RangeError);
 	expect(secondError).toEqual(firstError);
 });
 
