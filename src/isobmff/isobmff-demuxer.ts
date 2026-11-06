@@ -157,6 +157,8 @@ type InternalTrack = {
 	editListPreviousSegmentDurations: number;
 	/** The media time offset of the main edit list entry (with media time !== -1) */
 	editListOffset: number;
+	/** See getMaxReorderedSamples; computed on first use */
+	maxReorderedSamples?: number;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
@@ -3397,6 +3399,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestampInTimescale,
 			timestampInTimescale,
 			options,
+			false,
+			true,
 		);
 	}
 
@@ -3664,11 +3668,56 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 		// Whether the match must be a key frame, so that position cache entries without one can be skipped
 		requireKeyFrame = false,
+		// Whether the best match is the one with the latest presentation timestamp across all fragments. Fragments may
+		// interleave in presentation order (B-frames in fragments that don't start a GOP), so then the match found in
+		// one fragment is only final once no fragment before or after it can hold a later presentation timestamp.
+		matchByPresentationTimestamp = false,
 	): Promise<EncodedPacket | null> {
 		const { demuxer, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
 
 		let bestFragment: Fragment | null = null;
 		let bestSampleIndex = -1;
+
+		const getPresentationTimestamp = (fragment: Fragment, sampleIndex: number) => {
+			return fragment.trackData.get(this.internalTrack.id)!.samples[sampleIndex]!.presentationTimestamp;
+		};
+		const isBetterMatch = (fragment: Fragment, sampleIndex: number) => {
+			if (!bestFragment || !matchByPresentationTimestamp) {
+				return true;
+			}
+
+			const timestamp = getPresentationTimestamp(fragment, sampleIndex);
+			const bestTimestamp = getPresentationTimestamp(bestFragment, bestSampleIndex);
+			return timestamp > bestTimestamp
+				|| (timestamp === bestTimestamp && fragment.moofOffset > bestFragment.moofOffset);
+		};
+
+		// When matching by presentation timestamp, only what the scanned samples prove about the others ends the
+		// search, not where the fragments' timestamps happen to lie: a sample presented at or before latestTimestamp
+		// can't be decoded after more than maxReorderedSamples samples presented after it, so the forward scan can
+		// stop once it has seen more of those. And no sample decoded before a sync sample is presented after it, so
+		// the scan needn't go back further than a sync sample presented at or before latestTimestamp.
+		const maxReorderedSamples = matchByPresentationTimestamp ? getMaxReorderedSamples(this.internalTrack) : 0;
+		let samplesPresentedAfter = 0;
+		let syncSampleFound = false;
+		const scanSamples = (fragment: Fragment) => {
+			const trackData = fragment.trackData.get(this.internalTrack.id);
+			if (!trackData) {
+				return;
+			}
+
+			// The fragment's samples in presentation order
+			const { presentationTimestamps, samples } = trackData;
+			const index = binarySearchLessOrEqual(
+				presentationTimestamps,
+				latestTimestamp,
+				x => x.presentationTimestamp,
+			);
+			samplesPresentedAfter += presentationTimestamps.length - (index + 1);
+			for (let i = 0; i <= index && !syncSampleFound; i++) {
+				syncSampleFound = samples[presentationTimestamps[i]!.sampleIndex]!.isKeyFrame;
+			}
+		};
 
 		if (startFragment) {
 			const { sampleIndex, correctSampleFound } = getMatchInFragment(startFragment);
@@ -3721,6 +3770,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				if (lookupEntryPosition === null || startFragment.moofOffset >= lookupEntryPosition) {
 					currentPos = startFragment.moofOffset + startFragment.moofSize;
 					currentFragment = startFragment;
+					if (matchByPresentationTimestamp) {
+						scanSamples(startFragment);
+					}
 				} else {
 					// Use the lookup entry
 					currentPos = lookupEntryPosition;
@@ -3732,7 +3784,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			while (currentPos < stopPos) {
 				if (currentFragment) {
 					const trackData = currentFragment.trackData.get(this.internalTrack.id);
-					if (trackData && trackData.startTimestamp > latestTimestamp) {
+					const pastUpperBound = matchByPresentationTimestamp
+						// Only the first scan goes forward; scans further back must reach the fragments scanned before
+						? stopPos === Infinity && samplesPresentedAfter > maxReorderedSamples
+						: trackData && trackData.startTimestamp > latestTimestamp;
+					if (pastUpperBound) {
 						// We're already past the upper bound, no need to keep searching
 						break;
 					}
@@ -3765,11 +3821,15 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 						break;
 					}
 
+					if (matchByPresentationTimestamp) {
+						scanSamples(currentFragment);
+					}
+
 					const { sampleIndex, correctSampleFound } = getMatchInFragment(currentFragment);
-					if (correctSampleFound) {
+					if (correctSampleFound && !matchByPresentationTimestamp) {
 						return this.fetchPacketInFragment(currentFragment, sampleIndex, options);
 					}
-					if (sampleIndex !== -1) {
+					if (sampleIndex !== -1 && isBetterMatch(currentFragment, sampleIndex)) {
 						bestFragment = currentFragment;
 						bestSampleIndex = sampleIndex;
 					}
@@ -3778,12 +3838,20 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				currentPos = boxStartPos + boxInfo.totalSize;
 			}
 
-			if (lookupEntryPosition === null || (bestFragment && bestFragment.moofOffset >= lookupEntryPosition)) {
+			if (
+				lookupEntryPosition === null
+				|| (
+					bestFragment
+					&& bestFragment.moofOffset >= lookupEntryPosition
+					&& (!matchByPresentationTimestamp || syncSampleFound)
+				)
+			) {
 				break;
 			}
 
-			// We found a lookup entry but no fragment from there on that satisfied the match. In this case, let's
-			// search again from the lookup entry preceding the fragments we just scanned.
+			// We found a lookup entry but no fragment from there on that satisfied the match (or, when matching by
+			// presentation timestamp, an earlier fragment may still hold a better one). In this case, let's search
+			// again from the lookup entry preceding the fragments we just scanned.
 			stopPos = scanStartPos; // So we don't read the same fragments again
 			startFragment = null;
 		}
@@ -4212,6 +4280,48 @@ const getNextKeyframeIndexForSample = (sampleTable: SampleTable, sampleIndex: nu
 
 	const index = binarySearchLessOrEqual(sampleTable.keySampleIndices, sampleIndex, x => x);
 	return sampleTable.keySampleIndices[index + 1] ?? -1;
+};
+
+/**
+ * No sample is presented before more than this many samples that precede it in decoding order: AVC, HEVC and VVC can't
+ * reorder more frames than their decoded picture buffer holds (16 frames, 32 fields), and other codecs reorder less.
+ */
+const MAX_REORDERED_SAMPLES = 32;
+
+/** The most samples that can precede any sample of the track in decoding order and follow it in presentation order. */
+const getMaxReorderedSamples = (track: InternalTrack) => {
+	if (track.maxReorderedSamples !== undefined) {
+		return track.maxReorderedSamples;
+	}
+
+	const info = track.info;
+	let maxReorderedSamples = MAX_REORDERED_SAMPLES;
+	if (info?.type === 'audio') {
+		maxReorderedSamples = 0;
+	} else if (info?.type === 'video') {
+		if (info.codec === 'vp8' || info.codec === 'vp9' || info.codec === 'av1') {
+			// Their ISOBMFF bindings store one displayed frame per sample, in presentation order
+			maxReorderedSamples = 0;
+		} else if (info.codec === 'avc' && info.codecDescription) {
+			const sps = deserializeAvcDecoderConfigurationRecord(info.codecDescription)?.sequenceParameterSets[0];
+			const spsInfo = sps && parseAvcSps(sps);
+			if (spsInfo) {
+				// num_reorder_frames counts frames, whose two fields can be separate samples
+				maxReorderedSamples = spsInfo.frameMbsOnlyFlag
+					? spsInfo.numReorderFrames
+					: 2 * spsInfo.numReorderFrames + 1;
+			}
+		} else if (info.codec === 'hevc' && info.codecDescription) {
+			const sps = deserializeHevcDecoderConfigurationRecord(info.codecDescription)
+				?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
+			const spsInfo = sps && parseHevcSps(sps);
+			if (spsInfo) {
+				maxReorderedSamples = spsInfo.maxDecFrameBuffering; // At least sps_max_num_reorder_pics
+			}
+		}
+	}
+
+	return track.maxReorderedSamples = maxReorderedSamples;
 };
 
 const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timestamp: number) => {
