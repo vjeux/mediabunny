@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +83,63 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('Official Matroska tag names for the date and the track total', async () => {
+	// The Matroska tagging spec names the dates DATE_RELEASED, DATE_RECORDED, ... and the track total TOTAL_PARTS
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const utf8 = (text: string) => [...new TextEncoder().encode(text)];
+	const simpleTag = (name: string, value: string) => element(
+		EBMLId.SimpleTag,
+		element(EBMLId.TagName, utf8(name)),
+		element(EBMLId.TagString, utf8(value)),
+	);
+
+	const fileWithTags = (...simpleTags: number[][]) => new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, utf8('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, utf8('A_AC3')),
+			)),
+			element(EBMLId.Tags, element(
+				EBMLId.Tag,
+				element(EBMLId.Targets, element(EBMLId.TargetTypeValue, [50])),
+				...simpleTags,
+			)),
+		),
+	]);
+
+	const readTags = async (file: Uint8Array) => {
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		return await input.getMetadataTags();
+	};
+
+	const released = await readTags(fileWithTags(
+		simpleTag('DATE_RELEASED', '2019-05-01'),
+		simpleTag('TOTAL_PARTS', '12'),
+	));
+	expect(released.date).toEqual(new Date('2019-05-01'));
+	expect(released.tracksTotal).toBe(12);
+
+	const recorded = await readTags(fileWithTags(simpleTag('DATE_RECORDED', '2018-02-03')));
+	expect(recorded.date).toEqual(new Date('2018-02-03'));
 });
