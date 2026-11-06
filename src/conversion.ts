@@ -2433,19 +2433,25 @@ export class Conversion {
 
 		let maximumPacketCount = trackOptions.maximumPacketCount;
 		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
-			let packetRate: number;
-			if (needsTranscode) {
-				assert(outputCodec);
-				packetRate = sampleRate / getMinimumAudioPacketSize(outputCodec, sampleRate);
+			if (!needsTranscode && !await track.isLive()) {
+				// Copied packets can come at a varying rate too (think Opus with DTX, which only sends a packet
+				// every 400 ms during silence), so count them
+				maximumPacketCount = await this._countPacketsInTrimRange(track, copyStartPacket) + 64;
 			} else {
-				packetRate = (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				let packetRate: number;
+				if (needsTranscode) {
+					assert(outputCodec);
+					packetRate = sampleRate / getMinimumAudioPacketSize(outputCodec, sampleRate);
+				} else {
+					packetRate = (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				}
+
+				const startTimestamp = needsTranscode
+					? this._startTimestamp
+					: copyStartPacket?.timestamp ?? this._startTimestamp;
+
+				maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
 			}
-
-			const startTimestamp = needsTranscode
-				? this._startTimestamp
-				: copyStartPacket?.timestamp ?? this._startTimestamp;
-
-			maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
 		}
 
 		this.output.addAudioTrack(audioSource, {

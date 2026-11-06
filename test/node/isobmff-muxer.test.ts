@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -779,6 +779,37 @@ test('Reserved Fast Start conversion of a video whose frame rate rises later on'
 
 	using outputInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
 	const outputTrack = await outputInput.getPrimaryVideoTrack();
+	assert(outputTrack);
+	expect((await outputTrack.computePacketStats()).packetCount).toBe(timestamps.length);
+});
+
+test('Reserved Fast Start conversion of audio whose packet rate rises later on', async () => {
+	// Like a WebRTC recording with DTX: one Opus packet per 400 ms during silence, then one per 20 ms
+	const timestamps = [
+		...Array.from({ length: 300 }, (_, i) => i * 0.4),
+		...Array.from({ length: 3000 }, (_, i) => 120 + i * 0.02),
+	];
+
+	const inputOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const inputSource = new EncodedAudioPacketSource('opus');
+	inputOutput.addAudioTrack(inputSource);
+	await inputOutput.start();
+	for (let i = 0; i < timestamps.length; i++) {
+		await inputSource.add(
+			new EncodedPacket(new Uint8Array([0xfc, i & 0xff]), 'key', timestamps[i]!, 0.02),
+			i === 0 ? { decoderConfig: { codec: 'opus', numberOfChannels: 1, sampleRate: 48000 } } : undefined,
+		);
+	}
+	await inputOutput.finalize();
+
+	using input = new Input({ source: new BufferSource(inputOutput.target.buffer!), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
+
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	await conversion.execute(); // Used to exceed the estimated maximum packet count
+
+	using outputInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const outputTrack = await outputInput.getPrimaryAudioTrack();
 	assert(outputTrack);
 	expect((await outputTrack.computePacketStats()).packetCount).toBe(timestamps.length);
 });
