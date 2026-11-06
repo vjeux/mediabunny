@@ -2244,6 +2244,12 @@ class PacketReadingContext {
 			let firstField: AvcSliceField | null = null;
 			// Where the packet ends unless the next picture turns out to be the second field
 			let pendingBoundaryPos: number | null = null;
+			// Where the AUD beginning the second field's access unit ends, if it begins with one
+			let pendingAudEndPos: number | null = null;
+			let pendingBoundaryIsAud = false;
+			// AUDs of second fields, which we leave out of the packet (Chromium's decoder workaround in the sink cuts a
+			// packet at an AUD that follows picture data). Mediabunny's MPEG-TS muxer writes field pairs without them.
+			const droppedRanges: { start: number; end: number }[] = [];
 
 			while (true) {
 				let remaining = this.ensureBuffered(CHUNK_SIZE);
@@ -2298,6 +2304,10 @@ class PacketReadingContext {
 
 					// The packet only really begins at the first NAL unit; anything before it isn't usable
 					packetStartPos ??= startCodePos;
+
+					if (pendingBoundaryIsAud && pendingAudEndPos === null && startCodePos > pendingBoundaryPos!) {
+						pendingAudEndPos = startCodePos;
+					}
 
 					const nalHeaderStart = i + startCodeLength;
 					const payloadStart = nalHeaderStart + nalHeaderSize;
@@ -2388,8 +2398,16 @@ class PacketReadingContext {
 								) {
 									// The second field of the frame, so the packet goes on
 									startsNewPicture = false;
+									if (pendingBoundaryIsAud) {
+										droppedRanges.push({
+											start: pendingBoundaryPos!,
+											end: pendingAudEndPos ?? startCodePos,
+										});
+									}
 									firstField = null;
 									pendingBoundaryPos = null;
+									pendingAudEndPos = null;
+									pendingBoundaryIsAud = false;
 								}
 							}
 						} else {
@@ -2406,7 +2424,10 @@ class PacketReadingContext {
 					} else if (isAccessUnitStart && frameStartFound) {
 						if (firstField) {
 							// This might begin the second field; the next slice will tell
-							pendingBoundaryPos ??= startCodePos;
+							if (pendingBoundaryPos === null) {
+								pendingBoundaryPos = startCodePos;
+								pendingBoundaryIsAud = isAccessUnitDelimiter;
+							}
 						} else {
 							isFrameBoundary = true;
 						}
@@ -2420,7 +2441,7 @@ class PacketReadingContext {
 						// End the packet at this start code (the next frame begins here)
 						const packetLength = (pendingBoundaryPos ?? startCodePos) - packetStartPos;
 						this.seekTo(packetStartPos);
-						return this.supplyPacket(packetLength, 0);
+						return this.supplyPacket(packetLength, 0, droppedRanges);
 					}
 
 					i += startCodeLength;
@@ -2438,7 +2459,7 @@ class PacketReadingContext {
 
 				const packetLength = (pendingBoundaryPos ?? this.endPos) - packetStartPos;
 				this.seekTo(packetStartPos);
-				return this.supplyPacket(packetLength, 0);
+				return this.supplyPacket(packetLength, 0, droppedRanges);
 			}
 		} else {
 			const codec = elementaryStream.info.codec;
@@ -2698,7 +2719,12 @@ class PacketReadingContext {
 	}
 
 	/** Supplies the context with a new encoded packet, beginning at the current position. */
-	supplyPacket(packetLength: number, intrinsicDuration: number) {
+	supplyPacket(
+		packetLength: number,
+		intrinsicDuration: number,
+		// Ranges (in context positions) to leave out of the packet's data
+		droppedRanges: { start: number; end: number }[] = [],
+	) {
 		const currentPesPacket = this.getCurrentPesPacket();
 
 		let pts: number;
@@ -2722,7 +2748,26 @@ class PacketReadingContext {
 		// The sequence number is the starting position of the section the PES packet is in, PLUS the offset within the
 		// PES packet where the packet starts.
 		const sequenceNumber = sectionStartPos + (this.currentPos - this.currentPesPacketPos);
-		const data = this.readBytes(packetLength);
+		const packetStartPos = this.currentPos;
+		let data = this.readBytes(packetLength);
+
+		if (droppedRanges.length > 0) {
+			const parts: Uint8Array[] = [];
+			let offset = 0;
+			for (const range of droppedRanges) {
+				parts.push(data.subarray(offset, range.start - packetStartPos));
+				offset = range.end - packetStartPos;
+			}
+			parts.push(data.subarray(offset));
+
+			const filtered = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+			let pos = 0;
+			for (const part of parts) {
+				filtered.set(part, pos);
+				pos += part.length;
+			}
+			data = filtered;
+		}
 
 		let randomAccessIndicator = currentPesPacket.randomAccessIndicator;
 
