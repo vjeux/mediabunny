@@ -1170,6 +1170,17 @@ export const bytesToBase64 = (bytes: Uint8Array) => {
 	return btoa(string);
 };
 
+export const concatUint8Arrays = (arrays: Uint8Array[]) => {
+	const result = new Uint8Array(arrays.reduce((sum, x) => sum + x.byteLength, 0));
+	let offset = 0;
+	for (const array of arrays) {
+		result.set(array, offset);
+		offset += array.byteLength;
+	}
+
+	return result;
+};
+
 export const uint8ArraysAreEqual = (a: Uint8Array, b: Uint8Array) => {
 	if (a.length !== b.length) {
 		return false;
