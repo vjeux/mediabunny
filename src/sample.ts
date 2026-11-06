@@ -490,7 +490,8 @@ export class VideoSample implements Disposable {
 			this._data = init._doNotCopy
 				? toUint8Array(data)
 				: toUint8Array(data).slice(); // Copy it
-			this._layout = layout;
+			// Own copy of the layout, so later changes to the caller's objects can't move the planes (like the data)
+			this._layout = layout.map(({ offset, stride }) => ({ offset, stride }));
 			this.colorSpace = new VideoSampleColorSpace(colorSpaceInit);
 		} else if (typeof VideoFrame !== 'undefined' && data instanceof VideoFrame) {
 			if (init?.rotation !== undefined && ![0, 90, 180, 270].includes(init.rotation)) {
