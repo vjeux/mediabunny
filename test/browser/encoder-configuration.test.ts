@@ -379,7 +379,10 @@ describe('Key frames', () => {
 			timestamps,
 		});
 		expect(result.error).toBe(null);
-		return result.packets.filter(x => x.type === 'key').map(x => Math.round(x.timestamp * 1000) / 1000);
+		return result.packets
+			.filter(x => x.type === 'key')
+			.map(x => Math.round(x.timestamp * 1000) / 1000)
+			.sort((a, b) => a - b);
 	};
 
 	test('keyFrameInterval puts key frames on its multiples of absolute time', { timeout: 60_000 }, async () => {
@@ -636,8 +639,11 @@ describe('Frame geometry and timing', () => {
 			});
 			expect(result.error).toBe(null);
 			expect(result.packets.length).toBe(25);
-			expect(result.packets.filter(x => x.type === 'key').map(x => Math.round(x.timestamp * 10) / 10))
-				.toEqual([0, 1, 2]);
+			const keyTimestamps = result.packets
+				.filter(x => x.type === 'key')
+				.map(x => Math.round(x.timestamp * 10) / 10)
+				.sort((a, b) => a - b);
+			expect(keyTimestamps).toEqual([0, 1, 2]);
 		}
 	});
 });
@@ -662,7 +668,8 @@ describe('Callbacks', () => {
 			expect(result.decoderConfigs.length).toBeGreaterThan(0);
 			expect(result.decoderConfigs[0]).toMatchObject({ codedWidth: 160, codedHeight: 120 });
 			expect(result.encodedSampleTimestamps).toEqual([0, 0.04, 0.08, 0.12, 0.16]);
-			expect(result.packets.map(x => x.timestamp)).toEqual([0, 0.04, 0.08, 0.12, 0.16]);
+			// Packets come in decode order, which differs from presentation order with B-frames
+			expect(result.packets.map(x => x.timestamp).sort((a, b) => a - b)).toEqual([0, 0.04, 0.08, 0.12, 0.16]);
 		}
 	});
 });
