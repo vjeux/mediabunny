@@ -1815,3 +1815,35 @@ test('Encryption info in the senc box of a non-fragmented file', async () => {
 	expect(await decrypt(build('wrong-saio'))).toEqual(plaintexts);
 	expect(await decrypt(build('none'))).toEqual(plaintexts);
 });
+
+test('Two colr boxes in a sample entry', async () => {
+	// Like Firefox's dom/media/test/two-colr.mp4: two adjacent colr boxes, where the first one matches the bitstream
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 0.1), {
+		decoderConfig: {
+			codec: 'vp09.00.10.08',
+			codedWidth: 16,
+			codedHeight: 16,
+			colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
+		},
+	});
+	await output.finalize();
+
+	// Turn the btrt box that follows the colr box into a second colr box (same 20-byte size) claiming BT.2020
+	const bytes = new Uint8Array(output.target.buffer!);
+	const btrtPos = bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'btrt') - 4;
+	expect(String.fromCharCode(...bytes.subarray(btrtPos - 15, btrtPos - 11))).toBe('colr');
+	bytes.set([0, 0, 0, 20, ...[...'colrnclx'].map(char => char.charCodeAt(0)), 0, 9, 0, 14, 0, 9, 0, 0], btrtPos);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = (await input.getVideoTracks())[0]!;
+	expect(await track.getColorSpace()).toEqual({
+		primaries: 'bt709',
+		transfer: 'bt709',
+		matrix: 'bt709',
+		fullRange: false,
+	});
+});
