@@ -7,7 +7,7 @@
  */
 
 import { FileSlice, readI64Le, readU32Le, readU8 } from '../reader';
-import { OGGS } from './ogg-misc';
+import { computeOggPageCrc, OGGS } from './ogg-misc';
 
 export const MIN_PAGE_HEADER_SIZE = 27;
 export const MAX_PAGE_HEADER_SIZE = 27 + 255;
@@ -71,6 +71,22 @@ export const readPageHeader = (slice: FileSlice): Page | null => {
 	};
 };
 
+/** Whether the slice is positioned at a page without segments of the given bitstream. */
+export const isPageWithoutSegments = (slice: FileSlice, serialNumber: number) => {
+	const startPos = slice.filePos;
+	let result = false;
+
+	if (readU32Le(slice) === OGGS) {
+		slice.skip(10); // Version, header type, granule position
+		const pageSerialNumber = readU32Le(slice);
+		slice.skip(8); // Sequence number, checksum
+		result = pageSerialNumber === serialNumber && readU8(slice) === 0;
+	}
+
+	slice.filePos = startPos;
+	return result;
+};
+
 export const findNextPageHeader = (slice: FileSlice, until: number, serialNumber?: number) => {
 	while (slice.filePos < until - (4 - 1)) { // Size of word minus 1
 		const word = readU32Le(slice);
@@ -106,4 +122,9 @@ export const findNextPageHeader = (slice: FileSlice, until: number, serialNumber
 	}
 
 	return false;
+};
+
+/** Whether the page's checksum matches its bytes (the page's header and data). */
+export const pageChecksumMatches = (page: Page, pageBytes: Uint8Array) => {
+	return computeOggPageCrc(pageBytes) === page.checksum;
 };

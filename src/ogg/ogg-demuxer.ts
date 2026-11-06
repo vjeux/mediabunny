@@ -30,10 +30,12 @@ import { readBytes, Reader } from '../reader';
 import { buildOggMimeType, extractSampleMetadata, OggCodecInfo } from './ogg-misc';
 import {
 	findNextPageHeader,
+	isPageWithoutSegments,
 	MAX_PAGE_HEADER_SIZE,
 	MAX_PAGE_SIZE,
 	MIN_PAGE_HEADER_SIZE,
 	Page,
+	pageChecksumMatches,
 	readPageHeader,
 } from './ogg-reader';
 
@@ -315,25 +317,12 @@ export class OggDemuxer extends Demuxer {
 			}
 
 			// The packet extends to the next page; let's find it
-			let currentPos = currentPage.headerStartPos + currentPage.totalSize;
-			while (true) {
-				let headerSlice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-				if (isThenable(headerSlice)) headerSlice = await headerSlice;
-				if (!headerSlice) {
-					return null;
-				}
-
-				const nextPage = readPageHeader(headerSlice);
-				if (!nextPage) {
-					return null;
-				}
-
-				currentPage = nextPage;
-				if (currentPage.serialNumber === startPage.serialNumber) {
-					break;
-				}
-				currentPos = currentPage.headerStartPos + currentPage.totalSize;
+			const nextPage = await this.readNextPage(currentPage);
+			if (!nextPage) {
+				return null;
 			}
+
+			currentPage = nextPage;
 
 			startDataOffset = 0;
 			currentDataOffset = 0;
@@ -374,7 +363,39 @@ export class OggDemuxer extends Demuxer {
 		}
 
 		// Otherwise, search for the next page belonging to the same bitstream
-		let currentPos = lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize;
+		const nextPage = await this.readNextPage(lastPacket.endPage);
+		if (!nextPage) {
+			return null;
+		}
+
+		return { startPage: nextPage, startSegmentIndex: 0 };
+	}
+
+	/**
+	 * Returns the page of the same bitstream that follows the given page, skipping the pages of other bitstreams.
+	 * Where something other than a usable page sits between two pages (junk, or a page without segments), it searches
+	 * on for the next page of the bitstream, like libogg and FFmpeg do, instead of ending the stream there. That is
+	 * only done between intact pages, though: the pages on both sides must have matching checksums (a damaged page,
+	 * as when bytes were inserted into it, doesn't end where its header says), and the page after must continue the
+	 * bitstream, with no pages lost and no new bitstream reusing the serial number (as in a chained file whose
+	 * previous link was cut off). Otherwise the bitstream ends there, as the audio after would be damaged or get
+	 * wrong timestamps.
+	 */
+	/** Whether the page's checksum matches. Only checked where reading on past garbage, as that's rare. */
+	async pageChecksumIsValid(page: Page) {
+		let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		return !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
+	}
+
+	async readNextPage(previousPage: Page): Promise<Page | null> {
+		const serialNumber = previousPage.serialNumber;
+		let currentPos = previousPage.headerStartPos + previousPage.totalSize;
+		let skippedSomething = false;
+		let skippedPagesWithoutSegments = 0;
+
 		while (true) {
 			let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
 			if (isThenable(slice)) slice = await slice;
@@ -382,16 +403,60 @@ export class OggDemuxer extends Demuxer {
 				return null;
 			}
 
-			const nextPage = readPageHeader(slice);
-			if (!nextPage) {
+			const page = readPageHeader(slice);
+			if (page) {
+				if (page.serialNumber !== serialNumber) {
+					currentPos = page.headerStartPos + page.totalSize;
+					continue;
+				}
+
+				if (skippedSomething) {
+					// Pages without segments carry no data, but they may have used up sequence numbers
+					const sequenceNumberStep = page.sequenceNumber - previousPage.sequenceNumber;
+					if (sequenceNumberStep < 1 || sequenceNumberStep > 1 + skippedPagesWithoutSegments) {
+						return null;
+					}
+
+					if (!await this.pageChecksumIsValid(page)) {
+						return null;
+					}
+				}
+
+				return page;
+			}
+
+			// There's no usable page here, so scan forward for the next capture pattern of our bitstream
+			if (!skippedSomething && !await this.pageChecksumIsValid(previousPage)) {
 				return null;
 			}
-
-			if (nextPage.serialNumber === lastPacket.endPage.serialNumber) {
-				return { startPage: nextPage, startSegmentIndex: 0 };
+			skippedSomething = true;
+			slice.filePos = currentPos;
+			if (isPageWithoutSegments(slice, serialNumber)) {
+				skippedPagesWithoutSegments++;
 			}
 
-			currentPos = nextPage.headerStartPos + nextPage.totalSize;
+			let searchPos = currentPos + 1;
+			while (true) {
+				let searchSlice = this.reader.requestSliceRange(searchPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_SIZE);
+				if (isThenable(searchSlice)) {
+					searchSlice = await searchSlice;
+				}
+				if (!searchSlice) {
+					return null;
+				}
+
+				if (findNextPageHeader(searchSlice, searchSlice.end, serialNumber)) {
+					currentPos = searchSlice.filePos;
+					break;
+				}
+
+				if (searchSlice.end - searchPos < MAX_PAGE_SIZE) {
+					return null; // Reached the end of the file
+				}
+
+				// Overlap by 3 bytes so that a capture pattern on the boundary isn't missed
+				searchPos = searchSlice.end - 3;
+			}
 		}
 	}
 
