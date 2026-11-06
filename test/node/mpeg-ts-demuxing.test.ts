@@ -860,6 +860,45 @@ test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3
 	}
 });
 
+test('MPEG-TS files not starting with a whole packet', async () => {
+	const file = await fs.promises.readFile(path.join(__dirname, '../public/ac3.ts'));
+
+	const readPackets = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		expect(await input.getFormat()).toBe(MPEG_TS);
+
+		const track = (await input.getAudioTracks())[0];
+		assert(track);
+		expect(await track.getCodec()).toBe('ac3');
+
+		const packets: [number, number][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([packet.timestamp, packet.byteLength]);
+		}
+
+		return packets;
+	};
+
+	const expected = await readPackets(file);
+
+	// Recorders like set-top boxes write their own header in front of the transport stream
+	const withHeader = new Uint8Array(100 + file.length);
+	withHeader.set(new TextEncoder().encode('PVR recording header'));
+	withHeader.set(file, 100);
+	expect(await readPackets(withHeader)).toEqual(expected);
+
+	// A capture cut at an arbitrary byte starts in the middle of a packet
+	const cut = await readPackets(file.subarray(1000));
+	expect(cut.length).toBeGreaterThan(expected.length - 5);
+	expect(cut.at(-1)).toEqual(expected.at(-1));
+
+	// Repeated bytes holding 0x47 line up at any even stride, but they aren't packet headers (an MP3 whose frames
+	// contain such padding, samples.ffmpeg.org trac/ticket3844/tuu_gekisinn.mp3, was taken for MPEG-TS)
+	const padding = new Uint8Array(2000).map((_, i) => (i % 2 === 0 ? 0x4f : 0x47));
+	using paddingInput = new Input({ source: new BufferSource(padding), formats: [MPEG_TS] });
+	await expect(paddingInput.getFormat()).rejects.toThrow('unsupported or unrecognizable');
+});
+
 test('MPEG-TS partial reading', async () => {
 	const fullPath = path.join(__dirname, '../public/193039199_mp4_h264_aac_fhd_7.ts');
 	const buffer = await fs.promises.readFile(fullPath);
