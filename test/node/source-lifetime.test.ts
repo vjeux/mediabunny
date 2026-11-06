@@ -191,3 +191,36 @@ test('FilePathSource reads of 2 GiB or more are split into reads Node accepts', 
 		await rm(filePath);
 	}
 });
+
+test('FilePathSource reads of 2 GiB or more stop with an error where a shrunken file ends', async () => {
+	// The same sparse file, read through a stand-in file handle for which the file now ends after 1.5 GiB
+	const size = 2 ** 31 + 2 ** 20;
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-shrunk-read-${process.pid}.bin`);
+	await writeFile(filePath, new Uint8Array(0));
+	await truncate(filePath, size);
+
+	try {
+		const source = new FilePathSource(filePath);
+		expect(await source.getSize()).toBe(size);
+
+		const realHandle = source._fileHandle!;
+		const shrunkSize = 1.5 * 2 ** 30;
+		source._fileHandle = {
+			read: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				return { bytesRead: Math.max(0, Math.min(length, shrunkSize - position)), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		await expect(source._customSource._options.read(0, size)).rejects.toThrow(
+			`Unexpected end of file at byte ${shrunkSize}`,
+		);
+
+		source._dispose();
+	} finally {
+		await rm(filePath);
+	}
+});
