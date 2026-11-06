@@ -403,3 +403,59 @@ test('MP3 in a QuickTime sample table that counts decoded samples', async () => 
 	}
 	expect(packets).toEqual(frames.map((_, i) => [i * 576 / 16000, 576 / 16000, 144, i]));
 });
+
+test('Packet lookup by timestamp with B-frames spread over fragments', async () => {
+	// One frame per fragment (like FFmpeg's frag_every_frame), so the fragments interleave in presentation order
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...[...type].map(char => char.charCodeAt(0)), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), [...'vide'].map(char => char.charCodeAt(0)), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)),
+					box('stsc', zeros(8)),
+					box('stsz', zeros(12)),
+					box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	// Decode order I P B B P B B, presented as I B B P B B P
+	const compositionOffsets = [1, 3, 0, 0, 3, 0, 0];
+	const fragments = compositionOffsets.flatMap((offset, i) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(i)),
+			box('trun', u32(0xf01), u32(1), u32(dataOffset), u32(1), u32(1), u32(i === 0 ? 0 : 0x10000), u32(offset)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)), ...box('mdat', [i])];
+	});
+
+	const ftyp = box('ftyp', [...'iso5'].map(char => char.charCodeAt(0)), u32(0));
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...ftyp, ...moov, ...fragments])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sink = new EncodedPacketSink(track);
+	expect((await sink.getPacket(0.65))?.timestamp).toBe(0.6); // The last fragment's B-frame
+	expect((await sink.getPacket(0.45))?.timestamp).toBe(0.4); // The P-frame decoded before it
+	expect((await sink.getPacket(Infinity))?.timestamp).toBe(0.7); // Not the frame decoded last
+	expect(await track.computeDuration()).toBe(0.8);
+});
