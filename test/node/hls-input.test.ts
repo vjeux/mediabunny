@@ -2050,6 +2050,46 @@ test('Keys of unsupported KEYFORMATs are ignored when a supported key applies to
 	}
 });
 
+test.concurrent('Tracks sharing a media playlist agree on the live status while it loads', async () => {
+	const multivariantPlaylist = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f,mp4a.40.2"
+media.m3u8
+`;
+	const vodPlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXTINF:2,
+0.ts
+#EXT-X-ENDLIST
+`;
+	const livePlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXTINF:2,
+0.ts
+`;
+
+	const createInput = (mediaPlaylist: string) => new Input({
+		source: new CustomPathedSource('master.m3u8', async ({ path }) => {
+			if (path === 'master.m3u8') {
+				return new BufferSource(new TextEncoder().encode(multivariantPlaylist));
+			}
+
+			// The media playlist takes a moment to arrive, like over the network
+			await new Promise(resolve => setTimeout(resolve, 20));
+			return new BufferSource(new TextEncoder().encode(mediaPlaylist));
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	using vodInput = createInput(vodPlaylist);
+	const vodTracks = await vodInput.getTracks();
+	expect(vodTracks.map(x => x.type)).toEqual(['video', 'audio']);
+	expect(await Promise.all(vodTracks.map(x => x.isLive()))).toEqual([false, false]);
+
+	using liveInput = createInput(livePlaylist);
+	const liveTracks = await liveInput.getTracks();
+	expect(await Promise.all(liveTracks.map(x => x.getLiveRefreshInterval()))).toEqual([2, 2]);
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
