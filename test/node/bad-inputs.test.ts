@@ -7,6 +7,7 @@ import {
 	BufferSource,
 	CustomPathedSource,
 	CustomSource,
+	EncodedPacket,
 	EncodedPacketSink,
 	Input,
 	ReadableStreamSource,
@@ -1441,6 +1442,39 @@ test('Ogg: BOS page without segments', async () => {
 test('Ogg: Truncated page payload', async () => {
 	const file = concatList(opusPages());
 	await expectGracefulRead(file.subarray(0, file.length - 5));
+});
+
+test('Ogg: Truncated last page still lets lookups find the last complete packet', async () => {
+	// Like a partial download: there's no EOS page, and the cut-off page ends in the middle of a packet, as is the
+	// norm for Vorbis. Each page holds the tail of a packet started on the previous page, a whole packet, and the head
+	// of a packet continuing on the next page.
+	const wholePacket = concat([0xf8], zeros(99)); // 20 ms of CELT
+	const splitPacket = concat([0xf8], zeros(299));
+	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
+	for (let i = 0; i < 20; i++) {
+		pages.push(oggPage({
+			headerType: i === 0 ? 0 : 1,
+			granule: 960 * (1 + 2 * i),
+			sequence: 2 + i,
+			lacing: i === 0 ? [100, 255] : [45, 100, 255],
+			data: concat(i === 0 ? [] : splitPacket.subarray(255), wholePacket, splitPacket.subarray(0, 255)),
+		}));
+	}
+	const file = concatList(pages);
+
+	using input = new Input({ source: new BufferSource(file.subarray(0, file.length - 5)), formats: ALL_FORMATS });
+	const track = (await input.getAudioTracks())[0]!;
+	const sink = new EncodedPacketSink(track);
+
+	let lastPacket: EncodedPacket | null = null;
+	for await (const packet of sink.packets()) {
+		lastPacket = packet;
+	}
+	expect(lastPacket).not.toBeNull();
+
+	expect((await sink.getPacket(Infinity))?.timestamp).toBe(lastPacket!.timestamp);
+	expect((await sink.getKeyPacket(Infinity))?.timestamp).toBe(lastPacket!.timestamp);
+	expect(await track.computeDuration()).toBe(lastPacket!.timestamp + lastPacket!.duration);
 });
 
 test('Ogg: Truncated page header', async () => {
