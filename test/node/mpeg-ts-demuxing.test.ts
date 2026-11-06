@@ -801,6 +801,74 @@ test('MPEG-TS init input without stream data', async () => {
 	expect(await audioTrack.getSampleRate()).toBe(48000);
 });
 
+test('MPEG-TS getNextPacket finds the next audio frame when PES packets start inside a frame', async () => {
+	// MP3 frames of 104 bytes in PES packets of 150 bytes, so most PES packets begin with the end of a frame. In the
+	// second PES packet, those leftover bytes happen to look like an MP3 frame header.
+	const frameSize = 104;
+	const frameCount = 12;
+	const frames = new Uint8Array(frameSize * frameCount);
+	for (let i = 0; i < frameCount; i++) {
+		frames.set([0xff, 0xfb, 0x10, 0x00], i * frameSize); // MPEG-1 Layer III, 32 kbit/s, 44.1 kHz
+	}
+	frames.set([0xff, 0xf6, 0xd4, 0xed], 160); // Inside frame 1, which ends at byte 208
+
+	const packets: Uint8Array[] = [];
+	const pushPackets = (pid: number, payload: number[]) => {
+		for (let i = 0; i < payload.length; i += 184) {
+			const chunk = payload.slice(i, i + 184);
+			const packet = new Uint8Array(188);
+			const stuffing = 184 - chunk.length;
+			packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, (stuffing ? 0x30 : 0x10)], 0);
+			if (stuffing) {
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+				packet.fill(0xff, 6, 4 + stuffing);
+			}
+			packet.set(chunk, 4 + stuffing);
+			packets.push(packet);
+		}
+	};
+
+	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPackets(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x03, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+	for (let start = 0; start < frames.length; start += 150) {
+		// The PTS belongs to the first frame that starts in the PES packet
+		const firstFrame = Math.ceil(start / frameSize);
+		const pts = Math.round(firstFrame * 1152 * 90_000 / 44_100);
+		const data = [...frames.subarray(start, start + 150)];
+		pushPackets(0x100, [
+			0, 0, 1, 0xc0, (data.length + 8) >> 8, (data.length + 8) & 0xff, 0x84, 0x80, 5,
+			0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
+			((pts << 1) & 0xfe) | 1, ...data,
+		]);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: [MPEG_TS], // Two MP3 frame headers within one TS packet would make MP3 detection claim the file
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	const sink = new EncodedPacketSink(track!);
+
+	const allPackets: EncodedPacket[] = [];
+	for await (const packet of sink.packets()) {
+		allPackets.push(packet);
+	}
+	expect(allPackets).toHaveLength(frameCount);
+
+	// These packets carry no reading state anymore, so getNextPacket has to read again from their PES packet
+	for (let i = 0; i < allPackets.length - 1; i++) {
+		const next = await sink.getNextPacket(allPackets[i]!);
+		expect(next?.sequenceNumber).toBe(allPackets[i + 1]!.sequenceNumber);
+		expect(next?.timestamp).toBe(allPackets[i + 1]!.timestamp);
+	}
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({

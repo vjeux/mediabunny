@@ -1348,6 +1348,24 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		assert(pesPacket);
 
 		const context = new PacketReadingContext(this.elementaryStream, pesPacket);
+
+		if (this.elementaryStream.info.type === 'audio') {
+			// The PES packet may begin with the end of a frame that started in the previous one, and a fresh search
+			// for a sync word can mistake bytes in there for a frame header. But we know where the current packet
+			// starts and what its timestamp is, so let's continue reading from right there.
+			const offset = packet.sequenceNumber - sectionStartPos;
+			let remaining = context.ensureBuffered(offset + 1);
+			if (isThenable(remaining)) {
+				remaining = await remaining;
+			}
+
+			if (remaining > offset) {
+				context.seekTo(offset);
+				context.lastSuppliedPesPacket = context.getCurrentPesPacket();
+				context.nextPts = Math.round(packet.timestamp * MPEG_TS_TIMESCALE);
+			}
+		}
+
 		buffer = new PacketBuffer(this, context);
 
 		// Advance until we pass the current packet's sequence number
