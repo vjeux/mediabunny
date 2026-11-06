@@ -523,82 +523,88 @@ describe('Cancellation, errors and pausing', () => {
 });
 
 describe('Media sources', () => {
-	test('MediaStream sources record continuous video and audio; pausing removes the gap', async () => {
-		// Tracks that need no capture device or permission
-		const canvas = document.createElement('canvas');
-		canvas.width = 320;
-		canvas.height = 240;
-		const context = canvas.getContext('2d')!;
-		let frame = 0;
-		const draw = () => {
-			context.fillStyle = `hsl(${(frame++ * 10) % 360}, 100%, 50%)`;
-			context.fillRect(0, 0, 320, 240);
-		};
-		draw();
-		const drawInterval = setInterval(draw, 1000 / 30);
-		const videoTrack = canvas.captureStream(30).getVideoTracks()[0]!;
+	// MediaStreamTrackGenerator (and the MediaStreamTrackProcessor the sources use without a frame rate) are
+	// Chromium-only
+	test.skipIf(typeof MediaStreamTrackGenerator === 'undefined')(
+		'MediaStream sources record continuous video and audio; pausing removes the gap',
+		async () => {
+			// Tracks that need no capture device or permission
+			const canvas = document.createElement('canvas');
+			canvas.width = 320;
+			canvas.height = 240;
+			const context = canvas.getContext('2d')!;
+			let frame = 0;
+			const draw = () => {
+				context.fillStyle = `hsl(${(frame++ * 10) % 360}, 100%, 50%)`;
+				context.fillRect(0, 0, 320, 240);
+			};
+			draw();
+			const drawInterval = setInterval(draw, 1000 / 30);
+			const videoTrack = canvas.captureStream(30).getVideoTracks()[0]!;
 
-		const audioTrack = new MediaStreamTrackGenerator({ kind: 'audio' });
-		const audioWriter = audioTrack.writable.getWriter();
-		let writtenFrames = 0;
-		const writeAudio = () => {
-			const data = new Float32Array(960)
-				.map((_, i) => 0.5 * Math.sin(2 * Math.PI * 440 * (writtenFrames + i) / 48000));
-			void audioWriter.write(new AudioData({
-				format: 'f32',
-				sampleRate: 48000,
-				numberOfChannels: 1,
-				numberOfFrames: 960,
-				timestamp: Math.round(1e6 * writtenFrames / 48000),
-				data,
-			}));
-			writtenFrames += 960;
-		};
-		const audioInterval = setInterval(writeAudio, 20);
+			const audioTrack = new MediaStreamTrackGenerator({ kind: 'audio' });
+			const audioWriter = audioTrack.writable.getWriter();
+			let writtenFrames = 0;
+			const writeAudio = () => {
+				const data = new Float32Array(960)
+					.map((_, i) => 0.5 * Math.sin(2 * Math.PI * 440 * (writtenFrames + i) / 48000));
+				void audioWriter.write(new AudioData({
+					format: 'f32',
+					sampleRate: 48000,
+					numberOfChannels: 1,
+					numberOfFrames: 960,
+					timestamp: Math.round(1e6 * writtenFrames / 48000),
+					data,
+				}));
+				writtenFrames += 960;
+			};
+			const audioInterval = setInterval(writeAudio, 20);
 
-		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-		const videoSource = new MediaStreamVideoTrackSource(videoTrack, { codec: 'vp8', quality: new Quality('low') });
-		const audioSource = new MediaStreamAudioTrackSource(audioTrack, { codec: 'opus', quality: new Quality('low') });
-		output.addVideoTrack(videoSource);
-		output.addAudioTrack(audioSource);
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+			const quality = new Quality('low');
+			const videoSource = new MediaStreamVideoTrackSource(videoTrack, { codec: 'vp8', quality });
+			const audioSource = new MediaStreamAudioTrackSource(audioTrack, { codec: 'opus', quality });
+			output.addVideoTrack(videoSource);
+			output.addAudioTrack(audioSource);
 
-		await output.start();
-		await new Promise(resolve => setTimeout(resolve, 600));
-		videoSource.pause();
-		audioSource.pause();
-		await new Promise(resolve => setTimeout(resolve, 400));
-		videoSource.resume();
-		audioSource.resume();
-		await new Promise(resolve => setTimeout(resolve, 600));
-		await output.finalize();
+			await output.start();
+			await new Promise(resolve => setTimeout(resolve, 600));
+			videoSource.pause();
+			audioSource.pause();
+			await new Promise(resolve => setTimeout(resolve, 400));
+			videoSource.resume();
+			audioSource.resume();
+			await new Promise(resolve => setTimeout(resolve, 600));
+			await output.finalize();
 
-		clearInterval(drawInterval);
-		clearInterval(audioInterval);
-		videoTrack.stop();
-		audioTrack.stop();
+			clearInterval(drawInterval);
+			clearInterval(audioInterval);
+			videoTrack.stop();
+			audioTrack.stop();
 
-		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-		const video = await readPackets((await input.getPrimaryVideoTrack())!);
-		const audio = await readPackets((await input.getPrimaryAudioTrack())!);
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const video = await readPackets((await input.getPrimaryVideoTrack())!);
+			const audio = await readPackets((await input.getPrimaryAudioTrack())!);
 
-		// About 1.2 s were captured, starting right away
-		const videoEnd = video.at(-1)!.timestamp + video.at(-1)!.duration;
-		const audioEnd = audio.at(-1)!.timestamp + audio.at(-1)!.duration;
-		expect(videoEnd).toBeGreaterThan(0.9);
-		expect(videoEnd).toBeLessThan(1.6);
-		expect(Math.abs(audioEnd - videoEnd)).toBeLessThan(0.25);
-		expect(video[0]!.timestamp).toBeLessThan(0.25);
-		expect(audio[0]!.timestamp).toBeLessThan(0.25);
+			// About 1.2 s were captured, starting right away
+			const videoEnd = video.at(-1)!.timestamp + video.at(-1)!.duration;
+			const audioEnd = audio.at(-1)!.timestamp + audio.at(-1)!.duration;
+			expect(videoEnd).toBeGreaterThan(0.9);
+			expect(videoEnd).toBeLessThan(1.6);
+			expect(Math.abs(audioEnd - videoEnd)).toBeLessThan(0.25);
+			expect(video[0]!.timestamp).toBeLessThan(0.25);
+			expect(audio[0]!.timestamp).toBeLessThan(0.25);
 
-		// No 400 ms gap from the pause
-		for (let i = 1; i < video.length; i++) {
-			expect(video[i]!.timestamp).toBeGreaterThan(video[i - 1]!.timestamp);
-			expect(video[i]!.timestamp - video[i - 1]!.timestamp).toBeLessThan(0.2);
-		}
-		for (let i = 1; i < audio.length; i++) {
-			expect(audio[i]!.timestamp - audio[i - 1]!.timestamp).toBeCloseTo(0.02, 3);
-		}
-	});
+			// No 400 ms gap from the pause
+			for (let i = 1; i < video.length; i++) {
+				expect(video[i]!.timestamp).toBeGreaterThan(video[i - 1]!.timestamp);
+				expect(video[i]!.timestamp - video[i - 1]!.timestamp).toBeLessThan(0.2);
+			}
+			for (let i = 1; i < audio.length; i++) {
+				expect(audio[i]!.timestamp - audio[i - 1]!.timestamp).toBeCloseTo(0.02, 3);
+			}
+		},
+	);
 
 	test('CanvasSource frames keep their timestamps and durations', async () => {
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
