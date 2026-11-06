@@ -33,6 +33,7 @@ import {
 	Rational,
 	roundToDivisor,
 	simplifyRational,
+	Queue,
 } from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
@@ -93,7 +94,7 @@ export type IsobmffTrackData = {
 	muxer: IsobmffMuxer;
 	timescale: number;
 	samples: Sample[];
-	sampleQueue: Sample[];
+	sampleQueue: Queue<Sample>;
 	timestampProcessingQueue: Sample[];
 
 	timeToSampleTable: { sampleCount: number; sampleDelta: number }[];
@@ -530,7 +531,7 @@ export class IsobmffMuxer extends Muxer {
 			},
 			timescale,
 			samples: [],
-			sampleQueue: [],
+			sampleQueue: new Queue(),
 			timestampProcessingQueue: [],
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
@@ -638,7 +639,7 @@ export class IsobmffMuxer extends Muxer {
 			},
 			timescale: decoderConfig.sampleRate,
 			samples: [],
-			sampleQueue: [],
+			sampleQueue: new Queue(),
 			timestampProcessingQueue: [],
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
@@ -683,7 +684,7 @@ export class IsobmffMuxer extends Muxer {
 			},
 			timescale: 1000, // Reasonable
 			samples: [],
-			sampleQueue: [],
+			sampleQueue: new Queue(),
 			timestampProcessingQueue: [],
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
@@ -1234,7 +1235,7 @@ export class IsobmffMuxer extends Muxer {
 						return sample.type === 'key';
 					}
 
-					const firstQueuedSample = otherTrackData.sampleQueue[0];
+					const firstQueuedSample = otherTrackData.sampleQueue.peek();
 					if (firstQueuedSample) {
 						return firstQueuedSample.type === 'key';
 					}
@@ -1353,9 +1354,9 @@ export class IsobmffMuxer extends Muxer {
 					break outer;
 				}
 
-				if (trackData.sampleQueue.length > 0 && trackData.sampleQueue[0]!.timestamp < minTimestamp) {
+				if (trackData.sampleQueue.length > 0 && trackData.sampleQueue.peek()!.timestamp < minTimestamp) {
 					trackWithMinTimestamp = trackData;
-					minTimestamp = trackData.sampleQueue[0]!.timestamp;
+					minTimestamp = trackData.sampleQueue.peek()!.timestamp;
 				}
 			}
 
