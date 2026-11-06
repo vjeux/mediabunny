@@ -854,3 +854,36 @@ test('Tracks whose hdlr box comes after minf', async () => {
 	expect(await audioTrack.getSampleRate()).toBe(44100);
 	expect(await videoTrack.computeDuration()).toBeCloseTo(0.2);
 });
+
+test('VP9 with a version 0 vpcC box', async () => {
+	using webmInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/vp9-smpte170m.webm')),
+		formats: ALL_FORMATS,
+	});
+	const webmTrack = await webmInput.getPrimaryVideoTrack();
+	assert(webmTrack);
+	const keyFrame = await new EncodedPacketSink(webmTrack).getFirstPacket();
+	assert(keyFrame);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(keyFrame, { decoderConfig: (await webmTrack.getDecoderConfig())! });
+	await output.finalize();
+
+	// Rewrite vpcC in the layout of the spec's early draft (as found in WebKit's bipbop-vp9.mp4): profile, level,
+	// bitDepth + colorSpace, chromaSubsampling + transferFunction + videoFullRangeFlag, codecInitializationDataSize
+	const bytes = new Uint8Array(output.target.buffer!);
+	const vpcCPos = String.fromCharCode(...bytes).indexOf('vpcC');
+	expect(vpcCPos).toBeGreaterThan(0);
+	bytes.set([0, 0, 0, 0, 0, 0, 0x80, 0x10, 0, 0, 0, 0], vpcCPos + 4);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// The early layout doesn't have the fields we'd read, so the codec info comes from the key frame
+	expect(await track.getCodecParameterString()).toBe(await webmTrack.getCodecParameterString());
+	expect(await track.getColorSpace()).toEqual(await webmTrack.getColorSpace());
+});
