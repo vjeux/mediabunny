@@ -651,16 +651,23 @@ describe('CanvasSink', () => {
 
 		const sink = new CanvasSink(track, { poolSize: 2, width: 100, height: 100, fit: 'contain', alpha: true });
 		const a = await sink.getCanvas(0);
+		assert(a);
+
+		// Leave stale pixels all over the first canvas, including where the letterbox bars go
+		const context = a.canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+		context.fillStyle = 'red';
+		context.fillRect(0, 0, a.canvas.width, a.canvas.height);
+		expect([...context.getImageData(50, 2, 1, 1).data]).toEqual([255, 0, 0, 255]);
+
 		const b = await sink.getCanvas(0.5);
 		const c = await sink.getCanvas(0.9);
-		assert(a && b && c);
+		assert(b && c);
 
 		expect(a.canvas).not.toBe(b.canvas);
 		expect(c.canvas).toBe(a.canvas);
 		expect([a.timestamp, b.timestamp, c.timestamp]).toEqual([0, 0.5, 0.9]);
 
-		// The letterbox bars stay transparent, nothing of the previous draw shows through
-		const context = c.canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+		// Reusing the canvas cleared it: the letterbox bars are transparent again, and the frame is drawn opaque
 		expect([...context.getImageData(50, 2, 1, 1).data]).toEqual([0, 0, 0, 0]);
 		expect(context.getImageData(30, 40, 1, 1).data[3]).toBe(255);
 	});
