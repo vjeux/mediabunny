@@ -1957,3 +1957,308 @@ test('MPEG-TS with PIDs listed twice in the PMT', async () => {
 		['ac3', 2, [[3912634060, 768], [3912636940, 768], [3912639820, 768], [3912642700, 768], [3912645580, 354]]],
 	]);
 });
+
+const readAllPackets = async (sink: EncodedPacketSink) => {
+	const packets: EncodedPacket[] = [];
+	for await (const packet of sink.packets()) {
+		packets.push(packet);
+	}
+
+	return packets;
+};
+
+const expectLookupsToFindEachPacket = async (sink: EncodedPacketSink, packets: EncodedPacket[]) => {
+	for (const packet of packets) {
+		const found = await sink.getPacket(packet.timestamp);
+		expect(found?.sequenceNumber).toBe(packet.sequenceNumber);
+		expect(found?.timestamp).toBe(packet.timestamp);
+		expect(found?.duration).toBe(packet.duration);
+	}
+};
+
+test('MPEG-TS with PES packets that have no PTS', async () => {
+	// The first 400 TS packets of samples.ffmpeg.org/V-codecs/h264/last_samurai.ts. Its 25 fps video only has a PTS on
+	// every 13th PES packet, its MP3 audio on every fifth or sixth one, starting with the third.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/sparse-pts.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const videoSink = new EncodedPacketSink(videoTrack);
+	const videoPackets = await readAllPackets(videoSink);
+
+	// ffprobe reports PTS 1898214 for the first frame, 1945014 for the 14th, and none for the rest
+	expect(videoPackets.map(x => Math.round(x.timestamp * 90_000))).toEqual(
+		Array.from({ length: 16 }, (_, i) => 1898214 + 3600 * i),
+	);
+	expect(videoPackets.every(x => x.duration === 0.04)).toBe(true);
+	await expectLookupsToFindEachPacket(videoSink, videoPackets);
+	expect(await videoTrack.computeDuration()).toBe(videoPackets.at(-1)!.timestamp + 0.04);
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	const audioSink = new EncodedPacketSink(audioTrack);
+	const audioPackets = await readAllPackets(audioSink);
+
+	// What ffprobe reports: the frames continue from the last PTS, and the ones before the first PTS count back from it
+	expect(audioPackets.map(x => Math.round(x.timestamp * 90_000))).toEqual([
+		1891089, 1893440, 1895791, 1898142, 1900493, 1902844, 1905195, 1907546, 1909897, 1912248,
+		1914599, 1916950, 1919301, 1921652, 1924003, 1926354, 1928705, 1931056, 1933407, 1935758,
+		1938109, 1940460, 1942811, 1945162, 1947513, 1949864, 1952215, 1959514,
+	]);
+	await expectLookupsToFindEachPacket(audioSink, audioPackets);
+	expect(await audioTrack.getFirstTimestamp()).toBe(audioPackets[0]!.timestamp);
+});
+
+test('MPEG-TS with parameter sets in a PES packet of their own, without PTS', async () => {
+	// The PAT, PMT and video packets of the first 578 TS packets of samples.ffmpeg.org/ffmpeg-bugs/trac/ticket697/
+	// Deep%20Blue-short.ts. Before each I-frame, a PES packet without PTS holds an AUD, the SPS, the PPS and another
+	// AUD.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/parameter-sets-pes-without-pts.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect((await videoTrack.getDecoderConfig())?.codec).toBe('avc1.644028');
+
+	const sink = new EncodedPacketSink(videoTrack);
+	const packets = await readAllPackets(sink);
+
+	// Like ffprobe, one packet of 75203 bytes that begins with the parameter sets. Its timestamp is the PTS of the PES
+	// packet with the picture (ffprobe reports none).
+	expect(packets.map(x => [Math.round(x.timestamp * 90_000), x.data.byteLength])).toEqual([[800545050, 75203]]);
+	expect([...packets[0]!.data.subarray(0, 12)]).toEqual([0, 0, 0, 1, 0x09, 0x10, 0, 0, 0, 1, 0x67, 0x64]);
+	await expectLookupsToFindEachPacket(sink, packets);
+});
+
+/**
+ * Builds a transport stream with an AVC stream on PID 0x100 out of the given PES packets' access units (or just an AUD
+ * and parameter sets), optionally after the second half of a picture.
+ */
+const buildAvcTransportStream = (
+	pesPackets: { pts: number | null; accessUnitCount: number; parameterSetsOnly?: boolean; pictureRest?: boolean }[],
+) => {
+	const startCode = [0, 0, 0, 1];
+	const aud = [...startCode, 0x09, 0xf0];
+	const sps = [
+		...startCode, 0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0, 0, 3, 0, 0x10, 0, 0, 3, 3, 0x20,
+	];
+	const pps = [...startCode, 0x68, 0xce, 0x0f, 0xc8];
+	const sliceData = new Array<number>(20).fill(0xaa);
+	const slice = (key: boolean) => [...startCode, key ? 0x65 : 0x41, key ? 0x88 : 0x9a, 0x84, ...sliceData];
+
+	const packets: Uint8Array[] = [];
+	const packetize = (pid: number, payload: number[]) => {
+		for (let offset = 0; offset < payload.length; offset += 184) {
+			const chunk = payload.slice(offset, offset + 184);
+			const stuffing = 184 - chunk.length;
+			const packet = new Uint8Array(188).fill(0xff);
+			packet.set([0x47, (offset === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, stuffing > 0 ? 0x30 : 0x10]);
+			if (stuffing > 0) {
+				packet.set(stuffing > 1 ? [stuffing - 1, 0] : [0], 4);
+			}
+			packet.set(chunk, 4 + stuffing);
+			packets.push(packet);
+		}
+	};
+
+	packetize(0x0000, [0, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	packetize(0x1000, [
+		0, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+
+	let frameIndex = 0;
+	for (const { pts, accessUnitCount, parameterSetsOnly, pictureRest } of pesPackets) {
+		const data: number[] = [
+			// A slice starting at macroblock 8
+			...(pictureRest ? [...startCode, 0x41, 0x12, 0x22, ...sliceData] : []),
+			...(parameterSetsOnly ? [...aud, ...sps, ...pps] : []),
+		];
+		for (let i = 0; i < accessUnitCount; i++, frameIndex++) {
+			data.push(...aud, ...(frameIndex === 0 ? [...sps, ...pps] : []), ...slice(frameIndex === 0));
+		}
+
+		const ptsBytes = pts === null
+			? []
+			: [
+					0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
+					((pts << 1) & 0xfe) | 1,
+				];
+		const header = [0x80, pts === null ? 0x00 : 0x80, ptsBytes.length, ...ptsBytes];
+		packetize(0x100, [0, 0, 1, 0xe0, 0, 0, ...header, ...data]);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+	return bytes;
+};
+
+const expectEvenlySpacedFrames = async (
+	pesPackets: { pts: number | null; accessUnitCount: number }[],
+	frameCount: number,
+) => {
+	using input = new Input({ source: new BufferSource(buildAvcTransportStream(pesPackets)), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = await readAllPackets(sink);
+
+	expect(packets.map(x => Math.round(x.timestamp * 90_000))).toEqual(
+		Array.from({ length: frameCount }, (_, i) => 90_000 + 3000 * i),
+	);
+	expect(packets.every(x => Math.round(x.duration * 90_000) === 3000)).toBe(true);
+	await expectLookupsToFindEachPacket(sink, packets);
+
+	for (const packet of packets) {
+		const keyPacket = await sink.getKeyPacket(packet.timestamp);
+		expect(keyPacket?.sequenceNumber).toBe(packets[0]!.sequenceNumber);
+	}
+};
+
+test('MPEG-TS spaces out the frames that share a PES packet', async () => {
+	// Three frames per PES packet, 0.1 seconds apart. The frames after the last PTS continue at the same rate.
+	await expectEvenlySpacedFrames([
+		{ pts: 90_000, accessUnitCount: 3 },
+		{ pts: 99_000, accessUnitCount: 3 },
+		{ pts: 108_000, accessUnitCount: 3 },
+	], 9);
+});
+
+test('MPEG-TS times the frames of PES packets without PTS from the ones around them', async () => {
+	// Like after damage to the PES packet headers
+	await expectEvenlySpacedFrames([
+		{ pts: 90_000, accessUnitCount: 1 },
+		{ pts: null, accessUnitCount: 1 },
+		{ pts: null, accessUnitCount: 1 },
+		{ pts: 99_000, accessUnitCount: 1 },
+		{ pts: 102_000, accessUnitCount: 1 },
+		{ pts: null, accessUnitCount: 1 },
+	], 6);
+});
+
+test('MPEG-TS takes the PTS of the PES packet an access unit begins in', async () => {
+	// Like Chromium's extra-nalu.ts: a PES packet with only an AUD, the SPS and the PPS precedes the key frame's, and
+	// both have a PTS. The key frame's access unit begins at the AUD in its own PES packet, so that one's PTS is its
+	// (as in Chromium; FFmpeg takes the first one, which is the frame's DTS in that file).
+	using input = new Input({
+		source: new BufferSource(buildAvcTransportStream([
+			{ pts: 87_000, accessUnitCount: 0, parameterSetsOnly: true },
+			{ pts: 90_000, accessUnitCount: 1 },
+			{ pts: 93_000, accessUnitCount: 1 },
+		])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = await readAllPackets(sink);
+
+	expect(packets.map(x => Math.round(x.timestamp * 90_000))).toEqual([90_000, 93_000]);
+
+	// The first packet still holds the parameter sets before its AUD
+	const data = packets[0]!.data;
+	const nalUnitTypes: number[] = [];
+	for (let i = 0; i + 4 < data.length; i++) {
+		if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+			nalUnitTypes.push(data[i + 4]! & 0x1f);
+		}
+	}
+	expect(nalUnitTypes).toEqual([9, 7, 8, 9, 7, 8, 5]);
+	await expectLookupsToFindEachPacket(sink, packets);
+});
+
+test('MPEG-TS places B-frames without PTS by their picture order', async () => {
+	// The PAT, PMT and video packets of the first 717 TS packets of samples.ffmpeg.org/A-codecs/AAC/freetv_aac_latm.ts
+	// (25 fps, I P B B B P B B B ...). Each PES packet of B-frames only has a PTS for the first one.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/b-frames-without-pts.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = await readAllPackets(sink);
+	const ticks = packets.map(x => Math.round(x.timestamp * 90_000) - Math.round(packets[0]!.timestamp * 90_000));
+
+	// The B-frames without PTS follow the one with it, 40 ms apart (FFmpeg's decoder puts them there too)
+	expect(ticks.slice(0, 9)).toEqual([0, 14404, 3600, 7201, 10802, 28807, 18004, 21605, 25206]);
+
+	// In presentation order, the frames are a frame duration apart, give or take the source's jitter
+	const sorted = [...ticks].sort((a, b) => a - b);
+	for (let i = 1; i < sorted.length; i++) {
+		expect(Math.abs(sorted[i]! - sorted[i - 1]! - 3600)).toBeLessThanOrEqual(15);
+	}
+
+	for (const packet of packets) {
+		expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+	}
+});
+
+test('MPEG-TS restores the timestamps of damaged PES headers in streams with B-frames', async () => {
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/0.ts')));
+
+	const readVideoTimestamps = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const timestamps = new Map<number, number>();
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.set(packet.sequenceNumber, Math.round(packet.timestamp * 90_000));
+		}
+
+		return timestamps;
+	};
+
+	// Clear PTS_DTS_flags of the 2nd to 40th video PES packet, every third one
+	const damaged = bytes.slice();
+	let pesPacketIndex = 0;
+	for (let pos = 0; pos < damaged.length; pos += 188) {
+		const pid = ((damaged[pos + 1]! & 0x1f) << 8) | damaged[pos + 2]!;
+		if (pid !== 0x100 || !(damaged[pos + 1]! & 0x40)) {
+			continue;
+		}
+
+		pesPacketIndex++;
+		if (pesPacketIndex >= 2 && pesPacketIndex <= 40 && pesPacketIndex % 3 === 0) {
+			const payloadStart = pos + 4 + ((damaged[pos + 3]! & 0x20) ? 1 + damaged[pos + 4]! : 0);
+			damaged[payloadStart + 7]! &= 0x3f;
+		}
+	}
+
+	// The picture order counts in the slice headers tell where the frames go, B-frames included
+	const original = await readVideoTimestamps(bytes);
+	const restored = await readVideoTimestamps(damaged);
+	expect([...restored.keys()]).toEqual([...original.keys()]);
+	for (const [sequenceNumber, timestamp] of original) {
+		expect(Math.abs(restored.get(sequenceNumber)! - timestamp)).toBeLessThanOrEqual(1);
+	}
+});
+
+test('MPEG-TS with a file that starts in the middle of a picture', async () => {
+	// Like a file cut from a longer stream, the first PES packet begins with the rest of a picture before the first
+	// access unit, which the PES packet's PTS belongs to
+	using input = new Input({
+		source: new BufferSource(buildAvcTransportStream([
+			{ pts: 90_000, accessUnitCount: 1, pictureRest: true },
+			{ pts: 93_000, accessUnitCount: 1 },
+			{ pts: 96_000, accessUnitCount: 1 },
+		])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packets = await readAllPackets(new EncodedPacketSink(track));
+
+	// The key frame keeps the PTS, which the rest of the picture before it shares (like before)
+	expect(packets.map(x => [Math.round(x.timestamp * 90_000), x.type])).toEqual([
+		[90_000, 'delta'], [90_000, 'key'], [93_000, 'delta'], [96_000, 'delta'],
+	]);
+});
