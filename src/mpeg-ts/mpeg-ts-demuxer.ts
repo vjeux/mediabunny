@@ -202,8 +202,9 @@ const getVideoFrameDuration = (info: Extract<ElementaryStream['info'], { type: '
 		return null;
 	}
 
+	// Some encoders write a clock that isn't the frame rate (like 1411200000 Hz), so only take plausible frame rates
 	const frameDuration = ticksPerFrame * timingInfo.numUnitsInTick * MPEG_TS_TIMESCALE / timingInfo.timeScale;
-	return frameDuration > 0 && frameDuration <= MPEG_TS_TIMESCALE ? frameDuration : null;
+	return frameDuration >= MPEG_TS_TIMESCALE / 300 && frameDuration <= MPEG_TS_TIMESCALE ? frameDuration : null;
 };
 
 // Covers an AVC slice header up to pic_order_cnt_lsb, with room for emulation prevention bytes
@@ -2862,6 +2863,8 @@ class PacketBuffer {
 	defaultFrameDuration: number | null = null;
 	/** The SPS of an AVC stream with picture order counts in its slice headers, if this is one */
 	avcSpsInfo: AvcSpsInfo | null | undefined = undefined;
+	/** The time per picture order count of the last packets placed by their picture order */
+	ticksPerPicOrderCnt: number | null = null;
 
 	constructor(backing: MpegTsTrackBacking, context: PacketReadingContext) {
 		this.backing = backing;
@@ -2984,7 +2987,7 @@ class PacketBuffer {
 		}
 
 		const previousTimedPacket = this.lastTimedPacket;
-		const pictureOrderTimestamps = previousTimedPacket && nextTimedPacket && this.untimedPacketCount === 0
+		const pictureOrderTimestamps = previousTimedPacket && this.untimedPacketCount === 0
 			? this.getTimestampsFromPictureOrder(previousTimedPacket, packets, nextTimedPacket)
 			: null;
 
@@ -3032,13 +3035,14 @@ class PacketBuffer {
 	}
 
 	/**
-	 * For AVC with picture order counts in its slice headers, places the packets between two timed ones by their
-	 * picture order, which also works when frames are reordered (B-frames). Returns null if that can't be done.
+	 * For AVC with picture order counts in its slice headers, places the packets after a timed one (and before the next
+	 * timed one, if any) by their picture order, which also works when frames are reordered (B-frames). Returns null if
+	 * that can't be done.
 	 */
 	getTimestampsFromPictureOrder(
 		previous: TimedSuppliedPacket,
 		packets: SuppliedPacket[],
-		next: TimedSuppliedPacket,
+		next: TimedSuppliedPacket | null,
 	) {
 		if (this.avcSpsInfo === undefined) {
 			const info = this.backing.elementaryStream.info;
@@ -3052,40 +3056,35 @@ class PacketBuffer {
 			return null;
 		}
 
-		const picOrderCnts = getAvcPicOrderCnts([previous, ...packets, next], sps);
+		const picOrderCnts = getAvcPicOrderCnts([previous, ...packets, ...(next ? [next] : [])], sps);
 		if (!picOrderCnts) {
 			return null;
 		}
 
-		let ticksPerPicOrderCnt: number;
 		const previousPicOrderCnt = picOrderCnts[0] ?? null;
-		const nextPicOrderCnt = picOrderCnts[picOrderCnts.length - 1] ?? null;
+		const nextPicOrderCnt = next ? picOrderCnts[picOrderCnts.length - 1] ?? null : null;
 		if (previousPicOrderCnt === null) {
 			return null;
 		}
 
-		if (nextPicOrderCnt !== null) {
+		let ticksPerPicOrderCnt: number | null;
+		if (next && nextPicOrderCnt !== null) {
 			ticksPerPicOrderCnt = (next.pts - previous.pts) / (nextPicOrderCnt - previousPicOrderCnt);
-		} else {
-			// The next packet starts the picture order over (an IDR picture), so measure the time per picture order
-			// count on the two timed packets before instead
-			const before = this.timedPacketBeforeLast;
-			const pair = before && getAvcPicOrderCnts([before, previous], sps);
-			const beforePicOrderCnt = pair?.[0] ?? null;
-			const pairPreviousPicOrderCnt = pair?.[1] ?? null;
-			if (!before || beforePicOrderCnt === null || pairPreviousPicOrderCnt === null) {
-				return null;
+			if (ticksPerPicOrderCnt > 0 && Number.isFinite(ticksPerPicOrderCnt)) {
+				this.ticksPerPicOrderCnt = ticksPerPicOrderCnt;
 			}
-
-			ticksPerPicOrderCnt = (previous.pts - before.pts) / (pairPreviousPicOrderCnt - beforePicOrderCnt);
+		} else {
+			// There's no next timed packet (the end of the stream), or it starts the picture order over (an IDR
+			// picture), so the time per picture order count has to come from the packets before
+			ticksPerPicOrderCnt = this.getPreviousTicksPerPicOrderCnt(sps);
 		}
 
-		if (!(ticksPerPicOrderCnt > 0) || !Number.isFinite(ticksPerPicOrderCnt)) {
+		if (ticksPerPicOrderCnt === null || !(ticksPerPicOrderCnt > 0) || !Number.isFinite(ticksPerPicOrderCnt)) {
 			return null;
 		}
 
 		const result: number[] = [];
-		for (const picOrderCnt of picOrderCnts.slice(1, -1)) {
+		for (const picOrderCnt of picOrderCnts.slice(1, next ? -1 : undefined)) {
 			if (picOrderCnt === null) {
 				return null;
 			}
@@ -3094,6 +3093,27 @@ class PacketBuffer {
 		}
 
 		return result;
+	}
+
+	/**
+	 * Returns the time per picture order count measured on the two last timed packets, if they're consecutive, or
+	 * else on the last packets that were placed by their picture order.
+	 */
+	getPreviousTicksPerPicOrderCnt(sps: AvcSpsInfo) {
+		const before = this.timedPacketBeforeLast;
+		const last = this.lastTimedPacket;
+		const pair = before && last ? getAvcPicOrderCnts([before, last], sps) : null;
+		const beforePicOrderCnt = pair?.[0] ?? null;
+		const lastPicOrderCnt = pair?.[1] ?? null;
+
+		if (before && last && beforePicOrderCnt !== null && lastPicOrderCnt !== null) {
+			const ticksPerPicOrderCnt = (last.pts - before.pts) / (lastPicOrderCnt - beforePicOrderCnt);
+			if (ticksPerPicOrderCnt > 0 && Number.isFinite(ticksPerPicOrderCnt)) {
+				return ticksPerPicOrderCnt;
+			}
+		}
+
+		return this.ticksPerPicOrderCnt;
 	}
 
 	setLastTimedPacket(packet: TimedSuppliedPacket) {

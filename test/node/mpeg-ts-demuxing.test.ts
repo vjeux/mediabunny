@@ -1181,28 +1181,35 @@ test('MPEG-TS restores the timestamps of damaged PES headers in streams with B-f
 		return timestamps;
 	};
 
-	// Clear PTS_DTS_flags of the 2nd to 40th video PES packet, every third one
-	const damaged = bytes.slice();
-	let pesPacketIndex = 0;
-	for (let pos = 0; pos < damaged.length; pos += 188) {
-		const pid = ((damaged[pos + 1]! & 0x1f) << 8) | damaged[pos + 2]!;
-		if (pid !== 0x100 || !(damaged[pos + 1]! & 0x40)) {
-			continue;
-		}
-
-		pesPacketIndex++;
-		if (pesPacketIndex >= 2 && pesPacketIndex <= 40 && pesPacketIndex % 3 === 0) {
-			const payloadStart = pos + 4 + ((damaged[pos + 3]! & 0x20) ? 1 + damaged[pos + 4]! : 0);
-			damaged[payloadStart + 7]! &= 0x3f;
+	const pesHeaderPositions: number[] = [];
+	for (let pos = 0; pos < bytes.length; pos += 188) {
+		const pid = ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+		if (pid === 0x100 && bytes[pos + 1]! & 0x40) {
+			pesHeaderPositions.push(pos + 4 + ((bytes[pos + 3]! & 0x20) ? 1 + bytes[pos + 4]! : 0));
 		}
 	}
 
-	// The picture order counts in the slice headers tell where the frames go, B-frames included
 	const original = await readVideoTimestamps(bytes);
-	const restored = await readVideoTimestamps(damaged);
-	expect([...restored.keys()]).toEqual([...original.keys()]);
-	for (const [sequenceNumber, timestamp] of original) {
-		expect(Math.abs(restored.get(sequenceNumber)! - timestamp)).toBeLessThanOrEqual(1);
+
+	// Clear PTS_DTS_flags of every third of the 2nd to 40th video PES packet, then of the last four (B-frames at the
+	// end of the stream, without a timed packet after them)
+	const damagedPesPackets = [
+		pesHeaderPositions.filter((_, i) => i >= 1 && i <= 39 && (i + 1) % 3 === 0),
+		pesHeaderPositions.slice(-4),
+	];
+
+	for (const positions of damagedPesPackets) {
+		const damaged = bytes.slice();
+		for (const pos of positions) {
+			damaged[pos + 7]! &= 0x3f;
+		}
+
+		// The picture order counts in the slice headers tell where the frames go, B-frames included
+		const restored = await readVideoTimestamps(damaged);
+		expect([...restored.keys()]).toEqual([...original.keys()]);
+		for (const [sequenceNumber, timestamp] of original) {
+			expect(Math.abs(restored.get(sequenceNumber)! - timestamp)).toBeLessThanOrEqual(1);
+		}
 	}
 });
 
