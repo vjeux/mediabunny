@@ -1011,7 +1011,10 @@ export class UrlSource extends PathedSource {
 					// less data than was requested. In practice, it seems most servers don't do this though, and the
 					// Content-Length header actually contains the length until the end of the file.
 					// A non-206 response always spans the entire resource, no matter what range we asked for.
-					const basePos = response.status === 206 ? worker.currentPos : 0;
+					// A 206 body starts where its Content-Range says, which may lie before the requested position
+					const basePos = response.status === 206
+						? (parseContentRange(response.headers.get('Content-Range'))?.start ?? worker.currentPos)
+						: 0;
 					this._orchestrator.supplyFileSize(basePos + Number(contentLength));
 				}
 			}
@@ -1061,6 +1064,26 @@ export class UrlSource extends PathedSource {
 				this._abortControllers.delete(worker);
 				this._transitionToSequentialMode(response.body, abortController);
 				return;
+			}
+
+			// A 206 response states which range it encloses (RFC 9110, Section 15.3.7.1), which may begin before the
+			// requested position; Chromium's media loader handles such responses the same way. Content-Range counts
+			// encoded bytes when Content-Encoding is present, so it can't be used then.
+			let bytesToSkip = 0;
+			const enclosedRange = response.headers.has('Content-Encoding')
+				? null
+				: parseContentRange(response.headers.get('Content-Range'));
+			if (enclosedRange) {
+				if (enclosedRange.start > worker.currentPos || enclosedRange.end < worker.currentPos) {
+					void response.body.cancel().catch(() => {});
+					throw new Error(
+						// eslint-disable-next-line @typescript-eslint/no-base-to-string
+						`Error fetching ${String(this._url)}: requested bytes from ${worker.currentPos}, but the server`
+						+ ` sent bytes ${enclosedRange.start}-${enclosedRange.end}.`,
+					);
+				}
+
+				bytesToSkip = worker.currentPos - enclosedRange.start;
 			}
 
 			const reader = response.body.getReader();
@@ -1138,8 +1161,19 @@ export class UrlSource extends PathedSource {
 					}
 				}
 
-				this._dispatchRead(worker.currentPos, worker.currentPos + value.length);
-				this._orchestrator.supplyWorkerData(worker, value);
+				let chunk = value;
+				if (bytesToSkip > 0) {
+					const skipped = Math.min(bytesToSkip, chunk.length);
+					bytesToSkip -= skipped;
+					chunk = chunk.subarray(skipped);
+
+					if (chunk.length === 0) {
+						continue;
+					}
+				}
+
+				this._dispatchRead(worker.currentPos, worker.currentPos + chunk.length);
+				this._orchestrator.supplyWorkerData(worker, chunk);
 			}
 		}
 
@@ -1217,8 +1251,25 @@ export class UrlSource extends PathedSource {
 
 						currentReader = newResponse.body.getReader();
 						// If the server still doesn't do ranges, the new response starts at byte 0 again and
-						// we need to skip over everything we already delivered. Cursed!
-						skipRemaining = newResponse.status === 206 ? 0 : streamPosition;
+						// we need to skip over everything we already delivered. Cursed! A 206 response states
+						// where its range starts, which may lie before the requested position.
+						if (newResponse.status === 206) {
+							const enclosedRange = newResponse.headers.has('Content-Encoding')
+								? null
+								: parseContentRange(newResponse.headers.get('Content-Range'));
+							const rangeStart = enclosedRange?.start ?? streamPosition;
+							if (rangeStart > streamPosition) {
+								throw new Error(
+									// eslint-disable-next-line @typescript-eslint/no-base-to-string
+									`Error fetching ${String(this._url)}: requested bytes from ${streamPosition}, but`
+									+ ` the server sent bytes from ${rangeStart}.`,
+								);
+							}
+
+							skipRemaining = streamPosition - rangeStart;
+						} else {
+							skipRemaining = streamPosition;
+						}
 
 						continue;
 					}
@@ -1329,6 +1380,22 @@ export class UrlSource extends PathedSource {
 		}
 	}
 }
+
+const CONTENT_RANGE_REGEX = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/;
+const parseContentRange = (value: string | null) => {
+	const match = value !== null ? CONTENT_RANGE_REGEX.exec(value.trim()) : null;
+	if (!match) {
+		return null;
+	}
+
+	const start = Number(match[1]);
+	const end = Number(match[2]);
+	if (end < start) {
+		return null;
+	}
+
+	return { start, end };
+};
 
 const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/;
 const parseByteRangeHeader = (value: string) => {
