@@ -2192,6 +2192,30 @@ class PacketReadingContext {
 		this.currentPesPacketIndex++;
 	}
 
+	/** Returns the index of the buffered PES packet containing the given position, which mustn't lie ahead. */
+	getPesPacketIndexAt(pos: number) {
+		let index = this.currentPesPacketIndex;
+		let pesPacketPos = this.currentPesPacketPos;
+		while (index > 0 && pos < pesPacketPos) {
+			index--;
+			pesPacketPos -= this.pesPackets[index]!.data.byteLength;
+		}
+
+		return index;
+	}
+
+	/** Whether a PES packet with a PTS begins after the one containing `startPos`, up to the one holding `endPos`. */
+	hasTimestampedPesPacketIn(startPos: number, endPos: number) {
+		const endIndex = this.getPesPacketIndexAt(endPos);
+		for (let i = this.getPesPacketIndexAt(startPos) + 1; i <= endIndex; i++) {
+			if (this.pesPackets[i]!.pts !== null) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	async markNextPacket() {
 		assert(!this.suppliedPacket);
 
@@ -2355,6 +2379,12 @@ class PacketReadingContext {
 									&& field
 									&& field.bottomField !== firstField.bottomField
 									&& field.frameNum === firstField.frameNum
+									// When the second field comes in a PES packet with its own PTS, it's timed and
+									// looked up on its own, so it stays a packet of its own then
+									&& !this.hasTimestampedPesPacketIn(
+										packetStartPos,
+										pendingBoundaryPos ?? startCodePos,
+									)
 								) {
 									// The second field of the frame, so the packet goes on
 									startsNewPicture = false;
