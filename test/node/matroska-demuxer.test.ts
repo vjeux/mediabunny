@@ -33,6 +33,22 @@ test('Zero timestamp scale', async () => {
 	await expect(input.getTracks()).rejects.toThrow(/TimestampScale/);
 });
 
+test('VP9 codec string follows the Colour element', async () => {
+	// ffmpeg -f lavfi -i testsrc2=size=176x144:rate=25 -frames:v 1 -c:v libvpx-vp9 -deadline realtime
+	//   -pix_fmt yuv420p10le -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc
+	//   -fflags +bitexact out.webm
+	const filePath = path.join(__dirname, '..', 'public/vp9-hdr10-pq.webm');
+	using input = new Input({
+		source: new FilePathSource(filePath),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	// The bitstream only says BT.2020, the Colour element says that the transfer is PQ
+	expect((await track.getDecoderConfig())!.colorSpace!.transfer).toBe('pq');
+	expect(await track.getCodecParameterString()).toBe('vp09.02.10.10.01.09.16.09.00');
+});
+
 test('Concurrent metadata tag reads', async () => {
 	const filePath = path.join(__dirname, '..', 'public/tags-after-clusters.webm');
 	const buffer = await fs.promises.readFile(filePath);
