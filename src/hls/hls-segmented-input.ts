@@ -183,7 +183,30 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let accumulatedTime = 0;
 		let accumulatedUnixTime: number | null = null;
 		let nextSegmentDuration: number | null = null;
-		let currentKey: HlsEncryptionInfo | null = null;
+		// Every KEYFORMAT has its own current key (RFC 8216, Section 4.3.2.4), and keys we can't use must be ignored
+		// as long as a usable one applies (Section 6.3.6). Those are stored as the error to throw otherwise.
+		const currentKeys = new Map<string, HlsEncryptionInfo | Error>();
+		const setCurrentKey = (keyFormat: string, key: HlsEncryptionInfo | Error) => {
+			currentKeys.delete(keyFormat); // So that the most recently declared key comes last
+			currentKeys.set(keyFormat, key);
+		};
+		const getCurrentKey = () => {
+			let usableKey: HlsEncryptionInfo | null = null;
+			let error: Error | null = null;
+			for (const key of currentKeys.values()) {
+				if (key instanceof Error) {
+					error = key;
+				} else {
+					usableKey = key;
+				}
+			}
+
+			if (!usableKey && error) {
+				throw error;
+			}
+
+			return usableKey;
+		};
 		let nextSequenceNumber = 0;
 		let nextDiscontinuityNumber = 0;
 		let currentFirstSegment: HlsSegment | null = null;
@@ -253,7 +276,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						throw new Error('Invalid M3U8 file; a segment must be preceded by an #EXTINF tag.');
 					}
 
-					let key = currentKey;
+					let key = getCurrentKey();
 					if (key && key.method === 'AES-128' && !key.iv) {
 						// "the Media Sequence Number is to be used as the IV when decrypting a Media Segment, by
 						// putting its big-endian binary representation into a 16-octet (128-bit) buffer and padding
@@ -351,6 +374,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						length: parsedByteRange?.length ?? null,
 					};
 
+					const currentKey = getCurrentKey();
 					if (currentKey?.method === 'AES-128' && !currentKey.iv) {
 						// Required by the spec
 						throw new Error('IV attribute must be set on #EXT-X-KEY tag preceding the #EXT-X-MAP tag.');
@@ -386,9 +410,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 			} else if (line.startsWith(TAG_KEY)) {
 				const attributes = new AttributeList(line.slice(TAG_KEY.length), variables);
 				const method = attributes.get('method');
+				const keyFormat = attributes.get('keyformat') ?? 'identity';
 
 				if (method === 'NONE') {
-					currentKey = null;
+					currentKeys.clear();
 				} else if (method === 'AES-128') {
 					const uri = attributes.get('uri');
 					if (!uri) {
@@ -413,32 +438,23 @@ export class HlsSegmentedInput extends SegmentedInput {
 						}
 					}
 
-					const keyFormat = attributes.get('keyformat') ?? 'identity';
 					if (keyFormat !== 'identity') {
-						throw new Error(
+						setCurrentKey(keyFormat, new Error(
 							'For AES-128 encryption, only the \'identity\' KEYFORMAT is currently supported. If you'
 							+ ' think other formats should be supported, please raise an issue.',
-						);
+						));
+					} else {
+						setCurrentKey(keyFormat, {
+							method: 'AES-128',
+							keyUri: joinPaths(this.rootPath, uri),
+							iv,
+							keyFormat,
+						});
 					}
-
-					currentKey = {
-						method: 'AES-128',
-						keyUri: joinPaths(this.rootPath, uri),
-						iv,
-						keyFormat,
-					};
 				} else if (method === 'SAMPLE-AES' || method === 'SAMPLE-AES-CTR') {
 					const uri = attributes.get('uri');
 					if (!uri) {
 						throw new Error(`Invalid #EXT-X-KEY: ${method} requires a URI attribute.`);
-					}
-
-					const keyFormat = attributes.get('keyformat') ?? 'identity';
-					if (keyFormat === 'identity') {
-						throw new Error(
-							'For SAMPLE-AES and SAMPLE-AES-CTR encryption, the \'identity\' KEYFORMAT is not'
-							+ ' supported. If you think this format should be supported, please raise an issue.',
-						);
 					}
 
 					let psshBox: PsshBox | null = null;
@@ -458,15 +474,20 @@ export class HlsSegmentedInput extends SegmentedInput {
 						}
 					}
 
-					currentKey = {
-						method,
-						psshBox,
-					};
+					setCurrentKey(keyFormat, keyFormat === 'identity'
+						? new Error(
+							'For SAMPLE-AES and SAMPLE-AES-CTR encryption, the \'identity\' KEYFORMAT is not'
+							+ ' supported. If you think this format should be supported, please raise an issue.',
+						)
+						: {
+								method,
+								psshBox,
+							});
 				} else {
-					throw new Error(
+					setCurrentKey(keyFormat, new Error(
 						`Unsupported encryption method '${method}'. If you think this method should be supported,`
 						+ ` please raise an issue.`,
-					);
+					));
 				}
 			} else if (line.startsWith(TAG_MEDIA_SEQUENCE)) {
 				const value = line.slice(TAG_MEDIA_SEQUENCE.length);
