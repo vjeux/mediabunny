@@ -7,9 +7,9 @@ import { EncodedPacket } from '../../src/packet.js';
 import { Quality } from '../../src/encode.js';
 import { assert } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS, OggInputFormat } from '../../src/input-format.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 
 test('maximumPageDuration option', async () => {
 	const sampleRate = 48000;
@@ -303,4 +303,216 @@ test('Granule positions of full pages', async () => {
 		const packet = await sink.getPacket(timestamp);
 		expect(packet?.timestamp).toBe(timestamp);
 	}
+});
+
+test('Opus timestamp gaps are filled with packet loss concealment', async () => {
+	// Ogg Opus has no timestamps besides granule positions, which must advance by exactly the samples in the packets
+	// (RFC 7845, section 4.1). So a gap, as left by lost or paused packets, has to be filled with packets of empty
+	// frames, or all later audio would be pulled forward.
+	using sourceInput = new Input({ source: new UrlSource('/preroll-test.opus'), formats: ALL_FORMATS });
+	const sourceTrack = (await sourceInput.getPrimaryAudioTrack())!;
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const sourcePackets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		sourcePackets.push(packet);
+		if (sourcePackets.length === 7) {
+			break;
+		}
+	}
+
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const audioSource = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// 20 ms packets with a 1 s gap after the third one
+	const timestamps = [0, 0.02, 0.04, 1.06, 1.08, 1.1];
+	for (let i = 0; i < timestamps.length; i++) {
+		await audioSource.add(
+			new EncodedPacket(sourcePackets[i + 1]!.data, 'key', timestamps[i]!, 0.02),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+	audioSource.close();
+	await output.finalize();
+	assert(output.target.buffer);
+
+	using input = new Input({ source: new BufferSource(output.target.buffer), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	// The real packets keep their timestamps, and the gap is covered without overlaps
+	for (let i = 0; i < timestamps.length; i++) {
+		expect(packets.some(x => Math.abs(x.timestamp - timestamps[i]!) < 1e-9 && x.byteLength > 2)).toBe(true);
+	}
+	for (let i = 1; i < packets.length; i++) {
+		expect(packets[i]!.timestamp).toBeCloseTo(packets[i - 1]!.timestamp + packets[i - 1]!.duration, 9);
+	}
+	expect(await track.computeDuration()).toBeCloseTo(1.12, 9);
+
+	// The empty frames decode to concealment, so the decoded audio spans the gap
+	let decodedFrames = 0;
+	let lastSampleEnd = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		decodedFrames += sample.numberOfFrames;
+		lastSampleEnd = sample.timestamp + sample.duration;
+	}
+	expect(decodedFrames).toBeGreaterThan(1.1 * 48000);
+	expect(lastSampleEnd).toBeCloseTo(1.12, 9);
+});
+
+test('Opus timestamp gaps in multichannel audio are filled with valid multistream packets', async () => {
+	// Quadraphonic Opus made of two coupled (stereo) streams: each packet holds a self-delimited Opus packet for the
+	// first stream followed by a regular one for the second (RFC 7845, section 3). The streams' packets are taken
+	// from a stereo file, whose packets each hold one 20 ms frame (code 0).
+	using sourceInput = new Input({ source: new UrlSource('/preroll-test.opus'), formats: ALL_FORMATS });
+	const stereoPackets: Uint8Array[] = [];
+	for await (const packet of new EncodedPacketSink((await sourceInput.getPrimaryAudioTrack())!).packets()) {
+		stereoPackets.push(packet.data);
+		if (stereoPackets.length === 14) {
+			break;
+		}
+	}
+
+	const selfDelimited = (packet: Uint8Array) => {
+		const frameLength = packet.length - 1;
+		const lengthBytes = frameLength < 252
+			? [frameLength]
+			: [252 + (frameLength - 252) % 4, Math.floor((frameLength - 252) / 4)];
+		return new Uint8Array([packet[0]!, ...lengthBytes, ...packet.subarray(1)]);
+	};
+	const quadPacket = (i: number) => new Uint8Array([
+		...selfDelimited(stereoPackets[2 * i + 1]!),
+		...stereoPackets[2 * i + 2]!,
+	]);
+
+	const opusHead = new Uint8Array([
+		0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, // 'OpusHead'
+		1, 4, 0x38, 1, 0x80, 0xbb, 0, 0, 0, 0, // Version 1, 4 channels, pre-skip 312, 48 kHz, no gain
+		1, 2, 2, 0, 1, 2, 3, // Mapping family 1: 2 streams, both coupled, channels in order
+	]);
+	const decoderConfig = { codec: 'opus', numberOfChannels: 4, sampleRate: 48000, description: opusHead };
+
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const audioSource = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// 20 ms packets with a 1 s gap after the third one
+	const timestamps = [0, 0.02, 0.04, 1.06, 1.08, 1.1];
+	for (let i = 0; i < timestamps.length; i++) {
+		await audioSource.add(
+			new EncodedPacket(quadPacket(i), 'key', timestamps[i]!, 0.02),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+	audioSource.close();
+	await output.finalize();
+	assert(output.target.buffer);
+
+	using input = new Input({ source: new BufferSource(output.target.buffer), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getNumberOfChannels()).toBe(4);
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	for (const timestamp of timestamps) {
+		expect(packets.some(x => Math.abs(x.timestamp - timestamp) < 1e-9 && x.byteLength > 100)).toBe(true);
+	}
+
+	// Every packet decodes, including the synthesized ones, which would otherwise fail the decoder
+	let decodedFrames = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		decodedFrames += sample.numberOfFrames;
+	}
+	expect(decodedFrames).toBeGreaterThan(1.1 * 48000);
+});
+
+test('Vorbis timestamp gaps are kept in the granule positions', async () => {
+	using sourceInput = new Input({ source: new UrlSource('/vorbis-eos.ogg'), formats: ALL_FORMATS });
+	const sourceTrack = (await sourceInput.getPrimaryAudioTrack())!;
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		packets.push(packet);
+		if (packets.length === 100) {
+			break;
+		}
+	}
+
+	// Muxes the packets, with a gap of the given duration after the 45th
+	const mux = async (gap: number, maximumPageDuration?: number) => {
+		const output = new Output({
+			format: new OggOutputFormat({ maximumPageDuration }),
+			target: new BufferTarget(),
+		});
+		const audioSource = new EncodedAudioPacketSource('vorbis');
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		for (const [i, packet] of packets.entries()) {
+			const timestamp = packet.timestamp + (i >= 45 ? gap : 0);
+			await audioSource.add(
+				new EncodedPacket(packet.data, 'key', timestamp, packet.duration),
+				i === 0 ? { decoderConfig } : undefined,
+			);
+		}
+		audioSource.close();
+		await output.finalize();
+		assert(output.target.buffer);
+		return new Uint8Array(output.target.buffer);
+	};
+
+	// Maps the index of each page's last packet (counting the three header packets) to the page's granule position
+	const granulePositionsByLastPacket = (file: Uint8Array) => {
+		const result = new Map<number, number>();
+		const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+		let packetCount = 0;
+
+		for (let pos = 0; pos < file.length;) {
+			const lacingValues = file.subarray(pos + 27, pos + 27 + file[pos + 26]!);
+			const endingPackets = lacingValues.filter(x => x < 255).length;
+			packetCount += endingPackets;
+			if (endingPackets > 0) {
+				result.set(packetCount - 1, view.getUint32(pos + 6, true) + view.getInt32(pos + 10, true) * 2 ** 32);
+			}
+
+			pos += 27 + lacingValues.length + lacingValues.reduce((a, b) => a + b, 0);
+		}
+
+		return result;
+	};
+
+	// Where each packet ends without the gap, from a file with one packet per page
+	const gapless = await mux(0, 0.001);
+	const packetEnds = granulePositionsByLastPacket(gapless);
+	expect(packetEnds.size).toBe(3 + 100 - 1); // The first two header packets share a page
+
+	// With the gap, the 46th audio packet starts a new page (which it doesn't otherwise), and from that page on,
+	// granule positions are a second (44100 samples) ahead
+	const firstPacketAfterGap = 3 + 45;
+	expect(granulePositionsByLastPacket(await mux(0)).has(firstPacketAfterGap - 1)).toBe(false);
+	const gapped = await mux(1);
+	const gappedGranulePositions = granulePositionsByLastPacket(gapped);
+	expect(gappedGranulePositions.has(firstPacketAfterGap - 1)).toBe(true);
+
+	let pagesAfterGap = 0;
+	for (const [packetIndex, granulePosition] of gappedGranulePositions) {
+		if (packetIndex >= 3) {
+			const isAfterGap = packetIndex >= firstPacketAfterGap;
+			expect(granulePosition).toBe(packetEnds.get(packetIndex)! + (isAfterGap ? 44100 : 0));
+			pagesAfterGap += isAfterGap ? 1 : 0;
+		}
+	}
+	expect(pagesAfterGap).toBeGreaterThan(0);
+
+	const computeDuration = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		return await (await input.getPrimaryAudioTrack())!.computeDuration();
+	};
+	expect(await computeDuration(gapped) - await computeDuration(gapless)).toBeCloseTo(1, 10);
 });
