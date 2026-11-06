@@ -2700,7 +2700,11 @@ export class IsobmffDemuxer extends Demuxer {
 						sampleCompositionTimeOffset = readI32Be(slice);
 					}
 
-					const isKeyFrame = !(sampleFlags & 0x00010000);
+					// Some muxers mark every video frame as a sync sample and only signal the dependency on other
+					// samples, which FFmpeg (mov_read_trun) and Chromium (PopulateSampleInfo) then don't treat as key
+					// frames. Audio samples may depend on others and still be random access points.
+					const isKeyFrame = !(sampleFlags & 0x00010000)
+						&& !(track.info?.type === 'video' && ((sampleFlags >>> 24) & 0b11) === 1);
 
 					const { minCompositionOffset, maxCompositionOffset } = trackData;
 					trackData.minCompositionOffset = Math.min(minCompositionOffset, sampleCompositionTimeOffset);

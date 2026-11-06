@@ -527,3 +527,57 @@ test('Packet durations with B-frames spread over fragments', async () => {
 	}
 	expect(packets).toEqual([[0.1, 0.1], [0.4, 0.1], [0.2, 0.1], [0.3, 0.1], [0.7, 0.1], [0.5, 0.1], [0.6, 0.1]]);
 });
+
+test('Fragmented video frames that depend on others are not key frames, even if marked as sync samples', async () => {
+	// Every sample is a sync sample (no sample_is_non_sync_sample bit), but only the first doesn't depend on others
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	const sampleFlags = [0x02000000, 0x01000000, 0x01000000, 0x02000000, 0x01000000];
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x701), u32(sampleFlags.length), u32(dataOffset), ...sampleFlags.map(
+			flags => [...u32(1), ...u32(1), ...u32(flags)],
+		)),
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+	const fragment = [...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)), ...box('mdat', zeros(5))];
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...box('ftyp', ascii('iso5'), u32(0)), ...moov, ...fragment])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sink = new EncodedPacketSink(track);
+	const types: string[] = [];
+	for await (const packet of sink.packets()) {
+		types.push(packet.type);
+	}
+	expect(types).toEqual(['key', 'delta', 'delta', 'key', 'delta']);
+	expect((await sink.getKeyPacket(0.25))?.timestamp).toBe(0);
+});
