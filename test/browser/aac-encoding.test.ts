@@ -136,13 +136,18 @@ const encodeImpulseSignal = async (format: OutputFormat, signal: ImpulseSignal) 
 };
 
 /** Decodes the primary audio track and returns the time of the loudest sample of every channel. */
-const readImpulses = async (input: Input, skip: (condition: boolean, note?: string) => void) => {
+/**
+ * Decodes the impulses back. Encoders signal their priming through a negative first timestamp, in every container but
+ * ADTS (which keeps the priming samples): where the decoder scrambles negative timestamps, those can't be checked.
+ */
+const readImpulses = async (
+	input: Input,
+	skip: (condition: boolean, note?: string) => void,
+	startsBeforeZero = true,
+) => {
+	skip(startsBeforeZero && !negativeTimestampsDecodeCorrectly, 'the decoder scrambles negative timestamps here');
 	const track = await input.getPrimaryAudioTrack();
 	assert(track);
-	skip(
-		!negativeTimestampsDecodeCorrectly && await track.getFirstTimestamp() < 0,
-		'the decoder scrambles negative timestamps here',
-	);
 
 	const numberOfChannels = await track.getNumberOfChannels();
 	const peaks = Array.from({ length: numberOfChannels }, () => ({ time: -1, value: -1 }));
@@ -202,7 +207,7 @@ const defineAacEncodingTests = () => {
 			const { bytes, firstPacketTimestamp } = await encodeImpulseSignal(container.format(), STEREO_48K);
 
 			using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-			const result = await readImpulses(input, skip);
+			const result = await readImpulses(input, skip, !container.keepsPriming);
 
 			expect(result.codec).toBe('aac');
 			expect(result.sampleRate).toBe(48000);
