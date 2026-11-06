@@ -2,13 +2,13 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamAudioTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -731,3 +731,64 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test('MediaStreamAudioTrackSource, a busy main thread loses no audio', async ({ skip }) => {
+	const audioContext = new AudioContext({ sampleRate: 48000 });
+	await Promise.race([audioContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
+	if (audioContext.state !== 'running') {
+		await audioContext.close();
+		skip('Web Audio cannot run here without a user gesture');
+	}
+
+	// A continuous tone, rendered off the main thread
+	const destination = audioContext.createMediaStreamDestination();
+	const oscillator = audioContext.createOscillator();
+	oscillator.frequency.value = 441;
+	const gain = audioContext.createGain();
+	gain.gain.value = 0.5;
+	oscillator.connect(gain).connect(destination);
+	oscillator.start();
+	const track = destination.stream.getAudioTracks()[0]!;
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(track, { codec: 'opus', quality: new Quality('high') });
+	const errors: unknown[] = [];
+	audioSource.errorPromise.catch(error => errors.push(error));
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	await new Promise(resolve => setTimeout(resolve, 500));
+	const stallStart = performance.now();
+	while (performance.now() - stallStart < 300) {
+		// A long task keeping the main thread busy for 300 ms
+	}
+	await new Promise(resolve => setTimeout(resolve, 500));
+
+	await output.finalize();
+	track.stop();
+	await audioContext.close();
+	expect(errors).toEqual([]);
+
+	// Count the 2 ms stretches in which the tone is missing
+	const { input, track: audioTrack } = await readBackAudioTrack(output.target.buffer!);
+	let missingMs = 0;
+	let toneStarted = false;
+	for await (using sample of new AudioSampleSink(audioTrack).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		for (let i = 0; i + 96 <= data.length; i += 96) {
+			const peak = Math.max(...data.subarray(i, i + 96).map(Math.abs));
+			if (peak > 0.3) {
+				toneStarted = true;
+			} else if (toneStarted && peak < 0.05) {
+				missingMs += 2;
+			}
+		}
+	}
+	input.dispose();
+
+	expect(missingMs).toBeLessThan(60);
+});

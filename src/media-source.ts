@@ -2992,6 +2992,12 @@ export class AudioBufferSource extends AudioSource {
 }
 
 /**
+ * How many audio chunks MediaStreamTrackProcessor may buffer for a MediaStreamAudioTrackSource; about 5 seconds of
+ * the 10 ms chunks browsers deliver.
+ */
+const MEDIA_STREAM_AUDIO_BUFFER_SIZE = 500;
+
+/**
  * Options for {@link MediaStreamAudioTrackSource}.
  * @group Media sources
  * @public
@@ -3172,10 +3178,28 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		};
 
 		if (typeof MediaStreamTrackProcessor !== 'undefined') {
-			// Great, MediaStreamTrackProcessor is supported, this is the preferred way of doing things
-			const processor = new MediaStreamTrackProcessor({ track: this._track });
+			// Great, MediaStreamTrackProcessor is supported, this is the preferred way of doing things. By default, it
+			// only buffers 10 chunks (100 ms) of audio and drops older ones, so any longer stall of the main thread
+			// would cut audio out of the recording. Let it buffer a few seconds instead.
+			const processor = new MediaStreamTrackProcessor({
+				track: this._track,
+				maxBufferSize: MEDIA_STREAM_AUDIO_BUFFER_SIZE,
+			});
 			const consumer = new WritableStream<AudioData>({
-				write: audioData => onAudioSample(new AudioSample(audioData)),
+				write: async (audioData) => {
+					// The audio buffered during a stall arrives in one burst. Wait for the encoder to catch up rather
+					// than dropping it; meanwhile, the processor keeps buffering.
+					while (this._encoder.getQueueSize() >= 8 && !errored && !this._closingPromise) {
+						await wait(2);
+					}
+
+					if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
+						audioData.close();
+						return;
+					}
+
+					onAudioSample(new AudioSample(audioData));
+				},
 			});
 
 			processor.readable.pipeTo(consumer, {
