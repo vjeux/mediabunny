@@ -122,6 +122,7 @@ import {
 	readU64Be,
 	readU8,
 	readAscii,
+	SliceRangeError,
 } from '../reader';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, RichImageData, TrackDisposition } from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
@@ -1371,6 +1372,116 @@ export class IsobmffDemuxer extends Demuxer {
 	}
 
 	traverseBox(slice: FileSlice): boolean {
+		const startPos = slice.filePos;
+		const restoreState = this.snapshotParsingState();
+
+		try {
+			return this.parseBox(slice);
+		} catch (error) {
+			slice.filePos = startPos;
+			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
+			const name = size > 0 ? readAscii(slice, 4) : '';
+
+			// Sample tables are read as a whole: a failure discards the partial table (see getSampleTableForTrack)
+			const sampleTableBoxes = ['stbl', 'stts', 'ctts', 'stss', 'stsc', 'stsz', 'stz2', 'stco', 'co64'];
+			if (!(error instanceof SliceRangeError) || sampleTableBoxes.includes(name)) {
+				throw error;
+			}
+
+			// The box's fields run past its end and its parent's, so it's damaged (a broken size field, a cut-off
+			// file). Undo what it parsed so far and skip it rather than failing the whole file, like FFmpeg does with
+			// atoms it can't read.
+			restoreState();
+
+			if (size < MIN_BOX_HEADER_SIZE) {
+				return false; // Nothing to skip to (size 0 runs to the end, size 1 is a 64-bit size)
+			}
+
+			slice.filePos = Math.min(startPos + size, slice.end);
+			return true;
+		}
+	}
+
+	/** Remembers the fields a box can change (the demuxer's, the current track's and fragment's) for undoing it. */
+	snapshotParsingState() {
+		const track = this.currentTrack;
+		const fragment = this.currentFragment;
+		const objects: object[] = [this];
+		// The metadata tags and the track also have their plain objects (like the raw tags or the track's disposition)
+		// covered, as boxes change some of those in place
+		const withPlainObjects: Record<string, unknown>[] = [this.metadataTags];
+		if (track) {
+			withPlainObjects.push(track);
+			if (track.info) {
+				withPlainObjects.push(track.info);
+			}
+		}
+		for (const object of withPlainObjects) {
+			objects.push(object);
+			for (const key in object) {
+				const value = object[key];
+				if (value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype
+					&& value !== track?.info) {
+					objects.push(value);
+				}
+			}
+		}
+		if (fragment) {
+			objects.push(fragment);
+			const trackData = track && fragment.trackData.get(track.id);
+			if (trackData) {
+				objects.push(trackData);
+			}
+		}
+
+		// Flat list of [object, its keys, its values, then collection and length pairs] per object
+		const snapshots: unknown[][] = [];
+		for (const object of objects as Record<string, unknown>[]) {
+			const keys = Object.keys(object);
+			const values: unknown[] = [];
+			const snapshot: unknown[] = [object, keys, values];
+			for (const key of keys) {
+				const value = object[key];
+				values.push(value);
+				if (Array.isArray(value)) {
+					snapshot.push(value, value.length);
+				} else if (value instanceof Map || value instanceof Set) {
+					snapshot.push(value, value.size);
+				}
+			}
+			snapshots.push(snapshot);
+		}
+
+		return () => {
+			for (const snapshot of snapshots) {
+				const object = snapshot[0] as Record<string, unknown>;
+				const keys = snapshot[1] as string[];
+				const values = snapshot[2] as unknown[];
+				for (const key of Object.keys(object)) {
+					if (!keys.includes(key)) {
+						delete object[key];
+					}
+				}
+				for (let i = 0; i < keys.length; i++) {
+					object[keys[i]!] = values[i];
+				}
+				for (let i = 3; i < snapshot.length; i += 2) {
+					const collection = snapshot[i] as unknown[] | Map<unknown, unknown> | Set<unknown>;
+					const length = snapshot[i + 1] as number;
+					if (Array.isArray(collection)) {
+						collection.length = length;
+					} else {
+						// Entries keep insertion order, so the ones added since come last
+						for (const key of [...collection.keys()].slice(length)) {
+							collection.delete(key);
+						}
+					}
+				}
+			}
+		};
+	}
+
+	parseBox(slice: FileSlice): boolean {
 		const startPos = slice.filePos;
 		const boxInfo = readBoxHeader(slice);
 		if (!boxInfo) {

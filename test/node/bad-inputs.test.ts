@@ -716,6 +716,69 @@ test('MP4: trun outside of traf', async () => {
 	]));
 });
 
+test('MP4: Box fields running past the end of the parent box', async () => {
+	// A broken size field (a single flipped byte in real files) made a box's fixed fields run past the end of its
+	// parent, which failed the whole file with an internal error. Such a box is now skipped instead.
+	const goodTrak = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), id: 1 });
+	const damagedFiles = [
+		// Sample entry shorter than its fixed fields
+		mp4([goodTrak, trak({ handler: 'vide', stbl: [stsd(box('avc1', zeros(8)))], id: 2 })]),
+		// tkhd cut short at the end of its trak
+		mp4([goodTrak, box('trak', box('mdia', mdhd(), hdlr('vide')), fullBox('tkhd', 0, 1, u32(0)))]),
+		// DecoderSpecificInfo claiming more bytes than its esds holds
+		mp4([goodTrak, trak({ handler: 'soun', stbl: [stsd(audioSampleEntry('mp4a', fullBox(
+			'esds', 0, 0, u8(0x03), u8(23), u16(1), u8(0), u8(0x04), u8(15), u8(0x40), u8(0x15), zeros(11),
+			u8(0x05), u8(100), u8(0x12), u8(0x10),
+		)))], id: 2 })]),
+	];
+
+	for (const file of damagedFiles) {
+		await expectGracefulRead(file);
+		expect(await countPackets(new Input({ source: new BufferSource(file), formats: ALL_FORMATS }))).toBe(3);
+	}
+
+	// A file cut off within the 64-bit size of a box header
+	await expectGracefulRead(concat(box('ftyp', ascii('isom'), u32(0), ascii('isom')), u32(1), ascii('mdat')));
+
+	// What the skipped box parsed before failing is undone: a truncated second mvhd mustn't change the movie timescale
+	// that the edit list delaying the intact track by 1 s is in
+	const delayedTrak = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), extra: [box('edts', fullBox(
+		'elst', 0, 0, u32(2), u32(1000), u32(0xffffffff), u16(1), u16(0), u32(120), u32(0), u16(1), u16(0),
+	))] });
+	const truncatedMvhd = fullBox('mvhd', 0, 0, u32(0), u32(0), u32(1), u32(0));
+	expect(await firstPacketTimestamp(mp4([delayedTrak]))).toBe(1);
+	expect(await firstPacketTimestamp(mp4([delayedTrak, truncatedMvhd]))).toBe(1);
+
+	// ...including what it changed in place: a truncated second tkhd (track disabled, ID 999) mustn't change the track
+	const truncatedTkhd = fullBox('tkhd', 0, 0, u32(0), u32(0), u32(999));
+	const trakWithTruncatedTkhd = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), extra: [truncatedTkhd] });
+	{
+		using input = new Input({ source: new BufferSource(mp4([trakWithTruncatedTkhd])), formats: ALL_FORMATS });
+		const track = (await input.getVideoTracks())[0]!;
+		expect(track.id).toBe(1);
+		expect((await track.getDisposition()).default).toBe(true);
+	}
+
+	// ...and a damaged udta mustn't leave its items in the raw tags of an earlier one
+	const quickTimeText = (name: string, text: string) => box(name, u16(text.length), u16(0), ascii(text));
+	const damagedUdta = box('udta', quickTimeText('\u00a9cmt', 'Stale'), u32(200), ascii('XYZW'), zeros(4));
+	{
+		using input = new Input({
+			source: new BufferSource(mp4([goodTrak, box('udta', quickTimeText('\u00a9nam', 'Good')), damagedUdta])),
+			formats: ALL_FORMATS,
+		});
+		const tags = await input.getMetadataTags();
+		expect(tags.comment).toBeUndefined();
+		expect(tags.raw).toEqual({ '\u00a9nam': 'Good' });
+	}
+});
+
+const firstPacketTimestamp = async (file: Uint8Array) => {
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const packet = await new EncodedPacketSink((await input.getTracks())[0]!).getFirstPacket();
+	return packet?.timestamp;
+};
+
 test('MP4: trak inside moof', async () => {
 	// The trak used to hijack the current track, leaving the traf inside of it without fragment state
 	await expectGracefulRead(mp4(fragmentedMoov(), [
