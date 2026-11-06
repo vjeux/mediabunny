@@ -352,6 +352,15 @@ type SampleEncryptionAuxInfo = {
 // Anything beyond this is malicious
 const MAX_BOX_NESTING_DEPTH = 64;
 
+/**
+ * Caps the entry count read from a box at the number of entries that fit into the rest of the box, so that a corrupt
+ * count doesn't make us read past the box. FFmpeg's mov demuxer likewise stops at the end of the atom.
+ */
+const capEntryCount = (entryCount: number, slice: FileSlice, boxEndPos: number, entrySize: number) => {
+	const availableBytes = Math.min(boxEndPos, slice.end) - slice.filePos;
+	return Math.min(entryCount, Math.max(Math.floor(availableBytes / entrySize), 0));
+};
+
 export class IsobmffDemuxer extends Demuxer {
 	reader: Reader;
 	moovSlice: FileSlice | null = null;
@@ -1146,7 +1155,7 @@ export class IsobmffDemuxer extends Demuxer {
 				let relevantEntryFound = false;
 				let previousSegmentDurations = 0;
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, version === 1 ? 20 : 12);
 				for (let i = 0; i < entryCount; i++) {
 					const segmentDuration = version === 1
 						? readU64Be(slice)
@@ -2076,7 +2085,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 8);
 
 				let currentIndex = 0;
 				let currentTimestamp = 0;
@@ -2109,7 +2118,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(1 + 3); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 8);
 
 				let sampleIndex = 0;
 				for (let i = 0; i < entryCount; i++) {
@@ -2142,9 +2151,11 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(4); // Version + flags
 
 				const sampleSize = readU32Be(slice);
-				const sampleCount = readU32Be(slice);
+				let sampleCount = readU32Be(slice);
 
 				if (sampleSize === 0) {
+					sampleCount = capEntryCount(sampleCount, slice, boxEndPos, 4);
+
 					for (let i = 0; i < sampleCount; i++) {
 						const sampleSize = readU32Be(slice);
 						track.sampleTable.sampleSizes.push(sampleSize);
@@ -2170,11 +2181,13 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(3); // Reserved
 
 				const fieldSize = readU8(slice); // in bits
-				const sampleCount = readU32Be(slice);
+				let sampleCount = readU32Be(slice);
 
 				if (fieldSize !== 4 && fieldSize !== 8 && fieldSize !== 16) {
 					throw new Error(`Invalid stz2 box: unsupported field size ${fieldSize}.`);
 				}
+
+				sampleCount = capEntryCount(sampleCount, slice, boxEndPos, fieldSize / 8);
 
 				const bytes = readBytes(slice, Math.ceil(sampleCount * fieldSize / 8));
 				const bitstream = new Bitstream(bytes);
@@ -2201,7 +2214,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				track.sampleTable.keySampleIndices = [];
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 4);
 				for (let i = 0; i < entryCount; i++) {
 					const sampleIndex = readU32Be(slice) - 1; // Convert to 0-indexed
 					track.sampleTable.keySampleIndices.push(sampleIndex);
@@ -2229,7 +2242,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4);
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 12);
 				let skippedEntryCount = 0;
 
 				for (let i = 0; i < entryCount; i++) {
@@ -2284,7 +2297,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 4);
 
 				for (let i = 0; i < entryCount; i++) {
 					const chunkOffset = readU32Be(slice);
@@ -2304,7 +2317,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 8);
 
 				for (let i = 0; i < entryCount; i++) {
 					const chunkOffset = readU64Be(slice);
@@ -2601,7 +2614,7 @@ export class IsobmffDemuxer extends Demuxer {
 				const sampleFlagsPresent = Boolean(flags & 0x000400);
 				const sampleCompositionTimeOffsetsPresent = Boolean(flags & 0x000800);
 
-				const sampleCount = readU32Be(slice);
+				let sampleCount = readU32Be(slice);
 
 				const { defaultSampleDuration, defaultSampleSize, defaultSampleFlags } = track.currentFragmentState;
 				if (
@@ -2615,12 +2628,6 @@ export class IsobmffDemuxer extends Demuxer {
 					throw new Error('Invalid trun box: sample values are missing and there are no defaults.');
 				}
 
-				this.currentFragment.sampleCount += sampleCount;
-				if (this.currentFragment.sampleCount > 2 ** 20) {
-					// Safety measure
-					throw new Error('Too many (> 2^20) samples in fragment.');
-				}
-
 				let dataOffset: number | null = null;
 				if (dataOffsetPresent) {
 					dataOffset = readI32Be(slice);
@@ -2628,6 +2635,22 @@ export class IsobmffDemuxer extends Demuxer {
 				let firstSampleFlags: number | null = null;
 				if (firstSampleFlagsPresent) {
 					firstSampleFlags = readU32Be(slice);
+				}
+
+				const entrySize = 4 * [
+					sampleDurationPresent,
+					sampleSizePresent,
+					sampleFlagsPresent,
+					sampleCompositionTimeOffsetsPresent,
+				].filter(Boolean).length;
+				if (entrySize > 0) {
+					sampleCount = capEntryCount(sampleCount, slice, boxEndPos, entrySize);
+				}
+
+				this.currentFragment.sampleCount += sampleCount;
+				if (this.currentFragment.sampleCount > 2 ** 20) {
+					// Safety measure
+					throw new Error('Too many (> 2^20) samples in fragment.');
 				}
 
 				let trackData: FragmentTrackData;
