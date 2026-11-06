@@ -10,6 +10,7 @@ import {
 	OggOutputFormat,
 	OutputFormat,
 	WavOutputFormat,
+	WebMOutputFormat,
 } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
@@ -502,6 +503,39 @@ test('Read and write metadata, Matroska', async () => {
 	expect((secondFile![1] as AttachedFile).mimeType).toBe('font/ttf');
 	expect((secondFile![1] as AttachedFile).name).toBe('Heya');
 	expect((secondFile![1] as AttachedFile).description).toBe('A font file');
+});
+
+test('WebM output leaves out Attachments, which WebM does not support', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({
+		title: songMetadata.title,
+		images: songMetadata.images,
+		raw: { 123: new AttachedFile(new Uint8Array(20), 'font/ttf', 'Heya') },
+	});
+
+	const dummyTrack = createDummyAudioTrack('opus', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const attachmentsId = [0x19, 0x41, 0xa4, 0x69];
+	const hasAttachments = bytes.some((_, i) => attachmentsId.every((byte, j) => bytes[i + j] === byte));
+	expect(hasAttachments).toBe(false);
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.title).toBe(songMetadata.title); // Tags are still written
+	expect(readTags.images).toBeUndefined();
 });
 
 test('Read and write metadata, MP3', async () => {
