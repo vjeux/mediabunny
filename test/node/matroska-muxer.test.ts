@@ -519,3 +519,32 @@ test('AV1 blocks are stored without temporal delimiter OBUs', async () => {
 	const packet = await new EncodedPacketSink(track).getFirstPacket();
 	expect(packet?.data).toEqual(new Uint8Array(frame));
 });
+
+test('Equally spaced packets at half milliseconds stay equally spaced', async () => {
+	// Timestamps computed in floating point land a hair off their exact half millisecond: (0.0135 + 0.02 * 29) * 1000
+	// is 593.4999999999999. All of them must round the same way, or the 20 ms spacing becomes 19 and 21 ms.
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', 0.0135 + 0.02 * i, 0.02),
+			i === 0 ? { decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 } } : undefined,
+		);
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array(output.target.buffer!)),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const timestampsInMs: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		timestampsInMs.push(Math.round(packet.timestamp * 1000));
+	}
+	expect(timestampsInMs).toEqual(Array.from({ length: 100 }, (_, i) => 14 + 20 * i));
+});
