@@ -99,9 +99,6 @@ import { Bitstream } from '../../shared/bitstream';
 const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expected. PES packets without PTS are not'
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
-/** How many PES packets of the same PTS key packet lookups look back over to find the start of a key frame. */
-const MAX_KEY_FRAME_PES_PACKET_COUNT = 64;
-
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
@@ -1805,12 +1802,13 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				if (bestKeyPesHeader) {
 					let startPesHeader = bestKeyPesHeader;
 
-					// The key frame's access unit may be split over several PES packets, which all have its PTS (when
-					// the parameter sets come in PES packets of their own, say), so let's start reading at the first of
-					// them; only it may carry the random access flag. At the end of the stream, rewind a little more to
-					// obtain the correct packet duration.
+					// The key frame's access unit may be split over any number of PES packets, which all have its PTS
+					// (when the parameter sets come in PES packets of their own, say), so let's start reading at the
+					// first of them; only it may carry the random access flag. Each step goes back in the file and
+					// stops at the track's first PES packet, so this ends. At the end of the stream, rewind a little
+					// more to obtain the correct packet duration.
 					let extraRewindCount = lookaheadCount === 0 ? reorderSize : 0;
-					for (let i = 0; i < MAX_KEY_FRAME_PES_PACKET_COUNT + extraRewindCount; i++) {
+					while (true) {
 						const previous = await findPreviousTimestampedPesPacketHeader(startPesHeader);
 						if (!previous) {
 							break;

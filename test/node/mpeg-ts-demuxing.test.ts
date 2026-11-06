@@ -968,8 +968,8 @@ test('MPEG-TS key packet lookup finds key frames sharing their PTS with the fram
 });
 
 test('MPEG-TS key packet lookup returns key frames split over several PES packets whole', async () => {
-	// The first access unit comes in three PES packets with PTS 0: AUD + SPS, PPS, and SEI + IDR. The first and last
-	// are flagged with random_access_indicator, the middle one isn't, or all three are.
+	// The first access unit comes in PES packets with PTS 0: AUD + SPS, PPS, possibly many SEI ones, and SEI + IDR. The
+	// first and last are flagged with random_access_indicator, the middle ones aren't, or all of them are.
 	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
 		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64
 	const pps = [0x68, 0xce, 0x0f, 0xc8];
@@ -979,7 +979,7 @@ test('MPEG-TS key packet lookup returns key frames split over several PES packet
 	const slice = [0x41, 0x9a, 0x02, 0x04, ...new Array<number>(20).fill(0xaa)];
 	const nal = (nalUnit: number[]) => [0, 0, 0, 1, ...nalUnit];
 
-	const buildFile = (flagMiddle: boolean) => {
+	const buildFile = (flagMiddle: boolean, seiPesCount: number) => {
 		const packets: Uint8Array[] = [];
 		const pushPes = (pid: number, payload: number[], randomAccess: boolean) => {
 			// One TS packet per PES packet: adaptation field (flags + stuffing), then the payload
@@ -1001,6 +1001,9 @@ test('MPEG-TS key packet lookup returns key frames split over several PES packet
 		], false);
 		pushPes(0x100, pes(0, [aud, sps]), true);
 		pushPes(0x100, pes(0, [pps]), flagMiddle);
+		for (let i = 0; i < seiPesCount; i++) {
+			pushPes(0x100, pes(0, [sei]), flagMiddle);
+		}
 		pushPes(0x100, pes(0, [sei, idr]), true);
 		for (let i = 1; i < 4; i++) {
 			pushPes(0x100, pes(3000 * i, [aud, slice]), false);
@@ -1011,15 +1014,16 @@ test('MPEG-TS key packet lookup returns key frames split over several PES packet
 		return bytes;
 	};
 
-	for (const flagMiddle of [false, true]) {
+	for (const [flagMiddle, seiPesCount] of [[false, 0], [true, 0], [false, 70]] as const) {
 		using input = new Input({
-			source: new BufferSource(buildFile(flagMiddle)),
+			source: new BufferSource(buildFile(flagMiddle, seiPesCount)),
 			formats: ALL_FORMATS,
 		});
 
 		const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
 		const firstPacket = await sink.getFirstPacket();
-		expect(firstPacket!.byteLength).toBe([aud, sps, pps, sei, idr].flatMap(nal).length);
+		const nalUnits = [aud, sps, pps, ...new Array<number[]>(seiPesCount).fill(sei), sei, idr];
+		expect(firstPacket!.byteLength).toBe(nalUnits.flatMap(nal).length);
 
 		const keyPacket = await sink.getKeyPacket(0);
 		expect(keyPacket?.type).toBe('key');
