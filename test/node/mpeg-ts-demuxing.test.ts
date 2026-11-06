@@ -922,3 +922,74 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
 });
+
+test('MPEG-TS uses an intact copy of a damaged PAT or PMT', async () => {
+	// FFmpeg output, which repeats the PAT and PMT (PID 0x1000) several times per second, like broadcasts do
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/mp3.ts')));
+	const findFirstSection = (pid: number) => {
+		for (let pos = 0; pos < bytes.length; pos += 188) {
+			if (((bytes[pos + 1]! & 0x1f) << 8 | bytes[pos + 2]!) === pid && bytes[pos + 1]! & 0x40) {
+				return pos + 4 + 1 + bytes[pos + 4]!; // Skip the header and pointer_field
+			}
+		}
+
+		throw new Error('Section not found');
+	};
+
+	const readTracks = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		return Promise.all((await input.getTracks()).map(track => track.getCodec()));
+	};
+
+	// A bit error in the first PAT turns its program into the network PID entry
+	const damagedPat = bytes.slice();
+	damagedPat[findFirstSection(0) + 9] = 0x00; // program_number 1 -> 0
+	expect(await readTracks(damagedPat)).toEqual(['mp3']);
+
+	// A bit error in the first PMT changes the stream type
+	const damagedPmt = bytes.slice();
+	damagedPmt[findFirstSection(0x1000) + 12] = 0x13; // stream_type 0x03 (MPEG-1 audio) -> 0x13
+	expect(await readTracks(damagedPmt)).toEqual(['mp3']);
+
+	// A bit error in the first PAT's pointer_field, so its section (and table_id) is looked for in the wrong place
+	const damagedPointerField = bytes.slice();
+	damagedPointerField[findFirstSection(0) - 1]! ^= 0x80; // pointer_field 0 -> 128
+	expect(await readTracks(damagedPointerField)).toEqual(['mp3']);
+
+	// Some muxers write bad CRCs throughout, so without an intact copy, the damaged one is still used
+	const allBad = bytes.slice();
+	for (let pos = 0; pos < allBad.length; pos += 188) {
+		const pid = (allBad[pos + 1]! & 0x1f) << 8 | allBad[pos + 2]!;
+		if ((pid === 0 || pid === 0x1000) && allBad[pos + 1]! & 0x40) {
+			const sectionStart = pos + 4 + 1 + allBad[pos + 4]!;
+			const sectionEnd = sectionStart + 3 + ((allBad[sectionStart + 1]! & 0x0f) << 8 | allBad[sectionStart + 2]!);
+			allBad.fill(0, sectionEnd - 4, sectionEnd); // CRC_32
+		}
+	}
+	expect(await readTracks(allBad)).toEqual(['mp3']);
+
+	// With a single damaged copy of each, the search for an intact one stops after a few seconds of media rather than
+	// reading the whole file
+	const singleBad = allBad.slice();
+	let tableCount = 0;
+	for (let pos = 0; pos < singleBad.length; pos += 188) {
+		const pid = (singleBad[pos + 1]! & 0x1f) << 8 | singleBad[pos + 2]!;
+		if ((pid === 0 || pid === 0x1000) && ++tableCount > 2) {
+			singleBad.set([0x1f, 0xff], pos + 1); // Turn into a null packet
+		}
+	}
+
+	let maxEnd = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => singleBad.byteLength,
+			read: (start, end) => {
+				maxEnd = Math.max(maxEnd, end);
+				return singleBad.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	expect(await Promise.all((await input.getTracks()).map(track => track.getCodec()))).toEqual(['mp3']);
+	expect(maxEnd).toBeLessThan(singleBad.byteLength / 2);
+});
