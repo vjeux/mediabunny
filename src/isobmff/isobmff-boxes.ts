@@ -287,6 +287,7 @@ export const fullBox = (
 export const ftyp = (details: {
 	isQuickTime: boolean;
 	holdsAvc: boolean;
+	holdsAv1: boolean;
 	fragmented: boolean;
 	cmaf: boolean;
 }) => {
@@ -316,6 +317,7 @@ export const ftyp = (details: {
 				ascii('mp41'),
 				ascii('cmfc'),
 				ascii('dash'),
+				details.holdsAv1 ? ascii('av01') : [],
 			]);
 		} else {
 			return box('ftyp', [
@@ -325,6 +327,7 @@ export const ftyp = (details: {
 				ascii('iso5'),
 				ascii('iso6'),
 				ascii('mp41'),
+				details.holdsAv1 ? ascii('av01') : [],
 			]);
 		}
 	}
@@ -335,6 +338,8 @@ export const ftyp = (details: {
 		// Compatible brands
 		ascii('isom'),
 		details.holdsAvc ? ascii('avc1') : [],
+		// "It SHALL have the av01 brand among the compatible brands array of the FileTypeBox" (AV1-ISOBMFF, 2.1)
+		details.holdsAv1 ? ascii('av01') : [],
 		ascii('mp41'),
 	]);
 };

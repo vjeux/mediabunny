@@ -750,3 +750,39 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
+
+test('AV1 files list the av01 brand among the compatible brands', async () => {
+	// AV1-ISOBMFF, Section 2.1: "It SHALL have the av01 brand among the compatible brands array of the FileTypeBox"
+	const compatibleBrands = async (format: Mp4OutputFormat, codec: 'av1' | 'avc') => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource(codec);
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array([0x12, 0x00, 0x32, 0x00]), 'key', 0, 1 / 30), {
+			decoderConfig: codec === 'av1'
+				? { codec: 'av01.0.04M.08', codedWidth: 640, codedHeight: 360 }
+				: {
+						codec: 'avc1.42001f',
+						codedWidth: 640,
+						codedHeight: 360,
+						description: new Uint8Array([1, 0x42, 0, 0x1f, 0xff, 0xe0, 0]),
+					},
+		});
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const ftypSize = toDataView(bytes).getUint32(0);
+		expect(new TextDecoder().decode(bytes.subarray(4, 8))).toBe('ftyp');
+
+		const brands: string[] = [];
+		for (let pos = 16; pos < ftypSize; pos += 4) {
+			brands.push(new TextDecoder().decode(bytes.subarray(pos, pos + 4)));
+		}
+		return brands;
+	};
+
+	expect(await compatibleBrands(new Mp4OutputFormat(), 'av1')).toContain('av01');
+	expect(await compatibleBrands(new Mp4OutputFormat({ fastStart: 'fragmented' }), 'av1')).toContain('av01');
+	expect(await compatibleBrands(new Mp4OutputFormat({ fastStart: 'in-memory' }), 'av1')).toContain('av01');
+	expect(await compatibleBrands(new Mp4OutputFormat(), 'avc')).not.toContain('av01');
+});
