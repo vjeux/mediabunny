@@ -1001,7 +1001,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					&& packet.endPage.headerStartPos === endPage.headerStartPos
 					&& packet.endSegmentIndex === endSegmentIndex
 				) {
-					referenceGranulePosition = currentPage.granulePosition;
+					referenceGranulePosition = endPage.granulePosition;
 					referenceTimestampInSamples = currentTimestampInSamples;
 				}
 
