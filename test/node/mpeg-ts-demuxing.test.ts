@@ -1218,6 +1218,59 @@ test('MPEG-TS with field-coded H.264 keeps both fields of a frame in one packet'
 	);
 });
 
+test('MPEG-TS with a PMT whose packets have other packets between them finds all streams', async () => {
+	// The PMT is too long for one TS packet, and a null packet sits between its two packets, as remultiplexers do
+	const packets: Uint8Array[] = [];
+	const pushPacket = (pid: number, payload: number[], payloadUnitStart: boolean) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		packet.set([0x47, (payloadUnitStart ? 0x40 : 0) | (pid >> 8), pid & 0xff, 0x10 | (packets.length & 0xf)], 0);
+		packet.set(payload, 4);
+		packets.push(packet);
+	};
+	const adtsPes = (pts: number) => [
+		0, 0, 1, 0xc0, 0, 8 + 39, 0x84, 0x80, 5, 0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+		0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc, ...new Array<number>(32).fill(0), // AAC-LC, 48 kHz, stereo
+	];
+
+	const privateDescriptor = [0xf0, 200, ...new Array<number>(200).fill(0x55)];
+	const pmtBody = [
+		0, 1, 0xc1, 0, 0, 0xe1, 0x01, 0xf0, privateDescriptor.length, ...privateDescriptor,
+		0x0f, 0xe1, 0x01, 0xf0, 0x00, // AAC on PID 0x101
+		0x0f, 0xe1, 0x02, 0xf0, 0x00, // AAC on PID 0x102
+		0, 0, 0, 0, // CRC (not checked)
+	];
+	const pmtSection = [0x00, 0x02, 0xb0 | (pmtBody.length >> 8), pmtBody.length & 0xff, ...pmtBody];
+
+	pushPacket(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0], true);
+	pushPacket(0x1000, pmtSection.slice(0, 184), true);
+	pushPacket(0x1fff, [], false); // Null packet
+	pushPacket(0x1000, pmtSection.slice(184), false);
+	for (let i = 0; i < 3; i++) {
+		pushPacket(0x101, adtsPes(1920 * i), true);
+		pushPacket(0x102, adtsPes(1920 * i), true);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.id)).toEqual([0x101, 0x102]);
+
+	for (const track of tracks) {
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.byteLength).toBe(39);
+			packetCount++;
+		}
+		expect(packetCount).toBe(3);
+	}
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
