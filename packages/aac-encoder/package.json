@@ -16,6 +16,7 @@
     "package.json",
     "LICENSE",
     "licenses",
+    "patches",
     "dist",
     "src"
   ],
