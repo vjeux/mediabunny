@@ -190,7 +190,11 @@ export class MpegTsMuxer extends Muxer {
 			}; break;
 
 			case 'mp3': {
-				streamType = MpegTsStreamType.MP3_MPEG1;
+				// H.222.0 Table 2-34: 0x03 is ISO/IEC 11172-3 (MPEG-1) audio, 0x04 is ISO/IEC 13818-3 audio, which
+				// covers the MPEG-2 low sampling frequencies (below 32 kHz). FFmpeg makes the same distinction.
+				streamType = meta.decoderConfig.sampleRate < 32000
+					? MpegTsStreamType.MP3_MPEG2
+					: MpegTsStreamType.MP3_MPEG1;
 				streamId = AUDIO_STREAM_ID_BASE + this.audioTrackIndex++;
 			}; break;
 
