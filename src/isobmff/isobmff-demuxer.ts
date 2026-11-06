@@ -995,11 +995,24 @@ export class IsobmffDemuxer extends Demuxer {
 	snapshotParsingState() {
 		const track = this.currentTrack;
 		const fragment = this.currentFragment;
-		const objects: object[] = [this, this.metadataTags];
+		const objects: object[] = [this];
+		// The metadata tags and the track also have their plain objects (like the raw tags or the track's disposition)
+		// covered, as boxes change some of those in place
+		const withPlainObjects: Record<string, unknown>[] = [this.metadataTags];
 		if (track) {
-			objects.push(track);
+			withPlainObjects.push(track);
 			if (track.info) {
-				objects.push(track.info);
+				withPlainObjects.push(track.info);
+			}
+		}
+		for (const object of withPlainObjects) {
+			objects.push(object);
+			for (const key in object) {
+				const value = object[key];
+				if (value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype
+					&& value !== track?.info) {
+					objects.push(value);
+				}
 			}
 		}
 		if (fragment) {
@@ -1010,30 +1023,40 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 		}
 
-		const snapshots = objects.map((object) => {
-			const fields: Record<string, unknown> = { ...object };
-			const lengths: [unknown[] | Map<unknown, unknown> | Set<unknown>, number][] = [];
-			for (const key in fields) {
-				const value = fields[key];
+		// Flat list of [object, its keys, its values, then collection and length pairs] per object
+		const snapshots: unknown[][] = [];
+		for (const object of objects as Record<string, unknown>[]) {
+			const keys = Object.keys(object);
+			const values: unknown[] = [];
+			const snapshot: unknown[] = [object, keys, values];
+			for (const key of keys) {
+				const value = object[key];
+				values.push(value);
 				if (Array.isArray(value)) {
-					lengths.push([value, value.length]);
+					snapshot.push(value, value.length);
 				} else if (value instanceof Map || value instanceof Set) {
-					lengths.push([value, value.size]);
+					snapshot.push(value, value.size);
 				}
 			}
-
-			return { object: object as Record<string, unknown>, fields, lengths };
-		});
+			snapshots.push(snapshot);
+		}
 
 		return () => {
-			for (const { object, fields, lengths } of snapshots) {
+			for (const snapshot of snapshots) {
+				const object = snapshot[0] as Record<string, unknown>;
+				const keys = snapshot[1] as string[];
+				const values = snapshot[2] as unknown[];
 				for (const key of Object.keys(object)) {
-					if (!(key in fields)) {
+					if (!keys.includes(key)) {
 						delete object[key];
 					}
 				}
-				Object.assign(object, fields);
-				for (const [collection, length] of lengths) {
+				for (let i = 0; i < keys.length; i++) {
+					object[keys[i]!] = values[i];
+				}
+				for (let i = 3; i < snapshot.length; i += 2) {
+					const collection = snapshot[i] as unknown[] | Map<unknown, unknown> | Set<unknown>;
+					const length = snapshot[i + 1] as number;
 					if (Array.isArray(collection)) {
 						collection.length = length;
 					} else {

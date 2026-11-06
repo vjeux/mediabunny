@@ -648,6 +648,29 @@ test('MP4: Box fields running past the end of the parent box', async () => {
 	const truncatedMvhd = fullBox('mvhd', 0, 0, u32(0), u32(0), u32(1), u32(0));
 	expect(await firstPacketTimestamp(mp4([delayedTrak]))).toBe(1);
 	expect(await firstPacketTimestamp(mp4([delayedTrak, truncatedMvhd]))).toBe(1);
+
+	// ...including what it changed in place: a truncated second tkhd (track disabled, ID 999) mustn't change the track
+	const truncatedTkhd = fullBox('tkhd', 0, 0, u32(0), u32(0), u32(999));
+	const trakWithTruncatedTkhd = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), extra: [truncatedTkhd] });
+	{
+		using input = new Input({ source: new BufferSource(mp4([trakWithTruncatedTkhd])), formats: ALL_FORMATS });
+		const track = (await input.getVideoTracks())[0]!;
+		expect(track.id).toBe(1);
+		expect((await track.getDisposition()).default).toBe(true);
+	}
+
+	// ...and a damaged udta mustn't leave its items in the raw tags of an earlier one
+	const quickTimeText = (name: string, text: string) => box(name, u16(text.length), u16(0), ascii(text));
+	const damagedUdta = box('udta', quickTimeText('\u00a9cmt', 'Stale'), u32(200), ascii('XYZW'), zeros(4));
+	{
+		using input = new Input({
+			source: new BufferSource(mp4([goodTrak, box('udta', quickTimeText('\u00a9nam', 'Good')), damagedUdta])),
+			formats: ALL_FORMATS,
+		});
+		const tags = await input.getMetadataTags();
+		expect(tags.comment).toBeUndefined();
+		expect(tags.raw).toEqual({ '\u00a9nam': 'Good' });
+	}
 });
 
 const firstPacketTimestamp = async (file: Uint8Array) => {
