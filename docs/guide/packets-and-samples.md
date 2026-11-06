@@ -504,7 +504,8 @@ const sample = new AudioSample({
 // From AudioBuffer:
 const timestamp = 0; // in seconds
 const samples = AudioSample.fromAudioBuffer(audioBuffer, timestamp);
-// => Returns multiple AudioSamples if the AudioBuffer is very long
+// => Returns an array; it holds multiple AudioSamples when the AudioBuffer is longer
+// than 240,000 values (e.g. 5 seconds of mono or 2.5 seconds of stereo 48 kHz audio)
 ```
 
 The following audio sample formats are supported:
