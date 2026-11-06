@@ -12,10 +12,14 @@ import {
 	FilePathSource,
 	Input,
 	InputAudioTrack,
+	MkvOutputFormat,
 	Mp4OutputFormat,
 	Output,
+	TextSubtitleSource,
 	WebMOutputFormat,
 } from '../../src/index.js';
+import { child, childrenNamed, find as findEbml, findAll as findAllEbml, parseEbml, readString, readUint }
+	from './helpers/spec-matrix-ebml.js';
 
 // Normative compliance of Mediabunny's codec bindings: Opus in ISOBMFF, FLAC in ISOBMFF, AV1-ISOBMFF, the VP codec
 // ISOBMFF binding, RFC 6381 codec strings and the WebCodecs codec registrations. One test per checked statement; test
@@ -30,7 +34,7 @@ type Box = { type: string; data: Uint8Array; children: Box[] };
 /** Offsets of the children within container boxes, sample entries included */
 const CHILD_OFFSETS: Record<string, number> = {
 	moov: 8, trak: 8, mdia: 8, minf: 8, stbl: 8, mvex: 8, moof: 8, traf: 8, edts: 8, dinf: 8, stsd: 16,
-	av01: 86, vp08: 86, vp09: 86, avc1: 86, Opus: 36, fLaC: 36, mp4a: 36,
+	av01: 86, vp08: 86, vp09: 86, avc1: 86, Opus: 36, fLaC: 36, mp4a: 36, wvtt: 16,
 };
 
 const parseBoxes = (bytes: Uint8Array, start = 0): Box[] => {
@@ -619,6 +623,138 @@ describe('Writer: RFC 6381 (codecs parameter of output MIME types)', () => {
 		for (const format of [new Mp4OutputFormat(), new WebMOutputFormat()]) {
 			const match = /;\s*codecs="([^"]*)"/.exec(await mimeTypeOf(format))!;
 			expect(match[1]).toMatch(/^[^\s(),]+(,\s?[^\s(),]+)*$/);
+		}
+	});
+});
+
+// --- WebVTT (W3C WebVTT: The Web Video Text Tracks Format) ---
+
+const WEBVTT_TEXT = 'WEBVTT\tKaraoke test\r\n'
+	+ 'Kind: captions\r\n'
+	+ '\r\n'
+	+ 'STYLE\r\n'
+	+ '::cue { color: red }\r\n'
+	+ '\r\n'
+	+ 'first\r\n'
+	+ '00:01.500 --> 00:04.000 align:start line:0\r\n'
+	+ 'Caf\u0065\u0301 <00:02.500>au <00:03.250>lait\r\n'
+	+ 'second line\r\n'
+	+ '\r\n'
+	+ '01:00:05.000 --> 01:00:06.000\r\n'
+	+ 'Later\r\n';
+
+const writeWebVtt = async (format: Mp4OutputFormat | MkvOutputFormat) => {
+	const output = new Output({ format, target: new BufferTarget() });
+	const source = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(source);
+	await output.start();
+	await source.add(WEBVTT_TEXT);
+	source.close();
+	await output.finalize();
+	return new Uint8Array(output.target.buffer!);
+};
+
+type VttBlock = { timestamp: number; duration: number; payload: string; additions: string | null };
+
+const readMkvWebVtt = (bytes: Uint8Array) => {
+	const nodes = parseEbml(bytes);
+	const trackEntry = findEbml(nodes, 'TrackEntry')!;
+	const codecId = readString(child(trackEntry, 'CodecID')!);
+	const codecPrivate = new TextDecoder().decode(child(trackEntry, 'CodecPrivate')!.data);
+	const blocks: VttBlock[] = [];
+	for (const cluster of findAllEbml(nodes, 'Cluster')) {
+		const clusterTimestamp = readUint(child(cluster, 'Timestamp')!);
+		for (const group of childrenNamed(cluster, 'BlockGroup')) {
+			const block = child(group, 'Block')!.data;
+			const relative = (block[1]! << 8 | block[2]!) << 16 >> 16;
+			const additional = findEbml(group.children, 'BlockAdditional');
+			blocks.push({
+				timestamp: (clusterTimestamp + relative) / 1000,
+				duration: readUint(child(group, 'BlockDuration')!) / 1000,
+				payload: new TextDecoder().decode(block.subarray(4)),
+				additions: additional ? new TextDecoder().decode(additional.data) : null,
+			});
+		}
+	}
+	return { codecId, codecPrivate, blocks };
+};
+
+/** All boxes of the samples of an MP4 WebVTT track, in order */
+const readMp4WebVtt = (bytes: Uint8Array) => {
+	const boxes = parseBoxes(bytes);
+	const entry = find(boxes, 'wvtt')!;
+	const vttC = parseBoxes(entry.data, 16).find(box => box.type === 'vttC')!;
+	const mdat = boxes.find(box => box.type === 'mdat')!;
+	const sampleBoxes = parseBoxes(mdat.data, 8).map(box => ({
+		type: box.type,
+		children: Object.fromEntries(parseBoxes(box.data, 8)
+			.map(childBox => [childBox.type, new TextDecoder().decode(childBox.data.subarray(8))])),
+	}));
+	return { config: new TextDecoder().decode(vttC.data.subarray(8)), sampleBoxes };
+};
+
+const WEBVTT_TIMESTAMP = /^(\d{2,}:)?[0-5]\d:[0-5]\d\.\d{3}$/;
+
+describe('WebVTT (W3C): parsing cue text and serializing it into Matroska and MP4', () => {
+	test('§6.1: CR LF line terminators, header text after a tab, and header blocks are accepted and kept', async () => {
+		const mkv = readMkvWebVtt(await writeWebVtt(new MkvOutputFormat()));
+		expect(mkv.codecId).toBe('S_TEXT/WEBVTT');
+		expect(mkv.codecPrivate).toMatch(/^WEBVTT\tKaraoke test\nKind: captions\n\nSTYLE\n::cue \{ color: red \}/);
+		const mp4 = readMp4WebVtt(await writeWebVtt(new Mp4OutputFormat()));
+		expect(mp4.config).toMatch(/^WEBVTT\tKaraoke test\n/);
+	});
+
+	test('§6.3: timestamps with and without hours give the cue start and end times', async () => {
+		const { blocks } = readMkvWebVtt(await writeWebVtt(new MkvOutputFormat()));
+		expect(blocks.map(block => [block.timestamp, block.duration])).toEqual([[1.5, 2.5], [3605, 1]]);
+	});
+
+	test('§4.1/§6.1: the cue identifier and the cue settings are kept with the cue', async () => {
+		const { blocks } = readMkvWebVtt(await writeWebVtt(new MkvOutputFormat()));
+		expect(blocks[0]!.additions).toMatch(/^align:start line:0\nfirst\n/);
+		const { sampleBoxes } = readMp4WebVtt(await writeWebVtt(new Mp4OutputFormat()));
+		const firstCue = sampleBoxes.find(box => box.type === 'vttc')!;
+		expect(firstCue.children['iden']).toBe('first');
+		expect(firstCue.children['sttg']).toBe('align:start line:0');
+	});
+
+	test('§4.1: a multi-line cue payload is kept whole, without the blank line that ends it', async () => {
+		const { blocks } = readMkvWebVtt(await writeWebVtt(new MkvOutputFormat()));
+		expect(blocks[0]!.payload).toBe('Caf\u0065\u0301 <00:00:01.000>au <00:00:01.750>lait\nsecond line');
+		const { sampleBoxes } = readMp4WebVtt(await writeWebVtt(new Mp4OutputFormat()));
+		expect(sampleBoxes.find(box => box.type === 'vttc')!.children['payl'])
+			.toBe('Caf\u0065\u0301 <00:02.500>au <00:03.250>lait\nsecond line');
+	});
+
+	test('§2.2: text is not Unicode-normalized (the decomposed é stays decomposed)', async () => {
+		const { blocks } = readMkvWebVtt(await writeWebVtt(new MkvOutputFormat()));
+		expect(blocks[0]!.payload.startsWith('Cafe\u0301')).toBe(true);
+	});
+
+	test('§4.2.2: inline timestamps written into Matroska blocks are valid WebVTT timestamps', async () => {
+		const { blocks } = readMkvWebVtt(await writeWebVtt(new MkvOutputFormat()));
+		const timestamps = [...blocks[0]!.payload.matchAll(/<([^>]+)>/g)].map(match => match[1]!);
+		expect(timestamps).toHaveLength(2);
+		for (const timestamp of timestamps) {
+			expect(timestamp).toMatch(WEBVTT_TIMESTAMP);
+		}
+	});
+
+	test('§4.1: cues keep their order and every cue ends after it starts', async () => {
+		const { blocks } = readMkvWebVtt(await writeWebVtt(new MkvOutputFormat()));
+		for (let i = 0; i < blocks.length; i++) {
+			expect(blocks[i]!.duration).toBeGreaterThan(0);
+			if (i > 0) {
+				expect(blocks[i]!.timestamp).toBeGreaterThanOrEqual(blocks[i - 1]!.timestamp);
+			}
+		}
+	});
+
+	test('ISO/IEC 14496-30: gaps between cues are vtte samples, cues are vttc samples with a payl box', async () => {
+		const { sampleBoxes } = readMp4WebVtt(await writeWebVtt(new Mp4OutputFormat()));
+		expect(sampleBoxes.map(box => box.type)).toEqual(['vtte', 'vttc', 'vtte', 'vttc']);
+		for (const box of sampleBoxes.filter(box => box.type === 'vttc')) {
+			expect(box.children['payl']).toBeDefined();
 		}
 	});
 });
