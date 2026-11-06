@@ -439,6 +439,8 @@ export class EncodedPacketSink {
 				return { value: undefined, done: true };
 			},
 			async throw(error) {
+				// Like a generator function, a throw() ends the iteration
+				await this.return();
 				throw error;
 			},
 			[Symbol.asyncIterator]() {
