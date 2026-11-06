@@ -521,11 +521,7 @@ export abstract class BaseMediaSampleSink<
 		(async () => {
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
-				// The sample at the start timestamp is yielded even if the range is shorter than the epsilon
-				if (
-					sample.timestamp >= endTimestamp - TIMESTAMP_EPSILON
-					&& sample.timestamp > startTimestamp + TIMESTAMP_EPSILON
-				) {
+				if (sample.timestamp >= endTimestamp - TIMESTAMP_EPSILON) {
 					ended = true;
 				}
 

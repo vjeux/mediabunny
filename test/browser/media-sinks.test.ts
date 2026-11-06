@@ -302,6 +302,11 @@ test('Sample lookups agree on timestamps a rounding error before a frame', async
 		break;
 	}
 
+	// The end stays exclusive, so an empty range at a frame yields nothing
+	for await (using sample of sink.samples(0, 0)) {
+		expect.unreachable(`samples(0, 0) yielded the frame at ${sample.timestamp}`);
+	}
+
 	// The frame at 0.44 comes after the one at 0.4 in decode order, the frame at 0.48 before it. Both are found.
 	for await (using sample of sink.samplesAtTimestamps([0.44 - 1e-11, 0.48 - 1e-11])) {
 		assert(sample);
