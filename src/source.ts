@@ -1856,7 +1856,18 @@ export class CustomSource extends Source {
 		}
 
 		this._readers.clear();
-		this._options.dispose?.();
+
+		// The user's callback must not be able to abort the disposal of everything else (the other sources of the
+		// input, its demuxer), and there is nobody to surface its errors to, so we log them
+		const logError = (error: unknown) => Logging._error('Error in CustomSource dispose callback:', error);
+		try {
+			const result = this._options.dispose?.();
+			if (isThenable(result)) {
+				result.then(null, logError);
+			}
+		} catch (error) {
+			logError(error);
+		}
 	}
 }
 
