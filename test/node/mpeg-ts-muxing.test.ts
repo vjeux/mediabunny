@@ -13,7 +13,18 @@ const getFirstPmtStreamType = (bytes: Uint8Array) => {
 	let pmtPid: number | null = null;
 	for (let pos = 0; pos + 188 <= bytes.length; pos += 188) {
 		const pid = ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
-		const payloadStart = pos + 4 + 1 + bytes[pos + 4]!; // Skip the header and the pointer_field
+		const payloadUnitStart = (bytes[pos + 1]! & 0x40) !== 0;
+		const adaptationFieldControl = (bytes[pos + 3]! >> 4) & 0b11;
+		if (!payloadUnitStart || !(adaptationFieldControl & 0b01)) {
+			continue; // No section starts in this packet
+		}
+
+		let payloadStart = pos + 4;
+		if (adaptationFieldControl & 0b10) {
+			payloadStart += 1 + bytes[payloadStart]!; // Skip the adaptation field
+		}
+		payloadStart += 1 + bytes[payloadStart]!; // Skip the pointer_field
+
 		if (pid === 0 && pmtPid === null) {
 			pmtPid = ((bytes[payloadStart + 10]! & 0x1f) << 8) | bytes[payloadStart + 11]!;
 		} else if (pid === pmtPid) {
