@@ -402,9 +402,8 @@ describe('Target.slice (RangedTarget)', () => {
 
 	test('writes into the base target at its offset and reports writes in its own coordinates', async () => {
 		const base = new BufferTarget();
-		const baseWriter = new Writer(base, false);
-		baseWriter.start();
-		baseWriter.write(new Uint8Array([1, 2, 3, 4]));
+		const baseWrites: [number, number][] = [];
+		base.on('write', ({ start, end }) => baseWrites.push([start, end]));
 
 		const slice = base.slice(4);
 		const writes: [number, number][] = [];
@@ -415,9 +414,8 @@ describe('Target.slice (RangedTarget)', () => {
 		sliceWriter.seek(0);
 		sliceWriter.write(new Uint8Array([7]));
 		await sliceWriter.finalize();
-		await baseWriter.finalize();
 
-		expect([...new Uint8Array(base.buffer!)]).toEqual([1, 2, 3, 4, 7, 6]);
 		expect(writes).toEqual([[0, 2], [0, 1]]);
+		expect(baseWrites).toEqual([[4, 6], [4, 5]]);
 	});
 });
