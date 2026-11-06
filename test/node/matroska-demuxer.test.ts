@@ -239,7 +239,8 @@ test('Laced Opus frames at the end of a cluster get their own durations', async 
 			packets.push(packet);
 		}
 
-		return packets.map(x => [x.timestamp, x.duration]);
+		// The duration of the last packet, an unlaced block at the end of the file, isn't what's tested here
+		return packets.map((x, i) => [x.timestamp, i === packets.length - 1 ? null : x.duration]);
 	};
 
 	expect(await readTimings(
@@ -261,7 +262,7 @@ test('Laced Opus frames at the end of a cluster get their own durations', async 
 	)).toEqual([
 		[0, 0.02], [0.02, 0.02], [0.04, 0.06],
 		[0.1, 0.012], [0.112, 0.013], [0.125, 0.012], [0.137, 0.013],
-		[0.15, 0],
+		[0.15, null],
 	]);
 
 	// The next cluster's timestamp only serves as the base of its blocks' relative timestamps, so it's the track's
@@ -274,5 +275,5 @@ test('Laced Opus frames at the end of a cluster get their own durations', async 
 			element(EBMLId.Timestamp, [30]),
 			element(EBMLId.SimpleBlock, [0x81, 0, 70, 0x80, ...opus20ms]),
 		),
-	)).toEqual([[0, 0.02], [0.02, 0.02], [0.04, 0.02], [0.1, 0]]);
+	)).toEqual([[0, 0.02], [0.02, 0.02], [0.04, 0.02], [0.1, null]]);
 });
