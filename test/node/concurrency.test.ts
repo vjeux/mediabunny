@@ -1442,6 +1442,8 @@ const runConversion = async (bytes: Uint8Array, format: OutputFormat, scenario: 
 			await conversion.execute();
 		} else if (scenario === 'cancel') {
 			const execution = conversion.execute();
+			// Awaited below, but may reject (canceled) before cancel() resolves
+			execution.catch(() => {});
 			await randomDelays(rand, 200);
 			await conversion.cancel();
 			await execution;
