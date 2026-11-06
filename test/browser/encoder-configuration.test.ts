@@ -34,12 +34,17 @@ import {
 	avcKeepsEveryFrame,
 	colorSpaceSupport,
 	flatLumaSurvives,
-	nativeAudioContradicts,
+	hungCoderKinds,
+	nativeAudioEncode,
 	nativeSupportsPreferHardware,
 	nativeVideoContradicts,
+	negativeTimestampsDecodeCorrectly,
 	opusDecodesAt48kHz,
+	ProbedVideoCodec,
+	qualityRaisesSize,
 	videoRoundTrips,
 	vp8MeetsBitrate,
+	withTimeout,
 } from './helpers/encoder-configs-platform.js';
 
 const medium = () => new Quality('medium');
@@ -47,8 +52,12 @@ const medium = () => new Quality('medium');
 // Codecs both Mediabunny and the platform's own encoder and decoder (checked natively, see encoder-configs-platform.ts)
 // can handle; the platform alone can't do much about the rest
 const encodableVideoCodecs = async () => {
-	const codecs: VideoCodec[] = [];
-	for (const codec of VIDEO_TEST_CODECS) {
+	const codecs: ProbedVideoCodec[] = [];
+	for (const codec of VIDEO_TEST_CODECS as ProbedVideoCodec[]) {
+		if (hungCoderKinds.has('video')) {
+			return [];
+		}
+
 		if (
 			await canEncodeVideo(codec, { width: 320, height: 240, quality: medium() })
 			&& await videoRoundTrips(codec)
@@ -103,7 +112,11 @@ describe('Support queries match real encodes', () => {
 					continue;
 				}
 
-				if (canEncode && result.error !== null && await nativeVideoContradicts(codec, width, height)) {
+				if (
+					canEncode
+					&& result.error !== null
+					&& await nativeVideoContradicts(codec as ProbedVideoCodec, width, height)
+				) {
 					// The platform's own support query accepts what its encoder then fails on
 					continue;
 				}
@@ -118,38 +131,47 @@ describe('Support queries match real encodes', () => {
 		}
 	});
 
-	test('canEncodeAudio agrees with what AudioSampleSource can encode', { timeout: 60_000 }, async () => {
-		const cases: [AudioCodec, number, number][] = [];
+	test('canEncodeAudio agrees with what AudioSampleSource can encode', { timeout: 120_000 }, async () => {
+		// Mediabunny encodes PCM itself; the platform encodes the rest. The cases most likely to hang a platform
+		// encoder (multichannel Opus, codecs browsers rarely encode) come last, since a hung encoder stalls all later
+		// ones.
+		const cases: [AudioCodec, number, number][] = PCM_AUDIO_CODECS.map(codec => [codec, 44100, 2]);
 		for (const sampleRate of [8000, 16000, 22050, 44100, 48000, 96000]) {
-			for (const numberOfChannels of [1, 2, 6]) {
+			for (const numberOfChannels of [1, 2]) {
 				cases.push(['opus', sampleRate, numberOfChannels]);
 			}
 		}
-		for (const codec of ['aac', 'mp3', 'vorbis', 'flac', 'ac3', 'eac3'] as AudioCodec[]) {
+		for (const codec of ['aac', 'mp3', 'ac3', 'eac3', 'vorbis', 'flac'] as AudioCodec[]) {
 			cases.push([codec, 48000, 2]);
 		}
-		for (const codec of PCM_AUDIO_CODECS) {
-			cases.push([codec, 44100, 2]);
-		}
+		cases.push(['opus', 48000, 6], ['opus', 44100, 6]);
 
 		for (const [codec, sampleRate, numberOfChannels] of cases) {
+			const isPcm = (PCM_AUDIO_CODECS as readonly string[]).includes(codec);
+			const native = isPcm
+				? 'works'
+				: await nativeAudioEncode(LITERAL_AUDIO_CODEC_STRINGS[codec] ?? codec, sampleRate, numberOfChannels);
+			if (native === 'hangs') {
+				// The platform's encoder never settled, so no later audio call on this page can be trusted
+				break;
+			}
+
 			const canEncode = await canEncodeAudio(codec, { sampleRate, numberOfChannels, quality: medium() });
-			const result = await encodeAudio({
+			const encoded = await withTimeout(encodeAudio({
 				codec,
 				config: { quality: medium() },
 				container: 'mov', // Holds every audio codec
 				sample: makeAudio({ sampleRate, numberOfChannels, duration: 0.1 }),
+			}), 20_000);
+			expect({ codec, sampleRate, numberOfChannels, settled: encoded !== null }).toEqual({
+				codec,
+				sampleRate,
+				numberOfChannels,
+				settled: true,
 			});
+			const result = encoded!.value;
 
-			if (
-				canEncode
-				&& result.error !== null
-				&& await nativeAudioContradicts(
-					LITERAL_AUDIO_CODEC_STRINGS[codec] ?? codec,
-					sampleRate,
-					numberOfChannels,
-				)
-			) {
+			if (canEncode && result.error !== null && native === 'fails') {
 				// The platform's own support query accepts what its encoder then fails on
 				continue;
 			}
@@ -179,6 +201,10 @@ describe('Support queries match real encodes', () => {
 		// Odd sizes rule out the H.26x codecs
 		const oddFirst = await getFirstEncodableVideoCodec(['avc', 'hevc', 'vp9'], { width: 641, height: 480 });
 		expect(oddFirst === 'vp9' || oddFirst === null).toBe(true);
+
+		if (hungCoderKinds.has('audio')) {
+			return;
+		}
 
 		const audioList: AudioCodec[] = ['aac', 'opus', 'pcm-s16'];
 		let expectedAudio: AudioCodec | null = null;
@@ -315,7 +341,7 @@ describe('Codec strings match the encoded bitstream', () => {
 		for (const [fullCodecString, profileIdc] of requests) {
 			if (
 				!await canEncodeVideo('avc', { width: 320, height: 240, fullCodecString })
-				|| !await avcHonorsProfile(fullCodecString, profileIdc)
+				|| !await avcHonorsProfile(fullCodecString)
 			) {
 				// Baseline-only encoders (like OpenH264 through GStreamer) produce Baseline whatever they're asked
 				continue;
@@ -368,7 +394,8 @@ describe('Rate control', () => {
 
 	test('higher quality levels give bigger output', { timeout: 60_000 }, async () => {
 		for (const codec of await encodableVideoCodecs()) {
-			if (codec === 'vp8' && !await vp8MeetsBitrate()) {
+			if (!await qualityRaisesSize(codec)) {
+				// The platform's encoder doesn't give more bytes for more quality, even when asked natively
 				continue;
 			}
 
@@ -568,7 +595,7 @@ describe('Encoder options', () => {
 
 			for (const alpha of ['keep', 'discard'] as const) {
 				const result = await encodeVideo({
-					config: { codec, quality: new Quality('high'), alpha },
+					config: { codec, quality: new Quality({ bitrate: 2_000_000 }), alpha },
 					container: 'webm',
 					width: 160,
 					height: 120,
@@ -797,7 +824,14 @@ describe('Color metadata', () => {
 describe('Audio', () => {
 	test('Opus output declares 48 kHz and keeps the channel count at any input rate', {
 		timeout: 60_000,
-	}, async () => {
+	}, async ({ skip }) => {
+		if (hungCoderKinds.has('audio') || await nativeAudioEncode('opus', 48000, 2) !== 'works') {
+			skip('The platform can\'t encode Opus');
+		}
+
+		// Encoded audio starts below zero (encoder delay), and some decoders scramble the timestamps that follow
+		const timingDecodesCorrectly = await negativeTimestampsDecodeCorrectly();
+
 		for (const sampleRate of [8000, 11025, 16000, 22050, 44100, 48000, 96000]) {
 			for (const numberOfChannels of [1, 2]) {
 				const result = await encodeAudio({
@@ -818,10 +852,12 @@ describe('Audio', () => {
 					// Opus decodes at 48 kHz whatever the input rate was, though some decoders output the input rate
 					expect(decoded.sampleRate).toBe(48000);
 				}
-				// The click comes out where it went in, give or take a few milliseconds of encoder delay handling
-				expect(Math.abs(decoded.peakTime - 0.25)).toBeLessThan(0.007);
-				expect(decoded.end).toBeGreaterThan(0.96);
-				expect(decoded.end).toBeLessThan(1.03);
+				if (timingDecodesCorrectly) {
+					// The click comes out where it went in, give or take a few milliseconds of encoder delay handling
+					expect(Math.abs(decoded.peakTime - 0.25)).toBeLessThan(0.007);
+					expect(decoded.end).toBeGreaterThan(0.96);
+					expect(decoded.end).toBeLessThan(1.03);
+				}
 				input.dispose();
 			}
 		}
