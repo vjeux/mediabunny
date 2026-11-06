@@ -3412,6 +3412,50 @@ export const EAC3_REGISTRATION_DESCRIPTOR = new Uint8Array([0x05, 0x04, 0x45, 0x
 export const EAC3_NUMBLKS_TABLE = [1, 2, 3, 6];
 
 /**
+ * Returns how many audio blocks of independent substream 0 a packet of AC-3/E-AC-3 syncframes holds, or null if the
+ * packet isn't made of whole syncframes. Sections 4.3 and E.1.2.
+ */
+export const countEac3AudioBlocks = (data: Uint8Array) => {
+	let blocks = 0;
+	let pos = 0;
+
+	while (pos + 6 <= data.length) {
+		if (data[pos] !== 0x0B || data[pos + 1] !== 0x77) {
+			return null;
+		}
+
+		const bsid = data[pos + 5]! >> 3;
+		let frameSize: number;
+
+		if (bsid <= 10) {
+			// An AC-3 syncframe (e.g. the core of an E-AC-3 stream) always holds six blocks
+			const fscod = data[pos + 4]! >> 6;
+			const frmsizecod = data[pos + 4]! & 0x3f;
+			if (fscod === 3 || frmsizecod > 37) {
+				return null;
+			}
+
+			frameSize = AC3_FRAME_SIZES[3 * frmsizecod + fscod]!;
+			blocks += 6;
+		} else {
+			const strmtyp = data[pos + 2]! >> 6;
+			const substreamid = (data[pos + 2]! >> 3) & 0x7;
+			const fscod = data[pos + 4]! >> 6;
+			const numblkscod = fscod === 3 ? 3 : (data[pos + 4]! >> 4) & 0x3;
+
+			frameSize = 2 * ((((data[pos + 2]! & 0x7) << 8) | data[pos + 3]!) + 1);
+			if (strmtyp !== 1 && substreamid === 0) {
+				blocks += EAC3_NUMBLKS_TABLE[numblkscod]!;
+			}
+		}
+
+		pos += frameSize;
+	}
+
+	return pos === data.length ? blocks : null;
+};
+
+/**
  * E-AC-3 independent substream info.
  * Each independent substream represents a separate audio program.
  */
