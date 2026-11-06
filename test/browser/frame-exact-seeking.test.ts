@@ -11,7 +11,7 @@ import {
 } from '../../src/media-sink.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { assert, isFirefox } from '../../src/misc.js';
+import { assert } from '../../src/misc.js';
 
 // Checks that every sink lookup returns exactly the right decoded frame or audio, across hard real-world structures.
 //
@@ -68,38 +68,43 @@ const vfrFrames = Array.from({ length: 60 }, (_, i) => ({
 
 type VideoCase = {
 	file: string;
+	codec: ProbedCodec;
 	frames: Frame[];
-	firefoxSkipReason?: string;
+	/** Mediabunny hands the decoder timestamps below zero (pre-roll before an edit, a wrapped PTS). */
+	negativeTimestamps?: boolean;
+	/** Decoding can start at the recovery point of an open GOP (where the platform allows it). */
+	openGop?: boolean;
 };
 
 const ms = { milliseconds: true };
 const videoCases: VideoCase[] = [
-	{ file: 'seek-avc-bframes.mp4', frames: cfr(60, 30) },
-	{ file: 'seek-avc-negative-cts.mp4', frames: cfr(60, 30) },
-	{ file: 'seek-avc-bframes16.mp4', frames: cfr(90, 30) },
+	{ file: 'seek-avc-bframes.mp4', codec: 'avc', frames: cfr(60, 30) },
+	{ file: 'seek-avc-negative-cts.mp4', codec: 'avc', frames: cfr(60, 30) },
+	{ file: 'seek-avc-bframes16.mp4', codec: 'avc', frames: cfr(90, 30) },
+	{ file: 'seek-avc-open-gop.mkv', codec: 'avc', frames: cfr(60, 30, ms), openGop: true },
+	{ file: 'seek-avc-intra-refresh.mp4', codec: 'avc', frames: cfr(60, 30) },
+	{ file: 'seek-avc-bframes.mkv', codec: 'avc', frames: cfr(60, 30, ms) },
+	{ file: 'seek-avc-live.mkv', codec: 'avc', frames: cfr(60, 30, ms) },
+	{ file: 'seek-avc-small-clusters.mkv', codec: 'avc', frames: cfr(60, 30, ms) },
+	{ file: 'seek-avc-bframes.ts', codec: 'avc', frames: cfr(60, 30, { start: 1.4 + 2 / 30 }) },
 	{
-		file: 'seek-avc-open-gop.mkv',
-		frames: cfr(60, 30, ms),
-		firefoxSkipReason: 'Firefox drops the leading pictures of open GOPs, which shifts the decoded timestamps',
+		file: 'seek-avc-pts-wrap.ts',
+		codec: 'avc',
+		frames: cfr(60, 30, { start: -118592 / 90000 }),
+		negativeTimestamps: true,
 	},
-	{ file: 'seek-avc-intra-refresh.mp4', frames: cfr(60, 30) },
-	{ file: 'seek-avc-bframes.mkv', frames: cfr(60, 30, ms) },
-	{ file: 'seek-avc-live.mkv', frames: cfr(60, 30, ms) },
-	{ file: 'seek-avc-small-clusters.mkv', frames: cfr(60, 30, ms) },
-	{ file: 'seek-avc-bframes.ts', frames: cfr(60, 30, { start: 1.4 + 2 / 30 }) },
-	{ file: 'seek-avc-pts-wrap.ts', frames: cfr(60, 30, { start: -118592 / 90000 }) },
-	{ file: 'seek-avc-fragmented.mp4', frames: cfr(60, 30, { start: 2 / 30 }) },
-	{ file: 'seek-avc-ntsc.mp4', frames: cfr(60, 30000, { fpsDen: 1001 }) },
-	{ file: 'seek-avc-23.976.mkv', frames: cfr(48, 24000, { fpsDen: 1001, ...ms }) },
-	{ file: 'seek-avc-vfr.mkv', frames: vfrFrames },
-	{ file: 'seek-avc-delayed.mp4', frames: cfr(60, 30, { start: 1 }) },
+	{ file: 'seek-avc-fragmented.mp4', codec: 'avc', frames: cfr(60, 30, { start: 2 / 30 }) },
+	{ file: 'seek-avc-ntsc.mp4', codec: 'avc', frames: cfr(60, 30000, { fpsDen: 1001 }) },
+	{ file: 'seek-avc-23.976.mkv', codec: 'avc', frames: cfr(48, 24000, { fpsDen: 1001, ...ms }) },
+	{ file: 'seek-avc-vfr.mkv', codec: 'avc', frames: vfrFrames },
+	{ file: 'seek-avc-delayed.mp4', codec: 'avc', frames: cfr(60, 30, { start: 1 }) },
 	// The frames before the cut (indices 30 to 44) are kept at negative timestamps for decoding
-	{ file: 'seek-avc-copy-cut.mp4', frames: cfr(45, 30, { firstIndex: 45 }) },
-	{ file: 'seek-avc-mbaff.mp4', frames: cfr(60, 30) },
-	{ file: 'seek-vp8.webm', frames: cfr(60, 30, ms) },
-	{ file: 'seek-vp9-altref.webm', frames: cfr(60, 30, ms) },
-	{ file: 'seek-av1.mp4', frames: cfr(60, 30) },
-	{ file: 'seek-av1.webm', frames: cfr(60, 30, ms) },
+	{ file: 'seek-avc-copy-cut.mp4', codec: 'avc', frames: cfr(45, 30, { firstIndex: 45 }), negativeTimestamps: true },
+	{ file: 'seek-avc-mbaff.mp4', codec: 'avc', frames: cfr(60, 30) },
+	{ file: 'seek-vp8.webm', codec: 'vp8', frames: cfr(60, 30, ms) },
+	{ file: 'seek-vp9-altref.webm', codec: 'vp9', frames: cfr(60, 30, ms) },
+	{ file: 'seek-av1.mp4', codec: 'av1', frames: cfr(60, 30) },
+	{ file: 'seek-av1.webm', codec: 'av1', frames: cfr(60, 30, ms) },
 ];
 
 const readFrameIndex = (rgba: Uint8Array | Uint8ClampedArray, stride: number) => {
@@ -156,74 +161,183 @@ const negativeTimestampsDecodeCorrectly = await (async () => {
 	return timestamps.join() === '-20000,0,20000';
 })();
 
-/**
- * Whether the browser really decodes the track from its first key frame and from one in the middle. WebKitGTK says it
- * can decode AV1 and FLAC but then fails to, and can't start at the recovery point of an open GOP. This uses its own
- * decoder, so that one that hangs can be closed again.
- */
-const decodesFromKeyFrames = async (track: InputVideoTrack | InputAudioTrack) => {
-	const sink = new EncodedPacketSink(track);
-	// Verified, so that the key frames are the ones the browser's decoder takes as such
-	const options = { verifyKeyPackets: true };
-	const starts = [
-		await sink.getFirstPacket(options),
-		await sink.getKeyPacket(await track.computeDuration() / 2, options),
-	];
-
-	for (const start of starts) {
-		let outputs = 0;
-		let failed = false;
-		const output = (data: VideoFrame | AudioData) => {
-			outputs++;
-			data.close();
-		};
-		const error = () => {
-			failed = true;
-		};
-
-		let decoder: VideoDecoder | AudioDecoder;
-		if (track instanceof InputVideoTrack) {
-			const videoDecoder = new VideoDecoder({ output, error });
-			videoDecoder.configure((await track.getDecoderConfig())!);
-			decoder = videoDecoder;
-		} else {
-			const audioDecoder = new AudioDecoder({ output, error });
-			audioDecoder.configure((await track.getDecoderConfig())!);
-			decoder = audioDecoder;
-		}
-
-		let packet = start;
-		for (let i = 0; packet && i < 8 && !failed; i++) {
-			try {
-				if (decoder instanceof VideoDecoder) {
-					decoder.decode(packet.toEncodedVideoChunk());
-				} else {
-					decoder.decode(packet.toEncodedAudioChunk());
-				}
-			} catch {
-				failed = true;
-			}
-			packet = await sink.getNextPacket(packet, options);
-		}
-		await Promise.race([decoder.flush().catch(() => {}), new Promise(resolve => setTimeout(resolve, 2000))]);
-		if (decoder.state !== 'closed') {
-			decoder.close();
-		}
-
-		if (failed || outputs === 0) {
-			return false;
-		}
-	}
-
-	return true;
+// Whether the platform can decode a codec is decided with WebCodecs alone, on tiny known-good streams, never with
+// Mediabunny (so that a Mediabunny failure on a capable platform fails instead of skipping). isConfigSupported() isn't
+// enough: WebKitGTK says it decodes AV1 and FLAC but then doesn't, and bare Firefox says the same of AAC. Each probe is
+// a decoder config and the first packets of 0.4 s of black 64x64 video or 0.1 s of mono silence, made by FFmpeg and
+// read with ffprobe -show_streams -show_packets -show_data:
+//   avc               -c:v libx264 -x264-params keyint=30:bframes=0 (.mp4; avcC, the IDR without its SEI)
+//   avcRecoveryPoint  from seek-avc-open-gop.mkv below: its avcC, and its first recovery point I-frame (at 1 s)
+//                     with the 7 packets after it in decode order (the first is a leading B-frame)
+//   vp8, vp9          -c:v libvpx / libvpx-vp9 -b:v 50k (.webm)
+//   av1               -c:v libaom-av1 -cpu-used 8 -crf 50 (-f obu, with its sequence header)
+//   mp3               -c:a libmp3lame -b:a 32k -write_xing 0 (48 kHz)
+//   aac               -c:a aac -b:a 32k (.m4a, 48 kHz)
+//   opus              -c:a libopus -b:a 16k (.ogg)
+//   flac              -c:a flac (16 kHz; "fLaC" + the STREAMINFO block)
+type ProbedCodec = 'avc' | 'vp8' | 'vp9' | 'av1' | 'mp3' | 'aac' | 'opus' | 'flac';
+type Probe = { codec: string; sampleRate?: number; description?: string; chunks: string[] };
+const PLATFORM_PROBES: Record<ProbedCodec | 'avcRecoveryPoint', Probe> = {
+	avc: {
+		codec: 'avc1.64000a',
+		description: 'AWQACv/hABZnZAAKrLQhNgIgAAADACAAAAeB4kTUAQAEaO8Py/34+AA=',
+		chunks: ['AAAAImWIhAv/zfge5+dNGJXY/99lBqplGekvDAt4kBWRdmF/jqw='],
+	},
+	avcRecoveryPoint: {
+		codec: 'avc1.64000a',
+		description: 'AWQACv/hABhnZAAKrNlEJsBEAAADAAQAAAMA8DxIllgBAAVo74I8sP34+AA=',
+		chunks: [
+			'AAAABQYGAcSAAAAAQUGI/4DP4n8F3v7vuThbn27O1/qL5PGgLXffd3/Vei/PqrP9G7bB33udk1U8PvlMfZSGK65crXhfyPbD+gQLuhR4',
+			'AAAAEQGeHUQn//AoNieOr9YU5LOA',
+			'AAAAG0GaAjkyippYX//6mwkfeO+z1K35DE70QPOrpw==',
+			'AAAAD0GeIEIX/3/H2jSsKPPcmg==',
+			'AAAAEAGeX0Qn//AoNicsvKU7248=',
+			'AAAAEAGeQUQn/+z0AG6JDrl0KKI=',
+			'AAAADkGaRjRMQv/8Yvx3qzp0',
+			'AAAAD0GeZEURLCf/kLBLHvNggA==',
+		],
+	},
+	vp8: {
+		codec: 'vp8',
+		chunks: ['8AIAnQEqQABAAABHCIWFiIWEiAICAAZwPEJgCrIg9zAA/v+rUIA='],
+	},
+	vp9: {
+		codec: 'vp09.00.10.08',
+		chunks: ['gkmDQgAD8AP2ADgkHBhCAAAwYAAAZz///1mvETuzAA=='],
+	},
+	av1: {
+		codec: 'av01.0.00M.08',
+		chunks: ['EgAKCgAAAAKv/5tfIAgyDRAAuoAAAkAAAAPOF7o='],
+	},
+	mp3: {
+		codec: 'mp3',
+		sampleRate: 48000,
+		chunks: [
+			'//sUxAADwAABpAAAACAAADSAAAAETEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV'
+			+ 'VVVVVVVVVVVVVVVVVVVVVVVVVVVV',
+			'//sUxCWDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV'
+			+ 'VVVVVVVVVVVVVVVVVVVVVVVVVVVV',
+			'//sUxEsDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV'
+			+ 'VVVVVVVVVVVVVVVVVVVVVVVVVVVV',
+		],
+	},
+	aac: {
+		codec: 'mp4a.40.2',
+		sampleRate: 48000,
+		description: 'EYhW5QA=',
+		chunks: ['3gIATGF2YzYyLjExLjEwMwACMEAO', 'ARggBw==', 'ARggBw=='],
+	},
+	opus: {
+		codec: 'opus',
+		sampleRate: 48000,
+		description: 'T3B1c0hlYWQBATgBgLsAAAAAAA==',
+		chunks: ['eAvkwTbsxY2MSUaZpCaw', 'eAfJcifhROpV8fDA1d3pUmA=', 'eAfJecjJV8CiEiP672fzZMDg'],
+	},
+	flac: {
+		codec: 'flac',
+		sampleRate: 16000,
+		description: 'ZkxhQ4AAACIEgASAAAALAAANA+gA8AAABkCfCt/b50DLnNgYijV2HiR2',
+		chunks: ['//g1CAADAAAAakQ=', '//h1CAEBv70AAAAGlg=='],
+	},
 };
 
-const skipIfNotReallyDecodable = async (track: InputVideoTrack | InputAudioTrack, skip: (note: string) => void) => {
-	if (!negativeTimestampsDecodeCorrectly && await track.getFirstTimestamp() < 0) {
-		skip('the decoder scrambles negative timestamps here');
+const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+
+const decodesNatively = async (probe: Probe) => {
+	const isVideo = probe.sampleRate === undefined;
+	if (isVideo ? typeof VideoDecoder === 'undefined' : typeof AudioDecoder === 'undefined') {
+		return false;
 	}
-	if (!(await decodesFromKeyFrames(track))) {
-		skip(`${await track.getCodec()} doesn't really decode here`);
+
+	const description = probe.description !== undefined ? fromBase64(probe.description) : undefined;
+	const videoConfig: VideoDecoderConfig = { codec: probe.codec, codedWidth: 64, codedHeight: 64, description };
+	const audioConfig: AudioDecoderConfig = {
+		codec: probe.codec,
+		sampleRate: probe.sampleRate!,
+		numberOfChannels: 1,
+		description,
+	};
+	try {
+		const support = isVideo
+			? await VideoDecoder.isConfigSupported(videoConfig)
+			: await AudioDecoder.isConfigSupported(audioConfig);
+		if (!support.supported) {
+			return false;
+		}
+	} catch {
+		return false;
+	}
+
+	let outputs = 0;
+	let failed = false;
+	const init = {
+		output: (data: VideoFrame | AudioData) => {
+			outputs++;
+			data.close();
+		},
+		error: () => {
+			failed = true;
+		},
+	};
+	const decoder = isVideo ? new VideoDecoder(init) : new AudioDecoder(init);
+
+	try {
+		if (decoder instanceof VideoDecoder) {
+			decoder.configure(videoConfig);
+			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedVideoChunk({
+				type: i === 0 ? 'key' : 'delta',
+				timestamp: i * 33_333,
+				data: fromBase64(chunk),
+			})));
+		} else {
+			decoder.configure(audioConfig);
+			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+				type: 'key',
+				timestamp: i * 20_000,
+				data: fromBase64(chunk),
+			})));
+		}
+		// A decoder that hangs doesn't decode
+		await Promise.race([decoder.flush(), new Promise(resolve => setTimeout(resolve, 2000))]);
+	} catch {
+		failed = true;
+	}
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return !failed && outputs > 0;
+};
+
+const platformDecodes = Object.fromEntries(await Promise.all(
+	(Object.keys(PLATFORM_PROBES) as (keyof typeof PLATFORM_PROBES)[])
+		.map(async key => [key, await decodesNatively(PLATFORM_PROBES[key])] as const),
+)) as Record<keyof typeof PLATFORM_PROBES, boolean>;
+
+// Mediabunny starts decoding at recovery points everywhere but in Chromium (which rejects them as first frames).
+// WebKitGTK can't either, so there, open-GOP files can't be checked.
+const isChromiumUserAgent = /Chrome/.test(navigator.userAgent);
+const isFirefoxUserAgent = navigator.userAgent.includes('Firefox');
+const recoveryPointsUnsupported = !isChromiumUserAgent && !platformDecodes.avcRecoveryPoint;
+
+/** Skips for what the platform can't do; Mediabunny itself must then agree that the track can be decoded. */
+const skipUnlessPlatformCapable = (
+	codec: ProbedCodec,
+	{ negativeTimestamps = false, openGop = false },
+	skip: (note: string) => never,
+) => {
+	if (!platformDecodes[codec]) {
+		skip(`${codec} can't be decoded here (native probe)`);
+	}
+	if (negativeTimestamps && !negativeTimestampsDecodeCorrectly) {
+		skip('the decoder scrambles negative timestamps here (native probe)');
+	}
+	if (openGop && recoveryPointsUnsupported) {
+		skip('the decoder can\'t start at a recovery point here (native probe)');
+	}
+	if (openGop && isFirefoxUserAgent) {
+		// Known: Firefox drops the leading pictures of open GOPs, which shifts the decoded timestamps (fork PR #191)
+		skip('Firefox drops open-GOP leading pictures (#191)');
 	}
 };
 
@@ -383,6 +497,7 @@ const runVideoCase = async (videoCase: VideoCase, track: InputVideoTrack) => {
 			`canvasesAtTimestamps(..., ${timestamp}, ...)`,
 		);
 	}
+	expect(canvasIndex).toBe(canvasQueries.length);
 
 	const [rangeStart, rangeEnd] = ranges[1];
 	const canvasRange: number[] = [];
@@ -413,7 +528,9 @@ const runVideoCase = async (videoCase: VideoCase, track: InputVideoTrack) => {
 
 describe('Video', () => {
 	for (const videoCase of videoCases) {
-		test.skipIf(isFirefox() && !!videoCase.firefoxSkipReason)(videoCase.file, async (context) => {
+		test(videoCase.file, async (context) => {
+			skipUnlessPlatformCapable(videoCase.codec, videoCase, note => context.skip(note));
+
 			using input = new Input({
 				source: new UrlSource(`/${videoCase.file}`),
 				formats: ALL_FORMATS,
@@ -421,17 +538,15 @@ describe('Video', () => {
 
 			const track = await input.getPrimaryVideoTrack();
 			assert(track);
-			if (!(await track.canDecode())) {
-				// For example, Firefox without the system FFmpeg libraries can't decode H.264
-				context.skip(`${await track.getCodec()} can't be decoded here`);
-			}
-			await skipIfNotReallyDecodable(track, note => context.skip(note));
+			expect(await track.canDecode()).toBe(true);
 
 			await runVideoCase(videoCase, track);
 		});
 	}
 
 	test('MPEG-TS without random access indicators (key frames found in the bitstream)', async (context) => {
+		skipUnlessPlatformCapable('avc', {}, note => context.skip(note));
+
 		const bytes = new Uint8Array(await (await fetch('/seek-avc-bframes.ts')).arrayBuffer());
 		let cleared = 0;
 		for (let i = 0; i + 188 <= bytes.length; i += 188) {
@@ -451,9 +566,7 @@ describe('Video', () => {
 
 		const track = await input.getPrimaryVideoTrack();
 		assert(track);
-		if (!(await track.canDecode())) {
-			context.skip(`${await track.getCodec()} can't be decoded here`);
-		}
+		expect(await track.canDecode()).toBe(true);
 
 		await runVideoCase(videoCases.find(x => x.file === 'seek-avc-bframes.ts')!, track);
 	});
@@ -467,13 +580,20 @@ describe('Video', () => {
 //   seek-audio.opus  -c:a libopus -b:a 32k (Ogg)
 //   seek-audio.m4a   -c:a libfdk_aac -b:a 64k (edit list for the priming)
 //   seek-audio.aac   -c:a libfdk_aac -b:a 64k (ADTS)
-type AudioCase = { file: string; maxDifference: number };
+type AudioCase = {
+	file: string;
+	codec: ProbedCodec;
+	maxDifference: number;
+	/** The encoder delay (LAME delay, AAC priming, Opus pre-skip) puts the first packet before zero. */
+	negativeTimestamps?: boolean;
+};
 const audioCases: AudioCase[] = [
-	{ file: 'seek-audio.mp3', maxDifference: 1e-4 },
-	{ file: 'seek-audio.flac', maxDifference: 0 },
-	{ file: 'seek-audio.opus', maxDifference: 1e-3 }, // 80 ms pre-roll converges closely, not exactly
-	{ file: 'seek-audio.m4a', maxDifference: 1e-4 },
-	{ file: 'seek-audio.aac', maxDifference: 1e-4 },
+	{ file: 'seek-audio.mp3', codec: 'mp3', maxDifference: 1e-4, negativeTimestamps: true },
+	{ file: 'seek-audio.flac', codec: 'flac', maxDifference: 0 },
+	// 80 ms pre-roll converges closely, not exactly
+	{ file: 'seek-audio.opus', codec: 'opus', maxDifference: 1e-3, negativeTimestamps: true },
+	{ file: 'seek-audio.m4a', codec: 'aac', maxDifference: 1e-4, negativeTimestamps: true },
+	{ file: 'seek-audio.aac', codec: 'aac', maxDifference: 1e-4 },
 ];
 
 const getChannelData = (sample: AudioSample) => {
@@ -588,6 +708,8 @@ const runAudioCase = async (audioCase: AudioCase, track: InputAudioTrack) => {
 describe('Audio', () => {
 	for (const audioCase of audioCases) {
 		test(audioCase.file, async (context) => {
+			skipUnlessPlatformCapable(audioCase.codec, audioCase, note => context.skip(note));
+
 			using input = new Input({
 				source: new UrlSource(`/${audioCase.file}`),
 				formats: ALL_FORMATS,
@@ -595,10 +717,7 @@ describe('Audio', () => {
 
 			const track = await input.getPrimaryAudioTrack();
 			assert(track);
-			if (!(await track.canDecode())) {
-				context.skip(`${await track.getCodec()} can't be decoded here`);
-			}
-			await skipIfNotReallyDecodable(track, note => context.skip(note));
+			expect(await track.canDecode()).toBe(true);
 
 			await runAudioCase(audioCase, track);
 		});
