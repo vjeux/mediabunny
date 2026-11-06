@@ -1248,8 +1248,25 @@ export class UrlSource extends PathedSource {
 
 						currentReader = newResponse.body.getReader();
 						// If the server still doesn't do ranges, the new response starts at byte 0 again and
-						// we need to skip over everything we already delivered. Cursed!
-						skipRemaining = newResponse.status === 206 ? 0 : streamPosition;
+						// we need to skip over everything we already delivered. Cursed! A 206 response states
+						// where its range starts, which may lie before the requested position.
+						if (newResponse.status === 206) {
+							const enclosedRange = newResponse.headers.has('Content-Encoding')
+								? null
+								: parseContentRange(newResponse.headers.get('Content-Range'));
+							const rangeStart = enclosedRange?.start ?? streamPosition;
+							if (rangeStart > streamPosition) {
+								throw new Error(
+									// eslint-disable-next-line @typescript-eslint/no-base-to-string
+									`Error fetching ${String(this._url)}: requested bytes from ${streamPosition}, but`
+									+ ` the server sent bytes from ${rangeStart}.`,
+								);
+							}
+
+							skipRemaining = streamPosition - rangeStart;
+						} else {
+							skipRemaining = streamPosition;
+						}
 
 						continue;
 					}

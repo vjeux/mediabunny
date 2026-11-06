@@ -355,6 +355,48 @@ test('UrlSource rejects 206 bodies that start after the requested position', asy
 	}
 });
 
+test('UrlSource resumes sequential mode at the start its 206 response states', async () => {
+	const data = new Uint8Array(3_000_000).map((_, i) => Math.imul(i, 2654435761) >>> 24); // Not periodic
+	let requestCount = 0;
+	const server = http.createServer((req, res) => {
+		res.on('error', () => {});
+
+		if (requestCount++ === 0) {
+			// No range support at first, and the connection dies partway through
+			res.writeHead(200, { 'Content-Length': data.length });
+			res.write(data.subarray(0, 1_000_000), () => res.destroy());
+			return;
+		}
+
+		// The resume request gets a range that starts at the MiB boundary before the requested position
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		const start = requested - (requested % 2 ** 20);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using ref = new UrlSource(`http://localhost:${address.port}/data.bin`, { getRetryDelay: () => 0 }).ref();
+		const reader = new Reader(ref.source);
+
+		const slice = await reader.requestSlice(0, data.length);
+		expect(Buffer.compare(readBytes(slice!, data.length), data)).toBe(0);
+		expect(requestCount).toBe(2);
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
 ) => {
