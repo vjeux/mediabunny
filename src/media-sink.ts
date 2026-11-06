@@ -2309,6 +2309,68 @@ export class CanvasSink {
 	}
 }
 
+/**
+ * Mixes an audio sample to the given number of channels, the way the Web Audio API mixes speakers for mono and
+ * stereo: up from mono by copying the channel, down to mono by averaging the channels. Keeps the sample format.
+ */
+const remixAudioSample = (sample: AudioSample, numberOfChannels: number) => {
+	const frameCount = sample.numberOfFrames;
+	const sourcePlanes = Array.from({ length: sample.numberOfChannels }, (_, planeIndex) => {
+		const plane = new Float32Array(frameCount);
+		sample.copyTo(plane, { planeIndex, format: 'f32-planar' });
+		return plane;
+	});
+
+	const data = new Float32Array(numberOfChannels * frameCount);
+	for (let channel = 0; channel < numberOfChannels; channel++) {
+		const target = data.subarray(channel * frameCount, (channel + 1) * frameCount);
+
+		if (numberOfChannels === 1) {
+			for (const plane of sourcePlanes) {
+				for (let i = 0; i < frameCount; i++) {
+					target[i]! += plane[i]! / sourcePlanes.length;
+				}
+			}
+		} else {
+			target.set(sourcePlanes[Math.min(channel, sourcePlanes.length - 1)]!);
+		}
+	}
+
+	const remixed = new AudioSample({
+		data,
+		format: 'f32-planar',
+		numberOfChannels,
+		sampleRate: sample.sampleRate,
+		timestamp: sample.timestamp,
+	});
+
+	const format = sample.format;
+	if (format === 'f32-planar') {
+		return remixed;
+	}
+
+	const planeCount = format.endsWith('-planar') ? numberOfChannels : 1;
+	const planeSizes = Array.from({ length: planeCount }, (_, planeIndex) => {
+		return remixed.allocationSize({ planeIndex, format });
+	});
+	const converted = new Uint8Array(planeSizes.reduce((sum, size) => sum + size, 0));
+
+	let offset = 0;
+	planeSizes.forEach((size, planeIndex) => {
+		remixed.copyTo(converted.subarray(offset, offset + size), { planeIndex, format });
+		offset += size;
+	});
+	remixed.close();
+
+	return new AudioSample({
+		data: converted,
+		format,
+		numberOfChannels,
+		sampleRate: sample.sampleRate,
+		timestamp: sample.timestamp,
+	});
+};
+
 class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	decoder: AudioDecoder | null = null;
 
@@ -2337,6 +2399,16 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			: 0;
 
 		const sampleHandler = (sample: AudioSample) => {
+			if (codec === 'mp3' && sample.numberOfChannels !== decoderConfig.numberOfChannels) {
+				// The channel mode of MP3 frames may switch between mono and stereo mid-stream, and decoders output
+				// every frame with its own channel count. Keep the output at the track's channel count, as consumers
+				// (like encoders) need a constant one. Other codecs are left alone, since there, the decoder can
+				// rightfully output more channels than configured (HE-AAC v2 turns one channel into two).
+				const remixed = remixAudioSample(sample, decoderConfig.numberOfChannels);
+				sample.close();
+				sample = remixed;
+			}
+
 			let sampleTimestamp = sample.timestamp;
 
 			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
