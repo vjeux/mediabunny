@@ -190,6 +190,32 @@ test('Read and write metadata, QuickTime', async () => {
 	expect(readTags.raw!['cust']).toEqual(new Uint8Array([1, 2, 3, 4]));
 });
 
+test('QuickTime text tags longer than 64 KiB keep as much text as their 16-bit length field allows', async () => {
+	const output = new Output({
+		format: new MovOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	// 65534 bytes of 'a', then a two-byte character that would straddle the 65535-byte limit
+	const lyrics = 'a'.repeat(65534) + 'é' + 'b'.repeat(5000);
+	output.setMetadataTags({ title: 'Title', lyrics });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.title).toBe('Title');
+	expect(readTags.lyrics).toBe('a'.repeat(65534)); // The length used to wrap around to 70536 - 65536 bytes
+});
+
 test('Read and write metadata, MP4 with mdta format', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat({
