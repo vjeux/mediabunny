@@ -732,7 +732,11 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 	return { input, track };
 };
 
-test('MediaStreamAudioTrackSource, timestamp jitter adds no silence, real gaps still get filled', async () => {
+test('MediaStreamAudioTrackSource, timestamp jitter adds no silence, real gaps still get filled', async ({ skip }) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator (Chromium)');
+	}
+
 	const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
 	const audioWriter = audioGenerator.writable.getWriter();
 
