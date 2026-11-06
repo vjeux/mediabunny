@@ -1654,6 +1654,74 @@ test.concurrent('Disposing the input releases the sources of every segment it re
 	expect(disposedPaths.sort()).toEqual(Array.from({ length: 8 }, (_, i) => `segment-${i}.ts`));
 });
 
+test.concurrent('A live media playlist without segments yet is waited on', async () => {
+	// A live stream that just started: the first fetch of its playlist has no segments yet. Loaded directly, and
+	// through a multivariant playlist.
+	for (const rootPath of ['live.m3u8', 'master.m3u8']) {
+		let playlistFetches = 0;
+
+		using input = new Input({
+			source: new CustomPathedSource(rootPath, ({ path }) => {
+				if (path === '0.ts') {
+					return new FilePathSource('./test/public/0.ts');
+				}
+				if (path === 'master.m3u8') {
+					return new BufferSource(new TextEncoder().encode(
+						'#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.64001f,mp4a.40.2"\nlive.m3u8\n',
+					));
+				}
+
+				playlistFetches++;
+				const text = playlistFetches === 1
+					? '#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n'
+					: '#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n';
+				return new BufferSource(new TextEncoder().encode(text));
+			}),
+			formats: HLS_FORMATS,
+		});
+
+		const tracks = await input.getTracks();
+		expect(tracks.map(x => x.type)).toEqual(['video', 'audio']);
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.getFirstTimestamp()).toBe(0);
+		expect(playlistFetches).toBe(2);
+	}
+});
+
+test.concurrent('Media playlist tags in a multivariant playlist are ignored', async () => {
+	// Not allowed in a multivariant playlist, but found in the wild. #EXT-X-TARGETDURATION only marks a media playlist
+	// when there are no variant streams.
+	const variant = '#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.64001f,mp4a.40.2"\nvariant.m3u8\n';
+	const mediaPlaylist = '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n';
+
+	const readVariantTracks = async (master: string) => {
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => {
+				if (path === '0.ts') {
+					return new FilePathSource('./test/public/0.ts');
+				}
+
+				return new BufferSource(new TextEncoder().encode(path === 'master.m3u8' ? master : mediaPlaylist));
+			}),
+			formats: HLS_FORMATS,
+		});
+
+		const tracks = await input.getTracks();
+		return {
+			types: tracks.map(x => x.type),
+			firstTimestamp: await tracks[0]!.getFirstTimestamp(), // Loads the variant's media
+		};
+	};
+
+	const expected = { types: ['video', 'audio'], firstTimestamp: 0 };
+	expect(await readVariantTracks(`#EXTM3U\n#EXT-X-VERSION:3\n${variant}`)).toEqual(expected);
+	expect(await readVariantTracks(
+		`#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n${variant}`,
+	)).toEqual(expected);
+});
+
 test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {
 	const cases = [
 		{
