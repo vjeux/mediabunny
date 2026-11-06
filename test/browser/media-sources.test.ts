@@ -1431,7 +1431,11 @@ test.for(['video', 'audio'] as const)(
 	},
 );
 
-test('MediaStream sources, pausing and resuming keeps audio and video in sync', async () => {
+test('MediaStream sources, pausing and resuming keeps audio and video in sync', async ({ skip }) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator (Chromium)');
+	}
+
 	// A video track that emits no frames while paused (like a canvas that doesn't change), next to continuous audio
 	const videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
 	const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
