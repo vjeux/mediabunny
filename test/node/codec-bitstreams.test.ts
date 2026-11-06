@@ -609,8 +609,15 @@ describe('Audio configuration', () => {
 				.toBe(fixture.expected.numberOfChannels);
 			expect(bitRates[frame.bitRateCode]! * 1000, fixture.name).toBe(fixture.expected.bitRate);
 
-			// Not E-AC-3
-			expect(parseEac3SyncFrame(hexToBytes(fixture.frameStart)), fixture.name).toBe(null);
+			// The E-AC-3 parser may reject AC-3 frames, or describe them the way dec3 does for the AC-3 core of Blu-ray
+			// Dolby Digital Plus; either way it mustn't contradict the frame
+			const asEac3 = parseEac3SyncFrame(hexToBytes(fixture.frameStart));
+			if (asEac3) {
+				expect(asEac3.substreams, fixture.name).toHaveLength(1);
+				expect(getEac3SampleRate(asEac3), fixture.name).toBe(fixture.expected.sampleRate);
+				expect(getEac3ChannelCount(asEac3), fixture.name).toBe(fixture.expected.numberOfChannels);
+				expect(asEac3.dataRate * 1000, fixture.name).toBe(fixture.expected.bitRate);
+			}
 		}
 
 		for (const fixture of EAC3_FIXTURES) {
