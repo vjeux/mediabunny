@@ -1,7 +1,7 @@
 import { expect, test, vi } from 'vitest';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, AudioSampleSink } from '../../src/media-sink.js';
 import { BufferSource, FilePathSource, CustomSource } from '../../src/source.js';
 import { countMovedArrayElements } from './array-moves.js';
 import path from 'node:path';
@@ -11,6 +11,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { Output } from '../../src/output.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { BufferTarget } from '../../src/target.js';
+import { mapAsyncGenerator } from '../../src/misc.js';
 
 // 200k minimal ADTS frames (77 min at 44.1 kHz)
 const createAdtsFile = (frameCount: number) => {
@@ -145,4 +146,34 @@ test('packets() caps how much packet data it reads ahead', async () => {
 
 	// Up to 80 packets (40 MiB) used to be queued
 	expect(readAheadBytes).toBeLessThan(2 ** 25 + 4 * packetSize);
+});
+
+const readOneValueThenDispose = async (iterator: AsyncGenerator<unknown, void, unknown>) => {
+	// AsyncGenerator is AsyncDisposable in TypeScript's esnext lib, which this project doesn't use
+	await using disposable = iterator as AsyncGenerator<unknown, void, unknown> & AsyncDisposable;
+	const result = await disposable.next();
+	expect(result.done).toBe(false);
+	(result.value as { close?: () => void }).close?.();
+};
+
+test('Sink iterators end when disposed with await using, like native async generators', async () => {
+	using input = new Input({
+		source: new FilePathSource('./test/public/glitch-hop-is-dead.wav'),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryAudioTrack())!;
+	const sampleSink = new AudioSampleSink(track);
+
+	const iterators: AsyncGenerator<unknown, void, unknown>[] = [
+		new EncodedPacketSink(track).packets(),
+		sampleSink.samples(),
+		sampleSink.samplesAtTimestamps([0, 0.5, 1]),
+		// What CanvasSink and AudioBufferSink return
+		mapAsyncGenerator(new EncodedPacketSink(track).packets(), packet => packet.timestamp),
+	];
+
+	for (const iterator of iterators) {
+		await readOneValueThenDispose(iterator);
+		expect(await iterator.next()).toEqual({ value: undefined, done: true });
+	}
 });
