@@ -141,6 +141,16 @@ const nativeYuvToRgbaWorks = await (async () => {
 	return rgba[3] === 255 && rgba[7] === 255;
 })();
 
+// A decoder that hangs (WebKitGTK's FLAC decoder never finishes flushing) also stalls every later WebCodecs call of its
+// kind on the page, even once closed, isConfigSupported() included. So every native call is raced against a timeout,
+// probes run lazily (only once a test needs them), and after a hang, the later tests of that kind are skipped.
+const NATIVE_TIMEOUT = 2000;
+const hungDecoderKinds = new Set<'video' | 'audio'>();
+const withTimeout = <T>(promise: Promise<T>) => Promise.race([
+	promise.then(value => ({ value })),
+	new Promise<null>(resolve => setTimeout(() => resolve(null), NATIVE_TIMEOUT)),
+]);
+
 // WebKitGTK's GStreamer decoders scramble the timestamps that follow a negative one (they flip the playback direction
 // of their segment), so there, files that start before zero can't be checked
 const negativeTimestampsDecodeCorrectly = await (async () => {
@@ -156,8 +166,13 @@ const negativeTimestampsDecodeCorrectly = await (async () => {
 	for (const timestamp of [-20000, 0, 20000]) {
 		decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp, data: new Uint8Array(1920) }));
 	}
-	await decoder.flush();
-	decoder.close();
+	const flushed = await withTimeout(decoder.flush().catch(() => {}));
+	if (flushed === null) {
+		hungDecoderKinds.add('audio');
+	}
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
 	return timestamps.join() === '-20000,0,20000';
 })();
 
@@ -245,6 +260,7 @@ const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.char
 
 const decodesNatively = async (probe: Probe) => {
 	const isVideo = probe.sampleRate === undefined;
+	const kind = isVideo ? 'video' : 'audio';
 	if (isVideo ? typeof VideoDecoder === 'undefined' : typeof AudioDecoder === 'undefined') {
 		return false;
 	}
@@ -257,14 +273,15 @@ const decodesNatively = async (probe: Probe) => {
 		numberOfChannels: 1,
 		description,
 	};
-	try {
-		const support = isVideo
-			? await VideoDecoder.isConfigSupported(videoConfig)
-			: await AudioDecoder.isConfigSupported(audioConfig);
-		if (!support.supported) {
-			return false;
-		}
-	} catch {
+	const support = await withTimeout((isVideo
+		? VideoDecoder.isConfigSupported(videoConfig)
+		: AudioDecoder.isConfigSupported(audioConfig)
+	).then(x => x.supported === true, () => false));
+	if (support === null) {
+		hungDecoderKinds.add(kind);
+		return false;
+	}
+	if (!support.value) {
 		return false;
 	}
 
@@ -297,8 +314,12 @@ const decodesNatively = async (probe: Probe) => {
 				data: fromBase64(chunk),
 			})));
 		}
-		// A decoder that hangs doesn't decode
-		await Promise.race([decoder.flush(), new Promise(resolve => setTimeout(resolve, 2000))]);
+
+		const flushed = await withTimeout(decoder.flush());
+		if (flushed === null) {
+			hungDecoderKinds.add(kind);
+			failed = true;
+		}
 	} catch {
 		failed = true;
 	}
@@ -309,35 +330,50 @@ const decodesNatively = async (probe: Probe) => {
 	return !failed && outputs > 0;
 };
 
-const platformDecodes = Object.fromEntries(await Promise.all(
-	(Object.keys(PLATFORM_PROBES) as (keyof typeof PLATFORM_PROBES)[])
-		.map(async key => [key, await decodesNatively(PLATFORM_PROBES[key])] as const),
-)) as Record<keyof typeof PLATFORM_PROBES, boolean>;
+type ProbeKey = keyof typeof PLATFORM_PROBES;
+const probeResults = new Map<ProbeKey, Promise<boolean>>();
+const platformDecodes = (key: ProbeKey) => {
+	let result = probeResults.get(key);
+	if (!result) {
+		result = decodesNatively(PLATFORM_PROBES[key]);
+		probeResults.set(key, result);
+	}
+
+	return result;
+};
 
 // Mediabunny starts decoding at recovery points everywhere but in Chromium (which rejects them as first frames).
 // WebKitGTK can't either, so there, open-GOP files can't be checked.
 const isChromiumUserAgent = /Chrome/.test(navigator.userAgent);
 const isFirefoxUserAgent = navigator.userAgent.includes('Firefox');
-const recoveryPointsUnsupported = !isChromiumUserAgent && !platformDecodes.avcRecoveryPoint;
 
-/** Skips for what the platform can't do; Mediabunny itself must then agree that the track can be decoded. */
-const skipUnlessPlatformCapable = (
+const VIDEO_CODECS: ProbedCodec[] = ['avc', 'vp8', 'vp9', 'av1'];
+
+/**
+ * Skips for what the platform can't do; Mediabunny itself must then agree that the track can be decoded. The cheap,
+ * static reasons come first, so that a probe only runs (and can only hang) when its result matters.
+ */
+const skipUnlessPlatformCapable = async (
 	codec: ProbedCodec,
 	{ negativeTimestamps = false, openGop = false },
 	skip: (note: string) => never,
 ) => {
-	if (!platformDecodes[codec]) {
-		skip(`${codec} can't be decoded here (native probe)`);
+	const kind = VIDEO_CODECS.includes(codec) ? 'video' : 'audio';
+	if (hungDecoderKinds.has(kind)) {
+		skip(`an earlier ${kind} decoder hang stalled ${kind} decoding on this page (native probe)`);
 	}
 	if (negativeTimestamps && !negativeTimestampsDecodeCorrectly) {
 		skip('the decoder scrambles negative timestamps here (native probe)');
 	}
-	if (openGop && recoveryPointsUnsupported) {
-		skip('the decoder can\'t start at a recovery point here (native probe)');
-	}
 	if (openGop && isFirefoxUserAgent) {
 		// Known: Firefox drops the leading pictures of open GOPs, which shifts the decoded timestamps (fork PR #191)
 		skip('Firefox drops open-GOP leading pictures (#191)');
+	}
+	if (!(await platformDecodes(codec))) {
+		skip(`${codec} can't be decoded here (native probe)`);
+	}
+	if (openGop && !isChromiumUserAgent && !(await platformDecodes('avcRecoveryPoint'))) {
+		skip('the decoder can\'t start at a recovery point here (native probe)');
 	}
 };
 
@@ -527,25 +563,9 @@ const runVideoCase = async (videoCase: VideoCase, track: InputVideoTrack) => {
 };
 
 describe('Video', () => {
-	for (const videoCase of videoCases) {
-		test(videoCase.file, async (context) => {
-			skipUnlessPlatformCapable(videoCase.codec, videoCase, note => context.skip(note));
-
-			using input = new Input({
-				source: new UrlSource(`/${videoCase.file}`),
-				formats: ALL_FORMATS,
-			});
-
-			const track = await input.getPrimaryVideoTrack();
-			assert(track);
-			expect(await track.canDecode()).toBe(true);
-
-			await runVideoCase(videoCase, track);
-		});
-	}
-
+	// First, so that the AV1 files (the last cases, where a decoder may hang) come last
 	test('MPEG-TS without random access indicators (key frames found in the bitstream)', async (context) => {
-		skipUnlessPlatformCapable('avc', {}, note => context.skip(note));
+		await skipUnlessPlatformCapable('avc', {}, note => context.skip(note));
 
 		const bytes = new Uint8Array(await (await fetch('/seek-avc-bframes.ts')).arrayBuffer());
 		let cleared = 0;
@@ -570,6 +590,23 @@ describe('Video', () => {
 
 		await runVideoCase(videoCases.find(x => x.file === 'seek-avc-bframes.ts')!, track);
 	});
+
+	for (const videoCase of videoCases) {
+		test(videoCase.file, async (context) => {
+			await skipUnlessPlatformCapable(videoCase.codec, videoCase, note => context.skip(note));
+
+			using input = new Input({
+				source: new UrlSource(`/${videoCase.file}`),
+				formats: ALL_FORMATS,
+			});
+
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			expect(await track.canDecode()).toBe(true);
+
+			await runVideoCase(videoCase, track);
+		});
+	}
 });
 
 // Audio: each lookup must return the chunk containing the timestamp, with the same timestamp and the same data as
@@ -589,11 +626,12 @@ type AudioCase = {
 };
 const audioCases: AudioCase[] = [
 	{ file: 'seek-audio.mp3', codec: 'mp3', maxDifference: 1e-4, negativeTimestamps: true },
-	{ file: 'seek-audio.flac', codec: 'flac', maxDifference: 0 },
 	// 80 ms pre-roll converges closely, not exactly
 	{ file: 'seek-audio.opus', codec: 'opus', maxDifference: 1e-3, negativeTimestamps: true },
 	{ file: 'seek-audio.m4a', codec: 'aac', maxDifference: 1e-4, negativeTimestamps: true },
 	{ file: 'seek-audio.aac', codec: 'aac', maxDifference: 1e-4 },
+	// Last: WebKitGTK's FLAC decoder hangs, which stalls the audio decoders of the page
+	{ file: 'seek-audio.flac', codec: 'flac', maxDifference: 0 },
 ];
 
 const getChannelData = (sample: AudioSample) => {
@@ -708,7 +746,7 @@ const runAudioCase = async (audioCase: AudioCase, track: InputAudioTrack) => {
 describe('Audio', () => {
 	for (const audioCase of audioCases) {
 		test(audioCase.file, async (context) => {
-			skipUnlessPlatformCapable(audioCase.codec, audioCase, note => context.skip(note));
+			await skipUnlessPlatformCapable(audioCase.codec, audioCase, note => context.skip(note));
 
 			using input = new Input({
 				source: new UrlSource(`/${audioCase.file}`),
