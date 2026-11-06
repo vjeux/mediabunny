@@ -1,5 +1,12 @@
 import { expect, test } from 'vitest';
-import { AudioSample, VideoSample } from '../../src/sample.js';
+import {
+	AudioSample,
+	VideoSample,
+	VideoSampleColorSpace,
+	VideoSampleInit,
+	VideoSampleResource,
+} from '../../src/sample.js';
+import { SetRequired } from '../../src/misc.js';
 
 test('VideoSample creation from bytes', async () => {
 	const bytes = new Uint8Array(1280 * 720 * 4);
@@ -49,4 +56,76 @@ test('AudioSample creation from bytes', async () => {
 	});
 
 	sample.close();
+});
+
+test('VideoSampleResource RGB output is copied without converting its color space again', async () => {
+	// toRgbSample() converts into the requested color space, so its result must be copied as it is
+	const requested: PredefinedColorSpace[] = [];
+	class YuvResource extends VideoSampleResource {
+		getFormat() {
+			return 'I420' as const;
+		}
+
+		getCodedWidth() {
+			return 2;
+		}
+
+		getCodedHeight() {
+			return 2;
+		}
+
+		getSquarePixelWidth() {
+			return 2;
+		}
+
+		getSquarePixelHeight() {
+			return 2;
+		}
+
+		getColorSpace() {
+			return new VideoSampleColorSpace();
+		}
+
+		getDataPlanes() {
+			return [
+				{ data: new Uint8Array(4), stride: 2 },
+				{ data: new Uint8Array(1), stride: 1 },
+				{ data: new Uint8Array(1), stride: 1 },
+			];
+		}
+
+		toRgbSample(init: SetRequired<VideoSampleInit, 'timestamp'>, colorSpace: PredefinedColorSpace) {
+			requested.push(colorSpace);
+			const pixel = [200, 100, 50, 255];
+			return new VideoSample(new Uint8Array([...pixel, ...pixel, ...pixel, ...pixel]), {
+				...init, format: 'RGBA', codedWidth: 2, codedHeight: 2,
+			});
+		}
+
+		close() {}
+	}
+
+	using sample = new VideoSample(new YuvResource(), { timestamp: 0 });
+	const bytes = new Uint8Array(16);
+	await sample.copyTo(bytes, { format: 'BGRX', colorSpace: 'display-p3' });
+	expect(requested).toEqual(['display-p3']);
+	expect([...bytes.subarray(0, 4)]).toEqual([50, 100, 200, 255]);
+});
+
+test('Converting raw RGB data into another color space needs VideoFrame', async () => {
+	// R, G, B, orange with a visible rect that doesn't start at the origin
+	const pixels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 128, 0, 255]);
+	using sample = new VideoSample(pixels, {
+		format: 'RGBA',
+		codedWidth: 4,
+		codedHeight: 1,
+		timestamp: 0,
+		visibleRect: { left: 1, top: 0, width: 2, height: 1 },
+	});
+
+	// Node has no VideoFrame to convert with, so this fails instead of returning unconverted pixels
+	await expect(sample.copyTo(new Uint8Array(8), { format: 'RGBA', colorSpace: 'display-p3' }))
+		.rejects.toThrow('requires VideoFrame');
+	// sRGB data copied as sRGB needs no conversion
+	await sample.copyTo(new Uint8Array(8), { format: 'BGRA', colorSpace: 'srgb' });
 });
