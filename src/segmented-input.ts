@@ -632,7 +632,21 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			// Segments are muxed separately, so the end of one segment's media and the start of the next one's can
 			// overlap by a tick: the last packet's end and the next packet's start get rounded independently
 			const timestampTick = Math.floor(roundIfAlmostInteger(timestamp * timeResolution));
-			if (timestampTick >= Math.round(lastPacketEnd * timeResolution) - 1) {
+			let mayLieInNextSegment = timestampTick >= Math.round(lastPacketEnd * timeResolution) - 1;
+
+			if (!mayLieInNextSegment) {
+				// The last packet's duration can also be off (e.g. a nominal duration in variable frame rate media), in
+				// which case its end says nothing about where the next segment's media starts. The next segment's
+				// playlist timestamp says more, so also look there when the timestamp is within a tick of it.
+				const nextSegment = await this.segmentedInput.getNextSegment(currentSegment, { skipLiveWait: true });
+				if (nextSegment) {
+					const nextSegmentStart = nextSegment.timestamp
+						+ (this.segmentedInput.learnedSegmentTimestampOffset ?? 0);
+					mayLieInNextSegment = timestampTick >= Math.round(nextSegmentStart * timeResolution) - 1;
+				}
+			}
+
+			if (mayLieInNextSegment) {
 				// Not just the next segment's first packet matters: in decode order, an open GOP's leading frames come
 				// after the key frame that starts the segment
 				const next = await getPacketInNextSegment(currentSegment, options.skipLiveWait);

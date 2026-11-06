@@ -1721,6 +1721,35 @@ test.concurrent('Packets at segment boundaries can be looked up when the segment
 	}
 });
 
+test.concurrent('Packets at segment boundaries can be looked up when the last packet before them claims a longer duration', async () => {
+	// The last frame of each GOP claims 0.6 s although the next key frame follows 0.25 s later, as with nominal
+	// durations in variable frame rate media. The key frames sit a little after whole seconds, so the playlist starts
+	// their segments a few microseconds after where the 57600 Hz timescale of CMAF stores them.
+	const video: { timestamp: number; duration: number; type: 'key' | 'delta' }[] = [];
+	for (let gop = 0; gop < 3; gop++) {
+		const start = gop === 0 ? 0 : gop + 0.0000037;
+		video.push({ timestamp: start, duration: 0.25, type: 'key' });
+		video.push({ timestamp: start + 0.25, duration: 0.25, type: 'delta' });
+		video.push({ timestamp: start + 0.5, duration: 0.25, type: 'delta' });
+		video.push({ timestamp: start + 0.75, duration: 0.6, type: 'delta' });
+	}
+
+	using input = await writeHlsFromPackets(new CmafOutputFormat(), video, []);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	let count = 0;
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		if (packet.type === 'key') {
+			expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		}
+		count++;
+	}
+	expect(count).toBe(12);
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
