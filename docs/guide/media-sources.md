@@ -141,7 +141,7 @@ type AudioEncodingConfig = {
 };
 ```
 - `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding.
-- `quality`: The desired quality of the encoded audio. Required for compressed codecs; can be omitted for uncompressed PCM codecs, for which it is unused. See [Encoding quality](#encoding-quality).
+- `quality`: The desired quality of the encoded audio. Required for compressed codecs other than FLAC and TrueHD; can be omitted for those and for PCM codecs, for which it is unused. See [Encoding quality](#encoding-quality).
 - `fullCodecString`: Allows you to optionally specify the full codec string used by the audio encoder, as specified in the [Mediabunny Codec Registry](/codec-registry/overview). For example, you may set it to `'mp4a.40.2'` when using AAC. Keep in mind that the codec string must still match the codec specified in `codec`. If you don't set this field, a codec string will be generated automatically.
 - `transform`: Optional transformations to apply to the audio samples before they are passed to the encoder.
 	- `numberOfChannels`: The desired number of output channels to up/downmix to.

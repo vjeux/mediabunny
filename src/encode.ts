@@ -445,7 +445,8 @@ export type AudioEncodingConfig = {
 	/** The audio codec that should be used for encoding the audio samples. */
 	codec: AudioCodec;
 	/**
-	 * The desired quality of the encoded audio. Required for compressed audio codecs, unused for PCM codecs.
+	 * The desired quality of the encoded audio. Required for compressed audio codecs other than FLAC and
+	 * TrueHD; unused for those and for PCM codecs.
 	 */
 	quality?: Quality;
 	/**
