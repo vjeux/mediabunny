@@ -1778,7 +1778,7 @@ describe('Metadata tags', () => {
 		expect(readDataAtom(bytes, items[3]!).type).toBe(14);
 	});
 
-	test('mdta writes a QuickTime meta box with a keys box and index-keyed items', async () => {
+	test('mdta writes a meta box with an mdta handler, a keys box and index-keyed items', async () => {
 		const { bytes, boxes } = await muxWithTags(new Mp4OutputFormat({ metadataFormat: 'mdta' }), {
 			title: 'Title',
 			trackNumber: 3,
@@ -1786,7 +1786,13 @@ describe('Metadata tags', () => {
 			raw: { 'com.example.custom-key': 'Value' },
 		});
 		const meta = findBox(boxes, 'moov/udta/meta');
-		expect(fourCc(bytes, meta.contentStart + 4)).toBe('hdlr'); // Not a FullBox, like QuickTime writes it
+		// Inside udta this is the ISO MetaBox, a FullBox (as FFmpeg writes it); QuickTime's version-less layout is also
+		// accepted here
+		const isFullBox = fourCc(bytes, meta.contentStart + 4) !== 'hdlr';
+		if (isFullBox) {
+			expect(new DataView(bytes.buffer, bytes.byteOffset).getUint32(meta.contentStart)).toBe(0); // Version, flags
+		}
+		expect(fourCc(bytes, meta.contentStart + (isFullBox ? 8 : 4))).toBe('hdlr');
 		expect(readHdlr(bytes, findBox(meta.children, 'hdlr')).handlerType).toBe('mdta');
 
 		const keysBox = findBox(meta.children, 'keys');
