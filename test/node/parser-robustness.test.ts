@@ -12,7 +12,8 @@ import { walkInput } from './helpers/robustness-walk.js';
 //
 // - corpus-*.bin: small inputs that together cover the most reader code, picked greedily by V8 block coverage from
 //   the fuzzing corpus. They read fine today and guard against regressions.
-// - The other files fail today. Each is minimized and skipped until the PR named below lands.
+// - The other files fail today. Each is minimized and runs as an expected failure until the PR named below lands; then
+//   that test starts failing, as a reminder to take its file off the list so it guards against regressions too.
 
 const FIXTURES = path.join(__dirname, '../public/fuzzed');
 
@@ -40,10 +41,14 @@ const KNOWN_FAILURES: Record<string, string> = {
 	'wav/id3-frame-size-past-tag.bin': 'bug-fix-mania',
 };
 
-// These used to loop synchronously, which would stall the whole file instead of failing a test
-const ONCE_HUNG = new Set(['mkv/vorbis-unterminated-lacing.bin', 'aac/sample-rate-change.bin']);
+// These hang (or used to), which would stall the whole file instead of failing a test, so they run in a child process
+const ONCE_HUNG = new Set([
+	'mkv/vorbis-unterminated-lacing.bin',
+	'aac/sample-rate-change.bin',
+	'mp4/stsc-first-chunk-0.bin',
+]);
 
-const walkInChildProcess = (file: string) => {
+const walkInChildProcess = (file: string, deadline: number) => {
 	const script = `Promise.all([
 		import(${JSON.stringify(new URL('./helpers/robustness-walk.ts', import.meta.url).href)}),
 		import(${JSON.stringify(new URL('../../src/index.ts', import.meta.url).href)}),
@@ -57,11 +62,11 @@ const walkInChildProcess = (file: string) => {
 	try {
 		output = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
 			encoding: 'utf8',
-			timeout: 20_000,
+			timeout: deadline,
 		});
 	} catch (error) {
 		if ((error as { code?: string }).code === 'ETIMEDOUT') {
-			return ['The read hung (killed after 20 s).'];
+			return [`The read hung (killed after ${deadline / 1000} s).`];
 		}
 
 		throw error;
@@ -79,10 +84,11 @@ for (const format of readdirSync(FIXTURES).sort()) {
 			const fullPath = path.join(FIXTURES, file);
 			const fixedBy = KNOWN_FAILURES[file];
 
-			const title = fixedBy ? `${name} (fails until ${fixedBy} lands)` : name;
-			test.skipIf(fixedBy !== undefined)(title, async () => {
+			const title = fixedBy ? `${name} (fails until ${fixedBy} lands, then take it off KNOWN_FAILURES)` : name;
+			(fixedBy ? test.fails : test)(title, async () => {
 				if (ONCE_HUNG.has(file)) {
-					expect(walkInChildProcess(fullPath)).toEqual([]);
+					// A known hang only needs to show that it still hangs
+					expect(walkInChildProcess(fullPath, fixedBy ? 5_000 : 20_000)).toEqual([]);
 					return;
 				}
 
