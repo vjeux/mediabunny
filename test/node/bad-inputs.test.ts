@@ -591,11 +591,11 @@ test('MP4: Encryption subsamples exceeding the sample', async () => {
 
 test('MP4: Sample table failing to parse', async () => {
 	// A failed parse used to leave a half-built sample table behind, which later calls then tripped over
-	const truncatedStco = fullBox('stco', 0, 0, u32(1000), u32(0));
+	const invalidStz2 = fullBox('stz2', 0, 0, zeros(3), u8(3), u32(3)); // 3-bit field size doesn't exist
 	using input = new Input({
 		source: new BufferSource(mp4([trak({
 			handler: 'vide',
-			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), stsz([4, 4, 4]), truncatedStco],
+			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), invalidStz2, stco([0])],
 		})])),
 		formats: ALL_FORMATS,
 	});
@@ -604,7 +604,8 @@ test('MP4: Sample table failing to parse', async () => {
 	const firstError = await sink.getFirstPacket().catch((error: unknown) => error);
 	const secondError = await sink.getFirstPacket().catch((error: unknown) => error);
 
-	expect(firstError).toBeInstanceOf(RangeError);
+	expect(firstError).toBeInstanceOf(Error);
+	expect(String(firstError)).toMatch(/stz2/);
 	expect(secondError).toEqual(firstError);
 });
 
@@ -626,6 +627,61 @@ test('MP4: trak inside moof', async () => {
 		),
 		box('mdat', zeros(16)),
 	]));
+});
+
+test('MP4: Boxes claiming more entries than they hold', async () => {
+	// Like the edit list in FFmpeg's FATE sample mov/invalid_elst_entry_count.mov. Reading the claimed entries ran past
+	// the box with an internal error, which made the whole file unreadable.
+	const withEntryCount = (box: Uint8Array, entryCount: number, offset = 12) => {
+		const copy = box.slice();
+		new DataView(copy.buffer).setUint32(offset, entryCount);
+		return copy;
+	};
+	const tables: Record<string, Uint8Array> = {
+		stts: stts([[1, 40]]),
+		ctts: ctts([[1, 0]]),
+		stss: fullBox('stss', 0, 0, u32(1), u32(1)),
+		stsc: stsc([[1, 1, 1]]),
+		stsz: stsz([4]),
+		stco: stco([0]),
+	};
+
+	for (const name of [...Object.keys(tables), 'elst']) {
+		const stbl = [stsd(videoSampleEntry()), ...Object.entries(tables).map(([tableName, table]) => {
+			return tableName === name ? withEntryCount(table, 1000, name === 'stsz' ? 16 : 12) : table;
+		})];
+		const elst = fullBox('elst', 0, 0, u32(1), u32(40), u32(0), u32(0x10000));
+		const extra = [box('edts', name === 'elst' ? withEntryCount(elst, 2) : elst)];
+		const file = mp4([trak({ handler: 'vide', stbl, extra })]);
+
+		await expectGracefulRead(file);
+
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const track = (await input.getVideoTracks())[0];
+		expect(track).toBeDefined();
+		expect(await new EncodedPacketSink(track!).getFirstPacket()).not.toBeNull();
+	}
+
+	// The same for a fragment's trun (Firefox's dom/media/test/crashtests/1414444.mp4): 2 of 10 claimed sample sizes
+	const fragmented = mp4(fragmentedMoov(), [
+		moof(
+			fullBox('tfhd', 0, 0x020000, u32(1)),
+			fullBox('tfdt', 0, 0, u32(0)),
+			fullBox('trun', 0, 0x000200, u32(10), u32(4), u32(4)),
+		),
+		box('mdat', zeros(8)),
+	]);
+
+	await expectGracefulRead(fragmented);
+
+	using fragmentedInput = new Input({ source: new BufferSource(fragmented), formats: ALL_FORMATS });
+	const fragmentedTrack = (await fragmentedInput.getVideoTracks())[0]!;
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(fragmentedTrack).packets()) {
+		expect(packet.byteLength).toBe(4);
+		packetCount++;
+	}
+	expect(packetCount).toBe(2);
 });
 
 const mp4 = (moovChildren: Bytes[], after: Bytes[] = []) => concat(
