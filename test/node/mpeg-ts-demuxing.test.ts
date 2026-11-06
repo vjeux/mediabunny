@@ -925,7 +925,7 @@ test('MPEG-TS with AUD-less video packets', async () => {
 
 test('MPEG-TS metadata reading gives up on declared streams that never show up', async () => {
 	// The PMT declares two AAC streams, but only the first one has any packets (like a recording that dropped a
-	// language). 30 seconds of it, one ADTS frame per PES packet and TS packet.
+	// language). 5 minutes of it, one ADTS frame per PES packet and TS packet.
 	const packets: Uint8Array[] = [];
 	const continuityCounters = new Map<number, number>();
 	const pushPacket = (pid: number, payload: Uint8Array, isSection: boolean) => {
@@ -956,7 +956,7 @@ test('MPEG-TS metadata reading gives up on declared streams that never show up',
 	const adtsFrame = new Uint8Array(39); // LC, 48 kHz, stereo, 39 bytes
 	adtsFrame.set([0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc]);
 
-	const frameCount = Math.round(30 * 48000 / 1024);
+	const frameCount = Math.round(300 * 48000 / 1024);
 	for (let i = 0; i < frameCount; i++) {
 		const pts = Math.round(i * 1024 * 90000 / 48000);
 		const pes = new Uint8Array(14 + adtsFrame.length);

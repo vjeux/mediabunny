@@ -100,10 +100,11 @@ const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expect
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
 /**
- * How far into the media (in PTS) we keep looking for declared streams that haven't shown up yet. FFmpeg gives up on
- * finding a stream's parameters after 7 seconds of MPEG-TS media.
+ * How far into the media (in PTS) we keep looking for declared streams that haven't shown up yet. Streams can start a
+ * good while after the others (45 seconds in a Blu-ray excerpt whose DTS track starts after its AC-3 track), but one
+ * that never shows up would have us read the whole file.
  */
-const MAX_STREAM_START_DELAY = 10 * MPEG_TS_TIMESCALE;
+const MAX_STREAM_START_DELAY = 120 * MPEG_TS_TIMESCALE;
 
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 
