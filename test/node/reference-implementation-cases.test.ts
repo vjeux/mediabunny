@@ -18,7 +18,7 @@ import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
-import { inferCodecFromCodecString, validateVideoChunkMetadata } from '../../src/codec.js';
+import { inferCodecFromCodecString, validateAudioChunkMetadata, validateVideoChunkMetadata } from '../../src/codec.js';
 import {
 	deserializeAvcDecoderConfigurationRecord,
 	deserializeHevcDecoderConfigurationRecord,
@@ -1660,5 +1660,67 @@ describe('Chromium media/formats/mp4/mp4_stream_parser_unittest.cc', () => {
 			types.push(packet.type);
 		}
 		expect(types).toEqual(['key', ...new Array<string>(23).fill('delta')]);
+	});
+});
+
+describe('web-platform-tests webcodecs/video-decoder.https.any.js and audio-decoder.https.any.js (configs)', () => {
+	// WebCodecs rejects the invalid configs with a TypeError and reports the valid but unsupported ones as unsupported.
+	// Mediabunny's packet metadata validation has to refuse all of them, since a muxer couldn't describe them.
+	const rejectsVideo = (config: object) => {
+		try {
+			validateVideoChunkMetadata({ decoderConfig: config as VideoDecoderConfig }, null);
+			return false;
+		} catch (error) {
+			return error instanceof TypeError;
+		}
+	};
+	const rejectsAudio = (config: object) => {
+		try {
+			validateAudioChunkMetadata({ decoderConfig: config as AudioDecoderConfig }, null);
+			return false;
+		} catch (error) {
+			return error instanceof TypeError;
+		}
+	};
+
+	test('video configs', () => {
+		const size = { codedWidth: 16, codedHeight: 16 };
+		for (const config of [
+			{}, // Missing codec
+			{ codec: '' }, // Empty codec
+			{ codec: 'bogus', ...size }, // Unrecognized codec
+			{ codec: 'vorbis', ...size }, // Audio codec
+			{ codec: 'vp9', ...size }, // Ambiguous codec
+			{ codec: 'Vp09.00.10.08', ...size }, // Codec with bad casing
+			{ codec: 'video/webm; codecs="vp8"', ...size }, // Codec with MIME type
+			{ codec: '  vp09.00.10.08  ', ...size }, // Codec with spaces
+		]) {
+			expect(rejectsVideo(config), JSON.stringify(config)).toBe(true);
+		}
+		expect(rejectsVideo({ codec: 'vp8', ...size })).toBe(false);
+	});
+
+	test('audio configs', () => {
+		const format = { sampleRate: 48000, numberOfChannels: 2 };
+		for (const config of [
+			format, // Missing codec
+			{ codec: '', ...format }, // Empty codec
+			{ codec: 'opus', sampleRate: 48000 }, // Missing numberOfChannels
+			{ codec: 'opus', sampleRate: 0, numberOfChannels: 2 }, // Zero sampleRate
+			{ codec: 'opus', sampleRate: 8000, numberOfChannels: 0 }, // Zero channels
+			{ codec: 'bogus', ...format }, // Unrecognized codec
+			{ codec: 'vp8', ...format }, // Video codec
+			{ codec: 'vp9', ...format }, // Ambiguous codec
+			{ codec: 'audio/webm; codecs="opus"', ...format }, // Codec with MIME type
+			{ codec: 'opus.123', ...format }, // Possible future opus codec string
+			{ codec: 'mp4a.FF.9', ...format }, // Possible future aac codec string
+			{ codec: '  mp3  ', ...format }, // Codec with spaces
+			{ codec: 'opus', sampleRate: 48000, numberOfChannels: 3, description: new Uint8Array(9) }, // Too short
+			{ codec: 'vorbis', ...format }, // Vorbis requires a description
+			{ codec: 'flac', ...format }, // FLAC requires a description
+		]) {
+			expect(rejectsAudio(config), JSON.stringify(config)).toBe(true);
+		}
+		expect(rejectsAudio({ codec: 'opus', ...format })).toBe(false);
 	});
 });
