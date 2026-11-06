@@ -1583,16 +1583,23 @@ test('Ogg: Gaps in granule positions', async () => {
 		return (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp))?.timestamp;
 	};
 
-	// Ten 20 ms Opus packets per page, with a second missing before the fourth page, as in a capture with a dropout
-	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
-	for (let i = 0; i < 6; i++) {
-		pages.push(oggPacketsPage({
-			headerType: i === 5 ? 4 : 0,
-			granule: 312 + 9600 * (i + 1) + (i >= 3 ? 48000 : 0),
-			sequence: 2 + i,
-		}, Array<Bytes>(10).fill(OPUS_PACKET)));
-	}
-	const opusFile = concatList(pages);
+	// Six pages of ten 20 ms Opus packets, with a second missing before the given page, as in a capture with a
+	// dropout, and optionally samples trimmed off the end
+	const opusFileWithGap = (gapBeforePage: number, trimmedSamples = 0) => {
+		const pages = [
+			oggPacketsPage({ headerType: 2 }, [opusHead()]),
+			oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		];
+		for (let i = 0; i < 6; i++) {
+			pages.push(oggPacketsPage({
+				headerType: i === 5 ? 4 : 0,
+				granule: 312 + 9600 * (i + 1) + (i >= gapBeforePage ? 48000 : 0) - (i === 5 ? trimmedSamples : 0),
+				sequence: 2 + i,
+			}, Array<Bytes>(10).fill(OPUS_PACKET)));
+		}
+		return concatList(pages);
+	};
+	const opusFile = opusFileWithGap(3);
 
 	const opusTimestamps = (await readPackets(opusFile)).map(x => x.timestamp);
 	expect(opusTimestamps).toHaveLength(60);
@@ -1605,6 +1612,16 @@ test('Ogg: Gaps in granule positions', async () => {
 		expect(await lookUp(opusFile, timestamp)).toBe(timestamp);
 	}
 	expect(await lookUp(opusFile, 1)).toBe(opusTimestamps[29]);
+
+	// End trimming on the final page still applies after an earlier gap
+	const trimmedPackets = await readPackets(opusFileWithGap(3, 100));
+	expect(trimmedPackets[59]!.timestamp).toBeCloseTo(2.18, 10);
+	expect(trimmedPackets[59]!.duration).toBeCloseTo(860 / 48000, 10);
+
+	// On the final page itself, a gap and end trimming can't be told apart, as its granule position only gives their
+	// difference. The stream still ends where that granule position says.
+	const lastPacket = (await readPackets(opusFileWithGap(5, 100)))[59]!;
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo((9600 * 6 + 48000 - 100) / 48000, 10);
 
 	// The same in Vorbis, with a second missing before the sixth page of a file whose granule positions are off by
 	// a sample here and there, which isn't a gap

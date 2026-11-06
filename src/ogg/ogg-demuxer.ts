@@ -728,6 +728,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return encodedPacket;
 		}
 
+		// On the final page, end trimming (a granule position smaller than the durations add up to) can't be told
+		// apart from a gap, as the granule position only gives their difference. That difference is taken as the gap,
+		// which keeps the end of the stream exact, though the last packet then isn't trimmed (FFmpeg drops both).
 		const gapInSamples = page.granulePosition - previousPage.granulePosition - durations.sum;
 
 		// Some muxers write granule positions that are off by up to a packet's duration, which isn't a gap
