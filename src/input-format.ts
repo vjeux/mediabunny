@@ -245,7 +245,10 @@ export class MatroskaInputFormat extends InputFormat {
 			const dataStartPos = dataSlice.filePos;
 			if (size === undefined) return false;
 
-			if (dataStartPos + size > startPos + dataSize || (size > 8 && id !== EBMLId.DocType)) {
+			const isInteger = id === EBMLId.EBMLVersion
+				|| id === EBMLId.EBMLReadVersion
+				|| id === EBMLId.DocTypeVersion;
+			if (dataStartPos + size > startPos + dataSize || (isInteger && size > 8)) {
 				return false; // The element overruns the header or is an integer of impossible size
 			}
 
