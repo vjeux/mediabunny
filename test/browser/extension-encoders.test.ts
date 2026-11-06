@@ -84,7 +84,7 @@ const negativeTimestampsDecodeCorrectly = await (async () => {
 // packets of a tiny stream made by FFmpeg (0.1 s of silence), read with
 // ffprobe -show_streams -show_packets -show_data:
 //   flac      -c:a flac (16 kHz mono; "fLaC" + the STREAMINFO block)
-type Probe = { codec: string; sampleRate?: number; numberOfChannels?: number; description?: string; chunks: string[] };
+type Probe = { codec: string; sampleRate: number; numberOfChannels?: number; description?: string; chunks: string[] };
 const PROBES = {
 	flac: {
 		codec: 'flac',
@@ -97,64 +97,44 @@ type ProbeName = keyof typeof PROBES;
 
 const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
 
-// Set once the page's decoders stall: then every later decode on the page would hang
+// Set once the page's audio decoders stall: then every later audio decode on the page would hang
 let decodingStalled = false;
 
-/** Decodes a probe with WebCodecs; tells whether it decoded and the visible size of each video frame. */
+/** Decodes a probe with WebCodecs; tells whether it decoded. */
 const runProbe = async (probe: Probe) => {
-	const isVideo = probe.sampleRate === undefined;
-	const description = probe.description !== undefined ? fromBase64(probe.description) : undefined;
-	const videoConfig: VideoDecoderConfig = { codec: probe.codec, codedWidth: 64, codedHeight: 64, description };
-	const audioConfig: AudioDecoderConfig = {
+	const config: AudioDecoderConfig = {
 		codec: probe.codec,
-		sampleRate: probe.sampleRate!,
+		sampleRate: probe.sampleRate,
 		numberOfChannels: probe.numberOfChannels ?? 1,
-		description,
+		description: probe.description !== undefined ? fromBase64(probe.description) : undefined,
 	};
-	const result = { decodes: false, visibleSizes: [] as string[] };
 	try {
-		const support = isVideo
-			? await VideoDecoder.isConfigSupported(videoConfig)
-			: await AudioDecoder.isConfigSupported(audioConfig);
-		if (!support.supported) {
-			return result;
+		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
+			return false;
 		}
 	} catch {
-		return result;
+		return false;
 	}
 
 	let outputs = 0;
 	let failed = false;
-	const init = {
-		output: (data: VideoFrame | AudioData) => {
+	const decoder = new AudioDecoder({
+		output: (data) => {
 			outputs++;
-			if (data instanceof VideoFrame) {
-				result.visibleSizes.push(`${data.visibleRect!.width}x${data.visibleRect!.height}`);
-			}
 			data.close();
 		},
 		error: () => {
 			failed = true;
 		},
-	};
-	const decoder = isVideo ? new VideoDecoder(init) : new AudioDecoder(init);
+	});
 	let flushed = false;
 	try {
-		if (decoder instanceof VideoDecoder) {
-			decoder.configure(videoConfig);
-			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedVideoChunk({
-				type: i === 0 ? 'key' : 'delta',
-				timestamp: i * 33_333,
-				data: fromBase64(chunk),
-			})));
-		} else {
-			decoder.configure(audioConfig);
-			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
-				type: 'key',
-				timestamp: i * 20_000,
-				data: fromBase64(chunk),
-			})));
-		}
+		decoder.configure(config);
+		probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+			type: 'key',
+			timestamp: i * 20_000,
+			data: fromBase64(chunk),
+		})));
 		flushed = await Promise.race([
 			decoder.flush().then(() => true, () => false),
 			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
@@ -166,23 +146,21 @@ const runProbe = async (probe: Probe) => {
 		decoder.close();
 	}
 
-	result.decodes = flushed && !failed && outputs > 0;
-	if (!result.decodes) {
-		// A decoder that hung, or one that failed (WebKitGTK's FLAC decoder), can leave the page's other decoders of
-		// that kind stalled. Then even isConfigSupported() never settles.
-		const stillAnswers = isVideo
-			? VideoDecoder.isConfigSupported({ codec: 'vp8', codedWidth: 64, codedHeight: 64 })
-			: AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+	const decodes = flushed && !failed && outputs > 0;
+	if (!decodes) {
+		// A decoder that hung, or one that failed (WebKitGTK's FLAC decoder), can leave the page's other audio decoders
+		// stalled. Then even isConfigSupported() never settles.
+		const stillAnswers = AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
 		decodingStalled ||= !await Promise.race([
 			stillAnswers.then(() => true, () => true),
 			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1000)),
 		]);
 	}
 
-	return result;
+	return decodes;
 };
 
-const probeResults = new Map<ProbeName, ReturnType<typeof runProbe>>();
+const probeResults = new Map<ProbeName, Promise<boolean>>();
 /** Runs each probe once, when first needed, so that one that hangs runs as late as possible. */
 const probe = (name: ProbeName) => {
 	if (!probeResults.has(name)) {
@@ -232,7 +210,7 @@ describe.skipIf(!negativeTimestampsDecodeCorrectly)('MP3 encoder output, decoded
 
 describe('FLAC encoder output, decoded by the browser', () => {
 	beforeEach(async ({ skip }) => {
-		skip(!(await probe('flac')).decodes, 'FLAC can\'t be decoded here (native probe)');
+		skip(!await probe('flac'), 'FLAC can\'t be decoded here (native probe)');
 	});
 
 	const PERIODS = [218, 145, 109, 873, 87, 73, 61, 53];
