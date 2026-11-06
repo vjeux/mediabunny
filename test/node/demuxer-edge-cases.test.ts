@@ -1212,3 +1212,80 @@ describe('Matroska decoder configs taken from the first packet', () => {
 		});
 	});
 });
+
+describe('MP4 edit lists and visual sample entry boxes', () => {
+	const sps = buildAvcSps({ profileIdc: 66, levelIdc: 30, widthInMbs: 20, heightInMapUnits: 15 });
+	const pps = [0x68, 0xce, 0x38, 0x80];
+	const avcC = mp4Box('avcC', [1, 66, 0xc0, 30, 0xff, 0xe1], u16be(sps.length), sps, [1], u16be(pps.length), pps);
+	const openMp4 = (options: { elst?: [number, number][]; boxes?: Uint8Array[] }) => openBytes(buildMp4({
+		handler: 'vide',
+		timescale: 1000,
+		sampleEntry: mp4VisualEntry('avc1', 320, 240, avcC, ...(options.boxes ?? [])),
+		samples: [0, 1, 2, 3].map(i => new Uint8Array([0, 0, 0, 2, 0x65, i])),
+		stts: [[4, 100]],
+		stsc: [[1, 4]],
+		width: 320,
+		height: 240,
+		elst: options.elst,
+	}));
+
+	test.each([
+		['no edit list', undefined, [0, 100, 200, 300], 0.4],
+		['an empty edit delays the media', [[500, -1], [400, 0]], [500, 600, 700, 800], 0.9],
+		['a media time skips into the media', [[400, 200]], [-200, -100, 0, 100], 0.2],
+		['an empty edit and a media time combine', [[300, -1], [400, 100]], [200, 300, 400, 500], 0.6],
+		['only the first of several edits is used', [[200, 0], [200, 100]], [0, 100, 200, 300], 0.4],
+	] as [string, [number, number][] | undefined, number[], number][])('%s', async (_, elst, timestamps, duration) => {
+		using input = openMp4({ elst });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const read = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			read.push(Math.round(packet.timestamp * 1000));
+		}
+		expect(read).toEqual(timestamps);
+		expect(await track.getFirstTimestamp()).toBe(timestamps[0]! / 1000);
+		expect(await input.computeDuration()).toBeCloseTo(duration, 9);
+	});
+
+	const colr = (type: string, values: number[], fullRange?: boolean) => mp4Box(
+		'colr',
+		ascii(type),
+		...values.map(value => u16be(value)),
+		fullRange === undefined ? [] : [fullRange ? 0x80 : 0],
+	);
+
+	test.each([
+		['nclx, full range', colr('nclx', [1, 1, 1], true),
+			{ primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: true }],
+		['nclx, limited range', colr('nclx', [9, 16, 9], false),
+			{ primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false }],
+		['nclc (no range flag)', colr('nclc', [6, 6, 6]),
+			{ primaries: 'smpte170m', transfer: 'smpte170m', matrix: 'smpte170m', fullRange: false }],
+		['an ICC profile is ignored', mp4Box('colr', ascii('prof'), [1, 2, 3]), { fullRange: false }],
+	])('colr %s', async (_, box, colorSpace) => {
+		using input = openMp4({ boxes: [box] });
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect(await track.getColorSpace()).toEqual(colorSpace);
+		expect((await track.getDecoderConfig())!.colorSpace).toEqual(colorSpace);
+	});
+
+	test.each([
+		[4, 3, 427, 240],
+		[3, 4, 320, 320],
+		[0, 0, 320, 240], // Invalid, ignored
+	])('pasp %i:%i gives a %ix%i display size', async (hSpacing, vSpacing, width, height) => {
+		using input = openMp4({ boxes: [mp4Box('pasp', u32be(hSpacing), u32be(vSpacing))] });
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect([await track.getDisplayWidth(), await track.getDisplayHeight()]).toEqual([width, height]);
+	});
+
+	test('btrt gives the peak and average bitrates; zeros mean unknown', async () => {
+		using known = openMp4({ boxes: [mp4Box('btrt', u32be(1000), u32be(2_000_000), u32be(1_500_000))] });
+		const knownTrack = (await known.getPrimaryVideoTrack())!;
+		expect([await knownTrack.getBitrate(), await knownTrack.getAverageBitrate()]).toEqual([2_000_000, 1_500_000]);
+
+		using unknown = openMp4({ boxes: [mp4Box('btrt', u32be(0), u32be(0), u32be(0))] });
+		const unknownTrack = (await unknown.getPrimaryVideoTrack())!;
+		expect([await unknownTrack.getBitrate(), await unknownTrack.getAverageBitrate()]).toEqual([null, null]);
+	});
+});
