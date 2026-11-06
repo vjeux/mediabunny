@@ -57,6 +57,8 @@ const toHlsCodecString = (codecString: string) => {
 type HlsTrackData = {
 	track: OutputTrack;
 	packets: EncodedPacket[];
+	/** Whether a packet was ever added to the track, which then appears in the playlist's segments */
+	hasPackets: boolean;
 	playlist: Playlist;
 	// We must store it on the TrackData, reading it directly from the track leads to async race conditions!
 	closed: boolean;
@@ -612,6 +614,7 @@ export class HlsMuxer extends Muxer {
 		trackData = {
 			track,
 			packets: [],
+			hasPackets: false,
 			playlist: playlists[0]!,
 			closed: false,
 			info: {
@@ -642,6 +645,7 @@ export class HlsMuxer extends Muxer {
 		trackData = {
 			track,
 			packets: [],
+			hasPackets: false,
 			playlist: playlists[0]!,
 			closed: false,
 			info: {
@@ -668,6 +672,7 @@ export class HlsMuxer extends Muxer {
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
 			trackData.packets.push(packet);
+			trackData.hasPackets = true;
 			this.firstPacketTimestamp ??= packet.timestamp;
 
 			if (playlist.currentSegmentStartTimestamp === null) {
@@ -698,6 +703,7 @@ export class HlsMuxer extends Muxer {
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
 			trackData.packets.push(packet);
+			trackData.hasPackets = true;
 			this.firstPacketTimestamp ??= packet.timestamp;
 
 			if (playlist.currentSegmentStartTimestamp === null) {
@@ -1484,13 +1490,47 @@ export class HlsMuxer extends Muxer {
 		let groupIdTrackCount = 0;
 		let hasHadDefaultTrackInGroup = false;
 
+		// Once complete, a rendition whose playlist never got a packet holds nothing, and readers would look for its
+		// media in vain. So it's left out, along with its codec and, when no rendition of its group remains, the
+		// variant's reference to the group. An output without any packets stays as it is.
+		const someTrackHasPackets = this.trackDatas.some(x => x.hasPackets);
+		const isEmptyRendition = (decl: PlaylistDeclaration) => someTrackHasPackets
+			&& !decl.noUri // Its media is in the variant's own playlist
+			&& (!this.isLive || decl.playlist.done)
+			&& !decl.playlist.tracks.some(track => this.trackDatas.some(x => x.track === track && x.hasPackets));
+		const getListedReferences = (decl: PlaylistDeclaration) => decl.references.filter(x => !isEmptyRendition(x));
+		const playlistsListedWithoutRenditions = new Set<Playlist>();
+
 		for (const decl of this.playlistDeclarations) {
 			if (decl.groupId === null) {
+				const references = getListedReferences(decl);
+				if (decl.references.length > 0 && references.length === 0) {
+					// All renditions of the variant were left out. Variants that list the same playlist differ only
+					// by their group, so another one listing it with renditions (or without, already) covers it.
+					const listedWithRenditions = this.playlistDeclarations.some(
+						x => x.groupId === null && x.playlist === decl.playlist && getListedReferences(x).length > 0,
+					);
+					if (listedWithRenditions || playlistsListedWithoutRenditions.has(decl.playlist)) {
+						continue;
+					}
+					playlistsListedWithoutRenditions.add(decl.playlist);
+				}
+
 				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
 					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
+				// CODECS lists the formats present in the segments (RFC 8216, 4.3.4.2), so once the playlist is
+				// complete, tracks that never got a packet are left out (readers would look for them in vain), unless
+				// no track of the variant has any
+				const tracksWithPackets = decl.playlist.tracks.filter(
+					track => this.trackDatas.some(x => x.track === track && x.hasPackets),
+				);
+				const isComplete = !this.isLive || decl.playlist.done;
+				const codecTracks = isComplete && tracksWithPackets.length > 0
+					? tracksWithPackets
+					: decl.playlist.tracks;
 				const codecs: string[] = [];
-				for (const track of decl.playlist.tracks) {
+				for (const track of codecTracks) {
 					const trackData = this.trackDatas.find(x => x.track === track);
 					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
 					codecs.push(toHlsCodecString(codecString));
@@ -1499,14 +1539,14 @@ export class HlsMuxer extends Muxer {
 				let peakDeclBitrate = 0;
 				let maxRefAverageBitrate = 0;
 
-				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
+				if (references.length > 0) {
+					const firstRef = references[0]!;
 					const firstTrack = firstRef.playlist.tracks[0]!;
 					const trackData = this.trackDatas.find(x => x.track === firstTrack);
 					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
 					codecs.push(toHlsCodecString(codecString));
 
-					for (const ref of decl.references) {
+					for (const ref of references) {
 						assert(ref.playlist.peakBitrate !== null);
 						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
 						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
@@ -1566,7 +1606,7 @@ export class HlsMuxer extends Muxer {
 
 				if (!isKeyPacketsOnly) {
 					const groupIdForType = new Map<string, string>();
-					for (const ref of decl.references) {
+					for (const ref of references) {
 						assert(ref.groupId !== null);
 						const type = ref.playlist.tracks[0]!.type;
 						groupIdForType.set(type, ref.groupId);
@@ -1586,6 +1626,10 @@ export class HlsMuxer extends Muxer {
 					masterPlaylistText += `${decl.playlist.path}\n`;
 				}
 			} else {
+				if (isEmptyRendition(decl)) {
+					continue;
+				}
+
 				assert(decl.playlist.tracks.length === 1);
 
 				const track = decl.playlist.tracks[0]!;
