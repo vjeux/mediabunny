@@ -4,7 +4,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
-import { assert, colorSpaceIsComplete } from '../../src/misc.js';
+import { assert, colorSpaceIsComplete, isChromium } from '../../src/misc.js';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -237,8 +237,10 @@ test('VP8 and untagged VP9 decode with the BT.601 matrix', async () => {
 	//   if(lt(X,48),41,128)))':cb='if(lt(X,8),90,if(lt(X,16),54,if(lt(X,24),240,128)))':cr='if(lt(X,8),240,
 	//   if(lt(X,16),34,if(lt(X,24),110,128)))'" -c:v libvpx-vp9 -lossless 1 vp9-untagged-bars.webm
 	// (and -c:v libvpx -b:v 5M -qmin 0 -qmax 4 vp8-bars.webm). VP8 is always BT.601 (RFC 6386, section 9.2), and
-	// FFmpeg and Chrome's <video> render VP9 that signals no color space (CS_UNKNOWN) as BT.601 too.
-	for (const path of ['/vp8-bars.webm', '/vp9-untagged-bars.webm']) {
+	// FFmpeg and Chrome's <video> render VP9 that signals no color space (CS_UNKNOWN) as BT.601 too. (Firefox renders
+	// such VP9 as BT.709 on its own, which is why it's only checked in Chromium.)
+	const paths = isChromium() ? ['/vp8-bars.webm', '/vp9-untagged-bars.webm'] : ['/vp8-bars.webm'];
+	for (const path of paths) {
 		using input = new Input({ source: new UrlSource(path), formats: ALL_FORMATS });
 		const videoTrack = (await input.getPrimaryVideoTrack())!;
 		const sink = new VideoSampleSink(videoTrack);
