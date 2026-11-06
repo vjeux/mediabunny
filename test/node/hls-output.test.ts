@@ -2556,7 +2556,11 @@ test('Empty playlist bandwidth, medium quality default fallback', async () => {
 	expect(bandwidth).toBeGreaterThan(0);
 });
 
-test('A muxed track without packets is left out of the variant', async () => {
+/**
+ * Writes two video packets and the given audio tracks, of which only those with `packets` get two packets, like a
+ * conversion whose trim range ends before some of the audio starts. Returns the master playlist and the output.
+ */
+const writeTracksWithoutPackets = async (audioTracks: { codec: 'aac' | 'mp3'; packets: boolean }[]) => {
 	let masterText = '';
 	const targets = new Map<string, BufferTarget>();
 
@@ -2573,19 +2577,27 @@ test('A muxed track without packets is left out of the variant', async () => {
 		}),
 	});
 
-	// Like a conversion whose trim range ends before the audio starts
 	const video = videoSource();
 	output.addVideoTrack(video);
-	output.addAudioTrack(audioSource('mp3'));
+	const audios = audioTracks.map(({ codec }) => {
+		const audio = audioSource(codec);
+		output.addAudioTrack(audio);
+		return audio;
+	});
 
 	await output.start();
 	await video.add(new EncodedPacket(avcPacketData, 'key', 0, 0.5), avcMetadata);
 	await video.add(new EncodedPacket(avcPacketData, 'delta', 0.5, 0.5), avcMetadata);
+	for (let i = 0; i < audioTracks.length; i++) {
+		if (audioTracks[i]!.packets) {
+			assert(audioTracks[i]!.codec === 'aac');
+			await audios[i]!.add(new EncodedPacket(aacPacketData, 'key', 0, 0.02), aacMetadata);
+			await audios[i]!.add(new EncodedPacket(aacPacketData, 'key', 0.5, 0.02), aacMetadata);
+		}
+	}
 	await output.finalize();
 
-	expect(masterText).toMatch(/CODECS="avc1\.[0-9A-Fa-f]+"/);
-
-	using input = new Input({
+	const input = new Input({
 		source: new CustomPathedSource('master.m3u8', ({ path }) => {
 			const target = targets.get(path);
 			assert(target);
@@ -2595,10 +2607,60 @@ test('A muxed track without packets is left out of the variant', async () => {
 		formats: ALL_FORMATS,
 	});
 
+	return { masterText, input };
+};
+
+test('A muxed track without packets is left out of the variant', async () => {
+	const result = await writeTracksWithoutPackets([{ codec: 'mp3', packets: false }]);
+	using input = result.input;
+
+	expect(result.masterText).toMatch(/CODECS="avc1\.[0-9A-Fa-f]+"/);
+
 	const tracks = await input.getTracks();
 	expect(tracks.map(track => track.type)).toEqual(['video']);
 	expect(await tracks[0]!.getCodec()).toBe('avc');
 	expect(await input.computeDuration()).toBe(1);
+});
+
+test('Renditions without packets are left out of the master playlist', async () => {
+	// Two audio tracks go into an #EXT-X-MEDIA group; with neither getting packets, the group is left out
+	const empty = await writeTracksWithoutPackets([
+		{ codec: 'mp3', packets: false },
+		{ codec: 'mp3', packets: false },
+	]);
+	using emptyInput = empty.input;
+
+	expect(empty.masterText).toMatch(/CODECS="avc1\.[0-9A-Fa-f]+"/);
+	expect(empty.masterText).not.toContain('#EXT-X-MEDIA');
+	expect(empty.masterText).not.toContain('AUDIO=');
+	expect((await emptyInput.getTracks()).map(track => track.type)).toEqual(['video']);
+	expect(await emptyInput.computeDuration()).toBe(1);
+
+	// Only the rendition without packets is left out of a group
+	const partial = await writeTracksWithoutPackets([
+		{ codec: 'aac', packets: false },
+		{ codec: 'aac', packets: true },
+	]);
+	using partialInput = partial.input;
+
+	expect(partial.masterText.match(/#EXT-X-MEDIA:/g)).toHaveLength(1);
+	expect(partial.masterText).toMatch(/CODECS="avc1\.[0-9A-Fa-f]+,mp4a\.40\.2",.*AUDIO="audio-1"/);
+	expect((await partialInput.getTracks()).map(track => track.type).sort()).toEqual(['audio', 'video']);
+	expect(await partialInput.computeDuration()).toBe(1);
+
+	// Audio tracks of two codecs make two variants of the same video playlist, each with its own group; the one
+	// whose group is left out isn't listed either
+	const twoGroups = await writeTracksWithoutPackets([
+		{ codec: 'aac', packets: true },
+		{ codec: 'mp3', packets: false },
+	]);
+	using twoGroupsInput = twoGroups.input;
+
+	expect(twoGroups.masterText.match(/#EXT-X-STREAM-INF:/g)).toHaveLength(1);
+	expect(twoGroups.masterText.match(/#EXT-X-MEDIA:/g)).toHaveLength(1);
+	expect(twoGroups.masterText).not.toContain('mp3');
+	expect((await twoGroupsInput.getTracks()).map(track => track.type).sort()).toEqual(['audio', 'video']);
+	expect(await twoGroupsInput.computeDuration()).toBe(1);
 });
 
 const testSparseTracksInSegments = async (hlsOptions: HlsOutputFormatOptions) => {
