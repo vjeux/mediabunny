@@ -4,6 +4,7 @@ import { MkvOutputFormat, Mp4OutputFormat, MpegTsOutputFormat, OggOutputFormat }
 import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { countMovedArrayElements } from './array-moves.js';
 
 test('Output, onFinalize', async () => {
 	let callCount = 0;
@@ -82,32 +83,31 @@ test('Muxers write out a track queued far ahead of the others in linear time', a
 		await output.start();
 
 		const frameDuration = withVideo ? 1 / 30 : 0.02;
-		let start = performance.now();
-		for (let i = 0; i < count; i++) {
-			if (withVideo) {
-				const type = i % 30 === 0 ? 'key' : 'delta';
-				await videoSource.add(
-					new EncodedPacket(new Uint8Array(8), type, i * frameDuration, frameDuration),
-					i === 0 ? { decoderConfig: avcConfig } : undefined,
-				);
-			} else {
-				await firstAudioSource.add(
-					new EncodedPacket(opusPacket, 'key', i * frameDuration, frameDuration),
-					i === 0 ? { decoderConfig: opusConfig } : undefined,
-				);
+		const movedElements = await countMovedArrayElements(async () => {
+			for (let i = 0; i < count; i++) {
+				if (withVideo) {
+					const type = i % 30 === 0 ? 'key' : 'delta';
+					await videoSource.add(
+						new EncodedPacket(new Uint8Array(8), type, i * frameDuration, frameDuration),
+						i === 0 ? { decoderConfig: avcConfig } : undefined,
+					);
+				} else {
+					await firstAudioSource.add(
+						new EncodedPacket(opusPacket, 'key', i * frameDuration, frameDuration),
+						i === 0 ? { decoderConfig: opusConfig } : undefined,
+					);
+				}
 			}
-		}
-		const queueDuration = performance.now() - start;
 
-		// A packet of the other track past all of them lets the muxer write out the whole queue
-		start = performance.now();
-		await secondAudioSource.add(
-			new EncodedPacket(withVideo ? new Uint8Array(8) : opusPacket, 'key', count * frameDuration, 0.02),
-			{ decoderConfig: withVideo ? aacConfig : opusConfig },
-		);
-		await output.finalize();
-		const writeDuration = performance.now() - start;
+			// A packet of the other track past all of them lets the muxer write out the whole queue
+			await secondAudioSource.add(
+				new EncodedPacket(withVideo ? new Uint8Array(8) : opusPacket, 'key', count * frameDuration, 0.02),
+				{ decoderConfig: withVideo ? aacConfig : opusConfig },
+			);
+			await output.finalize();
+		});
 
-		expect(writeDuration).toBeLessThan(5 * queueDuration + 200);
+		// Linear: no per-packet copies of the queue (main moved ~5e9 elements per format)
+		expect(movedElements).toBeLessThan(2 * count);
 	}
 });
