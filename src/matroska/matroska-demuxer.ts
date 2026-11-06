@@ -715,7 +715,7 @@ export class MatroskaDemuxer extends Demuxer {
 			elementStartPos,
 			elementEndPos: dataStartPos + size,
 			dataStartPos,
-			timestamp: -1,
+			timestamp: 0, // In case the cluster lacks its (mandatory) Timestamp element
 			trackData: new Map(),
 		};
 		if (dataSlice) {
