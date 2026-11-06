@@ -375,38 +375,42 @@ export class MpegTsMuxer extends Muxer {
 		}
 
 		if (packet.type === 'key') {
-			// Add whichever NALUs are missing
+			// Add whichever parameter sets are missing, so that decoding can start at this packet
+			const getNalUnitType = (nalUnit: Uint8Array) => codec === 'avc'
+				? extractNalUnitTypeForAvc(nalUnit[0]!)
+				: extractNalUnitTypeForHevc(nalUnit[0]!);
+
+			// In the order in which they depend on each other
+			let parameterSets: { type: number; nalUnits: Uint8Array[] }[];
 			if (codec === 'avc') {
 				const config = trackData.avcDecoderConfig!;
-				for (const pps of config.pictureParameterSets) {
-					nalUnits.unshift(pps);
-				}
-				for (const sps of config.sequenceParameterSets) {
-					nalUnits.unshift(sps);
-				}
+				parameterSets = [
+					{ type: AvcNalUnitType.SPS, nalUnits: config.sequenceParameterSets },
+					{ type: AvcNalUnitType.PPS, nalUnits: config.pictureParameterSets },
+				];
 			} else {
 				const config = trackData.hevcDecoderConfig!;
-				for (const arr of config.arrays) {
-					if (arr.nalUnitType === HevcNalUnitType.PPS_NUT) {
-						for (const nal of arr.nalUnits) {
-							nalUnits.unshift(nal);
-						}
-					}
+				const types = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+				parameterSets = types.map(type => ({
+					type,
+					nalUnits: config.arrays.filter(x => x.nalUnitType === type).flatMap(x => x.nalUnits),
+				}));
+			}
+
+			for (let i = 0; i < parameterSets.length; i++) {
+				const { type, nalUnits: configNalUnits } = parameterSets[i]!;
+				if (nalUnits.some(x => getNalUnitType(x) === type)) {
+					continue;
 				}
-				for (const arr of config.arrays) {
-					if (arr.nalUnitType === HevcNalUnitType.SPS_NUT) {
-						for (const nal of arr.nalUnits) {
-							nalUnits.unshift(nal);
-						}
-					}
+
+				// Insert them before the parameter sets that may depend on them, and before everything else
+				const earlierTypes = parameterSets.slice(0, i + 1).map(x => x.type);
+				let index = nalUnits.findIndex(x => !earlierTypes.includes(getNalUnitType(x)));
+				if (index === -1) {
+					index = nalUnits.length;
 				}
-				for (const arr of config.arrays) {
-					if (arr.nalUnitType === HevcNalUnitType.VPS_NUT) {
-						for (const nal of arr.nalUnits) {
-							nalUnits.unshift(nal);
-						}
-					}
-				}
+
+				nalUnits.splice(index, 0, ...configNalUnits);
 			}
 		}
 
