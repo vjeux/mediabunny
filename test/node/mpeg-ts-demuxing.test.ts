@@ -920,6 +920,56 @@ test('MPEG-TS with several programs uses the first one whose PMT shows up', asyn
 	expect(packetCount).toBe(3);
 });
 
+test('MPEG-TS with an unreadable stream still opens with its other streams', async () => {
+	// The PMT declares H.264 video, MPEG audio that actually carries AC-3 (as some broadcast muxers mislabel it) and
+	// AAC whose PES packets are scrambled
+	const packets: Uint8Array[] = [];
+	const pushPacket = (pid: number, payload: number[], payloadUnitStart = true) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		packet.set([0x47, (payloadUnitStart ? 0x40 : 0) | (pid >> 8), pid & 0xff, 0x10 | (packets.length & 0xf)], 0);
+		packet.set(payload, 4);
+		packets.push(packet);
+	};
+	const pes = (streamId: number, pts: number, data: number[]) => [
+		0, 0, 1, streamId, 0, 0, 0x84, 0x80, 5, 0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1, ...data,
+	];
+
+	pushPacket(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPacket(0x1000, [
+		0x00, 0x02, 0xb0, 0x1c, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00,
+		0x1b, 0xe1, 0x00, 0xf0, 0x00, // H.264
+		0x03, 0xe1, 0x01, 0xf0, 0x00, // MPEG audio
+		0x0f, 0xe1, 0x02, 0xf0, 0x00, // AAC
+		0, 0, 0, 0, // CRC (not checked)
+	]);
+
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const idr = [0x65, 0x88, 0x84, 0x00, 0x33, 0xff, 0xaa, 0xaa, 0xaa, 0xaa];
+	pushPacket(0x100, pes(0xe0, 0, [0, 0, 0, 1, ...sps, 0, 0, 0, 1, ...pps, 0, 0, 0, 1, ...idr]));
+
+	const ac3Frame = new Array<number>(128).fill(0);
+	ac3Frame.splice(0, 6, 0x0b, 0x77, 0x00, 0x00, 0x00, 0x40); // 48 kHz, 32 kbit/s, 128 bytes
+	pushPacket(0x101, pes(0xbd, 0, ac3Frame));
+
+	// Scrambled (transport_scrambling_control = 0b10), so the PES header is unreadable too
+	pushPacket(0x102, [0x5a, 0x13, 0xe7, 0x02, 0x99, 0x41]);
+	packets.at(-1)![3]! |= 0x80;
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.id)).toEqual([0x100]);
+	expect(await tracks[0]!.getCodec()).toBe('avc');
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
