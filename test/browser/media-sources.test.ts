@@ -458,6 +458,35 @@ test('VideoSampleSource, transform.frameRate final padding fills remaining durat
 	}
 });
 
+test('VideoSampleSource, transform.frameRate is not thrown off by floating point error', async () => {
+	// 30 Hz frames doubled to 60 Hz. 5/30 + 1/30 sums to 0.19999999999999998 rather than 0.2, which must still
+	// count as the end of the 12th output frame.
+	const buffer = await encodeFrames(
+		{ codec: 'vp8', quality: new Quality('medium'), transform: { frameRate: 60 } },
+		Array.from({ length: 6 }, (_, i) => ({ width: 100, height: 100, timestamp: i / 30, duration: 1 / 30 })),
+	);
+
+	const samples = await readBackSamples(buffer);
+	expect(samples).toHaveLength(12);
+	for (let i = 0; i < 12; i++) {
+		expect(samples[i]!.timestamp).toBeCloseTo(i / 60);
+	}
+});
+
+test.each([0, 0.3 - (0.1 + 0.2)])(
+	'VideoSampleSource, transform.frameRate puts a timestamp of %s on the first frame',
+	async (timestamp) => {
+		// 0.3 - (0.1 + 0.2) is -5.55e-17
+		const buffer = await encodeFrames(
+			{ codec: 'vp8', quality: new Quality('medium'), transform: { frameRate: 30 } },
+			[{ width: 100, height: 100, timestamp, duration: 1 / 30 }],
+		);
+
+		const samples = await readBackSamples(buffer);
+		expect(samples.map(x => x.timestamp)).toEqual([0]);
+	},
+);
+
 test('VideoSampleSource, transform.frameRate skipping and padding combined', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { frameRate: 10 } },

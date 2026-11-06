@@ -30,7 +30,6 @@ import {
 	CallSerializer,
 	clamp,
 	clearIntervalUnthrottled,
-	floorToDivisor,
 	isCodecReclaimedError,
 	isFirefox,
 	isThenable,
@@ -249,6 +248,19 @@ export class EncodedVideoPacketSource extends VideoSource {
 	}
 }
 
+/**
+ * Floors the timestamp to the start of the frame it falls into at the given frame rate. Timestamps meant to sit exactly
+ * on a frame boundary often land a hair below it due to floating point error (1/30 + 1/30 + ..., or 0.3 - (0.1 + 0.2)
+ * for zero), so those count as being on the boundary. The tolerance is relative, but absolute around zero.
+ */
+const floorToFrame = (timestamp: number, frameRate: number) => {
+	const position = timestamp * frameRate;
+	const nearest = Math.round(position);
+	const snapped = Math.abs(position - nearest) < 1e-12 * Math.max(1, Math.abs(nearest)) ? nearest : position;
+
+	return Math.floor(snapped) / frameRate;
+};
+
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
 	private encoderInitialized = false;
@@ -405,7 +417,7 @@ class VideoEncoderWrapper {
 			if (frameRate !== undefined) {
 				// Apply frame rate normalization
 				const originalEndTimestamp = videoSample.timestamp + videoSample.duration;
-				const alignedTimestamp = floorToDivisor(videoSample.timestamp, frameRate);
+				const alignedTimestamp = floorToFrame(videoSample.timestamp, frameRate);
 
 				if (this.frameRateLastSample !== null) {
 					if (alignedTimestamp <= this.frameRateLastTimestamp!) {
@@ -1086,7 +1098,7 @@ class VideoEncoderWrapper {
 				// Final frame rate padding: fill remaining frames up to the last sample's original end timestamp
 				if (this.frameRateLastSample) {
 					const frameRate = this.encodingConfig.transform!.frameRate!;
-					const alignedEnd = floorToDivisor(this.frameRateLastEndTimestamp!, frameRate);
+					const alignedEnd = floorToFrame(this.frameRateLastEndTimestamp!, frameRate);
 					await this.padFrameRate(alignedEnd);
 				}
 			}
