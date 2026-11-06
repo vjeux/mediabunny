@@ -1946,6 +1946,30 @@ test('Ogg: Seeking across a region full of fake page headers', async () => {
 	expect(performance.now() - start).toBeLessThan(1000);
 });
 
+test('Ogg: Page chain jumping over the page found by bisection', async () => {
+	// A page header inside another page's payload made the walk from the bisection skip that page and record the
+	// pages out of order, after which stepping back to the last packet looped forever
+	const hiddenPage = oggPage({
+		headerType: 1,
+		granule: 960,
+		sequence: 3,
+		lacing: [255, 255, 255, 15],
+		data: zeros(780),
+	});
+	const payload = new Uint8Array(2000).fill(0xf8);
+	payload.set(hiddenPage, 1180);
+	const file = concat(
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		oggPage({ granule: 1920, sequence: 2, lacing: Array<number>(8).fill(250), data: payload }),
+		oggPage({ headerType: 1, granule: -1, sequence: 4, lacing: [255], data: zeros(255) }),
+		zeros(100),
+	);
+
+	expect(evaluateWithDeadline(file, 'input => input.computeDuration()')).toBeCloseTo(0.0335);
+	await expectGracefulRead(file);
+});
+
 test('Ogg: Short Opus identification header', async () => {
 	await expectGracefulRead(concat(
 		oggPacketsPage({ headerType: 2 }, [ascii('OpusHead')]),
