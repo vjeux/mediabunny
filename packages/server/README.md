@@ -106,6 +106,9 @@ const server = http.createServer(async (req, res) => {
 server.listen(3000);
 ```
 
+> [!NOTE]
+> This streaming setup needs inputs that can be read front to back. MP4 and MOV files qualify only with Fast Start (the `moov` box before the media data), which FFmpeg's default output and many camera recordings lack. For a file without it, Mediabunny has to read the end of the file first, and once the file outgrows `ReadableStreamSource`'s cache (32 MiB by default), the conversion fails with "Attempted to read data from an already-evicted part of the cache". To accept such files, write the upload to disk and read it with `FilePathSource`, or raise the source's `maxCacheSize`.
+
 For all the other ways to use Mediabunny, refer to its [guide](https://mediabunny.dev/guide/introduction).
 
 ## Performance
