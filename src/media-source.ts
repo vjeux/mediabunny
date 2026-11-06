@@ -1097,9 +1097,14 @@ class VideoEncoderWrapper {
 				if (this.customEncoder) {
 					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush());
 				} else if (this.encoder && !this.encodersReclaimed) {
-					// These are wired in series, therefore they must also be flushed in series
-					await this.encoder.flush();
-					await this.alphaEncoder?.flush();
+					// These are wired in series, therefore they must also be flushed in series. An encoder whose
+					// configure() threw is left unconfigured; there's nothing to flush then (it would throw).
+					if (this.encoder.state === 'configured') {
+						await this.encoder.flush();
+					}
+					if (this.alphaEncoder?.state === 'configured') {
+						await this.alphaEncoder.flush();
+					}
 
 					// Workaround for https://issues.chromium.org/issues/529852980 to give it time for errors to
 					// surface

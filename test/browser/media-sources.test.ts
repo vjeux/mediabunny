@@ -732,6 +732,98 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 	return { input, track };
 };
 
+type FinalizeOutcome = { status: 'resolved' } | { status: 'rejected'; error: unknown } | { status: 'hung' };
+
+/**
+ * Records three frames with a MediaStreamVideoTrackSource and finalizes the output (after closing the source, if
+ * `closeFirst`) while the source's encoder is still being set up: `VideoEncoder.isConfigSupported` is held until then.
+ * `createEncoder` may replace `VideoEncoder`, given the one with the held `isConfigSupported`.
+ */
+const finalizeDuringEncoderSetup = async (
+	closeFirst: boolean,
+	createEncoder: (HeldVideoEncoder: typeof VideoEncoder) => typeof VideoEncoder = Encoder => Encoder,
+) => {
+	const canvas = document.createElement('canvas');
+	canvas.width = 64;
+	canvas.height = 48;
+	const track = canvas.captureStream(0).getVideoTracks()[0]!;
+
+	// Frames reach the source through a stand-in MediaStreamTrackProcessor, so the test knows when it has them
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown; VideoEncoder: typeof VideoEncoder };
+	const originalProcessor = globals.MediaStreamTrackProcessor;
+	globals.MediaStreamTrackProcessor = class {
+		readable = new ReadableStream<VideoFrame>({
+			start: (c) => {
+				controller = c;
+			},
+		}, { highWaterMark: 0 });
+	};
+
+	let releaseSetup!: () => void;
+	const setupReleased = new Promise<void>((resolve) => {
+		releaseSetup = resolve;
+	});
+	const OriginalVideoEncoder = globals.VideoEncoder;
+	class HeldVideoEncoder extends OriginalVideoEncoder {
+		static override async isConfigSupported(config: VideoEncoderConfig) {
+			await setupReleased;
+			return OriginalVideoEncoder.isConfigSupported(config);
+		}
+	}
+	globals.VideoEncoder = createEncoder(HeldVideoEncoder);
+
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new MediaStreamVideoTrackSource(
+			track,
+			{ codec: 'vp8', quality: new Quality('low') },
+			{ frameRate: null },
+		);
+		const errors: unknown[] = [];
+		videoSource.errorPromise.catch(error => errors.push(error));
+		output.addVideoTrack(videoSource);
+		try {
+			await output.start();
+		} finally {
+			globals.MediaStreamTrackProcessor = originalProcessor;
+		}
+
+		// A short recording: three frames
+		const context = canvas.getContext('2d')!;
+		const start = 1000 * performance.now();
+		for (let i = 0; i < 3; i++) {
+			context.fillStyle = `rgb(${100 * i}, 0, 0)`;
+			context.fillRect(0, 0, canvas.width, canvas.height);
+			controller.enqueue(new VideoFrame(canvas, { timestamp: start + 40000 * i, duration: 40000 }));
+		}
+		while (controller.desiredSize! < 0) {
+			await new Promise(resolve => setTimeout(resolve, 0)); // Until the source has taken them all
+		}
+		await new Promise(resolve => setTimeout(resolve, 0));
+
+		if (closeFirst) {
+			videoSource.close();
+		}
+		const finalized = output.finalize();
+		releaseSetup();
+		const outcome = await Promise.race<FinalizeOutcome>([
+			finalized.then(() => ({ status: 'resolved' }), (error: unknown) => ({ status: 'rejected', error })),
+			new Promise(resolve => setTimeout(() => resolve({ status: 'hung' }), 2000)),
+		]);
+		track.stop();
+
+		return { outcome, errors, buffer: output.target.buffer };
+	} finally {
+		releaseSetup();
+		globals.VideoEncoder = OriginalVideoEncoder;
+		globals.MediaStreamTrackProcessor = originalProcessor;
+	}
+};
+
 test.for(['finalize', 'close'] as const)(
 	'MediaStreamVideoTrackSource, frames received while the encoder is set up survive a quick %s()',
 	async (ending, { skip }) => {
@@ -739,88 +831,110 @@ test.for(['finalize', 'close'] as const)(
 			skip('Needs VideoEncoder');
 		}
 
-		const canvas = document.createElement('canvas');
-		canvas.width = 64;
-		canvas.height = 48;
-		const track = canvas.captureStream(0).getVideoTracks()[0]!;
+		const { outcome, errors, buffer } = await finalizeDuringEncoderSetup(ending === 'close');
+		expect(outcome).toEqual({ status: 'resolved' });
+		expect(errors).toEqual([]);
 
-		// Frames reach the source through a stand-in MediaStreamTrackProcessor, so the test knows when it has them
-		let controller!: ReadableStreamDefaultController<VideoFrame>;
-		const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
-		const originalProcessor = globals.MediaStreamTrackProcessor;
-		globals.MediaStreamTrackProcessor = class {
-			readable = new ReadableStream<VideoFrame>({
-				start: (c) => {
-					controller = c;
-				},
-			}, { highWaterMark: 0 });
-		};
-
-		// The encoder's setup is held until the recording is being finalized or closed
-		let releaseSetup!: () => void;
-		const setupReleased = new Promise<void>((resolve) => {
-			releaseSetup = resolve;
-		});
-		const originalIsConfigSupported = VideoEncoder.isConfigSupported.bind(VideoEncoder);
-		VideoEncoder.isConfigSupported = async (config) => {
-			await setupReleased;
-			return originalIsConfigSupported(config);
-		};
-
-		try {
-			const output = new Output({
-				format: new WebMOutputFormat(),
-				target: new BufferTarget(),
-			});
-			const videoSource = new MediaStreamVideoTrackSource(
-				track,
-				{ codec: 'vp8', quality: new Quality('low') },
-				{ frameRate: null },
-			);
-			const errors: unknown[] = [];
-			videoSource.errorPromise.catch(error => errors.push(error));
-			output.addVideoTrack(videoSource);
-			try {
-				await output.start();
-			} finally {
-				globals.MediaStreamTrackProcessor = originalProcessor;
+		using input = new Input({ source: new BufferSource(buffer!), formats: ALL_FORMATS });
+		const videoTrack = await input.getPrimaryVideoTrack();
+		const timestamps: number[] = [];
+		if (videoTrack) {
+			for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+				timestamps.push(packet.timestamp);
 			}
-
-			// A short recording: three frames
-			const context = canvas.getContext('2d')!;
-			const start = 1000 * performance.now();
-			for (let i = 0; i < 3; i++) {
-				context.fillStyle = `rgb(${100 * i}, 0, 0)`;
-				context.fillRect(0, 0, canvas.width, canvas.height);
-				controller.enqueue(new VideoFrame(canvas, { timestamp: start + 40000 * i, duration: 40000 }));
-			}
-			while (controller.desiredSize! < 0) {
-				await new Promise(resolve => setTimeout(resolve, 0)); // Until the source has taken them all
-			}
-			await new Promise(resolve => setTimeout(resolve, 0));
-
-			if (ending === 'close') {
-				videoSource.close();
-			}
-			const finalized = output.finalize();
-			releaseSetup();
-			await finalized;
-			track.stop();
-
-			expect(errors).toEqual([]);
-			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-			const videoTrack = await input.getPrimaryVideoTrack();
-			const timestamps: number[] = [];
-			if (videoTrack) {
-				for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
-					timestamps.push(packet.timestamp);
-				}
-			}
-			expect(timestamps).toEqual([0, 0.04, 0.08]);
-		} finally {
-			releaseSetup();
-			VideoEncoder.isConfigSupported = originalIsConfigSupported;
-			globals.MediaStreamTrackProcessor = originalProcessor;
 		}
+		expect(timestamps).toEqual([0, 0.04, 0.08]);
 	},
 );
+
+test.for([
+	{
+		failure: 'an unsupported configuration',
+		createEncoder: (HeldVideoEncoder: typeof VideoEncoder) => class extends HeldVideoEncoder {
+			static override async isConfigSupported(config: VideoEncoderConfig) {
+				await HeldVideoEncoder.isConfigSupported(config);
+				return { supported: false, config };
+			}
+		},
+	},
+	{
+		failure: 'configure() throwing',
+		createEncoder: (HeldVideoEncoder: typeof VideoEncoder) => class extends HeldVideoEncoder {
+			override configure() {
+				throw new DOMException('Configuration rejected', 'NotSupportedError');
+			}
+		},
+	},
+	{
+		failure: 'an asynchronous configuration error',
+		createEncoder: (HeldVideoEncoder: typeof VideoEncoder) => {
+			// Fails its configuration the way the WebCodecs spec's "Close VideoEncoder" algorithm does: pending flushes
+			// are rejected with the error, the encoder is closed and the error callback is called
+			class AsyncFailingEncoder {
+				state: CodecState = 'unconfigured';
+				encodeQueueSize = 0;
+				private pendingFlushes: ((error: DOMException) => void)[] = [];
+
+				constructor(private init: VideoEncoderInit) {}
+
+				static isConfigSupported(config: VideoEncoderConfig) {
+					return HeldVideoEncoder.isConfigSupported(config);
+				}
+
+				configure() {
+					this.state = 'configured';
+					setTimeout(() => {
+						const error = new DOMException('Unsupported configuration', 'NotSupportedError');
+						for (const reject of this.pendingFlushes.splice(0)) {
+							reject(error);
+						}
+						this.state = 'closed';
+						this.init.error(error);
+					}, 5);
+				}
+
+				encode() {
+					if (this.state !== 'configured') {
+						throw new DOMException('Cannot call encode on a closed codec', 'InvalidStateError');
+					}
+				}
+
+				flush() {
+					if (this.state !== 'configured') {
+						return Promise.reject(new DOMException('Cannot flush a closed codec', 'InvalidStateError'));
+					}
+
+					return new Promise<void>((resolve, reject) => {
+						this.pendingFlushes.push(reject);
+					});
+				}
+
+				close() {
+					this.state = 'closed';
+				}
+
+				addEventListener() {}
+				removeEventListener() {}
+			}
+
+			return AsyncFailingEncoder as unknown as typeof VideoEncoder;
+		},
+	},
+])('MediaStreamVideoTrackSource, a quick finalize() settles and reports $failure in the encoder setup', async (
+	{ createEncoder },
+	{ skip },
+) => {
+	if (typeof VideoEncoder === 'undefined') {
+		skip('Needs VideoEncoder');
+	}
+
+	const { outcome, errors } = await finalizeDuringEncoderSetup(false, createEncoder);
+	expect(outcome.status).not.toBe('hung');
+
+	// The configuration's own error is reported, through errorPromise or by finalize() itself
+	const reported = outcome.status === 'rejected' ? [...errors, outcome.error] : errors;
+	expect(reported.length).toBeGreaterThan(0);
+	for (const error of reported) {
+		expect(String(error)).toMatch(/not supported|NotSupportedError/);
+	}
+});
