@@ -574,22 +574,26 @@ export const extractVideoCodecString = (trackInfo: {
 					: 0
 			);
 
-		let colorPrimaries: number;
-		let transferCharacteristics: number;
-		let matrixCoefficients: number;
-		let videoFullRangeFlag: number;
+		// Without a color description in the sequence header, the color fields default to ITU-R BT.709. The color space
+		// given by the container (an nclx colr box in MP4) takes precedence where it specifies a field, as AV1-ISOBMFF
+		// section 5 requires. Where it was filled in from the sequence header, it has the same values.
+		const hasColorInfo = av1CodecInfoHasColorInfo(av1CodecInfo);
+		let colorPrimaries = hasColorInfo ? av1CodecInfo.colourPrimaries : 1;
+		let transferCharacteristics = hasColorInfo ? av1CodecInfo.transferCharacteristics : 1;
+		let matrixCoefficients = hasColorInfo ? av1CodecInfo.matrixCoefficients : 1;
+		let videoFullRangeFlag = av1CodecInfo.videoFullRangeFlag;
 
-		if (av1CodecInfoHasColorInfo(av1CodecInfo)) {
-			colorPrimaries = av1CodecInfo.colourPrimaries;
-			transferCharacteristics = av1CodecInfo.transferCharacteristics;
-			matrixCoefficients = av1CodecInfo.matrixCoefficients;
-			videoFullRangeFlag = av1CodecInfo.videoFullRangeFlag;
-		} else {
-			// The defaults are 1 (ITU-R BT.709)
-			colorPrimaries = colorSpace?.primaries ? COLOR_PRIMARIES_MAP[colorSpace.primaries] : 1;
-			transferCharacteristics = colorSpace?.transfer ? TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer] : 1;
-			matrixCoefficients = colorSpace?.matrix ? MATRIX_COEFFICIENTS_MAP[colorSpace.matrix] : 1;
-			videoFullRangeFlag = colorSpace?.fullRange ? 1 : 0;
+		if (colorSpace?.primaries) {
+			colorPrimaries = COLOR_PRIMARIES_MAP[colorSpace.primaries];
+		}
+		if (colorSpace?.transfer) {
+			transferCharacteristics = TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer];
+		}
+		if (colorSpace?.matrix) {
+			matrixCoefficients = MATRIX_COEFFICIENTS_MAP[colorSpace.matrix];
+		}
+		if (colorSpace?.fullRange != null) {
+			videoFullRangeFlag = colorSpace.fullRange ? 1 : 0;
 		}
 
 		let string = `av01.${profile}.${level}${tier}.${bitDepth}`;

@@ -96,6 +96,30 @@ test('MP4 nclx color information', async () => {
 	expect(await track.hasHighDynamicRange()).toBe(true);
 });
 
+test('AV1 codec string follows the colr box', async () => {
+	// The sequence header leaves the primaries and matrix unspecified (2/1/2), and the colr box, retagged on a stream
+	// copy, says BT.709 (1/1/1). AV1-ISOBMFF section 5: with an nclx colr box, the codec string's color fields equal
+	// its values. Made with (FFmpeg 8):
+	// ffmpeg -f lavfi -i color=c=red:s=64x64:r=1 -frames:v 1 \
+	//   -vf setparams=color_trc=bt709:color_primaries=unknown:colorspace=unknown:range=tv -c:v libaom-av1 -cpu-used 8 \
+	//   -color_trc bt709 -color_primaries unspecified -colorspace unspecified -color_range tv partial.mp4
+	// ffmpeg -i partial.mp4 -c copy -color_primaries bt709 -colorspace bt709 av1-colr-retagged.mp4
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/av1-colr-retagged.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+	const decoderConfig = (await track.getDecoderConfig())!;
+
+	expect(decoderConfig.colorSpace).toEqual({
+		primaries: 'bt709',
+		transfer: 'bt709',
+		matrix: 'bt709',
+		fullRange: false,
+	});
+	expect(decoderConfig.codec).toBe('av01.0.00M.08'); // All color fields at their defaults (BT.709, limited range)
+});
+
 test('QuickTime nclc color information', async () => {
 	const output = new Output({
 		format: new MovOutputFormat(),
