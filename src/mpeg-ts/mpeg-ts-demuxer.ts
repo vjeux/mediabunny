@@ -69,6 +69,7 @@ import {
 	isThenable,
 	isIso639Dash2LanguageCode,
 	IDENTITY_MATRIX,
+	MaybePromise,
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
 	readExpGolomb,
@@ -420,6 +421,64 @@ const getAvcPicOrderCnts = (packets: { data: Uint8Array }[], sps: AvcSpsInfo) =>
 	return picOrderCnts;
 };
 
+// How many packets in a row must line up for a position to count as a packet start when resyncing
+const RESYNC_PACKET_COUNT = 3;
+// How many packet positions share an offset when resyncing
+const RESYNC_BLOCK_PACKET_COUNT = 64;
+
+/** What a packet position holds when there's no packet there (damage or junk), read like a null packet. */
+const NOT_A_PACKET_HEADER: TsPacketHeader = {
+	payloadUnitStartIndicator: 0,
+	pid: 0x1fff, // The null packet PID
+	adaptationFieldControl: 0,
+};
+
+/** Checks that a TS packet starts at the beginning of the slice, and that another one starts one stride later. */
+const startsWithPacket = (slice: FileSlice | null, stride: number): slice is FileSlice => {
+	return slice !== null
+		&& slice.view.getUint8(slice.bufferPos) === 0x47
+		&& slice.view.getUint8(slice.bufferPos + stride) === 0x47;
+};
+
+/** Reads the TS packet header fields following the sync byte. */
+const readPacketHeaderFields = (slice: FileSlice): TsPacketHeader => {
+	const nextTwoBytes = readU16Be(slice);
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	const transportErrorIndicator = nextTwoBytes >> 15;
+	const payloadUnitStartIndicator = (nextTwoBytes >> 14) & 0x1;
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	const transportPriority = (nextTwoBytes >> 13) & 0x1;
+	const pid = nextTwoBytes & 0x1FFF;
+
+	const nextByte = readU8(slice);
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	const transportScramblingControl = nextByte >> 6;
+	const adaptationFieldControl = (nextByte >> 4) & 0x3;
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	const continuityCounter = nextByte & 0xF;
+
+	return {
+		payloadUnitStartIndicator,
+		pid,
+		adaptationFieldControl,
+	};
+};
+
+/** Reads a whole TS packet. Code in here is duplicated from readPacketHeaderFields for performance reasons. */
+const readPacketFields = (bytes: Uint8Array): TsPacket => {
+	const nextTwoBytes = (bytes[1]! << 8) + bytes[2]!;
+	const payloadUnitStartIndicator = (nextTwoBytes >> 14) & 0x1;
+	const pid = nextTwoBytes & 0x1FFF;
+	const adaptationFieldControl = (bytes[3]! >> 4) & 0x3;
+
+	return {
+		payloadUnitStartIndicator,
+		pid,
+		adaptationFieldControl,
+		body: bytes.subarray(4),
+	};
+};
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -432,6 +491,8 @@ export class MpegTsDemuxer extends Demuxer {
 	seekChunkSize = 5 * 1024 * 1024; // 5 MiB, picked because most HLS segments are below this size
 	minReferencePointByteDistance = -1;
 	timestampWrapInfo: TimestampWrapInfo | null = null;
+	/** For damaged files, where the packets of blocks of packet positions are found relative to them */
+	blockOffsets = new Map<number, number>();
 
 	constructor(input: Input) {
 		super(input);
@@ -1494,78 +1555,183 @@ export class MpegTsDemuxer extends Demuxer {
 		return section;
 	}
 
-	async readPacketHeader(pos: number): Promise<TsPacketHeader | null> {
-		let slice = this.reader.requestSlice(pos, 4);
-		if (isThenable(slice)) slice = await slice;
-
-		if (!slice) {
-			return null;
+	readPacketHeader(pos: number): Promise<TsPacketHeader | null> {
+		// Read from the previous packet's sync byte on to check that the packets are where they should be. (Unlike
+		// the next one, it's usually been read already, or is about to be when reading backwards.)
+		const stride = this.packetStride;
+		const slice = pos >= stride ? this.reader.requestSlice(pos - stride, stride + 4) : null;
+		if (isThenable(slice) || !startsWithPacket(slice, stride)) {
+			return this.readPacketHeaderSlow(pos, slice);
 		}
 
-		const syncByte = readU8(slice);
-		if (syncByte !== 0x47) {
-			throw new Error('Invalid TS packet sync byte; the file is likely corrupted.');
-		}
-
-		const nextTwoBytes = readU16Be(slice);
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const transportErrorIndicator = nextTwoBytes >> 15;
-		const payloadUnitStartIndicator = (nextTwoBytes >> 14) & 0x1;
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const transportPriority = (nextTwoBytes >> 13) & 0x1;
-		const pid = nextTwoBytes & 0x1FFF;
-
-		const nextByte = readU8(slice);
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const transportScramblingControl = nextByte >> 6;
-		const adaptationFieldControl = (nextByte >> 4) & 0x3;
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const continuityCounter = nextByte & 0xF;
-
-		return {
-			payloadUnitStartIndicator,
-			pid,
-			adaptationFieldControl,
-		};
+		slice.skip(stride + 1); // The previous packet and the sync byte
+		return Promise.resolve(readPacketHeaderFields(slice));
 	}
 
-	async readPacket(pos: number): Promise<TsPacket | null> {
-		// Code in here is duplicated from readPacketHeader for performance reasons
-		let slice = this.reader.requestSlice(pos, TS_PACKET_SIZE);
+	async readPacketHeaderSlow(pos: number, slicePromise: MaybePromise<FileSlice | null>) {
+		const slice = await slicePromise;
+		if (startsWithPacket(slice, this.packetStride)) {
+			slice.skip(this.packetStride + 1);
+			return readPacketHeaderFields(slice);
+		}
+
+		const packetSlice = await this.findPacket(pos, 4);
+		if (!packetSlice) {
+			return packetSlice === null ? NOT_A_PACKET_HEADER : null;
+		}
+
+		packetSlice.skip(1); // Sync byte
+		return readPacketHeaderFields(packetSlice);
+	}
+
+	readPacket(pos: number): Promise<TsPacket | null> {
+		// Read up to the next packet's sync byte to check that the packets are where they should be
+		const slice = this.reader.requestSlice(pos, this.packetStride + 1);
+		if (isThenable(slice) || !startsWithPacket(slice, this.packetStride)) {
+			return this.readPacketSlow(pos, slice);
+		}
+
+		return Promise.resolve(readPacketFields(readBytes(slice, TS_PACKET_SIZE)));
+	}
+
+	async readPacketSlow(pos: number, slicePromise: MaybePromise<FileSlice | null>) {
+		const slice = await slicePromise;
+		const packetSlice = startsWithPacket(slice, this.packetStride)
+			? slice
+			: await this.findPacket(pos, TS_PACKET_SIZE);
+		if (!packetSlice) {
+			return packetSlice === null ? { ...NOT_A_PACKET_HEADER, body: new Uint8Array(0) } : null;
+		}
+
+		return readPacketFields(readBytes(packetSlice, TS_PACKET_SIZE));
+	}
+
+	/**
+	 * Damaged files can have bytes missing or added (or junk at the end), which shifts all packets after them away from
+	 * their positions. Like FFmpeg and Chromium, we then resync to where several packets in a row line up. To keep
+	 * this fast and the packet positions stable, the packet positions are grouped into blocks, and each block assumes
+	 * the offset at which its first packet was found until its packets turn out to be elsewhere.
+	 */
+	async findPacket(pos: number, length: number) {
+		let packetPos = pos + await this.getBlockOffset(pos);
+
+		const isAtExpectedPos = await this.isPacketStart(packetPos);
+		if (isAtExpectedPos === null) {
+			return undefined; // End of file
+		}
+
+		if (!isAtExpectedPos) {
+			const offset = await this.searchPacketStart(packetPos);
+			if (offset === null) {
+				return null;
+			}
+
+			packetPos += offset;
+		}
+
+		let slice = this.reader.requestSlice(packetPos, length);
+		if (isThenable(slice)) slice = await slice;
+		return slice ?? undefined;
+	}
+
+	/**
+	 * Returns the offset of the packets in the block of packet positions the given one belongs to: where a packet was
+	 * found for its first position that has one.
+	 */
+	async getBlockOffset(pos: number) {
+		const blockStride = RESYNC_BLOCK_PACKET_COUNT * this.packetStride;
+		const blockIndex = Math.floor((pos - this.packetOffset) / blockStride);
+
+		let blockOffset = this.blockOffsets.get(blockIndex);
+		if (blockOffset === undefined) {
+			blockOffset = 0;
+
+			const blockStartPos = this.packetOffset + blockIndex * blockStride;
+			for (let i = 0; i < RESYNC_BLOCK_PACKET_COUNT; i++) {
+				const slotPos = blockStartPos + i * this.packetStride;
+				if (await this.isPacketStart(slotPos)) {
+					break;
+				}
+
+				const offset = await this.searchPacketStart(slotPos);
+				if (offset !== null) {
+					blockOffset = offset;
+					break;
+				}
+			}
+
+			this.blockOffsets.set(blockIndex, blockOffset);
+		}
+
+		return blockOffset;
+	}
+
+	/**
+	 * Checks if a packet starts at the given position, with another one before or after it (or none at the end of the
+	 * file). Returns null past the end of the file.
+	 */
+	async isPacketStart(pos: number) {
+		const stride = this.packetStride;
+		const startPos = Math.max(pos - stride, 0);
+		let slice = this.reader.requestSliceRange(startPos, 0, pos + stride + 1 - startPos);
 		if (isThenable(slice)) slice = await slice;
 
+		const bytes = slice ? readBytes(slice, slice.length) : new Uint8Array(0);
+		const index = pos - startPos;
+		if (index >= bytes.length) {
+			return null;
+		}
+
+		return bytes[index] === 0x47 && (
+			bytes[index - stride] === 0x47
+			|| bytes[index + stride] === 0x47
+			|| index + stride >= bytes.length // The last packet
+		);
+	}
+
+	/**
+	 * Looks for a packet start near the given position, where several packets in a row start (at least two), and
+	 * returns its offset to the position. The search covers one stride, so that no two packet positions find the same
+	 * packet.
+	 */
+	async searchPacketStart(pos: number) {
+		const stride = this.packetStride;
+		const searchStartPos = Math.max(pos - Math.floor(stride / 2), this.packetOffset);
+		const searchEndPos = pos - Math.floor(stride / 2) + stride;
+
+		const searchLength = searchEndPos - searchStartPos + RESYNC_PACKET_COUNT * stride;
+		let slice = this.reader.requestSliceRange(searchStartPos, 0, searchLength);
+		if (isThenable(slice)) slice = await slice;
 		if (!slice) {
 			return null;
 		}
 
-		const bytes = readBytes(slice, TS_PACKET_SIZE);
+		const bytes = readBytes(slice, slice.length);
 
-		const syncByte = bytes[0]!;
-		if (syncByte !== 0x47) {
-			throw new Error('Invalid TS packet sync byte; the file is likely corrupted.');
+		// Try the closest positions first
+		for (let distance = 0; distance <= stride; distance++) {
+			const offset = (distance & 1) ? (distance + 1) / 2 : -distance / 2;
+			const index = pos + offset - searchStartPos;
+			if (pos + offset < searchStartPos || pos + offset >= searchEndPos || bytes[index] !== 0x47) {
+				continue;
+			}
+
+			let syncCount = 0;
+			while (syncCount < RESYNC_PACKET_COUNT && index + syncCount * stride < bytes.length) {
+				if (bytes[index + syncCount * stride] !== 0x47) {
+					break;
+				}
+
+				syncCount++;
+			}
+
+			const availableCount = Math.min(RESYNC_PACKET_COUNT, Math.ceil((bytes.length - index) / stride));
+			if (syncCount === availableCount && syncCount >= 2) {
+				return offset;
+			}
 		}
 
-		const nextTwoBytes = (bytes[1]! << 8) + bytes[2]!;
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const transportErrorIndicator = nextTwoBytes >> 15;
-		const payloadUnitStartIndicator = (nextTwoBytes >> 14) & 0x1;
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const transportPriority = (nextTwoBytes >> 13) & 0x1;
-		const pid = nextTwoBytes & 0x1FFF;
-
-		const nextByte = bytes[3]!;
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const transportScramblingControl = nextByte >> 6;
-		const adaptationFieldControl = (nextByte >> 4) & 0x3;
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		const continuityCounter = nextByte & 0xF;
-
-		return {
-			payloadUnitStartIndicator,
-			pid,
-			adaptationFieldControl,
-			body: bytes.subarray(4),
-		};
+		return null;
 	}
 
 	normalizeTimestamp(timestamp: number) {
