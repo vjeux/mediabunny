@@ -123,11 +123,13 @@ const HDPR_FORMAT_IDENTIFIER = 0x48445052;
 // 'DTS1', 'DTS2' and 'DTS3' all share this prefix
 const DTS_FORMAT_IDENTIFIER_PREFIX = 0x44545300;
 
-// Stream types that only mean DTS within a Blu-ray-derived program
-const BLU_RAY_DTS_STREAM_TYPES = new Set<number>([
-	MpegTsStreamType.BLU_RAY_DTS_HD,
-	MpegTsStreamType.BLU_RAY_DTS_HD_MASTER,
-	MpegTsStreamType.BLU_RAY_DTS_EXPRESS_SECONDARY,
+// Stream types that only mean E-AC-3 or DTS within a Blu-ray-derived program, and what they map to
+const BLU_RAY_STREAM_TYPES = new Map<number, MpegTsStreamType>([
+	[MpegTsStreamType.BLU_RAY_EAC3, MpegTsStreamType.EAC3_SYSTEM_A],
+	[MpegTsStreamType.BLU_RAY_EAC3_SECONDARY, MpegTsStreamType.EAC3_SYSTEM_A],
+	[MpegTsStreamType.BLU_RAY_DTS_HD, MpegTsStreamType.DTS],
+	[MpegTsStreamType.BLU_RAY_DTS_HD_MASTER, MpegTsStreamType.DTS],
+	[MpegTsStreamType.BLU_RAY_DTS_EXPRESS_SECONDARY, MpegTsStreamType.DTS],
 ]);
 
 type ElementaryStream = {
@@ -455,10 +457,9 @@ export class MpegTsDemuxer extends Demuxer {
 
 						let info: ElementaryStream['info'] | null = null;
 
-						// Blu-ray has its own stream types for the DTS extensions
-						const effectiveStreamType = isBluRayProgram && BLU_RAY_DTS_STREAM_TYPES.has(streamType)
-							? MpegTsStreamType.DTS
-							: streamType;
+						// Blu-ray has its own stream types for E-AC-3 and the DTS extensions
+						const effectiveStreamType = (isBluRayProgram && BLU_RAY_STREAM_TYPES.get(streamType))
+							|| streamType;
 
 						switch (effectiveStreamType) {
 							case MpegTsStreamType.AVC:
