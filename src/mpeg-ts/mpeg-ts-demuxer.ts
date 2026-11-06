@@ -2474,7 +2474,9 @@ class PacketReadingContext {
 
 						// Need at least 6 bytes for header parsing (sync word + frmsiz + fscod/numblkscod + bsid)
 						let remaining = this.ensureBuffered(6);
-						if (isThenable(remaining)) remaining = await remaining;
+						if (isThenable(remaining)) {
+							remaining = await remaining;
+						}
 
 						if (remaining < 6) {
 							return;
@@ -2518,7 +2520,9 @@ class PacketReadingContext {
 
 							const neededBytes = frameSize + 6;
 							let remaining = this.ensureBuffered(neededBytes);
-							if (isThenable(remaining)) remaining = await remaining;
+							if (isThenable(remaining)) {
+								remaining = await remaining;
+							}
 
 							if (remaining < neededBytes) {
 								break;
@@ -2543,7 +2547,9 @@ class PacketReadingContext {
 						this.seekTo(possibleSyncPos);
 
 						remaining = this.ensureBuffered(frameSize);
-						if (isThenable(remaining)) remaining = await remaining;
+						if (isThenable(remaining)) {
+							remaining = await remaining;
+						}
 
 						const duration = Math.round(
 							samplesPerFrame * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
