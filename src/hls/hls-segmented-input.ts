@@ -95,6 +95,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 	neverRemovesSegments = false;
 	lastSegmentUpdateTime = -Infinity;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
+	hasTargetDuration = false;
 	segmentTimestampOffsetPromise: Promise<number> | null = null;
 
 	constructor(
@@ -557,6 +558,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 
 				this.refreshInterval = clamp(duration, 0.5, 3600); // Clamped for safety
+				this.hasTargetDuration = true;
 			} else if (line === TAG_ENDLIST) {
 				this.streamHasEnded = true;
 				break; // No need to keep reading after this
@@ -584,8 +586,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (this.segments.length === 0) {
 			await this.runUpdateSegments();
 
-			// A live playlist may not list any segments yet, in which case we wait for the first one to show up
-			while (this.segments.length === 0 && !this.streamHasEnded) {
+			// A live playlist may not list any segments yet, in which case we wait for the first one to show up. Only
+			// for actual media playlists though, which always have a target duration.
+			while (this.segments.length === 0 && !this.streamHasEnded && this.hasTargetDuration) {
 				await this.runUpdateSegments();
 			}
 		}
