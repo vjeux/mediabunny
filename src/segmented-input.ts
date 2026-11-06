@@ -503,6 +503,63 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 		await this.hydrate();
 
+		// Finds the packet at or before the timestamp in the segment after `segment`, if there is one. Media can start
+		// before the playlist timestamp of its segment: timestamps rounded to the media's clock, or leading frames of
+		// an open GOP, which are presented before the key frame that starts their segment.
+		const getPacketInNextSegment = async (segment: Segment, skipLiveWait: boolean | undefined) => {
+			const nextSegment = await this.segmentedInput.getNextSegment(segment, { skipLiveWait });
+			if (!nextSegment) {
+				return null;
+			}
+
+			const nextInput = this.segmentedInput.getInputForSegment(nextSegment);
+			const nextTracks = await nextInput.getTracks();
+			const nextTrack = nextTracks.find(t => (
+				t.type === this.firstInputTrack!.type && t.number === this.firstInputTrack!.number
+			));
+			if (!nextTrack) {
+				return null;
+			}
+
+			const nextMediaOffset = await this.segmentedInput.getMediaOffset(nextSegment, nextInput);
+			const nextPacket = await this._getPacketAtOrBefore(
+				nextTrack,
+				nextMediaOffset,
+				timestamp,
+				{ ...options, metadataOnly: true },
+				keyframesOnly,
+			);
+			if (!nextPacket) {
+				return null;
+			}
+
+			return {
+				segment: nextSegment,
+				timestamp: roundToDivisor(nextPacket.timestamp + nextMediaOffset, await nextTrack.getTimeResolution()),
+			};
+		};
+
+		// Once a segment turns out to have no packet at or before the timestamp, we search the previous segments, and
+		// don't look forward anymore: the segment after the current one is the one we came from.
+		let searchingBackward = false;
+
+		// Called when the current segment has no packet at or before the timestamp
+		const moveToNeighbor = async (segment: Segment) => {
+			if (!searchingBackward) {
+				// Don't wait for a live stream's next segment just for this
+				const next = await getPacketInNextSegment(segment, true);
+				if (next) {
+					return next.segment;
+				}
+			}
+
+			// Search the previous segment
+			searchingBackward = true;
+			return this.segmentedInput.getPreviousSegment(segment, {
+				skipLiveWait: options.skipLiveWait,
+			});
+		};
+
 		while (currentSegment) {
 			const input = this.segmentedInput.getInputForSegment(currentSegment);
 			const tracks = await input.getTracks();
@@ -511,10 +568,7 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			));
 
 			if (!track) {
-				// Search the previous segment
-				currentSegment = await this.segmentedInput.getPreviousSegment(currentSegment, {
-					skipLiveWait: options.skipLiveWait,
-				});
+				currentSegment = await moveToNeighbor(currentSegment);
 				continue;
 			}
 
@@ -547,11 +601,13 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			const packet = await this._getPacketAtOrBefore(track, mediaOffset, timestamp, options, keyframesOnly);
 
 			if (!packet) {
-				// Search the previous segment
-				currentSegment = await this.segmentedInput.getPreviousSegment(currentSegment, {
-					skipLiveWait: options.skipLiveWait,
-				});
+				currentSegment = await moveToNeighbor(currentSegment);
 				continue;
+			}
+
+			if (searchingBackward) {
+				// The later segments have no packet at or before the timestamp
+				return this.createAdjustedPacket(packet, currentSegment, track);
 			}
 
 			// The playlist may claim the segment to be longer than its media actually is, in which case the timestamp
@@ -574,39 +630,12 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			);
 
 			if (timestamp >= lastPacketEnd) {
-				const nextSegment = await this.segmentedInput.getNextSegment(currentSegment, {
-					skipLiveWait: options.skipLiveWait,
-				});
-
-				if (nextSegment) {
-					const nextInput = this.segmentedInput.getInputForSegment(nextSegment);
-					const nextTracks = await nextInput.getTracks();
-					const nextTrack = nextTracks.find(t => (
-						t.type === this.firstInputTrack!.type && t.number === this.firstInputTrack!.number
-					));
-
-					let nextPacket = nextTrack
-						? await nextTrack._backing.getFirstPacket({ ...options, metadataOnly: true })
-						: null;
-					if (nextPacket && keyframesOnly && nextPacket.type !== 'key') {
-						nextPacket = await nextTrack!._backing.getNextKeyPacket(nextPacket, {
-							...options,
-							metadataOnly: true,
-						});
-					}
-
-					if (nextPacket) {
-						const nextMediaOffset = await this.segmentedInput.getMediaOffset(nextSegment, nextInput);
-						const nextPacketTimestamp = roundToDivisor(
-							nextPacket.timestamp + nextMediaOffset,
-							await nextTrack!.getTimeResolution(),
-						);
-
-						if (nextPacketTimestamp <= timestamp) {
-							currentSegment = nextSegment;
-							continue;
-						}
-					}
+				// Not just the next segment's first packet matters: in decode order, an open GOP's leading frames come
+				// after the key frame that starts the segment
+				const next = await getPacketInNextSegment(currentSegment, options.skipLiveWait);
+				if (next && next.timestamp >= roundToDivisor(packet.timestamp + mediaOffset, timeResolution)) {
+					currentSegment = next.segment;
+					continue;
 				}
 			}
 

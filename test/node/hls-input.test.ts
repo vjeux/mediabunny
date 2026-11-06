@@ -3,6 +3,7 @@ import {
 	ALL_FORMATS,
 	BufferSource,
 	BufferTarget,
+	CmafOutputFormat,
 	EncodedAudioPacketSource,
 	EncodedPacket,
 	EncodedPacketSink,
@@ -1581,6 +1582,118 @@ test.concurrent('Packet lookups at segment boundaries settle when the media offs
 	} finally {
 		spy.mockRestore();
 	}
+});
+
+/** Writes HLS from synthetic packets (with real H.264/AAC payloads) into memory. */
+const writeHlsFromPackets = async (
+	segmentFormat: MpegTsOutputFormat | CmafOutputFormat,
+	video: { timestamp: number; duration: number; type: 'key' | 'delta' }[],
+	audio: { timestamp: number; duration: number }[],
+) => {
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceVideoTrack = await sourceInput.getPrimaryVideoTrack();
+	const sourceAudioTrack = await sourceInput.getPrimaryAudioTrack();
+	assert(sourceVideoTrack && sourceAudioTrack);
+	const videoConfig = { decoderConfig: (await sourceVideoTrack.getDecoderConfig())! };
+	const audioConfig = { decoderConfig: (await sourceAudioTrack.getDecoderConfig())! };
+	const videoSink = new EncodedPacketSink(sourceVideoTrack);
+	const keyData = (await videoSink.getFirstKeyPacket())!.data;
+	const deltaData = (await videoSink.getNextPacket((await videoSink.getFirstKeyPacket())!))!.data;
+	const audioData = (await new EncodedPacketSink(sourceAudioTrack).getFirstPacket())!.data;
+
+	const files = new Map<string, Uint8Array>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat, targetDuration: 1 }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+			return target;
+		}),
+	});
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource);
+	const audioSource = audio.length > 0 ? new EncodedAudioPacketSource('aac') : null;
+	if (audioSource) {
+		output.addAudioTrack(audioSource);
+	}
+	await output.start();
+
+	let videoIndex = 0;
+	let audioIndex = 0;
+	while (videoIndex < video.length || audioIndex < audio.length) {
+		const nextVideo = video[videoIndex];
+		const nextAudio = audio[audioIndex];
+		if (nextVideo && (!nextAudio || nextVideo.timestamp <= nextAudio.timestamp)) {
+			const data = nextVideo.type === 'key' ? keyData : deltaData;
+			await videoSource.add(
+				new EncodedPacket(data, nextVideo.type, nextVideo.timestamp, nextVideo.duration),
+				videoConfig,
+			);
+			videoIndex++;
+		} else {
+			await audioSource!.add(new EncodedPacket(audioData, 'key', nextAudio!.timestamp, nextAudio!.duration), audioConfig);
+			audioIndex++;
+		}
+	}
+	await output.finalize();
+
+	return new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+		formats: HLS_FORMATS,
+	});
+};
+
+test.concurrent('Packets can be looked up by their own timestamp when their track is missing from the segment the playlist points to', async () => {
+	// The audio starts with the second segment, at 1.0000037 s, which is also where that segment starts in the
+	// playlist. The 90 kHz clock of MPEG-TS stores it at 1 s though, inside the first segment's time range, but the
+	// first segment has no audio at all.
+	using input = await writeHlsFromPackets(
+		new MpegTsOutputFormat(),
+		[0, 1.0000037, 2.0000037].map(timestamp => ({ timestamp, duration: 1, type: 'key' as const })),
+		Array.from({ length: 40 }, (_, i) => ({ timestamp: 1.0000037 + i * 1024 / 44100, duration: 1024 / 44100 })),
+	);
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+
+	const sink = new EncodedPacketSink(audioTrack);
+	const firstPacket = await sink.getFirstPacket();
+	expect(firstPacket?.timestamp).toBe(1);
+
+	for (let packet = firstPacket; packet; packet = await sink.getNextPacket(packet)) {
+		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+	}
+});
+
+test.concurrent('Leading frames of an open GOP can be looked up by their own timestamp', async () => {
+	// 24 fps in decode order K0 P2 B1 P4 B3 … P22 B21 K24 B23 P26 B25 …: each segment starts with a key frame that is
+	// followed by a frame shown before it, which therefore lies in the previous segment's time range
+	const fps = 24;
+	const video: { timestamp: number; duration: number; type: 'key' | 'delta' }[] = [];
+	for (let start = 0; start < 72; start += 24) {
+		video.push({ timestamp: start / fps, duration: 1 / fps, type: 'key' });
+		if (start > 0) {
+			video.push({ timestamp: (start - 1) / fps, duration: 1 / fps, type: 'delta' });
+		}
+		for (let frame = start + 2; frame < start + 24; frame += 2) {
+			video.push({ timestamp: frame / fps, duration: 1 / fps, type: 'delta' });
+			video.push({ timestamp: (frame - 1) / fps, duration: 1 / fps, type: 'delta' });
+		}
+	}
+	video.push({ timestamp: 71 / fps, duration: 1 / fps, type: 'delta' });
+
+	using input = await writeHlsFromPackets(new CmafOutputFormat(), video, []);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	let count = 0;
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		count++;
+	}
+	expect(count).toBe(72);
+	expect((await sink.getPacket(23 / fps))?.timestamp).toBe(23 / fps);
 });
 
 const fetchBytes = async (url: string) => {
