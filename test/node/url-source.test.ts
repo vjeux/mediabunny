@@ -299,6 +299,37 @@ test('UrlSource reads the full decoded body of a compressed 206 response', async
 	}
 });
 
+test('UrlSource reports the real size when its Range window ends past the end of the resource', async () => {
+	const data = new Uint8Array(1000);
+	const server = http.createServer((req, res) => {
+		const [, start, end] = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')!;
+		const last = Math.min(end ? Number(end) : Infinity, data.length - 1);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${last}/${data.length}`,
+			'Content-Length': last - Number(start) + 1,
+		});
+		res.end(data.subarray(Number(start), last + 1));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+
+		// RFC 9110 reads a last-pos past the end as "up to the end"
+		const source = new UrlSource(url, { requestInit: { headers: { Range: 'bytes=100-99999' } } });
+		expect(await source.getSize()).toBe(900);
+
+		const withinBounds = new UrlSource(url, { requestInit: { headers: { Range: 'bytes=100-199' } } });
+		expect(await withinBounds.getSize()).toBe(100);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
 ) => {
