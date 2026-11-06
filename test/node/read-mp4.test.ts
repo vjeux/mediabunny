@@ -296,3 +296,28 @@ test('AV1 track with an empty av1C box', async () => {
 	}
 	expect(packetCount).toBe(10);
 });
+
+test('MP3 audio in a QuickTime .mp3 sample entry', async () => {
+	// ffmpeg -f lavfi -i sine=frequency=440:sample_rate=22050 -t 1 -c:a libmp3lame -b:a 32k mp3-in-mov.mov
+	const filePath = path.join(__dirname, '..', 'public/mp3-in-mov.mov');
+	using input = new Input({
+		source: new FilePathSource(filePath),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	expect(await track.getCodec()).toBe('mp3');
+	expect(await track.getDecoderConfig()).toEqual({
+		codec: 'mp3',
+		numberOfChannels: 1,
+		sampleRate: 22050,
+		description: undefined,
+	});
+
+	const sink = new EncodedPacketSink(track);
+	const firstPacket = await sink.getFirstPacket();
+	expect(firstPacket?.timestamp).toBeCloseTo(-0.050113); // Encoder delay cut by the edit list
+	expect(firstPacket?.byteLength).toBe(104);
+});
