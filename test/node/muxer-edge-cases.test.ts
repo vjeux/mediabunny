@@ -4,10 +4,11 @@ import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { Mp3OutputFormat, OggOutputFormat, WavOutputFormat } from '../../src/output-format.js';
+import { Mp3OutputFormat, Mp4OutputFormat, OggOutputFormat, WavOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { EncodedAudioPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { adtsFrame, annexB, buildAvcSps } from './helpers/mutation-bytes.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 
@@ -287,5 +288,98 @@ describe('Ogg page layout on output', () => {
 		expect(() => new OggOutputFormat({ maximumPageDuration: 0 })).toThrow(TypeError);
 		expect(() => new OggOutputFormat({ maximumPageDuration: '1' as never })).toThrow(TypeError);
 		expect(() => new OggOutputFormat({ onPage: 1 as never })).toThrow(TypeError);
+	});
+});
+
+describe('MP4 output from Annex B and ADTS packets', () => {
+	const sps = buildAvcSps({ profileIdc: 66, levelIdc: 30, widthInMbs: 20, heightInMapUnits: 15 });
+	const pps = [0x68, 0xce, 0x38, 0x80];
+	const idr = [0x65, 0x88, 0x84, 0x21, 0x43];
+	const nonIdr = [0x41, 0x9a, 0x02];
+
+	const writeMp4 = async (add: (output: Output) => Promise<void>) => {
+		const target = new BufferTarget();
+		const output = new Output({ format: new Mp4OutputFormat(), target });
+		await add(output);
+		await output.finalize();
+		return new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+	};
+
+	test('AVC without a description gets its avcC from the first packet, packets become length-prefixed', async () => {
+		using input = await writeMp4(async (output) => {
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+			await output.start();
+			const decoderConfig = {
+				codec: 'avc1.42c01e',
+				codedWidth: 320,
+				codedHeight: 240,
+				displayAspectWidth: 16,
+				displayAspectHeight: 9,
+			};
+			await source.add(new EncodedPacket(annexB([0x09, 0xf0], sps, pps, idr), 'key', 0, 0.04), { decoderConfig });
+			await source.add(new EncodedPacket(annexB([0x09, 0xf0], nonIdr), 'delta', 0.04, 0.04));
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const config = (await track.getDecoderConfig())!;
+		const avcC = new Uint8Array(config.description as ArrayBuffer);
+		expect([...avcC.subarray(0, 6)]).toEqual([1, 66, sps[2], 30, 0xff, 0xe1]);
+		expect([await track.getDisplayWidth(), await track.getDisplayHeight()]).toEqual([427, 240]); // 16:9 pixels
+
+		const sink = new EncodedPacketSink(track);
+		const packets = [];
+		for await (const packet of sink.packets()) {
+			packets.push([...packet.data]);
+		}
+		// Parameter sets and access unit delimiters stay in the stream, each NAL unit prefixed by its length
+		expect(packets[1]).toEqual([0, 0, 0, 2, 0x09, 0xf0, 0, 0, 0, 3, ...nonIdr]);
+		expect(packets[0]!.slice(-9)).toEqual([0, 0, 0, 5, ...idr]);
+	});
+
+	test('AVC without a description fails clearly when the first packet has no parameter sets', async () => {
+		const target = new BufferTarget();
+		const output = new Output({ format: new Mp4OutputFormat(), target });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+		const decoderConfig = { codec: 'avc1.42c01e', codedWidth: 320, codedHeight: 240 };
+		await expect(source.add(new EncodedPacket(annexB(idr), 'key', 0, 0.04), { decoderConfig }))
+			.rejects.toThrow('Couldn\'t extract an AVCDecoderConfigurationRecord');
+	});
+
+	test('AAC without a description gets its AudioSpecificConfig from the ADTS header, which is stripped', async () => {
+		using input = await writeMp4(async (output) => {
+			const source = new EncodedAudioPacketSource('aac');
+			output.addAudioTrack(source);
+			await output.start();
+			const decoderConfig = { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100 };
+			const frame = adtsFrame(20, { samplingFrequencyIndex: 4, channelConfiguration: 2, fill: 0x5a });
+			await source.add(new EncodedPacket(frame, 'key', 0, 1024 / 44100), { decoderConfig });
+			await source.add(new EncodedPacket(frame, 'key', 1024 / 44100, 1024 / 44100));
+		});
+		const track = (await input.getPrimaryAudioTrack())!;
+		const config = (await track.getDecoderConfig())!;
+		// AAC LC (2), 44.1 kHz (index 4), stereo: 00010 0100 0010 000
+		expect([...new Uint8Array(config.description as ArrayBuffer)]).toEqual([0x12, 0x10]);
+		expect([await track.getSampleRate(), await track.getNumberOfChannels()]).toEqual([44100, 2]);
+		const first = (await new EncodedPacketSink(track).getFirstPacket())!;
+		expect(first.byteLength).toBe(20);
+		expect(first.data.every(byte => byte === 0x5a)).toBe(true);
+	});
+
+	test('when every track of a type is non-default, the first one is still enabled', async () => {
+		using input = await writeMp4(async (output) => {
+			const a = new EncodedAudioPacketSource('pcm-s16');
+			const b = new EncodedAudioPacketSource('pcm-s16');
+			output.addAudioTrack(a, { disposition: { default: false } });
+			output.addAudioTrack(b, { disposition: { default: false } });
+			await output.start();
+			const meta = { decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 } };
+			await a.add(new EncodedPacket(new Uint8Array(160), 'key', 0, 0.01), meta);
+			await b.add(new EncodedPacket(new Uint8Array(160), 'key', 0, 0.01), meta);
+		});
+		const tracks = await input.getAudioTracks();
+		const defaults = await Promise.all(tracks.map(async track => (await track.getDisposition()).default));
+		expect(defaults).toEqual([true, false]);
 	});
 });
