@@ -866,12 +866,20 @@ export const guessDescriptionForAudio = (decoderConfig: AudioDecoderConfig): Uin
 	}
 };
 
+// SBR doubles the core coder's sample rate, up to 48 kHz
+const MAX_AAC_SBR_CORE_SAMPLE_RATE = 24000;
+
 export const getAudioPreRollDuration = (codec: AudioCodec, decoderConfig: AudioDecoderConfig) => {
 	switch (codec) {
 		case 'aac': {
+			// Frames overlap, so decoding must start a frame early. SBR (HE-AAC) also keeps the state of the frame
+			// before and codes its envelopes relative to it, so it needs one more (as in FFmpeg's seek_preroll() in
+			// aacdec.c). SBR is often signaled only implicitly (ADTS, MPEG-TS), leaving a config that describes just
+			// the core coder at half the output rate, so assume SBR whenever the core rate allows for it.
 			if (!decoderConfig.description) {
 				// Best guess
-				return 1024 / decoderConfig.sampleRate;
+				const frameCount = decoderConfig.sampleRate <= MAX_AAC_SBR_CORE_SAMPLE_RATE ? 2 : 1;
+				return frameCount * 1024 / decoderConfig.sampleRate;
 			}
 
 			const audioSpecificConfig = parseAacAudioSpecificConfig(toUint8Array(decoderConfig.description));
@@ -879,7 +887,12 @@ export const getAudioPreRollDuration = (codec: AudioCodec, decoderConfig: AudioD
 				throw new Error('Invalid AAC sampling frequency index.');
 			}
 
-			return audioSpecificConfig.frameLength / audioSpecificConfig.coreSampleRate;
+			const mayHaveSbr = audioSpecificConfig.objectType === 5
+				|| audioSpecificConfig.objectType === 29
+				|| audioSpecificConfig.outputSampleRate !== audioSpecificConfig.coreSampleRate
+				|| audioSpecificConfig.coreSampleRate <= MAX_AAC_SBR_CORE_SAMPLE_RATE;
+
+			return (mayHaveSbr ? 2 : 1) * audioSpecificConfig.frameLength / audioSpecificConfig.coreSampleRate;
 		}
 
 		case 'opus': {
