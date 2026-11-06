@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +83,83 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('getPacket finds B-frames that straddle a cluster boundary', async () => {
+	// Clusters cut mid-GOP, as FFmpeg does in live mode or at its cluster size/time limits: the first cluster ends
+	// with the P frame at 120 ms, the B-frames presented before it (40, 80 ms) start the next cluster
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const matroskaFile = (...segmentChildren: number[][]) => new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, [...'matroska'].map(x => x.charCodeAt(0)))),
+		...element(EBMLId.Segment, segmentChildren.flat()),
+	]);
+
+	const simpleBlock = (timestamp: number, key = false) => element(
+		EBMLId.SimpleBlock,
+		[0x81, (timestamp >> 8) & 0xff, timestamp & 0xff, key ? 0x80 : 0, 1],
+	);
+	// A BlockGroup declaring a 40 ms BlockDuration; non-key frames reference another frame
+	const blockGroup = (timestamp: number, key = false) => element(
+		EBMLId.BlockGroup,
+		element(EBMLId.Block, [0x81, (timestamp >> 8) & 0xff, timestamp & 0xff, 0, 1]),
+		element(EBMLId.BlockDuration, [40]),
+		key ? [] : element(EBMLId.ReferenceBlock, [0xd8]), // -40
+	);
+
+	const makeFile = (defaultDuration: number[][], block: typeof simpleBlock) => matroskaFile(
+		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+		element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [1]),
+			element(EBMLId.CodecID, [...'V_MPEG4/ISO/AVC'].map(x => x.charCodeAt(0))),
+			...defaultDuration,
+			element(EBMLId.Video, element(EBMLId.PixelWidth, [16]), element(EBMLId.PixelHeight, [16])),
+		)),
+		element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), block(0, true), block(120)),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [40]),
+			block(0), block(40), block(200), block(120), block(160),
+		),
+	);
+
+	const files = [
+		makeFile([element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00])], simpleBlock), // 40 ms
+		makeFile([], simpleBlock), // DefaultDuration is optional
+		// A nominal DefaultDuration of 120 ms, which the blocks' own BlockDurations of 40 ms override
+		makeFile([element(EBMLId.DefaultDuration, [0x07, 0x27, 0x0e, 0x00])], blockGroup),
+	];
+
+	const checkLookups = async (file: Uint8Array, order: number[]) => {
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const sink = new EncodedPacketSink(track);
+		for (const timestamp of order) {
+			expect((await sink.getPacket(timestamp))!.timestamp).toBe(timestamp);
+		}
+	};
+
+	const timestamps = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24];
+	for (const file of files) {
+		await checkLookups(file, timestamps);
+		await checkLookups(file, [...timestamps].reverse());
+	}
 });
