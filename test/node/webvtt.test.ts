@@ -31,6 +31,14 @@ Tell me, is the lord of the universe in?
 	await output.finalize();
 });
 
+test('A WebVTT timing line ends the previous cue even without a blank line before it', () => {
+	const cues: SubtitleCue[] = [];
+	const parser = new SubtitleParser({ codec: 'webvtt', output: cue => cues.push(cue) });
+	parser.parse('WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n00:02.000 --> 00:03.000\nThere\n');
+
+	expect(cues.map(cue => [cue.timestamp, cue.duration, cue.text])).toEqual([[0, 1, 'Hi'], [2, 1, 'There']]);
+});
+
 test('Matroska muxing', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
@@ -55,12 +63,4 @@ Tell me, is the lord of the universe in?
 `);
 
 	await output.finalize();
-});
-
-test('A WebVTT timing line ends the previous cue even without a blank line before it', () => {
-	const cues: SubtitleCue[] = [];
-	const parser = new SubtitleParser({ codec: 'webvtt', output: cue => cues.push(cue) });
-	parser.parse('WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n00:02.000 --> 00:03.000\nThere\n');
-
-	expect(cues.map(cue => [cue.timestamp, cue.duration, cue.text])).toEqual([[0, 1, 'Hi'], [2, 1, 'There']]);
 });
