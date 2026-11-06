@@ -36,6 +36,8 @@ export class SubtitleParser {
 	private options: SubtitleParserOptions;
 	private preambleText: string | null = null;
 	private preambleEmitted = false;
+	/** Text after the last cue of the previous chunk, such as a NOTE block, which precedes this chunk's first cue. */
+	private pendingText = '';
 
 	constructor(options: SubtitleParserOptions) {
 		this.options = options;
@@ -65,7 +67,11 @@ export class SubtitleParser {
 			if (match) {
 				text = text.slice(match.index);
 				cueBlockHeaderRegex.lastIndex = 0;
+			} else {
+				text = ''; // All of it is the preamble
 			}
+		} else {
+			text = this.pendingText + text;
 		}
 
 		while ((match = cueBlockHeaderRegex.exec(text))) {
@@ -111,6 +117,8 @@ export class SubtitleParser {
 
 			this.options.output(cue, meta);
 		}
+
+		this.pendingText = text;
 	}
 }
 
