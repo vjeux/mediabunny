@@ -21,6 +21,7 @@ import {
 	multiplyMatrices,
 	normalizeRotation,
 	promiseWithResolvers,
+	Queue,
 	RAD_TO_DEG,
 	Rational,
 	Rotation,
@@ -98,7 +99,7 @@ type ClusterBlock = {
 };
 
 type MatroskaTrackData = {
-	chunkQueue: InternalMediaChunk[];
+	chunkQueue: Queue<InternalMediaChunk>;
 	lastWrittenMsTimestamp: number | null;
 	codecPrivate: AllowSharedBufferSource | null;
 	closed: boolean;
@@ -887,7 +888,7 @@ export class MatroskaMuxer extends Muxer {
 				decoderConfig: meta.decoderConfig,
 				alphaMode: track.metadata.canBeTransparent || (packet ? !!packet.sideData.alpha : null),
 			},
-			chunkQueue: [],
+			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
 			codecPrivate: meta.decoderConfig.description ?? null,
 			closed: false,
@@ -978,7 +979,7 @@ export class MatroskaMuxer extends Muxer {
 				requiresAdtsStripping,
 				codecDelay: null,
 			},
-			chunkQueue: [],
+			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
 			codecPrivate: decoderConfig.description ?? null,
 			closed: false,
@@ -1011,7 +1012,7 @@ export class MatroskaMuxer extends Muxer {
 			info: {
 				config: meta.config,
 			},
-			chunkQueue: [],
+			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
 			codecPrivate: textEncoder.encode(meta.config.description),
 			closed: false,
@@ -1165,9 +1166,9 @@ export class MatroskaMuxer extends Muxer {
 					break outer;
 				}
 
-				if (trackData.chunkQueue.length > 0 && trackData.chunkQueue[0]!.timestamp < minTimestamp) {
+				if (trackData.chunkQueue.length > 0 && trackData.chunkQueue.peek()!.timestamp < minTimestamp) {
 					trackWithMinTimestamp = trackData;
-					minTimestamp = trackData.chunkQueue[0]!.timestamp;
+					minTimestamp = trackData.chunkQueue.peek()!.timestamp;
 				}
 			}
 
@@ -1267,7 +1268,7 @@ export class MatroskaMuxer extends Muxer {
 				return chunk.type === 'key';
 			}
 
-			const firstQueuedSample = otherTrackData.chunkQueue[0];
+			const firstQueuedSample = otherTrackData.chunkQueue.peek();
 			if (firstQueuedSample) {
 				return firstQueuedSample.type === 'key';
 			}
