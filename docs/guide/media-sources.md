@@ -81,6 +81,7 @@ type VideoEncodingConfig = {
 	onEncoderConfig?: (
 		config: VideoEncoderConfig
 	) => unknown;
+	onEncodedSample?: (sample: VideoSample) => unknown;
 };
 ```
 - `codec`: The [video codec](./supported-formats-and-codecs#video-codecs) used for encoding.
@@ -110,6 +111,7 @@ type VideoEncodingConfig = {
 	- `force`: Forces every video frame through the transformation step even if no transformation properties are defined. This can be used, for example, to bake rotation and flip into the encoded video frames.
 - `onEncodedPacket`: Called for each successfully encoded packet. Useful for determining encoding progress.
 - `onEncoderConfig`: Called when the internal encoder config, as used by the WebCodecs API, is created. You can use this to introspect the full codec string.
+- `onEncodedSample`: Called right before a video sample is passed to the encoder.
 
 ### Audio encoding config
 
@@ -135,6 +137,7 @@ type AudioEncodingConfig = {
 	onEncoderConfig?: (
 		config: AudioEncoderConfig
 	) => unknown;
+	onEncodedSample?: (sample: AudioSample) => unknown;
 };
 ```
 - `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding.
@@ -146,6 +149,7 @@ type AudioEncodingConfig = {
 	- `process`: Allows for custom user-defined processing of audio samples, e.g. for applying audio effects or timestamp modifications. Called for each audio sample after resampling and remixing. Must return an `AudioSample`, an array of them, or `null` for dropping the sample.
 - `onEncodedPacket`: Called for each successfully encoded packet. Useful for determining encoding progress.	
 - `onEncoderConfig`: Called when the internal encoder config, as used by the WebCodecs API, is created. You can use this to introspect the full codec string.
+- `onEncodedSample`: Called right before an audio sample is passed to the encoder.
 
 ### Encoding quality
 
