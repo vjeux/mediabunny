@@ -23,6 +23,8 @@ const QUALITY = new Quality('high');
 import { EBMLId } from '../../src/matroska/ebml.js';
 import { ebml, ebmlFloat, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/mutation-bytes.js';
 
+const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
+
 const VP8_KEY_FRAME = [0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x00, 0x30, 0x00];
 
 // A small WebM with one VP8 video track and one 16-bit PCM audio track
@@ -455,13 +457,18 @@ describe('Ogg remuxing', () => {
 			original.push(packet);
 		}
 		let count = 0;
+		let mismatches = 0;
 		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
 			const source = original[count++]!;
-			expect(packet.timestamp).toBeCloseTo(source.timestamp + shift, 9);
-			expect(packet.duration).toBeCloseTo(source.duration, 9);
-			expect(packet.data).toEqual(source.data);
+			if (
+				Math.abs(packet.timestamp - (source.timestamp + shift)) > 1e-9
+				|| Math.abs(packet.duration - source.duration) > 1e-9
+				|| !sameBytes(packet.data, source.data)
+			) {
+				mismatches++;
+			}
 		}
-		expect(count).toBe(original.length);
+		expect([count, mismatches]).toEqual([original.length, 0]);
 		input.dispose();
 	});
 });
@@ -498,16 +505,21 @@ describe('Audio-only remuxing', () => {
 			original.push(packet);
 		}
 		let count = 0;
+		let mismatches = 0;
 		let shift: number | null = null;
 		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
 			const source = original[count++]!;
 			// Formats without a way to store the encoder delay may shift everything to start at zero
 			shift ??= packet.timestamp - source.timestamp;
-			expect(packet.timestamp).toBeCloseTo(source.timestamp + shift, 9);
-			expect(packet.duration).toBeCloseTo(source.duration, 9);
-			expect(packet.data).toEqual(source.data);
+			if (
+				Math.abs(packet.timestamp - (source.timestamp + shift)) > 1e-9
+				|| Math.abs(packet.duration - source.duration) > 1e-9
+				|| !sameBytes(packet.data, source.data)
+			) {
+				mismatches++;
+			}
 		}
-		expect(count).toBe(original.length);
+		expect([count, mismatches]).toEqual([original.length, 0]);
 		expect(shift).toBeGreaterThanOrEqual(0);
 		input.dispose();
 	});
