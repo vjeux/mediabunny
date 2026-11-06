@@ -1180,6 +1180,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	packetBuffers = new WeakMap<EncodedPacket, PacketBuffer>();
 	/** Used for recreating PacketBuffers if necessary. */
 	packetSectionStarts = new WeakMap<EncodedPacket, number>();
+	frameDuration: Promise<number> | null = null;
 
 	constructor(public elementaryStream: ElementaryStream) {}
 
@@ -1267,6 +1268,81 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	abstract allPacketsAreKeyPackets(): boolean;
 	abstract getReorderSize(): number;
 
+	/**
+	 * Returns the start of the `count`-th PES packet with a PTS before the given position, but not before the track's
+	 * first one.
+	 */
+	async findPesPacketBefore(pos: number, count: number) {
+		const demuxer = this.elementaryStream.demuxer;
+		const firstSection = this.elementaryStream.firstSection;
+		assert(firstSection);
+
+		let currentPos = pos;
+		while (count > 0 && currentPos > firstSection.startPos) {
+			currentPos -= demuxer.packetStride;
+
+			const packetHeader = await demuxer.readPacketHeader(currentPos);
+			assert(packetHeader);
+
+			if (packetHeader.pid === this.elementaryStream.pid && packetHeader.payloadUnitStartIndicator === 1) {
+				const section = await demuxer.readSection(currentPos, false);
+				const pesPacketHeader = section && readPesPacketHeader(demuxer, section, false);
+				if (pesPacketHeader && pesPacketHeader.pts !== null) {
+					count--;
+				}
+			}
+		}
+
+		return currentPos;
+	}
+
+	/**
+	 * Returns the time between frames, as the smallest gap between the presentation timestamps of the track's first
+	 * PES packets. Since it doesn't depend on where reading started, it gives packets without a successor the same
+	 * duration however they were reached.
+	 */
+	getFrameDuration() {
+		return this.frameDuration ??= (async () => {
+			const demuxer = this.elementaryStream.demuxer;
+			const firstSection = this.elementaryStream.firstSection;
+			assert(firstSection);
+
+			// Enough to see every frame of a reordering window in presentation order
+			const ptsCount = 2 * (this.getReorderSize() + 1) + 2;
+			const ptsValues: number[] = [];
+
+			let currentPos = firstSection.startPos;
+			while (ptsValues.length < ptsCount) {
+				const packetHeader = await demuxer.readPacketHeader(currentPos);
+				if (!packetHeader) {
+					break;
+				}
+
+				if (packetHeader.pid === this.elementaryStream.pid && packetHeader.payloadUnitStartIndicator === 1) {
+					const section = await demuxer.readSection(currentPos, false);
+					const pesPacketHeader = section && readPesPacketHeader(demuxer, section, false);
+					if (pesPacketHeader && pesPacketHeader.pts !== null) {
+						ptsValues.push(pesPacketHeader.pts);
+					}
+				}
+
+				currentPos += demuxer.packetStride;
+			}
+
+			ptsValues.sort((a, b) => a - b);
+
+			let frameDuration = Infinity;
+			for (let i = 1; i < ptsValues.length; i++) {
+				const gap = ptsValues[i]! - ptsValues[i - 1]!;
+				if (gap > 0) {
+					frameDuration = Math.min(frameDuration, gap);
+				}
+			}
+
+			return Number.isFinite(frameDuration) ? frameDuration : 0;
+		})();
+	}
+
 	createEncodedPacket(
 		suppliedPacket: SuppliedPacket,
 		duration: number,
@@ -1341,7 +1417,15 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		}
 
 		const demuxer = this.elementaryStream.demuxer;
-		const section = await demuxer.readSection(sectionStartPos, true);
+
+		// With frames being reordered, the packets presented around the next one may come before the current one in the
+		// stream, so start reading early enough to get its duration right (like packet lookups do)
+		const reorderSize = this.getReorderSize();
+		const startPos = reorderSize > 0
+			? await this.findPesPacketBefore(sectionStartPos, reorderSize + 1)
+			: sectionStartPos;
+
+		const section = await demuxer.readSection(startPos, true);
 		assert(section);
 
 		const pesPacket = readPesPacket(demuxer, section, true);
@@ -2679,8 +2763,12 @@ class PacketBuffer {
 
 		let duration: number;
 		if (presentationIndex === -1 || presentationIndex === this.presentationOrderPackets.length - 1) {
-			// The packet has no known successor (or isn't even placed yet when timestamps are messed up)
-			duration = this.lastDuration; // Reasonable heuristic
+			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). For video,
+			// whose frames may be reordered, the packets around it depend on where reading started, so use the
+			// track's frame duration.
+			duration = this.backing.elementaryStream.info.type === 'video'
+				? await this.backing.getFrameDuration()
+				: this.lastDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
 			duration = nextPacket.pts - packet.pts;
