@@ -1336,7 +1336,8 @@ export type HlsOutputFormatOptions = {
 	live?: boolean;
 	/**
 	 * When in live mode, this controls the maximum number of segments contained in each playlist. Defaults to
-	 * `Infinity`, meaning playlists continually grow in size.
+	 * `Infinity`, meaning playlists continually grow in size. Playlists keep more segments when fewer wouldn't add up
+	 * to three times the target duration, the minimum length of a live playlist in HLS.
 	 */
 	maxLiveSegmentCount?: number;
 	/**
