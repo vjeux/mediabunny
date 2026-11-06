@@ -16,6 +16,7 @@ import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
+import { Logging } from '../logging';
 
 export enum WaveFormat {
 	PCM = 0x0001,
@@ -329,7 +330,13 @@ export class WaveDemuxer extends Demuxer {
 
 			if (id3V2Header.size > 0) {
 				const contentSlice = slice.slice(startPos + ID3_V2_HEADER_SIZE, id3V2Header.size);
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+
+				try {
+					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				} catch (error) {
+					// A broken tag must not make the audio unreadable; keep whatever frames were read before the error
+					Logging._warn('Skipping the rest of a malformed ID3 chunk:', error);
+				}
 			}
 		}
 	}

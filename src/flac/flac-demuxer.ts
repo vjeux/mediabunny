@@ -39,6 +39,7 @@ import {
 } from './flac-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
+import { Logging } from '../logging';
 
 type FlacAudioInfo = {
 	numberOfChannels: number;
@@ -124,7 +125,12 @@ export class FlacDemuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				assert(contentSlice);
 
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				try {
+					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				} catch (error) {
+					// A broken tag must not make the audio unreadable; keep whatever frames were read before the error
+					Logging._warn('Skipping the rest of a malformed ID3v2 tag:', error);
+				}
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
