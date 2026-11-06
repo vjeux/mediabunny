@@ -57,6 +57,7 @@ import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
 
 export const GLOBAL_TIMESCALE = 57600; // LCM of a bunch of common frame rates (24, 25, 30, 60, 144, ...)
 const MIN_CHUNK_DURATION = 0.5; // In seconds
+const MAX_PADDING_SAMPLE_SIZE = 2 ** 24; // In bytes
 
 export type Sample = {
 	timestamp: number;
@@ -856,10 +857,13 @@ export class IsobmffMuxer extends Muxer {
 			trackData.info.decoderConfig.codec as PcmAudioCodec,
 		);
 
-		// Pad in samples of at most a second, so that long gaps don't allocate all their silence at once
+		// Pad in samples of at most 16 MiB, so that long gaps don't allocate all their silence at once. Shorter gaps
+		// stay one sample, which keeps them within packet counts reserved with maximumPacketCount.
+		const bytesPerFrame = sampleSize * trackData.info.numberOfChannels;
+		const maxFramesPerSample = Math.max(1, Math.floor(MAX_PADDING_SAMPLE_SIZE / bytesPerFrame));
 		for (let paddedFrames = 0; paddedFrames < deltaInTimescale;) {
-			const frames = Math.min(deltaInTimescale - paddedFrames, trackData.timescale);
-			const data = new Uint8Array(sampleSize * frames * trackData.info.numberOfChannels).fill(silentValue);
+			const frames = Math.min(deltaInTimescale - paddedFrames, maxFramesPerSample);
+			const data = new Uint8Array(bytesPerFrame * frames).fill(silentValue);
 
 			const paddingSample = this.createSampleForTrack(
 				trackData,

@@ -2022,6 +2022,7 @@ export class EncodedAudioPacketSource extends AudioSource {
 }
 
 export const PCM_ENCODER_PACKET_SIZE = 2048; // In frames
+const MAX_GAP_FILL_SAMPLE_SIZE = 2 ** 24; // In bytes
 
 class AudioEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
@@ -2231,15 +2232,16 @@ class AudioEncoderWrapper {
 					const sampleDiff = startSampleIndex - this.lastEndSampleIndex;
 
 					if (sampleDiff >= 64) {
-						// The gap is big enough, let's add correction samples. They're at most a second long each,
-						// since long gaps would otherwise allocate all their silence at once (over 2 GB for 90 minutes
-						// of 48 kHz stereo f32, more than an AudioData can hold).
-						const bytesPerSample = getBytesPerSample(audioSample.format);
+						// The gap is big enough, let's add correction samples. They're at most 16 MiB each, since long
+						// gaps would otherwise allocate all their silence at once (over 2 GB for 90 minutes of 48 kHz
+						// stereo f32, more than an AudioData can hold).
+						const bytesPerFrame = getBytesPerSample(audioSample.format) * audioSample.numberOfChannels;
+						const maxFramesPerSample = Math.max(1, Math.floor(MAX_GAP_FILL_SAMPLE_SIZE / bytesPerFrame));
 						let remainingFrames = sampleDiff;
 
 						while (remainingFrames > 0 && !this.closed) {
-							const numberOfFrames = Math.min(remainingFrames, audioSample.sampleRate);
-							const data = new Uint8Array(bytesPerSample * numberOfFrames * audioSample.numberOfChannels);
+							const numberOfFrames = Math.min(remainingFrames, maxFramesPerSample);
+							const data = new Uint8Array(bytesPerFrame * numberOfFrames);
 							if (audioSample.format === 'u8' || audioSample.format === 'u8-planar') {
 								data.fill(2 ** 7); // Fill it with the silent value
 							}

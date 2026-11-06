@@ -106,7 +106,7 @@ test('Encoded PCM packets have a fixed size', async () => {
 	expect(encoded).toEqual(data);
 });
 
-test('Long gaps between encoded audio samples are filled with silence a second at a time', async () => {
+test('Long gaps between encoded audio samples are filled with silence in pieces of at most 16 MiB', async () => {
 	const output = new Output({
 		format: new WavOutputFormat(),
 		target: new BufferTarget(),
@@ -120,7 +120,7 @@ test('Long gaps between encoded audio samples are filled with silence a second a
 	output.addAudioTrack(audioSource);
 	await output.start();
 
-	// One second of audio, a ten-minute gap, then another second
+	// One second of audio, a ten-minute gap (19.2 MB of f32 silence), then another second
 	for (const timestamp of [0, 601]) {
 		using sample = new AudioSample({
 			data: new Float32Array(8000).fill(0.5),
@@ -134,7 +134,7 @@ test('Long gaps between encoded audio samples are filled with silence a second a
 	await output.finalize();
 
 	// The whole gap used to be one sample, which at 48 kHz stereo exceeds what an AudioData can hold after 90 minutes
-	expect(frameCounts).toEqual(Array<number>(602).fill(8000));
+	expect(frameCounts).toEqual([8000, 2 ** 22, 4_800_000 - 2 ** 22, 8000]);
 
 	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
 	const track = (await input.getPrimaryAudioTrack())!;

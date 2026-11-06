@@ -751,7 +751,7 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
 
-test('Gaps between PCM packets are filled with silence a second at a time', async () => {
+test('Long gaps between PCM packets are filled with silence in pieces of at most 16 MiB', async () => {
 	const target = new BufferTarget();
 	const writeSizes: number[] = [];
 	target.on('write', ({ start, end }) => writeSizes.push(end - start));
@@ -761,16 +761,34 @@ test('Gaps between PCM packets are filled with silence a second at a time', asyn
 	output.addAudioTrack(source);
 	await output.start();
 
-	// One second of 8 kHz mono, a ten-minute gap, then another second
-	const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 };
-	await source.add(new EncodedPacket(new Uint8Array(16000), 'key', 0, 1), { decoderConfig });
-	await source.add(new EncodedPacket(new Uint8Array(16000), 'key', 601, 1));
+	// One second of 48 kHz stereo, a 100-second gap (19.2 MB of silence), then another second
+	const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 48000 };
+	await source.add(new EncodedPacket(new Uint8Array(192000), 'key', 0, 1), { decoderConfig });
+	await source.add(new EncodedPacket(new Uint8Array(192000), 'key', 101, 1));
 	await output.finalize();
 
-	// The padding used to be written as one 9.6 MB sample
-	expect(Math.max(...writeSizes)).toBe(16000);
+	// The padding used to be written as one 19.2 MB sample
+	expect(Math.max(...writeSizes)).toBe(2 ** 24);
 
 	using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
 	const track = (await input.getPrimaryAudioTrack())!;
-	expect(await track.computeDuration()).toBe(602);
+	expect(await track.computeDuration()).toBe(102);
+});
+
+test('Short gaps between PCM packets are padded with one sample, within the reserved packet count', async () => {
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source, { maximumPacketCount: 4 });
+	await output.start();
+
+	// Three 10 ms packets with a 10-second gap after the first
+	const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 };
+	for (const timestamp of [0, 10.01, 10.02]) {
+		await source.add(new EncodedPacket(new Uint8Array(960), 'key', timestamp, 0.01), { decoderConfig });
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBeCloseTo(10.03, 9);
 });
