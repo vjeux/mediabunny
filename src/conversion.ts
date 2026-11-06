@@ -2097,13 +2097,18 @@ export class Conversion {
 					? Math.max(startPacket.timestamp - this._startTimestamp, 0)
 					: Math.max(this._startTimestamp - startPacket.timestamp, 0);
 
-				// Audio before the start can be kept as-is if the format marks it as encoder priming (think the LAME
-				// delay of MP3s, which makes their first packet start before zero)
-				const canSignalPriming = startPacket.timestamp < this._startTimestamp
+				// A track's first packet often starts before zero due to encoder priming (an MP3's LAME delay, the
+				// Opus pre-skip). When copying the track from its start, formats that can signal priming keep it as-is,
+				// so no shift is needed.
+				const decoderConfig = await track.getDecoderConfig();
+				const firstPacket = await sink.getFirstPacket({ metadataOnly: true });
+				const canKeepPriming = startPacket.timestamp < this._startTimestamp
+					&& !!decoderConfig
+					&& startPacket.sequenceNumber === firstPacket?.sequenceNumber
 					&& this.output.format._canSignalAudioPriming(
 						sourceCodec,
 						this._startTimestamp - startPacket.timestamp,
-						originalSampleRate,
+						decoderConfig,
 					);
 
 				if (boundaryDeviation > this._copyBoundaryTolerance) {
@@ -2117,7 +2122,7 @@ export class Conversion {
 						if (!isValid) {
 							needsTranscode = true;
 						}
-					} else if (canSignalPriming) {
+					} else if (canKeepPriming) {
 						this._timestampOffset = -this._startTimestamp;
 						this._timestampOffsetAdjusted = true;
 					} else {
@@ -2140,6 +2145,7 @@ export class Conversion {
 				} else if (
 					this.output.format.negativeTimestampSupport !== 'full'
 					&& startPacket.timestamp < this._startTimestamp
+					&& !canKeepPriming
 				) {
 					const correction = Math.min(
 						this._startTimestamp - startPacket.timestamp,

@@ -1031,11 +1031,12 @@ test('Packet copy, whole file, Matroska', async () => {
 				shiftTolerance: Infinity,
 			},
 		},
-		expectedTimeOffset: -1024 / 48000,
-		videoStartTimestamp: 0 + 1024 / 48000,
-		videoEndTimestamp: 5 + 1024 / 48000 - 1 / 25,
-		audioStartTimestamp: 0,
-		audioEndTimestamp: 5 + 1024 / 48000,
+		// No shift is needed despite the tolerance, since the AAC priming is written as CodecDelay
+		expectedTimeOffset: 0,
+		videoStartTimestamp: 0,
+		videoEndTimestamp: 5 - 1 / 25,
+		audioStartTimestamp: -1024 / 48000,
+		audioEndTimestamp: 5,
 		precision: 0.001,
 	});
 });

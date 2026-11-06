@@ -5,9 +5,10 @@ import { BufferTarget, NullTarget } from '../../src/target.js';
 import { AudioBufferSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { Quality } from '../../src/encode.js';
-import { assert } from '../../src/misc.js';
+import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
+import { Conversion } from '../../src/conversion.js';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS, OggInputFormat } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 
@@ -302,5 +303,45 @@ test('Granule positions of full pages', async () => {
 	for (const timestamp of timestamps) {
 		const packet = await sink.getPacket(timestamp);
 		expect(packet?.timestamp).toBe(timestamp);
+	}
+});
+
+test('Conversion copies Opus whose first packet starts before zero due to the pre-skip', async () => {
+	for (const fileName of ['preroll-test.opus', 'demo.webm']) {
+		using input = new Input({
+			source: new UrlSource(`/${fileName}`),
+			formats: ALL_FORMATS,
+		});
+
+		const inputTrack = await input.getPrimaryAudioTrack();
+		assert(inputTrack);
+		expect(await inputTrack.getFirstTimestamp()).toBeLessThan(0);
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, showWarnings: false });
+		await conversion.execute();
+
+		using outputInput = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+
+		const outputTrack = await outputInput.getPrimaryAudioTrack();
+		assert(outputTrack);
+
+		const inputPackets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
+			inputPackets.push(packet);
+		}
+
+		const outputPackets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
+			outputPackets.push(packet);
+		}
+
+		// Copied, not re-encoded
+		expect(outputPackets).toHaveLength(inputPackets.length);
+		expect(outputPackets.every((x, i) => uint8ArraysAreEqual(x.data, inputPackets[i]!.data))).toBe(true);
+		expect(outputPackets[0]!.timestamp).toBe(-312 / 48000); // The pre-skip
 	}
 });

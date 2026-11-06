@@ -7,9 +7,9 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
-import { assert } from '../../src/misc.js';
+import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 
@@ -209,3 +209,48 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('Conversion copies audio whose first packet starts before zero due to priming', async () => {
+	// Opus pre-skip and an MP3 LAME delay, both written back as CodecDelay
+	for (const [fileName, format] of [
+		['preroll-test.opus', new WebMOutputFormat()],
+		['Toothsome-Meme.VBRv2.mp3', new MkvOutputFormat()],
+	] as const) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public', fileName)),
+			formats: ALL_FORMATS,
+		});
+
+		const inputTrack = await input.getPrimaryAudioTrack();
+		assert(inputTrack);
+		expect(await inputTrack.getFirstTimestamp()).toBeLessThan(0);
+
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, showWarnings: false });
+		expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+		await conversion.execute();
+
+		using outputInput = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+
+		const outputTrack = await outputInput.getPrimaryAudioTrack();
+		assert(outputTrack);
+
+		const inputPackets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
+			inputPackets.push(packet);
+		}
+
+		const outputPackets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
+			outputPackets.push(packet);
+		}
+
+		expect(outputPackets).toHaveLength(inputPackets.length);
+		// Same start, up to Matroska's millisecond timestamp precision
+		expect(Math.abs(outputPackets[0]!.timestamp - inputPackets[0]!.timestamp)).toBeLessThanOrEqual(0.001);
+		expect(outputPackets.every((x, i) => uint8ArraysAreEqual(x.data, inputPackets[i]!.data))).toBe(true);
+	}
+});
