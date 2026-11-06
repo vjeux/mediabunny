@@ -95,22 +95,25 @@ const checkRecording = async (mimeType: string, expectedCodecs: string[], decoda
 	}
 };
 
+// Not every browser has MediaRecorder (WebKit's WPE port ships without it)
+const canRecord = (mimeType: string) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(mimeType);
+
 test('reads H.264 MediaRecorder MP4 recordings', async (context) => {
-	if (!MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')) {
+	if (!canRecord('video/mp4;codecs=avc1')) {
 		context.skip();
 	}
 	await checkRecording('video/mp4;codecs=avc1', ['avc'], true);
 });
 
 test('reads AV1 and Opus MediaRecorder MP4 recordings', async (context) => {
-	if (!MediaRecorder.isTypeSupported('video/mp4;codecs=av01,opus')) {
+	if (!canRecord('video/mp4;codecs=av01,opus')) {
 		context.skip();
 	}
 	await checkRecording('video/mp4;codecs=av01,opus', ['av1', 'opus'], true);
 });
 
 test('reads VP9 MediaRecorder MP4 recordings', async (context) => {
-	if (!MediaRecorder.isTypeSupported('video/mp4;codecs=vp9')) {
+	if (!canRecord('video/mp4;codecs=vp9')) {
 		context.skip();
 	}
 	// Not decoded: Chrome writes level 0 into vpcC, which ends up in a codec string VideoDecoder rejects
@@ -118,7 +121,7 @@ test('reads VP9 MediaRecorder MP4 recordings', async (context) => {
 });
 
 test('reads Opus MediaRecorder MP4 recordings', async (context) => {
-	if (!MediaRecorder.isTypeSupported('audio/mp4;codecs=opus')) {
+	if (!canRecord('audio/mp4;codecs=opus')) {
 		context.skip();
 	}
 	await checkRecording('audio/mp4;codecs=opus', ['opus'], true);
