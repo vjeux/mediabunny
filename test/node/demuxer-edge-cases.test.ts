@@ -1,6 +1,7 @@
+import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -34,6 +35,7 @@ import {
 	mp4SoundEntry,
 	mp4SoundEntryV2,
 	mp4VisualEntry,
+	oggStream,
 	riffChunk,
 	tsPackets,
 	tsPat,
@@ -46,6 +48,7 @@ import {
 	waveFmt,
 } from './helpers/mutation-bytes.js';
 
+const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
 const openBytes = (bytes: Uint8Array) => new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 
 const mkvAudioTrack = (codecId: string, bitDepth: number | null, channels = 2, extra: Uint8Array[] = []) => ebml(
@@ -1287,5 +1290,50 @@ describe('MP4 edit lists and visual sample entry boxes', () => {
 		using unknown = openMp4({ boxes: [mp4Box('btrt', u32be(0), u32be(0), u32be(0))] });
 		const unknownTrack = (await unknown.getPrimaryVideoTrack())!;
 		expect([await unknownTrack.getBitrate(), await unknownTrack.getAverageBitrate()]).toEqual([null, null]);
+	});
+});
+
+describe('Ogg packets split across pages', () => {
+	test.each([4096, 1000, 600])('libogg-style pages of %i bytes read and seek like the original', async (target) => {
+		const filePath = path.join(__dirname, '..', 'public', 'preroll-test.opus');
+		using original = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+		const originalTrack = (await original.getPrimaryAudioTrack())!;
+		const opusHead = new Uint8Array((await originalTrack.getDecoderConfig())!.description as ArrayBuffer);
+		const preSkip = opusHead[10]! | (opusHead[11]! << 8);
+		const originalPackets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(originalTrack).packets()) {
+			originalPackets.push(packet);
+		}
+
+		const opusTags = new Uint8Array([...ascii('OpusTags'), 0, 0, 0, 0, 0, 0, 0, 0]);
+		const bytes = oggStream([opusHead, opusTags], originalPackets.map(packet => ({
+			data: packet.data,
+			endGranule: Math.round((packet.timestamp + packet.duration) * 48000) + preSkip,
+		})), target);
+
+		using input = openBytes(bytes);
+		const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+		const summary = (packet: EncodedPacket) => [packet.timestamp, packet.duration, packet.byteLength];
+		const read: EncodedPacket[] = [];
+		for await (const packet of sink.packets()) {
+			read.push(packet);
+		}
+		expect(read.map(summary)).toEqual(originalPackets.map(summary));
+		expect(read.every((packet, i) => sameBytes(packet.data, originalPackets[i]!.data))).toBe(true);
+
+		// Every packet is found again by a lookup into its middle, and the one after it by getNextPacket
+		let lookupMismatches = 0;
+		for (const [i, packet] of read.entries()) {
+			const found = await sink.getPacket(packet.timestamp + packet.duration / 2);
+			const next = await sink.getNextPacket(found!);
+			if (
+				found?.timestamp !== packet.timestamp
+				|| !sameBytes(found.data, packet.data)
+				|| next?.timestamp !== read[i + 1]?.timestamp
+			) {
+				lookupMismatches++;
+			}
+		}
+		expect(lookupMismatches).toBe(0);
 	});
 });

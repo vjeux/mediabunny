@@ -1282,3 +1282,89 @@ export const buildFragmentedMp4 = (options: {
 	});
 	return concatBytes(...parts);
 };
+
+/** The Ogg page checksum: CRC-32 with the MPEG-2 polynomial, but starting from 0. */
+export const oggCrc32 = (bytes: Uint8Array) => {
+	let crc = 0;
+	for (const byte of bytes) {
+		crc = ((crc << 8) ^ MPEG2_CRC_TABLE[((crc >>> 24) ^ byte) & 0xff]!) >>> 0;
+	}
+	return crc;
+};
+
+export type OggPacket = { data: Uint8Array; endGranule: number };
+
+/**
+ * Builds a single logical Ogg stream the way libogg pages it: each header packet on its own page, then audio packets
+ * filling pages of about `bodyTarget` (>= 255) bytes, split across pages wherever a page fills up. Pages on which no
+ * packet ends get a granule position of -1.
+ */
+export const oggStream = (headers: Uint8Array[], packets: OggPacket[], bodyTarget: number) => {
+	const pages: Uint8Array[] = [];
+	const writePage = (segments: number[], body: Uint8Array[], granule: bigint, headerType: number) => {
+		const bodyLength = body.reduce((sum, part) => sum + part.length, 0);
+		const page = new Uint8Array(27 + segments.length + bodyLength);
+		const view = new DataView(page.buffer);
+		page.set(ascii('OggS'), 0);
+		page[5] = headerType;
+		view.setBigInt64(6, granule, true);
+		view.setUint32(14, 0x1234, true); // Serial number
+		view.setUint32(18, pages.length, true); // Sequence number
+		page[26] = segments.length;
+		page.set(segments, 27);
+		page.set(concatBytes(...body), 27 + segments.length);
+		view.setUint32(22, oggCrc32(page), true);
+		pages.push(page);
+	};
+
+	headers.forEach((header, i) => writePage([header.length], [header], 0n, i === 0 ? 2 : 0));
+
+	let segments: number[] = [];
+	let body: Uint8Array[] = [];
+	let bodySize = 0;
+	let granule = -1n;
+	let pageStartsWithContinuation = false;
+	const flush = (isLast: boolean) => {
+		writePage(segments, body, granule, (pageStartsWithContinuation ? 1 : 0) | (isLast ? 4 : 0));
+		segments = [];
+		body = [];
+		bodySize = 0;
+		granule = -1n;
+	};
+
+	packets.forEach((packet, index) => {
+		let offset = 0;
+		while (true) {
+			const remaining = packet.data.length - offset;
+			const room = Math.min(bodyTarget - bodySize, (255 - segments.length) * 255);
+			const segmentsNeeded = Math.floor(remaining / 255) + 1;
+			if (remaining < room && segments.length + segmentsNeeded <= 255) {
+				// The rest of the packet ends on this page
+				for (let i = 0; i < segmentsNeeded - 1; i++) {
+					segments.push(255);
+				}
+				segments.push(remaining % 255);
+				body.push(packet.data.subarray(offset));
+				bodySize += remaining;
+				granule = BigInt(packet.endGranule);
+				break;
+			}
+
+			// Fill the page with whole segments of this packet, then continue it on the next page
+			const take = Math.floor(Math.max(room, 0) / 255) * 255;
+			for (let i = 0; i < take / 255; i++) {
+				segments.push(255);
+			}
+			body.push(packet.data.subarray(offset, offset + take));
+			offset += take;
+			flush(false);
+			pageStartsWithContinuation = offset > 0;
+		}
+
+		if (index === packets.length - 1) {
+			flush(true);
+		}
+	});
+
+	return concatBytes(...pages);
+};
