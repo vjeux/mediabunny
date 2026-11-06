@@ -299,6 +299,62 @@ test('UrlSource reads the full decoded body of a compressed 206 response', async
 	}
 });
 
+test('UrlSource places 206 bodies at the range their Content-Range states', async () => {
+	const data = new Uint8Array(3_000_000).map((_, i) => Math.imul(i, 2654435761) >>> 24); // Not periodic
+	const server = http.createServer((req, res) => {
+		// Answer with a range that starts at the MiB boundary before the requested position
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		const start = requested - (requested % 2 ** 20);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using ref = new UrlSource(`http://localhost:${address.port}/data.bin`).ref();
+		const reader = new Reader(ref.source);
+
+		for (const start of [0, 2_500_123]) {
+			const slice = await reader.requestSlice(start, 16);
+			expect(slice).not.toBeNull();
+			expect([...readBytes(slice!, 16)]).toEqual([...data.subarray(start, start + 16)]);
+		}
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource rejects 206 bodies that start after the requested position', async () => {
+	const server = http.createServer((req, res) => {
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		res.writeHead(206, { 'Content-Range': `bytes ${requested + 10}-999/1000`, 'Content-Length': 990 - requested });
+		res.end(new Uint8Array(990 - requested));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+		using ref = new UrlSource(url).ref();
+
+		await expect(async () => new Reader(ref.source).requestSlice(0, 16)).rejects.toThrow(
+			`Error fetching ${url}: requested bytes from 0, but the server sent bytes 10-999.`,
+		);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
 ) => {

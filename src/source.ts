@@ -1063,6 +1063,26 @@ export class UrlSource extends PathedSource {
 				return;
 			}
 
+			// A 206 response states which range it encloses (RFC 9110, Section 15.3.7.1), which may begin before the
+			// requested position; Chromium's media loader handles such responses the same way. Content-Range counts
+			// encoded bytes when Content-Encoding is present, so it can't be used then.
+			let bytesToSkip = 0;
+			const enclosedRange = response.headers.has('Content-Encoding')
+				? null
+				: parseContentRange(response.headers.get('Content-Range'));
+			if (enclosedRange) {
+				if (enclosedRange.start > worker.currentPos || enclosedRange.end < worker.currentPos) {
+					void response.body.cancel().catch(() => {});
+					throw new Error(
+						// eslint-disable-next-line @typescript-eslint/no-base-to-string
+						`Error fetching ${String(this._url)}: requested bytes from ${worker.currentPos}, but the server`
+						+ ` sent bytes ${enclosedRange.start}-${enclosedRange.end}.`,
+					);
+				}
+
+				bytesToSkip = worker.currentPos - enclosedRange.start;
+			}
+
 			const reader = response.body.getReader();
 			const responseStartPos = worker.currentPos;
 
@@ -1138,8 +1158,19 @@ export class UrlSource extends PathedSource {
 					}
 				}
 
-				this._dispatchRead(worker.currentPos, worker.currentPos + value.length);
-				this._orchestrator.supplyWorkerData(worker, value);
+				let chunk = value;
+				if (bytesToSkip > 0) {
+					const skipped = Math.min(bytesToSkip, chunk.length);
+					bytesToSkip -= skipped;
+					chunk = chunk.subarray(skipped);
+
+					if (chunk.length === 0) {
+						continue;
+					}
+				}
+
+				this._dispatchRead(worker.currentPos, worker.currentPos + chunk.length);
+				this._orchestrator.supplyWorkerData(worker, chunk);
 			}
 		}
 
@@ -1329,6 +1360,22 @@ export class UrlSource extends PathedSource {
 		}
 	}
 }
+
+const CONTENT_RANGE_REGEX = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/;
+const parseContentRange = (value: string | null) => {
+	const match = value !== null ? CONTENT_RANGE_REGEX.exec(value.trim()) : null;
+	if (!match) {
+		return null;
+	}
+
+	const start = Number(match[1]);
+	const end = Number(match[2]);
+	if (end < start) {
+		return null;
+	}
+
+	return { start, end };
+};
 
 const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/;
 const parseByteRangeHeader = (value: string) => {
