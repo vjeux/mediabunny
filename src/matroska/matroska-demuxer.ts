@@ -870,9 +870,17 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 
 				if (i < trackData.presentationTimestamps.length - 1) {
-					// Update block durations based on presentation order
-					const nextEntry = trackData.presentationTimestamps[i + 1]!;
-					currentBlock.duration = nextEntry.timestamp - currentBlock.timestamp;
+					if (currentBlock.duration === 0) {
+						// Without a BlockDuration, a frame lasts the track's DefaultDuration, or else until the next
+						// block in presentation order (RFC 9559, BlockDuration). Laced blocks get their DefaultDuration
+						// in the lace resolution code.
+						const nextEntry = trackData.presentationTimestamps[i + 1]!;
+						currentBlock.duration = track.defaultDuration == null
+							? nextEntry.timestamp - currentBlock.timestamp
+							: currentBlock.lacing === BlockLacing.None
+								? track.defaultDuration
+								: 0;
+					}
 				} else if (currentBlock.duration === 0) {
 					if (track.defaultDuration != null) {
 						if (currentBlock.lacing === BlockLacing.None) {
