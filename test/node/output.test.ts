@@ -34,3 +34,21 @@ test('Output, onFinalize', async () => {
 
 	expect(callCount).toBe(1);
 });
+
+test('Output validates initTarget and isRelativeToUnixEpoch like its other options', () => {
+	expect(() => new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+		initTarget: 'init.mp4' as never,
+	})).toThrow(new TypeError(
+		'options.initTarget, when provided, must be a Target or a function that returns or resolves to a Target.',
+	));
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	for (const isRelativeToUnixEpoch of ['false', 1, null]) {
+		expect(() => output.addVideoTrack(new EncodedVideoPacketSource('avc'), {
+			isRelativeToUnixEpoch: isRelativeToUnixEpoch as never,
+		})).toThrow(new TypeError('metadata.isRelativeToUnixEpoch, when provided, must be a boolean.'));
+	}
+	expect(output.tracks).toHaveLength(0);
+});
