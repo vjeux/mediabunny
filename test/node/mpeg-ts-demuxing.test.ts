@@ -801,6 +801,68 @@ test('MPEG-TS init input without stream data', async () => {
 	expect(await audioTrack.getSampleRate()).toBe(48000);
 });
 
+test('MPEG-TS with a damaged H.264 slice header reads past it', async () => {
+	// The header of the sixth frame's slice is zeroed out, as in a damaged recording
+	const packets: Uint8Array[] = [];
+	const pushPackets = (pid: number, payload: number[]) => {
+		for (let i = 0; i < payload.length; i += 184) {
+			const chunk = payload.slice(i, i + 184);
+			const packet = new Uint8Array(188);
+			const stuffing = 184 - chunk.length;
+			packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, (stuffing ? 0x30 : 0x10)], 0);
+			if (stuffing) {
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+				packet.fill(0xff, 6, 4 + stuffing);
+			}
+			packet.set(chunk, 4 + stuffing);
+			packets.push(packet);
+		}
+	};
+
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const aud = [0x09, 0xf0];
+	const slice = (idr: boolean, damaged: boolean) => [
+		idr ? 0x65 : 0x41,
+		...(damaged ? new Array<number>(12).fill(0) : [0x88, 0x84, 0x00, 0x33]),
+		...new Array<number>(40).fill(0xaa),
+	];
+	const annexB = (nalUnits: number[][]) => nalUnits.flatMap(nalUnit => [0, 0, 0, 1, ...nalUnit]);
+	const frames = Array.from({ length: 10 }, (_, i) => i === 0
+		? annexB([aud, sps, pps, slice(true, false)])
+		: annexB([aud, slice(false, i === 5)]),
+	);
+
+	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPackets(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+	frames.forEach((frame, i) => {
+		const pts = 3000 * i;
+		pushPackets(0x100, [
+			0, 0, 1, 0xe0, 0, 0, 0x84, 0x80, 5, 0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff,
+			((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1, ...frame,
+		]);
+	});
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryVideoTrack())!;
+	const sizes: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		sizes.push(packet.byteLength);
+	}
+
+	expect(sizes).toEqual(frames.map(frame => frame.length));
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
