@@ -583,6 +583,11 @@ export class HlsSegmentedInput extends SegmentedInput {
 	async getFirstSegment() {
 		if (this.segments.length === 0) {
 			await this.runUpdateSegments();
+
+			// A live playlist may not list any segments yet, in which case we wait for the first one to show up
+			while (this.segments.length === 0 && !this.streamHasEnded) {
+				await this.runUpdateSegments();
+			}
 		}
 
 		return this.segments[0] ?? null;
