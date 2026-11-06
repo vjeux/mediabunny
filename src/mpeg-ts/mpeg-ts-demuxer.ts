@@ -185,12 +185,19 @@ const ignoredStreamTypes = new Set<number>();
 const MAX_TABLE_NOT_IN_EFFECT_DISTANCE = 2 ** 22; // 4 MiB
 
 /**
- * Checks the current_next_indicator of the PSI section starting after the pointer_field of the given packet payload.
- * A section with 0 is the next version of its table, sent ahead of the switch, which isn't in effect yet.
+ * Checks the current_next_indicator of the PAT or PMT section starting after the pointer_field of the given packet
+ * payload. A section with 0 is the next version of its table, sent ahead of the switch, which isn't in effect yet.
  */
 const psiSectionIsInEffect = (payload: Uint8Array) => {
-	// table_id, section_length, and the table_id_extension (transport_stream_id or program_number) come before it
 	const sectionStart = 1 + (payload[0] ?? 0);
+	const tableId = payload[sectionStart];
+	if (tableId !== 0x00 && tableId !== 0x02) {
+		// Another table on the same PID (private sections can share the PMT's), which this doesn't apply to, like in
+		// FFmpeg, which checks the table_id first
+		return true;
+	}
+
+	// table_id, section_length, and the table_id_extension (transport_stream_id or program_number) come before it
 	return ((payload[sectionStart + 5] ?? 1) & 0x01) === 1;
 };
 
