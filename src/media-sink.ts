@@ -2322,14 +2322,19 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
+	// A Vorbis decoder outputs nothing for the first packet it gets, which only primes the window overlap. The first
+	// audio comes out of the second packet, so that's the one whose timestamp the output must start at.
+	primingPacketPending: boolean;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
 		onError: (error: unknown) => unknown,
-		codec: AudioCodec,
+		public codec: AudioCodec,
 		decoderConfig: AudioDecoderConfig,
 	) {
 		super(onSample, onError);
+
+		this.primingPacketPending = codec === 'vorbis';
 
 		// WebCodecs impls discards the preskip (correct) but doesn't advance the timestamp (incorrect)
 		const opusPreSkip = codec === 'opus' && decoderConfig.description
@@ -2337,6 +2342,13 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			: 0;
 
 		const sampleHandler = (sample: AudioSample) => {
+			if (sample.numberOfFrames === 0) {
+				// We skip zero-data (empty) AudioSamples. These are sometimes emitted, for example, by Firefox when it
+				// decodes Vorbis (at the start). They carry no audio, so they mustn't anchor the timestamps either.
+				sample.close();
+				return;
+			}
+
 			let sampleTimestamp = sample.timestamp;
 
 			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
@@ -2355,13 +2367,6 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 			const preciseTimestamp = this.currentTimestamp;
 			this.currentTimestamp += sample.duration;
-
-			if (sample.numberOfFrames === 0) {
-				// We skip zero-data (empty) AudioSamples. These are sometimes emitted, for example, by Firefox when it
-				// decodes Vorbis (at the start).
-				sample.close();
-				return;
-			}
 
 			// Round the timestamp to the sample rate
 			const sampleRate = decoderConfig.sampleRate;
@@ -2439,7 +2444,12 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		} else {
 			assert(this.decoder);
 
-			this.expectedFirstTimestamp ??= packet.timestamp;
+			if (this.primingPacketPending) {
+				this.primingPacketPending = false;
+			} else {
+				this.expectedFirstTimestamp ??= packet.timestamp;
+			}
+
 			this.decoder.decode(packet.toEncodedAudioChunk());
 		}
 	}
@@ -2455,6 +2465,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		this.currentTimestamp = null;
 		this.expectedFirstTimestamp = null;
 		this.timestampOffset = 0;
+		this.primingPacketPending = this.codec === 'vorbis';
 	}
 
 	close() {
