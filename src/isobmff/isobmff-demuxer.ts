@@ -4356,6 +4356,15 @@ const decryptCtr = async (
 	};
 
 	if (!sampleEncryption.subsamples) {
+		if (encryptionInfo.scheme === 'cens') {
+			// Whole-block full sample encryption (ISO/IEC 23001-7, 9.7), like Shaka Packager writes for audio: the
+			// sample is encrypted up to the last 16-byte boundary and the trailing 0 to 15 bytes are clear
+			const wholeBlockLength = 16 * Math.floor(data.length / 16);
+			const output = new Uint8Array(data);
+			output.set(await cryptApply(data.subarray(0, wholeBlockLength)));
+			return output;
+		}
+
 		// Whole sample is protected, no pattern
 		return cryptApply(data);
 	}

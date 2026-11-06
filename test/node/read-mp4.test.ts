@@ -1,3 +1,4 @@
+import { createCipheriv } from 'node:crypto';
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -271,4 +272,71 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('cens samples without subsamples leave their trailing partial block clear', async () => {
+	// Whole-block full sample encryption (ISO/IEC 23001-7, 9.7), as Shaka Packager writes for cens audio: AES-CTR
+	// up to the last 16-byte boundary, the trailing bytes stay clear
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const key = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+	const keyId = zeros(16).map((_, i) => 0x10 + i);
+	const iv = [1, 2, 3, 4, 5, 6, 7, 8];
+
+	const plaintext = Array.from({ length: 37 }, (_, i) => (i * 7) & 0xff);
+	const counter = Buffer.alloc(16);
+	counter.set(iv);
+	const ciphertext = [
+		...createCipheriv('aes-128-ctr', key, counter).update(Buffer.from(plaintext.slice(0, 32))),
+		...plaintext.slice(32),
+	];
+
+	const tenc = box('tenc', [1, 0, 0, 0], [0, 0x00, 1, 8], keyId);
+	const enca = box('enca', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4), u32(48000 * 0x10000),
+		box('sinf', box('frma', ascii('Opus')), box('schm', zeros(4), ascii('cens'), u32(0x10000)), box('schi', tenc)),
+		box('dOps', [0, 2], [0x01, 0x38], u32(48000), [0, 0], [0]));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(48000), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), enca),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(960), u32(0), u32(0))),
+	);
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x201), u32(1), u32(dataOffset), u32(ciphertext.length)),
+		box('senc', u32(0), u32(1), iv),
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', ciphertext),
+		])),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => key } },
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	expect([...packet!.data]).toEqual(plaintext);
 });
