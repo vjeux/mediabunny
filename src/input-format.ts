@@ -793,7 +793,9 @@ export const HLS = /* #__PURE__ */ new HlsInputFormat();
  * @group Input formats
  * @public
  */
-export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, OGG, FLAC, MP3, ADTS, MPEG_TS];
+// MPEG-TS comes before MP3 and ADTS: those are detected by searching for frame headers, which can find a couple of
+// small frames inside a transport stream, whereas MPEG-TS detection checks the packet structure.
+export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, OGG, FLAC, MPEG_TS, MP3, ADTS];
 
 /**
  * List of input formats required for playback of typical HLS manifests. Includes HLS itself as well as the typical
@@ -801,7 +803,7 @@ export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE,
  * @group Input formats
  * @public
  */
-export const HLS_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MP3, ADTS, MPEG_TS];
+export const HLS_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MPEG_TS, MP3, ADTS];
 
 /**
  * Additional per-format configuration.
