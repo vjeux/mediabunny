@@ -63,3 +63,18 @@ test('Reads RIFX samples as big-endian', async () => {
 
 	expect([...decoded]).toEqual(samples);
 });
+
+test('samplesAtTimestamps rejects non-iterable timestamps with a TypeError', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/glitch-hop-is-dead.wav')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	const sink = new AudioSampleSink(track!);
+
+	for (const timestamps of [null, undefined, 5, 'timestamps']) {
+		expect(() => sink.samplesAtTimestamps(timestamps as never)).toThrow(
+			new TypeError('Argument must be an iterable or async iterable.'),
+		);
+	}
+});
