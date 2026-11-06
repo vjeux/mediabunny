@@ -1483,8 +1483,14 @@ export class IsobmffMuxer extends Muxer {
 		}
 
 		for (const trackData of tracksInFragment) {
-			trackData.finalizedChunks.push(trackData.currentChunk!);
-			this.finalizedChunks.push(trackData.currentChunk!);
+			const chunk = trackData.currentChunk!;
+
+			// Once written, the chunk is only needed for its tfra entry, which points at its first key sample. Drop the
+			// samples after it, so that long fragmented outputs (like live streams) don't keep every sample in memory.
+			const keySampleIndex = chunk.samples.findIndex(sample => sample.type === 'key');
+			chunk.samples.length = keySampleIndex + 1;
+
+			trackData.finalizedChunks.push(chunk);
 			trackData.currentChunk = null;
 		}
 
