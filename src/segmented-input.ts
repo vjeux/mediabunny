@@ -19,7 +19,7 @@ import {
 	InputVideoTrackBacking,
 } from './input-track';
 import { PacketRetrievalOptions } from './media-sink';
-import { arrayCount, assert, MaybePromise, roundToDivisor } from './misc';
+import { arrayCount, assert, MaybePromise, roundIfAlmostInteger, roundToDivisor } from './misc';
 import { EncodedPacket } from './packet';
 
 export type SegmentedInputMetadata = {
@@ -544,10 +544,7 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 				}
 			}
 
-			const offsetTimestamp = timestamp - mediaOffset;
-			const packet = keyframesOnly
-				? await track._backing.getKeyPacket(offsetTimestamp, options)
-				: await track._backing.getPacket(offsetTimestamp, options);
+			const packet = await this._getPacketAtOrBefore(track, mediaOffset, timestamp, options, keyframesOnly);
 
 			if (!packet) {
 				// Search the previous segment
@@ -560,11 +557,23 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			// The playlist may claim the segment to be longer than its media actually is, in which case the timestamp
 			// can lie in the next segment instead. That's only possible if it lies past this segment's media.
 			const lastPacket = keyframesOnly
-				? await track._backing.getPacket(offsetTimestamp, { ...options, metadataOnly: true })
+				? await this._getPacketAtOrBefore(
+					track,
+					mediaOffset,
+					timestamp,
+					{ ...options, metadataOnly: true },
+					false,
+				)
 				: packet;
 			assert(lastPacket);
 
-			if (offsetTimestamp >= lastPacket.timestamp + lastPacket.duration) {
+			const timeResolution = await track.getTimeResolution();
+			const lastPacketEnd = roundToDivisor(
+				lastPacket.timestamp + lastPacket.duration + mediaOffset,
+				timeResolution,
+			);
+
+			if (timestamp >= lastPacketEnd) {
 				const nextSegment = await this.segmentedInput.getNextSegment(currentSegment, {
 					skipLiveWait: options.skipLiveWait,
 				});
@@ -588,7 +597,12 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 					if (nextPacket) {
 						const nextMediaOffset = await this.segmentedInput.getMediaOffset(nextSegment, nextInput);
-						if (nextPacket.timestamp + nextMediaOffset <= timestamp) {
+						const nextPacketTimestamp = roundToDivisor(
+							nextPacket.timestamp + nextMediaOffset,
+							await nextTrack!.getTimeResolution(),
+						);
+
+						if (nextPacketTimestamp <= timestamp) {
 							currentSegment = nextSegment;
 							continue;
 						}
@@ -600,6 +614,36 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		}
 
 		return null;
+	}
+
+	/**
+	 * Returns the last packet (or key packet) of a segment's track whose reported timestamp (see
+	 * `createAdjustedPacket`) is less than or equal to `timestamp`.
+	 */
+	async _getPacketAtOrBefore(
+		track: InputTrack,
+		mediaOffset: number,
+		timestamp: number,
+		options: PacketRetrievalOptions,
+		keyframesOnly: boolean,
+	) {
+		const getPacket = (offsetTimestamp: number) => keyframesOnly
+			? track._backing.getKeyPacket(offsetTimestamp, options)
+			: track._backing.getPacket(offsetTimestamp, options);
+
+		// Reported timestamps are rounded to the time resolution. If the media offset isn't a whole number of ticks, a
+		// packet can be reported at `timestamp` while lying up to half a tick after `timestamp - mediaOffset`, so we
+		// look up the point halfway between the last tick at or before `timestamp` and the next one instead.
+		const timeResolution = await track.getTimeResolution();
+		const tick = Math.floor(roundIfAlmostInteger(timestamp * timeResolution));
+		let packet = await getPacket((tick + 0.5) / timeResolution - mediaOffset);
+
+		if (packet && roundToDivisor(packet.timestamp + mediaOffset, timeResolution) > timestamp) {
+			// The packet lies exactly on the rounding boundary and is reported a tick later, so take the one before it
+			packet = await getPacket(packet.timestamp - 1 / (2 * timeResolution));
+		}
+
+		return packet;
 	}
 }
 
