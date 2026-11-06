@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from 'vitest';
@@ -937,23 +938,18 @@ test('Matroska: Xiph lacing running out of data', async () => {
 
 test('Matroska: Vorbis CodecPrivate with unterminated Xiph lacing', async () => {
 	// Computing the pre-roll used to scan past the end of the CodecPrivate forever, and asserted without one
-	const getPreRollDuration = async (codecPrivate: number[] | null) => {
-		const track = element(
-			EBMLId.TrackEntry,
-			uintElement(EBMLId.TrackNumber, 1),
-			uintElement(EBMLId.TrackType, 2),
-			element(EBMLId.CodecID, ascii('A_VORBIS')),
-			codecPrivate ? element(EBMLId.CodecPrivate, codecPrivate) : [],
-			element(EBMLId.Audio, element(EBMLId.SamplingFrequency, float64(48000)), uintElement(EBMLId.Channels, 2)),
-		);
-		const file = matroska(info(), tracks(track), cluster(0, simpleBlock(1, 0, 0x80)));
+	const vorbisFile = (codecPrivate: number[] | null) => matroska(info(), tracks(element(
+		EBMLId.TrackEntry,
+		uintElement(EBMLId.TrackNumber, 1),
+		uintElement(EBMLId.TrackType, 2),
+		element(EBMLId.CodecID, ascii('A_VORBIS')),
+		codecPrivate ? element(EBMLId.CodecPrivate, codecPrivate) : [],
+		element(EBMLId.Audio, element(EBMLId.SamplingFrequency, float64(48000)), uintElement(EBMLId.Channels, 2)),
+	)), cluster(0, simpleBlock(1, 0, 0x80)));
+	const getPreRollDuration = 'async input => (await input.getAudioTracks())[0].getPreRollDuration()';
 
-		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
-		return (await input.getAudioTracks())[0]!.getPreRollDuration();
-	};
-
-	expect(await getPreRollDuration([2, 0xff, 0xff, 0xff])).toBe(4096 / 48000);
-	expect(await getPreRollDuration(null)).toBe(4096 / 48000);
+	expect(evaluateWithDeadline(vorbisFile([2, 0xff, 0xff, 0xff]), getPreRollDuration)).toBe(4096 / 48000);
+	expect(evaluateWithDeadline(vorbisFile(null), getPreRollDuration)).toBe(4096 / 48000);
 });
 
 test('Matroska: Laced block without data', async () => {
@@ -2151,6 +2147,33 @@ const expectGracefulRead = async (fileOrSource: Uint8Array | Source, expectedErr
 	if (expectedError) {
 		expect(errors.some(x => expectedError.test(x))).toBe(true);
 	}
+};
+
+// A synchronous infinite loop stalls the whole file, since the test timeout can't fire while the event loop is blocked.
+// Reads that once looped like that run in a child process with a deadline instead, so that a regression fails fast.
+const evaluateWithDeadline = (file: Uint8Array, readFunction: string) => {
+	const script = `import(${JSON.stringify(new URL('../../src/index.ts', import.meta.url).href)}).then(async (mb) => {
+		const source = new mb.BufferSource(require('node:fs').readFileSync(0));
+		const input = new mb.Input({ source, formats: mb.ALL_FORMATS });
+		console.log(JSON.stringify(await (${readFunction})(input)));
+	});`;
+
+	let output: string;
+	try {
+		output = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
+			input: file,
+			encoding: 'utf8',
+			timeout: 10_000,
+		});
+	} catch (error) {
+		if ((error as { code?: string }).code === 'ETIMEDOUT') {
+			throw new Error('The read hung (killed after 10 s).');
+		}
+
+		throw error;
+	}
+
+	return JSON.parse(output.trim().split('\n').pop()!) as unknown;
 };
 
 // The file size stays unknown
