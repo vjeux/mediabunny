@@ -1556,3 +1556,109 @@ describe('Chromium media/formats/mp4/track_run_iterator_unittest.cc', () => {
 		expect((await readPackets(bytes, 25)).slice(0, 3).map(packet => packet[0])).toEqual([3, 7, 4]);
 	});
 });
+
+describe('Chromium media/formats/mpeg/mpeg1_audio_stream_parser_unittest.cc and adts_stream_parser_unittest.cc', () => {
+	const loadChromium = (name: string) => new Uint8Array(
+		readFileSync(path.join(__dirname, '..', 'public/chromium-media', name)),
+	);
+	const readAudio = async (bytes: Uint8Array) => {
+		using input = openBytes(bytes);
+		const track = (await input.getPrimaryAudioTrack())!;
+		const packets: { timestamp: number; data: Uint8Array }[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push({ timestamp: packet.timestamp, data: packet.data });
+		}
+		return {
+			codec: await track.getCodec(),
+			sampleRate: await track.getSampleRate(),
+			numberOfChannels: await track.getNumberOfChannels(),
+			packets,
+		};
+	};
+
+	test('UnalignedAppend and MetadataParsing: sfx.mp3', async () => {
+		// A 32-byte ID3 tag and a 417-byte Xing frame come before the 12 frames of audio, the first one 182 bytes long
+		const bytes = loadChromium('sfx.mp3');
+		const { codec, sampleRate, numberOfChannels, packets } = await readAudio(bytes);
+		expect([codec, sampleRate, numberOfChannels]).toEqual(['mp3', 44100, 1]);
+		expect(packets).toHaveLength(12);
+		expect(toHex(packets[0]!.data)).toBe(toHex(bytes.subarray(32 + 417, 32 + 417 + 182)));
+		// Chromium checks that there's a codec delay. The LAME tag gives 576 samples of encoder delay, plus 529 of
+		// decoder delay, which FFmpeg skips as well.
+		expect(Math.round(packets[0]!.timestamp * sampleRate)).toBe(-1105);
+	});
+
+	test('UnalignedAppendMP2: sfx.mp2', async () => {
+		const { sampleRate, numberOfChannels, packets } = await readAudio(loadChromium('sfx.mp2'));
+		expect({ sampleRate, numberOfChannels }).toEqual({ sampleRate: 44100, numberOfChannels: 1 });
+		expect(packets).toHaveLength(10);
+	});
+
+	test('AacLcAdts (es_parser_adts_unittest.cc): sfx.adts', async () => {
+		const { codec, sampleRate, packets } = await readAudio(loadChromium('sfx.adts'));
+		expect({ codec, sampleRate }).toEqual({ codec: 'aac', sampleRate: 44100 });
+		expect(packets).toHaveLength(14);
+	});
+
+	test('ChannelLayoutMapping: ADTS channel configurations 1 to 7', async () => {
+		const adtsFrame = (channelConfiguration: number) => {
+			const length = 7 + 4;
+			return [
+				0xff, 0xf1, // MPEG-4, no CRC
+				0x50 | (channelConfiguration >> 2), // AAC LC, 44.1 kHz
+				((channelConfiguration & 3) << 6) | (length >> 11),
+				(length >> 3) & 0xff,
+				((length & 7) << 5) | 0x1f,
+				0xfc,
+				0, 0, 0, 0,
+			];
+		};
+		const expectedChannels = [1, 2, 3, 4, 5, 6, 8]; // 7 is 7.1
+		for (let channelConfiguration = 1; channelConfiguration <= 7; channelConfiguration++) {
+			const frame = adtsFrame(channelConfiguration);
+			const { numberOfChannels } = await readAudio(new Uint8Array([...frame, ...frame, ...frame]));
+			expect(numberOfChannels, `channel configuration ${channelConfiguration}`)
+				.toBe(expectedChannels[channelConfiguration - 1]);
+		}
+	});
+});
+
+describe('Chromium media/formats/mp4/mp4_stream_parser_unittest.cc', () => {
+	const openChromium = (name: string) => openBytes(new Uint8Array(
+		readFileSync(path.join(__dirname, '..', 'public/chromium-media', name)),
+	));
+
+	test('NaturalSizeWithoutPASP and NaturalSizeWithPASP: 639x360 from non-square pixels', async () => {
+		for (const name of [
+			'bear-640x360-non_square_pixel-without_pasp.mp4', // The pixel aspect ratio comes from the SPS
+			'bear-640x360-non_square_pixel-with_pasp.mp4',
+		]) {
+			using input = openChromium(name);
+			const track = (await input.getPrimaryVideoTrack())!;
+			expect([await track.getDisplayWidth(), await track.getDisplayHeight()], name).toEqual([639, 360]);
+		}
+	});
+
+	test('Vp9: profile 2, level 3.1 and the colour of vp9-hdr-init-segment.mp4', async () => {
+		using input = openChromium('vp9-hdr-init-segment.mp4');
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect(await track.getCodecParameterString()).toBe('vp09.02.31.10.01.09.16.09.00');
+		expect(await track.getColorSpace()).toEqual({
+			primaries: 'bt2020',
+			transfer: 'pq',
+			matrix: 'bt2020-ncl',
+			fullRange: false,
+		});
+	});
+
+	test('MPEG4_XHE_AAC: one key frame followed by 23 others', async () => {
+		using input = openChromium('noise-xhe-aac.mp4');
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getCodecParameterString()).toBe('mp4a.40.42');
+		const types: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			types.push(packet.type);
+		}
+		expect(types).toEqual(['key', ...new Array<string>(23).fill('delta')]);
+	});
+});
