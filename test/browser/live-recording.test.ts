@@ -37,6 +37,8 @@ import {
 registerAacEncoder();
 
 const hasTrackGenerator = typeof MediaStreamTrackGenerator !== 'undefined';
+// The A/V sync tests tap the tracks on the main thread; Safari has MediaStreamTrackProcessor only in workers
+const hasMainThreadTrackProcessor = typeof MediaStreamTrackProcessor !== 'undefined';
 const runLongTests = !!(import.meta as unknown as { env: Record<string, string | undefined> })
 	.env['VITE_LIVE_RECORDING_LONG'];
 
@@ -187,7 +189,7 @@ const recordGenerated = async (options: {
 	};
 };
 
-describe('A/V sync of canvas capture and Web Audio', () => {
+describe.skipIf(!hasMainThreadTrackProcessor)('A/V sync of canvas capture and Web Audio', () => {
 	const cases = [
 		{
 			name: 'WebM, VP8 + Opus',
