@@ -272,3 +272,90 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('MP3 audio in a QuickTime .mp3 sample entry', async () => {
+	// ffmpeg -f lavfi -i sine=frequency=440:sample_rate=22050 -t 1 -c:a libmp3lame -b:a 32k mp3-in-mov.mov
+	const filePath = path.join(__dirname, '..', 'public/mp3-in-mov.mov');
+	using input = new Input({
+		source: new FilePathSource(filePath),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	expect(await track.getCodec()).toBe('mp3');
+	expect(await track.getDecoderConfig()).toEqual({
+		codec: 'mp3',
+		numberOfChannels: 1,
+		sampleRate: 22050,
+		description: undefined,
+	});
+
+	const sink = new EncodedPacketSink(track);
+	const firstPacket = await sink.getFirstPacket();
+	expect(firstPacket?.timestamp).toBeCloseTo(-0.050113); // Encoder delay cut by the edit list
+	expect(firstPacket?.byteLength).toBe(104);
+});
+
+test('MP3 in a QuickTime sample table that counts decoded samples', async () => {
+	// Old QuickTime files (e.g. samples.ffmpeg.org archive/all/mov+svq3+mp3++svq3_mediakey.mov) describe MP3 like PCM:
+	// one stsz entry of size 1 per decoded sample, with the packet layout in a version 1 sound description (here
+	// 1152 samples in 288 bytes, i.e. two 144-byte MPEG-2 frames)
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...[...type].map(char => char.charCodeAt(0)), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const frames = Array.from({ length: 8 }, (_, i) => [0xff, 0xf3, 0x48, 0x50, i, ...zeros(139)]);
+	const sampleEntry = box('ms\u0000U',
+		zeros(6), u16(1), // Data reference index
+		u16(1), zeros(6), // Version 1
+		u16(2), u16(16), u16(0xffff), u16(0), u32(16000 * 0x10000),
+		u32(1152), u32(144), u32(288), u32(2), // Samples per packet, bytes per packet, frame and sample
+	);
+
+	const moov = (chunkOffsets: number[]) => box('moov',
+		box('mvhd', zeros(12), u32(16000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(16000), u32(4608), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), sampleEntry),
+					box('stts', u32(0), u32(1), u32(4608), u32(1)),
+					box('stsc', u32(0), u32(1), u32(1), u32(2304), u32(1)),
+					box('stsz', u32(0), u32(1), u32(4608)),
+					box('stco', u32(0), u32(2), ...chunkOffsets.map(u32)),
+				)),
+			),
+		),
+	);
+	const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+	const dataStart = ftyp.length + moov([0, 0]).length + 8;
+	const gap = zeros(10);
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...ftyp,
+			...moov([dataStart, dataStart + 4 * 144 + gap.length]),
+			...box('mdat', ...frames.slice(0, 4), gap, ...frames.slice(4)),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('mp3');
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([packet.timestamp, packet.duration, packet.byteLength, packet.data[4]!]);
+	}
+	expect(packets).toEqual(frames.map((_, i) => [i * 576 / 16000, 576 / 16000, 144, i]));
+});
