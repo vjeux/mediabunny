@@ -786,13 +786,14 @@ describe('Color metadata', () => {
 	test('the color space of the frames reaches the decoder config, the container and the decoder', {
 		timeout: 60_000,
 	}, async () => {
-		// The color space reaches the container through the encoder's decoder config, and the decoded frames through
-		// the platform's decoder
-		const { encoderReports, decoderReports } = await colorSpaceSupport();
-
 		for (const codec of await encodableVideoCodecs()) {
 			for (const container of containersFor(codec)) {
 				for (const [name, colorSpace] of spaces) {
+					// The color space reaches the container through the encoder's decoder config, and the decoded
+					// frames through the platform's decoder
+					const support = await colorSpaceSupport(JSON.stringify({ codec, colorSpace }));
+					const { encoderReports, decoderReports } = support;
+
 					const result = await encodeVideo({
 						config: { codec, quality: medium() },
 						container,
@@ -823,10 +824,10 @@ describe('Color metadata', () => {
 
 describe('Audio', () => {
 	test('Opus output declares 48 kHz and keeps the channel count at any input rate', {
-		timeout: 60_000,
+		timeout: 180_000,
 	}, async ({ skip }) => {
-		if (hungCoderKinds.has('audio') || await nativeAudioEncode('opus', 48000, 2) !== 'works') {
-			skip('The platform can\'t encode Opus');
+		if (hungCoderKinds.has('audio') || await nativeAudioEncode('opus', 48000, 2, 48000) !== 'works') {
+			skip('The platform can\'t encode and decode Opus');
 		}
 
 		// Encoded audio starts below zero (encoder delay), and some decoders scramble the timestamps that follow
@@ -834,12 +835,23 @@ describe('Audio', () => {
 
 		for (const sampleRate of [8000, 11025, 16000, 22050, 44100, 48000, 96000]) {
 			for (const numberOfChannels of [1, 2]) {
-				const result = await encodeAudio({
+				// Natively first, decoding at 48 kHz like the read-back does; a hung coder stalls everything after it
+				const native = await nativeAudioEncode('opus', sampleRate, numberOfChannels, 48000);
+				if (native === 'hangs') {
+					return;
+				} else if (native !== 'works') {
+					continue;
+				}
+
+				const encoded = await withTimeout(encodeAudio({
 					codec: 'opus',
 					config: { quality: medium() },
 					container: 'webm',
 					sample: makeAudio({ sampleRate, numberOfChannels, duration: 1, clickTime: 0.25 }),
-				});
+				}), 20_000);
+				expect({ sampleRate, numberOfChannels, settled: encoded !== null })
+					.toEqual({ sampleRate, numberOfChannels, settled: true });
+				const result = encoded!.value;
 				expect(result.error).toBe(null);
 				expect(result.encoderConfigs[0]).toMatchObject({ codec: 'opus', sampleRate, numberOfChannels });
 
@@ -847,7 +859,10 @@ describe('Audio', () => {
 				expect(await track.getSampleRate()).toBe(48000);
 				expect(await track.getNumberOfChannels()).toBe(numberOfChannels);
 
-				const decoded = await decodeAudio(track);
+				const decodedResult = await withTimeout(decodeAudio(track), 20_000);
+				expect({ sampleRate, numberOfChannels, decoded: decodedResult !== null })
+					.toEqual({ sampleRate, numberOfChannels, decoded: true });
+				const decoded = decodedResult!.value;
 				if (await opusDecodesAt48kHz()) {
 					// Opus decodes at 48 kHz whatever the input rate was, though some decoders output the input rate
 					expect(decoded.sampleRate).toBe(48000);

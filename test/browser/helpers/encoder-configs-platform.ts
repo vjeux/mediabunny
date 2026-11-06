@@ -114,6 +114,7 @@ const nativeVideoConfig = async (codec: ProbedVideoCodec, width: number, height:
 const readCenterLuma = async (frame: VideoFrame) => {
 	const buffer = new Uint8Array(frame.allocationSize());
 	const layout = await frame.copyTo(buffer);
+	const tight = layout[0]!.offset === 0 && layout[0]!.stride === frame.visibleRect!.width;
 	const row = Math.floor(frame.codedHeight / 2);
 	const column = Math.floor(frame.codedWidth / 2);
 	const format = frame.format ?? '';
@@ -123,11 +124,11 @@ const readCenterLuma = async (frame: VideoFrame) => {
 		const [red, green, blue] = format.startsWith('RGB')
 			? [buffer[offset]!, buffer[offset + 1]!, buffer[offset + 2]!]
 			: [buffer[offset + 2]!, buffer[offset + 1]!, buffer[offset]!];
-		return 16 + (65.481 * red + 128.553 * green + 24.966 * blue) / 255;
+		return { luma: 16 + (65.481 * red + 128.553 * green + 24.966 * blue) / 255, tight: false };
 	}
 
 	// Planar and semi-planar YUV formats all start with the luma plane
-	return buffer[layout[0]!.offset + row * layout[0]!.stride + column]!;
+	return { luma: buffer[layout[0]!.offset + row * layout[0]!.stride + column]!, tight };
 };
 
 type NativeRoundTrip = {
@@ -136,6 +137,9 @@ type NativeRoundTrip = {
 	chunkBytes: number;
 	decoderConfig: VideoDecoderConfig | null;
 	decodedLuma: number[];
+	decodedColorSpaces: VideoColorSpaceInit[];
+	/** Whether every decoded frame's default copyTo layout starts its luma plane at 0, one visible row per stride. */
+	tightLayouts: boolean;
 };
 
 /**
@@ -145,7 +149,8 @@ type NativeRoundTrip = {
 const nativeRoundTrip = async (options: {
 	config: VideoEncoderConfig;
 	encodeOptions?: VideoEncoderEncodeOptions;
-	frames: { luma: number; colorSpace?: VideoColorSpaceInit }[];
+	/** Flat frames of a luma value, or textured ones like the tests' (a gradient with a moving bar). */
+	frames: { luma: number | 'textured'; colorSpace?: VideoColorSpaceInit }[];
 	decode?: boolean;
 	decoderColorSpace?: VideoColorSpaceInit;
 }): Promise<NativeRoundTrip | null> => {
@@ -160,6 +165,8 @@ const nativeRoundTrip = async (options: {
 		chunkBytes: 0,
 		decoderConfig: null,
 		decodedLuma: [],
+		decodedColorSpaces: [],
+		tightLayouts: true,
 	};
 	const chunks: EncodedVideoChunk[] = [];
 	const encoder = new VideoEncoder({
@@ -182,7 +189,15 @@ const nativeRoundTrip = async (options: {
 		const { width, height } = config;
 		options.frames.forEach(({ luma, colorSpace }, i) => {
 			const data = new Uint8Array(width * height + 2 * Math.ceil(width / 2) * Math.ceil(height / 2));
-			data.fill(luma, 0, width * height);
+			if (luma === 'textured') {
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						data[y * width + x] = Math.abs(x - (i * 8) % width) < 4 ? 235 : 16 + ((x + 2 * y) % 200);
+					}
+				}
+			} else {
+				data.fill(luma, 0, width * height);
+			}
 			data.fill(128, width * height);
 			const frame = new VideoFrame(data, {
 				format: 'I420',
@@ -200,11 +215,16 @@ const nativeRoundTrip = async (options: {
 			hungCoderKinds.add('video');
 			result.failed = true;
 		}
+		// Some encoders report failures after their flush has resolved
+		await new Promise(resolve => setTimeout(resolve, 50));
 	} catch {
 		result.failed = true;
 	}
 	if (encoder.state !== 'closed') {
 		encoder.close();
+	}
+	if (chunks.length < options.frames.length) {
+		result.failed = true;
 	}
 
 	if (result.failed || options.decode === false || !result.decoderConfig) {
@@ -215,8 +235,10 @@ const nativeRoundTrip = async (options: {
 	const decoder = new VideoDecoder({
 		output: (frame) => {
 			const index = pending.length;
-			pending.push(readCenterLuma(frame).then((luma) => {
+			result.decodedColorSpaces[index] = frame.colorSpace.toJSON();
+			pending.push(readCenterLuma(frame).then(({ luma, tight }) => {
 				result.decodedLuma[index] = luma;
+				result.tightLayouts &&= tight;
 			}).finally(() => frame.close()));
 		},
 		error: () => {
@@ -304,9 +326,12 @@ const nativeTexturedBytes = async (config: VideoEncoderConfig, encodeOptions: Vi
  * at a quality level would use. WebKitGTK accepts quantizer-based HEVC, then fails to encode it.
  */
 export const videoRoundTrips = memoizeByKey(async (codec: ProbedVideoCodec) => {
-	const { config, encodeOptions } = await nativeVideoConfig(codec, 160, 120, 500_000);
-	const roundTrip = await nativeRoundTrip({ config, encodeOptions, frames: [{ luma: 100 }, { luma: 150 }] });
-	return !!roundTrip && !roundTrip.failed && roundTrip.decodedLuma.filter(x => x !== undefined).length === 2;
+	// Textured I420 frames from buffers, like the tests encode (WebKitGTK's HEVC encoder fails on those, though not on
+	// canvas-backed frames)
+	const { config, encodeOptions } = await nativeVideoConfig(codec, 160, 120, 200_000);
+	const frames = Array.from({ length: 4 }, () => ({ luma: 'textured' as const }));
+	const roundTrip = await nativeRoundTrip({ config, encodeOptions, frames });
+	return !!roundTrip && !roundTrip.failed && roundTrip.decodedLuma.filter(x => x !== undefined).length === 4;
 });
 
 /**
@@ -318,10 +343,10 @@ export const nativeVideoContradicts = async (codec: ProbedVideoCodec, width: num
 	const roundTrip = await nativeRoundTrip({
 		config,
 		encodeOptions,
-		frames: [{ luma: 128 }, { luma: 140 }],
+		frames: [{ luma: 'textured' }, { luma: 'textured' }],
 		decode: false,
 	});
-	return !!roundTrip && (roundTrip.failed || roundTrip.chunkTimestamps.length === 0);
+	return !!roundTrip && roundTrip.failed;
 };
 
 /**
@@ -405,8 +430,9 @@ const ALPHA_COLOR_SPACE: VideoColorSpaceInit = {
 
 /**
  * Whether full-range flat frames of luma 255 and 64 come back through the platform's encoder and decoder within 10, at
- * 2 Mbps. Alpha is encoded as the luma of a second, full-range stream, so alpha values can only be checked where this
- * holds.
+ * 2 Mbps, in decoded frames whose default copyTo layout is tightly packed (as WebCodecs specifies, and as alpha merging
+ * reads them). Alpha is encoded as the luma of a second, full-range stream, so alpha values can only be checked where
+ * this holds.
  */
 export const flatLumaSurvives = memoizeByKey(async (codec: ProbedVideoCodec) => {
 	const lumas = [255, 64];
@@ -423,6 +449,7 @@ export const flatLumaSurvives = memoizeByKey(async (codec: ProbedVideoCodec) => 
 	});
 	return !!roundTrip
 		&& !roundTrip.failed
+		&& roundTrip.tightLayouts
 		&& lumas.every((luma, i) => Math.abs((roundTrip.decodedLuma[i] ?? -100) - luma) <= 10);
 });
 
@@ -435,49 +462,28 @@ const sameColorSpace = (a: VideoColorSpaceInit | undefined | null, b: VideoColor
 };
 
 /**
- * Whether the platform's VP8 encoder reports the color space of its frames in its decoder config, and whether its
- * decoder reports the color space of its config on the frames it outputs (checked on a known-good VP8 key frame of
- * 64x64 black made by FFmpeg with -c:v libvpx). WebKitGTK's report 'unspecified'.
+ * Whether the platform's encoder reports the color space of its frames in its decoder config, and whether its decoder
+ * reports the color space of its config on the frames it outputs, per codec and color space. WebKitGTK's report
+ * 'unspecified'.
  */
-export const colorSpaceSupport = memoize(async () => {
+export const colorSpaceSupport = memoizeByKey(async (key: string) => {
+	const { codec, colorSpace } = JSON.parse(key) as { codec: ProbedVideoCodec; colorSpace: VideoColorSpaceInit };
+	const { config, encodeOptions } = await nativeVideoConfig(codec, 160, 120, 200_000);
 	const roundTrip = await nativeRoundTrip({
-		config: { codec: 'vp8', width: 64, height: 64, bitrate: 200_000, framerate: 30 },
-		frames: [{ luma: 128, colorSpace: ALPHA_COLOR_SPACE }],
-		decode: false,
+		config,
+		encodeOptions,
+		frames: [{ luma: 'textured', colorSpace }, { luma: 'textured', colorSpace }],
+		decoderColorSpace: colorSpace,
 	});
-	const encoderReports = !!roundTrip
-		&& !roundTrip.failed
-		&& sameColorSpace(roundTrip.decoderConfig?.colorSpace, ALPHA_COLOR_SPACE);
-
-	let decoderReports = false;
-	if (typeof VideoDecoder !== 'undefined' && !hungCoderKinds.has('video')) {
-		const decoder = new VideoDecoder({
-			output: (frame) => {
-				decoderReports = sameColorSpace(frame.colorSpace.toJSON(), ALPHA_COLOR_SPACE);
-				frame.close();
-			},
-			error: () => {},
-		});
-		try {
-			decoder.configure({ codec: 'vp8', codedWidth: 64, codedHeight: 64, colorSpace: ALPHA_COLOR_SPACE });
-			decoder.decode(new EncodedVideoChunk({
-				type: 'key',
-				timestamp: 0,
-				data: fromBase64('8AIAnQEqQABAAABHCIWFiIWEiAICAAZwPEJgCrIg9zAA/v+rUIA='),
-			}));
-			if (await withTimeout(decoder.flush()) === null) {
-				hungCoderKinds.add('video');
-				decoderReports = false;
-			}
-		} catch {
-			decoderReports = false;
-		}
-		if (decoder.state !== 'closed') {
-			decoder.close();
-		}
+	if (!roundTrip || roundTrip.failed) {
+		return { encoderReports: false, decoderReports: false };
 	}
 
-	return { encoderReports, decoderReports };
+	return {
+		encoderReports: sameColorSpace(roundTrip.decoderConfig?.colorSpace, colorSpace),
+		decoderReports: roundTrip.decodedColorSpaces.length > 0
+			&& roundTrip.decodedColorSpaces.every(x => sameColorSpace(x, colorSpace)),
+	};
 });
 
 /**
@@ -539,14 +545,16 @@ export const nativeSupportsPreferHardware = async (codec: ProbedVideoCodec) => {
 };
 
 /**
- * Encodes 0.1 s of silence with a literal audio config. 'unsupported' when the platform's support query says no,
- * 'fails' when it says yes but encoding fails, 'hangs' when a call never settles (after which the audio coders on the
- * page can't be trusted).
+ * Encodes 0.1 s of silence with a literal audio config and decodes it back (Mediabunny decodes an encoder's output to
+ * measure its delay). 'unsupported' when the platform's support query says no, 'fails' when it says yes but encoding or
+ * decoding fails, 'hangs' when a call never settles (after which the audio coders on the page can't be trusted).
  */
 export const nativeAudioEncode = async (
 	codec: string,
 	sampleRate: number,
 	numberOfChannels: number,
+	/** The sample rate to decode with, if not the encoder's (Mediabunny's demuxers give Opus 48 kHz). */
+	decodeSampleRate?: number,
 ): Promise<'unsupported' | 'works' | 'fails' | 'hangs'> => {
 	if (typeof AudioEncoder === 'undefined') {
 		return 'unsupported';
@@ -565,11 +573,15 @@ export const nativeAudioEncode = async (
 		return 'unsupported';
 	}
 
-	let outputs = 0;
+	const chunks: EncodedAudioChunk[] = [];
+	let decoderConfig: AudioDecoderConfig | null = null;
 	let failed = false;
 	const encoder = new AudioEncoder({
-		output: () => {
-			outputs++;
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			if (meta?.decoderConfig && !decoderConfig) {
+				decoderConfig = meta.decoderConfig;
+			}
 		},
 		error: () => {
 			failed = true;
@@ -603,7 +615,22 @@ export const nativeAudioEncode = async (
 		hungCoderKinds.add('audio');
 		return 'hangs';
 	}
-	return failed || outputs === 0 ? 'fails' : 'works';
+	if (failed || chunks.length === 0 || !decoderConfig) {
+		return 'fails';
+	}
+
+	const decodingConfig: AudioDecoderConfig = decodeSampleRate !== undefined
+		? { ...(decoderConfig as AudioDecoderConfig), sampleRate: decodeSampleRate }
+		: decoderConfig;
+	const decoded = await nativeAudioDecode(decodingConfig, chunks.map((chunk) => {
+		const data = new Uint8Array(chunk.byteLength);
+		chunk.copyTo(data);
+		return { timestamp: chunk.timestamp, data };
+	}));
+	if (hungCoderKinds.has('audio')) {
+		return 'hangs';
+	}
+	return decoded && decoded.rates.length > 0 ? 'works' : 'fails';
 };
 
 /**
