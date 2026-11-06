@@ -493,6 +493,12 @@ const MIN_BOX_CONTENT_SIZES: Partial<Record<string, number>> = {
 	enda: 2,
 };
 
+/**
+ * Sample durations above this are taken to be negative values stored as unsigned ones (like FFmpeg's
+ * max_stts_delta default).
+ */
+const MAX_SAMPLE_DELTA = 0xffffffff - 48000 * 10;
+
 export class IsobmffDemuxer extends Demuxer {
 	reader: Reader;
 	moovSlice: FileSlice | null = null;
@@ -2593,10 +2599,29 @@ export class IsobmffDemuxer extends Demuxer {
 
 				let currentIndex = 0;
 				let currentTimestamp = 0;
+				// Where the timestamps would be if the deltas were applied as written, including negative ones
+				let correctedTimestamp = 0;
 
 				for (let i = 0; i < entryCount; i++) {
 					const sampleCount = readU32Be(slice);
-					const sampleDelta = readU32Be(slice);
+					let sampleDelta = readU32Be(slice);
+
+					// The deltas are unsigned, but some writers store negative ones to correct the timestamps. Like
+					// FFmpeg (mov_read_stts), treat huge deltas as such corrections: the samples get a delta of 1,
+					// and the following samples are shortened until the timestamps have caught up.
+					if (sampleDelta > MAX_SAMPLE_DELTA) {
+						const signedDelta = sampleDelta | 0;
+						correctedTimestamp += (signedDelta < 0 ? signedDelta : 1) * sampleCount;
+						sampleDelta = 1;
+					} else {
+						correctedTimestamp += sampleDelta * sampleCount;
+					}
+
+					const excess = currentTimestamp + sampleDelta * sampleCount - correctedTimestamp;
+					if (excess > 0) {
+						const drift = Math.floor(excess / Math.max(sampleCount, 1));
+						sampleDelta -= Math.min(drift, sampleDelta - 1);
+					}
 
 					track.sampleTable.sampleTimingEntries.push({
 						startIndex: currentIndex,
@@ -3275,6 +3300,9 @@ export class IsobmffDemuxer extends Demuxer {
 						sampleDuration = readU32Be(slice);
 					} else {
 						sampleDuration = defaultSampleDuration!;
+					}
+					if (sampleDuration > MAX_SAMPLE_DELTA) {
+						sampleDuration = 1; // Most likely a negative duration; FFmpeg clips these the same way
 					}
 
 					let sampleSize: number;
