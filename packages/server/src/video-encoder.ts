@@ -279,6 +279,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			codecContext.setOption('profile', String(profile));
 		}
 
+		if (this.avCodec.name === 'prores_ks') {
+			// Unlike the FFmpeg CLI, libavcodec defaults to a single thread, which makes prores_ks the slowest encoder
+			// here by far. Slice threading (one thread per core, up to 16) produces the exact same bytes, without the
+			// delay and the extra frames in memory that frame threading would bring.
+			codecContext.threadCount = 0;
+			codecContext.threadType = NodeAv.FF_THREAD_SLICE;
+		}
+
 		let primaries = this.frame.colorPrimaries;
 		let transfer = this.frame.colorTrc;
 		let matrix = this.frame.colorSpace;
