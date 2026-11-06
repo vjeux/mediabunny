@@ -4,7 +4,13 @@ import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { Mp3OutputFormat, Mp4OutputFormat, OggOutputFormat, WavOutputFormat } from '../../src/output-format.js';
+import {
+	MkvOutputFormat,
+	Mp3OutputFormat,
+	Mp4OutputFormat,
+	OggOutputFormat,
+	WavOutputFormat,
+} from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -381,5 +387,67 @@ describe('MP4 output from Annex B and ADTS packets', () => {
 		const tracks = await input.getAudioTracks();
 		const defaults = await Promise.all(tracks.map(async track => (await track.getDisposition()).default));
 		expect(defaults).toEqual([true, false]);
+	});
+});
+
+describe('Matroska metadata on output', () => {
+	test('every tag, the raw tag names and attached cover art round-trip', async () => {
+		const tags = {
+			title: 'Title',
+			description: 'Description',
+			artist: 'Artist',
+			album: 'Album',
+			albumArtist: 'Album artist',
+			genre: 'Genre',
+			beatsPerMinute: 120,
+			comment: 'Comment',
+			lyrics: 'Lyrics',
+			date: new Date('2015-06-12T00:00:00Z'),
+			trackNumber: 3,
+			tracksTotal: 12,
+			discNumber: 1,
+			discsTotal: 2,
+			images: [{
+				data: new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2]),
+				mimeType: 'image/jpeg',
+				kind: 'coverFront' as const,
+				description: 'Front',
+			}],
+			raw: { CUSTOM_KEY: 'custom value' },
+		};
+		const target = new BufferTarget();
+		const output = new Output({ format: new MkvOutputFormat(), target });
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source, { name: 'Commentary', languageCode: 'fra', disposition: { commentary: true } });
+		output.setMetadataTags(tags);
+		await output.start();
+		const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 };
+		await source.add(new EncodedPacket(new Uint8Array(160), 'key', 0, 0.01), { decoderConfig });
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		const read = await input.getMetadataTags();
+		const { images, raw, ...rest } = tags;
+		expect(read).toMatchObject(rest);
+		expect(read.images).toEqual([{ ...images[0], name: 'cover.jpg' }]);
+		expect(read.raw).toMatchObject({
+			...raw,
+			TITLE: 'Title',
+			DESCRIPTION: 'Description',
+			ARTIST: 'Artist',
+			ALBUM: 'Album',
+			ALBUM_ARTIST: 'Album artist',
+			GENRE: 'Genre',
+			BPM: '120',
+			COMMENT: 'Comment',
+			LYRICS: 'Lyrics',
+			DATE: '2015-06-12',
+			PART_NUMBER: '3/12',
+			DISC: '1/2',
+		});
+
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect([await track.getName(), await track.getLanguageCode()]).toEqual(['Commentary', 'fra']);
+		expect((await track.getDisposition()).commentary).toBe(true);
 	});
 });
