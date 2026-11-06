@@ -1072,7 +1072,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			this.decoder = new VideoDecoder({
 				output: (frame) => {
 					try {
-						colorHandler(this.copyFrameIfNeeded(frame));
+						colorHandler(this.applyConfiguredDisplayAspect(this.copyFrameIfNeeded(frame)));
 					} catch (error) {
 						this.onError(error);
 					}
@@ -1400,6 +1400,36 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			removeItem(this.mergeAlphaPromises, resolver.promise);
 			resolver.resolve();
 		}
+	}
+
+	/**
+	 * WebKit's VideoDecoder never applies the displayAspectWidth and displayAspectHeight of its config: its frames
+	 * always have their visible size as their display size, so anamorphic video would come out squeezed. For frames
+	 * whose display size is still their visible size, this applies the configured aspect ratio like the spec does
+	 * (growing the display width or height until the ratio matches).
+	 */
+	applyConfiguredDisplayAspect(frame: VideoFrame) {
+		const { displayAspectWidth, displayAspectHeight } = this.decoderConfig;
+		const visibleRect = frame.visibleRect;
+		if (
+			displayAspectWidth === undefined
+			|| displayAspectHeight === undefined
+			|| !visibleRect
+			|| frame.displayWidth !== visibleRect.width
+			|| frame.displayHeight !== visibleRect.height
+			|| frame.displayWidth * displayAspectHeight === frame.displayHeight * displayAspectWidth
+		) {
+			return frame;
+		}
+
+		const aspectRatio = displayAspectWidth / displayAspectHeight;
+		const displaySize = frame.displayWidth / frame.displayHeight < aspectRatio
+			? { displayWidth: Math.round(frame.displayHeight * aspectRatio), displayHeight: frame.displayHeight }
+			: { displayWidth: frame.displayWidth, displayHeight: Math.round(frame.displayWidth / aspectRatio) };
+		const corrected = new VideoFrame(frame, displaySize);
+		frame.close();
+
+		return corrected;
 	}
 
 	/**
