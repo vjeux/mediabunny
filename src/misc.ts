@@ -160,6 +160,46 @@ export const last = <T>(arr: T[]) => {
 	return arr && arr[arr.length - 1];
 };
 
+/**
+ * A first-in, first-out queue. Taking an item off the front is amortized O(1), unlike with
+ * `Array.prototype.shift()`, which copies the whole array once the array is large.
+ */
+export class Queue<T> {
+	private items: (T | undefined)[] = [];
+	private head = 0;
+
+	get length() {
+		return this.items.length - this.head;
+	}
+
+	push(...items: T[]) {
+		this.items.push(...items);
+	}
+
+	/** Returns the first item without removing it, or undefined if the queue is empty. */
+	peek() {
+		return this.items[this.head];
+	}
+
+	shift() {
+		if (this.head === this.items.length) {
+			return undefined;
+		}
+
+		const item = this.items[this.head];
+		this.items[this.head] = undefined; // So that it can be garbage-collected
+		this.head++;
+
+		if (2 * this.head >= this.items.length) {
+			// Drop the consumed items once they make up half the array, which keeps this amortized O(1)
+			this.items.splice(0, this.head);
+			this.head = 0;
+		}
+
+		return item;
+	}
+}
+
 export const isU32 = (value: number) => {
 	return value >= 0 && value < 2 ** 32;
 };
