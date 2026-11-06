@@ -4,12 +4,15 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
+	EncodedPacket,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +84,94 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('Laced Vorbis frames get their own durations', async () => {
+	// Vorbis at 8 kHz with 256/2048-sample blocks, one tick per sample. A frame lasts (previous block size + its own
+	// block size) / 4 samples: 128 for short after short, 576 for a short and a long block, 1024 for long after long.
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const matroskaFile = (...segmentChildren: number[][]) => new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, [...'matroska'].map(x => x.charCodeAt(0)))),
+		...element(EBMLId.Segment, segmentChildren.flat()),
+	]);
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const identificationHeader = [
+		1, ...ascii('vorbis'), 0, 0, 0, 0, 1, 0x40, 0x1f, 0, 0, // Version 0, mono, 8000 Hz
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Bitrates
+		0xb8, 1, // Block sizes 2^8 and 2^11, framing bit
+	];
+	const commentHeader = [3, ...ascii('vorbis'), 0, 0, 0, 0, 0, 0, 0, 0, 1];
+	// Ends with two modes: mode 0 uses short blocks, mode 1 long ones
+	const setupHeader = [5, ...ascii('vorbis'), 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 1];
+
+	const SHORT = 0x00; // Mode 0
+	const LONG_AFTER_SHORT = 0x02; // Mode 1, previous window flag clear
+	const LONG_AFTER_LONG = 0x06; // Mode 1, previous window flag set
+
+	const block = (relativeTimestamp: number, frames: number[]) => element(EBMLId.SimpleBlock, [
+		0x81, relativeTimestamp >> 8, relativeTimestamp & 0xff,
+		...(frames.length > 1
+			? [0x80 | 0x02, frames.length - 1, ...frames.slice(0, -1).map(() => 2)] // Xiph lacing, 2-byte frames
+			: [0x80]),
+		...frames.flatMap(x => [x, 0xaa]),
+	]);
+
+	const file = matroskaFile(
+		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x01, 0xe8, 0x48])), // 125 us = 1 sample
+		element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [2]),
+			element(EBMLId.CodecID, ascii('A_VORBIS')),
+			element(EBMLId.CodecPrivate, [
+				2, identificationHeader.length, commentHeader.length,
+				...identificationHeader, ...commentHeader, ...setupHeader,
+			]),
+			element(EBMLId.Audio, element(EBMLId.SamplingFrequency, [0x45, 0xfa, 0, 0]), element(EBMLId.Channels, [1])),
+		)),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [0]),
+			block(0, [SHORT, LONG_AFTER_SHORT, LONG_AFTER_LONG, SHORT]), // 128 + 576 + 1024 + 576 samples
+			block(2304, [LONG_AFTER_SHORT]),
+		),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [0x0b, 0x40]), // 2880
+			// The first frame follows a long block from the previous cluster, so it lasts 576 samples
+			block(0, [SHORT, SHORT]),
+			// The cluster's last block has no known duration, and the next cluster starts before its 384 samples end
+			// (as in some old mkvmerge files), so its frames stay at the block's timestamp rather than run past it
+			block(704, [SHORT, SHORT, SHORT]),
+		),
+		element(EBMLId.Cluster, element(EBMLId.Timestamp, [0x0e, 0x40]), block(0, [SHORT])), // 3648
+	);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	expect(packets.map(x => x.timestamp * 8000)).toEqual([0, 128, 704, 1728, 2304, 2880, 3456, 3584, 3584, 3584, 3648]);
+	expect(packets.slice(0, 4).map(x => x.duration * 8000)).toEqual([128, 576, 1024, 576]);
 });
