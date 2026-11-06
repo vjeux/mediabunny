@@ -353,7 +353,7 @@ export class FlacDemuxer extends Demuxer {
 		const maximumSliceLength
 			= effectiveMaxFrameSize + maximumHeaderLength;
 
-		const slice = await this.reader.requestSliceRange(
+		let slice = await this.reader.requestSliceRange(
 			startPos,
 			minimumHeaderLength,
 			maximumSliceLength,
@@ -377,9 +377,30 @@ export class FlacDemuxer extends Demuxer {
 		// we can skip over anything before that
 		slice.filePos = startPos + effectiveMinFrameSize;
 
+		// The frame sizes in STREAMINFO are only hints, though: frames of concatenated streams, or of files with a
+		// wrong STREAMINFO, can fall outside of them. If no frame follows within them, we search again, from the
+		// smallest frame up to the largest one the stream's block size and channel count allow.
+		let searchedAllSizes = effectiveMinFrameSize <= minimumFrameLength
+			&& effectiveMaxFrameSize >= maximumFrameLength;
+
 		while (true) {
-			// Reached end of the file, packet is over
 			if (slice.filePos > slice.end - minimumHeaderLength) {
+				if (!searchedAllSizes) {
+					searchedAllSizes = true;
+
+					const widerSlice = await this.reader.requestSliceRange(
+						startPos,
+						minimumHeaderLength,
+						Math.max(effectiveMaxFrameSize, maximumFrameLength) + maximumHeaderLength,
+					);
+					assert(widerSlice);
+
+					slice = widerSlice;
+					slice.filePos = startPos + minimumFrameLength;
+					continue;
+				}
+
+				// Reached end of the file, packet is over
 				return {
 					num: frameHeader.num,
 					blockSize: frameHeader.blockSize,
