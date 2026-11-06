@@ -334,6 +334,40 @@ type SampleEncryptionAuxInfo = {
 // Anything beyond this is malicious
 const MAX_BOX_NESTING_DEPTH = 64;
 
+/**
+ * The fewest content bytes that the fixed fields of these boxes take up. Boxes that are smaller (for example, empty)
+ * are skipped. Variable-length contents are checked where they're read.
+ */
+const MIN_BOX_CONTENT_SIZES: Partial<Record<string, number>> = {
+	meta: 4,
+	mehd: 8,
+	trex: 24,
+	tfhd: 8,
+	tfdt: 8,
+	trun: 8,
+	elst: 8,
+	stts: 8,
+	ctts: 8,
+	stss: 8,
+	stsc: 8,
+	stco: 8,
+	co64: 8,
+	stsz: 12,
+	stz2: 12,
+	frma: 4,
+	colr: 4,
+	pasp: 8,
+	btrt: 12,
+	vpcC: 10,
+	esds: 6,
+	dOps: 11,
+	dfLa: 8,
+	dac3: 3,
+	dmlp: 4,
+	pcmC: 6,
+	enda: 2,
+};
+
 export class IsobmffDemuxer extends Demuxer {
 	reader: Reader;
 	moovSlice: FileSlice | null = null;
@@ -968,6 +1002,12 @@ export class IsobmffDemuxer extends Demuxer {
 
 		const contentStartPos = slice.filePos;
 		const boxEndPos = startPos + boxInfo.totalSize;
+
+		if (boxInfo.contentSize < (MIN_BOX_CONTENT_SIZES[boxInfo.name] ?? 0)) {
+			// Too small for its fixed fields (e.g. empty); skip it rather than reading past it, like FFmpeg
+			slice.filePos = boxEndPos;
+			return true;
+		}
 
 		switch (boxInfo.name) {
 			case 'mdia':
@@ -1708,6 +1748,9 @@ export class IsobmffDemuxer extends Demuxer {
 				if (colourType !== 'nclx' && colourType !== 'nclc') {
 					break;
 				}
+				if (boxInfo.contentSize < (colourType === 'nclx' ? 11 : 10)) {
+					break;
+				}
 
 				const colourPrimaries = readU16Be(slice);
 				const transferCharacteristics = readU16Be(slice);
@@ -1848,6 +1891,10 @@ export class IsobmffDemuxer extends Demuxer {
 				const inputSampleRate = readU32Be(slice);
 				const outputGain = readI16Be(slice);
 				const channelMappingFamily = readU8(slice);
+
+				if (channelMappingFamily !== 0 && boxInfo.contentSize < 11 + 2 + outputChannelCount) {
+					break; // The channel mapping table is cut off
+				}
 
 				let channelMappingTable: Uint8Array;
 				if (channelMappingFamily !== 0) {
@@ -2282,6 +2329,10 @@ export class IsobmffDemuxer extends Demuxer {
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
+				if (version === 1 && boxInfo.contentSize < 12) {
+					break;
+				}
+
 				const fragmentDuration = version === 1 ? readU64Be(slice) : readU32Be(slice);
 				this.movieDurationInTimescale = fragmentDuration;
 			}; break;
@@ -2532,6 +2583,10 @@ export class IsobmffDemuxer extends Demuxer {
 
 				const version = readU8(slice);
 				slice.skip(3); // Flags
+
+				if (version !== 0 && boxInfo.contentSize < 12) {
+					break;
+				}
 
 				const baseMediaDecodeTime = version === 0 ? readU32Be(slice) : readU64Be(slice);
 				track.currentFragmentState.startTimestamp = baseMediaDecodeTime;
@@ -2792,6 +2847,14 @@ export class IsobmffDemuxer extends Demuxer {
 				const iterator = this.iterateContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 
 				for (const { boxInfo, slice } of iterator) {
+					if (
+						!this.currentTrack
+						&& (boxInfo.name[0] === '©' || boxInfo.name === 'name')
+						&& boxInfo.contentSize < 4
+					) {
+						continue; // Too small for the length and language code of a text atom
+					}
+
 					if (boxInfo.name !== 'meta' && !this.currentTrack) {
 						const startPos = slice.filePos;
 						this.metadataTags.raw ??= {};

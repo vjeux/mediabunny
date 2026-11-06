@@ -443,6 +443,41 @@ test('MP4: Nested moof', async () => {
 	]));
 });
 
+test('MP4: Empty boxes', async () => {
+	// An empty box used to be read past its end, which threw an internal error for the whole file when it was the
+	// last box of its parent (FFmpeg skips boxes that are too small)
+	const files: Uint8Array[] = [];
+
+	for (const name of ['stts', 'ctts', 'stss', 'stsz', 'stz2', 'stsc', 'stco', 'co64']) {
+		files.push(mp4([trak({ handler: 'vide', stbl: [...singleChunkStbl(1, 0), box(name)] })]));
+	}
+	files.push(mp4([trak({ handler: 'vide', stbl: singleChunkStbl(1, 0), extra: [box('edts', box('elst'))] })]));
+
+	for (const name of ['colr', 'pasp', 'btrt', 'vpcC']) {
+		files.push(mp4([trak({
+			handler: 'vide',
+			stbl: [stsd(videoSampleEntry('avc1', [box(name)])), ...singleChunkStbl(1, 0).slice(1)],
+		})]));
+	}
+	for (const name of ['esds', 'dOps', 'dfLa', 'dac3', 'dmlp', 'pcmC', 'enda', 'frma', 'btrt']) {
+		files.push(mp4([trak({
+			handler: 'soun',
+			stbl: [stsd(audioSampleEntry('mp4a', box(name))), ...singleChunkStbl(1, 0).slice(1)],
+		})]));
+	}
+
+	files.push(mp4([trak({ handler: 'vide', stbl: singleChunkStbl(1, 0) }), box('udta', box('©nam'))]));
+	files.push(mp4([trak({ handler: 'vide', stbl: singleChunkStbl(1, 0) }), box('udta', box('meta'))]));
+	files.push(mp4([trak({ handler: 'vide', stbl: emptyStbl() }), box('mvex', trex(1), box('mehd'))]));
+	files.push(mp4([trak({ handler: 'vide', stbl: emptyStbl() }), box('mvex', box('trex'))]));
+	files.push(mp4(fragmentedMoov(), [moof(fullBox('tfhd', 0, 0x020000, u32(1)), box('tfdt')), box('mdat', zeros(4))]));
+	files.push(mp4(fragmentedMoov(), [moof(fullBox('tfhd', 0, 0x020000, u32(1)), box('trun')), box('mdat', zeros(4))]));
+
+	for (const file of files) {
+		await expectGracefulRead(file);
+	}
+});
+
 test('MP4: Broken fragment followed by valid ones', async () => {
 	// An error inside one moof used to leave parser state behind that tripped up reading the next ones
 	await expectGracefulRead(mp4(fragmentedMoov({ trex: false }), [
