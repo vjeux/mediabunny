@@ -809,7 +809,7 @@ writer.write(chunk2);
 writer.close();
 ```
 
-This source is *unsized*, meaning calls to `.getSize()` will throw and readers are more limited due to the lack of random file access. You should only use this source with sequential access patterns, such as reading all packets from start to end or doing conversions. This source does not work well with random access patterns unless you increase its max cache size.
+This source is *unsized*, meaning calls to `.getSize()` will throw and readers are more limited due to the lack of random file access. You should only use this source with sequential access patterns, such as reading all packets from start to end or doing conversions. This source does not work well with random access patterns unless you increase its max cache size. MP4 and MOV files without Fast Start (their `moov` box comes after the media data, as in FFmpeg's default output) are such a case: converting one needs the entire file to fit in the cache.
 
 ```ts
 type ReadableStreamSourceOptions = {
