@@ -371,6 +371,15 @@ export class OggDemuxer extends Demuxer {
 		return { startPage: nextPage, startSegmentIndex: 0 };
 	}
 
+	/** Whether the page's checksum matches. Only checked where reading on past garbage, as that's rare. */
+	async pageChecksumIsValid(page: Page) {
+		let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		return !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
+	}
+
 	/**
 	 * Returns the page of the same bitstream that follows the given page, skipping the pages of other bitstreams.
 	 * Where something other than a usable page sits between two pages (junk, or a page without segments), it searches
@@ -381,15 +390,6 @@ export class OggDemuxer extends Demuxer {
 	 * previous link was cut off). Otherwise the bitstream ends there, as the audio after would be damaged or get
 	 * wrong timestamps.
 	 */
-	/** Whether the page's checksum matches. Only checked where reading on past garbage, as that's rare. */
-	async pageChecksumIsValid(page: Page) {
-		let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
-		if (isThenable(slice)) {
-			slice = await slice;
-		}
-		return !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
-	}
-
 	async readNextPage(previousPage: Page): Promise<Page | null> {
 		const serialNumber = previousPage.serialNumber;
 		let currentPos = previousPage.headerStartPos + previousPage.totalSize;
