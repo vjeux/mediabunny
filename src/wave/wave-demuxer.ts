@@ -74,6 +74,9 @@ export class WaveDemuxer extends Demuxer {
 			let chunksRead = 0;
 			let dataChunkSize: number | null = null;
 			let currentPos = slice.filePos;
+			// The sizes of chunks other than "data" that don't fit into 32 bits, from the table in the "ds64" chunk, by
+			// chunk ID in the order they come in
+			const largeChunkSizes = new Map<string, number[]>();
 
 			while (totalFileSize === null || currentPos < totalFileSize) {
 				let slice = this.reader.requestSlice(currentPos, 8);
@@ -81,11 +84,16 @@ export class WaveDemuxer extends Demuxer {
 				if (!slice) break;
 
 				const chunkId = readAscii(slice, 4);
-				const chunkSize = readU32(slice, littleEndian);
+				let chunkSize = readU32(slice, littleEndian);
 				const startPos = slice.filePos;
 
 				if (isRf64 && chunksRead === 0 && chunkId !== 'ds64') {
 					throw new Error('Invalid RF64 file: First chunk must be "ds64".');
+				}
+
+				if (isRf64 && chunkSize === 0xffffffff && chunkId !== 'data') {
+					// The chunk's real size is in the "ds64" chunk's table (EBU Tech 3306, Annex A.2)
+					chunkSize = largeChunkSizes.get(chunkId)?.shift() ?? chunkSize;
 				}
 
 				if (chunkId === 'fmt ') {
@@ -112,6 +120,22 @@ export class WaveDemuxer extends Demuxer {
 
 					const riffChunkSize = readU64(ds64Slice, littleEndian);
 					dataChunkSize = readU64(ds64Slice, littleEndian);
+
+					if (chunkSize >= 28) {
+						ds64Slice.skip(8); // Sample count
+						const tableLength = readU32(ds64Slice, littleEndian);
+
+						// Only the entries that the chunk actually holds
+						const entryCount = Math.min(tableLength, Math.floor((chunkSize - 28) / 12));
+						for (let i = 0; i < entryCount; i++) {
+							const id = readAscii(ds64Slice, 4);
+							const size = readU64(ds64Slice, littleEndian);
+
+							const sizes = largeChunkSizes.get(id) ?? [];
+							sizes.push(size);
+							largeChunkSizes.set(id, sizes);
+						}
+					}
 
 					totalFileSize = Math.min(riffChunkSize + 8, this.reader.fileSize ?? Infinity);
 				} else if (chunkId === 'LIST') {
