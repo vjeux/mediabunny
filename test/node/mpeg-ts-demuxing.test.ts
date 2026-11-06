@@ -1319,42 +1319,60 @@ test('MPEG-TS finds frames presented before the first PES packet', async () => {
 
 test('MPEG-TS places a first frame without PTS by its picture order', async () => {
 	// x264 output with B-frames and open GOPs (made with `ffmpeg -f lavfi -i mandelbrot=size=96x64:rate=25 -t 1.8 -c:v
-	// libx264 -x264-params keyint=30:open-gop=1:bframes=3:b-adapt=2:repeat-headers=1 -f mpegts`). Its first video PES
+	// libx264 -x264-params keyint=32:open-gop=1:bframes=3:b-adapt=0:repeat-headers=1 -f mpegts`). Its first video PES
 	// packet loses its PTS, in the file as is (an IDR picture, shown before the B-frames after it) and in the file cut
-	// at its second key frame (an I picture, shown after the leading B-frame after it).
+	// at its second key frame (an I picture, shown after the three leading B-frames after it), also with uneven
+	// timestamps among those B-frames.
 	const original = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/open-gop.ts')));
-	const keyFramePositions: number[] = [];
-	for (let pos = 0; pos < original.length; pos += 188) {
-		const pid = ((original[pos + 1]! & 0x1f) << 8) | original[pos + 2]!;
-		// random_access_indicator
-		if (pid === 0x100 && original[pos + 3]! & 0x20 && original[pos + 4]! > 0 && original[pos + 5]! & 0x40) {
-			keyFramePositions.push(pos);
+	const getVideoPesPacketPositions = (bytes: Uint8Array) => {
+		const positions: number[] = [];
+		for (let pos = 0; pos < bytes.length; pos += 188) {
+			if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && bytes[pos + 1]! & 0x40) {
+				positions.push(pos);
+			}
 		}
-	}
 
+		return positions;
+	};
+	const getPesHeaderPos = (bytes: Uint8Array, pos: number) => {
+		return pos + 4 + (bytes[pos + 3]! & 0x20 ? 1 + bytes[pos + 4]! : 0);
+	};
+	const readTimestamps = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const sink = new EncodedPacketSink(track);
+		const packets = await readAllPackets(sink);
+		for (const packet of packets) {
+			expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+		}
+
+		return packets.map(x => Math.round(x.timestamp * 90_000));
+	};
+
+	const videoPositions = getVideoPesPacketPositions(original);
+	const keyFramePositions = videoPositions.filter(pos => original[pos + 3]! & 0x20 && original[pos + 5]! & 0x40);
 	const cut = new Uint8Array([
-		...original.subarray(0, keyFramePositions[0]),
+		...original.subarray(0, videoPositions[0]),
 		...original.subarray(keyFramePositions[1]),
 	]);
 
-	for (const bytes of [original, cut]) {
+	// The second leading B-frame 2500 ticks early
+	const uneven = cut.slice();
+	const ptsPos = getPesHeaderPos(uneven, getVideoPesPacketPositions(uneven)[2]!) + 9;
+	const pts = ((uneven[ptsPos]! >> 1) & 0x07) * 2 ** 30 + (uneven[ptsPos + 1]! << 22)
+		+ ((uneven[ptsPos + 2]! >> 1) << 15) + (uneven[ptsPos + 3]! << 7) + (uneven[ptsPos + 4]! >> 1) - 2500;
+	uneven.set([
+		(uneven[ptsPos]! & 0xf1) | ((Math.floor(pts / 2 ** 30) & 0x07) << 1),
+		(pts >> 22) & 0xff,
+		((pts >> 14) & 0xfe) | 1,
+		(pts >> 7) & 0xff,
+		((pts << 1) & 0xfe) | 1,
+	], ptsPos);
+
+	for (const bytes of [original, cut, uneven]) {
 		const damaged = bytes.slice();
-		const pos = keyFramePositions[0]!;
-		damaged[pos + 4 + 1 + damaged[pos + 4]! + 7]! &= 0x3f; // PTS_DTS_flags of the first video PES packet
-
-		const readTimestamps = async (data: Uint8Array) => {
-			using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
-			const track = await input.getPrimaryVideoTrack();
-			assert(track);
-			const sink = new EncodedPacketSink(track);
-			const packets = await readAllPackets(sink);
-			for (const packet of packets) {
-				expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
-			}
-
-			return packets.map(x => Math.round(x.timestamp * 90_000));
-		};
-
+		damaged[getPesHeaderPos(damaged, getVideoPesPacketPositions(damaged)[0]!) + 7]! &= 0x3f; // PTS_DTS_flags
 		expect(await readTimestamps(damaged)).toEqual(await readTimestamps(bytes));
 	}
 });

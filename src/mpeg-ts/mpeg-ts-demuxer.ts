@@ -257,6 +257,53 @@ const readAvcPicOrderCntLsb = (data: Uint8Array, sps: AvcSpsInfo) => {
 };
 
 /**
+ * Places the first `count` of the given packets (in decode order) by their picture order counts, between the packets
+ * with a timestamp around each in picture order, or beyond the two closest ones for those before or after all of them.
+ * Returns null if that can't be done.
+ */
+const getTimestampsAmongPictures = (packets: SuppliedPacket[], picOrderCnts: (number | null)[], count: number) => {
+	const references: { pts: number; picOrderCnt: number }[] = [];
+	packets.forEach((packet, i) => {
+		const picOrderCnt = picOrderCnts[i] ?? null;
+		if (i >= count && packet.pts !== null && picOrderCnt !== null) {
+			references.push({ pts: packet.pts, picOrderCnt });
+		}
+	});
+	references.sort((a, b) => a.picOrderCnt - b.picOrderCnt);
+
+	if (references.length < 2) {
+		return null;
+	}
+
+	const result: number[] = [];
+	for (let i = 0; i < count; i++) {
+		const picOrderCnt = picOrderCnts[i] ?? null;
+		if (picOrderCnt === null) {
+			return null;
+		}
+
+		// The references around it, or the two closest ones if it comes before or after all of them
+		let index = references.findIndex(x => x.picOrderCnt > picOrderCnt);
+		if (index === -1) {
+			index = references.length - 1;
+		} else if (index === 0) {
+			index = 1;
+		}
+
+		const before = references[index - 1]!;
+		const after = references[index]!;
+		const ticksPerPicOrderCnt = (after.pts - before.pts) / (after.picOrderCnt - before.picOrderCnt);
+		if (!(ticksPerPicOrderCnt > 0) || !Number.isFinite(ticksPerPicOrderCnt)) {
+			return null;
+		}
+
+		result.push(before.pts + (picOrderCnt - before.picOrderCnt) * ticksPerPicOrderCnt);
+	}
+
+	return result;
+};
+
+/**
  * Derives the picture order counts of consecutive AVC access units (in decode order), relative to the first one. An
  * IDR picture after the first one starts the picture order over: it and the ones after it get null. Returns null if a
  * slice header can't be read.
@@ -2981,34 +3028,37 @@ class PacketBuffer {
 		}
 
 		// Packets before the first one with a timestamp are placed by their picture order too: an IDR picture whose PES
-		// packet has no PTS comes before the B-frames after it, an open-GOP I picture after its leading pictures. The
-		// time per picture order count comes from the first two packets with a timestamp, so read on to the second.
-		const packetAfter = await this.pullPacket();
-		const later = packetAfter && packetAfter.pts === null
-			? await this.readUntimedPackets(packetAfter)
-			: { packets: [], nextTimedPacket: packetAfter as TimedSuppliedPacket | null };
+		// packet has no PTS comes before the B-frames after it, an open-GOP I picture after its leading pictures. Each
+		// goes between the packets with a timestamp around it in picture order, so read on until one comes after all
+		// of them in picture order (and there are two).
+		const readPackets: SuppliedPacket[] = [...packets, nextTimedPacket];
+		const runs: { packets: SuppliedPacket[]; nextTimedPacket: TimedSuppliedPacket | null }[] = [];
+		let picOrderCnts = getAvcPicOrderCnts(readPackets, sps);
 
-		const secondTimedPacket = later.nextTimedPacket;
-		const picOrderCnts = secondTimedPacket
-			? getAvcPicOrderCnts([...packets, nextTimedPacket, ...later.packets, secondTimedPacket], sps)
-			: null;
-		const firstPicOrderCnt = picOrderCnts?.[packets.length] ?? null;
-		const secondPicOrderCnt = picOrderCnts?.at(-1) ?? null;
-		const ticksPerPicOrderCnt = secondTimedPacket && firstPicOrderCnt !== null && secondPicOrderCnt !== null
-			? (secondTimedPacket.pts - nextTimedPacket.pts) / (secondPicOrderCnt - firstPicOrderCnt)
-			: null;
+		while (picOrderCnts && readPackets.length < MAX_UNTIMED_PACKET_RUN_LENGTH) {
+			const lastLeadingPicOrderCnt = Math.max(...picOrderCnts.slice(0, packets.length).map(x => x ?? Infinity));
+			const timedPicOrderCnts = picOrderCnts.filter((x, i) => x !== null && readPackets[i]!.pts !== null);
+			if (timedPicOrderCnts.length >= 2 && timedPicOrderCnts.some(x => x! > lastLeadingPicOrderCnt)) {
+				break;
+			}
 
-		if (
-			picOrderCnts
-			&& firstPicOrderCnt !== null
-			&& ticksPerPicOrderCnt !== null
-			&& ticksPerPicOrderCnt > 0
-			&& Number.isFinite(ticksPerPicOrderCnt)
-			&& packets.every((_, i) => picOrderCnts[i] !== null)
-		) {
-			packets.forEach((packet, i) => packet.pts = Math.round(
-				nextTimedPacket.pts + (picOrderCnts[i]! - firstPicOrderCnt) * ticksPerPicOrderCnt,
-			));
+			const packetAfter = await this.pullPacket();
+			const run = packetAfter && packetAfter.pts === null
+				? await this.readUntimedPackets(packetAfter)
+				: { packets: [], nextTimedPacket: packetAfter as TimedSuppliedPacket | null };
+			runs.push(run);
+			readPackets.push(...run.packets, ...(run.nextTimedPacket ? [run.nextTimedPacket] : []));
+			picOrderCnts = getAvcPicOrderCnts(readPackets, sps);
+
+			if (!run.nextTimedPacket || picOrderCnts?.at(-1) === null) {
+				// The end of the stream, or the picture order starts over
+				break;
+			}
+		}
+
+		const timestamps = picOrderCnts && getTimestampsAmongPictures(readPackets, picOrderCnts, packets.length);
+		if (timestamps) {
+			packets.forEach((packet, i) => packet.pts = Math.round(timestamps[i]!));
 			this.pendingPackets.push(...packets as TimedSuppliedPacket[]);
 			this.setLastTimedPacket(nextTimedPacket);
 			this.pendingPackets.push(nextTimedPacket);
@@ -3016,7 +3066,9 @@ class PacketBuffer {
 			this.placeUntimedPackets(packets, nextTimedPacket);
 		}
 
-		this.placeUntimedPackets(later.packets, secondTimedPacket);
+		for (const run of runs) {
+			this.placeUntimedPackets(run.packets, run.nextTimedPacket);
+		}
 	}
 
 	/** Reads the packets without a timestamp starting with the given one, up to the next packet with one. */
