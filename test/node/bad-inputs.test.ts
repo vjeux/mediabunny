@@ -1705,6 +1705,15 @@ test('Ogg: Short Opus identification header', async () => {
 	));
 });
 
+test('Ogg: Opus with zero channels', async () => {
+	const head = opusHead();
+	head[9] = 0; // Output channel count
+	await expectGracefulRead(
+		concat(oggPacketsPage({ headerType: 2 }, [head]), ...opusPages().slice(1)),
+		/Invalid Opus identification header/,
+	);
+});
+
 test('Ogg: Opus comments with many repeated keys', async () => {
 	// Repeated keys used to copy the growing list of values each time
 	const tags = opusTags(Array<Bytes>(100_000).fill(ascii('A=')));
