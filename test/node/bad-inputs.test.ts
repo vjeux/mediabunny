@@ -478,6 +478,28 @@ test('MP4: Empty boxes', async () => {
 	}
 });
 
+test('MP4: nclx colr box without its full range byte', async () => {
+	// Real files carry 18-byte nclx boxes (ExoPlayer's sample_18byte_nclx_colr.mp4). The missing byte used to be read
+	// past the box, failing the whole file; like FFmpeg, the color description is still read
+	const avcC = box('avcC', [1, 0x64, 0x00, 0x1f, 0xff, 0xe0, 0x00]);
+	const colr = box('colr', ascii('nclx'), u16(1), u16(1), u16(1));
+	const file = mp4([trak({
+		handler: 'vide',
+		stbl: [stsd(videoSampleEntry('avc1', [avcC, colr])), ...singleChunkStbl(1, 0).slice(1)],
+	})]);
+
+	await expectGracefulRead(file);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await input.getVideoTracks())[0]!;
+	expect((await track.getDecoderConfig())?.colorSpace).toEqual({
+		primaries: 'bt709',
+		transfer: 'bt709',
+		matrix: 'bt709',
+		fullRange: undefined,
+	});
+});
+
 test('MP4: Broken fragment followed by valid ones', async () => {
 	// An error inside one moof used to leave parser state behind that tripped up reading the next ones
 	await expectGracefulRead(mp4(fragmentedMoov({ trex: false }), [

@@ -1748,7 +1748,7 @@ export class IsobmffDemuxer extends Demuxer {
 				if (colourType !== 'nclx' && colourType !== 'nclc') {
 					break;
 				}
-				if (boxInfo.contentSize < (colourType === 'nclx' ? 11 : 10)) {
+				if (boxInfo.contentSize < 10) {
 					break;
 				}
 
@@ -1756,8 +1756,10 @@ export class IsobmffDemuxer extends Demuxer {
 				const transferCharacteristics = readU16Be(slice);
 				const matrixCoefficients = readU16Be(slice);
 
+				// Some files have nclx boxes without the full range byte (ExoPlayer has a sample of them); like
+				// FFmpeg, the rest is still used
 				let fullRange: boolean | undefined = undefined;
-				if (colourType === 'nclx') {
+				if (colourType === 'nclx' && boxInfo.contentSize >= 11) {
 					fullRange = Boolean(readU8(slice) & 0x80);
 				}
 
