@@ -551,6 +551,24 @@ const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {
 	return canvas;
 };
 
+test('VideoSampleSource, transform.frameRate is the frame rate the encoder is configured with', async () => {
+	let framerate: number | undefined;
+
+	await encodeFrames(
+		{
+			codec: 'vp8',
+			quality: new Quality('medium'),
+			transform: { frameRate: 60 },
+			onEncoderConfig: (config) => {
+				framerate = config.framerate;
+			},
+		},
+		[{ width: 64, height: 64, timestamp: 0, duration: 1 / 60 }],
+	);
+
+	expect(framerate).toBe(60);
+});
+
 const encodeFrames = async (
 	encodingConfig: ConstructorParameters<typeof VideoSampleSource>[0],
 	frames: {
