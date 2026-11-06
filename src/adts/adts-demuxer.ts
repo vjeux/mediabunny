@@ -10,7 +10,9 @@ import { aacChannelMap, aacFrequencyTable } from '../../shared/aac-misc';
 import { AudioCodec } from '../codec';
 import { Demuxer } from '../demuxer';
 import {
+	ID3_V1_TAG_SIZE,
 	ID3_V2_HEADER_SIZE,
+	parseId3V1Tag,
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
@@ -27,7 +29,7 @@ import {
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
-import { readBytes, Reader } from '../reader';
+import { readAscii, readBytes, Reader } from '../reader';
 import {
 	AdtsFrameHeader,
 	MIN_ADTS_FRAME_HEADER_SIZE,
@@ -183,6 +185,19 @@ export class AdtsDemuxer extends Demuxer {
 				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
+			}
+
+			// Like for MP3, fall back to an ID3v1 tag at the end of the file when the ID3v2 tags gave us no text fields
+			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
+			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
+				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+
+				if (slice && readAscii(slice, 3) === 'TAG') {
+					parseId3V1Tag(slice, this.metadataTags);
+				}
 			}
 
 			return this.metadataTags;
