@@ -841,6 +841,31 @@ export class VideoSample implements Disposable {
 			return this._data.copyTo(destination, options);
 		}
 
+		// Copying into an RGB format converts the pixels into options.colorSpace (sRGB by default). We can't convert
+		// between color spaces ourselves, so let VideoFrame do it when the sample's RGB data is in another one. Custom
+		// resources are left alone, since they convert colors in toRgbSample().
+		if (
+			options.format
+			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
+			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(this.format!)
+			&& !(this._data instanceof VideoSampleResource)
+			&& !isInPredefinedColorSpace(this.colorSpace, options.colorSpace ?? 'srgb')
+		) {
+			if (typeof VideoFrame === 'undefined') {
+				throw new Error(
+					`For this sample, converting to the '${options.colorSpace ?? 'srgb'}' color space requires`
+					+ ' VideoFrame to be defined.',
+				);
+			}
+
+			const tempFrame = this.toVideoFrame();
+			try {
+				return await tempFrame.copyTo(destination, options);
+			} finally {
+				tempFrame.close();
+			}
+		}
+
 		// Detect non-RGB to RGB conversion
 		if (
 			options.format
@@ -1992,6 +2017,21 @@ export class VideoSampleColorSpace {
 
 const isVideoFrame = (x: unknown): x is VideoFrame => {
 	return typeof VideoFrame !== 'undefined' && x instanceof VideoFrame;
+};
+
+/**
+ * Whether RGB data in the given color space is already in the given predefined color space. Like Chrome, this treats
+ * unspecified members and the BT.709 transfer function as sRGB.
+ */
+const isInPredefinedColorSpace = (colorSpace: VideoSampleColorSpace, target: PredefinedColorSpace) => {
+	const primaries = colorSpace.primaries as string | null;
+	const transfer = colorSpace.transfer as string | null;
+	if (target === 'display-p3') {
+		return primaries === 'smpte432' && transfer === 'iec61966-2-1';
+	}
+
+	return (primaries === null || primaries === 'bt709')
+		&& (transfer === null || transfer === 'iec61966-2-1' || transfer === 'bt709');
 };
 
 /**

@@ -342,6 +342,43 @@ test('RGB conversion for ArrayBuffer-backed data', async () => {
 	}
 });
 
+test('RGB conversion for ArrayBuffer-backed data converts into the target color space', async () => {
+	const data = new Uint8Array([200, 100, 50, 255, 0, 255, 0, 255]);
+	const displayP3 = {
+		primaries: 'smpte432' as VideoColorPrimaries,
+		transfer: 'iec61966-2-1' as VideoTransferCharacteristics,
+		matrix: 'rgb' as VideoMatrixCoefficients,
+		fullRange: true,
+	};
+
+	// Same results as VideoFrame, for sRGB and Display P3 data
+	for (const colorSpace of [undefined, displayP3]) {
+		const init = { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0, colorSpace } as const;
+		using sample = new VideoSample(data, init);
+		const frame = new VideoFrame(data, init);
+		const optionSets: VideoFrameCopyToOptions[] = [
+			{ format: 'RGBA' },
+			{ format: 'BGRA', colorSpace: 'srgb' },
+			{ format: 'RGBA', colorSpace: 'display-p3' },
+			{ format: 'BGRX', colorSpace: 'display-p3' },
+		];
+		for (const options of optionSets) {
+			const expected = new Uint8Array(8);
+			await frame.copyTo(expected, options);
+			const actual = new Uint8Array(8);
+			await sample.copyTo(actual, options);
+			expect([...actual], JSON.stringify({ colorSpace, options })).toEqual([...expected]);
+		}
+		frame.close();
+	}
+
+	// E.g. sRGB orange as Display P3
+	using srgbSample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0 });
+	const p3Bytes = new Uint8Array(8);
+	await srgbSample.copyTo(p3Bytes, { format: 'RGBA', colorSpace: 'display-p3' });
+	[187, 105, 62].forEach((value, i) => expect(Math.abs(p3Bytes[i]! - value)).toBeLessThanOrEqual(2));
+});
+
 test('crop (rect option) for ArrayBuffer-backed data', async () => {
 	// 4x4 RGBA image where each pixel's R/G channels encode (x, y)
 	const width = 4;
