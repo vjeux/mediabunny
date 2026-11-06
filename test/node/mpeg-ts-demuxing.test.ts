@@ -962,4 +962,29 @@ test('MPEG-TS uses an intact copy of a damaged PAT or PMT', async () => {
 		}
 	}
 	expect(await readTracks(allBad)).toEqual(['mp3']);
+
+	// With a single damaged copy of each, the search for an intact one stops after a few seconds of media rather than
+	// reading the whole file
+	const singleBad = allBad.slice();
+	let tableCount = 0;
+	for (let pos = 0; pos < singleBad.length; pos += 188) {
+		const pid = (singleBad[pos + 1]! & 0x1f) << 8 | singleBad[pos + 2]!;
+		if ((pid === 0 || pid === 0x1000) && ++tableCount > 2) {
+			singleBad.set([0x1f, 0xff], pos + 1); // Turn into a null packet
+		}
+	}
+
+	let maxEnd = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => singleBad.byteLength,
+			read: (start, end) => {
+				maxEnd = Math.max(maxEnd, end);
+				return singleBad.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	expect(await Promise.all((await input.getTracks()).map(track => track.getCodec()))).toEqual(['mp3']);
+	expect(maxEnd).toBeLessThan(singleBad.byteLength / 2);
 });

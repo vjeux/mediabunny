@@ -180,10 +180,40 @@ type Section = {
 const ignoredStreamTypes = new Set<number>();
 
 // How far to look for an intact copy of a damaged PSI section. Broadcasts repeat their tables at least every 0.5
-// seconds (ETSI TR 101 290), and FFmpeg only takes damaged sections after 10 of them in a row on a PID.
+// seconds (ETSI TR 101 290), so we stop once the media has progressed by a few seconds, or after a few more damaged
+// copies (the muxer writes bad CRCs). FFmpeg only takes damaged sections after 10 of them in a row on a PID.
 const MAX_PSI_SECTION_REPETITION_DISTANCE = 4 * 1024 * 1024;
+const MAX_PSI_SECTION_REPETITION_DELAY = 2 * MPEG_TS_TIMESCALE;
+const MAX_DAMAGED_PSI_SECTION_COPY_COUNT = 2;
 
 const getPsiTableId = (payload: Uint8Array) => payload[1 + (payload[0] ?? 0)] ?? null;
+
+/** Returns the PTS of the PES packet starting in the given TS packet, as it is in the stream. */
+const getRawPesPacketPts = (packet: TsPacket) => {
+	let offset = 0;
+	if (packet.adaptationFieldControl === 2 || packet.adaptationFieldControl === 3) {
+		offset = 1 + packet.body[0]!;
+	}
+
+	const bytes = packet.body;
+	if (
+		offset + 14 > bytes.length
+		|| bytes[offset] !== 0
+		|| bytes[offset + 1] !== 0
+		|| bytes[offset + 2] !== 1
+		|| (bytes[offset + 6]! & 0xc0) !== 0x80 // No optional PES header
+		|| (bytes[offset + 7]! & 0x80) === 0 // No PTS
+	) {
+		return null;
+	}
+
+	const ptsOffset = offset + 9;
+	return ((bytes[ptsOffset]! >> 1) & 0x07) * 2 ** 30
+		+ (bytes[ptsOffset + 1]! << 22)
+		+ ((bytes[ptsOffset + 2]! >> 1) << 15)
+		+ (bytes[ptsOffset + 3]! << 7)
+		+ (bytes[ptsOffset + 4]! >> 1);
+};
 
 /** Checks the CRC_32 of the PSI section starting after the pointer_field of the given packet payload. */
 const psiSectionIsIntact = (payload: Uint8Array) => {
@@ -1006,6 +1036,8 @@ export class MpegTsDemuxer extends Demuxer {
 
 		const tableId = getPsiTableId(section.payload);
 		const endPos = section.startPos + MAX_PSI_SECTION_REPETITION_DISTANCE;
+		const firstPtsByPid = new Map<number, number>();
+		let damagedCopyCount = 0;
 
 		try {
 			for (let pos = section.startPos + this.packetStride; pos < endPos; pos += this.packetStride) {
@@ -1014,10 +1046,33 @@ export class MpegTsDemuxer extends Demuxer {
 					break;
 				}
 
-				if (packetHeader.pid === section.pid && packetHeader.payloadUnitStartIndicator === 1) {
+				if (packetHeader.payloadUnitStartIndicator === 0) {
+					continue;
+				}
+
+				if (packetHeader.pid === section.pid) {
 					const copy = await this.readSection(pos, true, true);
-					if (copy && getPsiTableId(copy.payload) === tableId && psiSectionIsIntact(copy.payload)) {
-						return copy;
+					if (copy && getPsiTableId(copy.payload) === tableId) {
+						if (psiSectionIsIntact(copy.payload)) {
+							return copy;
+						}
+
+						if (++damagedCopyCount === MAX_DAMAGED_PSI_SECTION_COPY_COUNT) {
+							break;
+						}
+					}
+				} else {
+					const packet = await this.readPacket(pos);
+					const pts = packet && getRawPesPacketPts(packet);
+					if (pts !== null) {
+						const firstPts = firstPtsByPid.get(packetHeader.pid) ?? pts;
+						firstPtsByPid.set(packetHeader.pid, firstPts);
+
+						// The difference, accounting for the timestamps wrapping around
+						const delay = (pts - firstPts + 3 * 2 ** 32) % 2 ** 33 - 2 ** 32;
+						if (delay > MAX_PSI_SECTION_REPETITION_DELAY) {
+							break;
+						}
 					}
 				}
 			}
