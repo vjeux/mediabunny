@@ -3,7 +3,8 @@
  * something is decided with WebCodecs alone, on literal configs and synthetic frames or a tiny known-good stream,
  * never with Mediabunny, so that a Mediabunny failure on a capable platform fails instead of skipping. The configs
  * have the shape of what the tests' encodes use (quantizer-based rate control where the platform accepts it, like
- * Mediabunny's quality levels). Probes run lazily (only when a test needs them) and every native call has a timeout,
+ * Mediabunny's quality levels; no frame rate, like the tests' tracks without frameRate metadata, since WebKitGTK's
+ * HEVC encoder fails without one). Probes run lazily (only when a test needs them) and every native call has a timeout,
  * since some coders hang instead of failing; a hung coder of a kind stalls every later call of that kind on the page,
  * so after one, the probes and tests of that kind report it instead of running.
  */
@@ -91,7 +92,6 @@ const nativeQuantizerMode = memoizeByKey(async (codec: ProbedVideoCodec) => {
 		width: 160,
 		height: 120,
 		bitrateMode: 'quantizer',
-		framerate: 30,
 	});
 });
 
@@ -100,13 +100,13 @@ const nativeVideoConfig = async (codec: ProbedVideoCodec, width: number, height:
 	const codecString = literalCodecString(codec, width, height);
 	if (await nativeQuantizerMode(codec)) {
 		return {
-			config: { codec: codecString, width, height, bitrateMode: 'quantizer', framerate: 30 },
+			config: { codec: codecString, width, height, bitrateMode: 'quantizer' },
 			encodeOptions: quantizerOptions(codec, LITERAL_QUANTIZERS[codec]!.middle),
 		} as const;
 	}
 
 	return {
-		config: { codec: codecString, width, height, bitrate, framerate: 30 },
+		config: { codec: codecString, width, height, bitrate },
 		encodeOptions: {},
 	} as const;
 };
@@ -356,7 +356,7 @@ export const nativeVideoContradicts = async (codec: ProbedVideoCodec, width: num
 export const avcKeepsEveryFrame = memoize(async () => {
 	const lumas = [16, 48, 80, 112, 144, 176, 208, 240];
 	const roundTrip = await nativeRoundTrip({
-		config: { codec: literalCodecString('avc', 64, 64), width: 64, height: 64, bitrate: 32_000, framerate: 30 },
+		config: { codec: literalCodecString('avc', 64, 64), width: 64, height: 64, bitrate: 32_000 },
 		frames: lumas.map(luma => ({ luma })),
 	});
 
@@ -371,7 +371,7 @@ export const avcKeepsEveryFrame = memoize(async () => {
 export const avcHonorsProfile = memoizeByKey(async (codecString: string) => {
 	const profileIdc = parseInt(codecString.slice(5, 7), 16);
 	const roundTrip = await nativeRoundTrip({
-		config: { codec: codecString, width: 64, height: 64, bitrate: 200_000, framerate: 30 },
+		config: { codec: codecString, width: 64, height: 64, bitrate: 200_000 },
 		frames: [{ luma: 128 }],
 		decode: false,
 	});
@@ -442,7 +442,6 @@ export const flatLumaSurvives = memoizeByKey(async (codec: ProbedVideoCodec) => 
 			width: 160,
 			height: 120,
 			bitrate: 2_000_000,
-			framerate: 30,
 		},
 		frames: lumas.map(luma => ({ luma, colorSpace: ALPHA_COLOR_SPACE })),
 		decoderColorSpace: ALPHA_COLOR_SPACE,
