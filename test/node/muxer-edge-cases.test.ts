@@ -113,3 +113,81 @@ describe('MP3 Xing header on output', () => {
 		expect(toc[99]).toBeGreaterThan(240);
 	});
 });
+
+describe('WAVE output variants', () => {
+	const write = async (format: WavOutputFormat, tags?: Parameters<Output['setMetadataTags']>[0]) => {
+		const target = new BufferTarget();
+		const output = new Output({ format, target });
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source);
+		if (tags) {
+			output.setMetadataTags(tags);
+		}
+		await output.start();
+		const meta = { decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 } };
+		for (let i = 0; i < 3; i++) {
+			await source.add(new EncodedPacket(new Uint8Array(160).fill(i), 'key', i * 0.01, 0.01), meta);
+		}
+		await output.finalize();
+		return new Uint8Array(target.buffer!);
+	};
+
+	test('large: true writes RF64 with the real sizes in ds64', async () => {
+		const bytes = await write(new WavOutputFormat({ large: true }));
+		const view = new DataView(bytes.buffer, bytes.byteOffset);
+		const text = (offset: number) => String.fromCharCode(...bytes.subarray(offset, offset + 4));
+		expect([text(0), view.getUint32(4, true), text(8), text(12), view.getUint32(16, true)])
+			.toEqual(['RF64', 0xffffffff, 'WAVE', 'ds64', 28]);
+		expect(Number(view.getBigUint64(20, true))).toBe(bytes.length - 8); // RIFF size
+		expect(Number(view.getBigUint64(28, true))).toBe(480); // Data size
+		expect(Number(view.getBigUint64(36, true))).toBe(240); // Sample count
+		expect(view.getUint32(44, true)).toBe(0); // Table length
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect([await track.getCodec(), await track.computeDuration()]).toEqual(['pcm-s16', 0.03]);
+	});
+
+	test('metadataFormat: id3 writes the tags into an ID3 chunk', async () => {
+		const bytes = await write(new WavOutputFormat({ metadataFormat: 'id3' }), {
+			title: 'Title',
+			artist: 'Ärtist',
+			albumArtist: 'Album artist',
+			discNumber: 2,
+		});
+		const chunkIds: string[] = [];
+		for (let pos = 12; pos + 8 <= bytes.length;) {
+			const size = new DataView(bytes.buffer, bytes.byteOffset).getUint32(pos + 4, true);
+			chunkIds.push(String.fromCharCode(...bytes.subarray(pos, pos + 4)));
+			pos += 8 + size + (size & 1);
+		}
+		expect(chunkIds).toEqual(['fmt ', 'ID3 ', 'data']);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		// Unlike RIFF INFO, ID3 keeps non-Latin-1 text and the album artist and disc number
+		expect(await input.getMetadataTags()).toMatchObject({
+			title: 'Title',
+			artist: 'Ärtist',
+			albumArtist: 'Album artist',
+			discNumber: 2,
+		});
+	});
+
+	test('onHeader receives the header up to the data chunk; options are validated', async () => {
+		const headers: [Uint8Array, number][] = [];
+		const bytes = await write(new WavOutputFormat({
+			onHeader: (data, position) => headers.push([data, position]),
+		}));
+		expect(headers.length).toBe(1);
+		const [data, position] = headers[0]!;
+		expect(position).toBe(0);
+		expect(data.length).toBe(44);
+		expect(String.fromCharCode(...data.subarray(36, 40))).toBe('data');
+		expect([...data.subarray(0, 4)]).toEqual([...bytes.subarray(0, 4)]);
+
+		expect(() => new WavOutputFormat({ large: 1 as never })).toThrow(TypeError);
+		expect(() => new WavOutputFormat({ metadataFormat: 'vorbis' as never })).toThrow(TypeError);
+		expect(() => new WavOutputFormat({ onHeader: 'no' as never })).toThrow(TypeError);
+		expect(() => new WavOutputFormat(null as never)).toThrow(TypeError);
+	});
+});
