@@ -954,8 +954,17 @@ export class IsobmffDemuxer extends Demuxer {
 				break;
 			}
 
-			yield { boxInfo, slice };
-			slice.filePos = startPos + boxInfo.totalSize;
+			// Like FFmpeg, cut a box that claims to extend past its parent down to the parent's end, and hand out a
+			// slice bounded to the box so that reading its contents can't run into the boxes after it
+			const totalSize = Math.min(boxInfo.totalSize, slice.end - startPos);
+			const boxSlice = slice.slice(startPos, totalSize);
+			boxSlice.filePos = startPos + boxInfo.headerSize;
+
+			yield {
+				boxInfo: { ...boxInfo, totalSize, contentSize: Math.max(totalSize - boxInfo.headerSize, 0) },
+				slice: boxSlice,
+			};
+			slice.filePos = startPos + totalSize;
 		}
 	}
 
