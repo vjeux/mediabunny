@@ -25,7 +25,15 @@ import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
-import { assert, computeRationalApproximation, last, promiseWithResolvers, Rational, simplifyRational } from '../misc';
+import {
+	assert,
+	computeRationalApproximation,
+	last,
+	promiseWithResolvers,
+	Rational,
+	simplifyRational,
+	toUint8Array,
+} from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
@@ -46,6 +54,7 @@ import { EncodedPacket, PacketType } from '../packet';
 import {
 	concatNalUnitsInLengthPrefixed,
 	extractAvcDecoderConfigurationRecord,
+	InBandParameterSetWriter,
 	extractHevcDecoderConfigurationRecord,
 	iterateNalUnitsInAnnexB,
 	parseOpusTocByte,
@@ -121,6 +130,8 @@ export type IsobmffTrackData = {
 		requiresAnnexBTransformation: boolean;
 		hasAlphaChannel: boolean;
 	};
+	/** Keeps parameter sets of later AVC/HEVC decoder configs, since the sample entry only holds the first one. */
+	parameterSetWriter: InBandParameterSetWriter | null;
 } | {
 	track: OutputAudioTrack;
 	type: 'audio';
@@ -517,6 +528,11 @@ export class IsobmffMuxer extends Muxer {
 				requiresAnnexBTransformation,
 				hasAlphaChannel,
 			},
+			parameterSetWriter: !requiresAnnexBTransformation
+				&& (track.source._codec === 'avc' || track.source._codec === 'hevc')
+				&& decoderConfig.description
+				? new InBandParameterSetWriter(track.source._codec, toUint8Array(decoderConfig.description))
+				: null,
 			timescale,
 			samples: [],
 			sampleQueue: [],
@@ -723,6 +739,12 @@ export class IsobmffMuxer extends Muxer {
 				// We don't strip things like SPS or PPS NALUs here, mainly because they can also appear in the middle
 				// of a stream and potentially modify the parameters of it. So, let's just leave them in to be sure.
 				packetData = concatNalUnitsInLengthPrefixed(nalUnits, 4);
+			} else if (trackData.parameterSetWriter) {
+				packetData = trackData.parameterSetWriter.process(
+					packetData,
+					packet.type,
+					meta?.decoderConfig?.description,
+				);
 			}
 
 			this.validateTimestamp(

@@ -305,19 +305,23 @@ export class MpegTsMuxer extends Muxer {
 		meta?: EncodedVideoChunkMetadata,
 	): Uint8Array {
 		const codec = (trackData.track as OutputVideoTrack).source._codec;
+		const description = meta?.decoderConfig?.description;
 
 		if (trackData.inputIsAnnexB === null) {
 			// This is the first packet
-			const description = meta?.decoderConfig?.description;
 			trackData.inputIsAnnexB = !description;
+		}
 
-			if (!trackData.inputIsAnnexB) {
-				const bytes = toUint8Array(description!);
-				if (codec === 'avc') {
-					trackData.avcDecoderConfig = deserializeAvcDecoderConfigurationRecord(bytes);
-				} else {
-					trackData.hevcDecoderConfig = deserializeHevcDecoderConfigurationRecord(bytes);
-				}
+		if (!trackData.inputIsAnnexB && description) {
+			// Always take the parameter sets of the latest decoder config, since they're written in front of every key
+			// frame and a config can change mid-stream (e.g. when the browser replaces a failing hardware encoder)
+			const bytes = toUint8Array(description);
+			if (codec === 'avc') {
+				trackData.avcDecoderConfig = deserializeAvcDecoderConfigurationRecord(bytes)
+					?? trackData.avcDecoderConfig;
+			} else {
+				trackData.hevcDecoderConfig = deserializeHevcDecoderConfigurationRecord(bytes)
+					?? trackData.hevcDecoderConfig;
 			}
 		}
 
