@@ -632,12 +632,18 @@ test('Treat non-standard VideoFrame color space values as unknown', () => {
 test('init visibleRect and display size refine a wrapped VideoFrame', () => {
 	using source = makeCoordinateSample({});
 
-	using cropped = new VideoSample(source.toVideoFrame(), { visibleRect: { left: 2, top: 0, width: 2, height: 4 } });
+	const frame = source.toVideoFrame();
+	const cropped = new VideoSample(frame, { visibleRect: { left: 2, top: 0, width: 2, height: 4 } });
 	expect(cropped.visibleRect).toEqual({ left: 2, top: 0, width: 2, height: 4 });
 	expect([cropped.displayWidth, cropped.displayHeight]).toEqual([2, 4]);
 	const pixels = drawToPixels(cropped, 2, 4);
 	expect(pixelAt(pixels, 2, 0, 0)).toEqual([2, 0]);
 	expect(pixelAt(pixels, 2, 1, 3)).toEqual([3, 3]);
+
+	// The passed frame stays usable until the sample is closed
+	expect(frame.format).toBe('RGBA');
+	cropped.close();
+	expect(frame.format).toBe(null);
 
 	using stretched = new VideoSample(source.toVideoFrame(), { displayWidth: 8, displayHeight: 4 });
 	expect([stretched.displayWidth, stretched.displayHeight]).toEqual([8, 4]);
