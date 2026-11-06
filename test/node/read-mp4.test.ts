@@ -611,3 +611,87 @@ test('A cold packet lookup in a file of many indexed fragments reads a bounded n
 		expect(reads).toBeLessThan(500);
 	}
 });
+
+test('Packet durations of frames presented at the same time, fragmented or not', async () => {
+	// From the L17 fuzz sweep: AVC with B-frames where two pairs of frames share a presentation timestamp. Like the
+	// non-fragmented reading, the frame decoded first of a pair lasts 0, also when the pair spans fragments.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	// In decode order, at a timescale of 57600; only the first frame is a sync sample
+	const presentationTimestamps = [2892, 2950, 2957, 2950, 2956, 3017, 3015, 2957];
+	const durations = [1, 1, 1, 1, 1, 57, 1, 1];
+	const decodeTimestamps = durations.map((_, i) => 2800 + durations.slice(0, i).reduce((a, b) => a + b, 0));
+	const offsets = presentationTimestamps.map((timestamp, i) => timestamp - decodeTimestamps[i]!);
+
+	const trak = (stbl: number[][]) => box('trak',
+		box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+		box('mdia',
+			box('mdhd', zeros(12), u32(57600), u32(0), [0x55, 0xc4, 0, 0]),
+			box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+			box('minf', box('stbl', box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+				...stbl)),
+		),
+	);
+	const mvhd = box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28));
+	const ftyp = box('ftyp', ascii('iso5'), u32(0));
+
+	const nonFragmented = () => {
+		const moov = (chunkOffset: number) => box('moov', mvhd, trak([
+			box('stts', u32(0), u32(3), u32(5), u32(1), u32(1), u32(57), u32(2), u32(1)),
+			box('ctts', u32(0), u32(8), ...offsets.map(offset => [...u32(1), ...u32(offset)])),
+			box('stss', u32(0), u32(1), u32(1)),
+			box('stsc', u32(0), u32(1), u32(1), u32(8), u32(1)),
+			box('stsz', u32(0), u32(1), u32(8)),
+			box('stco', u32(0), u32(1), u32(chunkOffset)),
+		]));
+		const dataStart = ftyp.length + moov(0).length + 8;
+		return new Uint8Array([...ftyp, ...moov(dataStart), ...box('mdat', zeros(8))]);
+	};
+
+	const fragmented = (fragmentSizes: number[]) => {
+		const moov = box('moov', mvhd, trak([
+			box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+		]), box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))));
+
+		let start = 0;
+		const fragments = fragmentSizes.flatMap((size, i) => {
+			const indices = Array.from({ length: size }, (_, j) => start + j);
+			const traf = (dataOffset: number) => box('traf',
+				box('tfhd', u32(0x020000), u32(1)),
+				box('tfdt', u32(0), u32(decodeTimestamps[indices[0]!]!)),
+				box('trun', u32(0xf01), u32(size), u32(dataOffset), ...indices.map(index => [
+					...u32(durations[index]!), ...u32(1), ...u32(index === 0 ? 0 : 0x10000), ...u32(offsets[index]!),
+				])),
+			);
+			start += size;
+			const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+			return [...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)), ...box('mdat', zeros(size))];
+		});
+		return new Uint8Array([...ftyp, ...moov, ...fragments]);
+	};
+
+	const readDurations = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const result: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			result.push(Math.round(packet.duration * 57600));
+		}
+		return result;
+	};
+
+	// Each frame lasts until the next one in presentation order, ties ordered by decoding
+	const expected = [58, 0, 0, 6, 1, 57, 2, 58];
+	expect(await readDurations(nonFragmented())).toEqual(expected);
+	expect(await readDurations(fragmented([8]))).toEqual(expected);
+	expect(await readDurations(fragmented([3, 3, 2]))).toEqual(expected); // Both pairs span fragments
+});

@@ -3593,10 +3593,18 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		}
 
 		const timestamp = sample.presentationTimestamp;
-		let nextTimestamp = getNextTimestamp(presentation.timestamps, timestamp);
+		// Samples presented at the same time are ordered by decoding, as in non-fragmented files, so a sample decoded
+		// after this one at the same timestamp ends it: later in this fragment, or in a later fragment
+		const lastAtTimestamp = searchTimestamps(presentation.timestamps, timestamp, false) - 1;
+		let nextTimestamp = trackData.presentationTimestamps[lastAtTimestamp]!.sampleIndex !== sampleIndex
+			? timestamp
+			: getNextTimestamp(presentation.timestamps, timestamp);
 		let presentedAfterNext = countTimestampsFrom(presentation.timestamps, nextTimestamp);
 
-		if (presentedAfterNext <= maxReorderedSamples || presentation.minSyncTimestamp > timestamp) {
+		if (
+			nextTimestamp > timestamp
+			&& (presentedAfterNext <= maxReorderedSamples || presentation.minSyncTimestamp > timestamp)
+		) {
 			// Later fragments can't hold a sample presented before nextTimestamp once more than maxReorderedSamples
 			// samples decoded before them are presented at or after it
 			const laterPresentations = [presentation];
@@ -3604,7 +3612,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			let laterSampleCount = 0;
 			let moofOffset = fragment.moofOffset;
 			while (
-				presentedAfterNext <= maxReorderedSamples
+				nextTimestamp > timestamp
+				&& presentedAfterNext <= maxReorderedSamples
 				&& laterSampleCount <= MAX_SCANNED_SAMPLES
 				// No conforming stream presents that many samples decoded after a sample before it
 				&& (nextTimestamp !== Infinity || laterSampleCount <= MAX_REORDERED_SAMPLES)
@@ -3624,7 +3633,10 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				latestTimestamp = Math.max(latestTimestamp, next.presentation.timestamps.at(-1) ?? -Infinity);
 				laterSampleCount += next.presentation.timestamps.length;
 
-				const candidate = getNextTimestamp(next.presentation.timestamps, timestamp);
+				// A later fragment's sample at the same timestamp is decoded after this one, so it counts too
+				const candidate = next.presentation.timestamps[
+					searchTimestamps(next.presentation.timestamps, timestamp, true)
+				] ?? Infinity;
 				if (candidate < nextTimestamp) {
 					nextTimestamp = candidate;
 					presentedAfterNext = 0;
@@ -3639,7 +3651,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			// Earlier fragments can't hold one once a sync sample presented at or before the sample has been seen,
 			// or all of the at most maxReorderedSamples samples decoded before it and presented after it
 			let syncTimestamp = presentation.minSyncTimestamp;
-			if (syncTimestamp > timestamp) {
+			if (syncTimestamp > timestamp && nextTimestamp > timestamp) {
 				let presentedAfterSample = 0;
 				for (let i = 0; i < sampleIndex; i++) {
 					if (trackData.samples[i]!.presentationTimestamp > timestamp) {
