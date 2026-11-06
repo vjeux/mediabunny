@@ -1255,7 +1255,13 @@ export class MatroskaDemuxer extends Demuxer {
 								objectType: null,
 							};
 							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
-						} else if (this.currentTrack.codecId === CODEC_STRING_MAP.mp3) {
+						} else if (
+							this.currentTrack.codecId === CODEC_STRING_MAP.mp3
+							// MPEG-1/2 Layer I and II (e.g. DVB broadcast audio) also go by 'mp3', like in the MP4 and
+							// MPEG-TS readers
+							|| this.currentTrack.codecId === 'A_MPEG/L2'
+							|| this.currentTrack.codecId === 'A_MPEG/L1'
+						) {
 							this.currentTrack.info.codec = 'mp3';
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.opus) {
 							this.currentTrack.info.codec = 'opus';
