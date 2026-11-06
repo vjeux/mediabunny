@@ -104,8 +104,8 @@ export type VideoTransformOptions = {
 	 * letterboxing.
 	 * - `'cover'` will scale the image until the entire box is filled, while preserving aspect ratio.
 	 *
-	 * To avoid ambiguity, this field must not be set when `sizeChangeBehavior` is `'fill'`, `'contain'` or
-	 * `'deny'`, since `sizeChangeBehavior` already determines the fitting algorithm.
+	 * Required when both width and height are set, unless `sizeChangeBehavior` is `'fill'`, `'contain'` or `'cover'`,
+	 * which already determines the fitting algorithm; then, this field can be omitted and, if set, must match it.
 	 */
 	fit?: 'fill' | 'contain' | 'cover';
 	/**

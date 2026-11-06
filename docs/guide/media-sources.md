@@ -98,7 +98,7 @@ type VideoEncodingConfig = {
 - `transform`: Optional transformations to apply to the video frames before they are passed to the encoder.
 	- `width`: The width in pixels to resize the frames to. If `height` is not set, it will be deduced automatically based on aspect ratio.
 	- `height`: The height in pixels to resize the frames to. If `width` is not set, it will be deduced automatically based on aspect ratio.
-	- `fit`: The fitting algorithm in case both `width` and `height` are set. To avoid ambiguity, this field must not be set when `sizeChangeBehavior` is `'fill'`, `'contain'` or `'deny'`, since `sizeChangeBehavior` already determines the fitting algorithm.
+	- `fit`: The fitting algorithm in case both `width` and `height` are set. Required in that case, unless `sizeChangeBehavior` is `'fill'`, `'contain'` or `'cover'`, which already determines the fitting algorithm; then, `fit` can be omitted and, if set, must match it.
 		- `'fill'` will stretch the image to fill the entire box, potentially altering aspect ratio.
 		- `'contain'` will contain the entire image within the box while preserving aspect ratio. This may lead to letterboxing.
 		- `'cover'` will scale the image until the entire box is filled, while preserving aspect ratio.
@@ -137,8 +137,8 @@ type AudioEncodingConfig = {
 	) => unknown;
 };
 ```
-- `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding. Can be omitted for uncompressed PCM codecs.
-- `quality`: The desired quality of the encoded audio; unused for PCM codecs. See [Encoding quality](#encoding-quality).
+- `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding.
+- `quality`: The desired quality of the encoded audio. Required for compressed codecs; can be omitted for uncompressed PCM codecs, for which it is unused. See [Encoding quality](#encoding-quality).
 - `fullCodecString`: Allows you to optionally specify the full codec string used by the audio encoder, as specified in the [Mediabunny Codec Registry](/codec-registry/overview). For example, you may set it to `'mp4a.40.2'` when using AAC. Keep in mind that the codec string must still match the codec specified in `codec`. If you don't set this field, a codec string will be generated automatically.
 - `transform`: Optional transformations to apply to the audio samples before they are passed to the encoder.
 	- `numberOfChannels`: The desired number of output channels to up/downmix to.
