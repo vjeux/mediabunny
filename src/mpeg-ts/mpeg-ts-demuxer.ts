@@ -65,6 +65,7 @@ import {
 	findLastIndex,
 	floorToMultiple,
 	isThenable,
+	isIso639Dash2LanguageCode,
 	IDENTITY_MATRIX,
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
@@ -113,6 +114,7 @@ const MISSING_STREAM_CHECK_SIZE = 2 ** 19;
 const MAX_STREAM_START_DELAY = 120 * MPEG_TS_TIMESCALE;
 
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
+const ISO_639_LANGUAGE_DESCRIPTOR_TAG = 0x0a;
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
 const HDMV_FORMAT_IDENTIFIER = 0x48444d56;
@@ -139,6 +141,9 @@ type ElementaryStream = {
 	 * compensate for another programmer's skill issue.
 	 */
 	canBeTrustedWithKeyPackets: boolean;
+	languageCode: string;
+	/** audio_type from the ISO 639 language descriptor. */
+	audioType: number;
 	info: {
 		type: 'video';
 		codec: VideoCodec;
@@ -412,6 +417,8 @@ export class MpegTsDemuxer extends Demuxer {
 						let hasAc3Descriptor = false;
 						let hasEac3Descriptor = false;
 						let hasDtsDescriptor = false;
+						let languageCode = UNDETERMINED_LANGUAGE;
+						let audioType = 0;
 						while (bitstream.pos < esInfoEndPos) {
 							const descriptorTag = bitstream.readBits(8);
 							const descriptorLength = bitstream.readBits(8);
@@ -428,6 +435,19 @@ export class MpegTsDemuxer extends Demuxer {
 								// which we work out from the bitstream anyway
 								const formatIdentifier = bitstream.readBits(32);
 								hasDtsDescriptor ||= (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
+							} else if (descriptorTag === ISO_639_LANGUAGE_DESCRIPTOR_TAG && descriptorLength >= 4) {
+								// Dual-mono audio may list a second language, but the first one is what describes the
+								// stream as a whole
+								languageCode = String.fromCharCode(
+									bitstream.readBits(8),
+									bitstream.readBits(8),
+									bitstream.readBits(8),
+								);
+								if (!isIso639Dash2LanguageCode(languageCode)) {
+									languageCode = UNDETERMINED_LANGUAGE;
+								}
+
+								audioType = bitstream.readBits(8);
 							}
 
 							bitstream.pos = descriptorEndPos;
@@ -555,6 +575,8 @@ export class MpegTsDemuxer extends Demuxer {
 								initialized: false,
 								firstSection: null,
 								canBeTrustedWithKeyPackets: false,
+								languageCode,
+								audioType,
 								info,
 								referencePesPackets: [],
 							});
@@ -1310,13 +1332,16 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	}
 
 	getLanguageCode() {
-		return UNDETERMINED_LANGUAGE;
+		return this.elementaryStream.languageCode;
 	}
 
 	getDisposition(): TrackDisposition {
 		return {
 			...DEFAULT_TRACK_DISPOSITION,
 			primary: false,
+			// audio_type values per ISO/IEC 13818-1, mapped like FFmpeg does
+			hearingImpaired: this.elementaryStream.audioType === 0x02,
+			visuallyImpaired: this.elementaryStream.audioType === 0x03,
 		};
 	}
 
