@@ -31,6 +31,7 @@ import {
 	TAG_I_FRAMES_ONLY,
 	TAG_MEDIA,
 	TAG_STREAM_INF,
+	TAG_TARGETDURATION,
 } from './hls-misc';
 import { HlsSegmentedInput } from './hls-segmented-input';
 import { SegmentedInputTrackDeclaration } from '../segmented-input';
@@ -190,8 +191,9 @@ export class HlsDemuxer extends Demuxer {
 					mediaTags.push({ fullPath, attributes, lineNumber: i });
 				} else if (line === TAG_I_FRAMES_ONLY) {
 					// iFramesOnlyTagFound = true;
-				} else if (line.startsWith(TAG_EXTINF)) {
-					// This is a media playlist, not a master playlist
+				} else if (line.startsWith(TAG_EXTINF) || line.startsWith(TAG_TARGETDURATION)) {
+					// This is a media playlist, not a master playlist. #EXT-X-TARGETDURATION is required in every media
+					// playlist, even in a live one that doesn't list any segments yet.
 					const segmentedInput = new HlsSegmentedInput(this, rootPath, null, lines);
 
 					this.segmentedInputs = [segmentedInput];
