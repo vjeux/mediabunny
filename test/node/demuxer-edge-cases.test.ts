@@ -759,7 +759,7 @@ describe('MPEG-TS demuxing', () => {
 
 	test('lookups in a long H.264 stream land on the right frames and key frames', async () => {
 		// 60 frames at 25 fps starting at 1 s, a key frame every 10 frames, ~2 KB each so that lookups have to search
-		const sps = buildAvcSps({ profileIdc: 66, levelIdc: 30 });
+		const sps = buildAvcSps({ profileIdc: 66, levelIdc: 30, widthInMbs: 20, heightInMapUnits: 15 });
 		const pps = [0x68, 0xce, 0x38, 0x80];
 		const counter = { value: 0 };
 		const frames = Array.from({ length: 60 }, (_, i) => {
@@ -778,6 +778,7 @@ describe('MPEG-TS demuxing', () => {
 		using input = openBytes(bytes);
 		const track = (await input.getPrimaryVideoTrack())!;
 		expect(await track.getCodec()).toBe('avc');
+		expect([await track.getCodedWidth(), await track.getCodedHeight()]).toEqual([320, 240]);
 		expect(await track.computeDuration()).toBeCloseTo(3.4, 10);
 		const sink = new EncodedPacketSink(track);
 		const frameIndex = (packet: EncodedPacket | null) => packet && Math.round((packet.timestamp - 1) / 0.04);
@@ -955,7 +956,8 @@ describe('FLAC frame parsing', () => {
 		[14, 4800, 28], // 16-bit tens of Hz
 	])('sample rate code %i is accepted when it matches STREAMINFO', async (sampleRateCode, uncommonRate, size) => {
 		const frames = [0, 1, 2].map((num) => {
-			return flacFrame({ num, blockSizeCode: 8, sampleRateCode, uncommonSampleRate: uncommonRate, payload: filler(20) });
+			const payload = filler(20);
+			return flacFrame({ num, blockSizeCode: 8, sampleRateCode, uncommonSampleRate: uncommonRate, payload });
 		});
 		const bytes = flacFile({ sampleRate: 48000, minBlockSize: 256, maxBlockSize: 256, totalSamples: 768, frames });
 		expect(await packetsOf(bytes)).toEqual([`0+256:${size}`, `256+256:${size}`, `512+256:${size}`]);
