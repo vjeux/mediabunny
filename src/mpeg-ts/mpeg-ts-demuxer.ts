@@ -204,6 +204,9 @@ const NOT_A_PACKET_HEADER: TsPacketHeader = {
 	adaptationFieldControl: 0,
 };
 
+/** Thrown for streams we can't make sense of, which then get skipped. */
+class UnreadableStreamError extends Error {}
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -247,6 +250,7 @@ export class MpegTsDemuxer extends Demuxer {
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
 			let firstPts: number | null = null;
+			const unreadableStreamErrors: UnreadableStreamError[] = [];
 
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
@@ -567,290 +571,313 @@ export class MpegTsDemuxer extends Demuxer {
 					const elementaryStream = this.elementaryStreams.find(x => x.pid === section.pid);
 					outer:
 					if (elementaryStream && !elementaryStream.initialized) {
-						const pesPacket = readPesPacket(this, section, true);
-						if (!pesPacket) {
-							throw new Error(
-								`Couldn't read first PES packet for Elementary Stream with PID ${elementaryStream.pid}`,
-							);
-						}
-
-						elementaryStream.firstSection = section;
-						elementaryStream.canBeTrustedWithKeyPackets = section.randomAccessIndicator === 1;
-						firstPts ??= pesPacket.pts;
-
-						if (this.input._initInput) {
-							const initDemuxer = (await this.input._initInput._getDemuxer()) as MpegTsDemuxer;
-							const matchingStream = initDemuxer.elementaryStreams.find(x => (
-								x.pid === section.pid && x.info.codec === elementaryStream.info.codec && x.initialized
-							));
-
-							if (matchingStream) {
-								elementaryStream.info = matchingStream.info;
-								elementaryStream.initialized = true;
-
-								break outer; // We have the stream info, we're done
+						try {
+							const untimedPesPacket = readPesPacket(this, section, false);
+							if (!untimedPesPacket) {
+								throw new UnreadableStreamError(
+									`Couldn't read first PES packet for Elementary Stream with PID`
+									+ ` ${elementaryStream.pid}`,
+								);
 							}
-						}
+							if (untimedPesPacket.pts === null) {
+								throw new UnreadableStreamError(MISSING_PTS_ERROR_MESSAGE);
+							}
+							const pesPacket = untimedPesPacket as TimestampedPesPacket;
 
-						const context = new PacketReadingContext(elementaryStream, pesPacket);
+							elementaryStream.firstSection = section;
+							elementaryStream.canBeTrustedWithKeyPackets = section.randomAccessIndicator === 1;
+							firstPts ??= pesPacket.pts;
 
-						if (elementaryStream.info.type === 'video') {
-							// We loop because in some files, the video parameters are not in the first packet
-							while (true) {
-								const contextAlias = context; // TyyyyypeScript 😩
-								contextAlias.suppliedPacket = null;
+							if (this.input._initInput) {
+								const initDemuxer = (await this.input._initInput._getDemuxer()) as MpegTsDemuxer;
+								const matchingStream = initDemuxer.elementaryStreams.find(x => (
+									x.pid === section.pid
+									&& x.info.codec === elementaryStream.info.codec
+									&& x.initialized
+								));
+
+								if (matchingStream) {
+									elementaryStream.info = matchingStream.info;
+									elementaryStream.initialized = true;
+
+									break outer; // We have the stream info, we're done
+								}
+							}
+
+							const context = new PacketReadingContext(elementaryStream, pesPacket);
+
+							if (elementaryStream.info.type === 'video') {
+								// We loop because in some files, the video parameters are not in the first packet
+								while (true) {
+									const contextAlias = context; // TyyyyypeScript 😩
+									contextAlias.suppliedPacket = null;
+									await context.markNextPacket();
+
+									if (elementaryStream.info.codec === 'avc') {
+										if (!context.suppliedPacket) {
+											throw new UnreadableStreamError(
+												'Invalid AVC video stream; could not extract'
+												+ ' AVCDecoderConfigurationRecord from any packet.',
+											);
+										}
+
+										elementaryStream.info.avcCodecInfo
+											= extractAvcDecoderConfigurationRecord(context.suppliedPacket.data);
+
+										if (!elementaryStream.info.avcCodecInfo) {
+											continue; // Search the next packet for it
+										}
+
+										const spsUnit = elementaryStream.info.avcCodecInfo.sequenceParameterSets[0];
+										assert(spsUnit);
+										const spsInfo = parseAvcSps(spsUnit)!;
+
+										elementaryStream.info.width = spsInfo.displayWidth;
+										elementaryStream.info.height = spsInfo.displayHeight;
+
+										const num = spsInfo.pixelAspectRatio.num;
+										const den = spsInfo.pixelAspectRatio.den;
+
+										elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
+										elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
+
+										if (num > 0 && den > 0) {
+											if (num > den) {
+												elementaryStream.info.squarePixelWidth = Math.round(
+													elementaryStream.info.width * num / den,
+												);
+											} else {
+												elementaryStream.info.squarePixelHeight = Math.round(
+													elementaryStream.info.height * den / num,
+												);
+											}
+										}
+
+										elementaryStream.info.colorSpace = {
+											primaries:
+												COLOR_PRIMARIES_MAP_INVERSE[spsInfo.colourPrimaries] as
+												VideoColorPrimaries | undefined,
+											transfer:
+												TRANSFER_CHARACTERISTICS_MAP_INVERSE[spsInfo.transferCharacteristics] as
+												VideoTransferCharacteristics | undefined,
+											matrix:
+												MATRIX_COEFFICIENTS_MAP_INVERSE[spsInfo.matrixCoefficients] as
+												VideoMatrixCoefficients | undefined,
+											fullRange: !!spsInfo.fullRangeFlag,
+										};
+										elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+
+										break;
+									} else if (elementaryStream.info.codec === 'hevc') {
+										if (!context.suppliedPacket) {
+											throw new UnreadableStreamError(
+												'Invalid HEVC video stream; could not extract'
+												+ ' HVCDecoderConfigurationRecord from first packet.',
+											);
+										}
+
+										elementaryStream.info.hevcCodecInfo
+											= extractHevcDecoderConfigurationRecord(context.suppliedPacket.data);
+
+										if (!elementaryStream.info.hevcCodecInfo) {
+											continue; // Search the next packet for it
+										}
+
+										const spsArray = elementaryStream.info.hevcCodecInfo.arrays.find(
+											a => a.nalUnitType === HevcNalUnitType.SPS_NUT,
+										)!;
+										const spsUnit = spsArray.nalUnits[0];
+										assert(spsUnit);
+										const spsInfo = parseHevcSps(spsUnit)!;
+
+										elementaryStream.info.width = spsInfo.displayWidth;
+										elementaryStream.info.height = spsInfo.displayHeight;
+
+										const num = spsInfo.pixelAspectRatio.num;
+										const den = spsInfo.pixelAspectRatio.den;
+
+										elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
+										elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
+
+										if (num > 0 && den > 0) {
+											if (num > den) {
+												elementaryStream.info.squarePixelWidth = Math.round(
+													elementaryStream.info.width * num / den,
+												);
+											} else {
+												elementaryStream.info.squarePixelHeight = Math.round(
+													elementaryStream.info.height * den / num,
+												);
+											}
+										}
+
+										elementaryStream.info.colorSpace = {
+											primaries:
+												COLOR_PRIMARIES_MAP_INVERSE[spsInfo.colourPrimaries] as
+												VideoColorPrimaries | undefined,
+											transfer:
+												TRANSFER_CHARACTERISTICS_MAP_INVERSE[spsInfo.transferCharacteristics] as
+												VideoTransferCharacteristics | undefined,
+											matrix:
+												MATRIX_COEFFICIENTS_MAP_INVERSE[spsInfo.matrixCoefficients] as
+												VideoMatrixCoefficients | undefined,
+											fullRange: !!spsInfo.fullRangeFlag,
+										};
+										elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+
+										break;
+									} else {
+										throw new Error('Unhandled.');
+									}
+								}
+
+								elementaryStream.info.decoderConfig = {
+									codec: extractVideoCodecString({
+										width: elementaryStream.info.width,
+										height: elementaryStream.info.height,
+										codec: elementaryStream.info.codec,
+										codecDescription: null,
+										colorSpace: elementaryStream.info.colorSpace,
+										avcType: 1,
+										avcCodecInfo: elementaryStream.info.avcCodecInfo,
+										hevcCodecInfo: elementaryStream.info.hevcCodecInfo,
+										vp9CodecInfo: null,
+										av1CodecInfo: null,
+										proresFormat: null,
+									}),
+									codedWidth: elementaryStream.info.width,
+									codedHeight: elementaryStream.info.height,
+									colorSpace: elementaryStream.info.colorSpace,
+								};
+
+								if (
+									elementaryStream.info.width !== elementaryStream.info.squarePixelWidth
+									|| elementaryStream.info.height !== elementaryStream.info.squarePixelHeight
+								) {
+									elementaryStream.info.decoderConfig.displayAspectWidth
+										= elementaryStream.info.squarePixelWidth;
+									elementaryStream.info.decoderConfig.displayAspectHeight
+										= elementaryStream.info.squarePixelHeight;
+								}
+
+								elementaryStream.initialized = true;
+							} else {
 								await context.markNextPacket();
+								if (!context.suppliedPacket) {
+									throw new UnreadableStreamError(
+										`Couldn't parse first media packet for Elementary Stream with`
+										+ ` PID ${elementaryStream.pid}`,
+									);
+								}
 
-								if (elementaryStream.info.codec === 'avc') {
-									if (!context.suppliedPacket) {
-										throw new Error(
-											'Invalid AVC video stream; could not extract AVCDecoderConfigurationRecord'
-											+ ' from any packet.',
+								if (elementaryStream.info.codec === 'aac') {
+									const slice = FileSlice.tempFromBytes(context.suppliedPacket.data);
+									const header = readAdtsFrameHeader(slice);
+									if (!header) {
+										throw new UnreadableStreamError(
+											'Invalid AAC audio stream; could not read ADTS frame header from first'
+											+ ' packet.',
 										);
 									}
 
-									elementaryStream.info.avcCodecInfo
-										= extractAvcDecoderConfigurationRecord(context.suppliedPacket.data);
-
-									if (!elementaryStream.info.avcCodecInfo) {
-										continue; // Search the next packet for it
-									}
-
-									const spsUnit = elementaryStream.info.avcCodecInfo.sequenceParameterSets[0];
-									assert(spsUnit);
-									const spsInfo = parseAvcSps(spsUnit)!;
-
-									elementaryStream.info.width = spsInfo.displayWidth;
-									elementaryStream.info.height = spsInfo.displayHeight;
-
-									const num = spsInfo.pixelAspectRatio.num;
-									const den = spsInfo.pixelAspectRatio.den;
-
-									elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
-									elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
-
-									if (num > 0 && den > 0) {
-										if (num > den) {
-											elementaryStream.info.squarePixelWidth = Math.round(
-												elementaryStream.info.width * num / den,
-											);
-										} else {
-											elementaryStream.info.squarePixelHeight = Math.round(
-												elementaryStream.info.height * den / num,
-											);
-										}
-									}
-
-									elementaryStream.info.colorSpace = {
-										primaries:
-											COLOR_PRIMARIES_MAP_INVERSE[spsInfo.colourPrimaries] as
-											VideoColorPrimaries | undefined,
-										transfer:
-											TRANSFER_CHARACTERISTICS_MAP_INVERSE[spsInfo.transferCharacteristics] as
-											VideoTransferCharacteristics | undefined,
-										matrix:
-											MATRIX_COEFFICIENTS_MAP_INVERSE[spsInfo.matrixCoefficients] as
-											VideoMatrixCoefficients | undefined,
-										fullRange: !!spsInfo.fullRangeFlag,
+									elementaryStream.info.aacCodecInfo = {
+										isMpeg2: false,
+										objectType: header.objectType,
 									};
-									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
-
-									break;
-								} else if (elementaryStream.info.codec === 'hevc') {
-									if (!context.suppliedPacket) {
-										throw new Error(
-											'Invalid HEVC video stream; could not extract HVCDecoderConfigurationRecord'
-											+ ' from first packet.',
+									elementaryStream.info.numberOfChannels
+										= aacChannelMap[header.channelConfiguration]!;
+									elementaryStream.info.sampleRate
+										= aacFrequencyTable[header.samplingFrequencyIndex]!;
+								} else if (elementaryStream.info.codec === 'mp3') {
+									const word = readU32Be(FileSlice.tempFromBytes(context.suppliedPacket.data));
+									const result = readMp3FrameHeader(word, context.suppliedPacket.data.byteLength);
+									if (!result.header) {
+										throw new UnreadableStreamError(
+											'Invalid MP3 audio stream; could not read frame header from first packet.',
 										);
 									}
 
-									elementaryStream.info.hevcCodecInfo
-										= extractHevcDecoderConfigurationRecord(context.suppliedPacket.data);
-
-									if (!elementaryStream.info.hevcCodecInfo) {
-										continue; // Search the next packet for it
+									elementaryStream.info.numberOfChannels = getMp3ChannelCount(result.header.channel);
+									elementaryStream.info.sampleRate = result.header.sampleRate;
+								} else if (elementaryStream.info.codec === 'ac3') {
+									const frameInfo = parseAc3SyncFrame(context.suppliedPacket.data);
+									if (!frameInfo) {
+										throw new UnreadableStreamError(
+											'Invalid AC-3 audio stream; could not read sync frame from first packet.',
+										);
 									}
 
-									const spsArray = elementaryStream.info.hevcCodecInfo.arrays.find(
-										a => a.nalUnitType === HevcNalUnitType.SPS_NUT,
-									)!;
-									const spsUnit = spsArray.nalUnits[0];
-									assert(spsUnit);
-									const spsInfo = parseHevcSps(spsUnit)!;
-
-									elementaryStream.info.width = spsInfo.displayWidth;
-									elementaryStream.info.height = spsInfo.displayHeight;
-
-									const num = spsInfo.pixelAspectRatio.num;
-									const den = spsInfo.pixelAspectRatio.den;
-
-									elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
-									elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
-
-									if (num > 0 && den > 0) {
-										if (num > den) {
-											elementaryStream.info.squarePixelWidth = Math.round(
-												elementaryStream.info.width * num / den,
-											);
-										} else {
-											elementaryStream.info.squarePixelHeight = Math.round(
-												elementaryStream.info.height * den / num,
-											);
-										}
+									if (frameInfo.fscod === 3) {
+										throw new UnreadableStreamError(
+											'Invalid AC-3 audio stream; reserved sample rate code found in first'
+											+ ' packet.',
+										);
 									}
 
-									elementaryStream.info.colorSpace = {
-										primaries:
-											COLOR_PRIMARIES_MAP_INVERSE[spsInfo.colourPrimaries] as
-											VideoColorPrimaries | undefined,
-										transfer:
-											TRANSFER_CHARACTERISTICS_MAP_INVERSE[spsInfo.transferCharacteristics] as
-											VideoTransferCharacteristics | undefined,
-										matrix:
-											MATRIX_COEFFICIENTS_MAP_INVERSE[spsInfo.matrixCoefficients] as
-											VideoMatrixCoefficients | undefined,
-										fullRange: !!spsInfo.fullRangeFlag,
-									};
-									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+									elementaryStream.info.numberOfChannels
+										= AC3_ACMOD_CHANNEL_COUNTS[frameInfo.acmod]! + frameInfo.lfeon;
+									elementaryStream.info.sampleRate = AC3_SAMPLE_RATES[frameInfo.fscod]!;
+								} else if (elementaryStream.info.codec === 'eac3') {
+									const frameInfo = parseEac3SyncFrame(context.suppliedPacket.data);
+									if (!frameInfo) {
+										throw new UnreadableStreamError(
+											'Invalid E-AC-3 audio stream; could not read sync frame from first packet.',
+										);
+									}
 
-									break;
+									const sampleRate = getEac3SampleRate(frameInfo);
+									if (sampleRate === null) {
+										throw new UnreadableStreamError(
+											'Invalid E-AC-3 audio stream; reserved sample rate code found in first'
+											+ ' packet.',
+										);
+									}
+
+									elementaryStream.info.numberOfChannels = getEac3ChannelCount(frameInfo);
+									elementaryStream.info.sampleRate = sampleRate;
+								} else if (elementaryStream.info.codec === 'dts') {
+									const frameInfo = parseDtsFrame(context.suppliedPacket.data);
+									if (!frameInfo) {
+										throw new UnreadableStreamError(
+											'Invalid DTS audio stream; could not read frame header from first packet.',
+										);
+									}
+
+									elementaryStream.info.numberOfChannels = frameInfo.numberOfChannels;
+									elementaryStream.info.sampleRate = frameInfo.sampleRate;
+
+									if (frameInfo.core) {
+										// Telling the two extension-only variants apart would need us to work out
+										// whether the asset holds XLL or LBR data, so we leave those unlabeled
+										elementaryStream.info.dtsFormat = frameInfo.hasExtensions ? 'dtsh' : 'dtsc';
+									}
 								} else {
 									throw new Error('Unhandled.');
 								}
-							}
 
-							elementaryStream.info.decoderConfig = {
-								codec: extractVideoCodecString({
-									width: elementaryStream.info.width,
-									height: elementaryStream.info.height,
-									codec: elementaryStream.info.codec,
-									codecDescription: null,
-									colorSpace: elementaryStream.info.colorSpace,
-									avcType: 1,
-									avcCodecInfo: elementaryStream.info.avcCodecInfo,
-									hevcCodecInfo: elementaryStream.info.hevcCodecInfo,
-									vp9CodecInfo: null,
-									av1CodecInfo: null,
-									proresFormat: null,
-								}),
-								codedWidth: elementaryStream.info.width,
-								codedHeight: elementaryStream.info.height,
-								colorSpace: elementaryStream.info.colorSpace,
-							};
-
-							if (
-								elementaryStream.info.width !== elementaryStream.info.squarePixelWidth
-								|| elementaryStream.info.height !== elementaryStream.info.squarePixelHeight
-							) {
-								elementaryStream.info.decoderConfig.displayAspectWidth
-									= elementaryStream.info.squarePixelWidth;
-								elementaryStream.info.decoderConfig.displayAspectHeight
-									= elementaryStream.info.squarePixelHeight;
-							}
-
-							elementaryStream.initialized = true;
-						} else {
-							await context.markNextPacket();
-							if (!context.suppliedPacket) {
-								throw new Error(
-									`Couldn't parse first media packet for Elementary Stream with`
-									+ ` PID ${elementaryStream.pid}`,
-								);
-							}
-
-							if (elementaryStream.info.codec === 'aac') {
-								const slice = FileSlice.tempFromBytes(context.suppliedPacket.data);
-								const header = readAdtsFrameHeader(slice);
-								if (!header) {
-									throw new Error(
-										'Invalid AAC audio stream; could not read ADTS frame header from first packet.',
-									);
-								}
-
-								elementaryStream.info.aacCodecInfo = {
-									isMpeg2: false,
-									objectType: header.objectType,
+								elementaryStream.info.decoderConfig = {
+									codec: extractAudioCodecString({
+										codec: elementaryStream.info.codec,
+										codecDescription: null,
+										aacCodecInfo: elementaryStream.info.aacCodecInfo,
+										dtsFormat: elementaryStream.info.dtsFormat,
+									}),
+									numberOfChannels: elementaryStream.info.numberOfChannels,
+									sampleRate: elementaryStream.info.sampleRate,
 								};
-								elementaryStream.info.numberOfChannels
-									= aacChannelMap[header.channelConfiguration]!;
-								elementaryStream.info.sampleRate
-									= aacFrequencyTable[header.samplingFrequencyIndex]!;
-							} else if (elementaryStream.info.codec === 'mp3') {
-								const word = readU32Be(FileSlice.tempFromBytes(context.suppliedPacket.data));
-								const result = readMp3FrameHeader(word, context.suppliedPacket.data.byteLength);
-								if (!result.header) {
-									throw new Error(
-										'Invalid MP3 audio stream; could not read frame header from first packet.',
-									);
-								}
-
-								elementaryStream.info.numberOfChannels = getMp3ChannelCount(result.header.channel);
-								elementaryStream.info.sampleRate = result.header.sampleRate;
-							} else if (elementaryStream.info.codec === 'ac3') {
-								const frameInfo = parseAc3SyncFrame(context.suppliedPacket.data);
-								if (!frameInfo) {
-									throw new Error(
-										'Invalid AC-3 audio stream; could not read sync frame from first packet.',
-									);
-								}
-
-								if (frameInfo.fscod === 3) {
-									throw new Error(
-										'Invalid AC-3 audio stream; reserved sample rate code found in first packet.',
-									);
-								}
-
-								elementaryStream.info.numberOfChannels
-									= AC3_ACMOD_CHANNEL_COUNTS[frameInfo.acmod]! + frameInfo.lfeon;
-								elementaryStream.info.sampleRate = AC3_SAMPLE_RATES[frameInfo.fscod]!;
-							} else if (elementaryStream.info.codec === 'eac3') {
-								const frameInfo = parseEac3SyncFrame(context.suppliedPacket.data);
-								if (!frameInfo) {
-									throw new Error(
-										'Invalid E-AC-3 audio stream; could not read sync frame from first packet.',
-									);
-								}
-
-								const sampleRate = getEac3SampleRate(frameInfo);
-								if (sampleRate === null) {
-									throw new Error(
-										'Invalid E-AC-3 audio stream; reserved sample rate code found in first packet.',
-									);
-								}
-
-								elementaryStream.info.numberOfChannels = getEac3ChannelCount(frameInfo);
-								elementaryStream.info.sampleRate = sampleRate;
-							} else if (elementaryStream.info.codec === 'dts') {
-								const frameInfo = parseDtsFrame(context.suppliedPacket.data);
-								if (!frameInfo) {
-									throw new Error(
-										'Invalid DTS audio stream; could not read frame header from first packet.',
-									);
-								}
-
-								elementaryStream.info.numberOfChannels = frameInfo.numberOfChannels;
-								elementaryStream.info.sampleRate = frameInfo.sampleRate;
-
-								if (frameInfo.core) {
-									// Telling the two extension-only variants apart would need us to work out
-									// whether the asset holds XLL or LBR data, so we leave those unlabeled
-									elementaryStream.info.dtsFormat = frameInfo.hasExtensions ? 'dtsh' : 'dtsc';
-								}
-							} else {
-								throw new Error('Unhandled.');
+								elementaryStream.initialized = true;
+							}
+						} catch (error) {
+							if (!(error instanceof UnreadableStreamError)) {
+								throw error;
 							}
 
-							elementaryStream.info.decoderConfig = {
-								codec: extractAudioCodecString({
-									codec: elementaryStream.info.codec,
-									codecDescription: null,
-									aacCodecInfo: elementaryStream.info.aacCodecInfo,
-									dtsFormat: elementaryStream.info.dtsFormat,
-								}),
-								numberOfChannels: elementaryStream.info.numberOfChannels,
-								sampleRate: elementaryStream.info.sampleRate,
-							};
-							elementaryStream.initialized = true;
+							// Like FFmpeg, let's not have one broken, mislabeled or scrambled stream make the whole
+							// file unreadable
+							const pid = elementaryStream.pid;
+							Logging._warn(`Skipping MPEG-TS stream with PID ${pid}: ${error.message}`);
+							this.elementaryStreams.splice(this.elementaryStreams.indexOf(elementaryStream), 1);
+							unreadableStreamErrors.push(error);
 						}
 					}
 				}
@@ -869,6 +896,11 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 
 				throw new Error('No Program Map Table found in the file.');
+			}
+
+			if (unreadableStreamErrors.length > 0 && !this.elementaryStreams.some(x => x.initialized)) {
+				// Nothing readable is left, so the error is more helpful than an empty file
+				throw unreadableStreamErrors[0]!;
 			}
 
 			for (const stream of this.elementaryStreams) {
