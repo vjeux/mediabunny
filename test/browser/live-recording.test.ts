@@ -173,9 +173,16 @@ const createGatedFeed = (
 ) => {
 	const videoGate = processor.gate(tracks.videoTrack);
 	const audioGate = processor.gate(tracks.audioTrack);
-	const waitForEncoderRoom = async (source: MediaStreamVideoTrackSource | MediaStreamAudioTrackSource) => {
-		const encoder = (source as unknown as { _encoder: { getQueueSize(): number } })._encoder;
-		while (encoder.getQueueSize() >= 4 && !source._closingPromise) {
+	type Source = MediaStreamVideoTrackSource | MediaStreamAudioTrackSource;
+	const waitForEncoderRoom = async (source: Source, sent: number) => {
+		const encoder = (source as unknown as { _encoder: { getQueueSize(): number; encoderInitialized: boolean } })
+			._encoder;
+		// The encoder gets set up (asynchronously) with the first sample; until then, it holds what it's given outside
+		// of its queue, and closing the source would discard it
+		while (
+			!source._closingPromise
+			&& (encoder.getQueueSize() >= 4 || (sent > 0 && !encoder.encoderInitialized))
+		) {
 			await sleep(1);
 		}
 	};
@@ -192,7 +199,7 @@ const createGatedFeed = (
 		},
 		writeNext: async () => {
 			if (10 * audioChunks <= 40 * videoFrames) {
-				await waitForEncoderRoom(sources.audio);
+				await waitForEncoderRoom(sources.audio, audioChunks);
 				await audioGate.push(new AudioData({
 					format: 'f32-planar',
 					sampleRate: 48000,
@@ -203,7 +210,7 @@ const createGatedFeed = (
 				}));
 				audioChunks++;
 			} else {
-				await waitForEncoderRoom(sources.video);
+				await waitForEncoderRoom(sources.video, videoFrames);
 				context.fillStyle = `rgb(${videoFrames % 256}, 0, 0)`;
 				context.fillRect(0, 0, canvas.width, canvas.height);
 				await videoGate.push(new VideoFrame(canvas, {
