@@ -189,7 +189,7 @@ You can query metadata related to the track's codec:
 ```ts
 await track.getCodec(); // => MediaCodec | null
 ```
-This field is `null` when the track's codec couldn't be recognized or is not supported by Mediabunny. See [Codecs](./supported-formats-and-codecs#codecs) for the full list of supported codecs. When Mediabunny doesn't recognize the format, you can still use the `internalCodecId` field to figure out the codec of the track, although its format depends on the container format used and is not homogenized by Mediabunny.
+This field is `null` when the track's codec couldn't be recognized or is not supported by Mediabunny. See [Codecs](./supported-formats-and-codecs#codecs) for the full list of supported codecs. When Mediabunny doesn't recognize the format, you can still use `getInternalCodecId()` to figure out the codec of the track, although its format depends on the container format used and is not homogenized by Mediabunny.
 
 You can also extract the full codec parameter string from the track, as specified in the [Mediabunny Codec Registry](/codec-registry/overview):
 ```ts
@@ -395,7 +395,7 @@ For example, here's the decoder configuration for an AAC audio track:
 	sampleRate: 44100,
 	description: new Uint8Array([
 		// Bytes of the AudioSpecificConfig
-		17, 144,
+		18, 16,
 	]),
 }
 ```
@@ -477,9 +477,14 @@ We may want to extract downscaled thumbnails from a video track:
 import { CanvasSink } from 'mediabunny';
 
 const videoTrack = await input.getPrimaryVideoTrack();
+if (!videoTrack) {
+	throw new Error('No video track.');
+}
+
 const sink = new CanvasSink(videoTrack, {
 	width: 320,
 	height: 180,
+	fit: 'contain',
 });
 
 const startTimestamp = await videoTrack.getFirstTimestamp();
@@ -616,6 +621,11 @@ type BlobSourceOptions = {
 	// in memory. Defaults to 8 MiB.
 	maxCacheSize?: number;
 
+	// Whether to read the blob through a ReadableStream reader.
+	// Defaults to true; set to false to use a slower but more
+	// stable reading method if you hit (very rare) browser bugs.
+	useStreamReader?: boolean;
+
 	// Handles errors that occur while no read is pending
 	handleUnhandledError?: (error: unknown) => unknown;
 };
@@ -643,7 +653,7 @@ type UrlSourceOptions = {
 	getRetryDelay?: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
 
 	// The maximum number of bytes the cache is allowed to hold
-	// in memory. Defaults to 8 MiB.
+	// in memory. Defaults to 64 MiB.
 	maxCacheSize?: number;
 
 	// The maximum number of parallel requests to use for fetching. Defaults to 2.
@@ -769,13 +779,13 @@ type MaybePromise<T> = T | Promise<T>;
 - `getSize`\
 	Called when the size of the entire file is requested. Must return or resolve to the size in bytes. This function is guaranteed to be called before `read`.
 - `read`\
-	Called when data is requested. Must return or resolve to the bytes from the specified byte range, or a stream that yields these bytes. You are guaranteed that `0 <= start < end < fileSize`.
+	Called when data is requested. Must return or resolve to the bytes from the specified byte range, or a stream that yields these bytes. You are guaranteed that `0 <= start < end <= fileSize`.
 - `dispose`\
 	Called when the `Input` driven by this source is disposed.
 - `maxCacheSize`\
 	The maximum number of bytes the cache is allowed to hold in memory. Defaults to 8 MiB.
 - `prefetchProfile`\
-	Specifies the prefetch profile that the reader should use with this source. A prefetch propfile specifies the pattern with which bytes outside of the requested range are preloaded to reduce latency for future reads.
+	Specifies the prefetch profile that the reader should use with this source. A prefetch profile specifies the pattern with which bytes outside of the requested range are preloaded to reduce latency for future reads.
 	- `'none'` (default): No prefetching; only the data needed in the moment is requested.
 	- `'fileSystem'`: File system-optimized prefetching: a small amount of data is prefetched bidirectionally, aligned with page boundaries.
 	- `'network'`: Network-optimized prefetching, or more generally, prefetching optimized for any high-latency environment: tries to minimize the amount of read calls and aggressively prefetches data when sequential access patterns are detected.
@@ -803,12 +813,12 @@ writer.write(chunk2);
 writer.close();
 ```
 
-This source is *unsized*, meaning calls to `.getSize()` will throw and readers are more limited due to the lack of random file access. You should only use this source with sequential access patterns, such as reading all packets from start to end or doing conversions. This source does not work well with random access patterns unless you increase its max cache size.
+This source is *unsized*, meaning calls to `.getSize()` will throw and readers are more limited due to the lack of random file access. You should only use this source with sequential access patterns, such as reading all packets from start to end or doing conversions. This source does not work well with random access patterns unless you increase its max cache size. MP4 and MOV files without Fast Start (their `moov` box comes after the media data, as in FFmpeg's default output) are such a case: converting one needs the entire file to fit in the cache.
 
 ```ts
 type ReadableStreamSourceOptions = {
 	// The maximum number of bytes the cache is allowed to hold
-	// in memory. Defaults to 16 MiB.
+	// in memory. Defaults to 32 MiB.
 	maxCacheSize?: number;
 
 	// Handles errors that occur while no read is pending
