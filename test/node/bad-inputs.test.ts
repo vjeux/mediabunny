@@ -443,6 +443,23 @@ test('MP4: Nested moof', async () => {
 	]));
 });
 
+test('MP4: trak extending past the end of the moov', async () => {
+	// Seen in old QuickTime files (FFmpeg's samples mov/broken-movs/apple_cv.mov): the trak claims more bytes than the
+	// moov holds. This used to throw for the whole file; FFmpeg cuts a box down to its parent and reads the track.
+	const sampleCount = 3;
+	const header = mp4([trak({ handler: 'vide', stbl: singleChunkStbl(sampleCount, 0) })]);
+	const file = mp4(
+		[trak({ handler: 'vide', stbl: singleChunkStbl(sampleCount, header.length + 8) })],
+		[box('mdat', zeros(4 * sampleCount))],
+	);
+	const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+	const trakPos = indexOfAscii(file, 'trak', 0) - 4;
+	view.setUint32(trakPos, view.getUint32(trakPos) + 100);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	expect(await countPackets(input)).toBe(sampleCount);
+});
+
 test('MP4: Broken fragment followed by valid ones', async () => {
 	// An error inside one moof used to leave parser state behind that tripped up reading the next ones
 	await expectGracefulRead(mp4(fragmentedMoov({ trex: false }), [
