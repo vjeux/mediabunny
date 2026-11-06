@@ -111,6 +111,7 @@ export enum EBMLId {
 	AlphaMode = 0x53c0,
 	Audio = 0xe1,
 	SamplingFrequency = 0xb5,
+	OutputSamplingFrequency = 0x78b5,
 	Channels = 0x9f,
 	BitDepth = 0x6264,
 	SimpleBlock = 0xa3,
