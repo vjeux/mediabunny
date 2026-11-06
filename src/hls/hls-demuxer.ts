@@ -720,16 +720,22 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 				// Avoids reading fields on the track
 				trackBacking = matchingType[0]!;
 			} else {
-				const matchingCodec: InputTrackBacking[] = [];
-				for (const backing of matchingType) {
-					if ((await backing.getCodec()) === this.getCodec()) {
-						matchingCodec.push(backing);
+				// The first, second, ... stream of the type for the first, second, ... rendition without a URI, as long
+				// as its codec matches
+				const indexed = matchingType[this.internalTrack.embeddedIndex];
+				if (indexed && (await indexed.getCodec()) === this.getCodec()) {
+					trackBacking = indexed;
+				} else {
+					const matchingCodec: InputTrackBacking[] = [];
+					for (const backing of matchingType) {
+						if ((await backing.getCodec()) === this.getCodec()) {
+							matchingCodec.push(backing);
+						}
 					}
-				}
 
-				// The first, second, ... stream of the type for the first, second, ... rendition without a URI
-				const index = Math.min(this.internalTrack.embeddedIndex, matchingCodec.length - 1);
-				trackBacking = matchingCodec[index] ?? null;
+					const index = Math.min(this.internalTrack.embeddedIndex, matchingCodec.length - 1);
+					trackBacking = matchingCodec[index] ?? null;
+				}
 			}
 
 			if (!trackBacking) {
