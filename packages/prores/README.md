@@ -22,7 +22,7 @@ npm install mediabunny @mediabunny/prores
 
 Alternatively, directly include them using a script tag:
 ```html
-<script src="mediabunny.js"></script>
+<script src="mediabunny.cjs"></script>
 <script src="mediabunny-prores.js"></script>
 ```
 
