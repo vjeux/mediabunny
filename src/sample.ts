@@ -28,6 +28,7 @@ import {
 	Rectangle,
 	validateRectangle,
 	composeRotationAndFlip,
+	normalizeRotation,
 	roundToMultiple,
 	arrayArgmin,
 	MaybePromise,
@@ -509,6 +510,23 @@ export class VideoSample implements Disposable {
 				validateRectangle(init.visibleRect, 'init.visibleRect');
 			}
 
+			// Browsers put an image's orientation into the frame's rotation and flip when it isn't baked into the
+			// pixels, e.g. for JPEGs with an EXIF orientation. VideoSample keeps orientation in its own metadata, so
+			// move it there and strip it from the frame (else drawing the frame would apply it a second time).
+			const frameRotation = normalizeRotation((data as OrientedVideoFrame).rotation ?? 0);
+			const frameFlip = (data as OrientedVideoFrame).flip ?? false;
+			if (frameRotation !== 0 || frameFlip) {
+				const unorientedFrame = new VideoFrame(data, {
+					// Undoes the orientation, as per the "Add Rotations" algorithm of the WebCodecs spec
+					rotation: frameFlip ? frameRotation : (360 - frameRotation) % 360,
+					flip: frameFlip,
+					displayWidth: frameRotation % 180 === 0 ? data.displayWidth : data.displayHeight,
+					displayHeight: frameRotation % 180 === 0 ? data.displayHeight : data.displayWidth,
+				} as VideoFrameInit);
+				data.close();
+				data = unorientedFrame;
+			}
+
 			this._data = data;
 			this._layout = null;
 
@@ -519,12 +537,18 @@ export class VideoSample implements Disposable {
 				width: data.visibleRect?.width ?? data.codedWidth,
 				height: data.visibleRect?.height ?? data.codedHeight,
 			};
-			// The VideoFrame's rotation and flip are ignored here. They're still new fields, and I'm not sure of any
-			// application where the browser makes use of them. If a case gets found, I'll add it.
-			this.rotation = init?.rotation ?? 0;
-			this.flip = init?.flip ?? false;
 
-			// Assuming no innate VideoFrame rotation here
+			// Like the VideoFrame constructor, the init's rotation and flip are applied on top of the frame's
+			const orientation = composeRotationAndFlip(
+				frameRotation,
+				frameFlip,
+				init?.rotation ?? 0,
+				init?.flip ?? false,
+			);
+			this.rotation = orientation.rotation;
+			this.flip = orientation.flip;
+
+			// The frame has no rotation at this point
 			this.squarePixelWidth = data.displayWidth;
 			this.squarePixelHeight = data.displayHeight;
 
@@ -1992,6 +2016,12 @@ export class VideoSampleColorSpace {
 
 const isVideoFrame = (x: unknown): x is VideoFrame => {
 	return typeof VideoFrame !== 'undefined' && x instanceof VideoFrame;
+};
+
+/** VideoFrame's orientation fields, which aren't in TypeScript's DOM types yet. */
+type OrientedVideoFrame = VideoFrame & {
+	rotation?: number;
+	flip?: boolean;
 };
 
 /**

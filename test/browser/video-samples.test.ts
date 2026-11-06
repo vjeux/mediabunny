@@ -467,7 +467,49 @@ test('transform with flip metadata and additional rotation', async () => {
 	expect(pixelAt(pixels, 4, 3, 0)).toEqual([3, 0]);
 });
 
-/** 4x4 RGBA sample where each pixel's R/G channels encode its (x, y) position. */
+test('VideoFrame rotation and flip become sample metadata', async () => {
+	// A JPEG with EXIF orientation 6 (how phones store portrait photos): stored as 8x4, displayed as 4x8
+	const canvas = new OffscreenCanvas(8, 4);
+	const ctx = canvas.getContext('2d')!;
+	ctx.fillStyle = 'red';
+	ctx.fillRect(0, 0, 8, 4);
+	ctx.fillStyle = 'blue';
+	ctx.fillRect(0, 0, 4, 2);
+	const jpeg = new Uint8Array(await (await canvas.convertToBlob({ type: 'image/jpeg', quality: 1 })).arrayBuffer());
+	// APP1 segment holding a big-endian TIFF with a single IFD entry: Orientation (0x0112) = 6
+	const exif = [
+		0x45, 0x78, 0x69, 0x66, 0, 0, 0x4d, 0x4d, 0, 0x2a, 0, 0, 0, 8,
+		0, 1, 1, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
+	];
+	const app1 = new Uint8Array([0xff, 0xe1, 0, exif.length + 2, ...exif]);
+	const image = new Image();
+	image.src = URL.createObjectURL(new Blob([jpeg.subarray(0, 2), app1, jpeg.subarray(2)]));
+	await image.decode();
+	URL.revokeObjectURL(image.src);
+	expect([image.naturalWidth, image.naturalHeight]).toEqual([4, 8]);
+
+	using sample = new VideoSample(image, { timestamp: 0 });
+	expect(sample.rotation).toBe(90);
+	expect(sample.flip).toBe(false);
+	expect([sample.squarePixelWidth, sample.squarePixelHeight]).toEqual([8, 4]);
+	expect([sample.displayWidth, sample.displayHeight]).toEqual([4, 8]);
+	expect(sample.pixelAspectRatio).toEqual({ num: 1, den: 1 });
+
+	// Drawing it must look like drawing the image itself, so the rotation isn't applied twice
+	const expected = new OffscreenCanvas(4, 8).getContext('2d', { willReadFrequently: true })!;
+	expected.drawImage(image, 0, 0);
+	const actual = new OffscreenCanvas(4, 8).getContext('2d', { willReadFrequently: true })!;
+	sample.draw(actual, 0, 0);
+	expect([...actual.getImageData(0, 0, 4, 8).data]).toEqual([...expected.getImageData(0, 0, 4, 8).data]);
+
+	// A frame's flip is composed with the init's rotation and flip, like the VideoFrame constructor does
+	const frame = new VideoFrame(new Uint8Array(4 * 2 * 4), {
+		format: 'RGBX', codedWidth: 4, codedHeight: 2, timestamp: 0, rotation: 90, flip: true,
+	} as VideoFrameBufferInit);
+	using flipped = new VideoSample(frame, { rotation: 90, flip: true });
+	expect([flipped.rotation, flipped.flip]).toEqual([0, false]);
+	expect([flipped.displayWidth, flipped.displayHeight]).toEqual([4, 2]);
+});
 const makeCoordinateSample = (init: { rotation?: Rotation; flip?: boolean }) => {
 	const data = new Uint8Array(4 * 4 * 4);
 	for (let y = 0; y < 4; y++) {
