@@ -65,7 +65,7 @@ test('Stream targets validate their constructor arguments', () => {
 
 	for (const writable of [undefined, null, {}, new ReadableStream()]) {
 		expect(() => new AppendOnlyStreamTarget(writable as never)).toThrow(
-			new TypeError('AppendOnlyStreamTarget requires a WritableStream instance.'),
+			new TypeError('AppendOnlyStreamTarget requires a WritableStream.'),
 		);
 	}
 });
