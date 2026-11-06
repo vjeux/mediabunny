@@ -3,6 +3,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { ReadableStreamSource } from '../../src/source.js';
+import { countMovedArrayElements } from './array-moves.js';
 
 test('ReadableStreamSource evicts small chunks in constant time', async () => {
 	// 160k ADTS frames of 8 bytes each (62 min at 44.1 kHz), streamed in 16-byte chunks
@@ -37,17 +38,13 @@ test('ReadableStreamSource evicts small chunks in constant time', async () => {
 	const sink = new EncodedPacketSink(track!);
 
 	let packetCount = 0;
-	let halfStart = performance.now();
-	let firstHalfDuration = 0;
-	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
-		packetCount++;
-		if (packetCount === frameCount / 2) {
-			firstHalfDuration = performance.now() - halfStart;
-			halfStart = performance.now();
+	const movedElements = await countMovedArrayElements(async () => {
+		for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+			packetCount++;
 		}
-	}
-	const secondHalfDuration = performance.now() - halfStart;
+	});
 
 	expect(packetCount).toBe(frameCount);
-	expect(secondHalfDuration).toBeLessThan(2 * firstHalfDuration + 100);
+	// Linear: no per-chunk copies of the cache (main moved ~1.6e9 elements)
+	expect(movedElements).toBeLessThan(file.length / chunkSize);
 });
