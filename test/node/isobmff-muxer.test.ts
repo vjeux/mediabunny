@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { CmafOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -749,4 +749,38 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
+});
+
+test('CMAF sidx uses the timescale and ID of the referenced track', async () => {
+	const output = new Output({
+		format: new CmafOutputFormat(),
+		target: new BufferTarget(),
+		initTarget: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	const decoderConfig = {
+		codec: 'mp4a.40.2',
+		numberOfChannels: 2,
+		sampleRate: 48000,
+		description: new Uint8Array([0x11, 0x90]), // AAC-LC, 48 kHz, stereo
+	};
+	for (let i = 0; i < 10; i++) {
+		const packet = new EncodedPacket(new Uint8Array(16), 'key', i * 1024 / 48000, 1024 / 48000);
+		await source.add(packet, { decoderConfig });
+	}
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = toDataView(bytes);
+	const sidxType = bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'sidx');
+	expect(sidxType).toBeGreaterThan(0);
+
+	// ISO 14496-12 recommends the mdhd timescale of the reference track; FFmpeg takes the subsegment duration as is
+	expect(view.getUint32(sidxType + 8)).toBe(1); // reference_ID
+	expect(view.getUint32(sidxType + 12)).toBe(48000); // timescale
+	expect(view.getUint32(sidxType + 40)).toBe(10 * 1024); // subsegment_duration
 });
