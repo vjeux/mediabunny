@@ -81,8 +81,8 @@ type FormatCase = {
 	inputFormat: InputFormat;
 	fixture: string;
 	fields: Field[];
-	/** Which images come back, by kind. */
-	imageKinds: AttachedImage['kind'][];
+	/** Which images come back, by kind; null if the test doesn't write images to this format. */
+	imageKinds: AttachedImage['kind'][] | null;
 	imageDescriptions: boolean;
 	creationTime: boolean;
 };
@@ -124,7 +124,8 @@ const cases: FormatCase[] = [
 		inputFormat: WEBM,
 		fixture: 'preroll-test.opus',
 		fields: ALL_FIELDS,
-		imageKinds: ['coverFront', 'coverBack'],
+		// The WebM spec leaves out Matroska's Attachments element, where cover art would go
+		imageKinds: null,
 		imageDescriptions: true,
 		creationTime: true,
 	},
@@ -222,7 +223,8 @@ const readTags = async (bytes: Uint8Array) => {
 
 describe('Metadata tags across formats', () => {
 	test.each(cases)('$name keeps the fields it can store', async (formatCase) => {
-		const bytes = await remuxWithTags(formatCase.fixture, formatCase.makeFormat(), TAGS);
+		const writtenTags = formatCase.imageKinds === null ? { ...TAGS, images: [] } : TAGS;
+		const bytes = await remuxWithTags(formatCase.fixture, formatCase.makeFormat(), writtenTags);
 		const { format, tags } = await readTags(bytes);
 		expect(format).toBe(formatCase.inputFormat);
 
@@ -238,7 +240,7 @@ describe('Metadata tags across formats', () => {
 		expect(tags.date).toEqual(new Date('2021-04-23T00:00:00Z'));
 
 		const images = tags.images ?? [];
-		expect(images.map(image => image.kind)).toEqual(formatCase.imageKinds);
+		expect(images.map(image => image.kind)).toEqual(formatCase.imageKinds ?? []);
 		for (const image of images) {
 			const written = image.kind === 'coverFront' ? FRONT_COVER : BACK_COVER;
 			expect(image.data).toEqual(written.data);
