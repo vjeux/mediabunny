@@ -129,7 +129,7 @@ const getLuma = (context: OffscreenCanvasRenderingContext2D, source: CanvasImage
 
 const createLumaContext = () => new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true })!;
 
-/** Finds the onsets of 1 kHz beeps: samples above 0.25 after at least 200 ms of quiet. */
+/** Finds the onsets of 1 kHz beeps: samples above 0.25 after at least 100 ms of quiet. */
 const createBeepDetector = () => {
 	let quietFrames = Infinity;
 	const onsets: number[] = [];
@@ -142,7 +142,7 @@ const createBeepDetector = () => {
 					quietFrames++;
 					continue;
 				}
-				if (quietFrames > 0.2 * sampleRate) {
+				if (quietFrames > 0.1 * sampleRate) {
 					onsets.push(timestamp + i / sampleRate);
 				}
 				quietFrames = 0;

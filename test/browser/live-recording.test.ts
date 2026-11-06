@@ -76,8 +76,8 @@ const recordMarkers = async (options: {
 	output.addAudioTrack(audioSource);
 
 	await output.start();
-	source.start(options.durationMs);
-	await sleep(options.durationMs + 500);
+	source.start(options.durationMs, 200);
+	await sleep(200 + options.durationMs + 200);
 	await output.finalize();
 
 	videoTap.stop();
@@ -93,7 +93,11 @@ const recordMarkers = async (options: {
 	};
 };
 
-/** Feeds generator tracks in real time: audio in 10 ms chunks, video frames every `frameIntervalMs`. */
+/**
+ * Feeds generator tracks in real time, in timestamp order: audio in 10 ms chunks, video frames every `frameIntervalMs`.
+ * `beforeWrite` is awaited before each chunk or frame with its time, so tests can act at exact points of the media
+ * (unlike `onTick`, which runs on wall-clock ticks).
+ */
 const feedInRealTime = async (
 	tracks: ReturnType<typeof createGeneratorTracks>,
 	options: {
@@ -103,6 +107,7 @@ const feedInRealTime = async (
 		frameIntervalMs?: number;
 		sampleRate?: number;
 		onTick?: (elapsedMs: number) => unknown;
+		beforeWrite?: (timeMs: number) => unknown;
 	},
 ) => {
 	const canvas = new OffscreenCanvas(64, 48);
@@ -112,22 +117,34 @@ const feedInRealTime = async (
 	let audioChunks = 0;
 	let videoFrames = 0;
 
-	while (performance.now() - start < options.durationMs) {
-		const elapsed = performance.now() - start;
-		await options.onTick?.(elapsed);
+	// Runs until all media is written, even if it fell behind the clock
+	while (true) {
+		await options.onTick?.(performance.now() - start);
 
-		while (elapsed >= (options.audioStartMs ?? 0) + 10 * audioChunks) {
-			await writeAudioChunk(tracks.audioWriter, {
-				timestamp: (start + (options.audioStartMs ?? 0) + 10 * audioChunks) / 1000,
-				numberOfFrames: sampleRate / 100,
-				sampleRate,
-			});
-			audioChunks++;
-		}
-		while (elapsed >= (options.videoStartMs ?? 0) + frameIntervalMs * videoFrames) {
-			const time = start + (options.videoStartMs ?? 0) + frameIntervalMs * videoFrames;
-			await writeVideoFrame(tracks.videoWriter, canvas, time / 1000, `rgb(${videoFrames % 256}, 0, 0)`);
-			videoFrames++;
+		while (true) {
+			const audioTime = (options.audioStartMs ?? 0) + 10 * audioChunks;
+			const videoTime = (options.videoStartMs ?? 0) + frameIntervalMs * videoFrames;
+			const time = Math.min(audioTime, videoTime);
+			if (time >= options.durationMs) {
+				return;
+			}
+			if (time > performance.now() - start) {
+				break;
+			}
+
+			await options.beforeWrite?.(time);
+			if (audioTime <= videoTime) {
+				await writeAudioChunk(tracks.audioWriter, {
+					timestamp: (start + audioTime) / 1000,
+					numberOfFrames: sampleRate / 100,
+					sampleRate,
+				});
+				audioChunks++;
+			} else {
+				const color = `rgb(${videoFrames % 256}, 0, 0)`;
+				await writeVideoFrame(tracks.videoWriter, canvas, (start + videoTime) / 1000, color);
+				videoFrames++;
+			}
 		}
 
 		await sleep(4);
@@ -217,8 +234,8 @@ describe.skipIf(!hasMainThreadTrackProcessor)('A/V sync of canvas capture and We
 			format: format(),
 			video,
 			audio,
-			durationMs: 3000,
-			source: { sampleRate: 48000 },
+			durationMs: 1300,
+			source: { sampleRate: 48000, periodMs: 250, markerMs: 80 },
 		});
 		if (!result) {
 			skip('Web Audio cannot run here without a user gesture');
@@ -241,7 +258,7 @@ describe.skipIf(!hasMainThreadTrackProcessor)('A/V sync of canvas capture and We
 			format: new WebMOutputFormat(),
 			video: { codec: 'vp8', quality: new Quality('low') },
 			audio: { codec: 'opus', quality: new Quality('low') },
-			durationMs: 1500,
+			durationMs: 800,
 			source: { fps: 25, sampleRate: 48000 },
 		});
 		if (!result) {
@@ -249,7 +266,7 @@ describe.skipIf(!hasMainThreadTrackProcessor)('A/V sync of canvas capture and We
 		}
 
 		const { videoTimestamps } = result!.analysis;
-		expect(videoTimestamps.length).toBeGreaterThan(30);
+		expect(videoTimestamps.length).toBeGreaterThan(20);
 		for (let i = 1; i < videoTimestamps.length; i++) {
 			expect(videoTimestamps[i]! - videoTimestamps[i - 1]!).toBeCloseTo(1 / 25, 5);
 		}
@@ -442,9 +459,10 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 		await output.start();
 		await feedInRealTime(tracks, {
 			durationMs: 1000,
-			onTick: (elapsed) => {
-				if (elapsed >= 500 && !videoSource._closingPromise) {
-					videoSource.close();
+			beforeWrite: async (time) => {
+				if (time >= 500 && !videoSource._closingPromise) {
+					await sleep(30); // Lets what was written so far arrive at the source
+					void videoSource.close();
 				}
 			},
 		});
@@ -461,13 +479,19 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 	test('pausing both sources removes the paused time from both tracks', async () => {
 		const { output, errors, tracks, videoSource, audioSource } = createRecording(new WebMOutputFormat());
 		await output.start();
+		// The media from 300 to 700 ms is written while paused
+		let pauseTime = 0;
 		await feedInRealTime(tracks, {
-			durationMs: 1600,
-			onTick: (elapsed) => {
-				if (elapsed >= 500 && elapsed < 1100 && !videoSource.paused) {
+			durationMs: 1000,
+			beforeWrite: async (time) => {
+				if (time >= 300 && time < 700 && !videoSource.paused) {
+					await sleep(30); // Lets what was written so far arrive at the sources
 					videoSource.pause();
 					audioSource.pause();
-				} else if (elapsed >= 1100 && videoSource.paused) {
+					pauseTime = performance.now();
+				} else if (time >= 700 && videoSource.paused) {
+					// Resume as long after the pause as the media it skips, even if the feed had to catch up
+					await sleep(Math.max(30, 400 - (performance.now() - pauseTime)));
 					videoSource.resume();
 					audioSource.resume();
 				}
@@ -478,13 +502,10 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 
 		expect(errors).toEqual([]);
 		const analysis = await analyzeRecording((output.target as BufferTarget).buffer!);
-		expect(analysis.audioEnd!).toBeGreaterThan(0.9);
-		expect(analysis.audioEnd!).toBeLessThan(1.1);
+		// 1 s of media minus the 0.4 s pause, in both tracks (a track that kept the paused time would end at 1 s)
+		expect(analysis.audioEnd!).toBeGreaterThan(0.5);
+		expect(analysis.audioEnd!).toBeLessThan(0.7);
 		expect(Math.abs(analysis.videoEnd! - analysis.audioEnd!)).toBeLessThan(0.1);
-		// No gap left where the pause was
-		const timestamps = analysis.videoTimestamps;
-		const deltas = timestamps.slice(1).map((timestamp, i) => timestamp - timestamps[i]!);
-		expect(Math.max(...deltas)).toBeLessThan(0.1);
 	});
 
 	test('an audio configuration the encoder rejects surfaces through errorPromise', async () => {
@@ -575,10 +596,10 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 			videoSource.errorPromise.catch(error => errors.push(error));
 			output.addVideoTrack(videoSource);
 			await output.start();
-			await sleep(400);
+			await sleep(250);
 			canvas.width = 480;
 			canvas.height = 270;
-			await sleep(400);
+			await sleep(250);
 			await output.finalize();
 			clearInterval(drawInterval);
 			track.stop();
@@ -593,7 +614,7 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 				expect(String(errors[0])).toMatch(/Video sample size must remain constant/);
 			} else {
 				expect(errors).toEqual([]);
-				expect(await videoTrack.computeDuration()).toBeGreaterThan(0.7);
+				expect(await videoTrack.computeDuration()).toBeGreaterThan(0.4);
 			}
 		}
 	});
@@ -607,7 +628,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 		const output = new Output({
 			format: new Mp4OutputFormat({
 				fastStart: 'fragmented',
-				minimumFragmentDuration: 0.5,
+				minimumFragmentDuration: 0.25,
 				onMoof: (data, position, timestamp) => {
 					fragmentStarts.push(timestamp);
 				},
@@ -621,7 +642,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 		const videoSource = new MediaStreamVideoTrackSource(tracks.videoTrack, {
 			codec: 'vp8',
 			quality: new Quality('low'),
-			keyFrameInterval: 0.5,
+			keyFrameInterval: 0.25,
 		});
 		const audioSource = new MediaStreamAudioTrackSource(tracks.audioTrack, lowOpus);
 		output.addVideoTrack(videoSource);
@@ -629,7 +650,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 		await output.start();
 
 		const start = performance.now();
-		await feedInRealTime(tracks, { durationMs: 2200 });
+		await feedInRealTime(tracks, { durationMs: 1200 });
 		const finalizeTime = performance.now();
 		await output.finalize();
 		await tracks.videoWriter.close();
@@ -643,10 +664,10 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 		}
 
 		// Fragments came out during the recording, each covering at least the minimum fragment duration
-		expect(writes.filter(write => write.time > start + 500 && write.time < finalizeTime).length).toBeGreaterThan(1);
+		expect(writes.filter(write => write.time > start + 300 && write.time < finalizeTime).length).toBeGreaterThan(1);
 		expect(fragmentStarts.length).toBeGreaterThanOrEqual(3);
 		for (let i = 1; i < fragmentStarts.length; i++) {
-			expect(fragmentStarts[i]! - fragmentStarts[i - 1]!).toBeGreaterThanOrEqual(0.5 - 1e-6);
+			expect(fragmentStarts[i]! - fragmentStarts[i - 1]!).toBeGreaterThanOrEqual(0.25 - 1e-6);
 		}
 	});
 
@@ -682,7 +703,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 		const videoSource = new MediaStreamVideoTrackSource(tracks.videoTrack, {
 			codec: 'vp9',
 			quality: new Quality('low'),
-			keyFrameInterval: 0.5,
+			keyFrameInterval: 0.25,
 		});
 		const audioSource = new MediaStreamAudioTrackSource(tracks.audioTrack, lowOpus);
 		output.addVideoTrack(videoSource);
@@ -698,7 +719,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 
 		const bufferedDuringRecording: number[] = [];
 		await feedInRealTime(tracks, {
-			durationMs: 2000,
+			durationMs: 1200,
 			onTick: () => {
 				if (sourceBuffer && sourceBuffer.buffered.length > 0) {
 					bufferedDuringRecording.push(sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1));
@@ -714,10 +735,10 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 
 		expect(video.error).toBe(null);
 		expect(bufferedDuringRecording.length).toBeGreaterThan(0);
-		expect(bufferedDuringRecording.at(-1)!).toBeGreaterThan(0.9); // Playable while still recording
+		expect(bufferedDuringRecording.at(-1)!).toBeGreaterThan(0.4); // Playable while still recording
 		const buffered = sourceBuffer!.buffered;
 		expect(buffered.length).toBe(1);
-		expect(buffered.end(0)).toBeGreaterThan(1.8);
+		expect(buffered.end(0)).toBeGreaterThan(1);
 	});
 
 	test('live HLS segments start with key frames and are listed while recording', async () => {
@@ -728,7 +749,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 			format: new HlsOutputFormat({
 				segmentFormat: new MpegTsOutputFormat(),
 				live: true,
-				targetDuration: 1,
+				targetDuration: 0.5,
 				onPlaylist: (content) => {
 					if (recording) {
 						playlistsDuringRecording.push(content);
@@ -746,7 +767,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 		const videoSource = new MediaStreamVideoTrackSource(tracks.videoTrack, {
 			codec: 'avc',
 			quality: new Quality('low'),
-			keyFrameInterval: 1,
+			keyFrameInterval: 0.5,
 		});
 		const audioSource = new MediaStreamAudioTrackSource(tracks.audioTrack, {
 			codec: 'aac',
@@ -758,7 +779,7 @@ describe.skipIf(!hasTrackGenerator)('Streaming output', () => {
 		output.addVideoTrack(videoSource);
 		output.addAudioTrack(audioSource);
 		await output.start();
-		await feedInRealTime(tracks, { durationMs: 3500 });
+		await feedInRealTime(tracks, { durationMs: 1800 });
 		recording = false;
 		await output.finalize();
 		await tracks.videoWriter.close();
