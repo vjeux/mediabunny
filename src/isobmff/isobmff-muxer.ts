@@ -1145,6 +1145,16 @@ export class IsobmffMuxer extends Muxer {
 				lastEntry.sampleCount += totalDuration;
 			}
 
+			// Each PCM frame is a sample, but stts and stsz count samples in 32 bits, which would silently wrap around
+			if (last(trackData.timeToSampleTable)!.sampleCount > 2 ** 32 - 1) {
+				throw new Error(
+					`Track #${trackData.track.id} holds more than ${2 ** 32 - 1} PCM audio frames, the most a`
+					+ ` non-fragmented MP4/MOV file can hold since each frame is a sample there. Use fastStart:`
+					+ ` 'fragmented' or another format (such as Matroska, or WAVE with large: true) for longer PCM`
+					+ ' audio.',
+				);
+			}
+
 			trackData.timestampProcessingQueue.length = 0;
 			return;
 		}

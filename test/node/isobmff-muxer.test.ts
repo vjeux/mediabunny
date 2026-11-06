@@ -1377,3 +1377,27 @@ test('Cover art gets the iTunes data type of its image format, whatever the MIME
 	const images = (await input.getMetadataTags()).images!;
 	expect(images.map(image => image.mimeType)).toEqual(['image/jpeg', 'image/png']);
 });
+
+test('PCM tracks with more frames than the sample tables count are rejected instead of wrapping around', async () => {
+	// Non-fragmented files store PCM as one sample per frame, and stts/stsz count samples in 32 bits. This is 2^32
+	// frames of 8-bit mono (24.9 hours at 48 kHz); the packets are views into one buffer and the target drops them.
+	const buffer = new Uint8Array(2 ** 26);
+	const output = new Output({
+		format: new MovOutputFormat({ fastStart: false }),
+		target: new NullTarget(),
+	});
+	const source = new EncodedAudioPacketSource('pcm-u8');
+	output.addAudioTrack(source);
+	await output.start();
+
+	const decoderConfig = { codec: 'pcm-u8', numberOfChannels: 1, sampleRate: 48000 };
+	const mux = async () => {
+		for (let i = 0; i < 64; i++) {
+			const timestamp = i * buffer.length / 48000;
+			await source.add(new EncodedPacket(buffer, 'key', timestamp, buffer.length / 48000), { decoderConfig });
+		}
+		await output.finalize();
+	};
+
+	await expect(mux()).rejects.toThrow(/more than 4294967295 PCM audio frames/);
+});
