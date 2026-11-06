@@ -750,3 +750,33 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
+
+test('FLAC sample entry declares the bit depth from STREAMINFO', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('flac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// 'fLaC', last STREAMINFO block header, then STREAMINFO: 48 kHz, 2 channels, 24 bits per sample
+	const description = new Uint8Array([
+		0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22,
+		0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0xb8, 0x03, 0x70,
+		0x00, 0x00, 0x00, 0x00, ...new Uint8Array(16),
+	]);
+	await source.add(new EncodedPacket(new Uint8Array(100), 'key', 0, 4096 / 48000), {
+		decoderConfig: { codec: 'flac', numberOfChannels: 2, sampleRate: 48000, description },
+	});
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const entryType = bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'fLaC');
+	expect(entryType).toBeGreaterThan(0);
+
+	// AudioSampleEntry: reserved (6), data_reference_index, reserved (8), channelcount, samplesize
+	const sampleSize = toDataView(bytes).getUint16(entryType + 4 + 6 + 2 + 8 + 2);
+	expect(sampleSize).toBe(24); // FLAC-in-ISOBMFF requires samplesize to equal the STREAMINFO bit depth
+});
