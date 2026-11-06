@@ -52,16 +52,22 @@ const ftyp = (majorBrand: string, compatibleBrands: string[] = []) => {
 };
 
 /** A minimal EBML header with the given DocType (string bytes, so padding can be tested) and versions. */
-type EbmlHeaderOptions = { docTypeVersion?: number; ebmlVersion?: number; extra?: number[] };
+type EbmlHeaderOptions = {
+	ebmlVersion?: number;
+	ebmlReadVersion?: number;
+	docTypeVersion?: number;
+	docTypeReadVersion?: number;
+	extra?: number[];
+};
 const ebmlHeader = (docType: number[], options: EbmlHeaderOptions = {}) => {
 	const children = [
 		0x42, 0x86, 0x81, options.ebmlVersion ?? 1, // EBMLVersion
-		0x42, 0xf7, 0x81, 0x01, // EBMLReadVersion
+		0x42, 0xf7, 0x81, options.ebmlReadVersion ?? 1, // EBMLReadVersion
 		0x42, 0xf2, 0x81, 0x04, // EBMLMaxIDLength
 		0x42, 0xf3, 0x81, 0x08, // EBMLMaxSizeLength
 		0x42, 0x82, 0x80 | docType.length, ...docType, // DocType
 		0x42, 0x87, 0x81, options.docTypeVersion ?? 4, // DocTypeVersion
-		0x42, 0x85, 0x81, 0x02, // DocTypeReadVersion
+		0x42, 0x85, 0x81, options.docTypeReadVersion ?? 2, // DocTypeReadVersion
 		...(options.extra ?? []),
 	];
 	return new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x80 | children.length, ...children]);
@@ -158,8 +164,15 @@ describe('Format detection', () => {
 		['FORM AIFF', () => concat(ascii('FORM'), u32be(4), ascii('AIFF'), new Uint8Array(100))],
 		['an unknown leading ISOBMFF box', () => isobmffBox('abcd', new Uint8Array(100))],
 		['an ISOBMFF box smaller than its header', () => concat(u32be(4), ascii('moof'), new Uint8Array(9))],
-		['EBML with DocType version 5', () => ebmlHeader(ascii('matroska'), { docTypeVersion: 5 })],
-		['EBML version 2', () => ebmlHeader(ascii('matroska'), { ebmlVersion: 2 })],
+		// Only the read versions say whether a reader can handle the file (RFC 8794 §11.2.3, RFC 9559 §7)
+		['EBML needing DocType read version 5', () => ebmlHeader(ascii('matroska'), {
+			docTypeVersion: 5,
+			docTypeReadVersion: 5,
+		})],
+		['EBML needing EBML read version 2', () => ebmlHeader(ascii('matroska'), {
+			ebmlVersion: 2,
+			ebmlReadVersion: 2,
+		})],
 		['an unknown EBML DocType', () => ebmlHeader(ascii('mka'))],
 		['a lone MP3 frame header and junk', () => concat(mp3Frame().subarray(0, 4), createRandomBytes(5000, 12))],
 		['ADTS frames with differing sample rates', () => {
