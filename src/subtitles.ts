@@ -71,10 +71,19 @@ export class SubtitleParser {
 			const notes = text.slice(0, match.index);
 			const cueIdentifier = match[1];
 			const matchEnd = match.index! + match[0].length;
-			const bodyStart = text.indexOf('\n', matchEnd) + 1;
+			const lineEnd = text.indexOf('\n', matchEnd);
+			// Without a line break after it, the timing line ends the text and the cue has no text
+			const bodyStart = lineEnd === -1 ? text.length : lineEnd + 1;
 			const cueSettings = text.slice(matchEnd, bodyStart).trim();
 			let bodyEnd = text.indexOf('\n\n', matchEnd);
 			if (bodyEnd === -1) bodyEnd = text.length;
+
+			// Like in the W3C parser, a line containing "-->" starts the next cue, even without a blank line before it.
+			// The search starts after this cue's timing line, so every iteration consumes at least that line.
+			const nextArrowIndex = text.indexOf('-->', bodyStart);
+			if (nextArrowIndex !== -1 && nextArrowIndex < bodyEnd) {
+				bodyEnd = Math.max(text.lastIndexOf('\n', nextArrowIndex), bodyStart);
+			}
 
 			const startTime = parseSubtitleTimestamp(match[2]!);
 			const endTime = parseSubtitleTimestamp(match[3]!);
