@@ -805,9 +805,15 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (this.inputCache.length > MAX_INPUT_CACHE_SIZE) {
 			const minAgeIndex = arrayArgmin(this.inputCache, x => x.age);
 			assert(minAgeIndex !== -1);
-			this.inputCache.splice(minAgeIndex, 1);
+			const [evicted] = this.inputCache.splice(minAgeIndex, 1);
 
-			// DON'T dispose here; the Input might still be used! The source disposal will happen with GC logic
+			// DON'T dispose here; the Input might still be used! The source disposal will happen with GC logic. But
+			// release its sources right away (they're requested again if the Input is read once more), so that a long
+			// read doesn't pile up open file handles and caches until GC gets to them.
+			const evictedSource = evicted!.input.disposed ? null : evicted!.input._rootSource;
+			if (evictedSource instanceof CustomPathedSource) {
+				evictedSource._releaseRoot();
+			}
 		}
 
 		return input;
