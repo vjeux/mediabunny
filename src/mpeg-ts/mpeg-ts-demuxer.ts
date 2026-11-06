@@ -726,7 +726,7 @@ export class MpegTsDemuxer extends Demuxer {
 						}
 
 						if (info) {
-							this.elementaryStreams.push({
+							const elementaryStream: ElementaryStream = {
 								demuxer: this,
 								pid: elementaryPid,
 								streamType,
@@ -737,7 +737,16 @@ export class MpegTsDemuxer extends Demuxer {
 								audioType,
 								info,
 								referencePesPackets: [],
-							});
+							};
+
+							// Some PMTs list a PID twice, with the later entry describing the stream better (like an
+							// AC-3 descriptor after MPEG audio), so that one wins, as in FFmpeg
+							const index = this.elementaryStreams.findIndex(x => x.pid === elementaryPid);
+							if (index === -1) {
+								this.elementaryStreams.push(elementaryStream);
+							} else {
+								this.elementaryStreams[index] = elementaryStream;
+							}
 						}
 					}
 
