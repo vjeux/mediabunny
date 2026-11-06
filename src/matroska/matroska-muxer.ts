@@ -364,6 +364,9 @@ export class MatroskaMuxer extends Muxer {
 				seekPreRollNs = Math.round(1e9 * preRollDuration);
 			}
 
+			// These Matroska v4 flags aren't part of WebM, and Chrome's WebM parser rejects files that contain them
+			const writeV4Flags = !(this.format instanceof WebMOutputFormat);
+
 			tracksElement.data.push({ id: EBMLId.TrackEntry, data: [
 				{ id: EBMLId.TrackNumber, data: trackData.track.id },
 				{ id: EBMLId.TrackUID, data: trackData.track.id },
@@ -374,16 +377,16 @@ export class MatroskaMuxer extends Muxer {
 				trackData.track.metadata.disposition?.forced
 					? { id: EBMLId.FlagForced, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.hearingImpaired
+				writeV4Flags && trackData.track.metadata.disposition?.hearingImpaired
 					? { id: EBMLId.FlagHearingImpaired, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.visuallyImpaired
+				writeV4Flags && trackData.track.metadata.disposition?.visuallyImpaired
 					? { id: EBMLId.FlagVisualImpaired, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.original
+				writeV4Flags && trackData.track.metadata.disposition?.original
 					? { id: EBMLId.FlagOriginal, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.commentary
+				writeV4Flags && trackData.track.metadata.disposition?.commentary
 					? { id: EBMLId.FlagCommentary, data: 1 }
 					: null,
 				{ id: EBMLId.FlagLacing, data: 0 },
