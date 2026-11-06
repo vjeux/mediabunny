@@ -4,12 +4,15 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
+	EncodedPacket,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +84,53 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('Cluster without a Timestamp', async () => {
+	// Timestamp is mandatory in a Cluster; a broken file without it should read as if it were 0
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, ascii('A_AC3')),
+			)),
+			element(
+				EBMLId.Cluster,
+				element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 1]),
+				element(EBMLId.SimpleBlock, [0x81, 0, 32, 0x80, 2]),
+			),
+		),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	expect(packets.map(x => x.timestamp)).toEqual([0, 0.032]);
 });
