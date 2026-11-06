@@ -534,10 +534,19 @@ describe('Media playlists', () => {
 		using encrypted = createMemoryInput(files, 'media.m3u8');
 		using clear = createMemoryInput(files, 'clear.m3u8');
 
-		expect(packetSummary(await readTrackPackets(encrypted.input, 'video')))
-			.toEqual(packetSummary(await readTrackPackets(clear.input, 'video')));
-		expect(packetSummary(await readTrackPackets(encrypted.input, 'audio')))
-			.toEqual(packetSummary(await readTrackPackets(clear.input, 'audio')));
+		const encryptedVideo = await readTrackPackets(encrypted.input, 'video');
+		const encryptedAudio = await readTrackPackets(encrypted.input, 'audio');
+		const clearVideo = await readTrackPackets(clear.input, 'video');
+		const clearAudio = await readTrackPackets(clear.input, 'audio');
+		expect(encryptedVideo).toHaveLength(225);
+		expect(encryptedAudio).toHaveLength(clearAudio.length);
+		expect(clearAudio.length).toBeGreaterThan(380);
+		expect(packetSummary(encryptedVideo)).toEqual(packetSummary(clearVideo));
+		expect(packetSummary(encryptedAudio)).toEqual(packetSummary(clearAudio));
+
+		// The decrypted payloads are the clear segments' bytes, not just boxes that happen to parse
+		expect(encryptedVideo.map(x => x.data)).toEqual(clearVideo.map(x => x.data));
+		expect(encryptedAudio.map(x => x.data)).toEqual(clearAudio.map(x => x.data));
 		expect(encrypted.requests.filter(x => x === 'key0.bin')).toHaveLength(1);
 	});
 });
@@ -604,28 +613,31 @@ u-6400-m-720x408-1628-a-96-1-2.ts
 		const audio = await readTrackPackets(input, 'audio');
 
 		// Each discontinuity's video starts where the playlist places it, so the timeline stays continuous
-		const countVideoPackets = async (bytes: Uint8Array) => {
+		const readSegmentVideo = async (bytes: Uint8Array) => {
 			using segmentInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-			return (await readPackets((await segmentInput.getVideoTracks())[0]!, { metadataOnly: true })).length;
+			return await readPackets((await segmentInput.getVideoTracks())[0]!);
 		};
 		const breaks = [[c0!, c1!], [a0!, a1!], [a0!, a1!], [c2!]];
 		let start = 0;
 		let index = 0;
 		for (const segments of breaks) {
-			let count = 0;
+			const clearPackets = [];
 			for (const segment of segments) {
-				count += await countVideoPackets(segment.bytes);
+				clearPackets.push(...await readSegmentVideo(segment.bytes));
 			}
 
-			const breakPackets = video.slice(index, index + count);
+			const breakPackets = video.slice(index, index + clearPackets.length);
 			expect(breakPackets[0]!.timestamp).toBeCloseTo(start, 3);
 			const breakEnd = start + segments.reduce((sum, segment) => sum + segment.duration, 0);
 			expect(breakPackets.every(x => x.timestamp >= start - 1e-3 && x.timestamp < breakEnd)).toBe(true);
+			// The decrypted content carries the clear segments' bytes
+			expect(breakPackets.map(x => x.data)).toEqual(clearPackets.map(x => x.data));
 
-			index += count;
+			index += clearPackets.length;
 			start = breakEnd;
 		}
 		expect(video).toHaveLength(index);
+		expect(index).toBeGreaterThan(300);
 
 		for (let i = 1; i < audio.length; i++) {
 			expect(audio[i]!.timestamp).toBeGreaterThan(audio[i - 1]!.timestamp);
@@ -858,16 +870,20 @@ describe('Live playlists', () => {
 
 		// A stream that never ends: disposing while waiting at the live edge rejects the read and stops reloading
 		const endless = createLiveInput(Infinity);
-		const reading = readTrackPackets(endless.input, 'video');
-		reading.catch(() => {});
-		while (endless.reloadTimes.length < 2) {
-			await new Promise(resolve => setTimeout(resolve, 50));
+		try {
+			const reading = readTrackPackets(endless.input, 'video');
+			reading.catch(() => {}); // Awaited below, once the dispose has rejected it
+			while (endless.reloadTimes.length < 2) {
+				await new Promise(resolve => setTimeout(resolve, 50));
+			}
+			endless.input.dispose();
+			await expect(reading).rejects.toThrow();
+			const requestCount = endless.requests.length;
+			await new Promise(resolve => setTimeout(resolve, 1500));
+			expect(endless.requests).toHaveLength(requestCount);
+		} finally {
+			endless.input.dispose();
 		}
-		endless.input.dispose();
-		await expect(reading).rejects.toThrow();
-		const requestCount = endless.requests.length;
-		await new Promise(resolve => setTimeout(resolve, 1500));
-		expect(endless.requests).toHaveLength(requestCount);
 	});
 
 	test('BBC test card: the multivariant playlist redirects to a CDN, and relative URIs resolve against the CDN', async () => {
