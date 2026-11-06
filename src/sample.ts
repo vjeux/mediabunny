@@ -40,6 +40,7 @@ polyfillSymbolDispose();
 type FinalizationRegistryValue = {
 	type: 'video';
 	data: VideoFrame | OffscreenCanvas | Uint8Array | VideoSampleResource;
+	passedFrame: VideoFrame | null;
 } | {
 	type: 'audio';
 	data: AudioData | Uint8Array | AudioSampleResource;
@@ -67,6 +68,7 @@ if (typeof FinalizationRegistry !== 'undefined') {
 
 			if (typeof VideoFrame !== 'undefined' && value.data instanceof VideoFrame) {
 				value.data.close(); // Prevent the browser error since we're logging our own
+				value.passedFrame?.close();
 			}
 		} else {
 			if (now - lastAudioGcErrorLog >= 1000) {
@@ -260,6 +262,12 @@ export class VideoSample implements Disposable {
 	_layout!: PlaneLayout[] | null;
 	/** @internal */
 	_closed: boolean = false;
+	/**
+	 * The VideoFrame passed to the constructor when the sample holds a wrapper of it instead; closed together with the
+	 * sample.
+	 * @internal
+	 */
+	_passedFrame: VideoFrame | null = null;
 
 	/**
 	 * The internal pixel format in which the frame is stored. Will be `null` if it's using an arbitrary internal
@@ -508,6 +516,42 @@ export class VideoSample implements Disposable {
 			if (init?.visibleRect !== undefined) {
 				validateRectangle(init.visibleRect, 'init.visibleRect');
 			}
+			if (
+				init?.displayWidth !== undefined
+				&& (!Number.isInteger(init.displayWidth) || init.displayWidth <= 0)
+			) {
+				throw new TypeError('init.displayWidth, when provided, must be a positive integer.');
+			}
+			if (
+				init?.displayHeight !== undefined
+				&& (!Number.isInteger(init.displayHeight) || init.displayHeight <= 0)
+			) {
+				throw new TypeError('init.displayHeight, when provided, must be a positive integer.');
+			}
+			if ((init?.displayWidth !== undefined) !== (init?.displayHeight !== undefined)) {
+				throw new TypeError(
+					'init.displayWidth and init.displayHeight must be either both provided or both omitted.',
+				);
+			}
+
+			if (init?.visibleRect !== undefined || init?.displayWidth !== undefined) {
+				// Crop and/or rescale the frame, like the VideoFrame constructor does. The display size in init is the
+				// one after rotation, which isn't passed on to the frame, so undo it.
+				const quarterTurn = (init.rotation ?? 0) % 180 !== 0;
+				const refinedFrame = new VideoFrame(data, {
+					visibleRect: init.visibleRect && {
+						x: init.visibleRect.left,
+						y: init.visibleRect.top,
+						width: init.visibleRect.width,
+						height: init.visibleRect.height,
+					},
+					displayWidth: quarterTurn ? init.displayHeight : init.displayWidth,
+					displayHeight: quarterTurn ? init.displayWidth : init.displayHeight,
+				});
+				// Keep the caller's frame open for as long as the sample, as if the sample held it directly
+				this._passedFrame = data;
+				data = refinedFrame;
+			}
 
 			this._data = data;
 			this._layout = null;
@@ -581,7 +625,8 @@ export class VideoSample implements Disposable {
 							height: init.visibleRect.height,
 						},
 					}),
-					init,
+					// The frame is already cropped
+					{ ...init, visibleRect: undefined },
 				);
 			}
 
@@ -702,7 +747,11 @@ export class VideoSample implements Disposable {
 			num: this.squarePixelWidth * this.codedHeight,
 			den: this.squarePixelHeight * this.codedWidth,
 		});
-		finalizationRegistry?.register(this, { type: 'video', data: this._data }, this);
+		finalizationRegistry?.register(this, {
+			type: 'video',
+			data: this._data,
+			passedFrame: this._passedFrame,
+		}, this);
 	}
 
 	/** Clones this video sample. */
@@ -786,6 +835,7 @@ export class VideoSample implements Disposable {
 			}
 		} else if (isVideoFrame(this._data)) {
 			this._data.close();
+			this._passedFrame?.close();
 		} else {
 			this._data = null; // GC that shit
 		}
