@@ -316,7 +316,7 @@ export abstract class InputTrack {
 	}
 
 	/** Returns the track's disposition, i.e. information about its intended usage. */
-	async getDisposition() {
+	async getDisposition(): Promise<TrackDisposition> {
 		// Copied so that callers can't modify the input's own state
 		return { ...await this._backing.getDisposition() };
 	}
@@ -325,7 +325,7 @@ export abstract class InputTrack {
 	 * The track's disposition, i.e. information about its intended usage.
 	 * @deprecated Use {@link InputTrack.getDisposition} instead.
 	 */
-	get disposition() {
+	get disposition(): TrackDisposition {
 		return { ...requireSync(this._backing.getDisposition(), 'disposition', 'getDisposition') };
 	}
 
@@ -732,7 +732,7 @@ export class InputVideoTrack extends InputTrack {
 	 * Returns the pixel aspect ratio of the track's frames as a rational number in its reduced form. Most videos use
 	 * square pixels (1:1).
 	 */
-	async getPixelAspectRatio() {
+	async getPixelAspectRatio(): Promise<Rational> {
 		// Potential minor async race condition here if called twice, but doesn't matter since the computation is
 		// so cheap
 		this._pixelAspectRatioCache ??= toPixelAspectRatio(
@@ -748,7 +748,7 @@ export class InputVideoTrack extends InputTrack {
 	 * square pixels (1:1).
 	 * @deprecated Use {@link InputVideoTrack.getPixelAspectRatio} instead.
 	 */
-	get pixelAspectRatio() {
+	get pixelAspectRatio(): Rational {
 		this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			requireSync(this._backing.getSquarePixelWidth(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedHeight(), 'pixelAspectRatio', 'getPixelAspectRatio'),
