@@ -7,6 +7,7 @@ import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
 import { CustomPathedSource, FilePathSource } from '../../src/source.js';
 import { createAes128CbcDecryptStream } from '../../src/aes.js';
 import { Reader } from '../../src/reader.js';
+import { HlsSegmentedInput } from '../../src/hls/hls-segmented-input.js';
 
 // A lot of test cases taken from:
 // https://github.com/video-dev/hls.js/blob/master/tests/test-streams.js
@@ -1384,6 +1385,136 @@ resource.ts
 
 	// Input-wide queries cover the I-frame track too
 	expect(await input.computeDuration()).toBeGreaterThan(4.9);
+});
+
+test.concurrent('Key packet lookups in I-frame playlists settle when a key frame is not first in its PES packet', async () => {
+	// Apple's segmenter cuts I-frame segments at PES packet boundaries, but its PES packets don't start at access unit
+	// boundaries, so a segment can start with a leftover slice of the previous frame, followed by the key frame in the
+	// same PES packet. Built here from 0.ts, whose first video PES packet is a key frame (with its last bytes spilling
+	// into the second PES packet, a P frame).
+	const ts = new Uint8Array(await fs.promises.readFile('./test/public/0.ts'));
+	const videoPid = 256;
+
+	const pesPackets: number[][] = [];
+	for (let pos = 0; pos < ts.length && pesPackets.length <= 2; pos += 188) {
+		if ((((ts[pos + 1]! & 0x1f) << 8) | ts[pos + 2]!) !== videoPid) {
+			continue;
+		}
+
+		const adaptationFieldLength = ts[pos + 3]! & 0x20 ? 1 + ts[pos + 4]! : 0;
+		if (ts[pos + 1]! & 0x40) {
+			pesPackets.push([]);
+		}
+		pesPackets.at(-1)!.push(...ts.subarray(pos + 4 + adaptationFieldLength, pos + 188));
+	}
+
+	const [keyPes, nextPes] = pesPackets.map(x => new Uint8Array(x)) as [Uint8Array, Uint8Array];
+	const findStartCode = (data: Uint8Array, start: number) => {
+		let i = start;
+		while (data[i] !== 0 || data[i + 1] !== 0 || data[i + 2] !== 1) {
+			i++;
+		}
+		return i;
+	};
+	const keyEs = keyPes.subarray(9 + keyPes[8]!);
+	const nextEs = nextPes.subarray(9 + nextPes[8]!);
+	const delimiterStart = findStartCode(nextEs, 0);
+	const sliceStart = findStartCode(nextEs, delimiterStart + 3);
+
+	// The key frame again one second later, after the P frame's slice, in a PES packet without a random access flag
+	const header = keyPes.slice(0, 9 + keyPes[8]!);
+	for (const offset of [9, 14]) { // PTS and DTS
+		const b = header;
+		const value = ((b[offset]! >> 1) & 0x07) * 2 ** 30 + b[offset + 1]! * 2 ** 22 + (b[offset + 2]! >> 1) * 2 ** 15
+			+ b[offset + 3]! * 2 ** 7 + (b[offset + 4]! >> 1) + 90000;
+		b[offset] = (b[offset]! & 0xf0) | ((Math.floor(value / 2 ** 30) & 0x07) << 1) | 1;
+		b[offset + 1] = Math.floor(value / 2 ** 22) & 0xff;
+		b[offset + 2] = ((Math.floor(value / 2 ** 15) & 0x7f) << 1) | 1;
+		b[offset + 3] = Math.floor(value / 2 ** 7) & 0xff;
+		b[offset + 4] = ((value & 0x7f) << 1) | 1;
+	}
+	const pes = new Uint8Array([
+		...header,
+		...nextEs.subarray(sliceStart),
+		...keyEs,
+		...nextEs.subarray(0, delimiterStart),
+	]);
+
+	const secondSegment: number[] = [];
+	for (let offset = 0, counter = 0; offset < pes.length; counter = (counter + 1) % 16) {
+		const payloadLength = Math.min(184, pes.length - offset);
+		const stuffing = 184 - payloadLength;
+		const packet = new Uint8Array(188).fill(0xff);
+		packet.set([0x47, (offset === 0 ? 0x40 : 0) | (videoPid >> 8), videoPid & 0xff, (stuffing ? 0x30 : 0x10) | counter]);
+		if (stuffing > 0) {
+			packet[4] = stuffing - 1; // Adaptation field for stuffing only, without flags
+			if (stuffing > 1) {
+				packet[5] = 0;
+			}
+		}
+		packet.set(pes.subarray(offset, offset + payloadLength), 4 + stuffing);
+		secondSegment.push(...packet);
+		offset += payloadLength;
+	}
+
+	// PAT and PMT, then the first segment (the key frame, up to the first TS packet of the next PES packet), then the
+	// second segment
+	const firstSegmentLength = 24628 + 188 - 376;
+	const resource = new Uint8Array([...ts.subarray(0, 376 + firstSegmentLength), ...secondSegment]);
+	const playlist = `#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:1
+#EXT-X-I-FRAMES-ONLY
+#EXTINF:1,
+#EXT-X-BYTERANGE:${firstSegmentLength}@376
+resource.ts
+#EXTINF:1,
+#EXT-X-BYTERANGE:${secondSegment.length}@${376 + firstSegmentLength}
+resource.ts
+#EXT-X-ENDLIST
+`;
+
+	using input = new Input({
+		source: new CustomPathedSource('iframes.m3u8', ({ path }) => new BufferSource(
+			path === 'iframes.m3u8' ? new TextEncoder().encode(playlist) : resource,
+		)),
+		formats: HLS_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const sink = new EncodedPacketSink(videoTrack);
+
+	const keyTimestamps: number[] = [];
+	for await (const packet of sink.packets()) {
+		if (packet.type === 'key') {
+			keyTimestamps.push(packet.timestamp);
+		}
+	}
+	expect(keyTimestamps).toEqual([0, 1]);
+
+	// Without a guard, the lookup went back and forth between the segments forever, never yielding to the event loop
+	// (so not even the test timeout could fire). Counting segment visits turns that into a quick failure.
+	let segmentVisits = 0;
+	// eslint-disable-next-line @typescript-eslint/unbound-method -- Called with the right `this` below
+	const getInputForSegment = HlsSegmentedInput.prototype.getInputForSegment;
+	const spy = vi.spyOn(HlsSegmentedInput.prototype, 'getInputForSegment').mockImplementation(function (
+		this: HlsSegmentedInput,
+		...args: Parameters<HlsSegmentedInput['getInputForSegment']>
+	) {
+		if (this.input === input && ++segmentVisits > 1000) {
+			throw new Error('The key packet lookup visited segments more than 1000 times without settling.');
+		}
+
+		return getInputForSegment.apply(this, args);
+	});
+
+	try {
+		const keyPacket = await sink.getKeyPacket(1.5);
+		expect(keyPacket?.type).toBe('key');
+		expect(keyPacket!.timestamp).toBeLessThanOrEqual(1.5);
+	} finally {
+		spy.mockRestore();
+	}
 });
 
 test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {
