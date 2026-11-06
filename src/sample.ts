@@ -41,7 +41,7 @@ polyfillSymbolDispose();
 type FinalizationRegistryValue = {
 	type: 'video';
 	data: VideoFrame | OffscreenCanvas | Uint8Array | VideoSampleResource;
-	orientedFrame: VideoFrame | null;
+	passedFrame: VideoFrame | null;
 } | {
 	type: 'audio';
 	data: AudioData | Uint8Array | AudioSampleResource;
@@ -69,7 +69,7 @@ if (typeof FinalizationRegistry !== 'undefined') {
 
 			if (typeof VideoFrame !== 'undefined' && value.data instanceof VideoFrame) {
 				value.data.close(); // Prevent the browser error since we're logging our own
-				value.orientedFrame?.close();
+				value.passedFrame?.close();
 			}
 		} else {
 			if (now - lastAudioGcErrorLog >= 1000) {
@@ -264,11 +264,11 @@ export class VideoSample implements Disposable {
 	/** @internal */
 	_closed: boolean = false;
 	/**
-	 * The VideoFrame passed to the constructor when its orientation had to be stripped by wrapping it; closed together
-	 * with the sample.
+	 * The VideoFrame passed to the constructor when the sample holds a wrapper of it instead; closed together with the
+	 * sample.
 	 * @internal
 	 */
-	_orientedFrame: VideoFrame | null = null;
+	_passedFrame: VideoFrame | null = null;
 
 	/**
 	 * The internal pixel format in which the frame is stored. Will be `null` if it's using an arbitrary internal
@@ -532,7 +532,7 @@ export class VideoSample implements Disposable {
 					displayHeight: frameRotation % 180 === 0 ? data.displayHeight : data.displayWidth,
 				} as VideoFrameInit);
 				// Keep the caller's frame open for as long as the sample, as if the sample held it directly
-				this._orientedFrame = data;
+				this._passedFrame = data;
 				data = unorientedFrame;
 			}
 
@@ -738,7 +738,7 @@ export class VideoSample implements Disposable {
 		finalizationRegistry?.register(this, {
 			type: 'video',
 			data: this._data,
-			orientedFrame: this._orientedFrame,
+			passedFrame: this._passedFrame,
 		}, this);
 	}
 
@@ -823,7 +823,7 @@ export class VideoSample implements Disposable {
 			}
 		} else if (isVideoFrame(this._data)) {
 			this._data.close();
-			this._orientedFrame?.close();
+			this._passedFrame?.close();
 		} else {
 			this._data = null; // GC that shit
 		}
