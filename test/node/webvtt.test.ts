@@ -39,6 +39,29 @@ test('A WebVTT timing line ends the previous cue even without a blank line befor
 	expect(cues.map(cue => [cue.timestamp, cue.duration, cue.text])).toEqual([[0, 1, 'Hi'], [2, 1, 'There']]);
 });
 
+test('A WebVTT cue whose timing line ends the text has empty text', () => {
+	const parse = (text: string) => {
+		const cues: SubtitleCue[] = [];
+		const parser = new SubtitleParser({
+			codec: 'webvtt',
+			output: (cue) => {
+				cues.push(cue);
+				if (cues.length > 10) {
+					throw new Error('The parser keeps emitting cues.'); // Instead of hanging the test
+				}
+			},
+		});
+		parser.parse(text);
+		return cues.map(cue => [cue.timestamp, cue.duration, cue.text, cue.settings]);
+	};
+
+	expect(parse('WEBVTT\n\n00:00.000 --> 00:01.000')).toEqual([[0, 1, '', '']]);
+	expect(parse('WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n00:02.000 --> 00:03.000 align:start')).toEqual([
+		[0, 1, 'Hi', ''],
+		[2, 1, '', 'align:start'],
+	]);
+});
+
 test('Matroska muxing', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
