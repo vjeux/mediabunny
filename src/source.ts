@@ -1694,7 +1694,10 @@ export class CustomSource extends Source {
 		) {
 			throw new TypeError('options.maxCacheSize, when provided, must be a non-negative number.');
 		}
-		if (options.prefetchProfile && !['none', 'fileSystem', 'network'].includes(options.prefetchProfile)) {
+		if (
+			options.prefetchProfile !== undefined
+			&& !['none', 'fileSystem', 'network'].includes(options.prefetchProfile)
+		) {
 			throw new TypeError(
 				'options.prefetchProfile, when provided, must be one of \'none\', \'fileSystem\' or \'network\'.',
 			);
