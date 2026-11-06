@@ -16,6 +16,8 @@ import {
 	ebmlFloat,
 	ebmlString,
 	ebmlUint,
+	flacFile,
+	flacFrame,
 	id3v24Tag,
 	mkvFile,
 	mkvSimpleBlock,
@@ -919,5 +921,93 @@ describe('WAVE demuxing', () => {
 			comment: 'Comment',
 			description: 'Description',
 		});
+	});
+});
+
+describe('FLAC frame parsing', () => {
+	const filler = (length: number) => new Array<number>(length).fill(0x11);
+	const packetsOf = async (bytes: Uint8Array) => {
+		using input = openBytes(bytes);
+		const track = (await input.getPrimaryAudioTrack())!;
+		const packets: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			const start = Math.round(packet.timestamp * 48000);
+			packets.push(`${start}+${Math.round(packet.duration * 48000)}:${packet.byteLength}`);
+		}
+		return packets;
+	};
+
+	test('every block size code gives the right packet duration and header length', async () => {
+		const codes: [number, number?][] = [[1], [2], [3], [8], [6, 100], [7, 1000], [12], [15]];
+		const frames = codes.map(([blockSizeCode, uncommonBlockSize], num) => {
+			return flacFrame({ num, blockSizeCode, uncommonBlockSize, sampleRateCode: 10, payload: filler(30) });
+		});
+		const bytes = flacFile({ sampleRate: 48000, minBlockSize: 16, maxBlockSize: 32768, totalSamples: 0, frames });
+		expect(await packetsOf(bytes)).toEqual([
+			'0+192:36', '192+576:36', '768+1152:36', '1920+256:36', '2176+100:37', '2276+1000:38', '3276+4096:36',
+			'7372+32768:36',
+		]);
+	});
+
+	test.each([
+		[0, undefined, 26], // Sample rate from STREAMINFO
+		[13, 48000, 28], // 16-bit Hz
+		[14, 4800, 28], // 16-bit tens of Hz
+	])('sample rate code %i is accepted when it matches STREAMINFO', async (sampleRateCode, uncommonRate, size) => {
+		const frames = [0, 1, 2].map((num) => {
+			return flacFrame({ num, blockSizeCode: 8, sampleRateCode, uncommonSampleRate: uncommonRate, payload: filler(20) });
+		});
+		const bytes = flacFile({ sampleRate: 48000, minBlockSize: 256, maxBlockSize: 256, totalSamples: 768, frames });
+		expect(await packetsOf(bytes)).toEqual([`0+256:${size}`, `256+256:${size}`, `512+256:${size}`]);
+	});
+
+	test('sync codes inside frame data only split frames when a whole, consistent header follows', async () => {
+		const brokenCrc = [0xff, 0xf8, 0x8a, 0x08, 0x01, 0x00];
+		const wrongNumber = flacFrame({ num: 5, blockSizeCode: 8, sampleRateCode: 10, payload: [] });
+		const wrongRate = flacFrame({ num: 1, blockSizeCode: 8, sampleRateCode: 9, payload: [] });
+		const otherBlocking = flacFrame({
+			num: 1,
+			variableBlocking: true,
+			blockSizeCode: 8,
+			sampleRateCode: 10,
+			payload: [],
+		});
+		const frames = [
+			flacFrame({
+				num: 0,
+				blockSizeCode: 8,
+				sampleRateCode: 10,
+				payload: [...filler(10), ...brokenCrc, ...filler(5), ...wrongNumber, ...wrongRate, ...otherBlocking],
+			}),
+			flacFrame({ num: 1, blockSizeCode: 8, sampleRateCode: 10, payload: filler(4) }),
+			flacFrame({ num: 2, blockSizeCode: 8, sampleRateCode: 10, payload: filler(12) }),
+		];
+		const bytes = flacFile({ sampleRate: 48000, minBlockSize: 256, maxBlockSize: 256, totalSamples: 768, frames });
+		expect(await packetsOf(bytes)).toEqual(['0+256:45', '256+256:10', '512+256:18']);
+	});
+
+	test('with variable blocking, frame headers carry sample numbers that must follow on', async () => {
+		const frame = (num: number, uncommonBlockSize: number, payload: number[]) => flacFrame({
+			num,
+			variableBlocking: true,
+			blockSizeCode: 7,
+			uncommonBlockSize,
+			sampleRateCode: 10,
+			payload,
+		});
+		const fakeHeader = frame(999, 256, []);
+		const frames = [
+			frame(0, 1000, [...filler(8), ...fakeHeader, ...filler(4)]),
+			frame(1000, 500, filler(20)),
+			frame(1500, 2000, filler(20)),
+		];
+		const bytes = flacFile({
+			sampleRate: 48000,
+			minBlockSize: 256,
+			maxBlockSize: 2000,
+			totalSamples: 3500,
+			frames,
+		});
+		expect(await packetsOf(bytes)).toEqual(['0+1000:29', '1000+500:29', '1500+2000:29']);
 	});
 });

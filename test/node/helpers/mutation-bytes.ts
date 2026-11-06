@@ -937,3 +937,88 @@ export const waveFile = (chunks: Uint8Array[], options: { riff?: 'RIFF' | 'RIFX'
 	const size = options.size ?? body.length;
 	return concatBytes(ascii(riff), riff === 'RIFX' ? u32be(size) : u32le(size), body);
 };
+
+const flacCrc8 = (bytes: number[]) => {
+	let crc = 0;
+	for (const byte of bytes) {
+		crc ^= byte;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+		}
+	}
+	return crc;
+};
+
+/** The UTF-8-like "coded number" of FLAC frame headers. */
+const flacCodedNumber = (value: number) => {
+	if (value < 0x80) {
+		return [value];
+	}
+	const bytes: number[] = [];
+	let remaining = value;
+	let payloadBitsInFirst = 6;
+	while (remaining >= 2 ** payloadBitsInFirst) {
+		bytes.unshift(0x80 | (remaining & 0x3f));
+		remaining = Math.floor(remaining / 64);
+		payloadBitsInFirst--;
+	}
+	const leadingOnes = bytes.length + 1;
+	const prefix = (0xff << (8 - leadingOnes)) & 0xff;
+	return [prefix | remaining, ...bytes];
+};
+
+/** A FLAC frame header (with CRC-8) followed by an opaque payload; the footer CRC-16 is not checked by demuxers. */
+export const flacFrame = (options: {
+	num: number;
+	variableBlocking?: boolean;
+	blockSizeCode: number;
+	uncommonBlockSize?: number;
+	sampleRateCode?: number;
+	uncommonSampleRate?: number;
+	payload: number[];
+}) => {
+	const header = [
+		0xff,
+		options.variableBlocking ? 0xf9 : 0xf8,
+		(options.blockSizeCode << 4) | (options.sampleRateCode ?? 0),
+		0x08, // Stereo-less mono, 16-bit
+		...flacCodedNumber(options.num),
+	];
+	if (options.blockSizeCode === 6) {
+		header.push(options.uncommonBlockSize! - 1);
+	} else if (options.blockSizeCode === 7) {
+		header.push(...u16be(options.uncommonBlockSize! - 1));
+	}
+	if (options.sampleRateCode === 12) {
+		header.push(options.uncommonSampleRate!);
+	} else if (options.sampleRateCode === 13 || options.sampleRateCode === 14) {
+		header.push(...u16be(options.uncommonSampleRate!));
+	}
+	header.push(flacCrc8(header));
+	return new Uint8Array([...header, ...options.payload]);
+};
+
+/** 'fLaC' plus a STREAMINFO block (mono, 16-bit) and the given frames. */
+export const flacFile = (options: {
+	sampleRate: number;
+	minBlockSize: number;
+	maxBlockSize: number;
+	minFrameSize?: number;
+	maxFrameSize?: number;
+	totalSamples: number;
+	frames: Uint8Array[];
+}) => {
+	const streamInfo = new BitWriter()
+		.writeBits(16, options.minBlockSize)
+		.writeBits(16, options.maxBlockSize)
+		.writeBits(24, options.minFrameSize ?? 0)
+		.writeBits(24, options.maxFrameSize ?? 0)
+		.writeBits(20, options.sampleRate)
+		.writeBits(3, 0) // channels - 1
+		.writeBits(5, 15) // bits per sample - 1
+		.writeBits(4, Math.floor(options.totalSamples / 2 ** 32))
+		.writeBits(32, options.totalSamples % 2 ** 32)
+		.toBytes();
+	const block = concatBytes([0x80], u24be(34), streamInfo, new Uint8Array(16)); // last block, MD5 zeroed
+	return concatBytes(ascii('fLaC'), block, ...options.frames);
+};
