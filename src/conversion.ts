@@ -1917,6 +1917,15 @@ export class Conversion {
 			const source = new VideoSampleSource(encodingConfig);
 			videoSource = source;
 
+			if (!trackOptions.frameRate && !trackOptions.process && !await track.isLive()) {
+				// Tell the encoder the source's frame rate, since it budgets each frame's bits based on it. Not with a
+				// process function, which may change the rate frames come out at.
+				const { averagePacketRate } = await track.computePacketStats(PACKET_STATS_PACKET_COUNT);
+				if (Number.isFinite(averagePacketRate) && averagePacketRate > 0) {
+					source._frameRateHint = averagePacketRate;
+				}
+			}
+
 			this._registerTrackPump(async (pump) => {
 				const sink = new VideoSampleSink(track, { hardwareAcceleration: trackOptions.hardwareAcceleration });
 

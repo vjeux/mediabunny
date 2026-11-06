@@ -386,6 +386,7 @@ export const buildVideoEncoderConfigs = (options: {
 		options.width,
 		options.height,
 		fallbackBitrateMode,
+		options.framerate,
 	);
 
 	const buildConfig = (
@@ -774,6 +775,7 @@ export class Quality {
 		width: number,
 		height: number,
 		fallbackBitrateMode: 'constant' | 'variable' | undefined,
+		frameRate?: number,
 	): VideoRateControl {
 		const quantizerSupport = VIDEO_CODEC_QUANTIZER_SUPPORT[codec];
 
@@ -829,7 +831,7 @@ export class Quality {
 				);
 			}
 
-			bitrate = computeVideoBitrate(codec, width, height, qualityToBitrateFactor(quality));
+			bitrate = computeVideoBitrate(codec, width, height, qualityToBitrateFactor(quality), frameRate);
 		}
 
 		return { quantizer, bitrate, bitrateMode };
@@ -842,7 +844,7 @@ export class Quality {
 		}
 
 		assert(this._quality !== undefined);
-		return computeVideoBitrate(codec, width, height, qualityToBitrateFactor(this._quality));
+		return computeVideoBitrate(codec, width, height, qualityToBitrateFactor(this._quality), undefined);
 	}
 
 	/** @internal */
@@ -933,7 +935,13 @@ const VIDEO_CODEC_QUANTIZER_SUPPORT: Partial<Record<VideoCodec, {
  */
 const qualityToBitrateFactor = (quality: number) => 0.3 * Math.exp(2.5538 * quality);
 
-const computeVideoBitrate = (codec: VideoCodec, width: number, height: number, factor: number) => {
+const computeVideoBitrate = (
+	codec: VideoCodec,
+	width: number,
+	height: number,
+	factor: number,
+	frameRate: number | undefined,
+) => {
 	const pixels = width * height;
 	const referencePixels = 1920 * 1080;
 	const referenceBitrate = 3_000_000;
@@ -950,7 +958,13 @@ const computeVideoBitrate = (codec: VideoCodec, width: number, height: number, f
 	};
 
 	const codecAdjustedBitrate = baseBitrate * codecEfficiencyFactors[codec];
-	const finalBitrate = codecAdjustedBitrate * factor;
+
+	// The reference bitrates are meant for up to 30 fps. Higher frame rates get proportionally more bits, which is
+	// also what they used to get when encoders weren't told the frame rate and assumed 30 fps. ProRes is left out: its
+	// bitrate only picks a profile, whose data rates are given at 30 fps and grow with the frame rate by themselves.
+	const frameRateFactor = frameRate !== undefined && codec !== 'prores' ? Math.max(1, frameRate / 30) : 1;
+
+	const finalBitrate = codecAdjustedBitrate * factor * frameRateFactor;
 
 	return Math.ceil(finalBitrate / 1000) * 1000;
 };
