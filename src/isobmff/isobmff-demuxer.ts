@@ -3600,6 +3600,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			// Later fragments can't hold a sample presented before nextTimestamp once more than maxReorderedSamples
 			// samples decoded before them are presented at or after it
 			const laterPresentations = [presentation];
+			let latestTimestamp = presentation.timestamps.at(-1) ?? -Infinity;
 			let laterSampleCount = 0;
 			let moofOffset = fragment.moofOffset;
 			while (
@@ -3612,12 +3613,15 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				if (isThenable(next)) {
 					next = await next;
 				}
-				if (!next) {
+				// A sync sample is presented after every sample decoded before it, so one presented earlier means that
+				// the fragments overlap (cut or edited content), which nothing reorders across
+				if (!next || next.presentation.minSyncTimestamp <= latestTimestamp) {
 					break;
 				}
 
 				moofOffset = next.moofOffset;
 				laterPresentations.push(next.presentation);
+				latestTimestamp = Math.max(latestTimestamp, next.presentation.timestamps.at(-1) ?? -Infinity);
 				laterSampleCount += next.presentation.timestamps.length;
 
 				const candidate = getNextTimestamp(next.presentation.timestamps, timestamp);
@@ -3654,7 +3658,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					if (isThenable(previous)) {
 						previous = await previous;
 					}
-					if (!previous) {
+					// Same for an earlier fragment presenting a sample after a later sync sample
+					if (!previous || (previous.presentation.timestamps.at(-1) ?? -Infinity) >= syncTimestamp) {
 						break;
 					}
 
@@ -3730,10 +3735,20 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 	}
 
 	private async findPreviousFragmentPresentation(moofOffset: number, knownOffset: number | null) {
-		const { fragmentPresentations } = this.internalTrack;
+		const { fragmentPresentations, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
 
-		// Boxes can only be walked forward, so start at the closest earlier fragment we know of, or the file start
-		let currentOffset = knownOffset ?? await this.findTrackMoof(0);
+		// Boxes can only be walked forward, so start at the closest earlier fragment of this track we know of: one read
+		// before, or one the fragment index (tfra) or the position cache points to. Only without any, at the file
+		// start.
+		const lookupEntry = fragmentLookupTable[
+			binarySearchLessOrEqual(fragmentLookupTable, moofOffset - 1, x => x.moofOffset)
+		];
+		const cacheEntry = fragmentPositionCache[
+			binarySearchLessOrEqual(fragmentPositionCache, moofOffset - 1, x => x.moofOffset)
+		];
+		const candidates = [knownOffset, lookupEntry?.moofOffset, cacheEntry?.moofOffset]
+			.filter((x): x is number => x != null && x < moofOffset);
+		let currentOffset = candidates.length > 0 ? Math.max(...candidates) : await this.findTrackMoof(0);
 		if (currentOffset === null || currentOffset >= moofOffset) {
 			return null;
 		}

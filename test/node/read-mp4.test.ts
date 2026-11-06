@@ -5,6 +5,7 @@ import {
 	ALL_FORMATS,
 	BufferSource,
 	BufferTarget,
+	CustomSource,
 	EncodedPacket,
 	EncodedPacketSink,
 	EncodedVideoPacketSource,
@@ -484,5 +485,129 @@ test('Packet durations are the same however many fragments were read before', as
 		const packet = await withSink(sink => sink.getPacket(timestamp!));
 		assert(packet);
 		expect(packet.duration).toBe(durations.get(packet.timestamp));
+	}
+});
+
+test('Packet durations with fragments that overlap in presentation time', async () => {
+	// The second fragment restarts at a sync sample presented before the end of the first one (cut or edited
+	// content). Nothing reorders across a sync sample, so the fragments don't shorten each other's frames.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(20), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(20), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	// Frames of 0.1 s: four starting at 0, then three starting at 0.15
+	const fragments = [[0, 4], [3, 3]].flatMap(([decodeTimestamp, sampleCount], i) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(decodeTimestamp!)),
+			box('trun', u32(0x701), u32(sampleCount!), u32(dataOffset), ...Array.from(
+				{ length: sampleCount! },
+				(_, j) => [...u32(2), ...u32(1), ...u32(j === 0 ? 0 : 0x10000)],
+			)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [
+			...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)),
+			...box('mdat', zeros(sampleCount!)),
+		];
+	});
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...box('ftyp', ascii('iso5'), u32(0)), ...moov, ...fragments])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([packet.timestamp, packet.duration]);
+	}
+	expect(packets).toEqual([[0, 0.1], [0.1, 0.1], [0.2, 0.1], [0.3, 0.1], [0.15, 0.1], [0.25, 0.1], [0.35, 0.1]]);
+});
+
+test('A cold packet lookup in a file of many indexed fragments reads a bounded number of them', async () => {
+	// One-sample fragments with a key frame every 60 and a tfra entry for each, like FFmpeg writes with
+	// -movflags empty_moov+default_base_moof -frag_duration 1. Finding where a sample ends must not walk the file.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const parts: number[][] = [box('ftyp', ascii('iso5'), u32(0)), box('moov',
+		box('mvhd', zeros(12), u32(30), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(30), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	)];
+	const tfraEntries: number[][] = [];
+	let pos = parts.reduce((total, part) => total + part.length, 0);
+	for (let i = 0; i < 20000; i++) {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(i)),
+			box('trun', u32(0x701), u32(1), u32(dataOffset), u32(1), u32(1), u32(i % 60 === 0 ? 0 : 0x10000)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		tfraEntries.push([...u32(0), ...u32(i), ...u32(0), ...u32(pos), ...u32(1), ...u32(1), ...u32(1)]);
+		parts.push(box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)), box('mdat', [0]));
+		pos += moofSize + 9;
+	}
+	// Version 1 (64-bit time and offset), 32-bit traf/trun/sample numbers
+	const tfra = box('tfra', [1, 0, 0, 0], u32(1), u32(0x3f), u32(tfraEntries.length), tfraEntries.flat());
+	parts.push(box('mfra', tfra, box('mfro', u32(0), u32(8 + tfra.length + 16))));
+	const file = new Uint8Array(parts.flat());
+
+	for (const timestamp of [10.5, 650.5]) {
+		let reads = 0;
+		using input = new Input({
+			source: new CustomSource({
+				getSize: () => file.length,
+				read: (start, end) => {
+					reads++;
+					return file.slice(start, end);
+				},
+			}),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const packet = await new EncodedPacketSink(track).getPacket(timestamp);
+		expect(packet?.timestamp).toBeCloseTo(Math.floor(timestamp * 30) / 30, 6);
+		// At most back to the previous key frame and some way forward, never from the start of the file
+		expect(reads).toBeLessThan(500);
 	}
 });
