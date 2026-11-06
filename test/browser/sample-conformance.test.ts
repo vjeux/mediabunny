@@ -8,7 +8,7 @@ import {
 	VideoSamplePixelFormat,
 	VideoSampleResource,
 } from '../../src/sample.js';
-import { isChromium, Rotation } from '../../src/misc.js';
+import { isChromium, isWebKit, Rotation } from '../../src/misc.js';
 import {
 	PIXEL_FORMAT_PLANES,
 	layoutSize,
@@ -121,6 +121,34 @@ const copyWith = async (source: VideoSample | VideoFrame, options: VideoFrameCop
 	}
 };
 
+// WebKitGTK's VideoFrame.copyTo() ignores the row padding of small I420 frames, drops the origin of visible rects and
+// doesn't convert between RGBA and BGRA, so there, it can't be the reference for those
+const nativeYuvCopyIsExact = await (async () => {
+	const data = Uint8Array.from({ length: 8 * 4 * 3 / 2 }, (_, i) => i);
+	const frame = new VideoFrame(data, {
+		format: 'I420', codedWidth: 8, codedHeight: 4, timestamp: 0, visibleRect: { x: 2, y: 2, width: 4, height: 2 },
+	});
+	const visible = new Uint8Array(frame.allocationSize());
+	await frame.copyTo(visible);
+	frame.close();
+
+	const small = new VideoFrame(data.subarray(0, 18), { format: 'I420', codedWidth: 6, codedHeight: 2, timestamp: 0 });
+	const whole = new Uint8Array(18);
+	await small.copyTo(whole);
+	small.close();
+
+	return visible[0] === 18 && whole.every((value, i) => value === i);
+})();
+const nativeRgbConversionWorks = await (async () => {
+	const frame = new VideoFrame(new Uint8Array([1, 2, 3, 4]), {
+		format: 'BGRA', codedWidth: 1, codedHeight: 1, timestamp: 0,
+	});
+	const rgba = new Uint8Array(4);
+	await frame.copyTo(rgba, { format: 'RGBA' });
+	frame.close();
+	return rgba[0] === 3 && rgba[2] === 1;
+})();
+
 describe('VideoSample matches VideoFrame', () => {
 	test('the browser supports most pixel formats', () => {
 		// Without these, the parity tests below would cover little
@@ -128,7 +156,9 @@ describe('VideoSample matches VideoFrame', () => {
 		expect(SUPPORTED_FORMATS).toEqual(expect.arrayContaining(expected));
 	});
 
-	test('in allocationSize() and copyTo() of ArrayBuffer- and resource-backed samples', async () => {
+	const ifExactNativeYuvCopy = test.skipIf(!nativeYuvCopyIsExact);
+
+	ifExactNativeYuvCopy('in allocationSize() and copyTo() of ArrayBuffer- and resource-backed samples', async () => {
 		let seed = 1;
 		for (const format of SUPPORTED_FORMATS) {
 			const planes = PIXEL_FORMAT_PLANES[format]!;
@@ -193,7 +223,7 @@ describe('VideoSample matches VideoFrame', () => {
 		}
 	});
 
-	test('in toVideoFrame()', async () => {
+	ifExactNativeYuvCopy('in toVideoFrame()', async () => {
 		let seed = 100;
 		for (const format of SUPPORTED_FORMATS) {
 			const { data, layout } = makePlanes(format, 6, 4, 2, seed++);
@@ -245,7 +275,7 @@ describe('VideoSample matches VideoFrame', () => {
 		}
 	});
 
-	test('with a visible rect smaller than the coded size', async () => {
+	ifExactNativeYuvCopy('with a visible rect smaller than the coded size', async () => {
 		// Like a decoder's 1920x1088 output showing 1920x1080
 		const data = seededBytes(16 * 10 * 3 / 2, 5);
 		const init = { format: 'I420' as const, codedWidth: 16, codedHeight: 10, timestamp: 0 };
@@ -531,7 +561,9 @@ describe('VideoSample drawing and transformation', () => {
 			return [...bytes];
 		};
 		using kept = await sample.transform({ width: 20 });
-		expect(await readPixel(kept, 2, 5)).toEqual([255, 0, 0, 255]);
+		if (nativeRgbConversionWorks) {
+			expect(await readPixel(kept, 2, 5)).toEqual([255, 0, 0, 255]);
+		}
 		expect((await readPixel(kept, 17, 5))[3]).toBe(0);
 
 		using discarded = await sample.transform({ width: 20, alpha: 'discard' });
@@ -674,6 +706,13 @@ describe('AudioSample matches AudioData', () => {
 				const planar = format.endsWith('-planar');
 				const otherArrangement = planar ? format.replace('-planar', '') : `${format}-planar`;
 				for (const destFormat of [format, otherArrangement]) {
+					if (isWebKit() && channels > 1 && destFormat !== format) {
+						// WebKit's AudioData.copyTo can crash the tab when converting the format of several channels
+						// (https://bugs.webkit.org/show_bug.cgi?id=302521; in WebKitGTK also with 2 channels at a frame
+						// offset), so it can't be the reference here
+						continue;
+					}
+
 					const planes = destFormat.endsWith('-planar') ? channels : 1;
 					for (const planeIndex of [0, planes - 1, planes]) {
 						const ranges = [
