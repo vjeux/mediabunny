@@ -34,7 +34,7 @@ import {
 	HevcNalUnitType,
 	parseAc3SyncFrame,
 	parseAvcSps,
-	parseEac3SyncFrame,
+	parseEac3OrAc3CoreSyncFrame,
 	parseHevcSps,
 	AC3_FRAME_SIZES,
 	extractNalUnitTypeForAvc,
@@ -762,7 +762,7 @@ export class MpegTsDemuxer extends Demuxer {
 								elementaryStream.info.sampleRate = AC3_SAMPLE_RATES[frameInfo.fscod]!;
 							} else if (elementaryStream.info.codec === 'eac3') {
 								// For Blu-ray's Dolby Digital Plus, this is an AC-3 frame (the core of each frame)
-								const frameInfo = parseEac3SyncFrame(context.suppliedPacket.data);
+								const frameInfo = parseEac3OrAc3CoreSyncFrame(context.suppliedPacket.data);
 								if (!frameInfo) {
 									throw new Error(
 										'Invalid E-AC-3 audio stream; could not read sync frame from first packet.',

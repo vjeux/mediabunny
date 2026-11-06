@@ -3250,30 +3250,6 @@ export const parseEac3SyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
 		return null;
 	}
 
-	if (data[5]! >> 3 <= 10) {
-		// An AC-3 frame (bsid up to 10), as Blu-ray's Dolby Digital Plus streams carry for their first independent
-		// substream, the E-AC-3 data extending it following in dependent substreams. dec3 describes it like an E-AC-3
-		// one (FFmpeg's MP4 muxer does the same).
-		const frameInfo = parseAc3SyncFrame(data);
-		if (!frameInfo) {
-			return null;
-		}
-
-		return {
-			dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]!,
-			substreams: [{
-				fscod: frameInfo.fscod,
-				fscod2: 0,
-				bsid: frameInfo.bsid,
-				bsmod: frameInfo.bsmod,
-				acmod: frameInfo.acmod,
-				lfeon: frameInfo.lfeon,
-				numDepSub: 0,
-				chanLoc: 0,
-			}],
-		};
-	}
-
 	const bitstream = new Bitstream(data);
 	bitstream.skipBits(16); // sync word
 
@@ -3338,6 +3314,36 @@ export const parseEac3SyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
 	return {
 		dataRate,
 		substreams: [substream],
+	};
+};
+
+/**
+ * Like parseEac3SyncFrame, but also accepts an AC-3 frame (bsid up to 10) as the first independent substream, as
+ * Blu-ray's Dolby Digital Plus streams carry it, the E-AC-3 data extending it following in dependent substreams. It's
+ * then described like an E-AC-3 one, as FFmpeg's MP4 muxer does in dec3.
+ */
+export const parseEac3OrAc3CoreSyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
+	if (data.length < 6 || data[0] !== 0x0B || data[1] !== 0x77 || data[5]! >> 3 > 10) {
+		return parseEac3SyncFrame(data);
+	}
+
+	const frameInfo = parseAc3SyncFrame(data);
+	if (!frameInfo) {
+		return null;
+	}
+
+	return {
+		dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]!,
+		substreams: [{
+			fscod: frameInfo.fscod,
+			fscod2: 0,
+			bsid: frameInfo.bsid,
+			bsmod: frameInfo.bsmod,
+			acmod: frameInfo.acmod,
+			lfeon: frameInfo.lfeon,
+			numDepSub: 0,
+			chanLoc: 0,
+		}],
 	};
 };
 
