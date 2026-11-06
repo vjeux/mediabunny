@@ -365,6 +365,9 @@ export class EncodedPacketSink {
 		let timestampsStart = 0;
 		// The queue should always be big enough to hold 1 second worth of packets
 		const maxQueueSize = () => Math.max(2, timestamps.length - timestampsStart);
+		// ...as long as their data (alpha included) stays within a limit: a second's worth of high-bitrate packets
+		// (copying lossless or ProRes video, say) can take up hundreds of megabytes
+		let queuedBytes = 0;
 
 		// The following is the "pump" process that keeps pumping packets into the queue
 		(async () => {
@@ -375,13 +378,17 @@ export class EncodedPacketSink {
 					break;
 				}
 
-				if (packetQueue.length - packetQueueStart > maxQueueSize()) {
+				if (
+					packetQueue.length - packetQueueStart > maxQueueSize()
+					|| (packetQueue.length - packetQueueStart >= 2 && queuedBytes >= MAX_QUEUED_PACKET_BYTES)
+				) {
 					({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 					await queueDequeue;
 					continue;
 				}
 
 				packetQueue.push(packet);
+				queuedBytes += getPacketDataSize(packet);
 
 				onQueueNotEmpty();
 				({ promise: queueNotEmpty, resolve: onQueueNotEmpty } = promiseWithResolvers());
@@ -412,6 +419,7 @@ export class EncodedPacketSink {
 						throw outOfBandError;
 					} else if (packetQueueStart < packetQueue.length) {
 						const value = packetQueue[packetQueueStart]!;
+						queuedBytes -= getPacketDataSize(value);
 						packetQueue[packetQueueStart] = undefined; // So it can be garbage-collected
 						packetQueueStart++;
 						if (packetQueueStart >= packetQueue.length / 2) {
@@ -460,6 +468,10 @@ export class EncodedPacketSink {
 }
 
 const MAX_QUEUE_SIZE = 4;
+const MAX_QUEUED_PACKET_BYTES = 2 ** 25; // 32 MiB
+
+/** The bytes a packet holds in memory (metadata-only packets hold none). */
+const getPacketDataSize = (packet: EncodedPacket) => packet.data.byteLength + (packet.sideData.alpha?.byteLength ?? 0);
 
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
