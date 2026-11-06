@@ -122,14 +122,15 @@ export class Mp3Demuxer extends Demuxer {
 			}
 		}
 
-		const result = this.firstFrameHeader
+		// Until a frame has been found, make sure we don't start off with a false sync. A Xing/Info frame confirms the
+		// stream already, so the frames after it are taken as they come.
+		const result = this.firstFrameHeader || this.xingFrameHeader
 			? await readNextMp3FrameHeader(
 				this.reader,
 				this.lastLoadedPos,
 				this.reader.fileSize,
 				this.firstFrameHeader,
 			)
-			// Nothing to compare against yet, so make sure we don't start off with a false sync
 			: await readFirstMp3FrameHeader(this.reader, this.lastLoadedPos, this.reader.fileSize);
 		if (!result) {
 			this.lastSampleLoaded = true;

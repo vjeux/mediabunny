@@ -114,3 +114,31 @@ test('Does not take an MPEG program stream holding MPEG audio for an MP3 file', 
 	});
 	await expect(input.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
 });
+
+test('Reads the frames after a Xing frame as they come', async () => {
+	// An Info frame, then a single frame followed by junk instead of another frame (like a very short file with a
+	// damaged end). The Info frame already confirms the stream, so the frame after it counts.
+	const frame = (tag?: string) => {
+		const bytes = new Uint8Array(417);
+		bytes.set([0xff, 0xfb, 0x90, 0x00]); // MPEG-1 Layer III, 128 kbps, 44.1 kHz, stereo
+		if (tag) {
+			bytes.set([...tag].map(char => char.charCodeAt(0)), 36); // Behind the side information
+		}
+		return bytes;
+	};
+	const bytes = new Uint8Array([...frame('Info'), ...frame(), ...new Uint8Array(100).fill(0x55)]);
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+
+	const packets: Uint8Array[] = [];
+	for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+		packets.push(packet.data);
+	}
+	expect(packets).toEqual([bytes.subarray(417, 2 * 417)]);
+});
