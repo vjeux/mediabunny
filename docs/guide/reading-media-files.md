@@ -617,6 +617,11 @@ type BlobSourceOptions = {
 	// in memory. Defaults to 8 MiB.
 	maxCacheSize?: number;
 
+	// Whether to read the blob through a ReadableStream reader.
+	// Defaults to true; set to false to use a slower but more
+	// stable reading method if you hit (very rare) browser bugs.
+	useStreamReader?: boolean;
+
 	// Handles errors that occur while no read is pending
 	handleUnhandledError?: (error: unknown) => unknown;
 };
