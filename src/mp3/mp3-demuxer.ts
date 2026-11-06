@@ -59,6 +59,8 @@ export class Mp3Demuxer extends Demuxer {
 	xingFrameHeaderPos: number | null = null;
 	loadedSamples: Sample[] = []; // All samples from the start of the file to lastLoadedPos
 	metadataTags: MetadataTags | null = null;
+	/** Whether metadataTags holds all tags, rather than the ones read before a parse error */
+	metadataTagsComplete = false;
 	xingData: {
 		isVbr: boolean;
 		frameCount: number | null;
@@ -230,7 +232,8 @@ export class Mp3Demuxer extends Demuxer {
 		try {
 			await this.readMetadata();
 
-			if (this.metadataTags) {
+			// Tags that failed to parse are read again, so that every call fails, not just the first one
+			if (this.metadataTags && this.metadataTagsComplete) {
 				return this.metadataTags;
 			}
 
@@ -271,6 +274,7 @@ export class Mp3Demuxer extends Demuxer {
 				}
 			}
 
+			this.metadataTagsComplete = true;
 			return this.metadataTags;
 		} finally {
 			release();
