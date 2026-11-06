@@ -205,71 +205,144 @@ const RATE_PAIRS: [number, number][] = [
 	[32000, 48000], [11025, 48000], [96000, 44100], [16000, 44100], [7350, 48000], [192000, 8000],
 ];
 
+// The checks below hold for any correct resampler (they don't pin an interpolation method). Output near the start
+// and the end of the stream may be shaped by how the edges are handled, so values are only checked away from them;
+// 20 ms is far more than any practical filter kernel spans.
+const EDGE_SECONDS = 0.02;
+
+type ResampleOutput = Awaited<ReturnType<typeof resample>>;
+
+/** Checks that the output samples follow each other without gaps or overlaps, starting at the given timestamp. */
+const expectContiguousOutput = (result: ResampleOutput, targetRate: number, startTimestamp: number) => {
+	expect(result.outputs.length).toBeGreaterThan(0);
+	let expectedTimestamp = startTimestamp;
+	for (const output of result.outputs) {
+		expect(output.timestamp).toBeCloseTo(expectedTimestamp, 6);
+		expectedTimestamp += output.frames / targetRate;
+	}
+};
+
+/** The largest deviation from the expected values, ignoring the frames near the start and the end. */
+const maxDeviationAwayFromEdges = (
+	samples: Float32Array,
+	channels: number,
+	targetRate: number,
+	expected: (frame: number) => number,
+) => {
+	const frames = samples.length / channels;
+	const edgeFrames = Math.ceil(EDGE_SECONDS * targetRate);
+	let worst = 0;
+	for (let frame = edgeFrames; frame < frames - edgeFrames; frame++) {
+		for (let channel = 0; channel < channels; channel++) {
+			worst = Math.max(worst, Math.abs(samples[frame * channels + channel]! - expected(frame)));
+		}
+	}
+	return worst;
+};
+
 describe('AudioResampler (resample.ts)', () => {
-	test.each(RATE_PAIRS)('outputs ceil(N * %i / %i) frames in any chunking', async (sourceRate, targetRate) => {
-		const totalFrames = Math.floor(sourceRate * 1.3) + 7;
-		for (const chunkFrames of [1024, 1152, 7, [1000, 333, 4096, 17]]) {
-			const { totalFrames: output } = await resample({
+	test.each(RATE_PAIRS)('keeps length, timing and low frequencies for any chunking (%i -> %i)', async (
+		sourceRate,
+		targetRate,
+	) => {
+		// A low-frequency sine (0.01 radians per source frame, at most ~300 Hz here), well below either Nyquist
+		// frequency, so resampling it must reproduce the same sine at the output times
+		const amplitude = 0.8;
+		const signal = (frame: number) => amplitude * Math.sin(frame * 0.01);
+		const totalFrames = Math.floor(sourceRate * 0.7) + 7;
+
+		const results: ResampleOutput[] = [];
+		for (const chunkFrames of [totalFrames, 1152, 7, [1000, 333, 4096, 17]]) {
+			results.push(await resample({
 				sourceRate,
 				targetRate,
 				totalFrames,
 				chunkFrames,
-				roundTimestampsToMicroseconds: true,
-			});
-			expect(output).toBe(Math.ceil(totalFrames * targetRate / sourceRate - 1e-9));
+				signal,
+				roundTimestampsToMicroseconds: true, // Like AudioData's microsecond timestamps
+			}));
 		}
+
+		// The output lasts as long as the input, give or take a frame, and the timing doesn't drift
+		const [reference] = results;
+		expect(Math.abs(reference!.totalFrames - totalFrames * targetRate / sourceRate)).toBeLessThanOrEqual(1);
+		expectContiguousOutput(reference!, targetRate, 0);
+
+		// How the input is chunked doesn't matter
+		for (const result of results.slice(1)) {
+			expect(result.totalFrames).toBe(reference!.totalFrames);
+			let worst = 0;
+			for (let i = 0; i < reference!.samples.length; i++) {
+				worst = Math.max(worst, Math.abs(result.samples[i]! - reference!.samples[i]!));
+			}
+			expect(worst).toBeLessThan(1e-5);
+		}
+
+		// The sine comes out with the same amplitude and phase. Being off by one source frame in timing would give
+		// errors of up to 0.01 * amplitude.
+		const deviation = maxDeviationAwayFromEdges(
+			reference!.samples,
+			1,
+			targetRate,
+			frame => signal(frame * sourceRate / targetRate),
+		);
+		expect(deviation).toBeLessThan(0.001 * amplitude);
 	});
 
-	test.each(RATE_PAIRS)('interpolates linearly across chunks (%i -> %i)', async (sourceRate, targetRate) => {
-		const signal = (frame: number) => 0.8 * Math.sin(frame * 0.01);
-		const totalFrames = Math.floor(sourceRate * 0.7);
+	test.each([
+		[48000, 8000, 6000],
+		[44100, 22050, 15000],
+		[96000, 44100, 30000],
+	])('doesn\'t amplify a tone above the target Nyquist frequency (%i -> %i, %i Hz)', async (
+		sourceRate,
+		targetRate,
+		frequency,
+	) => {
+		const amplitude = 0.8;
 		const { samples } = await resample({
 			sourceRate,
 			targetRate,
-			totalFrames,
-			chunkFrames: [1000, 333, 4096, 17],
-			signal,
-			roundTimestampsToMicroseconds: true,
+			totalFrames: sourceRate,
+			chunkFrames: 4096,
+			signal: frame => amplitude * Math.sin(2 * Math.PI * frequency * frame / sourceRate),
 		});
 
-		let worst = 0;
-		for (let k = 0; k < samples.length; k++) {
-			const position = k * sourceRate / targetRate;
-			const lower = Math.floor(position);
-			const fraction = position - lower;
-			const a = lower < totalFrames ? signal(lower) : 0;
-			const b = lower + 1 < totalFrames ? signal(lower + 1) : 0;
-			worst = Math.max(worst, Math.abs(samples[k]! - (a + fraction * (b - a))));
+		// Such a tone can't be represented at the target rate. A resampler may attenuate it (low-pass filtering) or
+		// alias it, but must not make it louder.
+		const edgeFrames = Math.ceil(EDGE_SECONDS * targetRate);
+		let sumOfSquares = 0;
+		for (let i = edgeFrames; i < samples.length - edgeFrames; i++) {
+			sumOfSquares += samples[i]! ** 2;
 		}
-		expect(worst).toBeLessThan(1e-6);
+		const rms = Math.sqrt(sumOfSquares / (samples.length - 2 * edgeFrames));
+		expect(rms).toBeLessThanOrEqual(1.05 * amplitude / Math.SQRT2);
 	});
 
-	test('keeps a constant signal constant over five-second buffer boundaries and long chunks', async () => {
-		const { outputs, samples } = await resample({
+	test('keeps a constant signal constant over output buffer boundaries and long chunks', async () => {
+		const result = await resample({
 			sourceRate: 44100,
 			targetRate: 48000,
 			sourceChannels: 2,
 			targetChannels: 2,
 			totalFrames: 44100 * 12 + 5,
-			chunkFrames: 44100 * 7, // Longer than the internal buffer
+			chunkFrames: 44100 * 7, // Longer than the five seconds the resampler buffers
 			signal: () => 0.25,
 		});
-		expect(outputs.map(x => x.timestamp)).toEqual([0, 5, 10]);
-		expect(outputs.map(x => x.frames)).toEqual([240000, 240000, 96006]);
-		// Only the very last frame interpolates toward the silence after the input
-		expect(samples.subarray(0, samples.length - 2).every(x => Math.abs(x - 0.25) < 1e-7)).toBe(true);
+		expectContiguousOutput(result, 48000, 0);
+		expect(Math.abs(result.totalFrames - (44100 * 12 + 5) * 48000 / 44100)).toBeLessThanOrEqual(1);
+		expect(maxDeviationAwayFromEdges(result.samples, 2, 48000, () => 0.25)).toBeLessThan(0.25 * 0.005);
 	});
 
 	test('stamps the output relative to the first input timestamp', async () => {
-		const { outputs } = await resample({
+		const result = await resample({
 			sourceRate: 22050,
 			targetRate: 48000,
 			totalFrames: 22050 * 6,
 			chunkFrames: 1024,
 			startTimestamp: 12.5,
 		});
-		expect(outputs.map(x => x.timestamp)).toEqual([12.5, 17.5]);
-		expect(outputs.map(x => x.frames)).toEqual([240000, 48000]);
+		expectContiguousOutput(result, 48000, 12.5);
+		expect(Math.abs(result.totalFrames - 48000 * 6)).toBeLessThanOrEqual(1);
 	});
 
 	test('fills a gap between input samples with silence', async () => {
@@ -284,24 +357,36 @@ describe('AudioResampler (resample.ts)', () => {
 				sample.close();
 			},
 		});
+		// 0.1 s of a constant at 0, 0.1 and 0.3 s, leaving a 0.1 s gap
 		for (const timestamp of [0, 0.1, 0.3]) {
 			const sample = new AudioSample({
 				format: 'f32',
-				sampleRate: 48000,
+				sampleRate: 44100,
 				numberOfChannels: 1,
 				timestamp,
-				data: new Float32Array(4800).fill(0.5),
+				data: new Float32Array(4410).fill(0.5),
 			});
 			await resampler.add(sample);
 			sample.close();
 		}
 		await resampler.finalize();
 
+		expect(outputs.map(x => x.timestamp)).toEqual([0]);
 		const data = outputs[0]!.data;
-		expect(data.length).toBe(4800 * 4);
-		expect(data.subarray(0, 9600).every(x => x === 0.5)).toBe(true);
-		expect(data.subarray(9600, 14400).every(x => x === 0)).toBe(true);
-		expect(data.subarray(14400).every(x => x === 0.5)).toBe(true);
+		expect(Math.abs(data.length - 4800 * 4)).toBeLessThanOrEqual(1);
+
+		// Away from the transitions (by 20 ms), there's the signal, then silence, then the signal again
+		const margin = EDGE_SECONDS * 48000;
+		const maxDeviation = (from: number, to: number, value: number) => {
+			let worst = 0;
+			for (let i = from + margin; i < to - margin; i++) {
+				worst = Math.max(worst, Math.abs(data[i]! - value));
+			}
+			return worst;
+		};
+		expect(maxDeviation(0, 9600, 0.5)).toBeLessThan(0.5 * 0.005);
+		expect(maxDeviation(9600, 14400, 0)).toBeLessThan(0.5 * 0.005);
+		expect(maxDeviation(14400, 19200, 0.5)).toBeLessThan(0.5 * 0.005);
 	});
 
 	const mixOnce = async (sourceChannels: number, targetChannels: number, values: number[]) => {
@@ -310,11 +395,11 @@ describe('AudioResampler (resample.ts)', () => {
 			targetRate: 48000,
 			sourceChannels,
 			targetChannels,
-			totalFrames: 50,
-			chunkFrames: 50,
+			totalFrames: 4800,
+			chunkFrames: 1000,
 			signal: (frame, channel) => values[channel]!,
 		});
-		return [...samples.subarray(10 * targetChannels, 11 * targetChannels)];
+		return [...samples.subarray(2400 * targetChannels, 2401 * targetChannels)];
 	};
 
 	const h = Math.SQRT1_2;
