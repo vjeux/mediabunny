@@ -78,6 +78,13 @@ import { Logging } from '../logging';
 import { VERSIONED_NAME } from '../version';
 
 const MIN_CLUSTER_TIMESTAMP_MS = -(2 ** 15);
+
+/**
+ * Converts seconds to milliseconds, the muxer's timestamp ticks. Timestamps computed in floating point land a hair
+ * above or below an exact half millisecond, so plain rounding would round them up or down at random and turn equally
+ * spaced packets into ones 1 ms closer or further apart. Rounding to whole microseconds first removes that noise.
+ */
+const secondsToMs = (seconds: number) => Math.round(Math.round(seconds * 1e6) / 1000);
 const MAX_CLUSTER_TIMESTAMP_MS = 2 ** 15 - 1;
 const SEGMENT_SIZE_BYTES = 6;
 const CLUSTER_SIZE_BYTES = 5;
@@ -1094,7 +1101,7 @@ export class MatroskaMuxer extends Muxer {
 			this.validateTimestamp(trackData.track, cue.timestamp, true);
 
 			let bodyText = cue.text;
-			const timestampMs = Math.round(cue.timestamp * 1000);
+			const timestampMs = secondsToMs(cue.timestamp);
 
 			// Replace in-body timestamps so that they're relative to the cue start time
 			inlineTimestampRegex.lastIndex = 0;
@@ -1231,7 +1238,7 @@ export class MatroskaMuxer extends Muxer {
 			this.createSegment();
 		}
 
-		const msTimestamp = Math.round(1000 * chunk.timestamp);
+		const msTimestamp = secondsToMs(chunk.timestamp);
 
 		// We wanna only finalize this cluster (and begin a new one) if we know that each track will be able to
 		// start the new one with a key frame.
@@ -1297,7 +1304,7 @@ export class MatroskaMuxer extends Muxer {
 		});
 
 		this.startTimestamp = Math.min(this.startTimestamp, msTimestamp);
-		this.endTimestamp = Math.max(this.endTimestamp, msTimestamp + Math.round(1000 * chunk.duration));
+		this.endTimestamp = Math.max(this.endTimestamp, msTimestamp + secondsToMs(chunk.duration));
 		trackData.lastWrittenMsTimestamp = msTimestamp;
 
 		this.currentClusterMaxMsTimestamp = Math.max(this.currentClusterMaxMsTimestamp!, msTimestamp);
@@ -1401,7 +1408,7 @@ export class MatroskaMuxer extends Muxer {
 		view.setUint8(0, 0x80 | trackData.track.id);
 		view.setInt16(1, msTimestamp - clusterMsTimestamp, false);
 
-		const msDuration = Math.round(1000 * chunk.duration);
+		const msDuration = secondsToMs(chunk.duration);
 
 		// A SimpleBlock has no duration; readers infer it from the track's next block. So subtitle cues need an
 		// explicit BlockDuration, and so does the last block of each track in the cluster, which has no next block
