@@ -440,7 +440,8 @@ export class Mp3Demuxer extends Demuxer {
 				return this.metadataTags;
 			}
 
-			this.metadataTags = {};
+			// Only cached once complete, so that a tag that fails to parse fails every call, not just the first one
+			const metadataTags: MetadataTags = {};
 			let currentPos = 0;
 
 			while (true) {
@@ -457,14 +458,14 @@ export class Mp3Demuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				if (!contentSlice) break;
 
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				parseId3V2Tag(contentSlice, id3V2Header, metadataTags);
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
 			// Fall back to an ID3v1 tag at the end of the file when the ID3v2 tags gave us no text fields, like ones
 			// holding nothing but PRIV frames or cover art, like FFmpeg
-			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
+			const hasTextFields = Object.keys(metadataTags).some(key => key !== 'raw' && key !== 'images');
 			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
 				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) slice = await slice;
@@ -472,11 +473,12 @@ export class Mp3Demuxer extends Demuxer {
 
 				const tag = readAscii(slice, 3);
 				if (tag === 'TAG') {
-					parseId3V1Tag(slice, this.metadataTags);
+					parseId3V1Tag(slice, metadataTags);
 				}
 			}
 
-			return this.metadataTags;
+			this.metadataTags = metadataTags;
+			return metadataTags;
 		} finally {
 			release();
 		}
