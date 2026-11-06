@@ -34,6 +34,7 @@ import {
 	MAX_PAGE_SIZE,
 	MIN_PAGE_HEADER_SIZE,
 	Page,
+	pageChecksumMatches,
 	readPageHeader,
 } from './ogg-reader';
 
@@ -682,7 +683,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			packetPosition.startSegmentIndex,
 		);
 
-		return this.createEncodedPacketFromOggPacket(
+		const encodedPacket = this.createEncodedPacketFromOggPacket(
 			packet,
 			{
 				timestampInSamples,
@@ -690,6 +691,170 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			},
 			options,
 		);
+
+		return this.skipGapBeforePacket(encodedPacket, prevMetadata, options);
+	}
+
+	/**
+	 * A stream may have gaps (such as a live capture with dropouts), which show as a page's granule position exceeding
+	 * what the durations of the packets since the previous page add up to. Given the packet following the previous one,
+	 * returns it shifted forward past such a gap, if it's the first packet to end on a page that follows one.
+	 */
+	async skipGapBeforePacket(
+		encodedPacket: EncodedPacket | null,
+		prevMetadata: EncodedPacketMetadata,
+		options: PacketRetrievalOptions,
+	) {
+		if (!encodedPacket) {
+			return null;
+		}
+
+		const metadata = this.encodedPacketToMetadata.get(encodedPacket);
+		assert(metadata);
+
+		const page = metadata.packet.endPage;
+		const previousPage = prevMetadata.packet.endPage;
+		if (
+			page.headerStartPos === previousPage.headerStartPos
+			|| page.serialNumber !== previousPage.serialNumber
+			|| page.granulePosition < 0
+			|| previousPage.granulePosition < 0
+		) {
+			return encodedPacket;
+		}
+
+		const durations = await this.getDurationsOfPacketsEndingOnPage(metadata);
+		if (!durations) {
+			return encodedPacket;
+		}
+
+		// On the final page, end trimming (a granule position smaller than the durations add up to) can't be told
+		// apart from a gap, as the granule position only gives their difference. That difference is taken as the gap,
+		// which keeps the end of the stream exact, though the last packet then isn't trimmed (FFmpeg drops both).
+		const gapInSamples = page.granulePosition - previousPage.granulePosition - durations.sum;
+		if (gapInSamples <= 0) {
+			return encodedPacket;
+		}
+
+		// Some muxers write granule positions that are off by up to a packet's duration, which isn't a gap. Where pages
+		// were lost, though (as their sequence numbers show), the granule positions are all there is to go by, so
+		// any gap counts, which keeps iteration in line with lookups.
+		const codecInfo = this.bitstream.codecInfo;
+		const longestPossibleDuration = codecInfo.vorbisInfo ? codecInfo.vorbisInfo.blocksizes[1]! / 2 : 0;
+		const tolerance = 2 * Math.max(durations.longest, prevMetadata.durationInSamples, longestPossibleDuration);
+		if (gapInSamples <= tolerance && !await this.pagesWereLostBetween(previousPage, page)) {
+			return encodedPacket;
+		}
+
+		// The granule positions of damaged pages may be anything
+		for (const checkedPage of [previousPage, page]) {
+			let slice = this.demuxer.reader.requestSlice(checkedPage.headerStartPos, checkedPage.totalSize);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice || !pageChecksumMatches(checkedPage, readBytes(slice, checkedPage.totalSize))) {
+				return encodedPacket;
+			}
+		}
+
+		return this.createEncodedPacketFromOggPacket(
+			metadata.packet,
+			{
+				...metadata, // Whatever else the packet was created with
+				timestampInSamples: metadata.timestampInSamples + gapInSamples,
+				vorbisLastBlocksize: metadata.vorbisLastBlockSize,
+			},
+			options,
+		);
+	}
+
+	/** Whether pages of the bitstream are missing between the two given pages, as their sequence numbers show. */
+	async pagesWereLostBetween(previousPage: Page, page: Page) {
+		if (page.sequenceNumber - previousPage.sequenceNumber <= 1) {
+			return false;
+		}
+
+		// The pages in between may all be there, holding the middle of a packet, so let's check
+		let expectedSequenceNumber = previousPage.sequenceNumber + 1;
+		let currentPos = previousPage.headerStartPos + previousPage.totalSize;
+		while (currentPos < page.headerStartPos) {
+			let slice = this.demuxer.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			const nextPage = slice && readPageHeader(slice);
+			if (!nextPage) {
+				return false; // Something other than a page sits in between, so it can't be told
+			}
+
+			if (nextPage.serialNumber === page.serialNumber) {
+				if (nextPage.sequenceNumber !== expectedSequenceNumber) {
+					return true;
+				}
+				expectedSequenceNumber++;
+			}
+
+			currentPos = nextPage.headerStartPos + nextPage.totalSize;
+		}
+
+		return page.sequenceNumber !== expectedSequenceNumber;
+	}
+
+	/**
+	 * Returns the sum and the longest of the durations of the packets ending on the given packet's end page, starting
+	 * with that packet, or null if they can't be determined. The page's granule position is the end of the last one.
+	 */
+	async getDurationsOfPacketsEndingOnPage(metadata: EncodedPacketMetadata) {
+		const codecInfo = this.bitstream.codecInfo;
+		const page = metadata.packet.endPage;
+
+		let pageSlice = this.demuxer.reader.requestSlice(page.dataStartPos, page.dataSize);
+		if (isThenable(pageSlice)) {
+			pageSlice = await pageSlice;
+		}
+		if (!pageSlice) {
+			return null;
+		}
+		const pageData = readBytes(pageSlice, page.dataSize);
+
+		try {
+			// The packet's duration, without any trimming at the end of the stream
+			let { durationInSamples: sum, vorbisBlockSize } = extractSampleMetadata(
+				metadata.packet.data,
+				codecInfo,
+				metadata.vorbisLastBlockSize,
+			);
+			let longest = sum;
+
+			let packetStart = 0;
+			for (let i = 0; i <= metadata.packet.endSegmentIndex; i++) {
+				packetStart += page.lacingValues[i]!;
+			}
+
+			let packetEnd = packetStart;
+			for (let i = metadata.packet.endSegmentIndex + 1; i < page.lacingValues.length; i++) {
+				const lacingValue = page.lacingValues[i]!;
+				packetEnd += lacingValue;
+
+				if (lacingValue < 255) {
+					// A packet ends here. Its first two bytes are enough to tell its duration.
+					const sampleMetadata = extractSampleMetadata(
+						pageData.subarray(packetStart, Math.min(packetEnd, packetStart + 2)),
+						codecInfo,
+						vorbisBlockSize,
+					);
+
+					sum += sampleMetadata.durationInSamples;
+					longest = Math.max(longest, sampleMetadata.durationInSamples);
+					vorbisBlockSize = sampleMetadata.vorbisBlockSize;
+					packetStart = packetEnd;
+				}
+			}
+
+			return { sum, longest };
+		} catch {
+			return null; // A damaged packet, which is reported once it's read
+		}
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
@@ -986,7 +1151,27 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					encodedPacketMetadata = this.encodedPacketToMetadata.get(encodedPacket);
 					assert(encodedPacketMetadata);
 				} else {
-					currentTimestampInSamples += encodedPacketMetadata.durationInSamples;
+					if (currentTimestampIsCorrect && lastEncodedPacketMetadata) {
+						// Like when iterating, skip a gap before the packet
+						const shiftedPacket = await this.skipGapBeforePacket(
+							encodedPacket,
+							lastEncodedPacketMetadata,
+							options,
+						);
+						if (shiftedPacket !== encodedPacket) {
+							assert(shiftedPacket);
+							encodedPacket = shiftedPacket;
+							encodedPacketMetadata = this.encodedPacketToMetadata.get(encodedPacket);
+							assert(encodedPacketMetadata);
+
+							if (encodedPacketMetadata.timestampInSamples > timestampInSamples) {
+								break; // The timestamp lies in the gap
+							}
+						}
+					}
+
+					currentTimestampInSamples = encodedPacketMetadata.timestampInSamples
+						+ encodedPacketMetadata.durationInSamples;
 				}
 
 				lastEncodedPacket = encodedPacket;
