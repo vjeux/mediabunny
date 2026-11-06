@@ -924,8 +924,9 @@ test('MPEG-TS with AUD-less video packets', async () => {
 });
 
 test('MPEG-TS ignores a PMT that is not in effect yet', async () => {
-	// Broadcasts may send the next version of a PMT (current_next_indicator 0) ahead of switching to it. Here, one that
-	// moves the audio to another PID comes before the PMT in effect; ffprobe reads the three frames.
+	// Broadcasts may send the next version of a PMT (current_next_indicator 0) ahead of switching to it. First, one
+	// that moves the audio to another PID comes before the PMT in effect (`ffprobe -f mpegts` reads the three frames).
+	// Then, the file only has a PMT for later, which is taken after all, as before.
 	const crc32 = (bytes: number[]) => {
 		let crc = 0xffffffff;
 		for (const byte of bytes) {
@@ -951,27 +952,28 @@ test('MPEG-TS ignores a PMT that is not in effect yet', async () => {
 	]);
 	const adtsFrame = [0xff, 0xf1, 0x4c, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c];
 
-	const packets = [
-		psiPacket(0x0000, [0x00, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00]),
-		pmt(1, 0, 0x101),
-		pmt(0, 1, 0x100),
-		...[0, 1, 2].map(i => tsPacket(0x100, [
-			0, 0, 1, 0xc0, 0, 8 + adtsFrame.length, 0x80, 0x80, 5,
-			0x21, 0, 1, ((1920 * i) >> 7) & 0xff, ((1920 * i << 1) & 0xfe) | 1, ...adtsFrame,
-		])),
-	];
-	const bytes = new Uint8Array(188 * packets.length);
-	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+	for (const pmts of [[pmt(1, 0, 0x101), pmt(0, 1, 0x100)], [pmt(0, 0, 0x100)]]) {
+		const packets = [
+			psiPacket(0x0000, [0x00, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00]),
+			...pmts,
+			...[0, 1, 2].map(i => tsPacket(0x100, [
+				0, 0, 1, 0xc0, 0, 8 + adtsFrame.length, 0x80, 0x80, 5,
+				0x21, 0, 1, ((1920 * i) >> 7) & 0xff, ((1920 * i << 1) & 0xfe) | 1, ...adtsFrame,
+			])),
+		];
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
 
-	using input = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-	expect(track.id).toBe(0x100);
+		using input = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		expect(track.id).toBe(0x100);
 
-	let count = 0;
-	for await (const packet of new EncodedPacketSink(track).packets()) {
-		expect(packet.byteLength).toBe(adtsFrame.length);
-		count++;
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.byteLength).toBe(adtsFrame.length);
+			count++;
+		}
+		expect(count).toBe(3);
 	}
-	expect(count).toBe(3);
 });

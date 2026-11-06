@@ -179,6 +179,12 @@ type Section = {
 const ignoredStreamTypes = new Set<number>();
 
 /**
+ * How far past a PAT or PMT that isn't in effect yet we look for one that is, before taking it anyway. PSI tables
+ * repeat at least every half second in broadcasts (DVB), which this covers even at high bitrates.
+ */
+const MAX_TABLE_NOT_IN_EFFECT_DISTANCE = 2 ** 22; // 4 MiB
+
+/**
  * Checks the current_next_indicator of the PSI section starting after the pointer_field of the given packet payload.
  * A section with 0 is the next version of its table, sent ahead of the switch, which isn't in effect yet.
  */
@@ -240,9 +246,26 @@ export class MpegTsDemuxer extends Demuxer {
 			// Some files contain these multiple times, but we only care about their first appearance
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
+			// PAT and PMT sections that only apply later are skipped while we look for the ones in effect (like in
+			// FFmpeg). If none turns up, we go back to the first one we skipped and take it after all.
+			let firstTableNotInEffectPos: number | null = null;
+			let takesTablesNotInEffect = false;
 
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
+
+				if (
+					!hasProgramMap
+					&& firstTableNotInEffectPos !== null
+					&& !takesTablesNotInEffect
+					&& (!packetHeader || currentPos - firstTableNotInEffectPos > MAX_TABLE_NOT_IN_EFFECT_DISTANCE)
+				) {
+					// A muxer that leaves current_next_indicator clear, or a capture that ends before the switch
+					currentPos = firstTableNotInEffectPos;
+					takesTablesNotInEffect = true;
+					continue;
+				}
+
 				if (!packetHeader) {
 					break;
 				}
@@ -294,8 +317,14 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 				}
 
-				// Tables that only apply later are skipped (like FFmpeg does), the current ones follow
-				if (section.pid === 0 && !hasProgramAssociationTable && psiSectionIsInEffect(section.payload)) {
+				const isTable = (section.pid === 0 && !hasProgramAssociationTable)
+					|| ((section.pid === programMapPid || isProbablyProgramMap) && !hasProgramMap);
+				const isInEffect = takesTablesNotInEffect || psiSectionIsInEffect(section.payload);
+				if (isTable && !isInEffect) {
+					firstTableNotInEffectPos ??= currentPos;
+				}
+
+				if (section.pid === 0 && !hasProgramAssociationTable && isInEffect) {
 					const bitstream = new Bitstream(section.payload);
 					const pointerField = bitstream.readAlignedByte();
 
@@ -325,11 +354,7 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					hasProgramAssociationTable = true;
-				} else if (
-					(section.pid === programMapPid || isProbablyProgramMap)
-					&& !hasProgramMap
-					&& psiSectionIsInEffect(section.payload)
-				) {
+				} else if ((section.pid === programMapPid || isProbablyProgramMap) && !hasProgramMap && isInEffect) {
 					const bitstream = new Bitstream(section.payload);
 					const pointerField = bitstream.readAlignedByte();
 
