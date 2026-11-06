@@ -247,7 +247,9 @@ export class Mp3Demuxer extends Demuxer {
 
 			for (const pos of positions) {
 				let slice = this.reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
-				if (isThenable(slice)) slice = await slice;
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
 				if (!slice) {
 					continue;
 				}
@@ -280,7 +282,9 @@ export class Mp3Demuxer extends Demuxer {
 
 		if (endPos >= ID3_V1_TAG_SIZE) {
 			let slice = this.reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 
 			if (slice && readAscii(slice, 3) === 'TAG') {
 				endPos -= ID3_V1_TAG_SIZE;
@@ -290,7 +294,9 @@ export class Mp3Demuxer extends Demuxer {
 		// APEv2 tags end with a 32-byte footer and sit in front of any ID3v1 tag
 		if (endPos >= APE_TAG_FOOTER_SIZE) {
 			let slice = this.reader.requestSlice(endPos - APE_TAG_FOOTER_SIZE, APE_TAG_FOOTER_SIZE);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 
 			if (slice && readAscii(slice, 8) === 'APETAGEX') {
 				slice.skip(4); // Version
