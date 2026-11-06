@@ -77,6 +77,12 @@ export class SubtitleParser {
 			let bodyEnd = text.indexOf('\n\n', matchEnd);
 			if (bodyEnd === -1) bodyEnd = text.length;
 
+			// Like in the W3C parser, a line containing "-->" starts the next cue, even without a blank line before it
+			const nextArrowIndex = text.indexOf('-->', bodyStart);
+			if (nextArrowIndex !== -1 && nextArrowIndex < bodyEnd) {
+				bodyEnd = Math.max(text.lastIndexOf('\n', nextArrowIndex), bodyStart);
+			}
+
 			const startTime = parseSubtitleTimestamp(match[2]!);
 			const endTime = parseSubtitleTimestamp(match[3]!);
 			const duration = endTime - startTime;
