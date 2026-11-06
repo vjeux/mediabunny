@@ -279,6 +279,83 @@ test('Can encode transparent video with odd dimensions', async () => {
 	await output.start();
 	await source.add(0, 1);
 	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(641);
+	expect(await videoTrack.getDisplayHeight()).toBe(479);
+	expect(await videoTrack.canBeTransparent()).toBe(true);
+
+	using sample = (await new VideoSampleSink(videoTrack).getSample(0))!;
+	expect(sample.hasAlpha).toBe(true);
+
+	// The last row and column keep their alpha too
+	const readbackContext = new OffscreenCanvas(641, 479).getContext('2d')!;
+	sample.draw(readbackContext, 0, 0);
+	expect(readbackContext.getImageData(640, 478, 1, 1).data[3]).toBeGreaterThan(100);
+});
+
+test('Can encode transparent YUV frames with odd dimensions', async () => {
+	// Decoders (like the ProRes one) hand out I420A frames with a padded coded size and an odd visible rect
+	const width = 161;
+	const height = 91;
+	const codedWidth = 176;
+	const codedHeight = 96;
+	const lumaSize = codedWidth * codedHeight;
+	const chromaSize = (codedWidth / 2) * (codedHeight / 2);
+	const data = new Uint8Array(2 * lumaSize + 2 * chromaSize);
+	data.fill(81, 0, lumaSize); // Red
+	data.fill(90, lumaSize, lumaSize + chromaSize);
+	data.fill(240, lumaSize + chromaSize, lumaSize + 2 * chromaSize);
+	data.fill(160, lumaSize + 2 * chromaSize); // Alpha
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		alpha: 'keep',
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	const frame = new VideoFrame(data, {
+		format: 'I420A',
+		codedWidth,
+		codedHeight,
+		visibleRect: { x: 0, y: 0, width, height },
+		timestamp: 0,
+		duration: 1e6,
+	});
+	using inputSample = new VideoSample(frame);
+	await source.add(inputSample);
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(width);
+	expect(await videoTrack.getDisplayHeight()).toBe(height);
+
+	using sample = (await new VideoSampleSink(videoTrack).getSample(0))!;
+	expect(sample.hasAlpha).toBe(true);
+
+	// Including the last row and column. Read through copyTo, as Firefox draws non-opaque RGBA frames with wrong colors
+	// (https://bugzilla.mozilla.org/show_bug.cgi?id=2079836)
+	const pixels = new Uint8Array(width * height * 4);
+	await sample.copyTo(pixels, { format: 'RGBA' });
+	const [red, green, , alpha] = pixels.subarray(pixels.length - 4);
+	expect(alpha).toBeGreaterThan(130);
+	expect(alpha).toBeLessThan(190);
+	expect(red).toBeGreaterThan(150);
+	expect(green).toBeLessThan(80);
 });
 
 test('Positive encodability check with alpha', async () => {
