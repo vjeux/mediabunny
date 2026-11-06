@@ -131,3 +131,58 @@ test('Blocks last their BlockDuration or the DefaultDuration, not until the next
 		expect(duration).toBeCloseTo(1 / 30, 6);
 	}
 });
+
+test('Laced blocks spread their frames over the gap to the next block', async () => {
+	// As in a broadcast recording remuxed to MKV: eight audio frames of 32 ms per block, blocks 256 ms apart, and a
+	// DefaultDuration of 192 ms that can't be the duration of each frame. The frames must stay 32 ms apart instead of
+	// following the DefaultDuration into the next block.
+	const element = (id: number[], ...parts: (number[] | Uint8Array)[]) => {
+		const size = parts.reduce((sum, part) => sum + part.length, 0);
+		const sizeBytes = [0x01, 0, 0, 0, size >>> 24, (size >> 16) & 0xff, (size >> 8) & 0xff, size & 0xff];
+		return [...id, ...sizeBytes, ...parts.flatMap(part => [...part])];
+	};
+	const uint = (id: number[], value: number) => element(
+		id,
+		[value >> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff],
+	);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+
+	const frameSize = 512; // 32 ms of 16-bit mono PCM at 8 kHz
+	const lacedBlock = (relativeTimestamp: number) => element(
+		[0xa3], // SimpleBlock
+		[0x81, relativeTimestamp >> 8, relativeTimestamp & 0xff, 0x84, 8 - 1], // Track 1, key frame, fixed-size lacing
+		new Uint8Array(8 * frameSize),
+	);
+	const bytes = new Uint8Array([
+		...element([0x1a, 0x45, 0xdf, 0xa3], element([0x42, 0x82], ascii('matroska'))),
+		...element(
+			[0x18, 0x53, 0x80, 0x67], // Segment
+			element([0x15, 0x49, 0xa9, 0x66], uint([0x2a, 0xd7, 0xb1], 1_000_000)), // Info: 1 ms timestamp scale
+			element([0x16, 0x54, 0xae, 0x6b], element(
+				[0xae], // TrackEntry
+				uint([0xd7], 1),
+				uint([0x73, 0xc5], 1),
+				uint([0x83], 2),
+				element([0x86], ascii('A_PCM/INT/LIT')),
+				uint([0x23, 0xe3, 0x83], 192_000_000), // DefaultDuration
+				element(
+					[0xe1], // Audio
+					element([0xb5], [0x40, 0xbf, 0x40, 0, 0, 0, 0, 0]), // SamplingFrequency 8000
+					uint([0x9f], 1), // Channels
+					uint([0x62, 0x64], 16), // BitDepth
+				),
+			)),
+			element([0x1f, 0x43, 0xb6, 0x75], uint([0xe7], 0), lacedBlock(0), lacedBlock(256), lacedBlock(512)),
+		),
+	]);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packets: [number, number][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([Math.round(packet.timestamp * 1000), Math.round(packet.duration * 1000)]);
+	}
+	expect(packets.slice(0, 16)).toEqual(Array.from({ length: 16 }, (_, i) => [32 * i, 32]));
+});
