@@ -2025,8 +2025,9 @@ const metaMdta = (tags: MetadataTags) => {
 		return null;
 	}
 
-	// box without version and flags
-	return box('meta', undefined, [
+	// fullBox format, like FFmpeg's use_metadata_tags: moov/udta/meta is an ISOBMFF MetaBox, and readers such as
+	// ExifTool expect its version and flags fields there
+	return fullBox('meta', 0, 0, undefined, [
 		hdlr(false, 'mdta', ''), // mdta handler
 		fullBox('keys', 0, 0, [
 			u32(pairs.length),
