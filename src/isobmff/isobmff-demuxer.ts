@@ -156,7 +156,7 @@ type InternalTrack = {
 	fragmentPositionCache: {
 		moofOffset: number;
 		startTimestamp: number;
-		endTimestamp: number;
+		endDecodeTimestamp: number;
 		hasKeyFrame: boolean;
 	}[];
 	/** The segment durations of all edit list entries leading up to the main one (from which the offset is taken.) */
@@ -1251,9 +1251,9 @@ export class IsobmffDemuxer extends Demuxer {
 						x => x.moofOffset,
 					);
 					if (lastCacheIndex !== -1) {
-						// Let's use the end timestamp of the previous fragment in the cache
+						// Let's continue decoding where the previous fragment in the cache left off
 						const lastCache = fragmentPositionCache[lastCacheIndex]!;
-						offsetFragmentTrackDataByTimestamp(trackData, lastCache.endTimestamp);
+						offsetFragmentTrackDataByTimestamp(trackData, lastCache.endDecodeTimestamp);
 					} else {
 						// We're the first fragment I guess, "offset by 0"
 					}
@@ -1301,7 +1301,7 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentPositionCache.splice(insertionIndex + 1, 0, {
 					moofOffset: fragment.moofOffset,
 					startTimestamp: trackData.startTimestamp,
-					endTimestamp: trackData.endTimestamp,
+					endDecodeTimestamp: trackData.currentTimestamp,
 					hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
 				});
 			}
@@ -5662,6 +5662,7 @@ const countTimestampsAfter = (timestamps: number[], timestamp: number) => {
 };
 
 const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timestamp: number) => {
+	trackData.currentTimestamp += timestamp;
 	trackData.startTimestamp += timestamp;
 	trackData.endTimestamp += timestamp;
 
