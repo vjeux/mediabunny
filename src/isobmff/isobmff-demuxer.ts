@@ -195,6 +195,8 @@ type InternalTrack = {
 		dtsFormat: DtsFourCc | null;
 		pcmLittleEndian: boolean;
 		pcmSampleSize: number | null;
+		/** The compressed packet layout from a QuickTime sound sample description version 1, if there is one. */
+		soundPacketLayout: { samplesPerPacket: number; bytesPerFrame: number } | null;
 	};
 });
 
@@ -731,6 +733,86 @@ export class IsobmffDemuxer extends Demuxer {
 			sampleTable.sampleTimingEntries = newSampleTimingEntries;
 			sampleTable.sampleSizes = newSampleSizes;
 			sampleTable.sampleCount = newSampleSizes.length;
+		} else if (
+			internalTrack.info?.type === 'audio'
+			&& internalTrack.info.soundPacketLayout
+			&& sampleTable.sampleCompositionTimeOffsets.length === 0
+			&& sampleTable.sampleTimingEntries.length > 0
+			&& sampleTable.sampleTimingEntries.every(x => x.delta === 1)
+			&& sampleTable.sampleSizes.length === 1
+		) {
+			// Old QuickTime files store some compressed audio (like MP3) the way they store PCM: the sample table
+			// counts decoded samples, each one byte "large", and the sound sample description tells how many decoded
+			// samples and bytes make up one compressed packet. Like FFmpeg, turn every packet into a sample.
+			let { samplesPerPacket, bytesPerFrame } = internalTrack.info.soundPacketLayout;
+
+			if (internalTrack.info.codec === 'mp3') {
+				// Packets can hold several MP3 frames, which are of the same size in such constant-bitrate files
+				const frameSamples = internalTrack.info.sampleRate >= 32000 ? 1152 : 576;
+				const framesPerPacket = samplesPerPacket / frameSamples;
+				if (Number.isInteger(framesPerPacket) && framesPerPacket > 1 && bytesPerFrame % framesPerPacket === 0) {
+					samplesPerPacket = frameSamples;
+					bytesPerFrame /= framesPerPacket;
+				}
+			}
+
+			// Chunks must hold whole packets; FFmpeg rejects them otherwise too
+			if (sampleTable.sampleToChunk.every(x => x.samplesPerChunk % samplesPerPacket === 0)) {
+				const newSampleTimingEntries: SampleTimingEntry[] = [];
+				let newSampleCount = 0;
+
+				for (let i = 0; i < sampleTable.sampleToChunk.length; i++) {
+					const chunkEntry = sampleTable.sampleToChunk[i]!;
+					const nextEntry = sampleTable.sampleToChunk[i + 1];
+					const chunkCount = Math.min(
+						nextEntry ? nextEntry.startChunkIndex : Infinity,
+						sampleTable.chunkOffsets.length,
+					) - chunkEntry.startChunkIndex;
+					const packetsPerChunk = chunkEntry.samplesPerChunk / samplesPerPacket;
+					const newStartSampleIndex = newSampleCount;
+
+					for (let j = 0; j < chunkCount; j++) {
+						const startSampleIndex = chunkEntry.startSampleIndex + j * chunkEntry.samplesPerChunk;
+						if (startSampleIndex >= sampleTable.sampleCount) {
+							break;
+						}
+
+						const timingEntry = sampleTable.sampleTimingEntries[binarySearchLessOrEqual(
+							sampleTable.sampleTimingEntries,
+							startSampleIndex,
+							x => x.startIndex,
+						)]!;
+						const startTimestamp = timingEntry.startDecodeTimestamp
+							+ (startSampleIndex - timingEntry.startIndex) * timingEntry.delta;
+
+						const lastTimingEntry = last(newSampleTimingEntries);
+						if (
+							lastTimingEntry
+							&& lastTimingEntry.startDecodeTimestamp + lastTimingEntry.count * samplesPerPacket
+							=== startTimestamp
+						) {
+							lastTimingEntry.count += packetsPerChunk;
+						} else {
+							newSampleTimingEntries.push({
+								startIndex: newSampleCount,
+								startDecodeTimestamp: startTimestamp,
+								count: packetsPerChunk,
+								delta: samplesPerPacket,
+							});
+						}
+
+						newSampleCount += packetsPerChunk;
+					}
+
+					chunkEntry.startSampleIndex = newStartSampleIndex;
+					chunkEntry.samplesPerChunk = packetsPerChunk;
+				}
+
+				sampleTable.sampleTimingEntries = newSampleTimingEntries;
+				sampleTable.sampleSizes = [bytesPerFrame];
+				sampleTable.sampleCount = newSampleCount;
+				sampleTable.keySampleIndices = null;
+			}
 		}
 
 		if (sampleTable.sampleCompositionTimeOffsets.length > 0) {
@@ -1230,6 +1312,7 @@ export class IsobmffDemuxer extends Demuxer {
 						dtsFormat: null,
 						pcmLittleEndian: false,
 						pcmSampleSize: null,
+						soundPacketLayout: null,
 					};
 				}
 			}; break;
@@ -1330,9 +1413,14 @@ export class IsobmffDemuxer extends Demuxer {
 						if (stsdVersion === 0 && version > 0) {
 							// Additional QuickTime fields
 							if (version === 1) {
-								slice.skip(4);
-								sampleSize = 8 * readU32Be(slice);
-								slice.skip(2 * 4);
+								const samplesPerPacket = readU32Be(slice);
+								sampleSize = 8 * readU32Be(slice); // Bytes per packet (per channel)
+								const bytesPerFrame = readU32Be(slice); // Bytes per packet (all channels)
+								slice.skip(4); // Bytes per sample
+
+								track.info.soundPacketLayout = samplesPerPacket > 0 && bytesPerFrame > 0
+									? { samplesPerPacket, bytesPerFrame }
+									: null;
 							} else if (version === 2) {
 								slice.skip(4);
 								sampleRate = readF64Be(slice);
