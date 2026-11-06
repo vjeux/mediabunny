@@ -2206,3 +2206,40 @@ test('Sample descriptions with NAL unit length prefixes of different sizes', asy
 		expect((await sink.getPacket(0.04, { metadataOnly: true }))?.byteLength).toBe(packet.byteLength);
 	}
 });
+
+test('A metadata atom overrunning its item neither breaks the file nor leaks into the next atoms', async () => {
+	const write = async (format: Mp4OutputFormat | MovOutputFormat) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source);
+		output.setMetadataTags({ title: 'Title', artist: 'Artist', comment: 'Comment' });
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(1024), 'key', 0, 0.1), {
+			decoderConfig: { codec: 'vp8', codedWidth: 1280, codedHeight: 720 },
+		});
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+	const find = (bytes: Uint8Array, name: string) => {
+		const index = Buffer.from(bytes).indexOf(Buffer.from(name, 'latin1'));
+		assert(index !== -1);
+		return index;
+	};
+	const read = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		expect(await input.getPrimaryVideoTrack()).not.toBeNull();
+		return input.getMetadataTags();
+	};
+
+	// MP4: the ©ART item's data box claims 4096 bytes
+	const mp4 = await write(new Mp4OutputFormat());
+	new DataView(mp4.buffer).setUint32(find(mp4, '\xa9ART') + 4, 4096); // The size field of the item's data box
+	const mp4Tags = await read(mp4);
+	expect(mp4Tags.artist).toBe('Artist');
+	expect(mp4Tags.title).toBe('Title');
+
+	// MOV: the ©nam string claims to be 65535 bytes long
+	const mov = await write(new MovOutputFormat());
+	new DataView(mov.buffer).setUint16(find(mov, '\xa9nam') + 4, 0xffff);
+	expect((await read(mov)).title).toBe('Title');
+});
