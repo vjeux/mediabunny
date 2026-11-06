@@ -569,6 +569,30 @@ test('VideoSampleSource, transform.frameRate is the frame rate the encoder is co
 	expect(framerate).toBe(60);
 });
 
+test('VideoSampleSource, quality-level bitrates grow above 30 fps while explicit bitrates stay', async () => {
+	const configuredBitrate = async (quality: Quality, frameRate: number) => {
+		let bitrate: number | undefined;
+		await encodeFrames(
+			{
+				codec: 'vp8',
+				quality,
+				transform: { frameRate },
+				onEncoderConfig: (config) => {
+					bitrate = config.bitrate;
+				},
+			},
+			[{ width: 64, height: 64, timestamp: 0, duration: 1 / frameRate }],
+		);
+		return bitrate!;
+	};
+
+	const bitrate30 = await configuredBitrate(new Quality('medium'), 30);
+	expect(await configuredBitrate(new Quality('medium'), 24)).toBe(bitrate30);
+	// Bitrates are rounded up to whole kbps
+	expect(Math.abs(await configuredBitrate(new Quality('medium'), 60) - 2 * bitrate30)).toBeLessThanOrEqual(1000);
+	expect(await configuredBitrate(new Quality({ bitrate: 300_000 }), 60)).toBe(300_000);
+});
+
 const encodeFrames = async (
 	encodingConfig: ConstructorParameters<typeof VideoSampleSource>[0],
 	frames: {

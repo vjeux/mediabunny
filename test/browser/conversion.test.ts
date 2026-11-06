@@ -1463,16 +1463,16 @@ const testReservedFastStart = async (
 	}
 };
 
-test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }, async () => {
-	// A 2 s, 60 fps WebM whose frames take some bits to encode
+/** Makes a 2 s WebM whose frames take some bits to encode, and transcodes it to VP8, returning the bitrate. */
+const transcodeToVp8 = async (frameRate: number, quality: Quality) => {
 	const width = 320;
 	const height = 180;
 	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
 	const sourceVideo = new VideoSampleSource({ codec: 'vp9', quality: new Quality({ bitrate: 2_000_000 }) });
-	sourceOutput.addVideoTrack(sourceVideo, { frameRate: 60 });
+	sourceOutput.addVideoTrack(sourceVideo, { frameRate });
 	await sourceOutput.start();
 
-	for (let i = 0; i < 120; i++) {
+	const addFrame = async (i: number) => {
 		const data = new Uint8Array(width * height * 3 / 2).fill(128);
 		for (let y = 0; y < height; y++) {
 			for (let x = 0; x < width; x++) {
@@ -1485,10 +1485,14 @@ test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }
 			format: 'I420',
 			codedWidth: width,
 			codedHeight: height,
-			timestamp: i / 60,
-			duration: 1 / 60,
+			timestamp: i / frameRate,
+			duration: 1 / frameRate,
 		});
 		await sourceVideo.add(sample);
+	};
+
+	for (let i = 0; i < 2 * frameRate; i++) {
+		await addFrame(i);
 	}
 	await sourceOutput.finalize();
 
@@ -1497,7 +1501,7 @@ test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }
 	const conversion = await Conversion.init({
 		input,
 		output,
-		video: { codec: 'vp8', quality: new Quality({ bitrate: 300_000 }) },
+		video: { codec: 'vp8', quality },
 	});
 	await conversion.execute();
 
@@ -1505,6 +1509,22 @@ test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }
 	const track = await newInput.getPrimaryVideoTrack();
 	assert(track);
 
-	const { averageBitrate } = await track.computePacketStats();
+	return (await track.computePacketStats()).averageBitrate;
+};
+
+test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }, async () => {
+	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }));
+	expect(averageBitrate).toBeGreaterThan(0.7 * 300_000);
 	expect(averageBitrate).toBeLessThan(1.3 * 300_000);
+});
+
+test('Transcoding 60 fps video with a quality level gets twice the bitrate of 30 fps', {
+	timeout: 30_000,
+}, async () => {
+	// Quality levels are meant for up to 30 fps, and 60 fps has always ended up with twice the bitrate (before
+	// encoders were told the frame rate, because they assumed 30 fps)
+	const bitrate30 = await transcodeToVp8(30, new Quality('medium'));
+	const bitrate60 = await transcodeToVp8(60, new Quality('medium'));
+	expect(bitrate60 / bitrate30).toBeGreaterThan(1.6);
+	expect(bitrate60 / bitrate30).toBeLessThan(2.4);
 });
