@@ -28,7 +28,7 @@ import {
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readBytes, Reader } from '../reader';
-import { buildOggMimeType, extractSampleMetadata, OggCodecInfo } from './ogg-misc';
+import { buildOggMimeType, extractSampleMetadata, OggCodecInfo, oggPageChecksumMatches } from './ogg-misc';
 import {
 	findNextPageHeader,
 	MAX_PAGE_HEADER_SIZE,
@@ -65,6 +65,8 @@ export class OggDemuxer extends Demuxer {
 	reader: Reader;
 
 	metadataPromise: Promise<void> | null = null;
+	/** Whether pages (by position) of chained links have a matching checksum. */
+	pageIntactness = new Map<number, boolean>();
 	bitstreams: LogicalBitstream[] = [];
 	trackBackings: OggAudioTrackBacking[] = [];
 	metadataTags: MetadataTags = {};
@@ -288,6 +290,56 @@ export class OggDemuxer extends Demuxer {
 	}
 
 	/**
+	 * Checks the checksum of the pages of chained links (those of the file's first bitstreams aren't checked, to stay
+	 * as lenient as before), so that a damaged later link, as found where a stream capture broke off, ends the track
+	 * instead of handing damaged data to the decoder. FFmpeg also drops pages whose checksum doesn't match.
+	 */
+	async pageIsIntact(page: Page) {
+		if (this.bitstreams.some(x => x.serialNumber === page.serialNumber)) {
+			return true;
+		}
+
+		let result = this.pageIntactness.get(page.headerStartPos);
+		if (result === undefined) {
+			let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
+			if (isThenable(slice)) slice = await slice;
+			result = !!slice && oggPageChecksumMatches(readBytes(slice, page.totalSize));
+			this.pageIntactness.set(page.headerStartPos, result);
+		}
+
+		return result;
+	}
+
+	/**
+	 * Follows the pages of a chained link's bitstream from its first page and returns where its intact part ends:
+	 * after its end-of-stream page, or at its first damaged page. Returns null if that can't be told, as the pages
+	 * stop being consecutive before either.
+	 */
+	async findIntactLinkEnd(bitstream: LogicalBitstream): Promise<number | null> {
+		let page = bitstream.bosPage;
+
+		while (true) {
+			if (!await this.pageIsIntact(page)) {
+				return page.headerStartPos;
+			}
+
+			const endPos = page.headerStartPos + page.totalSize;
+			if (page.headerType & 0x04) {
+				return endPos;
+			}
+
+			let slice = this.reader.requestSliceRange(endPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
+			if (isThenable(slice)) slice = await slice;
+			const nextPage = slice && readPageHeader(slice);
+			if (!nextPage || nextPage.serialNumber !== bitstream.serialNumber) {
+				return null;
+			}
+
+			page = nextPage;
+		}
+	}
+
+	/**
 	 * Reads the logical bitstream of the chained link (RFC 3533, section 4) that starts with the page at the given
 	 * position, if there is one. Only links made of a single logical bitstream are read.
 	 */
@@ -345,6 +397,10 @@ export class OggDemuxer extends Demuxer {
 
 		outer:
 		while (true) {
+			if (!await this.pageIsIntact(currentPage)) {
+				return null;
+			}
+
 			// Load the entire page data
 			let pageSlice = this.reader.requestSlice(currentPage.dataStartPos, currentPage.dataSize);
 			if (isThenable(pageSlice)) pageSlice = await pageSlice;
@@ -754,8 +810,8 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					this.warnedAboutIncompatibleLink = true;
 					Logging._warn(
 						'Ogg: The track ends before the chained logical bitstream at byte'
-						+ ` ${bitstream.bosPage.headerStartPos}, as its codec parameters (or serial number) don't allow`
-						+ ' continuing into it.',
+						+ ` ${bitstream.bosPage.headerStartPos}, which has different codec parameters, reuses the`
+						+ ' serial number or has damaged headers.',
 					);
 				}
 
@@ -774,7 +830,8 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				offsetInSamples: end.timestampInSamples - startInSamples,
 				firstTimestampInSamples: end.timestampInSamples,
 				initialVorbisLastBlocksize: end.vorbisBlockSize,
-				endPos: null,
+				// Reading the link stops at a damaged page, so lookups must not look past it either
+				endPos: await this.demuxer.findIntactLinkEnd(bitstream),
 				nextPromise: null,
 			};
 		})();
@@ -895,11 +952,14 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return null;
 		}
 
+		let previousLink: OggLink | null = null;
+
 		while (true) {
 			if (link.nextPromise) {
 				// We already know where the next link starts, so we can skip this one if the timestamp lies past it
 				const nextLink = await link.nextPromise;
 				if (nextLink && timestampInSamples >= nextLink.firstTimestampInSamples) {
+					previousLink = link;
 					link = nextLink;
 					continue;
 				}
@@ -907,7 +967,8 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 			const packet = await this.getPacketInLink(link, timestampInSamples, options);
 			if (!packet) {
-				return null;
+				// A later link whose first packet can't be read (as it's damaged) ends the track, like in iteration
+				return previousLink && this.getPacketInLink(previousLink, timestampInSamples, options);
 			}
 
 			const metadata = this.encodedPacketToMetadata.get(packet);
@@ -927,6 +988,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				return packet;
 			}
 
+			previousLink = link;
 			link = nextLink;
 		}
 	}

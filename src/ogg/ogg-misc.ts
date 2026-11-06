@@ -25,6 +25,17 @@ for (let n = 0; n < 256; n++) {
 	OGG_CRC_TABLE[n] = (crc >>> 0) & 0xffffffff;
 }
 
+/** Whether the page's checksum matches its bytes. Unlike {@link computeOggPageCrc}, this doesn't modify the bytes. */
+export const oggPageChecksumMatches = (pageBytes: Uint8Array) => {
+	let crc = 0;
+	for (let i = 0; i < pageBytes.length; i++) {
+		const byte = i >= 22 && i < 26 ? 0 : pageBytes[i]!; // The checksum field counts as zeros
+		crc = ((crc << 8) ^ OGG_CRC_TABLE[(crc >>> 24) ^ byte]!) >>> 0;
+	}
+
+	return crc === toDataView(pageBytes).getUint32(22, true);
+};
+
 export const computeOggPageCrc = (bytes: Uint8Array) => {
 	const view = toDataView(bytes);
 

@@ -184,3 +184,38 @@ test('stops with a warning at a chained link with different codec parameters', a
 		removeListener();
 	}
 });
+
+test('ends the track at a damaged page of a chained link', async () => {
+	const { links } = await remuxToOggLinks('/preroll-test.opus', [100, 220]);
+
+	// Flip a byte in the third link's second audio page, which comes after its two header pages and one audio page
+	const thirdLink = links[2]!.slice();
+	let offset = 0;
+	for (let i = 0; i < 3; i++) {
+		const segmentCount = thirdLink[offset + 26]!;
+		const dataSize = thirdLink.subarray(offset + 27, offset + 27 + segmentCount).reduce((a, b) => a + b, 0);
+		offset += 27 + segmentCount + dataSize;
+	}
+	thirdLink[offset + 40]! ^= 0xff;
+
+	const file = concatBytes([links[0]!, links[1]!, thirdLink]);
+	const { packets, duration } = await readPackets(new BufferSource(file));
+
+	// The track ends before the damaged page, whose packets would make decoding fail
+	expect(packets.length).toBeGreaterThan(220);
+	expect(packets.length).toBeLessThan(301);
+	expect(duration).toBeCloseTo(packets.at(-1)!.timestamp + packets.at(-1)!.duration, 9);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	const sink = new EncodedPacketSink(track);
+	for (const packet of [packets[219]!, packets[220]!, packets.at(-1)!]) {
+		expect((await sink.getPacket(packet.timestamp))?.byteLength).toBe(packet.byteLength);
+	}
+
+	let decodedFrames = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		decodedFrames += sample.numberOfFrames;
+	}
+	expect(decodedFrames).toBeGreaterThan(duration * 48000 - 1);
+});
