@@ -627,6 +627,43 @@ test('VideoSampleSource, transform.frameRate works with process', async () => {
 	input.dispose();
 });
 
+test('VideoSampleSource, VP9 codec string level accounts for frame rate, bitrate and a requested level', async () => {
+	const encodeVp9 = async (
+		width: number,
+		height: number,
+		frameRate: number,
+		config: Omit<ConstructorParameters<typeof VideoSampleSource>[0], 'codec'>,
+	) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const videoSource = new VideoSampleSource({ codec: 'vp9', ...config });
+		output.addVideoTrack(videoSource, { frameRate });
+		await output.start();
+
+		for (let i = 0; i < 2; i++) {
+			using sample = new VideoSample(makeCanvas(width, height), {
+				timestamp: i / frameRate,
+				duration: 1 / frameRate,
+			});
+			await videoSource.add(sample);
+		}
+
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		return (await track.getCodecParameterString())!.slice(0, 13);
+	};
+
+	// The frame size alone fits level 2.1, but at 60 fps it exceeds its luma sample rate (9216000/s)
+	expect(await encodeVp9(640, 360, 60, { quality: new Quality('medium') })).toBe('vp09.00.30.08');
+	// Level 2 by frame size, but 4 Mbps exceeds the maximum bitrate of levels 2 and 2.1
+	expect(await encodeVp9(320, 240, 30, { quality: new Quality({ bitrate: 4_000_000 }) })).toBe('vp09.00.30.08');
+	expect(await encodeVp9(320, 240, 30, { quality: new Quality('medium'), fullCodecString: 'vp09.00.41.08' }))
+		.toBe('vp09.00.41.08');
+});
+
 const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {
 	const canvas = new OffscreenCanvas(width, height);
 	const ctx = canvas.getContext('2d')!;
