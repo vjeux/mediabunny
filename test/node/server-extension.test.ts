@@ -2011,6 +2011,45 @@ describe('Audio', async () => {
 		await encoder.close();
 	});
 
+	test('AAC encoding of samples that hold NaN or infinite values', async () => {
+		const encoder = new NodeAvAudioEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'aac';
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: buildAudioCodecString('aac', 2, 48000),
+			numberOfChannels: 2,
+			sampleRate: 48000,
+			bitrate: 128000,
+		} satisfies AudioEncoderConfig;
+
+		let packetCount = 0;
+		// @ts-expect-error Readonly
+		encoder.onPacket = () => {
+			packetCount++;
+		};
+
+		await encoder.init();
+
+		const data = createF32SineWave(48000, 2, 1);
+		data[1000] = NaN; // Like a glitch in a float WAV file or an unstable audio effect
+		data[30000] = Infinity;
+		data[30001] = -Infinity;
+		using sample = new AudioSample({
+			data,
+			format: 'f32',
+			timestamp: 0,
+			numberOfChannels: 2,
+			sampleRate: 48000,
+		});
+
+		await encoder.encode(sample);
+		await encoder.flush();
+		await encoder.close();
+
+		expect(packetCount).toBe(Math.ceil(48000 / 1024) + 1);
+	});
+
 	const createF32SineWave = (sampleRate: number, channels: number, durationSeconds: number) => {
 		const totalFrames = sampleRate * durationSeconds;
 		const data = new Float32Array(totalFrames * channels);
