@@ -25,12 +25,16 @@ import {
 	mp4SoundEntry,
 	mp4SoundEntryV2,
 	mp4VisualEntry,
+	riffChunk,
 	tsPackets,
 	tsPat,
 	tsPes,
 	tsPmt,
 	u16be,
 	u32be,
+	u32le,
+	waveFile,
+	waveFmt,
 } from './helpers/mutation-bytes.js';
 
 const openBytes = (bytes: Uint8Array) => new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
@@ -756,5 +760,118 @@ describe('MPEG-TS demuxing', () => {
 			streams: [[0x15, 0x102], [0x0f, 0x101]],
 		});
 		expect(await describeTrack(bytes)).toEqual(expected);
+	});
+});
+
+describe('WAVE demuxing', () => {
+	const fmt = (formatTag: number, channels: number, bitsPerSample: number, extensible = false) => {
+		return riffChunk('fmt ', waveFmt({ formatTag, channels, sampleRate: 8000, bitsPerSample, extensible }));
+	};
+	const probe = async (bytes: Uint8Array) => {
+		using input = openBytes(bytes);
+		const track = (await input.getPrimaryAudioTrack())!;
+		const packets: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(`${packet.timestamp}+${Math.round(packet.duration * 1e6) / 1e6}:${packet.byteLength}`);
+		}
+		return {
+			codec: await track.getCodec(),
+			channels: await track.getNumberOfChannels(),
+			duration: await track.computeDuration(),
+			packets,
+		};
+	};
+
+	test('PCM data is cut into packets of 2048 frames', async () => {
+		const bytes = waveFile([fmt(1, 2, 16), riffChunk('data', new Uint8Array(5000 * 4))]);
+		expect(await probe(bytes)).toEqual({
+			codec: 'pcm-s16',
+			channels: 2,
+			duration: 0.625,
+			packets: ['0+0.256:8192', '0.256+0.256:8192', '0.512+0.113:3616'],
+		});
+	});
+
+	test.each([
+		[1, 8, false, 'pcm-u8'],
+		[1, 24, false, 'pcm-s24'],
+		[1, 32, false, 'pcm-s32'],
+		[3, 32, false, 'pcm-f32'],
+		[3, 64, false, 'pcm-f64'],
+		[6, 8, false, 'alaw'],
+		[7, 8, false, 'ulaw'],
+		[1, 24, true, 'pcm-s24'],
+		[3, 32, true, 'pcm-f32'],
+	])('format tag %i with %i bits (extensible: %s) reads as %s', async (formatTag, bits, extensible, codec) => {
+		const data = riffChunk('data', new Uint8Array(100 * bits / 8));
+		const bytes = waveFile([fmt(formatTag, 1, bits, extensible), data]);
+		const info = await probe(bytes);
+		expect(info.codec).toBe(codec);
+		expect(info.packets).toEqual([`0+0.0125:${100 * bits / 8}`]);
+	});
+
+	test.each([
+		[1, 12, 'Unsupported WAVE PCM bit depth (12)'],
+		[3, 16, 'Unsupported WAVE float bit depth (16)'],
+		[2, 4, 'Unsupported WAVE codec (format tag 2)'],
+	])('format tag %i with %i bits is rejected', async (formatTag, bits, message) => {
+		const bytes = waveFile([fmt(formatTag, 1, bits), riffChunk('data', new Uint8Array(100))]);
+		await expect(probe(bytes)).rejects.toThrow(message);
+	});
+
+	test('missing fmt or data chunks are errors', async () => {
+		await expect(probe(waveFile([riffChunk('data', new Uint8Array(40))]))).rejects.toThrow('missing "fmt " chunk');
+		await expect(probe(waveFile([fmt(1, 2, 16)]))).rejects.toThrow('missing "data" chunk');
+	});
+
+	test('RF64 takes its sizes from ds64, which must come first', async () => {
+		const ds64 = (riffSizeHigh: number, dataSizeHigh: number) => riffChunk(
+			'ds64',
+			concatBytes(u32le(672), u32le(riffSizeHigh), u32le(400), u32le(dataSizeHigh), u32le(0), u32le(0), u32le(0)),
+		);
+		const data = riffChunk('data', new Uint8Array(600), { size: 0xffffffff });
+		const rf64 = (ds: Uint8Array) => waveFile([ds, fmt(1, 1, 16), data], { riff: 'RF64', size: 0xffffffff });
+		expect((await probe(rf64(ds64(0, 0)))).packets).toEqual(['0+0.025:400']);
+		// 64-bit sizes beyond the file are clamped to what is there
+		expect((await probe(rf64(ds64(1, 1)))).packets).toEqual(['0+0.0375:600']);
+		const withoutDs64 = waveFile([fmt(1, 1, 16), data], { riff: 'RF64' });
+		await expect(probe(withoutDs64)).rejects.toThrow('First chunk must be "ds64"');
+	});
+
+	test('odd-sized chunks are padded, the data size is clamped to the file and to whole frames', async () => {
+		const pcm = new Uint8Array(40);
+		expect((await probe(waveFile([riffChunk('junk', [1, 2, 3]), fmt(1, 2, 16), riffChunk('data', pcm)]))).packets)
+			.toEqual(['0+0.00125:40']);
+		expect((await probe(waveFile([fmt(1, 2, 16), riffChunk('data', pcm, { size: 4000 })]))).packets)
+			.toEqual(['0+0.00125:40']);
+		expect((await probe(waveFile([fmt(1, 2, 16), riffChunk('data', new Uint8Array(42))]))).packets)
+			.toEqual(['0+0.00125:40']);
+	});
+
+	test('LIST INFO chunks provide the metadata tags; other LIST types are ignored', async () => {
+		const info = riffChunk('LIST', concatBytes(
+			ascii('INFO'),
+			riffChunk('INAM', [...ascii('Title'), 0]),
+			riffChunk('IART', ascii('Artist')),
+			riffChunk('IPRD', ascii('Album')),
+			riffChunk('ITRK', ascii('3/10')),
+			riffChunk('ICRD', ascii('2015-06-12')),
+			riffChunk('IGNR', ascii('Genre')),
+			riffChunk('ICMT', ascii('Comment')),
+			riffChunk('TIT3', ascii('Description')),
+		));
+		const adtl = riffChunk('LIST', concatBytes(ascii('adtl'), riffChunk('INAM', ascii('Not a title'))));
+		using input = openBytes(waveFile([fmt(1, 2, 16), adtl, info, riffChunk('data', new Uint8Array(40))]));
+		expect(await input.getMetadataTags()).toMatchObject({
+			title: 'Title',
+			artist: 'Artist',
+			album: 'Album',
+			trackNumber: 3,
+			tracksTotal: 10,
+			date: new Date('2015-06-12T00:00:00Z'),
+			genre: 'Genre',
+			comment: 'Comment',
+			description: 'Description',
+		});
 	});
 });

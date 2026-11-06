@@ -886,3 +886,54 @@ export const tsPackets = (
 	}
 	return concatBytes(...packets);
 };
+
+/** A RIFF chunk with its pad byte; `size` overrides the declared size. */
+export const riffChunk = (
+	id: string,
+	payload: Uint8Array | number[],
+	options: { size?: number; bigEndian?: boolean } = {},
+) => {
+	const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+	const size = options.size ?? bytes.length;
+	return concatBytes(
+		ascii(id),
+		options.bigEndian ? u32be(size) : u32le(size),
+		bytes,
+		bytes.length % 2 === 1 ? [0] : [],
+	);
+};
+
+/** A WAVE 'fmt ' chunk body; `extensible` wraps the format tag into a WAVE_FORMAT_EXTENSIBLE sub-format GUID. */
+export const waveFmt = (options: {
+	formatTag: number;
+	channels: number;
+	sampleRate: number;
+	bitsPerSample: number;
+	extensible?: boolean;
+	bigEndian?: boolean;
+}) => {
+	const u16 = options.bigEndian ? u16be : u16le;
+	const u32 = options.bigEndian ? u32be : u32le;
+	const blockAlign = options.channels * Math.ceil(options.bitsPerSample / 8);
+	const base = concatBytes(
+		u16(options.extensible ? 0xfffe : options.formatTag),
+		u16(options.channels),
+		u32(options.sampleRate),
+		u32(options.sampleRate * blockAlign),
+		u16(blockAlign),
+		u16(options.bitsPerSample),
+	);
+	if (!options.extensible) {
+		return base;
+	}
+	const guidTail = [0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71];
+	return concatBytes(base, u16(22), u16(options.bitsPerSample), u32(0), u16le(options.formatTag), guidTail);
+};
+
+/** A RIFF/RIFX/RF64 WAVE file made of the given chunks. */
+export const waveFile = (chunks: Uint8Array[], options: { riff?: 'RIFF' | 'RIFX' | 'RF64'; size?: number } = {}) => {
+	const body = concatBytes(ascii('WAVE'), ...chunks);
+	const riff = options.riff ?? 'RIFF';
+	const size = options.size ?? body.length;
+	return concatBytes(ascii(riff), riff === 'RIFX' ? u32be(size) : u32le(size), body);
+};
