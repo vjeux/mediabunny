@@ -271,6 +271,11 @@ document.addEventListener('dragover', (event) => {
 
 document.addEventListener('drop', (event) => {
 	event.preventDefault();
+	if (!directoryHandle) {
+		// Like the disabled file buttons: the output files need a directory to go to
+		return;
+	}
+
 	const files = event.dataTransfer!.files;
 	const file = files[0];
 	if (file) {
