@@ -130,11 +130,11 @@ test('AAC with huge timestamps', async () => {
 	expect(firstPacket.timestamp).toBe(timestamp - primingDelay);
 });
 
-test('AAC encoding finishes for a tone after silence at 192 kbps per channel', { timeout: 20_000 }, async () => {
+test('AAC encoding of a tone after silence at 192 kbps per channel', { timeout: 20_000 }, async () => {
 	registerAacEncoder();
 
 	// FFmpeg's encoder used to retry this tone's onset frame forever, as its coder ignores the lambda that the
-	// retries lower
+	// retries lower, and the frame must not come out bigger than the decoder buffer either
 	const sampleRate = 48000;
 	const data = new Float32Array(sampleRate);
 	for (let i = sampleRate / 4; i < sampleRate; i++) {
@@ -182,4 +182,11 @@ test('AAC encoding finishes for a tone after silence at 192 kbps per channel', {
 	const track = (await input.getPrimaryAudioTrack())!;
 	expect(await track.getCodec()).toBe('aac');
 	expect(await track.computeDuration()).toBeCloseTo(1, 1);
+
+	// A frame may take up at most 6144 bits per channel, the size of the decoder's input buffer
+	let largestPacket = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		largestPacket = Math.max(largestPacket, packet.data.byteLength);
+	}
+	expect(largestPacket).toBeLessThanOrEqual(6144 / 8);
 });
