@@ -1572,9 +1572,9 @@ test('Ogg: Vorbis with zero sample rate', async () => {
 test('Ogg: Gaps in granule positions', async () => {
 	const readPackets = async (file: Uint8Array) => {
 		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
-		const packets: { timestamp: number; duration: number }[] = [];
+		const packets: { timestamp: number; duration: number; byteLength: number }[] = [];
 		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
-			packets.push({ timestamp: packet.timestamp, duration: packet.duration });
+			packets.push({ timestamp: packet.timestamp, duration: packet.duration, byteLength: packet.byteLength });
 		}
 		return packets;
 	};
@@ -1622,6 +1622,32 @@ test('Ogg: Gaps in granule positions', async () => {
 	// difference. The stream still ends where that granule position says.
 	const lastPacket = (await readPackets(opusFileWithGap(5, 100)))[59]!;
 	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo((9600 * 6 + 48000 - 100) / 48000, 10);
+
+	// Where pages were lost, as their sequence numbers show, even a gap too short to count above counts, so that
+	// iteration agrees with lookups, which go by the granule positions. Here, the page holding the 11th packet is
+	// lost, either whole or holding the start of a packet that ends on the next page. That orphaned end isn't read as
+	// a packet with #371, and isn't counted below either way.
+	const lostPageFile = (withOrphanedEnd: boolean) => concatList([
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		oggPacketsPage({ granule: 312 + 9600, sequence: 2 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+		oggPacketsPage(
+			{ headerType: withOrphanedEnd ? 1 : 0, granule: 312 + 20160, sequence: 4 },
+			[...(withOrphanedEnd ? [zeros(10)] : []), ...Array<Bytes>(10).fill(OPUS_PACKET)],
+		),
+		oggPacketsPage({ headerType: 4, granule: 312 + 29760, sequence: 5 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+	]);
+	for (const withOrphanedEnd of [false, true]) {
+		const file = lostPageFile(withOrphanedEnd);
+		const timestamps = (await readPackets(file)).filter(x => x.byteLength === 3).map(x => x.timestamp);
+		expect(timestamps.map(x => Math.round(x * 48000))).toEqual([
+			...Array.from({ length: 10 }, (_, i) => 960 * i),
+			...Array.from({ length: 20 }, (_, i) => 10560 + 960 * i),
+		]);
+		for (const timestamp of timestamps) {
+			expect(await lookUp(file, timestamp)).toBe(timestamp);
+		}
+	}
 
 	// The same in Vorbis, with a second missing before the sixth page of a file whose granule positions are off by
 	// a sample here and there, which isn't a gap

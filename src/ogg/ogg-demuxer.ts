@@ -732,12 +732,17 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		// apart from a gap, as the granule position only gives their difference. That difference is taken as the gap,
 		// which keeps the end of the stream exact, though the last packet then isn't trimmed (FFmpeg drops both).
 		const gapInSamples = page.granulePosition - previousPage.granulePosition - durations.sum;
+		if (gapInSamples <= 0) {
+			return encodedPacket;
+		}
 
-		// Some muxers write granule positions that are off by up to a packet's duration, which isn't a gap
+		// Some muxers write granule positions that are off by up to a packet's duration, which isn't a gap. Where pages
+		// were lost, though (as their sequence numbers show), the granule positions are all there is to go by, so
+		// any gap counts, which keeps iteration in line with lookups.
 		const codecInfo = this.bitstream.codecInfo;
 		const longestPossibleDuration = codecInfo.vorbisInfo ? codecInfo.vorbisInfo.blocksizes[1]! / 2 : 0;
 		const tolerance = 2 * Math.max(durations.longest, prevMetadata.durationInSamples, longestPossibleDuration);
-		if (gapInSamples <= tolerance) {
+		if (gapInSamples <= tolerance && !await this.pagesWereLostBetween(previousPage, page)) {
 			return encodedPacket;
 		}
 
@@ -761,6 +766,38 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			},
 			options,
 		);
+	}
+
+	/** Whether pages of the bitstream are missing between the two given pages, as their sequence numbers show. */
+	async pagesWereLostBetween(previousPage: Page, page: Page) {
+		if (page.sequenceNumber - previousPage.sequenceNumber <= 1) {
+			return false;
+		}
+
+		// The pages in between may all be there, holding the middle of a packet, so let's check
+		let expectedSequenceNumber = previousPage.sequenceNumber + 1;
+		let currentPos = previousPage.headerStartPos + previousPage.totalSize;
+		while (currentPos < page.headerStartPos) {
+			let slice = this.demuxer.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			const nextPage = slice && readPageHeader(slice);
+			if (!nextPage) {
+				return false; // Something other than a page sits in between, so it can't be told
+			}
+
+			if (nextPage.serialNumber === page.serialNumber) {
+				if (nextPage.sequenceNumber !== expectedSequenceNumber) {
+					return true;
+				}
+				expectedSequenceNumber++;
+			}
+
+			currentPos = nextPage.headerStartPos + nextPage.totalSize;
+		}
+
+		return page.sequenceNumber !== expectedSequenceNumber;
 	}
 
 	/**
