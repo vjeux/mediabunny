@@ -7,8 +7,9 @@ import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -672,6 +673,97 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 	expect(await track.getFirstTimestamp()).toBe(1);
 	expect(await track.computeDuration()).toBe(2);
 	input.dispose();
+});
+
+test('AudioSampleSource, AAC codec string follows the AudioSpecificConfig the encoder produced', async () => {
+	// Real AAC-LC frames and AudioSpecificConfig, standing in for an encoder that, like Media Foundation's, produces
+	// AAC-LC even when configured for HE-AAC
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const inputTrack = await input.getPrimaryAudioTrack();
+	assert(inputTrack);
+	const lcConfig = await inputTrack.getDecoderConfig();
+	assert(lcConfig?.description);
+	const frames: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
+		frames.push(packet);
+		if (frames.length === 50) {
+			break;
+		}
+	}
+
+	class FakeAacEncoder {
+		state = 'unconfigured';
+		encodeQueueSize = 0;
+		config: AudioEncoderConfig | null = null;
+		pending: Promise<void>[] = [];
+		emittedConfig = false;
+		nextFrame = 0;
+
+		constructor(private init: AudioEncoderInit) {}
+
+		static isConfigSupported(config: AudioEncoderConfig) {
+			return Promise.resolve({ supported: true, config });
+		}
+
+		configure(config: AudioEncoderConfig) {
+			this.config = config;
+			this.state = 'configured';
+		}
+
+		encode(audioData: AudioData) {
+			const frameDuration = 1024 / audioData.sampleRate * 1e6;
+			for (let i = 0; i < Math.ceil(audioData.numberOfFrames / 1024); i++) {
+				const chunk = new EncodedAudioChunk({
+					type: 'key',
+					timestamp: Math.round(audioData.timestamp + i * frameDuration),
+					duration: Math.round(frameDuration),
+					data: frames[this.nextFrame++ % frames.length]!.data,
+				});
+				// The codec string just echoes the configured one
+				const meta = this.emittedConfig
+					? undefined
+					: { decoderConfig: { ...lcConfig!, codec: this.config!.codec } };
+				this.emittedConfig = true;
+				this.pending.push(Promise.resolve().then(() => this.init.output(chunk, meta)));
+			}
+		}
+
+		async flush() {
+			await Promise.all(this.pending);
+		}
+
+		close() {
+			this.state = 'closed';
+		}
+
+		addEventListener() {}
+		removeEventListener() {}
+	}
+
+	const globals = globalThis as { AudioEncoder: unknown };
+	const OriginalAudioEncoder = globals.AudioEncoder;
+	globals.AudioEncoder = FakeAacEncoder;
+
+	try {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({
+			codec: 'aac',
+			quality: new Quality('medium'),
+			fullCodecString: 'mp4a.40.5',
+		});
+		output.addAudioTrack(source);
+		await output.start();
+
+		const sample = makeSineWave(48000, 2, 0.5);
+		await source.add(sample);
+		sample.close();
+		await output.finalize();
+
+		// The AudioSpecificConfig says AAC-LC (object type 2), and so must the codec string
+		expect(await output.getMimeType()).toMatch(/codecs="mp4a\.40\.2"/);
+	} finally {
+		globals.AudioEncoder = OriginalAudioEncoder;
+	}
 });
 
 const makeSineWave = (
