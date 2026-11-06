@@ -1304,3 +1304,32 @@ test('Sample durations that exceed 32 bits are rejected instead of wrapping arou
 	await expect(muxWithGap(false)).rejects.toThrow(/more than an MP4\/MOV sample duration can hold/);
 	await expect(muxWithGap('fragmented')).rejects.toThrow(/more than an MP4\/MOV sample duration can hold/);
 });
+
+test('AV1 samples are stored without temporal delimiter and padding OBUs', async () => {
+	const target = new BufferTarget();
+	const output = new Output({ target, format: new Mp4OutputFormat() });
+	const source = new EncodedVideoPacketSource('av1');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// Temporal unit as WebCodecs encoders emit it: OBU_TEMPORAL_DELIMITER, OBU_FRAME, OBU_PADDING
+	const temporalDelimiter = [0x12, 0x00];
+	const frame = [0x32, 0x03, 0xaa, 0xbb, 0xcc];
+	const padding = [0x7a, 0x02, 0x00, 0x00];
+	await source.add(new EncodedPacket(new Uint8Array([...temporalDelimiter, ...frame, ...padding]), 'key', 0, 1), {
+		decoderConfig: { codec: 'av01.0.04M.08', codedWidth: 320, codedHeight: 240 },
+	});
+	await source.add(new EncodedPacket(new Uint8Array(frame), 'delta', 1, 1)); // Nothing to strip
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// AV1-ISOBMFF 2.4: these OBUs SHOULD NOT be stored; FFmpeg's movenc strips them too
+	const packets: Uint8Array[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet.data);
+	}
+	expect(packets).toEqual([new Uint8Array(frame), new Uint8Array(frame)]);
+});

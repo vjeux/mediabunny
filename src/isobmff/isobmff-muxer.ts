@@ -63,6 +63,7 @@ import {
 	parseOpusTocByte,
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
+	filterAv1SampleObus,
 } from '../codec-data';
 import { buildIsobmffMimeType, TIMESTAMP_OFFSET } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
@@ -769,6 +770,8 @@ export class IsobmffMuxer extends Muxer {
 					packet.type,
 					meta?.decoderConfig?.description,
 				);
+			} else if (track.source._codec === 'av1') {
+				packetData = filterAv1SampleObus(packetData);
 			}
 
 			this.validateTimestamp(
