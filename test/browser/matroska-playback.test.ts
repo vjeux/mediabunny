@@ -20,7 +20,7 @@ import {
 	WEBM,
 	WebMOutputFormat,
 } from '../../src/index.js';
-import { isFirefox } from '../../src/misc.js';
+import { isFirefox, isWebKit } from '../../src/misc.js';
 
 // Matroska/WebM interoperability with Chrome: files Mediabunny writes must play through Media Source Extensions (which
 // uses Chromium's own WebM parser) and the <video> element, and files Chrome's MediaRecorder writes must demux and
@@ -156,8 +156,8 @@ describe('Mediabunny WebM in Chrome', () => {
 		const result = await loadInVideoElement(bytes, 'video/webm');
 		expect(result.duration).toBeCloseTo(1.5, 2);
 
-		// Firefox's WebM demuxer ignores the Matroska rotation
-		const rotatedSize = isFirefox() ? [160, 120] : [120, 160];
+		// Firefox's WebM demuxer ignores the Matroska rotation, and so does WebKit's GStreamer-based one
+		const rotatedSize = isFirefox() || isWebKit() ? [160, 120] : [120, 160];
 		expect([result.width, result.height]).toEqual(rotatedSize);
 
 		const mse = await playThroughMse(bytes, 'video/webm; codecs="vp9"');
@@ -251,7 +251,11 @@ describe('MediaRecorder files', () => {
 		{ mimeType: 'video/x-matroska;codecs=avc1,opus', format: MATROSKA, video: 'avc' },
 	])('reads and decodes $mimeType', async ({ mimeType, format, video }, { skip }) => {
 		// Capability guard: not every browser's MediaRecorder writes every combination (e.g. H.264 in Matroska)
-		skip(!MediaRecorder.isTypeSupported(mimeType), `MediaRecorder can't record ${mimeType} here`);
+		// (and WebKit's WPE port has no MediaRecorder at all)
+		skip(
+			typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported(mimeType),
+			`MediaRecorder can't record ${mimeType} here`,
+		);
 
 		const bytes = await record(mimeType, 1200);
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
