@@ -659,8 +659,13 @@ class VideoEncoderWrapper {
 								this.splitter = new ColorAlphaSplitter();
 							}
 
+							// Frames made from canvases and images come with premultiplied colors, but the color
+							// frame must hold straight ones, as the alpha channel is applied on top when decoding
+							const premultiplied = sampleToEncode._fromImageSource
+								&& await imageSourceFramesArePremultiplied();
+
 							// The splitter takes ownership, so no need to close the frames ourselves
-							const { colorFrame, alphaFrame } = await this.splitter.split(videoFrame);
+							const { colorFrame, alphaFrame } = await this.splitter.split(videoFrame, premultiplied);
 
 							this.alphaFrameQueue.push(alphaFrame);
 							try {
@@ -1247,6 +1252,44 @@ const detectAvcChunkTimestampShift = () => {
 
 let splitterWorkerUrl: string | null = null;
 
+let imageSourceFramesArePremultipliedPromise: Promise<boolean> | null = null;
+
+/**
+ * Browsers store canvases and images premultiplied by alpha, and VideoFrames created from them hand out these
+ * premultiplied color values from copyTo() (Chromium and Firefox both do). Detects this once.
+ */
+const imageSourceFramesArePremultiplied = () => {
+	return imageSourceFramesArePremultipliedPromise ??= (async () => {
+		let frame: VideoFrame | null = null;
+
+		try {
+			const canvas = new OffscreenCanvas(1, 1);
+			const context = canvas.getContext('2d');
+			if (!context) {
+				return false;
+			}
+
+			context.fillStyle = 'rgba(255, 0, 0, 0.5)';
+			context.fillRect(0, 0, 1, 1);
+
+			frame = new VideoFrame(canvas, { timestamp: 0 });
+			if (frame.format !== 'RGBA' && frame.format !== 'BGRA') {
+				return false;
+			}
+
+			const data = new Uint8Array(frame.allocationSize());
+			await frame.copyTo(data);
+
+			// Red reads as 255 when straight and as 128 when premultiplied
+			return data[frame.format === 'RGBA' ? 0 : 2]! < 192;
+		} catch {
+			return false;
+		} finally {
+			frame?.close();
+		}
+	})();
+};
+
 /** Utility class for splitting a composite frame into separate color and alpha parts on the CPU in a worker. */
 export class ColorAlphaSplitter {
 	private worker: Worker | null = null;
@@ -1257,7 +1300,11 @@ export class ColorAlphaSplitter {
 
 	private nextRequestId = 0;
 
-	split(sourceFrame: VideoFrame): Promise<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }> {
+	/** `premultiplied` says whether the color values of an RGBA source frame are premultiplied by alpha. */
+	split(
+		sourceFrame: VideoFrame,
+		premultiplied: boolean,
+	): Promise<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }> {
 		if (!this.worker) {
 			if (!splitterWorkerUrl) {
 				const blob = new Blob(
@@ -1296,7 +1343,7 @@ export class ColorAlphaSplitter {
 		const id = this.nextRequestId++;
 		const pending = promiseWithResolvers<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }>();
 		this.pendingRequests.set(id, pending);
-		this.worker.postMessage({ id, sourceFrame }, { transfer: [sourceFrame] });
+		this.worker.postMessage({ id, sourceFrame, premultiplied }, { transfer: [sourceFrame] });
 
 		return pending.promise;
 	}
@@ -1316,6 +1363,7 @@ export class ColorAlphaSplitter {
 type ColorAlphaSplitterWorkerRequest = {
 	id: number;
 	sourceFrame: VideoFrame;
+	premultiplied: boolean;
 };
 
 type ColorAlphaSplitterWorkerResponse =
@@ -1329,10 +1377,10 @@ const colorAlphaSplitterWorkerCode = () => {
 	// Serialize execution internally so concurrent requests don't race on the shared cpuSourceBuffer.
 	let chain: Promise<void> = Promise.resolve();
 	self.addEventListener('message', (event: MessageEvent<ColorAlphaSplitterWorkerRequest>) => {
-		const { id, sourceFrame } = event.data;
+		const { id, sourceFrame, premultiplied } = event.data;
 		chain = chain.then(async () => {
 			try {
-				const { colorFrame, alphaFrame } = await split(sourceFrame);
+				const { colorFrame, alphaFrame } = await split(sourceFrame, premultiplied);
 				self.postMessage({ id, colorFrame, alphaFrame }, { transfer: [colorFrame, alphaFrame] });
 			} catch (error) {
 				self.postMessage({ id, error: (error as Error).message });
@@ -1342,7 +1390,7 @@ const colorAlphaSplitterWorkerCode = () => {
 		});
 	});
 
-	const split = async (sourceFrame: VideoFrame) => {
+	const split = async (sourceFrame: VideoFrame, premultiplied: boolean) => {
 		const format = sourceFrame.format as VideoSamplePixelFormat | null;
 		if (!format) {
 			throw new Error('CPU color/alpha splitting requires a known VideoFrame format.');
@@ -1356,7 +1404,7 @@ const colorAlphaSplitterWorkerCode = () => {
 		const layout = await sourceFrame.copyTo(cpuSourceBuffer);
 
 		if (format === 'RGBA' || format === 'BGRA') {
-			return splitInterleavedRgba(cpuSourceBuffer, format, sourceFrame);
+			return splitInterleavedRgba(cpuSourceBuffer, format, sourceFrame, premultiplied);
 		} else if (
 			format === 'I420A' || format === 'I420AP10' || format === 'I420AP12'
 			|| format === 'I422A' || format === 'I422AP10' || format === 'I422AP12'
@@ -1372,6 +1420,7 @@ const colorAlphaSplitterWorkerCode = () => {
 		source: Uint8Array,
 		format: 'RGBA' | 'BGRA',
 		sourceFrame: VideoFrame,
+		premultiplied: boolean,
 	) => {
 		const width = sourceFrame.visibleRect?.width ?? sourceFrame.codedWidth;
 		const height = sourceFrame.visibleRect?.height ?? sourceFrame.codedHeight;
@@ -1400,6 +1449,19 @@ const colorAlphaSplitterWorkerCode = () => {
 			alphaBuffer.copyWithin(height * alphaCodedWidth, lastRowStart, lastRowStart + alphaCodedWidth);
 		}
 		alphaBuffer.fill(128, lumaSize);
+
+		if (premultiplied) {
+			// Undo the premultiplication so that the color frame holds the straight colors
+			for (let i = 0; i < width * height * 4; i += 4) {
+				const alpha = source[i + 3]!;
+				if (alpha !== 0 && alpha !== 255) {
+					const scale = 255 / alpha;
+					source[i] = Math.min(Math.round(source[i]! * scale), 255);
+					source[i + 1] = Math.min(Math.round(source[i + 1]! * scale), 255);
+					source[i + 2] = Math.min(Math.round(source[i + 2]! * scale), 255);
+				}
+			}
+		}
 
 		// Hand the source buffer straight to VideoFrame as RGBX/BGRX so the A bytes are ignored
 		const colorFrame = new VideoFrame(source, {
