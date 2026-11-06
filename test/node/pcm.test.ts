@@ -106,6 +106,41 @@ test('Encoded PCM packets have a fixed size', async () => {
 	expect(encoded).toEqual(data);
 });
 
+test('Long gaps between encoded audio samples are filled with silence a second at a time', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const frameCounts: number[] = [];
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-s16',
+		onEncodedSample: sample => frameCounts.push(sample.numberOfFrames),
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// One second of audio, a ten-minute gap, then another second
+	for (const timestamp of [0, 601]) {
+		using sample = new AudioSample({
+			data: new Float32Array(8000).fill(0.5),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 8000,
+			timestamp,
+		});
+		await audioSource.add(sample);
+	}
+	await output.finalize();
+
+	// The whole gap used to be one sample, which at 48 kHz stereo exceeds what an AudioData can hold after 90 minutes
+	expect(frameCounts).toEqual(Array<number>(602).fill(8000));
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBe(602);
+});
+
 const testCopyToIdentity = (format: SampleFormat, data: SampleData) => {
 	using sample = new AudioSample({
 		data,

@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { MovOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -749,4 +749,28 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
+});
+
+test('Gaps between PCM packets are filled with silence a second at a time', async () => {
+	const target = new BufferTarget();
+	const writeSizes: number[] = [];
+	target.on('write', ({ start, end }) => writeSizes.push(end - start));
+
+	const output = new Output({ format: new MovOutputFormat({ fastStart: false }), target });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// One second of 8 kHz mono, a ten-minute gap, then another second
+	const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 };
+	await source.add(new EncodedPacket(new Uint8Array(16000), 'key', 0, 1), { decoderConfig });
+	await source.add(new EncodedPacket(new Uint8Array(16000), 'key', 601, 1));
+	await output.finalize();
+
+	// The padding used to be written as one 9.6 MB sample
+	expect(Math.max(...writeSizes)).toBe(16000);
+
+	using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBe(602);
 });
