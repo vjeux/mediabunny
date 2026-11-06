@@ -4,7 +4,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
-import { assert, colorSpaceIsComplete, isChromium } from '../../src/misc.js';
+import { assert, colorSpaceIsComplete, isChromium, isFirefox } from '../../src/misc.js';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -47,7 +47,12 @@ test('Color space extraction, VP9 in MP4', async () => {
 	});
 });
 
-test('Color space extraction, AV1 in MP4', async () => {
+test('Color space extraction, AV1 in MP4', async (context) => {
+	if (isFirefox()) {
+		// Firefox's AV1 encoder writes no color description (https://bugzilla.mozilla.org/show_bug.cgi?id=2056028)
+		context.skip();
+	}
+
 	const source = await encodePackets('av1', 'av01.0.04M.08');
 	const buffer = await remuxWithoutColorSpace(new Mp4OutputFormat(), source);
 
@@ -91,7 +96,12 @@ test('Color space extraction, VP9 in Matroska', async () => {
 	});
 });
 
-test('Color space extraction, AV1 in Matroska', async () => {
+test('Color space extraction, AV1 in Matroska', async (context) => {
+	if (isFirefox()) {
+		// Firefox's AV1 encoder writes no color description (https://bugzilla.mozilla.org/show_bug.cgi?id=2056028)
+		context.skip();
+	}
+
 	const source = await encodePackets('av1', 'av01.0.04M.08');
 	const buffer = await remuxWithoutColorSpace(new MkvOutputFormat(), source);
 
