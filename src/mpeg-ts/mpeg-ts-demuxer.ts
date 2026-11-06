@@ -1149,7 +1149,9 @@ export class MpegTsDemuxer extends Demuxer {
 		const stride = this.packetStride;
 		const startPos = Math.max(pos - stride, 0);
 		let slice = this.reader.requestSliceRange(startPos, 0, pos + stride + 1 - startPos);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 
 		const bytes = slice ? readBytes(slice, slice.length) : new Uint8Array(0);
 		const index = pos - startPos;
@@ -1176,7 +1178,9 @@ export class MpegTsDemuxer extends Demuxer {
 
 		const searchLength = searchEndPos - searchStartPos + RESYNC_PACKET_COUNT * stride;
 		let slice = this.reader.requestSliceRange(searchStartPos, 0, searchLength);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		if (!slice) {
 			return null;
 		}
