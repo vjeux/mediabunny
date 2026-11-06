@@ -14,8 +14,10 @@ import {
 	arrayArgmax,
 	assert,
 	AsyncMutex,
+	computeRationalApproximation,
 	findLastIndex,
 	joinPaths,
+	roundToDivisor,
 	textEncoder,
 	toArray,
 	toDataView,
@@ -45,7 +47,7 @@ import { SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
 import { HLS_MIME_TYPE, TIMESTAMP_PRIV_OWNER } from './hls-misc';
 import { secondsToMpegTsTimestamp } from '../mpeg-ts/mpeg-ts-misc';
-import type { IsobmffMuxer } from '../isobmff/isobmff-muxer';
+import { GLOBAL_TIMESCALE, type IsobmffMuxer } from '../isobmff/isobmff-muxer';
 
 /** The VIDEO-RANGE of video with the given decoder config (draft-pantos-hls-rfc8216bis, Section 4.4.6.2). */
 const getVideoRange = (decoderConfig: VideoDecoderConfig) => {
@@ -147,6 +149,24 @@ type FragmentedIsobmffOutput = {
 	audioSource: EncodedAudioPacketSource | null;
 	firstMoofPosition: number | null;
 	currentFileSize: number;
+};
+
+/**
+ * The frame rate to give the video track of a segment muxer. The HLS muxer snaps to the track's frame rate itself, in
+ * the input timeline, since the segment muxers see timestamps shifted by an amount that's usually not on the frame
+ * grid. Snapping again there, or using the frame rate as the timescale (CMAF does, so 30 fps gets ticks of 1/30 s),
+ * would move video against audio by up to half a frame. CMAF still needs a timescale that holds the frame duration
+ * exactly though, so it gets the smallest multiple of the frame rate's timescale that's at least as fine as the default
+ * one: its grid contains every frame, and snapping to it is just rounding to the timescale.
+ */
+const getSegmentFrameRate = (frameRate: number | undefined, segmentFormat: OutputFormat) => {
+	if (frameRate === undefined || !(segmentFormat instanceof IsobmffOutputFormat)) {
+		return undefined;
+	}
+
+	// The timescale the ISOBMFF muxer would derive from the frame rate itself
+	const timescale = computeRationalApproximation(1 / frameRate, 1e6).den;
+	return timescale * Math.ceil(GLOBAL_TIMESCALE / timescale);
 };
 
 export class HlsMuxer extends Muxer {
@@ -685,6 +705,16 @@ export class HlsMuxer extends Muxer {
 
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
+
+			if (track.metadata.frameRate !== undefined) {
+				// Constrain the time values to the frame rate here, in the input timeline. The segment muxers don't get
+				// the frame rate, since snapping the shifted media timestamps would move video relative to audio.
+				packet = packet.clone({
+					timestamp: roundToDivisor(packet.timestamp, track.metadata.frameRate),
+					duration: roundToDivisor(packet.duration, track.metadata.frameRate),
+				});
+			}
+
 			trackData.packets.push(packet);
 			this.firstPacketTimestamp ??= packet.timestamp;
 
@@ -980,6 +1010,10 @@ export class HlsMuxer extends Muxer {
 								fragmentedIsobmffOutput.videoSource,
 								{
 									...videoTrack.track.metadata,
+									frameRate: getSegmentFrameRate(
+										(videoTrack.track as OutputVideoTrack).metadata.frameRate,
+										playlist.segmentFormat,
+									),
 									decoderConfig: videoTrack.info.decoderConfig,
 									primingPacket: videoTrack.info.primingPacket ?? undefined,
 								},
@@ -1145,6 +1179,10 @@ export class HlsMuxer extends Muxer {
 						);
 						output.addVideoTrack(videoSource, {
 							...videoTrack.track.metadata,
+							frameRate: getSegmentFrameRate(
+								(videoTrack.track as OutputVideoTrack).metadata.frameRate,
+								playlist.segmentFormat,
+							),
 							decoderConfig: videoTrack.info.decoderConfig,
 							primingPacket: videoTrack.info.primingPacket ?? undefined,
 						});
