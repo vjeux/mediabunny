@@ -1366,19 +1366,26 @@ describe('Chromium media/formats/webm/webm_parser_unittest.cc and webm_cluster_p
 
 	test('ParseWithoutAnyDurations{SimpleBlocks,BlockGroups}: a block lasts until the next of its track', async () => {
 		// Without BlockDuration or DefaultDuration. (For the last block of each track in a cluster, Chromium estimates
-		// the largest duration seen so far; that isn't asserted here.)
+		// the largest duration seen so far; that isn't asserted here.) The audio track is 48 kHz mono PCM whose blocks
+		// hold as many samples as the gap to the next block, so the data agrees with the container timing; that makes
+		// it a Matroska file, since WebM has no PCM.
 		const blocks: [track: number, timestamp: number][] = [
 			[1, 0], [1, 23], [2, 33], [1, 45], [2, 66], [1, 68], [2, 100],
 		];
+		const audioTimestamps = blocks.filter(([track]) => track === 1).map(([, timestamp]) => timestamp);
+		const pcmBytes = (timestamp: number) => {
+			const next = audioTimestamps.find(other => other > timestamp) ?? timestamp + 23;
+			return new Array<number>(96 * (next - timestamp)).fill(0); // 96 bytes per millisecond
+		};
 		const frame = (track: number, timestamp: number) => blockPayload(
 			track,
 			timestamp,
 			0x80,
-			track === 1 ? new Array<number>(96).fill(0) : vp8Frame(true),
+			track === 1 ? pcmBytes(timestamp) : vp8Frame(true),
 		);
 		const tracks = [webmAudioTrack(1), webmVideoTrack(2)];
 		for (const blockGroups of [false, true]) {
-			const bytes = buildWebm({ tracks, body: [
+			const bytes = buildWebm({ docType: 'matroska', tracks, body: [
 				ebml(
 					EBML.Cluster,
 					ebmlUint(EBML.Timestamp, 0),
@@ -1401,26 +1408,33 @@ describe('Chromium media/formats/webm/webm_parser_unittest.cc and webm_cluster_p
 	});
 });
 
-describe('Chromium media/formats/webm/opus_packet_builder.cc (Opus packet durations from the TOC byte)', () => {
-	test('every configuration with 1 to 48 frames, with and without VBR', () => {
-		// WebMClusterParser::kOpusFrameDurationsMu, in microseconds
+describe('Chromium media/formats/webm/opus_packet_builder.cc (Opus TOC byte arithmetic)', () => {
+	test('frame durations and frame counts of every configuration, up to the 120 ms packet limit', () => {
+		// Only the packet header is built, as in Chromium's builder: the TOC byte, the frame count byte for code 3,
+		// then one dummy byte. Chromium's builder goes up to 48 frames for every configuration, but RFC 6716 section
+		// 3.2.5 limits a packet to 120 ms, so the over-long ones would be malformed packets and are left out.
+		// WebMClusterParser::kOpusFrameDurationsMu, in microseconds:
 		const frameDurationsUs = [
 			10000, 20000, 40000, 60000, 10000, 20000, 40000, 60000,
 			10000, 20000, 40000, 60000, 10000, 20000, 10000, 20000,
 			2500, 5000, 10000, 20000, 2500, 5000, 10000, 20000,
 			2500, 5000, 10000, 20000, 2500, 5000, 10000, 20000,
 		];
-		for (let frameCount = 1; frameCount <= 48; frameCount++) {
-			for (let config = 0; config < 32; config++) {
+		let packetCount = 0;
+		for (let config = 0; config < 32; config++) {
+			const frameDurationUs = frameDurationsUs[config]!;
+			for (let frameCount = 1; frameCount * frameDurationUs <= 120_000; frameCount++) {
 				for (const vbr of frameCount >= 2 ? [false, true] : [false]) {
 					const code = frameCount === 1 ? 0 : frameCount === 2 ? (vbr ? 2 : 1) : 3;
 					const frameCountByte = code === 3 ? [(vbr ? 0x80 : 0) | frameCount] : [];
 					const packet = new Uint8Array([(config << 3) | code, ...frameCountByte, 0]);
 					expect(parseOpusTocByte(packet).durationInSamples, `config ${config}, ${frameCount} frames`)
-						.toBe(frameCount * frameDurationsUs[config]! * 48 / 1000);
+						.toBe(frameCount * frameDurationUs * 48 / 1000);
+					packetCount++;
 				}
 			}
 		}
+		expect(packetCount).toBe(898); // The 2.5 ms configurations reach 48 frames
 	});
 });
 
@@ -1577,7 +1591,9 @@ describe('Chromium media/formats/mpeg/mpeg1_audio_stream_parser_unittest.cc and 
 		};
 	};
 
-	test('UnalignedAppend and MetadataParsing: sfx.mp3', async () => {
+	// Chromium's tests feed these files to its push parser in 17- and 512-byte appends. Mediabunny reads through a
+	// random-access source, so there's no append path to port; these cases check what the tests expect of the files.
+	test('sfx.mp3 frames and codec delay (UnalignedAppend, MetadataParsing)', async () => {
 		// A 32-byte ID3 tag and a 417-byte Xing frame come before the 12 frames of audio, the first one 182 bytes long
 		const bytes = loadChromium('sfx.mp3');
 		const { codec, sampleRate, numberOfChannels, packets } = await readAudio(bytes);
@@ -1589,7 +1605,7 @@ describe('Chromium media/formats/mpeg/mpeg1_audio_stream_parser_unittest.cc and 
 		expect(Math.round(packets[0]!.timestamp * sampleRate)).toBe(-1105);
 	});
 
-	test('UnalignedAppendMP2: sfx.mp2', async () => {
+	test('sfx.mp2 frames (UnalignedAppendMP2)', async () => {
 		const { sampleRate, numberOfChannels, packets } = await readAudio(loadChromium('sfx.mp2'));
 		expect({ sampleRate, numberOfChannels }).toEqual({ sampleRate: 44100, numberOfChannels: 1 });
 		expect(packets).toHaveLength(10);
