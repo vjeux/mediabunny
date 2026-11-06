@@ -3845,7 +3845,19 @@ export class IsobmffDemuxer extends Demuxer {
 
 						case 'disc':
 						case 'disk': {
-							if (data instanceof Uint8Array && data.length >= 6) {
+							if (typeof data === 'string') {
+								// mdta keys hold it as a string, like the track number
+								const parts = data.split('/');
+								const discNum = Number.parseInt(parts[0]!, 10);
+								const discsTotal = parts[1] && Number.parseInt(parts[1], 10);
+
+								if (Number.isInteger(discNum) && discNum > 0) {
+									this.metadataTags.discNumber ??= discNum;
+								}
+								if (discsTotal && Number.isInteger(discsTotal) && discsTotal > 0) {
+									this.metadataTags.discsTotal ??= discsTotal;
+								}
+							} else if (data instanceof Uint8Array && data.length >= 6) {
 								const view = toDataView(data);
 
 								const discNumber = view.getUint16(2, false);
