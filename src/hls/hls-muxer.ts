@@ -35,6 +35,7 @@ import {
 	HlsOutputFormatOptions,
 	HlsOutputPlaylistInfo,
 	HlsOutputSegmentInfo,
+	Mp3OutputFormat,
 	OutputFormat,
 } from '../output-format';
 import { Writer } from '../writer';
@@ -1033,7 +1034,7 @@ export class HlsMuxer extends Muxer {
 				} else {
 					// Create the output for this segment
 					output = new Output({
-						format: playlist.segmentFormat,
+						format: toSegmentOutputFormat(playlist.segmentFormat),
 						target: new PathedTarget(
 							fullSegmentPath,
 							async (request: TargetRequest) => {
@@ -1752,6 +1753,16 @@ const validateInitPath = (path: string) => {
 			'Init paths cannot contain line feed, carriage return, or double quote characters.',
 		);
 	}
+};
+
+const toSegmentOutputFormat = (format: OutputFormat) => {
+	if (format instanceof Mp3OutputFormat) {
+		// The Xing frame describes an entire MP3 file. At the start of a packed audio segment, players read it as an
+		// extra frame of audio (FFmpeg does), so every segment would gain a frame of silence.
+		return new Mp3OutputFormat({ ...format._options, xingHeader: false });
+	}
+
+	return format;
 };
 
 const toPlaylistInfo = (playlist: Playlist): HlsOutputPlaylistInfo => {
