@@ -978,9 +978,10 @@ export class UrlSource extends PathedSource {
 
 			let response = await fetchFromCurrentPos();
 
-			if (response.status === 200 && worker.currentPos === 0 && isFirefox()) {
+			if (response.status === 200 && worker.currentPos === 0 && isFirefox() && !this._usedForHls) {
 				// Firefox answers bytes=0- with a 200 from its HTTP cache when it holds the entire resource, so this
-				// doesn't mean the server ignores range requests. Ask the server itself.
+				// doesn't mean the server ignores range requests. Ask the server itself. HLS segments are read
+				// sequentially anyway, so they keep the cached response.
 				void response.body?.cancel().catch(() => {});
 				response = await fetchFromCurrentPos('no-store');
 			}
