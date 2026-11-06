@@ -12,6 +12,7 @@ import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { PacketRetrievalOptions } from '../media-sink';
+import { Logging } from '../logging';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import {
 	assert,
@@ -259,11 +260,21 @@ export class OggDemuxer extends Demuxer {
 			return;
 		}
 
+		const header = parseOpusIdentificationHeader(firstPacket.data);
+		if (header.outputChannelCount === 0) {
+			// https://datatracker.ietf.org/doc/html/rfc7845#section-5.1: "This MUST NOT be zero." Skip the stream like
+			// one of an unknown codec, which keeps any other streams in the file readable.
+			Logging._warn(
+				`Ogg: Skipping the Opus stream with serial number ${bitstream.serialNumber}, whose identification`
+				+ ' header has a channel count of 0.',
+			);
+			return;
+		}
+
 		bitstream.codecInfo.codec = 'opus';
 		bitstream.description = firstPacket.data;
 		bitstream.lastMetadataPacket = secondPacket;
 
-		const header = parseOpusIdentificationHeader(firstPacket.data);
 		bitstream.numberOfChannels = header.outputChannelCount;
 		bitstream.sampleRate = OPUS_SAMPLE_RATE; // Always the same
 

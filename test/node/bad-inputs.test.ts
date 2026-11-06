@@ -1705,6 +1705,39 @@ test('Ogg: Short Opus identification header', async () => {
 	));
 });
 
+test('Ogg: Opus with zero channels', async () => {
+	const head = opusHead();
+	head[9] = 0; // Output channel count
+
+	// The stream is skipped, not read as a track with zero channels
+	const file = concat(oggPacketsPage({ headerType: 2 }, [head]), ...opusPages().slice(1));
+	await expectGracefulRead(file);
+	{
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		expect(await input.getTracks()).toEqual([]);
+	}
+
+	// Next to it, a valid stream stays readable
+	const multiplexedFile = concatList([
+		oggPacketsPage({ headerType: 2, serial: 1 }, [opusHead()]),
+		oggPacketsPage({ headerType: 2, serial: 2 }, [head]),
+		oggPacketsPage({ serial: 1, sequence: 1 }, [opusTags([])]),
+		oggPacketsPage({ serial: 2, sequence: 1 }, [opusTags([])]),
+		oggPacketsPage({ headerType: 4, granule: 9600, serial: 1, sequence: 2 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+		oggPacketsPage({ headerType: 4, serial: 2, sequence: 2 }, []),
+	]);
+	using input = new Input({ source: new BufferSource(multiplexedFile), formats: ALL_FORMATS });
+	expect(await input.getTracks()).toHaveLength(1);
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getNumberOfChannels()).toBe(2);
+
+	const packets = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	expect(packets).toHaveLength(10);
+});
+
 test('Ogg: Opus comments with many repeated keys', async () => {
 	// Repeated keys used to copy the growing list of values each time
 	const tags = opusTags(Array<Bytes>(100_000).fill(ascii('A=')));
