@@ -16,6 +16,7 @@ import {
 	isNumber,
 	isThenable,
 	isWebKit,
+	MAX_FILE_IO_SIZE,
 	MaybePromise,
 	mergeRequestInit,
 	normalizeHeaders,
@@ -1418,7 +1419,27 @@ export class FilePathSource extends PathedSource {
 				assert(this._fileHandle);
 
 				const buffer = new Uint8Array(end - start);
-				await this._fileHandle.read(buffer, 0, end - start, start);
+				let bytesFilled = 0;
+
+				// A single read may deliver fewer bytes than asked for (FUSE and network file systems do this), and
+				// reaching the end early means the file shrank after its size was read
+				while (bytesFilled < buffer.length) {
+					const { bytesRead } = await this._fileHandle.read(
+						buffer,
+						bytesFilled,
+						// Node rejects reads of 2 GiB or more, and Linux reads at most 0x7ffff000 bytes at once
+						Math.min(buffer.length - bytesFilled, MAX_FILE_IO_SIZE),
+						start + bytesFilled,
+					);
+					if (bytesRead === 0) {
+						throw new Error(
+							`Unexpected end of file at byte ${start + bytesFilled} of ${filePath}; the file got shorter`
+							+ ` while being read.`,
+						);
+					}
+
+					bytesFilled += bytesRead;
+				}
 
 				return buffer;
 			},
