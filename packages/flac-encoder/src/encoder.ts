@@ -17,9 +17,13 @@ import type { PacketInfo, WorkerCommand, WorkerResponse, WorkerResponseData } fr
 // @ts-expect-error An esbuild plugin handles this, TypeScript doesn't need to understand
 import createWorker from './encode.worker';
 
-const FLAC_SAMPLE_RATES = [
-	8000, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 176400, 192000,
-];
+// libFLAC takes any rate the FLAC subset can signal in its frame headers: in Hz up to 65535 Hz, and in steps of
+// 10 Hz up to 655350 Hz
+const isFlacSubsetSampleRate = (sampleRate: number) => {
+	return Number.isInteger(sampleRate)
+		&& sampleRate >= 1
+		&& (sampleRate <= 65535 || (sampleRate <= 655350 && sampleRate % 10 === 0));
+};
 
 class FlacEncoder extends CustomAudioEncoder {
 	private worker: Worker | null = null;
@@ -39,7 +43,7 @@ class FlacEncoder extends CustomAudioEncoder {
 		return codec === 'flac'
 			&& config.numberOfChannels >= 1
 			&& config.numberOfChannels <= 8
-			&& FLAC_SAMPLE_RATES.includes(config.sampleRate);
+			&& isFlacSubsetSampleRate(config.sampleRate);
 	}
 
 	async init() {
