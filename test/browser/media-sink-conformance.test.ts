@@ -496,6 +496,15 @@ describe('CanvasSink', () => {
 			expect(await track.getSquarePixelWidth()).toBe(squarePixelWidth);
 			expect(await track.getSquarePixelHeight()).toBe(squarePixelHeight);
 
+			// Display dimensions are after rotation
+			const quarterTurn = rotation % 180 !== 0;
+			expect(await track.getDisplayWidth()).toBe(quarterTurn ? squarePixelHeight : squarePixelWidth);
+			expect(await track.getDisplayHeight()).toBe(quarterTurn ? squarePixelWidth : squarePixelHeight);
+			const codedWidth = await track.getCodedWidth();
+			expect(await track.getPixelAspectRatio()).toEqual(
+				codedWidth === squarePixelWidth ? { num: 1, den: 1 } : { num: squarePixelWidth / codedWidth, den: 1 },
+			);
+
 			for (const options of OPTIONS) {
 				const expected = expectCanvas(
 					squarePixelWidth,
