@@ -715,7 +715,12 @@ export const searchForNextElementId = async (
 			return { pos: currentPos, found: true };
 		}
 
-		assertDefinedSize(elementHeader.size);
+		if (elementHeader.size === undefined) {
+			// Only master elements can have an unknown size (livestreamed files, such as WebM written by browsers, also
+			// use it for Cues and their children), and their children follow directly, so keep searching inside it
+			currentPos = slice.filePos;
+			continue;
+		}
 
 		currentPos = slice.filePos + elementHeader.size;
 	}
