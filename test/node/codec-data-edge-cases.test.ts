@@ -10,8 +10,13 @@ import {
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	extractVp9CodecInfoFromPacket,
+	getEac3ChannelCount,
+	getEac3SampleRate,
 	iterateNalUnitsInAnnexB,
+	parseAc3SyncFrame,
 	parseAvcSps,
+	parseEac3Config,
+	parseEac3SyncFrame,
 	parseHevcSps,
 	parseOpusIdentificationHeader,
 	parseOpusTocByte,
@@ -1331,5 +1336,162 @@ describe('AVC and HEVC decoder configuration records', () => {
 			numTemporalLayers: 2,
 			lengthSizeMinusOne: 3,
 		});
+	});
+});
+
+describe('AC-3 and E-AC-3 headers', () => {
+	type Ac3Fields = {
+		fscod?: number;
+		frmsizecod?: number;
+		bsid?: number;
+		bsmod?: number;
+		acmod: number;
+		lfeon: number;
+	};
+	const ac3Header = (fields: Ac3Fields) => {
+		const w = new BitWriter()
+			.writeBits(16, 0x0b77)
+			.writeBits(16, 0) // crc1
+			.writeBits(2, fields.fscod ?? 0)
+			.writeBits(6, fields.frmsizecod ?? 28)
+			.writeBits(5, fields.bsid ?? 8)
+			.writeBits(3, fields.bsmod ?? 0)
+			.writeBits(3, fields.acmod);
+		if ((fields.acmod & 1) && fields.acmod !== 1) {
+			w.writeBits(2, 0b01); // cmixlev
+		}
+		if (fields.acmod & 4) {
+			w.writeBits(2, 0b10); // surmixlev
+		}
+		if (fields.acmod === 2) {
+			w.writeBits(2, 0b11); // dsurmod
+		}
+		w.writeBits(1, fields.lfeon).writeBits(5, 27).writeBits(16, 0);
+		return w.toBytes();
+	};
+
+	test.each([0, 1, 2, 3, 4, 5, 6, 7])('reads acmod %i and the LFE flag past the optional mix levels', (acmod) => {
+		for (const lfeon of [0, 1]) {
+			const info = parseAc3SyncFrame(ac3Header({ acmod, lfeon, bsmod: 5, frmsizecod: 29, fscod: 1, bsid: 6 }));
+			expect(info).toEqual({ fscod: 1, bsid: 6, bsmod: 5, acmod, lfeon, bitRateCode: 14 });
+		}
+	});
+
+	test('rejects bad sync words, reserved sample rates, E-AC-3 bitstream IDs and short data', () => {
+		expect(parseAc3SyncFrame(ac3Header({ acmod: 2, lfeon: 0, fscod: 3 }))).toBe(null);
+		expect(parseAc3SyncFrame(ac3Header({ acmod: 2, lfeon: 0, bsid: 9 }))).toBe(null);
+		const badSync = ac3Header({ acmod: 2, lfeon: 0 });
+		badSync[1] = 0x78;
+		expect(parseAc3SyncFrame(badSync)).toBe(null);
+		expect(parseAc3SyncFrame(ac3Header({ acmod: 2, lfeon: 0 }).subarray(0, 6))).toBe(null);
+	});
+
+	type Eac3Fields = {
+		strmtyp?: number;
+		frmsiz: number;
+		fscod: number;
+		fscod2OrBlocks: number;
+		acmod: number;
+		lfeon: number;
+		bsid?: number;
+	};
+	const eac3Header = (fields: Eac3Fields) => {
+		return new BitWriter()
+			.writeBits(16, 0x0b77)
+			.writeBits(2, fields.strmtyp ?? 0)
+			.writeBits(3, 0) // substreamid
+			.writeBits(11, fields.frmsiz)
+			.writeBits(2, fields.fscod)
+			.writeBits(2, fields.fscod2OrBlocks)
+			.writeBits(3, fields.acmod)
+			.writeBits(1, fields.lfeon)
+			.writeBits(5, fields.bsid ?? 16)
+			.writeBits(16, 0)
+			.toBytes();
+	};
+
+	test('E-AC-3 sync frames give the data rate, sample rate and channel count', () => {
+		// 48 kHz, 6 blocks, frmsiz 767 (1536 bytes): 1536 * 8 bits per 1536 samples at 48 kHz = 384 kbps
+		const full = parseEac3SyncFrame(eac3Header({ frmsiz: 767, fscod: 0, fscod2OrBlocks: 3, acmod: 7, lfeon: 1 }))!;
+		expect(full.dataRate).toBe(384);
+		expect(full.substreams).toEqual([
+			{ fscod: 0, fscod2: 0, bsid: 16, bsmod: 0, acmod: 7, lfeon: 1, numDepSub: 0, chanLoc: 0 },
+		]);
+		expect([getEac3SampleRate(full), getEac3ChannelCount(full)]).toEqual([48000, 6]);
+
+		// One block per frame at 44.1 kHz
+		const oneBlock = parseEac3SyncFrame(eac3Header({
+			frmsiz: 127,
+			fscod: 1,
+			fscod2OrBlocks: 0,
+			acmod: 2,
+			lfeon: 0,
+			bsid: 11,
+		}))!;
+		expect(oneBlock.dataRate).toBe(Math.round(128 * 44.1 / 16));
+		expect([getEac3SampleRate(oneBlock), getEac3ChannelCount(oneBlock)]).toEqual([44100, 2]);
+
+		// fscod 3 switches to the reduced sample rates, with 6 blocks implied
+		const reduced = parseEac3SyncFrame(eac3Header({
+			frmsiz: 383,
+			fscod: 3,
+			fscod2OrBlocks: 1,
+			acmod: 1,
+			lfeon: 0,
+		}))!;
+		expect(reduced.substreams[0]!.fscod2).toBe(1);
+		expect(reduced.dataRate).toBe(Math.round(384 * 22.05 / 96));
+		expect([getEac3SampleRate(reduced), getEac3ChannelCount(reduced)]).toEqual([22050, 1]);
+
+		expect(parseEac3SyncFrame(eac3Header({
+			strmtyp: 1,
+			frmsiz: 767,
+			fscod: 0,
+			fscod2OrBlocks: 3,
+			acmod: 2,
+			lfeon: 0,
+		}))).toBe(null);
+		expect(parseEac3SyncFrame(eac3Header({
+			frmsiz: 767,
+			fscod: 0,
+			fscod2OrBlocks: 3,
+			acmod: 2,
+			lfeon: 0,
+			bsid: 8,
+		}))).toBe(null);
+		expect(parseEac3SyncFrame(eac3Header({
+			frmsiz: 767,
+			fscod: 0,
+			fscod2OrBlocks: 3,
+			acmod: 2,
+			lfeon: 0,
+			bsid: 17,
+		}))).toBe(null);
+		expect(parseEac3SyncFrame(new Uint8Array([0x0b, 0x77, 0, 0, 0]))).toBe(null);
+	});
+
+	test('dec3 boxes with dependent substreams add their channel locations', () => {
+		const dec3 = new BitWriter()
+			.writeBits(13, 640) // data rate
+			.writeBits(3, 1) // two independent substreams
+			// First: 48 kHz, 5.1 with a dependent substream carrying Lrs/Rrs (chan_loc bit 1)
+			.writeBits(2, 0).writeBits(5, 16).writeBits(1, 0).writeBits(1, 0).writeBits(3, 2)
+			.writeBits(3, 7).writeBits(1, 1).writeBits(3, 0).writeBits(4, 1).writeBits(9, 0b0_1000_0000)
+			// Second: stereo, no dependent substreams
+			.writeBits(2, 0).writeBits(5, 16).writeBits(1, 0).writeBits(1, 0).writeBits(3, 0)
+			.writeBits(3, 2).writeBits(1, 0).writeBits(3, 0).writeBits(4, 0).writeBits(1, 0)
+			.toBytes();
+		const config = parseEac3Config(dec3)!;
+		expect(config.dataRate).toBe(640);
+		expect(config.substreams).toEqual([
+			{ fscod: 0, fscod2: null, bsid: 16, bsmod: 2, acmod: 7, lfeon: 1, numDepSub: 1, chanLoc: 0b0_1000_0000 },
+			{ fscod: 0, fscod2: null, bsid: 16, bsmod: 0, acmod: 2, lfeon: 0, numDepSub: 0, chanLoc: 0 },
+		]);
+		expect([getEac3SampleRate(config), getEac3ChannelCount(config)]).toEqual([48000, 8]);
+
+		// A truncated second substream is dropped; no substream at all is no config
+		expect(parseEac3Config(dec3.subarray(0, 6))!.substreams.length).toBe(1);
+		expect(parseEac3Config(new Uint8Array([0x50, 0x00]))).toBe(null);
+		expect(parseEac3Config(new Uint8Array([0x50]))).toBe(null);
 	});
 });
