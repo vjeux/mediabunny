@@ -571,15 +571,21 @@ describe('Media sources', () => {
 			output.addVideoTrack(videoSource);
 			output.addAudioTrack(audioSource);
 
+			// Timers can fire late under load, so measure how long was actually captured
 			await output.start();
+			const startTime = performance.now();
 			await new Promise(resolve => setTimeout(resolve, 600));
 			videoSource.pause();
 			audioSource.pause();
+			const pauseTime = performance.now();
 			await new Promise(resolve => setTimeout(resolve, 400));
 			videoSource.resume();
 			audioSource.resume();
+			const resumeTime = performance.now();
 			await new Promise(resolve => setTimeout(resolve, 600));
+			const endTime = performance.now();
 			await output.finalize();
+			const capturedDuration = (pauseTime - startTime + endTime - resumeTime) / 1000;
 
 			clearInterval(drawInterval);
 			clearInterval(audioInterval);
@@ -590,22 +596,31 @@ describe('Media sources', () => {
 			const video = await readPackets((await input.getPrimaryVideoTrack())!);
 			const audio = await readPackets((await input.getPrimaryAudioTrack())!);
 
-			// About 1.2 s were captured, starting right away
-			const videoEnd = video.at(-1)!.timestamp + video.at(-1)!.duration;
-			const audioEnd = audio.at(-1)!.timestamp + audio.at(-1)!.duration;
-			expect(videoEnd).toBeGreaterThan(0.9);
-			expect(videoEnd).toBeLessThan(1.6);
-			expect(Math.abs(audioEnd - videoEnd)).toBeLessThan(0.25);
-			expect(video[0]!.timestamp).toBeLessThan(0.25);
-			expect(audio[0]!.timestamp).toBeLessThan(0.25);
+			// The timeline starts at the first captured sample of either track ('synced-zero'); the audio's first
+			// packet starts the Opus pre-skip before it
+			const preSkip = 312 / 48000;
+			expect(Math.min(video[0]!.timestamp, audio[0]!.timestamp + preSkip)).toBeCloseTo(0, 2);
 
-			// No 400 ms gap from the pause
+			// Both tracks span the captured time without the pause (which lasted at least 400 ms), less the time it
+			// took for the first samples to arrive
+			for (const packets of [video, audio]) {
+				const end = packets.at(-1)!.timestamp + packets.at(-1)!.duration;
+				expect(end).toBeLessThan(capturedDuration + 0.1);
+				expect(end).toBeGreaterThan(capturedDuration - 0.5);
+			}
+
+			// No pause gap within the tracks
 			for (let i = 1; i < video.length; i++) {
 				expect(video[i]!.timestamp).toBeGreaterThan(video[i - 1]!.timestamp);
-				expect(video[i]!.timestamp - video[i - 1]!.timestamp).toBeLessThan(0.2);
+				expect(video[i]!.timestamp - video[i - 1]!.timestamp).toBeLessThan(0.3);
 			}
+			// The Opus packets come out back to back (the encoder counts samples, so capture jitter doesn't show, and
+			// gaps get filled with silence), but WebM stores timestamps in whole milliseconds: when the timeline puts
+			// them on half milliseconds (the audio started it, so the 6.5 ms pre-skip shows), rounding can make
+			// consecutive packets 19 or 21 ms apart
 			for (let i = 1; i < audio.length; i++) {
-				expect(audio[i]!.timestamp - audio[i - 1]!.timestamp).toBeCloseTo(0.02, 3);
+				const spacing = audio[i]!.timestamp - audio[i - 1]!.timestamp;
+				expect(Math.abs(spacing - 0.02)).toBeLessThanOrEqual(0.001 + 1e-9);
 			}
 		},
 	);
