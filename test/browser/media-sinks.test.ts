@@ -514,3 +514,65 @@ test('Empty packets are skipped when decoding', async () => {
 	}
 	expect(audioSampleCount).toBeGreaterThan(30);
 });
+
+test('Decoded audio samples can be looked up by their own timestamps (Matroska)', async () => {
+	using input = new Input({
+		source: new UrlSource('/demo.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+	const samples: { timestamp: number; numberOfFrames: number }[] = [];
+	for await (using sample of sink.samples(0, 1)) {
+		samples.push({ timestamp: sample.timestamp, numberOfFrames: sample.numberOfFrames });
+	}
+
+	// Matroska stores packet timestamps in milliseconds, while decoded audio is timed by its sample count. Decoding
+	// from elsewhere can move a sample by up to that precision, but must not give the sample before it (20 ms earlier).
+	for (const { timestamp, numberOfFrames } of samples.slice(1)) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBeCloseTo(timestamp, 2);
+		expect(sample.numberOfFrames).toBe(numberOfFrames);
+
+		for await (using first of sink.samples(timestamp)) {
+			expect(first.timestamp).toBeCloseTo(timestamp, 2);
+			break;
+		}
+	}
+});
+
+test('Audio lookups stay sample-exact where packets sit on the sample grid', async () => {
+	// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet
+	// before it
+	for (const file of ['/Toothsome-Meme.VBRv2.mp3', '/sample.flac']) {
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sampleRate = await track.getSampleRate();
+
+		const packetSink = new EncodedPacketSink(track);
+		const packet = await packetSink.getPacket(1);
+		assert(packet);
+		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
+		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
+
+		const sink = new AudioSampleSink(track);
+		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
+		using sampleAt = await sink.getSample(packet.timestamp);
+		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
+
+		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
+			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+			break;
+		}
+	}
+});
