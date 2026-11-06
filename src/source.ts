@@ -14,6 +14,7 @@ import {
 	closedIntervalsOverlap,
 	FilePath,
 	isNumber,
+	isFirefox,
 	isThenable,
 	isWebKit,
 	MaybePromise,
@@ -960,7 +961,7 @@ export class UrlSource extends PathedSource {
 			const abortController = new AbortController();
 			this._abortControllers.set(worker, abortController);
 
-			const response = await retriedFetch(
+			const fetchFromCurrentPos = (cache?: RequestCache) => retriedFetch(
 				this._options.fetchFn ?? fetch,
 				this._url,
 				mergeRequestInit(this._requestInit, {
@@ -969,10 +970,20 @@ export class UrlSource extends PathedSource {
 						Range: `bytes=${worker.currentPos}-`,
 					},
 					signal: abortController.signal,
+					...(cache && { cache }),
 				}),
 				this._getRetryDelay,
 				() => abortController.signal.aborted,
 			);
+
+			let response = await fetchFromCurrentPos();
+
+			if (response.status === 200 && worker.currentPos === 0 && isFirefox()) {
+				// Firefox answers bytes=0- with a 200 from its HTTP cache when it holds the entire resource, so this
+				// doesn't mean the server ignores range requests. Ask the server itself.
+				void response.body?.cancel().catch(() => {});
+				response = await fetchFromCurrentPos('no-store');
+			}
 
 			if (!response.ok) {
 				// eslint-disable-next-line @typescript-eslint/no-base-to-string
