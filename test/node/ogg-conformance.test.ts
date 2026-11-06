@@ -447,7 +447,7 @@ describe('Opus in Ogg (RFC 7845)', () => {
 		expect(await sink.getPacket(-0.01)).toBe(null);
 		for (let i = 0; i < sequential.length; i += Math.max(1, Math.floor(sequential.length / 37))) {
 			const [start] = sequential[i]!;
-			for (const offset of [0, 1, 958]) {
+			for (const offset of [0, 1, 959]) {
 				const packet = (await sink.getPacket((start! + offset) / 48000))!;
 				expect(layout48k([packet])[0]).toEqual(sequential[i]);
 			}
