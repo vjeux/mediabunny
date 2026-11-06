@@ -37,6 +37,8 @@ import { AvFrameVideoSampleResource } from '../../packages/server/src/video-samp
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
 import * as NodeAv from 'node-av';
+import os from 'node:os';
+import { createHash } from 'node:crypto';
 
 beforeAll(() => {
 	registerMediabunnyServer();
@@ -1548,6 +1550,213 @@ describe('Video', async () => {
 		}
 
 		expect(count).toBe(48);
+	});
+
+	describe('Threading', () => {
+		// libavcodec opens codecs on a single thread unless told otherwise, which is what these compare against
+		const withSingleThreadedCodecs = async <T>(fn: () => Promise<T>) => {
+			const prototype = NodeAv.CodecContext.prototype;
+			const descriptor = Object.getOwnPropertyDescriptor(prototype, 'open2');
+			assert(descriptor);
+			const open2 = descriptor.value as typeof prototype.open2;
+
+			Object.defineProperty(prototype, 'open2', {
+				...descriptor,
+				value: function (this: NodeAv.CodecContext, ...args: Parameters<typeof prototype.open2>) {
+					this.threadCount = 1;
+					return open2.apply(this, args);
+				},
+			});
+
+			try {
+				return await fn();
+			} finally {
+				Object.defineProperty(prototype, 'open2', descriptor);
+			}
+		};
+
+		const fingerprint = (data: Uint8Array) => createHash('sha256').update(data).digest('hex');
+
+		const readPackets = async (path: string, count: number) => {
+			using input = new Input({
+				source: new FilePathSource(path),
+				formats: ALL_FORMATS,
+			});
+
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			const packets: EncodedPacket[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push(packet);
+				if (packets.length === count) {
+					break;
+				}
+			}
+
+			const codec = await track.getCodec();
+			const decoderConfig = await track.getDecoderConfig();
+			assert(codec && decoderConfig);
+
+			return { codec, decoderConfig, packets };
+		};
+
+		const encodePackets = async (codec: VideoCodec, width: number, height: number) => {
+			const encoder = new NodeAvVideoEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = codec;
+			// @ts-expect-error Readonly
+			encoder.config = {
+				codec: buildVideoCodecString(codec, width, height, 2e6, false),
+				width,
+				height,
+				bitrate: 2e6,
+			} satisfies VideoEncoderConfig;
+
+			const packets: EncodedPacket[] = [];
+			let decoderConfig: VideoDecoderConfig | undefined;
+			// @ts-expect-error Readonly
+			encoder.onPacket = (packet: EncodedPacket, meta: EncodedVideoChunkMetadata) => {
+				packets.push(packet);
+				decoderConfig ??= meta.decoderConfig;
+			};
+
+			await encoder.init();
+
+			let threadCount = 0;
+			const data = new Uint8Array(width * height * 4);
+			for (let i = 0; i < 20; i++) {
+				// A moving gradient, so that every frame has something to encode
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						const offset = 4 * (y * width + x);
+						data[offset] = (x + 4 * i) & 0xff;
+						data[offset + 1] = (y + 2 * i) & 0xff;
+						data[offset + 2] = (x ^ y) & 0xff;
+					}
+				}
+
+				using sample = new VideoSample(data, {
+					format: 'RGBX',
+					codedWidth: width,
+					codedHeight: height,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await encoder.encode(sample, {});
+
+				assert(encoder.codecContext);
+				threadCount = encoder.codecContext.threadCount;
+			}
+
+			await encoder.flush();
+			await encoder.close();
+
+			assert(decoderConfig);
+			return { packets, decoderConfig, threadCount };
+		};
+
+		const decodePackets = async (
+			codec: VideoCodec,
+			decoderConfig: VideoDecoderConfig,
+			packets: EncodedPacket[],
+		) => {
+			const decoder = new NodeAvVideoDecoder();
+			// @ts-expect-error Readonly
+			decoder.codec = codec;
+			// @ts-expect-error Readonly
+			decoder.config = decoderConfig;
+
+			const samples: VideoSample[] = [];
+			// @ts-expect-error Readonly
+			decoder.onSample = (sample: VideoSample) => {
+				samples.push(sample);
+			};
+
+			await decoder.init();
+
+			// How many frames have come out after each packet
+			const framesOut: number[] = [];
+			for (const packet of packets) {
+				await decoder.decode(packet);
+				framesOut.push(samples.length);
+			}
+
+			await decoder.flush();
+
+			assert(decoder.codecContext);
+			const threadCount = decoder.codecContext.threadCount;
+			await decoder.close();
+
+			const frames: string[] = [];
+			for (using sample of samples) {
+				const data = new Uint8Array(sample.allocationSize());
+				await sample.copyTo(data);
+				frames.push(`${sample.timestamp}: ${fingerprint(data)}`);
+			}
+
+			return { frames, framesOut, threadCount };
+		};
+
+		test('Decoders run on several threads and give the same frames as on one', { timeout: 30_000 }, async () => {
+			const inputs = [
+				await readPackets('./test/public/video.mp4', 30), // H.264
+				await readPackets('./test/public/video-h265.mp4', 30), // HEVC
+				await readPackets('./test/public/demo.webm', 30), // VP9
+				await readPackets('./test/public/transparency.webm', 10), // VP9 with alpha, decoded by libvpx
+				{ codec: 'vp8' as const, ...await encodePackets('vp8', 640, 360) },
+				{ codec: 'av1' as const, ...await encodePackets('av1', 640, 360) }, // Decoded by dav1d
+			];
+
+			for (const { codec, decoderConfig, packets } of inputs) {
+				const threaded = await decodePackets(codec, decoderConfig, packets);
+				const singleThreaded = await withSingleThreadedCodecs(
+					() => decodePackets(codec, decoderConfig, packets),
+				);
+
+				expect(singleThreaded.threadCount).toBe(1);
+				if (os.availableParallelism() > 1) {
+					expect(threaded.threadCount, codec).toBeGreaterThan(1);
+				}
+
+				expect(threaded.frames, codec).toHaveLength(packets.length);
+				expect(threaded.frames, codec).toEqual(singleThreaded.frames);
+			}
+		});
+
+		test('Decoders asked to minimize latency output frames as early as on one thread', async () => {
+			// Frame threading holds back frames until more packets come in, so it must be off here
+			const inputs = [
+				await readPackets('./test/public/video.mp4', 20), // H.264
+				await readPackets('./test/public/demo.webm', 20), // VP9
+				{ codec: 'av1' as const, ...await encodePackets('av1', 640, 360) }, // dav1d, which threads by itself
+			];
+
+			for (const { codec, decoderConfig, packets } of inputs) {
+				const lowLatency = await decodePackets(codec, { ...decoderConfig, optimizeForLatency: true }, packets);
+				const singleThreaded = await withSingleThreadedCodecs(
+					() => decodePackets(codec, decoderConfig, packets),
+				);
+
+				expect(lowLatency.framesOut, codec).toEqual(singleThreaded.framesOut);
+				expect(lowLatency.frames, codec).toEqual(singleThreaded.frames);
+			}
+		});
+
+		test('VP9 encoding runs on several threads and gives the same packets as on one', async () => {
+			const threaded = await encodePackets('vp9', 1280, 720);
+			const singleThreaded = await withSingleThreadedCodecs(() => encodePackets('vp9', 1280, 720));
+
+			expect(singleThreaded.threadCount).toBe(1);
+			if (os.availableParallelism() > 1) {
+				expect(threaded.threadCount).toBeGreaterThan(1);
+			}
+
+			const describePackets = (packets: EncodedPacket[]) => packets.map(
+				packet => `${packet.timestamp} ${packet.type}: ${fingerprint(packet.data)}`,
+			);
+			expect(describePackets(threaded.packets)).toEqual(describePackets(singleThreaded.packets));
+		});
 	});
 
 	describe('VideoSample transformation', () => {
