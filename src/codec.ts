@@ -1152,6 +1152,48 @@ const HEVC_CODEC_STRING_REGEX = /^(hev1|hvc1)\.(?:[ABC]?\d+)\.[0-9a-fA-F]{1,8}\.
 const VP9_CODEC_STRING_REGEX = /^vp09(?:\.\d{2}){3}(?:(?:\.\d{2}){5})?$/;
 const AV1_CODEC_STRING_REGEX = /^av01\.\d\.\d{2}[MH]\.\d{2}(?:\.\d\.\d{3}\.\d{2}\.\d{2}\.\d{2}\.\d)?$/;
 
+// The vpcC box and the WebM CodecPrivate are built from the codec string, so its fields have to be within the ranges
+// the VP codec ISOBMFF binding allows, which are also what fits their bit fields
+const vp9CodecStringFieldsAreValid = (codecString: string) => {
+	const [profile, level, bitDepth, chromaSubsampling, , , , videoFullRangeFlag] = codecString
+		.split('.')
+		.slice(1)
+		.map(Number);
+
+	return profile! <= 3
+		&& (level === 0 || VP9_LEVEL_TABLE.some(entry => entry.level === level)) // 0 means undefined
+		&& [8, 10, 12].includes(bitDepth!)
+		&& (chromaSubsampling === undefined || chromaSubsampling <= 3)
+		&& (videoFullRangeFlag === undefined || videoFullRangeFlag <= 1);
+};
+
+// Same for the av1C box: the fields have to be within the ranges of the corresponding sequence header fields
+const av1CodecStringFieldsAreValid = (codecString: string) => {
+	const parts = codecString.split('.');
+	const profile = Number(parts[1]);
+	const level = Number(parts[2]!.slice(0, 2));
+	const bitDepth = Number(parts[3]);
+
+	if (profile > 2 || level > 31 || ![8, 10, 12].includes(bitDepth)) {
+		return false;
+	}
+	if (parts.length === 4) {
+		return true;
+	}
+
+	const monochrome = Number(parts[4]);
+	const [subsamplingX, subsamplingY, chromaSamplePosition] = [...parts[5]!].map(Number);
+	const videoFullRangeFlag = Number(parts[9]);
+
+	return monochrome <= 1
+		&& subsamplingX! <= 1
+		&& subsamplingY! <= 1
+		&& chromaSamplePosition! <= 3
+		// The chroma sample position is only coded for 4:2:0
+		&& (chromaSamplePosition === 0 || (subsamplingX === 1 && subsamplingY === 1))
+		&& videoFullRangeFlag <= 1;
+};
+
 export const validateVideoChunkMetadata = (
 	metadata: EncodedVideoChunkMetadata | undefined,
 	trackCodec: VideoCodec | null,
@@ -1301,7 +1343,10 @@ export const validateVideoChunkMetadata = (
 	} else if (metadata.decoderConfig.codec.startsWith('vp09')) {
 		// VP9-specific validation
 
-		if (!VP9_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)) {
+		if (
+			!VP9_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)
+			|| !vp9CodecStringFieldsAreValid(metadata.decoderConfig.codec)
+		) {
 			throw new TypeError(
 				'Video chunk metadata decoder configuration codec string for VP9 must be a valid VP9 codec string as'
 				+ ' specified in Section "Codecs Parameter String" of https://www.webmproject.org/vp9/mp4/.',
@@ -1310,7 +1355,10 @@ export const validateVideoChunkMetadata = (
 	} else if (metadata.decoderConfig.codec.startsWith('av01')) {
 		// AV1-specific validation
 
-		if (!AV1_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)) {
+		if (
+			!AV1_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)
+			|| !av1CodecStringFieldsAreValid(metadata.decoderConfig.codec)
+		) {
 			throw new TypeError(
 				'Video chunk metadata decoder configuration codec string for AV1 must be a valid AV1 codec string as'
 				+ ' specified in Section "Codecs Parameter String" of https://aomediacodec.github.io/av1-isobmff/.',
