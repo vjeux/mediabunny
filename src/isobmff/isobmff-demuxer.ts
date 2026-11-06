@@ -98,6 +98,7 @@ import {
 	MIN_BOX_HEADER_SIZE,
 	readBoxHeader,
 	readDataBox,
+	readFreeformMetadataItem,
 	readFixed_16_16,
 	readFixed_2_30,
 	readEsDescriptor,
@@ -2940,7 +2941,20 @@ export class IsobmffDemuxer extends Demuxer {
 						metadataKey = this.currentMetadataKeys.get(nameAsNumber)!;
 					}
 
-					const data = readDataBox(slice);
+					let data: ReturnType<typeof readDataBox>;
+					if (metadataKey === '----') {
+						// All freeform items share this name, so key them by their domain and name instead, like TagLib
+						// and Mutagen do (e.g. '----:com.apple.iTunes:iTunSMPB')
+						const freeform = readFreeformMetadataItem(slice, boxInfo.contentSize);
+						if (!freeform) {
+							continue;
+						}
+
+						metadataKey = `----:${freeform.mean}:${freeform.name}`;
+						data = freeform.data;
+					} else {
+						data = readDataBox(slice);
+					}
 
 					this.metadataTags.raw ??= {};
 					this.metadataTags.raw[metadataKey] ??= data;
