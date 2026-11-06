@@ -31,8 +31,9 @@ export class Reader {
 			throw new InputDisposedError();
 		}
 
-		if (start < 0 || start + length > Number.MAX_SAFE_INTEGER) {
-			// No file is that large, and positions past 2^53 lose precision (a huge size field in a damaged file)
+		if (!(start >= 0 && start + length <= Number.MAX_SAFE_INTEGER)) {
+			// Also NaN (from a damaged file's tables), and past 2^53, where positions lose precision (from a huge size
+			// field); no file is that large. Without a file size to compare against, such reads would never settle.
 			return null;
 		}
 
@@ -70,7 +71,7 @@ export class Reader {
 			throw new InputDisposedError();
 		}
 
-		if (start < 0 || start + maxLength > Number.MAX_SAFE_INTEGER) {
+		if (!(start >= 0 && start + maxLength <= Number.MAX_SAFE_INTEGER)) {
 			return null;
 		}
 
