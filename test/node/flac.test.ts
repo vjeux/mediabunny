@@ -344,3 +344,67 @@ test('can read a FLAC file with leading ID3v2 tags', async () => {
 	expect(metadataTags.raw!['TIT2']).toBe('First tag');
 	expect(metadataTags.raw!['TITLE']).toBe('The Happy Meeting');
 });
+
+test('reads frames outside the frame size range given in STREAMINFO', async () => {
+	// Files joined with `ffmpeg -f concat -c copy` keep the first file's STREAMINFO, and some files simply have a
+	// wrong one, so frames can be smaller than the minimum or larger than the maximum frame size it states
+	const crc8 = (bytes: number[]) => bytes.reduce((crc, byte) => {
+		crc ^= byte;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+		}
+		return crc;
+	}, 0);
+	const crc16 = (bytes: number[]) => bytes.reduce((crc, byte) => {
+		crc ^= byte << 8;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x8000 ? ((crc << 1) ^ 0x8005) & 0xffff : (crc << 1) & 0xffff;
+		}
+		return crc;
+	}, 0);
+
+	// Mono 16-bit 44.1 kHz frames with 576 samples, the block size stored as an uncommon 16-bit value
+	const frame = (frameNumber: number, verbatim: boolean) => {
+		const header = [0xff, 0xf8, 0x79, 0x08, frameNumber, 0x02, 0x3f];
+		const subframe = verbatim
+			? [0x02, ...new Array<number>(576 * 2).fill(0x11)] // 1153 bytes
+			: [0x00, 0x12, frameNumber]; // 3 bytes
+		const bytes = [...header, crc8(header), ...subframe];
+		const crc = crc16(bytes);
+		return [...bytes, crc >> 8, crc & 0xff];
+	};
+
+	const read = async (minimumFrameSize: number, maximumFrameSize: number, frames: number[][]) => {
+		const streamInfo = new Uint8Array(34);
+		const view = new DataView(streamInfo.buffer);
+		view.setUint16(0, 576);
+		view.setUint16(2, 576);
+		view.setUint32(4, minimumFrameSize << 8);
+		view.setUint32(7, maximumFrameSize << 8);
+		view.setUint32(10, (44100 << 12) | (0 << 9) | (15 << 4)); // 44.1 kHz, mono, 16 bits per sample
+		view.setUint32(14, 576 * frames.length);
+
+		const file = new Uint8Array([
+			0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34, ...streamInfo,
+			...frames.flat(),
+		]);
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packets: [number, number][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([Math.round(packet.timestamp * 44100), packet.byteLength]);
+		}
+		return packets;
+	};
+	const layout = (frames: number[][]) => frames.map((frame, i) => [576 * i, frame.length]);
+
+	// Small frames stated, but large ones follow
+	const growing = [frame(0, false), frame(1, false), frame(2, true), frame(3, true), frame(4, false)];
+	expect(await read(13, 13, growing)).toEqual(layout(growing));
+
+	// Large frames stated, but small ones follow
+	const shrinking = [frame(0, true), frame(1, true), frame(2, false), frame(3, false), frame(4, true)];
+	expect(await read(1163, 1163, shrinking)).toEqual(layout(shrinking));
+});
