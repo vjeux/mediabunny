@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -82,3 +84,61 @@ test('Key packet lookup past position cache entries', async () => {
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
 });
+
+test('DiscardPadding shortens the last Opus packet', async () => {
+	// FFmpeg ends every Opus track whose length isn't a multiple of the frame duration like this: the last 20 ms
+	// block carries 13.5 ms of padding, and there's no BlockDuration or DefaultDuration
+	const opusPacket = [0xfc, 0xff, 0xfe]; // CELT, 20 ms
+	const padding = element(0x75a2, [0x00, 0xcd, 0xfe, 0x60]); // DiscardPadding: 13,500,000 ns
+
+	const makeFile = (lastBlockExtra: number[]) => matroskaFile(
+		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+		element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [2]),
+			element(EBMLId.CodecID, [...'A_OPUS'].map(x => x.charCodeAt(0))),
+			element(EBMLId.Audio, element(EBMLId.Channels, [2])),
+		)),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [0]),
+			element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, ...opusPacket]),
+			element(EBMLId.BlockGroup, element(EBMLId.Block, [0x81, 0, 20, 0, ...opusPacket]), lastBlockExtra),
+		),
+	);
+
+	for (const lastBlockExtra of [padding, [...element(EBMLId.BlockDuration, [20]), ...padding]]) {
+		using input = new Input({
+			source: new BufferSource(makeFile(lastBlockExtra)),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const sink = new EncodedPacketSink(track);
+		const durations: number[] = [];
+		for await (const packet of sink.packets()) {
+			durations.push(packet.duration);
+		}
+
+		expect(durations).toEqual([0.02, 0.0065]);
+	}
+});
+
+const matroskaFile = (...segmentChildren: number[][]) => new Uint8Array([
+	...element(EBMLId.EBML, element(EBMLId.DocType, [...'webm'].map(x => x.charCodeAt(0)))),
+	...element(EBMLId.Segment, segmentChildren.flat()),
+]);
+
+const element = (id: number, ...parts: number[][]) => {
+	const data = parts.flat();
+	const idBytes: number[] = [];
+	for (let value = id; value > 0; value = Math.floor(value / 256)) {
+		idBytes.unshift(value & 0xff);
+	}
+
+	const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+	return [...idBytes, ...size, ...data];
+};

@@ -14,6 +14,7 @@ import {
 	extractHevcDecoderConfigurationRecord,
 	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
+	parseOpusTocByte,
 } from '../codec-data';
 import {
 	AacCodecInfo,
@@ -166,6 +167,8 @@ type ClusterBlock = {
 	decoded: boolean;
 	postProcessed: boolean; // For codec-specific processing
 	mainAdditional: Uint8Array | null;
+	/** In nanoseconds. Positive values are silence at the end of the block that isn't meant to be played. */
+	discardPadding: number;
 };
 
 type CuePoint = {
@@ -786,6 +789,27 @@ export class MatroskaDemuxer extends Demuxer {
 					.sort((a, b) => a.timestamp - b.timestamp);
 			}
 
+			for (const block of trackData.blocks) {
+				if (block.discardPadding <= 0) {
+					continue;
+				}
+
+				// The padding is silence at the end of the block that isn't part of the track's duration, so the
+				// block plays for less than its full duration. When nothing else tells us that full duration, Opus
+				// codes it in the packet itself (FFmpeg writes such blocks at the end of every trimmed Opus track).
+				let fullDuration = block.duration;
+				if (fullDuration === 0 && track.info?.type === 'audio' && track.info.codec === 'opus') {
+					const data = block.decoded ? block.data : this.decodeBlockData(track, block.data);
+					if (data.length > 0) {
+						const { durationInSamples } = parseOpusTocByte(data);
+						fullDuration = durationInSamples / OPUS_SAMPLE_RATE * cluster.segment.timestampFactor;
+					}
+				}
+
+				const padding = block.discardPadding * cluster.segment.timestampFactor / 1e9;
+				block.duration = Math.max(fullDuration - padding, 0);
+			}
+
 			const firstBlock = trackData.blocks[trackData.presentationTimestamps[0]!.blockIndex]!;
 			const lastBlock = trackData.blocks[last(trackData.presentationTimestamps)!.blockIndex]!;
 
@@ -962,6 +986,8 @@ export class MatroskaDemuxer extends Demuxer {
 					decoded: originalBlock.decoded,
 					postProcessed: false,
 					mainAdditional: originalBlock.mainAdditional,
+					// The padding is at the end of the block, so it belongs to the last frame
+					discardPadding: i === frameCount - 1 ? originalBlock.discardPadding : 0,
 				});
 			}
 		}
@@ -1717,6 +1743,7 @@ export class MatroskaDemuxer extends Demuxer {
 					decoded: !hasDecodingInstructions,
 					postProcessed: false,
 					mainAdditional: null,
+					discardPadding: 0,
 				});
 			}; break;
 
@@ -1756,6 +1783,7 @@ export class MatroskaDemuxer extends Demuxer {
 					decoded: !hasDecodingInstructions,
 					postProcessed: false,
 					mainAdditional: null,
+					discardPadding: 0,
 				};
 				trackData.blocks.push(this.currentBlock);
 			}; break;
@@ -1807,6 +1835,12 @@ export class MatroskaDemuxer extends Demuxer {
 				this.currentBlock.isKeyFrame = false;
 				// We ignore the actual value here, we just use the reference as an indicator for "not a key frame".
 				// This is in line with FFmpeg's behavior.
+			}; break;
+
+			case EBMLId.DiscardPadding: {
+				if (!this.currentBlock) break;
+
+				this.currentBlock.discardPadding = Number(readSignedBigInt(slice, size));
 			}; break;
 
 			case EBMLId.Tag: {
