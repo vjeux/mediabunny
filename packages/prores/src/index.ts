@@ -25,6 +25,19 @@ if ((globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL]) {
 }
 (globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL] = true;
 
+/**
+ * Without shared memory, every TurboRes worker gets its own WASM memory, and Chromium only reserves address space for
+ * about a hundred of those per page, after which starting more workers fails and decoding hangs. 16 workers already
+ * give close to full throughput.
+ */
+const MAX_MESSAGE_PASSING_WORKERS = 16;
+
+/**
+ * TurboRes decoders share their workers, but decoders that are created at the same time each start a full set of them,
+ * so they're created one after another.
+ */
+let lastDecoderCreation: Promise<unknown> = Promise.resolve();
+
 class ProresDecoder extends CustomVideoDecoder {
 	private decoder: Decoder | null = null;
 	private framePool: Frame[] = [];
@@ -68,11 +81,20 @@ class ProresDecoder extends CustomVideoDecoder {
 			ProresDecoder._supportedVideoFrameFormats ??= ProresDecoder._determineSupportedVideoFrameFormats();
 		}
 
-		const decoder = await Decoder.create({
+		const useSharedMemory = Decoder.canUseSharedMemory();
+		const hardwareConcurrency = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 0;
+
+		const creation = lastDecoderCreation.then(() => Decoder.create({
 			proresFourCc: this.config.codec as ProresFourCc,
-			useSharedMemory: Decoder.canUseSharedMemory(),
+			useSharedMemory,
+			concurrency: useSharedMemory
+				? undefined // One worker per core, all sharing a single memory
+				: Math.max(1, Math.min(hardwareConcurrency || 1, MAX_MESSAGE_PASSING_WORKERS)),
 			allowedOutputFormats: ProresDecoder._supportedVideoFrameFormats ?? undefined,
-		});
+		}));
+		lastDecoderCreation = creation.catch(() => {});
+
+		const decoder = await creation;
 		if (decoder instanceof Error) {
 			throw decoder;
 		}
