@@ -783,6 +783,82 @@ test('MPEG-TS with E-AC-3 audio in a Blu-ray (BDAV) stream', async () => {
 	expect(count).toBe(32); // As counted by ffprobe
 });
 
+test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3 extension', async () => {
+	// Blu-ray's Dolby Digital Plus (stream_type 0x84) carries an AC-3 frame as the core of each frame, optionally
+	// followed by an E-AC-3 dependent substream frame extending it (to 7.1, say)
+	const ac3Core = new Uint8Array(128); // 48 kHz, 32 kbit/s, stereo
+	// The crc1 bytes 0x40 0x00 look like the strmtyp of an E-AC-3 dependent substream, if read as one
+	ac3Core.set([0x0b, 0x77, 0x40, 0x00, 0x00, 0x40, 0x40]);
+	const eac3Dependent = new Uint8Array(64); // strmtyp 1, frmsiz 31, 6 blocks, bsid 16
+	eac3Dependent.set([0x0b, 0x77, 0x40, 0x1f, 0x34, 0x80]);
+
+	const buildFile = (withExtension: boolean) => {
+		const packets: Uint8Array[] = [];
+		const pushPacket = (pid: number, payload: number[], payloadUnitStart: boolean) => {
+			// 192-byte packets: a 4-byte TP_extra_header before each TS packet
+			const packet = new Uint8Array(192).fill(0xff);
+			packet.set([0, 0, 0, 0, 0x47, (payloadUnitStart ? 0x40 : 0) | (pid >> 8), pid & 0xff], 0);
+			const stuffing = 184 - payload.length;
+			if (stuffing > 0) {
+				packet[7] = 0x30;
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 8);
+			} else {
+				packet[7] = 0x10;
+			}
+			packet.set(payload, 8 + stuffing);
+			packets.push(packet);
+		};
+
+		pushPacket(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0], true);
+		pushPacket(0x0100, [
+			0x00, 0x02, 0xb0, 0x18, 0, 1, 0xc1, 0, 0, 0xf1, 0x00, 0xf0, 0x06,
+			0x05, 0x04, 0x48, 0x44, 0x4d, 0x56, // Registration descriptor: 'HDMV'
+			0x84, 0xf1, 0x00, 0xf0, 0x00, // Dolby Digital Plus on PID 0x1100
+			0, 0, 0, 0, // CRC (not checked)
+		], true);
+
+		for (let i = 0; i < 8; i++) {
+			const frame = withExtension ? [...ac3Core, ...eac3Dependent] : [...ac3Core];
+			const pts = 2880 * i;
+			const pes = [
+				0, 0, 1, 0xbd, (frame.length + 8) >> 8, (frame.length + 8) & 0xff, 0x80, 0x80, 5,
+				0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
+				((pts << 1) & 0xfe) | 1, ...frame,
+			];
+			for (let offset = 0; offset < pes.length; offset += 184) {
+				pushPacket(0x1100, pes.slice(offset, offset + 184), offset === 0);
+			}
+		}
+
+		const bytes = new Uint8Array(192 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 192 * i));
+		return bytes;
+	};
+
+	for (const withExtension of [false, true]) {
+		using input = new Input({
+			source: new BufferSource(buildFile(withExtension)),
+			formats: ALL_FORMATS,
+		});
+
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(audioTrack);
+		expect(await audioTrack.getCodec()).toBe('eac3');
+		expect(await audioTrack.getDecoderConfig()).toEqual({ codec: 'ec-3', numberOfChannels: 2, sampleRate: 48000 });
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+			packets.push(packet);
+		}
+
+		// One packet per frame, the extension included
+		const frameSize = ac3Core.length + (withExtension ? eac3Dependent.length : 0);
+		expect(packets.map(packet => [packet.timestamp, packet.duration, packet.byteLength])).toEqual(
+			[0, 1, 2, 3, 4, 5, 6, 7].map(i => [0.032 * i, 0.032, frameSize]),
+		);
+	}
+});
+
 test('MPEG-TS partial reading', async () => {
 	const fullPath = path.join(__dirname, '../public/193039199_mp4_h264_aac_fhd_7.ts');
 	const buffer = await fs.promises.readFile(fullPath);
