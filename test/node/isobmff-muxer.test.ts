@@ -750,3 +750,47 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
+
+test('Cover art gets the iTunes data type of its image format, whatever the MIME type spelling', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedVideoPacketSource('vp8');
+	output.addVideoTrack(source);
+
+	const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+	const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	output.setMetadataTags({
+		images: [
+			{ data: jpeg, mimeType: 'image/jpg', kind: 'coverFront' },
+			{ data: png, mimeType: 'IMAGE/PNG', kind: 'coverFront' },
+		],
+	});
+
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(1024), 'key', 0, 0.1), {
+		decoderConfig: { codec: 'vp8', codedWidth: 1280, codedHeight: 720 },
+	});
+	await output.finalize();
+
+	// FFmpeg skips covr data of an unknown type ("Unknown cover type: 0x0"), so the type must be JPEG (13) or PNG (14)
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = toDataView(bytes);
+	const types: number[] = [];
+	for (let i = 0; i + 16 <= bytes.length; i++) {
+		if (String.fromCharCode(...bytes.subarray(i, i + 4)) === 'covr') {
+			types.push(view.getUint32(i + 12)); // Skip 'covr', then the data box's size and name
+		}
+	}
+	expect(types).toEqual([13, 14]);
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const images = (await input.getMetadataTags()).images!;
+	expect(images.map(image => image.mimeType)).toEqual(['image/jpeg', 'image/png']);
+});
