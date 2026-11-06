@@ -870,3 +870,56 @@ test('init visibleRect and display size refine a wrapped VideoFrame', () => {
 	expect([fromCanvas.displayWidth, fromCanvas.displayHeight]).toEqual([4, 2]);
 	expect(pixelAt(drawToPixels(fromCanvas, 4, 2), 4, 0, 0)).toEqual([2, 2]);
 });
+
+test('toVideoFrame() keeps the pixels of padded and odd-sized YUV data', async () => {
+	// Firefox's VideoFrame constructor ignores `layout` and refuses odd-sized I420 frames
+	const readRgba = async (frame: VideoFrame) => {
+		const rgba = new Uint8Array(frame.allocationSize({ format: 'RGBA' }));
+		await frame.copyTo(rgba, { format: 'RGBA' });
+		frame.close();
+		return rgba;
+	};
+
+	// Reference color from tightly packed data
+	const reference = await readRgba(new VideoFrame(new Uint8Array([100, 100, 100, 100, 90, 200]), {
+		format: 'I420', codedWidth: 2, codedHeight: 2, timestamp: 0,
+	}));
+
+	for (const [width, height] of [[4, 2], [5, 3]] as const) {
+		// Rows padded with zeros, which must not show up in the frame
+		const yStride = width + 3;
+		const uvStride = Math.ceil(width / 2) + 2;
+		const uvRows = Math.ceil(height / 2);
+		const data = new Uint8Array(yStride * height + 2 * uvStride * uvRows);
+		for (let row = 0; row < height; row++) {
+			data.fill(100, row * yStride, row * yStride + width);
+		}
+		for (let row = 0; row < uvRows; row++) {
+			const uStart = yStride * height + row * uvStride;
+			data.fill(90, uStart, uStart + Math.ceil(width / 2));
+			const vStart = yStride * height + (uvRows + row) * uvStride;
+			data.fill(200, vStart, vStart + Math.ceil(width / 2));
+		}
+
+		using sample = new VideoSample(data, {
+			format: 'I420',
+			codedWidth: width,
+			codedHeight: height,
+			timestamp: 0,
+			layout: [
+				{ offset: 0, stride: yStride },
+				{ offset: yStride * height, stride: uvStride },
+				{ offset: yStride * height + uvStride * uvRows, stride: uvStride },
+			],
+		});
+
+		const frame = sample.toVideoFrame();
+		expect([frame.displayWidth, frame.displayHeight]).toEqual([width, height]);
+		const rgba = await readRgba(frame);
+		expect(rgba.length).toBe(width * height * 4);
+		for (let i = 0; i < rgba.length; i += 4) {
+			const pixel = [...rgba.subarray(i, i + 4)];
+			expect(pixel, `${width}x${height} pixel ${i / 4}`).toEqual([...reference.subarray(0, 4)]);
+		}
+	}
+});

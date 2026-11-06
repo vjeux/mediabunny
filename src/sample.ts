@@ -1204,6 +1204,13 @@ export class VideoSample implements Disposable {
 				);
 			}
 
+			if (isFirefox()) {
+				const repacked = repackPlanesForFirefox(this.format, this.codedWidth, this.codedHeight, planes, null);
+				assert(repacked);
+
+				return this._repackedToVideoFrame(repacked);
+			}
+
 			// We can't use allocationSize since that method assumes a tight packing
 			const size = planes.reduce((a, b) => a + b.data.byteLength, 0);
 			const buffer = new Uint8Array(size);
@@ -1241,6 +1248,20 @@ export class VideoSample implements Disposable {
 		} else if (this._data instanceof Uint8Array) {
 			assert(this._layout);
 
+			if (isFirefox()) {
+				const data = this._data;
+				const repacked = repackPlanesForFirefox(
+					this.format!,
+					this.codedWidth,
+					this.codedHeight,
+					this._layout.map(({ offset, stride }) => ({ data: data.subarray(offset), stride })),
+					this._layout,
+				);
+				if (repacked) {
+					return this._repackedToVideoFrame(repacked);
+				}
+			}
+
 			return new VideoFrame(this._data, {
 				format: this.format! as VideoPixelFormat,
 				codedWidth: this.codedWidth, // This is technically wrong! codedWidth is a lie technically. But, since
@@ -1259,6 +1280,21 @@ export class VideoSample implements Disposable {
 				duration: this.microsecondDuration || undefined,
 			});
 		}
+	}
+
+	/** @internal */
+	_repackedToVideoFrame(repacked: { data: Uint8Array; codedWidth: number; codedHeight: number }) {
+		return new VideoFrame(repacked.data, {
+			format: this.format! as VideoPixelFormat,
+			codedWidth: repacked.codedWidth,
+			codedHeight: repacked.codedHeight,
+			visibleRect: { x: 0, y: 0, width: this.codedWidth, height: this.codedHeight },
+			timestamp: this.microsecondTimestamp,
+			duration: this.microsecondDuration || undefined,
+			colorSpace: this.colorSpace,
+			displayWidth: this.squarePixelWidth, // Not display* since we're not passing rotation
+			displayHeight: this.squarePixelHeight,
+		});
 	}
 
 	/**
@@ -2334,6 +2370,61 @@ const createDefaultPlaneLayout = (
 	}
 
 	return layouts;
+};
+
+/**
+ * Firefox's VideoFrame constructor ignores `layout`, reading the buffer as tightly packed planes of the coded size, and
+ * only accepts even coded sizes for chroma-subsampled formats (https://bugzilla.mozilla.org/show_bug.cgi?id=1899811).
+ * Repacks the top-left width x height region of the planes into that shape, repeating the edge into any padding.
+ * Returns null if the given layout already has that shape.
+ */
+const repackPlanesForFirefox = (
+	format: VideoSamplePixelFormat,
+	width: number,
+	height: number,
+	planes: VideoDataPlane[],
+	layout: PlaneLayout[] | null,
+) => {
+	const configs = getPlaneConfigs(format);
+	const subX = Math.max(...configs.map(x => x.widthDivisor));
+	const subY = Math.max(...configs.map(x => x.heightDivisor));
+	const codedWidth = Math.ceil(width / subX) * subX;
+	const codedHeight = Math.ceil(height / subY) * subY;
+	const packedLayout = createDefaultPlaneLayout(format, codedWidth, codedHeight);
+
+	if (
+		layout
+		&& codedWidth === width
+		&& codedHeight === height
+		&& layout.every((x, i) => x.offset === packedLayout[i]!.offset && x.stride === packedLayout[i]!.stride)
+	) {
+		return null;
+	}
+
+	const lastPlane = packedLayout.length - 1;
+	const size = packedLayout[lastPlane]!.offset
+		+ packedLayout[lastPlane]!.stride * (codedHeight / configs[lastPlane]!.heightDivisor);
+	const data = new Uint8Array(size);
+
+	for (let i = 0; i < configs.length; i++) {
+		const { sampleBytes, widthDivisor, heightDivisor } = configs[i]!;
+		const { offset, stride } = packedLayout[i]!;
+		const plane = planes[i]!;
+		const rowBytes = Math.ceil(width / widthDivisor) * sampleBytes;
+		const rows = Math.ceil(height / heightDivisor);
+
+		for (let row = 0; row < codedHeight / heightDivisor; row++) {
+			const sourceStart = Math.min(row, rows - 1) * plane.stride;
+			const rowStart = offset + row * stride;
+			data.set(plane.data.subarray(sourceStart, sourceStart + rowBytes), rowStart);
+
+			for (let x = rowBytes; x < stride; x += sampleBytes) {
+				data.copyWithin(rowStart + x, rowStart + rowBytes - sampleBytes, rowStart + rowBytes);
+			}
+		}
+	}
+
+	return { data, codedWidth, codedHeight };
 };
 
 type PlaneConfig = {
