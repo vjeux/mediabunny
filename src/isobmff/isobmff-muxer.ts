@@ -93,6 +93,8 @@ export type IsobmffTrackData = {
 	lastTimescaleUnits: number | null;
 	lastSample: Sample | null;
 	startTimestampOffset: number | null;
+	/** Added to every composition time offset (in the track timescale), compensated by the edit list's media time. */
+	compositionTimeOffsetShift: number;
 
 	finalizedChunks: Chunk[];
 	currentChunk: Chunk | null;
@@ -524,6 +526,7 @@ export class IsobmffMuxer extends Muxer {
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
 			lastTimescaleUnits: null,
+			compositionTimeOffsetShift: 0,
 			lastSample: null,
 			startTimestampOffset: null,
 			finalizedChunks: [],
@@ -632,6 +635,7 @@ export class IsobmffMuxer extends Muxer {
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
 			lastTimescaleUnits: null,
+			compositionTimeOffsetShift: 0,
 			lastSample: null,
 			startTimestampOffset: null,
 			finalizedChunks: [],
@@ -677,6 +681,7 @@ export class IsobmffMuxer extends Muxer {
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
 			lastTimescaleUnits: null,
+			compositionTimeOffsetShift: 0,
 			lastSample: null,
 			startTimestampOffset: null,
 			finalizedChunks: [],
@@ -1048,6 +1053,7 @@ export class IsobmffMuxer extends Muxer {
 
 		const sortedTimestamps = trackData.timestampProcessingQueue.map(x => x.timestamp).sort((a, b) => a - b);
 
+		let extendedLastPresentedSample = false;
 		if (nextSample === undefined && trackData.closed && !this.isFragmented) {
 			// The track's last presented sample lasts until the next sample in decode order begins (its decode slot),
 			// both for us and for readers. When B-frames follow it in decode order, that's where they begin, not where
@@ -1067,6 +1073,7 @@ export class IsobmffMuxer extends Muxer {
 				for (let i = lastPresentedIndex + 1; i < queue.length; i++) {
 					sortedTimestamps[i]! += shift;
 				}
+				extendedLastPresentedSample = shift > 0;
 			}
 		}
 
@@ -1170,6 +1177,20 @@ export class IsobmffMuxer extends Muxer {
 		}
 
 		trackData.timestampProcessingQueue.length = 0;
+
+		if (extendedLastPresentedSample) {
+			// The delayed samples now have composition offsets more negative than any before them. FFmpeg derives
+			// the decode time shift for negative offsets from all ctts entries but the last two, so those samples
+			// would end up presented before they're decoded. Make every offset non-negative instead, moving media
+			// time 0 by the same amount in the edit list, the way FFmpeg itself writes B-frame delay.
+			const minOffset = Math.min(...trackData.compositionTimeOffsetTable.map(x => x.sampleCompositionTimeOffset));
+			if (minOffset < 0) {
+				for (const entry of trackData.compositionTimeOffsetTable) {
+					entry.sampleCompositionTimeOffset -= minOffset;
+				}
+				trackData.compositionTimeOffsetShift = -minOffset;
+			}
+		}
 
 		assert(trackData.lastSample);
 		assert(trackData.lastTimescaleUnits !== null);

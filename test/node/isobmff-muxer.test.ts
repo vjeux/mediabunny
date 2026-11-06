@@ -722,36 +722,58 @@ test('Reserved Fast Start with a B-frame GOP completed before all tracks are kno
 });
 
 test('The last presented frame keeps its duration when B-frames follow it in decode order', async () => {
-	// I P B B in decode order, where the P frame is presented last and held for 0.2 s
-	const timestamps = [0, 0.12, 0.04, 0.08];
+	// Presentation times in decode order: I P B B, and a B-pyramid tail like x264's (I P B b b P B B), where the last
+	// P frame is presented last
+	const gops = [[0, 0.12, 0.04, 0.08], [0, 0.16, 0.08, 0.04, 0.12, 0.28, 0.20, 0.24]];
 
-	for (const format of [new Mp4OutputFormat({ fastStart: false }), new Mp4OutputFormat({ fastStart: 'in-memory' })]) {
-		for (const heldDuration of [0.04, 0.2]) {
-			const output = new Output({ format, target: new BufferTarget() });
-			const source = new EncodedVideoPacketSource('vp9');
-			output.addVideoTrack(source);
-			await output.start();
+	for (const timestamps of gops) {
+		const lastPresented = timestamps.indexOf(Math.max(...timestamps));
 
-			for (const [i, timestamp] of timestamps.entries()) {
-				const duration = i === 1 ? heldDuration : 0.04;
-				const packet = new EncodedPacket(new Uint8Array([i]), i === 0 ? 'key' : 'delta', timestamp, duration);
-				await source.add(packet, {
-					decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
-				});
+		for (const fastStart of [false, 'in-memory'] as const) {
+			for (const heldDuration of [0.04, 0.5]) {
+				const output = new Output({ format: new Mp4OutputFormat({ fastStart }), target: new BufferTarget() });
+				const source = new EncodedVideoPacketSource('vp9');
+				output.addVideoTrack(source);
+				await output.start();
+
+				for (const [i, timestamp] of timestamps.entries()) {
+					const duration = i === lastPresented ? heldDuration : 0.04;
+					const type = i === 0 ? 'key' : 'delta';
+					const packet = new EncodedPacket(new Uint8Array([i]), type, timestamp, duration);
+					await source.add(packet, {
+						decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+					});
+				}
+				await output.finalize();
+
+				const bytes = new Uint8Array(output.target.buffer!);
+				using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+				const track = await input.getPrimaryVideoTrack();
+				assert(track);
+
+				const packets: { timestamp: number; duration: number }[] = [];
+				for await (const packet of new EncodedPacketSink(track).packets()) {
+					packets[packet.data[0]!] = { timestamp: packet.timestamp, duration: packet.duration };
+				}
+				expect(packets.map(x => x.timestamp)).toEqual(timestamps);
+				// Was 0.04, the time up to the next decoded frame
+				expect(packets[lastPresented]!.duration).toBeCloseTo(heldDuration, 6);
+				expect(await track.computeDuration()).toBeCloseTo(timestamps[lastPresented]! + heldDuration, 6);
+
+				if (heldDuration > 0.04) {
+					// FFmpeg takes the decode time shift for negative composition offsets from all ctts entries but the
+					// last two, so the trailing frames must not need more of it than the earlier ones give
+					const ctts = bytes.findIndex(
+						(_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'ctts',
+					);
+					const view = toDataView(bytes);
+					const offsets = Array.from(
+						{ length: view.getUint32(ctts + 8) },
+						(_, i) => view.getInt32(ctts + 16 + 8 * i),
+					);
+					expect(Math.min(...offsets)).toBeGreaterThanOrEqual(0);
+				}
 			}
-			await output.finalize();
-
-			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-			const track = await input.getPrimaryVideoTrack();
-			assert(track);
-
-			const packets: { timestamp: number; duration: number }[] = [];
-			for await (const packet of new EncodedPacketSink(track).packets()) {
-				packets[packet.data[0]!] = { timestamp: packet.timestamp, duration: packet.duration };
-			}
-			expect(packets.map(x => x.timestamp)).toEqual(timestamps);
-			expect(packets[1]!.duration).toBeCloseTo(heldDuration, 6); // Was the 0.04 s up to the next decoded frame
-			expect(await track.computeDuration()).toBeCloseTo(0.12 + heldDuration, 6);
 		}
 	}
 });
