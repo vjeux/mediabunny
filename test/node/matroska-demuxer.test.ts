@@ -124,6 +124,13 @@ test('Nested SimpleTags', async () => {
 				),
 				simpleTag(tagName('ORIGINAL'), simpleTag(tagName('TITLE'), tagString('Original title'))),
 				simpleTag(tagName('TITLE'), tagString('Title')),
+				// Element order within a SimpleTag is free: the nested tag and the value may come before the name
+				simpleTag(
+					simpleTag(tagName('SORT_WITH'), tagString('Brel, Jacques')),
+					tagString('Jacques Brel'),
+					tagName('COMPOSER'),
+				),
+				simpleTag(tagString('Some album'), tagName('ALBUM')),
 			)),
 		),
 	]);
@@ -136,8 +143,11 @@ test('Nested SimpleTags', async () => {
 	const tags = await input.getMetadataTags();
 	expect(tags.artist).toBe('The Beatles');
 	expect(tags.title).toBe('Title');
+	expect(tags.album).toBe('Some album');
 	expect(tags.raw).toMatchObject({
 		'ARTIST/SORT_WITH': 'Beatles, The',
 		'ORIGINAL/TITLE': 'Original title',
+		'COMPOSER': 'Jacques Brel',
+		'COMPOSER/SORT_WITH': 'Brel, Jacques',
 	});
 });

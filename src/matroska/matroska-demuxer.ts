@@ -1840,6 +1840,25 @@ export class MatroskaDemuxer extends Demuxer {
 				this.currentSimpleTag = { name: null, parent };
 
 				try {
+					// The tag's value and the tags nested in it need its name, but TagName may come after them, so
+					// let's read it first
+					const children = slice.slice(dataStartPos, size);
+					while (children.remainingLength >= MIN_HEADER_SIZE) {
+						const childStartPos = children.filePos;
+						const childHeader = readElementHeader(children);
+						if (!childHeader || childHeader.size === undefined) {
+							break;
+						}
+
+						if (childHeader.id === EBMLId.TagName) {
+							children.filePos = childStartPos;
+							this.traverseElement(children);
+							break;
+						}
+
+						children.skip(childHeader.size);
+					}
+
 					this.readContiguousElements(slice.slice(dataStartPos, size));
 				} finally {
 					this.currentSimpleTag = parent;
