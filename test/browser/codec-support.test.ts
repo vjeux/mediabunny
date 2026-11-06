@@ -92,8 +92,14 @@ describe('Codec strings in the browser', () => {
 	});
 
 	test('Support queries agree with WebCodecs', async () => {
-		for (const codec of ['avc', 'vp8', 'vp9', 'av1'] as VideoCodec[]) {
-			const codecString = buildVideoCodecString(codec, 1280, 720, 1e6, false);
+		// The browser's own answer for a fixed, valid 1280x720 config of each codec decides what the queries must say
+		const fixedCodecStrings: [VideoCodec, string][] = [
+			['avc', 'avc1.64001f'],
+			['vp8', 'vp8'],
+			['vp9', 'vp09.00.31.08'],
+			['av1', 'av01.0.05M.08'],
+		];
+		for (const [codec, codecString] of fixedCodecStrings) {
 			expect(await canDecodeVideo(codec), codec).toBe(await isDecodable(codecString, 1280, 720));
 		}
 
@@ -102,8 +108,16 @@ describe('Codec strings in the browser', () => {
 			expect(await canDecodeAudio(codec), codec).toBe(true);
 		}
 
-		// AVC encoders need even dimensions
-		if (await canEncodeVideo('avc', { width: 1280, height: 720 })) {
+		// Where the browser encodes AVC at all, the query says so, but not for odd dimensions, which AVC encoders need
+		// to be even
+		const avcEncoderSupport = await VideoEncoder.isConfigSupported({
+			codec: 'avc1.64001f',
+			width: 1280,
+			height: 720,
+			bitrate: 1_000_000,
+		});
+		if (avcEncoderSupport.supported) {
+			expect(await canEncodeVideo('avc', { width: 1280, height: 720 })).toBe(true);
 			expect(await canEncodeVideo('avc', { width: 1281, height: 720 })).toBe(false);
 		}
 
