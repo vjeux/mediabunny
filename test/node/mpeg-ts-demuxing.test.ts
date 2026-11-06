@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -1268,4 +1272,47 @@ test('MPEG-TS times frames without PTS by the frame rate in the SPS', async () =
 
 	expect(await readTimestamps(bytes)).toEqual([126000, 126188, 126375]);
 	expect(await readTimestamps(damaged)).toEqual([126000, 126188, 126375]);
+});
+
+test('MPEG-TS finds frames presented before the first PES packet', async () => {
+	// With open GOPs, the frames right after a key frame in decode order can be presented before it (like in an HLS
+	// segment cut at such a key frame). Made here from video.mp4's first frames (I P B B B ...), the key frame shown
+	// after the two B-frames presented before 0.1 seconds.
+	using mp4 = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		await source.add(
+			count === 0 ? packet.clone({ timestamp: 0.1, duration: 0.02 }) : packet,
+			count === 0 ? { decoderConfig: (await mp4Track.getDecoderConfig())! } : undefined,
+		);
+		if (++count === 12) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = await readAllPackets(sink);
+	expect(packets.slice(0, 4).map(x => x.timestamp)).toEqual([0.1, 0.16, 0.08, 0.04]);
+
+	for (const packet of packets) {
+		expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+	}
+	expect(await sink.getPacket(0.02)).toBeNull();
+	expect(await sink.getKeyPacket(0.09)).toBeNull();
+	expect((await sink.getKeyPacket(0.11))?.sequenceNumber).toBe(packets[0]!.sequenceNumber);
 });

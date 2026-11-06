@@ -1674,10 +1674,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		};
 
 		if (!firstTimedPesPacket || searchPts < firstTimedPesPacket.header.pts) {
-			// Only the packets before the first PES packet with a PTS can come this early
-			return !firstTimedPesPacket || firstSection.startPos < firstTimedPesPacket.header.sectionStartPos
-				? retrieveEncodedPacket(firstSection.startPos, isTargetPacket)
-				: null;
+			// Only packets right at the start of the track can come this early: those before the first PES packet with
+			// a PTS, and leading frames decoded after it but presented before it (open GOPs), so read from there
+			return retrieveEncodedPacket(firstSection.startPos, isTargetPacket);
 		}
 
 		const firstPesPacketHeader = firstTimedPesPacket.header;
