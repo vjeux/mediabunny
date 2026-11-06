@@ -42,6 +42,10 @@ import {
 const MAX_LOGICAL_BITSTREAMS = 64;
 const VORBIS_IDENTIFICATION_HEADER_SIZE = 30;
 const OPUS_IDENTIFICATION_HEADER_MIN_SIZE = 19;
+// An encoder's pre-skip covers its algorithmic delay: libopus' lookahead is 312 samples (120 in its low-delay mode),
+// and resampling the input first (as opusenc does for 44.1 kHz input, giving 356) adds up to a few hundred more. A
+// larger pre-skip crops the start of the stream, for which RFC 7845 (section 4.2) recommends at least 3840 samples.
+const MAX_ENCODER_PRE_SKIP = 1000;
 
 type LogicalBitstream = {
 	serialNumber: number;
@@ -814,24 +818,25 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				return null; // The file doesn't continue with another link
 			}
 
-			if (!this.canContinueInto(bitstream)) {
+			const incompatibility = this.getLinkIncompatibility(bitstream);
+			if (incompatibility) {
 				if (!this.warnedAboutIncompatibleLink) {
 					this.warnedAboutIncompatibleLink = true;
 					Logging._warn(
 						'Ogg: The track ends before the chained logical bitstream at byte'
-						+ ` ${bitstream.bosPage.headerStartPos}, which has different codec parameters, reuses the`
-						+ ' serial number or has damaged headers.',
+						+ ` ${bitstream.bosPage.headerStartPos}, which ${incompatibility}.`,
 					);
 				}
 
 				return null;
 			}
 
-			// The link's first packet continues the track right where the previous link ended. The decoder isn't reset
-			// in between, so the samples the link's pre-skip (or the Vorbis priming packet) would discard at the start
-			// of a stream are played, as Chrome does too: discarding them would need timestamps that overlap the
-			// previous link and may go backwards, which muxers reject. A later start (as in a live capture) would leave
-			// a gap, so it's not kept either.
+			// The link's first packet continues the track right where the previous link ended. The decoder isn't
+			// reset in between, so the samples that the encoder's pre-skip (or the Vorbis priming packet) would discard
+			// at the start of a stream are played, as Chrome does too: discarding them would need timestamps that
+			// overlap the previous link and may go backwards, which muxers reject. These are only a few milliseconds,
+			// as links with a larger, cropping pre-skip aren't continued into. A later start (as in a live capture)
+			// would leave a gap, so it's not kept either.
 			const startInSamples = await this.computeStartInSamples(bitstream, end.vorbisBlockSize);
 
 			return {
@@ -846,16 +851,23 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		})();
 	}
 
-	/** Whether the decoder configured for this track's first link can also decode the given link. */
-	canContinueInto(bitstream: LogicalBitstream) {
+	/**
+	 * Returns why the track can't continue into the given link, or null if it can: the decoder configured for the
+	 * track's first link must be able to decode it, and its start must not be cropped.
+	 */
+	getLinkIncompatibility(bitstream: LogicalBitstream) {
 		const first = this.bitstream;
+		if (bitstream.serialNumber === first.serialNumber) {
+			return 'reuses the serial number';
+		}
+
+		const differentCodecParameters = 'has different codec parameters or damaged headers';
 		if (
 			bitstream.codecInfo.codec !== first.codecInfo.codec
 			|| bitstream.numberOfChannels !== first.numberOfChannels
 			|| bitstream.sampleRate !== first.sampleRate
-			|| bitstream.serialNumber === first.serialNumber
 		) {
-			return false;
+			return differentCodecParameters;
 		}
 
 		const [firstIdentification, firstSetup] = first.headerPackets;
@@ -864,15 +876,30 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 		if (first.codecInfo.codec === 'opus') {
 			// Everything but the pre-skip and the input sample rate (bytes 10 to 15) must match
-			return identification.length === firstIdentification.length
+			const sameHeader = identification.length === firstIdentification.length
 				&& identification.every((byte, i) => (i >= 10 && i < 16) || byte === firstIdentification[i]);
+			if (!sameHeader) {
+				return differentCodecParameters;
+			}
+
+			// A pre-skip larger than any encoder's delay crops the start of the link (RFC 7845, section 4.2).
+			// Discarding those samples would take dropping decoded audio in the middle of the track, which isn't
+			// supported, and playing them would add audio that isn't part of the link.
+			assert(bitstream.codecInfo.opusInfo);
+			const preSkip = bitstream.codecInfo.opusInfo.preSkip;
+			if (preSkip > MAX_ENCODER_PRE_SKIP) {
+				return `has a pre-skip of ${preSkip} samples that crops its start (not supported mid-track)`;
+			}
+
+			return null;
 		}
 
 		// Vorbis: the same block sizes, and the same setup header with its codebooks and modes
 		assert(firstSetup && setup);
-		return identification[28] === firstIdentification[28]
+		const sameHeaders = identification[28] === firstIdentification[28]
 			&& setup.length === firstSetup.length
 			&& setup.every((byte, i) => byte === firstSetup[i]);
+		return sameHeaders ? null : differentCodecParameters;
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions) {

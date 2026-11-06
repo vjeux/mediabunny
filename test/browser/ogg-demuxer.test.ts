@@ -9,6 +9,7 @@ import { OggOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Logging } from '../../src/logging.js';
+import { computeOggPageCrc } from '../../src/ogg/ogg-misc.js';
 import { assert } from '../../src/misc.js';
 
 // VLC creates OGG files with an empty EOS page, which previously caused decoding errors
@@ -180,6 +181,30 @@ test('stops with a warning at a chained link with different codec parameters', a
 		const { packets } = await readPackets(new BufferSource(file));
 		expect(packets).toHaveLength(100);
 		expect(warnings.some(x => x.includes('chained logical bitstream at byte'))).toBe(true);
+	} finally {
+		removeListener();
+	}
+});
+
+test('stops with a warning at a chained Opus link whose pre-skip crops its start', async () => {
+	const { links } = await remuxToOggLinks('/preroll-test.opus', [100]);
+	const [firstLink] = await Promise.all(links.map(link => readPackets(new BufferSource(link))));
+
+	// Raise the second link's pre-skip from 312 to 4800 samples (100 ms), as when cropping its start (RFC 7845, section
+	// 4.2). Its first page holds the OpusHead packet, whose pre-skip is at byte 10.
+	const secondLink = links[1]!.slice();
+	const dataStart = 27 + secondLink[26]!;
+	new DataView(secondLink.buffer).setUint16(dataStart + 10, 4800, true);
+	new DataView(secondLink.buffer).setUint32(22, computeOggPageCrc(secondLink.subarray(0, dataStart + 19)), true);
+
+	const warnings: string[] = [];
+	const removeListener = Logging.on('warn', args => warnings.push(args.join(' ')));
+	try {
+		// Playing the cropped samples would add 100 ms of audio that isn't part of either link
+		const { packets, duration } = await readPackets(new BufferSource(concatBytes([links[0]!, secondLink])));
+		expect(packets).toHaveLength(100);
+		expect(duration).toBe(firstLink!.duration);
+		expect(warnings.some(x => x.includes('pre-skip of 4800 samples'))).toBe(true);
 	} finally {
 		removeListener();
 	}
