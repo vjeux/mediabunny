@@ -100,6 +100,12 @@ import { Bitstream } from '../../shared/bitstream';
 const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expected. PES packets without PTS are not'
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
+/**
+ * How far into the media (in PTS) we keep looking for declared streams that haven't shown up yet. FFmpeg gives up on
+ * finding a stream's parameters after 7 seconds of MPEG-TS media.
+ */
+const MAX_STREAM_START_DELAY = 10 * MPEG_TS_TIMESCALE;
+
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
@@ -241,6 +247,7 @@ export class MpegTsDemuxer extends Demuxer {
 			// Some files contain these multiple times, but we only care about their first appearance
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
+			let firstPts: number | null = null;
 
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
@@ -258,7 +265,22 @@ export class MpegTsDemuxer extends Demuxer {
 					hasProgramMap
 					&& !this.elementaryStreams.some(x => x.pid === packetHeader.pid && !x.initialized)
 				) {
-					// Don't care about this PID (anymore)
+					// Don't care about this PID (anymore), except for checking how far into the media we are
+					if (firstPts !== null && this.elementaryStreams.some(x => x.pid === packetHeader.pid)) {
+						const section = await this.readSection(currentPos, false);
+						const pesPacketHeader = section ? readPesPacketHeader(this, section, false) : null;
+
+						if (
+							pesPacketHeader
+							&& pesPacketHeader.pts !== null
+							&& pesPacketHeader.pts - firstPts > MAX_STREAM_START_DELAY
+						) {
+							// The streams that still haven't shown up are declared, but don't seem to be in the file
+							// (recorders may drop some), so let's stop looking for them instead of reading it all
+							break;
+						}
+					}
+
 					currentPos += this.packetStride;
 					continue;
 				}
@@ -541,6 +563,7 @@ export class MpegTsDemuxer extends Demuxer {
 
 						elementaryStream.firstSection = section;
 						elementaryStream.canBeTrustedWithKeyPackets = section.randomAccessIndicator === 1;
+						firstPts ??= pesPacket.pts;
 
 						if (this.input._initInput) {
 							const initDemuxer = (await this.input._initInput._getDemuxer()) as MpegTsDemuxer;
