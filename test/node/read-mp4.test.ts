@@ -272,3 +272,20 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('EncodedPacketSink.packets() ends iteration on throw()', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets = new EncodedPacketSink(track).packets();
+	expect((await packets.next()).done).toBe(false);
+
+	const error = new Error('Consumer gave up');
+	await expect(packets.throw(error)).rejects.toBe(error);
+	// Same as for a generator function: once thrown into, the iterator is done
+	expect(await packets.next()).toEqual({ value: undefined, done: true });
+});
