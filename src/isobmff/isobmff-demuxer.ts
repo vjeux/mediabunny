@@ -334,6 +334,65 @@ type SampleEncryptionAuxInfo = {
 // Anything beyond this is malicious
 const MAX_BOX_NESTING_DEPTH = 64;
 
+/**
+ * Vorbis in MP4 is nonstandard. gpac's esds holds the three Vorbis headers each prefixed with a 16-bit length, while
+ * decoders (like WebCodecs, and FFmpeg's own layout) expect Xiph lacing. Like FFmpeg's avpriv_split_xiph_headers,
+ * recognize that layout by the size of the identification header and convert it. Returns null for anything else.
+ */
+const xiphLaceLengthPrefixedVorbisHeaders = (bytes: Uint8Array) => {
+	const VORBIS_IDENTIFICATION_HEADER_SIZE = 30;
+
+	const headers: Uint8Array[] = [];
+	let pos = 0;
+	for (let i = 0; i < 3; i++) {
+		if (pos + 2 > bytes.length) {
+			return null;
+		}
+
+		const length = (bytes[pos]! << 8) | bytes[pos + 1]!;
+		if (pos + 2 + length > bytes.length) {
+			return null;
+		}
+
+		headers.push(bytes.subarray(pos + 2, pos + 2 + length));
+		pos += 2 + length;
+	}
+
+	const identificationHeader = headers[0]!;
+	if (identificationHeader.length !== VORBIS_IDENTIFICATION_HEADER_SIZE || identificationHeader[0] !== 1) {
+		return null;
+	}
+
+	const view = toDataView(identificationHeader);
+	const numberOfChannels = view.getUint8(11);
+	const sampleRate = view.getUint32(12, true);
+	if (numberOfChannels === 0 || sampleRate === 0) {
+		return null;
+	}
+
+	// The segment table holds the sizes of the first two headers; the third one takes up the rest
+	const segmentTable: number[] = [];
+	for (const header of headers.slice(0, 2)) {
+		for (let remaining = header.length; ; remaining -= 255) {
+			segmentTable.push(Math.min(remaining, 255));
+			if (remaining < 255) {
+				break;
+			}
+		}
+	}
+
+	const laced = new Uint8Array(1 + segmentTable.length + pos - 6);
+	laced[0] = 2; // Number of headers minus one
+	laced.set(segmentTable, 1);
+	let writePos = 1 + segmentTable.length;
+	for (const header of headers) {
+		laced.set(header, writePos);
+		writePos += header.length;
+	}
+
+	return { description: laced, numberOfChannels, sampleRate };
+};
+
 export class IsobmffDemuxer extends Demuxer {
 	reader: Reader;
 	moovSlice: FileSlice | null = null;
@@ -1805,6 +1864,14 @@ export class IsobmffDemuxer extends Demuxer {
 						}
 						if (audioSpecificConfig.outputSampleRate !== null) {
 							track.info.sampleRate = audioSpecificConfig.outputSampleRate;
+						}
+					} else if (track.info.codec === 'vorbis') {
+						const converted = xiphLaceLengthPrefixedVorbisHeaders(decoderSpecificInfo);
+						if (converted) {
+							track.info.codecDescription = converted.description;
+							// The identification header has the actual values
+							track.info.numberOfChannels = converted.numberOfChannels;
+							track.info.sampleRate = converted.sampleRate;
 						}
 					}
 				}
