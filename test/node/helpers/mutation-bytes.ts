@@ -355,3 +355,195 @@ export const mkvFile = (options: {
 	const tracks = ebml(EBMLId.Tracks, ...options.trackEntries);
 	return concatBytes(header, ebml(EBMLId.Segment, info, tracks, ...options.rest));
 };
+
+/** An ISOBMFF box: 32-bit size, four-character type, payload. */
+export const mp4Box = (type: string, ...payload: (Uint8Array | number[])[]) => {
+	const data = concatBytes(...payload);
+	return concatBytes(u32be(8 + data.length), ascii(type), data);
+};
+
+/** An ISOBMFF FullBox: like a box, with a version byte and 24 flag bits before the payload. */
+export const mp4FullBox = (type: string, version: number, flags: number, ...payload: (Uint8Array | number[])[]) => {
+	return mp4Box(type, [version], u24be(flags), ...payload);
+};
+
+/** A QuickTime/ISO sound sample entry (version 0) followed by optional child boxes. */
+export const mp4SoundEntry = (
+	format: string,
+	channels: number,
+	sampleSize: number,
+	sampleRate: number,
+	...children: Uint8Array[]
+) => mp4Box(
+	format,
+	[0, 0, 0, 0, 0, 0], u16be(1), // reserved, data_reference_index
+	u16be(0), u16be(0), u32be(0), // version, revision level, vendor
+	u16be(channels), u16be(sampleSize), u16be(0), u16be(0),
+	u32be(sampleRate * 0x10000),
+	...children,
+);
+
+/** A visual sample entry followed by optional child boxes (avcC etc.). */
+export const mp4VisualEntry = (format: string, width: number, height: number, ...children: Uint8Array[]) => mp4Box(
+	format,
+	[0, 0, 0, 0, 0, 0], u16be(1),
+	new Uint8Array(16), // pre_defined, reserved
+	u16be(width), u16be(height),
+	u32be(0x00480000), u32be(0x00480000), u32be(0), u16be(1),
+	new Uint8Array(32), // compressorname
+	u16be(0x18), [0xff, 0xff],
+	...children,
+);
+
+export type Mp4TrackOptions = {
+	handler: 'soun' | 'vide';
+	timescale: number;
+	sampleEntry: Uint8Array;
+	/** Sample payloads in decode order; their order in the file follows the chunk layout from `stsc`. */
+	samples: Uint8Array[];
+	/** stts entries: [sample_count, sample_delta] */
+	stts: [number, number][];
+	/** ctts entries: [sample_count, sample_offset]; version 1 allows negative offsets */
+	ctts?: { version: 0 | 1; entries: [number, number][] };
+	/** stsc entries: [first_chunk (1-based), samples_per_chunk] */
+	stsc: [number, number][];
+	/** 1-based sync sample numbers; all samples are sync samples when absent */
+	stss?: number[];
+	/** Writes one constant sample size instead of a size table */
+	constantSampleSize?: number;
+	/** elst entries: [segment_duration (movie timescale), media_time] */
+	elst?: [number, number][];
+	co64?: boolean;
+	width?: number;
+	height?: number;
+};
+
+/** Builds a single-track, non-fragmented MP4 (ftyp, moov, mdat) whose chunks follow the stsc layout. */
+export const buildMp4 = (track: Mp4TrackOptions) => {
+	// Lay the samples out into chunks
+	const chunks: Uint8Array[][] = [];
+	let sampleIndex = 0;
+	for (let i = 0; sampleIndex < track.samples.length; i++) {
+		const entry = [...track.stsc].reverse().find(([firstChunk]) => firstChunk <= i + 1)!;
+		const chunk = track.samples.slice(sampleIndex, sampleIndex + entry[1]);
+		chunks.push(chunk);
+		sampleIndex += entry[1];
+	}
+
+	const table = (type: string, version: number, rows: number[][]) => {
+		const body = rows.map(row => row.flatMap(value => u32be(value >>> 0)));
+		return mp4FullBox(type, version, 0, u32be(rows.length), ...body);
+	};
+
+	const build = (chunkOffsets: number[]) => {
+		const duration = track.stts.reduce((sum, [count, delta]) => sum + count * delta, 0);
+		const sampleCount = track.samples.length;
+		const stbl = mp4Box(
+			'stbl',
+			mp4FullBox('stsd', 0, 0, u32be(1), track.sampleEntry),
+			table('stts', 0, track.stts),
+			...(track.ctts ? [table('ctts', track.ctts.version, track.ctts.entries)] : []),
+			...(track.stss ? [table('stss', 0, track.stss.map(n => [n]))] : []),
+			table('stsc', 0, track.stsc.map(([first, perChunk]) => [first, perChunk, 1])),
+			track.constantSampleSize !== undefined
+				? mp4FullBox('stsz', 0, 0, u32be(track.constantSampleSize), u32be(sampleCount))
+				: mp4FullBox('stsz', 0, 0, u32be(0), u32be(sampleCount), ...track.samples.map(s => u32be(s.length))),
+			track.co64
+				? table('co64', 0, chunkOffsets.map(o => [0, o]))
+				: table('stco', 0, chunkOffsets.map(o => [o])),
+		);
+		const mediaHeader = track.handler === 'soun'
+			? mp4FullBox('smhd', 0, 0, u32be(0))
+			: mp4FullBox('vmhd', 0, 1, new Uint8Array(8));
+		const minf = mp4Box(
+			'minf',
+			mediaHeader,
+			mp4Box('dinf', mp4FullBox('dref', 0, 0, u32be(1), mp4FullBox('url ', 0, 1))),
+			stbl,
+		);
+		const mdhd = mp4FullBox(
+			'mdhd', 0, 0,
+			u32be(0), u32be(0), u32be(track.timescale), u32be(duration), u16be(0x55c4), u16be(0),
+		);
+		const mdia = mp4Box(
+			'mdia',
+			mdhd,
+			mp4FullBox('hdlr', 0, 0, u32be(0), ascii(track.handler), new Uint8Array(12), [0]),
+			minf,
+		);
+		const matrix = [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000].flatMap(v => u32be(v));
+		const tkhd = mp4FullBox(
+			'tkhd', 0, 3,
+			u32be(0), u32be(0), u32be(1), u32be(0), u32be(duration),
+			new Uint8Array(8), u16be(0), u16be(0), u16be(track.handler === 'soun' ? 0x0100 : 0), u16be(0),
+			matrix,
+			u32be((track.width ?? 0) * 0x10000), u32be((track.height ?? 0) * 0x10000),
+		);
+		const edts = track.elst
+			? [mp4Box('edts', mp4FullBox(
+					'elst', 0, 0,
+					u32be(track.elst.length),
+					...track.elst.map(([d, t]) => [...u32be(d), ...u32be(t >>> 0), ...u16be(1), ...u16be(0)]),
+				))]
+			: [];
+		const mvhd = mp4FullBox(
+			'mvhd', 0, 0,
+			u32be(0), u32be(0), u32be(track.timescale), u32be(duration),
+			u32be(0x10000), u16be(0x100), new Uint8Array(10), matrix, new Uint8Array(24), u32be(2),
+		);
+		const moov = mp4Box('moov', mvhd, mp4Box('trak', tkhd, ...edts, mdia));
+		const ftyp = mp4Box('ftyp', ascii('isom'), u32be(0x200), ascii('isomiso2mp41'));
+		return { ftyp, moov };
+	};
+
+	// First pass to size the moov, second pass with the real chunk offsets
+	const { ftyp, moov } = build(chunks.map(() => 0));
+	const mdatStart = ftyp.length + moov.length + 8;
+	const offsets: number[] = [];
+	let offset = mdatStart;
+	for (const chunk of chunks) {
+		offsets.push(offset);
+		offset += chunk.reduce((sum, s) => sum + s.length, 0);
+	}
+	const final = build(offsets);
+	return concatBytes(final.ftyp, final.moov, mp4Box('mdat', ...chunks.flat()));
+};
+
+/** One ADTS frame (MPEG-4, no multiple raw data blocks) with a payload of the given size filled with `fill`. */
+export const adtsFrame = (payloadSize: number, options: {
+	objectType?: number;
+	samplingFrequencyIndex?: number;
+	channelConfiguration?: number;
+	crc?: boolean;
+	fill?: number;
+} = {}) => {
+	const headerSize = options.crc ? 9 : 7;
+	const writer = new BitWriter()
+		.writeBits(12, 0xfff)
+		.writeBits(1, 0) // MPEG-4
+		.writeBits(2, 0) // layer
+		.writeBits(1, options.crc ? 0 : 1) // protection_absent
+		.writeBits(2, (options.objectType ?? 2) - 1)
+		.writeBits(4, options.samplingFrequencyIndex ?? 4)
+		.writeBits(1, 0)
+		.writeBits(3, options.channelConfiguration ?? 2)
+		.writeBits(4, 0)
+		.writeBits(13, headerSize + payloadSize)
+		.writeBits(11, 0x7ff)
+		.writeBits(2, 0);
+	if (options.crc) {
+		writer.writeBits(16, 0x1234);
+	}
+	return concatBytes(writer.toBytes(), new Uint8Array(payloadSize).fill(options.fill ?? 0x21));
+};
+
+const synchsafe = (value: number) => [(value >> 21) & 0x7f, (value >> 14) & 0x7f, (value >> 7) & 0x7f, value & 0x7f];
+
+/** An ID3v2.4 tag holding UTF-8 text frames. */
+export const id3v24Tag = (frames: [string, string][]) => {
+	const body = concatBytes(...frames.map(([id, text]) => {
+		const data = concatBytes([3], new TextEncoder().encode(text));
+		return concatBytes(ascii(id), synchsafe(data.length), [0, 0], data);
+	}));
+	return concatBytes(ascii('ID3'), [4, 0, 0], synchsafe(body.length), body);
+};

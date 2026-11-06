@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'vitest';
-import { determineVideoPacketType, parseAvcSps, readVorbisComments } from '../../src/codec-data.js';
+import {
+	determineVideoPacketType,
+	extractVp9CodecInfoFromPacket,
+	parseAvcSps,
+	parseOpusIdentificationHeader,
+	readVorbisComments,
+	vp9CodecInfoHasColorInfo,
+} from '../../src/codec-data.js';
 import { MetadataTags } from '../../src/metadata.js';
 import {
 	addEmulationPrevention,
@@ -567,6 +574,179 @@ describe('readVorbisComments', () => {
 		expect(tooShort).toEqual({});
 	});
 });
+/** A VP9 key frame uncompressed header (profile, colour config, frame size), as far as codec info parsing reads. */
+const vp9KeyFrameHeader = (options: {
+	profile: number;
+	bitDepth?: number;
+	colorSpace: number;
+	fullRange?: boolean;
+	subsampling?: [number, number];
+	width: number;
+	height: number;
+	frameType?: number;
+	showExisting?: boolean;
+	syncCode?: number;
+}) => {
+	const writer = new BitWriter()
+		.writeBits(2, 2)
+		.writeBits(1, options.profile & 1)
+		.writeBits(1, options.profile >> 1);
+	if (options.profile === 3) {
+		writer.writeBits(1, 0);
+	}
+	writer.writeFlag(options.showExisting ?? false);
+	if (options.showExisting) {
+		return writer.writeBits(3, 0).alignZero().toBytes();
+	}
+	writer.writeBits(1, options.frameType ?? 0).writeBits(1, 1).writeBits(1, 0);
+	writer.writeBits(24, options.syncCode ?? 0x498342);
+	if (options.profile >= 2) {
+		writer.writeFlag(options.bitDepth === 12);
+	}
+	writer.writeBits(3, options.colorSpace).writeFlag(options.fullRange ?? false);
+	if (options.profile === 1 || options.profile === 3) {
+		const [x, y] = options.subsampling ?? [1, 1];
+		writer.writeBits(1, x).writeBits(1, y).writeBits(1, 0);
+	}
+	writer.writeBits(16, options.width - 1).writeBits(16, options.height - 1).writeBits(1, 0);
+	return writer.alignZero().toBytes();
+};
+
+describe('extractVp9CodecInfoFromPacket', () => {
+	test.each([
+		// profile, subsampling_x/y, expected chromaSubsampling (vpcC: 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4)
+		[0, undefined, 1],
+		[1, [1, 0] as [number, number], 2],
+		[1, [0, 0] as [number, number], 3],
+		[1, [1, 1] as [number, number], 1],
+		[3, [1, 0] as [number, number], 2],
+	])('profile %i with subsampling %j has chroma subsampling %i', (profile, subsampling, expected) => {
+		const info = extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({
+			profile,
+			bitDepth: profile >= 2 ? 10 : 8,
+			colorSpace: 2,
+			subsampling,
+			width: 320,
+			height: 240,
+		}));
+		expect(info).toMatchObject({ profile, chromaSubsampling: expected });
+	});
+
+	test('profiles 2 and 3 carry the 10/12-bit flag; 0 and 1 are 8-bit', () => {
+		const p2 = extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({
+			profile: 2,
+			bitDepth: 12,
+			colorSpace: 5,
+			width: 64,
+			height: 64,
+		}));
+		expect(p2).toMatchObject({ profile: 2, bitDepth: 12 });
+		const p3 = extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({
+			profile: 3,
+			bitDepth: 10,
+			colorSpace: 5,
+			subsampling: [0, 0],
+			width: 64,
+			height: 64,
+		}));
+		expect(p3).toMatchObject({ profile: 3, bitDepth: 10, chromaSubsampling: 3 });
+		const p1 = extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({
+			profile: 1,
+			colorSpace: 1,
+			width: 64,
+			height: 64,
+		}));
+		expect(p1).toMatchObject({ profile: 1, bitDepth: 8 });
+	});
+
+	test.each([
+		[0, [2, 2, 2]], // CS_UNKNOWN
+		[2, [1, 1, 1]], // CS_BT_709
+		[3, [6, 6, 6]], // CS_SMPTE_170
+		[4, [7, 7, 7]], // CS_SMPTE_240
+		[5, [9, 14, 9]], // CS_BT_2020
+		[6, [2, 2, 2]], // CS_RESERVED
+	])('color_space %i maps to primaries/transfer/matrix %j', (colorSpace, [p, t, m]) => {
+		const info = extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({
+			profile: 0,
+			colorSpace,
+			fullRange: true,
+			width: 64,
+			height: 64,
+		}));
+		expect(info).toMatchObject({
+			colourPrimaries: p,
+			transferCharacteristics: t,
+			matrixCoefficients: m,
+			videoFullRangeFlag: 1,
+		});
+		expect(vp9CodecInfoHasColorInfo(info!)).toBe(p !== 2);
+	});
+
+	test.each([
+		[192, 192, 10], // 36864: level 1
+		[192, 193, 11],
+		[384, 320, 20], // 122880: level 2
+		[384, 321, 21],
+		[1920, 1080, 40],
+		[1920, 1161, 50], // 2229120 > 2228224: past level 4/4.1's picture size
+		[8192, 4352, 60],
+		[16384, 16384, 62], // larger than every level: the highest
+	])('a %ix%i frame gets level %i from the picture size', (width, height, level) => {
+		const info = extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({ profile: 0, colorSpace: 2, width, height }));
+		expect(info!.level).toBe(level);
+	});
+
+	test('inter frames, shown existing frames and bad sync codes or frame markers give no codec info', () => {
+		const base = { profile: 0, colorSpace: 2, width: 64, height: 64 };
+		expect(extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({ ...base, frameType: 1 }))).toBe(null);
+		expect(extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({ ...base, showExisting: true }))).toBe(null);
+		expect(extractVp9CodecInfoFromPacket(vp9KeyFrameHeader({ ...base, syncCode: 0x498343 }))).toBe(null);
+		const badMarker = vp9KeyFrameHeader(base);
+		badMarker[0]! &= 0x3f;
+		expect(extractVp9CodecInfoFromPacket(badMarker)).toBe(null);
+	});
+
+	test('colour info is present as soon as any of primaries, transfer or matrix is specified', () => {
+		const info = { profile: 0, level: 10, bitDepth: 8, chromaSubsampling: 1, videoFullRangeFlag: 0 };
+		const unspecified = { colourPrimaries: 2, transferCharacteristics: 2, matrixCoefficients: 2 };
+		expect(vp9CodecInfoHasColorInfo({ ...info, ...unspecified })).toBe(false);
+		expect(vp9CodecInfoHasColorInfo({ ...info, ...unspecified, colourPrimaries: 1 })).toBe(true);
+		expect(vp9CodecInfoHasColorInfo({ ...info, ...unspecified, transferCharacteristics: 16 })).toBe(true);
+		expect(vp9CodecInfoHasColorInfo({ ...info, ...unspecified, matrixCoefficients: 9 })).toBe(true);
+	});
+});
+
+describe('parseOpusIdentificationHeader', () => {
+	const opusHead = (channels: number, family: number, extra: number[] = []) => concatBytes(
+		ascii('OpusHead'),
+		[1, channels],
+		[0x38, 0x01], // pre-skip 312
+		u32le(44100),
+		[0xfe, 0xff], // output gain -2
+		[family],
+		extra,
+	);
+
+	test('reads the fields, and the channel mapping table only for nonzero mapping families', () => {
+		expect(parseOpusIdentificationHeader(opusHead(2, 0))).toEqual({
+			outputChannelCount: 2,
+			preSkip: 312,
+			inputSampleRate: 44100,
+			outputGain: -2,
+			channelMappingFamily: 0,
+			channelMappingTable: null,
+		});
+		const surround = parseOpusIdentificationHeader(opusHead(6, 1, [4, 2, 0, 4, 1, 2, 3, 5]));
+		expect(surround.channelMappingFamily).toBe(1);
+		expect([...surround.channelMappingTable!]).toEqual([4, 2, 0, 4, 1, 2, 3, 5]);
+	});
+
+	test('rejects headers shorter than 19 bytes', () => {
+		expect(() => parseOpusIdentificationHeader(opusHead(2, 0).subarray(0, 18))).toThrow();
+	});
+});
+
 /** A two-byte HEVC NAL unit header of the given type (layer 0, TemporalId 0) followed by a few payload bytes. */
 const hevcNal = (type: number) => [type << 1, 0x01, 0xaf, 0x09, 0x40];
 
