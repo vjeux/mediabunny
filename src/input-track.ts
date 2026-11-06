@@ -316,7 +316,8 @@ export abstract class InputTrack {
 
 	/** Returns the track's disposition, i.e. information about its intended usage. */
 	async getDisposition() {
-		return this._backing.getDisposition();
+		// Copied so that callers can't modify the input's own state
+		return { ...await this._backing.getDisposition() };
 	}
 
 	/**
@@ -324,7 +325,7 @@ export abstract class InputTrack {
 	 * @deprecated Use {@link InputTrack.getDisposition} instead.
 	 */
 	get disposition() {
-		return requireSync(this._backing.getDisposition(), 'disposition', 'getDisposition');
+		return { ...requireSync(this._backing.getDisposition(), 'disposition', 'getDisposition') };
 	}
 
 	/**
@@ -733,10 +734,12 @@ export class InputVideoTrack extends InputTrack {
 	async getPixelAspectRatio() {
 		// Potential minor async race condition here if called twice, but doesn't matter since the computation is
 		// so cheap
-		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
+		this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			(await this.getSquarePixelWidth()) * (await this.getCodedHeight()),
 			(await this.getSquarePixelHeight()) * (await this.getCodedWidth()),
 		);
+
+		return { ...this._pixelAspectRatioCache };
 	}
 
 	/**
@@ -745,12 +748,14 @@ export class InputVideoTrack extends InputTrack {
 	 * @deprecated Use {@link InputVideoTrack.getPixelAspectRatio} instead.
 	 */
 	get pixelAspectRatio() {
-		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
+		this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			requireSync(this._backing.getSquarePixelWidth(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedHeight(), 'pixelAspectRatio', 'getPixelAspectRatio'),
 			requireSync(this._backing.getSquarePixelHeight(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedWidth(), 'pixelAspectRatio', 'getPixelAspectRatio'),
 		);
+
+		return { ...this._pixelAspectRatioCache };
 	}
 
 	/** Returns the display width of the track's frames in pixels, after aspect ratio adjustment and rotation. */
@@ -844,7 +849,10 @@ export class InputVideoTrack extends InputTrack {
 	 * null if the track's codec is unknown.
 	 */
 	async getDecoderConfig() {
-		return this._backing.getDecoderConfig();
+		// Copied so that changes made by the caller (e.g. before configuring their own decoder) don't leak into the
+		// input's own state
+		const config = await this._backing.getDecoderConfig();
+		return config && { ...config, colorSpace: config.colorSpace && { ...config.colorSpace } };
 	}
 
 	async getCodecParameterString() {
@@ -1136,7 +1144,9 @@ export class InputAudioTrack extends InputTrack {
 	 * null if the track's codec is unknown.
 	 */
 	async getDecoderConfig() {
-		return this._backing.getDecoderConfig();
+		// Copied so that changes made by the caller don't leak into the input's own state
+		const config = await this._backing.getDecoderConfig();
+		return config && { ...config };
 	}
 
 	async getCodecParameterString() {
