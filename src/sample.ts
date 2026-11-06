@@ -811,7 +811,7 @@ export class VideoSample implements Disposable {
 
 		if (isVideoFrame(this._data)) {
 			// Call the native method purely for performance
-			return this._data.allocationSize(options);
+			return this._data.allocationSize(toNativeCopyToOptions(this._data, options));
 		}
 
 		const combinedLayout = ParseVideoFrameCopyToOptions(this, options);
@@ -838,7 +838,7 @@ export class VideoSample implements Disposable {
 		assert(this._data !== null);
 
 		if (isVideoFrame(this._data)) {
-			return this._data.copyTo(destination, options);
+			return this._data.copyTo(destination, toNativeCopyToOptions(this._data, options));
 		}
 
 		// Detect non-RGB to RGB conversion
@@ -1992,6 +1992,22 @@ export class VideoSampleColorSpace {
 
 const isVideoFrame = (x: unknown): x is VideoFrame => {
 	return typeof VideoFrame !== 'undefined' && x instanceof VideoFrame;
+};
+
+/**
+ * VideoFrame only accepts RGB formats in its copy options, while our own copy routine also accepts the frame's own
+ * format. Copying into it is a plain copy, so drop the format (and the color space, which only applies to RGB).
+ */
+const toNativeCopyToOptions = (frame: VideoFrame, options: VideoFrameCopyToOptions): VideoFrameCopyToOptions => {
+	if (
+		options.format !== undefined
+		&& options.format === frame.format
+		&& !['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
+	) {
+		return { ...options, format: undefined, colorSpace: undefined };
+	}
+
+	return options;
 };
 
 /**

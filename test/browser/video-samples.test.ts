@@ -74,6 +74,31 @@ test('allocationSize', async () => {
 	}
 });
 
+test('Copying into the sample\'s own pixel format, for VideoFrame- and ArrayBuffer-backed data', async () => {
+	for (const format of ['I420', 'NV12', 'I420A', 'I444', 'RGBA'] as const) {
+		const planeSize = { I420: 1.5, NV12: 1.5, I420A: 2.5, I444: 3, RGBA: 4 }[format];
+		const data = new Uint8Array(4 * 2 * planeSize).map((_, i) => (i * 37 + 11) % 256);
+		const init = { format, codedWidth: 4, codedHeight: 2, timestamp: 0 };
+		using rawSample = new VideoSample(data, init);
+		using frameSample = new VideoSample(new VideoFrame(data, init));
+
+		const optionSets: VideoFrameCopyToOptions[] = [
+			{ format },
+			{ format, colorSpace: 'srgb' },
+			{ format, rect: { x: 2, y: 0, width: 2, height: 2 } },
+		];
+		for (const options of optionSets) {
+			const expected = new Uint8Array(rawSample.allocationSize(options));
+			const expectedLayout = await rawSample.copyTo(expected, options);
+
+			expect(frameSample.allocationSize(options), `${format} ${JSON.stringify(options)}`).toBe(expected.length);
+			const actual = new Uint8Array(expected.length);
+			expect(await frameSample.copyTo(actual, options)).toEqual(expectedLayout);
+			expect(actual).toEqual(expected);
+		}
+	}
+});
+
 test('copyTo and plane layouts', async () => {
 	const buffer = new ArrayBuffer(1e7);
 
