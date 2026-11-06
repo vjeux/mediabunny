@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import { Readable } from 'node:stream';
-import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
+import { ALL_FORMATS, HLS_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -1630,6 +1630,67 @@ test('MPEG-TS getNextPacket finds the next audio frame when PES packets start in
 		const next = await sink.getNextPacket(allPackets[i]!);
 		expect(next?.sequenceNumber).toBe(allPackets[i + 1]!.sequenceNumber);
 		expect(next?.timestamp).toBe(allPackets[i + 1]!.timestamp);
+	}
+});
+
+test('MPEG-TS with small MP3 frames is not taken for an MP3 file', async () => {
+	// 32 kbit/s MP3 (104-byte frames), several frames per PES packet. The PSI sections are padded with
+	// adaptation-field stuffing, so the first frame header in the file is followed by another one 104 bytes later.
+	const frameSize = 104;
+	const frameCount = 12;
+	const frames = new Uint8Array(frameSize * frameCount);
+	for (let i = 0; i < frameCount; i++) {
+		frames.set([0xff, 0xfb, 0x10, 0x00], i * frameSize); // MPEG-1 Layer III, 32 kbit/s, 44.1 kHz
+	}
+
+	const packets: Uint8Array[] = [];
+	const pushPackets = (pid: number, payload: number[]) => {
+		for (let i = 0; i < payload.length; i += 184) {
+			const chunk = payload.slice(i, i + 184);
+			const packet = new Uint8Array(188);
+			const stuffing = 184 - chunk.length;
+			packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, (stuffing ? 0x30 : 0x10)], 0);
+			if (stuffing) {
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+				packet.fill(0xff, 6, 4 + stuffing);
+			}
+			packet.set(chunk, 4 + stuffing);
+			packets.push(packet);
+		}
+	};
+
+	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPackets(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x03, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+	for (let i = 0; i < frameCount; i += 3) {
+		const pts = 90_000 + Math.round(i * 1152 * 90_000 / 44_100);
+		const data = [...frames.subarray(i * frameSize, (i + 3) * frameSize)];
+		pushPackets(0x100, [
+			0, 0, 1, 0xc0, (data.length + 8) >> 8, (data.length + 8) & 0xff, 0x84, 0x80, 5,
+			0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
+			((pts << 1) & 0xfe) | 1, ...data,
+		]);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	for (const formats of [ALL_FORMATS, HLS_FORMATS]) {
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats,
+		});
+
+		expect(await input.getFormat()).toBe(MPEG_TS);
+
+		const track = await input.getPrimaryAudioTrack();
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track!).packets()) {
+			expect(packet.byteLength).toBe(frameSize);
+			packetCount++;
+		}
+		expect(packetCount).toBe(frameCount);
 	}
 });
 
