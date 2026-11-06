@@ -292,6 +292,39 @@ test('FFmpeg-unsafe raw udta tags, MP4', async () => {
 	}
 });
 
+test('Read every image of an MP4 covr item', async () => {
+	// iTunes, AtomicParsley and mutagen put all cover images into one covr item, one data box each
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const mvhd = box('mvhd', u32(0), u32(0), u32(0), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10),
+		u32(0x10000), u32(0), u32(0), u32(0), u32(0x10000), u32(0), u32(0), u32(0), u32(0x40000000), zeros(28));
+	const png = [0x89, 0x50, 0x4e, 0x47];
+	const jpeg = [0xff, 0xd8, 0xff];
+	const file = new Uint8Array([
+		...box('ftyp', ascii('M4A '), u32(0), ascii('M4A ')),
+		...box('moov', mvhd, box('udta', box('meta', u32(0),
+			box('hdlr', u32(0), u32(0), ascii('mdir'), zeros(13)),
+			box('ilst', box('covr', box('data', u32(14), u32(0), png), box('data', u32(13), u32(0), jpeg))),
+		))),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const images = (await input.getMetadataTags()).images;
+	expect(images?.map(image => [image.mimeType, [...image.data]])).toEqual([
+		['image/png', png],
+		['image/jpeg', jpeg],
+	]);
+});
+
 test('Read and write metadata, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
