@@ -432,6 +432,16 @@ export class EBMLWriter {
 
 				if (data.size !== -1) {
 					const size = this.writer.getPos() - startPos;
+
+					if (size >= 2 ** (7 * sizeSize) - 1) {
+						// The content outgrew the reserved size field (which would silently wrap around), so write the
+						// element again with a size field wide enough for it
+						this.writer.seek(this.offsets.get(data)!);
+						data.size = measureVarInt(size);
+						this.writeEBML(data);
+						return;
+					}
+
 					const endPos = this.writer.getPos();
 					this.writer.seek(sizePos);
 					this.writeVarInt(size, sizeSize);

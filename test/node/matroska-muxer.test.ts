@@ -548,3 +548,26 @@ test('Equally spaced packets at half milliseconds stay equally spaced', async ()
 	}
 	expect(timestampsInMs).toEqual(Array.from({ length: 100 }, (_, i) => 14 + 20 * i));
 });
+
+test('Frames that outgrow a 4-byte element size keep their size', async () => {
+	// Blocks reserve 4 size bytes, which hold up to 2^28 - 2
+	const frameSizes = [2 ** 28, 100];
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const decoderConfig = { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 };
+	await source.add(new EncodedPacket(new Uint8Array(frameSizes[0]!), 'key', 0, 0.5), { decoderConfig });
+	await source.add(new EncodedPacket(new Uint8Array(frameSizes[1]!), 'delta', 0.5, 0.5));
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+	const sizes: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+		sizes.push(packet.byteLength);
+	}
+	expect(sizes).toEqual(frameSizes);
+});
