@@ -487,6 +487,8 @@ type OggLink = {
 	firstTimestampInSamples: number;
 	/** For Vorbis, the block size of the packet that precedes the link's first packet in the track. */
 	initialVorbisLastBlocksize: number | null;
+	/** Where the link's last page ends, once known. */
+	endPos: number | null;
 	nextPromise: Promise<OggLink | null> | null;
 };
 
@@ -673,6 +675,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			offsetInSamples: 0,
 			firstTimestampInSamples: await this.computeStartInSamples(this.bitstream, null),
 			initialVorbisLastBlocksize: null,
+			endPos: null,
 			nextPromise: null,
 		}))();
 	}
@@ -738,8 +741,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	 * into. `end` is where the given link ends.
 	 */
 	getNextLink(link: OggLink, end: { lastPage: Page; timestampInSamples: number; vorbisBlockSize: number | null }) {
+		link.endPos ??= end.lastPage.headerStartPos + end.lastPage.totalSize;
+
 		return link.nextPromise ??= (async () => {
-			const bitstream = await this.demuxer.readChainedLink(end.lastPage.headerStartPos + end.lastPage.totalSize);
+			const bitstream = await this.demuxer.readChainedLink(link.endPos!);
 			if (!bitstream) {
 				return null; // The file doesn't continue with another link
 			}
@@ -769,6 +774,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				offsetInSamples: end.timestampInSamples - startInSamples,
 				firstTimestampInSamples: end.timestampInSamples,
 				initialVorbisLastBlocksize: end.vorbisBlockSize,
+				endPos: null,
 				nextPromise: null,
 			};
 		})();
@@ -890,6 +896,15 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		}
 
 		while (true) {
+			if (link.nextPromise) {
+				// We already know where the next link starts, so we can skip this one if the timestamp lies past it
+				const nextLink = await link.nextPromise;
+				if (nextLink && timestampInSamples >= nextLink.firstTimestampInSamples) {
+					link = nextLink;
+					continue;
+				}
+			}
+
 			const packet = await this.getPacketInLink(link, timestampInSamples, options);
 			if (!packet) {
 				return null;
@@ -928,7 +943,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		}
 
 		let lowPage = startPosition.startPage;
-		let high = this.demuxer.reader.fileSize;
+		let high = link.endPos ?? this.demuxer.reader.fileSize;
 
 		const lowPages: Page[] = [lowPage];
 
