@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +83,45 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('EBML header with Void padding or a DocTypeExtension', async () => {
+	// Both may be larger than the 8 bytes an integer element can have
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const docTypeExtension = element(
+		0x4281, // DocTypeExtension
+		element(0x4283, ascii('extension-name')), // DocTypeExtensionName
+		element(0x4284, [1]), // DocTypeExtensionVersion
+	);
+
+	for (const extra of [element(EBMLId.Void, new Array<number>(16).fill(0)), docTypeExtension]) {
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska')), extra),
+			...element(EBMLId.Segment, element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, ascii('A_AC3')),
+			))),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		expect(await input.getTracks()).toHaveLength(1);
+	}
 });
