@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, type TestContext } from 'vitest';
 import { registerMp3Encoder } from '@mediabunny/mp3-encoder';
 import { registerFlacEncoder } from '@mediabunny/flac-encoder';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -6,7 +6,13 @@ import { Input } from '../../src/input.js';
 import { BufferSource } from '../../src/source.js';
 import { analyzeInput, type MediaView } from './helpers/convmatrix-analysis.js';
 import { buildSyntheticInput, SYNTHETIC_INPUTS } from './helpers/convmatrix-inputs.js';
-import { audioDecodingResponds, decodesNatively, NATIVE_PROBES } from './helpers/convmatrix-probes.js';
+import {
+	audioDecodingResponds,
+	decodesNatively,
+	getPlatformSupport,
+	NATIVE_PROBES,
+	type PlatformSupport,
+} from './helpers/convmatrix-probes.js';
 import {
 	AUDIO_ONLY_OUTPUTS,
 	runCell,
@@ -28,7 +34,9 @@ import {
 // (more trims and boundary policies, every video and audio option on every input, more codecs; several minutes).
 //
 // Cells that decode FLAC or Vorbis run last, and only where WebCodecs decodes a tiny known-good stream of that codec:
-// on WebKitGTK, a FLAC or Vorbis decode stalls every later audio decode on the page.
+// on WebKitGTK, a FLAC or Vorbis decode stalls every later audio decode on the page. Likewise, cells that need Opus or
+// AAC encoding, decoding past negative timestamps, AV1 decoding or AVC encoding are skipped where WebCodecs fails on
+// those (see helpers/convmatrix-probes.ts), and every skip is reported.
 
 const FULL = !!(import.meta as unknown as { env: Record<string, string | undefined> })
 	.env['VITE_CONVERSION_MATRIX_FULL'];
@@ -50,17 +58,18 @@ const INPUT_INFO: InputInfo[] = SYNTHETIC_INPUTS.map(spec => ({
 
 // Files from elsewhere (B-frames, edit lists, odd start times, real codec settings), in the full matrix only. They
 // don't carry the generator's markers, so only timing and format are checked for them, on their first 3 seconds.
-const PUBLIC_INPUTS: { id: string; url: string; audioCodec: string | null }[] = FULL
+type PublicInput = { id: string; url: string; videoCodec: string | null; audioCodec: string | null };
+const PUBLIC_INPUTS: PublicInput[] = FULL
 	? [
-			{ id: 'mp4-b-frames-edit-list', url: '/edts.mp4', audioCodec: 'aac' },
-			{ id: 'mp4-sar-b-frames', url: '/sar_2x1.mp4', audioCodec: null },
-			{ id: 'mp4-rotated-51', url: '/rotate-buck-bunny.mp4', audioCodec: 'aac' },
-			{ id: 'webm-vp9-opus-negative-start', url: '/demo.webm', audioCodec: 'opus' },
-			{ id: 'ts-b-frames', url: '/0.ts', audioCodec: 'aac' },
-			{ id: 'ogg-opus-preroll', url: '/preroll-test.opus', audioCodec: 'opus' },
-			{ id: 'ogg-vorbis', url: '/vorbis-eos.ogg', audioCodec: 'vorbis' },
-			{ id: 'adts-aac', url: '/sample3.aac', audioCodec: 'aac' },
-			{ id: 'mp3-vbr-24k', url: '/Toothsome-Meme.VBRv2.mp3', audioCodec: 'mp3' },
+			{ id: 'mp4-b-frames-edit-list', url: '/edts.mp4', videoCodec: 'avc', audioCodec: 'aac' },
+			{ id: 'mp4-sar-b-frames', url: '/sar_2x1.mp4', videoCodec: 'avc', audioCodec: null },
+			{ id: 'mp4-rotated-51', url: '/rotate-buck-bunny.mp4', videoCodec: 'avc', audioCodec: 'aac' },
+			{ id: 'webm-vp9-opus-negative-start', url: '/demo.webm', videoCodec: 'vp9', audioCodec: 'opus' },
+			{ id: 'ts-b-frames', url: '/0.ts', videoCodec: 'avc', audioCodec: 'aac' },
+			{ id: 'ogg-opus-preroll', url: '/preroll-test.opus', videoCodec: null, audioCodec: 'opus' },
+			{ id: 'ogg-vorbis', url: '/vorbis-eos.ogg', videoCodec: null, audioCodec: 'vorbis' },
+			{ id: 'adts-aac', url: '/sample3.aac', videoCodec: null, audioCodec: 'aac' },
+			{ id: 'mp3-vbr-24k', url: '/Toothsome-Meme.VBRv2.mp3', videoCodec: null, audioCodec: 'mp3' },
 		]
 	: [];
 
@@ -282,24 +291,76 @@ const deferredCodecOf = (cell: Cell, inputAudioCodec: string | null): DeferredCo
 /** Cells whose output audio turned out to use a deferred codec, by codec and input. */
 const deferredAtRuntime = new Map<string, Cell[]>();
 
+// Codecs whose encoders delay the audio (priming, Opus pre-skip), which containers signal with timestamps before zero
+const PRIMED_AUDIO_CODECS = ['opus', 'aac'];
+
+/** Why the platform can't run a matrix input at all (building it, or decoding it to know what it holds). */
+const getInputSkipReason = (matrixInput: MatrixInput, support: PlatformSupport) => {
+	if (matrixInput.url === null && matrixInput.audioCodec === 'opus' && !support.opusEncoding) {
+		return 'Opus encoding';
+	}
+	if (PRIMED_AUDIO_CODECS.includes(matrixInput.audioCodec ?? '') && !support.negativeTimestamps) {
+		return 'decoding past negative timestamps';
+	}
+	if (matrixInput.videoCodec === 'av1' && !support.av1Decoding) {
+		return 'AV1 decoding';
+	}
+
+	return null;
+};
+
+/** Why the platform can't run a cell, from the conversion's track decisions. */
+const getCellSkipReason = (cell: Cell, support: PlatformSupport) => (run: RunResult) => {
+	const audioCodec = run.outputCodecs.audio;
+	if (run.copied.audio === false && audioCodec === 'opus' && !support.opusEncoding) {
+		return 'Opus encoding';
+	}
+	if (run.copied.audio === false && audioCodec === 'aac' && !support.aacEncoding) {
+		return 'AAC encoding';
+	}
+	if (run.copied.video === false && run.outputCodecs.video === 'avc' && !support.avcEncoding) {
+		return 'AVC encoding';
+	}
+	if (run.outputCodecs.video === 'av1' && !support.av1Decoding) {
+		return 'AV1 decoding';
+	}
+	// Primed audio starts before zero, and so does a copy trimmed into compressed audio (its decoder pre-roll)
+	const trimmedCopy = run.copied.audio === true && (cell.options.trim?.start ?? -Infinity) > run.startTimestamp - 1
+		&& audioCodec !== null && !audioCodec.startsWith('pcm') && audioCodec !== 'flac';
+	if ((PRIMED_AUDIO_CODECS.includes(audioCodec ?? '') || trimmedCopy) && !support.negativeTimestamps) {
+		return 'decoding past negative timestamps';
+	}
+	return null;
+};
+
+type CellsResult = { failures: string[]; skipReasons: string[]; ran: number };
+
 const runCells = async (
 	bytes: Uint8Array,
 	view: MediaView,
 	cells: Cell[],
-	markers: boolean,
+	matrixInput: MatrixInput,
+	support: PlatformSupport,
 	deferAudioCodecs: DeferredCodec[],
-) => {
-	const failures: string[] = [];
+): Promise<CellsResult> => {
+	const result: CellsResult = { failures: [], skipReasons: [], ran: 0 };
 
 	for (const cell of cells) {
-		const run = await runCell(bytes, cell, deferAudioCodecs);
+		const getSkipReason = getCellSkipReason(cell, support);
+		const run = await runCell(bytes, cell, deferAudioCodecs, getSkipReason);
 		if (run.deferredCodec !== null) {
 			const key = `${run.deferredCodec} ${cell.input}`;
 			deferredAtRuntime.set(key, [...deferredAtRuntime.get(key) ?? [], cell]);
 			continue;
 		}
+		if (run.skipReason !== null) {
+			result.skipReasons.push(run.skipReason);
+			continue;
+		}
+		result.ran++;
 
-		const issues = verifyCell(cell, view, run, markers).filter(issue => !isKnownIssue(cell, view, run, issue));
+		const issues = verifyCell(cell, view, run, matrixInput.markers)
+			.filter(issue => !isKnownIssue(cell, view, run, issue));
 
 		if (cell.options.repeat && run.outputBytes) {
 			const again = await runCell(bytes, cell);
@@ -311,18 +372,53 @@ const runCells = async (
 		}
 
 		if (issues.length > 0) {
-			failures.push(`${cell.id}: ${issues.map(x => `${x.kind}: ${x.detail}`).join('; ')}`);
+			result.failures.push(`${cell.id}: ${issues.map(x => `${x.kind}: ${x.detail}`).join('; ')}`);
 		}
 	}
 
-	return failures;
+	return result;
 };
 
-type MatrixInput = { id: string; audioCodec: string | null; markers: boolean; url: string | null };
+/** Reports the cells the platform couldn't run: skips the test when none ran, notes the count otherwise. */
+const reportSkips = async (result: CellsResult, context: TestContext) => {
+	if (result.skipReasons.length === 0) {
+		return;
+	}
+
+	const counts = new Map<string, number>();
+	for (const reason of result.skipReasons) {
+		counts.set(reason, (counts.get(reason) ?? 0) + 1);
+	}
+	const summary = [...counts].map(([reason, count]) => `${reason} (${count})`).join(', ');
+	if (result.ran === 0 && result.failures.length === 0) {
+		context.skip(`WebCodecs fails here on ${summary}`);
+	}
+	await context.annotate(`${result.skipReasons.length} cells skipped, as WebCodecs fails here on ${summary}`);
+};
+
+type MatrixInput = {
+	id: string;
+	videoCodec: string | null;
+	audioCodec: string | null;
+	markers: boolean;
+	url: string | null;
+};
 
 const MATRIX_INPUTS: MatrixInput[] = [
-	...SYNTHETIC_INPUTS.map(spec => ({ id: spec.id, audioCodec: spec.audio?.codec ?? null, markers: true, url: null })),
-	...PUBLIC_INPUTS.map(({ id, url, audioCodec }) => ({ id, audioCodec, markers: false, url })),
+	...SYNTHETIC_INPUTS.map(spec => ({
+		id: spec.id,
+		videoCodec: spec.video?.codec ?? null,
+		audioCodec: spec.audio?.codec ?? null,
+		markers: true,
+		url: null,
+	})),
+	...PUBLIC_INPUTS.map(({ id, url, videoCodec, audioCodec }) => ({
+		id,
+		videoCodec,
+		audioCodec,
+		markers: false,
+		url,
+	})),
 ];
 
 const loadedInputs = new Map<string, Promise<{ bytes: Uint8Array; view: MediaView; cells: Cell[] }>>();
@@ -363,12 +459,19 @@ describe('Conversion matrix', () => {
 			continue;
 		}
 
-		test(matrixInput.id, async () => {
+		test(matrixInput.id, async (context) => {
+			const support = await getPlatformSupport();
+			const inputSkipReason = getInputSkipReason(matrixInput, support);
+			if (inputSkipReason !== null) {
+				context.skip(`WebCodecs fails here on ${inputSkipReason}`);
+			}
+
 			const { bytes, view, cells } = await loadInput(matrixInput);
 			const plainCells = cells.filter(cell => deferredCodecOf(cell, matrixInput.audioCodec) === null);
 
-			const failures = await runCells(bytes, view, plainCells, matrixInput.markers, ['flac', 'vorbis']);
-			expect(failures).toEqual([]);
+			const result = await runCells(bytes, view, plainCells, matrixInput, support, ['flac', 'vorbis']);
+			await reportSkips(result, context);
+			expect(result.failures).toEqual([]);
 		}, testTimeout(matrixInput));
 	}
 });
@@ -382,15 +485,31 @@ describe('Conversion matrix oracle', () => {
 		return copy;
 	};
 	const getInput = (id: string) => loadInput(MATRIX_INPUTS.find(x => x.id === id)!);
+	/** Skips the test where the platform can't run the input at all. */
+	const requireInput = async (id: string, context: TestContext) => {
+		const inputSkipReason = getInputSkipReason(MATRIX_INPUTS.find(x => x.id === id)!, await getPlatformSupport());
+		if (inputSkipReason !== null) {
+			context.skip(`WebCodecs fails here on ${inputSkipReason}`);
+		}
+	};
+	/** Runs a baseline cell, or skips the test where the platform can't run it. */
+	const runBaseline = async (bytes: Uint8Array, cell: Cell, context: TestContext) => {
+		const run = await runCell(bytes, cell, [], getCellSkipReason(cell, await getPlatformSupport()));
+		if (run.skipReason !== null) {
+			context.skip(`WebCodecs fails here on ${run.skipReason}`);
+		}
+		return run;
+	};
 
-	test('rejects wrong frames, timing, dimensions, beeps and progress', async () => {
+	test('rejects wrong frames, timing, dimensions, beeps and progress', async (context) => {
+		await requireInput('mp4-avc-opus', context);
 		const { bytes, view } = await getInput('mp4-avc-opus');
 		const transcode: Cell = { id: 'transcode', input: 'mp4-avc-opus', output: 'mp4', options: { copy: false } };
 		const canvas: Cell = { ...transcode, id: 'canvas', options: { video: { processPreset: 'canvas' } } };
 		const vp9: Cell = { ...transcode, id: 'vp9', output: 'webm' };
 
 		for (const cell of [transcode, canvas, vp9]) {
-			const run = await runCell(bytes, cell);
+			const run = await runBaseline(bytes, cell, context);
 			expect(verifyCell(cell, view, run)).toEqual([]);
 
 			// Blank frames, and a frozen output
@@ -409,7 +528,7 @@ describe('Conversion matrix oracle', () => {
 			expect(kinds(verifyCell(cell, view, frozen))).toContain('video-content');
 		}
 
-		const run = await runCell(bytes, transcode);
+		const run = await runBaseline(bytes, transcode, context);
 		const check = (change: (copy: RunResult) => void) => kinds(verifyCell(transcode, view, mutate(run, change)));
 
 		expect(check((copy) => {
@@ -463,7 +582,8 @@ describe('Conversion matrix oracle', () => {
 		})).toContain('progress');
 	});
 
-	test('requires evidence of cancellation', async () => {
+	test('requires evidence of cancellation', async (context) => {
+		await requireInput('mp4-avc-opus', context);
 		const { bytes, view } = await getInput('mp4-avc-opus');
 		const cell: Cell = {
 			id: 'cancel',
@@ -471,7 +591,7 @@ describe('Conversion matrix oracle', () => {
 			output: 'webm',
 			options: { copy: false, cancelAt: 0.5 },
 		};
-		const run = await runCell(bytes, cell);
+		const run = await runBaseline(bytes, cell, context);
 		expect(verifyCell(cell, view, run)).toEqual([]);
 
 		// Progress never reaches 2, so the conversion runs to the end
@@ -526,9 +646,14 @@ describe('Conversion matrix, FLAC', () => {
 			continue;
 		}
 
-		test(matrixInput.id, async ({ skip }) => {
+		test(matrixInput.id, async (context) => {
 			if (!await flacRuns()) {
-				skip('WebCodecs doesn\'t decode FLAC here');
+				context.skip('WebCodecs doesn\'t decode FLAC here');
+			}
+			const support = await getPlatformSupport();
+			const inputSkipReason = getInputSkipReason(matrixInput, support);
+			if (inputSkipReason !== null) {
+				context.skip(`WebCodecs fails here on ${inputSkipReason}`);
 			}
 
 			const { bytes, view, cells } = await loadInput(matrixInput);
@@ -537,8 +662,9 @@ describe('Conversion matrix, FLAC', () => {
 				...deferredAtRuntime.get(`flac ${matrixInput.id}`) ?? [],
 			];
 
-			const failures = await runCells(bytes, view, flacCells, matrixInput.markers, ['vorbis']);
-			expect(failures).toEqual([]);
+			const result = await runCells(bytes, view, flacCells, matrixInput, support, ['vorbis']);
+			await reportSkips(result, context);
+			expect(result.failures).toEqual([]);
 		}, testTimeout(matrixInput));
 	}
 });
@@ -549,33 +675,44 @@ describe('Conversion matrix, Vorbis', () => {
 			continue;
 		}
 
-		test(matrixInput.id, async ({ skip }) => {
+		test(matrixInput.id, async (context) => {
 			if (!await vorbisRuns()) {
-				skip('WebCodecs doesn\'t decode Vorbis here, or the page\'s audio decoding stalled');
+				context.skip('WebCodecs doesn\'t decode Vorbis here, or the page\'s audio decoding stalled');
+			}
+			const support = await getPlatformSupport();
+			const inputSkipReason = getInputSkipReason(matrixInput, support);
+			if (inputSkipReason !== null) {
+				context.skip(`WebCodecs fails here on ${inputSkipReason}`);
 			}
 
 			const { bytes, view, cells } = await loadInput(matrixInput);
-			const failures = await runCells(bytes, view, cells, matrixInput.markers, []);
-			expect(failures).toEqual([]);
+			const result = await runCells(bytes, view, cells, matrixInput, support, []);
+			await reportSkips(result, context);
+			expect(result.failures).toEqual([]);
 		}, testTimeout(matrixInput));
 	}
 
 	// Cells of other inputs whose output audio turned out to be Vorbis
-	test('Vorbis outputs', async ({ skip }) => {
+	test('Vorbis outputs', async (context) => {
 		const deferred = MATRIX_INPUTS.filter(x => deferredAtRuntime.has(`vorbis ${x.id}`));
 		if (deferred.length === 0) {
 			return;
 		}
 		if (!await vorbisRuns()) {
-			skip('WebCodecs doesn\'t decode Vorbis here, or the page\'s audio decoding stalled');
+			context.skip('WebCodecs doesn\'t decode Vorbis here, or the page\'s audio decoding stalled');
 		}
+		const support = await getPlatformSupport();
 
-		const failures: string[] = [];
+		const result: CellsResult = { failures: [], skipReasons: [], ran: 0 };
 		for (const matrixInput of deferred) {
 			const { bytes, view } = await loadInput(matrixInput);
 			const cells = deferredAtRuntime.get(`vorbis ${matrixInput.id}`)!;
-			failures.push(...await runCells(bytes, view, cells, matrixInput.markers, []));
+			const inputResult = await runCells(bytes, view, cells, matrixInput, support, []);
+			result.failures.push(...inputResult.failures);
+			result.skipReasons.push(...inputResult.skipReasons);
+			result.ran += inputResult.ran;
 		}
-		expect(failures).toEqual([]);
+		await reportSkips(result, context);
+		expect(result.failures).toEqual([]);
 	}, FULL ? 1_800_000 : 300_000);
 });

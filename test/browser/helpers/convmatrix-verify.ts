@@ -153,6 +153,8 @@ export type RunResult = {
 	cancelRequested: boolean;
 	/** Set when the output's audio codec was one of `deferAudioCodecs`, so the cell wasn't run. */
 	deferredCodec: string | null;
+	/** Set when `getSkipReason` said the platform can't run the cell, so it wasn't run. */
+	skipReason: string | null;
 	conversionState: string | null;
 	outputState: string | null;
 	startTimestamp: number;
@@ -163,12 +165,14 @@ export type RunResult = {
 
 /**
  * Runs a cell. With `deferAudioCodecs`, a cell whose output audio would use one of these codecs isn't executed, for
- * running later (decoding it can stall the page's audio decoding on some platforms).
+ * running later (decoding it can stall the page's audio decoding on some platforms). `getSkipReason` sees the
+ * conversion's track decisions (copy or transcode, codecs) before it runs, and can tell why the platform can't run it.
  */
 export const runCell = async (
 	inputBytes: Uint8Array,
 	cell: Cell,
 	deferAudioCodecs: string[] = [],
+	getSkipReason: (run: RunResult) => string | null = () => null,
 ): Promise<RunResult> => {
 	const result: RunResult = {
 		error: null,
@@ -179,6 +183,7 @@ export const runCell = async (
 		progress: [],
 		cancelRequested: false,
 		deferredCodec: null,
+		skipReason: null,
 		conversionState: null,
 		outputState: null,
 		startTimestamp: 0,
@@ -222,6 +227,10 @@ export const runCell = async (
 		result.startTimestamp = conversion._startTimestamp;
 		if (result.outputCodecs.audio !== null && deferAudioCodecs.includes(result.outputCodecs.audio)) {
 			result.deferredCodec = result.outputCodecs.audio;
+			return result;
+		}
+		result.skipReason = getSkipReason(result);
+		if (result.skipReason !== null) {
 			return result;
 		}
 		conversion.onProgress = (progress) => {
