@@ -100,6 +100,18 @@ import { Bitstream } from '../../shared/bitstream';
 const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expected. PES packets without PTS are not'
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
+/**
+ * Declared streams can start a good while after the others (45 seconds in a Blu-ray excerpt whose DTS track starts
+ * after its AC-3 track), but one that never shows up would have us read the whole file. So once we're this far into
+ * the media (in PTS) without having seen a declared stream, we check a few spots later in the file for its packets,
+ * and only keep looking for it if it's there.
+ */
+const MISSING_STREAM_CHECK_DELAY = 10 * MPEG_TS_TIMESCALE;
+const MISSING_STREAM_CHECK_COUNT = 4;
+const MISSING_STREAM_CHECK_SIZE = 2 ** 19;
+/** When we can't do that check (the file size is unknown), how far into the media we look before giving up. */
+const MAX_STREAM_START_DELAY = 120 * MPEG_TS_TIMESCALE;
+
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
@@ -231,6 +243,10 @@ export class MpegTsDemuxer extends Demuxer {
 			// Some files contain these multiple times, but we only care about their first appearance
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
+			let firstPts: number | null = null;
+			// PIDs of missing streams we've already checked for later in the file, and those we found there
+			const checkedPids = new Set<number>();
+			const pidsFoundLater = new Set<number>();
 
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
@@ -248,7 +264,35 @@ export class MpegTsDemuxer extends Demuxer {
 					hasProgramMap
 					&& !this.elementaryStreams.some(x => x.pid === packetHeader.pid && !x.initialized)
 				) {
-					// Don't care about this PID (anymore)
+					// Don't care about this PID (anymore), except for checking how far into the media we are
+					if (firstPts !== null && this.elementaryStreams.some(x => x.pid === packetHeader.pid)) {
+						const section = await this.readSection(currentPos, false);
+						const pesPacketHeader = section ? readPesPacketHeader(this, section, false) : null;
+
+						const fileSize = this.reader.fileSizeNonStrict;
+						const delay = pesPacketHeader && pesPacketHeader.pts !== null
+							? pesPacketHeader.pts - firstPts
+							: 0;
+
+						if (delay > (fileSize !== null ? MISSING_STREAM_CHECK_DELAY : MAX_STREAM_START_DELAY)) {
+							const missingPids = this.elementaryStreams.filter(x => !x.initialized).map(x => x.pid);
+							const uncheckedPids = missingPids.filter(pid => !checkedPids.has(pid));
+
+							if (fileSize !== null && uncheckedPids.length > 0) {
+								const foundPids = await this.findPidsLaterInFile(uncheckedPids, currentPos, fileSize);
+								uncheckedPids.forEach(pid => checkedPids.add(pid));
+								foundPids.forEach(pid => pidsFoundLater.add(pid));
+							}
+
+							if (!missingPids.some(pid => pidsFoundLater.has(pid))) {
+								// The streams that still haven't shown up are declared, but don't seem to be in the
+								// file (recorders may drop some), so let's stop looking for them instead of reading
+								// it all
+								break;
+							}
+						}
+					}
+
 					currentPos += this.packetStride;
 					continue;
 				}
@@ -531,6 +575,7 @@ export class MpegTsDemuxer extends Demuxer {
 
 						elementaryStream.firstSection = section;
 						elementaryStream.canBeTrustedWithKeyPackets = section.randomAccessIndicator === 1;
+						firstPts ??= pesPacket.pts;
 
 						if (this.input._initInput) {
 							const initDemuxer = (await this.input._initInput._getDemuxer()) as MpegTsDemuxer;
@@ -968,6 +1013,46 @@ export class MpegTsDemuxer extends Demuxer {
 			payload: merged,
 			randomAccessIndicator,
 		};
+	}
+
+	/** Looks for packets of the given PIDs in a few spots spread over the file after `startPos`. */
+	async findPidsLaterInFile(pids: number[], startPos: number, fileSize: number) {
+		const found = new Set<number>();
+
+		for (let i = 1; i <= MISSING_STREAM_CHECK_COUNT && found.size < pids.length; i++) {
+			// The spots are evenly spread, the last one at the end of the file
+			const spotEnd = startPos + Math.floor((fileSize - startPos) * i / MISSING_STREAM_CHECK_COUNT);
+			const spotStart = Math.max(startPos, spotEnd - MISSING_STREAM_CHECK_SIZE);
+			const firstPacketPos = this.packetOffset
+				+ Math.ceil((spotStart - this.packetOffset) / this.packetStride) * this.packetStride;
+			const packetCount = Math.floor((spotEnd - firstPacketPos - TS_PACKET_SIZE) / this.packetStride) + 1;
+			if (packetCount <= 0) {
+				continue;
+			}
+
+			const length = (packetCount - 1) * this.packetStride + TS_PACKET_SIZE;
+			let slice = this.reader.requestSlice(firstPacketPos, length);
+			if (isThenable(slice)) slice = await slice;
+			if (!slice) {
+				continue;
+			}
+
+			const bytes = readBytes(slice, length);
+			for (let j = 0; j < packetCount; j++) {
+				const offset = j * this.packetStride;
+				if (bytes[offset] !== 0x47) {
+					continue; // Not a packet
+				}
+
+				const pid = ((bytes[offset + 1]! & 0x1f) << 8) | bytes[offset + 2]!;
+				const hasPayload = (bytes[offset + 3]! & 0x10) !== 0;
+				if (hasPayload && pids.includes(pid)) {
+					found.add(pid);
+				}
+			}
+		}
+
+		return found;
 	}
 
 	async readPacketHeader(pos: number): Promise<TsPacketHeader | null> {
