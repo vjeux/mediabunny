@@ -1,5 +1,5 @@
 /* eslint-disable @stylistic/max-len */
-import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
+import { ALL_FORMATS, BufferSource, BufferTarget, EncodedPacketSink, EncodedVideoPacketSource, Input, InputAudioTrack, InputVideoTrack, Mp4OutputFormat, Output, UrlSource } from 'mediabunny';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
@@ -1405,6 +1405,106 @@ b.ts
 
 	expect(types.length).toBeGreaterThan(0);
 	expect(types.every(type => type === 'key')).toBe(true);
+});
+
+test.concurrent('A live reload onto a new init section uses it, also when EXT-X-MAP precedes EXT-X-MEDIA-SEQUENCE', { timeout: 30_000 }, async () => {
+	// Real x264 output as fragmented MP4, one fragment per GOP (a key frame every 1.92 s)
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceTrack = (await sourceInput.getPrimaryVideoTrack())!;
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration: 0 }),
+		target: new BufferTarget(),
+	});
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource);
+	await output.start();
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		await videoSource.add(packet, { decoderConfig });
+	}
+	await output.finalize();
+
+	const file = new Uint8Array(output.target.buffer!);
+	const view = new DataView(file.buffer);
+	let init: Uint8Array | null = null;
+	const fragments: Uint8Array[] = [];
+	for (let offset = 0; offset < file.length;) {
+		const size = view.getUint32(offset);
+		const type = new TextDecoder().decode(file.subarray(offset + 4, offset + 8));
+		if (type === 'moov') {
+			init = file.subarray(0, offset + size);
+		} else if (type === 'moof') {
+			const mdatSize = view.getUint32(offset + size);
+			fragments.push(file.subarray(offset, offset + size + mdatSize));
+			offset += mdatSize;
+		}
+		offset += size;
+	}
+	assert(init);
+	expect(fragments.length).toBeGreaterThanOrEqual(3);
+
+	// After the reload, the encoder has restarted with a new init section, whose track has another ID: its segments
+	// can only be read with it
+	const withTrackId2 = (bytes: Uint8Array) => {
+		const copy = bytes.slice();
+		const copyView = new DataView(copy.buffer);
+		for (let i = 4; i + 12 <= copy.length; i++) {
+			const type = String.fromCharCode(copy[i]!, copy[i + 1]!, copy[i + 2]!, copy[i + 3]!);
+			if (type === 'tkhd') {
+				copyView.setUint32(i + (copy[i + 4] === 1 ? 24 : 16), 2);
+			} else if (type === 'trex' || type === 'tfhd') {
+				copyView.setUint32(i + 8, 2);
+			}
+		}
+		return copy;
+	};
+	const files = new Map<string, Uint8Array>([['a/init.mp4', init], ['b/init.mp4', withTrackId2(init)]]);
+	for (let i = 0; i < 3; i++) {
+		files.set(`a/${i}.m4s`, fragments[i]!);
+		files.set(`b/${i + 3}.m4s`, withTrackId2(fragments[i]!));
+	}
+
+	// EXT-X-MAP applies to every segment after it (RFC 8216, 4.3.2.5), and EXT-X-MEDIA-SEQUENCE only has to come
+	// before the first segment; Mux's live playlists put the map first
+	for (const mapFirst of [false, true]) {
+		const createPlaylist = (window: 'a' | 'b') => {
+			const map = `#EXT-X-MAP:URI="${window}/init.mp4"`;
+			const sequence = `#EXT-X-MEDIA-SEQUENCE:${window === 'a' ? 0 : 3}`;
+			return [
+				'#EXTM3U',
+				'#EXT-X-VERSION:7',
+				'#EXT-X-TARGETDURATION:2',
+				...(window === 'b' ? ['#EXT-X-DISCONTINUITY-SEQUENCE:1'] : []),
+				...(mapFirst ? [map, sequence] : [sequence, map]),
+				...[0, 1, 2].flatMap(i => ['#EXTINF:1.92,', `${window}/${window === 'a' ? i : i + 3}.m4s`]),
+				...(window === 'b' ? ['#EXT-X-ENDLIST'] : []),
+			].join('\n');
+		};
+
+		let playlistRequests = 0;
+		using input = new Input({
+			source: new CustomPathedSource('live.m3u8', ({ path }) => {
+				if (path === 'live.m3u8') {
+					return new BufferSource(new TextEncoder().encode(createPlaylist(playlistRequests++ === 0 ? 'a' : 'b')));
+				}
+
+				return new BufferSource(files.get(path)!);
+			}),
+			formats: ALL_FORMATS,
+		});
+
+		const videoTrack = (await input.getVideoTracks())[0];
+		assert(videoTrack);
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+
+		// The frames of both windows, the second one starting where the playlist places it
+		expect(timestamps).toHaveLength(2 * 144);
+		expect(Math.min(...timestamps.slice(144))).toBeCloseTo(5.76, 3);
+		expect(playlistRequests).toBe(2);
+	}
 });
 
 const fetchBytes = async (url: string) => {
