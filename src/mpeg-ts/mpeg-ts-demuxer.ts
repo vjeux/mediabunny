@@ -392,12 +392,12 @@ export class MpegTsDemuxer extends Demuxer {
 								hasDtsDescriptor ||= (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
 							} else if (descriptorTag === ISO_639_LANGUAGE_DESCRIPTOR_TAG && descriptorLength >= 4) {
 								// Dual-mono audio may list a second language, but the first one is what describes the
-								// stream as a whole
+								// stream as a whole. Some muxers write it in upper case.
 								languageCode = String.fromCharCode(
 									bitstream.readBits(8),
 									bitstream.readBits(8),
 									bitstream.readBits(8),
-								);
+								).toLowerCase();
 								if (!isIso639Dash2LanguageCode(languageCode)) {
 									languageCode = UNDETERMINED_LANGUAGE;
 								}

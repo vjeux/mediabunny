@@ -956,4 +956,18 @@ test('MPEG-TS track language and audio type come from the ISO 639 language descr
 		expect(disposition.hearingImpaired).toBe(hearingImpaired);
 		expect(disposition.visuallyImpaired).toBe(visuallyImpaired);
 	}
+
+	// Some muxers write the language code in upper case
+	const upperCase = buffer.slice();
+	for (let i = 0; i < upperCase.length - descriptor.length; i++) {
+		if (descriptor.every((byte, j) => upperCase[i + j] === byte)) {
+			upperCase.set([0x45, 0x4e, 0x47], i + 2); // 'ENG'
+		}
+	}
+
+	using upperCaseInput = new Input({
+		source: new BufferSource(upperCase),
+		formats: ALL_FORMATS,
+	});
+	expect(await (await upperCaseInput.getPrimaryAudioTrack())!.getLanguageCode()).toBe('eng');
 });
