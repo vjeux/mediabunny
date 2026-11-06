@@ -363,6 +363,9 @@ const validateBaseTrackMetadata = (metadata: BaseTrackMetadata) => {
 	) {
 		throw new TypeError('metadata.averageBitrate, when provided, must be a non-negative number.');
 	}
+	if (metadata.isRelativeToUnixEpoch !== undefined && typeof metadata.isRelativeToUnixEpoch !== 'boolean') {
+		throw new TypeError('metadata.isRelativeToUnixEpoch, when provided, must be a boolean.');
+	}
 	if (
 		metadata.group !== undefined
 		&& !(metadata.group instanceof OutputTrackGroup)
@@ -527,7 +530,7 @@ export class Output<
 			&& !(options.initTarget instanceof Target)
 			&& typeof options.initTarget !== 'function'
 		) {
-			throw new Error(
+			throw new TypeError(
 				'options.initTarget, when provided, must be a Target or a function that returns or resolves to'
 				+ ' a Target.',
 			);
