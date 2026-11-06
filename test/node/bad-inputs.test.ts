@@ -1783,6 +1783,45 @@ test('Ogg: Continuation page without a preceding packet', async () => {
 	));
 });
 
+test('Ogg: Packets can be looked up by their own timestamps despite granule positions off by a sample', async () => {
+	// Some of the granule positions in VLC's vorbis-eos.ogg disagree with the packet durations by a sample, so the
+	// timestamps derived from them differ from those of the same packets when iterating from the start
+	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	const iterated: { timestamp: number; sequenceNumber: number }[] = [];
+	{
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			iterated.push({ timestamp: packet.timestamp, sequenceNumber: packet.sequenceNumber });
+		}
+	}
+	expect(iterated).toHaveLength(365);
+
+	// A fresh input for each lookup, so that it can't benefit from earlier ones
+	const lookUp = async (timestamp: number) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const packet = await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp);
+		return packet?.sequenceNumber;
+	};
+
+	const mismatches: number[] = [];
+	for (const { timestamp, sequenceNumber } of iterated) {
+		if (await lookUp(timestamp) !== sequenceNumber) {
+			mismatches.push(timestamp);
+		}
+	}
+	expect(mismatches).toEqual([]);
+
+	// Where the granule positions add up, a lookup less than a sample before a packet still returns the one before it
+	const opusFile = concatList(opusPages({ pageCount: 3 }));
+	using opusInput = new Input({ source: new BufferSource(opusFile), formats: ALL_FORMATS });
+	const opusSink = new EncodedPacketSink((await opusInput.getPrimaryAudioTrack())!);
+	const packetStart = (960 * 15 - 312) / 48000;
+	for (const offset of [-1e-7, -1e-5, -2e-5]) {
+		expect((await opusSink.getPacket(packetStart + offset))?.timestamp).toBeCloseTo((960 * 14 - 312) / 48000, 9);
+	}
+	expect((await opusSink.getPacket(packetStart))?.timestamp).toBeCloseTo(packetStart, 9);
+});
+
 test('Ogg: Many logical bitstreams', async () => {
 	// Each bitstream used to scan all following pages for its second header packet
 	const pages = Array.from(

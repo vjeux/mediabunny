@@ -20,6 +20,7 @@ import {
 	binarySearchLessOrEqual,
 	clamp,
 	findLast,
+	findLastIndex,
 	isThenable,
 	last,
 	roundIfAlmostInteger,
@@ -1351,6 +1352,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		let lastEncodedPacket: EncodedPacket | null = null;
 		let lastEncodedPacketMetadata: EncodedPacketMetadata | null = null;
 
+		// The granule position that the timestamps are derived from, if they are, and the timestamp it maps to
+		const timestampsComeFromGranulePosition = !currentTimestampIsCorrect;
+		let referenceGranulePosition: number | null = null;
+		let referenceTimestampInSamples = 0;
+
 		// Alright, now it's time for the final, granular seek: We keep iterating over packets until we've found the
 		// one with the correct timestamp - i.e., the last one with a timestamp <= the timestamp we're looking for.
 		while (currentPage !== null) {
@@ -1413,6 +1419,16 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					currentTimestampInSamples += encodedPacketMetadata.durationInSamples;
 				}
 
+				if (
+					timestampsComeFromGranulePosition
+					&& referenceGranulePosition === null
+					&& packet.endPage.headerStartPos === endPage.headerStartPos
+					&& packet.endSegmentIndex === endSegmentIndex
+				) {
+					referenceGranulePosition = endPage.granulePosition;
+					referenceTimestampInSamples = currentTimestampInSamples;
+				}
+
 				lastEncodedPacket = encodedPacket;
 				lastEncodedPacketMetadata = encodedPacketMetadata;
 
@@ -1438,7 +1454,67 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			currentSegmentIndex = nextPosition.startSegmentIndex;
 		}
 
+		// Some muxers (VLC, for one) write granule positions that disagree with the packet durations by a sample. The
+		// timestamps derived from them here can then come out a sample later than when iterating from the start, where
+		// each is the sum of the preceding durations, so that looking a packet up by its own timestamp would return the
+		// packet before it. So, if the timestamp lies less than a sample before the next packet and the granule
+		// positions around it are off by a sample, let's return that next packet. Elsewhere, the packet returned is
+		// always the last one starting at or before the timestamp.
+		if (
+			lastEncodedPacket
+			&& lastEncodedPacketMetadata
+			&& referenceGranulePosition !== null
+			&& lastEncodedPacketMetadata.timestampInSamples < timestampInSamples
+			&& currentTimestampInSamples > timestampInSamples
+			&& currentTimestampInSamples - timestampInSamples <= 1
+		) {
+			const nextPacket = await this.getNextPacket(lastEncodedPacket, options);
+			if (
+				nextPacket
+				&& await this.isNextGranulePositionOffByOne(
+					nextPacket,
+					referenceGranulePosition,
+					referenceTimestampInSamples,
+				)
+			) {
+				return nextPacket;
+			}
+		}
+
 		return lastEncodedPacket;
+	}
+
+	/**
+	 * Whether the granule position of the next page on which a packet ends, starting with the given packet, is off by
+	 * one sample from the timestamp the packet durations add up to, relative to the given reference.
+	 */
+	async isNextGranulePositionOffByOne(
+		packet: EncodedPacket,
+		referenceGranulePosition: number,
+		referenceTimestampInSamples: number,
+	) {
+		let currentPacket: EncodedPacket | null = packet;
+
+		while (currentPacket) {
+			const metadata = this.encodedPacketToMetadata.get(currentPacket);
+			assert(metadata);
+
+			// A page's granule position is the end of the last packet that ends on it
+			const page = metadata.packet.endPage;
+			if (metadata.packet.endSegmentIndex === findLastIndex([...page.lacingValues], x => x < 255)) {
+				if (page.headerType & 0x04) {
+					return false; // The final page's granule position may signal end trimming
+				}
+
+				const endInSamples = metadata.timestampInSamples + metadata.durationInSamples;
+				const durationsSum = endInSamples - referenceTimestampInSamples;
+				return Math.abs(durationsSum - (page.granulePosition - referenceGranulePosition)) === 1;
+			}
+
+			currentPacket = await this.getNextPacket(currentPacket, { metadataOnly: true });
+		}
+
+		return false;
 	}
 
 	// A slower but simpler and sequential algorithm for finding a packet in a file
