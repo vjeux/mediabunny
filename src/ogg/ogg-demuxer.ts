@@ -64,6 +64,8 @@ export class OggDemuxer extends Demuxer {
 
 	metadataPromise: Promise<void> | null = null;
 	bitstreams: LogicalBitstream[] = [];
+	/** The logical bitstreams skipped for an invalid identification header, with the error. */
+	invalidHeaders: { serialNumber: number; error: string }[] = [];
 	trackBackings: OggAudioTrackBacking[] = [];
 	metadataTags: MetadataTags = {};
 
@@ -152,6 +154,15 @@ export class OggDemuxer extends Demuxer {
 					this.trackBackings.push(new OggAudioTrackBacking(bitstream, this));
 				}
 			}
+
+			// A logical bitstream with an invalid identification header is skipped, which keeps the file's other
+			// streams readable. Without any, the file can't be read.
+			if (this.trackBackings.length === 0 && this.invalidHeaders.length > 0) {
+				throw new Error(this.invalidHeaders[0]!.error);
+			}
+			for (const { serialNumber, error } of this.invalidHeaders) {
+				Logging._warn(`Ogg: Skipping the logical bitstream with serial number ${serialNumber}. ${error}`);
+			}
 		})();
 	}
 
@@ -184,7 +195,11 @@ export class OggDemuxer extends Demuxer {
 		const numberOfChannels = view.getUint8(11);
 		const sampleRate = view.getUint32(12, true);
 		if (numberOfChannels === 0 || sampleRate === 0) {
-			throw new Error('Invalid Vorbis identification header: channel count and sample rate must not be 0.');
+			this.invalidHeaders.push({
+				serialNumber: bitstream.serialNumber,
+				error: 'Invalid Vorbis identification header: channel count and sample rate must not be 0.',
+			});
+			return;
 		}
 
 		const lacingValues: number[] = [];
@@ -260,12 +275,11 @@ export class OggDemuxer extends Demuxer {
 
 		const header = parseOpusIdentificationHeader(firstPacket.data);
 		if (header.outputChannelCount === 0) {
-			// https://datatracker.ietf.org/doc/html/rfc7845#section-5.1: "This MUST NOT be zero." Skip the stream like
-			// one of an unknown codec, which keeps any other streams in the file readable.
-			Logging._warn(
-				`Ogg: Skipping the Opus stream with serial number ${bitstream.serialNumber}, whose identification`
-				+ ' header has a channel count of 0.',
-			);
+			// https://datatracker.ietf.org/doc/html/rfc7845#section-5.1: "This MUST NOT be zero."
+			this.invalidHeaders.push({
+				serialNumber: bitstream.serialNumber,
+				error: 'Invalid Opus identification header: channel count must not be 0.',
+			});
 			return;
 		}
 

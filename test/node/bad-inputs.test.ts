@@ -1545,15 +1545,11 @@ test('Ogg: Opus with zero channels', async () => {
 	const head = opusHead();
 	head[9] = 0; // Output channel count
 
-	// The stream is skipped, not read as a track with zero channels
+	// As the only stream, the file can't be read
 	const file = concat(oggPacketsPage({ headerType: 2 }, [head]), ...opusPages().slice(1));
-	await expectGracefulRead(file);
-	{
-		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
-		expect(await input.getTracks()).toEqual([]);
-	}
+	await expectGracefulRead(file, /Invalid Opus identification header/);
 
-	// Next to it, a valid stream stays readable
+	// Next to a valid stream, it's skipped and the valid stream stays readable
 	const multiplexedFile = concatList([
 		oggPacketsPage({ headerType: 2, serial: 1 }, [opusHead()]),
 		oggPacketsPage({ headerType: 2, serial: 2 }, [head]),
@@ -1572,6 +1568,27 @@ test('Ogg: Opus with zero channels', async () => {
 		packets.push(packet);
 	}
 	expect(packets).toHaveLength(10);
+});
+
+test('Ogg: Vorbis with zero sample rate next to a valid stream', async () => {
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	vorbisFile.set(u32le(0), 28 + 12); // Sample rate field of the identification header
+
+	// The Vorbis stream is skipped, and the Opus stream stays readable. All beginning-of-stream pages come first.
+	const [opusBosPage, ...otherOpusPages] = opusPages();
+	const file = concatList([opusBosPage!, vorbisFile, ...otherOpusPages]);
+	await expectGracefulRead(file);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	expect(await input.getTracks()).toHaveLength(1);
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getCodec()).toBe('opus');
+
+	const packets = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	expect(packets).toHaveLength(100);
 });
 
 test('Ogg: Opus comments with many repeated keys', async () => {
