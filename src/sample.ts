@@ -2945,8 +2945,17 @@ export class AudioSample implements Disposable {
 				throw new TypeError('init.timestamp must be a number.');
 			}
 
+			let dataBuffer: Uint8Array;
+			if (init.data instanceof ArrayBuffer) {
+				dataBuffer = new Uint8Array(init.data);
+			} else if (ArrayBuffer.isView(init.data)) {
+				dataBuffer = new Uint8Array(init.data.buffer, init.data.byteOffset, init.data.byteLength);
+			} else {
+				throw new TypeError('Invalid AudioDataInit: data is not a BufferSource.');
+			}
+
 			const numberOfFrames
-				= init.data.byteLength / (getBytesPerSample(init.format) * init.numberOfChannels);
+				= dataBuffer.byteLength / (getBytesPerSample(init.format) * init.numberOfChannels);
 			if (!Number.isInteger(numberOfFrames)) {
 				throw new TypeError('Invalid AudioDataInit: data size is not a multiple of frame size.');
 			}
@@ -2957,15 +2966,6 @@ export class AudioSample implements Disposable {
 			this.numberOfChannels = init.numberOfChannels;
 			this.timestamp = init.timestamp;
 			this.duration = numberOfFrames / init.sampleRate;
-
-			let dataBuffer: Uint8Array;
-			if (init.data instanceof ArrayBuffer) {
-				dataBuffer = new Uint8Array(init.data);
-			} else if (ArrayBuffer.isView(init.data)) {
-				dataBuffer = new Uint8Array(init.data.buffer, init.data.byteOffset, init.data.byteLength);
-			} else {
-				throw new TypeError('Invalid AudioDataInit: data is not a BufferSource.');
-			}
 
 			const expectedSize
                 = this.numberOfFrames * this.numberOfChannels * getBytesPerSample(this.format);
