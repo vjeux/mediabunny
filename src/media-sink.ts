@@ -344,7 +344,9 @@ export class EncodedPacketSink {
 			throw new InputDisposedError();
 		}
 
-		const packetQueue: EncodedPacket[] = [];
+		// Dequeued packets are dropped from the front in bulk (see timestamps below)
+		const packetQueue: (EncodedPacket | undefined)[] = [];
+		let packetQueueStart = 0;
 
 		let { promise: queueNotEmpty, resolve: onQueueNotEmpty } = promiseWithResolvers();
 		let { promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers();
@@ -373,7 +375,7 @@ export class EncodedPacketSink {
 					break;
 				}
 
-				if (packetQueue.length > maxQueueSize()) {
+				if (packetQueue.length - packetQueueStart > maxQueueSize()) {
 					({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 					await queueDequeue;
 					continue;
@@ -408,8 +410,15 @@ export class EncodedPacketSink {
 						return { value: undefined, done: true };
 					} else if (hasOutOfBandError) {
 						throw outOfBandError;
-					} else if (packetQueue.length > 0) {
-						const value = packetQueue.shift()!;
+					} else if (packetQueueStart < packetQueue.length) {
+						const value = packetQueue[packetQueueStart]!;
+						packetQueue[packetQueueStart] = undefined; // So it can be garbage-collected
+						packetQueueStart++;
+						if (packetQueueStart >= packetQueue.length / 2) {
+							packetQueue.splice(0, packetQueueStart);
+							packetQueueStart = 0;
+						}
+
 						const now = performance.now();
 						timestamps.push(now);
 
