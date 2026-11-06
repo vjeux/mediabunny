@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from 'vitest';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -705,6 +706,17 @@ describe('UrlSource', () => {
 		30_000,
 	);
 
+	test('passes the random read fuzz without a cache and with reads larger than the prefetch', async () => {
+		await withServer(FUZZ_DATA, {}, async (server) => {
+			for (const parallelism of [1, 2]) {
+				await fuzzReads(new UrlSource(server.url, { maxCacheSize: 0, parallelism }), FUZZ_DATA, {
+					rounds: 10,
+					maxLength: 600_000,
+				});
+			}
+		});
+	}, 30_000);
+
 	test('passes the random read fuzz when the server ignores Range and sends the whole file', async () => {
 		for (const contentLength of [true, false]) {
 			await withServer(FUZZ_DATA, { honorRanges: false, contentLength }, async (server) => {
@@ -813,6 +825,28 @@ describe('UrlSource', () => {
 				`Error fetching ${server.origin}/missing.bin: 404 Not Found`,
 			);
 		});
+	});
+
+	test('rejects when a 206 response delivers no data and getRetryDelay gives up', async () => {
+		const server = http.createServer((req, res) => {
+			const start = /^bytes=(\d+)-/.exec(req.headers.range ?? '')![1];
+			res.writeHead(206, { 'Content-Range': `bytes ${start}-999/1000`, 'Content-Length': 0 });
+			res.end();
+		});
+		await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+		const restoreLogs = silenceLogs();
+
+		try {
+			const { port } = server.address() as { port: number };
+			using ref = new UrlSource(`http://127.0.0.1:${port}/empty.bin`, { getRetryDelay: () => null }).ref();
+			await expect(async () => new Reader(ref.source).requestSlice(0, 10)).rejects.toThrow(
+				'Range response ended without delivering any data.',
+			);
+		} finally {
+			restoreLogs();
+			server.closeAllConnections();
+			server.close();
+		}
 	});
 
 	test('retries failed fetches with the delays from getRetryDelay', async () => {
