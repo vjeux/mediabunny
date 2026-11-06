@@ -701,11 +701,14 @@ class VideoEncoderWrapper {
 				squarePixelWidth: videoSample.squarePixelWidth,
 				squarePixelHeight: videoSample.squarePixelHeight,
 				// Encoders split the bitrate across frames based on this rate (browsers assume 30 Hz without it), so
-				// pass whichever rate the frames are known to come in at
-				framerate: this.encodingConfig.transform?.frameRate
-					?? this.source._connectedTrack?.metadata.frameRate
-					?? this.source._frameRateHint
-					?? undefined,
+				// pass whichever rate the frames are known to come in at. A process function can drop, duplicate or
+				// retime frames, in which case only the track's declared frame rate can be trusted.
+				framerate: this.encodingConfig.transform?.process
+					? this.source._connectedTrack?.metadata.frameRate
+					: this.encodingConfig.transform?.frameRate
+						?? this.source._connectedTrack?.metadata.frameRate
+						?? this.source._frameRateHint
+						?? undefined,
 			});
 
 			// Try the candidate configs in order of preference until we find one that is supported

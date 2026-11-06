@@ -4,7 +4,7 @@ import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { Quality } from '../../src/encode.js';
+import { Quality, VideoTransformOptions } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -552,21 +552,25 @@ const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {
 };
 
 test('VideoSampleSource, transform.frameRate is the frame rate the encoder is configured with', async () => {
-	let framerate: number | undefined;
-
-	await encodeFrames(
-		{
-			codec: 'vp8',
-			quality: new Quality('medium'),
-			transform: { frameRate: 60 },
-			onEncoderConfig: (config) => {
-				framerate = config.framerate;
+	const configuredFramerate = async (transform: VideoTransformOptions) => {
+		let framerate: number | undefined;
+		await encodeFrames(
+			{
+				codec: 'vp8',
+				quality: new Quality('medium'),
+				transform,
+				onEncoderConfig: (config) => {
+					framerate = config.framerate;
+				},
 			},
-		},
-		[{ width: 64, height: 64, timestamp: 0, duration: 1 / 60 }],
-	);
+			[{ width: 64, height: 64, timestamp: 0, duration: 1 / 60 }],
+		);
+		return framerate;
+	};
 
-	expect(framerate).toBe(60);
+	expect(await configuredFramerate({ frameRate: 60 })).toBe(60);
+	// A process function may change the rate frames come out at
+	expect(await configuredFramerate({ frameRate: 60, process: sample => sample })).toBe(undefined);
 });
 
 test('VideoSampleSource, quality-level bitrates grow above 30 fps while explicit bitrates stay', async () => {

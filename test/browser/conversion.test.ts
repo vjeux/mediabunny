@@ -1464,7 +1464,11 @@ const testReservedFastStart = async (
 };
 
 /** Makes a 2 s WebM whose frames take some bits to encode, and transcodes it to VP8, returning the bitrate. */
-const transcodeToVp8 = async (frameRate: number, quality: Quality) => {
+const transcodeToVp8 = async (
+	frameRate: number,
+	quality: Quality,
+	process?: (sample: VideoSample) => VideoSample | null,
+) => {
 	const width = 320;
 	const height = 180;
 	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
@@ -1501,7 +1505,7 @@ const transcodeToVp8 = async (frameRate: number, quality: Quality) => {
 	const conversion = await Conversion.init({
 		input,
 		output,
-		video: { codec: 'vp8', quality },
+		video: { codec: 'vp8', quality, process },
 	});
 	await conversion.execute();
 
@@ -1514,6 +1518,18 @@ const transcodeToVp8 = async (frameRate: number, quality: Quality) => {
 
 test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }, async () => {
 	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }));
+	expect(averageBitrate).toBeGreaterThan(0.7 * 300_000);
+	expect(averageBitrate).toBeLessThan(1.3 * 300_000);
+});
+
+test('Transcoding 60 fps video whose process function drops every other frame keeps the requested bitrate', {
+	timeout: 30_000,
+}, async () => {
+	// The output runs at 30 fps, so the input's 60 fps must not be what the encoder budgets for
+	let index = 0;
+	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }), (sample) => {
+		return index++ % 2 === 0 ? sample : null;
+	});
 	expect(averageBitrate).toBeGreaterThan(0.7 * 300_000);
 	expect(averageBitrate).toBeLessThan(1.3 * 300_000);
 });
