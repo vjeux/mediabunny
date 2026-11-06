@@ -1818,6 +1818,62 @@ describe('Audio', async () => {
 		eac3: 256,
 	};
 
+	test('Decoding a packet that holds several frames', async () => {
+		using input = new Input({
+			source: new FilePathSource('./test/public/eac3.mp4'),
+			formats: ALL_FORMATS,
+		});
+
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(audioTrack);
+
+		// Like FFmpeg's E-AC-3 MP4 samples at high bitrates, which hold several syncframes each
+		const sink = new EncodedPacketSink(audioTrack);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of sink.packets()) {
+			packets.push(packet);
+			if (packets.length === 3) {
+				break;
+			}
+		}
+
+		const combinedData = new Uint8Array(packets.reduce((sum, packet) => sum + packet.data.byteLength, 0));
+		let offset = 0;
+		for (const packet of packets) {
+			combinedData.set(packet.data, offset);
+			offset += packet.data.byteLength;
+		}
+		const combined = new EncodedPacket(
+			combinedData,
+			'key',
+			packets[0]!.timestamp,
+			packets.reduce((sum, packet) => sum + packet.duration, 0),
+		);
+
+		const decoder = new NodeAvAudioDecoder();
+		// @ts-expect-error Readonly
+		decoder.codec = await audioTrack.getCodec();
+		// @ts-expect-error Readonly
+		decoder.config = await audioTrack.getDecoderConfig();
+
+		const timestamps: number[] = [];
+		// @ts-expect-error Readonly
+		decoder.onSample = (sample: AudioSample) => {
+			timestamps.push(sample.timestamp);
+			sample.close();
+		};
+
+		await decoder.init();
+		await decoder.decode(combined);
+		await decoder.flush();
+		await decoder.close();
+
+		expect(timestamps).toHaveLength(3);
+		for (let i = 0; i < 3; i++) {
+			expect(timestamps[i]).toBeCloseTo(packets[i]!.timestamp, 6);
+		}
+	});
+
 	test('Decoder lifecycle', async () => {
 		using input = new Input({
 			source: new FilePathSource('./test/public/trim-buck-bunny-ffmpeg.ts'),
