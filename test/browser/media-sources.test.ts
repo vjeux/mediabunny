@@ -755,7 +755,18 @@ test('MediaStreamAudioTrackSource, the Web Audio fallback keeps audio in sync li
 const measureBeepToFlashOffset = async (hideMediaStreamTrackProcessor: boolean) => {
 	const audioContext = new AudioContext();
 	await Promise.race([audioContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
-	if (audioContext.state !== 'running') {
+
+	// A running context may not have rendered yet, and until it has, getOutputTimestamp() maps context time 0 to
+	// performance time 0: the beeps would be scheduled at the page's age, minutes late in a long test run
+	const renderWaitStart = performance.now();
+	while (
+		audioContext.state === 'running'
+		&& audioContext.currentTime === 0
+		&& performance.now() - renderWaitStart < 2000
+	) {
+		await new Promise(resolve => setTimeout(resolve, 10));
+	}
+	if (audioContext.state !== 'running' || audioContext.currentTime === 0) {
 		await audioContext.close();
 		return null;
 	}
