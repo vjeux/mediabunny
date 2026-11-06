@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -711,9 +711,15 @@ describe('Conversion', () => {
 	});
 
 	test('Conversions do not inherit the creation time', async () => {
-		const before = Date.now();
-		const tags = await convert('metadata-atomicparsley.m4a', new Mp4OutputFormat());
-		expect(tags.creationTime!.getTime()).toBeGreaterThanOrEqual(Math.floor(before / 1000) * 1000);
+		// The output gets the time of writing instead, so the clock is frozen (MP4 stores whole seconds)
+		vi.useFakeTimers({ toFake: ['Date'] });
+		vi.setSystemTime(new Date('2030-05-06T07:08:09.500Z'));
+		try {
+			const tags = await convert('metadata-atomicparsley.m4a', new Mp4OutputFormat());
+			expect(tags.creationTime).toEqual(new Date('2030-05-06T07:08:09Z'));
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	test('The tags option replaces the input\'s tags', async () => {
