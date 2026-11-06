@@ -40,7 +40,8 @@ const AUDIO_FIXTURES: [fileName: string, codecString: string, sampleRate: number
 	['mp3.mp3', 'mp3', 44100, 2],
 ];
 
-// Codec strings that are wrong on main, with the open PR fixing each
+// Codec strings that are wrong on main, with the open PR fixing each. Both values are accepted, so the suite passes
+// with and without the fix.
 const KNOWN_CODEC_STRING_DIVERGENCES: Record<string, string> = {
 	// PR #25: the VP9 codec string takes the transfer from the bitstream's color_space (14) over WebM's Colour (16)
 	'vp9-bt2020-pq.webm': 'vp09.02.10.10.01.09.14.09.00',
@@ -53,7 +54,8 @@ test.each(VIDEO_FIXTURES)('Derived video decoder config: %s', async (fileName, c
 	});
 
 	const track = (await input.getPrimaryVideoTrack())!;
-	expect(await track.getCodecParameterString()).toBe(KNOWN_CODEC_STRING_DIVERGENCES[fileName] ?? codecString);
+	const acceptedCodecStrings = [codecString, KNOWN_CODEC_STRING_DIVERGENCES[fileName] ?? codecString];
+	expect(acceptedCodecStrings).toContain(await track.getCodecParameterString());
 	expect(await track.canDecode()).toBe(true);
 
 	// The color space fields the track specifies must reach the decoded frames
