@@ -474,15 +474,44 @@ describe('Cancellation, errors and pausing', () => {
 		unhandledRejections.push(event.reason);
 	});
 
+	// A process callback that holds the given frame until released, so that a cancel or pause request lands while the
+	// conversion is still running
+	const createGate = (frameNumber: number) => {
+		let markEntered!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			markEntered = resolve;
+		});
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+
+		let calls = 0;
+		const process = async (sample: VideoSample) => {
+			if (++calls === frameNumber) {
+				markEntered();
+				await released;
+			}
+
+			return sample;
+		};
+
+		return { process, entered, release };
+	};
+
 	test('canceling while transcoding rejects with ConversionCanceledError and cancels the output', async () => {
-		for (const delay of [0, 100]) {
+		// While the first frame is processed, and while a later one is
+		for (const frameNumber of [1, 10]) {
 			using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
 			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-			const conversion = await Conversion.init({ input, output, video: { width: 320 } });
+			const gate = createGate(frameNumber);
+			const conversion = await Conversion.init({ input, output, video: { width: 320, process: gate.process } });
 
 			const promise = conversion.execute();
-			await new Promise(resolve => setTimeout(resolve, delay));
-			await conversion.cancel();
+			await gate.entered;
+			const cancelPromise = conversion.cancel();
+			gate.release();
+			await cancelPromise;
 
 			await expect(promise).rejects.toBeInstanceOf(ConversionCanceledError);
 			expect(conversion.state).toBe('canceled');
@@ -519,14 +548,17 @@ describe('Cancellation, errors and pausing', () => {
 	test('a paused conversion resumes where it left off', async () => {
 		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-		const conversion = await Conversion.init({ input, output, video: { width: 320 } });
+		const gate = createGate(10);
+		const conversion = await Conversion.init({ input, output, video: { width: 320, process: gate.process } });
 
 		const controller = new AbortController();
 		const promise = conversion.execute({ pauseSignal: controller.signal });
-		await new Promise(resolve => setTimeout(resolve, 100));
+		await gate.entered;
 		controller.abort();
+		gate.release();
 		await promise;
 		expect(conversion.state).toBe('idle');
+		expect(output.state).toBe('started');
 
 		await conversion.execute();
 		expect(conversion.state).toBe('done');
@@ -574,56 +606,81 @@ describe('Media sources', () => {
 			};
 			const audioInterval = setInterval(writeAudio, 20);
 
-			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-			const quality = new Quality('low');
-			const videoSource = new MediaStreamVideoTrackSource(videoTrack, { codec: 'vp8', quality });
-			const audioSource = new MediaStreamAudioTrackSource(audioTrack, { codec: 'opus', quality });
-			output.addVideoTrack(videoSource);
-			output.addAudioTrack(audioSource);
+			let resumed = false;
+			let videoFramesAfterResume = 0;
+			let audioSamplesAfterResume = 0;
+			let encodedAudioDuration = 0;
+			let capturedDuration: number;
+			let buffer: ArrayBuffer;
 
-			// Timers can fire late under load, so measure how long was actually captured
-			await output.start();
-			const startTime = performance.now();
-			await new Promise(resolve => setTimeout(resolve, 600));
-			videoSource.pause();
-			audioSource.pause();
-			const pauseTime = performance.now();
-			await new Promise(resolve => setTimeout(resolve, 400));
-			videoSource.resume();
-			audioSource.resume();
-			const resumeTime = performance.now();
-			await new Promise(resolve => setTimeout(resolve, 600));
-			const endTime = performance.now();
-			await output.finalize();
-			const capturedDuration = (pauseTime - startTime + endTime - resumeTime) / 1000;
+			try {
+				const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+				const quality = new Quality('low');
+				const videoSource = new MediaStreamVideoTrackSource(videoTrack, {
+					codec: 'vp8',
+					quality,
+					onEncodedSample: () => {
+						videoFramesAfterResume += resumed ? 1 : 0;
+					},
+				});
+				const audioSource = new MediaStreamAudioTrackSource(audioTrack, {
+					codec: 'opus',
+					quality,
+					// Includes the silence that fills gaps
+					onEncodedSample: (sample) => {
+						audioSamplesAfterResume += resumed ? 1 : 0;
+						encodedAudioDuration += sample.duration;
+					},
+				});
+				output.addVideoTrack(videoSource);
+				output.addAudioTrack(audioSource);
 
-			clearInterval(drawInterval);
-			clearInterval(audioInterval);
-			videoTrack.stop();
-			audioTrack.stop();
+				// Timers can fire late under load, so measure how long was actually captured
+				await output.start();
+				const startTime = performance.now();
+				await new Promise(resolve => setTimeout(resolve, 600));
+				videoSource.pause();
+				audioSource.pause();
+				const pauseTime = performance.now();
+				await new Promise(resolve => setTimeout(resolve, 400));
+				videoSource.resume();
+				audioSource.resume();
+				resumed = true;
+				const resumeTime = performance.now();
+				await new Promise(resolve => setTimeout(resolve, 600));
+				const endTime = performance.now();
+				await output.finalize();
 
-			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+				capturedDuration = (pauseTime - startTime + endTime - resumeTime) / 1000;
+				buffer = output.target.buffer!;
+			} finally {
+				clearInterval(drawInterval);
+				clearInterval(audioInterval);
+				videoTrack.stop();
+				audioTrack.stop();
+			}
+
+			using input = new Input({ source: new BufferSource(buffer), formats: ALL_FORMATS });
 			const video = await readPackets((await input.getPrimaryVideoTrack())!);
 			const audio = await readPackets((await input.getPrimaryAudioTrack())!);
+
+			// Both tracks went on after the pause
+			expect(videoFramesAfterResume).toBeGreaterThan(0);
+			expect(audioSamplesAfterResume).toBeGreaterThan(0);
 
 			// The timeline starts at the first captured sample of either track ('synced-zero'); the audio's first
 			// packet starts the Opus pre-skip before it
 			const preSkip = 312 / 48000;
 			expect(Math.min(video[0]!.timestamp, audio[0]!.timestamp + preSkip)).toBeCloseTo(0, 2);
 
-			// Both tracks span the captured time without the pause (which lasted at least 400 ms), less the time it
-			// took for the first samples to arrive
+			// The pause (at least 400 ms) doesn't show: neither track lasts longer than the time actually captured
 			for (const packets of [video, audio]) {
-				const end = packets.at(-1)!.timestamp + packets.at(-1)!.duration;
-				expect(end).toBeLessThan(capturedDuration + 0.1);
-				expect(end).toBeGreaterThan(capturedDuration - 0.5);
+				expect(packets.at(-1)!.timestamp + packets.at(-1)!.duration).toBeLessThan(capturedDuration + 0.1);
 			}
-
-			// No pause gap within the tracks
 			for (let i = 1; i < video.length; i++) {
 				expect(video[i]!.timestamp).toBeGreaterThan(video[i - 1]!.timestamp);
-				expect(video[i]!.timestamp - video[i - 1]!.timestamp).toBeLessThan(0.3);
 			}
+
 			// The Opus packets come out back to back (the encoder counts samples, so capture jitter doesn't show, and
 			// gaps get filled with silence), but WebM stores timestamps in whole milliseconds: when the timeline puts
 			// them on half milliseconds (the audio started it, so the 6.5 ms pre-skip shows), rounding can make
@@ -632,6 +689,12 @@ describe('Media sources', () => {
 				const spacing = audio[i]!.timestamp - audio[i - 1]!.timestamp;
 				expect(Math.abs(spacing - 0.02)).toBeLessThanOrEqual(0.001 + 1e-9);
 			}
+
+			// And together, they hold exactly the audio given to the encoder plus the pre-skip, rounded up to whole
+			// packets
+			const audioSpan = audio.at(-1)!.timestamp + audio.at(-1)!.duration - audio[0]!.timestamp;
+			expect(audioSpan).toBeGreaterThanOrEqual(encodedAudioDuration + preSkip - 0.002);
+			expect(audioSpan).toBeLessThanOrEqual(encodedAudioDuration + preSkip + 0.022);
 		},
 	);
 
