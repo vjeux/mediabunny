@@ -2784,6 +2784,50 @@ test('Key packet verification with timestamps beyond float precision', async () 
 	expect(packet!.timestamp).toBe(0);
 });
 
+test('Key packet verification in a big fragment of fake key frames', async () => {
+	// Each step back to the previous key frame used to scan all of the fragment's (or cluster's) samples, making
+	// verification quadratic in their number
+	const sampleCount = 50_000;
+	const realKeyFrame = [0x00, 0x00, 0x00];
+	const fakeKeyFrame = [0x01, 0x00, 0x00];
+	const fragment = (dataOffset: number) => moof(
+		fullBox('tfhd', 0, 0x020038, u32(1), u32(1), u32(3), u32(0)), // Default duration 1, size 3, key frames
+		fullBox('tfdt', 0, 0, u32(0)),
+		fullBox('trun', 0, 0x000001, u32(sampleCount), u32(dataOffset)),
+	);
+	const moov = [
+		trak({ handler: 'vide', stbl: [stsd(videoSampleEntry('vp08')), ...emptyStbl().slice(1)] }),
+		box('mvex', trex(1)),
+	];
+	const data = concat(realKeyFrame, ...Array<Bytes>(sampleCount - 1).fill(fakeKeyFrame));
+	using input = new Input({
+		source: new BufferSource(mp4(moov, [fragment(fragment(0).length + 8), box('mdat', data)])),
+		formats: ALL_FORMATS,
+	});
+	const sink = new EncodedPacketSink((await input.getVideoTracks())[0]!);
+
+	const start = performance.now();
+	const packet = await sink.getKeyPacket(Infinity, { verifyKeyPackets: true });
+	expect(packet!.timestamp).toBe(0);
+	expect(performance.now() - start).toBeLessThan(1000);
+
+	// The same in a Matroska cluster, as many blocks as its 16-bit relative timestamps allow
+	const blocks = [simpleBlock(1, 0, 0x80, [0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00])];
+	for (let i = 1; i < 32_000; i++) {
+		blocks.push(simpleBlock(1, i, 0x80, fakeKeyFrame));
+	}
+	using matroskaInput = new Input({
+		source: new BufferSource(matroska(info(), tracks(videoTrack(1)), cluster(0, concatList(blocks)))),
+		formats: ALL_FORMATS,
+	});
+	const matroskaSink = new EncodedPacketSink((await matroskaInput.getVideoTracks())[0]!);
+
+	const matroskaStart = performance.now();
+	const matroskaPacket = await matroskaSink.getKeyPacket(Infinity, { verifyKeyPackets: true });
+	expect(matroskaPacket!.timestamp).toBe(0);
+	expect(performance.now() - matroskaStart).toBeLessThan(500);
+});
+
 test('PCM blocks not containing whole frames', async () => {
 	for (const channels of [2, 0]) {
 		const audioTrack = element(
