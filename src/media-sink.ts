@@ -42,6 +42,7 @@ import {
 	isNumber,
 	isWebKit,
 	last,
+	makeAsyncDisposable,
 	mapAsyncGenerator,
 	missingWebCodecsClassMessage,
 	promiseWithResolvers,
@@ -396,7 +397,7 @@ export class EncodedPacketSink {
 
 		const track = this._track;
 
-		return {
+		return makeAsyncDisposable<EncodedPacket>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -437,7 +438,7 @@ export class EncodedPacketSink {
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		});
 	}
 }
 
@@ -627,7 +628,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		return makeAsyncDisposable<MediaSample>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -671,7 +672,7 @@ export abstract class BaseMediaSampleSink<
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		});
 	}
 
 	/** @internal */
@@ -892,7 +893,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		return makeAsyncDisposable<MediaSample | null>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -934,7 +935,7 @@ export abstract class BaseMediaSampleSink<
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		});
 	}
 }
 

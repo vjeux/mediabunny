@@ -723,7 +723,7 @@ export const mapAsyncGenerator = <T, U>(
 	generator: AsyncGenerator<T, void, unknown>,
 	map: (t: T) => U,
 ): AsyncGenerator<U, void, unknown> => {
-	return {
+	return makeAsyncDisposable<U>({
 		async next() {
 			const result = await generator.next();
 			if (result.done) {
@@ -741,7 +741,22 @@ export const mapAsyncGenerator = <T, U>(
 		[Symbol.asyncIterator]() {
 			return this;
 		},
-	};
+	});
+};
+
+/**
+ * Gives a hand-written async generator the `Symbol.asyncDispose` method that native async generators have, which ends
+ * the iteration when the generator was declared with `await using`.
+ */
+export const makeAsyncDisposable = <T>(generator: AsyncGenerator<T, void, unknown>) => {
+	Object.defineProperty(generator, Symbol.asyncDispose, {
+		value: async () => {
+			await generator.return();
+		},
+		writable: true,
+		configurable: true,
+	});
+	return generator;
 };
 
 export const clamp = (value: number, min: number, max: number) => {
@@ -1188,6 +1203,8 @@ export const polyfillSymbolDispose = () => {
 	// https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-2.html
 	// @ts-expect-error Readonly
 	Symbol.dispose ??= Symbol('Symbol.dispose');
+	// @ts-expect-error Readonly
+	Symbol.asyncDispose ??= Symbol('Symbol.asyncDispose');
 };
 
 export const isNumber = (x: unknown) => {
