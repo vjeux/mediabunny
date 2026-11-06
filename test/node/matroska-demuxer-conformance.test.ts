@@ -3,6 +3,7 @@ import {
 	ALL_FORMATS,
 	AudioSampleSink,
 	BufferSource,
+	CustomSource,
 	EncodedPacket,
 	EncodedPacketSink,
 	Input,
@@ -26,6 +27,8 @@ import {
 	elUnknownSize,
 	elWithSizeWidth,
 	ExtraId,
+	findAll,
+	findFirst,
 	float32,
 	float64,
 	info,
@@ -33,6 +36,8 @@ import {
 	mkv,
 	opusHead,
 	opusPacket,
+	parseEbml,
+	readUnsigned,
 	seekEntry,
 	simpleBlock,
 	simpleTag,
@@ -1050,17 +1055,17 @@ describe('Content encodings', () => {
 });
 
 describe('Cues and seeking', () => {
-	const makeFile = (withCues: boolean) => {
+	const makeFile = (withCues: boolean, videoPayload?: number[]) => {
 		const trackElement = tracks(
 			videoTrack(1, 'V_VP8', { extra: [uint(EBMLId.DefaultDuration, 40_000_000)] }),
 			audioTrack(2, 'A_OPUS', { codecPrivate: opusHead() }),
 		);
 		const clusters: Uint8Array[] = [];
 		for (let i = 0; i < 10; i++) {
-			const blocks: Uint8Array[] = [simpleBlock(1, 0, KEY)];
+			const blocks: Uint8Array[] = [simpleBlock(1, 0, KEY, videoPayload)];
 			for (let j = 1; j < 25; j++) {
 				// A key frame every half second
-				blocks.push(simpleBlock(1, 40 * j, j === 12 ? KEY : 0));
+				blocks.push(simpleBlock(1, 40 * j, j === 12 ? KEY : 0, videoPayload));
 			}
 			for (let j = 0; j < 50; j++) {
 				blocks.push(simpleBlock(2, 20 * j, KEY, opusPacket()));
@@ -1068,16 +1073,42 @@ describe('Cues and seeking', () => {
 			clusters.push(cluster(1000 * i, ...blocks));
 		}
 
+		// The Cues come before the clusters, so their size (which depends on the CueTimes) must be known first
+		const cuePoints = (positions: number[]) => positions.map((position, i) => {
+			return cuePoint(1000 * i, { track: 1, clusterPosition: position });
+		});
 		const infoElement = info({ duration: 10_000 });
-		const cuesLength = el(EBMLId.Cues, ...clusters.map(() => cuePoint(0, { track: 1, clusterPosition: 0 }))).length;
+		const cuesLength = el(EBMLId.Cues, ...cuePoints(clusters.map(() => 0))).length;
 		let position = infoElement.length + trackElement.length + (withCues ? cuesLength : 0);
-		const points: Uint8Array[] = [];
-		for (let i = 0; i < clusters.length; i++) {
-			points.push(cuePoint(1000 * i, { track: 1, clusterPosition: position }));
-			position += clusters[i]!.length;
+		const positions: number[] = [];
+		for (const clusterElement of clusters) {
+			positions.push(position);
+			position += clusterElement.length;
 		}
 
-		return mkv(infoElement, trackElement, withCues ? el(EBMLId.Cues, ...points) : [], ...clusters);
+		const cues = withCues ? el(EBMLId.Cues, ...cuePoints(positions)) : [];
+		const file = mkv(infoElement, trackElement, cues, ...clusters);
+		if (withCues) {
+			expectCuesToPointAtClusters(file);
+		}
+
+		return file;
+	};
+
+	/** Checks the fixture: every cue point must lead to the start of a cluster with the cue's timestamp. */
+	const expectCuesToPointAtClusters = (file: Uint8Array) => {
+		const segment = findFirst(parseEbml(file), EBMLId.Segment);
+		const points = findAll(segment.children, EBMLId.Cues, EBMLId.CuePoint);
+		expect(points.length).toBeGreaterThan(0);
+
+		for (const point of points) {
+			const time = readUnsigned(findFirst(point.children, EBMLId.CueTime).data);
+			const positionElement = findFirst(point.children, EBMLId.CueTrackPositions, EBMLId.CueClusterPosition);
+			const position = readUnsigned(positionElement.data);
+			const target = segment.children.find(x => x.start === segment.dataStart + position);
+			expect(target?.id).toBe(EBMLId.Cluster);
+			expect(readUnsigned(findFirst(target!.children, EBMLId.Timestamp).data)).toBe(time);
+		}
 	};
 
 	test.each([true, false])('seeks to packets and key packets (cues: %s)', async (withCues) => {
@@ -1110,6 +1141,33 @@ describe('Cues and seeking', () => {
 		for (const i of order) {
 			expect((await sink.getPacket(packets[i]!.timestamp))!.timestamp).toBe(packets[i]!.timestamp);
 		}
+	});
+
+	test('jumps straight to the right cluster through the Cues', async () => {
+		// Without prefetching, the bytes read show which clusters the lookup touched
+		const readClusters = async (withCues: boolean) => {
+			const file = makeFile(withCues, new Array<number>(1000).fill(7)); // 1 kB video frames, ~25 kB clusters
+			let bytesRead = 0;
+			using input = new Input({
+				source: new CustomSource({
+					getSize: () => file.length,
+					read: (start, end) => {
+						bytesRead += end - start;
+						return file.subarray(start, end);
+					},
+					prefetchProfile: 'none',
+				}),
+				formats: ALL_FORMATS,
+			});
+
+			const video = (await input.getVideoTracks())[0]!;
+			bytesRead = 0;
+			expect((await new EncodedPacketSink(video).getPacket(9.5))!.timestamp).toBe(9.48);
+			return bytesRead / (file.length / 10);
+		};
+
+		expect(await readClusters(true)).toBeLessThan(1.5); // Just the cluster at 9 s
+		expect(await readClusters(false)).toBeGreaterThan(9); // All of them, in order
 	});
 
 	test('falls back to scanning when cue points point at the wrong clusters', async () => {
