@@ -125,11 +125,13 @@ const HDPR_FORMAT_IDENTIFIER = 0x48445052;
 // 'DTS1', 'DTS2' and 'DTS3' all share this prefix
 const DTS_FORMAT_IDENTIFIER_PREFIX = 0x44545300;
 
-// Stream types that only mean DTS within a Blu-ray-derived program
-const BLU_RAY_DTS_STREAM_TYPES = new Set<number>([
-	MpegTsStreamType.BLU_RAY_DTS_HD,
-	MpegTsStreamType.BLU_RAY_DTS_HD_MASTER,
-	MpegTsStreamType.BLU_RAY_DTS_EXPRESS_SECONDARY,
+// Stream types that only mean E-AC-3 or DTS within a Blu-ray-derived program, and what they map to
+const BLU_RAY_STREAM_TYPES = new Map<number, MpegTsStreamType>([
+	[MpegTsStreamType.BLU_RAY_EAC3, MpegTsStreamType.EAC3_SYSTEM_A],
+	[MpegTsStreamType.BLU_RAY_EAC3_SECONDARY, MpegTsStreamType.EAC3_SYSTEM_A],
+	[MpegTsStreamType.BLU_RAY_DTS_HD, MpegTsStreamType.DTS],
+	[MpegTsStreamType.BLU_RAY_DTS_HD_MASTER, MpegTsStreamType.DTS],
+	[MpegTsStreamType.BLU_RAY_DTS_EXPRESS_SECONDARY, MpegTsStreamType.DTS],
 ]);
 
 type ElementaryStream = {
@@ -197,6 +199,9 @@ type Section = {
 
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
+
+/** Whether a syncframe beginning with 0x0B77 uses AC-3's syntax (bsid up to 10) rather than E-AC-3's. */
+const isAc3FamilyFrame = (bytes: Uint8Array) => bytes.length >= 6 && bytes[5]! >> 3 <= 10;
 
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
@@ -472,10 +477,9 @@ export class MpegTsDemuxer extends Demuxer {
 
 						let info: ElementaryStream['info'] | null = null;
 
-						// Blu-ray has its own stream types for the DTS extensions
-						const effectiveStreamType = isBluRayProgram && BLU_RAY_DTS_STREAM_TYPES.has(streamType)
-							? MpegTsStreamType.DTS
-							: streamType;
+						// Blu-ray has its own stream types for E-AC-3 and the DTS extensions
+						const effectiveStreamType = (isBluRayProgram && BLU_RAY_STREAM_TYPES.get(streamType))
+							|| streamType;
 
 						switch (effectiveStreamType) {
 							case MpegTsStreamType.AVC:
@@ -842,6 +846,7 @@ export class MpegTsDemuxer extends Demuxer {
 									= AC3_ACMOD_CHANNEL_COUNTS[frameInfo.acmod]! + frameInfo.lfeon;
 								elementaryStream.info.sampleRate = AC3_SAMPLE_RATES[frameInfo.fscod]!;
 							} else if (elementaryStream.info.codec === 'eac3') {
+								// For Blu-ray's Dolby Digital Plus, this is an AC-3 frame (the core of each frame)
 								const frameInfo = parseEac3SyncFrame(context.suppliedPacket.data);
 								if (!frameInfo) {
 									throw new Error(
@@ -2641,34 +2646,85 @@ class PacketReadingContext {
 						this.skip(-1);
 						const possibleSyncPos = this.currentPos;
 
-						// Need at least 5 bytes for E-AC-3 header parsing (sync word + frmsiz + fscod/numblkscod)
-						let remaining = this.ensureBuffered(5);
-						if (isThenable(remaining)) remaining = await remaining;
+						// Need at least 6 bytes for header parsing (sync word + frmsiz + fscod/numblkscod + bsid)
+						let remaining = this.ensureBuffered(6);
+						if (isThenable(remaining)) {
+							remaining = await remaining;
+						}
 
-						if (remaining < 5) {
+						if (remaining < 6) {
 							return;
 						}
 
-						const headerBytes = this.readBytes(5);
+						const headerBytes = this.readBytes(6);
 
 						if (headerBytes[0] !== 0x0b || headerBytes[1] !== 0x77) {
 							this.seekTo(possibleSyncPos + 1);
 							continue;
 						}
 
-						const frmsiz = ((headerBytes[2]! & 0x07) << 8) | headerBytes[3]!;
-						const frameSize = (frmsiz + 1) * 2;
-						const fscod = headerBytes[4]! >> 6;
-						const numblkscod = fscod === 3 ? 3 : (headerBytes[4]! >> 4) & 0x03;
-						const numblks = EAC3_NUMBLKS_TABLE[numblkscod]!;
+						let frameSize: number;
+						let samplesPerFrame: number;
+
+						if (isAc3FamilyFrame(headerBytes)) {
+							// An AC-3 frame, as Blu-ray's Dolby Digital Plus streams carry for their core
+							const fscod = headerBytes[4]! >> 6;
+							const frmsizecod = headerBytes[4]! & 0x3f;
+
+							if (fscod === 3 || frmsizecod > 37) {
+								// Invalid
+								this.seekTo(possibleSyncPos + 1);
+								continue;
+							}
+
+							frameSize = AC3_FRAME_SIZES[3 * frmsizecod + fscod]!;
+							samplesPerFrame = AC3_SAMPLES_PER_FRAME;
+						} else {
+							const frmsiz = ((headerBytes[2]! & 0x07) << 8) | headerBytes[3]!;
+							frameSize = (frmsiz + 1) * 2;
+							const fscod = headerBytes[4]! >> 6;
+							const numblkscod = fscod === 3 ? 3 : (headerBytes[4]! >> 4) & 0x03;
+							samplesPerFrame = EAC3_NUMBLKS_TABLE[numblkscod]! * 256; // 256 samples per block
+						}
+
+						// Dependent substreams extend the frame before them to more channels, so they're part of its
+						// access unit (taken from upstream's bug-fix-mania branch)
+						while (true) {
+							this.seekTo(possibleSyncPos);
+
+							const neededBytes = frameSize + 6;
+							let remaining = this.ensureBuffered(neededBytes);
+							if (isThenable(remaining)) {
+								remaining = await remaining;
+							}
+
+							if (remaining < neededBytes) {
+								break;
+							}
+
+							this.seekTo(possibleSyncPos + frameSize);
+							const nextHeaderBytes = this.readBytes(6);
+
+							if (
+								nextHeaderBytes[0] !== 0x0b
+								|| nextHeaderBytes[1] !== 0x77
+								// In an AC-3 frame, the bits of strmtyp belong to its CRC
+								|| isAc3FamilyFrame(nextHeaderBytes)
+								|| (nextHeaderBytes[2]! >> 6) !== 1 // strmtyp of a dependent substream
+							) {
+								break;
+							}
+
+							frameSize += 2 * ((((nextHeaderBytes[2]! & 0x07) << 8) | nextHeaderBytes[3]!) + 1);
+						}
 
 						this.seekTo(possibleSyncPos);
 
 						remaining = this.ensureBuffered(frameSize);
-						if (isThenable(remaining)) remaining = await remaining;
+						if (isThenable(remaining)) {
+							remaining = await remaining;
+						}
 
-						// Duration = numblks * 256 samples per block
-						const samplesPerFrame = numblks * 256;
 						const duration = Math.round(
 							samplesPerFrame * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);

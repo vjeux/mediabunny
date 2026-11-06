@@ -3137,6 +3137,9 @@ export const parseAc3SyncFrame = (data: Uint8Array): Ac3FrameInfo | null => {
 	return { fscod, bsid, bsmod, acmod, lfeon, bitRateCode };
 };
 
+/** AC-3 bit rates in kbit/s, indexed by frmsizecod / 2 (Table 4.13). */
+const AC3_BIT_RATES = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640];
+
 /**
  * AC-3 frame sizes in bytes, indexed by [3 * frmsizecod + fscod].
  * fscod: 0=48kHz, 1=44.1kHz, 2=32kHz
@@ -3245,6 +3248,30 @@ export const parseEac3SyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
 	// Check sync word (0x0B77)
 	if (data[0] !== 0x0B || data[1] !== 0x77) {
 		return null;
+	}
+
+	if (data[5]! >> 3 <= 10) {
+		// An AC-3 frame (bsid up to 10), as Blu-ray's Dolby Digital Plus streams carry for their first independent
+		// substream, the E-AC-3 data extending it following in dependent substreams. dec3 describes it like an E-AC-3
+		// one (FFmpeg's MP4 muxer does the same).
+		const frameInfo = parseAc3SyncFrame(data);
+		if (!frameInfo) {
+			return null;
+		}
+
+		return {
+			dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]!,
+			substreams: [{
+				fscod: frameInfo.fscod,
+				fscod2: 0,
+				bsid: frameInfo.bsid,
+				bsmod: frameInfo.bsmod,
+				acmod: frameInfo.acmod,
+				lfeon: frameInfo.lfeon,
+				numDepSub: 0,
+				chanLoc: 0,
+			}],
+		};
 	}
 
 	const bitstream = new Bitstream(data);
