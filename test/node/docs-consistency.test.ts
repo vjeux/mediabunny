@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,10 +50,14 @@ const extractSnippets = (page: string): Snippet[] => {
 
 const allSnippets = DOC_PAGES.flatMap(extractSnippets);
 
+// Divergences that open docs fixes address are exempted below. Each exemption ends with a fingerprint of the snippet or
+// table row it applies to, as that text is today, so it lapses as soon as the text changes: a corrected snippet is
+// checked like any other, and an exemption can't hide a later regression. Failure messages print the fingerprint.
+const fingerprint = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 12);
+
 describe('Codec compatibility table', () => {
-	// Cells known to be wrong, each fixed by an open docs PR. Ignoring a cell is harmless once it's fixed.
 	const IGNORED_CELLS = new Set([
-		'pcm-f64 .wav',
+		'pcm-f64 .wav fcc8a2bf2e1e',
 	]);
 
 	test('marks exactly the codecs each output format accepts', () => {
@@ -80,13 +85,17 @@ describe('Codec compatibility table', () => {
 		for (const row of rows.slice(2)) {
 			const cells = row.split('|').slice(1, -1).map(cell => cell.trim());
 			const codec = /`'([^']+)'`/.exec(cells[0]!)![1]!;
+			const rowFingerprint = fingerprint(row);
 			documentedCodecs.push(codec);
 
 			header.forEach((extension, i) => {
 				const documented = cells[i + 1] === '✓' || cells[i + 1] === '(✓)';
 				const supported = formats[extension]!.getSupportedCodecs().includes(codec as Mediabunny.MediaCodec);
-				if (documented !== supported && !IGNORED_CELLS.has(`${codec} ${extension}`)) {
-					mismatches.push(`${codec} ${extension}: documented ${documented}, supported ${supported}`);
+				if (documented !== supported && !IGNORED_CELLS.has(`${codec} ${extension} ${rowFingerprint}`)) {
+					mismatches.push(
+						`${codec} ${extension}: documented ${documented}, supported ${supported}`
+						+ ` (row ${rowFingerprint})`,
+					);
 				}
 			});
 		}
@@ -99,15 +108,14 @@ describe('Codec compatibility table', () => {
 });
 
 describe('Option types spelled out in the guides', () => {
-	// Fields the guides don't list yet, each added by an open docs PR. Ignoring a field is harmless once it's listed.
 	const IGNORED_MISSING_FIELDS = new Set([
-		'BlobSourceOptions.useStreamReader',
-		'MpegTsOutputFormatOptions.timestampOffset',
-		'HlsOutputFormatOptions.mediaTimestampBase',
-		'HlsOutputFormatOptions.onSegmentPopped',
-		'VideoEncodingConfig.onEncodedSample',
-		'AudioEncodingConfig.onEncodedSample',
-		'ConversionAudioOptions.group',
+		'BlobSourceOptions.useStreamReader fbd327eb2175',
+		'MpegTsOutputFormatOptions.timestampOffset b9bf9c230ac5',
+		'HlsOutputFormatOptions.mediaTimestampBase c83c7df86912',
+		'HlsOutputFormatOptions.onSegmentPopped c83c7df86912',
+		'VideoEncodingConfig.onEncodedSample 80b65fb577a1',
+		'AudioEncodingConfig.onEncodedSample 691a464e93eb',
+		'ConversionAudioOptions.group 30f3b250485e',
 	]);
 	// The guides only show excerpts of these types
 	const EXCERPTED_TYPES = new Set(['ConversionOptions']);
@@ -171,23 +179,23 @@ describe('Option types spelled out in the guides', () => {
 				return;
 			}
 
-			const missingFields = [...exportedFields!]
-				.filter(field => !fields.includes(field) && !IGNORED_MISSING_FIELDS.has(`${name}.${field}`));
-			expect(missingFields, 'exported fields the guide leaves out').toEqual([]);
+			const snippetFingerprint = fingerprint(snippet.code);
+			const missingFields = [...exportedFields!].filter(field => !fields.includes(field)
+				&& !IGNORED_MISSING_FIELDS.has(`${name}.${field} ${snippetFingerprint}`));
+			expect(missingFields, `exported fields the guide leaves out (snippet ${snippetFingerprint})`).toEqual([]);
 		});
 	}
 });
 
 describe('Snippet imports', () => {
-	// Missing imports fixed by open docs PRs, keyed by page and name. Ignoring them is harmless once they're fixed.
 	const IGNORED_MISSING_IMPORTS = new Set([
-		'README.md BufferTarget',
-		'docs/guide/quick-start.md BufferTarget',
-		'docs/guide/converting-media-files.md Quality',
-		'docs/guide/input-formats.md MatroskaInputFormat',
-		'docs/guide/input-formats.md IsobmffInputFormat',
-		'docs/guide/output-formats.md BufferTarget',
-		'docs/guide/output-formats.md HlsOutputFormat',
+		'README.md BufferTarget 668e446e02e0',
+		'docs/guide/quick-start.md BufferTarget d1225810e0be',
+		'docs/guide/converting-media-files.md Quality e3481a83fcd2',
+		'docs/guide/input-formats.md MatroskaInputFormat aa090c221b27',
+		'docs/guide/input-formats.md IsobmffInputFormat aa090c221b27',
+		'docs/guide/output-formats.md BufferTarget 51e63aba33cf',
+		'docs/guide/output-formats.md HlsOutputFormat 9f44c14adf93',
 	]);
 
 	const exportNames = new Set(Object.keys(Mediabunny));
@@ -237,12 +245,15 @@ describe('Snippet imports', () => {
 		};
 		visit(sourceFile);
 
-		return [...missing].filter(name => !IGNORED_MISSING_IMPORTS.has(`${snippet.page} ${name}`));
+		const snippetFingerprint = fingerprint(snippet.code);
+		return [...missing]
+			.filter(name => !IGNORED_MISSING_IMPORTS.has(`${snippet.page} ${name} ${snippetFingerprint}`));
 	};
 
 	test('self-contained snippets import every Mediabunny export they use', () => {
 		const problems = allSnippets.flatMap(snippet => findMissingImports(snippet)
-			.map(name => `${snippet.page}:${snippet.line} uses ${name} without importing it`));
+			.map(name => `${snippet.page}:${snippet.line} uses ${name} without importing it`
+				+ ` (snippet ${fingerprint(snippet.code)})`));
 		expect(problems).toEqual([]);
 	});
 
@@ -253,5 +264,8 @@ describe('Snippet imports', () => {
 			code: 'import { Output } from \'mediabunny\';\nnew Output({ target: new BufferTarget() });',
 		};
 		expect(findMissingImports(snippet)).toEqual(['BufferTarget']);
+
+		// README.md has a BufferTarget exemption, but only for its current snippet text
+		expect(findMissingImports({ ...snippet, page: 'README.md' })).toEqual(['BufferTarget']);
 	});
 });
