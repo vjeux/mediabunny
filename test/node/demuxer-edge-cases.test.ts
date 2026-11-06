@@ -3,6 +3,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
 import {
 	adtsFrame,
@@ -597,5 +598,82 @@ describe('Matroska demuxing', () => {
 		const { raw, ...tags } = await input.getMetadataTags();
 		expect(raw).toBeDefined();
 		expect(tags).toEqual(expected);
+	});
+});
+
+describe('Matroska cue-based lookups', () => {
+	const trackEntry = ebml(
+		EBMLId.TrackEntry,
+		ebmlUint(EBMLId.TrackNumber, 1),
+		ebmlUint(EBMLId.TrackUID, 1),
+		ebmlUint(EBMLId.TrackType, 1),
+		ebmlString(EBMLId.CodecID, 'V_VP8'),
+		ebml(EBMLId.Video, ebmlUint(EBMLId.PixelWidth, 640), ebmlUint(EBMLId.PixelHeight, 480)),
+	);
+	// Three one-second clusters, each with a key frame followed by three delta frames
+	const clusters = [0, 1000, 2000].map(start => ebml(
+		EBMLId.Cluster,
+		ebmlUint(EBMLId.Timestamp, start),
+		...[0, 250, 500, 750].map((offset) => {
+			const isKey = offset === 0;
+			const block = mkvSimpleBlock(1, offset, isKey ? 0x80 : 0x00, [isKey ? 0x10 : 0x11, 0, 0]);
+			return ebml(EBMLId.SimpleBlock, block);
+		}),
+	));
+	const build = (withCues: boolean) => {
+		const info = ebml(EBMLId.Info, ebmlUint(EBMLId.TimestampScale, 1_000_000));
+		const tracks = ebml(EBMLId.Tracks, trackEntry);
+		const buildCues = (cuesLength: number) => {
+			const clusterPositions: number[] = [];
+			let position = info.length + tracks.length + cuesLength;
+			for (const cluster of clusters) {
+				clusterPositions.push(position);
+				position += cluster.length;
+			}
+			const cuePoint = (index: number) => ebml(
+				EBMLId.CuePoint,
+				ebmlUint(EBMLId.CueTime, index * 1000),
+				ebml(
+					EBMLId.CueTrackPositions,
+					ebmlUint(EBMLId.CueTrack, 1),
+					ebmlUint(EBMLId.CueClusterPosition, clusterPositions[index]!),
+				),
+			);
+			// Out of order and with a duplicate, which the demuxer has to sort out
+			return ebml(EBMLId.Cues, cuePoint(2), cuePoint(0), cuePoint(1), cuePoint(1));
+		};
+		// The cues sit before the clusters, so their own size shifts the cluster positions they point to
+		let cues = buildCues(0);
+		cues = buildCues(cues.length);
+		cues = buildCues(cues.length);
+		return concatBytes(
+			ebml(EBMLId.EBML, ebmlString(EBMLId.DocType, 'webm')),
+			ebml(EBMLId.Segment, info, tracks, ...(withCues ? [cues] : []), ...clusters),
+		);
+	};
+
+	test.each([true, false])('lookups are exact (with cues: %s)', async (withCues) => {
+		using input = openBytes(build(withCues));
+		const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+		const at = (packet: EncodedPacket | null) => packet && Math.round(packet.timestamp * 1000);
+
+		expect(at(await sink.getPacket(1.3))).toBe(1250);
+		expect(at(await sink.getPacket(2.999))).toBe(2750);
+		expect(await sink.getPacket(-0.1)).toBe(null);
+		expect(at(await sink.getKeyPacket(1.6))).toBe(1000);
+		expect(at(await sink.getKeyPacket(2.9))).toBe(2000);
+		expect(at(await sink.getKeyPacket(0.999))).toBe(0);
+
+		const delta = (await sink.getPacket(0.5))!;
+		expect(at(await sink.getNextKeyPacket(delta))).toBe(1000);
+		expect(at(await sink.getNextPacket(delta))).toBe(750);
+		const lastKey = (await sink.getKeyPacket(2.5))!;
+		expect(await sink.getNextKeyPacket(lastKey)).toBe(null);
+
+		const all: number[] = [];
+		for await (const packet of sink.packets()) {
+			all.push(at(packet)!);
+		}
+		expect(all).toEqual([0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750]);
 	});
 });
