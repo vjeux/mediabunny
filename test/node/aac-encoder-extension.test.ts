@@ -129,3 +129,64 @@ test('AAC with huge timestamps', async () => {
 	const primingDelay = 1024 / 48000;
 	expect(firstPacket.timestamp).toBe(timestamp - primingDelay);
 });
+
+test('AAC encoding of a tone after silence at 192 kbps per channel', { timeout: 20_000 }, async () => {
+	registerAacEncoder();
+
+	// FFmpeg's encoder used to retry this tone's onset frame forever, as its coder ignores the lambda that the
+	// retries lower, and the frame must not come out bigger than the decoder buffer either
+	const sampleRate = 48000;
+	const data = new Float32Array(sampleRate);
+	for (let i = sampleRate / 4; i < sampleRate; i++) {
+		data[i] = 0.3 * Math.sin(2 * Math.PI * 220 * i / sampleRate);
+	}
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const audioSource = new AudioSampleSource({ codec: 'aac', quality: new Quality({ bitrate: 192000 }) });
+	output.addAudioTrack(audioSource);
+
+	const encode = async () => {
+		await output.start();
+		using sample = new AudioSample({
+			data,
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate,
+			timestamp: 0,
+		});
+		await audioSource.add(sample);
+		audioSource.close();
+		await output.finalize();
+	};
+
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+	const hang = new Promise<never>((_, reject) => {
+		timeoutId = setTimeout(() => reject(new Error('The AAC encoder hung.')), 10_000);
+	});
+
+	try {
+		await Promise.race([encode(), hang]);
+	} finally {
+		clearTimeout(timeoutId);
+	}
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getCodec()).toBe('aac');
+	expect(await track.computeDuration()).toBeCloseTo(1, 1);
+
+	// A frame may take up at most 6144 bits per channel, the size of the decoder's input buffer
+	let largestPacket = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		largestPacket = Math.max(largestPacket, packet.data.byteLength);
+	}
+	expect(largestPacket).toBeLessThanOrEqual(6144 / 8);
+});
