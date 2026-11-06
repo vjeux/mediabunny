@@ -31,6 +31,7 @@ import {
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
 import {
 	calculateCrc8,
+	calculateCrc16,
 	readBlockSize,
 	getBlockSizeOrUncommon,
 	readCodedNumber,
@@ -414,16 +415,30 @@ export class FlacDemuxer extends Demuxer {
 				// Ensure the frameOrSampleNum is consecutive.
 				// https://github.com/Vanilagy/mediabunny/issues/194
 
+				let isConsecutive: boolean;
 				if (this.blockingBit === 0) {
 					// Case A: If the stream is fixed block size, this is the frame number, which increments by 1
-					if (nextFrameHeader.num - frameHeader.num !== 1) {
-						slice.filePos = positionBeforeReading;
-						continue;
-					}
+					isConsecutive = nextFrameHeader.num - frameHeader.num === 1;
 				} else {
 					// Case B: If the stream is variable block size, this is the sample number, which increments by
 					// amount of samples in a frame.
-					if (nextFrameHeader.num - frameHeader.num !== frameHeader.blockSize) {
+					isConsecutive = nextFrameHeader.num - frameHeader.num === frameHeader.blockSize;
+				}
+
+				// Where FLAC streams were joined (e.g. by FFmpeg's concat demuxer), the numbering starts over. Accept
+				// such a boundary if the frame before it ends with a valid CRC-16, which a sync code that's part of
+				// the frame data practically never produces.
+				if (!isConsecutive) {
+					const numberingStartsOver = nextFrameHeader.num <= frameHeader.num;
+					if (!numberingStartsOver) {
+						slice.filePos = positionBeforeReading;
+						continue;
+					}
+
+					slice.filePos = startPos;
+					const frameBytes = readBytes(slice, lengthIfNextFlacFrameHeaderIsLegit);
+
+					if (calculateCrc16(frameBytes) !== 0) {
 						slice.filePos = positionBeforeReading;
 						continue;
 					}
