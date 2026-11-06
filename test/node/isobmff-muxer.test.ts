@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { CmafOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -749,4 +749,27 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
+});
+
+test('CMAF segments too long for the sidx subsegment duration are rejected instead of wrapping around', async () => {
+	// The sidx box counts the segment's duration in 32 bits of its 57600 Hz timescale, which ends after ~20.7 hours.
+	// This is 21 hours of 1-second video frames.
+	const output = new Output({
+		format: new CmafOutputFormat(),
+		target: new BufferTarget(),
+		initTarget: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const mux = async () => {
+		const decoderConfig = { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 };
+		for (let i = 0; i < 21 * 3600; i++) {
+			await source.add(new EncodedPacket(new Uint8Array(1), i === 0 ? 'key' : 'delta', i, 1), { decoderConfig });
+		}
+		await output.finalize();
+	};
+
+	await expect(mux()).rejects.toThrow(/sidx/);
 });

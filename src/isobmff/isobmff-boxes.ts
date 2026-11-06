@@ -359,6 +359,15 @@ export const sidx = (muxer: IsobmffMuxer, referencedSize: number) => {
 		duration = 0;
 	}
 
+	const subsegmentDuration = intoTimescale(duration, GLOBAL_TIMESCALE);
+	if (!isU32(subsegmentDuration)) {
+		// It would silently wrap around otherwise
+		throw new Error(
+			`The CMAF segment lasts ${duration} seconds, more than the sidx box's 32-bit subsegment duration can hold`
+			+ ` (${Math.floor((2 ** 32 - 1) / GLOBAL_TIMESCALE)} seconds). Split the media into shorter segments.`,
+		);
+	}
+
 	return fullBox('sidx', 1, 0, [
 		u32(1), // Reference ID
 		u32(GLOBAL_TIMESCALE), // Timescale
@@ -367,7 +376,7 @@ export const sidx = (muxer: IsobmffMuxer, referencedSize: number) => {
 		u16(0), // Reserved
 		u16(1), // Reference count
 		u32(referencedSize & 0x7fffffff), // Reference type (0) + referenced size
-		u32(intoTimescale(duration, GLOBAL_TIMESCALE)), // Subsegment duration
+		u32(subsegmentDuration), // Subsegment duration
 		u32(0), // Starts with SAP + SAP type + SAP delta time (no information provided)
 	]);
 };
