@@ -737,3 +737,31 @@ export const buildHevcPps = (tiles: boolean, entropyCodingSync: boolean, cuQpDel
 	w.writeTrailingBits();
 	return concatBytes([0x44, 0x01], addEmulationPrevention(w.toBytes()));
 };
+
+/** A QuickTime version 2 sound description ('lpcm' etc.) with a float64 sample rate and format flags. */
+export const mp4SoundEntryV2 = (
+	format: string,
+	channels: number,
+	bitsPerChannel: number,
+	flags: number,
+	sampleRate: number,
+	...children: Uint8Array[]
+) => {
+	const rate = new Uint8Array(8);
+	new DataView(rate.buffer).setFloat64(0, sampleRate);
+	return mp4Box(
+		format,
+		[0, 0, 0, 0, 0, 0], u16be(1),
+		u16be(2), u16be(0), u32be(0), // version 2, revision level, vendor
+		u16be(3), u16be(16), u16be(0xfffe), u16be(0), u32be(0x00010000),
+		u32be(72), // sizeOfStructOnly
+		rate,
+		u32be(channels),
+		u32be(0x7f000000),
+		u32be(bitsPerChannel),
+		u32be(flags),
+		u32be(channels * Math.ceil(bitsPerChannel / 8)), // constBytesPerAudioPacket
+		u32be(1), // constLPCMFramesPerAudioPacket
+		...children,
+	);
+};

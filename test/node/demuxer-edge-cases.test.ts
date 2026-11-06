@@ -6,6 +6,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
 import {
 	adtsFrame,
+	ascii,
 	buildAvcSps,
 	buildMp4,
 	concatBytes,
@@ -17,7 +18,9 @@ import {
 	mkvFile,
 	mkvSimpleBlock,
 	mp4Box,
+	mp4FullBox,
 	mp4SoundEntry,
+	mp4SoundEntryV2,
 	mp4VisualEntry,
 	u16be,
 } from './helpers/mutation-bytes.js';
@@ -264,6 +267,93 @@ describe('ADTS demuxing', () => {
 		expect((await sink.getKeyPacket(frameDuration * 2.5))!.timestamp).toBe(2 * frameDuration);
 		const last = await sink.getPacket(100);
 		expect(await sink.getNextPacket(last!)).toBe(null);
+	});
+});
+
+describe('MP4 PCM sample entries', () => {
+	const pcmCodec = async (sampleEntry: Uint8Array, bytesPerFrame: number) => {
+		const bytes = buildMp4({
+			handler: 'soun',
+			timescale: 48000,
+			sampleEntry,
+			samples: Array.from({ length: 8 }, () => new Uint8Array(bytesPerFrame)),
+			stts: [[8, 1]],
+			stsc: [[1, 8]],
+			constantSampleSize: bytesPerFrame,
+		});
+		using input = openBytes(bytes);
+		const track = (await input.getPrimaryAudioTrack())!;
+		return {
+			codec: await track.getCodec(),
+			channels: await track.getNumberOfChannels(),
+			sampleRate: await track.getSampleRate(),
+		};
+	};
+
+	test.each([
+		// bits, lpcm format flags (1 = float, 2 = big-endian, 4 = signed integer, 8 = packed), expected codec
+		[8, 0x0c, 'pcm-s8'],
+		[8, 0x08, 'pcm-u8'],
+		[16, 0x0c, 'pcm-s16'],
+		[16, 0x0e, 'pcm-s16be'],
+		[24, 0x0c, 'pcm-s24'],
+		[24, 0x0e, 'pcm-s24be'],
+		[32, 0x0c, 'pcm-s32'],
+		[32, 0x0e, 'pcm-s32be'],
+		[32, 0x09, 'pcm-f32'],
+		[32, 0x0b, 'pcm-f32be'],
+		[20, 0x0c, 'pcm-s24'], // 20 bits are stored in 3 bytes
+		[16, 0x08, null], // unsigned 16-bit has no codec
+		[24, 0x09, null], // 24-bit float doesn't exist
+		[0, 0x0c, null],
+		[72, 0x0c, null],
+	])('QuickTime v2 lpcm with %i bits and flags %i reads as %s', async (bits, flags, expected) => {
+		const entry = mp4SoundEntryV2('lpcm', 2, bits, flags, 44100);
+		const info = await pcmCodec(entry, 2 * Math.ceil(bits / 8));
+		expect(info).toEqual({ codec: expected, channels: 2, sampleRate: 44100 });
+	});
+
+	test.each([
+		['ipcm', 0x01, 16, 'pcm-s16'],
+		['ipcm', 0x01, 24, 'pcm-s24'],
+		['ipcm', 0x01, 32, 'pcm-s32'],
+		['ipcm', 0x00, 16, 'pcm-s16be'],
+		['ipcm', 0x00, 24, 'pcm-s24be'],
+		['ipcm', 0x00, 32, 'pcm-s32be'],
+		['ipcm', 0x01, 8, null],
+		['fpcm', 0x01, 32, 'pcm-f32'],
+		['fpcm', 0x01, 64, 'pcm-f64'],
+		['fpcm', 0x00, 32, 'pcm-f32be'],
+		['fpcm', 0x00, 64, 'pcm-f64be'],
+		['fpcm', 0x00, 16, null],
+	])('%s with pcmC format flags %i and %i bits reads as %s', async (format, formatFlags, bits, expected) => {
+		const pcmC = mp4FullBox('pcmC', 0, 0, [formatFlags, bits]);
+		const entry = mp4SoundEntry(format, 2, bits, 48000, pcmC);
+		expect((await pcmCodec(entry, 2 * Math.ceil(bits / 8))).codec).toBe(expected);
+	});
+
+	test.each([
+		['sowt', 8, null, 'pcm-s8'],
+		['twos', 8, null, 'pcm-s8'],
+		['twos', 16, null, 'pcm-s16be'],
+		['twos', 16, [0, 1], 'pcm-s16'], // enda says little-endian
+		['raw ', 8, null, 'pcm-u8'],
+		['in24', 24, null, 'pcm-s24be'],
+		['in24', 24, [0, 1], 'pcm-s24'],
+		['in32', 32, null, 'pcm-s32be'],
+		['fl32', 32, [0, 1], 'pcm-f32'],
+		['fl64', 64, null, 'pcm-f64be'],
+	])('QuickTime %j with %i-bit samples (enda %j) reads as %s', async (format, bits, enda, expected) => {
+		const entry = mp4SoundEntry(format, 1, bits, 48000, ...(enda ? [mp4Box('enda', enda)] : []));
+		expect((await pcmCodec(entry, Math.ceil(bits / 8))).codec).toBe(expected);
+	});
+
+	test('an enda box inside a wave box (as FFmpeg writes it for MOV) makes in24/in32/fl32 little-endian', async () => {
+		const cases = [['in24', 24, 'pcm-s24'], ['in32', 32, 'pcm-s32'], ['fl32', 32, 'pcm-f32']] as const;
+		for (const [format, bits, expected] of cases) {
+			const wave = mp4Box('wave', mp4Box('frma', ascii(format)), mp4Box('enda', [0, 1]), new Uint8Array(8));
+			expect((await pcmCodec(mp4SoundEntry(format, 2, bits, 48000, wave), 2 * bits / 8)).codec).toBe(expected);
+		}
 	});
 });
 
