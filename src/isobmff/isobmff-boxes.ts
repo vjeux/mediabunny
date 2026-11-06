@@ -1793,6 +1793,24 @@ const DATA_BOX_MIME_TYPE_MAP: Record<string, number> = {
 	'image/bmp': 27,
 };
 
+/**
+ * Returns the iTunes well-known data type for an image. Readers like FFmpeg skip cover art of any other type, so like
+ * FFmpeg and AtomicParsley, the type follows the image's actual format, whatever spelling its MIME type uses.
+ */
+const getImageDataType = (data: Uint8Array, mimeType: string) => {
+	if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+		return 13; // JPEG
+	}
+	if (data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
+		return 14; // PNG
+	}
+	if (data[0] === 0x42 && data[1] === 0x4d) {
+		return 27; // BMP
+	}
+
+	return DATA_BOX_MIME_TYPE_MAP[mimeType.toLowerCase()] ?? 0;
+};
+
 // FFmpeg parses these assuming a udta layout even when they're not in udta, so we simply skip these if we'd write them
 // to ilst metadata
 const ILST_UNSAFE_RAW_KEYS = new Set(['HMMT', 'loci', 'chpl']);
@@ -1867,7 +1885,7 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 					}
 
 					pairs.push({ key: 'covr', value: box('data', [
-						u32(DATA_BOX_MIME_TYPE_MAP[image.mimeType] ?? 0), // Type indicator
+						u32(getImageDataType(image.data, image.mimeType)), // Type indicator
 						u32(0), // Locale indicator
 						Array.from(image.data), // Kinda slow, hopefully temp
 					]) });
@@ -1945,7 +1963,7 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 				]) });
 			} else if (value instanceof RichImageData) {
 				pairs.push({ key, value: box('data', [
-					u32(DATA_BOX_MIME_TYPE_MAP[value.mimeType] ?? 0), // Type indicator
+					u32(getImageDataType(value.data, value.mimeType)), // Type indicator
 					u32(0), // Locale indicator
 					Array.from(value.data), // Kinda slow, hopefully temp
 				]) });
