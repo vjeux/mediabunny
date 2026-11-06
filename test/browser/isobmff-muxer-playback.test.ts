@@ -73,7 +73,7 @@ const encode = async (options: {
 };
 
 /** Appends the given chunks to a MediaSource, then plays it through and reports what Chrome made of it. */
-const playWithMse = async (mimeType: string, chunks: Uint8Array[]) => {
+const playWithMse = async (mimeType: string, chunks: Uint8Array<ArrayBuffer>[]) => {
 	const mediaSource = new MediaSource();
 	const video = document.createElement('video');
 	video.muted = true;
