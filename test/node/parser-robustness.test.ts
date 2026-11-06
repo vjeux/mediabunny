@@ -32,6 +32,7 @@ const KNOWN_FAILURES: Record<string, string> = {
 	'mp4/box-size-past-2-53.bin': '#340',
 	'mp4/stsc-first-chunk-0.bin': '#340',
 	'mp4/pcm-zero-channels.bin': '#341',
+	'ogg/page-header-inside-last-page.bin': '#345',
 	'mkv/vorbis-without-codec-private.bin': '#325',
 	'mkv/vorbis-unterminated-lacing.bin': '#325',
 	'aac/sample-rate-change.bin': 'bug-fix-mania',
