@@ -31,6 +31,41 @@ import { assert } from '../../src/misc.js';
 // Foundation on Windows, AudioToolbox on macOS; Chrome on Linux has none)
 const nativeAacEncoding = await canEncodeAudio('aac');
 
+// WebKitGTK's GStreamer AudioEncoder stamps every chunk with the timestamp of the input it came from, so there, the
+// encoded timing can't be right
+const nativeAacTimestampsAdvance = nativeAacEncoding && await (async () => {
+	const timestamps: number[] = [];
+	const encoder = new AudioEncoder({ output: chunk => timestamps.push(chunk.timestamp), error: () => {} });
+	encoder.configure({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 1, bitrate: 64000 });
+	encoder.encode(new AudioData({
+		format: 'f32-planar', sampleRate: 48000, numberOfChannels: 1, numberOfFrames: 4800, timestamp: 0,
+		data: new Float32Array(4800),
+	}));
+	await encoder.flush();
+	encoder.close();
+	return timestamps.length > 1 && new Set(timestamps).size === timestamps.length;
+})();
+
+// WebKitGTK's GStreamer decoders scramble the timestamps that follow a negative one (they flip the playback direction
+// of their segment), so there, decoded AAC whose priming is signaled through a negative timestamp can't be checked
+const negativeTimestampsDecodeCorrectly = await (async () => {
+	const timestamps: number[] = [];
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			timestamps.push(data.timestamp);
+			data.close();
+		},
+		error: () => {},
+	});
+	decoder.configure({ codec: 'pcm-s16', sampleRate: 48000, numberOfChannels: 1 });
+	for (const timestamp of [-20000, 0, 20000]) {
+		decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp, data: new Uint8Array(1920) }));
+	}
+	await decoder.flush();
+	decoder.close();
+	return timestamps.join() === '-20000,0,20000';
+})();
+
 type ImpulseSignal = {
 	sampleRate: number;
 	numberOfChannels: number;
@@ -101,9 +136,13 @@ const encodeImpulseSignal = async (format: OutputFormat, signal: ImpulseSignal) 
 };
 
 /** Decodes the primary audio track and returns the time of the loudest sample of every channel. */
-const readImpulses = async (input: Input) => {
+const readImpulses = async (input: Input, skip: (condition: boolean, note?: string) => void) => {
 	const track = await input.getPrimaryAudioTrack();
 	assert(track);
+	skip(
+		!negativeTimestampsDecodeCorrectly && await track.getFirstTimestamp() < 0,
+		'the decoder scrambles negative timestamps here',
+	);
 
 	const numberOfChannels = await track.getNumberOfChannels();
 	const peaks = Array.from({ length: numberOfChannels }, () => ({ time: -1, value: -1 }));
@@ -159,11 +198,11 @@ const CONTAINER_CASES: ContainerCase[] = [
 
 const defineAacEncodingTests = () => {
 	for (const container of CONTAINER_CASES) {
-		test(`${container.name}: keeps the timing, rate and channel count of encoded AAC`, async () => {
+		test(`${container.name}: keeps the timing, rate and channel count of encoded AAC`, async ({ skip }) => {
 			const { bytes, firstPacketTimestamp } = await encodeImpulseSignal(container.format(), STEREO_48K);
 
 			using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-			const result = await readImpulses(input);
+			const result = await readImpulses(input, skip);
 
 			expect(result.codec).toBe('aac');
 			expect(result.sampleRate).toBe(48000);
@@ -185,7 +224,7 @@ const defineAacEncodingTests = () => {
 		});
 	}
 
-	test('CMAF: segments keep the timing of encoded AAC', async () => {
+	test('CMAF: segments keep the timing of encoded AAC', async ({ skip }) => {
 		const initTarget = new BufferTarget();
 		const target = new BufferTarget();
 		const output = new Output({ format: new CmafOutputFormat(), target, initTarget: () => initTarget });
@@ -198,14 +237,14 @@ const defineAacEncodingTests = () => {
 
 		using initInput = new Input({ source: new BufferSource(initTarget.buffer!), formats: ALL_FORMATS });
 		using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS, initInput });
-		const result = await readImpulses(input);
+		const result = await readImpulses(input, skip);
 
 		expect(result.codec).toBe('aac');
 		expect(Math.abs(result.peakTimes[0]! - 0.25)).toBeLessThanOrEqual(TWO_SAMPLES);
 		expect(Math.abs(result.peakTimes[1]! - 0.5)).toBeLessThanOrEqual(TWO_SAMPLES);
 	});
 
-	test('HLS: MPEG-TS segments keep the timing of encoded AAC across segment boundaries', async () => {
+	test('HLS: MPEG-TS segments keep the timing of encoded AAC across segment boundaries', async ({ skip }) => {
 		const files = new Map<string, BufferTarget>();
 		let playlistText = '';
 		const output = new Output({
@@ -254,7 +293,7 @@ const defineAacEncodingTests = () => {
 			}),
 			formats: ALL_FORMATS,
 		});
-		const result = await readImpulses(input);
+		const result = await readImpulses(input, skip);
 
 		expect(result.codec).toBe('aac');
 		// The segments' media starts with the first packet (see HlsOutputFormatOptions.mediaTimestampBase), so encoder
@@ -265,7 +304,7 @@ const defineAacEncodingTests = () => {
 		expect(Math.abs(result.peakTimes[1]! - (3.5 + priming))).toBeLessThanOrEqual(TWO_SAMPLES);
 	});
 
-	test('5.1 AAC keeps every channel in place', async () => {
+	test('5.1 AAC keeps every channel in place', async ({ skip }) => {
 		const signal: ImpulseSignal = {
 			sampleRate: 48000,
 			numberOfChannels: 6,
@@ -275,7 +314,7 @@ const defineAacEncodingTests = () => {
 		const { bytes } = await encodeImpulseSignal(new Mp4OutputFormat(), signal);
 
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-		const result = await readImpulses(input);
+		const result = await readImpulses(input, skip);
 
 		expect(result.numberOfChannels).toBe(6);
 		for (const channel of [0, 1, 2, 4, 5]) { // The LFE channel (3) is low-passed, so its click spreads out
@@ -284,7 +323,7 @@ const defineAacEncodingTests = () => {
 		}
 	});
 
-	test('44.1 kHz mono AAC keeps its timing', async () => {
+	test('44.1 kHz mono AAC keeps its timing', async ({ skip }) => {
 		const signal: ImpulseSignal = {
 			sampleRate: 44100,
 			numberOfChannels: 1,
@@ -294,14 +333,14 @@ const defineAacEncodingTests = () => {
 		const { bytes } = await encodeImpulseSignal(new Mp4OutputFormat(), signal);
 
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-		const result = await readImpulses(input);
+		const result = await readImpulses(input, skip);
 
 		expect(result.sampleRate).toBe(44100);
 		expect(result.numberOfChannels).toBe(1);
 		expect(Math.abs(result.peakTimes[0]! - 0.5)).toBeLessThanOrEqual(2 / 44100);
 	});
 
-	test('AudioBufferSource doesn\'t drift over 20 s of 10 ms buffers', { timeout: 30_000 }, async () => {
+	test('AudioBufferSource doesn\'t drift over 20 s of 10 ms buffers', { timeout: 30_000 }, async ({ skip }) => {
 		const sampleRate = 44100;
 		const bufferFrames = 441;
 		const impulseFrame = 19.5 * sampleRate;
@@ -325,13 +364,13 @@ const defineAacEncodingTests = () => {
 		await output.finalize();
 
 		using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
-		const result = await readImpulses(input);
+		const result = await readImpulses(input, skip);
 
 		expect(Math.abs(result.peakTimes[0]! - 19.5)).toBeLessThanOrEqual(2 / sampleRate);
 		expect(result.duration).toBeGreaterThanOrEqual(20);
 	});
 
-	test('Conversion to AAC keeps the timing of a 22.05 kHz WAV', async () => {
+	test('Conversion to AAC keeps the timing of a 22.05 kHz WAV', async ({ skip }) => {
 		const wavTarget = new BufferTarget();
 		const wavOutput = new Output({ format: new WavOutputFormat(), target: wavTarget });
 		const wavSource = new AudioSampleSource({ codec: 'pcm-s16' });
@@ -356,7 +395,7 @@ const defineAacEncodingTests = () => {
 		await conversion.execute();
 
 		using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
-		const result = await readImpulses(input);
+		const result = await readImpulses(input, skip);
 
 		// Encoders that can't take 22.05 kHz get resampled audio
 		expect(result.codec).toBe('aac');
@@ -381,7 +420,7 @@ const defineAacEncodingTests = () => {
 };
 
 // Runs where the browser itself can encode AAC (Windows, macOS)
-describe.runIf(nativeAacEncoding)('Native AAC encoding', () => {
+describe.runIf(nativeAacEncoding && nativeAacTimestampsAdvance)('Native AAC encoding', () => {
 	defineAacEncodingTests();
 });
 
