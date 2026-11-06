@@ -473,3 +473,66 @@ describe('AudioSample from AudioBuffer, format helpers and timestamp setters', (
 		expect(() => video.setDuration(Infinity)).toThrow(TypeError);
 	});
 });
+
+describe('AudioSampleSink iterator lifecycle', () => {
+	// 100 blocks of 10 ms of 8 kHz mono 16-bit PCM
+	const bytes = mkvFile({
+		trackEntries: [ebml(
+			EBMLId.TrackEntry,
+			ebmlUint(EBMLId.TrackNumber, 1),
+			ebmlUint(EBMLId.TrackUID, 1),
+			ebmlUint(EBMLId.TrackType, 2),
+			ebmlString(EBMLId.CodecID, 'A_PCM/INT/LIT'),
+			ebml(
+				EBMLId.Audio,
+				ebmlFloat(EBMLId.SamplingFrequency, 8000),
+				ebmlUint(EBMLId.Channels, 1),
+				ebmlUint(EBMLId.BitDepth, 16),
+			),
+		)],
+		rest: [ebml(
+			EBMLId.Cluster,
+			ebmlUint(EBMLId.Timestamp, 0),
+			...Array.from({ length: 100 }, (_, i) => ebml(
+				EBMLId.SimpleBlock,
+				mkvSimpleBlock(1, i * 10, 0x80, new Array(160).fill(i)),
+			)),
+		)],
+	});
+
+	test('return() ends an iteration early, and later iterations start afresh', async () => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const sink = new AudioSampleSink((await input.getPrimaryAudioTrack())!);
+
+		const samples = sink.samples();
+		(await samples.next()).value!.close();
+		expect(await samples.return(undefined)).toEqual({ done: true, value: undefined });
+		expect(await samples.next()).toEqual({ done: true, value: undefined });
+
+		const atTimestamps = sink.samplesAtTimestamps([0.5, 0.2, 0.9]);
+		const first = (await atTimestamps.next()).value!;
+		expect(first.timestamp).toBe(0.5);
+		first.close();
+		expect(await atTimestamps.return(undefined)).toEqual({ done: true, value: undefined });
+		expect(await atTimestamps.next()).toEqual({ done: true, value: undefined });
+
+		// A slow consumer gets every sample, in order
+		const timestamps: number[] = [];
+		for await (const sample of sink.samples()) {
+			await new Promise(resolve => setTimeout(resolve, 0));
+			timestamps.push(Math.round(sample.timestamp * 1000));
+			sample.close();
+		}
+		expect(timestamps).toEqual(Array.from({ length: 100 }, (_, i) => i * 10));
+	});
+
+	test('disposing the input fails pending and later reads', async () => {
+		const input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const sink = new AudioSampleSink((await input.getPrimaryAudioTrack())!);
+		const samples = sink.samples();
+		(await samples.next()).value!.close();
+		input.dispose();
+		await expect(samples.next()).rejects.toThrow('Input has been disposed.');
+		await expect(sink.getSample(0.5)).rejects.toThrow('Input has been disposed.');
+	});
+});
