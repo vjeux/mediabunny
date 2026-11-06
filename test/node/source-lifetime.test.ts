@@ -146,3 +146,15 @@ test('CustomSource releases stream readers after read errors', async () => {
 	await expect(input.getFormat()).rejects.toBe(error);
 	expect(stream.locked).toBe(false);
 });
+
+test('CustomSource rejects falsy prefetchProfile values it cannot use', async () => {
+	for (const prefetchProfile of ['', false, 0, null]) {
+		expect(() => new CustomSource({
+			getSize: () => 1024,
+			read: (start, end) => new Uint8Array(end - start),
+			prefetchProfile: prefetchProfile as never,
+		})).toThrow(new TypeError(
+			'options.prefetchProfile, when provided, must be one of \'none\', \'fileSystem\' or \'network\'.',
+		));
+	}
+});
