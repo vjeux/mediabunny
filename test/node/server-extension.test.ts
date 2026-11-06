@@ -1519,10 +1519,13 @@ describe('Video', async () => {
 		};
 		await decoder.init();
 
-		const iterations = 300;
+		// The encoder holds frames in its lookahead and in its frame threads, whose count grows with the CPU count, so
+		// memory keeps growing until well after the first packet comes out. Only measure from there.
+		let packetCount = 0;
+		let baselineIteration: number | null = null;
 		let baselineRss = 0;
 
-		for (let i = 1; i <= iterations; i++) {
+		for (let i = 1; baselineIteration === null || i <= baselineIteration + 200; i++) {
 			await decoder.decode(sourcePacket.clone({ timestamp: i / 30 }));
 
 			for (const frame of decodedFrames) {
@@ -1530,9 +1533,11 @@ describe('Video', async () => {
 				frame.close();
 			}
 			decodedFrames.length = 0;
+			packetCount += pendingPackets.length;
 			pendingPackets.length = 0;
 
-			if (i === 100) { // Should have stabilized by then
+			if (baselineIteration === null && packetCount >= 150) {
+				baselineIteration = i;
 				baselineRss = process.memoryUsage().rss;
 			}
 		}
