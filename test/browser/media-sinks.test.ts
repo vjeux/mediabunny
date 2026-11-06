@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { assert, promiseWithResolvers } from '../../src/misc.js';
+import { assert, promiseWithResolvers, clamp } from '../../src/misc.js';
 import { AudioBufferSink, AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
@@ -684,5 +684,35 @@ test('Empty sample ranges yield nothing', async () => {
 		}
 
 		expect(timestamps).toEqual([]);
+	}
+});
+
+test('Seeking into open-GOP H.264 returns the right frames', async () => {
+	// One IDR, then I-frames with recovery point SEIs whose leading B-frames reference the previous GOP. The luma of
+	// each frame encodes its index:
+	// ffmpeg -f lavfi -i "nullsrc=s=64x64:r=30:d=2.5,geq=lum='mod(N\,16)*16+8':cb=128:cr=128,format=yuv420p" \
+	//   -c:v libx264 -preset fast -bf 2 -x264-params "open-gop=1:keyint=30:min-keyint=30:scenecut=0" \
+	//   -movflags +faststart open-gop-h264.mp4
+	// ffmpeg -i open-gop-h264.mp4 -c copy open-gop-h264.ts
+	const context = new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true })!;
+
+	for (const file of ['open-gop-h264.mp4', 'open-gop-h264.ts']) {
+		using input = new Input({ source: new UrlSource(`/${file}`), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const firstTimestamp = await track.getFirstTimestamp();
+		const sink = new VideoSampleSink(track);
+
+		for (const frame of [29, 30, 31, 32, 45, 59, 61]) {
+			const sample = await sink.getSample(firstTimestamp + (frame + 0.5) / 30);
+			expect(sample, `${file} frame ${frame}`).not.toBeNull();
+			assert(sample);
+			expect(Math.round((sample.timestamp - firstTimestamp) * 30), `${file} frame ${frame}`).toBe(frame);
+
+			sample.draw(context, 0, 0, 1, 1);
+			sample.close();
+			const expectedGray = clamp(Math.round(((frame % 16) * 16 + 8 - 16) * 255 / 219), 0, 255);
+			const gray = context.getImageData(0, 0, 1, 1).data[1]!;
+			expect(Math.abs(gray - expectedGray), `${file} frame ${frame}`).toBeLessThan(6);
+		}
 	}
 });
