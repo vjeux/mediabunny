@@ -8,6 +8,8 @@ import { promiseWithResolvers } from '../../src/misc.js';
 import { FileHandle, open, readFile, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { Reader } from '../../src/reader.js';
+import fs from 'node:fs';
+import ts from 'typescript';
 import { setImmediate } from 'node:timers/promises';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Logging } from '../../src/logging.js';
@@ -281,3 +283,43 @@ test('A throwing CustomSource dispose callback does not stop the rest of the inp
 		unsubscribe();
 	}
 });
+
+test('Declarations of the disposable classes compile without TypeScript\'s esnext lib', () => {
+	// Emits the declaration files the package ships and type-checks a consumer against them with skipLibCheck off and
+	// the ES2022 lib, which has no Disposable or Symbol.dispose
+	const outDir = path.join(__dirname, '../../node_modules/.cache/mediabunny-disposable-declarations-test');
+	fs.rmSync(outDir, { recursive: true, force: true });
+	const config = ts.getParsedCommandLineOfConfigFile(path.join(__dirname, '../../src/tsconfig.json'), {}, {
+		...ts.sys,
+		onUnRecoverableConfigFileDiagnostic: () => {},
+	})!;
+	ts.createProgram({
+		rootNames: [path.join(__dirname, '../../src/index.ts')],
+		options: {
+			...config.options, outDir, noCheck: true, emitDeclarationOnly: true, composite: false, incremental: false,
+		},
+	}).emit();
+
+	const consumerFile = path.join(outDir, 'consumer.ts');
+	fs.writeFileSync(consumerFile, [
+		`import { Input, SourceRef, VideoSample, AudioSample } from './src/index.js';`,
+		'export const used = [Input, SourceRef, VideoSample, AudioSample];',
+	].join('\n'));
+	const consumer = ts.createProgram({
+		rootNames: [consumerFile],
+		options: {
+			target: ts.ScriptTarget.ES2022,
+			module: ts.ModuleKind.ESNext,
+			moduleResolution: ts.ModuleResolutionKind.Bundler,
+			lib: ['lib.es2022.d.ts', 'lib.dom.d.ts'],
+			types: [],
+			strict: true,
+			skipLibCheck: false,
+			noEmit: true,
+		},
+	});
+	const errorsInOwnDeclarations = ts.getPreEmitDiagnostics(consumer)
+		.filter(diagnostic => diagnostic.file?.fileName.startsWith(path.join(outDir, 'src')))
+		.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, ' '));
+	expect(errorsInOwnDeclarations).toEqual([]);
+}, 60_000);
