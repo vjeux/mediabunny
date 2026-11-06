@@ -1196,3 +1196,35 @@ test('VP9 and AV1 codec strings whose fields do not fit vpcC or av1C are rejecte
 	const av1cOffset = Buffer.from(av1c).indexOf('av1C') + 4;
 	expect([...av1c.subarray(av1cOffset, av1cOffset + 3)]).toEqual([0x81, 0x1f, 0x4e]); // Profile 0, level 31, 10-bit
 });
+
+test('esds ES_Descriptor is written with ES_ID 0', async () => {
+	const target = new BufferTarget();
+	const output = new Output({ target, format: new Mp4OutputFormat() });
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 1024 / 48000), {
+		decoderConfig: {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 2,
+			sampleRate: 48000,
+			description: new Uint8Array([0x11, 0x90]),
+		},
+	});
+	await output.finalize();
+
+	const bytes = new Uint8Array(target.buffer!);
+	const esdsPos = String.fromCharCode(...bytes).indexOf('esds');
+	expect(esdsPos).toBeGreaterThan(0);
+
+	// After the FullBox header comes the ES_Descriptor: tag 3, an expandable length, then ES_ID (CMAF 10.3.4.2.3
+	// requires 0; ISO/IEC 14496-14 stores 0 in files)
+	let pos = esdsPos + 8;
+	expect(bytes[pos++]).toBe(0x03);
+	while (bytes[pos]! & 0x80) {
+		pos++;
+	}
+	pos++;
+	expect((bytes[pos]! << 8) | bytes[pos + 1]!).toBe(0);
+});
