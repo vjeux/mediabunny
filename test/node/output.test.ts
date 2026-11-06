@@ -426,3 +426,22 @@ test('Muxers keep the parameter sets of a mid-stream AVC decoder config change',
 		}
 	}
 });
+
+test('Opus with more than two channels needs a decoder description', async () => {
+	const addFirstPacket = async (numberOfChannels: number) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array([0xfc, 0xff, 0xfe]), 'key', 0, 0.02), {
+			decoderConfig: { codec: 'opus', numberOfChannels, sampleRate: 48000 },
+		});
+		await output.finalize();
+	};
+
+	// Without a description, channel mapping family 0 applies, which only covers mono and stereo. Six channels used to
+	// be written as a dOps box with mapping family 0 (FFmpeg: "Channel mapping 0 is only specified for up to 2
+	// channels"), and as a Matroska track without CodecPrivate, which readers take for stereo.
+	await expect(addFirstPacket(6)).rejects.toThrow(TypeError);
+	await addFirstPacket(2);
+});
