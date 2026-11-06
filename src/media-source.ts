@@ -1713,7 +1713,8 @@ export class CanvasSource extends VideoSource {
 export type MediaStreamVideoTrackSourceOptions = {
 	/**
 	 * The frame rate at which the underlying video track is sampled. Defaults to the frame rate specified in the
-	 * track's [`MediaTrackSettings`](https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackSettings). Set to
+	 * track's [`MediaTrackSettings`](https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackSettings), or to
+	 * `null` if the track reports none or a frame rate of 0 (like `captureStream(0)` canvas tracks). Set to
 	 * `null` to only add a frame whenever the underlying track pushes one - this minimizes frame count but can
 	 * lead to wildly irregular FPS.
 	 */
@@ -1833,9 +1834,17 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 			);
 		}
 
-		const frameRate = this._options.frameRate !== undefined
-			? this._options.frameRate
-			: (this._track.getSettings().frameRate ?? null);
+		let frameRate: number | null;
+		if (this._options.frameRate !== undefined) {
+			frameRate = this._options.frameRate;
+		} else {
+			// Tracks can report a frame rate of 0, like canvas capture tracks created with captureStream(0), which only
+			// emit frames when requestFrame() is called. There's no rate to sample at, so take the frames as they come.
+			const settingsFrameRate = this._track.getSettings().frameRate;
+			frameRate = settingsFrameRate !== undefined && Number.isFinite(settingsFrameRate) && settingsFrameRate > 0
+				? settingsFrameRate
+				: null;
+		}
 
 		this._abortController = new AbortController();
 
