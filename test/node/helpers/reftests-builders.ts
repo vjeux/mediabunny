@@ -237,3 +237,121 @@ export const esds = (options: {
 	const slConfig = descriptor(6, new Uint8Array([2]));
 	return fullBox('esds', 0, 0, descriptor(3, concatBytes(u16(1), [0], decoderConfig, slConfig)));
 };
+
+// Matroska/WebM
+
+/** An EBML variable-length integer of the smallest length that holds the value (element sizes, track numbers). */
+export const ebmlVint = (value: number) => {
+	let length = 1;
+	while (value >= 2 ** (7 * length) - 1) {
+		length++;
+	}
+	const bytes: number[] = [];
+	let rest = value;
+	for (let i = 0; i < length; i++) {
+		bytes.unshift(rest % 256);
+		rest = Math.floor(rest / 256);
+	}
+	bytes[0]! |= 1 << (8 - length);
+	return bytes;
+};
+
+/** Element IDs include their own length marker, so they're written as plain big-endian bytes. */
+const ebmlIdBytes = (id: number) => {
+	const bytes: number[] = [];
+	let rest = id;
+	while (rest > 0) {
+		bytes.unshift(rest % 256);
+		rest = Math.floor(rest / 256);
+	}
+	return bytes;
+};
+
+export const ebml = (id: number, ...contents: (Uint8Array | number[])[]) => {
+	const payload = concatBytes(...contents);
+	return concatBytes(ebmlIdBytes(id), ebmlVint(payload.length), payload);
+};
+
+/** An element whose size field has all value bits set, meaning "unknown size". */
+export const ebmlUnknownSize = (id: number, sizeLength: number, ...contents: (Uint8Array | number[])[]) => {
+	const size = new Array<number>(sizeLength).fill(0xff);
+	size[0] = 0xff >> (sizeLength - 1);
+	return concatBytes(ebmlIdBytes(id), size, ...contents);
+};
+
+export const ebmlUint = (id: number, value: number) => {
+	const bytes: number[] = [];
+	let rest = value;
+	do {
+		bytes.unshift(rest % 256);
+		rest = Math.floor(rest / 256);
+	} while (rest > 0);
+	return ebml(id, bytes);
+};
+
+export const ebmlFloat = (id: number, value: number) => {
+	const bytes = new Uint8Array(8);
+	new DataView(bytes.buffer).setFloat64(0, value);
+	return ebml(id, bytes);
+};
+
+export const EBML = {
+	Header: 0x1a45dfa3, DocType: 0x4282, Segment: 0x18538067, Info: 0x1549a966, TimestampScale: 0x2ad7b1,
+	Tracks: 0x1654ae6b, TrackEntry: 0xae, TrackNumber: 0xd7, TrackUID: 0x73c5, TrackType: 0x83, CodecID: 0x86,
+	CodecPrivate: 0x63a2, DefaultDuration: 0x23e383, Video: 0xe0, PixelWidth: 0xb0, PixelHeight: 0xba, Audio: 0xe1,
+	SamplingFrequency: 0xb5, Channels: 0x9f, BitDepth: 0x6264, Cluster: 0x1f43b675, Timestamp: 0xe7,
+	SimpleBlock: 0xa3, BlockGroup: 0xa0, Block: 0xa1, BlockDuration: 0x9b, ReferenceBlock: 0xfb, Void: 0xec,
+	Crc32: 0xbf,
+} as const;
+
+/** The payload of a SimpleBlock or Block: track number, timestamp relative to the cluster, flags, frame. */
+export const blockPayload = (trackNumber: number, relativeTimestamp: number, flags: number, frame: number[]) => {
+	return concatBytes(ebmlVint(trackNumber), [(relativeTimestamp >> 8) & 0xff, relativeTimestamp & 0xff, flags], frame);
+};
+
+/** A 16x16 VP8 key frame header, or a delta frame header, followed by a filler byte. */
+export const vp8Frame = (key: boolean) => key
+	? [0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00, 0x00]
+	: [0x11, 0x02, 0x00, 0x00];
+
+export const webmVideoTrack = (trackNumber: number, ...extra: Uint8Array[]) => ebml(
+	EBML.TrackEntry,
+	ebmlUint(EBML.TrackNumber, trackNumber),
+	ebmlUint(EBML.TrackUID, trackNumber),
+	ebmlUint(EBML.TrackType, 1),
+	ebml(EBML.CodecID, ascii('V_VP8')),
+	ebml(EBML.Video, ebmlUint(EBML.PixelWidth, 16), ebmlUint(EBML.PixelHeight, 16)),
+	...extra,
+);
+
+/** 16-bit mono PCM at 48 kHz. */
+export const webmAudioTrack = (trackNumber: number, ...extra: Uint8Array[]) => ebml(
+	EBML.TrackEntry,
+	ebmlUint(EBML.TrackNumber, trackNumber),
+	ebmlUint(EBML.TrackUID, trackNumber),
+	ebmlUint(EBML.TrackType, 2),
+	ebml(EBML.CodecID, ascii('A_PCM/INT/LIT')),
+	ebml(EBML.Audio, ebmlFloat(EBML.SamplingFrequency, 48000), ebmlUint(EBML.Channels, 1),
+		ebmlUint(EBML.BitDepth, 16)),
+	...extra,
+);
+
+/** A WebM file with a millisecond timestamp scale: EBML header, then a Segment holding Info, Tracks and the rest. */
+export const buildWebm = (options: { docType?: string; tracks: Uint8Array[]; body: Uint8Array[] }) => concatBytes(
+	ebml(
+		EBML.Header,
+		ebmlUint(0x4286, 1), // EBMLVersion
+		ebmlUint(0x42f7, 1), // EBMLReadVersion
+		ebmlUint(0x42f2, 4), // EBMLMaxIDLength
+		ebmlUint(0x42f3, 8), // EBMLMaxSizeLength
+		ebml(EBML.DocType, ascii(options.docType ?? 'webm')),
+		ebmlUint(0x4287, 4), // DocTypeVersion
+		ebmlUint(0x4285, 2), // DocTypeReadVersion
+	),
+	ebml(
+		EBML.Segment,
+		ebml(EBML.Info, ebmlUint(EBML.TimestampScale, 1_000_000), ebml(0x4d80, ascii('ref')), ebml(0x5741, ascii('ref'))),
+		ebml(EBML.Tracks, ...options.tracks),
+		...options.body,
+	),
+);
