@@ -2022,6 +2022,10 @@ export const registerVideoSampleTransformer = (
 		description: VideoSampleTransformationDescription,
 	) => MaybePromise<VideoSample | null>,
 ) => {
+	if (typeof transformer !== 'function') {
+		throw new TypeError('transformer must be a function.');
+	}
+
 	if (registeredVideoSampleTransformers.includes(transformer)) {
 		return; // Already in there
 	}
