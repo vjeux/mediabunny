@@ -4852,15 +4852,18 @@ const decryptCbcs = (
 		return output;
 	}
 
-	if (cryptByteBlock === 0 && skipByteBlock === 0) {
-		throw new Error('cbcs with subsamples requires pattern encryption.');
-	}
-
 	const output = new Uint8Array(data);
 
 	// Pattern decryption: IV is reset at the start of each subsample. Within a subsample, the CBC chain continues
 	// across skipped blocks (the IV after a crypt group carries over to the next crypt group's first block).
-	const cryptRanges = collectCryptRanges(sampleEncryption.subsamples, cryptByteBlock, skipByteBlock, data.length);
+	// The pattern 0:0 encrypts every complete block, like 1:0 (as in Chromium and Shaka Packager)
+	const encryptsAllBlocks = cryptByteBlock === 0 && skipByteBlock === 0;
+	const cryptRanges = collectCryptRanges(
+		sampleEncryption.subsamples,
+		encryptsAllBlocks ? 1 : cryptByteBlock,
+		encryptsAllBlocks ? 0 : skipByteBlock,
+		data.length,
+	);
 	const ivView = new DataView(sampleEncryption.iv.buffer, sampleEncryption.iv.byteOffset, 16);
 
 	for (const range of cryptRanges) {
