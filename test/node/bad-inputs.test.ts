@@ -1981,12 +1981,46 @@ test('WAV: Block alignment not matching the channel count', async () => {
 	await expectGracefulDecode(wav([fmtChunk({ channels: 3, blockAlign: 4 }), dataChunk()]));
 });
 
+test('WAV: Block alignment not matching the sample size', async () => {
+	// The duration and timestamps used to go by the block alignment, while the samples are decoded by their bit depth.
+	// A block alignment too small for the samples, or one the byte rate disagrees with, is now overruled.
+	const readTimeline = async (fmt: Bytes) => {
+		using input = new Input({ source: new BufferSource(wav([fmt, dataChunk()])), formats: ALL_FORMATS });
+		const duration = await input.computeDuration();
+
+		let frameCount = 0;
+		for await (const sample of new AudioSampleSink((await input.getAudioTracks())[0]!).samples()) {
+			expect(Math.round(sample.timestamp * 44100)).toBe(frameCount);
+			frameCount += sample.numberOfFrames;
+			sample.close();
+		}
+		return { duration, frameCount };
+	};
+
+	expect(await readTimeline(fmtChunk({ blockAlign: 2 }))).toEqual({ duration: 1, frameCount: 44100 });
+	expect(await readTimeline(fmtChunk({ blockAlign: 8, bytesPerSecond: 44100 * 4 })))
+		.toEqual({ duration: 1, frameCount: 44100 });
+
+	// A larger block alignment that the byte rate agrees with is kept, like for 24-bit samples in 4-byte containers
+	using input = new Input({
+		source: new BufferSource(wav([fmtChunk({ bitsPerSample: 24, blockAlign: 8 }), dataChunk()])),
+		formats: ALL_FORMATS,
+	});
+	expect(await input.computeDuration()).toBe(0.5);
+});
+
 const wav = (chunks: Bytes[], riffType = 'RIFF') => {
 	const body = concatList(chunks);
 	return concat(ascii(riffType), u32le(4 + body.length), ascii('WAVE'), body);
 };
 
-const fmtChunk = (options: { channels?: number; sampleRate?: number; blockAlign?: number } = {}) => {
+const fmtChunk = (options: {
+	channels?: number;
+	sampleRate?: number;
+	blockAlign?: number;
+	bytesPerSecond?: number;
+	bitsPerSample?: number;
+} = {}) => {
 	const channels = options.channels ?? 2;
 	const sampleRate = options.sampleRate ?? 44100;
 	const blockAlign = options.blockAlign ?? 4;
@@ -1995,9 +2029,9 @@ const fmtChunk = (options: { channels?: number; sampleRate?: number; blockAlign?
 		u16le(1),
 		u16le(channels),
 		u32le(sampleRate),
-		u32le(sampleRate * blockAlign),
+		u32le(options.bytesPerSecond ?? sampleRate * blockAlign),
 		u16le(blockAlign),
-		u16le(16),
+		u16le(options.bitsPerSample ?? 16),
 	));
 };
 
