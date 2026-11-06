@@ -7,7 +7,8 @@ import { BufferTarget } from '../../src/target.js';
 import { canEncode, Quality } from '../../src/encode.js';
 import { AudioSampleSource } from '../../src/media-source.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WavOutputFormat } from '../../src/output-format.js';
+import { Conversion, ConversionAudioOptions } from '../../src/conversion.js';
 import { AudioSample } from '../../src/sample.js';
 import { registerAacEncoder } from '@mediabunny/aac-encoder';
 import { assert } from '../../src/misc.js';
@@ -182,4 +183,42 @@ test('AAC encoding finishes for a tone after silence at 192 kbps per channel', {
 	const track = (await input.getPrimaryAudioTrack())!;
 	expect(await track.getCodec()).toBe('aac');
 	expect(await track.computeDuration()).toBeCloseTo(1, 1);
+});
+
+test('Conversion falls back to the closest encodable audio parameters', async () => {
+	registerAacEncoder();
+
+	// AAC has no 192 kHz, so only the sample rate needs a fallback
+	const createWav = async (numberOfChannels: number) => {
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'pcm-s16' });
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new AudioSample({
+			data: createSineWave(192000, numberOfChannels, 0.1),
+			format: 'f32',
+			numberOfChannels,
+			sampleRate: 192000,
+			timestamp: 0,
+		}));
+		await output.finalize();
+		return output.target.buffer!;
+	};
+
+	const convert = async (buffer: ArrayBuffer, audio: ConversionAudioOptions) => {
+		using input = new Input({ source: new BufferSource(buffer), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, audio });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryAudioTrack();
+		assert(track);
+		return [await track.getCodec(), await track.getNumberOfChannels(), await track.getSampleRate()];
+	};
+
+	// 5.1 stays 5.1 instead of being downmixed to stereo
+	expect(await convert(await createWav(6), { codec: 'aac' })).toEqual(['aac', 6, 48000]);
+	// An explicitly requested channel count is kept
+	expect(await convert(await createWav(2), { codec: 'aac', numberOfChannels: 1 })).toEqual(['aac', 1, 48000]);
 });
