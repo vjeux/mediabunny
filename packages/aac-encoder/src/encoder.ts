@@ -158,6 +158,15 @@ class AacEncoder extends CustomAudioEncoder {
 		audioSample.copyTo(audioBytes, { format: 'f32', planeIndex: 0 });
 		const incomingData = new Float32Array(audioBytes.buffer);
 
+		// FFmpeg's encoder rejects a whole frame if it holds a NaN or infinite sample, so map those like the conversion
+		// to integer samples does: NaN to silence, infinities to full scale
+		for (let i = 0; i < incomingData.length; i++) {
+			const value = incomingData[i]!;
+			if (!Number.isFinite(value)) {
+				incomingData[i] = Number.isNaN(value) ? 0 : Math.sign(value);
+			}
+		}
+
 		const requiredSamples = (this.pendingFrames + incomingFrames) * channels;
 		if (requiredSamples > this.pendingBuffer.length) {
 			let newSize = this.pendingBuffer.length;
