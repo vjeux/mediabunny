@@ -787,10 +787,11 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 	}
 
 	const expectedPackets = timestamps.map(timestamp => ({ timestamp, duration }));
+	// Sorted, since encoders with B-frames (like Firefox's H.264 encoder) emit them in decode order
 	expect(outputPackets.map(packet => ({
 		timestamp: packet.timestamp,
 		duration: packet.duration,
-	}))).toEqual(expectedPackets);
+	})).sort((a, b) => a.timestamp - b.timestamp)).toEqual(expectedPackets);
 
 	for (const expectedPacket of expectedPackets) {
 		const outputPacket = await sink.getPacket(expectedPacket.timestamp);
