@@ -2060,6 +2060,7 @@ export class IsobmffDemuxer extends Demuxer {
 					?.sequenceParameterSets[0];
 				const spsInfo = sps && parseAvcSps(sps);
 				if (spsInfo) {
+					applySpsDimensions(track, spsInfo.displayWidth, spsInfo.displayHeight);
 					applySpsPixelAspectRatio(track, spsInfo.pixelAspectRatio);
 				}
 			}; break;
@@ -2081,6 +2082,7 @@ export class IsobmffDemuxer extends Demuxer {
 					?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
 				const spsInfo = sps && parseHevcSps(sps);
 				if (spsInfo) {
+					applySpsDimensions(track, spsInfo.displayWidth, spsInfo.displayHeight);
 					applySpsPixelAspectRatio(track, spsInfo.pixelAspectRatio);
 				}
 			}; break;
@@ -4919,6 +4921,22 @@ const readMatrix = (slice: FileSlice): TransformationMatrix => {
 		readFixed_16_16(slice),
 		readFixed_2_30(slice),
 	];
+};
+
+/**
+ * Takes the dimensions from the SPS when the sample entry leaves them at 0, as some writers do. FFmpeg also uses the
+ * dimensions of the parameter sets.
+ */
+const applySpsDimensions = (track: InternalTrack, width: number, height: number) => {
+	const info = track.info!;
+	if (info.type !== 'video' || (info.width > 0 && info.height > 0) || !(width > 0 && height > 0)) {
+		return;
+	}
+
+	info.width = width;
+	info.height = height;
+	info.squarePixelWidth = width;
+	info.squarePixelHeight = height;
 };
 
 const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Rational) => {
