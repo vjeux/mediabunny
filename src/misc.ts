@@ -1276,6 +1276,18 @@ export const uint8ArraysAreEqual = (a: Uint8Array, b: Uint8Array) => {
 	return true;
 };
 
+// The explicit resource management types the public declarations use (as @types/node declares them), so that they
+// compile without TypeScript's esnext.disposable lib
+declare global {
+	interface SymbolConstructor {
+		readonly dispose: unique symbol;
+	}
+
+	interface Disposable {
+		[Symbol.dispose](): void;
+	}
+}
+
 export const polyfillSymbolDispose = () => {
 	// https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-2.html
 	// @ts-expect-error Readonly
