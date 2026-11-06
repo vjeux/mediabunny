@@ -628,3 +628,35 @@ test('Treat non-standard VideoFrame color space values as unknown', () => {
 	expect(sample.colorSpace.matrix).toBe('smpte170m');
 	expect(sample.colorSpace.fullRange).toBe(true);
 });
+
+test('init visibleRect and display size refine a wrapped VideoFrame', () => {
+	using source = makeCoordinateSample({});
+
+	using cropped = new VideoSample(source.toVideoFrame(), { visibleRect: { left: 2, top: 0, width: 2, height: 4 } });
+	expect(cropped.visibleRect).toEqual({ left: 2, top: 0, width: 2, height: 4 });
+	expect([cropped.displayWidth, cropped.displayHeight]).toEqual([2, 4]);
+	const pixels = drawToPixels(cropped, 2, 4);
+	expect(pixelAt(pixels, 2, 0, 0)).toEqual([2, 0]);
+	expect(pixelAt(pixels, 2, 1, 3)).toEqual([3, 3]);
+
+	using stretched = new VideoSample(source.toVideoFrame(), { displayWidth: 8, displayHeight: 4 });
+	expect([stretched.displayWidth, stretched.displayHeight]).toEqual([8, 4]);
+	expect(stretched.pixelAspectRatio).toEqual({ num: 2, den: 1 });
+
+	// Like for ArrayBuffer-backed samples, the display size is the one after rotation
+	using rotated = new VideoSample(source.toVideoFrame(), { rotation: 90, displayWidth: 4, displayHeight: 8 });
+	expect([rotated.squarePixelWidth, rotated.squarePixelHeight]).toEqual([8, 4]);
+
+	// Image sources get cropped only once
+	const canvas = new OffscreenCanvas(4, 4);
+	source.draw(canvas.getContext('2d')!, 0, 0);
+	using fromCanvas = new VideoSample(canvas, {
+		timestamp: 0,
+		visibleRect: { left: 2, top: 2, width: 2, height: 2 },
+		displayWidth: 4,
+		displayHeight: 2,
+	});
+	expect([fromCanvas.codedWidth, fromCanvas.codedHeight]).toEqual([2, 2]);
+	expect([fromCanvas.displayWidth, fromCanvas.displayHeight]).toEqual([4, 2]);
+	expect(pixelAt(drawToPixels(fromCanvas, 4, 2), 4, 0, 0)).toEqual([2, 2]);
+});
