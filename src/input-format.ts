@@ -361,7 +361,9 @@ export class Mp3InputFormat extends InputFormat {
 		// MPEG program streams (like VOB files) hold runs of MPEG audio frames in their packets, which the search below
 		// would find. They start with a pack header, which an MP3 file doesn't.
 		let packHeaderSlice = input._reader.requestSlice(currentPos, 5);
-		if (isThenable(packHeaderSlice)) packHeaderSlice = await packHeaderSlice;
+		if (isThenable(packHeaderSlice)) {
+			packHeaderSlice = await packHeaderSlice;
+		}
 		if (packHeaderSlice && isMpegPackHeader(readBytes(packHeaderSlice, 5))) {
 			return false;
 		}

@@ -98,7 +98,9 @@ export const readFirstMp3FrameHeader = async (
 			result.startPos + getXingOffset(firstHeader.mpegVersionId, firstHeader.channel),
 			4,
 		);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		if (slice) {
 			const word = readU32Be(slice);
 			if (word === XING || word === INFO) {
@@ -113,7 +115,9 @@ export const readFirstMp3FrameHeader = async (
 
 		while (!runIsLongEnough() && nextPos !== reader.fileSize) {
 			slice = reader.requestSlice(nextPos, MP3_FRAME_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			if (!slice) {
 				break;
 			}
