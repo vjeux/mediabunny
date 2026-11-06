@@ -10,6 +10,7 @@ import { CanvasSource, VideoSampleSource } from '../../src/media-source.js';
 import { canEncodeVideo, Quality } from '../../src/encode.js';
 import { VideoSample } from '../../src/sample.js';
 import { Conversion } from '../../src/conversion.js';
+import { isFirefox } from '../../src/misc.js';
 
 const decodeTransparentVideoTest = async () => {
 	using input = new Input({
@@ -386,7 +387,9 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	expect(sample.hasAlpha).toBe(true);
 });
 
-test('Encoding planar YUV frames with alpha keeps their color space', async () => {
+// Firefox's encoder always reports BT.709 limited range, whatever it encodes:
+// https://bugzilla.mozilla.org/show_bug.cgi?id=2056028
+test.skipIf(isFirefox())('Encoding planar YUV frames with alpha keeps their color space', async () => {
 	// BT.601 full-range I420A frames, which take the CPU color/alpha splitting path
 	const width = 64;
 	const height = 64;
