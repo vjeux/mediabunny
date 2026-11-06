@@ -643,6 +643,15 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 					const nextSegmentStart = nextSegment.timestamp
 						+ (this.segmentedInput.learnedSegmentTimestampOffset ?? 0);
 					mayLieInNextSegment = timestampTick >= Math.round(nextSegmentStart * timeResolution) - 1;
+
+					if (!mayLieInNextSegment && !keyframesOnly && track.isVideoTrack()) {
+						// Leading frames of an open GOP in the next segment are shown right after this segment's last
+						// frame, possibly well before the next segment starts, and the last frame's duration can cover
+						// them. So if the packet is the segment's last frame, the next segment may hold a packet closer
+						// to the timestamp.
+						const lastTimestamp = await this.getLastPacketTimestamp(track);
+						mayLieInNextSegment = lastTimestamp !== null && packet.timestamp >= lastTimestamp;
+					}
 				}
 			}
 
@@ -660,6 +669,20 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		}
 
 		return null;
+	}
+
+	/** The timestamp of the last packet in presentation order of each segment track, computed once per track. */
+	lastPacketTimestamps = new WeakMap<InputTrack, Promise<number | null>>();
+
+	getLastPacketTimestamp(track: InputTrack) {
+		let promise = this.lastPacketTimestamps.get(track);
+		if (!promise) {
+			promise = track._backing.getPacket(Infinity, { metadataOnly: true })
+				.then(packet => packet?.timestamp ?? null);
+			this.lastPacketTimestamps.set(track, promise);
+		}
+
+		return promise;
 	}
 
 	/**

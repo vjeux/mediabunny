@@ -1750,6 +1750,35 @@ test.concurrent('Packets at segment boundaries can be looked up when the last pa
 	expect(count).toBe(12);
 });
 
+test.concurrent('Leading frames of an open GOP can be looked up when the previous segment\'s last frame covers them', async () => {
+	// 24 fps. Each segment after the first starts with a key frame followed (in decode order) by a leading frame shown
+	// 1/24 s before it, and the previous segment's last frame claims 0.2 s, covering that leading frame's timestamp.
+	const fps = 24;
+	const video: { timestamp: number; duration: number; type: 'key' | 'delta' }[] = [];
+	for (let start = 0; start < 72; start += 24) {
+		video.push({ timestamp: start / fps, duration: 1 / fps, type: 'key' });
+		if (start > 0) {
+			video.push({ timestamp: (start - 1) / fps, duration: 1 / fps, type: 'delta' });
+		}
+		for (let frame = start + 1; frame < start + 23; frame++) {
+			video.push({ timestamp: frame / fps, duration: frame === start + 22 ? 0.2 : 1 / fps, type: 'delta' });
+		}
+	}
+
+	using input = await writeHlsFromPackets(new CmafOutputFormat(), video, []);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	let count = 0;
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		count++;
+	}
+	expect(count).toBe(video.length);
+	expect((await sink.getPacket(23 / fps))?.timestamp).toBe(23 / fps);
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
