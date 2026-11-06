@@ -1541,7 +1541,7 @@ test('Ogg: Page chain jumping over the page found by bisection', async () => {
 	const hiddenPage = oggPage({
 		headerType: 1,
 		granule: 960,
-		sequence: 3,
+		sequence: 9, // Out of sequence, so that it can't pass for a real page in the chain
 		lacing: [255, 255, 255, 15],
 		data: zeros(780),
 	});
@@ -1555,8 +1555,7 @@ test('Ogg: Page chain jumping over the page found by bisection', async () => {
 		zeros(100),
 	);
 
-	// The duration of such a file depends on which page header the lookup trusts; it just has to come back
-	expect(evaluateWithDeadline(file, 'input => input.computeDuration()')).toBeTypeOf('number');
+	expect(evaluateWithDeadline(file, 'input => input.computeDuration()')).toBeCloseTo(0.0335);
 	await expectGracefulRead(file);
 });
 
