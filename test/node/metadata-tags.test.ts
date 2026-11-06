@@ -1042,6 +1042,39 @@ test('Read ID3v2 tags from WAV file', async () => {
 	expect(tags.raw['APIC']).toBeInstanceOf(Uint8Array);
 });
 
+test('Read the ID3v2.4 release time as the date when there is no recording time, MP3', async () => {
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const textFrame = (id: string, text: string) => [...ascii(id), 0, 0, 0, text.length + 1, 0, 0, 0, ...ascii(text)];
+	const tag = (frames: number[]) => [...ascii('ID3'), 4, 0, 0, 0, 0, 0, frames.length, ...frames];
+
+	const mp3Frames = new Uint8Array(3 * 417);
+	for (let i = 0; i < 3; i++) {
+		mp3Frames.set([0xff, 0xfb, 0x90, 0x00], i * 417);
+	}
+
+	const readDate = async (...tags: number[][]) => {
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...tags.flat(), ...mp3Frames])),
+			formats: ALL_FORMATS,
+		});
+		return (await input.getMetadataTags()).date;
+	};
+
+	// As written by older FFmpeg versions
+	expect(await readDate(tag(textFrame('TDRL', '1997')))).toEqual(new Date('1997-01-01T00:00:00Z'));
+	// The recording time still wins
+	expect(await readDate(tag([...textFrame('TDRL', '1997'), ...textFrame('TDRC', '1995')])))
+		.toEqual(new Date('1995-01-01T00:00:00Z'));
+	// Even when it's in a later tag (the MP3 demuxer reads every ID3v2 tag in front of the audio)
+	expect(await readDate(tag(textFrame('TDRL', '1997')), tag(textFrame('TDRC', '1995'))))
+		.toEqual(new Date('1995-01-01T00:00:00Z'));
+	expect(await readDate(tag(textFrame('TDRL', '1997')), tag(textFrame('TYER', '1995'))))
+		.toEqual(new Date('1995-01-01T00:00:00Z'));
+	// While the first recording time still beats one in a later tag
+	expect(await readDate(tag(textFrame('TDRC', '1995')), tag(textFrame('TDRC', '1990'))))
+		.toEqual(new Date('1995-01-01T00:00:00Z'));
+});
+
 test('Write WAV with ID3 tags', async () => {
 	const output = new Output({
 		target: new BufferTarget(),
