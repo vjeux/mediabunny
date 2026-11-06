@@ -7,6 +7,7 @@ import {
 	ALL_FORMATS,
 	AdtsOutputFormat,
 	AudioSample,
+	AudioSampleSink,
 	BufferSource,
 	BufferTarget,
 	CmafOutputFormat,
@@ -41,7 +42,9 @@ import {
 	StreamTarget,
 	StreamTargetChunk,
 	Target,
+	UrlSource,
 	VideoSample,
+	VideoSampleSink,
 	WavOutputFormat,
 	WebMOutputFormat,
 	registerDecoder,
@@ -95,6 +98,13 @@ const randomDelays = async (rand: Rand, maxCount: number) => {
 	const count = Math.floor(rand() * maxCount);
 	for (let i = 0; i < count; i++) {
 		await randomDelay(rand);
+	}
+};
+
+/** Waits a bounded number of event loop turns for `condition`, for cleanup that finishes shortly after the fact. */
+const waitFor = async (condition: () => boolean) => {
+	for (let i = 0; i < 100 && !condition(); i++) {
+		await new Promise(resolve => setImmediate(resolve));
 	}
 };
 
@@ -584,6 +594,141 @@ test.each([
 	}
 });
 
+/**
+ * A fetch() serving `bytes` after seeded delays, with response bodies arriving in seeded chunks. Range requests get a
+ * 206 response unless `rangeSupport` is off, and with `failureRate`, bodies may break off midway.
+ */
+const makeRacyFetch = (bytes: Uint8Array, rand: Rand, { rangeSupport = true, failureRate = 0 } = {}) => {
+	const openBodies = new Set<ReadableStream<Uint8Array>>();
+	let requestCount = 0;
+
+	const fetchFn = async (url: string | URL | Request, init?: RequestInit) => {
+		requestCount++;
+		await randomDelay(rand);
+		const signal = init?.signal;
+		signal?.throwIfAborted();
+
+		const rangeHeader = new Headers(init?.headers).get('Range');
+		const isRangeResponse = rangeSupport && rangeHeader !== null;
+		const start = isRangeResponse ? Number(/bytes=(\d+)-/.exec(rangeHeader)![1]) : 0;
+		let position = start;
+
+		const body: ReadableStream<Uint8Array> = new ReadableStream<Uint8Array>({
+			start: (controller) => {
+				signal?.addEventListener('abort', () => {
+					if (openBodies.delete(body)) {
+						controller.error(signal.reason);
+					}
+				});
+			},
+			pull: async (controller) => {
+				await randomDelay(rand);
+				if (!openBodies.has(body)) {
+					return;
+				}
+
+				if (position >= bytes.length) {
+					openBodies.delete(body);
+					controller.close();
+				} else if (rand() < failureRate) {
+					openBodies.delete(body);
+					controller.error(new TypeError('Connection reset.'));
+				} else {
+					const size = Math.min(bytes.length - position, 16384 + Math.floor(rand() * 65536));
+					controller.enqueue(bytes.slice(position, position + size));
+					position += size;
+				}
+			},
+			cancel: () => {
+				openBodies.delete(body);
+			},
+		});
+		openBodies.add(body);
+
+		const headers = new Headers({ 'Content-Length': String(bytes.length - start) });
+		if (isRangeResponse) {
+			headers.set('Content-Range', `bytes ${start}-${bytes.length - 1}/${bytes.length}`);
+		}
+
+		return new Response(body, { status: isRangeResponse ? 206 : 200, headers });
+	};
+
+	return { fetchFn: fetchFn as typeof fetch, openBodies, getRequestCount: () => requestCount };
+};
+
+const URL_SOURCE_SETUPS = [
+	{ rangeSupport: true, failureRate: 0, parallelism: 2, maxCacheSize: undefined },
+	{ rangeSupport: true, failureRate: 0.05, parallelism: 3, maxCacheSize: 256 * 1024 },
+	{ rangeSupport: false, failureRate: 0, parallelism: 2, maxCacheSize: Infinity },
+];
+
+const makeRacyUrlSource = (bytes: Uint8Array, rand: Rand, setup: typeof URL_SOURCE_SETUPS[number]) => {
+	const fetch = makeRacyFetch(bytes, rand, setup);
+	const source = new UrlSource('https://example.com/media', {
+		fetchFn: fetch.fetchFn,
+		getRetryDelay: () => 0,
+		parallelism: setup.parallelism,
+		maxCacheSize: setup.maxCacheSize,
+	});
+
+	return { source, ...fetch };
+};
+
+const silenceUrlSourceLogs = () => {
+	// UrlSource logs resumed requests and missing range support
+	vi.spyOn(console, 'error').mockImplementation(() => {});
+	vi.spyOn(console, 'warn').mockImplementation(() => {});
+};
+
+const URL_FIXTURES = ['video.mp4', 'demo.webm'];
+
+test.each(URL_FIXTURES)('Concurrent reads through a UrlSource match sequential reads: %s', async (fixture) => {
+	silenceUrlSourceLogs();
+	const bytes = await readFixture(fixture);
+	const ops = buildReadOps(await getReferencePackets(new BufferSource(bytes)), mulberry32(1));
+	const expected = await runSequentially(ops, () => new BufferSource(bytes));
+
+	for (const [index, setup] of URL_SOURCE_SETUPS.entries()) {
+		const rand = mulberry32(index + 1);
+		const { source, openBodies } = makeRacyUrlSource(bytes, rand, setup);
+		const actual = await runConcurrently(ops, source, rand);
+		expect(findMismatches(expected, actual), JSON.stringify(setup)).toEqual([]);
+
+		// The input was disposed at the end, which must close every response body
+		await waitFor(() => openBodies.size === 0);
+		expect(openBodies.size, JSON.stringify(setup)).toBe(0);
+	}
+});
+
+test.each(URL_FIXTURES)('Disposing an input mid-read aborts every request of a UrlSource: %s', async (fixture) => {
+	silenceUrlSourceLogs();
+	const bytes = await readFixture(fixture);
+	const ops = buildReadOps(await getReferencePackets(new BufferSource(bytes)), mulberry32(1));
+
+	for (let seed = 1; seed <= 6; seed++) {
+		const rand = mulberry32(seed);
+		const setup = URL_SOURCE_SETUPS[seed % URL_SOURCE_SETUPS.length]!;
+		const { source, openBodies, getRequestCount } = makeRacyUrlSource(bytes, rand, setup);
+		const input = new Input({ source, formats: ALL_FORMATS });
+
+		const outcomes = ops.map(op => op.run(input).then(
+			() => 'resolved',
+			(error: unknown) => error instanceof InputDisposedError ? 'disposed' : `rejected with ${String(error)}`,
+		));
+		await randomDelays(rand, 60);
+		input.dispose();
+		const requestCount = getRequestCount();
+
+		// Hangs (and times out) if a call never settles
+		const settled = await Promise.all(outcomes);
+		expect(settled.filter(x => x.startsWith('rejected')), `seed ${seed}`).toEqual([]);
+
+		await waitFor(() => openBodies.size === 0);
+		expect(openBodies.size, `seed ${seed}`).toBe(0);
+		expect(getRequestCount(), `seed ${seed}`).toBe(requestCount);
+	}
+});
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Writing
 
@@ -1012,6 +1157,133 @@ for (const SampleClass of [VideoSample, AudioSample]) {
 	} as never;
 }
 
+type SinkOp = {
+	name: string;
+	run: (sink: VideoSampleSink | AudioSampleSink, rand: Rand | null) => Promise<string>;
+};
+
+/** Describes the sample and closes it. */
+const describeSample = (sample: VideoSample | AudioSample | null) => {
+	if (!sample) {
+		return 'null';
+	}
+
+	const description = `${sample.timestamp.toFixed(6)}|${sample.duration.toFixed(6)}`;
+	sample.close();
+	return description;
+};
+
+/** getSample() at seeded timestamps, samplesAtTimestamps() over seeded lists, and samples() over seeded ranges. */
+const buildSinkOps = (referencePackets: EncodedPacket[], rand: Rand) => {
+	const randomTimestamp = () => {
+		const packet = referencePackets[Math.floor(rand() * referencePackets.length)]!;
+		return rand() < 0.5 ? packet.timestamp : packet.timestamp + 0.01 * rand();
+	};
+
+	const ops: SinkOp[] = [];
+	for (let i = 0; i < 8; i++) {
+		const timestamp = randomTimestamp();
+		ops.push({
+			name: `sample at ${timestamp}`,
+			run: async sink => describeSample(await sink.getSample(timestamp)),
+		});
+	}
+
+	for (let i = 0; i < 3; i++) {
+		const timestamps = Array.from({ length: 1 + Math.floor(rand() * 8) }, randomTimestamp);
+		if (rand() < 0.5) {
+			timestamps.sort((a, b) => a - b);
+		}
+
+		ops.push({ name: `samples at ${timestamps.join(', ')}`, run: async (sink, rand) => {
+			const descriptions: string[] = [];
+			for await (const sample of sink.samplesAtTimestamps(timestamps)) {
+				descriptions.push(describeSample(sample));
+				if (rand) {
+					await randomDelay(rand);
+				}
+			}
+			return descriptions.join(' ');
+		} });
+	}
+
+	for (let i = 0; i < 3; i++) {
+		const start = randomTimestamp();
+		const end = start + 1.5 * rand();
+		ops.push({ name: `samples from ${start} to ${end}`, run: async (sink, rand) => {
+			const descriptions: string[] = [];
+			for await (const sample of sink.samples(start, end)) {
+				descriptions.push(describeSample(sample));
+				if (rand) {
+					await randomDelay(rand);
+				}
+			}
+			return descriptions.join(' ');
+		} });
+	}
+
+	return ops;
+};
+
+const makeSampleSink = async (input: Input, trackIndex: number) => {
+	const track = await getTrack(input, trackIndex);
+	return track.isVideoTrack() ? new VideoSampleSink(track) : new AudioSampleSink(track as never);
+};
+
+const runSinkOpOnFreshInput = async (op: SinkOp, bytes: Uint8Array, trackIndex: number) => {
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	try {
+		return await op.run(await makeSampleSink(input, trackIndex), null);
+	} catch (error) {
+		return `error: ${String(error)}`;
+	}
+};
+
+test.each([
+	'video.mp4',
+	'demo.webm',
+	'Toothsome-Meme.VBRv2.mp3',
+])('Concurrent calls on one sample sink match sequential calls and release everything: %s', async (fixture) => {
+	const bytes = await readFixture(fixture);
+	const referencePackets = await getReferencePackets(new BufferSource(bytes));
+
+	for (const [trackIndex, packets] of referencePackets.entries()) {
+		const ops = buildSinkOps(packets, mulberry32(trackIndex + 1));
+		const expected = new Map<string, string>();
+		for (const op of ops) {
+			expected.set(op.name, await runSinkOpOnFreshInput(op, bytes, trackIndex));
+		}
+
+		for (let seed = 1; seed <= 2; seed++) {
+			const rand = mulberry32(seed);
+			coderState.rand = mulberry32(seed + 100);
+			coderState.liveCoders.clear();
+			coderState.samples.clear();
+
+			const input = new Input({ source: makeRacySource(bytes, rand), formats: ALL_FORMATS });
+			const sink = await makeSampleSink(input, trackIndex);
+			const actual = new Map<string, string>();
+			await Promise.all(shuffle(ops, rand).map(async (op) => {
+				await randomDelay(rand);
+				try {
+					actual.set(op.name, await op.run(sink, rand));
+				} catch (error) {
+					actual.set(op.name, `error: ${String(error)}`);
+				}
+			}));
+
+			const context = `track ${trackIndex}, seed ${seed}`;
+			expect(findMismatches(expected, actual), context).toEqual([]);
+
+			// Decoders close once their iteration has wound down
+			await waitFor(() => coderState.liveCoders.size === 0);
+			expect(coderState.liveCoders.size, context).toBe(0);
+			expect([...coderState.samples].filter(sample => !sample._closed).length, context).toBe(0);
+			input.dispose();
+		}
+	}
+});
+
 type ConversionScenario = 'complete' | 'cancel' | 'pause and resume' | 'pause and cancel';
 
 /** Runs one conversion and returns how it ended, plus what was left open once it had settled. */
@@ -1057,9 +1329,7 @@ const runConversion = async (bytes: Uint8Array, format: OutputFormat, scenario: 
 	}
 
 	// The track pumps wind down, closing their decoders, shortly after a cancel
-	for (let i = 0; i < 100 && coderState.liveCoders.size > 0; i++) {
-		await new Promise(resolve => setImmediate(resolve));
-	}
+	await waitFor(() => coderState.liveCoders.size === 0);
 
 	return {
 		outcome,
