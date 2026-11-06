@@ -1177,7 +1177,7 @@ describe('Audio sample entries', () => {
 
 	test('Opus holds a big-endian dOps translated from the OpusHead description', async () => {
 		const opusHead = new Uint8Array([
-			...new TextEncoder().encode('OpusHead'), 1, 2, 0x38, 0x01, 0x44, 0xac, 0x00, 0x00, 0xfe, 0xff, 0,
+			...new TextEncoder().encode('OpusHead'), 1, 2, 0x38, 0x01, 0x80, 0xbb, 0x00, 0x00, 0xfe, 0xff, 0,
 		]);
 		const { bytes, boxes } = await muxAudio(
 			'opus',
@@ -1193,7 +1193,7 @@ describe('Audio sample entries', () => {
 		expect(dOps.u8()).toBe(0); // Version
 		expect(dOps.u8()).toBe(2); // OutputChannelCount
 		expect(dOps.u16()).toBe(312); // PreSkip
-		expect(dOps.u32()).toBe(44100); // InputSampleRate
+		expect(dOps.u32()).toBe(48000); // InputSampleRate
 		expect(dOps.i16()).toBe(-2); // OutputGain
 		expect(dOps.u8()).toBe(0); // ChannelMappingFamily
 		expect(dOps.remaining()).toBe(0);
