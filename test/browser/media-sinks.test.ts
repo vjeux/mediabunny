@@ -5,12 +5,14 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
-import { InputAudioTrack } from '../../src/input-track.js';
+import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -275,4 +277,60 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test('Empty packets are skipped when decoding', async () => {
+	// MP4 allows zero-size samples (Chromium's test file bear-1280x720-zero-stsz-entry.mp4 ends with one), and
+	// WebCodecs decoders error out on empty chunks
+	using sourceInput = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const sourceVideoTrack = (await sourceInput.getPrimaryVideoTrack())!;
+	const sourceAudioTrack = (await sourceInput.getPrimaryAudioTrack())!;
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('avc');
+	const audioSource = new EncodedAudioPacketSource('aac');
+	output.addVideoTrack(videoSource);
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const copyPackets = async (
+		track: InputVideoTrack | InputAudioTrack,
+		source: EncodedVideoPacketSource | EncodedAudioPacketSource,
+		count: number,
+	) => {
+		const decoderConfig = await track.getDecoderConfig();
+		let last: EncodedPacket | null = null;
+		let i = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			await source.add(packet, i === 0 ? { decoderConfig } as never : undefined);
+			last = packet;
+			if (++i === count) {
+				break;
+			}
+		}
+		const empty = new EncodedPacket(new Uint8Array(0), 'delta', last!.timestamp + last!.duration, last!.duration);
+		await source.add(empty);
+	};
+	await copyPackets(sourceVideoTrack, videoSource, 30);
+	await copyPackets(sourceAudioTrack, audioSource, 40);
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	const audioTrack = (await input.getPrimaryAudioTrack())!;
+	expect((await new EncodedPacketSink(videoTrack).getPacket(Infinity))!.byteLength).toBe(0);
+
+	let frameCount = 0;
+	for await (const sample of new VideoSampleSink(videoTrack).samples()) {
+		frameCount++;
+		sample.close();
+	}
+	expect(frameCount).toBe(30);
+
+	let audioSampleCount = 0;
+	for await (const sample of new AudioSampleSink(audioTrack).samples()) {
+		audioSampleCount++;
+		sample.close();
+	}
+	expect(audioSampleCount).toBeGreaterThan(30);
 });
