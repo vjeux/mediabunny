@@ -622,3 +622,217 @@ test('Clear lead samples of an encrypted track stay unencrypted', async () => {
 	}
 	expect(packets).toEqual([plaintext, plaintext]);
 });
+
+test('Packet durations with B-frames spread over fragments', async () => {
+	// Fragments that don't start a GOP: a frame's successor in presentation order can be in the next fragment
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	// Decode order I P | B B P | B B with a decode duration of 1 each, presented as I B B P B B P
+	const fragments = [[1, 3], [0, 0, 3], [0, 0]].flatMap((compositionOffsets, i) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32([0, 2, 5][i]!)),
+			box('trun', u32(0xf01), u32(compositionOffsets.length), u32(dataOffset), ...compositionOffsets.map(
+				(offset, j) => [...u32(1), ...u32(1), ...u32(i === 0 && j === 0 ? 0 : 0x10000), ...u32(offset)],
+			)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [
+			...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)),
+			...box('mdat', zeros(compositionOffsets.length)),
+		];
+	});
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...box('ftyp', ascii('iso5'), u32(0)), ...moov, ...fragments])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([packet.timestamp, packet.duration]);
+	}
+	expect(packets).toEqual([[0.1, 0.1], [0.4, 0.1], [0.2, 0.1], [0.3, 0.1], [0.7, 0.1], [0.5, 0.1], [0.6, 0.1]]);
+});
+
+test('Packet durations of a long-held frame with fragments that start a GOP', async () => {
+	// Variable frame rate with x264's b-pyramid: decode timestamps trail the presentation ones by two frames, so the
+	// decode duration covering the held frame's presentation gap is in the next fragment
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(30), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(30), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	// One tick per frame. GOP 1 presents ticks 2 to 6 and holds 6 until 16, GOP 2 starts at 17; [duration, offset]
+	const fragments = [
+		{ decodeTimestamp: 0, samples: [[1, 2], [1, 5], [1, 2], [1, 0], [1, 1], [1, 11]] }, // I P B b b P
+		{ decodeTimestamp: 6, samples: [[10, 11], [1, 2]] },
+	].flatMap(({ decodeTimestamp, samples }, i) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(decodeTimestamp)),
+			box('trun', u32(0xf01), u32(samples.length), u32(dataOffset), ...samples.map(([duration, offset], j) =>
+				[...u32(duration!), ...u32(1), ...u32(j === 0 ? 0 : 0x10000), ...u32(offset!)],
+			)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [
+			...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)),
+			...box('mdat', zeros(samples.length)),
+		];
+	});
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...box('ftyp', ascii('iso5'), u32(0)), ...moov, ...fragments])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([Math.round(packet.timestamp * 30), Math.round(packet.duration * 30)]);
+	}
+	packets.sort((a, b) => a[0]! - b[0]!);
+
+	// Every frame lasts until the next presented one
+	expect(packets).toEqual([[2, 1], [3, 1], [4, 1], [5, 1], [6, 10], [16, 1], [17, 1], [18, 1]]);
+});
+
+test('Packet durations are the same however many fragments were read before', async () => {
+	// Fragments that don't start a GOP, one to three frames each: a frame's successor in presentation order can be
+	// decoded in an earlier fragment or a later one
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	// Decode order I P B B P B B I P B B, presented as I B B P B B P I B B P, with a variable frame rate: frame
+	// durations in presentation order 1 2 1 3 1 1 2 1 1 1 1
+	const presentationTimestamps = [0, 1, 3, 4, 7, 8, 9, 11, 12, 13, 14];
+	const decodeOrder = [0, 3, 1, 2, 6, 4, 5, 7, 10, 8, 9]; // Presented frame index of each decoded frame
+	const fragmentSizes = [2, 3, 1, 2, 3];
+	// Negative composition offsets instead of a decoding delay
+	const decodeTimestamps = presentationTimestamps;
+	let decoded = 0;
+	const fragments = fragmentSizes.flatMap((size, i) => {
+		const samples = decodeOrder.slice(decoded, decoded + size).map((frame, j) => {
+			const index = decoded + j;
+			const nextDecodeTimestamp = decodeTimestamps[index + 1] ?? decodeTimestamps[index]! + 1;
+			return {
+				duration: nextDecodeTimestamp - decodeTimestamps[index]!,
+				offset: presentationTimestamps[frame]! - decodeTimestamps[index]!,
+				isKeyFrame: frame === 0 || frame === 7,
+			};
+		});
+		const startDecodeTimestamp = decodeTimestamps[decoded]!;
+		decoded += size;
+
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(startDecodeTimestamp)),
+			box('trun', [1, 0, 0x0f, 0x01], u32(samples.length), u32(dataOffset), ...samples.map(sample => [
+				...u32(sample.duration),
+				...u32(1),
+				...u32(sample.isKeyFrame ? 0 : 0x10000),
+				...u32(sample.offset >>> 0),
+			])),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)), ...box('mdat', zeros(size))];
+	});
+	const bytes = new Uint8Array([...box('ftyp', ascii('iso6'), u32(0)), ...moov, ...fragments]);
+
+	const expected = presentationTimestamps.map((timestamp, i) => [
+		timestamp / 10,
+		((presentationTimestamps[i + 1] ?? timestamp + 1) - timestamp) / 10,
+	]);
+	const withSink = async <T>(use: (sink: EncodedPacketSink) => Promise<T>) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return await use(new EncodedPacketSink(track));
+	};
+
+	// Reading every packet in decode order
+	const sequential = await withSink(async (sink) => {
+		const packets: number[][] = [];
+		for await (const packet of sink.packets()) {
+			packets.push([packet.timestamp, packet.duration]);
+		}
+		return packets.sort((a, b) => a[0]! - b[0]!);
+	});
+	expect(sequential).toEqual(expected);
+
+	// Each packet on its own, looked up by timestamp with nothing read before: whichever packet the lookup returns,
+	// it has the duration it has when reading every packet
+	const durations = new Map(expected.map(([timestamp, duration]) => [timestamp!, duration!]));
+	for (const [timestamp] of expected) {
+		const packet = await withSink(sink => sink.getPacket(timestamp!));
+		assert(packet);
+		expect(packet.duration).toBe(durations.get(packet.timestamp));
+	}
+});
