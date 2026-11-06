@@ -11,6 +11,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Logging, LogLevel } from '../../src/logging.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -980,47 +981,83 @@ test('MPEG-TS metadata reading gives up on declared streams that never show up, 
 		return bytes;
 	};
 
-	const getTracks = async (bytes: Uint8Array, maxMissingStreamScanSize?: number) => {
+	const getTracks = async (
+		bytes: Uint8Array,
+		options: { maxMissingStreamScanSize?: number; unknownSize?: boolean } = {},
+	) => {
 		let bytesRead = 0;
 		let readCount = 0;
-		using input = new Input({
-			source: new CustomSource({
-				getSize: () => bytes.byteLength,
-				read: (start, end) => {
-					bytesRead += end - start;
-					readCount++;
-					return bytes.subarray(start, end);
-				},
-			}),
-			formats: ALL_FORMATS,
-		});
+		const warnings: string[] = [];
+		const previousLogLevel = Logging.level;
+		Logging.level = LogLevel.Silent;
+		const stopCapturing = Logging.on('warn', args => warnings.push(args.map(String).join(' ')));
 
-		if (maxMissingStreamScanSize !== undefined) {
-			((await input._getDemuxer()) as MpegTsDemuxer).maxMissingStreamScanSize = maxMissingStreamScanSize;
+		try {
+			using input = new Input({
+				source: options.unknownSize
+					? new ReadableStreamSource(new ReadableStream({
+						start(controller) {
+							for (let i = 0; i < bytes.length; i += 2 ** 16) {
+								controller.enqueue(bytes.slice(i, i + 2 ** 16));
+							}
+							controller.close();
+						},
+					}))
+					: new CustomSource({
+						getSize: () => bytes.byteLength,
+						read: (start, end) => {
+							bytesRead += end - start;
+							readCount++;
+							return bytes.subarray(start, end);
+						},
+					}),
+				formats: ALL_FORMATS,
+			});
+
+			if (options.maxMissingStreamScanSize !== undefined) {
+				const demuxer = (await input._getDemuxer()) as MpegTsDemuxer;
+				demuxer.maxMissingStreamScanSize = options.maxMissingStreamScanSize;
+			}
+
+			const tracks = await input.getTracks();
+			return {
+				bytesRead,
+				readCount,
+				warnings: warnings.filter(warning => warning.includes('declared but')),
+				tracks: await Promise.all(tracks.map(async track => [track.id, await track.getFirstTimestamp()])),
+			};
+		} finally {
+			stopCapturing();
+			Logging.level = previousLogLevel;
 		}
-
-		const tracks = await input.getTracks();
-		return {
-			bytesRead,
-			readCount,
-			tracks: await Promise.all(tracks.map(async track => [track.id, await track.getFirstTimestamp()])),
-		};
 	};
 
 	// Never sent: the file gets scanned for it in large chunks, instead of packet by packet (tens of thousands of
-	// reads), and only up to a limit
+	// reads). The whole file was scanned, so nothing was left out that's in it, and there's no warning.
 	const absent = buildFile(null);
 	const absentResult = await getTracks(absent);
 	expect(absentResult.tracks).toEqual([[0x100, 0]]);
 	expect(absentResult.readCount).toBeLessThan(2000);
-	const limitedResult = await getTracks(absent, 2 ** 20);
-	expect(limitedResult.tracks).toEqual([[0x100, 0]]);
-	expect(limitedResult.bytesRead).toBeLessThan(absent.byteLength / 3);
+	expect(absentResult.warnings).toEqual([]);
 
 	const late = buildFile([8400, Infinity]); // 179.2 s
-	expect((await getTracks(late)).tracks).toEqual([[0x100, 0], [0x101, 179.2]]);
+	expect(await getTracks(late)).toMatchObject({ tracks: [[0x100, 0], [0x101, 179.2]], warnings: [] });
 
 	// Only there for a moment, between spots a sampling approach would look at
 	const brief = buildFile([2850, 3085]); // 60.8 s to 65.8 s
-	expect((await getTracks(brief)).tracks).toEqual([[0x100, 0], [0x101, 60.8]]);
+	expect(await getTracks(brief)).toMatchObject({ tracks: [[0x100, 0], [0x101, 60.8]], warnings: [] });
+
+	// When the search gives up before the end of the file (it scans 256 MiB, here less), a stream that starts later
+	// is left out, with a warning
+	const limited = await getTracks(late, { maxMissingStreamScanSize: 2 ** 20 });
+	expect(limited.tracks).toEqual([[0x100, 0]]);
+	expect(limited.bytesRead).toBeLessThan(late.byteLength / 3);
+	expect(limited.warnings).toEqual([expect.stringContaining('within 1 MiB of the file')]);
+	expect(limited.warnings[0]).toContain('PID 257 (stream_type 0x0f)');
+
+	// The same for sources of unknown size, where the search gives up after 2 minutes of media
+	const unknownSize = await getTracks(late, { unknownSize: true });
+	expect(unknownSize.tracks).toEqual([[0x100, 0]]);
+	expect(unknownSize.warnings).toEqual([expect.stringContaining('within the first 120 seconds of media')]);
+	expect(unknownSize.warnings[0]).toContain('PID 257 (stream_type 0x0f)');
 });

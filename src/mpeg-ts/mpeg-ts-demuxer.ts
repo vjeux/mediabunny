@@ -278,6 +278,9 @@ export class MpegTsDemuxer extends Demuxer {
 							if (delay > MAX_STREAM_START_DELAY) {
 								// The streams that still haven't shown up are declared, but don't seem to be in the
 								// file, so let's stop looking for them instead of reading it all
+								this.warnAboutMissingStreams(
+									`within the first ${MAX_STREAM_START_DELAY / MPEG_TS_TIMESCALE} seconds of media`,
+								);
 								break;
 							}
 						} else if (delay > MISSING_STREAM_SCAN_DELAY) {
@@ -292,6 +295,10 @@ export class MpegTsDemuxer extends Demuxer {
 							if (nextPos === null) {
 								// The streams that still haven't shown up are declared, but aren't in the file (or
 								// only far later), so let's stop looking for them
+								if (missingStreamScanEndPos < fileSize) {
+									const scanSize = `${Math.round(this.maxMissingStreamScanSize / 2 ** 20)} MiB`;
+									this.warnAboutMissingStreams(`within ${scanSize} of the file`);
+								}
 								break;
 							}
 
@@ -1021,6 +1028,18 @@ export class MpegTsDemuxer extends Demuxer {
 			payload: merged,
 			randomAccessIndicator,
 		};
+	}
+
+	/** Warns that declared streams which haven't shown up `where` are left out, since they may start later on. */
+	warnAboutMissingStreams(where: string) {
+		const streams = this.elementaryStreams
+			.filter(x => !x.initialized)
+			.map(x => `PID ${x.pid} (stream_type 0x${x.streamType.toString(16).padStart(2, '0')})`);
+
+		Logging._warn(
+			`MPEG-TS: these streams are declared but didn't show up ${where}, so they're left out (if they start later`
+			+ ` in the file, they won't be available): ${streams.join(', ')}.`,
+		);
 	}
 
 	/** Returns the position of the next TS packet that starts a payload unit on one of the given PIDs, if any. */
