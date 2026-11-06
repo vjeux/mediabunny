@@ -990,6 +990,12 @@ class VideoEncoderWrapper {
 				proresFormat: null, // Can't be encoded by WebCodecs
 			});
 
+			if (this.encodingConfig.codec === 'hevc' && meta.decoderConfig.description) {
+				// A description means the parameter sets are out of band, which is what 'hvc1' stands for (ISO/IEC
+				// 14496-15). It's also the sample entry the ISOBMFF muxer writes, which the codec string must name.
+				meta.decoderConfig.codec = meta.decoderConfig.codec.replace(/^hev1\./, 'hvc1.');
+			}
+
 			if (this.encodingConfig.codec === 'avc' && meta.decoderConfig.description && isFirefox()) {
 				// This works around https://bugzilla.mozilla.org/show_bug.cgi?id=2082867
 				// Also see https://github.com/Vanilagy/mediabunny/issues/559
