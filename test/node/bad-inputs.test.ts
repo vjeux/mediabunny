@@ -296,6 +296,12 @@ test('MP4: Streamed truns adding up to billions of samples', async () => {
 	await expectGracefulRead(streamedSource(file), /Too many \(> 2\^20\) samples in fragment/);
 });
 
+test('MP4: Streamed with a 64-bit box size beyond 2^53', async () => {
+	// The next box's position lost precision, so reading there became a zero-length read that slipped past the bounds
+	// checks and failed in a DataView
+	await expectGracefulRead(streamedSource(concat(u32(1), ascii('styp'), u64(2 ** 62), ascii('isom'), zeros(12))));
+});
+
 test('MP4: trun without default sample values', async () => {
 	await expectGracefulRead(mp4(fragmentedMoov({ trex: false }), [
 		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('trun', 0, 0, u32(1))),

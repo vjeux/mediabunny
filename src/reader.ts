@@ -31,7 +31,8 @@ export class Reader {
 			throw new InputDisposedError();
 		}
 
-		if (start < 0) {
+		if (start < 0 || start + length > Number.MAX_SAFE_INTEGER) {
+			// No file is that large, and positions past 2^53 lose precision (a huge size field in a damaged file)
 			return null;
 		}
 
@@ -69,7 +70,7 @@ export class Reader {
 			throw new InputDisposedError();
 		}
 
-		if (start < 0) {
+		if (start < 0 || start + maxLength > Number.MAX_SAFE_INTEGER) {
 			return null;
 		}
 
