@@ -179,6 +179,16 @@ type Section = {
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
+/**
+ * What a position without a sync byte reads as: trailing junk (like zero padding) or a damaged packet. FFmpeg and
+ * Chromium skip over such bytes, so instead of failing the whole read, we skip the position like a null packet.
+ */
+const NOT_A_PACKET_HEADER: TsPacketHeader = {
+	payloadUnitStartIndicator: 0,
+	pid: 0x1fff, // The null packet PID
+	adaptationFieldControl: 0,
+};
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -980,7 +990,7 @@ export class MpegTsDemuxer extends Demuxer {
 
 		const syncByte = readU8(slice);
 		if (syncByte !== 0x47) {
-			throw new Error('Invalid TS packet sync byte; the file is likely corrupted.');
+			return NOT_A_PACKET_HEADER;
 		}
 
 		const nextTwoBytes = readU16Be(slice);
@@ -1018,7 +1028,7 @@ export class MpegTsDemuxer extends Demuxer {
 
 		const syncByte = bytes[0]!;
 		if (syncByte !== 0x47) {
-			throw new Error('Invalid TS packet sync byte; the file is likely corrupted.');
+			return { ...NOT_A_PACKET_HEADER, body: bytes.subarray(4) };
 		}
 
 		const nextTwoBytes = (bytes[1]! << 8) + bytes[2]!;

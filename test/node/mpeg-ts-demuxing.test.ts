@@ -952,3 +952,45 @@ test('MPEG-TS random_access_indicator on non-key frames does not make them key p
 		expect(keyPacket.sequenceNumber).toBe(packets[0]!.sequenceNumber);
 	}
 });
+
+test('MPEG-TS with trailing junk or a damaged packet reads to the end', async () => {
+	const buffer = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/0.ts')));
+
+	const readAll = async (bytes: Uint8Array) => {
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+
+		const counts: number[] = [];
+		for (const track of await input.getTracks()) {
+			let count = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				expect(packet.byteLength).toBeGreaterThan(0);
+				count++;
+			}
+			counts.push(count);
+		}
+
+		return { counts, duration: await input.computeDuration() };
+	};
+
+	const reference = await readAll(buffer);
+	expect(reference).toEqual({ counts: [298, 234], duration: 15.004 });
+
+	// Zero padding up to the next 64 KiB, as left behind by recorders that write whole blocks
+	const zeroPadded = new Uint8Array(Math.ceil(buffer.byteLength / 65536) * 65536);
+	zeroPadded.set(buffer);
+	expect(await readAll(zeroPadded)).toEqual(reference);
+
+	// A few bytes that aren't TS packets at all
+	const textTail = new Uint8Array(buffer.byteLength + 16);
+	textTail.set(buffer);
+	textTail.set(new TextEncoder().encode('end of recording'), buffer.byteLength);
+	expect(await readAll(textTail)).toEqual(reference);
+
+	// The sync byte of a packet in the middle of a video PES packet is damaged
+	const damaged = buffer.slice();
+	damaged[188 * 5000] = 0x00;
+	expect(await readAll(damaged)).toEqual(reference);
+});
