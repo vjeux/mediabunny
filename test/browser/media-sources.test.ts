@@ -737,9 +737,13 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 	return { input, track };
 };
 
-test.each(['audio', 'video'] as const)(
+test.for(['audio', 'video'] as const)(
 	'MediaStream sources, an ended %s track stops holding back the other track',
-	async (endingTrack) => {
+	async (endingTrack, { skip }) => {
+		if (typeof MediaStreamTrackGenerator === 'undefined') {
+			skip('Needs MediaStreamTrackGenerator (Chromium)');
+		}
+
 		const videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
 		const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
 		const videoWriter = videoGenerator.writable.getWriter();
@@ -823,11 +827,30 @@ test.each(['audio', 'video'] as const)(
 	},
 );
 
+/** Whether workers have MediaStreamTrackProcessor (Safari); MediaStreamVideoTrackSource then captures video there. */
+const hasWorkerTrackProcessor = async () => {
+	const url = URL.createObjectURL(new Blob(
+		['postMessage(typeof MediaStreamTrackProcessor !== \'undefined\')'],
+		{ type: 'application/javascript' },
+	));
+	const worker = new Worker(url);
+	const supported = await new Promise<boolean>((resolve) => {
+		worker.onmessage = event => resolve(event.data as boolean);
+	});
+	worker.terminate();
+	URL.revokeObjectURL(url);
+	return supported;
+};
+
 test.for(['video', 'audio'] as const)(
 	'MediaStream sources, track.stop() closes the %s source when capturing without MediaStreamTrackProcessor',
 	async (kind, { skip }) => {
 		// Without MediaStreamTrackProcessor (Firefox, Safari), video is sampled from a <video> element and audio comes
 		// through a ScriptProcessorNode. Stopping a track with track.stop() fires no 'ended' event.
+		if (kind === 'video' && await hasWorkerTrackProcessor()) {
+			skip('Captures video through MediaStreamTrackProcessor in a worker here, not through a <video> element');
+		}
+
 		let track: MediaStreamVideoTrack | MediaStreamAudioTrack;
 		let audioContext: AudioContext | null = null;
 		let stopDrawing = () => {};
