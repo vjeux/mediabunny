@@ -13,9 +13,10 @@ import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
 import { countMovedArrayElements } from './array-moves.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { MpegTsOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { Conversion } from '../../src/conversion.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -2000,4 +2001,46 @@ test('MPEG-TS with PIDs listed twice in the PMT', async () => {
 		['ac3', 6, [[3912633305, 1536], [3912636185, 1536], [3912639065, 1536], [3912641945, 1536], [3912644825, 906]]],
 		['ac3', 2, [[3912634060, 768], [3912636940, 768], [3912639820, 768], [3912642700, 768], [3912645580, 354]]],
 	]);
+});
+
+test('MPEG-TS packets can be advanced from twice at once', async () => {
+	const bytes = fs.readFileSync(path.join(__dirname, '../public/0.ts'));
+
+	// Conversion does this at the trim end, looking ahead from the packet its packet iterator is advancing from
+	using conversionInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input: conversionInput,
+		output,
+		trim: { end: await conversionInput.getFirstTimestamp() + 1 },
+	});
+	await conversion.execute();
+
+	using outputInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect((await outputInput.getTracks()).map(x => x.type)).toEqual(['video', 'audio']);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	const timestamps: number[] = [];
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		timestamps.push(packet.timestamp);
+		if (timestamps.length === 30) {
+			break;
+		}
+	}
+
+	let packet = await sink.getFirstPacket();
+	for (let i = 1; i < 30; i++) {
+		assert(packet);
+		const [next, nextMetadata] = await Promise.all([
+			sink.getNextPacket(packet),
+			sink.getNextPacket(packet, { metadataOnly: true }),
+		]);
+		expect(next?.timestamp).toBe(timestamps[i]);
+		expect(nextMetadata?.timestamp).toBe(timestamps[i]);
+		packet = next;
+	}
 });
