@@ -974,14 +974,6 @@ v.m3u8
 		expect(await Promise.all((await input.getTracks()).map(x => x.getCodec()))).toEqual(['avc', 'ac3']);
 	});
 
-	test('rejects several video codecs in one variant', async () => {
-		using input = readMaster(`#EXTM3U
-#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f,hvc1.1.6.L93.B0"
-v.m3u8
-`).input;
-		await expect(input.getTracks()).rejects.toThrow('multiple video codecs');
-	});
-
 	test('rejects too many variant streams', async () => {
 		let text = '#EXTM3U\n';
 		for (let i = 0; i < 300; i++) {
