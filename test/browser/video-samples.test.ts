@@ -6,7 +6,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Quality } from '../../src/encode.js';
 import { PacketType } from '../../src/packet.js';
-import { Rotation } from '../../src/misc.js';
+import { isChromium, Rotation } from '../../src/misc.js';
 
 test('allocationSize', async () => {
 	{
@@ -372,11 +372,13 @@ test('RGB conversion for ArrayBuffer-backed data converts into the target color 
 		frame.close();
 	}
 
-	// E.g. sRGB orange as Display P3
-	using srgbSample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0 });
-	const p3Bytes = new Uint8Array(8);
-	await srgbSample.copyTo(p3Bytes, { format: 'RGBA', colorSpace: 'display-p3' });
-	[187, 105, 62].forEach((value, i) => expect(Math.abs(p3Bytes[i]! - value)).toBeLessThanOrEqual(2));
+	// E.g. sRGB orange as Display P3 (Firefox's VideoFrame doesn't convert color spaces in copyTo())
+	if (isChromium()) {
+		using srgbSample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0 });
+		const p3Bytes = new Uint8Array(8);
+		await srgbSample.copyTo(p3Bytes, { format: 'RGBA', colorSpace: 'display-p3' });
+		[187, 105, 62].forEach((value, i) => expect(Math.abs(p3Bytes[i]! - value)).toBeLessThanOrEqual(2));
+	}
 });
 
 test('crop (rect option) for ArrayBuffer-backed data', async () => {
