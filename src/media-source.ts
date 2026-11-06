@@ -1839,11 +1839,14 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 			if (supportedInWorker) {
 				this._workerTrackId = nextMediaStreamTrackProcessorWorkerId++;
 
+				// MediaStreamTracks can only be transferred, not cloned via postMessage (WebKit throws a DataCloneError
+				// otherwise). Transfer a clone so that the caller's own track stays live; the worker stops the clone.
+				const workerTrack = this._track.clone();
 				sendMessageToMediaStreamTrackProcessorWorker({
 					type: 'videoTrack',
 					trackId: this._workerTrackId,
-					track: this._track,
-				});
+					track: workerTrack,
+				}, [workerTrack as unknown as Transferable]);
 
 				this._workerListener = (event: MessageEvent) => {
 					const message = event.data as MediaStreamTrackProcessorWorkerMessage;
