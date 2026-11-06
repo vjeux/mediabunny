@@ -128,7 +128,8 @@ export abstract class MediaSource {
 			throw new Error('Output has not started.');
 		}
 
-		if (this._closed) {
+		// Closing is asynchronous, but no samples may be added once it was requested
+		if (this._closed || this._closingPromise) {
 			throw new Error('Source is closed.');
 		}
 	}
@@ -1743,7 +1744,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		};
 
 		const addVideoFrame = (videoFrame: VideoFrame, now = performance.now()) => {
-			if (errored) {
+			if (errored || this._closingPromise) {
 				videoFrame.close();
 				return;
 			}
@@ -3105,7 +3106,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let timestampOffset = 0;
 
 		const onAudioSample = (audioSample: AudioSample) => {
-			if (errored) {
+			if (errored || this._closingPromise) {
 				audioSample.close();
 				return;
 			}
