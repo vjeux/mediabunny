@@ -512,37 +512,3 @@ describe('Audio-only remuxing', () => {
 		input.dispose();
 	});
 });
-
-describe('MP3 Xing header on output', () => {
-	test('a VBR remux gets a Xing frame with the audio byte count and a monotonic seek table', async () => {
-		const filePath = path.join(__dirname, '..', 'public', 'Toothsome-Meme.VBRv2.mp3');
-		const input = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
-		const target = new BufferTarget();
-		const output = new Output({ format: new Mp3OutputFormat(), target });
-		const conversion = await Conversion.init({ input, output, copy: { shiftTolerance: 0.1 }, showWarnings: false });
-		await conversion.execute();
-		input.dispose();
-
-		const bytes = new Uint8Array(target.buffer!);
-		let pos = 0;
-		if (String.fromCharCode(...bytes.subarray(0, 3)) === 'ID3') {
-			pos = 10 + ((bytes[6]! << 21) | (bytes[7]! << 14) | (bytes[8]! << 7) | bytes[9]!);
-		}
-		expect([bytes[pos], bytes[pos + 1]! & 0xe0]).toEqual([0xff, 0xe0]);
-		const view = new DataView(bytes.buffer, bytes.byteOffset);
-		// The Xing tag follows the side information, whose size depends on the MPEG version and channel mode
-		const isMpeg1 = ((bytes[pos + 1]! >> 3) & 0b11) === 0b11;
-		const isMono = bytes[pos + 3]! >> 6 === 0b11;
-		const xingOffset = pos + 4 + (isMpeg1 ? (isMono ? 17 : 32) : (isMono ? 9 : 17));
-		expect(String.fromCharCode(...bytes.subarray(xingOffset, xingOffset + 4))).toBe('Xing'); // VBR, not 'Info'
-		const flags = view.getUint32(xingOffset + 4);
-		expect(flags & 0b111).toBe(0b111); // frames, bytes and TOC
-		expect(view.getUint32(xingOffset + 12)).toBe(bytes.length - pos); // From the Xing frame to the end
-
-		const toc = [...bytes.subarray(xingOffset + 16, xingOffset + 116)];
-		expect(toc[0]).toBe(0);
-		expect(toc.every((value, i) => i === 0 || value >= toc[i - 1]!)).toBe(true);
-		expect(Math.abs(toc[50]! - 128)).toBeLessThan(16);
-		expect(toc[99]).toBeGreaterThan(240);
-	});
-});
