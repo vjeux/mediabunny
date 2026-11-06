@@ -17,10 +17,15 @@ export const createRunningAudioContext = async (options: AudioContextOptions = {
 		return null;
 	}
 
-	// Wait for the clock to actually advance, so that getOutputTimestamp() maps context time to page time
+	// A running context may not have rendered yet, and until it has, getOutputTimestamp() maps context time 0 to
+	// performance time 0: anything scheduled from it would land at the page's age, minutes late in a long test run
 	const start = performance.now();
-	while (audioContext.currentTime === 0 && performance.now() - start < 1000) {
+	while (audioContext.currentTime === 0 && performance.now() - start < 2000) {
 		await sleep(10);
+	}
+	if (audioContext.currentTime === 0) {
+		await audioContext.close();
+		return null;
 	}
 
 	return audioContext;
