@@ -3392,6 +3392,16 @@ export class AudioBufferSource extends AudioSource {
 }
 
 /**
+ * The largest deviation, in seconds, between where an audio chunk's capture timestamp puts it and the end of the
+ * audio before it, that is still treated as continuous audio. Capture timestamps jitter around the actual sample clock
+ * (Chrome stamps Web Audio-sourced tracks with the time a render callback ran, for example); filling these
+ * deviations with silence or cutting them would put audible gaps and clicks into continuous audio. Larger deviations
+ * are real gaps or drift between the sample clock and the system clock, and are corrected, which keeps the audio
+ * within this distance of its capture timestamps.
+ */
+const MAX_AUDIO_TIMESTAMP_JITTER = 0.04;
+
+/**
  * How many audio chunks MediaStreamTrackProcessor may buffer for a MediaStreamAudioTrackSource; about 5 seconds of
  * the 10 ms chunks browsers deliver.
  */
@@ -3523,7 +3533,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let firstAudioDataTimestamp: number | null = null;
 		let errored = false;
 		let timestampOffset = 0;
-		let lastEndTimestamp: number | null = null;
+		let nextTimestamp: number | null = null; // Where the audio continues seamlessly
 
 		// `captureTime` is when the sample's first audio frame was captured (in seconds, performance.now() time base)
 		const onAudioSample = (audioSample: AudioSample, captureTime = performance.now() / 1000) => {
@@ -3562,36 +3572,45 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 				timestampOffset = target - firstAudioDataTimestamp;
 			}
 
+			const pausedTime = this._options.timestampBase === 'unix' ? 0 : this._pausedTime;
+			let timestamp = currentTimestamp + timestampOffset - pausedTime;
+
+			if (nextTimestamp !== null) {
+				const deviation = timestamp - nextTimestamp;
+
+				if (!this._resumedSinceLastSample && Math.abs(deviation) <= MAX_AUDIO_TIMESTAMP_JITTER) {
+					timestamp = nextTimestamp; // Timestamp jitter; the audio itself is continuous
+				} else if (deviation < 0) {
+					// This audio overlaps audio that's already been added: the sample clock ran ahead of the
+					// timestamps, or, since exactly the paused time is removed, the first audio after resuming begins
+					// before the end of the last audio before pausing. Cut off the overlapping start to stay in sync.
+					const overlappingFrames = Math.round(-deviation * audioSample.sampleRate);
+					if (overlappingFrames >= audioSample.numberOfFrames) {
+						audioSample.close();
+						return;
+					}
+
+					if (overlappingFrames > 0) {
+						const trimmed = audioSample.trim(overlappingFrames);
+						audioSample.close();
+						audioSample = trimmed;
+					}
+					timestamp = nextTimestamp;
+				}
+				// A larger positive deviation is a real gap (or the cut at a resume), which the encoder fills with
+				// silence
+			}
+
+			this._resumedSinceLastSample = false;
+			nextTimestamp = timestamp + audioSample.duration;
+
 			if (this._encoder.getQueueSize() >= 8) {
-				// Drop data if the encoder is overloaded
+				// Drop data if the encoder is overloaded; the gap it leaves gets filled with silence
 				audioSample.close();
 				return;
 			}
 
-			const pausedTime = this._options.timestampBase === 'unix' ? 0 : this._pausedTime;
-			let timestamp = currentTimestamp + timestampOffset - pausedTime;
-
-			if (this._resumedSinceLastSample && lastEndTimestamp !== null && timestamp < lastEndTimestamp) {
-				// Since exactly the paused time is removed, the first audio after resuming can begin before the end of
-				// the last audio before pausing (audio data spans many milliseconds). Cut off the overlapping start to
-				// keep the audio in place, in sync with the other tracks.
-				const overlappingFrames = Math.round((lastEndTimestamp - timestamp) * audioSample.sampleRate);
-				if (overlappingFrames >= audioSample.numberOfFrames) {
-					audioSample.close();
-					return;
-				}
-
-				if (overlappingFrames > 0) {
-					const trimmed = audioSample.trim(overlappingFrames);
-					audioSample.close();
-					audioSample = trimmed;
-					timestamp += overlappingFrames / audioSample.sampleRate;
-				}
-			}
-
-			this._resumedSinceLastSample = false;
 			audioSample.setTimestamp(timestamp);
-			lastEndTimestamp = timestamp + audioSample.duration;
 
 			void this._encoder.add(audioSample, true)
 				.catch((error) => {

@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WebMOutputFormat, MkvOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WebMOutputFormat, MkvOutputFormat, WavOutputFormat } from '../../src/output-format.js';
 import { BufferTarget, StreamTarget } from '../../src/target.js';
 import {
 	AudioSampleSource,
@@ -1552,4 +1552,79 @@ test('MediaStreamAudioTrackSource, a busy main thread loses no audio', async ({ 
 	input.dispose();
 
 	expect(missingMs).toBeLessThan(60);
+});
+
+test('MediaStreamAudioTrackSource, timestamp jitter adds no silence, real gaps still get filled', async () => {
+	const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
+	const audioWriter = audioGenerator.writable.getWriter();
+
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(audioGenerator as unknown as MediaStreamAudioTrack, {
+		codec: 'pcm-f32',
+	});
+	const errors: unknown[] = [];
+	audioSource.errorPromise.catch(error => errors.push(error));
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// Continuous, never-silent audio in 10 ms chunks, whose capture timestamps jitter by up to 9 ms like those of a
+	// Web Audio-sourced track. 60 chunks in, 6 chunks (60 ms) go missing.
+	const jitter = [6, 3, 9, 4, 8, 2, 7, 5];
+	const start = performance.now();
+	let writtenFrames = 0;
+	for (let i = 0; i < 100; i++) {
+		while (performance.now() - start < 10 * i) {
+			await new Promise(resolve => setTimeout(resolve, 2));
+		}
+		if (i >= 60 && i < 66) {
+			continue;
+		}
+
+		const data = new Float32Array(480);
+		for (let j = 0; j < 480; j++) {
+			data[j] = 0.5 + 0.25 * Math.sin(2 * Math.PI * 440 * (480 * i + j) / 48000);
+		}
+		const jitterMs = i === 0 || i === 66 ? 0 : jitter[i % jitter.length]!;
+		await audioWriter.write(new AudioData({
+			format: 'f32-planar',
+			sampleRate: 48000,
+			numberOfChannels: 1,
+			numberOfFrames: 480,
+			timestamp: Math.round(1000 * (start + 10 * i + jitterMs)),
+			data,
+		}));
+		writtenFrames += 480;
+	}
+
+	await new Promise(resolve => setTimeout(resolve, 50));
+	await output.finalize();
+	await audioWriter.close();
+	expect(errors).toEqual([]);
+
+	const { input, track } = await readBackAudioTrack(output.target.buffer!);
+	let frames = 0;
+	const silentRuns: number[] = [];
+	let silentRun = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		for (const value of data) {
+			if (value === 0) {
+				silentRun++;
+			} else if (silentRun > 0) {
+				silentRuns.push(silentRun);
+				silentRun = 0;
+			}
+		}
+		frames += sample.numberOfFrames;
+	}
+	input.dispose();
+
+	// The only silence is the one filling the 60 ms gap (2880 frames, give or take the timestamps' rounding)
+	expect(silentRuns).toHaveLength(1);
+	expect(Math.abs(silentRuns[0]! - 2880)).toBeLessThanOrEqual(10);
+	expect(frames).toBe(writtenFrames + silentRuns[0]!);
 });
