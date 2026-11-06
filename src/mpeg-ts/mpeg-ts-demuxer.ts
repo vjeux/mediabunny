@@ -1031,7 +1031,9 @@ export class MpegTsDemuxer extends Demuxer {
 
 			const length = (packetCount - 1) * this.packetStride + TS_PACKET_SIZE;
 			let slice = this.reader.requestSlice(firstPacketPos, length);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			if (!slice) {
 				continue;
 			}
