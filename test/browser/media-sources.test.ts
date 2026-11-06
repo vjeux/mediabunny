@@ -732,7 +732,12 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 	return { input, track };
 };
 
-test('MediaStreamVideoTrackSource, records every requested frame of a captureStream(0) canvas', async () => {
+test('MediaStreamVideoTrackSource, records every requested frame of a captureStream(0) canvas', async ({ skip }) => {
+	// Without a frame rate, frames can only be captured through MediaStreamTrackProcessor
+	if (typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackProcessor on the main thread (Chromium)');
+	}
+
 	const canvas = document.createElement('canvas');
 	canvas.width = 64;
 	canvas.height = 48;
