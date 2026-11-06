@@ -4914,11 +4914,13 @@ const collectCryptRanges = (
 			let remaining = subsample.protectedLen;
 			let pos = cursor;
 			while (remaining > 0) {
-				if (remaining < 16 * cryptByteBlock) {
-					break; // Partial final crypt group stays clear
+				// The last pattern may end inside the crypt blocks: its complete 16-byte blocks are still encrypted
+				// and only a trailing partial block stays clear (ISO/IEC 23001-7 10.4.2, like Chromium and Shaka)
+				const cryptBytes = Math.min(16 * cryptByteBlock, 16 * Math.floor(remaining / 16));
+				if (cryptBytes === 0) {
+					break;
 				}
 
-				const cryptBytes = 16 * cryptByteBlock;
 				perSubsample.push({ offset: pos, length: cryptBytes });
 				pos += cryptBytes;
 				remaining -= cryptBytes;
