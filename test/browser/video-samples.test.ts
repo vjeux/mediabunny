@@ -74,6 +74,51 @@ test('allocationSize', async () => {
 	}
 });
 
+test('Copying into the sample\'s own pixel format, for VideoFrame- and ArrayBuffer-backed data', async () => {
+	for (const format of ['I420', 'NV12', 'I420A', 'I444', 'RGBA'] as const) {
+		const planeSize = { I420: 1.5, NV12: 1.5, I420A: 2.5, I444: 3, RGBA: 4 }[format];
+		const data = new Uint8Array(4 * 2 * planeSize).map((_, i) => (i * 37 + 11) % 256);
+		const init = { format, codedWidth: 4, codedHeight: 2, timestamp: 0 };
+		let frame: VideoFrame;
+		try {
+			frame = new VideoFrame(data, init);
+		} catch (error) {
+			// Not every browser's VideoFrame has every format (Firefox has no 4:4:4)
+			if (isChromium()) {
+				throw error;
+			}
+			continue;
+		}
+		using rawSample = new VideoSample(data, init);
+		using frameSample = new VideoSample(frame);
+
+		const crop = { x: 2, y: 0, width: 2, height: 2 };
+		const optionSets: VideoFrameCopyToOptions[] = [
+			{ format },
+			{ format, colorSpace: 'srgb' },
+			{ format, rect: crop },
+			// Dictionary members may be inherited
+			Object.assign(Object.create({ rect: crop }) as VideoFrameCopyToOptions, { format }),
+			new (class {
+				format = format;
+				get rect() {
+					return crop;
+				}
+			})(),
+		];
+		for (const options of optionSets) {
+			const label = `${format} ${JSON.stringify(options)} rect ${JSON.stringify(options.rect)}`;
+			const expected = new Uint8Array(rawSample.allocationSize(options));
+			const expectedLayout = await rawSample.copyTo(expected, options);
+
+			expect(frameSample.allocationSize(options), label).toBe(expected.length);
+			const actual = new Uint8Array(expected.length);
+			expect(await frameSample.copyTo(actual, options), label).toEqual(expectedLayout);
+			expect(actual, label).toEqual(expected);
+		}
+	}
+});
+
 test('copyTo and plane layouts', async () => {
 	const buffer = new ArrayBuffer(1e7);
 
