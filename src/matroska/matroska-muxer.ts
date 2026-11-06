@@ -801,6 +801,13 @@ export class MatroskaMuxer extends Muxer {
 			return;
 		}
 
+		if (this.format instanceof WebMOutputFormat) {
+			// WebM doesn't support the Attachments element (https://www.webmproject.org/docs/container/), and FFmpeg
+			// drops attachments when writing WebM as well
+			Logging._warn('Images and attached files were not written because WebM doesn\'t support attachments.');
+			return;
+		}
+
 		this.attachmentsElement = { id: EBMLId.Attachments, data: elements };
 	}
 
