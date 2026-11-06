@@ -123,6 +123,10 @@ export const readMetadataStringShort = (slice: FileSlice) => {
 };
 
 export const readDataBox = (slice: FileSlice) => {
+	if (slice.remainingLength < MIN_BOX_HEADER_SIZE) {
+		return null;
+	}
+
 	const header = readBoxHeader(slice);
 	if (!header || header.name !== 'data') {
 		return null;
@@ -135,7 +139,7 @@ export const readDataBox = (slice: FileSlice) => {
 
 	const typeIndicator = readU32Be(slice);
 	slice.skip(4); // Locale indicator
-	const data = readBytes(slice, header.contentSize - 8);
+	const data = readBytes(slice, Math.min(header.contentSize - 8, slice.remainingLength)); // Cut off if it overruns
 
 	switch (typeIndicator) {
 		case 1: return textDecoder.decode(data); // UTF-8
