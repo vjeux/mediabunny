@@ -4,8 +4,9 @@ import {
 	BufferSource,
 	BufferTarget,
 	EncodedAudioPacketSource,
-	EncodedVideoPacketSource,
+	EncodedPacket,
 	EncodedPacketSink,
+	EncodedVideoPacketSource,
 	HlsOutputFormat,
 	Input,
 	InputAudioTrack,
@@ -1516,6 +1517,47 @@ test.concurrent('Packets at segment boundaries can be looked up by their own tim
 		if (packet.type === 'key') {
 			expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
 		}
+	}
+});
+
+test.concurrent('Packet lookups at segment boundaries settle when the media offset is large', async () => {
+	// After 2^33 / 90 kHz = 95443.7 s, MPEG-TS timestamps wrap, so these segments get a media offset of about 95433 s.
+	// Before the fix, getPacket(95440) bounced between two segments forever without yielding to the event loop.
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceTrack = await sourceInput.getPrimaryVideoTrack();
+	assert(sourceTrack);
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const keyPacket = (await new EncodedPacketSink(sourceTrack).getFirstPacket())!;
+
+	const files = new Map<string, Uint8Array>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1 }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+			return target;
+		}),
+	});
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const timestamps = [0, 95440, 95441, 95442];
+	for (const timestamp of timestamps) {
+		await videoSource.add(new EncodedPacket(keyPacket.data, 'key', timestamp, 1), { decoderConfig });
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+		formats: HLS_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	for (const timestamp of timestamps) {
+		expect((await sink.getPacket(timestamp))?.timestamp).toBe(timestamp);
 	}
 });
 
