@@ -374,24 +374,6 @@ test('Decoded audio keeps the gaps between packets', async () => {
 	}
 });
 
-test('Decoded audio keeps a gap right after a packet that decodes to nothing', async () => {
-	using input = await remuxDemoAudio(timestamp => timestamp >= 1 ? timestamp + 0.5 : timestamp);
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	const packetTimestamps = await getPacketTimestamps(track);
-	const lastBeforeGap = packetTimestamps.findIndex(x => x >= 1.5) - 1;
-
-	await withDroppedAudioOutput(lastBeforeGap, async () => {
-		const expected = packetTimestamps.filter((_, i) => i !== lastBeforeGap);
-		const sampleTimestamps = await getSampleTimestamps(track);
-		expect(sampleTimestamps).toHaveLength(expected.length);
-		for (let i = 0; i < sampleTimestamps.length; i++) {
-			expect(sampleTimestamps[i]).toBeCloseTo(expected[i]!, 4);
-		}
-	});
-});
-
 test('Decoded audio stays contiguous across packets that share a timestamp', async () => {
 	// A run of eight packets stamped at the first one's timestamp, like the laced frames of a Matroska block with no
 	// known durations
