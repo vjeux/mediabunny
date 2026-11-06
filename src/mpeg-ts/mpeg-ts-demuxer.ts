@@ -2973,6 +2973,54 @@ class PacketBuffer {
 	 * row, continue at the rate seen before them.
 	 */
 	async timePackets(firstPacket: SuppliedPacket) {
+		const { packets, nextTimedPacket } = await this.readUntimedPackets(firstPacket);
+		const sps = !this.lastTimedPacket && nextTimedPacket ? this.getAvcSpsInfo() : null;
+		if (!sps || !nextTimedPacket) {
+			this.placeUntimedPackets(packets, nextTimedPacket);
+			return;
+		}
+
+		// Packets before the first one with a timestamp are placed by their picture order too: an IDR picture whose PES
+		// packet has no PTS comes before the B-frames after it, an open-GOP I picture after its leading pictures. The
+		// time per picture order count comes from the first two packets with a timestamp, so read on to the second.
+		const packetAfter = await this.pullPacket();
+		const later = packetAfter && packetAfter.pts === null
+			? await this.readUntimedPackets(packetAfter)
+			: { packets: [], nextTimedPacket: packetAfter as TimedSuppliedPacket | null };
+
+		const secondTimedPacket = later.nextTimedPacket;
+		const picOrderCnts = secondTimedPacket
+			? getAvcPicOrderCnts([...packets, nextTimedPacket, ...later.packets, secondTimedPacket], sps)
+			: null;
+		const firstPicOrderCnt = picOrderCnts?.[packets.length] ?? null;
+		const secondPicOrderCnt = picOrderCnts?.at(-1) ?? null;
+		const ticksPerPicOrderCnt = secondTimedPacket && firstPicOrderCnt !== null && secondPicOrderCnt !== null
+			? (secondTimedPacket.pts - nextTimedPacket.pts) / (secondPicOrderCnt - firstPicOrderCnt)
+			: null;
+
+		if (
+			picOrderCnts
+			&& firstPicOrderCnt !== null
+			&& ticksPerPicOrderCnt !== null
+			&& ticksPerPicOrderCnt > 0
+			&& Number.isFinite(ticksPerPicOrderCnt)
+			&& packets.every((_, i) => picOrderCnts[i] !== null)
+		) {
+			packets.forEach((packet, i) => packet.pts = Math.round(
+				nextTimedPacket.pts + (picOrderCnts[i]! - firstPicOrderCnt) * ticksPerPicOrderCnt,
+			));
+			this.pendingPackets.push(...packets as TimedSuppliedPacket[]);
+			this.setLastTimedPacket(nextTimedPacket);
+			this.pendingPackets.push(nextTimedPacket);
+		} else {
+			this.placeUntimedPackets(packets, nextTimedPacket);
+		}
+
+		this.placeUntimedPackets(later.packets, secondTimedPacket);
+	}
+
+	/** Reads the packets without a timestamp starting with the given one, up to the next packet with one. */
+	async readUntimedPackets(firstPacket: SuppliedPacket) {
 		const packets = [firstPacket];
 		let nextTimedPacket: TimedSuppliedPacket | null = null;
 
@@ -2990,49 +3038,56 @@ class PacketBuffer {
 			packets.push(packet);
 		}
 
+		return { packets, nextTimedPacket };
+	}
+
+	/** Gives timestamps to the given packets without one, which come before the given packet with one (if any). */
+	placeUntimedPackets(packets: SuppliedPacket[], nextTimedPacket: TimedSuppliedPacket | null) {
 		const previousTimedPacket = this.lastTimedPacket;
-		const pictureOrderTimestamps = previousTimedPacket && this.untimedPacketCount === 0
-			? this.getTimestampsFromPictureOrder(previousTimedPacket, packets, nextTimedPacket)
-			: null;
 
-		if (pictureOrderTimestamps) {
-			packets.forEach((packet, i) => packet.pts = Math.round(pictureOrderTimestamps[i]!));
-		} else if (
-			previousTimedPacket
-			&& nextTimedPacket
-			&& this.untimedPacketCount === 0
-			&& nextTimedPacket.pts > previousTimedPacket.pts
-		) {
-			const step = (nextTimedPacket.pts - previousTimedPacket.pts) / (packets.length + 1);
-			packets.forEach((packet, i) => packet.pts = Math.round(previousTimedPacket.pts + (i + 1) * step));
-		} else if (previousTimedPacket) {
-			const step = this.timedPacketSpacing ?? this.getDefaultFrameDuration();
-			packets.forEach((packet, i) => packet.pts = Math.round(
-				previousTimedPacket.pts + (this.untimedPacketCount + i + 1) * step,
-			));
-		} else {
-			// These come before the first packet with a timestamp, so count back from it (or forward from zero if
-			// there's none)
-			let pts = nextTimedPacket?.pts
-				?? packets.reduce((sum, x) => sum + (x.intrinsicDuration || this.getDefaultFrameDuration()), 0);
+		if (packets.length > 0) {
+			const pictureOrderTimestamps = previousTimedPacket && this.untimedPacketCount === 0
+				? this.getTimestampsFromPictureOrder(previousTimedPacket, packets, nextTimedPacket)
+				: null;
 
-			for (let i = packets.length - 1; i >= 0; i--) {
-				const packet = packets[i]!;
-				pts -= packet.intrinsicDuration || this.getDefaultFrameDuration();
-				packet.pts = Math.round(pts);
+			if (pictureOrderTimestamps) {
+				packets.forEach((packet, i) => packet.pts = Math.round(pictureOrderTimestamps[i]!));
+			} else if (
+				previousTimedPacket
+				&& nextTimedPacket
+				&& this.untimedPacketCount === 0
+				&& nextTimedPacket.pts > previousTimedPacket.pts
+			) {
+				const step = (nextTimedPacket.pts - previousTimedPacket.pts) / (packets.length + 1);
+				packets.forEach((packet, i) => packet.pts = Math.round(previousTimedPacket.pts + (i + 1) * step));
+			} else if (previousTimedPacket) {
+				const step = this.timedPacketSpacing ?? this.getDefaultFrameDuration();
+				packets.forEach((packet, i) => packet.pts = Math.round(
+					previousTimedPacket.pts + (this.untimedPacketCount + i + 1) * step,
+				));
+			} else {
+				// These come before the first packet with a timestamp, so count back from it (or forward from zero if
+				// there's none)
+				let pts = nextTimedPacket?.pts
+					?? packets.reduce((sum, x) => sum + (x.intrinsicDuration || this.getDefaultFrameDuration()), 0);
+
+				for (let i = packets.length - 1; i >= 0; i--) {
+					const packet = packets[i]!;
+					pts -= packet.intrinsicDuration || this.getDefaultFrameDuration();
+					packet.pts = Math.round(pts);
+				}
 			}
-		}
 
-		const timedPackets = packets as TimedSuppliedPacket[];
-		this.pendingPackets.push(...timedPackets);
-		this.untimedPacketCount += packets.length;
+			this.pendingPackets.push(...packets as TimedSuppliedPacket[]);
+			this.untimedPacketCount += packets.length;
+		}
 
 		if (nextTimedPacket) {
 			this.setLastTimedPacket(nextTimedPacket);
 			this.pendingPackets.push(nextTimedPacket);
-		} else if (!previousTimedPacket) {
+		} else if (!previousTimedPacket && packets.length > 0) {
 			// Let the packets after these continue from them
-			this.lastTimedPacket = timedPackets.at(-1)!;
+			this.lastTimedPacket = packets.at(-1) as TimedSuppliedPacket;
 			this.timedPacketBeforeLast = null;
 			this.untimedPacketCount = 0;
 		}
@@ -3048,14 +3103,7 @@ class PacketBuffer {
 		packets: SuppliedPacket[],
 		next: TimedSuppliedPacket | null,
 	) {
-		if (this.avcSpsInfo === undefined) {
-			const info = this.backing.elementaryStream.info;
-			const sps = info.type === 'video' ? info.avcCodecInfo?.sequenceParameterSets[0] : undefined;
-			const spsInfo = sps ? parseAvcSps(sps) : null;
-			this.avcSpsInfo = spsInfo?.picOrderCntType === 0 ? spsInfo : null;
-		}
-
-		const sps = this.avcSpsInfo;
+		const sps = this.getAvcSpsInfo();
 		if (!sps) {
 			return null;
 		}
@@ -3097,6 +3145,18 @@ class PacketBuffer {
 		}
 
 		return result;
+	}
+
+	/** The SPS of an AVC stream with picture order counts in its slice headers, or null if this isn't one. */
+	getAvcSpsInfo() {
+		if (this.avcSpsInfo === undefined) {
+			const info = this.backing.elementaryStream.info;
+			const sps = info.type === 'video' ? info.avcCodecInfo?.sequenceParameterSets[0] : undefined;
+			const spsInfo = sps ? parseAvcSps(sps) : null;
+			this.avcSpsInfo = spsInfo?.picOrderCntType === 0 ? spsInfo : null;
+		}
+
+		return this.avcSpsInfo;
 	}
 
 	/**

@@ -1316,3 +1316,45 @@ test('MPEG-TS finds frames presented before the first PES packet', async () => {
 	expect(await sink.getKeyPacket(0.09)).toBeNull();
 	expect((await sink.getKeyPacket(0.11))?.sequenceNumber).toBe(packets[0]!.sequenceNumber);
 });
+
+test('MPEG-TS places a first frame without PTS by its picture order', async () => {
+	// x264 output with B-frames and open GOPs (made with `ffmpeg -f lavfi -i mandelbrot=size=96x64:rate=25 -t 1.8 -c:v
+	// libx264 -x264-params keyint=30:open-gop=1:bframes=3:b-adapt=2:repeat-headers=1 -f mpegts`). Its first video PES
+	// packet loses its PTS, in the file as is (an IDR picture, shown before the B-frames after it) and in the file cut
+	// at its second key frame (an I picture, shown after the leading B-frame after it).
+	const original = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/open-gop.ts')));
+	const keyFramePositions: number[] = [];
+	for (let pos = 0; pos < original.length; pos += 188) {
+		const pid = ((original[pos + 1]! & 0x1f) << 8) | original[pos + 2]!;
+		// random_access_indicator
+		if (pid === 0x100 && original[pos + 3]! & 0x20 && original[pos + 4]! > 0 && original[pos + 5]! & 0x40) {
+			keyFramePositions.push(pos);
+		}
+	}
+
+	const cut = new Uint8Array([
+		...original.subarray(0, keyFramePositions[0]),
+		...original.subarray(keyFramePositions[1]),
+	]);
+
+	for (const bytes of [original, cut]) {
+		const damaged = bytes.slice();
+		const pos = keyFramePositions[0]!;
+		damaged[pos + 4 + 1 + damaged[pos + 4]! + 7]! &= 0x3f; // PTS_DTS_flags of the first video PES packet
+
+		const readTimestamps = async (data: Uint8Array) => {
+			using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			const sink = new EncodedPacketSink(track);
+			const packets = await readAllPackets(sink);
+			for (const packet of packets) {
+				expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+			}
+
+			return packets.map(x => Math.round(x.timestamp * 90_000));
+		};
+
+		expect(await readTimestamps(damaged)).toEqual(await readTimestamps(bytes));
+	}
+});
