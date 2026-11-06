@@ -8,10 +8,11 @@ import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { BufferSource, FilePathSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, Source } from '../../src/source.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import {
 	AvcNalUnitType,
+	concatNalUnitsInLengthPrefixed,
 	deserializeAvcDecoderConfigurationRecord,
 	extractNalUnitTypeForAvc,
 	iterateAvcNalUnits,
@@ -49,11 +50,8 @@ test('Output, onFinalize', async () => {
 	expect(callCount).toBe(1);
 });
 
-const readAvcClip = async (name: string) => {
-	using input = new Input({
-		source: new FilePathSource(path.join(__dirname, '..', 'public', name)),
-		formats: ALL_FORMATS,
-	});
+const readAvcTrack = async (source: Source) => {
+	using input = new Input({ source, formats: ALL_FORMATS });
 	const track = (await input.getPrimaryVideoTrack())!;
 	const decoderConfig = (await track.getDecoderConfig())!;
 	const packets: EncodedPacket[] = [];
@@ -63,6 +61,8 @@ const readAvcClip = async (name: string) => {
 
 	return { decoderConfig, packets };
 };
+
+const readAvcClip = (name: string) => readAvcTrack(new FilePathSource(path.join(__dirname, '..', 'public', name)));
 
 const getNalUnits = (packet: EncodedPacket, decoderConfig: VideoDecoderConfig) => {
 	return [...iterateAvcNalUnits(packet.data, decoderConfig)]
@@ -98,15 +98,7 @@ const muxAvcClipsAndReadBack = async (
 
 	await output.finalize();
 
-	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-	const track = (await input.getPrimaryVideoTrack())!;
-	const decoderConfig = (await track.getDecoderConfig())!;
-	const packets: EncodedPacket[] = [];
-	for await (const packet of new EncodedPacketSink(track).packets()) {
-		packets.push(packet);
-	}
-
-	return { decoderConfig, packets };
+	return readAvcTrack(new BufferSource(output.target.buffer!));
 };
 
 test('Muxers keep the parameter sets of a mid-stream AVC decoder config change', async () => {
@@ -153,6 +145,58 @@ test('Muxers keep the parameter sets of a mid-stream AVC decoder config change',
 			} else {
 				// MPEG-TS repeats the parameter sets in front of every key frame, the others hold them out of band
 				expect(parameterSets).toEqual(format instanceof MpegTsOutputFormat ? firstParameterSets : []);
+			}
+		}
+	}
+});
+
+test('Muxers reject a decoder config change whose NAL units exceed the track\'s NAL unit length size', async () => {
+	const { decoderConfig } = await readAvcClip('avc-config-change-baseline.mp4');
+	const record = deserializeAvcDecoderConfigurationRecord(decoderConfig.description as Uint8Array)!;
+	const parameterSets = [...record.sequenceParameterSets, ...record.pictureParameterSets];
+
+	// The same config with another lengthSizeMinusOne
+	const withLengthSize = (lengthSize: number): VideoDecoderConfig => {
+		const description = new Uint8Array(decoderConfig.description as Uint8Array);
+		description[4] = 0xfc | (lengthSize - 1);
+		return { ...decoderConfig, description };
+	};
+	const slice = (size: number) => {
+		const nalUnit = new Uint8Array(size).fill(0xaa);
+		nalUnit[0] = 0x65; // IDR slice
+		return nalUnit;
+	};
+
+	for (const createFormat of [() => new Mp4OutputFormat(), () => new MkvOutputFormat()]) {
+		for (const lengthSize of [1, 2]) {
+			const output = new Output({ format: createFormat(), target: new BufferTarget() });
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source, { frameRate: 10 });
+			await output.start();
+
+			await source.add(
+				new EncodedPacket(concatNalUnitsInLengthPrefixed([slice(100)], lengthSize as 1 | 2), 'key', 0, 0.1),
+				{ decoderConfig: withLengthSize(lengthSize) },
+			);
+			// The new config uses 4-byte lengths and comes with a 300-byte NAL unit
+			const added = source.add(
+				new EncodedPacket(concatNalUnitsInLengthPrefixed([slice(300)], 4), 'key', 0.1, 0.1),
+				{ decoderConfig: withLengthSize(4) },
+			);
+
+			if (lengthSize === 1) {
+				// 300 doesn't fit the track's 1-byte length fields; it must not be written truncated
+				await expect(added).rejects.toThrow('A 300-byte NAL unit doesn\'t fit the 1-byte NAL unit');
+				await output.cancel();
+			} else {
+				await added;
+				await output.finalize();
+
+				const { decoderConfig: writtenConfig, packets } = await readAvcTrack(
+					new BufferSource(output.target.buffer!),
+				);
+				expect(getNalUnits(packets[1]!, writtenConfig).map(x => x.byteLength))
+					.toEqual([...parameterSets.map(x => x.byteLength), 300]);
 			}
 		}
 	}

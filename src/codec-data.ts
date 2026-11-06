@@ -1774,7 +1774,8 @@ const extractParameterSetsFromDescription = (codec: 'avc' | 'hevc', description:
  * encoder mid-stream; the new parameter sets are then only in the new description, not in the packets. Once a
  * packet arrives with a description that differs from the stored one, every key packet from then on gets the current
  * parameter sets in front of its first slice (unless it carries them itself), so decoders pick up the change, also
- * when they start at a later key packet. Length prefixes are rewritten if the new description uses another size.
+ * when they start at a later key packet. Length prefixes are rewritten if the new description uses another size; a
+ * NAL unit too large for the track's length size throws instead.
  */
 export class InBandParameterSetWriter {
 	private readonly storedLengthSize: 1 | 2 | 3 | 4;
@@ -1841,6 +1842,18 @@ export class InBandParameterSetWriter {
 			}
 
 			nalUnits.splice(insertionIndex, 0, ...missing);
+		}
+
+		const maxNalUnitLength = 2 ** (8 * this.storedLengthSize) - 1;
+		for (const nalUnit of nalUnits) {
+			if (nalUnit.byteLength > maxNalUnitLength) {
+				// Writing it would truncate its length field and corrupt the rest of the sample
+				throw new Error(
+					`A ${nalUnit.byteLength}-byte NAL unit doesn't fit the ${this.storedLengthSize}-byte NAL unit`
+					+ ' length fields of the track\'s first decoder configuration, which the container uses for the'
+					+ ' whole track. Use 4-byte NAL unit lengths when the decoder configuration can change.',
+				);
+			}
 		}
 
 		return concatNalUnitsInLengthPrefixed(nalUnits, this.storedLengthSize);
