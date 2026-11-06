@@ -315,25 +315,15 @@ export class OggDemuxer extends Demuxer {
 			}
 
 			// The packet extends to the next page; let's find it
-			let currentPos = currentPage.headerStartPos + currentPage.totalSize;
-			while (true) {
-				let headerSlice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-				if (isThenable(headerSlice)) headerSlice = await headerSlice;
-				if (!headerSlice) {
-					return null;
-				}
-
-				const nextPage = readPageHeader(headerSlice);
-				if (!nextPage) {
-					return null;
-				}
-
-				currentPage = nextPage;
-				if (currentPage.serialNumber === startPage.serialNumber) {
-					break;
-				}
-				currentPos = currentPage.headerStartPos + currentPage.totalSize;
+			const nextPage = await this.readNextPage(
+				currentPage.headerStartPos + currentPage.totalSize,
+				startPage.serialNumber,
+			);
+			if (!nextPage) {
+				return null;
 			}
+
+			currentPage = nextPage;
 
 			startDataOffset = 0;
 			currentDataOffset = 0;
@@ -374,7 +364,25 @@ export class OggDemuxer extends Demuxer {
 		}
 
 		// Otherwise, search for the next page belonging to the same bitstream
-		let currentPos = lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize;
+		const nextPage = await this.readNextPage(
+			lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize,
+			lastPacket.endPage.serialNumber,
+		);
+		if (!nextPage) {
+			return null;
+		}
+
+		return { startPage: nextPage, startSegmentIndex: 0 };
+	}
+
+	/**
+	 * Returns the first page of the given bitstream that starts at or after `pos`, skipping the pages of other
+	 * bitstreams. Where something other than a usable page sits between two pages (junk, or a page without segments),
+	 * it searches on for the next page of the bitstream, like libogg and FFmpeg do, instead of ending the stream there.
+	 */
+	async readNextPage(pos: number, serialNumber: number): Promise<Page | null> {
+		let currentPos = pos;
+
 		while (true) {
 			let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
 			if (isThenable(slice)) slice = await slice;
@@ -382,16 +390,37 @@ export class OggDemuxer extends Demuxer {
 				return null;
 			}
 
-			const nextPage = readPageHeader(slice);
-			if (!nextPage) {
-				return null;
+			const page = readPageHeader(slice);
+			if (page) {
+				if (page.serialNumber === serialNumber) {
+					return page;
+				}
+
+				currentPos = page.headerStartPos + page.totalSize;
+				continue;
 			}
 
-			if (nextPage.serialNumber === lastPacket.endPage.serialNumber) {
-				return { startPage: nextPage, startSegmentIndex: 0 };
-			}
+			// There's no page here, so scan forward for the next capture pattern of our bitstream
+			let searchPos = currentPos + 1;
+			while (true) {
+				let searchSlice = this.reader.requestSliceRange(searchPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_SIZE);
+				if (isThenable(searchSlice)) searchSlice = await searchSlice;
+				if (!searchSlice) {
+					return null;
+				}
 
-			currentPos = nextPage.headerStartPos + nextPage.totalSize;
+				if (findNextPageHeader(searchSlice, searchSlice.end, serialNumber)) {
+					currentPos = searchSlice.filePos;
+					break;
+				}
+
+				if (searchSlice.end - searchPos < MAX_PAGE_SIZE) {
+					return null; // Reached the end of the file
+				}
+
+				// Overlap by 3 bytes so that a capture pattern on the boundary isn't missed
+				searchPos = searchSlice.end - 3;
+			}
 		}
 	}
 
