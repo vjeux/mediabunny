@@ -84,10 +84,12 @@ import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../r
 import {
 	buildMpegTsMimeType,
 	createTimestampWrapInfo,
+	findTsPacketLayout,
 	MpegTsStreamType,
 	normalizeWrappedTimestamp,
 	MPEG_TS_TIMESCALE,
 	TimestampWrapInfo,
+	TS_PACKET_LAYOUT_PROBE_SIZE,
 	TS_PACKET_SIZE,
 } from './mpeg-ts-misc';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
@@ -199,28 +201,17 @@ export class MpegTsDemuxer extends Demuxer {
 
 	async readMetadata() {
 		return this.metadataPromise ??= (async () => {
-			const lengthToCheck = TS_PACKET_SIZE + 16 + 1;
-			let startingSlice = this.reader.requestSlice(0, lengthToCheck);
+			let startingSlice = this.reader.requestSliceRange(0, TS_PACKET_SIZE + 16 + 1, TS_PACKET_LAYOUT_PROBE_SIZE);
 			if (isThenable(startingSlice)) startingSlice = await startingSlice;
 			assert(startingSlice);
 
-			const startingBytes = readBytes(startingSlice, lengthToCheck);
-
-			if (startingBytes[0] === 0x47 && startingBytes[TS_PACKET_SIZE] === 0x47) {
-				// Regular MPEG-TS
-				this.packetOffset = 0;
-				this.packetStride = TS_PACKET_SIZE;
-			} else if (startingBytes[0] === 0x47 && startingBytes[TS_PACKET_SIZE + 16] === 0x47) {
-				// MPEG-TS with Forward Error Correction
-				this.packetOffset = 0;
-				this.packetStride = TS_PACKET_SIZE + 16;
-			} else if (startingBytes[4] === 0x47 && startingBytes[4 + TS_PACKET_SIZE + 4] === 0x47) {
-				// MPEG-2-TS (DVHS)
-				this.packetOffset = 4;
-				this.packetStride = TS_PACKET_SIZE + 4;
-			} else {
+			const layout = findTsPacketLayout(readBytes(startingSlice, startingSlice.length));
+			if (!layout) {
 				throw new Error('Unreachable.');
 			}
+
+			this.packetOffset = layout.offset;
+			this.packetStride = layout.stride;
 
 			const MIN_REFERENCE_POINT_PACKET_DISTANCE = 256;
 			this.minReferencePointByteDistance = MIN_REFERENCE_POINT_PACKET_DISTANCE * this.packetStride;
