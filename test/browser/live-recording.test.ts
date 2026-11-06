@@ -456,6 +456,35 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 		expect(analysis.audioEnd).toBeGreaterThan(0.95);
 	});
 
+	test('pausing both sources removes the paused time from both tracks', async () => {
+		const { output, errors, tracks, videoSource, audioSource } = createRecording(new WebMOutputFormat());
+		await output.start();
+		await feedInRealTime(tracks, {
+			durationMs: 1600,
+			onTick: (elapsed) => {
+				if (elapsed >= 500 && elapsed < 1100 && !videoSource.paused) {
+					videoSource.pause();
+					audioSource.pause();
+				} else if (elapsed >= 1100 && videoSource.paused) {
+					videoSource.resume();
+					audioSource.resume();
+				}
+			},
+		});
+		await sleep(50);
+		await output.finalize();
+
+		expect(errors).toEqual([]);
+		const analysis = await analyzeRecording((output.target as BufferTarget).buffer!);
+		expect(analysis.audioEnd!).toBeGreaterThan(0.9);
+		expect(analysis.audioEnd!).toBeLessThan(1.1);
+		expect(Math.abs(analysis.videoEnd! - analysis.audioEnd!)).toBeLessThan(0.1);
+		// No gap left where the pause was
+		const timestamps = analysis.videoTimestamps;
+		const deltas = timestamps.slice(1).map((timestamp, i) => timestamp - timestamps[i]!);
+		expect(Math.max(...deltas)).toBeLessThan(0.1);
+	});
+
 	test('an audio configuration the encoder rejects surfaces through errorPromise', async () => {
 		const tracks = createGeneratorTracks();
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
