@@ -25,7 +25,15 @@ import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
-import { assert, computeRationalApproximation, last, promiseWithResolvers, Rational, simplifyRational } from '../misc';
+import {
+	assert,
+	computeRationalApproximation,
+	concatUint8Arrays,
+	last,
+	promiseWithResolvers,
+	Rational,
+	simplifyRational,
+} from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
@@ -45,6 +53,7 @@ import { FileSlice } from '../reader';
 import { EncodedPacket, PacketType } from '../packet';
 import {
 	concatNalUnitsInLengthPrefixed,
+	countEac3AudioBlocks,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	iterateNalUnitsInAnnexB,
@@ -145,6 +154,8 @@ export type IsobmffTrackData = {
 			accumulatedAudioSamples: number;
 			audioSampleDurationHistory: number[];
 		};
+		/** E-AC-3 syncframes waiting to be combined into a six-block sample. */
+		pendingEac3: { parts: Uint8Array[]; timestamp: number; duration: number; blocks: number } | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -624,6 +635,7 @@ export class IsobmffMuxer extends Muxer {
 					accumulatedAudioSamples: 0,
 					audioSampleDurationHistory: [],
 				},
+				pendingEac3: null,
 			},
 			timescale: decoderConfig.sampleRate,
 			samples: [],
@@ -773,6 +785,40 @@ export class IsobmffMuxer extends Muxer {
 			let timestamp = packet.timestamp;
 			let duration = packet.duration;
 
+			if (track.source._codec === 'eac3') {
+				// An E-AC-3 sample holds six audio blocks (1536 samples, ETSI TS 102 366 F.2), so syncframes with fewer
+				// blocks are combined until there are six. A syncframe that doesn't start where the group ends (within
+				// half a block) ends the group early instead, so that timestamp gaps are kept.
+				const blocks = countEac3AudioBlocks(packetData);
+				const pending = trackData.info.pendingEac3;
+
+				if (pending) {
+					const blockDuration = 256 / trackData.info.sampleRate;
+					const pendingEnd = pending.timestamp + pending.blocks * blockDuration;
+					const isContiguous = Math.abs(timestamp - pendingEnd) <= blockDuration / 2;
+
+					if (blocks === null || pending.blocks + blocks > 6 || !isContiguous) {
+						await this.writePendingEac3Sample(trackData);
+					}
+				}
+
+				if (blocks !== null && blocks < 6) {
+					const group = trackData.info.pendingEac3 ??= { parts: [], timestamp, duration: 0, blocks: 0 };
+					group.parts.push(packetData);
+					group.duration += duration;
+					group.blocks += blocks;
+
+					if (group.blocks < 6) {
+						return;
+					}
+
+					trackData.info.pendingEac3 = null;
+					packetData = concatUint8Arrays(group.parts);
+					timestamp = group.timestamp;
+					duration = group.duration;
+				}
+			}
+
 			if (trackData.info.requiresPcmTransformation) {
 				// Packets may have only approximate timestamp/duration information, but for our PCM logic, we need it
 				// to be precise. So here, we refine the values.
@@ -846,6 +892,18 @@ export class IsobmffMuxer extends Muxer {
 		} finally {
 			release();
 		}
+	}
+
+	private async writePendingEac3Sample(trackData: IsobmffTrackData) {
+		if (trackData.type !== 'audio' || !trackData.info.pendingEac3) {
+			return;
+		}
+
+		const { parts, timestamp, duration } = trackData.info.pendingEac3;
+		trackData.info.pendingEac3 = null;
+
+		const sample = this.createSampleForTrack(trackData, concatUint8Arrays(parts), timestamp, duration, 'key', 0);
+		await this.registerSample(trackData, sample);
 	}
 
 	private async padWithSilence(trackData: IsobmffAudioTrackData, timestamp: number, duration: number) {
@@ -1560,6 +1618,7 @@ export class IsobmffMuxer extends Muxer {
 
 		const trackData = this.trackDatas.find(x => x.track === track);
 		if (trackData) {
+			await this.writePendingEac3Sample(trackData);
 			trackData.closed = true;
 
 			if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
@@ -1631,6 +1690,7 @@ export class IsobmffMuxer extends Muxer {
 		this.ensureOneEnabledTrack();
 
 		for (const trackData of this.trackDatas) {
+			await this.writePendingEac3Sample(trackData);
 			trackData.closed = true;
 
 			if (trackData.type === 'subtitle' && trackData.track.source._codec === 'webvtt') {
