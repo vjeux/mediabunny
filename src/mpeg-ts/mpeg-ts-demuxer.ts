@@ -1792,6 +1792,34 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const firstPesPacketHeader = readPesPacketHeader(demuxer, firstSection, true);
 		assert(firstPesPacketHeader);
 
+		// Finds the PES packet with a PTS that comes before the given one, never before the track's first PES packet
+		// (which may come before the PMT)
+		const findPreviousTimestampedPesPacketHeader = async (pesPacketHeader: TimestampedPesPacketHeader) => {
+			const readSectionsInFull = !this.elementaryStream.canBeTrustedWithKeyPackets;
+			let pos = pesPacketHeader.sectionStartPos - demuxer.packetStride;
+
+			while (pos >= firstPesPacketHeader.sectionStartPos) {
+				const packetHeader = await demuxer.readPacketHeader(pos);
+				if (!packetHeader) {
+					return null;
+				}
+
+				if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
+					const section = await demuxer.readSection(pos, readSectionsInFull);
+					if (section) {
+						const header = readPesPacketHeader(demuxer, section, false);
+						if (header && header.pts !== null) {
+							return header as TimestampedPesPacketHeader;
+						}
+					}
+				}
+
+				pos -= demuxer.packetStride;
+			}
+
+			return null;
+		};
+
 		if (searchPts < firstPesPacketHeader.pts) {
 			// We're before the first packet, definitely nothing here
 			return null;
@@ -1867,6 +1895,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const retrieveEncodedPacket = async (
 			sectionStartPos: number,
 			predicate: (packet: SuppliedPacket) => boolean,
+			// Whether to also read the packets that share searchPts with the first one reaching it. Data of another
+			// access unit that begins a PES packet takes that PES packet's PTS too, ahead of the key frame.
+			readPacketsAtSearchPts = false,
 		) => {
 			// Load the relevant section in full
 			const section = await demuxer.readSection(sectionStartPos, true);
@@ -1881,7 +1912,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			// Advance until the top-most presentation timestamp crosses or equals searchPts
 			while (true) {
 				const topPts = last(buffer.presentationOrderPackets)?.pts ?? -Infinity;
-				if (topPts >= searchPts) {
+				if (readPacketsAtSearchPts ? topPts > searchPts : topPts >= searchPts) {
 					break;
 				}
 
@@ -2053,8 +2084,18 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 								}
 							}
 
-							isKeyPacket = context.suppliedPacket?.sectionStartPos === pesHeader.sectionStartPos
-								&& context.suppliedPacket.randomAccessIndicator === 1;
+							// Any packet starting in this PES packet may be the key frame: it may begin with data of
+							// another access unit
+							isKeyPacket = false;
+							while (context.suppliedPacket?.sectionStartPos === pesHeader.sectionStartPos) {
+								if (context.suppliedPacket.randomAccessIndicator === 1) {
+									isKeyPacket = true;
+									break;
+								}
+
+								context.suppliedPacket = null;
+								await context.markNextPacket();
+							}
 						}
 
 						if (isKeyPacket) {
@@ -2106,41 +2147,32 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				if (bestKeyPesHeader) {
 					let startPesHeader = bestKeyPesHeader;
 
-					if (lookaheadCount === 0) {
-						// Packet is at the end of stream, let's rewind a little to obtain the correct packet duration
-						outer:
-						for (let i = 0; i < reorderSize; i++) {
-							let pos = startPesHeader.sectionStartPos - demuxer.packetStride;
+					// The key frame's access unit may be split over any number of PES packets, which all have its PTS
+					// (when the parameter sets come in PES packets of their own, say), so let's start reading at the
+					// first of them; only it may carry the random access flag. Each step goes back in the file and
+					// stops at the track's first PES packet, so this ends. At the end of the stream, rewind a little
+					// more to obtain the correct packet duration.
+					let extraRewindCount = lookaheadCount === 0 ? reorderSize : 0;
+					while (true) {
+						const previous = await findPreviousTimestampedPesPacketHeader(startPesHeader);
+						if (!previous) {
+							break;
+						}
 
-							while (pos >= demuxer.packetOffset) {
-								const packetHeader = await demuxer.readPacketHeader(pos);
-								if (!packetHeader) {
-									break outer;
-								}
-
-								if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
-									const section = await demuxer.readSection(pos, readSectionsInFull);
-									if (section) {
-										const header = readPesPacketHeader(demuxer, section, false);
-										if (header && header.pts !== null) {
-											startPesHeader = header as TimestampedPesPacketHeader;
-											break;
-										}
-									}
-								}
-
-								pos -= demuxer.packetStride;
-							}
-
-							if (pos < demuxer.packetOffset) {
-								break; // We've hit the start of the file, there's nothing more to rewind
-							}
+						if (previous.pts === bestKeyPesHeader.pts) {
+							startPesHeader = previous;
+						} else if (extraRewindCount > 0) {
+							startPesHeader = previous;
+							extraRewindCount--;
+						} else {
+							break;
 						}
 					}
 
 					const encodedPacket = await retrieveEncodedPacket(
 						startPesHeader.sectionStartPos,
 						p => p.pts <= searchPts && p.randomAccessIndicator === 1,
+						true,
 					);
 					if (encodedPacket) {
 						return encodedPacket;
