@@ -293,26 +293,33 @@ test('FFmpeg-unsafe raw udta tags, MP4', async () => {
 });
 
 test('Read the iTunes gnre genre number, MP4', async () => {
-	const output = new Output({
-		format: new Mp4OutputFormat(),
-		target: new BufferTarget(),
-	});
+	const readGenre = async (gnre: string | Uint8Array) => {
+		const output = new Output({
+			format: new Mp4OutputFormat(),
+			target: new BufferTarget(),
+		});
+
+		// A string is written as text, a Uint8Array as binary data
+		output.setMetadataTags({ raw: { gnre } });
+
+		const dummyTrack = createDummyAudioTrack('aac', output);
+
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+
+		return (await input.getMetadataTags()).genre;
+	};
 
 	// iTunes and AtomicParsley store predefined genres as an ID3v1 genre number plus one
-	output.setMetadataTags({ raw: { gnre: new Uint8Array([0, 18]) } });
-
-	const dummyTrack = createDummyAudioTrack('aac', output);
-
-	await output.start();
-	await dummyTrack.addPacket();
-	await output.finalize();
-
-	using input = new Input({
-		source: new BufferSource(output.target.buffer!),
-		formats: ALL_FORMATS,
-	});
-
-	expect((await input.getMetadataTags()).genre).toBe('Rock');
+	expect(await readGenre(new Uint8Array([0, 18]))).toBe('Rock');
+	// Some writers put text there instead
+	expect(await readGenre('Rock')).toBe('Rock');
 });
 
 test('Read and write metadata, Matroska', async () => {

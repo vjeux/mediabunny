@@ -3007,8 +3007,10 @@ export class IsobmffDemuxer extends Demuxer {
 						}; break;
 
 						case 'gnre': {
-							// Holds a 16-bit ID3v1 genre number plus one, not a string
-							if (data instanceof Uint8Array && data.length >= 2) {
+							// Holds a 16-bit ID3v1 genre number plus one, though some writers put text there
+							if (typeof data === 'string') {
+								this.metadataTags.genre ??= data;
+							} else if (data instanceof Uint8Array && data.length >= 2) {
 								const genre = ID3_V1_GENRES[toDataView(data).getUint16(0, false) - 1];
 								if (genre !== undefined) {
 									this.metadataTags.genre ??= genre;
