@@ -158,6 +158,10 @@ type InternalTrack = {
 	editListOffset: number;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
+	/** The entries of the track's 'seig' sample group description, which fragments can refer to. */
+	encryptionGroups: SampleGroupEncryption[];
+	/** The entry of the track's 'seig' sample group description that applies to samples without a mapping. */
+	defaultEncryptionGroup: SampleGroupEncryption | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
@@ -256,6 +260,14 @@ type FragmentTrackState = {
 	defaultSampleFlags: number | null;
 	startTimestamp: number | null;
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
+	/** The traf's own 'seig' sample group entries */
+	encryptionGroups: SampleGroupEncryption[];
+	/** The traf's own 'seig' entry for samples without a mapping */
+	defaultEncryptionGroup: SampleGroupEncryption | null;
+	/** The traf's 'seig' sample-to-group runs */
+	encryptionGroupRuns: { sampleCount: number; groupDescriptionIndex: number }[] | null;
+	/** The senc box, read once the samples' groups are known */
+	sencSlice: FileSlice | null;
 };
 
 type FragmentTrackData = {
@@ -283,6 +295,7 @@ type FragmentTrackSample = {
 	duration: number;
 	byteOffset: number;
 	byteSize: number;
+	encryptionGroup: SampleGroupEncryption | null;
 	isKeyFrame: boolean;
 	encryption: SampleEncryptionInfo | null;
 };
@@ -317,6 +330,16 @@ type SampleEncryptionInfo = {
 		clearLen: number;
 		protectedLen: number;
 	}[] | null;
+};
+
+/** A CENC sample group entry ('seig'), overriding the tenc defaults for its samples (e.g. for key rotation). */
+type SampleGroupEncryption = {
+	isProtected: boolean;
+	perSampleIvSize: number;
+	kid: string;
+	constantIv: Uint8Array | null;
+	cryptByteBlock: number;
+	skipByteBlock: number;
 };
 
 /**
@@ -559,6 +582,8 @@ export class IsobmffDemuxer extends Demuxer {
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
 				encryptionInfo: foreignTrack.encryptionInfo,
+				encryptionGroups: foreignTrack.encryptionGroups,
+				defaultEncryptionGroup: foreignTrack.defaultEncryptionGroup,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
 				maxBitrate: foreignTrack.maxBitrate,
@@ -910,6 +935,7 @@ export class IsobmffDemuxer extends Demuxer {
 					this.reader,
 					track.encryptionInfo,
 					trackData.encryptionAuxInfo,
+					i => trackData.samples[i]?.encryptionGroup ?? null,
 				);
 
 				for (let i = 0; i < Math.min(trackData.samples.length, entries.length); i++) {
@@ -1040,6 +1066,8 @@ export class IsobmffDemuxer extends Demuxer {
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
 					encryptionInfo: null,
+					encryptionGroups: [],
+					defaultEncryptionGroup: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
 					maxBitrate: null,
@@ -2434,6 +2462,17 @@ export class IsobmffDemuxer extends Demuxer {
 							trackData.startTimestampIsFinal = true;
 						}
 
+						if (
+							currentFragmentState.encryptionGroupRuns
+							|| currentFragmentState.defaultEncryptionGroup
+							|| this.currentTrack.defaultEncryptionGroup
+						) {
+							assignEncryptionGroups(this.currentTrack, currentFragmentState, trackData);
+						}
+						if (currentFragmentState.sencSlice) {
+							readSampleEncryptionBox(currentFragmentState.sencSlice, this.currentTrack, trackData);
+						}
+
 						// Transfer the buffered saiz+saio state onto the track data, so readFragment can resolve it
 						// once all boxes are parsed. Only relevant if senc wasn't already used to populate samples.
 						if (currentFragmentState.encryptionAuxInfo && !trackData.samples[0]!.encryption) {
@@ -2500,6 +2539,10 @@ export class IsobmffDemuxer extends Demuxer {
 					defaultSampleFlags: defaults?.defaultSampleFlags ?? null,
 					startTimestamp: null,
 					encryptionAuxInfo: null,
+					encryptionGroups: [],
+					defaultEncryptionGroup: null,
+					encryptionGroupRuns: null,
+					sencSlice: null,
 				};
 
 				if (baseDataOffsetPresent) {
@@ -2653,6 +2696,7 @@ export class IsobmffDemuxer extends Demuxer {
 						byteSize: sampleSize,
 						isKeyFrame,
 						encryption: null,
+						encryptionGroup: null,
 					});
 
 					trackData.currentOffset += sampleSize;
@@ -2740,48 +2784,105 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				const trackData = this.currentFragment?.trackData.get(track.id);
-				if (!trackData) {
+				if (!track.currentFragmentState || !this.currentFragment?.trackData.has(track.id)) {
 					break;
 				}
 
-				slice.skip(1); // Version
-				const flags = readU24Be(slice);
-				const useSubsamples = Boolean(flags & 0x000002);
+				// The IV sizes can depend on the samples' sample groups, which may come later in the traf
+				track.currentFragmentState.sencSlice = slice.slice(contentStartPos, boxInfo.contentSize);
+			}; break;
 
-				const sampleCount = readU32Be(slice);
-				const ivSize = track.encryptionInfo.defaultPerSampleIvSize;
-				if (ivSize === null) {
-					throw new Error('Invalid file: encrypted track is missing its tenc box.');
+			case 'sgpd': {
+				// Sample group description; only CENC sample groups ('seig') are of interest
+				const track = this.currentTrack;
+				if (!track?.encryptionInfo) {
+					break;
 				}
 
-				for (let i = 0; i < Math.min(sampleCount, trackData.samples.length); i++) {
-					// Normalize the IV to 16 bytes so downstream code can assume a full-length buffer. For CTR with
-					// an 8-byte per-sample IV the lower 8 bytes are zero (that's the CENC spec's block counter start);
-					// for CBC/cbcs the IV is always 16 bytes by spec.
-					const iv = new Uint8Array(16);
-					if (ivSize > 0) {
-						iv.set(readBytes(slice, ivSize), 0);
-					} else if (track.encryptionInfo.defaultConstantIv) {
-						iv.set(track.encryptionInfo.defaultConstantIv, 0);
-					} else {
-						throw new Error('Invalid file: encrypted sample has no IV.');
-					}
+				const version = readU8(slice);
+				slice.skip(3); // Flags
+				if (readAscii(slice, 4) !== 'seig') {
+					break;
+				}
 
-					let subsamples: SampleEncryptionInfo['subsamples'] = null;
-					if (useSubsamples) {
-						const subsampleCount = readU16Be(slice);
-						subsamples = [];
-						for (let j = 0; j < subsampleCount; j++) {
-							const clearLen = readU16Be(slice);
-							const protectedLen = readU32Be(slice);
-							subsamples.push({ clearLen, protectedLen });
+				// ISO/IEC 14496-12 8.9.3: the default length exists since version 1, the default entry since version 2
+				const defaultLength = version >= 1 ? readU32Be(slice) : 0;
+				const defaultGroupDescriptionIndex = version >= 2 ? readU32Be(slice) : 0;
+				const hasLengthFields = version >= 1 && defaultLength === 0;
+
+				const entryCount = readU32Be(slice);
+				const entries: SampleGroupEncryption[] = [];
+				for (let i = 0; i < entryCount && boxEndPos - slice.filePos >= (hasLengthFields ? 24 : 20); i++) {
+					const length = hasLengthFields ? readU32Be(slice) : defaultLength;
+					const entryStartPos = slice.filePos;
+
+					slice.skip(1); // Reserved
+					const pattern = readU8(slice);
+					const isProtected = readU8(slice) !== 0;
+					const perSampleIvSize = readU8(slice);
+					const kid = [...readBytes(slice, 16)].map(x => x.toString(16).padStart(2, '0')).join('');
+					let constantIv: Uint8Array | null = null;
+					if (isProtected && perSampleIvSize === 0) {
+						if (boxEndPos - slice.filePos < 1) {
+							break;
 						}
+						const constantIvSize = Math.min(readU8(slice), 16, boxEndPos - slice.filePos);
+						constantIv = new Uint8Array(16);
+						constantIv.set(readBytes(slice, constantIvSize));
 					}
 
-					const sample = trackData.samples[i]!;
-					sample.encryption = { iv, subsamples };
+					entries.push({
+						isProtected,
+						perSampleIvSize,
+						kid,
+						constantIv,
+						cryptByteBlock: pattern >> 4,
+						skipByteBlock: pattern & 0xf,
+					});
+
+					if (length > 0) {
+						slice.filePos = entryStartPos + length;
+					}
 				}
+
+				// The default entry is an index into this box's entries (traf-local ones may use the sbgp convention)
+				const defaultIndex = defaultGroupDescriptionIndex > 0x10000
+					? defaultGroupDescriptionIndex - 0x10000
+					: defaultGroupDescriptionIndex;
+				const defaultGroup = defaultIndex > 0 ? entries[defaultIndex - 1] ?? null : null;
+
+				if (track.currentFragmentState) {
+					track.currentFragmentState.encryptionGroups = entries;
+					track.currentFragmentState.defaultEncryptionGroup = defaultGroup;
+				} else if (!this.currentFragment) {
+					track.encryptionGroups = entries;
+					track.defaultEncryptionGroup = defaultGroup;
+				}
+			}; break;
+
+			case 'sbgp': {
+				// Sample to group; only CENC sample groups ('seig') in fragments are of interest
+				const fragmentState = this.currentTrack?.currentFragmentState;
+				if (!fragmentState) {
+					break;
+				}
+
+				const version = readU8(slice);
+				slice.skip(3); // Flags
+				if (readAscii(slice, 4) !== 'seig') {
+					break;
+				}
+				if (version === 1) {
+					slice.skip(4); // Grouping type parameter
+				}
+
+				const entryCount = readU32Be(slice);
+				const runs: { sampleCount: number; groupDescriptionIndex: number }[] = [];
+				for (let i = 0; i < entryCount && boxEndPos - slice.filePos >= 8; i++) {
+					runs.push({ sampleCount: readU32Be(slice), groupDescriptionIndex: readU32Be(slice) });
+				}
+
+				fragmentState.encryptionGroupRuns = runs;
 			}; break;
 
 				// Metadata section
@@ -3505,10 +3606,14 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			data = readBytes(slice, fragmentSample.byteSize);
 
 			if (this.internalTrack.encryptionInfo) {
-				const sampleEncryption = fragmentSample.encryption
-					?? getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
-				if (sampleEncryption) {
-					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment);
+				const group = fragmentSample.encryptionGroup;
+				const encryptionInfo = group
+					? applySampleGroupEncryption(this.internalTrack.encryptionInfo, group)
+					: this.internalTrack.encryptionInfo;
+				const sampleEncryption = fragmentSample.encryption ?? getDefaultSampleEncryption(encryptionInfo);
+
+				if (sampleEncryption && (!group || group.isProtected)) {
+					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment, encryptionInfo);
 				}
 			}
 		}
@@ -4178,6 +4283,8 @@ const resolveEncryptionAuxInfo = async (
 	reader: Reader,
 	encryptionInfo: TrackEncryptionInfo,
 	aux: SampleEncryptionAuxInfo,
+	// The 'seig' sample group entry of each sample, which overrides tenc's IV size and constant IV
+	getEncryptionGroup: (sampleIndex: number) => SampleGroupEncryption | null = () => null,
 ) => {
 	if (aux.resolved) {
 		return aux.resolved;
@@ -4203,26 +4310,28 @@ const resolveEncryptionAuxInfo = async (
 		throw new Error('Failed to read auxiliary encryption info.');
 	}
 
-	const ivSize = encryptionInfo.defaultPerSampleIvSize;
-	if (ivSize === null) {
-		throw new Error('Invalid file: encrypted track is missing its tenc box.');
-	}
-
 	// Each aux entry has the same byte layout as a senc entry: IV (of size ivSize, or the constant IV from tenc
 	// when ivSize is 0), then optionally subsample count + [clearLen, protectedLen] pairs. Subsamples are present
-	// iff the entry is larger than the IV.
+	// iff the entry is larger than the IV. Like in senc, a sample's 'seig' group overrides tenc's IV parameters.
 	const entries: SampleEncryptionInfo[] = [];
 	for (let i = 0; i < aux.sampleCount; i++) {
 		const entrySize = aux.defaultSampleInfoSize > 0
 			? aux.defaultSampleInfoSize
 			: aux.sampleSizes![i]!;
 
+		const group = getEncryptionGroup(i);
+		const ivSize = group ? group.perSampleIvSize : encryptionInfo.defaultPerSampleIvSize;
+		const constantIv = group ? group.constantIv : encryptionInfo.defaultConstantIv;
+		if (ivSize === null) {
+			throw new Error('Invalid file: encrypted track is missing its tenc box.');
+		}
+
 		const iv = new Uint8Array(16);
 		if (ivSize > 0) {
 			iv.set(readBytes(slice, ivSize), 0);
-		} else if (encryptionInfo.defaultConstantIv) {
-			iv.set(encryptionInfo.defaultConstantIv, 0);
-		} else {
+		} else if (constantIv) {
+			iv.set(constantIv, 0);
+		} else if (!group || group.isProtected) {
 			throw new Error('Invalid file: encrypted sample has no IV.');
 		}
 
@@ -4244,6 +4353,92 @@ const resolveEncryptionAuxInfo = async (
 	return entries;
 };
 
+/** The track's encryption parameters, as overridden by a 'seig' sample group entry */
+const applySampleGroupEncryption = (
+	encryptionInfo: TrackEncryptionInfo,
+	group: SampleGroupEncryption,
+): TrackEncryptionInfo => ({
+	...encryptionInfo,
+	defaultKid: group.kid,
+	defaultIsProtected: group.isProtected,
+	defaultPerSampleIvSize: group.perSampleIvSize,
+	defaultConstantIv: group.constantIv,
+	defaultCryptByteBlock: group.cryptByteBlock,
+	defaultSkipByteBlock: group.skipByteBlock,
+});
+
+/** Maps a traf's samples to their 'seig' sample group entries (ISO/IEC 23001-7, 6). */
+const assignEncryptionGroups = (track: InternalTrack, state: FragmentTrackState, trackData: FragmentTrackData) => {
+	// Samples that no sbgp entry covers get the default entry of a version 2 sample group description, the traf's
+	// before the track's (ISO/IEC 14496-12 8.9.2.1). Samples mapped to index 0 explicitly belong to no group.
+	const defaultGroup = state.defaultEncryptionGroup ?? track.defaultEncryptionGroup;
+	for (const sample of trackData.samples) {
+		sample.encryptionGroup = defaultGroup;
+	}
+
+	let sampleIndex = 0;
+	for (const run of state.encryptionGroupRuns ?? []) {
+		// Indices above 0x10000 refer to the traf's own sample group description, the others to the track's
+		const index = run.groupDescriptionIndex;
+		const group = index > 0x10000
+			? state.encryptionGroups[index - 0x10001] ?? null
+			: index > 0
+				? track.encryptionGroups[index - 1] ?? null
+				: null;
+
+		const end = Math.min(sampleIndex + run.sampleCount, trackData.samples.length);
+		for (; sampleIndex < end; sampleIndex++) {
+			trackData.samples[sampleIndex]!.encryptionGroup = group;
+		}
+	}
+};
+
+/** Reads the per-sample IVs and subsamples of a traf's senc box. */
+const readSampleEncryptionBox = (slice: FileSlice, track: InternalTrack, trackData: FragmentTrackData) => {
+	assert(track.encryptionInfo);
+
+	slice.skip(1); // Version
+	const flags = readU24Be(slice);
+	const useSubsamples = Boolean(flags & 0x000002);
+
+	const sampleCount = readU32Be(slice);
+
+	for (let i = 0; i < Math.min(sampleCount, trackData.samples.length); i++) {
+		const sample = trackData.samples[i]!;
+		const group = sample.encryptionGroup;
+		const ivSize = group ? group.perSampleIvSize : track.encryptionInfo.defaultPerSampleIvSize;
+		const constantIv = group ? group.constantIv : track.encryptionInfo.defaultConstantIv;
+		if (ivSize === null) {
+			throw new Error('Invalid file: encrypted track is missing its tenc box.');
+		}
+
+		// Normalize the IV to 16 bytes so downstream code can assume a full-length buffer. For CTR with
+		// an 8-byte per-sample IV the lower 8 bytes are zero (that's the CENC spec's block counter start);
+		// for CBC/cbcs the IV is always 16 bytes by spec.
+		const iv = new Uint8Array(16);
+		if (ivSize > 0) {
+			iv.set(readBytes(slice, ivSize), 0);
+		} else if (constantIv) {
+			iv.set(constantIv, 0);
+		} else if (!group || group.isProtected) {
+			throw new Error('Invalid file: encrypted sample has no IV.');
+		}
+
+		let subsamples: SampleEncryptionInfo['subsamples'] = null;
+		if (useSubsamples) {
+			const subsampleCount = readU16Be(slice);
+			subsamples = [];
+			for (let j = 0; j < subsampleCount; j++) {
+				const clearLen = readU16Be(slice);
+				const protectedLen = readU32Be(slice);
+				subsamples.push({ clearLen, protectedLen });
+			}
+		}
+
+		sample.encryption = { iv, subsamples };
+	}
+};
+
 const getDefaultSampleEncryption = (encryptionInfo: TrackEncryptionInfo): SampleEncryptionInfo | null => {
 	if (!encryptionInfo.defaultConstantIv) {
 		return null;
@@ -4260,9 +4455,9 @@ const decryptSample = async (
 	sampleEncryption: SampleEncryptionInfo,
 	data: Uint8Array,
 	fragment: Fragment | null,
+	encryptionInfo = track.encryptionInfo,
 ): Promise<Uint8Array> => {
-	assert(track.encryptionInfo);
-	const encryptionInfo = track.encryptionInfo;
+	assert(encryptionInfo);
 	if (encryptionInfo.defaultKid === null) {
 		throw new Error('Invalid file: encrypted track is missing its tenc box.');
 	}
