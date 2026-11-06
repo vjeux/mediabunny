@@ -2719,11 +2719,12 @@ class AudioEncoderWrapper {
 					);
 				}
 
-				const primingShiftInSamples = await detectAudioEncoderPrimingShift(
+				const primingShift = await detectAudioEncoderPrimingShift( // In seconds
 					this.encodingConfig.codec,
 					encoderConfig.codec,
+					encoderConfig.sampleRate,
+					encoderConfig.numberOfChannels,
 				);
-				const primingShift = primingShiftInSamples / encoderConfig.sampleRate;
 				let opusPreSkip = 0; // In seconds
 
 				const stack = new Error('Encoding error').stack;
@@ -2984,16 +2985,22 @@ const audioEncoderPrimingShiftPromises = new Map<string, Promise<number>>();
 
 // WebCodecs audio encoders have encoder priming delay but don't surface this delay whatsoever, meaning they typically
 // just emit audio at incorrect timestamps. This priming delay depends heavily on the browser-OS combo, so instead of
-// hardcoding it, we simply detect it locally.
-const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) => {
-	let promise = audioEncoderPrimingShiftPromises.get(codecString);
+// hardcoding it, we simply detect it locally. It also depends on the sample rate, since encoders may resample the input
+// internally (Chrome's Opus encoder resamples everything to 48 kHz, which delays other rates by up to 5.5 ms), so it's
+// detected with the sample rate and channel count of the actual encoder. Resolves to the shift in seconds.
+const detectAudioEncoderPrimingShift = (
+	codec: AudioCodec,
+	codecString: string,
+	sampleRate: number,
+	numberOfChannels: number,
+) => {
+	const key = `${codecString} ${sampleRate} ${numberOfChannels}`;
+	let promise = audioEncoderPrimingShiftPromises.get(key);
 	if (promise) {
 		return promise;
 	}
 
 	promise = (async () => {
-		const numberOfChannels = 1;
-		const sampleRate = 48000;
 		const encoderConfig: AudioEncoderConfig = {
 			codec: codecString,
 			numberOfChannels,
@@ -3009,6 +3016,7 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 		let peakIndex = null as number | null;
 		let peakValue = -Infinity;
 		let decodedFrames = 0;
+		let decodedSampleRate = sampleRate; // Decoders may output another rate than the one encoded
 		let codecError = null as DOMException | null;
 
 		const encoder = new AudioEncoder({
@@ -3025,6 +3033,7 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 		});
 		const decoder = new AudioDecoder({
 			output: (audioData) => {
+				decodedSampleRate = audioData.sampleRate;
 				const values = new Float32Array(audioData.numberOfFrames);
 				audioData.copyTo(values, { planeIndex: 0, format });
 				audioData.close();
@@ -3051,7 +3060,7 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 			}
 
 			const data = new Float32Array(numberOfChannels * numberOfFrames);
-			data[impulseIndex] = 1;
+			data[impulseIndex] = 1; // In the first channel
 
 			const audioData = new AudioData({
 				data,
@@ -3088,14 +3097,13 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 
 		assert(peakIndex !== null);
 
-		const firstChunkTimestampInSamples = Math.round(chunks[0]!.timestamp / 1e6 * sampleRate);
-		return peakIndex - impulseIndex + firstChunkTimestampInSamples;
+		return peakIndex / decodedSampleRate - impulseIndex / sampleRate + chunks[0]!.timestamp / 1e6;
 	})();
 
-	audioEncoderPrimingShiftPromises.set(codecString, promise);
+	audioEncoderPrimingShiftPromises.set(key, promise);
 
 	// Don't remember failures because they _could_ be transient
-	promise.catch(() => audioEncoderPrimingShiftPromises.delete(codecString));
+	promise.catch(() => audioEncoderPrimingShiftPromises.delete(key));
 
 	return promise;
 };
