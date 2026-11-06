@@ -7,7 +7,7 @@
  */
 
 import { TrackType } from '../output';
-import { parseAacAudioSpecificConfig } from '../../shared/aac-misc';
+import { buildAacAudioSpecificConfig, parseAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
 	AacCodecInfo,
 	AudioCodec,
@@ -1792,6 +1792,20 @@ export class IsobmffDemuxer extends Demuxer {
 					Logging._warn(
 						`Unsupported audio codec (objectTypeIndication ${objectTypeIndication}) - discarding track.`,
 					);
+				}
+
+				if (!decoderSpecificInfo && track.info.codec === 'aac') {
+					// Some writers leave out the AudioSpecificConfig. Like FFmpeg, assume AAC-LC with the sample
+					// entry's sample rate and channel count.
+					try {
+						track.info.codecDescription = buildAacAudioSpecificConfig({
+							objectType: 2,
+							outputSampleRate: track.info.sampleRate,
+							outputNumberOfChannels: track.info.numberOfChannels,
+						});
+					} catch {
+						// Channel count not expressible in an AudioSpecificConfig
+					}
 				}
 
 				if (decoderSpecificInfo) {
