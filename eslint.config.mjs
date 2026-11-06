@@ -39,6 +39,7 @@ export default tseslint.config(
 		ignores: [
 			'dist',
 			'dist-docs',
+			'types',
 			'packages/mp3-encoder/dist',
 			'packages/mp3-encoder/build',
 			'packages/ac3/dist',
