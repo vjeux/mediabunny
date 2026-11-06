@@ -547,3 +547,193 @@ export const id3v24Tag = (frames: [string, string][]) => {
 	}));
 	return concatBytes(ascii('ID3'), [4, 0, 0], synchsafe(body.length), body);
 };
+
+export type HevcSpsOptions = {
+	profileSpace?: number;
+	tierFlag?: number;
+	profileIdc?: number;
+	compatibilityFlags?: number;
+	constraintFlags?: number[];
+	levelIdc?: number;
+	maxSubLayersMinus1?: number;
+	/** Per sub-layer [profile_present, level_present] */
+	subLayerFlags?: [number, number][];
+	chromaFormatIdc?: number;
+	separateColourPlane?: boolean;
+	width: number;
+	height: number;
+	/** conf_win_left/right/top/bottom_offset */
+	conformanceWindow?: [number, number, number, number];
+	bitDepthLuma?: number;
+	bitDepthChroma?: number;
+	subLayerOrderingInfo?: boolean;
+	/** sps_max_num_reorder_pics per written sub-layer */
+	reorderPics?: number[];
+	scalingListData?: boolean;
+	pcm?: boolean;
+	/** Explicit short-term RPSs: [negative POC count, positive POC count] each */
+	shortTermRps?: [number, number][];
+	vui?: {
+		sar?: number | [number, number];
+		videoSignal?: { fullRange: boolean; colour?: [number, number, number] };
+		defaultDisplayWindow?: boolean;
+		timing?: { pocProportional: boolean };
+		minSpatialSegmentationIdc?: number;
+	};
+};
+
+/** Builds an H.265 SPS NAL unit (type 33, with emulation prevention) from the given fields. */
+export const buildHevcSps = (options: HevcSpsOptions) => {
+	const maxSubLayersMinus1 = options.maxSubLayersMinus1 ?? 0;
+	const w = new BitWriter()
+		.writeBits(4, 0) // sps_video_parameter_set_id
+		.writeBits(3, maxSubLayersMinus1)
+		.writeBits(1, 1) // sps_temporal_id_nesting_flag
+		.writeBits(2, options.profileSpace ?? 0)
+		.writeBits(1, options.tierFlag ?? 0)
+		.writeBits(5, options.profileIdc ?? 1)
+		.writeBits(32, options.compatibilityFlags ?? 0x60000000);
+	for (const byte of options.constraintFlags ?? [0x90, 0, 0, 0, 0, 0]) {
+		w.writeBits(8, byte);
+	}
+	w.writeBits(8, options.levelIdc ?? 93);
+	const subLayerFlags = options.subLayerFlags ?? Array.from({ length: maxSubLayersMinus1 }, () => [0, 0]);
+	for (const [profilePresent, levelPresent] of subLayerFlags) {
+		w.writeBits(1, profilePresent).writeBits(1, levelPresent);
+	}
+	if (maxSubLayersMinus1 > 0) {
+		for (let i = maxSubLayersMinus1; i < 8; i++) {
+			w.writeBits(2, 0);
+		}
+	}
+	for (const [profilePresent, levelPresent] of subLayerFlags) {
+		if (profilePresent) {
+			w.writeBits(8, 0x01).writeBits(32, 0x60000000).writeBits(32, 0x90000000).writeBits(16, 0);
+		}
+		if (levelPresent) {
+			w.writeBits(8, 90);
+		}
+	}
+	w.writeUe(0); // sps_seq_parameter_set_id
+	const chromaFormatIdc = options.chromaFormatIdc ?? 1;
+	w.writeUe(chromaFormatIdc);
+	if (chromaFormatIdc === 3) {
+		w.writeFlag(options.separateColourPlane ?? false);
+	}
+	w.writeUe(options.width).writeUe(options.height);
+	w.writeFlag(options.conformanceWindow !== undefined);
+	for (const offset of options.conformanceWindow ?? []) {
+		w.writeUe(offset);
+	}
+	w.writeUe((options.bitDepthLuma ?? 8) - 8).writeUe((options.bitDepthChroma ?? 8) - 8);
+	w.writeUe(4); // log2_max_pic_order_cnt_lsb_minus4
+	const orderingInfo = options.subLayerOrderingInfo ?? false;
+	w.writeFlag(orderingInfo);
+	const orderingCount = orderingInfo ? maxSubLayersMinus1 + 1 : 1;
+	for (let i = 0; i < orderingCount; i++) {
+		const reorder = options.reorderPics?.[i] ?? 0;
+		w.writeUe(reorder + 1).writeUe(reorder).writeUe(0);
+	}
+	w.writeUe(0).writeUe(3).writeUe(0).writeUe(3).writeUe(2).writeUe(2); // block sizes, transform depths
+	w.writeFlag(options.scalingListData ?? false);
+	if (options.scalingListData) {
+		w.writeFlag(true); // sps_scaling_list_data_present_flag
+		for (let sizeId = 0; sizeId < 4; sizeId++) {
+			for (let matrixId = 0; matrixId < 6; matrixId += sizeId === 3 ? 3 : 1) {
+				// Alternate between copying a reference list and coding one explicitly
+				const explicit = (sizeId + matrixId) % 2 === 0;
+				w.writeFlag(explicit);
+				if (!explicit) {
+					w.writeUe(0);
+					continue;
+				}
+				if (sizeId > 1) {
+					w.writeSe(8);
+				}
+				const coefNum = Math.min(64, 1 << (4 + (sizeId << 1)));
+				for (let i = 0; i < coefNum; i++) {
+					w.writeSe(i % 3 - 1);
+				}
+			}
+		}
+	}
+	w.writeFlag(false).writeFlag(true); // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+	w.writeFlag(options.pcm ?? false);
+	if (options.pcm) {
+		w.writeBits(4, 7).writeBits(4, 7).writeUe(0).writeUe(1).writeFlag(true);
+	}
+	const rpsList = options.shortTermRps ?? [[1, 0]];
+	w.writeUe(rpsList.length);
+	rpsList.forEach(([negative, positive], index) => {
+		if (index !== 0) {
+			w.writeFlag(false); // inter_ref_pic_set_prediction_flag
+		}
+		w.writeUe(negative).writeUe(positive);
+		for (let i = 0; i < negative + positive; i++) {
+			w.writeUe(i).writeFlag(true);
+		}
+	});
+	w.writeFlag(false); // long_term_ref_pics_present_flag
+	w.writeFlag(true).writeFlag(true); // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+	const vui = options.vui;
+	w.writeFlag(vui !== undefined);
+	if (vui) {
+		w.writeFlag(vui.sar !== undefined);
+		if (typeof vui.sar === 'number') {
+			w.writeBits(8, vui.sar);
+		} else if (vui.sar) {
+			w.writeBits(8, 255).writeBits(16, vui.sar[0]).writeBits(16, vui.sar[1]);
+		}
+		w.writeFlag(false); // overscan_info_present_flag
+		w.writeFlag(vui.videoSignal !== undefined);
+		if (vui.videoSignal) {
+			w.writeBits(3, 5).writeFlag(vui.videoSignal.fullRange).writeFlag(vui.videoSignal.colour !== undefined);
+			for (const value of vui.videoSignal.colour ?? []) {
+				w.writeBits(8, value);
+			}
+		}
+		w.writeFlag(true).writeUe(0).writeUe(0); // chroma_loc_info
+		w.writeFlag(false).writeFlag(false).writeFlag(false); // neutral chroma, field_seq, frame_field_info
+		w.writeFlag(vui.defaultDisplayWindow ?? false);
+		if (vui.defaultDisplayWindow) {
+			w.writeUe(1).writeUe(2).writeUe(3).writeUe(4);
+		}
+		w.writeFlag(vui.timing !== undefined);
+		if (vui.timing) {
+			w.writeBits(32, 1001).writeBits(32, 60000).writeFlag(vui.timing.pocProportional);
+			if (vui.timing.pocProportional) {
+				w.writeUe(0);
+			}
+			w.writeFlag(false); // vui_hrd_parameters_present_flag
+		}
+		w.writeFlag(vui.minSpatialSegmentationIdc !== undefined);
+		if (vui.minSpatialSegmentationIdc !== undefined) {
+			w.writeFlag(false).writeFlag(true).writeFlag(false)
+				.writeUe(vui.minSpatialSegmentationIdc).writeUe(2).writeUe(1).writeUe(15).writeUe(15);
+		}
+	}
+	w.writeFlag(false); // sps_extension_present_flag
+	w.writeTrailingBits();
+	return concatBytes([0x42, 0x01], addEmulationPrevention(w.toBytes()));
+};
+
+/** Builds an H.265 PPS NAL unit (type 34) with the given tiles/WPP flags; tiles use a single uniform column/row. */
+export const buildHevcPps = (tiles: boolean, entropyCodingSync: boolean, cuQpDelta = false) => {
+	const w = new BitWriter()
+		.writeUe(0).writeUe(0) // pps_pic_parameter_set_id, pps_seq_parameter_set_id
+		.writeFlag(false).writeFlag(false).writeBits(3, 0).writeFlag(false).writeFlag(true)
+		.writeUe(0).writeUe(0).writeSe(-3) // num_ref_idx defaults, init_qp_minus26
+		.writeFlag(false).writeFlag(false).writeFlag(cuQpDelta);
+	if (cuQpDelta) {
+		w.writeUe(1);
+	}
+	w.writeSe(-2).writeSe(2).writeFlag(false).writeFlag(false).writeFlag(false).writeFlag(false);
+	w.writeFlag(tiles).writeFlag(entropyCodingSync);
+	if (tiles) {
+		w.writeUe(1).writeUe(1).writeFlag(true).writeFlag(true); // 2x2 uniform tiles, loop filter across tiles
+	}
+	w.writeFlag(true).writeFlag(false).writeFlag(false).writeFlag(false).writeFlag(false).writeUe(0);
+	w.writeFlag(false).writeFlag(false).writeFlag(false);
+	w.writeTrailingBits();
+	return concatBytes([0x44, 0x01], addEmulationPrevention(w.toBytes()));
+};

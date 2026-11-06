@@ -1,5 +1,70 @@
 import { describe, expect, test } from 'vitest';
 import { AudioSample, VideoSample } from '../../src/sample.js';
+import { Input } from '../../src/input.js';
+import { BufferSource } from '../../src/source.js';
+import { ALL_FORMATS } from '../../src/input-format.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
+import { ebml, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/mutation-bytes.js';
+
+describe('EncodedPacketSink verifyKeyPackets', () => {
+	const vp9Frame = (frameType: number, showExisting = false) => {
+		// frame_marker 10, profile 0, show_existing_frame, frame_type, then filler
+		const first = 0b1000_0000 | (showExisting ? 0b1000 : 0) | (showExisting ? 0 : frameType << 2);
+		return [first, 0x49, 0x83, 0x42, 0x00, 0x13, 0xf0, 0x0b, 0x30];
+	};
+	const bytes = mkvFile({
+		trackEntries: [ebml(
+			EBMLId.TrackEntry,
+			ebmlUint(EBMLId.TrackNumber, 1),
+			ebmlUint(EBMLId.TrackUID, 1),
+			ebmlUint(EBMLId.TrackType, 1),
+			ebmlString(EBMLId.CodecID, 'V_VP9'),
+			ebml(EBMLId.Video, ebmlUint(EBMLId.PixelWidth, 320), ebmlUint(EBMLId.PixelHeight, 240)),
+		)],
+		rest: [ebml(
+			EBMLId.Cluster,
+			ebmlUint(EBMLId.Timestamp, 0),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 0, 0x80, vp9Frame(0))), // key, and really key
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 40, 0x80, vp9Frame(1))), // claims key, is an inter frame
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 80, 0x80, vp9Frame(0, true))), // claims key, can't tell
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 120, 0x00, vp9Frame(0))), // claims delta, bitstream says key
+		)],
+	});
+
+	test('key packets are checked against the bitstream; delta and undecidable packets keep their type', async () => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const sink = new EncodedPacketSink(track);
+
+		const claimed = [];
+		for await (const packet of sink.packets()) {
+			claimed.push(packet.type);
+		}
+		expect(claimed).toEqual(['key', 'key', 'key', 'delta']);
+
+		const verified = [];
+		for await (const packet of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+			verified.push(packet.type);
+		}
+		expect(verified).toEqual(['key', 'delta', 'key', 'delta']);
+
+		const options = { verifyKeyPackets: true };
+		expect((await sink.getFirstPacket(options))!.type).toBe('key');
+		const second = await sink.getPacket(0.04, options);
+		expect(second!.type).toBe('delta');
+		expect((await sink.getNextPacket(second!, options))!.type).toBe('key');
+		expect((await sink.getPacket(0.12, options))!.type).toBe('delta');
+	});
+
+	test('verifyKeyPackets must be a boolean and cannot be combined with metadataOnly', async () => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const sink = new EncodedPacketSink(track);
+		await expect(sink.getFirstPacket({ verifyKeyPackets: 1 as never })).rejects.toThrow(TypeError);
+		await expect(sink.getFirstPacket({ verifyKeyPackets: true, metadataOnly: true })).rejects.toThrow(TypeError);
+	});
+});
 
 describe('VideoSample from raw pixels: init validation', () => {
 	const base = { format: 'RGBA' as const, codedWidth: 4, codedHeight: 2, timestamp: 0 };

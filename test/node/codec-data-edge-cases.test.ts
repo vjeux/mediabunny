@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'vitest';
 import {
 	determineVideoPacketType,
+	extractHevcDecoderConfigurationRecord,
 	extractVp9CodecInfoFromPacket,
 	parseAvcSps,
+	parseHevcSps,
 	parseOpusIdentificationHeader,
 	readVorbisComments,
 	vp9CodecInfoHasColorInfo,
@@ -14,6 +16,8 @@ import {
 	ascii,
 	BitWriter,
 	buildAvcSps,
+	buildHevcPps,
+	buildHevcSps,
 	concatBytes,
 	lengthPrefixed,
 	u32le,
@@ -749,6 +753,170 @@ describe('parseOpusIdentificationHeader', () => {
 
 /** A two-byte HEVC NAL unit header of the given type (layer 0, TemporalId 0) followed by a few payload bytes. */
 const hevcNal = (type: number) => [type << 1, 0x01, 0xaf, 0x09, 0x40];
+
+describe('parseHevcSps and extractHevcDecoderConfigurationRecord', () => {
+	test('crops by the conformance window in chroma units for each chroma format', () => {
+		expect(parseHevcSps(buildHevcSps({
+			width: 1920,
+			height: 1088,
+			conformanceWindow: [0, 0, 0, 4],
+		}))).toMatchObject({
+			displayWidth: 1920,
+			displayHeight: 1080,
+			chromaFormatIdc: 1,
+		});
+		expect(parseHevcSps(buildHevcSps({
+			chromaFormatIdc: 2,
+			width: 1280,
+			height: 720,
+			conformanceWindow: [1, 2, 3, 4],
+		}))).toMatchObject({ displayWidth: 1280 - 6, displayHeight: 720 - 7, chromaFormatIdc: 2 });
+		expect(parseHevcSps(buildHevcSps({
+			chromaFormatIdc: 3,
+			width: 1280,
+			height: 720,
+			conformanceWindow: [1, 2, 3, 4],
+		}))).toMatchObject({ displayWidth: 1280 - 3, displayHeight: 720 - 7 });
+		expect(parseHevcSps(buildHevcSps({
+			chromaFormatIdc: 3,
+			separateColourPlane: true,
+			width: 64,
+			height: 64,
+			conformanceWindow: [1, 0, 0, 2],
+		}))).toMatchObject({ displayWidth: 63, displayHeight: 62 });
+		expect(parseHevcSps(buildHevcSps({
+			chromaFormatIdc: 0,
+			width: 64,
+			height: 64,
+			conformanceWindow: [1, 0, 0, 2],
+		}))).toMatchObject({ displayWidth: 63, displayHeight: 62, chromaFormatIdc: 0 });
+	});
+
+	test('a conformance window covering the whole picture makes the SPS invalid', () => {
+		expect(parseHevcSps(buildHevcSps({ width: 64, height: 64, conformanceWindow: [16, 16, 0, 0] }))).toBe(null);
+		expect(parseHevcSps(buildHevcSps({ width: 64, height: 64, conformanceWindow: [0, 0, 16, 16] }))).toBe(null);
+		expect(parseHevcSps(buildHevcSps({ width: 64, height: 64, conformanceWindow: [0, 0, 15, 16] }))).toMatchObject({
+			displayHeight: 2,
+		});
+	});
+
+	test('reads profile, tier, level, compatibility and constraint flags', () => {
+		const info = parseHevcSps(buildHevcSps({
+			profileSpace: 0,
+			tierFlag: 1,
+			profileIdc: 2,
+			compatibilityFlags: 0x20000000,
+			constraintFlags: [0xb0, 0x01, 0x02, 0x03, 0x04, 0x05],
+			levelIdc: 153,
+			bitDepthLuma: 10,
+			bitDepthChroma: 10,
+			width: 3840,
+			height: 2160,
+		}));
+		expect(info).toMatchObject({
+			generalProfileSpace: 0,
+			generalTierFlag: 1,
+			generalProfileIdc: 2,
+			generalProfileCompatibilityFlags: 0x20000000,
+			generalLevelIdc: 153,
+			bitDepthLumaMinus8: 2,
+			bitDepthChromaMinus8: 2,
+		});
+		expect([...info!.generalConstraintIndicatorFlags]).toEqual([0xb0, 0x01, 0x02, 0x03, 0x04, 0x05]);
+	});
+
+	test('skips sub-layer profile and level data and takes the highest sub-layer\'s reorder depth', () => {
+		const info = parseHevcSps(buildHevcSps({
+			maxSubLayersMinus1: 2,
+			subLayerFlags: [[1, 1], [0, 1]],
+			subLayerOrderingInfo: true,
+			reorderPics: [0, 1, 3],
+			width: 640,
+			height: 360,
+		}));
+		expect(info).toMatchObject({ spsMaxSubLayersMinus1: 2, maxDecFrameBuffering: 4, displayWidth: 640 });
+
+		const single = parseHevcSps(buildHevcSps({ maxSubLayersMinus1: 1, reorderPics: [2], width: 640, height: 360 }));
+		expect(single).toMatchObject({ spsMaxSubLayersMinus1: 1, maxDecFrameBuffering: 3, displayHeight: 360 });
+	});
+
+	test('skips scaling list data, PCM parameters and several short-term reference picture sets', () => {
+		const info = parseHevcSps(buildHevcSps({
+			width: 1280,
+			height: 720,
+			scalingListData: true,
+			pcm: true,
+			shortTermRps: [[2, 0], [1, 1], [0, 3]],
+			vui: { videoSignal: { fullRange: true, colour: [9, 16, 9] } },
+		}));
+		expect(info).toMatchObject({
+			displayWidth: 1280,
+			colourPrimaries: 9,
+			transferCharacteristics: 16,
+			matrixCoefficients: 9,
+			fullRangeFlag: 1,
+		});
+	});
+
+	test('reads the VUI aspect ratio, colour description and min_spatial_segmentation_idc past optional fields', () => {
+		const info = parseHevcSps(buildHevcSps({
+			width: 720,
+			height: 576,
+			vui: {
+				sar: 12,
+				videoSignal: { fullRange: false, colour: [5, 6, 5] },
+				defaultDisplayWindow: true,
+				timing: { pocProportional: true },
+				minSpatialSegmentationIdc: 7,
+			},
+		}));
+		expect(info).toMatchObject({
+			pixelAspectRatio: { num: 64, den: 33 },
+			colourPrimaries: 5,
+			transferCharacteristics: 6,
+			matrixCoefficients: 5,
+			fullRangeFlag: 0,
+			minSpatialSegmentationIdc: 7,
+		});
+
+		const extendedSar = parseHevcSps(buildHevcSps({ width: 720, height: 576, vui: { sar: [16, 15] } }));
+		expect(extendedSar!.pixelAspectRatio).toEqual({ num: 16, den: 15 });
+		const plain = parseHevcSps(buildHevcSps({ width: 720, height: 576 }));
+		expect(plain).toMatchObject({
+			pixelAspectRatio: { num: 1, den: 1 },
+			colourPrimaries: 2,
+			minSpatialSegmentationIdc: 0,
+		});
+	});
+
+	test.each([
+		[true, false, false, 2], // tiles: tile-based
+		[false, true, false, 3], // wavefront
+		[true, true, true, 0], // both: mixed
+	])('tiles %s, entropy coding sync %s (cu_qp_delta %s): parallelismType %i', (tiles, wpp, cuQpDelta, expected) => {
+		const vps = [0x40, 0x01, 0x0c, 0x01, 0xff, 0xff];
+		const sps = buildHevcSps({ width: 640, height: 360, vui: { minSpatialSegmentationIdc: 4 } });
+		const pps = buildHevcPps(tiles, wpp, cuQpDelta);
+		const prefixSei = [0x4e, 0x01, 0x05, 0x01, 0x11, 0x80];
+		const record = extractHevcDecoderConfigurationRecord(annexB(vps, sps, pps, prefixSei, hevcNal(19)));
+		expect(record).toMatchObject({
+			parallelismType: expected,
+			minSpatialSegmentationIdc: 4,
+			generalProfileIdc: 1,
+			numTemporalLayers: 1,
+			lengthSizeMinusOne: 3,
+		});
+		expect(record!.arrays.map(array => [array.nalUnitType, array.nalUnits.length])).toEqual([
+			[32, 1], [33, 1], [34, 1], [39, 1],
+		]);
+	});
+
+	test('no record without both an SPS and a PPS', () => {
+		const sps = buildHevcSps({ width: 640, height: 360 });
+		expect(extractHevcDecoderConfigurationRecord(annexB(sps, hevcNal(19)))).toBe(null);
+		expect(extractHevcDecoderConfigurationRecord(annexB(buildHevcPps(false, false), hevcNal(19)))).toBe(null);
+	});
+});
 
 describe('determineVideoPacketType: HEVC', () => {
 	test.each([
