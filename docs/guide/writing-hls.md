@@ -134,14 +134,17 @@ const output = new Output({
 			>();
 
 			const url = `/upload?file=${encodeURIComponent(path)}`;
-			const promise = fetch(url, {
+			// Streaming request bodies require `duplex: 'half'`, which
+			// TypeScript's DOM types don't declare yet
+			const init: RequestInit & { duplex: 'half' } = {
 				method: 'POST',
 				body: readable,
 				duplex: 'half',
 				headers: {
 					'Content-Type': mimeType,
 				},
-			});
+			};
+			const promise = fetch(url, init);
 			promises.push(promise);
 
 			// Requires that all segments use an append-only format
