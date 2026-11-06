@@ -73,7 +73,7 @@ import { FileSlice } from '../reader';
 import { Muxer } from '../muxer';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
-import { AttachedFile } from '../metadata';
+import { AttachedFile, formatMetadataDate } from '../metadata';
 import { Logging } from '../logging';
 import { VERSIONED_NAME } from '../version';
 
@@ -557,6 +557,8 @@ export class MatroskaMuxer extends Muxer {
 
 		const metadataTags = this.output._metadataTags;
 		const writtenTags = new Set<string>();
+		// Keys left out on purpose, which a raw tag may not fill in
+		const omittedTags = new Set<string>();
 
 		for (const { key, value } of keyValueIterator(metadataTags)) {
 			switch (key) {
@@ -606,8 +608,13 @@ export class MatroskaMuxer extends Muxer {
 				}; break;
 
 				case 'date': {
-					addSimpleTag('DATE', value.toISOString().slice(0, 10));
-					writtenTags.add('DATE');
+					const dateString = formatMetadataDate(value);
+					if (dateString !== null) {
+						addSimpleTag('DATE', dateString);
+						writtenTags.add('DATE');
+					} else {
+						omittedTags.add('DATE');
+					}
 				}; break;
 
 				case 'trackNumber': {
@@ -646,7 +653,8 @@ export class MatroskaMuxer extends Muxer {
 		if (metadataTags.raw) {
 			for (const key in metadataTags.raw) {
 				const value = metadataTags.raw[key]!;
-				if (value == null || writtenTags.has(key)) {
+				// Tag names are read case-insensitively, so compare them that way for the keys left out
+				if (value == null || writtenTags.has(key) || omittedTags.has(key.toUpperCase())) {
 					continue;
 				}
 
