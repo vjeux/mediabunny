@@ -783,6 +783,39 @@ test('MPEG-TS with E-AC-3 audio in a Blu-ray (BDAV) stream', async () => {
 	expect(count).toBe(32); // As counted by ffprobe
 });
 
+test('MPEG-TS files not starting with a whole packet', async () => {
+	const file = await fs.promises.readFile(path.join(__dirname, '../public/ac3.ts'));
+
+	const readPackets = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		expect(await input.getFormat()).toBe(MPEG_TS);
+
+		const track = (await input.getAudioTracks())[0];
+		assert(track);
+		expect(await track.getCodec()).toBe('ac3');
+
+		const packets: [number, number][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([packet.timestamp, packet.byteLength]);
+		}
+
+		return packets;
+	};
+
+	const expected = await readPackets(file);
+
+	// Recorders like set-top boxes write their own header in front of the transport stream
+	const withHeader = new Uint8Array(100 + file.length);
+	withHeader.set(new TextEncoder().encode('PVR recording header'));
+	withHeader.set(file, 100);
+	expect(await readPackets(withHeader)).toEqual(expected);
+
+	// A capture cut at an arbitrary byte starts in the middle of a packet
+	const cut = await readPackets(file.subarray(1000));
+	expect(cut.length).toBeGreaterThan(expected.length - 5);
+	expect(cut.at(-1)).toEqual(expected.at(-1));
+});
+
 test('MPEG-TS partial reading', async () => {
 	const fullPath = path.join(__dirname, '../public/193039199_mp4_h264_aac_fhd_7.ts');
 	const buffer = await fs.promises.readFile(fullPath);
