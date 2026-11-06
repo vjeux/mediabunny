@@ -964,6 +964,86 @@ test('MPEG-TS with an unreadable stream still opens with its other streams', asy
 	expect(await tracks[0]!.getCodec()).toBe('avc');
 });
 
+test('MPEG-TS with field-coded H.264 keeps both fields of a frame in one packet', async () => {
+	// Like camcorder AVCHD recordings (PAFF): each frame is a top and a bottom field picture, each with its own AUD,
+	// in one PES packet. One frame-coded picture and one unpaired field are mixed in.
+	const fromBits = (bits: string) => {
+		const padded = bits + '1' + '0'.repeat((8 - ((bits.length + 1) % 8)) % 8); // rbsp_stop_one_bit + alignment
+		return padded.match(/.{8}/g)!.map(byte => parseInt(byte, 2));
+	};
+	const ue = (value: number) => {
+		const code = (value + 1).toString(2);
+		return '0'.repeat(code.length - 1) + code;
+	};
+	const bits4 = (value: number) => value.toString(2).padStart(4, '0');
+
+	// Main profile, 64x64, log2_max_frame_num 4, frame_mbs_only_flag 0
+	const sps = [0x67, 0x4d, 0x40, 0x28, ...fromBits('1111' + '010' + '0' + ue(3) + ue(1) + '0' + '0' + '1' + '00')];
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const aud = [0x09, 0xf0];
+	// field: 0 = frame, 1 = top field, 2 = bottom field
+	const slice = (idr: boolean, frameNum: number, field: 0 | 1 | 2) => [
+		idr ? 0x65 : 0x41,
+		...fromBits('1' + ue(idr ? 7 : 5) + '1' + bits4(frameNum) + (field === 0 ? '0' : field === 1 ? '10' : '11')),
+		...new Array<number>(40).fill(0xaa),
+	];
+	const annexB = (nalUnits: number[][]) => nalUnits.flatMap(nalUnit => [0, 0, 0, 1, ...nalUnit]);
+
+	const frames = [
+		annexB([aud, sps, pps, slice(true, 0, 1), aud, slice(false, 0, 2)]),
+		annexB([aud, slice(false, 1, 1), aud, slice(false, 1, 2)]),
+		annexB([aud, slice(false, 2, 0)]), // Frame-coded
+		annexB([aud, slice(false, 3, 2), aud, slice(false, 3, 1)]), // Bottom field first
+		annexB([aud, slice(false, 4, 1)]), // Unpaired
+		annexB([aud, slice(false, 5, 1), aud, slice(false, 5, 2)]),
+	];
+
+	const packets: Uint8Array[] = [];
+	const pushPackets = (pid: number, payload: number[]) => {
+		for (let i = 0; i < payload.length; i += 184) {
+			const chunk = payload.slice(i, i + 184);
+			const packet = new Uint8Array(188);
+			const stuffing = 184 - chunk.length;
+			const header = [0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, (stuffing ? 0x30 : 0x10)];
+			packet.set(header, 0);
+			if (stuffing) {
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+				packet.fill(0xff, 6, 4 + stuffing);
+			}
+			packet.set(chunk, 4 + stuffing);
+			packets.push(packet);
+		}
+	};
+
+	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPackets(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+	frames.forEach((frame, i) => {
+		const pts = 3600 * i;
+		pushPackets(0x100, [
+			0, 0, 1, 0xe0, 0, 0, 0x84, 0x80, 5, 0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff,
+			((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1, ...frame,
+		]);
+	});
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryVideoTrack())!;
+	const result = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		result.push({ timestamp: packet.timestamp, duration: packet.duration, size: packet.byteLength });
+	}
+
+	expect(result).toEqual(frames.map((frame, i) => ({ timestamp: 0.04 * i, duration: 0.04, size: frame.length })));
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
