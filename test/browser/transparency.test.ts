@@ -387,9 +387,8 @@ test('Can reencode transparent video, keeping alpha', async () => {
 });
 
 test('Decoded frames with alpha keep the color space of the color stream', async () => {
-	// Opaque bars encoded with alpha: 'keep', like a canvas recording from Chrome's MediaRecorder: the color stream comes
-	// out full range, and every packet carries alpha side data
-	// (Grays, so that only the range matters, not the matrix)
+	// Opaque gray bars encoded with alpha: 'keep', like a canvas recording from Chrome's MediaRecorder: the color
+	// stream comes out full range, and every packet carries alpha side data. Grays, so that only the range matters.
 	const colors = [[16, 16, 16], [64, 64, 64], [192, 192, 192], [240, 240, 240]];
 	const data = new Uint8Array(64 * 16 * 4);
 	for (let i = 0; i < 64 * 16; i++) {
