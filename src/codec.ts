@@ -534,10 +534,25 @@ export const extractVideoCodecString = (trackInfo: {
 		const level = vp9CodecInfo.level.toString().padStart(2, '0');
 		const bitDepth = vp9CodecInfo.bitDepth.toString().padStart(2, '0');
 		const chromaSubsampling = vp9CodecInfo.chromaSubsampling.toString().padStart(2, '0');
-		const colourPrimaries = vp9CodecInfo.colourPrimaries.toString().padStart(2, '0');
-		const transferCharacteristics = vp9CodecInfo.transferCharacteristics.toString().padStart(2, '0');
-		const matrixCoefficients = vp9CodecInfo.matrixCoefficients.toString().padStart(2, '0');
-		const videoFullRangeFlag = vp9CodecInfo.videoFullRangeFlag.toString().padStart(2, '0');
+
+		// The VP9 bitstream only signals a color space, from which the primaries and especially the transfer
+		// characteristics can merely be guessed (BT.2020 content may well be PQ or HLG). So, explicitly signaled
+		// color information, such as WebM's Colour element, takes precedence, keeping the string in line with the
+		// color space.
+		const colourPrimaries = (
+			colorSpace?.primaries ? COLOR_PRIMARIES_MAP[colorSpace.primaries] : vp9CodecInfo.colourPrimaries
+		).toString().padStart(2, '0');
+		const transferCharacteristics = (
+			colorSpace?.transfer
+				? TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer]
+				: vp9CodecInfo.transferCharacteristics
+		).toString().padStart(2, '0');
+		const matrixCoefficients = (
+			colorSpace?.matrix ? MATRIX_COEFFICIENTS_MAP[colorSpace.matrix] : vp9CodecInfo.matrixCoefficients
+		).toString().padStart(2, '0');
+		const videoFullRangeFlag = (
+			typeof colorSpace?.fullRange === 'boolean' ? Number(colorSpace.fullRange) : vp9CodecInfo.videoFullRangeFlag
+		).toString().padStart(2, '0');
 
 		let string = `vp09.${profile}.${level}.${bitDepth}.${chromaSubsampling}`;
 		string += `.${colourPrimaries}.${transferCharacteristics}.${matrixCoefficients}.${videoFullRangeFlag}`;
