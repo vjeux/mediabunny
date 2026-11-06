@@ -142,6 +142,31 @@ test('Read and write metadata, MP4', async () => {
 	expect(readTags.raw!['©hog']).toBe('pish');
 });
 
+test('MP4 leaves out track numbers and tempos that don\'t fit their 16-bit iTunes fields', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({ trackNumber: 70000, tracksTotal: 12, beatsPerMinute: 40000 });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.trackNumber).toBeUndefined(); // Was 70000 - 65536 = 4464
+	expect(readTags.tracksTotal).toBe(12);
+	expect(readTags.raw!['tmpo']).toBeUndefined(); // Was the signed 16-bit value 40000 - 65536
+});
+
 test('Read and write metadata, QuickTime', async () => {
 	const output = new Output({
 		format: new MovOutputFormat(),
