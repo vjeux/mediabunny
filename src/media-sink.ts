@@ -2325,10 +2325,11 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	timestampOffset = 0;
 	// By spec, each output carries the timestamp of the chunk it was decoded from, but Chromium instead counts up from
 	// the first chunk's timestamp, which loses any gap between packets. So there, we keep where the audio of each
-	// packet passed to the decoder starts (in decode order), and where the next packet's audio would start if there
-	// were no gap.
+	// chunk passed to the decoder starts (by chunk index, in decode order), and where the next chunk's audio would
+	// start if there were no gap.
 	stampsOutputsItself = isChromium();
-	queuedOutputs: number[] = [];
+	submittedChunkCount = 0;
+	queuedOutputs: { chunkIndex: number; timestamp: number }[] = [];
 	expectedQueuedTimestamp: number | null = null;
 	// WebCodecs impls discard the Opus pre-skip (correct) but don't advance the timestamp (incorrect). These are the
 	// pre-skip and the part of it the decoder still has to discard from the packets to come, in Opus samples.
@@ -2359,26 +2360,25 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				return;
 			}
 
-			if (this.stampsOutputsItself && !this.customDecoder) {
-				// Some packets decode to nothing (discard padding, for example), so pair this output with the queued
-				// packet start closest to where the audio continues instead of just the next one. Equal starts (laced
-				// frames sharing one timestamp, for example) each keep their own output.
-				if (this.currentTimestamp !== null) {
-					const current = this.currentTimestamp;
-					while (
-						this.queuedOutputs.length > 1
-						&& Math.abs(this.queuedOutputs[1]! - current) < Math.abs(this.queuedOutputs[0]! - current)
-					) {
-						this.queuedOutputs.shift();
-					}
+			if (this.stampsOutputsItself && this.decoder) {
+				// Chromium decodes one audio chunk at a time and delivers its output before taking the next chunk
+				// from the queue, so the chunks taken so far tell which chunk this output comes from. Earlier chunks
+				// still queued here decoded to nothing (discard padding, for example).
+				const chunkIndex = this.submittedChunkCount - this.decoder.decodeQueueSize - 1;
+				while (this.queuedOutputs.length > 0 && this.queuedOutputs[0]!.chunkIndex < chunkIndex) {
+					this.queuedOutputs.shift();
 				}
+
+				// A chunk's further outputs, if any, just continue its audio
+				const queued = this.queuedOutputs[0]?.chunkIndex === chunkIndex
+					? this.queuedOutputs.shift()!.timestamp
+					: undefined;
 
 				// Packet timestamps are often off by a frame or more (rounding, laced frames, jitter), and decoded
 				// audio can run a little longer or shorter than them, so the audio just continues. Only where a
-				// packet's audio starts at least 0.1 s after both the previous packet's audio ends and where the
+				// chunk's audio starts at least 0.1 s after both the previous chunk's audio ends and where the
 				// decoded audio has got to (a gap, as FFmpeg's aresample defines it with min_hard_comp) does it skip
 				// ahead. It never moves back, which would play audio twice.
-				const queued = this.queuedOutputs.shift();
 				if (this.currentTimestamp === null) {
 					this.currentTimestamp = queued ?? sample.timestamp;
 				} else if (
@@ -2500,11 +2500,12 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 				this.expectedFirstTimestamp ??= outputTimestamp;
 				if (this.stampsOutputsItself) {
-					this.queuedOutputs.push(outputTimestamp);
+					this.queuedOutputs.push({ chunkIndex: this.submittedChunkCount, timestamp: outputTimestamp });
 				}
 			}
 
 			this.decoder.decode(packet.toEncodedAudioChunk());
+			this.submittedChunkCount++;
 		}
 	}
 
@@ -2519,6 +2520,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		this.currentTimestamp = null;
 		this.expectedFirstTimestamp = null;
 		this.timestampOffset = 0;
+		this.submittedChunkCount = 0;
 		this.queuedOutputs.length = 0;
 		this.expectedQueuedTimestamp = null;
 		// The decoder starts over after a flush
