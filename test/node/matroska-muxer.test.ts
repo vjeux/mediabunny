@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -198,6 +198,44 @@ test('Negative audio start timestamps via CodecDelay', async () => {
 
 		expect(outputPacket.timestamp).toBe(inputPacket.timestamp);
 	}
+});
+
+test('WebM output stores the display size in pixels', async () => {
+	// WebM only allows pixels as the DisplayUnit. WebKit and Gecko read DisplayWidth/DisplayHeight as a pixel size.
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedVideoPacketSource('vp8');
+	output.addVideoTrack(source);
+	await output.start();
+
+	await source.add(new EncodedPacket(new Uint8Array(64), 'key', 0, 0.04), {
+		decoderConfig: {
+			codec: 'vp8',
+			codedWidth: 640,
+			codedHeight: 480,
+			displayAspectWidth: 16,
+			displayAspectHeight: 9,
+		},
+	});
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	expect(containsBytes(bytes, [0x54, 0xb0, 0x82, 0x03, 0x55])).toBe(true); // DisplayWidth 853
+	expect(containsBytes(bytes, [0x54, 0xba, 0x82, 0x01, 0xe0])).toBe(true); // DisplayHeight 480
+	expect(containsBytes(bytes, [0x54, 0xb2])).toBe(false); // No DisplayUnit
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getSquarePixelWidth()).toBe(853);
+	expect(await track.getSquarePixelHeight()).toBe(480);
 });
 
 const containsBytes = (haystack: Uint8Array, needle: number[]) => {
