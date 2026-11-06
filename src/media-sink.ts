@@ -2358,6 +2358,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			}
 
 			let sampleTimestamp = sample.timestamp;
+			let resyncThreshold = sample.duration;
 			if (this.stampsOutputsItself && !this.customDecoder) {
 				// Some packets decode to nothing (discard padding, for example), so pair this output with the queued
 				// packet start closest to where the audio continues instead of just the next one
@@ -2373,6 +2374,10 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 				// Should there be more outputs than packets, assume the audio continues seamlessly
 				sampleTimestamp = this.inputTimestamps.shift() ?? this.currentTimestamp ?? sampleTimestamp;
+
+				// Packet timestamps can be off by a few frames (rounding, laced frames, jitter), so only follow them
+				// once the audio is clearly off, like FFmpeg's aresample does by default (min_hard_comp, 0.1 s)
+				resyncThreshold = Math.max(sample.duration, 0.1);
 			} else {
 				if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
 					this.timestampOffset = this.expectedFirstTimestamp - sampleTimestamp;
@@ -2383,7 +2388,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 			if (
 				this.currentTimestamp === null
-				|| Math.abs(sampleTimestamp - this.currentTimestamp) >= sample.duration
+				|| Math.abs(sampleTimestamp - this.currentTimestamp) >= resyncThreshold
 			) {
 				// We need to sync with the sample timestamp again
 				this.currentTimestamp = sampleTimestamp;
