@@ -750,3 +750,37 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
+
+test('Opus sample entry and dOps both declare 48 kHz, whatever the input sample rate was', async () => {
+	for (const sampleRate of [48000, 16000]) {
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+			target: new BufferTarget(),
+		});
+
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source);
+		await output.start();
+
+		// OpusHead of a stream encoded from 44.1 kHz input, as Chromium's encoder writes it
+		const description = new Uint8Array([
+			0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0x38, 0x01, 0x44, 0xac, 0x00, 0x00, 0, 0, 0,
+		]);
+		await source.add(new EncodedPacket(new Uint8Array([0xfc, 0xff, 0xfe]), 'key', 0, 0.02), {
+			decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate, description },
+		});
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = toDataView(bytes);
+		const find = (type: string) => bytes.findIndex(
+			(_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === type,
+		);
+
+		// Opus-in-ISOBMFF requires 48000 in the sample entry, and Chromium requires dOps' InputSampleRate to match it
+		const entryRate = view.getUint32(find('Opus') + 4 + 6 + 2 + 8 + 2 + 2 + 4) / 0x10000;
+		const inputSampleRate = view.getUint32(find('dOps') + 4 + 1 + 1 + 2);
+		expect(entryRate).toBe(48000);
+		expect(inputSampleRate).toBe(48000);
+	}
+});
