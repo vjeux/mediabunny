@@ -238,6 +238,58 @@ test('WebM output stores the display size in pixels', async () => {
 	expect(await track.getSquarePixelHeight()).toBe(480);
 });
 
+test('Negative audio start timestamps that aren\'t whole milliseconds stay within half a millisecond', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+
+	await output.start();
+
+	// AAC with the usual 1024 priming samples at 44.1 kHz: the first frame starts at -23.2199... ms
+	const frameDuration = 1024 / 44100;
+	const meta = {
+		decoderConfig: {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 2,
+			sampleRate: 44100,
+			description: new Uint8Array([0x12, 0x10]),
+		},
+	};
+	const inputPackets = Array.from({ length: 20 }, (_, index) => new EncodedPacket(
+		new Uint8Array(64).fill(index),
+		'key',
+		(index - 1) * frameDuration,
+		frameDuration,
+	));
+
+	for (let i = 0; i < inputPackets.length; i++) {
+		await source.add(inputPackets[i]!, i === 0 ? meta : undefined);
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const outputTimestamps: number[] = [];
+	for await (const packet of sink.packets()) {
+		outputTimestamps.push(packet.timestamp);
+	}
+
+	// Matroska stores millisecond ticks, so each timestamp should be the input rounded to the nearest millisecond
+	expect(outputTimestamps).toEqual(inputPackets.map(packet => Math.round(packet.timestamp * 1000) / 1000));
+});
+
 const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 	for (let i = 0; i <= haystack.length - needle.length; i++) {
 		if (needle.every((byte, j) => haystack[i + j] === byte)) {
