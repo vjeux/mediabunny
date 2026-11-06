@@ -10,6 +10,7 @@ import { Quality } from '../../src/encode.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { assert } from '../../src/misc.js';
 import { Conversion } from '../../src/conversion.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 test('MPEG-TS output format', async () => {
 	const format = new MpegTsOutputFormat();
@@ -603,6 +604,50 @@ test('MPEG-TS muxing with two audio tracks', async () => {
 	expect(await audioTracks[1]!.getCodec()).toBe('aac');
 	expect(audioTracks[0]!.id).toBe(0x100);
 	expect(audioTracks[1]!.id).toBe(0x101);
+});
+
+test('MPEG-TS muxing writes track languages and audio types into the PMT', async () => {
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const sources = [new EncodedAudioPacketSource('aac'), new EncodedAudioPacketSource('aac')];
+	output.addAudioTrack(sources[0]!, { languageCode: 'fra', disposition: { hearingImpaired: true } });
+	output.addAudioTrack(sources[1]!); // No language
+
+	await output.start();
+
+	// ADTS frames (AAC-LC, 48 kHz, stereo) with an empty raw data block
+	const frame = new Uint8Array([0xff, 0xf1, 0x4c, 0x80, 0x01, 0x3f, 0xfc, 0x00, 0x00]);
+	for (const source of sources) {
+		for (let i = 0; i < 3; i++) {
+			await source.add(new EncodedPacket(frame, 'key', i * 1024 / 48000, 1024 / 48000), {
+				decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000 },
+			});
+		}
+	}
+
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const pmtPacket = bytes.subarray(188, 2 * 188); // PAT first, then the PMT
+	expect(((pmtPacket[1]! & 0x1f) << 8) | pmtPacket[2]!).toBe(0x1000);
+
+	const section = pmtPacket.subarray(5); // Skip the header and pointer_field
+	const sectionLength = ((section[1]! & 0x0f) << 8) | section[2]!;
+	const esInfo = new Map<number, number[]>();
+	let pos = 12 + (((section[10]! & 0x0f) << 8) | section[11]!);
+	while (pos < 3 + sectionLength - 4) {
+		const pid = ((section[pos + 1]! & 0x1f) << 8) | section[pos + 2]!;
+		const length = ((section[pos + 3]! & 0x0f) << 8) | section[pos + 4]!;
+		esInfo.set(pid, [...section.subarray(pos + 5, pos + 5 + length)]);
+		pos += 5 + length;
+	}
+
+	// ISO_639_language_descriptor: 'fra', audio_type 0x02 (hearing impaired)
+	expect(esInfo.get(0x100)).toEqual([0x0a, 0x04, 0x66, 0x72, 0x61, 0x02]);
+	expect(esInfo.get(0x101)).toEqual([]);
 });
 
 test('MPEG-TS transmux (Annex B and ADTS passthrough)', async () => {
