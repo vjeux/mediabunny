@@ -2454,10 +2454,13 @@ class PacketReadingContext {
 					parameterSetFound ||= isParameterSet && !frameStartFound;
 
 					if (isFrameBoundary) {
-						// End the packet at this start code (the next frame begins here)
+						// End the packet at this start code (the next frame begins here). A picture without an AUD
+						// that's followed by an access unit with one is in a stream that has AUDs, so its own AUD came
+						// before where reading began (like in a segment cut from a longer stream).
 						const packetLength = startCodePos - packetStartPos;
+						const continuesAccessUnit = isPictureRest || (accessUnitPos === null && isAccessUnitDelimiter);
 						this.seekTo(packetStartPos);
-						return this.supplyPacket(packetLength, 0, accessUnitPos, isPictureRest);
+						return this.supplyPacket(packetLength, 0, accessUnitPos, continuesAccessUnit);
 					}
 
 					i += startCodeLength;
@@ -2736,13 +2739,14 @@ class PacketReadingContext {
 
 	/**
 	 * Supplies the context with a new encoded packet, beginning at the current position. For video, `accessUnitPos` is
-	 * where the packet's AUD starts, if known, and `isPictureRest` whether the packet lacks the start of its picture.
+	 * where the packet's AUD starts, if known, and `continuesAccessUnit` whether the packet doesn't begin its access
+	 * unit (it lacks the start of its picture, or its AUD).
 	 */
 	supplyPacket(
 		packetLength: number,
 		intrinsicDuration: number,
 		accessUnitPos: number | null = null,
-		isPictureRest = false,
+		continuesAccessUnit = false,
 	) {
 		const currentPesPacket = this.getCurrentPesPacket();
 		const hasUnusedPts = (pesPacket: PesPacket) => {
@@ -2771,7 +2775,7 @@ class PacketReadingContext {
 		}
 
 		let pts: number | null;
-		if (ptsPesPacket && isPictureRest && accessUnitPos === null) {
+		if (ptsPesPacket && continuesAccessUnit && accessUnitPos === null) {
 			// No access unit begins with this packet, so the PTS belongs to the one after it in the PES packet. Like
 			// before, the packet shares it.
 			pts = ptsPesPacket.pts;

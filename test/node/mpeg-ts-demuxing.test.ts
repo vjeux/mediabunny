@@ -1002,10 +1002,15 @@ test('MPEG-TS with parameter sets in a PES packet of their own, without PTS', as
 
 /**
  * Builds a transport stream with an AVC stream on PID 0x100 out of the given PES packets' access units (or just an AUD
- * and parameter sets), optionally after the second half of a picture.
+ * and parameter sets), optionally after a picture's second half or a whole picture whose AUD isn't there.
  */
 const buildAvcTransportStream = (
-	pesPackets: { pts: number | null; accessUnitCount: number; parameterSetsOnly?: boolean; pictureRest?: boolean }[],
+	pesPackets: {
+		pts: number | null;
+		accessUnitCount: number;
+		parameterSetsOnly?: boolean;
+		leadingSlice?: 'pictureRest' | 'picture';
+	}[],
 ) => {
 	const startCode = [0, 0, 0, 1];
 	const aud = [...startCode, 0x09, 0xf0];
@@ -1037,10 +1042,11 @@ const buildAvcTransportStream = (
 	]);
 
 	let frameIndex = 0;
-	for (const { pts, accessUnitCount, parameterSetsOnly, pictureRest } of pesPackets) {
+	for (const { pts, accessUnitCount, parameterSetsOnly, leadingSlice } of pesPackets) {
 		const data: number[] = [
-			// A slice starting at macroblock 8
-			...(pictureRest ? [...startCode, 0x41, 0x12, 0x22, ...sliceData] : []),
+			// A slice starting at macroblock 8, or at 0
+			...(leadingSlice === 'pictureRest' ? [...startCode, 0x41, 0x12, 0x22, ...sliceData] : []),
+			...(leadingSlice === 'picture' ? slice(false) : []),
 			...(parameterSetsOnly ? [...aud, ...sps, ...pps] : []),
 		];
 		for (let i = 0; i < accessUnitCount; i++, frameIndex++) {
@@ -1213,24 +1219,27 @@ test('MPEG-TS restores the timestamps of damaged PES headers in streams with B-f
 	}
 });
 
-test('MPEG-TS with a file that starts in the middle of a picture', async () => {
-	// Like a file cut from a longer stream, the first PES packet begins with the rest of a picture before the first
-	// access unit, which the PES packet's PTS belongs to
-	using input = new Input({
-		source: new BufferSource(buildAvcTransportStream([
-			{ pts: 90_000, accessUnitCount: 1, pictureRest: true },
-			{ pts: 93_000, accessUnitCount: 1 },
-			{ pts: 96_000, accessUnitCount: 1 },
-		])),
-		formats: ALL_FORMATS,
-	});
+test('MPEG-TS with a file that starts in the middle of an access unit', async () => {
+	// Like a file or segment cut from a longer stream, the first PES packet begins with the rest of an access unit (the
+	// second half of a picture, or a whole picture without its AUD) before the first access unit beginning in it, which
+	// the PES packet's PTS belongs to
+	for (const leadingSlice of ['pictureRest', 'picture'] as const) {
+		using input = new Input({
+			source: new BufferSource(buildAvcTransportStream([
+				{ pts: 90_000, accessUnitCount: 1, leadingSlice },
+				{ pts: 93_000, accessUnitCount: 1 },
+				{ pts: 96_000, accessUnitCount: 1 },
+			])),
+			formats: ALL_FORMATS,
+		});
 
-	const track = await input.getPrimaryVideoTrack();
-	assert(track);
-	const packets = await readAllPackets(new EncodedPacketSink(track));
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packets = await readAllPackets(new EncodedPacketSink(track));
 
-	// The key frame keeps the PTS, which the rest of the picture before it shares (like before)
-	expect(packets.map(x => [Math.round(x.timestamp * 90_000), x.type])).toEqual([
-		[90_000, 'delta'], [90_000, 'key'], [93_000, 'delta'], [96_000, 'delta'],
-	]);
+		// The key frame keeps the PTS, which the rest before it shares (like before)
+		expect(packets.map(x => [Math.round(x.timestamp * 90_000), x.type])).toEqual([
+			[90_000, 'delta'], [90_000, 'key'], [93_000, 'delta'], [96_000, 'delta'],
+		]);
+	}
 });
