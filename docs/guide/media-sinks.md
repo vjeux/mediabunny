@@ -272,7 +272,7 @@ Sometimes, you may want to retrieve the samples for multiple timestamps at once 
 ```ts
 for await (const sample of sink.samplesAtTimestamps([0, 1, 2, 3, 4, 5])) {
 	// `sample` is either VideoSample or null
-	sample.close();
+	sample?.close();
 }
 
 // Any timestamp sequence is allowed:
@@ -558,12 +558,13 @@ For example, let's use this sink to play the last 10 seconds of an audio track:
 const sink = new AudioBufferSink(audioTrack);
 const audioContext = new AudioContext();
 const lastTimestamp = await audioTrack.computeDuration();
+const startTimestamp = lastTimestamp - 10;
 const baseTime = audioContext.currentTime;
 
-for await (const { buffer, timestamp } of sink.buffers(lastTimestamp - 10)) {
+for await (const { buffer, timestamp } of sink.buffers(startTimestamp)) {
 	const source = audioContext.createBufferSource();
 	source.buffer = buffer;
 	source.connect(audioContext.destination);
-	source.start(baseTime + timestamp);
+	source.start(baseTime + timestamp - startTimestamp);
 }
 ```
