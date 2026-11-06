@@ -25,6 +25,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AudioCodec, buildAudioCodecString } from '../../src/codec.js';
 import { Conversion } from '../../src/conversion.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
+import fs from 'node:fs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -1461,5 +1463,38 @@ test('Getters return copies that callers can modify without affecting the input'
 			ratio.num = 99;
 			expect((await track.getPixelAspectRatio()).num, file).not.toBe(99);
 		}
+	}
+});
+
+test('A malformed ID3 tag keeps WAVE and FLAC files readable', async () => {
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const frame = (id: string, body: number[]) => [...ascii(id), 0, 0, 0, body.length, 0, 0, ...body];
+	// ID3v2.4: a valid TIT2 frame, then a TPE1 frame with the undefined text encoding 4
+	const frames = [...frame('TIT2', [0, ...ascii('Title')]), ...frame('TPE1', [4, ...ascii('Artist')])];
+	const tag = [...ascii('ID3'), 4, 0, 0, 0, 0, 0, frames.length, ...frames];
+
+	const le32 = (value: number) => [value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, value >>> 24];
+	const wavChunks = [
+		...ascii('WAVE'),
+		...ascii('fmt '), ...le32(16), 1, 0, 1, 0, ...le32(8000), ...le32(16000), 2, 0, 16, 0, // Mono 16-bit PCM
+		...ascii('data'), ...le32(4), 0, 0, 0, 0,
+		...ascii('ID3 '), ...le32(tag.length), ...tag, ...(tag.length % 2 ? [0] : []),
+	];
+	const wav = new Uint8Array([...ascii('RIFF'), ...le32(wavChunks.length), ...wavChunks]);
+
+	const flacFile = fs.readFileSync(path.join(__dirname, '..', 'public/sample.flac'));
+	const flac = new Uint8Array(tag.length + flacFile.byteLength);
+	flac.set(tag, 0);
+	flac.set(flacFile, tag.length);
+
+	for (const bytes of [wav, flac]) {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+
+		const track = await input.getPrimaryAudioTrack();
+		expect(track).not.toBeNull();
+		expect(await new EncodedPacketSink(track!).getFirstPacket()).not.toBeNull();
+
+		// Like for MP3 files, only reading the tags fails
+		await expect(input.getMetadataTags()).rejects.toThrow('Unsupported text encoding: 4');
 	}
 });
