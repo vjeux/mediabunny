@@ -5,6 +5,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
+import { buildIsobmffMimeType, parsePsshBoxContents, psshBoxesAreEqual } from '../../src/isobmff/isobmff-misc.js';
 import {
 	adtsFrame,
 	annexB,
@@ -1106,5 +1107,59 @@ describe('Fragmented MP4 track runs', () => {
 			}],
 		});
 		expect((await read(bytes)).packets).toEqual(['0@0+10k']);
+	});
+});
+
+describe('ISOBMFF MIME types and pssh boxes', () => {
+	test.each([
+		[
+			{
+				isQuickTime: false,
+				hasVideo: true,
+				hasAudio: true,
+				codecStrings: ['avc1.42c01e', 'mp4a.40.2', 'mp4a.40.2'],
+			},
+			'video/mp4; codecs="avc1.42c01e, mp4a.40.2"',
+		],
+		[{ isQuickTime: false, hasVideo: false, hasAudio: true, codecStrings: ['opus'] }, 'audio/mp4; codecs="opus"'],
+		[{ isQuickTime: true, hasVideo: true, hasAudio: false, codecStrings: [] }, 'video/quicktime'],
+		[{ isQuickTime: true, hasVideo: false, hasAudio: true, codecStrings: [] }, 'audio/quicktime'],
+		[{ isQuickTime: false, hasVideo: false, hasAudio: false, codecStrings: [] }, 'application/mp4'],
+	])('buildIsobmffMimeType(%j) is %s', (info, expected) => {
+		expect(buildIsobmffMimeType(info)).toBe(expected);
+	});
+
+	const systemId = Array.from({ length: 16 }, (_, i) => 0xe0 + i);
+	const kid = (fill: number) => new Array<number>(16).fill(fill);
+	const hex = (bytes: number[]) => bytes.map(b => b.toString(16).padStart(2, '0')).join('');
+
+	test('parses version 0 and version 1 pssh contents', () => {
+		const v0 = parsePsshBoxContents(new Uint8Array([0, 0, 0, 0, ...systemId, ...u32be(3), 7, 8, 9]));
+		expect(v0).toEqual({ systemId: hex(systemId), keyIds: null, data: new Uint8Array([7, 8, 9]) });
+
+		const v1 = parsePsshBoxContents(new Uint8Array([
+			1, 0, 0, 0, ...systemId, ...u32be(2), ...kid(0x11), ...kid(0x22), ...u32be(2), 5, 6,
+		]));
+		expect(v1).toEqual({
+			systemId: hex(systemId),
+			keyIds: [hex(kid(0x11)), hex(kid(0x22))],
+			data: new Uint8Array([5, 6]),
+		});
+
+		const noKeys = parsePsshBoxContents(new Uint8Array([1, 0, 0, 0, ...systemId, ...u32be(0), ...u32be(0)]));
+		expect(noKeys).toEqual({ systemId: hex(systemId), keyIds: null, data: new Uint8Array(0) });
+	});
+
+	test('rejects pssh contents that are too small or claim too many key IDs', () => {
+		expect(() => parsePsshBoxContents(new Uint8Array(23))).toThrow('too small');
+		const tooManyKeys = new Uint8Array([1, 0, 0, 0, ...systemId, ...u32be(2), ...kid(1), ...u32be(0)]);
+		expect(() => parsePsshBoxContents(tooManyKeys)).toThrow('key ID count exceeds box size');
+	});
+
+	test('pssh boxes are equal when system ID and data match, whatever their key IDs', () => {
+		const box = { systemId: 'aa', keyIds: null, data: new Uint8Array([1, 2]) };
+		expect(psshBoxesAreEqual(box, { ...box, keyIds: ['bb'] })).toBe(true);
+		expect(psshBoxesAreEqual(box, { ...box, data: new Uint8Array([1, 3]) })).toBe(false);
+		expect(psshBoxesAreEqual(box, { ...box, systemId: 'ab' })).toBe(false);
 	});
 });
