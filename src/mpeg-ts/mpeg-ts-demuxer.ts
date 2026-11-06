@@ -178,6 +178,10 @@ type Section = {
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
+// How far to look for the rest of a PSI section whose packets are interleaved with other PIDs' packets. A section is
+// at most 1024 bytes, so its packets don't sit far apart in any sane stream.
+const MAX_PSI_SECTION_SCAN_PACKETS = 1000;
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -282,6 +286,13 @@ export class MpegTsDemuxer extends Demuxer {
 						const tableId = bitstream.readBits(8);
 						isProbablyProgramMap = tableId === 0x02; // 0x02 == TS_program_map_section
 					}
+				}
+
+				if (
+					(section.pid === 0 && !hasProgramAssociationTable)
+					|| (!hasProgramMap && (section.pid === programMapPid || isProbablyProgramMap))
+				) {
+					await this.completePsiSection(section);
 				}
 
 				if (section.pid === 0 && !hasProgramAssociationTable) {
@@ -967,6 +978,54 @@ export class MpegTsDemuxer extends Demuxer {
 			payload: merged,
 			randomAccessIndicator,
 		};
+	}
+
+	/**
+	 * Before we have the PMT, sections are only read as long as their TS packets are contiguous. But packets of other
+	 * PIDs may well sit between the packets of a PSI section, so this appends whatever the section is still missing.
+	 */
+	async completePsiSection(section: Section) {
+		const sectionStart = 1 + (section.payload[0] ?? 0); // Skip the pointer_field
+		if (sectionStart + 3 > section.payload.length || section.endPos === null) {
+			return;
+		}
+
+		const sectionLength = ((section.payload[sectionStart + 1]! & 0x0f) << 8) | section.payload[sectionStart + 2]!;
+		const missingLength = sectionStart + 3 + sectionLength - section.payload.length;
+		if (missingLength <= 0) {
+			return;
+		}
+
+		const chunks = [section.payload];
+		let collectedLength = 0;
+		let currentPos = section.endPos;
+
+		for (let i = 0; i < MAX_PSI_SECTION_SCAN_PACKETS && collectedLength < missingLength; i++) {
+			const packet = await this.readPacket(currentPos);
+			currentPos += this.packetStride;
+
+			if (!packet || (packet.pid === section.pid && packet.payloadUnitStartIndicator === 1)) {
+				break;
+			}
+
+			if (packet.pid !== section.pid || !(packet.adaptationFieldControl & 0b01)) {
+				continue;
+			}
+
+			const payloadStart = packet.adaptationFieldControl & 0b10 ? 1 + packet.body[0]! : 0;
+			const payload = packet.body.subarray(payloadStart);
+			chunks.push(payload);
+			collectedLength += payload.length;
+		}
+
+		const merged = new Uint8Array(section.payload.length + collectedLength);
+		let offset = 0;
+		for (const chunk of chunks) {
+			merged.set(chunk, offset);
+			offset += chunk.length;
+		}
+
+		section.payload = merged;
 	}
 
 	async readPacketHeader(pos: number): Promise<TsPacketHeader | null> {
