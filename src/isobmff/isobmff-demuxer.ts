@@ -2099,6 +2099,18 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
+				const { colorSpace } = track.info;
+				if (
+					colorSpace.primaries !== undefined
+					|| colorSpace.transfer !== undefined
+					|| colorSpace.matrix !== undefined
+					|| colorSpace.fullRange !== undefined
+				) {
+					// An earlier colr box already set the color space. Boxes are ordered from the most accurate to
+					// the least (ISO/IEC 14496-12), and Chromium also reads the first one.
+					break;
+				}
+
 				const colourPrimaries = readU16Be(slice);
 				const transferCharacteristics = readU16Be(slice);
 				const matrixCoefficients = readU16Be(slice);
