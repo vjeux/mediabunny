@@ -567,3 +567,47 @@ test('Encoding semi-transparent canvas content keeps the colors unpremultiplied'
 
 	expectStraightColors(await readColors(resizedOutput.target.buffer!));
 });
+
+test('Decoded frames with alpha keep the color space of the color stream', async () => {
+	// Opaque gray bars encoded with alpha: 'keep', like a canvas recording from Chrome's MediaRecorder: the color
+	// stream comes out full range, and every packet carries alpha side data. Grays, so that only the range matters.
+	const colors = [[16, 16, 16], [64, 64, 64], [192, 192, 192], [240, 240, 240]];
+	const data = new Uint8Array(64 * 16 * 4);
+	for (let i = 0; i < 64 * 16; i++) {
+		data.set([...colors[Math.floor((i % 64) / 16)]!, 255], i * 4);
+	}
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new VideoSampleSource({ codec: 'vp9', bitrate: 8e6, alpha: 'keep' });
+	output.addVideoTrack(source);
+	await output.start();
+	using inputSample = new VideoSample(data, {
+		format: 'RGBA',
+		codedWidth: 64,
+		codedHeight: 16,
+		timestamp: 0,
+		duration: 1,
+	});
+	await source.add(inputSample);
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	const sink = new VideoSampleSink(videoTrack);
+	using sample = (await sink.getSample(0))!;
+	expect(sample.hasAlpha).toBe(true); // Went through the alpha merger
+
+	const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+	await sample.copyTo(rgba, { format: 'RGBA' });
+	for (let i = 0; i < colors.length; i++) {
+		const offset = (8 * 64 + i * 16 + 8) * 4;
+		const actual = Array.from(rgba.subarray(offset, offset + 3));
+		for (let j = 0; j < 3; j++) {
+			expect(Math.abs(actual[j]! - colors[i]![j]!), `${actual.join()} vs ${colors[i]!.join()}`)
+				.toBeLessThanOrEqual(6);
+		}
+	}
+});
