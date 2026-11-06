@@ -167,6 +167,11 @@ type InternalTrack = {
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
+	/**
+	 * Whether each sample description (stsd entry) is an encrypted one. A track may also have clear ones, which
+	 * clear lead samples use (Shaka Packager, for example).
+	 */
+	encryptedSampleDescriptions: boolean[];
 	/** In bits per second, from the btrt box if present. */
 	maxBitrate: number | null;
 	avgBitrate: number | null;
@@ -289,6 +294,8 @@ type FragmentTrackData = {
 	startTimestampIsFinal: boolean;
 	trunSampleCounts: number[];
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
+	/** Whether the samples use an encrypted sample description */
+	isEncrypted: boolean;
 };
 
 type FragmentTrackSample = {
@@ -575,6 +582,7 @@ export class IsobmffDemuxer extends Demuxer {
 				encryptionInfo: foreignTrack.encryptionInfo,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
+				encryptedSampleDescriptions: foreignTrack.encryptedSampleDescriptions,
 				maxBitrate: foreignTrack.maxBitrate,
 				avgBitrate: foreignTrack.avgBitrate,
 				info: foreignTrack.info,
@@ -1142,6 +1150,7 @@ export class IsobmffDemuxer extends Demuxer {
 					encryptionInfo: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
+					encryptedSampleDescriptions: [],
 					maxBitrate: null,
 					avgBitrate: null,
 				} satisfies InternalTrack as InternalTrack;
@@ -1371,6 +1380,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 					track.internalCodecId = sampleBoxInfo.name;
 					const lowercaseBoxName = sampleBoxInfo.name.toLowerCase();
+					track.encryptedSampleDescriptions.push(lowercaseBoxName === 'encv' || lowercaseBoxName === 'enca');
 
 					if (track.info.type === 'video') {
 						slice.skip(6 * 1 + 2 + 2 + 2 + 3 * 4);
@@ -2725,6 +2735,10 @@ export class IsobmffDemuxer extends Demuxer {
 						startTimestampIsFinal: false,
 						trunSampleCounts: [],
 						encryptionAuxInfo: null,
+						isEncrypted: sampleDescriptionIsEncrypted(
+							track,
+							track.currentFragmentState.sampleDescriptionIndex ?? 1,
+						),
 					};
 					this.currentFragment.trackData.set(track.id, trackData);
 				}
@@ -3587,13 +3601,14 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			data = readBytes(slice, sampleInfo.sampleSize);
 
-			if (this.internalTrack.encryptionInfo) {
+			const { encryptionInfo } = this.internalTrack;
+			if (encryptionInfo && sampleDescriptionIsEncrypted(this.internalTrack, sampleInfo.sampleDescriptionIndex)) {
 				let sampleEncryption: SampleEncryptionInfo | null = null;
 
 				if (this.internalTrack.encryptionAuxInfo) {
 					const entries = await resolveEncryptionAuxInfo(
 						this.internalTrack.demuxer.reader,
-						this.internalTrack.encryptionInfo,
+						encryptionInfo,
 						this.internalTrack.encryptionAuxInfo,
 					);
 
@@ -3602,7 +3617,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					}
 				}
 
-				sampleEncryption ??= getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
+				sampleEncryption ??= getDefaultSampleEncryption(encryptionInfo);
 				if (sampleEncryption) {
 					data = await decryptSample(this.internalTrack, sampleEncryption, data, null);
 				}
@@ -3650,9 +3665,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			data = readBytes(slice, fragmentSample.byteSize);
 
-			if (this.internalTrack.encryptionInfo) {
-				const sampleEncryption = fragmentSample.encryption
-					?? getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
+			const { encryptionInfo } = this.internalTrack;
+			if (encryptionInfo && trackData.isEncrypted) {
+				const sampleEncryption = fragmentSample.encryption ?? getDefaultSampleEncryption(encryptionInfo);
 				if (sampleEncryption) {
 					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment);
 				}
@@ -4119,6 +4134,7 @@ type SampleInfo = {
 	sampleSize: number;
 	chunkOffset: number;
 	isKeyFrame: boolean;
+	sampleDescriptionIndex: number;
 };
 
 const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInfo | null => {
@@ -4180,6 +4196,7 @@ const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInf
 		isKeyFrame: sampleTable.keySampleIndices
 			? binarySearchExact(sampleTable.keySampleIndices, sampleIndex, x => x) !== -1
 			: true,
+		sampleDescriptionIndex: chunkEntry.sampleDescriptionIndex,
 	};
 };
 
@@ -4358,6 +4375,11 @@ const capEntryCounts = (entries: { startIndex: number; count: number }[], sample
 	if (lastEntry) {
 		lastEntry.count = Math.min(lastEntry.count, sampleCount - lastEntry.startIndex);
 	}
+};
+
+/** `index` is 1-based. Descriptions of a track that we couldn't classify count as encrypted. */
+const sampleDescriptionIsEncrypted = (track: InternalTrack, index: number) => {
+	return track.encryptionInfo !== null && track.encryptedSampleDescriptions[index - 1] !== false;
 };
 
 const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
