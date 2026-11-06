@@ -2927,6 +2927,7 @@ export class IsobmffDemuxer extends Demuxer {
 				const iterator = this.iterateContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 
 				for (const { boxInfo, slice } of iterator) {
+					const itemEndPos = slice.filePos + boxInfo.contentSize;
 					let metadataKey = boxInfo.name;
 
 					// Interpret the box name as a u32be
@@ -3036,20 +3037,30 @@ export class IsobmffDemuxer extends Demuxer {
 
 						case 'covr':
 						case 'com.apple.quicktime.artwork': {
-							if (data instanceof RichImageData) {
-								this.metadataTags.images ??= [];
-								this.metadataTags.images.push({
-									data: data.data,
-									kind: 'coverFront',
-									mimeType: data.mimeType,
-								});
-							} else if (data instanceof Uint8Array) {
-								this.metadataTags.images ??= [];
-								this.metadataTags.images.push({
-									data,
-									kind: 'coverFront',
-									mimeType: 'image/*',
-								});
+							// The item holds one data box per image
+							let image = data;
+							while (image) {
+								if (image instanceof RichImageData) {
+									this.metadataTags.images ??= [];
+									this.metadataTags.images.push({
+										data: image.data,
+										kind: 'coverFront',
+										mimeType: image.mimeType,
+									});
+								} else if (image instanceof Uint8Array) {
+									this.metadataTags.images ??= [];
+									this.metadataTags.images.push({
+										data: image,
+										kind: 'coverFront',
+										mimeType: 'image/*',
+									});
+								}
+
+								if (itemEndPos - slice.filePos < MIN_BOX_HEADER_SIZE) {
+									break;
+								}
+
+								image = readDataBox(slice);
 							}
 						}; break;
 
