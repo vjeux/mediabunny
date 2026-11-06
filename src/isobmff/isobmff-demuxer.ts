@@ -3516,12 +3516,21 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		const timestamp = (fragmentSample.presentationTimestamp - this.internalTrack.editListOffset)
 			/ this.internalTrack.timescale;
 		const duration = fragmentSample.duration / this.internalTrack.timescale;
+
+		// Sequence numbers count up from the moof's offset, and the next fragment's moof starts after this one ends. If
+		// the fragment has more samples than its moof has bytes (possible when their sizes and durations are defaults),
+		// squeeze them into that range so that they still come before the next fragment's samples.
+		const sampleCount = trackData.samples.length;
+		const sequenceNumber = sampleCount <= fragment.moofSize
+			? fragment.moofOffset + sampleIndex
+			: fragment.moofOffset + sampleIndex * fragment.moofSize / sampleCount;
+
 		const packet = new EncodedPacket(
 			data,
 			fragmentSample.isKeyFrame ? 'key' : 'delta',
 			timestamp,
 			duration,
-			fragment.moofOffset + sampleIndex,
+			sequenceNumber,
 			fragmentSample.byteSize,
 		);
 
