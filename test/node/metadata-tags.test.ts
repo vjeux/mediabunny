@@ -22,6 +22,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { AttachedFile, MetadataTags, RichImageData } from '../../src/metadata.js';
 import { VERSIONED_NAME } from '../../src/version.js';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { AudioCodec, buildAudioCodecString } from '../../src/codec.js';
 import { Conversion } from '../../src/conversion.js';
@@ -653,6 +654,43 @@ test('Read and write metadata, MP3', async () => {
 		baz: 'qux',
 		你: '好',
 	});
+});
+
+test('A malformed ID3 tag fails every getMetadataTags() call, MP3 and ADTS', async () => {
+	const output = new Output({
+		format: new Mp3OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({ title: 'Title', artist: 'Artist' });
+
+	const dummyTrack = createDummyAudioTrack('mp3', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	// TPE1's text encoding byte becomes 4, which doesn't exist
+	const mp3 = new Uint8Array(output.target.buffer!);
+	mp3[Buffer.from(mp3).indexOf('TPE1') + 10] = 4;
+
+	// The same tag in front of an ADTS stream
+	const tagSize = 10 + ((mp3[6]! << 21) | (mp3[7]! << 14) | (mp3[8]! << 7) | mp3[9]!);
+	const aac = readFileSync(path.join(__dirname, '../public/sample3.aac')).subarray(0, 10_000);
+	const adts = new Uint8Array([...mp3.subarray(0, tagSize), ...aac]);
+
+	for (const bytes of [mp3, adts]) {
+		const input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+
+		await expect(input.getMetadataTags()).rejects.toThrow('Unsupported text encoding: 4');
+		// Again, rather than the tags read before the error
+		await expect(input.getMetadataTags()).rejects.toThrow('Unsupported text encoding: 4');
+
+		input.dispose();
+	}
 });
 
 test('Read and write metadata, Ogg', async () => {
