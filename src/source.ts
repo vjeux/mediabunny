@@ -1418,7 +1418,26 @@ export class FilePathSource extends PathedSource {
 				assert(this._fileHandle);
 
 				const buffer = new Uint8Array(end - start);
-				await this._fileHandle.read(buffer, 0, end - start, start);
+				let bytesFilled = 0;
+
+				// A single read may deliver fewer bytes than asked for (FUSE and network file systems do this), and
+				// reaching the end early means the file shrank after its size was read
+				while (bytesFilled < buffer.length) {
+					const { bytesRead } = await this._fileHandle.read(
+						buffer,
+						bytesFilled,
+						buffer.length - bytesFilled,
+						start + bytesFilled,
+					);
+					if (bytesRead === 0) {
+						throw new Error(
+							`Unexpected end of file at byte ${start + bytesFilled} of ${filePath}; the file got shorter`
+							+ ` while being read.`,
+						);
+					}
+
+					bytesFilled += bytesRead;
+				}
 
 				return buffer;
 			},
