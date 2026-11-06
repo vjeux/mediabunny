@@ -778,6 +778,39 @@ test('The last presented frame keeps its duration when B-frames follow it in dec
 	}
 });
 
+test('B-frame streams that hold nothing keep their layout, however long', { timeout: 120_000 }, async () => {
+	// P B B mini-GOPs in decode order, timestamps index * (1 / fps), every frame lasting 1 / fps
+	const write = async (frameCount: number, fps: number, keyInterval: number) => {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+
+		const data = new Uint8Array(1);
+		const frame = 1 / fps;
+		for (let k = 0; k < frameCount / 3; k++) {
+			for (const j of k === 0 ? [0, 2, 1] : [2, 0, 1]) {
+				const index = 3 * k + j;
+				const isKey = index % keyInterval === 0 && (k === 0 || j === 2);
+				await source.add(
+					new EncodedPacket(data, isKey ? 'key' : 'delta', index * frame, frame),
+					{ decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } },
+				);
+			}
+		}
+		await output.finalize();
+
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	// Floating-point noise in the last frame's end used to count as a hold, adding an edit list
+	const bytes = await write(33, 30, 1000);
+	expect(bytes.some((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'edts')).toBe(false);
+
+	// About 220,000 ctts entries, which used to overflow the call stack
+	expect((await write(330_000, 25, 250)).byteLength).toBeGreaterThan(0);
+});
+
 test('Fragmented MP4 preserves interior key packets', async () => {
 	const target = new BufferTarget();
 	const output = new Output({
