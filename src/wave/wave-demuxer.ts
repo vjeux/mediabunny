@@ -207,12 +207,16 @@ export class WaveDemuxer extends Demuxer {
 			);
 		}
 
+		const sampleSizeInBytes = Math.ceil(bitsPerSample / 8);
+
 		this.audioInfo = {
 			format: formatTag,
 			numberOfChannels: numChannels,
 			sampleRate,
-			sampleSizeInBytes: Math.ceil(bitsPerSample / 8),
-			blockSizeInBytes: blockAlign,
+			sampleSizeInBytes,
+			// Not taken from the block align field, which some writers get wrong: the samples are decoded by their bit
+			// depth, so this is the size their frames actually have (FFmpeg computes the duration the same way)
+			blockSizeInBytes: numChannels * sampleSizeInBytes,
 		};
 	}
 
