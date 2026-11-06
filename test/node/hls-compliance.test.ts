@@ -731,10 +731,14 @@ describe('Writer: RFC 8216 §3 (media segments)', () => {
 		expect(segments.length).toBeGreaterThan(0);
 		for (const { bytes } of segments) {
 			const pid = (offset: number) => ((bytes[offset + 1]! & 0x1f) << 8) | bytes[offset + 2]!;
+			// The payload follows the adaptation field, if adaptation_field_control says there is one
+			const payloadStart = (offset: number) => offset + 4
+				+ ((bytes[offset + 3]! & 0x20) ? 1 + bytes[offset + 4]! : 0);
 			expect(bytes[0]).toBe(0x47);
 			expect(pid(0)).toBe(0); // PAT
+			expect(bytes[1]! & 0x40).toBe(0x40); // payload_unit_start_indicator
 			// PAT section: pointer field, then table_id 0; section_length counts the 5-byte header, programs and CRC
-			const section = 4 + 1 + bytes[4]!;
+			const section = payloadStart(0) + 1 + bytes[payloadStart(0)]!;
 			expect(bytes[section]).toBe(0);
 			const sectionLength = ((bytes[section + 1]! & 0x0f) << 8) | bytes[section + 2]!;
 			const programs = (sectionLength - 5 - 4) / 4;

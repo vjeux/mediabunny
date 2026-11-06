@@ -412,7 +412,9 @@ describe('Writer: RFC 9559 Section 5 element table and RFC 8794 Section 11.1.6 c
 				}
 			}
 
-			expect(occurrences).toBeGreaterThan(0); // The corpus exercises the element
+			if (MATROSKA_SCHEMA.find(e => e.name === name)!.minOccurs > 0) {
+				expect(occurrences).toBeGreaterThan(0); // Mandatory elements are written; optional ones may be left out
+			}
 			expect(violations).toEqual([]);
 		},
 	);

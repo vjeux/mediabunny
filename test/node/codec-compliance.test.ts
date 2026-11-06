@@ -214,7 +214,10 @@ describe('Writer: Opus in ISOBMFF', () => {
 		expect(dOps.getUint8(8)).toBe(0); // Version
 		expect(dOps.getUint8(9)).toBe(2); // OutputChannelCount
 		expect(dOps.getUint16(10)).toBe(312); // PreSkip
-		expect(dOps.getUint32(12)).toBe(44100); // InputSampleRate
+		// InputSampleRate copies the identification header (44100), or is 48000: Chromium's AudioSampleEntry parser
+		// requires the entry's samplerate, which this specification fixes at 48000, to equal dOps's InputSampleRate
+		// (media/formats/mp4/box_definitions.cc), and the field is informational (RFC 7845, Section 5.1)
+		expect([44100, 48000]).toContain(dOps.getUint32(12));
 		expect(dOps.getInt16(16)).toBe(-256); // OutputGain
 		expect(dOps.getUint8(18)).toBe(0); // ChannelMappingFamily
 		expect(dOps.byteLength).toBe(19);
