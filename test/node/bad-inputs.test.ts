@@ -1715,6 +1715,47 @@ test('Ogg: Pages without granule positions at the start', async () => {
 	await expectGracefulRead(concatList(pages));
 });
 
+test('Ogg: Repeated header packets are not taken for audio', async () => {
+	// Some muxers write the header pages twice, as in ExoPlayer's bear_duplicate_header.opus test file
+	const readPackets = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+		const packets: [number, number][] = [];
+		for await (const packet of sink.packets()) {
+			packets.push([packet.timestamp, packet.byteLength]);
+		}
+		return packets;
+	};
+
+	const opusPageList = opusPages({ pageCount: 3 });
+	const opusFile = concatList(opusPageList);
+	const opusFileWithRepeatedHeaders = concatList([
+		...opusPageList.slice(0, 2),
+		...opusPageList.slice(0, 2),
+		...opusPageList.slice(2),
+	]);
+	const opusPackets = await readPackets(opusFile);
+	expect(opusPackets).toHaveLength(30);
+	expect(await readPackets(opusFileWithRepeatedHeaders)).toEqual(opusPackets);
+
+	// The Vorbis fixture's header packets fill its first two pages
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	let headerPagesLength = 0;
+	for (let i = 0; i < 2; i++) {
+		const segmentCount = vorbisFile[headerPagesLength + 26]!;
+		const lacing = vorbisFile.subarray(headerPagesLength + 27, headerPagesLength + 27 + segmentCount);
+		headerPagesLength += 27 + segmentCount + lacing.reduce((a, b) => a + b, 0);
+	}
+	const vorbisFileWithRepeatedHeaders = concat(
+		vorbisFile.subarray(0, headerPagesLength),
+		vorbisFile.subarray(0, headerPagesLength),
+		vorbisFile.subarray(headerPagesLength),
+	);
+	const vorbisPackets = await readPackets(vorbisFile);
+	expect(vorbisPackets).toHaveLength(365);
+	expect(await readPackets(vorbisFileWithRepeatedHeaders)).toEqual(vorbisPackets);
+});
+
 test('Ogg: Continuation page without a preceding packet', async () => {
 	// Seeking couldn't step back from the continued packet and used to read a packet past the end of the page
 	await expectGracefulRead(concat(
