@@ -2,13 +2,13 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -731,3 +731,96 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test.for(['finalize', 'close'] as const)(
+	'MediaStreamVideoTrackSource, frames received while the encoder is set up survive a quick %s()',
+	async (ending, { skip }) => {
+		if (typeof VideoEncoder === 'undefined') {
+			skip('Needs VideoEncoder');
+		}
+
+		const canvas = document.createElement('canvas');
+		canvas.width = 64;
+		canvas.height = 48;
+		const track = canvas.captureStream(0).getVideoTracks()[0]!;
+
+		// Frames reach the source through a stand-in MediaStreamTrackProcessor, so the test knows when it has them
+		let controller!: ReadableStreamDefaultController<VideoFrame>;
+		const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+		const originalProcessor = globals.MediaStreamTrackProcessor;
+		globals.MediaStreamTrackProcessor = class {
+			readable = new ReadableStream<VideoFrame>({
+				start: (c) => {
+					controller = c;
+				},
+			}, { highWaterMark: 0 });
+		};
+
+		// The encoder's setup is held until the recording is being finalized or closed
+		let releaseSetup!: () => void;
+		const setupReleased = new Promise<void>((resolve) => {
+			releaseSetup = resolve;
+		});
+		const originalIsConfigSupported = VideoEncoder.isConfigSupported.bind(VideoEncoder);
+		VideoEncoder.isConfigSupported = async (config) => {
+			await setupReleased;
+			return originalIsConfigSupported(config);
+		};
+
+		try {
+			const output = new Output({
+				format: new WebMOutputFormat(),
+				target: new BufferTarget(),
+			});
+			const videoSource = new MediaStreamVideoTrackSource(
+				track,
+				{ codec: 'vp8', quality: new Quality('low') },
+				{ frameRate: null },
+			);
+			const errors: unknown[] = [];
+			videoSource.errorPromise.catch(error => errors.push(error));
+			output.addVideoTrack(videoSource);
+			try {
+				await output.start();
+			} finally {
+				globals.MediaStreamTrackProcessor = originalProcessor;
+			}
+
+			// A short recording: three frames
+			const context = canvas.getContext('2d')!;
+			const start = 1000 * performance.now();
+			for (let i = 0; i < 3; i++) {
+				context.fillStyle = `rgb(${100 * i}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+				controller.enqueue(new VideoFrame(canvas, { timestamp: start + 40000 * i, duration: 40000 }));
+			}
+			while (controller.desiredSize! < 0) {
+				await new Promise(resolve => setTimeout(resolve, 0)); // Until the source has taken them all
+			}
+			await new Promise(resolve => setTimeout(resolve, 0));
+
+			if (ending === 'close') {
+				videoSource.close();
+			}
+			const finalized = output.finalize();
+			releaseSetup();
+			await finalized;
+			track.stop();
+
+			expect(errors).toEqual([]);
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const videoTrack = await input.getPrimaryVideoTrack();
+			const timestamps: number[] = [];
+			if (videoTrack) {
+				for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+					timestamps.push(packet.timestamp);
+				}
+			}
+			expect(timestamps).toEqual([0, 0.04, 0.08]);
+		} finally {
+			releaseSetup();
+			VideoEncoder.isConfigSupported = originalIsConfigSupported;
+			globals.MediaStreamTrackProcessor = originalProcessor;
+		}
+	},
+);

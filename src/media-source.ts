@@ -1616,6 +1616,8 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 	private _timerHandle: UnthrottledTimerHandle | null = null;
 	/** @internal */
 	private _videoElement: HTMLVideoElement | null = null;
+	/** @internal */
+	private _pendingAdds = new Set<Promise<void>>();
 
 	/** A promise that rejects upon any error within this source. This promise never resolves. */
 	get errorPromise() {
@@ -1802,7 +1804,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				timestamp: currentTimestamp + timestampOffset,
 			});
 
-			void this._encoder.add(sample, true)
+			const addPromise: Promise<void> = this._encoder.add(sample, true)
 				.catch((error) => {
 					errored = true;
 
@@ -1816,7 +1818,11 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 							trackId: this._workerTrackId,
 						});
 					}
+				})
+				.finally(() => {
+					this._pendingAdds.delete(addPromise);
 				});
+			this._pendingAdds.add(addPromise);
 		};
 
 		if (typeof MediaStreamTrackProcessor !== 'undefined') {
@@ -1956,6 +1962,12 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				});
 			}
 		} finally {
+			if (!forceClose) {
+				// Frames are handed to the encoder without waiting for it, and the first ones wait for its
+				// (asynchronous) setup. Closing it before they got to it would discard them.
+				await Promise.all(this._pendingAdds);
+			}
+
 			// The encoder must be closed even if the track teardown above threw
 			await this._encoder.flushAndClose(forceClose);
 		}
