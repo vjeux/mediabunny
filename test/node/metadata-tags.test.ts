@@ -292,6 +292,29 @@ test('FFmpeg-unsafe raw udta tags, MP4', async () => {
 	}
 });
 
+test('Read the iTunes gnre genre number, MP4', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	// iTunes and AtomicParsley store predefined genres as an ID3v1 genre number plus one
+	output.setMetadataTags({ raw: { gnre: new Uint8Array([0, 18]) } });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	expect((await input.getMetadataTags()).genre).toBe('Rock');
+});
+
 test('Read and write metadata, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
