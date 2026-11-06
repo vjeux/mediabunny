@@ -416,6 +416,12 @@ export class VideoSample implements Disposable {
 			}
 			if (init.visibleRect !== undefined) {
 				validateRectangle(init.visibleRect, 'init.visibleRect');
+				if (
+					init.visibleRect.left + init.visibleRect.width > init.codedWidth!
+					|| init.visibleRect.top + init.visibleRect.height > init.codedHeight!
+				) {
+					throw new TypeError('init.visibleRect must lie within the coded size.');
+				}
 			}
 			if (
 				init.displayWidth !== undefined
@@ -735,8 +741,10 @@ export class VideoSample implements Disposable {
 			return new VideoSample(this._data, {
 				format: this.format!,
 				layout: this._layout,
-				codedWidth: this.codedWidth,
-				codedHeight: this.codedHeight,
+				// The smallest coded size containing the visible rect (codedWidth/Height are the visible size); the
+				// layout has the actual strides
+				codedWidth: this.visibleRect.left + this.visibleRect.width,
+				codedHeight: this.visibleRect.top + this.visibleRect.height,
 				timestamp: this.timestamp,
 				duration: this.duration,
 				colorSpace: this.colorSpace,
