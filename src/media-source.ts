@@ -1328,17 +1328,30 @@ const colorAlphaSplitterWorkerCode = () => {
 		const width = sourceFrame.visibleRect?.width ?? sourceFrame.codedWidth;
 		const height = sourceFrame.visibleRect?.height ?? sourceFrame.codedHeight;
 
-		const pixelCount = width * height;
-		const chromaW = Math.ceil(width / 2);
-		const chromaH = Math.ceil(height / 2);
-		const alphaSize = pixelCount + chromaW * chromaH * 2;
+		// Firefox only accepts I420 frames with even coded dimensions
+		// (https://bugzilla.mozilla.org/show_bug.cgi?id=1899811), so pad the alpha frame and crop it via visibleRect
+		const alphaCodedWidth = width + (width % 2);
+		const alphaCodedHeight = height + (height % 2);
+		const lumaSize = alphaCodedWidth * alphaCodedHeight;
+		const alphaSize = lumaSize + 2 * (alphaCodedWidth / 2) * (alphaCodedHeight / 2);
 
 		// Encode alpha as I420: Y = source A bytes, UV = 128
 		const alphaBuffer = new Uint8Array(alphaSize);
-		for (let i = 0, j = 3; i < pixelCount; i++, j += 4) {
-			alphaBuffer[i] = source[j]!;
+		for (let y = 0, j = 3; y < height; y++) {
+			const rowStart = y * alphaCodedWidth;
+			for (let x = 0; x < width; x++, j += 4) {
+				alphaBuffer[rowStart + x] = source[j]!;
+			}
+			if (alphaCodedWidth > width) {
+				// Repeat the edge, since some encoders scale the whole coded frame instead of cropping it
+				alphaBuffer[rowStart + width] = alphaBuffer[rowStart + width - 1]!;
+			}
 		}
-		alphaBuffer.fill(128, pixelCount);
+		if (alphaCodedHeight > height) {
+			const lastRowStart = (height - 1) * alphaCodedWidth;
+			alphaBuffer.copyWithin(height * alphaCodedWidth, lastRowStart, lastRowStart + alphaCodedWidth);
+		}
+		alphaBuffer.fill(128, lumaSize);
 
 		// Hand the source buffer straight to VideoFrame as RGBX/BGRX so the A bytes are ignored
 		const colorFrame = new VideoFrame(source, {
@@ -1351,8 +1364,9 @@ const colorAlphaSplitterWorkerCode = () => {
 		});
 		const alphaInit = {
 			format: 'I420' as const,
-			codedWidth: width,
-			codedHeight: height,
+			codedWidth: alphaCodedWidth,
+			codedHeight: alphaCodedHeight,
+			visibleRect: { x: 0, y: 0, width, height },
 			timestamp: sourceFrame.timestamp,
 			duration: sourceFrame.duration ?? undefined,
 			colorSpace: {

@@ -278,6 +278,23 @@ test('Can encode transparent video with odd dimensions', async () => {
 	await output.start();
 	await source.add(0, 1);
 	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(641);
+	expect(await videoTrack.getDisplayHeight()).toBe(479);
+	expect(await videoTrack.canBeTransparent()).toBe(true);
+
+	using sample = (await new VideoSampleSink(videoTrack).getSample(0))!;
+	expect(sample.hasAlpha).toBe(true);
+
+	// The last row and column keep their alpha too
+	const readbackContext = new OffscreenCanvas(641, 479).getContext('2d')!;
+	sample.draw(readbackContext, 0, 0);
+	expect(readbackContext.getImageData(640, 478, 1, 1).data[3]).toBeGreaterThan(100);
 });
 
 test('Positive encodability check with alpha', async () => {
