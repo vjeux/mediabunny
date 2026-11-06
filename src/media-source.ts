@@ -10,6 +10,7 @@ import { buildAacAudioSpecificConfig, parseAacAudioSpecificConfig } from '../sha
 import {
 	AUDIO_CODECS,
 	AudioCodec,
+	extractAudioCodecString,
 	extractVideoCodecString,
 	getAudioEncoderConfigExtension,
 	MediaCodec,
@@ -2875,6 +2876,18 @@ const fixAudioDecoderConfig = (
 				objectType,
 				outputNumberOfChannels: decoderConfig.numberOfChannels,
 				outputSampleRate: decoderConfig.sampleRate,
+			});
+		}
+
+		// The codec string is the one the encoder was configured with, but the encoder may well have produced a
+		// different object type (Media Foundation encodes AAC-LC when asked for HE-AAC). So, like for any other AAC
+		// track, derive the codec string from the AudioSpecificConfig.
+		if (decoderConfig.codec.startsWith('mp4a.40.')) {
+			decoderConfig.codec = extractAudioCodecString({
+				codec: 'aac',
+				codecDescription: toUint8Array(decoderConfig.description!),
+				aacCodecInfo: { isMpeg2: false, objectType: null },
+				dtsFormat: null,
 			});
 		}
 	}
