@@ -134,9 +134,10 @@ export const readMetadataStringShort = (slice: FileSlice) => {
 
 	const text = textDecoder.decode(bytes);
 
-	// Language codes below 0x400 are Macintosh language codes, whose text is in a Mac encoding (Mac Roman for the
-	// Western languages) rather than UTF-8. Text that is valid UTF-8 anyway is kept as is.
-	if (languageCode < 0x400 && text.includes('\ufffd')) {
+	// Language codes below 0x400 are Macintosh language codes (0x7fff: unspecified), whose text is in a Mac encoding
+	// (Mac Roman for the Western languages) rather than UTF-8. Text that is valid UTF-8 anyway is kept as is.
+	const isMacLanguage = languageCode < 0x400 || languageCode === 0x7fff;
+	if (isMacLanguage && text.includes('\ufffd')) {
 		let macRomanText = '';
 		for (const byte of bytes) {
 			macRomanText += byte < 0x80 ? String.fromCharCode(byte) : MAC_ROMAN_HIGH_CHARACTERS[byte - 0x80]!;
