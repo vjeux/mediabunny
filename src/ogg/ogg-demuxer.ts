@@ -1032,6 +1032,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return this.getPacketSequential(timestamp, options);
 		}
 
+		// Here, packet timestamps are derived from granule positions, which can disagree with the packet durations by
+		// a sample (VLC writes such files). So a packet's timestamp can come out a sample later than when iterating
+		// from the start, where it's the sum of the preceding durations. Let's match packets starting within a sample.
+		timestamp += 1 / this.internalSampleRate;
+
 		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 		let link = await this.getFirstLink();
 		if (timestampInSamples === link.firstTimestampInSamples) {
