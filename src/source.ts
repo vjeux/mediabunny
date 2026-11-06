@@ -366,9 +366,34 @@ export class CustomPathedSource extends PathedSource {
 	_root: SourceRef | null = null;
 	/** @internal */
 	_rootRequest: Promise<SourceRef> | null = null;
+	/** @internal */
+	_pendingReadCount = 0;
+	/** @internal */
+	_releaseRootWhenIdle = false;
+	/** @internal */
+	_releasedRootFileSize: number | null | undefined = undefined;
 
 	/** @internal */
 	override _read(
+		start: number,
+		end: number,
+		minReadPosition: number,
+		maxReadPosition: number,
+	): MaybePromise<ReadResult | null> {
+		const result = this._readFromRoot(start, end, minReadPosition, maxReadPosition);
+		if (!isThenable(result)) {
+			return result;
+		}
+
+		this._pendingReadCount++;
+		return result.finally(() => {
+			this._pendingReadCount--;
+			this._maybeReleaseRoot();
+		});
+	}
+
+	/** @internal */
+	_readFromRoot(
 		start: number,
 		end: number,
 		minReadPosition: number,
@@ -411,7 +436,33 @@ export class CustomPathedSource extends PathedSource {
 			return this._root.source._getFileSize();
 		}
 
-		return undefined;
+		return this._releasedRootFileSize;
+	}
+
+	/**
+	 * Frees the root source once no read is pending; the next read requests it again. This lets an input that's
+	 * unlikely to be read again release the root's file handles and caches without waiting for garbage collection.
+	 * @internal
+	 */
+	_releaseRoot() {
+		if (!this._root && !this._rootRequest) {
+			return;
+		}
+
+		this._releaseRootWhenIdle = true;
+		this._maybeReleaseRoot();
+	}
+
+	/** @internal */
+	_maybeReleaseRoot() {
+		if (!this._releaseRootWhenIdle || this._pendingReadCount > 0 || !this._root || this._disposed) {
+			return;
+		}
+
+		this._releasedRootFileSize = this._root.source._getFileSize();
+		this._root.free();
+		this._root = null;
+		this._releaseRootWhenIdle = false;
 	}
 
 	/** @internal */
