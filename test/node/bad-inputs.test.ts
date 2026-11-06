@@ -1525,6 +1525,16 @@ test('Ogg: Packets can be looked up by their own timestamps despite granule posi
 		}
 	}
 	expect(mismatches).toEqual([]);
+
+	// Where the granule positions add up, a lookup less than a sample before a packet still returns the one before it
+	const opusFile = concatList(opusPages({ pageCount: 3 }));
+	using opusInput = new Input({ source: new BufferSource(opusFile), formats: ALL_FORMATS });
+	const opusSink = new EncodedPacketSink((await opusInput.getPrimaryAudioTrack())!);
+	const packetStart = (960 * 15 - 312) / 48000;
+	for (const offset of [-1e-7, -1e-5, -2e-5]) {
+		expect((await opusSink.getPacket(packetStart + offset))?.timestamp).toBeCloseTo((960 * 14 - 312) / 48000, 9);
+	}
+	expect((await opusSink.getPacket(packetStart))?.timestamp).toBeCloseTo(packetStart, 9);
 });
 
 test('Ogg: Many logical bitstreams', async () => {
