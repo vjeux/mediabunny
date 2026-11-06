@@ -191,7 +191,9 @@ export class AdtsDemuxer extends Demuxer {
 			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
 			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
 				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
-				if (isThenable(slice)) slice = await slice;
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
 
 				if (slice && readAscii(slice, 3) === 'TAG') {
 					parseId3V1Tag(slice, this.metadataTags);
