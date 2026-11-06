@@ -375,11 +375,8 @@ test('AVC and HEVC tracks whose sample descriptions carry different parameter se
 		const sink = new EncodedPacketSink(track);
 		const packets: number[][] = [];
 		for await (const packet of sink.packets()) {
-			if (secondLengthSize === 4) {
-				// Converting length prefixes changes the size in a way that only the data tells
-				const metadataOnly = await sink.getPacket(packet.timestamp, { metadataOnly: true });
-				expect(metadataOnly?.byteLength).toBe(packet.byteLength);
-			}
+			const metadataOnly = await sink.getPacket(packet.timestamp, { metadataOnly: true });
+			expect(metadataOnly?.byteLength).toBe(packet.byteLength);
 			packets.push([...packet.data]);
 		}
 

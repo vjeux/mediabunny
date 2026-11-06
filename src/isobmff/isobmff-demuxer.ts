@@ -3478,12 +3478,23 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 		}
 
+		let sizingData: Uint8Array | null = null;
+		const sampleDescriptionIndex = sampleInfo.sampleDescriptionIndex;
+		if (options.metadataOnly && inBandParameterSetsNeedData(this.internalTrack, sampleDescriptionIndex)) {
+			let slice = this.internalTrack.demuxer.reader.requestSlice(sampleInfo.sampleOffset, sampleInfo.sampleSize);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			sizingData = slice && readBytes(slice, sampleInfo.sampleSize);
+		}
+
 		const withParameterSets = applyInBandParameterSets(
 			this.internalTrack,
-			options.metadataOnly ? null : data,
+			options.metadataOnly ? sizingData : data,
 			sampleInfo.sampleSize,
 			sampleInfo.sampleDescriptionIndex,
 			sampleInfo.isKeyFrame,
+			!!options.metadataOnly,
 		);
 		if (withParameterSets.data) {
 			data = withParameterSets.data;
@@ -3539,12 +3550,26 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 		}
 
+		let sizingData: Uint8Array | null = null;
+		const sampleDescriptionIndex = trackData.sampleDescriptionIndex;
+		if (options.metadataOnly && inBandParameterSetsNeedData(this.internalTrack, sampleDescriptionIndex)) {
+			let slice = this.internalTrack.demuxer.reader.requestSlice(
+				fragmentSample.byteOffset,
+				fragmentSample.byteSize,
+			);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			sizingData = slice && readBytes(slice, fragmentSample.byteSize);
+		}
+
 		const withParameterSets = applyInBandParameterSets(
 			this.internalTrack,
-			options.metadataOnly ? null : data,
+			options.metadataOnly ? sizingData : data,
 			fragmentSample.byteSize,
 			trackData.sampleDescriptionIndex,
 			fragmentSample.isKeyFrame,
+			!!options.metadataOnly,
 		);
 		if (withParameterSets.data) {
 			data = withParameterSets.data;
@@ -4016,8 +4041,19 @@ const getInBandParameterSets = (track: InternalTrack) => {
 };
 
 /**
+ * Whether a sample's NAL unit length prefixes get converted to the decoder config's size, which makes the packet's size
+ * depend on its NAL units: then even a metadata-only packet needs the sample's data to know its size.
+ */
+const inBandParameterSetsNeedData = (track: InternalTrack, sampleDescriptionIndex: number) => {
+	const inBand = getInBandParameterSets(track);
+	const description = inBand?.bySampleDescription.get(sampleDescriptionIndex);
+	return !!inBand && !!description && description.lengthSize !== inBand.lengthSize;
+};
+
+/**
  * Prepends a key sample's own parameter sets when the track's sample descriptions differ in them, converting NAL unit
- * length prefixes to the decoder config's size if needed. Without data (metadata only), only computes the size.
+ * length prefixes to the decoder config's size if needed. For metadata-only packets, only computes the size (from the
+ * data when inBandParameterSetsNeedData says so) and returns no data.
  */
 const applyInBandParameterSets = (
 	track: InternalTrack,
@@ -4025,11 +4061,12 @@ const applyInBandParameterSets = (
 	byteLength: number,
 	sampleDescriptionIndex: number,
 	isKeyFrame: boolean,
+	metadataOnly: boolean,
 ) => {
 	const inBand = getInBandParameterSets(track);
 	const description = inBand?.bySampleDescription.get(sampleDescriptionIndex);
 	if (!inBand || !description) {
-		return { data, byteLength };
+		return { data: metadataOnly ? null : data, byteLength };
 	}
 
 	if (data && description.lengthSize !== inBand.lengthSize) {
@@ -4039,18 +4076,21 @@ const applyInBandParameterSets = (
 		data = concatNalUnitsInLengthPrefixed(nalUnits, inBand.lengthSize);
 	}
 
+	if (data) {
+		byteLength = data.byteLength;
+	}
+
 	if (isKeyFrame) {
-		if (data) {
-			const result = new Uint8Array(description.parameterSets.byteLength + data.byteLength);
+		byteLength += description.parameterSets.byteLength;
+		if (data && !metadataOnly) {
+			const result = new Uint8Array(byteLength);
 			result.set(description.parameterSets, 0);
 			result.set(data, description.parameterSets.byteLength);
 			data = result;
-		} else {
-			byteLength += description.parameterSets.byteLength;
 		}
 	}
 
-	return { data, byteLength: data ? data.byteLength : byteLength };
+	return { data: metadataOnly ? null : data, byteLength };
 };
 
 type SampleInfo = {
