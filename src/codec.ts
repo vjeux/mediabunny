@@ -186,22 +186,36 @@ const HEVC_LEVEL_TABLE = [
 	{ maxPictureSize: 35651584, maxBitrate: 800000000, tier: 'H', level: 186 }, // Level 6.2 (High Tier)
 ];
 
-// https://en.wikipedia.org/wiki/VP9
+// https://www.webmproject.org/vp9/levels/
 export const VP9_LEVEL_TABLE = [
-	{ maxPictureSize: 36864, maxBitrate: 200000, level: 10 }, // Level 1
-	{ maxPictureSize: 73728, maxBitrate: 800000, level: 11 }, // Level 1.1
-	{ maxPictureSize: 122880, maxBitrate: 1800000, level: 20 }, // Level 2
-	{ maxPictureSize: 245760, maxBitrate: 3600000, level: 21 }, // Level 2.1
-	{ maxPictureSize: 552960, maxBitrate: 7200000, level: 30 }, // Level 3
-	{ maxPictureSize: 983040, maxBitrate: 12000000, level: 31 }, // Level 3.1
-	{ maxPictureSize: 2228224, maxBitrate: 18000000, level: 40 }, // Level 4
-	{ maxPictureSize: 2228224, maxBitrate: 30000000, level: 41 }, // Level 4.1
-	{ maxPictureSize: 8912896, maxBitrate: 60000000, level: 50 }, // Level 5
-	{ maxPictureSize: 8912896, maxBitrate: 120000000, level: 51 }, // Level 5.1
-	{ maxPictureSize: 8912896, maxBitrate: 180000000, level: 52 }, // Level 5.2
-	{ maxPictureSize: 35651584, maxBitrate: 180000000, level: 60 }, // Level 6
-	{ maxPictureSize: 35651584, maxBitrate: 240000000, level: 61 }, // Level 6.1
-	{ maxPictureSize: 35651584, maxBitrate: 480000000, level: 62 }, // Level 6.2
+	// Level 1
+	{ maxPictureSize: 36864, maxSampleRate: 829440, maxDimension: 512, maxBitrate: 200000, level: 10 },
+	// Level 1.1
+	{ maxPictureSize: 73728, maxSampleRate: 2764800, maxDimension: 768, maxBitrate: 800000, level: 11 },
+	// Level 2
+	{ maxPictureSize: 122880, maxSampleRate: 4608000, maxDimension: 960, maxBitrate: 1800000, level: 20 },
+	// Level 2.1
+	{ maxPictureSize: 245760, maxSampleRate: 9216000, maxDimension: 1344, maxBitrate: 3600000, level: 21 },
+	// Level 3
+	{ maxPictureSize: 552960, maxSampleRate: 20736000, maxDimension: 2048, maxBitrate: 7200000, level: 30 },
+	// Level 3.1
+	{ maxPictureSize: 983040, maxSampleRate: 36864000, maxDimension: 2752, maxBitrate: 12000000, level: 31 },
+	// Level 4
+	{ maxPictureSize: 2228224, maxSampleRate: 83558400, maxDimension: 4160, maxBitrate: 18000000, level: 40 },
+	// Level 4.1
+	{ maxPictureSize: 2228224, maxSampleRate: 160432128, maxDimension: 4160, maxBitrate: 30000000, level: 41 },
+	// Level 5
+	{ maxPictureSize: 8912896, maxSampleRate: 311951360, maxDimension: 8384, maxBitrate: 60000000, level: 50 },
+	// Level 5.1
+	{ maxPictureSize: 8912896, maxSampleRate: 588251136, maxDimension: 8384, maxBitrate: 120000000, level: 51 },
+	// Level 5.2
+	{ maxPictureSize: 8912896, maxSampleRate: 1176502272, maxDimension: 8384, maxBitrate: 180000000, level: 52 },
+	// Level 6
+	{ maxPictureSize: 35651584, maxSampleRate: 1176502272, maxDimension: 16832, maxBitrate: 180000000, level: 60 },
+	// Level 6.1
+	{ maxPictureSize: 35651584, maxSampleRate: 2353004544, maxDimension: 16832, maxBitrate: 240000000, level: 61 },
+	// Level 6.2
+	{ maxPictureSize: 35651584, maxSampleRate: 4706009088, maxDimension: 16832, maxBitrate: 480000000, level: 62 },
 ];
 
 // https://en.wikipedia.org/wiki/AV1
@@ -269,6 +283,7 @@ export const buildVideoCodecString = (
 	height: number,
 	bitrate: number,
 	alpha: boolean,
+	framerate?: number,
 ) => {
 	if (codec === 'avc') {
 		// Needed as a workaround for https://github.com/WebKit/WebKit/pull/74602, otherwise the encoder stalls.
@@ -317,7 +332,10 @@ export const buildVideoCodecString = (
 
 		const pictureSize = width * height;
 		const levelInfo = VP9_LEVEL_TABLE.find(
-			level => pictureSize <= level.maxPictureSize && bitrate <= level.maxBitrate,
+			level => pictureSize <= level.maxPictureSize
+				&& Math.max(width, height) <= level.maxDimension
+				&& bitrate <= level.maxBitrate
+				&& (framerate === undefined || pictureSize * framerate <= level.maxSampleRate),
 		) ?? last(VP9_LEVEL_TABLE)!;
 
 		const bitDepth = '08'; // 8-bit
