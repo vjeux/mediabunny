@@ -3,6 +3,7 @@ import { buildVideoCodecString, extractVideoCodecString, VideoCodec } from '../.
 import { extractAv1CodecInfoFromPacket, extractVp9CodecInfoFromPacket, parseAvcSps } from '../../src/codec-data.js';
 import { canDecodeAudio, canDecodeVideo } from '../../src/decode.js';
 import { canEncodeAudio, canEncodeVideo, Quality } from '../../src/encode.js';
+import { isWebKit } from '../../src/misc.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { AV1_FIXTURES, AVC_SPS_FIXTURES, hexToBytes, VP9_FIXTURES } from '../node/helpers/codecs-fixtures.js';
 
@@ -30,9 +31,12 @@ const isDecodable = async (codec: string, width = 176, height = 144) => {
 
 describe('Codec strings in the browser', () => {
 	test('Strings derived from real streams are accepted', async () => {
-		// Malformed strings are rejected
-		expect(await isDecodable('av01.0.04X.08')).toBe(false);
-		expect(await isDecodable('vp09.00.10')).toBe(false);
+		// Malformed strings are rejected, except by WebKit, whose codec string parser accepts them (the checks below
+		// still hold there)
+		if (!isWebKit()) {
+			expect(await isDecodable('av01.0.04X.08')).toBe(false);
+			expect(await isDecodable('vp09.00.10')).toBe(false);
+		}
 
 		for (const fixture of AV1_FIXTURES) {
 			const av1CodecInfo = extractAv1CodecInfoFromPacket(hexToBytes(fixture.sequenceHeaderObu))!;
