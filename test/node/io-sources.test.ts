@@ -684,7 +684,7 @@ describe('UrlSource', () => {
 			await run(server);
 		} finally {
 			restoreLogs();
-			server.close();
+			await server.close();
 		}
 	};
 
@@ -890,7 +890,8 @@ describe('UrlSource', () => {
 		await withServer(FUZZ_DATA, { chunkSize: 1024, chunkDelayMs: 20 }, async (server) => {
 			const input = new Input({ source: new UrlSource(server.url), formats: ALL_FORMATS });
 			const pending = input.getFormat();
-			await new Promise(resolve => setTimeout(resolve, 30));
+			// Dispose once the body has started trickling in (a 1 KiB piece every 20 ms), so the read is in flight
+			await vi.waitFor(() => expect(server.requests.length).toBeGreaterThan(0));
 			input.dispose();
 			await expect(pending).rejects.toBeInstanceOf(InputDisposedError);
 		});

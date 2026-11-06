@@ -35,6 +35,8 @@ export type RecordedRequest = {
 export const startByteServer = async (data: Uint8Array, options: ByteServerOptions = {}) => {
 	const requests: RecordedRequest[] = [];
 	let failuresLeft = options.failFirstRequests ?? 0;
+	// Stops the body pumps of responses in flight; destroying a socket doesn't cancel their timers
+	const stopFunctions = new Set<() => void>();
 
 	const server = http.createServer((req, res) => {
 		res.on('error', () => {});
@@ -101,19 +103,31 @@ export const startByteServer = async (data: Uint8Array, options: ByteServerOptio
 
 		const chunkSize = options.chunkSize ?? body.length;
 		let position = 0;
+		let timeout: ReturnType<typeof setTimeout> | null = null;
+		let immediate: ReturnType<typeof setImmediate> | null = null;
+
 		const pump = () => {
+			timeout = null;
+			immediate = null;
+
+			// The client may have gone away in the meantime
+			if (res.destroyed || res.writableEnded) {
+				stop();
+				return;
+			}
+
 			while (position < body.length) {
 				const piece = body.subarray(position, position + chunkSize);
 				position += piece.length;
 				const canContinue = res.write(piece);
 
 				if (options.chunkDelayMs) {
-					setTimeout(pump, options.chunkDelayMs);
+					timeout = setTimeout(pump, options.chunkDelayMs);
 					return;
 				}
 				if (options.trickle) {
 					// Not a timer, whose granularity is ~16 ms on some platforms
-					setImmediate(pump);
+					immediate = setImmediate(pump);
 					return;
 				}
 				if (!canContinue) {
@@ -124,6 +138,22 @@ export const startByteServer = async (data: Uint8Array, options: ByteServerOptio
 
 			res.end();
 		};
+
+		const stop = () => {
+			if (timeout !== null) {
+				clearTimeout(timeout);
+				timeout = null;
+			}
+			if (immediate !== null) {
+				clearImmediate(immediate);
+				immediate = null;
+			}
+			res.off('drain', pump);
+			stopFunctions.delete(stop);
+		};
+
+		stopFunctions.add(stop);
+		res.once('close', stop); // Once the response has ended or its connection went away
 		pump();
 	});
 
@@ -139,9 +169,12 @@ export const startByteServer = async (data: Uint8Array, options: ByteServerOptio
 		origin,
 		url: `${origin}/file.bin`,
 		requests,
-		close: () => {
+		close: async () => {
+			for (const stop of [...stopFunctions]) {
+				stop();
+			}
 			server.closeAllConnections();
-			server.close();
+			await new Promise<void>(resolve => server.close(() => resolve()));
 		},
 	};
 };
