@@ -1043,11 +1043,18 @@ ${secondUri}
 		});
 	};
 
-	// The same resource: the second segment starts where the first one ends
-	using sameResourceInput = openPlaylist('0.ts');
-	const videoTrack = await sameResourceInput.getPrimaryVideoTrack();
-	assert(videoTrack);
-	expect(await videoTrack.getDurationFromMetadata()).toBe(5);
+	// The same resource, however it's spelled (URIs are compared once resolved): the second segment starts where the
+	// first one ends
+	const checkSameResource = async (secondUri: string) => {
+		using input = openPlaylist(secondUri);
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.getDurationFromMetadata()).toBe(5);
+		expect(await new EncodedPacketSink(videoTrack).getFirstPacket()).not.toBeNull();
+	};
+	await checkSameResource('0.ts');
+	await checkSameResource('./0.ts');
+	await checkSameResource('x/../0.ts');
 
 	// "If o is not present, a previous Media Segment MUST appear in the Playlist file and MUST be a sub-range of the same
 	// media resource, or the Media Segment is undefined and the client MUST fail to parse the Playlist." (RFC 8216,
