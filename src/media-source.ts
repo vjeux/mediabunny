@@ -1391,7 +1391,7 @@ const colorAlphaSplitterWorkerCode = () => {
 
 		if (premultiplied) {
 			// Undo the premultiplication so that the color frame holds the straight colors
-			for (let i = 0; i < pixelCount * 4; i += 4) {
+			for (let i = 0; i < width * height * 4; i += 4) {
 				const alpha = source[i + 3]!;
 				if (alpha !== 0 && alpha !== 255) {
 					const scale = 255 / alpha;
