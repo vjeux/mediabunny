@@ -138,7 +138,10 @@ const writePcmOutput = async (output: Output) => {
 	await output.finalize();
 };
 
-test.each([
+// The origin private file system isn't available everywhere (e.g. in WebKit's ephemeral automation sessions)
+const hasOpfs = await navigator.storage.getDirectory().then(() => true, () => false);
+
+test.skipIf(!hasOpfs).each([
 	['MP4', () => new Mp4OutputFormat({ fastStart: false })],
 	['MKV', () => new MkvOutputFormat()],
 	['WAVE', () => new WavOutputFormat()],
