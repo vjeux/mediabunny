@@ -1574,6 +1574,54 @@ test('Ogg: Garbage between pages', async () => {
 	await expectGracefulRead(concatList(pages.flatMap((page, i) => i >= 2 ? [page, zeros(8)] : [page])));
 });
 
+test('Ogg: Reading goes on past garbage and empty pages between pages', async () => {
+	// Like libogg and FFmpeg, skip whatever sits between two pages instead of ending the stream there
+	const pages = opusPages({ pageCount: 10 });
+	const file = concatList([
+		...pages.slice(0, 2), // The header pages
+		new Uint8Array(100).fill(0x4f), // Garbage made of 'O's
+		...pages.slice(2, 6),
+		oggPage({ granule: -1, sequence: 99, lacing: [], data: [] }), // A page without segments
+		...pages.slice(6),
+	]);
+
+	for (const source of [new BufferSource(file), streamedSource(file)]) {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(Math.round(packet.timestamp * 48000));
+		}
+		expect(timestamps).toEqual(Array.from({ length: 100 }, (_, i) => 960 * i - 312));
+	}
+});
+
+test('Ogg: Reading doesn\'t go on past garbage into lost pages or another bitstream', async () => {
+	const readTimestamps = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			timestamps.push(Math.round(packet.timestamp * 48000));
+		}
+		return timestamps;
+	};
+	const expectedTimestamps = (count: number) => Array.from({ length: count }, (_, i) => 960 * i - 312);
+
+	// A page replaced by garbage: the audio after it would get wrong timestamps, so the stream ends there
+	const pages = opusPages({ pageCount: 10 });
+	const lostPage = new Uint8Array(pages[6]!.length).fill(0x4f);
+	expect(await readTimestamps(concatList([...pages.slice(0, 6), lostPage, ...pages.slice(7)])))
+		.toEqual(expectedTimestamps(40));
+
+	// A chained file whose first link was cut off in the middle of a packet, and whose second link reuses the serial
+	// number (as in a broken-off Icecast capture): the second link must not be read as a continuation of the first
+	const firstLink = opusPages({ pageCount: 9, lastEos: false });
+	const cutOffPage = oggPage({ granule: -1, sequence: 11, lacing: [255, 255], data: new Uint8Array(510).fill(0xf8) });
+	const file = concat(...firstLink, cutOffPage.subarray(0, 100), ...opusPages({ pageCount: 10 }));
+	expect(await readTimestamps(file)).toEqual(expectedTimestamps(90));
+});
+
 test('Ogg: Pages without granule positions at the start', async () => {
 	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
 	for (let i = 0; i < 20; i++) {
