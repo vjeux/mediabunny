@@ -337,7 +337,9 @@ const skipZeroBytes = async (reader: Reader, pos: number, maxLength: number) => 
 
 	while (pos < end) {
 		let slice = reader.requestSliceRange(pos, 1, Math.min(2 ** 16, end - pos));
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		if (!slice || slice.length === 0) {
 			break;
 		}
