@@ -504,3 +504,26 @@ test('Opus without a decoder description still gets its identification header as
 	// The pre-skip can't hold more than 65535 samples; the rest of a longer delay stays in the block timestamps
 	await check(-2, false, 65535);
 });
+
+test('Movie-level tags are written without a TargetType string', async () => {
+	// FFmpeg prefixes every tag name with the TargetType (MOVIE/TITLE instead of title), so its own muxer leaves it
+	// out of global tags; TargetTypeValue 50 alone marks the tags as movie-level
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(source);
+	output.setMetadataTags({ title: 'Title', artist: 'Artist' });
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', 0, 0.02), {
+		decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 },
+	});
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const containsId = (id: number[]) => bytes.some((_, i) => id.every((byte, j) => bytes[i + j] === byte));
+	expect(containsId([0x63, 0xca])).toBe(false); // TargetType
+	expect(containsId([0x68, 0xca, 0x81, 50])).toBe(true); // TargetTypeValue 50
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tags = await input.getMetadataTags();
+	expect([tags.title, tags.artist]).toEqual(['Title', 'Artist']);
+});
