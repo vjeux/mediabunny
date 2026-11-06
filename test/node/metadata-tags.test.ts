@@ -245,6 +245,31 @@ test('Read and write metadata, MP4 with mdta format', async () => {
 	expect(readTags.raw!['bytes']).toEqual(new Uint8Array([2, 3, 4, 5]));
 });
 
+test('MP4 mdta metadata is written as a MetaBox with version and flags, like FFmpeg', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat({ metadataFormat: 'mdta' }),
+		target: new BufferTarget(),
+	});
+	output.setMetadataTags({ title: 'Hello' });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const ascii = String.fromCharCode(...bytes);
+	const metaPos = ascii.indexOf('meta', ascii.indexOf('udta'));
+	expect(metaPos).toBeGreaterThan(0);
+
+	// moov/udta/meta must carry version and flags before its hdlr child (ExifTool reads no tags otherwise)
+	const view = new DataView(bytes.buffer, bytes.byteOffset);
+	expect(view.getUint32(metaPos + 4)).toBe(0);
+	expect(ascii.slice(metaPos + 12, metaPos + 16)).toBe('hdlr');
+	expect(ascii.slice(metaPos + 24, metaPos + 28)).toBe('mdta');
+});
+
 test('Read MOV metadata tags, ilst with keys', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/trunc-buck-bunny.mov')),
