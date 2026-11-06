@@ -3607,3 +3607,64 @@ const testTimestampWraparound = async (
 		expect(timestamps[i]).toBeCloseTo(start + 0.5 * i, 4);
 	}
 };
+
+test('VIDEO-RANGE describes HDR variants', async () => {
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceTrack = await sourceInput.getPrimaryVideoTrack();
+	assert(sourceTrack);
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		packets.push(packet);
+	}
+
+	// Writes one variant per transfer characteristic and returns the master playlist
+	const writeVariants = async (transfers: VideoTransferCharacteristics[]) => {
+		let master = '';
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new CmafOutputFormat(),
+				onMaster: (text) => {
+					master = text;
+				},
+			}),
+			target: new PathedTarget('master.m3u8', () => new BufferTarget()),
+		});
+
+		const sources = transfers.map((transfer) => {
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source, { group: new OutputTrackGroup() });
+			return { source, transfer };
+		});
+		await output.start();
+
+		for (const { source, transfer } of sources) {
+			const colorSpace = {
+				primaries: 'bt2020',
+				transfer,
+				matrix: 'bt2020-ncl',
+				fullRange: false,
+			} as unknown as VideoColorSpaceInit;
+			for (const packet of packets) {
+				await source.add(packet, { decoderConfig: { ...decoderConfig, colorSpace } });
+			}
+		}
+		await output.finalize();
+
+		return master.split('\n').filter(line => line.startsWith('#EXT-X-STREAM-INF'));
+	};
+
+	// "The value MUST be PQ if the video in the Variant Stream is encoded using [...] TransferCharacteristics code
+	// point 16", and HLG for 18; its absence implies SDR, so the SDR variant next to them says so explicitly
+	// (TypeScript's DOM types don't list the BT.2100 values yet)
+	const hdrTransfers = ['pq', 'hlg'] as unknown as VideoTransferCharacteristics[];
+	const variants = await writeVariants([...hdrTransfers, 'bt709']);
+	expect(variants).toHaveLength(3);
+	expect(variants[0]).toContain(',VIDEO-RANGE=PQ');
+	expect(variants[1]).toContain(',VIDEO-RANGE=HLG');
+	expect(variants[2]).toContain(',VIDEO-RANGE=SDR');
+
+	// SDR-only output doesn't need the attribute
+	const sdrVariants = await writeVariants(['bt709']);
+	expect(sdrVariants[0]).not.toContain('VIDEO-RANGE');
+});
