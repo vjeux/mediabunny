@@ -129,7 +129,7 @@ The available options are the same `IsobmffOutputFormatOptions` used by [MP4](#m
 
 This output format creates a single Common Media Application Format (CMAF) segment (.m4s).
 ```ts
-import { Output, CmafOutputFormat } from 'mediabunny';
+import { Output, CmafOutputFormat, BufferTarget } from 'mediabunny';
 
 const output = new Output({
 	format: new CmafOutputFormat(options),
@@ -355,9 +355,12 @@ This format ensures [append-only writing](#append-only-writing).
 The following options are available:
 ```ts
 type MpegTsOutputFormatOptions = {
+	timestampOffset?: number;
 	onPacket?: (data: Uint8Array, position: number) => unknown;
 };
 ```
+- `timestampOffset`\
+	An offset in seconds that is added to all timestamps written to the file. It keeps timestamps that would otherwise be negative (caused by audio priming samples or B-frames) positive, since negative timestamps trip up some players. A recommended value is 10 seconds. Defaults to 0. When writing HLS, prefer the HLS `mediaTimestampBase` option instead.
 - `onPacket`\
 	Will be called for each 188-byte Transport Stream packet that is written.
 
@@ -373,7 +376,7 @@ This output format creates the following files:
 To emit media playlists that use the `#EXT-X-PROGRAM-DATE-TIME` tag to map segment timestamps to real-world time, set `BaseTrackMetadata.isRelativeToUnixEpoch` to `true` for all output tracks.
 
 ```ts
-import { Output, PathedTarget, MpegTsOutputFormat } from 'mediabunny';
+import { Output, PathedTarget, HlsOutputFormat } from 'mediabunny';
 
 const output = new Output({
 	format: new HlsOutputFormat(options),
@@ -396,6 +399,7 @@ export type HlsOutputFormatOptions = {
 	singleFilePerPlaylist?: boolean;
 	live?: boolean;
 	maxLiveSegmentCount?: number;
+	mediaTimestampBase?: number;
 	getPlaylistPath?: (info: HlsOutputPlaylistInfo) => MaybePromise<FilePath>;
 	getSegmentPath?: (info: HlsOutputSegmentInfo) => MaybePromise<FilePath>;
 	getInitPath?: (info: HlsOutputPlaylistInfo) => MaybePromise<FilePath>;
@@ -404,6 +408,7 @@ export type HlsOutputFormatOptions = {
 	onPlaylist?: (content: string, info: HlsOutputPlaylistInfo) => unknown;
 	onSegment?: (target: Target, info: HlsOutputSegmentInfo) => unknown;
 	onInit?: (target: Target, info: HlsOutputPlaylistInfo) => unknown;
+	onSegmentPopped?: (path: FilePath, info: HlsOutputSegmentInfo) => unknown;
 };
 ```
 - `segmentFormat`\
@@ -422,6 +427,8 @@ export type HlsOutputFormatOptions = {
 	When `false` (the default), all playlists will only be emitted once, upon output finalization.
 - `maxLiveSegmentCount`\
 	When in live mode, this controls the maximum number of segments contained in each playlist. Defaults to `Infinity`, meaning playlists continually grow in size. Playlists keep more segments when fewer wouldn't add up to three times the target duration, the minimum length of a live playlist in HLS.
+- `mediaTimestampBase`\
+	The timestamp in seconds at which the media written into the segments starts. All media is shifted such that the first packet added to the output lands on this timestamp, no matter its original timestamp. This keeps timestamps positive that would otherwise be negative (caused by audio priming samples, B-frames, or tracks starting slightly before the first packet). The timestamps in the playlists are not affected. Defaults to 10 seconds.
 - `getPlaylistPath`\
 	Returns the file path for a given media playlist. If the returned path is relative, it is relative to the root path.
 
@@ -446,3 +453,5 @@ export type HlsOutputFormatOptions = {
 	Called whenever a media segment has been fully written. In single-file mode, this function will only be called once when the playlist is finalized.
 - `onInit`\
 	Called when a media playlist is initialized, before any segments have been written. In single-file mode, this function is never called.
+- `onSegmentPopped`\
+	Called when a media segment is removed from the start of a media playlist due to `maxLiveSegmentCount`, with the segment's path. Not called when `singleFilePerPlaylist` is enabled.
