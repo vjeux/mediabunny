@@ -589,9 +589,10 @@ describe('AudioSampleSink with PCM (decoded by Mediabunny itself, so also in Nod
 		assert(track);
 
 		const sink = new AudioSampleSink(track);
-		const timestamps = [-1, -1e-6, 0, 1e-6, 0.4999, 0.5, 0.55, 0.6, 0.6001, 1.0999, 2, Infinity];
+		// Off-boundary probes stay a few milliseconds away from packet starts, beyond Matroska's timestamp precision
+		const timestamps = [-1, -0.005, 0, 1e-6, 0.4999, 0.5, 0.55, 0.6, 0.6001, 1.0999, 2, Infinity];
 		for (let i = 0; i < PACKET_COUNT; i += 7) {
-			timestamps.push(packetTimestamp(i), packetTimestamp(i) + 0.01, packetTimestamp(i) - 1e-7);
+			timestamps.push(packetTimestamp(i), packetTimestamp(i) + 0.01, packetTimestamp(i) - 0.005);
 		}
 
 		for (const timestamp of timestamps) {
