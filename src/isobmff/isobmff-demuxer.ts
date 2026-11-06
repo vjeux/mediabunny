@@ -1054,6 +1054,13 @@ export class IsobmffDemuxer extends Demuxer {
 		}
 
 		const contentStartPos = slice.filePos;
+
+		if (startPos + boxInfo.totalSize > slice.end) {
+			// Like FFmpeg (mov_read_default), cut a box that claims to extend past its parent down to the parent's end
+			boxInfo.totalSize = slice.end - startPos;
+			boxInfo.contentSize = Math.max(slice.end - contentStartPos, 0);
+		}
+
 		const boxEndPos = startPos + boxInfo.totalSize;
 
 		switch (boxInfo.name) {
