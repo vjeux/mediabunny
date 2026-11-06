@@ -156,6 +156,7 @@ type InternalTrack = {
 	editListPreviousSegmentDurations: number;
 	/** The media time offset of the main edit list entry (with media time !== -1) */
 	editListOffset: number;
+	hasEditList: boolean;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
@@ -347,6 +348,8 @@ export class IsobmffDemuxer extends Demuxer {
 	movieMatrix = IDENTITY_MATRIX;
 	isQuickTime = false;
 	metadataTags: MetadataTags = {};
+	/** The encoder delay from the iTunSMPB tag, in samples. */
+	iTunesPriming: number | null = null;
 	currentMetadataKeys: Map<number, string> | null = null;
 
 	isFragmented = false;
@@ -436,6 +439,17 @@ export class IsobmffDemuxer extends Demuxer {
 						const previousSegmentDurationsInSeconds
 							= track.editListPreviousSegmentDurations / this.movieTimescale;
 						track.editListOffset -= Math.round(previousSegmentDurationsInSeconds * track.timescale);
+
+						if (
+							this.iTunesPriming !== null
+							&& !track.hasEditList
+							&& track.info?.type === 'audio'
+							&& track.info.codec === 'aac'
+						) {
+							// Without an edit list, iTunes-style files only declare the encoder delay in iTunSMPB,
+							// which FFmpeg applies just like an edit list's media time
+							track.editListOffset = this.iTunesPriming;
+						}
 					}
 
 					lookForMfraBox = this.isFragmented
@@ -558,6 +572,7 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentPositionCache: [],
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
+				hasEditList: foreignTrack.hasEditList,
 				encryptionInfo: foreignTrack.encryptionInfo,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
@@ -922,6 +937,44 @@ export class IsobmffDemuxer extends Demuxer {
 		return fragment;
 	}
 
+	/** Reads a '----' ilst item, made of mean, name and data boxes. */
+	readFreeformMetadataItem(slice: FileSlice, endPos: number) {
+		let name: string | null = null;
+		let value: string | null = null;
+
+		while (endPos - slice.filePos >= MIN_BOX_HEADER_SIZE) {
+			const startPos = slice.filePos;
+			const boxInfo = readBoxHeader(slice);
+			if (!boxInfo || startPos + boxInfo.totalSize > endPos) {
+				break;
+			}
+
+			if (boxInfo.name === 'name' && boxInfo.contentSize >= 4) {
+				slice.skip(4); // Version + flags
+				name = textDecoder.decode(readBytes(slice, boxInfo.contentSize - 4));
+			} else if (boxInfo.name === 'data') {
+				slice.filePos = startPos;
+				const data = readDataBox(slice);
+				if (typeof data === 'string') {
+					value = data;
+				}
+			}
+
+			slice.filePos = startPos + boxInfo.totalSize;
+		}
+
+		if (name === 'iTunSMPB' && value !== null) {
+			// Hex fields: reserved, encoder delay, end padding, sample count (FFmpeg's ff_itunes_parse_smpb)
+			const match = /^\s*[0-9a-fA-F]{1,16}\s+([0-9a-fA-F]{1,16})\s+[0-9a-fA-F]{1,16}\s+[0-9a-fA-F]{1,16}\b/
+				.exec(value);
+			const priming = match ? Number.parseInt(match[1]!, 16) : 0;
+
+			if (priming > 0 && priming < 16384) { // The plausible range used by FFmpeg
+				this.iTunesPriming ??= priming;
+			}
+		}
+	}
+
 	readContiguousBoxes(slice: FileSlice) {
 		if (this.boxNestingDepth === MAX_BOX_NESTING_DEPTH) {
 			throw new Error('Invalid file: boxes are nested too deeply.');
@@ -1039,6 +1092,7 @@ export class IsobmffDemuxer extends Demuxer {
 					fragmentPositionCache: [],
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
+					hasEditList: false,
 					encryptionInfo: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
@@ -1116,6 +1170,7 @@ export class IsobmffDemuxer extends Demuxer {
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
+				track.hasEditList = true;
 				let relevantEntryFound = false;
 				let previousSegmentDurations = 0;
 
@@ -2938,6 +2993,12 @@ export class IsobmffDemuxer extends Demuxer {
 					if (this.currentMetadataKeys.has(nameAsNumber)) {
 						// An entry exists for this number
 						metadataKey = this.currentMetadataKeys.get(nameAsNumber)!;
+					}
+
+					if (metadataKey === '----') {
+						const startPos = slice.filePos;
+						this.readFreeformMetadataItem(slice, startPos + boxInfo.contentSize);
+						slice.filePos = startPos;
 					}
 
 					const data = readDataBox(slice);
