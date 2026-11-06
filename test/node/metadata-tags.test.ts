@@ -1086,3 +1086,31 @@ test('Creation time override in conversion', async () => {
 
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
+
+test('Read the disc number of FFmpeg use_metadata_tags files', async () => {
+	// ffmpeg -i in.mp4 -c copy -movflags use_metadata_tags -metadata track=3/12 -metadata disc=2/5 out.mp4
+	const output = new Output({
+		format: new Mp4OutputFormat({ metadataFormat: 'mdta' }),
+		target: new BufferTarget(),
+	});
+
+	// FFmpeg writes its generic keys, with string values
+	output.setMetadataTags({ raw: { track: '3/12', disc: '2/5' } });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.trackNumber).toBe(3);
+	expect(readTags.tracksTotal).toBe(12);
+	expect(readTags.discNumber).toBe(2);
+	expect(readTags.discsTotal).toBe(5);
+});
