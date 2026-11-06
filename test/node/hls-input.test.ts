@@ -1,5 +1,5 @@
 /* eslint-disable @stylistic/max-len */
-import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
+import { ALL_FORMATS, BufferSource, BufferTarget, EncodedPacket, EncodedPacketSink, EncodedVideoPacketSource, Input, InputAudioTrack, InputVideoTrack, Mp4OutputFormat, Output, UrlSource } from 'mediabunny';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
@@ -1405,6 +1405,94 @@ b.ts
 
 	expect(types.length).toBeGreaterThan(0);
 	expect(types.every(type => type === 'key')).toBe(true);
+});
+
+test.concurrent('AES-128 I-frame playlists point into resources encrypted as a whole', async () => {
+	// Fragmented MP4 with one fragment per GOP; each I-frame's bytes are filled with its index
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration: 0 }),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source, { frameRate: 30 });
+	await output.start();
+	for (let i = 0; i < 90; i++) {
+		const isKey = i % 30 === 0;
+		await source.add(
+			new EncodedPacket(new Uint8Array(isKey ? 1000 : 100).fill(i / 30 + 1), isKey ? 'key' : 'delta', i / 30, 1 / 30),
+			{ decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } },
+		);
+	}
+	await output.finalize();
+
+	const file = new Uint8Array(output.target.buffer!);
+	const view = new DataView(file.buffer);
+	let initSize = 0;
+	const fragments: { offset: number; moofSize: number; size: number }[] = [];
+	for (let offset = 0; offset < file.length; offset += view.getUint32(offset)) {
+		const type = new TextDecoder().decode(file.subarray(offset + 4, offset + 8));
+		if (type === 'moov') {
+			initSize = offset + view.getUint32(offset);
+		} else if (type === 'moof') {
+			const moofSize = view.getUint32(offset);
+			fragments.push({ offset, moofSize, size: moofSize + view.getUint32(offset + moofSize) });
+		}
+	}
+	expect(fragments).toHaveLength(3);
+	expect(fragments.every(x => x.offset % 16 !== 0)).toBe(true);
+
+	// With AES-128, an I-frame playlist's resource is encrypted as a whole (RFC 8216bis, 5.2), so its byte ranges
+	// don't start on their own cipher blocks
+	const key = new Uint8Array(16).map((_, i) => i * 7 + 1);
+	const iv = new Uint8Array(16).map((_, i) => 255 - i);
+	const algorithm = { name: 'AES-CBC', iv };
+	const cryptoKey = await crypto.subtle.importKey('raw', key, algorithm, false, ['encrypt']);
+	const encrypted = new Uint8Array(await crypto.subtle.encrypt(algorithm, cryptoKey, file));
+
+	const createPlaylist = (iFramesOnly: boolean) => [
+		'#EXTM3U',
+		'#EXT-X-TARGETDURATION:1',
+		'#EXT-X-VERSION:7',
+		'#EXT-X-PLAYLIST-TYPE:VOD',
+		...(iFramesOnly
+			? ['#EXT-X-I-FRAMES-ONLY', `#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x${[...iv].map(x => x.toString(16).padStart(2, '0')).join('')}`]
+			: []),
+		`#EXT-X-MAP:URI="${iFramesOnly ? 'encrypted.mp4' : 'clear.mp4'}",BYTERANGE="${initSize}@0"`,
+		...fragments.flatMap(fragment => [
+			'#EXTINF:1,',
+			`#EXT-X-BYTERANGE:${iFramesOnly ? fragment.moofSize + 8 + 1000 : fragment.size}@${fragment.offset}`,
+			iFramesOnly ? 'encrypted.mp4' : 'clear.mp4',
+		]),
+		'#EXT-X-ENDLIST',
+	].join('\n');
+	const files: Record<string, Uint8Array> = {
+		'master.m3u8': new TextEncoder().encode(`#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=100000,CODECS="vp09.00.10.08"
+main.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=30000,CODECS="vp09.00.10.08",URI="iframes.m3u8"
+`),
+		'main.m3u8': new TextEncoder().encode(createPlaylist(false)),
+		'iframes.m3u8': new TextEncoder().encode(createPlaylist(true)),
+		'clear.mp4': file,
+		'encrypted.mp4': encrypted,
+		'key.bin': key,
+	};
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files[path]!)),
+		formats: ALL_FORMATS,
+	});
+
+	const iFrameTrack = (await input.getVideoTracks())[1];
+	assert(iFrameTrack);
+	expect(await iFrameTrack.hasOnlyKeyPackets()).toBe(true);
+
+	const sink = new EncodedPacketSink(iFrameTrack);
+	const packets: string[] = [];
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextKeyPacket(packet)) {
+		packets.push(`${packet.timestamp} ${packet.type} ${packet.byteLength} ${new Set(packet.data).size === 1 ? packet.data[0] : 'garbage'}`);
+	}
+	expect(packets).toEqual(['0 key 1000 1', '1 key 1000 2', '2 key 1000 3']);
 });
 
 const fetchBytes = async (url: string) => {
