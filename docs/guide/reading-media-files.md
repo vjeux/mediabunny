@@ -477,6 +477,10 @@ We may want to extract downscaled thumbnails from a video track:
 import { CanvasSink } from 'mediabunny';
 
 const videoTrack = await input.getPrimaryVideoTrack();
+if (!videoTrack) {
+	throw new Error('No video track.');
+}
+
 const sink = new CanvasSink(videoTrack, {
 	width: 320,
 	height: 180,
