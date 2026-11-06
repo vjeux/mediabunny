@@ -3352,7 +3352,19 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.currentFragmentState || !this.currentFragment?.trackData.has(track.id)) {
+				if (!this.currentFragment) {
+					// ISO/IEC 23001-7 also allows senc in the sample table of a non-fragmented file, where FFmpeg
+					// writes it. Like FFmpeg, prefer it over saiz/saio, whose offset older FFmpeg versions got wrong.
+					getOrCreateEncryptionAuxInfo(track).resolved = readSampleEncryptionEntries(
+						slice,
+						boxEndPos,
+						track.encryptionInfo,
+						Infinity,
+					);
+					break;
+				}
+
+				if (!track.currentFragmentState || !this.currentFragment.trackData.has(track.id)) {
 					break;
 				}
 
@@ -4995,6 +5007,62 @@ const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
 			resolved: null,
 		};
 	}
+};
+
+/** Reads up to `maxCount` entries of a senc box, stopping early if the box is truncated. */
+const readSampleEncryptionEntries = (
+	slice: FileSlice,
+	boxEndPos: number,
+	encryptionInfo: TrackEncryptionInfo,
+	maxCount: number,
+) => {
+	slice.skip(1); // Version
+	const flags = readU24Be(slice);
+	const useSubsamples = Boolean(flags & 0x000002);
+
+	const sampleCount = readU32Be(slice);
+	const ivSize = encryptionInfo.defaultPerSampleIvSize;
+	if (ivSize === null) {
+		throw new Error('Invalid file: encrypted track is missing its tenc box.');
+	}
+
+	const entries: SampleEncryptionInfo[] = [];
+	for (let i = 0; i < Math.min(sampleCount, maxCount); i++) {
+		if (boxEndPos - slice.filePos < ivSize + (useSubsamples ? 2 : 0)) {
+			break;
+		}
+
+		// Normalize the IV to 16 bytes so downstream code can assume a full-length buffer. For CTR with
+		// an 8-byte per-sample IV the lower 8 bytes are zero (that's the CENC spec's block counter start);
+		// for CBC/cbcs the IV is always 16 bytes by spec.
+		const iv = new Uint8Array(16);
+		if (ivSize > 0) {
+			iv.set(readBytes(slice, ivSize), 0);
+		} else if (encryptionInfo.defaultConstantIv) {
+			iv.set(encryptionInfo.defaultConstantIv, 0);
+		} else {
+			throw new Error('Invalid file: encrypted sample has no IV.');
+		}
+
+		let subsamples: SampleEncryptionInfo['subsamples'] = null;
+		if (useSubsamples) {
+			const subsampleCount = readU16Be(slice);
+			if (boxEndPos - slice.filePos < 6 * subsampleCount) {
+				break;
+			}
+
+			subsamples = [];
+			for (let j = 0; j < subsampleCount; j++) {
+				const clearLen = readU16Be(slice);
+				const protectedLen = readU32Be(slice);
+				subsamples.push({ clearLen, protectedLen });
+			}
+		}
+
+		entries.push({ iv, subsamples });
+	}
+
+	return entries;
 };
 
 const resolveEncryptionAuxInfo = async (
