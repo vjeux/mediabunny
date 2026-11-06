@@ -716,6 +716,31 @@ test('MP4: trun outside of traf', async () => {
 	]));
 });
 
+test('MP4: Box fields running past the end of the parent box', async () => {
+	// A broken size field (a single flipped byte in real files) made a box's fixed fields run past the end of its
+	// parent, which failed the whole file with an internal error. Such a box is now skipped instead.
+	const goodTrak = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), id: 1 });
+	const damagedFiles = [
+		// Sample entry shorter than its fixed fields
+		mp4([goodTrak, trak({ handler: 'vide', stbl: [stsd(box('avc1', zeros(8)))], id: 2 })]),
+		// tkhd cut short at the end of its trak
+		mp4([goodTrak, box('trak', box('mdia', mdhd(), hdlr('vide')), fullBox('tkhd', 0, 1, u32(0)))]),
+		// DecoderSpecificInfo claiming more bytes than its esds holds
+		mp4([goodTrak, trak({ handler: 'soun', stbl: [stsd(audioSampleEntry('mp4a', fullBox(
+			'esds', 0, 0, u8(0x03), u8(23), u16(1), u8(0), u8(0x04), u8(15), u8(0x40), u8(0x15), zeros(11),
+			u8(0x05), u8(100), u8(0x12), u8(0x10),
+		)))], id: 2 })]),
+	];
+
+	for (const file of damagedFiles) {
+		await expectGracefulRead(file);
+		expect(await countPackets(new Input({ source: new BufferSource(file), formats: ALL_FORMATS }))).toBe(3);
+	}
+
+	// A file cut off within the 64-bit size of a box header
+	await expectGracefulRead(concat(box('ftyp', ascii('isom'), u32(0), ascii('isom')), u32(1), ascii('mdat')));
+});
+
 test('MP4: trak inside moof', async () => {
 	// The trak used to hijack the current track, leaving the traf inside of it without fragment state
 	await expectGracefulRead(mp4(fragmentedMoov(), [

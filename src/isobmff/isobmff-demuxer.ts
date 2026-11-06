@@ -122,6 +122,7 @@ import {
 	readU64Be,
 	readU8,
 	readAscii,
+	SliceRangeError,
 } from '../reader';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, RichImageData, TrackDisposition } from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
@@ -1376,6 +1377,39 @@ export class IsobmffDemuxer extends Demuxer {
 	}
 
 	traverseBox(slice: FileSlice): boolean {
+		const startPos = slice.filePos;
+		const { currentTrack, currentFragment, isReadingTraf, currentMetadataKeys } = this;
+
+		try {
+			return this.parseBox(slice);
+		} catch (error) {
+			slice.filePos = startPos;
+			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
+			const name = size > 0 ? readAscii(slice, 4) : '';
+
+			// Sample tables are read as a whole: a failure discards the partial table (see getSampleTableForTrack)
+			const sampleTableBoxes = ['stbl', 'stts', 'ctts', 'stss', 'stsc', 'stsz', 'stz2', 'stco', 'co64'];
+			if (!(error instanceof SliceRangeError) || sampleTableBoxes.includes(name)) {
+				throw error;
+			}
+
+			// The box's fields run past its end and its parent's, so it's damaged (a broken size field, a cut-off
+			// file). Skip it rather than failing the whole file, like FFmpeg does with atoms it can't read.
+			this.currentTrack = currentTrack;
+			this.currentFragment = currentFragment;
+			this.isReadingTraf = isReadingTraf;
+			this.currentMetadataKeys = currentMetadataKeys;
+
+			if (size < MIN_BOX_HEADER_SIZE) {
+				return false; // Nothing to skip to (size 0 runs to the end, size 1 is a 64-bit size)
+			}
+
+			slice.filePos = Math.min(startPos + size, slice.end);
+			return true;
+		}
+	}
+
+	parseBox(slice: FileSlice): boolean {
 		const startPos = slice.filePos;
 		const boxInfo = readBoxHeader(slice);
 		if (!boxInfo) {
