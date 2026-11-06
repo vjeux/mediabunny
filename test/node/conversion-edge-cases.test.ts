@@ -3,7 +3,16 @@ import { Input } from '../../src/input.js';
 import { BufferSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output, OutputTrackGroup } from '../../src/output.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import {
+	AdtsOutputFormat,
+	FlacOutputFormat,
+	MkvOutputFormat,
+	Mp3OutputFormat,
+	Mp4OutputFormat,
+	OggOutputFormat,
+	OutputFormat,
+	WavOutputFormat,
+} from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { Quality } from '../../src/encode.js';
@@ -217,5 +226,83 @@ describe('Conversion top-level options validation', () => {
 		]) {
 			expect(await init(options)).toBeInstanceOf(Conversion);
 		}
+	});
+});
+
+describe('Conversion invalidity explanations', () => {
+	const audioOnlyBytes = mkvFile({
+		trackEntries: [ebml(
+			EBMLId.TrackEntry,
+			ebmlUint(EBMLId.TrackNumber, 1),
+			ebmlUint(EBMLId.TrackUID, 1),
+			ebmlUint(EBMLId.TrackType, 2),
+			ebmlString(EBMLId.CodecID, 'A_PCM/INT/LIT'),
+			ebml(
+				EBMLId.Audio,
+				ebmlFloat(EBMLId.SamplingFrequency, 8000),
+				ebmlUint(EBMLId.Channels, 1),
+				ebmlUint(EBMLId.BitDepth, 16),
+			),
+		)],
+		rest: [ebml(
+			EBMLId.Cluster,
+			ebmlUint(EBMLId.Timestamp, 0),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 0, 0x80, new Array(160).fill(0))),
+		)],
+	});
+
+	const convert = async (format: OutputFormat, audio?: Record<string, unknown>) => {
+		const input = new Input({ source: new BufferSource(audioOnlyBytes), formats: ALL_FORMATS });
+		const output = new Output({ format, target: new BufferTarget() });
+		return Conversion.init({ input, output, audio, showWarnings: false } as never);
+	};
+
+	test.each([
+		['MP3', () => new Mp3OutputFormat(), 'mp3', 'The @mediabunny/mp3-encoder extension package'],
+		['ADTS', () => new AdtsOutputFormat(), 'aac', 'The @mediabunny/aac-encoder extension package'],
+		['FLAC', () => new FlacOutputFormat(), 'flac', 'The @mediabunny/flac-encoder extension package'],
+	])('an %s output without an encoder names the codec and the extension package', async (_, format, codec, hint) => {
+		const conversion = await convert(format());
+		expect(conversion.isValid).toBe(false);
+		expect(conversion.discardedTracks.map(x => x.reason)).toEqual(['no_encodable_target_codec']);
+		const error = await conversion.execute().catch((e: unknown) => e as Error);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain('Due to discarded tracks, this conversion cannot be executed.');
+		expect((error as Error).message).toContain(
+			`Tracks were discarded because your environment is not able to encode '${codec}' with the provided`,
+		);
+		expect((error as Error).message).toContain(hint);
+	});
+
+	test('a requested codec is the only one named; AC-3 points to the ac3 package', async () => {
+		const ac3 = await convert(new MkvOutputFormat(), { codec: 'ac3' });
+		expect(ac3.isValid).toBe(false);
+		const message = ((await ac3.execute().catch((e: unknown) => e)) as Error).message;
+		expect(message).toContain('not able to encode \'ac3\' with the provided parameters.');
+		expect(message).toContain('The @mediabunny/ac3 extension package provides support');
+		expect(message).not.toContain('aac-encoder');
+	});
+
+	test('several unencodable codecs are listed together', async () => {
+		const conversion = await convert(new OggOutputFormat());
+		expect(conversion.isValid).toBe(false);
+		const message = ((await conversion.execute().catch((e: unknown) => e)) as Error).message;
+		expect(message).toMatch(/not able to encode any of the codecs ('opus', 'vorbis'|'vorbis', 'opus') with/);
+		expect(message).not.toContain('extension package');
+	});
+
+	test('tracks discarded only by the user point to discardedTracks', async () => {
+		const conversion = await convert(new Mp3OutputFormat(), { discard: true });
+		expect(conversion.isValid).toBe(false);
+		expect(conversion.discardedTracks.map(x => x.reason)).toEqual(['discarded_by_user']);
+		const message = ((await conversion.execute().catch((e: unknown) => e)) as Error).message;
+		expect(message).toContain('Check the discardedTracks field for more info.');
+		expect(message).not.toContain('not able to encode');
+	});
+
+	test('a PCM-capable output stays valid by transcoding to PCM', async () => {
+		const conversion = await convert(new WavOutputFormat(), { forceTranscode: true });
+		expect(conversion.isValid).toBe(true);
+		await conversion.execute();
 	});
 });
