@@ -1196,7 +1196,7 @@ export const isNumber = (x: unknown) => {
 
 /**
  * A path to a file. File paths can be relative or absolute, and be local paths or full URLs. Paths must be POSIX-like,
- * using `/` as the separator.
+ * using `/` as the separator. The exception are local paths on Windows, which may also use `\`.
  *
  * Examples of valid paths:
  * - `'video.mp4'`
@@ -1216,6 +1216,15 @@ export type FilePath = string;
 export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 	// If relativePath is a full URL with protocol, return it as-is
 	if (relativePath.includes('://')) {
+		return relativePath;
+	}
+
+	// Local paths on Windows (like the ones Node's path module produces there) may also use backslashes as
+	// separators, so treat them as such, just like FFmpeg does on Windows
+	const isWindowsLocalPath = !basePath.includes('://')
+		&& (globalThis as { process?: { platform?: string } }).process?.platform === 'win32';
+	if (isWindowsLocalPath && /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(relativePath)) {
+		// A path starting with a drive letter or a UNC prefix is absolute already
 		return relativePath;
 	}
 
@@ -1242,7 +1251,9 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 			}
 		}
 	} else {
-		const lastSlash = basePath.lastIndexOf('/');
+		const lastSlash = isWindowsLocalPath
+			? Math.max(basePath.lastIndexOf('/'), basePath.lastIndexOf('\\'))
+			: basePath.lastIndexOf('/');
 		if (lastSlash === -1) {
 			result = relativePath;
 		} else {
@@ -1262,7 +1273,7 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 		}
 	}
 
-	const segments = result.split('/');
+	const segments = result.split(isWindowsLocalPath ? /[\\/]/ : '/');
 	const normalized: string[] = [];
 	for (const segment of segments) {
 		if (segment === '..') {
@@ -1272,7 +1283,9 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 		}
 	}
 
-	return prefix + normalized.join('/');
+	// Windows paths keep their native separator if they use it
+	const separator = isWindowsLocalPath && result.includes('\\') ? '\\' : '/';
+	return prefix + normalized.join(separator);
 };
 
 // eg. path `/media.m3u8?token=abc%20123` and name `token` resolve to `abc 123`

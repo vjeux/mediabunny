@@ -57,3 +57,42 @@ test('joinPaths', () => {
 	expect(joinPaths('file:///path/to/entry.m3u8', 'https://example.com/other.m3u8'))
 		.toBe('https://example.com/other.m3u8');
 });
+
+const withPlatform = (platform: string, fn: () => void) => {
+	const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+	Object.defineProperty(process, 'platform', { ...descriptor, value: platform });
+	try {
+		fn();
+	} finally {
+		Object.defineProperty(process, 'platform', descriptor);
+	}
+};
+
+test('joinPaths with Windows paths', () => {
+	withPlatform('win32', () => {
+		// What Node's path module produces on Windows, e.g. for a FilePathSource or a PathedTarget root
+		expect(joinPaths('C:\\media\\hls\\master.m3u8', 'playlist-1.m3u8')).toBe('C:\\media\\hls\\playlist-1.m3u8');
+		expect(joinPaths('C:\\media\\hls\\playlist-1.m3u8', 'segments/segment-1-1.ts'))
+			.toBe('C:\\media\\hls\\segments\\segment-1-1.ts');
+		expect(joinPaths('C:\\media\\hls\\master.m3u8', '../other/./playlist.m3u8'))
+			.toBe('C:\\media\\other\\playlist.m3u8');
+		expect(joinPaths('hls\\master.m3u8', 'playlist-1.m3u8')).toBe('hls\\playlist-1.m3u8');
+		expect(joinPaths('\\\\server\\share\\master.m3u8', 'playlist-1.m3u8'))
+			.toBe('\\\\server\\share\\playlist-1.m3u8');
+		expect(joinPaths('C:/media/hls/master.m3u8', 'playlist-1.m3u8')).toBe('C:/media/hls/playlist-1.m3u8');
+
+		// Absolute Windows paths
+		expect(joinPaths('C:\\media\\master.m3u8', 'D:\\other\\playlist.m3u8')).toBe('D:\\other\\playlist.m3u8');
+		expect(joinPaths('C:\\media\\master.m3u8', '\\\\server\\share\\playlist.m3u8'))
+			.toBe('\\\\server\\share\\playlist.m3u8');
+
+		// URLs are unaffected
+		expect(joinPaths('https://example.com/path/to/entry.m3u8', '../other.m3u8'))
+			.toBe('https://example.com/path/other.m3u8');
+	});
+
+	withPlatform('linux', () => {
+		// Elsewhere, a backslash is just a character in a file name
+		expect(joinPaths('/media/hls\\files/master.m3u8', 'playlist-1.m3u8')).toBe('/media/hls\\files/playlist-1.m3u8');
+	});
+});
