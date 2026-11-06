@@ -41,6 +41,7 @@ import {
 	extractNalUnitTypeForHevc,
 	parseDtsFrame,
 	parseDtsCoreFrameHeader,
+	removeEmulationPreventionBytes,
 	parseDtsExssHeader,
 	DTS_CORE_FRAME_HEADER_SIZE,
 	DTS_EXSS_HEADER_PREFIX_SIZE,
@@ -138,6 +139,8 @@ type ElementaryStream = {
 		squarePixelWidth: number;
 		squarePixelHeight: number;
 		reorderSize: number;
+		/** How to find the field of a slice, for AVC streams that may contain field pictures. */
+		avcFieldCoding: AvcFieldCoding | null;
 	} | {
 		type: 'audio';
 		codec: AudioCodec;
@@ -177,6 +180,47 @@ type Section = {
 
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
+
+type AvcFieldCoding = {
+	log2MaxFrameNum: number;
+	separateColourPlane: boolean;
+};
+
+type AvcSliceField = {
+	frameNum: number;
+	bottomField: number;
+};
+
+// Covers an AVC slice header up to bottom_field_flag, with room for emulation prevention bytes
+const AVC_SLICE_FIELD_PEEK_SIZE = 16;
+
+/** Reads which field a slice belongs to from the start of its header, or null for a frame or unreadable header. */
+const readAvcSliceField = (bytes: Uint8Array, fieldCoding: AvcFieldCoding): AvcSliceField | null => {
+	const unescaped = removeEmulationPreventionBytes(bytes);
+	const bitstream = new Bitstream(unescaped);
+
+	try {
+		readExpGolomb(bitstream); // first_mb_in_slice
+		readExpGolomb(bitstream); // slice_type
+		readExpGolomb(bitstream); // pic_parameter_set_id
+	} catch {
+		return null;
+	}
+
+	if (fieldCoding.separateColourPlane) {
+		bitstream.skipBits(2); // colour_plane_id
+	}
+
+	const frameNum = bitstream.readBits(fieldCoding.log2MaxFrameNum);
+	const fieldPicFlag = bitstream.readBits(1);
+	const bottomField = bitstream.readBits(1);
+
+	if (bitstream.pos > 8 * unescaped.length || !fieldPicFlag) {
+		return null;
+	}
+
+	return { frameNum, bottomField };
+};
 
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
@@ -417,6 +461,7 @@ export class MpegTsDemuxer extends Demuxer {
 									squarePixelWidth: -1,
 									squarePixelHeight: -1,
 									reorderSize: -1,
+									avcFieldCoding: null,
 								};
 							}; break;
 
@@ -607,6 +652,12 @@ export class MpegTsDemuxer extends Demuxer {
 										fullRange: !!spsInfo.fullRangeFlag,
 									};
 									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+									elementaryStream.info.avcFieldCoding = spsInfo.frameMbsOnlyFlag
+										? null
+										: {
+												log2MaxFrameNum: spsInfo.log2MaxFrameNumMinus4 + 4,
+												separateColourPlane: spsInfo.separateColourPlaneFlag === 1,
+											};
 
 									break;
 								} else if (elementaryStream.info.codec === 'hevc') {
@@ -2162,6 +2213,14 @@ class PacketReadingContext {
 			let frameStartFound = false;
 			let lastFirstMacroblockInSlice = 0;
 
+			// Field-coded AVC (PAFF) codes the two fields of a frame as separate pictures, each with its own access
+			// unit. Like MP4 samples, packets should hold whole frames, so we keep a complementary field pair together.
+			const avcFieldCoding = elementaryStream.info.avcFieldCoding;
+			// The current picture's field, as long as its second field may still follow
+			let firstField: AvcSliceField | null = null;
+			// Where the packet ends unless the next picture turns out to be the second field
+			let pendingBoundaryPos: number | null = null;
+
 			while (true) {
 				let remaining = this.ensureBuffered(CHUNK_SIZE);
 				if (isThenable(remaining)) remaining = await remaining;
@@ -2224,8 +2283,12 @@ class PacketReadingContext {
 					const AVC_SLICE_HEADER_PEEK_SIZE = 6;
 
 					// We read the NAL header plus, for slices, the start of the slice header to decode the
-					// first_mb_in_slice / first_slice_segment_in_pic_flag. Make sure all of it is buffered.
-					const bytesNeeded = payloadStart + (codec === 'avc' ? AVC_SLICE_HEADER_PEEK_SIZE : 1);
+					// first_mb_in_slice / first_slice_segment_in_pic_flag (and the field). Make sure all of it is
+					// buffered.
+					const slicePeekSize = codec === 'avc'
+						? (avcFieldCoding ? AVC_SLICE_FIELD_PEEK_SIZE : AVC_SLICE_HEADER_PEEK_SIZE)
+						: 1;
+					const bytesNeeded = payloadStart + slicePeekSize;
 					if (bytesNeeded > length) {
 						this.seekTo(posBeforeZero);
 						break;
@@ -2278,6 +2341,27 @@ class PacketReadingContext {
 							const firstMacroblockInSlice = readExpGolomb(new Bitstream(headerBytes));
 							startsNewPicture = !frameStartFound || firstMacroblockInSlice <= lastFirstMacroblockInSlice;
 							lastFirstMacroblockInSlice = firstMacroblockInSlice;
+
+							if (startsNewPicture && avcFieldCoding) {
+								const field = readAvcSliceField(
+									chunk.subarray(payloadStart, payloadStart + AVC_SLICE_FIELD_PEEK_SIZE),
+									avcFieldCoding,
+								);
+
+								if (!frameStartFound) {
+									firstField = field;
+								} else if (
+									firstField
+									&& field
+									&& field.bottomField !== firstField.bottomField
+									&& field.frameNum === firstField.frameNum
+								) {
+									// The second field of the frame, so the packet goes on
+									startsNewPicture = false;
+									firstField = null;
+									pendingBoundaryPos = null;
+								}
+							}
 						} else {
 							startsNewPicture = (chunk[payloadStart]! >> 7) === 1;
 						}
@@ -2290,7 +2374,12 @@ class PacketReadingContext {
 							}
 						}
 					} else if (isAccessUnitStart && frameStartFound) {
-						isFrameBoundary = true;
+						if (firstField) {
+							// This might begin the second field; the next slice will tell
+							pendingBoundaryPos ??= startCodePos;
+						} else {
+							isFrameBoundary = true;
+						}
 					} else if (isAccessUnitDelimiter) {
 						// An AUD always begins a new access unit. We haven't seen a slice yet, so whatever came before
 						// it holds no picture; let's drop it
@@ -2299,7 +2388,7 @@ class PacketReadingContext {
 
 					if (isFrameBoundary) {
 						// End the packet at this start code (the next frame begins here)
-						const packetLength = startCodePos - packetStartPos;
+						const packetLength = (pendingBoundaryPos ?? startCodePos) - packetStartPos;
 						this.seekTo(packetStartPos);
 						return this.supplyPacket(packetLength, 0);
 					}
@@ -2317,7 +2406,7 @@ class PacketReadingContext {
 			if (frameStartFound) {
 				assert(packetStartPos !== null);
 
-				const packetLength = this.endPos - packetStartPos;
+				const packetLength = (pendingBoundaryPos ?? this.endPos) - packetStartPos;
 				this.seekTo(packetStartPos);
 				return this.supplyPacket(packetLength, 0);
 			}
