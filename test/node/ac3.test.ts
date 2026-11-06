@@ -443,3 +443,54 @@ test('E-AC-3 with huge timestamps', async () => {
 
 	expect(firstSample.timestamp).toBe(timestamp - primingDelay);
 });
+
+// ETSI TS 102 366 F.2: an E-AC-3 sample in ISOBMFF holds six audio blocks (1536 samples, the stts delta), so
+// syncframes with fewer blocks are combined, as FFmpeg's MP4 muxer does. FFmpeg's encoder uses 3-block syncframes here:
+// ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=0.1 -ac 2 -c:a eac3 -b:a 1536k \
+//   eac3-three-block-frames.mkv
+test('writes E-AC-3 syncframes with fewer than six blocks as 1536-sample MP4 samples', async () => {
+	using originalInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/eac3-three-block-frames.mkv')),
+		formats: ALL_FORMATS,
+	});
+
+	const originalPackets: Uint8Array[] = [];
+	for await (const packet of new EncodedPacketSink((await originalInput.getPrimaryAudioTrack())!).packets()) {
+		originalPackets.push(packet.data);
+	}
+	expect(originalPackets.length).toBe(7);
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({ input: originalInput, output, copy: { mode: 'forced' } });
+	await conversion.execute();
+
+	using newInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const newPackets = [];
+	for await (const packet of new EncodedPacketSink((await newInput.getPrimaryAudioTrack())!).packets()) {
+		newPackets.push(packet);
+	}
+
+	// Pairs of 3-block syncframes, then the leftover one
+	expect(newPackets.map(x => x.data.byteLength)).toEqual([6144, 6144, 6144, 3072]);
+	expect(newPackets.slice(0, 3).map(x => Math.round(x.duration * 48000))).toEqual([1536, 1536, 1536]);
+	expect([...newPackets[0]!.data]).toEqual([...originalPackets[0]!, ...originalPackets[1]!]);
+	expect([...newPackets[3]!.data]).toEqual([...originalPackets[6]!]);
+
+	// Every syncframe of a sample is decoded
+	registerAc3Decoder();
+	const timestamps: number[] = [];
+	for await (using sample of new AudioSampleSink((await newInput.getPrimaryAudioTrack())!).samples()) {
+		expect(sample.numberOfFrames).toBe(768);
+		timestamps.push(Math.round(sample.timestamp * 48000));
+	}
+
+	expect(timestamps).toEqual([-240, 528, 1296, 2064, 2832, 3600, 4368]);
+});

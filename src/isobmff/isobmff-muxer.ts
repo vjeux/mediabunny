@@ -36,6 +36,7 @@ import {
 	Queue,
 	toUint8Array,
 	isU32,
+	concatUint8Arrays,
 } from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
@@ -56,6 +57,7 @@ import { FileSlice } from '../reader';
 import { EncodedPacket, PacketType } from '../packet';
 import {
 	concatNalUnitsInLengthPrefixed,
+	countEac3AudioBlocks,
 	extractAvcDecoderConfigurationRecord,
 	InBandParameterSetWriter,
 	extractHevcDecoderConfigurationRecord,
@@ -160,6 +162,8 @@ export type IsobmffTrackData = {
 			accumulatedAudioSamples: number;
 			audioSampleDurationHistory: number[];
 		};
+		/** E-AC-3 syncframes waiting to be combined into a six-block sample. */
+		pendingEac3: { parts: Uint8Array[]; timestamp: number; duration: number; blocks: number } | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -665,6 +669,7 @@ export class IsobmffMuxer extends Muxer {
 					accumulatedAudioSamples: 0,
 					audioSampleDurationHistory: [],
 				},
+				pendingEac3: null,
 			},
 			timescale: decoderConfig.sampleRate,
 			samples: [],
@@ -832,6 +837,33 @@ export class IsobmffMuxer extends Muxer {
 			let timestamp = packet.timestamp;
 			let duration = packet.duration;
 
+			if (track.source._codec === 'eac3') {
+				// An E-AC-3 sample holds six audio blocks (1536 samples, ETSI TS 102 366 F.2), so syncframes with fewer
+				// blocks are combined until there are six.
+				const blocks = countEac3AudioBlocks(packetData);
+				const pending = trackData.info.pendingEac3;
+
+				if (pending && (blocks === null || pending.blocks + blocks > 6)) {
+					await this.writePendingEac3Sample(trackData);
+				}
+
+				if (blocks !== null && blocks < 6) {
+					const group = trackData.info.pendingEac3 ??= { parts: [], timestamp, duration: 0, blocks: 0 };
+					group.parts.push(packetData);
+					group.duration += duration;
+					group.blocks += blocks;
+
+					if (group.blocks < 6) {
+						return;
+					}
+
+					trackData.info.pendingEac3 = null;
+					packetData = concatUint8Arrays(group.parts);
+					timestamp = group.timestamp;
+					duration = group.duration;
+				}
+			}
+
 			if (trackData.info.requiresPcmTransformation) {
 				// Packets may have only approximate timestamp/duration information, but for our PCM logic, we need it
 				// to be precise. So here, we refine the values.
@@ -905,6 +937,18 @@ export class IsobmffMuxer extends Muxer {
 		} finally {
 			release();
 		}
+	}
+
+	private async writePendingEac3Sample(trackData: IsobmffTrackData) {
+		if (trackData.type !== 'audio' || !trackData.info.pendingEac3) {
+			return;
+		}
+
+		const { parts, timestamp, duration } = trackData.info.pendingEac3;
+		trackData.info.pendingEac3 = null;
+
+		const sample = this.createSampleForTrack(trackData, concatUint8Arrays(parts), timestamp, duration, 'key', 0);
+		await this.registerSample(trackData, sample);
 	}
 
 	private async padWithSilence(trackData: IsobmffAudioTrackData, timestamp: number, duration: number) {
@@ -1641,6 +1685,8 @@ export class IsobmffMuxer extends Muxer {
 
 		const trackData = this.trackDatas.find(x => x.track === track);
 		if (trackData) {
+			await this.writePendingEac3Sample(trackData);
+
 			// Flush the remaining cues while the track is still open: a closed track no longer holds back fragments, so
 			// its last samples could otherwise get written before their timestamps are processed
 			if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
@@ -1713,6 +1759,8 @@ export class IsobmffMuxer extends Muxer {
 		this.ensureOneEnabledTrack();
 
 		for (const trackData of this.trackDatas) {
+			await this.writePendingEac3Sample(trackData);
+
 			// Like in onTrackClose, the remaining cues are flushed before the track counts as closed
 			if (trackData.type === 'subtitle' && trackData.track.source._codec === 'webvtt') {
 				await this.processWebVTTCues(trackData, Infinity);
