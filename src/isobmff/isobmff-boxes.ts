@@ -1821,7 +1821,7 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 			}; break;
 
 			case 'description': {
-				pairs.push({ key: isMdta ? 'description' : '©des', value: dataStringBoxLong(value) });
+				pairs.push({ key: isMdta ? 'description' : 'desc', value: dataStringBoxLong(value) });
 			}; break;
 
 			case 'artist': {
@@ -1932,6 +1932,11 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 	if (tags.raw) {
 		for (const key in tags.raw) {
 			const value = tags.raw[key];
+			if (!isMdta && key === '©des' && pairs.some(x => x.key === 'desc')) {
+				// The description read from a '©des' atom (where earlier versions put it), already written as desc
+				continue;
+			}
+
 			if (
 				value == null
 				|| (!isMdta && (key.length !== 4 || ILST_UNSAFE_RAW_KEYS.has(key)))
