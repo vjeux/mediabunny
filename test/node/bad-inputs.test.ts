@@ -189,6 +189,24 @@ test('MP4: stsc with alternating chunk indices', async () => {
 	})]));
 });
 
+test('MP4: stsc entry starting at chunk 0', async () => {
+	// The first chunk became chunk -1, whose offset doesn't exist, so the packets came out without their data
+	const stbl = (dataOffset: number) => [
+		stsd(videoSampleEntry()), stts([[2, 1]]), stsc([[0, 2, 1]]), stsz([4, 4]), stco([dataOffset]),
+	];
+	const header = mp4([trak({ handler: 'vide', stbl: stbl(0) })]);
+	const file = mp4(
+		[trak({ handler: 'vide', stbl: stbl(header.length + 8) })],
+		[box('mdat', [1, 2, 3, 4, 5, 6, 7, 8])],
+	);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getTracks())[0]!);
+	const first = await sink.getFirstPacket();
+	expect([...first!.data]).toEqual([1, 2, 3, 4]);
+	expect([...(await sink.getNextPacket(first!))!.data]).toEqual([5, 6, 7, 8]);
+});
+
 test('MP4: Single chunk with many samples', async () => {
 	// Computing a sample's offset in its chunk used to be linear, making iteration quadratic
 	const sampleCount = 100_000;
