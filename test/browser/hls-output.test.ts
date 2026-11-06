@@ -76,8 +76,10 @@ test.each(['MPEG-TS', 'CMAF'] as const)('HLS output decodes back frame by frame 
 		}),
 	});
 
-	// One color per second, so every frame tells which second it belongs to
-	const colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255], [0, 0, 0]];
+	// One gray level per second, so every frame tells which second it belongs to. Grays decode the same under the
+	// BT.601 and BT.709 matrices, so this doesn't depend on encoders agreeing on the matrix (Firefox's encoder converts
+	// with BT.601 but signals BT.709).
+	const grays = [0, 64, 128, 192, 255];
 	const canvas = new OffscreenCanvas(320, 240);
 	const ctx = canvas.getContext('2d')!;
 
@@ -86,8 +88,8 @@ test.each(['MPEG-TS', 'CMAF'] as const)('HLS output decodes back frame by frame 
 	await output.start();
 
 	for (let i = 0; i < 50; i++) {
-		const [r, g, b] = colors[Math.floor(i / 10)]!;
-		ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+		const gray = grays[Math.floor(i / 10)]!;
+		ctx.fillStyle = `rgb(${gray}, ${gray}, ${gray})`;
 		ctx.fillRect(0, 0, canvas.width, canvas.height);
 		await videoSource.add(i / 10, 1 / 10);
 	}
@@ -106,16 +108,17 @@ test.each(['MPEG-TS', 'CMAF'] as const)('HLS output decodes back frame by frame 
 		sample!.draw(readCtx, 0, 0);
 		return [...readCtx.getImageData(160, 120, 1, 1).data.subarray(0, 3)];
 	};
-	const expectColor = (actual: number[], second: number) => {
-		for (let i = 0; i < 3; i++) {
-			expect(Math.abs(actual[i]! - colors[second]![i]!)).toBeLessThan(40);
+	const expectGray = (actual: number[], second: number) => {
+		// Adjacent seconds differ by at least 63
+		for (const channel of actual) {
+			expect(Math.abs(channel - grays[second]!)).toBeLessThan(16);
 		}
 	};
 
 	let count = 0;
 	for await (const sample of sink.samples()) {
 		expect(sample.timestamp).toBeCloseTo(count / 10, 5);
-		expectColor(readColor(sample), Math.floor(count / 10));
+		expectGray(readColor(sample), Math.floor(count / 10));
 		sample.close();
 		count++;
 	}
@@ -125,7 +128,7 @@ test.each(['MPEG-TS', 'CMAF'] as const)('HLS output decodes back frame by frame 
 	for (const timestamp of [3.55, 1.05, 4.95]) {
 		const sample = await sink.getSample(timestamp);
 		expect(sample!.timestamp).toBeCloseTo(Math.floor(timestamp * 10) / 10, 5);
-		expectColor(readColor(sample), Math.floor(timestamp));
+		expectGray(readColor(sample), Math.floor(timestamp));
 		sample!.close();
 	}
 });
