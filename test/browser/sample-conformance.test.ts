@@ -8,10 +8,18 @@ import {
 	VideoSamplePixelFormat,
 	VideoSampleResource,
 } from '../../src/sample.js';
-import { Rotation } from '../../src/misc.js';
-import { PIXEL_FORMAT_PLANES, layoutSize, seededBytes, tightLayout } from '../node/helpers/samples-formats.js';
+import { isChromium, Rotation } from '../../src/misc.js';
+import {
+	PIXEL_FORMAT_PLANES,
+	layoutSize,
+	referenceCopy,
+	seededBytes,
+	tightLayout,
+} from '../node/helpers/samples-formats.js';
 
-// Chrome's VideoFrame and AudioData are the reference implementation for everything in here
+// The browser's VideoFrame and AudioData are the reference implementation for everything in here. The expectations
+// are Chrome's; elsewhere, cases the browser's VideoFrame refuses are skipped (Firefox, for instance, has no 4:2:2 or
+// 4:4:4 formats, no odd YUV sizes and no rects of odd height in sub-sampled formats).
 
 const tryCall = <T>(fn: () => T) => {
 	try {
@@ -104,10 +112,10 @@ const copyWith = async (source: VideoSample | VideoFrame, options: VideoFrameCop
 };
 
 describe('VideoSample matches VideoFrame', () => {
-	test('Chrome supports most pixel formats', () => {
+	test('the browser supports most pixel formats', () => {
 		// Without these, the parity tests below would cover little
-		expect(SUPPORTED_FORMATS)
-			.toEqual(expect.arrayContaining(['I420', 'I420A', 'I422', 'I444', 'NV12', 'RGBA', 'BGRX']));
+		const expected = ['I420', 'I420A', 'NV12', 'RGBA', 'BGRX', ...(isChromium() ? ['I422', 'I444'] : [])];
+		expect(SUPPORTED_FORMATS).toEqual(expect.arrayContaining(expected));
 	});
 
 	test('in allocationSize() and copyTo() of ArrayBuffer- and resource-backed samples', async () => {
@@ -124,7 +132,16 @@ describe('VideoSample matches VideoFrame', () => {
 					const planeLayouts = layout.map(({ offset, stride }) => ({ offset, stride }));
 					const init = { format, codedWidth: width, codedHeight: height, timestamp: 0, layout: planeLayouts };
 
-					const frame = new VideoFrame(data, { ...init, format: format as VideoPixelFormat });
+					// The reference frame gets the same pixels tightly packed, as not all browsers honor `layout`
+					const tight = referenceCopy(format, data, layout, { x: 0, y: 0, width, height });
+					const frameResult = tryCall(() => new VideoFrame(tight, {
+						format: format as VideoPixelFormat, codedWidth: width, codedHeight: height, timestamp: 0,
+					}));
+					if (!frameResult.ok) {
+						expect(isChromium(), `${format} ${width}x${height}`).toBe(false);
+						continue;
+					}
+					const frame = frameResult.value;
 					using raw = new VideoSample(data, init);
 					using resource = new VideoSample(new PlanesResource(format, width, height, layout.map(plane => ({
 						data: data.subarray(plane.offset, plane.offset + plane.stride * plane.rows),
@@ -150,7 +167,11 @@ describe('VideoSample matches VideoFrame', () => {
 						const expected = await copyWith(frame, options);
 						// Only the misaligned and the out-of-bounds rects fail
 						const misaligned = i === 4 && (subX > 1 || subY > 1);
-						expect('error' in expected, label).toBe(misaligned || i === 6);
+						if (isChromium()) {
+							expect('error' in expected, label).toBe(misaligned || i === 6);
+						} else if ('error' in expected !== (misaligned || i === 6)) {
+							continue; // This browser's VideoFrame can't serve as the reference here
+						}
 
 						expect(await copyWith(raw, options), `raw ${label}`).toEqual(expected);
 						expect(await copyWith(resource, options), `resource ${label}`).toEqual(expected);
@@ -179,7 +200,14 @@ describe('VideoSample matches VideoFrame', () => {
 				displayWidth: 12,
 				displayHeight: 4,
 			};
-			const reference = new VideoFrame(data, { ...init, format: format as VideoPixelFormat, colorSpace });
+			// Built from tightly packed pixels, as not all browsers honor `layout`
+			const reference = new VideoFrame(referenceCopy(format, data, layout, { x: 0, y: 0, width: 6, height: 4 }), {
+				format: format as VideoPixelFormat,
+				codedWidth: 6,
+				codedHeight: 4,
+				timestamp: 0,
+				colorSpace,
+			});
 			const expected = new Uint8Array(reference.allocationSize());
 			await reference.copyTo(expected);
 
