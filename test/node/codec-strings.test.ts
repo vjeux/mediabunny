@@ -61,27 +61,52 @@ const hevcRecord = (record: Partial<HevcDecoderConfigurationRecord>): HevcDecode
 });
 
 describe('Codec strings for encoder configs', () => {
-	test('AVC picks the lowest level that fits frame size and bit rate', () => {
-		// Table A-1 of H.264: MaxFS in macroblocks and MaxBR, both of which must be met
-		const cases: [number, number, number, string][] = [
-			[176, 144, 64_000, 'avc1.64000a'], // 99 MBs: level 1
-			[176, 144, 100_000, 'avc1.64000b'], // Level 1 caps the bit rate at 64 kbps: level 1.1
-			[320, 240, 300_000, 'avc1.64000c'], // 300 MBs, more than 192 kbps: level 1.2
-			[352, 288, 1_000_000, 'avc1.640014'], // 396 MBs at 1 Mbps: level 2
-			[640, 480, 1_000_000, 'avc1.640016'], // 1200 MBs: level 2.2
-			[1280, 720, 5_000_000, 'avc1.64001f'], // 3600 MBs: level 3.1
-			[1920, 1080, 10_000_000, 'avc1.640028'], // 120x68 = 8160 MBs: level 4
-			[1918, 1078, 10_000_000, 'avc1.640028'], // Partial macroblocks count fully
-			[1920, 1080, 30_000_000, 'avc1.640029'], // Over 20 Mbps: level 4.1
-			[2560, 1440, 10_000_000, 'avc1.640032'], // 14400 MBs: level 5
-			[3840, 2160, 40_000_000, 'avc1.640033'], // 32400 MBs: level 5.1
-			[7680, 4320, 40_000_000, 'avc1.64003c'], // 129600 MBs: level 6
-			[1920, 1080, 500_000_000, 'avc1.64003e'], // Only level 6.2 allows 500 Mbps
-			[16384, 16384, 1_000_000, 'avc1.64003e'], // Too large for any level: the highest one
+	test('AVC picks a level that fits frame size and bit rate', () => {
+		// Table A-1 of H.264 (as reproduced by FFmpeg's libavcodec/h264_levels.c): level_idc, MaxFS in macroblocks and
+		// MaxBR in units of cpbBrVclFactor bits/s. Level 1b, an optional rung, is left out.
+		const levels: [number, number, number][] = [
+			[10, 99, 64], [11, 396, 192], [12, 396, 384], [13, 396, 768], [20, 396, 2000], [21, 792, 4000],
+			[22, 1620, 4000], [30, 1620, 10000], [31, 3600, 14000], [32, 5120, 20000], [40, 8192, 20000],
+			[41, 8192, 50000], [42, 8704, 50000], [50, 22080, 135000], [51, 36864, 240000], [52, 36864, 240000],
+			[60, 139264, 240000], [61, 139264, 480000], [62, 139264, 800000],
+		];
+		const lowestLevelIndex = (macroblocks: number, bitrate: number, cpbBrVclFactor: number) => {
+			const index = levels.findIndex(([, maxFs, maxBr]) => {
+				return macroblocks <= maxFs && bitrate <= maxBr * cpbBrVclFactor;
+			});
+			return index === -1 ? levels.length - 1 : index;
+		};
+
+		const cases: [number, number, number][] = [
+			[176, 144, 64_000], // 99 MBs: level 1
+			[176, 144, 100_000], // Above level 1's bit rate: level 1.1
+			[320, 240, 300_000], // 300 MBs: level 1.2
+			[352, 288, 1_000_000], // 396 MBs: level 2
+			[640, 480, 1_000_000], // 1200 MBs: level 2.2
+			[1280, 720, 5_000_000], // 3600 MBs: level 3.1
+			[1920, 1080, 10_000_000], // 120x68 = 8160 MBs: level 4
+			[1918, 1078, 10_000_000], // Partial macroblocks count fully
+			[1920, 1080, 30_000_000], // Above level 4's bit rate: level 4.1
+			[2560, 1440, 10_000_000], // 14400 MBs: level 5
+			[3840, 2160, 40_000_000], // 32400 MBs: level 5.1
+			[7680, 4320, 40_000_000], // 129600 MBs: level 6
+			[1920, 1080, 500_000_000], // Level 6.1 for High profile bit rates, 6.2 for Baseline/Main ones
+			[16384, 16384, 1_000_000], // Too large for any level: the highest one
 		];
 
-		for (const [width, height, bitrate, expected] of cases) {
-			expect(buildVideoCodecString('avc', width, height, bitrate, false)).toBe(expected);
+		for (const [width, height, bitrate] of cases) {
+			const codecString = buildVideoCodecString('avc', width, height, bitrate, false);
+			expect(codecString.slice(0, 9), codecString).toBe('avc1.6400'); // High profile, no constraints
+
+			// The string is for the High profile, whose MaxBR is 1.25 times Table A-1's (cpbBrVclFactor 1250). Any
+			// level from the lowest one that fits with that factor up to the lowest one that fits with the stricter
+			// Baseline/Main factor (1000) declares the stream correctly.
+			const macroblocks = Math.ceil(width / 16) * Math.ceil(height / 16);
+			const lowest = lowestLevelIndex(macroblocks, bitrate, 1250);
+			const conservative = lowestLevelIndex(macroblocks, bitrate, 1000);
+			const index = levels.findIndex(([levelIdc]) => levelIdc === parseInt(codecString.slice(9), 16));
+			expect(index, codecString).toBeGreaterThanOrEqual(lowest);
+			expect(index, codecString).toBeLessThanOrEqual(conservative);
 		}
 	});
 
