@@ -2307,10 +2307,12 @@ export class Conversion {
 			};
 			assert(encodingConfig.transform);
 
-			if (numberOfChannels !== originalNumberOfChannels) {
+			// Requested parameters apply even when the metadata already matches them, since the decoded audio can
+			// differ from it (implicitly signaled HE-AAC decodes at twice the sample rate, HE-AACv2 to stereo)
+			if (trackOptions.numberOfChannels !== undefined || numberOfChannels !== originalNumberOfChannels) {
 				encodingConfig.transform.numberOfChannels = numberOfChannels;
 			}
-			if (sampleRate !== originalSampleRate) {
+			if (trackOptions.sampleRate !== undefined || sampleRate !== originalSampleRate) {
 				encodingConfig.transform.sampleRate = sampleRate;
 			}
 

@@ -1209,6 +1209,49 @@ const testCopy = async (options: {
 	}
 };
 
+test('Requested audio parameters apply when the decoded audio differs from the metadata', async () => {
+	// ADTS signals HE-AACv2 implicitly, with the core's 22.05 kHz mono, while it decodes to 44.1 kHz stereo
+	using mp4Input = new Input({
+		source: new UrlSource('/he-aac-v2.mp4'),
+		formats: ALL_FORMATS,
+	});
+	const adtsOutput = new Output({ format: new AdtsOutputFormat(), target: new BufferTarget() });
+	const toAdts = await Conversion.init({
+		input: mp4Input,
+		output: adtsOutput,
+		video: { discard: true },
+		copy: { mode: 'forced', shiftTolerance: Infinity },
+		trim: { end: 1 },
+	});
+	await toAdts.execute();
+
+	using adtsInput = new Input({
+		source: new BufferSource(adtsOutput.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const adtsTrack = await adtsInput.getPrimaryAudioTrack();
+	assert(adtsTrack);
+	expect(await adtsTrack.getSampleRate()).toBe(22050);
+	expect(await adtsTrack.getNumberOfChannels()).toBe(1);
+
+	for (const audio of [{ numberOfChannels: 1 }, { sampleRate: 22050 }]) {
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input: adtsInput, output, audio });
+		await conversion.execute();
+
+		using wavInput = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+		const wavTrack = await wavInput.getPrimaryAudioTrack();
+		assert(wavTrack);
+		expect({
+			numberOfChannels: await wavTrack.getNumberOfChannels(),
+			sampleRate: await wavTrack.getSampleRate(),
+		}).toEqual({ numberOfChannels: 2, sampleRate: 44100, ...audio });
+	}
+});
+
 test('Trim wholly before media data, transcode', async () => {
 	using input = new Input({
 		source: new UrlSource('/demo.mp4'),
