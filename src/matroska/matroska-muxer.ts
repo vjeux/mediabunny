@@ -1214,6 +1214,10 @@ export class MatroskaMuxer extends Muxer {
 	 * Due to [a bug in Chromium](https://bugs.chromium.org/p/chromium/issues/detail?id=1377842), VP9 streams often
  	 * lack color space information. This method patches in that information.
 	 */
+	private getCodecDelayMs(trackData: MatroskaTrackData) {
+		return trackData.type === 'audio' ? Math.round(1000 * (trackData.info.codecDelay ?? 0)) : 0;
+	}
+
 	private fixVP9ColorSpace(
 		trackData: MatroskaVideoTrackData,
 		chunk: InternalMediaChunk,
@@ -1350,7 +1354,11 @@ export class MatroskaMuxer extends Muxer {
 		});
 
 		this.startTimestamp = Math.min(this.startTimestamp, msTimestamp);
-		this.endTimestamp = Math.max(this.endTimestamp, msTimestamp + Math.round(1000 * chunk.duration));
+		// Audio blocks are shifted by their track's codec delay, so the media ends that much earlier
+		this.endTimestamp = Math.max(
+			this.endTimestamp,
+			msTimestamp - this.getCodecDelayMs(trackData) + Math.round(1000 * chunk.duration),
+		);
 		trackData.lastWrittenMsTimestamp = msTimestamp;
 
 		this.currentClusterMaxMsTimestamp = Math.max(this.currentClusterMaxMsTimestamp!, msTimestamp);
@@ -1545,7 +1553,9 @@ export class MatroskaMuxer extends Muxer {
 			this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
 
 			// Write the duration of the media to the Segment
-			const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp;
+			// Readers take the Duration minus the smallest codec delay of all tracks as the end of the media
+			const minCodecDelayMs = Math.min(...this.trackDatas.map(trackData => this.getCodecDelayMs(trackData)));
+			const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp + minCodecDelayMs;
 			this.segmentDuration!.data = new EBMLFloat64(duration);
 			this.writer.seek(this.ebmlWriter.offsets.get(this.segmentDuration!)!);
 			this.ebmlWriter.writeEBML(this.segmentDuration);
