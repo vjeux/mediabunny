@@ -173,6 +173,8 @@ type InternalTrack = {
 		height: number;
 		squarePixelWidth: number;
 		squarePixelHeight: number;
+		/** Whether the current sample entry has a pasp box, whose pixel aspect ratio wins over the bitstream's */
+		hasPixelAspectRatioBox: boolean;
 		codec: VideoCodec | null;
 		codecDescription: Uint8Array | null;
 		colorSpace: VideoColorSpaceInit;
@@ -1208,6 +1210,7 @@ export class IsobmffDemuxer extends Demuxer {
 						height: -1,
 						squarePixelWidth: -1,
 						squarePixelHeight: -1,
+						hasPixelAspectRatioBox: false,
 						codec: null,
 						codecDescription: null,
 						colorSpace: { ...EMPTY_COLOR_SPACE },
@@ -1277,6 +1280,7 @@ export class IsobmffDemuxer extends Demuxer {
 						track.info.height = readU16Be(slice);
 						track.info.squarePixelWidth = track.info.width;
 						track.info.squarePixelHeight = track.info.height;
+						track.info.hasPixelAspectRatioBox = false;
 
 						slice.skip(4 + 4 + 4 + 2 + 32 + 2 + 2);
 
@@ -1737,9 +1741,11 @@ export class IsobmffDemuxer extends Demuxer {
 
 				// https://github.com/Vanilagy/mediabunny/issues/362
 				if (num > 0 && den > 0) {
-					// The ratio may already be set by the SPS, but the pasp box wins
+					// The ratio may already be set by the SPS, but the pasp box wins (also over an SPS that comes after
+					// it)
 					track.info.squarePixelWidth = track.info.width;
 					track.info.squarePixelHeight = track.info.height;
+					track.info.hasPixelAspectRatioBox = true;
 
 					if (num > den) {
 						track.info.squarePixelWidth = Math.round(track.info.width * num / den);
@@ -4121,7 +4127,7 @@ const readMatrix = (slice: FileSlice): TransformationMatrix => {
 
 const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Rational) => {
 	const info = track.info!;
-	if (info.type !== 'video') {
+	if (info.type !== 'video' || info.hasPixelAspectRatioBox) {
 		return;
 	}
 
