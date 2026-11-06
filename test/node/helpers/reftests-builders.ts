@@ -306,7 +306,8 @@ export const EBML = {
 
 /** The payload of a SimpleBlock or Block: track number, timestamp relative to the cluster, flags, frame. */
 export const blockPayload = (trackNumber: number, relativeTimestamp: number, flags: number, frame: number[]) => {
-	return concatBytes(ebmlVint(trackNumber), [(relativeTimestamp >> 8) & 0xff, relativeTimestamp & 0xff, flags], frame);
+	const timestamp = [(relativeTimestamp >> 8) & 0xff, relativeTimestamp & 0xff];
+	return concatBytes(ebmlVint(trackNumber), timestamp, [flags], frame);
 };
 
 /** A 16x16 VP8 key frame header, or a delta frame header, followed by a filler byte. */
@@ -350,7 +351,12 @@ export const buildWebm = (options: { docType?: string; tracks: Uint8Array[]; bod
 	),
 	ebml(
 		EBML.Segment,
-		ebml(EBML.Info, ebmlUint(EBML.TimestampScale, 1_000_000), ebml(0x4d80, ascii('ref')), ebml(0x5741, ascii('ref'))),
+		ebml(
+			EBML.Info,
+			ebmlUint(EBML.TimestampScale, 1_000_000),
+			ebml(0x4d80, ascii('ref')), // MuxingApp
+			ebml(0x5741, ascii('ref')), // WritingApp
+		),
 		ebml(EBML.Tracks, ...options.tracks),
 		...options.body,
 	),

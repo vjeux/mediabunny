@@ -27,21 +27,32 @@ import {
 	extractVp9CodecInfoFromPacket,
 	parseAvcSps,
 	parseHevcSps,
+	parseOpusTocByte,
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
 } from '../../src/codec-data.js';
 import { parseAacAudioSpecificConfig } from '../../shared/aac-misc.js';
 import {
 	BitWriter,
+	EBML,
 	annexB,
+	ascii,
 	audioSampleEntry,
+	blockPayload,
 	box,
 	buildSingleTrackMp4,
+	buildWebm,
+	ebml,
+	ebmlUint,
+	ebmlUnknownSize,
 	escapeRbsp,
 	esds,
 	hexBytes,
 	toHex,
 	visualSampleEntry,
+	vp8Frame,
+	webmAudioTrack,
+	webmVideoTrack,
 } from './helpers/reftests-builders.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -1254,4 +1265,158 @@ describe('web-platform-tests webcodecs/videoDecoder-codec-specific-setup.js and 
 			expect(timestamps).toEqual(firstTimestamps);
 		});
 	}
+});
+
+describe('Chromium media/formats/webm/webm_parser_unittest.cc and webm_cluster_parser_unittest.cc', () => {
+	type Packet = { timestamp: number; duration: number };
+
+	// Timestamps and durations in milliseconds, per track type
+	const readPackets = async (bytes: Uint8Array) => {
+		using input = openBytes(bytes);
+		const result: Partial<Record<'video' | 'audio' | 'subtitle', Packet[]>> = {};
+		for (const track of await input.getTracks()) {
+			const packets: Packet[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push({
+					timestamp: Math.round(packet.timestamp * 1000),
+					duration: Math.round(packet.duration * 1000),
+				});
+			}
+			result[track.type] = packets;
+		}
+		return result;
+	};
+	const videoTimestamps = async (bytes: Uint8Array) => (await readPackets(bytes)).video!.map(x => x.timestamp);
+
+	const cluster = (timestamp: number, ...blocks: Uint8Array[]) => ebml(
+		EBML.Cluster,
+		ebmlUint(EBML.Timestamp, timestamp),
+		...blocks.map(block => ebml(EBML.SimpleBlock, block)),
+	);
+	const keyFrame = (relativeTimestamp: number) => blockPayload(1, relativeTimestamp, 0x80, vp8Frame(true));
+	const deltaFrame = (relativeTimestamp: number) => blockPayload(1, relativeTimestamp, 0, vp8Frame(false));
+
+	test('VoidAndCRC32InList: Void and CRC-32 elements are skipped in the Segment and in a Cluster', async () => {
+		const bytes = buildWebm({ tracks: [webmVideoTrack(1)], body: [
+			ebml(EBML.Void, [0, 0, 0]),
+			ebml(EBML.Crc32, [0, 0, 0, 0]),
+			ebml(
+				EBML.Cluster,
+				ebml(EBML.Crc32, [0, 0, 0, 0]),
+				ebml(EBML.Void, [0, 0, 0]),
+				ebmlUint(EBML.Timestamp, 0),
+				ebml(EBML.SimpleBlock, keyFrame(0)),
+				ebml(EBML.Void, [0, 0, 0]),
+				ebml(EBML.SimpleBlock, deltaFrame(33)),
+			),
+		] });
+		expect(await videoTimestamps(bytes)).toEqual([0, 33]);
+	});
+
+	test('EmptyClusterInSegment: an empty Cluster between two others', async () => {
+		const bytes = buildWebm({ tracks: [webmVideoTrack(1)], body: [
+			cluster(0, keyFrame(0)),
+			ebml(EBML.Cluster),
+			cluster(33, deltaFrame(0)),
+		] });
+		expect(await videoTimestamps(bytes)).toEqual([0, 33]);
+	});
+
+	test('ReservedSizes: a Cluster of unknown size, ended by the next Cluster', async () => {
+		for (const sizeLength of [1, 8]) {
+			const bytes = buildWebm({ tracks: [webmVideoTrack(1)], body: [
+				ebmlUnknownSize(
+					EBML.Cluster,
+					sizeLength,
+					ebmlUint(EBML.Timestamp, 0),
+					ebml(EBML.SimpleBlock, keyFrame(0)),
+					ebml(EBML.SimpleBlock, deltaFrame(33)),
+				),
+				cluster(66, deltaFrame(0)),
+			] });
+			expect(await videoTimestamps(bytes), `${sizeLength}-byte size`).toEqual([0, 33, 66]);
+		}
+	});
+
+	test('ZeroPaddedStrings: DocType and CodecID padded with zero bytes', async () => {
+		const track = ebml(
+			EBML.TrackEntry,
+			ebmlUint(EBML.TrackNumber, 1),
+			ebmlUint(EBML.TrackUID, 1),
+			ebmlUint(EBML.TrackType, 1),
+			ebml(EBML.CodecID, ascii('V_VP8\0\0')),
+			ebml(EBML.Video, ebmlUint(EBML.PixelWidth, 16), ebmlUint(EBML.PixelHeight, 16)),
+		);
+		const bytes = buildWebm({ docType: 'webm\0\0', tracks: [track], body: [cluster(0, keyFrame(0))] });
+		using input = openBytes(bytes);
+		expect(await (await input.getPrimaryVideoTrack())!.getCodec()).toBe('vp8');
+	});
+
+	test('ChildNonListLargerThanParent: a Cluster whose Timestamp runs past its end', async () => {
+		const bytes = buildWebm({ tracks: [webmVideoTrack(1)], body: [
+			cluster(0, keyFrame(0)),
+			hexBytes('1f43b675 81 e7 81 01'), // Cluster (size 1) holding a Timestamp (size 1)
+			cluster(33, deltaFrame(0)),
+		] });
+		expect(await videoTimestamps(bytes)).toEqual([0, 33]);
+	});
+
+	test('ParseWithoutAnyDurations{SimpleBlocks,BlockGroups}: a block lasts until the next of its track', async () => {
+		// Without BlockDuration or DefaultDuration. (For the last block of each track in a cluster, Chromium estimates
+		// the largest duration seen so far; that isn't asserted here.)
+		const blocks: [track: number, timestamp: number][] = [
+			[1, 0], [1, 23], [2, 33], [1, 45], [2, 66], [1, 68], [2, 100],
+		];
+		const frame = (track: number, timestamp: number) => blockPayload(
+			track,
+			timestamp,
+			0x80,
+			track === 1 ? new Array<number>(96).fill(0) : vp8Frame(true),
+		);
+		const tracks = [webmAudioTrack(1), webmVideoTrack(2)];
+		for (const blockGroups of [false, true]) {
+			const bytes = buildWebm({ tracks, body: [
+				ebml(
+					EBML.Cluster,
+					ebmlUint(EBML.Timestamp, 0),
+					...blocks.map(([track, timestamp]) => blockGroups
+						? ebml(EBML.BlockGroup, ebml(EBML.Block, frame(track, timestamp)))
+						: ebml(EBML.SimpleBlock, frame(track, timestamp))),
+				),
+			] });
+			const packets = await readPackets(bytes);
+			expect(packets.audio!.slice(0, -1), `BlockGroups: ${blockGroups}`).toEqual([
+				{ timestamp: 0, duration: 23 },
+				{ timestamp: 23, duration: 22 },
+				{ timestamp: 45, duration: 23 },
+			]);
+			expect(packets.video!.slice(0, -1), `BlockGroups: ${blockGroups}`).toEqual([
+				{ timestamp: 33, duration: 33 },
+				{ timestamp: 66, duration: 34 },
+			]);
+		}
+	});
+});
+
+describe('Chromium media/formats/webm/opus_packet_builder.cc (Opus packet durations from the TOC byte)', () => {
+	test('every configuration with 1 to 48 frames, with and without VBR', () => {
+		// WebMClusterParser::kOpusFrameDurationsMu, in microseconds
+		const frameDurationsUs = [
+			10000, 20000, 40000, 60000, 10000, 20000, 40000, 60000,
+			10000, 20000, 40000, 60000, 10000, 20000, 10000, 20000,
+			2500, 5000, 10000, 20000, 2500, 5000, 10000, 20000,
+			2500, 5000, 10000, 20000, 2500, 5000, 10000, 20000,
+		];
+		for (let frameCount = 1; frameCount <= 48; frameCount++) {
+			for (let config = 0; config < 32; config++) {
+				for (const vbr of frameCount >= 2 ? [false, true] : [false]) {
+					const code = frameCount === 1 ? 0 : frameCount === 2 ? (vbr ? 2 : 1) : 3;
+					const frameCountByte = code === 3 ? [(vbr ? 0x80 : 0) | frameCount] : [];
+					const packet = new Uint8Array([(config << 3) | code, ...frameCountByte, 0]);
+					expect(parseOpusTocByte(packet).durationInSamples, `config ${config}, ${frameCount} frames`)
+						.toBe(frameCount * frameDurationsUs[config]! * 48 / 1000);
+				}
+			}
+		}
+	});
 });
