@@ -1381,23 +1381,6 @@ export class UrlSource extends PathedSource {
 	}
 }
 
-// Range unit names are case-insensitive (RFC 9110, Section 14.1)
-const CONTENT_RANGE_REGEX = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/i;
-const parseContentRange = (value: string | null) => {
-	const match = value !== null ? CONTENT_RANGE_REGEX.exec(value.trim()) : null;
-	if (!match) {
-		return null;
-	}
-
-	const start = Number(match[1]);
-	const end = Number(match[2]);
-	if (end < start) {
-		return null;
-	}
-
-	return { start, end };
-};
-
 const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/;
 const parseByteRangeHeader = (value: string) => {
 	const match = BYTE_RANGE_REGEX.exec(value.trim());
@@ -1416,6 +1399,23 @@ const parseByteRangeHeader = (value: string) => {
 		offset,
 		length: end !== null ? end - offset + 1 : null,
 	};
+};
+
+// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+const CONTENT_RANGE_REGEX = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/i;
+const parseContentRange = (value: string | null) => {
+	const match = value !== null ? CONTENT_RANGE_REGEX.exec(value.trim()) : null;
+	if (!match) {
+		return null;
+	}
+
+	const start = Number(match[1]);
+	const end = Number(match[2]);
+	if (end < start) {
+		return null;
+	}
+
+	return { start, end };
 };
 
 /**
