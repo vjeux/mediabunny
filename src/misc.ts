@@ -1690,8 +1690,9 @@ export class ConcurrentRunner {
 	parallelism: number;
 
 	constructor(parallelism: number) {
-		if (!(Number.isInteger(parallelism) && parallelism >= 1) && parallelism !== Infinity) {
-			throw new TypeError('parallelism must be a positive integer or Infinity.');
+		// Fractional values keep working as on main (1.5 lets two functions run at once); NaN fails this check too
+		if (typeof parallelism !== 'number' || !(parallelism > 0)) {
+			throw new TypeError('parallelism must be a positive number or Infinity.');
 		}
 
 		this.parallelism = parallelism;

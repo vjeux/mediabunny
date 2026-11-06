@@ -283,15 +283,29 @@ test('flush waits for all in-flight tasks', async () => {
 });
 
 test('rejects parallelism values that would hang or disable the limit', async () => {
-	for (const parallelism of [0, -1, NaN, 1.5, '2', null]) {
+	for (const parallelism of [0, -1, NaN, -Infinity, '2', null]) {
 		expect(() => new ConcurrentRunner(parallelism as number)).toThrow(
-			new TypeError('parallelism must be a positive integer or Infinity.'),
+			new TypeError('parallelism must be a positive number or Infinity.'),
 		);
 	}
 
 	const unlimited = new ConcurrentRunner(Infinity);
 	await unlimited.run(async () => {});
 	await unlimited.flush();
+
+	// A fractional limit still works, rounded up
+	const fractional = new ConcurrentRunner(1.5);
+	let running = 0;
+	let maxRunning = 0;
+	const task = async () => {
+		running++;
+		maxRunning = Math.max(maxRunning, running);
+		await new Promise(resolve => setTimeout(resolve, 5));
+		running--;
+	};
+	await Promise.all([fractional.run(task), fractional.run(task), fractional.run(task)]);
+	await fractional.flush();
+	expect(maxRunning).toBe(2);
 
 	// Shrinking the limit at runtime must not leave run() waiting on an empty queue forever
 	const runner = new ConcurrentRunner(1);
