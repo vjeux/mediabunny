@@ -287,3 +287,13 @@ const flushMicrotasks = async (iterations = 10) => {
 		await Promise.resolve();
 	}
 };
+
+test('parallelism below 1 or NaN is rejected instead of hanging', async () => {
+	for (const value of [0, -1, NaN]) {
+		expect(() => new ConcurrentRunner(value)).toThrow(TypeError);
+	}
+
+	const runner = new ConcurrentRunner(1);
+	runner.parallelism = 0;
+	await expect(runner.run(async () => {})).rejects.toThrow(TypeError);
+});
