@@ -570,7 +570,9 @@ export class IsobmffDemuxer extends Demuxer {
 
 		for (let i = 0; i < 8; i++) { // Some boxes (like sidx, styp, emsg or free) may come before the first moof box
 			let slice = this.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			if (!slice) {
 				break;
 			}
@@ -582,7 +584,9 @@ export class IsobmffDemuxer extends Demuxer {
 
 			if (boxInfo.name === 'moof') {
 				let moofSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
-				if (isThenable(moofSlice)) moofSlice = await moofSlice;
+				if (isThenable(moofSlice)) {
+					moofSlice = await moofSlice;
+				}
 				if (!moofSlice) {
 					break;
 				}
