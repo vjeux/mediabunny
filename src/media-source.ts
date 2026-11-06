@@ -31,11 +31,13 @@ import {
 	CallSerializer,
 	clamp,
 	clearIntervalUnthrottled,
+	COLOR_PRIMARIES_MAP,
 	isCodecReclaimedError,
 	isFirefox,
 	isThenable,
 	isWebKit,
 	last,
+	MATRIX_COEFFICIENTS_MAP,
 	missingWebCodecsClassMessage,
 	promiseWithResolvers,
 	roundToDivisor,
@@ -44,6 +46,7 @@ import {
 	setUint24,
 	toDataView,
 	toUint8Array,
+	TRANSFER_CHARACTERISTICS_MAP,
 	UnthrottledTimerHandle,
 	wait,
 } from './misc';
@@ -984,6 +987,18 @@ class VideoEncoderWrapper {
 
 		const encoderConfig = this.encoderConfig;
 		assert(encoderConfig);
+
+		if (meta?.decoderConfig?.colorSpace) {
+			// WebKitGTK's encoder passes the input frames' color space through, including its non-standard values like
+			// 'unspecified' (the same ones VideoSample treats as unknown), so treat those as unknown here too
+			const { primaries, transfer, matrix, fullRange } = meta.decoderConfig.colorSpace;
+			meta.decoderConfig.colorSpace = {
+				primaries: primaries != null && primaries in COLOR_PRIMARIES_MAP ? primaries : null,
+				transfer: transfer != null && transfer in TRANSFER_CHARACTERISTICS_MAP ? transfer : null,
+				matrix: matrix != null && matrix in MATRIX_COEFFICIENTS_MAP ? matrix : null,
+				fullRange,
+			};
+		}
 
 		if (meta?.decoderConfig) {
 			let vp9CodecInfo: Vp9CodecInfo | null = null;
