@@ -41,6 +41,7 @@ polyfillSymbolDispose();
 type FinalizationRegistryValue = {
 	type: 'video';
 	data: VideoFrame | OffscreenCanvas | Uint8Array | VideoSampleResource;
+	orientedFrame: VideoFrame | null;
 } | {
 	type: 'audio';
 	data: AudioData | Uint8Array | AudioSampleResource;
@@ -68,6 +69,7 @@ if (typeof FinalizationRegistry !== 'undefined') {
 
 			if (typeof VideoFrame !== 'undefined' && value.data instanceof VideoFrame) {
 				value.data.close(); // Prevent the browser error since we're logging our own
+				value.orientedFrame?.close();
 			}
 		} else {
 			if (now - lastAudioGcErrorLog >= 1000) {
@@ -261,6 +263,12 @@ export class VideoSample implements Disposable {
 	_layout!: PlaneLayout[] | null;
 	/** @internal */
 	_closed: boolean = false;
+	/**
+	 * The VideoFrame passed to the constructor when its orientation had to be stripped by wrapping it; closed together
+	 * with the sample.
+	 * @internal
+	 */
+	_orientedFrame: VideoFrame | null = null;
 
 	/**
 	 * The internal pixel format in which the frame is stored. Will be `null` if it's using an arbitrary internal
@@ -523,7 +531,8 @@ export class VideoSample implements Disposable {
 					displayWidth: frameRotation % 180 === 0 ? data.displayWidth : data.displayHeight,
 					displayHeight: frameRotation % 180 === 0 ? data.displayHeight : data.displayWidth,
 				} as VideoFrameInit);
-				data.close();
+				// Keep the caller's frame open for as long as the sample, as if the sample held it directly
+				this._orientedFrame = data;
 				data = unorientedFrame;
 			}
 
@@ -726,7 +735,11 @@ export class VideoSample implements Disposable {
 			num: this.squarePixelWidth * this.codedHeight,
 			den: this.squarePixelHeight * this.codedWidth,
 		});
-		finalizationRegistry?.register(this, { type: 'video', data: this._data }, this);
+		finalizationRegistry?.register(this, {
+			type: 'video',
+			data: this._data,
+			orientedFrame: this._orientedFrame,
+		}, this);
 	}
 
 	/** Clones this video sample. */
@@ -810,6 +823,7 @@ export class VideoSample implements Disposable {
 			}
 		} else if (isVideoFrame(this._data)) {
 			this._data.close();
+			this._orientedFrame?.close();
 		} else {
 			this._data = null; // GC that shit
 		}

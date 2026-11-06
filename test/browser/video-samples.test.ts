@@ -506,10 +506,17 @@ test('VideoFrame rotation and flip become sample metadata', async () => {
 	const frame = new VideoFrame(new Uint8Array(4 * 2 * 4), {
 		format: 'RGBX', codedWidth: 4, codedHeight: 2, timestamp: 0, rotation: 90, flip: true,
 	} as VideoFrameBufferInit);
-	using flipped = new VideoSample(frame, { rotation: 90, flip: true });
+	const flipped = new VideoSample(frame, { rotation: 90, flip: true });
 	expect([flipped.rotation, flipped.flip]).toEqual([0, false]);
 	expect([flipped.displayWidth, flipped.displayHeight]).toEqual([4, 2]);
+
+	// The passed frame stays usable until the sample is closed
+	expect(frame.format).toBe('RGBX');
+	flipped.close();
+	expect(frame.format).toBe(null);
 });
+
+/** 4x4 RGBA sample where each pixel's R/G channels encode its (x, y) position. */
 const makeCoordinateSample = (init: { rotation?: Rotation; flip?: boolean }) => {
 	const data = new Uint8Array(4 * 4 * 4);
 	for (let y = 0; y < 4; y++) {
