@@ -442,6 +442,20 @@ describe('WAVE writing', () => {
 		return new Uint8Array(output.target.buffer!);
 	};
 
+	// Walks the chunks of a written file, so that its layout isn't assumed
+	const readChunks = (bytes: Uint8Array, start = 12) => {
+		const chunks: { id: string; offset: number; data: Uint8Array }[] = [];
+		for (let pos = start; pos + 8 <= bytes.length;) {
+			let size = readU32(bytes, pos + 4);
+			if (size === 0xffffffff) {
+				size = bytes.length - pos - 8; // RF64 keeps the size in the ds64 chunk
+			}
+			chunks.push({ id: readFourCc(bytes, pos), offset: pos, data: bytes.subarray(pos + 8, pos + 8 + size) });
+			pos += 8 + size + (size & 1);
+		}
+		return chunks;
+	};
+
 	test('writes the header fields for every codec', async () => {
 		const cases: [PcmAudioCodec, number, number][] = [
 			// Codec, format tag, bytes per sample
@@ -463,17 +477,40 @@ describe('WAVE writing', () => {
 			expect(readFourCc(bytes, 0)).toBe('RIFF');
 			expect(readU32(bytes, 4)).toBe(bytes.length - 8);
 			expect(readFourCc(bytes, 8)).toBe('WAVE');
-			expect(readFourCc(bytes, 12)).toBe('fmt ');
-			expect(readU32(bytes, 16)).toBe(16);
-			expect(readU16(bytes, 20)).toBe(formatTag);
-			expect(readU16(bytes, 22)).toBe(channels);
-			expect(readU32(bytes, 24)).toBe(32000);
-			expect(readU32(bytes, 28)).toBe(32000 * channels * bytesPerSample); // Bytes per second
-			expect(readU16(bytes, 32)).toBe(channels * bytesPerSample); // Block align
-			expect(readU16(bytes, 34)).toBe(8 * bytesPerSample);
-			expect(readFourCc(bytes, 36)).toBe('data');
-			expect(readU32(bytes, 40)).toBe(data.length);
-			expect(bytes.subarray(44)).toEqual(data);
+
+			// The format chunk comes first and the data chunk last. Formats other than PCM may have a fact chunk
+			// holding the sample count in between, which Microsoft's spec asks for.
+			const chunks = readChunks(bytes);
+			const ids = chunks.map(chunk => chunk.id);
+			expect(ids[0], codec).toBe('fmt ');
+			expect(ids.at(-1), codec).toBe('data');
+			expect(ids.slice(1, -1).every(id => id === 'fact' && formatTag !== WAVE_FORMAT_PCM), codec).toBe(true);
+
+			const fmt = chunks[0]!.data;
+			if (formatTag === WAVE_FORMAT_PCM) {
+				expect(fmt.length, codec).toBe(16); // PCMWAVEFORMAT
+			} else {
+				// The spec wants a WAVEFORMATEX for formats other than PCM, here with a cbSize of 0. Readers accept the
+				// shorter PCMWAVEFORMAT layout too.
+				expect([16, 18], codec).toContain(fmt.length);
+				if (fmt.length === 18) {
+					expect(readU16(fmt, 16), codec).toBe(0);
+				}
+			}
+			expect(readU16(fmt, 0)).toBe(formatTag);
+			expect(readU16(fmt, 2)).toBe(channels);
+			expect(readU32(fmt, 4)).toBe(32000);
+			expect(readU32(fmt, 8)).toBe(32000 * channels * bytesPerSample); // Bytes per second
+			expect(readU16(fmt, 12)).toBe(channels * bytesPerSample); // Block align
+			expect(readU16(fmt, 14)).toBe(8 * bytesPerSample);
+
+			const fact = chunks.find(chunk => chunk.id === 'fact');
+			if (fact) {
+				expect(readU32(fact.data, 0), codec).toBe(50); // Sample frames
+			}
+
+			expect(chunks.at(-1)!.data).toEqual(data);
+			expect(chunks.at(-1)!.offset + 8 + data.length).toBe(bytes.length);
 
 			const info = await readTrackInfo(bytes);
 			expect(info.codec).toBe(codec);
@@ -497,9 +534,11 @@ describe('WAVE writing', () => {
 		expect(readU32(bytes, 36)).toBe(3000); // Sample count
 		expect(readU32(bytes, 40)).toBe(0);
 		expect(readU32(bytes, 44)).toBe(0); // Table length
-		expect(readFourCc(bytes, 48)).toBe('fmt ');
-		expect(readFourCc(bytes, 72)).toBe('data');
-		expect(readU32(bytes, 76)).toBe(0xffffffff);
+
+		const chunks = readChunks(bytes);
+		expect(chunks.map(chunk => chunk.id)).toEqual(['ds64', 'fmt ', 'data']);
+		expect(readU32(bytes, chunks[2]!.offset + 4)).toBe(0xffffffff); // The data size is in the ds64 chunk
+		expect(chunks[2]!.data).toEqual(data);
 
 		const info = await readTrackInfo(bytes);
 		expect(concat(...info.packets.map(packet => packet.data))).toEqual(data);
@@ -519,18 +558,15 @@ describe('WAVE writing', () => {
 			raw: { ISFT: 'Encoder', IENG: 'Engineer', TOOLONG: 'ignored' },
 		});
 
-		expect(readFourCc(bytes, 36)).toBe('LIST');
-		const listSize = readU32(bytes, 40);
-		expect(listSize % 2).toBe(0);
-		expect(readFourCc(bytes, 44)).toBe('INFO');
-		expect(readFourCc(bytes, 44 + listSize)).toBe('data');
+		const chunks = readChunks(bytes);
+		expect(chunks.map(chunk => chunk.id)).toEqual(['fmt ', 'LIST', 'data']);
+		const list = chunks[1]!.data;
+		expect(list.length % 2).toBe(0);
+		expect(readFourCc(list, 0)).toBe('INFO');
 
 		const entries: Record<string, number[]> = {};
-		let pos = 48;
-		while (pos < 44 + listSize) {
-			const size = readU32(bytes, pos + 4);
-			entries[readFourCc(bytes, pos)] = [...bytes.subarray(pos + 8, pos + 8 + size)];
-			pos += 8 + size + (size & 1);
+		for (const entry of readChunks(list, 4)) {
+			entries[entry.id] = [...entry.data];
 		}
 
 		expect(entries).toEqual({
@@ -591,8 +627,12 @@ describe('WAVE writing', () => {
 		await output.finalize();
 
 		const bytes = new Uint8Array(output.target.buffer!);
-		expect(bytes.length).toBe(44);
-		expect(readU32(bytes, 40)).toBe(0);
+		const chunks = readChunks(bytes);
+		expect(chunks[0]!.id).toBe('fmt ');
+		const dataChunk = chunks.at(-1)!;
+		expect(dataChunk.id).toBe('data');
+		expect(dataChunk.data.length).toBe(0);
+		expect(dataChunk.offset + 8).toBe(bytes.length);
 
 		const info = await readTrackInfo(bytes);
 		expect(info.codec).toBe('pcm-f32');
