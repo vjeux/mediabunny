@@ -16,6 +16,7 @@ import {
 	AsyncMutex,
 	findLastIndex,
 	joinPaths,
+	roundToDivisor,
 	textEncoder,
 	toArray,
 	toDataView,
@@ -685,6 +686,16 @@ export class HlsMuxer extends Muxer {
 
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
+
+			if (track.metadata.frameRate !== undefined) {
+				// Constrain the time values to the frame rate here, in the input timeline. The segment muxers don't get
+				// the frame rate, since snapping the shifted media timestamps would move video relative to audio.
+				packet = packet.clone({
+					timestamp: roundToDivisor(packet.timestamp, track.metadata.frameRate),
+					duration: roundToDivisor(packet.duration, track.metadata.frameRate),
+				});
+			}
+
 			trackData.packets.push(packet);
 			this.firstPacketTimestamp ??= packet.timestamp;
 
@@ -980,6 +991,7 @@ export class HlsMuxer extends Muxer {
 								fragmentedIsobmffOutput.videoSource,
 								{
 									...videoTrack.track.metadata,
+									frameRate: undefined, // Already applied, see addEncodedVideoPacket
 									decoderConfig: videoTrack.info.decoderConfig,
 									primingPacket: videoTrack.info.primingPacket ?? undefined,
 								},
@@ -1145,6 +1157,7 @@ export class HlsMuxer extends Muxer {
 						);
 						output.addVideoTrack(videoSource, {
 							...videoTrack.track.metadata,
+							frameRate: undefined, // Already applied, see addEncodedVideoPacket
 							decoderConfig: videoTrack.info.decoderConfig,
 							primingPacket: videoTrack.info.primingPacket ?? undefined,
 						});
