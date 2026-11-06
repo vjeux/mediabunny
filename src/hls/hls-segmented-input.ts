@@ -90,6 +90,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 	demuxer: HlsDemuxer;
 	segments: HlsSegment[] = [];
 	nextLines: string[] | null = null;
+	lastPlaylistText: string | null = null;
+	lastReloadWasUnchanged = false;
 	currentUpdateSegmentsPromise: Promise<void> | null = null;
 	streamHasEnded = false;
 	neverRemovesSegments = false;
@@ -113,7 +115,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 	runUpdateSegments() {
 		return this.currentUpdateSegmentsPromise ??= (async () => {
 			try {
-				const remainingWaitTimeMs = this.getRemainingWaitTimeMs();
+				// Even when a refresh counts as due, wait out the whole refresh interval: "the client MUST wait for at
+				// least the target duration before attempting to reload the Playlist file again" (RFC 8216, Section
+				// 6.3.4)
+				const remainingWaitTimeMs = this.getRemainingWaitTimeMs(true);
 				if (remainingWaitTimeMs > 0) {
 					await wait(remainingWaitTimeMs);
 				}
@@ -126,13 +131,25 @@ export class HlsSegmentedInput extends SegmentedInput {
 		})();
 	}
 
-	getRemainingWaitTimeMs() {
+	/**
+	 * The time left until the playlist may be reloaded. Unless `exact` is set, a little time left counts as none, which
+	 * makes a refresh count as due.
+	 */
+	getRemainingWaitTimeMs(exact = false) {
+		// "If the client reloads a Playlist file and finds that it has not changed, then it MUST wait for a period of
+		// one-half the target duration before retrying." (RFC 8216, Section 6.3.4)
+		const interval = this.lastReloadWasUnchanged ? this.refreshInterval / 2 : this.refreshInterval;
 		const elapsed = performance.now() - this.lastSegmentUpdateTime;
-		const result = Math.max(0, 1000 * this.refreshInterval - elapsed);
+		const result = Math.max(0, 1000 * interval - elapsed);
+
+		if (exact) {
+			return result;
+		}
 
 		if (result <= 50) {
-			// If only a little bit of time is left, don't wait at all; this removes the chance for timing race
-			// conditions when running a task every `refreshInterval` seconds
+			// If only a little bit of time is left, count a refresh as due already; this removes the chance for timing
+			// race conditions when running a task every `refreshInterval` seconds. The reload itself still waits out
+			// the remaining time.
 			return 0;
 		}
 
@@ -172,6 +189,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 				this.rootPath = ref.source.rootPath;
 			}
 		}
+
+		const text = lines.join('\n');
+		this.lastReloadWasUnchanged = text === this.lastPlaylistText;
+		this.lastPlaylistText = text;
 
 		const offsetTimestampsByDateTime = this.input._formatOptions.hls?.offsetTimestampsByDateTime !== false;
 		const variables = new HlsPlaylistVariables(
