@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WebMOutputFormat, MkvOutputFormat } from '../../src/output-format.js';
 import { BufferTarget, StreamTarget } from '../../src/target.js';
 import {
 	AudioSampleSource,
@@ -1372,3 +1372,142 @@ test('MediaStream sources, pausing and resuming keeps audio and video in sync', 
 	expect(audioEnd).toBeCloseTo(1, 0);
 	expect(Math.abs(videoEnd - audioEnd)).toBeLessThan(0.1);
 });
+
+test('MediaStreamAudioTrackSource, the Web Audio fallback keeps audio in sync like MediaStreamTrackProcessor', async ({
+	skip,
+}) => {
+	// Without MediaStreamTrackProcessor (Firefox, Safari), audio is captured through a ScriptProcessorNode. Record the
+	// same beeps and flashes both ways and compare where the beeps land relative to the flashes.
+	if (typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackProcessor on the main thread (Chromium) to compare against');
+	}
+
+	const withProcessor = await measureBeepToFlashOffset(false);
+	const withFallback = await measureBeepToFlashOffset(true);
+	if (withProcessor === null || withFallback === null) {
+		skip('Web Audio cannot run here without a user gesture');
+	}
+
+	expect(Math.abs(withFallback! - withProcessor!)).toBeLessThan(0.045);
+});
+
+/** Records 100 ms flashes and beeps every 500 ms and returns their mean offset (beep - flash) in the file. */
+const measureBeepToFlashOffset = async (hideMediaStreamTrackProcessor: boolean) => {
+	const audioContext = new AudioContext();
+	await Promise.race([audioContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
+
+	// A running context may not have rendered yet, and until it has, getOutputTimestamp() maps context time 0 to
+	// performance time 0: the beeps would be scheduled at the page's age, minutes late in a long test run
+	const renderWaitStart = performance.now();
+	while (
+		audioContext.state === 'running'
+		&& audioContext.currentTime === 0
+		&& performance.now() - renderWaitStart < 2000
+	) {
+		await new Promise(resolve => setTimeout(resolve, 10));
+	}
+	if (audioContext.state !== 'running' || audioContext.currentTime === 0) {
+		await audioContext.close();
+		return null;
+	}
+
+	const destination = audioContext.createMediaStreamDestination();
+	const oscillator = audioContext.createOscillator();
+	oscillator.frequency.value = 1000;
+	const gain = audioContext.createGain();
+	gain.gain.value = 0;
+	oscillator.connect(gain).connect(destination);
+	oscillator.start();
+
+	const canvas = document.createElement('canvas');
+	canvas.width = 64;
+	canvas.height = 48;
+	document.body.appendChild(canvas);
+	const context = canvas.getContext('2d')!;
+	// 60 FPS keeps the frame quantization of the flashes small
+	const videoTrack = canvas.captureStream(60).getVideoTracks()[0]!;
+	const audioTrack = destination.stream.getAudioTracks()[0]!;
+
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+	output.addVideoTrack(new MediaStreamVideoTrackSource(videoTrack, { codec: 'vp8', quality: new Quality('low') }));
+	output.addAudioTrack(new MediaStreamAudioTrackSource(audioTrack, { codec: 'pcm-f32' }));
+
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const processor = globals.MediaStreamTrackProcessor;
+	if (hideMediaStreamTrackProcessor) {
+		globals.MediaStreamTrackProcessor = undefined;
+	}
+	try {
+		await output.start();
+	} finally {
+		globals.MediaStreamTrackProcessor = processor;
+	}
+
+	// Schedule the beeps at the same moments the flashes start
+	const start = performance.now() + 300;
+	const { contextTime, performanceTime } = audioContext.getOutputTimestamp();
+	for (let i = 0; i < 6; i++) {
+		const beepTime = contextTime! + (start + 500 * i - performanceTime!) / 1000;
+		gain.gain.setValueAtTime(0.5, beepTime);
+		gain.gain.setValueAtTime(0, beepTime + 0.1);
+	}
+	let lastColor = '';
+	const drawInterval = setInterval(() => {
+		const elapsed = performance.now() - start;
+		const color = elapsed >= 0 && elapsed % 500 < 100 ? 'white' : 'black';
+		if (color !== lastColor) {
+			context.fillStyle = color;
+			context.fillRect(0, 0, canvas.width, canvas.height);
+			lastColor = color;
+		}
+	}, 2);
+	await new Promise(resolve => setTimeout(resolve, 3300));
+
+	await output.finalize();
+	clearInterval(drawInterval);
+	videoTrack.stop();
+	audioTrack.stop();
+	canvas.remove();
+	await audioContext.close();
+
+	const input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const flashes: number[] = [];
+	const lumaCanvas = new OffscreenCanvas(1, 1);
+	const lumaContext = lumaCanvas.getContext('2d', { willReadFrequently: true })!;
+	let wasBright = false;
+	for await (using sample of new VideoSampleSink((await input.getPrimaryVideoTrack())!).samples()) {
+		sample.draw(lumaContext, 0, 0, 1, 1);
+		const isBright = lumaContext.getImageData(0, 0, 1, 1).data[0]! > 128;
+		if (isBright && !wasBright) {
+			flashes.push(sample.timestamp);
+		}
+		wasBright = isBright;
+	}
+
+	const beeps: number[] = [];
+	let quietFrames = Infinity;
+	for await (using sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		for (let i = 0; i < data.length; i++) {
+			if (Math.abs(data[i]!) < 0.25) {
+				quietFrames++;
+				continue;
+			}
+			if (quietFrames > 0.2 * sample.sampleRate) {
+				beeps.push(sample.timestamp + i / sample.sampleRate);
+			}
+			quietFrames = 0;
+		}
+	}
+	input.dispose();
+
+	const offsets = flashes
+		.map(flash => beeps.find(beep => Math.abs(beep - flash) < 0.2)! - flash)
+		.filter(offset => !Number.isNaN(offset));
+	expect(offsets.length).toBeGreaterThanOrEqual(4);
+	return offsets.reduce((a, b) => a + b, 0) / offsets.length;
+};
