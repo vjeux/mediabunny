@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import path from 'node:path';
 import { joinPaths } from '../../src/misc.js';
 
 test('joinPaths', () => {
@@ -81,6 +82,17 @@ test('joinPaths with Windows paths', () => {
 			.toBe('\\\\server\\share\\playlist-1.m3u8');
 		expect(joinPaths('C:/media/hls/master.m3u8', 'playlist-1.m3u8')).toBe('C:/media/hls/playlist-1.m3u8');
 
+		// Paths starting with a separator are rooted at the base path's drive or share
+		expect(joinPaths('C:\\media\\hls\\master.m3u8', '\\other\\playlist.m3u8')).toBe('C:\\other\\playlist.m3u8');
+		expect(joinPaths('C:\\media\\hls\\master.m3u8', '/other/playlist.m3u8')).toBe('C:\\other\\playlist.m3u8');
+		expect(joinPaths('\\\\server\\share\\hls\\master.m3u8', '\\playlist.m3u8'))
+			.toBe('\\\\server\\share\\playlist.m3u8');
+
+		// .. never goes above the drive or share
+		expect(joinPaths('\\\\server\\share\\hls\\master.m3u8', '../../playlist.m3u8'))
+			.toBe('\\\\server\\share\\playlist.m3u8');
+		expect(joinPaths('C:\\master.m3u8', '..\\playlist.m3u8')).toBe('C:\\playlist.m3u8');
+
 		// Absolute Windows paths
 		expect(joinPaths('C:\\media\\master.m3u8', 'D:\\other\\playlist.m3u8')).toBe('D:\\other\\playlist.m3u8');
 		expect(joinPaths('C:\\media\\master.m3u8', '\\\\server\\share\\playlist.m3u8'))
@@ -94,5 +106,32 @@ test('joinPaths with Windows paths', () => {
 	withPlatform('linux', () => {
 		// Elsewhere, a backslash is just a character in a file name
 		expect(joinPaths('/media/hls\\files/master.m3u8', 'playlist-1.m3u8')).toBe('/media/hls\\files/playlist-1.m3u8');
+	});
+});
+
+test('joinPaths with Windows paths points where Windows resolves the reference', () => {
+	const cases = [
+		['C:\\media\\hls\\master.m3u8', 'segments\\..\\playlist-1.m3u8'],
+		['C:\\media\\hls\\master.m3u8', '\\other\\playlist.m3u8'],
+		['C:\\media\\hls\\master.m3u8', '/other/playlist.m3u8'],
+		['C:\\media\\master.m3u8', '..\\..\\..\\playlist.m3u8'],
+		['C:\\media\\master.m3u8', 'D:\\other\\playlist.m3u8'],
+		['C:\\media\\master.m3u8', 'C:playlist.m3u8'],
+		['C:media\\master.m3u8', 'playlist-1.m3u8'],
+		['\\\\server\\share\\hls\\master.m3u8', '../../../playlist.m3u8'],
+		['\\\\server\\share\\hls\\master.m3u8', '\\other\\playlist.m3u8'],
+		['//server/share/hls/master.m3u8', 'playlist-1.m3u8'],
+		['\\\\?\\C:\\media\\master.m3u8', '..\\playlist-1.m3u8'],
+		['hls\\master.m3u8', '..\\..\\playlist.m3u8'],
+		['master.m3u8', 'playlist-1.m3u8'],
+	];
+
+	withPlatform('win32', () => {
+		for (const [basePath, relativePath] of cases) {
+			// Node's own Windows path resolution as the reference, with a fixed working directory
+			const expected = path.win32.resolve('C:\\cwd', path.win32.dirname(basePath!), relativePath!);
+			expect(path.win32.resolve('C:\\cwd', joinPaths(basePath!, relativePath!)), `${basePath} + ${relativePath}`)
+				.toBe(expected);
+		}
 	});
 });

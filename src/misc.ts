@@ -1213,19 +1213,78 @@ export const isNumber = (x: unknown) => {
  */
 export type FilePath = string;
 
+const isWindowsPathSeparator = (char: string | undefined) => char === '\\' || char === '/';
+
+/** Splits a Windows path into its device (drive or UNC share), whether it's rooted, and the rest. */
+const splitWindowsPathRoot = (path: string) => {
+	if (isWindowsPathSeparator(path[0]) && isWindowsPathSeparator(path[1])) {
+		const uncRoot = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.exec(path);
+		if (uncRoot) {
+			return { device: uncRoot[0], isRooted: true, rest: path.slice(uncRoot[0].length) };
+		}
+	}
+
+	if (/^[a-zA-Z]:/.test(path)) {
+		return { device: path.slice(0, 2), isRooted: isWindowsPathSeparator(path[2]), rest: path.slice(2) };
+	}
+
+	return { device: '', isRooted: isWindowsPathSeparator(path[0]), rest: path };
+};
+
+/** Joins local paths like Windows resolves them, where both `\` and `/` are separators. */
+const joinWindowsPaths = (basePath: FilePath, relativePath: FilePath) => {
+	const base = splitWindowsPathRoot(basePath);
+	const relative = splitWindowsPathRoot(relativePath);
+
+	let device = base.device;
+	let isRooted = base.isRooted;
+	let path: string;
+
+	// A drive-relative path (C:file) on the base path's drive is relative to the base path
+	const isOnBaseDrive = relative.device.length === 2 && relative.device.toLowerCase() === base.device.toLowerCase();
+
+	if (relative.device && !(isOnBaseDrive && !relative.isRooted)) {
+		// Drive letters and UNC shares begin a path of their own
+		({ device, isRooted } = relative);
+		path = relative.rest;
+	} else if (relative.isRooted) {
+		// A leading separator refers to the root of the base path's drive or share
+		isRooted = true;
+		path = relative.rest;
+	} else {
+		const lastSeparator = Math.max(base.rest.lastIndexOf('/'), base.rest.lastIndexOf('\\'));
+		path = base.rest.slice(0, lastSeparator + 1) + relative.rest;
+	}
+
+	const segments: string[] = [];
+	for (const segment of path.split(/[\\/]/)) {
+		if (segment === '..') {
+			if (segments.length > 0 && last(segments) !== '..') {
+				segments.pop();
+			} else if (!isRooted) {
+				// A relative path keeps the parts reaching above its start; a rooted one can't go above its root
+				segments.push(segment);
+			}
+		} else if (segment !== '.' && segment !== '') {
+			segments.push(segment);
+		}
+	}
+
+	// Keep the native separator if the paths use it
+	const separator = (basePath + relativePath).includes('\\') ? '\\' : '/';
+	return device + (isRooted ? separator : '') + segments.join(separator);
+};
+
 export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 	// If relativePath is a full URL with protocol, return it as-is
 	if (relativePath.includes('://')) {
 		return relativePath;
 	}
 
-	// Local paths on Windows (like the ones Node's path module produces there) may also use backslashes as
-	// separators, so treat them as such, just like FFmpeg does on Windows
-	const isWindowsLocalPath = !basePath.includes('://')
-		&& (globalThis as { process?: { platform?: string } }).process?.platform === 'win32';
-	if (isWindowsLocalPath && /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(relativePath)) {
-		// A path starting with a drive letter or a UNC prefix is absolute already
-		return relativePath;
+	// Local paths on Windows (like the ones Node's path module produces there) may use backslashes too
+	const platform = (globalThis as { process?: { platform?: string } }).process?.platform;
+	if (platform === 'win32' && !basePath.includes('://')) {
+		return joinWindowsPaths(basePath, relativePath);
 	}
 
 	// Strip query parameters from URL base paths so their contents don't mess up the join
@@ -1251,9 +1310,7 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 			}
 		}
 	} else {
-		const lastSlash = isWindowsLocalPath
-			? Math.max(basePath.lastIndexOf('/'), basePath.lastIndexOf('\\'))
-			: basePath.lastIndexOf('/');
+		const lastSlash = basePath.lastIndexOf('/');
 		if (lastSlash === -1) {
 			result = relativePath;
 		} else {
@@ -1273,7 +1330,7 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 		}
 	}
 
-	const segments = result.split(isWindowsLocalPath ? /[\\/]/ : '/');
+	const segments = result.split('/');
 	const normalized: string[] = [];
 	for (const segment of segments) {
 		if (segment === '..') {
@@ -1283,9 +1340,7 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 		}
 	}
 
-	// Windows paths keep their native separator if they use it
-	const separator = isWindowsLocalPath && result.includes('\\') ? '\\' : '/';
-	return prefix + normalized.join(separator);
+	return prefix + normalized.join('/');
 };
 
 // eg. path `/media.m3u8?token=abc%20123` and name `token` resolve to `abc 123`
