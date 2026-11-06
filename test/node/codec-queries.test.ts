@@ -33,9 +33,6 @@ test('Codec support queries validate their options and codec lists', async () =>
 		getEncodableSubtitleCodecs,
 		getDecodableVideoCodecs,
 		getDecodableAudioCodecs,
-		getFirstEncodableVideoCodec,
-		getFirstEncodableAudioCodec,
-		getFirstEncodableSubtitleCodec,
 	];
 	for (const query of listQueries) {
 		for (const checkedCodecs of [null, 'avc', 1]) {
@@ -44,8 +41,21 @@ test('Codec support queries validate their options and codec lists', async () =>
 			);
 		}
 	}
+	// These only iterate over the codecs, so any iterable works (but not a string, which yields characters)
+	const firstQueries = [getFirstEncodableVideoCodec, getFirstEncodableAudioCodec, getFirstEncodableSubtitleCodec];
+	for (const query of firstQueries) {
+		for (const checkedCodecs of [undefined, null, 'avc', 1, {}]) {
+			await expect((query as (codecs: unknown) => Promise<unknown>)(checkedCodecs)).rejects.toThrow(
+				new TypeError('checkedCodecs must be an iterable of codecs.'),
+			);
+		}
+	}
 
 	expect(await getFirstEncodableAudioCodec(['aac', 'pcm-s16'])).toBe('pcm-s16');
+	expect(await getFirstEncodableAudioCodec(new Set(['aac', 'pcm-s16']) as never)).toBe('pcm-s16');
+	expect(await getFirstEncodableSubtitleCodec((function* () {
+		yield 'webvtt' as const;
+	})() as never)).toBe('webvtt');
 	expect(await getEncodableAudioCodecs(['pcm-s16', 'pcm-f32'], { numberOfChannels: 1 }))
 		.toEqual(['pcm-s16', 'pcm-f32']);
 });

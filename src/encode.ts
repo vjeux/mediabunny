@@ -18,6 +18,7 @@ import {
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
+	validateCheckedCodecIterable,
 	validateCheckedCodecs,
 	VIDEO_CODECS,
 	VideoCodec,
@@ -1448,7 +1449,7 @@ export const getFirstEncodableVideoCodec = async (
 		frameRate?: number;
 	},
 ): Promise<VideoCodec | null> => {
-	validateCheckedCodecs(checkedCodecs);
+	validateCheckedCodecIterable(checkedCodecs);
 
 	for (const codec of checkedCodecs) {
 		if (await canEncodeVideo(codec, options)) {
@@ -1481,7 +1482,7 @@ export const getFirstEncodableAudioCodec = async (
 		bitrate?: number | Quality;
 	},
 ): Promise<AudioCodec | null> => {
-	validateCheckedCodecs(checkedCodecs);
+	validateCheckedCodecIterable(checkedCodecs);
 
 	for (const codec of checkedCodecs) {
 		if (await canEncodeAudio(codec, options)) {
@@ -1500,7 +1501,7 @@ export const getFirstEncodableAudioCodec = async (
 export const getFirstEncodableSubtitleCodec = async (
 	checkedCodecs: SubtitleCodec[],
 ): Promise<SubtitleCodec | null> => {
-	validateCheckedCodecs(checkedCodecs);
+	validateCheckedCodecIterable(checkedCodecs);
 
 	for (const codec of checkedCodecs) {
 		if (await canEncodeSubtitles(codec)) {

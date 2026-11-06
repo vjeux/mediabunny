@@ -116,6 +116,18 @@ export const validateCheckedCodecs = (checkedCodecs: unknown) => {
 	}
 };
 
+/** Like {@link validateCheckedCodecs}, for the functions that only iterate over the codecs. */
+export const validateCheckedCodecIterable = (checkedCodecs: unknown) => {
+	if (
+		!checkedCodecs
+		// A string is iterable, but only yields characters
+		|| (typeof checkedCodecs !== 'object' && typeof checkedCodecs !== 'function')
+		|| !(Symbol.iterator in checkedCodecs)
+	) {
+		throw new TypeError('checkedCodecs must be an iterable of codecs.');
+	}
+};
+
 /**
  * Union type of known video codecs.
  * @group Codecs
