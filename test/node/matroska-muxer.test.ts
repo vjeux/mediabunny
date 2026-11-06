@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -209,3 +209,38 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('Opus without a decoder description still gets its identification header as CodecPrivate', async () => {
+	// The Matroska Opus mapping requires the OpusHead in CodecPrivate, e.g. for packets remuxed from MPEG-TS
+	const muxAndRead = async (firstTimestamp: number) => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source);
+		await output.start();
+		for (let i = 0; i < 3; i++) {
+			await source.add(
+				new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', firstTimestamp + 0.02 * i, 0.02),
+				i === 0 ? { decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 44100 } } : undefined,
+			);
+		}
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array(output.target.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const config = await track.getDecoderConfig();
+		return config!.description && [...new Uint8Array(config!.description as ArrayBuffer)];
+	};
+
+	const opusHead = (preSkip: number) => [
+		...[...'OpusHead'].map(x => x.charCodeAt(0)),
+		1, 2, preSkip & 0xff, preSkip >> 8, 0x44, 0xac, 0, 0, 0, 0, 0,
+	];
+
+	expect(await muxAndRead(0)).toEqual(opusHead(0));
+	// A negative start is the pre-skip, written both as CodecDelay and in the header
+	expect(await muxAndRead(-0.0065)).toEqual(opusHead(312));
+});
