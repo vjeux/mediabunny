@@ -1,11 +1,17 @@
 import { describe, expect, test } from 'vitest';
 import {
+	addEmulationPreventionBytes,
+	av1CodecInfoHasColorInfo,
+	createVorbisComments,
 	determineVideoPacketType,
+	extractAv1CodecInfoFromPacket,
 	extractHevcDecoderConfigurationRecord,
 	extractVp9CodecInfoFromPacket,
+	iterateNalUnitsInAnnexB,
 	parseAvcSps,
 	parseHevcSps,
 	parseOpusIdentificationHeader,
+	parseOpusTocByte,
 	readVorbisComments,
 	vp9CodecInfoHasColorInfo,
 } from '../../src/codec-data.js';
@@ -14,6 +20,8 @@ import {
 	addEmulationPrevention,
 	annexB,
 	ascii,
+	av1SequenceHeaderObu,
+	Av1SequenceHeaderOptions,
 	BitWriter,
 	buildAvcSps,
 	buildHevcPps,
@@ -1023,5 +1031,216 @@ describe('determineVideoPacketType: AV1', () => {
 	test('the last OBU may omit its size field and extend to the end of the packet', () => {
 		const packet = new Uint8Array([...temporalDelimiter, (6 << 3), 0b0010_0000, 0x55, 0x66]);
 		expect(determineVideoPacketType('av1', av1Config, packet)).toBe('delta');
+	});
+});
+
+describe('Annex B scanning and emulation prevention', () => {
+	const nalUnits = (bytes: number[]) => {
+		const data = new Uint8Array(bytes);
+		return [...iterateNalUnitsInAnnexB(data)].map(({
+			offset,
+			length,
+		}) => [...data.subarray(offset, offset + length)]);
+	};
+
+	test.each([
+		['a 4-byte start code', [0, 0, 0, 1, 0x65, 0xaa], [[0x65, 0xaa]]],
+		['3-byte start codes', [0, 0, 1, 0x67, 0, 0, 1, 0x68], [[0x67], [0x68]]],
+		['leading bytes before the first start code', [0xff, 0x00, 0, 0, 1, 0x65], [[0x65]]],
+		['zeros inside a NAL unit', [0, 0, 1, 0x65, 0, 0xbb, 0, 0, 2, 0xcc], [[0x65, 0, 0xbb, 0, 0, 2, 0xcc]]],
+		['back-to-back start codes', [0, 0, 1, 0, 0, 1, 0x41], [[0x41]]],
+		['a start code at the very end', [0, 0, 1, 0x41, 0x99, 0, 0, 1], [[0x41, 0x99]]],
+		['no start code at all', [0x65, 0x88, 0x84], []],
+		['too little data', [0, 0], []],
+	])('handles %s', (_, bytes, expected) => {
+		expect(nalUnits(bytes)).toEqual(expected);
+	});
+
+	test.each([
+		[[0, 0, 0], [0, 0, 3, 0]],
+		[[0, 0, 1], [0, 0, 3, 1]],
+		[[0, 0, 2], [0, 0, 3, 2]],
+		[[0, 0, 3], [0, 0, 3, 3]],
+		[[0, 0, 4], [0, 0, 4]],
+		[[0, 0, 0, 0, 1], [0, 0, 3, 0, 0, 3, 1]],
+		[[0, 1, 0, 0, 0x80, 0, 0], [0, 1, 0, 0, 0x80, 0, 0]],
+	])('addEmulationPreventionBytes(%j) is %j', (input, expected) => {
+		expect([...addEmulationPreventionBytes(new Uint8Array(input))]).toEqual(expected);
+	});
+});
+
+describe('parseOpusTocByte', () => {
+	test.each([
+		[0, 480], [1, 960], [2, 1920], [3, 2880], // SILK NB
+		[8, 480], [11, 2880], // SILK WB
+		[12, 480], [13, 960], [15, 960], // Hybrid
+		[16, 120], [17, 240], [18, 480], [19, 960], // CELT NB
+		[28, 120], [31, 960], // CELT FB
+	])('config %i lasts %i samples per frame', (config, samples) => {
+		expect(parseOpusTocByte(new Uint8Array([config << 3])).durationInSamples).toBe(samples);
+	});
+
+	test('frame count codes 1 and 2 hold two frames; code 3 reads the count from the next byte', () => {
+		const config = 19 << 3; // 20 ms CELT
+		expect(parseOpusTocByte(new Uint8Array([config | 1])).durationInSamples).toBe(1920);
+		expect(parseOpusTocByte(new Uint8Array([config | 2])).durationInSamples).toBe(1920);
+		expect(parseOpusTocByte(new Uint8Array([config | 3, 0b1000_0101])).durationInSamples).toBe(5 * 960);
+		expect(parseOpusTocByte(new Uint8Array([config | 3, 0b0011_1111])).durationInSamples).toBe(63 * 960);
+	});
+});
+
+describe('createVorbisComments', () => {
+	test('round-trips through readVorbisComments', () => {
+		const tags = {
+			title: 'Title',
+			description: 'Description',
+			artist: 'Artist',
+			album: 'Album',
+			albumArtist: 'Album artist',
+			genre: 'Genre',
+			date: new Date('2015-06-12T00:00:00Z'),
+			comment: 'Comment',
+			lyrics: 'Lyrics',
+			trackNumber: 3,
+			tracksTotal: 12,
+			discNumber: 1,
+			discsTotal: 2,
+			images: [{ data: new Uint8Array([1, 2, 3]), mimeType: 'image/png', kind: 'coverFront' as const }],
+		};
+		const header = new Uint8Array([0x03, ...[...'vorbis'].map(char => char.charCodeAt(0))]);
+		const bytes = createVorbisComments(header, tags, true);
+		expect([...bytes.subarray(0, 7)]).toEqual([...header]);
+
+		const read: MetadataTags = {};
+		readVorbisComments(bytes.subarray(7), read);
+		expect(read).toMatchObject({
+			...tags,
+			images: [{ data: new Uint8Array([1, 2, 3]), mimeType: 'image/png', kind: 'coverFront' }],
+		});
+
+		const withoutImages: MetadataTags = {};
+		readVorbisComments(createVorbisComments(new Uint8Array(0), tags, false), withoutImages);
+		expect(withoutImages.images).toBeUndefined();
+		expect(withoutImages.title).toBe('Title');
+	});
+});
+
+describe('extractAv1CodecInfoFromPacket', () => {
+	const info = (options: Av1SequenceHeaderOptions, before: number[][] = []) => {
+		// Temporal delimiter and padding OBUs before the sequence header are skipped
+		return extractAv1CodecInfoFromPacket(concatBytes(...before, av1SequenceHeaderObu(options)));
+	};
+	const base = {
+		profile: 0,
+		level: 8,
+		tier: 0,
+		bitDepth: 8,
+		monochrome: 0,
+		chromaSubsamplingX: 1,
+		chromaSubsamplingY: 1,
+		chromaSamplePosition: 0,
+		videoFullRangeFlag: 0,
+		colourPrimaries: 2,
+		transferCharacteristics: 2,
+		matrixCoefficients: 2,
+	};
+
+	test('reads a Main profile 8-bit 4:2:0 header after other OBUs', () => {
+		expect(info({ profile: 0 }, [[0x12, 0x00], [0x7a, 0x02, 0xaa, 0xbb]])).toEqual(base);
+	});
+
+	test.each([
+		['Main 10-bit', { profile: 0, highBitdepth: true }, { bitDepth: 10 }],
+		[
+			'High 4:4:4',
+			{ profile: 1, highBitdepth: true },
+			{ profile: 1, bitDepth: 10, chromaSubsamplingX: 0, chromaSubsamplingY: 0 },
+		],
+		[
+			'Professional 10-bit 4:2:2',
+			{ profile: 2, highBitdepth: true },
+			{ profile: 2, bitDepth: 10, chromaSubsamplingY: 0 },
+		],
+		['Professional 8-bit', { profile: 2 }, { profile: 2, chromaSubsamplingY: 0 }],
+		[
+			'Professional 12-bit 4:2:0 with a chroma sample position',
+			{ profile: 2, highBitdepth: true, twelveBit: true, subsampling: [1, 1], chromaSamplePosition: 2 },
+			{ profile: 2, bitDepth: 12, chromaSamplePosition: 2 },
+		],
+		[
+			'Professional 12-bit 4:2:2',
+			{ profile: 2, highBitdepth: true, twelveBit: true, subsampling: [1, 0] },
+			{ profile: 2, bitDepth: 12, chromaSubsamplingY: 0 },
+		],
+		[
+			'Professional 12-bit 4:4:4',
+			{ profile: 2, highBitdepth: true, twelveBit: true, subsampling: [0, 0] },
+			{ profile: 2, bitDepth: 12, chromaSubsamplingX: 0, chromaSubsamplingY: 0 },
+		],
+		[
+			'monochrome full range',
+			{ profile: 0, monochrome: true, fullRange: true },
+			{ monochrome: 1, videoFullRangeFlag: 1 },
+		],
+		[
+			'BT.2020 PQ colour description',
+			{ profile: 0, highBitdepth: true, colour: [9, 16, 9], fullRange: false },
+			{ bitDepth: 10, colourPrimaries: 9, transferCharacteristics: 16, matrixCoefficients: 9 },
+		],
+		[
+			'sRGB with an identity matrix (implicitly full range 4:4:4)',
+			{ profile: 1, colour: [1, 13, 0] },
+			{
+				profile: 1,
+				colourPrimaries: 1,
+				transferCharacteristics: 13,
+				matrixCoefficients: 0,
+				videoFullRangeFlag: 1,
+				chromaSubsamplingX: 0,
+				chromaSubsamplingY: 0,
+			},
+		],
+	] as [string, Av1SequenceHeaderOptions, object][])('reads %s', (_, options, expected) => {
+		expect(info(options)).toEqual({ ...base, ...expected });
+	});
+
+	test('takes level and tier from the first operating point, past timing and decoder model info', () => {
+		expect(info({
+			profile: 0,
+			level: 13,
+			tier: 1,
+			timing: { equalPictureInterval: 5, decoderModel: { bufferDelayLengthMinus1: 9 } },
+			initialDisplayDelay: true,
+			extraOperatingPoints: [[4, 0], [12, 0]],
+			colour: [1, 1, 1],
+		})).toEqual({
+			...base,
+			level: 13,
+			tier: 1,
+			colourPrimaries: 1,
+			transferCharacteristics: 1,
+			matrixCoefficients: 1,
+		});
+
+		// A level of 7 or below has no tier bit
+		expect(info({ profile: 0, level: 5, timing: {}, colour: [6, 6, 6] }))
+			.toEqual({ ...base, level: 5, colourPrimaries: 6, transferCharacteristics: 6, matrixCoefficients: 6 });
+	});
+
+	test('handles reduced still picture headers, frame ID numbers and the screen content tool variants', () => {
+		expect(info({ profile: 0, reducedStillPicture: true, level: 9, colour: [1, 1, 1] }))
+			.toEqual({ ...base, level: 9, colourPrimaries: 1, transferCharacteristics: 1, matrixCoefficients: 1 });
+		for (const screenContent of ['off', 'on', 'select'] as const) {
+			expect(info({ profile: 0, frameIdNumbers: true, orderHint: false, screenContent, colour: [5, 6, 7] }))
+				.toEqual({ ...base, colourPrimaries: 5, transferCharacteristics: 6, matrixCoefficients: 7 });
+		}
+	});
+
+	test('no sequence header, no info; colour info is only reported when present', () => {
+		expect(extractAv1CodecInfoFromPacket(new Uint8Array([0x12, 0x00, 0x32, 0x01, 0x00]))).toBe(null);
+		expect(av1CodecInfoHasColorInfo(base)).toBe(false);
+		expect(av1CodecInfoHasColorInfo({ ...base, colourPrimaries: 1 })).toBe(true);
+		expect(av1CodecInfoHasColorInfo({ ...base, transferCharacteristics: 16 })).toBe(true);
+		expect(av1CodecInfoHasColorInfo({ ...base, matrixCoefficients: 9 })).toBe(true);
 	});
 });

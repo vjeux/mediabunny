@@ -1022,3 +1022,135 @@ export const flacFile = (options: {
 	const block = concatBytes([0x80], u24be(34), streamInfo, new Uint8Array(16)); // last block, MD5 zeroed
 	return concatBytes(ascii('fLaC'), block, ...options.frames);
 };
+
+export type Av1SequenceHeaderOptions = {
+	profile: number;
+	reducedStillPicture?: boolean;
+	level?: number;
+	tier?: number;
+	timing?: { equalPictureInterval?: number; decoderModel?: { bufferDelayLengthMinus1: number } };
+	initialDisplayDelay?: boolean;
+	/** Extra operating points after the first: [seq_level_idx, seq_tier] */
+	extraOperatingPoints?: [number, number][];
+	frameIdNumbers?: boolean;
+	orderHint?: boolean;
+	screenContent?: 'select' | 'off' | 'on';
+	highBitdepth?: boolean;
+	twelveBit?: boolean;
+	monochrome?: boolean;
+	colour?: [number, number, number];
+	fullRange?: boolean;
+	/** Only read for profile 2 at 12 bits */
+	subsampling?: [number, number];
+	chromaSamplePosition?: number;
+};
+
+/** An AV1 sequence header OBU (with size field) built from the given fields. */
+export const av1SequenceHeaderObu = (options: Av1SequenceHeaderOptions) => {
+	const w = new BitWriter()
+		.writeBits(3, options.profile)
+		.writeFlag(false) // still_picture
+		.writeFlag(options.reducedStillPicture ?? false);
+	if (options.reducedStillPicture) {
+		w.writeBits(5, options.level ?? 8);
+	} else {
+		w.writeFlag(options.timing !== undefined);
+		const decoderModel = options.timing?.decoderModel;
+		if (options.timing) {
+			w.writeBits(32, 1001).writeBits(32, 60000);
+			const interval = options.timing.equalPictureInterval;
+			w.writeFlag(interval !== undefined);
+			if (interval !== undefined) {
+				// uvlc(): leading zeros, a one, then the remainder
+				const value = interval + 1;
+				const bits = Math.floor(Math.log2(value));
+				w.writeBits(bits, 0).writeBits(1, 1).writeBits(bits, value - 2 ** bits);
+			}
+			w.writeFlag(decoderModel !== undefined);
+			if (decoderModel) {
+				w.writeBits(5, decoderModel.bufferDelayLengthMinus1).writeBits(32, 1000);
+				w.writeBits(5, 10).writeBits(5, 10);
+			}
+		}
+		w.writeFlag(options.initialDisplayDelay ?? false);
+		const points: [number, number][] = [
+			[options.level ?? 8, options.tier ?? 0],
+			...(options.extraOperatingPoints ?? []),
+		];
+		w.writeBits(5, points.length - 1);
+		for (const [level, tier] of points) {
+			w.writeBits(12, 0).writeBits(5, level);
+			if (level > 7) {
+				w.writeBits(1, tier);
+			}
+			if (decoderModel) {
+				const n = decoderModel.bufferDelayLengthMinus1 + 1;
+				w.writeFlag(true).writeBits(n, 3).writeBits(n, 5).writeFlag(false);
+			}
+			if (options.initialDisplayDelay) {
+				w.writeFlag(true).writeBits(4, 9);
+			}
+		}
+	}
+	w.writeBits(4, 10).writeBits(4, 10).writeBits(11, 1919).writeBits(11, 1079); // max frame size 1920x1080
+	if (!options.reducedStillPicture) {
+		w.writeFlag(options.frameIdNumbers ?? false);
+		if (options.frameIdNumbers) {
+			w.writeBits(4, 5).writeBits(3, 2);
+		}
+	}
+	w.writeFlag(false).writeFlag(true).writeFlag(true); // 128x128 superblocks, filter intra, intra edge filter
+	if (!options.reducedStillPicture) {
+		w.writeFlag(true).writeFlag(true).writeFlag(true).writeFlag(true); // interintra, masked, warped, dual filter
+		w.writeFlag(options.orderHint ?? true);
+		if (options.orderHint ?? true) {
+			w.writeFlag(true).writeFlag(true); // jnt_comp, ref_frame_mvs
+		}
+		const screen = options.screenContent ?? 'select';
+		w.writeFlag(screen === 'select');
+		if (screen !== 'select') {
+			w.writeFlag(screen === 'on');
+		}
+		if (screen !== 'off') {
+			w.writeFlag(false).writeFlag(true); // seq_choose_integer_mv = 0, seq_force_integer_mv = 1
+		}
+		if (options.orderHint ?? true) {
+			w.writeBits(3, 6);
+		}
+	}
+	w.writeFlag(false).writeFlag(true).writeFlag(true); // superres, cdef, restoration
+	// color_config()
+	w.writeFlag(options.highBitdepth ?? false);
+	if (options.profile === 2 && options.highBitdepth) {
+		w.writeFlag(options.twelveBit ?? false);
+	}
+	if (options.profile !== 1) {
+		w.writeFlag(options.monochrome ?? false);
+	}
+	w.writeFlag(options.colour !== undefined);
+	for (const value of options.colour ?? []) {
+		w.writeBits(8, value);
+	}
+	const [cp, tc, mc] = options.colour ?? [2, 2, 2];
+	if (options.monochrome) {
+		w.writeFlag(options.fullRange ?? false);
+	} else if (!(cp === 1 && tc === 13 && mc === 0)) {
+		w.writeFlag(options.fullRange ?? false);
+		let [x, y] = options.profile === 0 ? [1, 1] : options.profile === 1 ? [0, 0] : [1, 0];
+		if (options.profile === 2 && options.highBitdepth && options.twelveBit) {
+			[x, y] = options.subsampling ?? [1, 1];
+			w.writeBits(1, x);
+			if (x) {
+				w.writeBits(1, y);
+			}
+		}
+		if (x && y) {
+			w.writeBits(2, options.chromaSamplePosition ?? 0);
+		}
+	}
+	w.writeFlag(false); // separate_uv_delta_q
+	w.writeFlag(false); // film_grain_params_present
+	w.writeTrailingBits();
+	const payload = w.toBytes();
+	return concatBytes([0x0a, payload.length], payload);
+};
