@@ -6,7 +6,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { parsePcmCodec, PCM_AUDIO_CODECS, PcmAudioCodec, VideoCodec, AudioCodec, OPUS_SAMPLE_RATE } from './codec';
+import {
+	parsePcmCodec,
+	PCM_AUDIO_CODECS,
+	PcmAudioCodec,
+	VideoCodec,
+	AudioCodec,
+	OPUS_SAMPLE_RATE,
+	toChromiumCompatibleAvcCodecString,
+} from './codec';
 import {
 	addAvcBitstreamRestriction,
 	AvcNalUnitType,
@@ -1090,6 +1098,13 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			};
 
 			if (isChromium() || isFirefox()) {
+				if (codec === 'avc' && isChromium()) {
+					this.decoderConfig = {
+						...this.decoderConfig,
+						codec: toChromiumCompatibleAvcCodecString(this.decoderConfig.codec),
+					};
+				}
+
 				if (codec === 'avc' && this.decoderConfig.description) {
 					const record = deserializeAvcDecoderConfigurationRecord(
 						toUint8Array(this.decoderConfig.description),
