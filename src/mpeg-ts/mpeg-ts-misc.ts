@@ -11,6 +11,61 @@ import { modEuclid } from '../misc';
 export const MPEG_TS_TIMESCALE = 90_000; // MPEG-TS timestamps run on a 90 kHz clock
 export const TIMESTAMP_MODULUS = 2 ** 33;
 export const TS_PACKET_SIZE = 188;
+/** How many bytes from the start of a file are enough to work out its packet layout. */
+export const TS_PACKET_LAYOUT_PROBE_SIZE = 1024;
+
+export type TsPacketLayout = {
+	/** The position of the first whole packet's sync byte. */
+	offset: number;
+	/** The distance between the sync bytes of consecutive packets. */
+	stride: number;
+};
+
+/**
+ * Determines the packet layout of a transport stream from its first bytes: plain 188-byte packets, 204-byte packets
+ * (with forward error correction) or 192-byte packets (with a 4-byte prefix, like M2TS). Captures cut at an arbitrary
+ * byte, or recordings with the recorder's own header in front, don't start with a whole packet; for those, the first
+ * position where several consecutive packets line up is used, like FFmpeg resyncs.
+ */
+export const findTsPacketLayout = (bytes: Uint8Array): TsPacketLayout | null => {
+	if (bytes[0] === 0x47 && bytes[TS_PACKET_SIZE] === 0x47) {
+		// Regular MPEG-TS
+		return { offset: 0, stride: TS_PACKET_SIZE };
+	} else if (bytes[0] === 0x47 && bytes[TS_PACKET_SIZE + 16] === 0x47) {
+		// MPEG-TS with Forward Error Correction
+		return { offset: 0, stride: TS_PACKET_SIZE + 16 };
+	} else if (bytes[4] === 0x47 && bytes[4 + TS_PACKET_SIZE + 4] === 0x47) {
+		// MPEG-2-TS (DVHS)
+		return { offset: 4, stride: TS_PACKET_SIZE + 4 };
+	}
+
+	// The file doesn't start with a whole packet. A stray 0x47 lining up by chance is likely enough with two packets,
+	// so require more of them here.
+	const REQUIRED_SYNC_BYTE_COUNT = 4;
+	const strides = [TS_PACKET_SIZE, TS_PACKET_SIZE + 16, TS_PACKET_SIZE + 4];
+
+	for (let offset = 0; offset < TS_PACKET_SIZE + 16; offset++) {
+		for (const stride of strides) {
+			if (offset + (REQUIRED_SYNC_BYTE_COUNT - 1) * stride >= bytes.length) {
+				continue;
+			}
+
+			let linesUp = true;
+			for (let i = 0; i < REQUIRED_SYNC_BYTE_COUNT; i++) {
+				if (bytes[offset + i * stride] !== 0x47) {
+					linesUp = false;
+					break;
+				}
+			}
+
+			if (linesUp) {
+				return { offset, stride };
+			}
+		}
+	}
+
+	return null;
+};
 
 export type TimestampWrapInfo = {
 	reference: number;
