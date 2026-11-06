@@ -210,48 +210,69 @@ test('Laced Opus frames at the end of a cluster get their own durations', async 
 		...frames.flat(),
 	]);
 
-	const file = new Uint8Array([
-		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('webm'))),
-		...element(
-			EBMLId.Segment,
-			element(EBMLId.Tracks, element(
-				EBMLId.TrackEntry,
-				element(EBMLId.TrackNumber, [1]),
-				element(EBMLId.TrackType, [2]),
-				element(EBMLId.CodecID, ascii('A_OPUS')),
-				element(EBMLId.CodecPrivate, [...ascii('OpusHead'), 1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]),
-			)),
-			// 100 ms of frames, which fit before the next cluster
-			element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), lace(0, [opus20ms, opus20ms, opus60ms])),
-			// 80 ms of frames, but the next cluster starts 50 ms later, so they're squeezed to fit
-			element(
-				EBMLId.Cluster,
-				element(EBMLId.Timestamp, [100]),
-				lace(0, [opus20ms, opus20ms, opus20ms, opus20ms]),
+	const readTimings = async (...clusters: number[][]) => {
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('webm'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, ascii('A_OPUS')),
+					element(EBMLId.CodecPrivate, [...ascii('OpusHead'), 1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]),
+				)),
+				...clusters,
 			),
-			// FFmpeg writes a CRC-32 before the Timestamp
-			element(
-				EBMLId.Cluster,
-				element(0xbf, [0, 0, 0, 0]),
-				element(EBMLId.Timestamp, [150]),
-				element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, ...opus20ms]),
-			),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		return packets.map(x => [x.timestamp, x.duration]);
+	};
+
+	expect(await readTimings(
+		// 100 ms of frames, which fit before the track's next block
+		element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), lace(0, [opus20ms, opus20ms, opus60ms])),
+		// 80 ms of frames, but the track's next block starts 50 ms later, so they're squeezed to fit
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [100]),
+			lace(0, [opus20ms, opus20ms, opus20ms, opus20ms]),
 		),
+		// FFmpeg writes a CRC-32 before the Timestamp
+		element(
+			EBMLId.Cluster,
+			element(0xbf, [0, 0, 0, 0]),
+			element(EBMLId.Timestamp, [150]),
+			element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, ...opus20ms]),
+		),
+	)).toEqual([
+		[0, 0.02], [0.02, 0.02], [0.04, 0.06],
+		[0.1, 0.012], [0.112, 0.013], [0.125, 0.012], [0.137, 0.013],
+		[0.15, 0],
 	]);
 
-	using input = new Input({
-		source: new BufferSource(file),
-		formats: ALL_FORMATS,
-	});
-
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	const packets: EncodedPacket[] = [];
-	for await (const packet of new EncodedPacketSink(track).packets()) {
-		packets.push(packet);
-	}
-
-	expect(packets.map(x => x.timestamp)).toEqual([0, 0.02, 0.04, 0.1, 0.112, 0.125, 0.137, 0.15]);
-	expect(packets.slice(0, 7).map(x => x.duration)).toEqual([0.02, 0.02, 0.06, 0.012, 0.013, 0.012, 0.013]);
+	// The next cluster's timestamp only serves as the base of its blocks' relative timestamps, so it's the track's
+	// next block, not the cluster's start, that bounds the lace (here 70 ms after the base, as when the next cluster
+	// starts with another track's block)
+	expect(await readTimings(
+		element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), lace(0, [opus20ms, opus20ms, opus20ms])),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [30]),
+			element(EBMLId.SimpleBlock, [0x81, 0, 70, 0x80, ...opus20ms]),
+		),
+	)).toEqual([[0, 0.02], [0.02, 0.02], [0.04, 0.02], [0.1, 0]]);
 });
