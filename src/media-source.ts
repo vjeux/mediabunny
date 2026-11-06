@@ -1305,7 +1305,7 @@ const colorAlphaSplitterWorkerCode = () => {
 		if (!cpuSourceBuffer || cpuSourceBuffer.byteLength !== sourceSize) {
 			cpuSourceBuffer = new Uint8Array(sourceSize);
 		}
-		await sourceFrame.copyTo(cpuSourceBuffer);
+		const layout = await sourceFrame.copyTo(cpuSourceBuffer);
 
 		if (format === 'RGBA' || format === 'BGRA') {
 			return splitInterleavedRgba(cpuSourceBuffer, format, sourceFrame);
@@ -1314,7 +1314,7 @@ const colorAlphaSplitterWorkerCode = () => {
 			|| format === 'I422A' || format === 'I422AP10' || format === 'I422AP12'
 			|| format === 'I444A' || format === 'I444AP10' || format === 'I444AP12'
 		) {
-			return splitPlanarYuvA(cpuSourceBuffer, format, sourceFrame);
+			return splitPlanarYuvA(cpuSourceBuffer, layout, format, sourceFrame);
 		}
 
 		throw new Error(`CPU color/alpha splitting does not support format '${format}'.`);
@@ -1383,6 +1383,7 @@ const colorAlphaSplitterWorkerCode = () => {
 
 	const splitPlanarYuvA = (
 		source: Uint8Array,
+		layout: PlaneLayout[],
 		format:
 			| 'I420A' | 'I420AP10' | 'I420AP12'
 			| 'I422A' | 'I422AP10' | 'I422AP12'
@@ -1441,6 +1442,18 @@ const colorAlphaSplitterWorkerCode = () => {
 
 		const alphaFormat = (is10 ? 'I420P10' : (is12 ? 'I420P12' : 'I420')) as VideoPixelFormat;
 
+		if (width % 2 === 1 || height % 2 === 1) {
+			return splitOddPlanarYuvA(
+				source,
+				layout,
+				colorFormat,
+				alphaFormat,
+				bytesPerSample,
+				neutralChroma,
+				sourceFrame,
+			);
+		}
+
 		// Color frame is simply a prefix of the combined bytes
 		const colorFrame = new VideoFrame(source.subarray(0, colorBytes), {
 			format: colorFormat,
@@ -1463,6 +1476,113 @@ const colorAlphaSplitterWorkerCode = () => {
 			} as const,
 			transfer: [alphaBuffer.buffer],
 		};
+		const alphaFrame = new VideoFrame(alphaBuffer, alphaInit);
+		return { colorFrame, alphaFrame };
+	};
+
+	/**
+	 * Firefox only accepts subsampled frames with even coded dimensions
+	 * (https://bugzilla.mozilla.org/show_bug.cgi?id=1899811), so both frames get padded and cropped via visibleRect.
+	 * Also, Firefox rounds the chroma planes of odd copies down instead of up
+	 * (https://bugzilla.mozilla.org/show_bug.cgi?id=2068332), so the planes are read through the copy's layout.
+	 */
+	const splitOddPlanarYuvA = (
+		source: Uint8Array,
+		layout: PlaneLayout[],
+		colorFormat: VideoPixelFormat,
+		alphaFormat: VideoPixelFormat,
+		bytesPerSample: number,
+		neutralChroma: number,
+		sourceFrame: VideoFrame,
+	) => {
+		const width = sourceFrame.visibleRect?.width ?? sourceFrame.codedWidth;
+		const height = sourceFrame.visibleRect?.height ?? sourceFrame.codedHeight;
+		const subX = colorFormat.startsWith('I444') ? 1 : 2;
+		const subY = colorFormat.startsWith('I420') ? 2 : 1;
+
+		// Copies a plane into a tightly packed target plane, repeating the edge into the padding, since some encoders
+		// scale the whole coded frame instead of cropping it
+		const copyPlane = (
+			planeIndex: number,
+			sourceWidth: number,
+			sourceHeight: number,
+			target: Uint8Array,
+			targetOffset: number,
+			targetWidth: number,
+			targetHeight: number,
+		) => {
+			const { offset, stride } = layout[planeIndex]!;
+			const nextOffset = layout[planeIndex + 1]?.offset ?? source.byteLength;
+			const rowBytes = Math.min(sourceWidth * bytesPerSample, stride);
+			const rows = Math.min(sourceHeight, Math.floor((nextOffset - offset) / stride));
+			const targetStride = targetWidth * bytesPerSample;
+
+			for (let y = 0; y < targetHeight; y++) {
+				const sourceStart = offset + Math.min(y, rows - 1) * stride;
+				const rowStart = targetOffset + y * targetStride;
+				target.set(source.subarray(sourceStart, sourceStart + rowBytes), rowStart);
+
+				for (let x = rowBytes; x < targetStride; x += bytesPerSample) {
+					target.copyWithin(rowStart + x, rowStart + rowBytes - bytesPerSample, rowStart + rowBytes);
+				}
+			}
+		};
+
+		const colorWidth = Math.ceil(width / subX) * subX;
+		const colorHeight = Math.ceil(height / subY) * subY;
+		const colorLumaBytes = colorWidth * colorHeight * bytesPerSample;
+		const colorChromaBytes = (colorWidth / subX) * (colorHeight / subY) * bytesPerSample;
+		const colorBuffer = new Uint8Array(colorLumaBytes + 2 * colorChromaBytes);
+		copyPlane(0, width, height, colorBuffer, 0, colorWidth, colorHeight);
+		for (const i of [1, 2]) {
+			copyPlane(
+				i,
+				Math.ceil(width / subX),
+				Math.ceil(height / subY),
+				colorBuffer,
+				colorLumaBytes + (i - 1) * colorChromaBytes,
+				colorWidth / subX,
+				colorHeight / subY,
+			);
+		}
+
+		const alphaWidth = width + (width % 2);
+		const alphaHeight = height + (height % 2);
+		const alphaLumaBytes = alphaWidth * alphaHeight * bytesPerSample;
+		const alphaBuffer = new Uint8Array(alphaLumaBytes + (alphaWidth / 2) * (alphaHeight / 2) * 2 * bytesPerSample);
+		copyPlane(3, width, height, alphaBuffer, 0, alphaWidth, alphaHeight);
+		if (bytesPerSample === 1) {
+			alphaBuffer.fill(neutralChroma, alphaLumaBytes);
+		} else {
+			new Uint16Array(alphaBuffer.buffer, alphaLumaBytes).fill(neutralChroma);
+		}
+
+		const visibleRect = { x: 0, y: 0, width, height };
+		const colorInit = {
+			format: colorFormat,
+			codedWidth: colorWidth,
+			codedHeight: colorHeight,
+			visibleRect,
+			timestamp: sourceFrame.timestamp,
+			duration: sourceFrame.duration ?? undefined,
+			transfer: [colorBuffer.buffer],
+		};
+		const alphaInit = {
+			format: alphaFormat,
+			codedWidth: alphaWidth,
+			codedHeight: alphaHeight,
+			visibleRect,
+			timestamp: sourceFrame.timestamp,
+			duration: sourceFrame.duration ?? undefined,
+			colorSpace: {
+				fullRange: true,
+				matrix: 'bt709',
+				primaries: 'bt709',
+				transfer: 'bt709',
+			} as const,
+			transfer: [alphaBuffer.buffer],
+		};
+		const colorFrame = new VideoFrame(colorBuffer, colorInit);
 		const alphaFrame = new VideoFrame(alphaBuffer, alphaInit);
 		return { colorFrame, alphaFrame };
 	};
