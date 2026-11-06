@@ -444,8 +444,9 @@ test('Vorbis timestamp gaps are kept in the granule positions', async () => {
 		}
 	}
 
-	// Muxes the packets, with a gap of the given duration after the 45th
-	const mux = async (gap: number, maximumPageDuration?: number) => {
+	// Muxes the packets, with a gap of the given duration after the given number of packets and the given number of
+	// samples trimmed off the end
+	const mux = async (gap: number, maximumPageDuration?: number, packetsBeforeGap = 45, trimmedSamples = 0) => {
 		const output = new Output({
 			format: new OggOutputFormat({ maximumPageDuration }),
 			target: new BufferTarget(),
@@ -455,9 +456,10 @@ test('Vorbis timestamp gaps are kept in the granule positions', async () => {
 		await output.start();
 
 		for (const [i, packet] of packets.entries()) {
-			const timestamp = packet.timestamp + (i >= 45 ? gap : 0);
+			const timestamp = packet.timestamp + (i >= packetsBeforeGap ? gap : 0);
+			const duration = packet.duration - (i === packets.length - 1 ? trimmedSamples / 44100 : 0);
 			await audioSource.add(
-				new EncodedPacket(packet.data, 'key', timestamp, packet.duration),
+				new EncodedPacket(packet.data, 'key', timestamp, duration),
 				i === 0 ? { decoderConfig } : undefined,
 			);
 		}
@@ -492,13 +494,14 @@ test('Vorbis timestamp gaps are kept in the granule positions', async () => {
 	const packetEnds = granulePositionsByLastPacket(gapless);
 	expect(packetEnds.size).toBe(3 + 100 - 1); // The first two header packets share a page
 
-	// With the gap, the 46th audio packet starts a new page (which it doesn't otherwise), and from that page on,
+	// With the gap, the 46th audio packet gets a page of its own (which it doesn't otherwise), and from that page on,
 	// granule positions are a second (44100 samples) ahead
 	const firstPacketAfterGap = 3 + 45;
 	expect(granulePositionsByLastPacket(await mux(0)).has(firstPacketAfterGap - 1)).toBe(false);
 	const gapped = await mux(1);
 	const gappedGranulePositions = granulePositionsByLastPacket(gapped);
 	expect(gappedGranulePositions.has(firstPacketAfterGap - 1)).toBe(true);
+	expect(gappedGranulePositions.has(firstPacketAfterGap)).toBe(true);
 
 	let pagesAfterGap = 0;
 	for (const [packetIndex, granulePosition] of gappedGranulePositions) {
@@ -515,4 +518,18 @@ test('Vorbis timestamp gaps are kept in the granule positions', async () => {
 		return await (await input.getPrimaryAudioTrack())!.computeDuration();
 	};
 	expect(await computeDuration(gapped) - await computeDuration(gapless)).toBeCloseTo(1, 10);
+
+	// Near the end of a trimmed stream, the gap doesn't share the final page with the end trimming, so that both
+	// can be read back: the packet after the gap has a page of its own, and the final page's granule position is the
+	// trimmed end, a second later
+	const trimmedPacketEnds = granulePositionsByLastPacket(await mux(0, 0.001, 98, 100));
+	const gappedTrimmed = await mux(1, undefined, 98, 100);
+	const gappedTrimmedGranulePositions = granulePositionsByLastPacket(gappedTrimmed);
+	expect([...gappedTrimmedGranulePositions.keys()].slice(-3)).toEqual([3 + 97, 3 + 98, 3 + 99]);
+	for (const [packetIndex, granulePosition] of gappedTrimmedGranulePositions) {
+		if (packetIndex >= 3) {
+			expect(granulePosition).toBe(trimmedPacketEnds.get(packetIndex)! + (packetIndex >= 3 + 98 ? 44100 : 0));
+		}
+	}
+	expect(trimmedPacketEnds.get(3 + 99)).toBe(packetEnds.get(3 + 99)! - 100);
 });

@@ -562,8 +562,11 @@ export class OggMuxer extends Muxer {
 
 		// With a start offset, the second audio packet flushes the page. This keeps the offset from sharing a page
 		// with end trimming, as both are signaled through the granule position and would be indistinguishable.
-		// This mirrors a requirement of the Vorbis spec.
-		const forcePageFlush = trackData.startOffsetInSamples > 0 && trackData.audioPacketCount === 1;
+		// This mirrors a requirement of the Vorbis spec. Likewise, a packet after a gap gets a page of its own, so that
+		// the gap isn't signaled on the final page, where readers couldn't tell it apart from end trimming (unless the
+		// stream ends with that packet).
+		const forcePageFlush = startsNewPage
+			|| (trackData.startOffsetInSamples > 0 && trackData.audioPacketCount === 1);
 		trackData.audioPacketCount++;
 
 		trackData.packetQueue.push({
