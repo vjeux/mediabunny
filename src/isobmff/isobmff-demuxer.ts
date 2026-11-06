@@ -2516,6 +2516,14 @@ export class IsobmffDemuxer extends Demuxer {
 							.map((x, i) => ({ presentationTimestamp: x.presentationTimestamp, sampleIndex: i }))
 							.sort((a, b) => a.presentationTimestamp - b.presentationTimestamp);
 
+						// When fragments don't start a GOP, a sample's successor in presentation order can be a B-frame
+						// in the next fragment, leaving a gap in this one. No frame lasts longer than the longest
+						// decode duration, so that caps the durations derived from the gaps.
+						let maxDecodeDuration = 0;
+						for (const sample of trackData.samples) {
+							maxDecodeDuration = Math.max(maxDecodeDuration, sample.duration);
+						}
+
 						for (let i = 0; i < trackData.presentationTimestamps.length; i++) {
 							const currentEntry = trackData.presentationTimestamps[i]!;
 							const currentSample = trackData.samples[currentEntry.sampleIndex]!;
@@ -2529,7 +2537,9 @@ export class IsobmffDemuxer extends Demuxer {
 								const nextEntry = trackData.presentationTimestamps[i + 1]!;
 								const duration = nextEntry.presentationTimestamp - currentEntry.presentationTimestamp;
 
-								currentSample.duration = duration;
+								currentSample.duration = maxDecodeDuration > 0
+									? Math.min(duration, maxDecodeDuration)
+									: duration;
 							}
 						}
 
