@@ -864,7 +864,8 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		if (currentPage.headerStartPos === startPosition.startPage.headerStartPos) {
 			currentTimestampInSamples = firstTimestampInSamples;
 			currentTimestampIsCorrect = true;
-			currentSegmentIndex = 0;
+			// Not 0: the page may begin with the end of the last header packet, which readPacket wouldn't read there
+			currentSegmentIndex = startPosition.startSegmentIndex;
 		} else {
 			// Holds since lowPage, if not the start page, came out of the bisection, which skips such pages
 			assert(currentPage.granulePosition !== -1);

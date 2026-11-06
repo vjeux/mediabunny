@@ -1534,6 +1534,25 @@ test('Ogg: Continuation pages after lost pages', async () => {
 		expect(lookup.byteLength).toBe(3);
 		expect(lookup.timestamp).toBeLessThanOrEqual(orphanOnly.packets[i]!.timestamp);
 	}
+
+	// Without lost pages, a page continuing a packet is read as before, here the first audio page, which begins with
+	// the end of the comment header
+	const tags = opusTags([ascii(`A=${'x'.repeat(600)}`)]);
+	const intact = await readPackets(concatList([
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPage({ granule: -1, sequence: 1, lacing: [255, 255], data: tags.subarray(0, 510) }),
+		oggPage({
+			headerType: 1,
+			granule: 312 + 9600,
+			sequence: 2,
+			lacing: [tags.length - 510, ...Array<number>(10).fill(3)],
+			data: concatList([tags.subarray(510), ...Array<Bytes>(10).fill(OPUS_PACKET)]),
+		}),
+		oggPacketsPage({ headerType: 4, granule: 312 + 19200, sequence: 3 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+	]));
+	const intactTimestamps = intact.packets.map(x => Math.round(x.timestamp * 48000));
+	expect(intactTimestamps).toEqual(Array.from({ length: 20 }, (_, i) => 960 * i));
+	expect(intact.lookups).toEqual(intact.packets);
 });
 
 test('Ogg: Garbage between pages', async () => {
