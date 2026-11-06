@@ -603,8 +603,10 @@ const checkLookups = async (
 		problems.push('getNextPacket walk returns extra packets');
 	}
 
+	// computeDuration() is the end of the last packet (in presentation order)
 	const duration = await track.computeDuration();
-	const end = Math.max(...actual.map(packet => packet.timestamp + packet.duration));
+	const lastPacket = sorted[sorted.length - 1]!;
+	const end = lastPacket.timestamp + lastPacket.duration;
 	if (checkDuration && Math.abs(duration - end) > 1e-9) {
 		problems.push(`computeDuration() = ${duration}, last packet ends at ${end}`);
 	}
