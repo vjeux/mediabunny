@@ -240,8 +240,11 @@ test('UrlSource rejects Range headers it cannot map onto the resource', () => {
 			.toThrow(TypeError);
 	}
 
-	expect(() => new UrlSource('https://example.com/a.mp4', { requestInit: { headers: { Range: 'bytes=100-' } } }))
-		.not.toThrow();
+	// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+	for (const range of ['bytes=100-', 'Bytes=100-199', 'BYTES=0-0']) {
+		expect(() => new UrlSource('https://example.com/a.mp4', { requestInit: { headers: { Range: range } } }))
+			.not.toThrow();
+	}
 });
 
 test('UrlSource reads the full decoded body of a compressed response', async () => {

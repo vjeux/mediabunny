@@ -1336,7 +1336,8 @@ export class UrlSource extends PathedSource {
 	}
 }
 
-const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/;
+// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/i;
 const parseByteRangeHeader = (value: string) => {
 	const match = BYTE_RANGE_REGEX.exec(value.trim());
 	if (!match) {
