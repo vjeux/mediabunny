@@ -1678,7 +1678,9 @@ export class MatroskaDemuxer extends Demuxer {
 			}; break;
 
 			case EBMLId.OutputSamplingFrequency: {
-				if (this.currentTrack?.info?.type !== 'audio') break;
+				if (this.currentTrack?.info?.type !== 'audio') {
+					break;
+				}
 
 				const outputSampleRate = readFloat(slice, size);
 				if (outputSampleRate > 0 && Number.isFinite(outputSampleRate)) {
