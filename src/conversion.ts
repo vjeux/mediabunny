@@ -2297,28 +2297,49 @@ export class Conversion {
 				quality,
 			});
 
+			// Fallback parameters, closest first (keep the channel count if possible), and those that change
+			// explicitly requested parameters last
+			const countOverriddenParams = (params: { numberOfChannels: number; sampleRate: number }) =>
+				Number(trackOptions.numberOfChannels !== undefined && params.numberOfChannels !== numberOfChannels)
+				+ Number(trackOptions.sampleRate !== undefined && params.sampleRate !== sampleRate);
+			const fallbackParams: { numberOfChannels: number; sampleRate: number }[] = [];
+			for (const params of [
+				{ numberOfChannels, sampleRate: FALLBACK_SAMPLE_RATE },
+				{ numberOfChannels: FALLBACK_NUMBER_OF_CHANNELS, sampleRate },
+				{ numberOfChannels: FALLBACK_NUMBER_OF_CHANNELS, sampleRate: FALLBACK_SAMPLE_RATE },
+			]) {
+				const isNew = [{ numberOfChannels, sampleRate }, ...fallbackParams]
+					.every(x => x.numberOfChannels !== params.numberOfChannels || x.sampleRate !== params.sampleRate);
+				if (isNew) {
+					fallbackParams.push(params);
+				}
+			}
+			fallbackParams.sort((a, b) => countOverriddenParams(a) - countOverriddenParams(b));
+
 			if (
 				!encodableCodecs.some(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec))
 				&& audioCodecs.some(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec))
-				&& (numberOfChannels !== FALLBACK_NUMBER_OF_CHANNELS || sampleRate !== FALLBACK_SAMPLE_RATE)
+				&& fallbackParams.length > 0
 			) {
 				// We could not find a compatible non-PCM codec despite the container supporting them. This can be
 				// caused by strange channel count or sample rate configurations. Therefore, let's try again but with
 				// fallback parameters.
 
-				const encodableCodecsWithDefaultParams = await getEncodableAudioCodecs(audioCodecs, {
-					numberOfChannels: FALLBACK_NUMBER_OF_CHANNELS,
-					sampleRate: FALLBACK_SAMPLE_RATE,
-					quality,
-				});
+				for (const params of fallbackParams) {
+					const encodableCodecsWithFallbackParams = await getEncodableAudioCodecs(audioCodecs, {
+						...params,
+						quality,
+					});
 
-				const nonPcmCodec = encodableCodecsWithDefaultParams
-					.find(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec));
-				if (nonPcmCodec) {
-					// We are able to encode using a non-PCM codec, but it'll require resampling
-					outputCodec = nonPcmCodec;
-					numberOfChannels = FALLBACK_NUMBER_OF_CHANNELS;
-					sampleRate = FALLBACK_SAMPLE_RATE;
+					const nonPcmCodec = encodableCodecsWithFallbackParams
+						.find(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec));
+					if (nonPcmCodec) {
+						// We are able to encode using a non-PCM codec, but it'll require resampling
+						outputCodec = nonPcmCodec;
+						numberOfChannels = params.numberOfChannels;
+						sampleRate = params.sampleRate;
+						break;
+					}
 				}
 			} else {
 				outputCodec = encodableCodecs[0] ?? null;
