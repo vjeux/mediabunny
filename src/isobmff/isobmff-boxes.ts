@@ -337,6 +337,9 @@ export const ftyp = (details: {
 		u32(minorVersion), // Minor version
 		// Compatible brands
 		ascii('isom'),
+		// The roll sample groups written for audio tracks need a brand that supports them; Opus in ISOBMFF (4.3.6.2)
+		// requires one, as 'iso2' is
+		ascii('iso2'),
 		details.holdsAvc ? ascii('avc1') : [],
 		// "It SHALL have the av01 brand among the compatible brands array of the FileTypeBox" (AV1-ISOBMFF, 2.1)
 		details.holdsAv1 ? ascii('av01') : [],

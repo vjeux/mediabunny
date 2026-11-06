@@ -751,23 +751,36 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
 
-test('AV1 files list the av01 brand among the compatible brands', async () => {
-	// AV1-ISOBMFF, Section 2.1: "It SHALL have the av01 brand among the compatible brands array of the FileTypeBox"
-	const compatibleBrands = async (format: Mp4OutputFormat, codec: 'av1' | 'avc') => {
+test('Files list the brands that AV1 and Opus tracks require among the compatible brands', async () => {
+	// AV1-ISOBMFF, Section 2.1: "It SHALL have the av01 brand among the compatible brands array of the FileTypeBox".
+	// Opus in ISOBMFF, Section 4.3.6.2: "the compatible_brands field in the File Type Box shall contain at least one
+	// brand which requires support for roll groups", which 'iso2' and later structural brands do.
+	const compatibleBrands = async (format: Mp4OutputFormat, codec: 'av1' | 'avc' | 'opus') => {
 		const output = new Output({ format, target: new BufferTarget() });
-		const source = new EncodedVideoPacketSource(codec);
-		output.addVideoTrack(source);
-		await output.start();
-		await source.add(new EncodedPacket(new Uint8Array([0x12, 0x00, 0x32, 0x00]), 'key', 0, 1 / 30), {
-			decoderConfig: codec === 'av1'
-				? { codec: 'av01.0.04M.08', codedWidth: 640, codedHeight: 360 }
-				: {
-						codec: 'avc1.42001f',
-						codedWidth: 640,
-						codedHeight: 360,
-						description: new Uint8Array([1, 0x42, 0, 0x1f, 0xff, 0xe0, 0]),
-					},
-		});
+		if (codec === 'opus') {
+			const source = new EncodedAudioPacketSource('opus');
+			output.addAudioTrack(source);
+			await output.start();
+			for (let i = 0; i < 3; i++) {
+				await source.add(new EncodedPacket(new Uint8Array([0xfc, 0xff, 0xfe]), 'key', i * 0.02, 0.02), {
+					decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 },
+				});
+			}
+		} else {
+			const source = new EncodedVideoPacketSource(codec);
+			output.addVideoTrack(source);
+			await output.start();
+			await source.add(new EncodedPacket(new Uint8Array([0x12, 0x00, 0x32, 0x00]), 'key', 0, 1 / 30), {
+				decoderConfig: codec === 'av1'
+					? { codec: 'av01.0.04M.08', codedWidth: 640, codedHeight: 360 }
+					: {
+							codec: 'avc1.42001f',
+							codedWidth: 640,
+							codedHeight: 360,
+							description: new Uint8Array([1, 0x42, 0, 0x1f, 0xff, 0xe0, 0]),
+						},
+			});
+		}
 		await output.finalize();
 
 		const bytes = new Uint8Array(output.target.buffer!);
@@ -785,4 +798,9 @@ test('AV1 files list the av01 brand among the compatible brands', async () => {
 	expect(await compatibleBrands(new Mp4OutputFormat({ fastStart: 'fragmented' }), 'av1')).toContain('av01');
 	expect(await compatibleBrands(new Mp4OutputFormat({ fastStart: 'in-memory' }), 'av1')).toContain('av01');
 	expect(await compatibleBrands(new Mp4OutputFormat(), 'avc')).not.toContain('av01');
+
+	const opusBrands = await compatibleBrands(new Mp4OutputFormat(), 'opus');
+	expect(opusBrands.some(brand => /^iso[2-9]$/.test(brand))).toBe(true);
+	const fragmentedOpusBrands = await compatibleBrands(new Mp4OutputFormat({ fastStart: 'fragmented' }), 'opus');
+	expect(fragmentedOpusBrands.some(brand => /^iso[2-9]$/.test(brand))).toBe(true);
 });
