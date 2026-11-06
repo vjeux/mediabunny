@@ -3551,8 +3551,35 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let timestampOffset = 0;
 		let nextTimestamp: number | null = null; // Where the audio continues seamlessly
 
-		// `captureTime` is when the sample's first audio frame was captured (in seconds, performance.now() time base)
-		const onAudioSample = (audioSample: AudioSample, captureTime = performance.now() / 1000) => {
+		const addToEncoder = (audioSample: AudioSample) => {
+			void this._encoder.add(audioSample, true)
+				.catch((error) => {
+					errored = true;
+
+					this._abortController?.abort();
+					this._promiseWithResolvers.reject(error);
+					void this._audioContext?.suspend();
+				});
+		};
+
+		const encodeNow = (audioSample: AudioSample) => {
+			if (this._encoder.getQueueSize() >= 8) {
+				// Drop data if the encoder is overloaded; the gap it leaves gets filled with silence
+				audioSample.close();
+				return;
+			}
+
+			addToEncoder(audioSample);
+		};
+
+		// Everything about a sample, like whether it was captured during a pause and its timestamp, is decided here, as
+		// it arrives; `encode` then hands it to the encoder. `captureTime` is when the sample's first audio frame was
+		// captured (in seconds, performance.now() time base).
+		const onAudioSample = (
+			audioSample: AudioSample,
+			encode: (audioSample: AudioSample) => void,
+			captureTime = performance.now() / 1000,
+		) => {
 			if (errored) {
 				audioSample.close();
 				return;
@@ -3620,22 +3647,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 			this._resumedSinceLastSample = false;
 			nextTimestamp = timestamp + audioSample.duration;
 
-			if (this._encoder.getQueueSize() >= 8) {
-				// Drop data if the encoder is overloaded; the gap it leaves gets filled with silence
-				audioSample.close();
-				return;
-			}
-
 			audioSample.setTimestamp(timestamp);
-
-			void this._encoder.add(audioSample, true)
-				.catch((error) => {
-					errored = true;
-
-					this._abortController?.abort();
-					this._promiseWithResolvers.reject(error);
-					void this._audioContext?.suspend();
-				});
+			encode(audioSample);
 		};
 
 		// An ended track can't produce any more data, so we close this source. Otherwise, the output would keep
@@ -3661,20 +3674,53 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 				track: this._track,
 				maxBufferSize: MEDIA_STREAM_AUDIO_BUFFER_SIZE,
 			});
-			const consumer = new WritableStream<AudioData>({
-				write: async (audioData) => {
-					// The audio buffered during a stall arrives in one burst. Wait for the encoder to catch up rather
-					// than dropping it; meanwhile, the processor keeps buffering.
-					while (this._encoder.getQueueSize() >= 8 && !errored && !this._closingPromise) {
+			// The audio buffered during a stall arrives in one burst. Rather than dropping what the encoder can't take
+			// yet, queue it and feed it to the encoder as it catches up. The stream itself is read right away, so that
+			// each sample is handled as it arrives (a sample captured during a pause must not be recorded just because
+			// the encoder was busy until after the resume).
+			const pendingSamples: AudioSample[] = [];
+			let draining = false;
+			const drainPendingSamples = async () => {
+				if (draining) {
+					return;
+				}
+
+				draining = true;
+				while (pendingSamples.length > 0 && !errored && !this._closingPromise) {
+					if (this._encoder.getQueueSize() >= 8) {
 						await wait(2);
+						continue;
 					}
 
-					if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
+					addToEncoder(pendingSamples.shift()!);
+				}
+				draining = false;
+
+				if (errored || this._closingPromise) {
+					for (const audioSample of pendingSamples) {
+						audioSample.close();
+					}
+					pendingSamples.length = 0;
+				}
+			};
+			const encodeWhenReady = (audioSample: AudioSample) => {
+				pendingSamples.push(audioSample);
+				if (pendingSamples.length > MEDIA_STREAM_AUDIO_BUFFER_SIZE) {
+					// The encoder can't keep up for good; drop the oldest audio, like the processor itself would
+					pendingSamples.shift()!.close();
+				}
+
+				void drainPendingSamples();
+			};
+
+			const consumer = new WritableStream<AudioData>({
+				write: (audioData) => {
+					if (this._closingPromise || this._connectedTrack!.output.state !== 'started') {
 						audioData.close();
 						return;
 					}
 
-					onAudioSample(new AudioSample(audioData));
+					onAudioSample(new AudioSample(audioData), encodeWhenReady);
 				},
 			});
 
@@ -3727,7 +3773,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 				totalDuration += event.inputBuffer.duration;
 
 				for (const audioSample of iterator) {
-					onAudioSample(audioSample, bufferCaptureTime + audioSample.timestamp - bufferTimestamp);
+					onAudioSample(audioSample, encodeNow, bufferCaptureTime + audioSample.timestamp - bufferTimestamp);
 				}
 			};
 		}
