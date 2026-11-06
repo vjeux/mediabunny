@@ -2361,12 +2361,13 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 			if (this.stampsOutputsItself && !this.customDecoder) {
 				// Some packets decode to nothing (discard padding, for example), so pair this output with the queued
-				// packet start closest to where the audio continues instead of just the next one
+				// packet start closest to where the audio continues instead of just the next one. Equal starts (laced
+				// frames sharing one timestamp, for example) each keep their own output.
 				if (this.currentTimestamp !== null) {
 					const current = this.currentTimestamp;
 					while (
 						this.queuedOutputs.length > 1
-						&& Math.abs(this.queuedOutputs[1]! - current) <= Math.abs(this.queuedOutputs[0]! - current)
+						&& Math.abs(this.queuedOutputs[1]! - current) < Math.abs(this.queuedOutputs[0]! - current)
 					) {
 						this.queuedOutputs.shift();
 					}
@@ -2374,8 +2375,9 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 				// Packet timestamps are often off by a frame or more (rounding, laced frames, jitter), and decoded
 				// audio can run a little longer or shorter than them, so the audio just continues. Only where a
-				// packet's audio starts at least 0.1 s after the previous one's ends (a gap, as FFmpeg's aresample
-				// defines it with min_hard_comp) does it skip ahead. It never moves back, which would play audio twice.
+				// packet's audio starts at least 0.1 s after both the previous packet's audio ends and where the
+				// decoded audio has got to (a gap, as FFmpeg's aresample defines it with min_hard_comp) does it skip
+				// ahead. It never moves back, which would play audio twice.
 				const queued = this.queuedOutputs.shift();
 				if (this.currentTimestamp === null) {
 					this.currentTimestamp = queued ?? sample.timestamp;
@@ -2383,7 +2385,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 					queued !== undefined
 					&& this.expectedQueuedTimestamp !== null
 					&& queued - this.expectedQueuedTimestamp >= 0.1
-					&& queued > this.currentTimestamp
+					&& queued - this.currentTimestamp >= 0.1
 				) {
 					this.currentTimestamp = queued;
 				}

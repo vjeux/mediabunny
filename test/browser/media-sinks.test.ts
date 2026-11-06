@@ -332,6 +332,61 @@ test('Decoded audio keeps the gaps between packets', async () => {
 	}
 });
 
+test('Decoded audio stays contiguous across packets that share a timestamp', async () => {
+	using input = new Input({
+		source: new UrlSource('/demo.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+
+	// Remux two seconds of the AAC track with a run of eight packets stamped at the first one's timestamp, like the
+	// laced frames of a Matroska block with no known durations
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	let index = 0;
+	let runTimestamp = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		if (packet.timestamp >= 2) {
+			break;
+		}
+
+		if (index === 20) {
+			runTimestamp = packet.timestamp;
+		}
+
+		const timestamp = index >= 20 && index < 28 ? runTimestamp : packet.timestamp;
+		await source.add(packet.clone({ timestamp }), { decoderConfig });
+		index++;
+	}
+	await output.finalize();
+
+	using laceInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const laceTrack = await laceInput.getPrimaryAudioTrack();
+	assert(laceTrack);
+
+	let previousEnd: number | null = null;
+	for await (using sample of new AudioSampleSink(laceTrack).samples()) {
+		if (previousEnd !== null) {
+			expect(sample.timestamp).toBeCloseTo(previousEnd, 4);
+		}
+
+		previousEnd = sample.timestamp + sample.duration;
+	}
+});
+
 test('Decoded audio stays in order when a packet decodes to nothing', async () => {
 	// Some packets decode to no audio at all (discard padding, for example); simulate one by dropping its output
 	const OriginalAudioDecoder = globalThis.AudioDecoder;
