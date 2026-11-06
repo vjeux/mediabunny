@@ -952,6 +952,33 @@ test('Conversion metadata tags, modified', async () => {
 	expect(Object.keys(readTags.raw!).length).toBe(2);
 });
 
+test('Read the ID3v1 tag behind an ID3v2 tag without text, MP3', async () => {
+	// Like files tagged by Windows Media Player, whose ID3v2 tag only holds PRIV frames, with the title left in ID3v1
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const priv = [...ascii('PeakValue'), 0, 0x05, 0x53, 0, 0];
+	const frame = [...ascii('PRIV'), 0, 0, 0, priv.length, 0, 0, ...priv];
+	const id3V2Tag = [...ascii('ID3'), 3, 0, 0, 0, 0, 0, frame.length, ...frame];
+
+	const mp3Frames = new Uint8Array(3 * 417);
+	for (let i = 0; i < 3; i++) {
+		mp3Frames.set([0xff, 0xfb, 0x90, 0x00], i * 417);
+	}
+
+	const id3V1Tag = new Uint8Array(128);
+	id3V1Tag.set([...ascii('TAG'), ...ascii('Sample title')]);
+	id3V1Tag[127] = 12; // Genre: Other
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...id3V2Tag, ...mp3Frames, ...id3V1Tag])),
+		formats: ALL_FORMATS,
+	});
+
+	const tags = await input.getMetadataTags();
+	expect(tags.title).toBe('Sample title');
+	expect(tags.genre).toBe('Other');
+	expect(tags.raw!['PRIV']).toEqual(new Uint8Array(priv));
+});
+
 test('Read ID3v2 tags from WAV file', async () => {
 	const filePath = path.join(import.meta.dirname, '../public/glitch-hop-is-dead.wav');
 
