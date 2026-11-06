@@ -153,7 +153,7 @@ Mediabunny provides the [`Quality`](../api/Quality) class as a way to describe t
 
 #### Qualitative quality
 
-Qualitative qualities are defined abstractly will automatically map to an underlying bitrate or quantizer based on codec and media parameters (such as video dimensions).
+Qualitative qualities are defined abstractly will automatically map to an underlying bitrate or quantizer based on codec and media parameters (such as video dimensions and, above 30 fps, frame rate).
 
 ```ts
 import { Quality } from 'mediabunny';
