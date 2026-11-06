@@ -291,6 +291,8 @@ type Fragment = {
 	moofOffset: number;
 	moofSize: number;
 	implicitBaseDataOffset: number;
+	/** Where the data of a skipped traf lies, so the implicit base data offset can move past it. */
+	skippedTraf: { baseDataOffset: number; dataEnd: number | null; defaultSampleSize: number | null } | null;
 	trackData: Map<InternalTrack['id'], FragmentTrackData>;
 	psshBoxes: PsshBox[];
 	sampleCount: number;
@@ -2360,6 +2362,7 @@ export class IsobmffDemuxer extends Demuxer {
 					moofOffset: startPos,
 					moofSize: boxInfo.totalSize,
 					implicitBaseDataOffset: startPos,
+					skippedTraf: null,
 					trackData: new Map(),
 					psshBoxes: [],
 					sampleCount: 0,
@@ -2380,6 +2383,7 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				this.isReadingTraf = true;
+				this.currentFragment.skippedTraf = null;
 				try {
 					this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 				} finally {
@@ -2478,21 +2482,8 @@ export class IsobmffDemuxer extends Demuxer {
 				const defaultBaseIsMoof = Boolean(flags & 0x020000);
 
 				const trackId = readU32Be(slice);
-				const track = this.idToTrack.get(trackId);
-				if (!track) {
-					// We don't care about this track
-					break;
-				}
-
-				if (this.currentFragment.trackData.has(trackId)) {
-					Logging._warn(`Multiple traf boxes for track ${trackId} in the same moof box; skipping.`);
-					break;
-				}
-
 				const defaults = this.fragmentTrackDefaults.get(trackId);
-
-				this.currentTrack = track;
-				track.currentFragmentState = {
+				const fragmentState: FragmentTrackState = {
 					baseDataOffset: this.currentFragment.implicitBaseDataOffset,
 					sampleDescriptionIndex: defaults?.defaultSampleDescriptionIndex ?? null,
 					defaultSampleDuration: defaults?.defaultSampleDuration ?? null,
@@ -2503,25 +2494,44 @@ export class IsobmffDemuxer extends Demuxer {
 				};
 
 				if (baseDataOffsetPresent) {
-					track.currentFragmentState.baseDataOffset = readU64Be(slice);
+					fragmentState.baseDataOffset = readU64Be(slice);
 				} else if (defaultBaseIsMoof) {
-					track.currentFragmentState.baseDataOffset = this.currentFragment.moofOffset;
+					fragmentState.baseDataOffset = this.currentFragment.moofOffset;
 				}
 				if (sampleDescriptionIndexPresent) {
-					track.currentFragmentState.sampleDescriptionIndex = readU32Be(slice);
+					fragmentState.sampleDescriptionIndex = readU32Be(slice);
 				}
 				if (defaultSampleDurationPresent) {
-					track.currentFragmentState.defaultSampleDuration = readU32Be(slice);
+					fragmentState.defaultSampleDuration = readU32Be(slice);
 				}
 				if (defaultSampleSizePresent) {
-					track.currentFragmentState.defaultSampleSize = readU32Be(slice);
+					fragmentState.defaultSampleSize = readU32Be(slice);
 				}
 				if (defaultSampleFlagsPresent) {
-					track.currentFragmentState.defaultSampleFlags = readU32Be(slice);
+					fragmentState.defaultSampleFlags = readU32Be(slice);
 				}
 				if (durationIsEmpty) {
-					track.currentFragmentState.defaultSampleDuration = 0;
+					fragmentState.defaultSampleDuration = 0;
 				}
+
+				const track = this.idToTrack.get(trackId);
+				const isDuplicate = this.currentFragment.trackData.has(trackId);
+				if (isDuplicate) {
+					Logging._warn(`Multiple traf boxes for track ${trackId} in the same moof box; skipping.`);
+				}
+
+				if (!track || isDuplicate) {
+					// We don't care about this traf, but a later traf's data may start where this one's ends
+					this.currentFragment.skippedTraf = {
+						baseDataOffset: fragmentState.baseDataOffset,
+						dataEnd: null,
+						defaultSampleSize: fragmentState.defaultSampleSize,
+					};
+					break;
+				}
+
+				this.currentTrack = track;
+				track.currentFragmentState = fragmentState;
 			}; break;
 
 			case 'tfdt': {
@@ -2539,6 +2549,47 @@ export class IsobmffDemuxer extends Demuxer {
 
 			case 'trun': {
 				const track = this.currentTrack;
+				const skippedTraf = this.currentFragment?.skippedTraf;
+				if (!track?.currentFragmentState && skippedTraf) {
+					// Only find out where the run's data ends, for the implicit base data offset of later trafs
+					slice.skip(1); // Version
+					const flags = readU24Be(slice);
+					const sampleCount = readU32Be(slice);
+					const dataOffset = flags & 0x000001 ? readI32Be(slice) : null;
+					if (flags & 0x000004) {
+						slice.skip(4); // First sample flags
+					}
+
+					const sampleSizePresent = Boolean(flags & 0x000200);
+					const entrySize = 4 * [0x000100, 0x000200, 0x000400, 0x000800].filter(x => flags & x).length;
+					let dataSize: number;
+
+					if (sampleSizePresent) {
+						dataSize = 0;
+						const entryCount = Math.min(sampleCount, Math.floor((boxEndPos - slice.filePos) / entrySize));
+						const sizeOffset = flags & 0x000100 ? 4 : 0;
+
+						for (let i = 0; i < entryCount; i++) {
+							const entryStartPos = slice.filePos;
+							slice.skip(sizeOffset);
+							dataSize += readU32Be(slice);
+							slice.filePos = entryStartPos + entrySize;
+						}
+					} else if (skippedTraf.defaultSampleSize !== null) {
+						dataSize = sampleCount * skippedTraf.defaultSampleSize;
+					} else {
+						break;
+					}
+
+					const dataStart = dataOffset !== null
+						? skippedTraf.baseDataOffset + dataOffset
+						: skippedTraf.dataEnd ?? skippedTraf.baseDataOffset;
+					skippedTraf.dataEnd = dataStart + dataSize;
+					this.currentFragment!.implicitBaseDataOffset = skippedTraf.dataEnd;
+
+					break;
+				}
+
 				if (!track?.currentFragmentState || !this.currentFragment) {
 					break;
 				}
