@@ -590,11 +590,11 @@ test('MP4: Encryption subsamples exceeding the sample', async () => {
 
 test('MP4: Sample table failing to parse', async () => {
 	// A failed parse used to leave a half-built sample table behind, which later calls then tripped over
-	const truncatedStco = fullBox('stco', 0, 0, u32(1000), u32(0));
+	const invalidStz2 = fullBox('stz2', 0, 0, zeros(3), u8(3), u32(3)); // 3-bit field size doesn't exist
 	using input = new Input({
 		source: new BufferSource(mp4([trak({
 			handler: 'vide',
-			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), stsz([4, 4, 4]), truncatedStco],
+			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), invalidStz2, stco([0])],
 		})])),
 		formats: ALL_FORMATS,
 	});
@@ -603,7 +603,8 @@ test('MP4: Sample table failing to parse', async () => {
 	const firstError = await sink.getFirstPacket().catch((error: unknown) => error);
 	const secondError = await sink.getFirstPacket().catch((error: unknown) => error);
 
-	expect(firstError).toBeInstanceOf(RangeError);
+	expect(firstError).toBeInstanceOf(Error);
+	expect(String(firstError)).toMatch(/stz2/);
 	expect(secondError).toEqual(firstError);
 });
 
@@ -614,6 +615,31 @@ test('MP4: trun outside of traf', async () => {
 		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('tfdt', 0, 0, u32(0)), fullBox('trun', 0, 0, u32(1))),
 		box('mdat', zeros(16)),
 	]));
+});
+
+test('MP4: Box fields running past the end of the parent box', async () => {
+	// A broken size field (a single flipped byte in real files) made a box's fixed fields run past the end of its
+	// parent, which failed the whole file with an internal error. Such a box is now skipped instead.
+	const goodTrak = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), id: 1 });
+	const damagedFiles = [
+		// Sample entry shorter than its fixed fields
+		mp4([goodTrak, trak({ handler: 'vide', stbl: [stsd(box('avc1', zeros(8)))], id: 2 })]),
+		// tkhd cut short at the end of its trak
+		mp4([goodTrak, box('trak', box('mdia', mdhd(), hdlr('vide')), fullBox('tkhd', 0, 1, u32(0)))]),
+		// DecoderSpecificInfo claiming more bytes than its esds holds
+		mp4([goodTrak, trak({ handler: 'soun', stbl: [stsd(audioSampleEntry('mp4a', fullBox(
+			'esds', 0, 0, u8(0x03), u8(23), u16(1), u8(0), u8(0x04), u8(15), u8(0x40), u8(0x15), zeros(11),
+			u8(0x05), u8(100), u8(0x12), u8(0x10),
+		)))], id: 2 })]),
+	];
+
+	for (const file of damagedFiles) {
+		await expectGracefulRead(file);
+		expect(await countPackets(new Input({ source: new BufferSource(file), formats: ALL_FORMATS }))).toBe(3);
+	}
+
+	// A file cut off within the 64-bit size of a box header
+	await expectGracefulRead(concat(box('ftyp', ascii('isom'), u32(0), ascii('isom')), u32(1), ascii('mdat')));
 });
 
 test('MP4: trak inside moof', async () => {
