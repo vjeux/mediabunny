@@ -1062,6 +1062,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		return this.createEncodedPacketFromOggPacket(
 			metadata.packet,
 			{
+				...metadata, // Whatever else the packet was created with
 				timestampInSamples: metadata.timestampInSamples + shiftInSamples,
 				vorbisLastBlocksize: metadata.vorbisLastBlockSize,
 			},
