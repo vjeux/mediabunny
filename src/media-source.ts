@@ -1587,7 +1587,7 @@ export type MediaStreamVideoTrackSourceOptions = {
  * [`MediaStreamVideoTrack`](https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamTrack) and pipes them into the
  * output. This is useful for capturing live or real-time data such as webcams or screen captures. Frames will
  * automatically start being captured once the connected {@link Output} is started, and will keep being captured until
- * the {@link Output} is finalized or this source is closed.
+ * the {@link Output} is finalized or this source is closed. The source closes itself once the track has ended.
  * @group Media sources
  * @public
  */
@@ -1616,6 +1616,8 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 	private _timerHandle: UnthrottledTimerHandle | null = null;
 	/** @internal */
 	private _videoElement: HTMLVideoElement | null = null;
+	/** @internal */
+	private _trackEndedListener: (() => void) | null = null;
 
 	/** A promise that rejects upon any error within this source. This promise never resolves. */
 	get errorPromise() {
@@ -1819,6 +1821,21 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				});
 		};
 
+		// An ended track can't produce any more frames, so we close this source. Otherwise, the output would keep
+		// waiting for frames from this track, holding back the media of all other tracks until finalization.
+		const onTrackEnded = () => {
+			if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
+				return;
+			}
+
+			this.close();
+			this._closingPromise!.catch((error) => {
+				this._promiseWithResolvers.reject(error);
+			});
+		};
+		this._trackEndedListener = onTrackEnded;
+		this._track.addEventListener('ended', onTrackEnded);
+
 		if (typeof MediaStreamTrackProcessor !== 'undefined') {
 			// We can do it here directly, perfect
 			const processor = new MediaStreamTrackProcessor({ track: this._track });
@@ -1826,7 +1843,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 
 			processor.readable.pipeTo(consumer, {
 				signal: this._abortController.signal,
-			}).catch((error) => {
+			}).then(onTrackEnded, (error) => { // The stream ends once the track has ended
 				// Handle AbortError silently
 				if (error instanceof DOMException && error.name === 'AbortError') return;
 
@@ -1917,6 +1934,11 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 			if (this._abortController) {
 				this._abortController.abort();
 				this._abortController = null;
+			}
+
+			if (this._trackEndedListener) {
+				this._track.removeEventListener('ended', this._trackEndedListener);
+				this._trackEndedListener = null;
 			}
 
 			if (this._timerHandle) {
@@ -3019,7 +3041,8 @@ export type MediaStreamAudioTrackSourceOptions = {
  * [`MediaStreamAudioTrack`](https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamTrack) and pipes it into the
  * output. This is useful for capturing live or real-time audio such as microphones or audio from other media elements.
  * Audio will automatically start being captured once the connected {@link Output} is started, and will keep being
- * captured until the {@link Output} is finalized or this source is closed.
+ * captured until the {@link Output} is finalized or this source is closed. The source closes itself once the track has
+ * ended.
  * @group Media sources
  * @public
  */
@@ -3043,6 +3066,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	private _errorPromiseAccessed = false;
 	/** @internal */
 	private _paused = false;
+	/** @internal */
+	private _trackEndedListener: (() => void) | null = null;
 
 	/** A promise that rejects upon any error within this source. This promise never resolves. */
 	get errorPromise() {
@@ -3171,6 +3196,21 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 				});
 		};
 
+		// An ended track can't produce any more data, so we close this source. Otherwise, the output would keep
+		// waiting for data from this track, holding back the media of all other tracks until finalization.
+		const onTrackEnded = () => {
+			if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
+				return;
+			}
+
+			this.close();
+			this._closingPromise!.catch((error) => {
+				this._promiseWithResolvers.reject(error);
+			});
+		};
+		this._trackEndedListener = onTrackEnded;
+		this._track.addEventListener('ended', onTrackEnded);
+
 		if (typeof MediaStreamTrackProcessor !== 'undefined') {
 			// Great, MediaStreamTrackProcessor is supported, this is the preferred way of doing things
 			const processor = new MediaStreamTrackProcessor({ track: this._track });
@@ -3180,7 +3220,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			processor.readable.pipeTo(consumer, {
 				signal: this._abortController.signal,
-			}).catch((error) => {
+			}).then(onTrackEnded, (error) => { // The stream ends once the track has ended
 				// Handle AbortError silently
 				if (error instanceof DOMException && error.name === 'AbortError') return;
 
@@ -3239,6 +3279,11 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 			if (this._abortController) {
 				this._abortController.abort();
 				this._abortController = null;
+			}
+
+			if (this._trackEndedListener) {
+				this._track.removeEventListener('ended', this._trackEndedListener);
+				this._trackEndedListener = null;
 			}
 
 			if (this._audioContext) {
