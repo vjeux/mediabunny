@@ -12,6 +12,7 @@ const createVariants = async (
 	specificUmdConfig: esbuild.BuildOptions = {},
 	specificEsmConfig: esbuild.BuildOptions = {},
 	nodeUmdVariant = false,
+	cjsVariant = false,
 ) => {
 	const baseConfig: esbuild.BuildOptions = {
 		entryPoints: [entryPoint],
@@ -86,6 +87,18 @@ const createVariants = async (
 		variants.push(nodeVariant);
 	}
 
+	if (cjsVariant) {
+		// The build for require(). Its require('mediabunny') loads the same CommonJS build of Mediabunny that the app
+		// gets, whereas the ESM build would import Mediabunny's ESM build, a second copy the extension registers with.
+		const cjsVariantContext = await esbuild.context({
+			...esmConfig,
+			...specificEsmConfig,
+			format: 'cjs',
+			outfile: `${outfileBase}.cjs`,
+		});
+		variants.push(cjsVariantContext);
+	}
+
 	return variants;
 };
 
@@ -128,6 +141,8 @@ const mp3EncoderVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const ac3Variants = await createVariants(
@@ -159,6 +174,8 @@ const ac3Variants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const dtsVariants = await createVariants(
@@ -190,6 +207,8 @@ const dtsVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const trueHdVariants = await createVariants(
@@ -221,6 +240,8 @@ const trueHdVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const aacEncoderVariants = await createVariants(
@@ -252,6 +273,8 @@ const aacEncoderVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const flacEncoderVariants = await createVariants(
@@ -283,6 +306,8 @@ const flacEncoderVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const proresVariants = await createVariants(
@@ -301,6 +326,8 @@ const proresVariants = await createVariants(
 		external: ['mediabunny'],
 		platform: 'node', // To retain the Node imports
 	},
+	false,
+	true,
 );
 
 const serverVariants = await createVariants(
