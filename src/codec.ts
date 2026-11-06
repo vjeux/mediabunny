@@ -110,6 +110,12 @@ export const SUBTITLE_CODECS = [
 	'webvtt',
 ] as const; // TODO add the rest
 
+export const validateCheckedCodecs = (checkedCodecs: unknown) => {
+	if (!Array.isArray(checkedCodecs)) {
+		throw new TypeError('checkedCodecs must be an array.');
+	}
+};
+
 /**
  * Union type of known video codecs.
  * @group Codecs
