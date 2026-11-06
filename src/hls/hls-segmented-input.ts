@@ -862,8 +862,14 @@ export class HlsSegmentedInput extends SegmentedInput {
 			const [evicted] = this.inputCache.splice(minAgeIndex, 1);
 
 			// DON'T dispose here; the Input might still be used! The source disposal will happen with GC logic, or
-			// when this input is disposed
+			// when this input is disposed. But release its sources right away (they're requested again if the Input
+			// is read once more), so that a long read doesn't pile up open file handles and caches until GC gets to
+			// them.
 			this.trackEvictedInput(evicted!.input);
+			const evictedSource = evicted!.input.disposed ? null : evicted!.input._rootSource;
+			if (evictedSource instanceof CustomPathedSource) {
+				evictedSource._releaseRoot();
+			}
 		}
 
 		return input;

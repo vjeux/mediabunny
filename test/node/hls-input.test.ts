@@ -2120,6 +2120,55 @@ test.concurrent('Packets at segment boundaries can be looked up when the segment
 	}
 });
 
+test.concurrent('Long reads release the sources of segments that dropped out of the input cache', async () => {
+	let playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:5\n';
+	for (let i = 0; i < 30; i++) {
+		playlist += `${i > 0 ? '#EXT-X-DISCONTINUITY\n' : ''}#EXTINF:4.944,\nsegment-${i}.ts\n`;
+	}
+	playlist += '#EXT-X-ENDLIST\n';
+
+	// Stands in for a FilePathSource holding a file handle until it's disposed
+	const segmentData = new Uint8Array(await fs.promises.readFile('./test/public/mp3.ts'));
+	let openSegmentSources = 0;
+	let maxOpenSegmentSources = 0;
+	class TrackedSource extends BufferSource {
+		constructor() {
+			super(segmentData);
+			openSegmentSources++;
+			maxOpenSegmentSources = Math.max(maxOpenSegmentSources, openSegmentSources);
+		}
+
+		override _dispose() {
+			openSegmentSources--;
+		}
+	}
+
+	using input = new Input({
+		source: new CustomPathedSource('playlist.m3u8', ({ path }) => path === 'playlist.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new TrackedSource()),
+		formats: HLS_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	const sink = new EncodedPacketSink(audioTrack);
+
+	const firstPacket = await sink.getFirstPacket();
+	assert(firstPacket);
+	const secondPacket = await sink.getNextPacket(firstPacket);
+	assert(secondPacket);
+	for (let packet: EncodedPacket | null = secondPacket; packet; packet = await sink.getNextPacket(packet)) {
+		// Read everything
+	}
+
+	// Instead of one source per segment read, only those of the cached segment inputs are open
+	expect(maxOpenSegmentSources).toBeLessThan(10);
+
+	// The first segment's input still works: it requests its source again
+	expect((await sink.getNextPacket(firstPacket))?.timestamp).toBe(secondPacket.timestamp);
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
