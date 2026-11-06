@@ -1819,6 +1819,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const retrieveEncodedPacket = async (
 			sectionStartPos: number,
 			predicate: (packet: SuppliedPacket) => boolean,
+			// Whether to also read the packets that share searchPts with the first one reaching it. Data of another
+			// access unit that begins a PES packet takes that PES packet's PTS too, ahead of the key frame.
+			readPacketsAtSearchPts = false,
 		) => {
 			// Load the relevant section in full
 			const section = await demuxer.readSection(sectionStartPos, true);
@@ -1833,7 +1836,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			// Advance until the top-most presentation timestamp crosses or equals searchPts
 			while (true) {
 				const topPts = last(buffer.presentationOrderPackets)?.pts ?? -Infinity;
-				if (topPts >= searchPts) {
+				if (readPacketsAtSearchPts ? topPts > searchPts : topPts >= searchPts) {
 					break;
 				}
 
@@ -2005,8 +2008,18 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 								}
 							}
 
-							isKeyPacket = context.suppliedPacket?.sectionStartPos === pesHeader.sectionStartPos
-								&& context.suppliedPacket.randomAccessIndicator === 1;
+							// Any packet starting in this PES packet may be the key frame: it may begin with data of
+							// another access unit
+							isKeyPacket = false;
+							while (context.suppliedPacket?.sectionStartPos === pesHeader.sectionStartPos) {
+								if (context.suppliedPacket.randomAccessIndicator === 1) {
+									isKeyPacket = true;
+									break;
+								}
+
+								context.suppliedPacket = null;
+								await context.markNextPacket();
+							}
 						}
 
 						if (isKeyPacket) {
@@ -2058,41 +2071,45 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				if (bestKeyPesHeader) {
 					let startPesHeader = bestKeyPesHeader;
 
-					if (lookaheadCount === 0) {
-						// Packet is at the end of stream, let's rewind a little to obtain the correct packet duration
-						outer:
-						for (let i = 0; i < reorderSize; i++) {
-							let pos = startPesHeader.sectionStartPos - demuxer.packetStride;
+					// Let's start reading one PES packet early: the key packet's PES packet may begin with the end of
+					// the previous access unit, which would otherwise pass for a packet of its own and hide the key
+					// packet. At the end of the stream, rewind a little more to obtain the correct packet duration.
+					const rewindCount = 1 + (lookaheadCount === 0 ? reorderSize : 0);
 
-							while (pos >= demuxer.packetOffset) {
-								const packetHeader = await demuxer.readPacketHeader(pos);
-								if (!packetHeader) {
-									break outer;
-								}
+					outer:
+					for (let i = 0; i < rewindCount; i++) {
+						let pos = startPesHeader.sectionStartPos - demuxer.packetStride;
 
-								if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
-									const section = await demuxer.readSection(pos, readSectionsInFull);
-									if (section) {
-										const header = readPesPacketHeader(demuxer, section, false);
-										if (header && header.pts !== null) {
-											startPesHeader = header as TimestampedPesPacketHeader;
-											break;
-										}
+						// Never before the track's first PES packet, which may come before the PMT
+						while (pos >= firstPesPacketHeader.sectionStartPos) {
+							const packetHeader = await demuxer.readPacketHeader(pos);
+							if (!packetHeader) {
+								break outer;
+							}
+
+							if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
+								const section = await demuxer.readSection(pos, readSectionsInFull);
+								if (section) {
+									const header = readPesPacketHeader(demuxer, section, false);
+									if (header && header.pts !== null) {
+										startPesHeader = header as TimestampedPesPacketHeader;
+										break;
 									}
 								}
-
-								pos -= demuxer.packetStride;
 							}
 
-							if (pos < demuxer.packetOffset) {
-								break; // We've hit the start of the file, there's nothing more to rewind
-							}
+							pos -= demuxer.packetStride;
+						}
+
+						if (pos < firstPesPacketHeader.sectionStartPos) {
+							break; // We've hit the track's start, there's nothing more to rewind
 						}
 					}
 
 					const encodedPacket = await retrieveEncodedPacket(
 						startPesHeader.sectionStartPos,
 						p => p.pts <= searchPts && p.randomAccessIndicator === 1,
+						true,
 					);
 					if (encodedPacket) {
 						return encodedPacket;
