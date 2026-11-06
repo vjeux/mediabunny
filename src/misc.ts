@@ -374,6 +374,11 @@ export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 							i += 2;
 						} else {
 							units.push(0xfffd);
+
+							if (next === -1) {
+								// Cut off by the end: like in the WHATWG decoder, a dangling odd byte shares this error
+								i = bytes.length;
+							}
 						}
 					} else if (unit >= 0xdc00 && unit <= 0xdfff) {
 						units.push(0xfffd);
