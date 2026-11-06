@@ -2,8 +2,10 @@ import { expect, test, vi } from 'vitest';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { countMovedArrayElements } from './array-moves.js';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // 200k minimal ADTS frames (77 min at 44.1 kHz)
 const createAdtsFile = (frameCount: number) => {
@@ -72,4 +74,21 @@ test('packets() keeps a constant cost per packet when its queue runs far ahead',
 	expect(packetCount).toBe(count);
 	// Linear: each entry is moved at most about once (main moved ~5e9)
 	expect(movedElements).toBeLessThan(2 * count);
+});
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+test('throw() on the packets() iterator ends the iteration', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	const iterator = new EncodedPacketSink(track!).packets();
+
+	expect((await iterator.next()).done).toBe(false);
+	await expect(iterator.throw(new Error('Stop'))).rejects.toThrow('Stop');
+
+	// Like for a generator function, the iterator is done after the throw
+	expect(await iterator.next()).toEqual({ value: undefined, done: true });
 });
