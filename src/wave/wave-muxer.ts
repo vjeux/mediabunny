@@ -167,15 +167,20 @@ export class WaveMuxer extends Muxer {
 			// Empty table
 		}
 
-		// fmt chunk
+		// fmt chunk. Formats other than PCM use the WAVEFORMATEX structure, which ends with the size of the extra
+		// format information (cbSize), here none.
+		const isPcm = format === WaveFormat.PCM;
 		this.riffWriter.writeAscii('fmt ');
-		this.riffWriter.writeU32(16); // Chunk size
+		this.riffWriter.writeU32(isPcm ? 16 : 18); // Chunk size
 		this.riffWriter.writeU16(format);
 		this.riffWriter.writeU16(channels);
 		this.riffWriter.writeU32(sampleRate);
 		this.riffWriter.writeU32(sampleRate * blockSize); // Bytes per second
 		this.riffWriter.writeU16(blockSize);
 		this.riffWriter.writeU16(8 * pcmInfo.sampleSize);
+		if (!isPcm) {
+			this.riffWriter.writeU16(0); // cbSize
+		}
 
 		// Metadata tags
 		if (!metadataTagsAreEmpty(this.output._metadataTags)) {
