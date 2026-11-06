@@ -2371,7 +2371,9 @@ export class MatroskaDemuxer extends Demuxer {
 					metadataTags.lyrics ??= value;
 				}; break;
 
-				case 'date': {
+				case 'date':
+				case 'date_released': // The official Matroska names
+				case 'date_recorded': {
 					const date = new Date(value);
 					if (!Number.isNaN(date.getTime())) {
 						metadataTags.date ??= date;
@@ -2388,6 +2390,14 @@ export class MatroskaDemuxer extends Demuxer {
 						metadataTags.trackNumber ??= trackNum;
 					}
 					if (tracksTotal && Number.isInteger(tracksTotal) && tracksTotal > 0) {
+						metadataTags.tracksTotal ??= tracksTotal;
+					}
+				}; break;
+
+				case 'total_parts': {
+					// The official Matroska name; in the "3/12" form, PART_NUMBER carries the total too
+					const tracksTotal = Number.parseInt(value, 10);
+					if (Number.isInteger(tracksTotal) && tracksTotal > 0) {
 						metadataTags.tracksTotal ??= tracksTotal;
 					}
 				}; break;
