@@ -610,6 +610,58 @@ test('Chunks written in chronological order, reserved Fast Start', async () => {
 	await testChunkOrder('reserve');
 });
 
+test('A video ending in B-frames keeps presentation after decode time for FFmpeg', async () => {
+	// I P B B in decode order: the B-frames have the only negative composition offsets
+	const gop = [0, 0.12, 0.04, 0.08];
+
+	for (const gopCount of [1, 3]) {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+
+		const timestamps = Array.from({ length: gopCount }, (_, i) => gop.map(t => t + 0.16 * i)).flat();
+		for (const [i, timestamp] of timestamps.entries()) {
+			const packet = new EncodedPacket(new Uint8Array([i]), i % 4 === 0 ? 'key' : 'delta', timestamp, 0.04);
+			await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+		}
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = toDataView(bytes);
+		const find = (type: string) => bytes.findIndex(
+			(_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === type,
+		);
+		const ctts = find('ctts');
+		const offsets = Array.from({ length: view.getUint32(ctts + 8) }, (_, i) => view.getInt32(ctts + 16 + 8 * i));
+
+		if (gopCount === 1) {
+			// FFmpeg takes the decode time shift for negative offsets from all ctts entries but the last two, so with
+			// one GOP it read the B-frames with pts < dts. Now no offset is negative, and the edit list compensates.
+			expect(Math.min(...offsets)).toBe(0);
+			const elst = find('elst');
+			expect(view.getUint32(elst + 8)).toBe(1); // One entry
+			expect(view.getInt32(elst + 16)).toBe(0.04 * 57600); // Media time
+		} else {
+			// Earlier GOPs already give FFmpeg the shift, so the layout stays as it was
+			expect(Math.min(...offsets.slice(0, -2))).toBeLessThan(0);
+			expect(find('edts')).toBe(-1);
+		}
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const readTimestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			readTimestamps[packet.data[0]!] = packet.timestamp;
+		}
+		const round = (t: number) => Math.round(t * 1e6) / 1e6;
+		expect(readTimestamps.map(round)).toEqual(timestamps.map(round));
+		expect(await track.computeDuration()).toBeCloseTo(0.16 * gopCount, 6);
+	}
+});
+
 const testChunkOrder = async (fastStart: false | 'in-memory' | 'reserve') => {
 	const output = new Output({
 		format: new Mp4OutputFormat({ fastStart }),
