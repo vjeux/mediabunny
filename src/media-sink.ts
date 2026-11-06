@@ -2214,7 +2214,7 @@ export class CanvasSink {
 		if (!(videoTrack instanceof InputVideoTrack)) {
 			throw new TypeError('videoTrack must be an InputVideoTrack.');
 		}
-		if (options && typeof options !== 'object') {
+		if (!options || typeof options !== 'object') {
 			throw new TypeError('options must be an object.');
 		}
 		if (options.alpha !== undefined && typeof options.alpha !== 'boolean') {
