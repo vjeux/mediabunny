@@ -1847,7 +1847,9 @@ export class MatroskaDemuxer extends Demuxer {
 			}; break;
 
 			case EBMLId.TagName: {
-				if (!this.currentSimpleTag) break;
+				if (!this.currentSimpleTag) {
+					break;
+				}
 
 				this.currentSimpleTag.name = readUnicodeString(slice, size);
 			}; break;
@@ -1864,7 +1866,9 @@ export class MatroskaDemuxer extends Demuxer {
 
 					name = name === null ? tag.name : `${tag.name}/${name}`;
 				}
-				if (name === null) break;
+				if (name === null) {
+					break;
+				}
 
 				const value = id === EBMLId.TagString ? readUnicodeString(slice, size) : readBytes(slice, size);
 				this.processTagValue(name, value);
