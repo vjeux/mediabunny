@@ -1355,7 +1355,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			// starts and what its timestamp is, so let's continue reading from right there.
 			const offset = packet.sequenceNumber - sectionStartPos;
 			let remaining = context.ensureBuffered(offset + 1);
-			if (isThenable(remaining)) remaining = await remaining;
+			if (isThenable(remaining)) {
+				remaining = await remaining;
+			}
 
 			if (remaining > offset) {
 				context.seekTo(offset);
