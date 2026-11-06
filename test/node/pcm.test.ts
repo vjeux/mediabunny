@@ -5,7 +5,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { WavOutputFormat } from '../../src/output-format.js';
-import { AudioSampleSource, PCM_ENCODER_PACKET_SIZE } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource, PCM_ENCODER_PACKET_SIZE } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
 import { AudioSample } from '../../src/sample.js';
@@ -282,3 +282,51 @@ const expectG711FileRoundtrip = async (codec: 'ulaw' | 'alaw', decodeCodeword: (
 	expect(frameOffset).toBe(data.length);
 	expect(decoded).toEqual(data);
 };
+
+test('WAVE writes the format chunk of non-PCM formats as a WAVEFORMATEX with cbSize', async () => {
+	// Microsoft's WAVEFORMATEX, which formats other than PCM use, ends with cbSize, the size of the extra format
+	// information. It must be 0 if there is none, and is only ignored for PCM.
+	const codecs: [PcmAudioCodec, number][] = [
+		// Codec, expected fmt chunk size
+		['pcm-s16', 16],
+		['pcm-u8', 16],
+		['pcm-f32', 18],
+		['pcm-f64', 18],
+		['alaw', 18],
+		['ulaw', 18],
+	];
+
+	for (const [codec, fmtSize] of codecs) {
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource(codec);
+		output.addAudioTrack(source);
+		await output.start();
+
+		const data = Uint8Array.from({ length: 2 * 8 * 100 }, (_, i) => i * 7);
+		await source.add(
+			new EncodedPacket(data, 'key', 0, 0.01),
+			{ decoderConfig: { codec, numberOfChannels: 2, sampleRate: 48000 } },
+		);
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = new DataView(bytes.buffer);
+		const chunks = new Map<string, Uint8Array>();
+		for (let pos = 12; pos + 8 <= bytes.length;) {
+			const size = view.getUint32(pos + 4, true);
+			chunks.set(String.fromCharCode(...bytes.subarray(pos, pos + 4)), bytes.subarray(pos + 8, pos + 8 + size));
+			pos += 8 + size + (size & 1);
+		}
+
+		const fmt = chunks.get('fmt ')!;
+		expect(fmt.length, codec).toBe(fmtSize);
+		if (fmtSize === 18) {
+			expect(new DataView(fmt.buffer, fmt.byteOffset).getUint16(16, true), codec).toBe(0);
+		}
+		expect(chunks.get('data'), codec).toEqual(data);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getCodec(), codec).toBe(codec);
+	}
+});
