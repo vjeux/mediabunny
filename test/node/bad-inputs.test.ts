@@ -13,6 +13,8 @@ import {
 	Source,
 } from '../../src/index.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
+import type { IsobmffDemuxer } from '../../src/isobmff/isobmff-demuxer.js';
+import type { MatroskaDemuxer } from '../../src/matroska/matroska-demuxer.js';
 
 // Each test tests a malicious or malformed ("bad") file that once made the code hang, exhaust memory, burn CPU for way
 // too long, or fail in an unintended way (a failed assertion or an implicit error). The tests make sure the files
@@ -2078,6 +2080,73 @@ test('Key packet verification with timestamps beyond float precision', async () 
 	const packet = await sink.getKeyPacket(Infinity, { verifyKeyPackets: true });
 	expect(packet!.timestamp).toBe(0);
 });
+
+test('Key packet verification in a big fragment of fake key frames', async () => {
+	// Each step back to the previous key frame used to scan all of the fragment's (or cluster's) samples, making
+	// verification quadratic in their number. Count the key frame flags read rather than time it, to be independent
+	// of machine speed.
+	const sampleCount = 5000;
+	const realKeyFrame = [0x00, 0x00, 0x00];
+	const fakeKeyFrame = [0x01, 0x00, 0x00];
+	const fragment = (dataOffset: number) => moof(
+		fullBox('tfhd', 0, 0x020038, u32(1), u32(1), u32(3), u32(0)), // Default duration 1, size 3, key frames
+		fullBox('tfdt', 0, 0, u32(0)),
+		fullBox('trun', 0, 0x000001, u32(sampleCount), u32(dataOffset)),
+	);
+	const moov = [
+		trak({ handler: 'vide', stbl: [stsd(videoSampleEntry('vp08')), ...emptyStbl().slice(1)] }),
+		box('mvex', trex(1)),
+	];
+	const data = concat(realKeyFrame, ...Array<Bytes>(sampleCount - 1).fill(fakeKeyFrame));
+	using input = new Input({
+		source: new BufferSource(mp4(moov, [fragment(fragment(0).length + 8), box('mdat', data)])),
+		formats: ALL_FORMATS,
+	});
+	const sink = new EncodedPacketSink((await input.getVideoTracks())[0]!);
+	await sink.getFirstPacket(); // Loads the fragment
+	const isobmffDemuxer = (await input._demuxerPromise) as IsobmffDemuxer;
+	const flagReads = countKeyFrameFlagReads(isobmffDemuxer.lastReadFragment!.trackData.get(1)!.samples);
+
+	const packet = await sink.getKeyPacket(Infinity, { verifyKeyPackets: true });
+	expect(packet!.timestamp).toBe(0);
+	expect(flagReads.count).toBeGreaterThanOrEqual(sampleCount - 1); // Every sample was stepped through
+	expect(flagReads.count).toBeLessThan(10 * sampleCount);
+
+	// The same in a Matroska cluster
+	const blocks = [simpleBlock(1, 0, 0x80, [0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00])];
+	for (let i = 1; i < sampleCount; i++) {
+		blocks.push(simpleBlock(1, i, 0x80, fakeKeyFrame));
+	}
+	using matroskaInput = new Input({
+		source: new BufferSource(matroska(info(), tracks(videoTrack(1)), cluster(0, concatList(blocks)))),
+		formats: ALL_FORMATS,
+	});
+	const matroskaSink = new EncodedPacketSink((await matroskaInput.getVideoTracks())[0]!);
+	await matroskaSink.getFirstPacket(); // Loads the cluster
+	const matroskaDemuxer = (await matroskaInput._demuxerPromise) as MatroskaDemuxer;
+	const loadedCluster = matroskaDemuxer.segments[0]!.lastReadCluster!;
+	const matroskaFlagReads = countKeyFrameFlagReads([...loadedCluster.trackData.values()][0]!.blocks);
+
+	const matroskaPacket = await matroskaSink.getKeyPacket(Infinity, { verifyKeyPackets: true });
+	expect(matroskaPacket!.timestamp).toBe(0);
+	expect(matroskaFlagReads.count).toBeGreaterThanOrEqual(sampleCount - 1);
+	expect(matroskaFlagReads.count).toBeLessThan(10 * sampleCount);
+});
+
+const countKeyFrameFlagReads = (samples: { isKeyFrame: boolean }[]) => {
+	const reads = { count: 0 };
+	for (const sample of samples) {
+		const isKeyFrame = sample.isKeyFrame;
+		Object.defineProperty(sample, 'isKeyFrame', {
+			get: () => {
+				reads.count++;
+				return isKeyFrame;
+			},
+		});
+	}
+
+	return reads;
+};
 
 test('PCM blocks not containing whole frames', async () => {
 	for (const channels of [2, 0]) {
