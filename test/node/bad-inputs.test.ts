@@ -1515,16 +1515,24 @@ test('Ogg: Packets can be looked up by their own timestamps despite granule posi
 	const lookUp = async (timestamp: number) => {
 		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
 		const packet = await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp);
-		return packet?.sequenceNumber;
+		return packet && { timestamp: packet.timestamp, sequenceNumber: packet.sequenceNumber };
 	};
 
+	// Lookups return the same packet with the same timestamp as iteration
 	const mismatches: number[] = [];
-	for (const { timestamp, sequenceNumber } of iterated) {
-		if (await lookUp(timestamp) !== sequenceNumber) {
-			mismatches.push(timestamp);
+	for (const packet of iterated) {
+		const found = await lookUp(packet.timestamp);
+		if (found?.sequenceNumber !== packet.sequenceNumber || found.timestamp !== packet.timestamp) {
+			mismatches.push(packet.timestamp);
 		}
 	}
 	expect(mismatches).toEqual([]);
+
+	// Also when looking up a timestamp within a packet
+	for (const packet of iterated.filter((_, i) => i % 10 === 5)) {
+		const found = await lookUp(packet.timestamp + 0.001);
+		expect(found).toEqual({ timestamp: packet.timestamp, sequenceNumber: packet.sequenceNumber });
+	}
 
 	// Where the granule positions add up, a lookup less than a sample before a packet still returns the one before it
 	const opusFile = concatList(opusPages({ pageCount: 3 }));
