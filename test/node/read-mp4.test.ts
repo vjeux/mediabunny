@@ -2004,3 +2004,61 @@ test('Two colr boxes in a sample entry', async () => {
 		fullRange: false,
 	});
 });
+
+test('AAC whose esds box has no AudioSpecificConfig', async () => {
+	// Like samples.ffmpeg.org archive/all/mov+mpeg4+aac++trutter1_problem.mp4: the DecoderConfigDescriptor carries no
+	// DecoderSpecificInfo. FFmpeg decodes it as AAC-LC with the sample entry's sample rate and channel count.
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	// The descriptors of that file: ES_Descriptor > DecoderConfigDescriptor (AAC, no DecoderSpecificInfo), SLConfig
+	const esds = box('esds', zeros(4), [0x03, 0x16, 0, 0, 0], [
+		0x04, 0x0d, 0x40, 0x15, 0x03, 0xd0, 0x90, 0x00, 0x00, 0xfa, 0x00, 0x00, 0x00, 0x00, 0x00,
+	], [0x06, 0x01, 0x02]);
+	const mp4a = box('mp4a', zeros(6), u16(1), zeros(8), u16(2), u16(16), zeros(4), u32(48000 * 0x10000), esds);
+	const moov = (chunkOffset: number) => box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(48000), u32(1024), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), mp4a),
+					box('stts', u32(0), u32(1), u32(1), u32(1024)),
+					box('stsc', u32(0), u32(1), u32(1), u32(1), u32(1)),
+					box('stsz', u32(0), u32(4), u32(1)),
+					box('stco', u32(0), u32(1), u32(chunkOffset)),
+				)),
+			),
+		),
+	);
+	const ftyp = box('ftyp', ascii('mp42'), u32(0), ascii('mp42'));
+	const moovSize = moov(0).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...ftyp,
+			...moov(ftyp.length + moovSize + 8),
+			...box('mdat', zeros(4)),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	expect(await track.getDecoderConfig()).toEqual({
+		codec: 'mp4a.40.2',
+		numberOfChannels: 2,
+		sampleRate: 48000,
+		description: new Uint8Array([0x11, 0x90]), // AAC-LC, 48 kHz, stereo
+	});
+	expect(await input.getMimeType()).toBe('audio/mp4; codecs="mp4a.40.2"');
+});
