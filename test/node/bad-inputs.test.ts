@@ -1014,6 +1014,45 @@ test('Matroska: Track disabled from within content encodings', async () => {
 	))));
 });
 
+test('Matroska: Video and Audio elements before TrackType', async () => {
+	// EBML doesn't fix the order of child elements, and some old muxers write TrackType after Video and Audio
+	// (samples.ffmpeg.org Matroska/Mushishi24-head.mkv). Those elements used to be skipped, leaving the defaults.
+	const samplingFrequency = new Uint8Array(4);
+	new DataView(samplingFrequency.buffer).setFloat32(0, 48000);
+	const file = matroska(info(), tracks(
+		element(
+			EBMLId.TrackEntry,
+			uintElement(EBMLId.TrackNumber, 1),
+			element(EBMLId.Video, uintElement(EBMLId.PixelWidth, 320), uintElement(EBMLId.PixelHeight, 240)),
+			uintElement(EBMLId.TrackType, 1),
+			element(EBMLId.CodecID, ascii('V_VP8')),
+		),
+		element(
+			EBMLId.TrackEntry,
+			uintElement(EBMLId.TrackNumber, 2),
+			element(
+				EBMLId.Audio,
+				element(EBMLId.SamplingFrequency, samplingFrequency),
+				uintElement(EBMLId.Channels, 2),
+				uintElement(EBMLId.BitDepth, 16),
+			),
+			uintElement(EBMLId.TrackType, 2),
+			element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+		),
+	), cluster(0, simpleBlock(1, 0, 0x80), simpleBlock(2, 0, 0x80, zeros(16))));
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const video = (await input.getVideoTracks())[0];
+	expect(video).toBeDefined();
+	expect(await video!.getCodedWidth()).toBe(320);
+	expect(await video!.getCodedHeight()).toBe(240);
+	const audio = (await input.getAudioTracks())[0];
+	expect(audio).toBeDefined();
+	expect(await audio!.getCodec()).toBe('pcm-s16');
+	expect(await audio!.getSampleRate()).toBe(48000);
+	expect(await audio!.getNumberOfChannels()).toBe(2);
+});
+
 test('Matroska: Nested BlockMore', async () => {
 	const blockGroup = element(
 		EBMLId.BlockGroup,

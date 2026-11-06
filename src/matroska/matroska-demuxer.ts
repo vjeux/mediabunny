@@ -1156,6 +1156,25 @@ export class MatroskaDemuxer extends Demuxer {
 					info: null,
 				};
 
+				// Video and Audio elements are only read once the track type is known, but EBML doesn't fix the order
+				// of child elements and some muxers write TrackType after them, so read TrackType first
+				const childrenSlice = slice.slice(dataStartPos, size);
+				while (childrenSlice.remainingLength >= MIN_HEADER_SIZE) {
+					const elementStartPos = childrenSlice.filePos;
+					const header = readElementHeader(childrenSlice);
+					if (!header || header.size === undefined) {
+						break;
+					}
+
+					if (header.id === EBMLId.TrackType) {
+						childrenSlice.filePos = elementStartPos;
+						this.traverseElement(childrenSlice);
+						break;
+					}
+
+					childrenSlice.skip(header.size);
+				}
+
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 
 				// Check if track was disabled during parsing (e.g., by FlagEnabled being 0)
@@ -1331,7 +1350,7 @@ export class MatroskaDemuxer extends Demuxer {
 				if (!this.currentTrack) break;
 
 				const type = readUnsignedInt(slice, size);
-				if (type === 1) {
+				if (type === 1 && this.currentTrack.info?.type !== 'video') {
 					this.currentTrack.info = {
 						type: 'video',
 						width: -1,
@@ -1350,7 +1369,7 @@ export class MatroskaDemuxer extends Demuxer {
 						alphaMode: false,
 						proresFormat: null,
 					};
-				} else if (type === 2) {
+				} else if (type === 2 && this.currentTrack.info?.type !== 'audio') {
 					this.currentTrack.info = {
 						type: 'audio',
 						numberOfChannels: 1, // Default value
