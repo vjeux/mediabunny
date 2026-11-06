@@ -7,9 +7,9 @@ import { EncodedPacket } from '../../src/packet.js';
 import { Quality } from '../../src/encode.js';
 import { assert } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS, OggInputFormat } from '../../src/input-format.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 
 test('maximumPageDuration option', async () => {
 	const sampleRate = 48000;
@@ -303,4 +303,63 @@ test('Granule positions of full pages', async () => {
 		const packet = await sink.getPacket(timestamp);
 		expect(packet?.timestamp).toBe(timestamp);
 	}
+});
+
+test('Opus timestamp gaps are filled with packet loss concealment', async () => {
+	// Ogg Opus has no timestamps besides granule positions, which must advance by exactly the samples in the packets
+	// (RFC 7845, section 4.1). So a gap, as left by lost or paused packets, has to be filled with packets of empty
+	// frames, or all later audio would be pulled forward.
+	using sourceInput = new Input({ source: new UrlSource('/preroll-test.opus'), formats: ALL_FORMATS });
+	const sourceTrack = (await sourceInput.getPrimaryAudioTrack())!;
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const sourcePackets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		sourcePackets.push(packet);
+		if (sourcePackets.length === 7) {
+			break;
+		}
+	}
+
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const audioSource = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// 20 ms packets with a 1 s gap after the third one
+	const timestamps = [0, 0.02, 0.04, 1.06, 1.08, 1.1];
+	for (let i = 0; i < timestamps.length; i++) {
+		await audioSource.add(
+			new EncodedPacket(sourcePackets[i + 1]!.data, 'key', timestamps[i]!, 0.02),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+	audioSource.close();
+	await output.finalize();
+	assert(output.target.buffer);
+
+	using input = new Input({ source: new BufferSource(output.target.buffer), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	// The real packets keep their timestamps, and the gap is covered without overlaps
+	for (let i = 0; i < timestamps.length; i++) {
+		expect(packets.some(x => Math.abs(x.timestamp - timestamps[i]!) < 1e-9 && x.byteLength > 2)).toBe(true);
+	}
+	for (let i = 1; i < packets.length; i++) {
+		expect(packets[i]!.timestamp).toBeCloseTo(packets[i - 1]!.timestamp + packets[i - 1]!.duration, 9);
+	}
+	expect(await track.computeDuration()).toBeCloseTo(1.12, 9);
+
+	// The empty frames decode to concealment, so the decoded audio spans the gap
+	let decodedFrames = 0;
+	let lastSampleEnd = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		decodedFrames += sample.numberOfFrames;
+		lastSampleEnd = sample.timestamp + sample.duration;
+	}
+	expect(decodedFrames).toBeGreaterThan(1.1 * 48000);
+	expect(lastSampleEnd).toBeCloseTo(1.12, 9);
 });
