@@ -872,7 +872,20 @@ export class VideoSample implements Disposable {
 				);
 			}
 
-			const tempFrame = this.toVideoFrame();
+			// For raw data, wrap exactly the visible rect: the smallest coded size containing it, with the strides of
+			// the layout (toVideoFrame() would reset a visible rect that doesn't start at the origin)
+			const visible = this.visibleRect;
+			const tempFrame = this._data instanceof Uint8Array
+				? new VideoFrame(this._data, {
+					format: this.format as VideoPixelFormat,
+					codedWidth: visible.left + visible.width,
+					codedHeight: visible.top + visible.height,
+					layout: this._layout!,
+					visibleRect: { x: visible.left, y: visible.top, width: visible.width, height: visible.height },
+					timestamp: this.microsecondTimestamp,
+					colorSpace: this.colorSpace,
+				})
+				: this.toVideoFrame();
 			try {
 				return await tempFrame.copyTo(destination, options);
 			} finally {

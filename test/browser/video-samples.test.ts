@@ -372,6 +372,24 @@ test('RGB conversion for ArrayBuffer-backed data converts into the target color 
 		frame.close();
 	}
 
+	// A visible rect that doesn't start at the origin: R, G, B, orange cropped to G, B
+	const pixels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 128, 0, 255]);
+	const croppedInit = { format: 'RGBA', codedWidth: 4, codedHeight: 1, timestamp: 0 } as const;
+	using cropped = new VideoSample(pixels, { ...croppedInit, visibleRect: { left: 1, top: 0, width: 2, height: 1 } });
+	const croppedFrame = new VideoFrame(pixels, { ...croppedInit, visibleRect: { x: 1, y: 0, width: 2, height: 1 } });
+	const croppedOptionSets: VideoFrameCopyToOptions[] = [
+		{ format: 'RGBA', colorSpace: 'display-p3' },
+		{ format: 'BGRA', colorSpace: 'display-p3', rect: { x: 1, y: 0, width: 1, height: 1 } },
+	];
+	for (const options of croppedOptionSets) {
+		const expected = new Uint8Array(croppedFrame.allocationSize(options));
+		await croppedFrame.copyTo(expected, options);
+		const actual = new Uint8Array(cropped.allocationSize(options));
+		await cropped.copyTo(actual, options);
+		expect([...actual], JSON.stringify(options)).toEqual([...expected]);
+	}
+	croppedFrame.close();
+
 	// E.g. sRGB orange as Display P3 (Firefox's VideoFrame doesn't convert color spaces in copyTo())
 	if (isChromium()) {
 		using srgbSample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0 });

@@ -86,3 +86,21 @@ test('VideoSampleResource RGB output is copied without converting its color spac
 	expect(requested).toEqual(['display-p3']);
 	expect([...bytes.subarray(0, 4)]).toEqual([50, 100, 200, 255]);
 });
+
+test('Converting raw RGB data into another color space needs VideoFrame', async () => {
+	// R, G, B, orange with a visible rect that doesn't start at the origin
+	const pixels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 128, 0, 255]);
+	using sample = new VideoSample(pixels, {
+		format: 'RGBA',
+		codedWidth: 4,
+		codedHeight: 1,
+		timestamp: 0,
+		visibleRect: { left: 1, top: 0, width: 2, height: 1 },
+	});
+
+	// Node has no VideoFrame to convert with, so this fails instead of returning unconverted pixels
+	await expect(sample.copyTo(new Uint8Array(8), { format: 'RGBA', colorSpace: 'display-p3' }))
+		.rejects.toThrow('requires VideoFrame');
+	// sRGB data copied as sRGB needs no conversion
+	await sample.copyTo(new Uint8Array(8), { format: 'BGRA', colorSpace: 'srgb' });
+});
