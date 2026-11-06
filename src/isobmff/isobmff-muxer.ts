@@ -1732,6 +1732,11 @@ export class IsobmffMuxer extends Muxer {
 					}
 				}
 
+				if (currentChunkPos < 2 ** 32) {
+					// All offsets fit in 32 bits, which the first measurement assumed (stco, small mdat header)
+					break;
+				}
+
 				if (mdatSize >= 2 ** 32) {
 					this.mdat.largeSize = true;
 				}
