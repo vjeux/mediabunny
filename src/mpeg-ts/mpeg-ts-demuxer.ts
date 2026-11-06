@@ -231,9 +231,53 @@ export class MpegTsDemuxer extends Demuxer {
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
 
+			// Data without a PAT and PMT of its own, such as an HLS I-frame segment whose Media Initialization Section
+			// precedes it in the resource, uses the program map of its init input. The data is then scanned again for
+			// the first packets of the streams.
+			const adoptInitProgramMap = async () => {
+				if (hasProgramMap || !this.input._initInput) {
+					return false;
+				}
+
+				const initDemuxer = await this.input._initInput._getDemuxer();
+				if (!(initDemuxer instanceof MpegTsDemuxer)) {
+					return false;
+				}
+
+				try {
+					await initDemuxer.readMetadata();
+				} catch {
+					return false;
+				}
+
+				if (initDemuxer.elementaryStreams.length === 0) {
+					return false;
+				}
+
+				for (const stream of initDemuxer.elementaryStreams) {
+					this.elementaryStreams.push({
+						...stream,
+						demuxer: this,
+						initialized: false,
+						firstSection: null,
+						canBeTrustedWithKeyPackets: false,
+						info: { ...stream.info },
+						referencePesPackets: [],
+					});
+				}
+
+				hasProgramMap = true;
+				currentPos = this.packetOffset;
+				return true;
+			};
+
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
 				if (!packetHeader) {
+					if (await adoptInitProgramMap()) {
+						continue;
+					}
+
 					break;
 				}
 
@@ -258,6 +302,10 @@ export class MpegTsDemuxer extends Demuxer {
 					!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
 				);
 				if (!section) {
+					if (await adoptInitProgramMap()) {
+						continue;
+					}
+
 					break;
 				}
 

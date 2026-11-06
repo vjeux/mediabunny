@@ -1320,6 +1320,58 @@ test.concurrent('#EXT-X-DEFINE QUERYPARAM variables can be IMPORTed into media p
 	expect(requestedPaths).toContain(expectedSegmentPath);
 });
 
+test.concurrent('I-frame segments read their PAT and PMT from the start of the resource', async () => {
+	// Like the I-frame playlists of Apple's segmenter: 0.ts starts with its PAT and PMT (bytes 0 to 375), followed by
+	// the key frame's PES packet (bytes 376 to 24627), which is the I-frame segment
+	const files = new Map([
+		['master.m3u8', `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.64001f,mp4a.40.2"
+main.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=40000,CODECS="avc1.64001f",URI="iframes.m3u8"
+`],
+		['main.m3u8', `#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXTINF:5,
+0.ts
+#EXT-X-ENDLIST
+`],
+		['iframes.m3u8', `#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:5
+#EXT-X-I-FRAMES-ONLY
+#EXTINF:5,
+#EXT-X-BYTERANGE:24252@376
+0.ts
+#EXT-X-ENDLIST
+`],
+	]);
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			const text = files.get(path);
+			return text !== undefined
+				? new BufferSource(new TextEncoder().encode(text))
+				: new FilePathSource(`./test/public/${path}`);
+		}),
+		formats: HLS_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	const iFrameTrack = tracks[2];
+	assert(iFrameTrack?.isVideoTrack());
+	expect(await iFrameTrack.hasOnlyKeyPackets()).toBe(true);
+
+	const sink = new EncodedPacketSink(iFrameTrack);
+	const packet = await sink.getFirstPacket();
+	expect(packet?.type).toBe('key');
+	expect(packet?.timestamp).toBe(0);
+	expect(await sink.getNextPacket(packet!)).toBeNull();
+	expect((await iFrameTrack.getDecoderConfig())?.codec).toMatch(/^avc1\./);
+
+	// Input-wide queries cover the I-frame track too
+	expect(await input.computeDuration()).toBeGreaterThan(4.9);
+});
+
 test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {
 	const cases = [
 		{
