@@ -1369,14 +1369,14 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		let buffer = this.packetBuffers.get(packet);
 
 		if (buffer) {
-			// Fast path
+			// Remove PacketBuffer access from the old packet, it belongs to the next packet now. Remove it before any
+			// async to prevent races
+			this.packetBuffers.delete(packet);
+
 			const result = await buffer.readNext();
 			if (!result) {
 				return null;
 			}
-
-			// Remove PacketBuffer access from the old packet, it belongs to the next packet now
-			this.packetBuffers.delete(packet);
 
 			const newPacket = this.createEncodedPacket(result.packet, result.duration, options);
 			this.packetBuffers.set(newPacket, buffer);

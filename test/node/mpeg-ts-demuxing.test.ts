@@ -886,6 +886,11 @@ test('MPEG-TS with field-coded H.264 keeps both fields of a frame in one packet'
 			expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
 		}
 
+		// Concurrent calls for the next packet of the same packet (as Conversion makes when trimming) agree
+		const first = await sink.getFirstPacket();
+		const nextPackets = await Promise.all([sink.getNextPacket(first!), sink.getNextPacket(first!)]);
+		expect(nextPackets.map(packet => packet?.sequenceNumber)).toEqual([1, 1].map(() => packets[1]!.sequenceNumber));
+
 		return packets;
 	};
 
