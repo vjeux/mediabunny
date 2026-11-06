@@ -42,6 +42,8 @@ export class WaveDemuxer extends Demuxer {
 	trackBackings: WaveAudioTrackBacking[] = [];
 	lastKnownPacketIndex = 0;
 	metadataTags: MetadataTags = {};
+	/** Rethrown by getMetadataTags(), so that a broken tag can't make the audio unreadable */
+	id3Error: Error | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -329,7 +331,12 @@ export class WaveDemuxer extends Demuxer {
 
 			if (id3V2Header.size > 0) {
 				const contentSlice = slice.slice(startPos + ID3_V2_HEADER_SIZE, id3V2Header.size);
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+
+				try {
+					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				} catch (error) {
+					this.id3Error ??= error as Error;
+				}
 			}
 		}
 	}
@@ -377,6 +384,11 @@ export class WaveDemuxer extends Demuxer {
 
 	async getMetadataTags() {
 		await this.readMetadata();
+
+		if (this.id3Error) {
+			throw this.id3Error;
+		}
+
 		return this.metadataTags;
 	}
 }

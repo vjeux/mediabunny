@@ -74,6 +74,8 @@ export class FlacDemuxer extends Demuxer {
 	metadataPromise: Promise<void> | null = null;
 	trackBacking: FlacAudioTrackBacking | null = null;
 	metadataTags: MetadataTags = {};
+	/** Rethrown by getMetadataTags(), so that a broken tag can't make the audio unreadable */
+	id3Error: Error | null = null;
 
 	audioInfo: FlacAudioInfo | null = null;
 	lastLoadedPos: number | null = null;
@@ -90,6 +92,11 @@ export class FlacDemuxer extends Demuxer {
 
 	override async getMetadataTags(): Promise<MetadataTags> {
 		await this.readMetadata();
+
+		if (this.id3Error) {
+			throw this.id3Error;
+		}
+
 		return this.metadataTags;
 	}
 
@@ -124,7 +131,11 @@ export class FlacDemuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				assert(contentSlice);
 
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				try {
+					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				} catch (error) {
+					this.id3Error ??= error as Error;
+				}
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
