@@ -2299,6 +2299,9 @@ class PacketReadingContext {
 			// Where the packet's access unit (its AUD) starts, and whether parameter sets come before it
 			let accessUnitPos: number | null = null;
 			let parameterSetFound = false;
+			// Whether the packet's first slice doesn't begin its picture: the rest of a picture whose start lies before
+			// where reading began (like at the start of a file cut from a longer stream)
+			let isPictureRest = false;
 
 			while (true) {
 				let remaining = this.ensureBuffered(CHUNK_SIZE);
@@ -2418,6 +2421,10 @@ class PacketReadingContext {
 						if (codec === 'avc') {
 							const headerBytes = chunk.subarray(payloadStart, payloadStart + AVC_SLICE_HEADER_PEEK_SIZE);
 							const firstMacroblockInSlice = readExpGolomb(new Bitstream(headerBytes));
+							if (!frameStartFound) {
+								isPictureRest = firstMacroblockInSlice > 0;
+							}
+
 							startsNewPicture = !frameStartFound || firstMacroblockInSlice <= lastFirstMacroblockInSlice;
 							lastFirstMacroblockInSlice = firstMacroblockInSlice;
 						} else {
@@ -2449,7 +2456,7 @@ class PacketReadingContext {
 						// End the packet at this start code (the next frame begins here)
 						const packetLength = startCodePos - packetStartPos;
 						this.seekTo(packetStartPos);
-						return this.supplyPacket(packetLength, 0, accessUnitPos);
+						return this.supplyPacket(packetLength, 0, accessUnitPos, isPictureRest);
 					}
 
 					i += startCodeLength;
@@ -2467,7 +2474,7 @@ class PacketReadingContext {
 
 				const packetLength = this.endPos - packetStartPos;
 				this.seekTo(packetStartPos);
-				return this.supplyPacket(packetLength, 0, accessUnitPos);
+				return this.supplyPacket(packetLength, 0, accessUnitPos, isPictureRest);
 			}
 		} else {
 			const codec = elementaryStream.info.codec;
@@ -2727,10 +2734,15 @@ class PacketReadingContext {
 	}
 
 	/**
-	 * Supplies the context with a new encoded packet, beginning at the current position. For video, `accessUnitPos`
-	 * and `picturePos` are where the packet's AUD and picture start, if known.
+	 * Supplies the context with a new encoded packet, beginning at the current position. For video, `accessUnitPos` is
+	 * where the packet's AUD starts, if known, and `isPictureRest` whether the packet lacks the start of its picture.
 	 */
-	supplyPacket(packetLength: number, intrinsicDuration: number, accessUnitPos: number | null = null) {
+	supplyPacket(
+		packetLength: number,
+		intrinsicDuration: number,
+		accessUnitPos: number | null = null,
+		isPictureRest = false,
+	) {
 		const currentPesPacket = this.getCurrentPesPacket();
 		const hasUnusedPts = (pesPacket: PesPacket) => {
 			return pesPacket.pts !== null && pesPacket.sectionStartPos > this.lastPtsSectionStartPos;
@@ -2758,7 +2770,11 @@ class PacketReadingContext {
 		}
 
 		let pts: number | null;
-		if (ptsPesPacket) {
+		if (ptsPesPacket && isPictureRest && accessUnitPos === null) {
+			// No access unit begins with this packet, so the PTS belongs to the one after it in the PES packet. Like
+			// before, the packet shares it.
+			pts = ptsPesPacket.pts;
+		} else if (ptsPesPacket) {
 			pts = ptsPesPacket.pts;
 			this.lastPtsSectionStartPos = ptsPesPacket.sectionStartPos;
 
