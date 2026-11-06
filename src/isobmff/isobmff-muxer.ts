@@ -61,6 +61,10 @@ const MIN_CHUNK_DURATION = 0.5; // In seconds
 export type Sample = {
 	timestamp: number;
 	decodeTimestamp: number;
+	/** The decode timestamp in the track's timescale, rounded from the absolute timestamp. */
+	decodeTimeInTimescale: number;
+	/** Presentation minus decode time in the track's timescale, each rounded from the absolute timestamp. */
+	compositionTimeOffsetInTimescale: number;
 	duration: number;
 	data: Uint8Array | null;
 	size: number;
@@ -999,6 +1003,8 @@ export class IsobmffMuxer extends Muxer {
 		const sample: Sample = {
 			timestamp,
 			decodeTimestamp: timestamp, // This may be refined later
+			decodeTimeInTimescale: intoTimescale(timestamp, trackData.timescale), // This may be refined later
+			compositionTimeOffsetInTimescale: 0, // This may be refined later
 			duration,
 			data,
 			size: data.byteLength,
@@ -1063,18 +1069,22 @@ export class IsobmffMuxer extends Muxer {
 			// model it.
 			sample.decodeTimestamp = sortedTimestamps[i]!;
 
-			const sampleCompositionTimeOffset
-				= intoTimescale(sample.timestamp - sample.decodeTimestamp, trackData.timescale);
+			// Each timestamp is rounded into the timescale exactly once, from its absolute value, so every sample
+			// lands on round(timestamp * timescale) whether it's written in a regular or a fragmented file
+			sample.decodeTimeInTimescale = intoTimescale(sample.decodeTimestamp, trackData.timescale);
+			sample.compositionTimeOffsetInTimescale
+				= intoTimescale(sample.timestamp, trackData.timescale) - sample.decodeTimeInTimescale;
+
+			const sampleCompositionTimeOffset = sample.compositionTimeOffsetInTimescale;
 			const durationInTimescale = intoTimescale(sample.duration, trackData.timescale);
 
 			if (trackData.lastTimescaleUnits !== null) {
 				assert(trackData.lastSample);
 
-				const timescaleUnits = intoTimescale(sample.decodeTimestamp, trackData.timescale, false);
-				const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
+				const delta = sample.decodeTimeInTimescale - trackData.lastTimescaleUnits;
 				assert(delta >= 0);
 
-				trackData.lastTimescaleUnits += delta;
+				trackData.lastTimescaleUnits = sample.decodeTimeInTimescale;
 				trackData.lastSample.timescaleUnitsToNextSample = delta;
 
 				if (!this.isFragmented) {
@@ -1130,7 +1140,7 @@ export class IsobmffMuxer extends Muxer {
 				}
 			} else {
 				// Decode timestamp of the first sample
-				trackData.lastTimescaleUnits = intoTimescale(sample.decodeTimestamp, trackData.timescale, false);
+				trackData.lastTimescaleUnits = sample.decodeTimeInTimescale;
 
 				if (!this.isFragmented) {
 					trackData.timeToSampleTable.push({
@@ -1159,8 +1169,7 @@ export class IsobmffMuxer extends Muxer {
 			// the last sample's duration in each fragment be "0" for fragmented files. The guess we make here is
 			// actually correct most of the time, since typically, no delta frame with a lower timestamp follows the key
 			// frame (although it can happen).
-			const timescaleUnits = intoTimescale(nextSample.timestamp, trackData.timescale, false);
-			const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
+			const delta = intoTimescale(nextSample.timestamp, trackData.timescale) - trackData.lastTimescaleUnits;
 			trackData.lastSample.timescaleUnitsToNextSample = delta;
 		}
 	}

@@ -602,6 +602,50 @@ test('Chunks written in chronological order, no Fast Start', async () => {
 	await testChunkOrder(false);
 });
 
+test('Timestamps land on the nearest timescale tick in regular and fragmented files alike', async () => {
+	const timescale = 57600; // The default video timescale, used when no frame rate is given
+
+	// Timestamps in ticks: key frames only, then key + P + B frames in decode order
+	const cases: { ticks: number[]; types: ('key' | 'delta')[] }[] = [
+		{ ticks: [0.6, 11.1], types: ['key', 'key'] },
+		{ ticks: [0.4, 15.6, 35.7], types: ['key', 'key', 'key'] },
+		{ ticks: [0.4, 20.6, 10.3, 40.6, 30.3], types: ['key', 'delta', 'delta', 'delta', 'delta'] },
+	];
+
+	for (const { ticks, types } of cases) {
+		for (const fastStart of [false, 'fragmented'] as const) {
+			const output = new Output({
+				format: new Mp4OutputFormat({ fastStart, minimumFragmentDuration: 0 }),
+				target: new BufferTarget(),
+			});
+			const source = new EncodedVideoPacketSource('vp9');
+			output.addVideoTrack(source);
+			await output.start();
+
+			for (const [i, tick] of ticks.entries()) {
+				const packet = new EncodedPacket(new Uint8Array([i]), types[i]!, tick / timescale, 10 / timescale);
+				await source.add(packet, {
+					decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+				});
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			const readTicks: number[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				readTicks[packet.data[0]!] = packet.timestamp * timescale;
+			}
+
+			// Regular files used to round the first timestamp's fraction twice (0.6 + 10.5 -> 1 + 11 = 12), and both
+			// layouts rounded the composition offsets separately from the decode times
+			expect(readTicks.map(x => Math.round(x * 1000) / 1000)).toEqual(ticks.map(x => Math.round(x)));
+		}
+	}
+});
+
 test('Chunks written in chronological order, in-memory Fast Start', async () => {
 	await testChunkOrder('in-memory');
 });
