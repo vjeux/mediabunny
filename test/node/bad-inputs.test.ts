@@ -430,6 +430,18 @@ test('MP4: tfdt in trak', async () => {
 	]));
 });
 
+test('MP4: Sample table boxes in a fragment', async () => {
+	// Misplaced sample table boxes changed the track's sample table once it was loaded, leaving it with samples
+	// without timing information
+	const stsz = fullBox('stsz', 0, 0, u32(4), u32(1000));
+	for (const misplaced of [stsz, box('stbl', stsz)]) {
+		await expectGracefulRead(mp4(fragmentedMoov(), [
+			moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('trun', 0, 0x000200, u32(2), u32(4), u32(4)), misplaced),
+			box('mdat', zeros(8)),
+		]));
+	}
+});
+
 test('MP4: Truncated moof', async () => {
 	const file = mp4(fragmentedMoov(), [
 		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('trun', 0, 0, u32(1)), zeros(100)),
