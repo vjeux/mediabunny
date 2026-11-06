@@ -245,7 +245,7 @@ export const PRORES_FOURCCS = [
 	'ap4x', // ProRes 4444 XQ
 	'ap4h', // ProRes 4444
 	'apch', // ProRes 422 High Quality
-	'apcn', // ProRes 422 Standard Definition
+	'apcn', // ProRes 422
 	'apcs', // ProRes 422 LT
 	'apco', // ProRes 422 Proxy
 ] as const;
