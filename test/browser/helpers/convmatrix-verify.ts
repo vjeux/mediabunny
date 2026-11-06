@@ -89,10 +89,13 @@ const makeVideoProcess = (preset: VideoProcessPreset) => {
 			return (sample: VideoSample) => (n++ % 2 === 1 ? null : sample);
 		}
 		case 'canvas': {
+			// The encoder then gets a canvas showing the frame instead of the sample
 			let canvas: OffscreenCanvas | null = null;
 			return (sample: VideoSample) => {
 				canvas ??= new OffscreenCanvas(sample.displayWidth, sample.displayHeight);
-				sample.draw(canvas.getContext('2d')!, 0, 0);
+				const context = canvas.getContext('2d')!;
+				context.clearRect(0, 0, canvas.width, canvas.height);
+				sample.draw(context, 0, 0);
 				return canvas;
 			};
 		}
@@ -146,6 +149,10 @@ export type RunResult = {
 	copied: { video: boolean | null; audio: boolean | null };
 	outputCodecs: { video: string | null; audio: string | null };
 	progress: number[];
+	/** Whether the cell's `cancelAt` was reached, so that cancel() got called. */
+	cancelRequested: boolean;
+	conversionState: string | null;
+	outputState: string | null;
 	startTimestamp: number;
 	timestampOffset: number | null;
 	view: MediaView | null;
@@ -160,6 +167,9 @@ export const runCell = async (inputBytes: Uint8Array, cell: Cell): Promise<RunRe
 		copied: { video: null, audio: null },
 		outputCodecs: { video: null, audio: null },
 		progress: [],
+		cancelRequested: false,
+		conversionState: null,
+		outputState: null,
 		startTimestamp: 0,
 		timestampOffset: null,
 		view: null,
@@ -179,9 +189,14 @@ export const runCell = async (inputBytes: Uint8Array, cell: Cell): Promise<RunRe
 		})
 		: new BufferTarget();
 	const output = new Output({ format: makeOutputFormat(cell.output), target });
+	let conversion: Conversion | null = null;
+	const recordStates = () => {
+		result.conversionState = conversion?.state ?? null;
+		result.outputState = output.state;
+	};
 
 	try {
-		const conversion = await Conversion.init({ input, output, ...buildConversionOptions(cell.options) });
+		conversion = await Conversion.init({ input, output, ...buildConversionOptions(cell.options) });
 		result.isValid = conversion.isValid;
 		result.discarded = conversion.discardedTracks.map(x => `${x.track.type}: ${x.reason}`);
 		for (const track of output.tracks) {
@@ -196,11 +211,13 @@ export const runCell = async (inputBytes: Uint8Array, cell: Cell): Promise<RunRe
 		result.startTimestamp = conversion._startTimestamp;
 		conversion.onProgress = (progress) => {
 			result.progress.push(progress);
-			if (cell.options.cancelAt !== undefined && progress >= cell.options.cancelAt) {
-				void conversion.cancel();
+			if (cell.options.cancelAt !== undefined && progress >= cell.options.cancelAt && !result.cancelRequested) {
+				result.cancelRequested = true;
+				void conversion!.cancel();
 			}
 		};
 		if (!conversion.isValid) {
+			recordStates();
 			return result;
 		}
 
@@ -219,8 +236,10 @@ export const runCell = async (inputBytes: Uint8Array, cell: Cell): Promise<RunRe
 		result.timestampOffset = conversion._timestampOffset;
 	} catch (error) {
 		result.error = String(error);
+		recordStates();
 		return result;
 	}
+	recordStates();
 
 	if (!pathed) {
 		result.outputBytes = new Uint8Array((target as BufferTarget).buffer!);
@@ -335,10 +354,20 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 	const options = cell.options;
 
 	if (options.cancelAt !== undefined) {
-		// execute() is documented to throw a ConversionCanceledError, but on main a sample still being added when the
-		// output gets canceled throws "Output has been canceled." first (upstream's bug-fix-mania branch fixes that)
-		if (run.error && !/ConversionCanceledError|has been canceled/.test(run.error)) {
+		// A cancellation needs evidence: the conversion ran, cancel() got called, execute() rejected, and both the
+		// conversion and the output ended up canceled. execute() is documented to throw a ConversionCanceledError, but
+		// on main a sample still being added when the output gets canceled throws "Output has been canceled." first
+		// (upstream's bug-fix-mania branch fixes that).
+		if (!run.isValid) {
+			add('invalid', run.discarded.join(', '));
+		} else if (!run.cancelRequested) {
+			add('cancel', `Progress never reached ${options.cancelAt}, so the conversion was never canceled`);
+		} else if (!run.error) {
+			add('cancel', 'execute() resolved although the conversion was canceled');
+		} else if (!/ConversionCanceledError|has been canceled/.test(run.error)) {
 			add('cancel', run.error);
+		} else if (run.conversionState !== 'canceled' || run.outputState !== 'canceled') {
+			add('cancel', `The conversion ended up ${run.conversionState} and the output ${run.outputState}`);
 		}
 		return issues;
 	}
@@ -482,8 +511,11 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 				const level = expected[i]!.level;
 				if (markers && level !== null && expected[i]!.opaque && outFrames[i]!.level !== level) {
 					// Chrome's VP9 encoder with a per-frame quantizer sometimes doesn't update a flat frame after a big
-					// drop in brightness, so the decoded frame repeats the previous one (plain WebCodecs does the same)
-					if (!run.copied.video && i > 0 && outFrames[i]!.level === outFrames[i - 1]!.level) {
+					// change in brightness, so the decoded frame repeats the previous one (plain WebCodecs does the
+					// same). Frames that show no generator level at all (blank, garbled) never count as such.
+					const stale = !run.copied.video && run.outputCodecs.video === 'vp9' && i > 0
+						&& outFrames[i]!.level >= 0 && outFrames[i]!.level === outFrames[i - 1]!.level;
+					if (stale) {
 						repeatedFrames++;
 					} else {
 						levelMismatches++;
@@ -499,10 +531,10 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 			// Realtime encoders occasionally leave a flat frame partially updated (mostly after a big change); copies
 			// must be exact
 			const allowedMismatches = run.copied.video ? 0 : Math.max(2, Math.ceil(0.04 * n));
-			if (levelMismatches > allowedMismatches && process !== 'canvas') {
+			if (levelMismatches > allowedMismatches) {
 				add('video-content', `${levelMismatches} of ${n} frames show another input frame`);
 			}
-			if (repeatedFrames > Math.ceil(0.2 * n) && process !== 'canvas') {
+			if (repeatedFrames > Math.ceil(0.2 * n)) {
 				add('video-content', `${repeatedFrames} of ${n} frames repeat the previous frame instead of a new one`);
 			}
 			if (out.firstPacketIsKey === false) {
@@ -597,7 +629,9 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 		} else if (out.decodeError) {
 			add('audio-decode', out.decodeError);
 		} else if (run.copied.audio && policy === 'shrink' && ['opus', 'aac', 'mp3', 'vorbis'].includes(out.codec!)) {
-			// Without the decoder pre-roll that 'shrink' leaves out, these decoders start with a burst of noise
+			// Without the decoder pre-roll that 'shrink' leaves out, these decoders start with a burst of noise that
+			// drowns the beeps, so only the format and the extent are checked
+			checkAudioFormat(cell, inView, run, add);
 		} else if (!markers) {
 			checkAudioFormat(cell, inView, run, add);
 		} else {

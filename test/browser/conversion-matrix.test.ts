@@ -314,3 +314,129 @@ describe('Conversion matrix', () => {
 		}, 1_800_000);
 	}
 });
+
+// Negative controls: outputs that are wrong in one way each, which the checks above must catch
+describe('Conversion matrix oracle', () => {
+	const kinds = (issues: Issue[]) => issues.map(issue => issue.kind);
+	const mutate = (run: RunResult, change: (copy: RunResult) => void) => {
+		const copy = structuredClone(run);
+		change(copy);
+		return copy;
+	};
+	const getInput = async (id: string) => {
+		const bytes = await buildSyntheticInput(SYNTHETIC_INPUTS.find(x => x.id === id)!);
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return { bytes, view: await analyzeInput(input) };
+	};
+
+	test('rejects wrong frames, timing, dimensions, beeps and progress', async () => {
+		const { bytes, view } = await getInput('mp4-avc-opus');
+		const transcode: Cell = { id: 'transcode', input: 'mp4-avc-opus', output: 'mp4', options: { copy: false } };
+		const canvas: Cell = { ...transcode, id: 'canvas', options: { video: { processPreset: 'canvas' } } };
+		const vp9: Cell = { ...transcode, id: 'vp9', output: 'webm' };
+
+		for (const cell of [transcode, canvas, vp9]) {
+			const run = await runCell(bytes, cell);
+			expect(verifyCell(cell, view, run)).toEqual([]);
+
+			// Blank frames, and a frozen output
+			const blank = mutate(run, (copy) => {
+				for (const frame of copy.view!.video!.frames) {
+					frame.level = -1;
+					frame.gray = 0;
+				}
+			});
+			expect(kinds(verifyCell(cell, view, blank))).toContain('video-content');
+			const frozen = mutate(run, (copy) => {
+				for (const frame of copy.view!.video!.frames) {
+					frame.level = copy.view!.video!.frames[0]!.level;
+				}
+			});
+			expect(kinds(verifyCell(cell, view, frozen))).toContain('video-content');
+		}
+
+		const run = await runCell(bytes, transcode);
+		const check = (change: (copy: RunResult) => void) => kinds(verifyCell(transcode, view, mutate(run, change)));
+
+		expect(check((copy) => {
+			const levels = copy.view!.video!.frames.map(frame => frame.level).reverse();
+			copy.view!.video!.frames.forEach((frame, i) => {
+				frame.level = levels[i]!;
+			});
+		})).toContain('video-content');
+		expect(check(copy => copy.view!.video!.frames.splice(10, 1))).toContain('video-count');
+		expect(check((copy) => {
+			for (const frame of copy.view!.video!.frames) {
+				frame.timestamp += 0.04;
+			}
+		})).toEqual(expect.arrayContaining(['video-offset', 'av-sync']));
+		expect(check((copy) => {
+			copy.view!.video!.frames[20]!.timestamp += 0.01;
+		})).toContain('video-timestamps');
+		expect(check((copy) => {
+			copy.view!.video!.displayWidth += 2;
+		})).toContain('video-dimensions');
+		expect(check((copy) => {
+			copy.view!.video!.firstPacketIsKey = false;
+		})).toContain('video-key');
+
+		expect(check(copy => copy.view!.audio!.beeps.splice(2, 1))).toContain('audio-beeps');
+		expect(check((copy) => {
+			for (const beep of copy.view!.audio!.beeps) {
+				beep.time += 0.005;
+			}
+		})).toEqual(expect.arrayContaining(['audio-offset', 'av-sync']));
+		expect(check((copy) => {
+			for (const beep of copy.view!.audio!.beeps) {
+				beep.amplitudes = beep.amplitudes.map(amplitude => amplitude / 2);
+			}
+		})).toContain('audio-level');
+		expect(check((copy) => {
+			copy.view!.audio!.decodedNumberOfChannels = 1;
+		})).toContain('audio-channels');
+		expect(check((copy) => {
+			copy.view!.audio!.discontinuities.push({ at: 1, delta: 0.01 });
+		})).toContain('audio-gaps');
+		expect(check((copy) => {
+			copy.view!.audio!.endTimestamp! -= 0.5;
+		})).toContain('audio-end');
+
+		expect(check((copy) => {
+			copy.progress = [0, 0.6, 0.4, 1];
+		})).toContain('progress');
+		expect(check((copy) => {
+			copy.progress = [0, 0.5];
+		})).toContain('progress');
+	});
+
+	test('requires evidence of cancellation', async () => {
+		const { bytes, view } = await getInput('mp4-avc-opus');
+		const cell: Cell = {
+			id: 'cancel',
+			input: 'mp4-avc-opus',
+			output: 'webm',
+			options: { copy: false, cancelAt: 0.5 },
+		};
+		const run = await runCell(bytes, cell);
+		expect(verifyCell(cell, view, run)).toEqual([]);
+
+		// Progress never reaches 2, so the conversion runs to the end
+		const neverCanceled: Cell = { ...cell, options: { copy: false, cancelAt: 2 } };
+		expect(kinds(verifyCell(neverCanceled, view, await runCell(bytes, neverCanceled)))).toEqual(['cancel']);
+
+		// With every track discarded, the conversion is invalid and never runs
+		const invalid: Cell = {
+			...cell,
+			options: { cancelAt: 0.5, video: { discard: true }, audio: { discard: true } },
+		};
+		expect(kinds(verifyCell(invalid, view, await runCell(bytes, invalid)))).toEqual(['invalid']);
+
+		// execute() resolving, or anything left uncanceled, doesn't count either
+		expect(kinds(verifyCell(cell, view, mutate(run, (copy) => {
+			copy.error = null;
+		})))).toEqual(['cancel']);
+		expect(kinds(verifyCell(cell, view, mutate(run, (copy) => {
+			copy.outputState = 'finalized';
+		})))).toEqual(['cancel']);
+	});
+});
