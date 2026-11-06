@@ -27,8 +27,8 @@ import {
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
-import { readBytes, Reader } from '../reader';
-import { buildOggMimeType, extractSampleMetadata, OggCodecInfo } from './ogg-misc';
+import { readBytes, Reader, readU8 } from '../reader';
+import { buildOggMimeType, extractSampleMetadata, isHeaderPacket, OggCodecInfo } from './ogg-misc';
 import {
 	findNextPageHeader,
 	isPageWithoutSegments,
@@ -477,6 +477,50 @@ export class OggDemuxer extends Demuxer {
 	}
 
 	async findNextPacketStart(lastPacket: Packet) {
+		let position = await this.findNextPacketStartIncludingHeaders(lastPacket);
+
+		// Some muxers repeat the header packets after the first ones. Once a bitstream's headers have been read, such
+		// packets aren't audio, so let's skip them like FFmpeg and ExoPlayer do.
+		const bitstream = this.bitstreams.find(x => x.serialNumber === lastPacket.endPage.serialNumber);
+		if (!bitstream?.lastMetadataPacket) {
+			return position;
+		}
+
+		while (position) {
+			let firstByteOffset = position.startPage.dataStartPos;
+			for (let i = 0; i < position.startSegmentIndex; i++) {
+				firstByteOffset += position.startPage.lacingValues[i]!;
+			}
+
+			let slice = this.reader.requestSlice(firstByteOffset, 1);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice || position.startPage.lacingValues[position.startSegmentIndex] === 0) {
+				break;
+			}
+
+			// Cheap check first: header packets start with 'O' (Opus) or an odd packet type (Vorbis)
+			const firstByte = readU8(slice);
+			const mightBeHeader = bitstream.codecInfo.codec === 'opus'
+				? firstByte === 0x4f
+				: (firstByte & 1) === 1;
+			if (!mightBeHeader) {
+				break;
+			}
+
+			const packet = await this.readPacket(position.startPage, position.startSegmentIndex);
+			if (!packet || !isHeaderPacket(bitstream.codecInfo, packet.data)) {
+				break;
+			}
+
+			position = await this.findNextPacketStartIncludingHeaders(packet);
+		}
+
+		return position;
+	}
+
+	async findNextPacketStartIncludingHeaders(lastPacket: Packet) {
 		// If there's another segment in the same page, return it
 		if (lastPacket.endSegmentIndex < lastPacket.endPage.lacingValues.length - 1) {
 			return { startPage: lastPacket.endPage, startSegmentIndex: lastPacket.endSegmentIndex + 1 };
