@@ -26,11 +26,12 @@ if ((globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL]) {
 (globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL] = true;
 
 /**
- * Without shared memory, every TurboRes worker gets its own WASM memory, and Chromium only reserves address space for
- * about a hundred of those per page, after which starting more workers fails and decoding hangs. 16 workers already
- * give close to full throughput.
+ * TurboRes starts one worker per core unless told otherwise, but its throughput stops growing at around 16 workers.
+ * Beyond that, workers only cost: with shared memory (Node, cross-origin isolated pages) they burn CPU and even slow
+ * decoding down, and without it every worker gets its own WASM memory, of which Chromium only reserves address space
+ * for about a hundred per page, after which starting more workers fails and decoding hangs.
  */
-const MAX_MESSAGE_PASSING_WORKERS = 16;
+const MAX_WORKERS = 16;
 
 /**
  * TurboRes decoders share their workers, but decoders that are created at the same time each start a full set of them,
@@ -81,15 +82,13 @@ class ProresDecoder extends CustomVideoDecoder {
 			ProresDecoder._supportedVideoFrameFormats ??= ProresDecoder._determineSupportedVideoFrameFormats();
 		}
 
-		const useSharedMemory = Decoder.canUseSharedMemory();
-		const hardwareConcurrency = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 0;
+		// Node 20 and older have no navigator, in which case TurboRes asks the OS for the core count itself
+		const hardwareConcurrency = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : undefined;
 
 		const creation = lastDecoderCreation.then(() => Decoder.create({
 			proresFourCc: this.config.codec as ProresFourCc,
-			useSharedMemory,
-			concurrency: useSharedMemory
-				? undefined // One worker per core, all sharing a single memory
-				: Math.max(1, Math.min(hardwareConcurrency || 1, MAX_MESSAGE_PASSING_WORKERS)),
+			useSharedMemory: Decoder.canUseSharedMemory(),
+			concurrency: hardwareConcurrency ? Math.min(hardwareConcurrency, MAX_WORKERS) : undefined,
 			allowedOutputFormats: ProresDecoder._supportedVideoFrameFormats ?? undefined,
 		}));
 		lastDecoderCreation = creation.catch(() => {});
