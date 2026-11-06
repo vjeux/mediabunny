@@ -113,6 +113,102 @@ const audioTrackOf = async (input: Input) => {
 	return track;
 };
 
+// WebKitGTK's GStreamer decoders scramble the timestamps that follow a negative one (they flip the playback direction
+// of their segment)
+const negativeTimestampsDecodeCorrectly = await (async () => {
+	const timestamps: number[] = [];
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			timestamps.push(data.timestamp);
+			data.close();
+		},
+		error: () => {},
+	});
+	decoder.configure({ codec: 'pcm-s16', sampleRate: 48000, numberOfChannels: 1 });
+	for (const timestamp of [-20000, 0, 20000]) {
+		decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp, data: new Uint8Array(1920) }));
+	}
+	await decoder.flush();
+	decoder.close();
+	return timestamps.join() === '-20000,0,20000';
+})();
+
+/**
+ * Why the browser's decoder can't be checked on this track, if it can't. Besides the timestamps, WebKitGTK says it
+ * can decode AV1 and FLAC but then fails to, and scales anamorphic frames to square pixels. This decodes the first
+ * packets with its own decoder, so that one that hangs can be closed again.
+ */
+const decodeLimitation = async (track: InputVideoTrack | InputAudioTrack) => {
+	if (!negativeTimestampsDecodeCorrectly && await track.getFirstTimestamp() < 0) {
+		return 'the decoder scrambles negative timestamps here';
+	}
+
+	let failed = false;
+	const frameSizes: string[] = [];
+	const output = (data: VideoFrame | AudioData) => {
+		if (data instanceof VideoFrame) {
+			frameSizes.push(`${data.visibleRect!.width}x${data.visibleRect!.height}`);
+		}
+		data.close();
+	};
+	const error = () => {
+		failed = true;
+	};
+
+	let decoder: VideoDecoder | AudioDecoder;
+	if (track instanceof InputVideoTrack) {
+		const videoDecoder = new VideoDecoder({ output, error });
+		videoDecoder.configure((await track.getDecoderConfig())!);
+		decoder = videoDecoder;
+	} else {
+		const audioDecoder = new AudioDecoder({ output, error });
+		audioDecoder.configure((await track.getDecoderConfig())!);
+		decoder = audioDecoder;
+	}
+
+	const sink = new EncodedPacketSink(track);
+	let packet = await sink.getFirstPacket();
+	for (let i = 0; packet && i < 8 && !failed; i++) {
+		try {
+			if (decoder instanceof VideoDecoder) {
+				decoder.decode(packet.toEncodedVideoChunk());
+			} else {
+				decoder.decode(packet.toEncodedAudioChunk());
+			}
+		} catch {
+			failed = true;
+		}
+		packet = await sink.getNextPacket(packet);
+	}
+	const flushed = await Promise.race([
+		decoder.flush().then(() => true, () => false),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
+	]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	if (failed || !flushed) {
+		return `${await track.getCodec()} doesn't really decode here`;
+	}
+	if (track instanceof InputVideoTrack) {
+		const size = `${await track.getCodedWidth()}x${await track.getCodedHeight()}`;
+		if (frameSizes.some(x => x !== size)) {
+			return 'the decoder rescales the frames here';
+		}
+	}
+
+	return null;
+};
+
+const skipIfDecodeLimited = async (
+	track: InputVideoTrack | InputAudioTrack,
+	skip: (condition: boolean, note?: string) => void,
+) => {
+	const limitation = await decodeLimitation(track);
+	skip(limitation !== null, limitation ?? undefined);
+};
+
 const indexCanvas = new OffscreenCanvas(64, 64);
 const indexContext = indexCanvas.getContext('2d', { willReadFrequently: true })!;
 
@@ -170,26 +266,31 @@ const probeTimestamps = (fixture: VideoFixture) => {
 };
 
 describe('VideoSampleSink', () => {
-	test.each(VIDEO_FIXTURES)('$file: samples() yields every frame once, in presentation order', async (fixture) => {
+	test.for(VIDEO_FIXTURES)(
+		'$file: samples() yields every frame once, in presentation order',
+		async (fixture, { skip }) => {
+			using input = openInput(fixture.file);
+			const track = await videoTrackOf(input);
+			await skipIfDecodeLimited(track, skip);
+
+			const sink = new VideoSampleSink(track);
+			let i = 0;
+			for await (using sample of sink.samples()) {
+				expect(readFrameIndex(sample)).toBe(i);
+				expect(sample.timestamp).toBeCloseTo(fixture.frameTimestamp(i), 6);
+				expect(sample.duration).toBeGreaterThan(0);
+				i++;
+			}
+
+			expect(i).toBe(FRAME_COUNT);
+			await expectNoLeaks();
+		},
+	);
+
+	test.for(VIDEO_FIXTURES)('$file: getSample(t) returns the frame displayed at t', async (fixture, { skip }) => {
 		using input = openInput(fixture.file);
 		const track = await videoTrackOf(input);
-
-		const sink = new VideoSampleSink(track);
-		let i = 0;
-		for await (using sample of sink.samples()) {
-			expect(readFrameIndex(sample)).toBe(i);
-			expect(sample.timestamp).toBeCloseTo(fixture.frameTimestamp(i), 6);
-			expect(sample.duration).toBeGreaterThan(0);
-			i++;
-		}
-
-		expect(i).toBe(FRAME_COUNT);
-		await expectNoLeaks();
-	});
-
-	test.each(VIDEO_FIXTURES)('$file: getSample(t) returns the frame displayed at t', async (fixture) => {
-		using input = openInput(fixture.file);
-		const track = await videoTrackOf(input);
+		await skipIfDecodeLimited(track, skip);
 
 		const sink = new VideoSampleSink(track);
 		for (const timestamp of probeTimestamps(fixture)) {
@@ -208,11 +309,12 @@ describe('VideoSampleSink', () => {
 		await expectNoLeaks();
 	});
 
-	test.each(VIDEO_FIXTURES)(
+	test.for(VIDEO_FIXTURES)(
 		'$file: samplesAtTimestamps() answers sorted, unsorted, repeated and out-of-range timestamps',
-		async (fixture) => {
+		async (fixture, { skip }) => {
 			using input = openInput(fixture.file);
 			const track = await videoTrackOf(input);
+			await skipIfDecodeLimited(track, skip);
 
 			const sink = new VideoSampleSink(track);
 			const probes = probeTimestamps(fixture).filter(x => Number.isFinite(x));
@@ -237,11 +339,12 @@ describe('VideoSampleSink', () => {
 		},
 	);
 
-	test.each(VIDEO_FIXTURES)(
+	test.for(VIDEO_FIXTURES)(
 		'$file: samples(start, end) starts with the frame displayed at start and excludes end',
-		async (fixture) => {
+		async (fixture, { skip }) => {
 			using input = openInput(fixture.file);
 			const track = await videoTrackOf(input);
+			await skipIfDecodeLimited(track, skip);
 
 			const sink = new VideoSampleSink(track);
 			const at = fixture.frameTimestamp;
@@ -485,11 +588,12 @@ describe('CanvasSink', () => {
 		{ width: 16, height: 16, fit: 'cover' }, // Mipmapped downscale
 	];
 
-	test.each(QUADRANT_FIXTURES)(
+	test.for(QUADRANT_FIXTURES)(
 		'%s: geometry follows rotation, flip, crop and fit',
-		async (file, rotation, flip, squarePixelWidth, squarePixelHeight) => {
+		async ([file, rotation, flip, squarePixelWidth, squarePixelHeight], { skip }) => {
 			using input = openInput(file);
 			const track = await videoTrackOf(input);
+			await skipIfDecodeLimited(track, skip);
 
 			expect(await track.getRotation()).toBe(rotation);
 			expect(await track.getFlip()).toBe(flip);
@@ -606,9 +710,10 @@ const findBurst = async (sink: AudioSampleSink, startTimestamp?: number) => {
 };
 
 describe('AudioSampleSink', () => {
-	test.each(AUDIO_FIXTURES)('%s: audio lands at its source time, also after seeking', async (file) => {
+	test.for(AUDIO_FIXTURES)('%s: audio lands at its source time, also after seeking', async (file, { skip }) => {
 		using input = openInput(file);
 		const track = await audioTrackOf(input);
+		await skipIfDecodeLimited(track, skip);
 
 		const sink = new AudioSampleSink(track);
 
@@ -622,40 +727,44 @@ describe('AudioSampleSink', () => {
 		await expectNoLeaks();
 	});
 
-	test.each(AUDIO_FIXTURES)('%s: samples are contiguous and getSample(t) agrees with samples()', async (file) => {
-		using input = openInput(file);
-		const track = await audioTrackOf(input);
+	test.for(AUDIO_FIXTURES)(
+		'%s: samples are contiguous and getSample(t) agrees with samples()',
+		async (file, { skip }) => {
+			using input = openInput(file);
+			const track = await audioTrackOf(input);
+			await skipIfDecodeLimited(track, skip);
 
-		const sink = new AudioSampleSink(track);
-		const samples: { timestamp: number; numberOfFrames: number }[] = [];
-		for await (using sample of sink.samples()) {
-			const previous = samples.at(-1);
-			if (previous) {
-				const previousEnd = previous.timestamp + previous.numberOfFrames / sample.sampleRate;
-				expect(sample.timestamp).toBeCloseTo(previousEnd, 6);
+			const sink = new AudioSampleSink(track);
+			const samples: { timestamp: number; numberOfFrames: number }[] = [];
+			for await (using sample of sink.samples()) {
+				const previous = samples.at(-1);
+				if (previous) {
+					const previousEnd = previous.timestamp + previous.numberOfFrames / sample.sampleRate;
+					expect(sample.timestamp).toBeCloseTo(previousEnd, 6);
+				}
+
+				samples.push({ timestamp: sample.timestamp, numberOfFrames: sample.numberOfFrames });
 			}
 
-			samples.push({ timestamp: sample.timestamp, numberOfFrames: sample.numberOfFrames });
-		}
+			// Decoding starts with the first packet, minus what the decoder discards (the Opus pre-skip)
+			const firstTimestamp = await track.getFirstTimestamp();
+			expect(samples[0]!.timestamp).toBeGreaterThanOrEqual(firstTimestamp);
+			expect(samples[0]!.timestamp).toBeLessThan(firstTimestamp + 0.01);
 
-		// Decoding starts with the first packet, minus what the decoder discards (the Opus pre-skip)
-		const firstTimestamp = await track.getFirstTimestamp();
-		expect(samples[0]!.timestamp).toBeGreaterThanOrEqual(firstTimestamp);
-		expect(samples[0]!.timestamp).toBeLessThan(firstTimestamp + 0.01);
-
-		for (let i = 0; i < samples.length; i += 9) {
-			const reference = samples[i]!;
-			for (const timestamp of [reference.timestamp, reference.timestamp + 0.001]) {
-				using sample = await sink.getSample(timestamp);
-				assert(sample);
-				expect(sample.timestamp).toBe(reference.timestamp);
-				expect(sample.numberOfFrames).toBe(reference.numberOfFrames);
+			for (let i = 0; i < samples.length; i += 9) {
+				const reference = samples[i]!;
+				for (const timestamp of [reference.timestamp, reference.timestamp + 0.001]) {
+					using sample = await sink.getSample(timestamp);
+					assert(sample);
+					expect(sample.timestamp).toBe(reference.timestamp);
+					expect(sample.numberOfFrames).toBe(reference.numberOfFrames);
+				}
 			}
-		}
 
-		expect(await sink.getSample(samples[0]!.timestamp - 0.001)).toBe(null);
-		await expectNoLeaks();
-	});
+			expect(await sink.getSample(samples[0]!.timestamp - 0.001)).toBe(null);
+			await expectNoLeaks();
+		},
+	);
 
 	test('AudioBufferSink yields the samples as AudioBuffers', async () => {
 		using input = openInput('clicks-aac.m4a');
