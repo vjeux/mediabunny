@@ -35,6 +35,7 @@ import {
 	MAX_PAGE_SIZE,
 	MIN_PAGE_HEADER_SIZE,
 	Page,
+	pageChecksumMatches,
 	readPageHeader,
 } from './ogg-reader';
 
@@ -373,10 +374,20 @@ export class OggDemuxer extends Demuxer {
 	/**
 	 * Returns the page of the same bitstream that follows the given page, skipping the pages of other bitstreams.
 	 * Where something other than a usable page sits between two pages (junk, or a page without segments), it searches
-	 * on for the next page of the bitstream, like libogg and FFmpeg do, instead of ending the stream there. That page
-	 * must continue the bitstream, though: if its sequence number shows that pages were lost, or that a new bitstream
-	 * with the same serial number started (as in a chained file whose previous link was cut off), the bitstream ends.
+	 * on for the next page of the bitstream, like libogg and FFmpeg do, instead of ending the stream there. That is
+	 * only done between intact pages, though: the pages on both sides must have matching checksums (a damaged page,
+	 * as when bytes were inserted into it, doesn't end where its header says), and the page after must continue the
+	 * bitstream, with no pages lost and no new bitstream reusing the serial number (as in a chained file whose
+	 * previous link was cut off). Otherwise the bitstream ends there, as the audio after would be damaged or get
+	 * wrong timestamps.
 	 */
+	/** Whether the page's checksum matches. Only checked where reading on past garbage, as that's rare. */
+	async pageChecksumIsValid(page: Page) {
+		let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
+		if (isThenable(slice)) slice = await slice;
+		return !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
+	}
+
 	async readNextPage(previousPage: Page): Promise<Page | null> {
 		const serialNumber = previousPage.serialNumber;
 		let currentPos = previousPage.headerStartPos + previousPage.totalSize;
@@ -403,12 +414,19 @@ export class OggDemuxer extends Demuxer {
 					if (sequenceNumberStep < 1 || sequenceNumberStep > 1 + skippedPagesWithoutSegments) {
 						return null;
 					}
+
+					if (!await this.pageChecksumIsValid(page)) {
+						return null;
+					}
 				}
 
 				return page;
 			}
 
 			// There's no usable page here, so scan forward for the next capture pattern of our bitstream
+			if (!skippedSomething && !await this.pageChecksumIsValid(previousPage)) {
+				return null;
+			}
 			skippedSomething = true;
 			slice.filePos = currentPos;
 			if (isPageWithoutSegments(slice, serialNumber)) {

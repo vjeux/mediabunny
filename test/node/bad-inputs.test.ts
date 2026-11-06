@@ -1490,7 +1490,7 @@ test('Ogg: Reading goes on past garbage and empty pages between pages', async ()
 	}
 });
 
-test('Ogg: Reading doesn\'t go on past garbage into lost pages or another bitstream', async () => {
+test('Ogg: Reading doesn\'t go on past garbage after damaged pages, into lost pages or another bitstream', async () => {
 	const readTimestamps = async (file: Uint8Array) => {
 		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
 		const timestamps: number[] = [];
@@ -1513,6 +1513,15 @@ test('Ogg: Reading doesn\'t go on past garbage into lost pages or another bitstr
 	const cutOffPage = oggPage({ granule: -1, sequence: 11, lacing: [255, 255], data: new Uint8Array(510).fill(0xf8) });
 	const file = concat(...firstLink, cutOffPage.subarray(0, 100), ...opusPages({ pageCount: 10 }));
 	expect(await readTimestamps(file)).toEqual(expectedTimestamps(90));
+
+	// Bytes inserted into a page (as into sectors of game discs) damage it and make it end before where its header
+	// says, and the pages after it are likely damaged too, so the stream ends after it
+	const withInsertedBytes = concatList([
+		...pages.slice(0, 5),
+		concat(pages[5]!.subarray(0, 40), new Uint8Array(16).fill(0x99), pages[5]!.subarray(40)),
+		...pages.slice(6),
+	]);
+	expect((await readTimestamps(withInsertedBytes)).length).toBeLessThanOrEqual(40);
 });
 
 test('Ogg: Pages without granule positions at the start', async () => {
