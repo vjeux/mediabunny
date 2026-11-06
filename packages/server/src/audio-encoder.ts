@@ -164,6 +164,10 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			copyAudioSampleToAvFrame(audioSample, this.frame);
 		}
 
+		if (this.codec === 'aac') {
+			replaceNonFiniteSamples(this.frame);
+		}
+
 		this.frame.pts = BigInt(Math.round(audioSample.timestamp * this.config.sampleRate));
 		this.frame.duration = BigInt(Math.round(audioSample.duration * this.config.sampleRate));
 		this.frame.timeBase = new NodeAv.Rational(1, this.config.sampleRate);
@@ -411,6 +415,43 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		this.resampler?.free();
 	}
 }
+
+/**
+ * libav's AAC encoder rejects a whole frame if it holds a NaN or infinite sample, so this maps those like the
+ * conversion to integer samples does: NaN to silence, infinities to full scale.
+ */
+const replaceNonFiniteSamples = (frame: NodeAv.Frame) => {
+	const planar = frame.format === NodeAv.AV_SAMPLE_FMT_FLTP;
+	if (!planar && frame.format !== NodeAv.AV_SAMPLE_FMT_FLT) {
+		return;
+	}
+
+	const valuesPerPlane = planar ? frame.nbSamples : frame.nbSamples * frame.channels;
+	const forEachValue = (callback: (view: DataView, offset: number, value: number) => void) => {
+		for (const plane of frame.data ?? []) {
+			const view = new DataView(plane.buffer, plane.byteOffset, plane.byteLength);
+			for (let i = 0; i < valuesPerPlane; i++) {
+				callback(view, 4 * i, view.getFloat32(4 * i, true));
+			}
+		}
+	};
+
+	let found = false;
+	forEachValue((view, offset, value) => {
+		found ||= !Number.isFinite(value);
+	});
+	if (!found) {
+		return;
+	}
+
+	// The data may be shared with the decoded frame it was reffed from
+	NodeAv.FFmpegError.throwIfError(frame.makeWritable(), 'makeWritable');
+	forEachValue((view, offset, value) => {
+		if (!Number.isFinite(value)) {
+			view.setFloat32(offset, Number.isNaN(value) ? 0 : Math.sign(value), true);
+		}
+	});
+};
 
 const resolveBitrate = (config: AudioEncoderConfig, codec: AudioCodec) => {
 	return config.bitrate ?? new Quality('medium')._toAudioBitrate(codec) ?? 0;
