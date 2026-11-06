@@ -431,3 +431,88 @@ test('Opus timestamp gaps in multichannel audio are filled with valid multistrea
 	}
 	expect(decodedFrames).toBeGreaterThan(1.1 * 48000);
 });
+
+test('Vorbis timestamp gaps are kept in the granule positions', async () => {
+	using sourceInput = new Input({ source: new UrlSource('/vorbis-eos.ogg'), formats: ALL_FORMATS });
+	const sourceTrack = (await sourceInput.getPrimaryAudioTrack())!;
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		packets.push(packet);
+		if (packets.length === 100) {
+			break;
+		}
+	}
+
+	// Muxes the packets, with a gap of the given duration after the 45th
+	const mux = async (gap: number, maximumPageDuration?: number) => {
+		const output = new Output({
+			format: new OggOutputFormat({ maximumPageDuration }),
+			target: new BufferTarget(),
+		});
+		const audioSource = new EncodedAudioPacketSource('vorbis');
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		for (const [i, packet] of packets.entries()) {
+			const timestamp = packet.timestamp + (i >= 45 ? gap : 0);
+			await audioSource.add(
+				new EncodedPacket(packet.data, 'key', timestamp, packet.duration),
+				i === 0 ? { decoderConfig } : undefined,
+			);
+		}
+		audioSource.close();
+		await output.finalize();
+		assert(output.target.buffer);
+		return new Uint8Array(output.target.buffer);
+	};
+
+	// Maps the index of each page's last packet (counting the three header packets) to the page's granule position
+	const granulePositionsByLastPacket = (file: Uint8Array) => {
+		const result = new Map<number, number>();
+		const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+		let packetCount = 0;
+
+		for (let pos = 0; pos < file.length;) {
+			const lacingValues = file.subarray(pos + 27, pos + 27 + file[pos + 26]!);
+			const endingPackets = lacingValues.filter(x => x < 255).length;
+			packetCount += endingPackets;
+			if (endingPackets > 0) {
+				result.set(packetCount - 1, view.getUint32(pos + 6, true) + view.getInt32(pos + 10, true) * 2 ** 32);
+			}
+
+			pos += 27 + lacingValues.length + lacingValues.reduce((a, b) => a + b, 0);
+		}
+
+		return result;
+	};
+
+	// Where each packet ends without the gap, from a file with one packet per page
+	const gapless = await mux(0, 0.001);
+	const packetEnds = granulePositionsByLastPacket(gapless);
+	expect(packetEnds.size).toBe(3 + 100 - 1); // The first two header packets share a page
+
+	// With the gap, the 46th audio packet starts a new page (which it doesn't otherwise), and from that page on,
+	// granule positions are a second (44100 samples) ahead
+	const firstPacketAfterGap = 3 + 45;
+	expect(granulePositionsByLastPacket(await mux(0)).has(firstPacketAfterGap - 1)).toBe(false);
+	const gapped = await mux(1);
+	const gappedGranulePositions = granulePositionsByLastPacket(gapped);
+	expect(gappedGranulePositions.has(firstPacketAfterGap - 1)).toBe(true);
+
+	let pagesAfterGap = 0;
+	for (const [packetIndex, granulePosition] of gappedGranulePositions) {
+		if (packetIndex >= 3) {
+			const isAfterGap = packetIndex >= firstPacketAfterGap;
+			expect(granulePosition).toBe(packetEnds.get(packetIndex)! + (isAfterGap ? 44100 : 0));
+			pagesAfterGap += isAfterGap ? 1 : 0;
+		}
+	}
+	expect(pagesAfterGap).toBeGreaterThan(0);
+
+	const computeDuration = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		return await (await input.getPrimaryAudioTrack())!.computeDuration();
+	};
+	expect(await computeDuration(gapped) - await computeDuration(gapless)).toBeCloseTo(1, 10);
+});

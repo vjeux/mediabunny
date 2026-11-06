@@ -236,6 +236,8 @@ type Packet = {
 	durationInSamples: number;
 	trimmedDurationInSamples: number;
 	forcePageFlush: boolean;
+	/** Whether the packet must start a new page, as after a gap. */
+	startsNewPage?: boolean;
 };
 
 export class OggMuxer extends Muxer {
@@ -493,6 +495,8 @@ export class OggMuxer extends Muxer {
 				trackData.timestampOffsetInSamples = trackData.currentTimestampInSamples - timestampInSamples;
 			}
 
+			let startsNewPage = false;
+
 			if (trackData.codecInfo.codec === 'opus') {
 				// Granule positions must advance by exactly the samples in the packets (RFC 7845, section 4.1), so a
 				// gap in the packet timestamps would silently pull all later audio forward. Instead, fill a gap of at
@@ -516,6 +520,20 @@ export class OggMuxer extends Muxer {
 
 				// If the packet can't be parsed, the next gap (if any) isn't filled
 				trackData.lastOpusTocBytes = getOpusStreamTocBytes(packet.data, trackData.opusStreamCount);
+			} else if (trackData.codecInfo.codec === 'vorbis' && trackData.audioPacketCount > 0) {
+				// Vorbis can express a gap through its granule positions, which may jump ahead from one page to the
+				// next. So, a packet after a gap starts a new page and keeps its timestamp. Readers may take smaller
+				// deviations for imprecise granule positions (some muxers write them a packet off), so only gaps longer
+				// than the longest packet duration doubled (a long block) are kept.
+				assert(trackData.codecInfo.vorbisInfo);
+				const timestampInSamples = Math.round(packet.timestamp * trackData.internalSampleRate)
+					+ trackData.timestampOffsetInSamples;
+				const gapInSamples = timestampInSamples - trackData.currentTimestampInSamples;
+
+				if (gapInSamples > trackData.codecInfo.vorbisInfo.blocksizes[1]!) {
+					trackData.currentTimestampInSamples += gapInSamples;
+					startsNewPage = true;
+				}
 			}
 
 			trackData.vorbisLastBlocksize = vorbisBlockSize;
@@ -525,7 +543,7 @@ export class OggMuxer extends Muxer {
 				? clamp(Math.round(packet.duration * trackData.internalSampleRate), 0, durationInSamples)
 				: durationInSamples;
 
-			this.queueAudioPacket(trackData, packet.data, durationInSamples, trimmedDurationInSamples);
+			this.queueAudioPacket(trackData, packet.data, durationInSamples, trimmedDurationInSamples, startsNewPage);
 
 			await this.interleavePages();
 		} finally {
@@ -538,6 +556,7 @@ export class OggMuxer extends Muxer {
 		data: Uint8Array,
 		durationInSamples: number,
 		trimmedDurationInSamples: number,
+		startsNewPage = false,
 	) {
 		assert(trackData.startOffsetInSamples !== null);
 
@@ -553,6 +572,7 @@ export class OggMuxer extends Muxer {
 			durationInSamples,
 			trimmedDurationInSamples,
 			forcePageFlush,
+			startsNewPage,
 		});
 		trackData.currentTimestampInSamples += durationInSamples;
 	}
@@ -638,6 +658,10 @@ export class OggMuxer extends Muxer {
 				? packet.trimmedDurationInSamples
 				: packet.durationInSamples
 		);
+
+		if (packet.startsNewPage && trackData.currentLacingValues.length > 0) {
+			this.writePage(trackData, false);
+		}
 
 		if (trackData.currentLacingValues.length === 0) {
 			trackData.currentPageStartTimestampInSamples = packet.timestampInSamples;
