@@ -962,7 +962,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 	traverseBox(slice: FileSlice): boolean {
 		const startPos = slice.filePos;
-		const { currentTrack, currentFragment, isReadingTraf, currentMetadataKeys } = this;
+		const restoreState = this.snapshotParsingState();
 
 		try {
 			return this.parseBox(slice);
@@ -978,11 +978,9 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 
 			// The box's fields run past its end and its parent's, so it's damaged (a broken size field, a cut-off
-			// file). Skip it rather than failing the whole file, like FFmpeg does with atoms it can't read.
-			this.currentTrack = currentTrack;
-			this.currentFragment = currentFragment;
-			this.isReadingTraf = isReadingTraf;
-			this.currentMetadataKeys = currentMetadataKeys;
+			// file). Undo what it parsed so far and skip it rather than failing the whole file, like FFmpeg does with
+			// atoms it can't read.
+			restoreState();
 
 			if (size < MIN_BOX_HEADER_SIZE) {
 				return false; // Nothing to skip to (size 0 runs to the end, size 1 is a 64-bit size)
@@ -991,6 +989,62 @@ export class IsobmffDemuxer extends Demuxer {
 			slice.filePos = Math.min(startPos + size, slice.end);
 			return true;
 		}
+	}
+
+	/** Remembers the fields a box can change (the demuxer's, the current track's and fragment's) for undoing it. */
+	snapshotParsingState() {
+		const track = this.currentTrack;
+		const fragment = this.currentFragment;
+		const objects: object[] = [this, this.metadataTags];
+		if (track) {
+			objects.push(track);
+			if (track.info) {
+				objects.push(track.info);
+			}
+		}
+		if (fragment) {
+			objects.push(fragment);
+			const trackData = track && fragment.trackData.get(track.id);
+			if (trackData) {
+				objects.push(trackData);
+			}
+		}
+
+		const snapshots = objects.map((object) => {
+			const fields: Record<string, unknown> = { ...object };
+			const lengths: [unknown[] | Map<unknown, unknown> | Set<unknown>, number][] = [];
+			for (const key in fields) {
+				const value = fields[key];
+				if (Array.isArray(value)) {
+					lengths.push([value, value.length]);
+				} else if (value instanceof Map || value instanceof Set) {
+					lengths.push([value, value.size]);
+				}
+			}
+
+			return { object: object as Record<string, unknown>, fields, lengths };
+		});
+
+		return () => {
+			for (const { object, fields, lengths } of snapshots) {
+				for (const key of Object.keys(object)) {
+					if (!(key in fields)) {
+						delete object[key];
+					}
+				}
+				Object.assign(object, fields);
+				for (const [collection, length] of lengths) {
+					if (Array.isArray(collection)) {
+						collection.length = length;
+					} else {
+						// Entries keep insertion order, so the ones added since come last
+						for (const key of [...collection.keys()].slice(length)) {
+							collection.delete(key);
+						}
+					}
+				}
+			}
+		};
 	}
 
 	parseBox(slice: FileSlice): boolean {

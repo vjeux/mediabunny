@@ -639,7 +639,22 @@ test('MP4: Box fields running past the end of the parent box', async () => {
 
 	// A file cut off within the 64-bit size of a box header
 	await expectGracefulRead(concat(box('ftyp', ascii('isom'), u32(0), ascii('isom')), u32(1), ascii('mdat')));
+
+	// What the skipped box parsed before failing is undone: a truncated second mvhd mustn't change the movie timescale
+	// that the edit list delaying the intact track by 1 s is in
+	const delayedTrak = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), extra: [box('edts', fullBox(
+		'elst', 0, 0, u32(2), u32(1000), u32(0xffffffff), u16(1), u16(0), u32(120), u32(0), u16(1), u16(0),
+	))] });
+	const truncatedMvhd = fullBox('mvhd', 0, 0, u32(0), u32(0), u32(1), u32(0));
+	expect(await firstPacketTimestamp(mp4([delayedTrak]))).toBe(1);
+	expect(await firstPacketTimestamp(mp4([delayedTrak, truncatedMvhd]))).toBe(1);
 });
+
+const firstPacketTimestamp = async (file: Uint8Array) => {
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const packet = await new EncodedPacketSink((await input.getTracks())[0]!).getFirstPacket();
+	return packet?.timestamp;
+};
 
 test('MP4: trak inside moof', async () => {
 	// The trak used to hijack the current track, leaving the traf inside of it without fragment state
