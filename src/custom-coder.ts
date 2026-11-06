@@ -154,7 +154,7 @@ export const customAudioEncoders: typeof CustomAudioEncoder[] = [];
  * @public
  */
 export const registerDecoder = (decoder: typeof CustomVideoDecoder | typeof CustomAudioDecoder) => {
-	if (decoder.prototype instanceof CustomVideoDecoder) {
+	if (decoder?.prototype instanceof CustomVideoDecoder) {
 		const casted = decoder as typeof CustomVideoDecoder;
 
 		if (customVideoDecoders.includes(casted)) {
@@ -164,7 +164,7 @@ export const registerDecoder = (decoder: typeof CustomVideoDecoder | typeof Cust
 
 		customVideoDecoders.push(casted);
 		canDecodeVideoMemo.clear();
-	} else if (decoder.prototype instanceof CustomAudioDecoder) {
+	} else if (decoder?.prototype instanceof CustomAudioDecoder) {
 		const casted = decoder as typeof CustomAudioDecoder;
 
 		if (customAudioDecoders.includes(casted)) {
@@ -186,7 +186,7 @@ export const registerDecoder = (decoder: typeof CustomVideoDecoder | typeof Cust
  * @public
  */
 export const registerEncoder = (encoder: typeof CustomVideoEncoder | typeof CustomAudioEncoder) => {
-	if (encoder.prototype instanceof CustomVideoEncoder) {
+	if (encoder?.prototype instanceof CustomVideoEncoder) {
 		const casted = encoder as typeof CustomVideoEncoder;
 
 		if (customVideoEncoders.includes(casted)) {
@@ -196,7 +196,7 @@ export const registerEncoder = (encoder: typeof CustomVideoEncoder | typeof Cust
 
 		customVideoEncoders.push(casted);
 		canEncodeVideoMemo.clear();
-	} else if (encoder.prototype instanceof CustomAudioEncoder) {
+	} else if (encoder?.prototype instanceof CustomAudioEncoder) {
 		const casted = encoder as typeof CustomAudioEncoder;
 
 		if (customAudioEncoders.includes(casted)) {
