@@ -1957,6 +1957,24 @@ test('Ogg: Many logical bitstreams', async () => {
 	await expectGracefulRead(concatList(pages), /logical bitstreams/);
 });
 
+test('Ogg: Page header inside the last page', async () => {
+	// Seeking to the last packet found the page header embedded in the last page's data, which continues a packet from
+	// before the first page walked. Stepping back from it failed, and the lookup then read from past the page's end.
+	const embeddedPage = oggPage({ headerType: 5, sequence: 3, lacing: [0], data: [] });
+	await expectGracefulRead(concat(
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		oggPage({
+			headerType: 1,
+			granule: 9600,
+			sequence: 2,
+			lacing: [255],
+			data: concat(zeros(173), embeddedPage, zeros(255 - 173 - embeddedPage.length)),
+		}),
+		zeros(1),
+	));
+});
+
 test('Ogg: Seeking across a region full of fake page headers', async () => {
 	// Every fake header found while bisecting used to have its CRC computed over the large amount of data it claims
 	const junk = new Uint8Array(256 * 1024);
