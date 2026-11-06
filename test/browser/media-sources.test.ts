@@ -7,8 +7,8 @@ import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -746,3 +746,74 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test('VideoSampleSource, HEVC output with a description gets an hvc1 codec string', async () => {
+	// Real HEVC parameter sets and key frame, since HEVC encoding isn't available everywhere
+	using input = new Input({ source: new UrlSource('/video-h265.mp4'), formats: ALL_FORMATS });
+	const inputTrack = await input.getPrimaryVideoTrack();
+	assert(inputTrack);
+	const decoderConfig = await inputTrack.getDecoderConfig();
+	assert(decoderConfig?.description);
+	const keyPacket = await new EncodedPacketSink(inputTrack).getFirstPacket();
+	assert(keyPacket);
+
+	// Stands in for a platform HEVC encoder in its default 'hevc' bitstream format, which provides an hvcC description
+	class FakeHevcEncoder {
+		state = 'unconfigured';
+		encodeQueueSize = 0;
+		pending: Promise<void>[] = [];
+		emittedConfig = false;
+
+		constructor(private init: VideoEncoderInit) {}
+
+		static isConfigSupported(config: VideoEncoderConfig) {
+			return Promise.resolve({ supported: true, config });
+		}
+
+		configure() {
+			this.state = 'configured';
+		}
+
+		encode(frame: VideoFrame) {
+			const chunk = new EncodedVideoChunk({ type: 'key', timestamp: frame.timestamp, data: keyPacket!.data });
+			const meta = this.emittedConfig
+				? undefined
+				: { decoderConfig: { ...decoderConfig!, codec: 'hvc1.1.6.L120.90' } };
+			this.emittedConfig = true;
+			this.pending.push(Promise.resolve().then(() => this.init.output(chunk, meta)));
+		}
+
+		async flush() {
+			await Promise.all(this.pending);
+		}
+
+		close() {
+			this.state = 'closed';
+		}
+
+		addEventListener() {}
+		removeEventListener() {}
+	}
+
+	const globals = globalThis as { VideoEncoder: unknown };
+	const OriginalVideoEncoder = globals.VideoEncoder;
+	globals.VideoEncoder = FakeHevcEncoder;
+
+	try {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'hevc', quality: new Quality('high') });
+		output.addVideoTrack(source);
+		await output.start();
+
+		const canvas = new OffscreenCanvas(1920, 1080);
+		canvas.getContext('2d')!.fillRect(0, 0, 1920, 1080);
+		using sample = new VideoSample(canvas, { timestamp: 0, duration: 1 / 30 });
+		await source.add(sample);
+		await output.finalize();
+
+		// The MP4 sample entry is hvc1, and the codec string must name it
+		expect(await output.getMimeType()).toMatch(/codecs="hvc1\./);
+	} finally {
+		globals.VideoEncoder = OriginalVideoEncoder;
+	}
+});
