@@ -124,7 +124,118 @@ const readFrameIndex = (rgba: Uint8Array | Uint8ClampedArray, stride: number) =>
 	return index;
 };
 
+// WebKitGTK's VideoFrame.copyTo() doesn't convert YUV frames to RGBA, so read decoded frames by drawing them there
+// instead
+const nativeYuvToRgbaWorks = await (async () => {
+	const frame = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
+		format: 'I420', codedWidth: 2, codedHeight: 2, timestamp: 0,
+	});
+	const rgba = new Uint8Array(16);
+	await frame.copyTo(rgba, { format: 'RGBA' });
+	frame.close();
+	return rgba[3] === 255 && rgba[7] === 255;
+})();
+
+// WebKitGTK's GStreamer decoders scramble the timestamps that follow a negative one (they flip the playback direction
+// of their segment), so there, files that start before zero can't be checked
+const negativeTimestampsDecodeCorrectly = await (async () => {
+	const timestamps: number[] = [];
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			timestamps.push(data.timestamp);
+			data.close();
+		},
+		error: () => {},
+	});
+	decoder.configure({ codec: 'pcm-s16', sampleRate: 48000, numberOfChannels: 1 });
+	for (const timestamp of [-20000, 0, 20000]) {
+		decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp, data: new Uint8Array(1920) }));
+	}
+	await decoder.flush();
+	decoder.close();
+	return timestamps.join() === '-20000,0,20000';
+})();
+
+/**
+ * Whether the browser really decodes the track from its first key frame and from one in the middle. WebKitGTK says it
+ * can decode AV1 and FLAC but then fails to, and can't start at the recovery point of an open GOP. This uses its own
+ * decoder, so that one that hangs can be closed again.
+ */
+const decodesFromKeyFrames = async (track: InputVideoTrack | InputAudioTrack) => {
+	const sink = new EncodedPacketSink(track);
+	// Verified, so that the key frames are the ones the browser's decoder takes as such
+	const options = { verifyKeyPackets: true };
+	const starts = [
+		await sink.getFirstPacket(options),
+		await sink.getKeyPacket(await track.computeDuration() / 2, options),
+	];
+
+	for (const start of starts) {
+		let outputs = 0;
+		let failed = false;
+		const output = (data: VideoFrame | AudioData) => {
+			outputs++;
+			data.close();
+		};
+		const error = () => {
+			failed = true;
+		};
+
+		let decoder: VideoDecoder | AudioDecoder;
+		if (track instanceof InputVideoTrack) {
+			const videoDecoder = new VideoDecoder({ output, error });
+			videoDecoder.configure((await track.getDecoderConfig())!);
+			decoder = videoDecoder;
+		} else {
+			const audioDecoder = new AudioDecoder({ output, error });
+			audioDecoder.configure((await track.getDecoderConfig())!);
+			decoder = audioDecoder;
+		}
+
+		let packet = start;
+		for (let i = 0; packet && i < 8 && !failed; i++) {
+			try {
+				if (decoder instanceof VideoDecoder) {
+					decoder.decode(packet.toEncodedVideoChunk());
+				} else {
+					decoder.decode(packet.toEncodedAudioChunk());
+				}
+			} catch {
+				failed = true;
+			}
+			packet = await sink.getNextPacket(packet, options);
+		}
+		await Promise.race([decoder.flush().catch(() => {}), new Promise(resolve => setTimeout(resolve, 2000))]);
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+
+		if (failed || outputs === 0) {
+			return false;
+		}
+	}
+
+	return true;
+};
+
+const skipIfNotReallyDecodable = async (track: InputVideoTrack | InputAudioTrack, skip: (note: string) => void) => {
+	if (!negativeTimestampsDecodeCorrectly && await track.getFirstTimestamp() < 0) {
+		skip('the decoder scrambles negative timestamps here');
+	}
+	if (!(await decodesFromKeyFrames(track))) {
+		skip(`${await track.getCodec()} doesn't really decode here`);
+	}
+};
+
 const readSample = async (sample: VideoSample): Promise<Frame> => {
+	if (!nativeYuvToRgbaWorks) {
+		const canvas = new OffscreenCanvas(sample.displayWidth, sample.displayHeight);
+		const context = canvas.getContext('2d')!;
+		sample.draw(context, 0, 0);
+		const rgba = context.getImageData(0, 0, canvas.width, canvas.height).data;
+		return { index: readFrameIndex(rgba, canvas.width * 4), timestamp: sample.timestamp };
+	}
+
 	const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
 	await sample.copyTo(rgba, { format: 'RGBA' });
 
@@ -314,6 +425,7 @@ describe('Video', () => {
 				// For example, Firefox without the system FFmpeg libraries can't decode H.264
 				context.skip(`${await track.getCodec()} can't be decoded here`);
 			}
+			await skipIfNotReallyDecodable(track, note => context.skip(note));
 
 			await runVideoCase(videoCase, track);
 		});
@@ -486,6 +598,7 @@ describe('Audio', () => {
 			if (!(await track.canDecode())) {
 				context.skip(`${await track.getCodec()} can't be decoded here`);
 			}
+			await skipIfNotReallyDecodable(track, note => context.skip(note));
 
 			await runAudioCase(audioCase, track);
 		});
