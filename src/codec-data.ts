@@ -644,15 +644,16 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 
 		const picWidthInMbsMinus1 = readExpGolomb(bitstream);
 		const picHeightInMapUnitsMinus1 = readExpGolomb(bitstream);
-		const codedWidth = 16 * (picWidthInMbsMinus1 + 1);
-		const codedHeight = 16 * (picHeightInMapUnitsMinus1 + 1);
-		let displayWidth = codedWidth;
-		let displayHeight = codedHeight;
 
 		const frameMbsOnlyFlag = bitstream.readBits(1);
 		if (!frameMbsOnlyFlag) {
 			bitstream.skipBits(1); // mb_adaptive_frame_field_flag
 		}
+
+		const codedWidth = 16 * (picWidthInMbsMinus1 + 1);
+		const codedHeight = 16 * (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1);
+		let displayWidth = codedWidth;
+		let displayHeight = codedHeight;
 
 		bitstream.skipBits(1); // direct_8x8_inference_flag
 		const frameCroppingFlag = bitstream.readBits(1);
