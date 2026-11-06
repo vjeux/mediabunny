@@ -12,6 +12,7 @@ const createVariants = async (
 	specificUmdConfig: esbuild.BuildOptions = {},
 	specificEsmConfig: esbuild.BuildOptions = {},
 	nodeUmdVariant = false,
+	scriptVariants = false,
 ) => {
 	const baseConfig: esbuild.BuildOptions = {
 		entryPoints: [entryPoint],
@@ -86,6 +87,20 @@ const createVariants = async (
 		variants.push(nodeVariant);
 	}
 
+	if (scriptVariants) {
+		// The UMD build again, as .js for script tags: CDNs and servers send .cjs files as application/node or
+		// application/octet-stream, which browsers refuse to run in workers (importScripts), and as script tags when
+		// the response has `X-Content-Type-Options: nosniff` (jsDelivr does both)
+		for (const minify of [false, true]) {
+			variants.push(await esbuild.context({
+				...umdConfig,
+				...specificUmdConfig,
+				outfile: `${outfileBase}${minify ? '.min' : ''}.js`,
+				minify,
+			}));
+		}
+	}
+
 	return variants;
 };
 
@@ -96,6 +111,7 @@ const mediabunnyVariants = await createVariants(
 	'cjs',
 	undefined,
 	undefined,
+	true,
 	true,
 );
 
