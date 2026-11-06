@@ -8,6 +8,7 @@ import {
 	Mp3OutputFormat,
 	Mp4OutputFormat,
 	OggOutputFormat,
+	OutputFormat,
 	WavOutputFormat,
 } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -742,6 +743,114 @@ test('Read and write metadata, WAVE', async () => {
 
 	expect(readTags.raw!['INAM']).toBe(songMetadata.title);
 	expect(readTags.raw!['IKEK']).toBe('RIFF INFO lowkey mid');
+});
+
+test('Metadata dates outside the years 0 to 9999 are left out instead of written malformed', async () => {
+	// toISOString().slice(0, 10) would give '+010000-01' and '-000001-01'
+	const writeAndRead = async (format: OutputFormat, codec: AudioCodec, date: Date) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		output.setMetadataTags({ title: 'Title', date });
+		const track = createDummyAudioTrack(codec, output);
+		await output.start();
+		await track.addPacket();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+
+	const formats: [() => OutputFormat, AudioCodec][] = [
+		[() => new Mp4OutputFormat(), 'opus'],
+		[() => new MkvOutputFormat(), 'opus'],
+		[() => new OggOutputFormat(), 'opus'],
+		[() => new Mp3OutputFormat(), 'mp3'],
+		[() => new FlacOutputFormat(), 'flac'],
+		[() => new WavOutputFormat(), 'pcm-s16'],
+	];
+	for (const [format, codec] of formats) {
+		for (const date of [new Date(Date.UTC(10000, 0, 15)), new Date(Date.UTC(-1, 0, 15))]) {
+			const tags = await writeAndRead(format(), codec, date);
+			expect(tags.title).toBe('Title');
+			expect(tags.date).toBeUndefined();
+		}
+	}
+});
+
+test('Conversion copies tags of an input whose date lies past the year 9999', async () => {
+	// A ©day such as Mediabunny itself wrote for such dates before
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	output.setMetadataTags({ title: 'Title', raw: { '©day': '+010000-01' } });
+	const dummyTrack = createDummyAudioTrack('opus', output);
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect((await input.getMetadataTags()).date!.getUTCFullYear()).toBe(10000);
+
+	const output2 = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output: output2 });
+	await conversion.execute();
+
+	using input2 = new Input({ source: new BufferSource(output2.target.buffer!), formats: ALL_FORMATS });
+	const tags = await input2.getMetadataTags();
+	expect(tags.title).toBe('Title');
+	expect(tags.date).toBeUndefined();
+});
+
+test('A same-format conversion leaves out an unrepresentable date instead of copying its raw tag back', async () => {
+	const writeWithDummyTrack = async (format: OutputFormat, codec: AudioCodec, tags: MetadataTags) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		output.setMetadataTags(tags);
+		const dummyTrack = createDummyAudioTrack(codec, output);
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+		return output.target.buffer!;
+	};
+	const writeFlac = async (tags: MetadataTags) => {
+		const fixturePath = path.join(__dirname, '../public/sample.flac');
+		using fixture = new Input({ source: new FilePathSource(fixturePath), formats: ALL_FORMATS });
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input: fixture, output, tags });
+		await conversion.execute();
+		return output.target.buffer!;
+	};
+
+	// Converting to the same format keeps the raw tags, which hold the date in its original form
+	const convertToSameFormat = async (bytes: ArrayBuffer, format: OutputFormat) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const inputYear = (await input.getMetadataTags()).date?.getUTCFullYear();
+
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+
+		using converted = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return { inputYear, tags: await converted.getMetadataTags() };
+	};
+
+	// A null codec means the file is made from the FLAC fixture instead of a dummy track
+	const cases: [string, () => OutputFormat, AudioCodec | null, string][] = [
+		['MP4', () => new Mp4OutputFormat(), 'opus', '©day'],
+		['MOV', () => new MovOutputFormat(), 'pcm-s16', '©day'],
+		['MKV', () => new MkvOutputFormat(), 'opus', 'DATE'],
+		['MP3', () => new Mp3OutputFormat(), 'mp3', 'TDRC'],
+		['FLAC', () => new FlacOutputFormat(), null, 'DATE'], // Same Vorbis comment writer as Ogg
+		['WAVE', () => new WavOutputFormat(), 'pcm-s16', 'ICRD'],
+	];
+	for (const [name, format, codec, dateKey] of cases) {
+		// A date tag such as Mediabunny itself wrote for years past 9999 before
+		const writtenTags: MetadataTags = { title: 'Title', raw: { [dateKey]: '+010000-01' } };
+		const bytes = codec === null
+			? await writeFlac(writtenTags)
+			: await writeWithDummyTrack(format(), codec, writtenTags);
+		const { inputYear, tags } = await convertToSameFormat(bytes, format());
+		expect(inputYear, name).toBe(10000);
+		expect(tags.title, name).toBe('Title');
+		expect(tags.date, name).toBeUndefined();
+		expect(tags.raw?.[dateKey], name).toBeUndefined();
+	}
 });
 
 test('Conversion metadata tags, default case', async () => {

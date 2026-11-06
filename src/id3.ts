@@ -8,7 +8,7 @@
 
 import { decodeSynchsafe, encodeSynchsafe } from '../shared/mp3-misc';
 import { Logging } from './logging';
-import { MetadataTags } from './metadata';
+import { formatMetadataDate, MetadataTags } from './metadata';
 import {
 	coalesceIndex,
 	TextDecoder,
@@ -761,7 +761,11 @@ export class Id3V2Writer {
 				}; break;
 
 				case 'date': {
-					this.writeId3V2TextFrame('TDRC', value.toISOString().slice(0, 10));
+					const dateString = formatMetadataDate(value);
+					if (dateString !== null) {
+						this.writeId3V2TextFrame('TDRC', dateString);
+					}
+					// Marked as written even when left out, so that a raw tag can't bring the date back
 					writtenTags.add('TDRC');
 				}; break;
 

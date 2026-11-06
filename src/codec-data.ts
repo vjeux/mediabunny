@@ -29,7 +29,7 @@ import {
 } from './misc';
 import { Logging } from './logging';
 import { PacketType } from './packet';
-import { MetadataTags } from './metadata';
+import { formatMetadataDate, MetadataTags } from './metadata';
 import { AC3_SAMPLE_RATES, EAC3_REDUCED_SAMPLE_RATES } from '../shared/ac3-misc';
 import { Bitstream } from '../shared/bitstream';
 import { TRUEHD_MAJOR_SYNC_WORD } from '../shared/truehd-misc';
@@ -2891,6 +2891,8 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	commentHeaderParts.push(currentBuffer);
 
 	const writtenTags: string[] = [];
+	// Keys left out on purpose, which a raw tag may not fill in
+	const omittedTags: string[] = [];
 	const addCommentTag = (key: string, value: string) => {
 		const joined = `${key}=${value}`;
 		const encoded = textEncoder.encode(joined);
@@ -2932,7 +2934,12 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 			}; break;
 
 			case 'date': {
-				addCommentTag('DATE', value.toISOString().slice(0, 10));
+				const dateString = formatMetadataDate(value);
+				if (dateString !== null) {
+					addCommentTag('DATE', dateString);
+				} else {
+					omittedTags.push('DATE');
+				}
 			}; break;
 
 			case 'comment': {
@@ -3025,7 +3032,7 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	if (tags.raw) {
 		for (const key in tags.raw) {
 			const value = tags.raw[key] ?? tags.raw[key.toLowerCase()];
-			if (key === 'vendor' || value == null || writtenTags.includes(key)) {
+			if (key === 'vendor' || value == null || writtenTags.includes(key) || omittedTags.includes(key)) {
 				continue;
 			}
 
