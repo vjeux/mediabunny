@@ -680,6 +680,67 @@ test('Reserved Fast Start rejects a maximum packet count beyond u32', async () =
 	await expect(output.start()).rejects.toThrow('exceeds the maximum');
 });
 
+test('Reserved Fast Start leaves room for many short tracks', async () => {
+	const audioConfig = {
+		codec: 'mp4a.40.2',
+		numberOfChannels: 2,
+		sampleRate: 48000,
+		description: new Uint8Array([0x11, 0x90]),
+	};
+	const videoConfig = { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 };
+
+	for (const kind of ['video', 'audio'] as const) {
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'reserve' }),
+			target: new BufferTarget(),
+		});
+
+		// Few packets per track, starting at 1 s: each track's edit list, btrt and sample group (audio) or
+		// stss/ctts/cslg (video) headers outweigh the slack in its sample table estimate
+		const trackCount = kind === 'audio' ? 100 : 40;
+		const packetCount = kind === 'audio' ? 2 : 3;
+		const sources = Array.from({ length: trackCount }, () => {
+			if (kind === 'audio') {
+				const source = new EncodedAudioPacketSource('aac');
+				output.addAudioTrack(source, { maximumPacketCount: packetCount });
+				return source;
+			} else {
+				const source = new EncodedVideoPacketSource('vp9');
+				output.addVideoTrack(source, { maximumPacketCount: packetCount });
+				return source;
+			}
+		});
+		await output.start();
+
+		for (let i = 0; i < packetCount; i++) {
+			for (const source of sources) {
+				if (source instanceof EncodedAudioPacketSource) {
+					const packet = new EncodedPacket(new Uint8Array(10), 'key', 1 + i * 1024 / 48000, 1024 / 48000);
+					await source.add(packet, { decoderConfig: audioConfig });
+				} else {
+					// I P B in decode order, with slightly uneven frame times
+					const frame = [0, 2, 1][i]!;
+					const timestamp = 1 + frame / 30 + i * 1e-4;
+					const packet = new EncodedPacket(new Uint8Array(10), i === 0 ? 'key' : 'delta', timestamp, 1 / 30);
+					await source.add(packet, { decoderConfig: videoConfig });
+				}
+			}
+		}
+
+		await output.finalize(); // Threw "The moov box … exceed the space reserved for them"
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const tracks = await input.getTracks();
+		expect(tracks).toHaveLength(trackCount);
+		let packetsRead = 0;
+		for await (const packet of new EncodedPacketSink(tracks.at(-1)!).packets()) {
+			expect(packet.timestamp).toBeGreaterThanOrEqual(1);
+			packetsRead++;
+		}
+		expect(packetsRead).toBe(packetCount);
+	}
+});
+
 // This used to cause an assertion failure in the box writing code
 test('Reserved Fast Start with a B-frame GOP completed before all tracks are known', async () => {
 	const output = new Output({
