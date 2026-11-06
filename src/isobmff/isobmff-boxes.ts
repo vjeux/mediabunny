@@ -61,7 +61,7 @@ import {
 	parseEac3SyncFrame,
 	parseOpusIdentificationHeader,
 } from '../codec-data';
-import { MetadataTags, RichImageData } from '../metadata';
+import { formatMetadataDate, MetadataTags, RichImageData } from '../metadata';
 import { Bitstream } from '../../shared/bitstream';
 import { VERSIONED_NAME } from '../version';
 
@@ -1747,7 +1747,10 @@ const addQuickTimeMetadataTagBoxes = (boxes: Box[], tags: MetadataTags) => {
 			}; break;
 
 			case 'date': {
-				boxes.push(metadataTagStringBoxShort('©day', value.toISOString().slice(0, 10)));
+				const dateString = formatMetadataDate(value);
+				if (dateString !== null) {
+					boxes.push(metadataTagStringBoxShort('©day', dateString));
+				}
 			}; break;
 
 			case 'comment': {
@@ -1887,10 +1890,13 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 			}; break;
 
 			case 'date': {
-				pairs.push({
-					key: isMdta ? 'date' : '©day',
-					value: dataStringBoxLong(value.toISOString().slice(0, 10)),
-				});
+				const dateString = formatMetadataDate(value);
+				if (dateString !== null) {
+					pairs.push({
+						key: isMdta ? 'date' : '©day',
+						value: dataStringBoxLong(dateString),
+					});
+				}
 			}; break;
 
 			case 'images': {
