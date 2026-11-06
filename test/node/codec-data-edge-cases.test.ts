@@ -3,8 +3,11 @@ import {
 	addEmulationPreventionBytes,
 	av1CodecInfoHasColorInfo,
 	createVorbisComments,
+	deserializeAvcDecoderConfigurationRecord,
+	deserializeHevcDecoderConfigurationRecord,
 	determineVideoPacketType,
 	extractAv1CodecInfoFromPacket,
+	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	extractVp9CodecInfoFromPacket,
 	iterateNalUnitsInAnnexB,
@@ -13,6 +16,8 @@ import {
 	parseOpusIdentificationHeader,
 	parseOpusTocByte,
 	readVorbisComments,
+	serializeAvcDecoderConfigurationRecord,
+	serializeHevcDecoderConfigurationRecord,
 	vp9CodecInfoHasColorInfo,
 } from '../../src/codec-data.js';
 import { MetadataTags } from '../../src/metadata.js';
@@ -1242,5 +1247,89 @@ describe('extractAv1CodecInfoFromPacket', () => {
 		expect(av1CodecInfoHasColorInfo({ ...base, colourPrimaries: 1 })).toBe(true);
 		expect(av1CodecInfoHasColorInfo({ ...base, transferCharacteristics: 16 })).toBe(true);
 		expect(av1CodecInfoHasColorInfo({ ...base, matrixCoefficients: 9 })).toBe(true);
+	});
+});
+
+describe('AVC and HEVC decoder configuration records', () => {
+	const pps = new Uint8Array([0x68, 0xce, 0x38, 0x80]);
+	const idr = new Uint8Array([0x65, 0x88, 0x84]);
+
+	test('a High profile record carries chroma format, bit depths and SPS extensions, and round-trips', () => {
+		const sps = buildAvcSps({
+			profileIdc: 100,
+			chromaFormatIdc: 1,
+			bitDepthLuma: 10,
+			bitDepthChroma: 10,
+			widthInMbs: 20,
+			heightInMapUnits: 15,
+		});
+		const spsExt = new Uint8Array([0x6d, 0x11, 0x22]);
+		const record = extractAvcDecoderConfigurationRecord(annexB(sps, pps, spsExt, idr))!;
+		expect(record).toMatchObject({
+			configurationVersion: 1,
+			avcProfileIndication: 100,
+			lengthSizeMinusOne: 3,
+			chromaFormat: 1,
+			bitDepthLumaMinus8: 2,
+			bitDepthChromaMinus8: 2,
+		});
+		expect(record.sequenceParameterSets.map(x => [...x])).toEqual([[...sps]]);
+		expect(record.pictureParameterSets.map(x => [...x])).toEqual([[...pps]]);
+		expect(record.sequenceParameterSetExt!.map(x => [...x])).toEqual([[...spsExt]]);
+
+		const bytes = serializeAvcDecoderConfigurationRecord(record);
+		expect(bytes[4]).toBe(0xff); // reserved bits + lengthSizeMinusOne
+		expect(bytes[5]).toBe(0xe1); // reserved bits + one SPS
+		const roundTripped = deserializeAvcDecoderConfigurationRecord(bytes)!;
+		expect({ ...roundTripped, sequenceParameterSets: 0, pictureParameterSets: 0, sequenceParameterSetExt: 0 })
+			.toEqual({ ...record, sequenceParameterSets: 0, pictureParameterSets: 0, sequenceParameterSetExt: 0 });
+		expect(roundTripped.sequenceParameterSetExt!.map(x => [...x])).toEqual([[...spsExt]]);
+
+		// Without the trailing extension bytes, the extension fields are absent
+		const truncated = deserializeAvcDecoderConfigurationRecord(bytes.subarray(0, bytes.length - 9))!;
+		expect([truncated.chromaFormat, truncated.sequenceParameterSetExt]).toEqual([null, null]);
+	});
+
+	test('a Baseline record has no extension fields; records need both an SPS and a PPS', () => {
+		const sps = buildAvcSps({ profileIdc: 66, widthInMbs: 20, heightInMapUnits: 15 });
+		const record = extractAvcDecoderConfigurationRecord(annexB(sps, pps, new Uint8Array([0x6d, 0x01]), idr))!;
+		const { avcProfileIndication, chromaFormat, sequenceParameterSetExt } = record;
+		expect([avcProfileIndication, chromaFormat, sequenceParameterSetExt]).toEqual([66, null, null]);
+		const bytes = serializeAvcDecoderConfigurationRecord(record);
+		expect(bytes.length).toBe(6 + 2 + sps.length + 1 + 2 + pps.length);
+		const parsed = deserializeAvcDecoderConfigurationRecord(bytes)!;
+		expect(parsed.pictureParameterSets.map(x => [...x])).toEqual([[...pps]]);
+
+		expect(extractAvcDecoderConfigurationRecord(annexB(sps, idr))).toBe(null);
+		expect(extractAvcDecoderConfigurationRecord(annexB(pps, idr))).toBe(null);
+	});
+
+	test('an HEVC record round-trips through serialization', () => {
+		const vps = new Uint8Array([0x40, 0x01, 0x0c, 0x01, 0xff, 0xff]);
+		const sps = buildHevcSps({
+			width: 1280,
+			height: 720,
+			tierFlag: 1,
+			levelIdc: 120,
+			maxSubLayersMinus1: 1,
+			vui: { minSpatialSegmentationIdc: 3 },
+		});
+		const record = extractHevcDecoderConfigurationRecord(annexB(vps, sps, buildHevcPps(false, true), hevcNal(19)))!;
+		const bytes = serializeHevcDecoderConfigurationRecord(record);
+		const roundTripped = deserializeHevcDecoderConfigurationRecord(bytes)!;
+		const simplify = (r: typeof record) => ({
+			...r,
+			generalConstraintIndicatorFlags: [...r.generalConstraintIndicatorFlags],
+			arrays: r.arrays.map(a => ({ ...a, nalUnits: a.nalUnits.map(x => [...x]) })),
+		});
+		expect(simplify(roundTripped)).toEqual(simplify(record));
+		expect(roundTripped).toMatchObject({
+			generalTierFlag: 1,
+			generalLevelIdc: 120,
+			minSpatialSegmentationIdc: 3,
+			parallelismType: 3,
+			numTemporalLayers: 2,
+			lengthSizeMinusOne: 3,
+		});
 	});
 });
