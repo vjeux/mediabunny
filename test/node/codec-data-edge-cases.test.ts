@@ -1474,9 +1474,9 @@ describe('AC-3 and E-AC-3 headers', () => {
 		const dec3 = new BitWriter()
 			.writeBits(13, 640) // data rate
 			.writeBits(3, 1) // two independent substreams
-			// First: 48 kHz, 5.1 with a dependent substream carrying Lrs/Rrs (chan_loc bit 1)
+			// First: 48 kHz, 5.1 with a dependent substream carrying a channel pair (the middle chan_loc bit, Lsd/Rsd)
 			.writeBits(2, 0).writeBits(5, 16).writeBits(1, 0).writeBits(1, 0).writeBits(3, 2)
-			.writeBits(3, 7).writeBits(1, 1).writeBits(3, 0).writeBits(4, 1).writeBits(9, 0b0_1000_0000)
+			.writeBits(3, 7).writeBits(1, 1).writeBits(3, 0).writeBits(4, 1).writeBits(9, 0b0_0001_0000)
 			// Second: stereo, no dependent substreams
 			.writeBits(2, 0).writeBits(5, 16).writeBits(1, 0).writeBits(1, 0).writeBits(3, 0)
 			.writeBits(3, 2).writeBits(1, 0).writeBits(3, 0).writeBits(4, 0).writeBits(1, 0)
@@ -1484,7 +1484,7 @@ describe('AC-3 and E-AC-3 headers', () => {
 		const config = parseEac3Config(dec3)!;
 		expect(config.dataRate).toBe(640);
 		expect(config.substreams).toEqual([
-			{ fscod: 0, fscod2: null, bsid: 16, bsmod: 2, acmod: 7, lfeon: 1, numDepSub: 1, chanLoc: 0b0_1000_0000 },
+			{ fscod: 0, fscod2: null, bsid: 16, bsmod: 2, acmod: 7, lfeon: 1, numDepSub: 1, chanLoc: 0b0_0001_0000 },
 			{ fscod: 0, fscod2: null, bsid: 16, bsmod: 0, acmod: 2, lfeon: 0, numDepSub: 0, chanLoc: 0 },
 		]);
 		expect([getEac3SampleRate(config), getEac3ChannelCount(config)]).toEqual([48000, 8]);
