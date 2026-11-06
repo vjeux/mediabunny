@@ -2130,6 +2130,11 @@ export class IsobmffDemuxer extends Demuxer {
 						} else {
 							Logging._warn(`Unsupported audio codec (sample entry type '${sampleBoxInfo.name}').`);
 						}
+
+						if (track.info.numberOfChannels === 0 && track.info.codec !== null) {
+							Logging._warn('Invalid audio sample entry: channel count must not be 0.');
+							track.info.codec = null;
+						}
 					}
 
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
