@@ -276,3 +276,33 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
+
+test('Decoded audio samples can be looked up by their own timestamps (Matroska)', async () => {
+	using input = new Input({
+		source: new UrlSource('/demo.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+	const samples: { timestamp: number; numberOfFrames: number }[] = [];
+	for await (using sample of sink.samples(0, 1)) {
+		samples.push({ timestamp: sample.timestamp, numberOfFrames: sample.numberOfFrames });
+	}
+
+	// Matroska stores packet timestamps in milliseconds, while decoded audio is timed by its sample count. Decoding
+	// from elsewhere can move a sample by up to that precision, but must not give the sample before it (20 ms earlier).
+	for (const { timestamp, numberOfFrames } of samples.slice(1)) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBeCloseTo(timestamp, 2);
+		expect(sample.numberOfFrames).toBe(numberOfFrames);
+
+		for await (using first of sink.samples(timestamp)) {
+			expect(first.timestamp).toBeCloseTo(timestamp, 2);
+			break;
+		}
+	}
+});
