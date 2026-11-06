@@ -48,7 +48,8 @@ export class SubtitleParser {
 		let match: RegExpMatchArray | null;
 
 		if (!this.preambleText) {
-			if (!preambleStartRegex.test(text)) {
+			// The text may also end right after the header, as a file without cues does
+			if (!preambleStartRegex.test(text + '\n\n')) {
 				throw new Error('WebVTT preamble incorrect.');
 			}
 
