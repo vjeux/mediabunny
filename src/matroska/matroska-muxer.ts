@@ -1093,12 +1093,19 @@ export class MatroskaMuxer extends Muxer {
 			const isKeyFrame = packet.type === 'key';
 			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
 
-			// A negative start (like from encoder priming) is expressed this way.
+			// A negative start (like from encoder priming) is expressed this way. Readers (like FFmpeg) convert
+			// CodecDelay to whole timestamp ticks before subtracting it, so the blocks are shifted by that same rounded
+			// amount; shifting them by the exact delay would add up to another tick of error to every timestamp.
 			trackData.info.codecDelay ??= Math.max(-packet.timestamp, 0);
+			const codecDelayMs = Math.round(Math.round(1e9 * trackData.info.codecDelay) / 1e6);
+			// The shifted timestamp goes onto the millisecond grid here. Rounding via whole microseconds keeps
+			// timestamps that sit right at half a millisecond (like a -6.5 ms Opus start in 20 ms steps) from rounding
+			// up or down at random on floating-point noise.
+			const msTimestamp = Math.round(Math.round(1e6 * packet.timestamp) / 1000) + codecDelayMs;
 
 			const audioChunk = this.createInternalChunk(
 				packetData,
-				packet.timestamp + trackData.info.codecDelay,
+				msTimestamp / 1000,
 				packet.duration,
 				packet.type,
 			);
