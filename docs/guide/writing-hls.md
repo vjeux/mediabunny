@@ -714,6 +714,8 @@ new HlsOutputFormat({
 });
 ```
 
+Segments are only popped as long as the playlist still spans three times the target duration, the minimum length of a live playlist in HLS, so a playlist may hold more segments than `maxLiveSegmentCount`.
+
 Whenever a segment is popped off the playlist in this fashion, the `onSegmentPopped` callback is called, which you can use to be notified of a segment being removed and to take action; for example, to delete the segment file. The callback is passed the path of the segment and [`HlsOutputSegmentInfo`](../api/HlsOutputSegmentInfo).
 
 ::: info
