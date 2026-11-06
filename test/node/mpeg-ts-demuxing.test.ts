@@ -11,6 +11,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { countMovedArrayElements } from './array-moves.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -961,18 +962,21 @@ test('MPEG-TS reading one track after another stays linear', async () => {
 	const tracks = await input.getAudioTracks();
 	expect(tracks).toHaveLength(2);
 
-	const durations: number[] = [];
-	for (const track of tracks) {
-		const start = performance.now();
-		let packetCount = 0;
-		for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
-			void packet;
-			packetCount++;
+	const packetCounts: number[] = [];
+	const movedElements = await countMovedArrayElements(async () => {
+		for (const track of tracks) {
+			const sink = new EncodedPacketSink(track);
+			let packetCount = 0;
+			for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+				void packet;
+				packetCount++;
+			}
+			packetCounts.push(packetCount);
 		}
-		durations.push(performance.now() - start);
-		expect(packetCount).toBeGreaterThan(count - 2);
-	}
+	});
 
-	// Both tracks span the same bytes, so reading the second one shouldn't take much longer than the first
-	expect(durations[1]!).toBeLessThan(2 * durations[0]! + 100);
+	expect(packetCounts[0]).toBeGreaterThan(count - 2);
+	expect(packetCounts[1]).toBeGreaterThan(count - 2);
+	// Linear: no per-packet array copies (main moved ~4e9 elements)
+	expect(movedElements).toBeLessThan(2 * count);
 });
