@@ -83,6 +83,7 @@ import { EncodedPacket, PacketType, PLACEHOLDER_DATA } from '../packet';
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
 import {
 	buildMpegTsMimeType,
+	computeMpegTsCrc32,
 	createTimestampWrapInfo,
 	MpegTsStreamType,
 	normalizeWrappedTimestamp,
@@ -177,6 +178,29 @@ type Section = {
 
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
+
+// How far to look for an intact copy of a damaged PSI section. Broadcasts repeat their tables at least every 0.5
+// seconds (ETSI TR 101 290), and FFmpeg only takes damaged sections after 10 of them in a row on a PID.
+const MAX_PSI_SECTION_REPETITION_DISTANCE = 4 * 1024 * 1024;
+
+const getPsiTableId = (payload: Uint8Array) => payload[1 + (payload[0] ?? 0)] ?? null;
+
+/** Checks the CRC_32 of the PSI section starting after the pointer_field of the given packet payload. */
+const psiSectionIsIntact = (payload: Uint8Array) => {
+	const sectionStart = 1 + (payload[0] ?? 0);
+	if (sectionStart + 3 > payload.length) {
+		return false;
+	}
+
+	const sectionLength = ((payload[sectionStart + 1]! & 0x0f) << 8) | payload[sectionStart + 2]!;
+	const sectionEnd = sectionStart + 3 + sectionLength;
+	if (sectionLength < 4 || sectionEnd > payload.length) {
+		return false;
+	}
+
+	// Running the CRC over the section including its CRC_32 field gives zero
+	return computeMpegTsCrc32(payload.subarray(sectionStart, sectionEnd)) === 0;
+};
 
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
@@ -285,7 +309,7 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 
 				if (section.pid === 0 && !hasProgramAssociationTable) {
-					const bitstream = new Bitstream(section.payload);
+					const bitstream = new Bitstream((await this.findIntactPsiSection(section)).payload);
 					const pointerField = bitstream.readAlignedByte();
 
 					bitstream.skipBits(8 * pointerField);
@@ -315,7 +339,7 @@ export class MpegTsDemuxer extends Demuxer {
 
 					hasProgramAssociationTable = true;
 				} else if ((section.pid === programMapPid || isProbablyProgramMap) && !hasProgramMap) {
-					const bitstream = new Bitstream(section.payload);
+					const bitstream = new Bitstream((await this.findIntactPsiSection(section)).payload);
 					const pointerField = bitstream.readAlignedByte();
 
 					bitstream.skipBits(8 * pointerField);
@@ -967,6 +991,41 @@ export class MpegTsDemuxer extends Demuxer {
 			payload: merged,
 			randomAccessIndicator,
 		};
+	}
+
+	/**
+	 * PSI sections end in a CRC so that damaged copies can be told apart, which matters for captures with reception
+	 * errors. Since the tables are repeated several times per second, we look a bit further for a copy that passes the
+	 * check if the given one doesn't, like FFmpeg skips damaged sections. Some muxers write bad CRCs though, so if
+	 * there's no intact copy, we go with the given one.
+	 */
+	async findIntactPsiSection(section: Section): Promise<Section> {
+		if (psiSectionIsIntact(section.payload)) {
+			return section;
+		}
+
+		const tableId = getPsiTableId(section.payload);
+		const endPos = section.startPos + MAX_PSI_SECTION_REPETITION_DISTANCE;
+
+		try {
+			for (let pos = section.startPos + this.packetStride; pos < endPos; pos += this.packetStride) {
+				const packetHeader = await this.readPacketHeader(pos);
+				if (!packetHeader) {
+					break;
+				}
+
+				if (packetHeader.pid === section.pid && packetHeader.payloadUnitStartIndicator === 1) {
+					const copy = await this.readSection(pos, true, true);
+					if (copy && getPsiTableId(copy.payload) === tableId && psiSectionIsIntact(copy.payload)) {
+						return copy;
+					}
+				}
+			}
+		} catch {
+			// The search ran into more damage, so let's go with what we have
+		}
+
+		return section;
 	}
 
 	async readPacketHeader(pos: number): Promise<TsPacketHeader | null> {

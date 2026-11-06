@@ -922,3 +922,44 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
 });
+
+test('MPEG-TS uses an intact copy of a damaged PAT or PMT', async () => {
+	// FFmpeg output, which repeats the PAT and PMT (PID 0x1000) several times per second, like broadcasts do
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/mp3.ts')));
+	const findFirstSection = (pid: number) => {
+		for (let pos = 0; pos < bytes.length; pos += 188) {
+			if (((bytes[pos + 1]! & 0x1f) << 8 | bytes[pos + 2]!) === pid && bytes[pos + 1]! & 0x40) {
+				return pos + 4 + 1 + bytes[pos + 4]!; // Skip the header and pointer_field
+			}
+		}
+
+		throw new Error('Section not found');
+	};
+
+	const readTracks = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		return Promise.all((await input.getTracks()).map(track => track.getCodec()));
+	};
+
+	// A bit error in the first PAT turns its program into the network PID entry
+	const damagedPat = bytes.slice();
+	damagedPat[findFirstSection(0) + 9] = 0x00; // program_number 1 -> 0
+	expect(await readTracks(damagedPat)).toEqual(['mp3']);
+
+	// A bit error in the first PMT changes the stream type
+	const damagedPmt = bytes.slice();
+	damagedPmt[findFirstSection(0x1000) + 12] = 0x13; // stream_type 0x03 (MPEG-1 audio) -> 0x13
+	expect(await readTracks(damagedPmt)).toEqual(['mp3']);
+
+	// Some muxers write bad CRCs throughout, so without an intact copy, the damaged one is still used
+	const allBad = bytes.slice();
+	for (let pos = 0; pos < allBad.length; pos += 188) {
+		const pid = (allBad[pos + 1]! & 0x1f) << 8 | allBad[pos + 2]!;
+		if ((pid === 0 || pid === 0x1000) && allBad[pos + 1]! & 0x40) {
+			const sectionStart = pos + 4 + 1 + allBad[pos + 4]!;
+			const sectionEnd = sectionStart + 3 + ((allBad[sectionStart + 1]! & 0x0f) << 8 | allBad[sectionStart + 2]!);
+			allBad.fill(0, sectionEnd - 4, sectionEnd); // CRC_32
+		}
+	}
+	expect(await readTracks(allBad)).toEqual(['mp3']);
+});
