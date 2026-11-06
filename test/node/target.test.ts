@@ -5,7 +5,7 @@ import { Input } from '../../src/input.js';
 import { FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { BufferTarget } from '../../src/target.js';
+import { AppendOnlyStreamTarget, BufferTarget, StreamTarget } from '../../src/target.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 
@@ -56,4 +56,16 @@ test('BufferTarget internal buffer transfer on finalize', async () => {
 
 	expect(target.buffer).toHaveProperty('resizable', false);
 	expect([...new Uint8Array(target.buffer!)]).toEqual([1, 2, 3, 6, 7]);
+});
+
+test('Stream targets validate their constructor arguments', () => {
+	expect(() => new StreamTarget(new WritableStream(), null as never)).toThrow(
+		new TypeError('StreamTarget options, when provided, must be an object.'),
+	);
+
+	for (const writable of [undefined, null, {}, new ReadableStream()]) {
+		expect(() => new AppendOnlyStreamTarget(writable as never)).toThrow(
+			new TypeError('AppendOnlyStreamTarget requires a WritableStream instance.'),
+		);
+	}
 });
