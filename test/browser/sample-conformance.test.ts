@@ -504,6 +504,110 @@ describe('VideoSample drawing and transformation', () => {
 type AudioFormat = 'u8' | 's16' | 's32' | 'f32' | 'u8-planar' | 's16-planar' | 's32-planar' | 'f32-planar';
 const AUDIO_FORMATS: AudioFormat[] = ['u8', 's16', 's32', 'f32', 'u8-planar', 's16-planar', 's32-planar', 'f32-planar'];
 
+describe('VideoSample from image sources', () => {
+	const makeCanvas = () => {
+		// Left half red, right half blue
+		const canvas = new OffscreenCanvas(4, 2);
+		const context = canvas.getContext('2d')!;
+		context.fillStyle = 'rgb(255, 0, 0)';
+		context.fillRect(0, 0, 2, 2);
+		context.fillStyle = 'rgb(0, 0, 255)';
+		context.fillRect(2, 0, 2, 2);
+		return canvas;
+	};
+
+	const readRgb = (sample: VideoSample) => {
+		const context = newContext(sample.displayWidth, sample.displayHeight);
+		sample.draw(context, 0, 0);
+		const pixels = context.getImageData(0, 0, sample.displayWidth, sample.displayHeight).data;
+		const colors: string[] = [];
+		for (let i = 0; i < pixels.length; i += 4) {
+			colors.push(pixels[i]! > 128 ? 'R' : pixels[i + 2]! > 128 ? 'B' : '?');
+		}
+		return colors.join('');
+	};
+
+	test('wraps canvases, bitmaps and images with the given timing', async () => {
+		const canvas = makeCanvas();
+		const image = new Image();
+		image.src = URL.createObjectURL(await canvas.convertToBlob({ type: 'image/png' }));
+		await image.decode();
+		URL.revokeObjectURL(image.src);
+		const bitmap = await createImageBitmap(canvas);
+
+		for (const source of [canvas, bitmap, image]) {
+			using sample = new VideoSample(source, { timestamp: -0.0333333, duration: 0.04 });
+			expect([sample.displayWidth, sample.displayHeight]).toEqual([4, 2]);
+			expect([sample.timestamp, sample.duration]).toEqual([-0.0333333, 0.04]);
+			expect(sample.colorSpace.toJSON())
+				.toEqual({ primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true });
+			expect(readRgb(sample)).toBe('RRBBRRBB');
+
+			const frame = sample.toVideoFrame();
+			expect([frame.timestamp, frame.duration]).toEqual([-33333, 40000]);
+			frame.close();
+
+			expect(() => new VideoSample(source, {} as never)).toThrow(TypeError);
+		}
+		bitmap.close();
+	});
+
+	test('crops image sources to the visible rect', () => {
+		const visibleRect = { left: 1, top: 0, width: 2, height: 2 };
+		using sample = new VideoSample(makeCanvas(), { timestamp: 0, visibleRect });
+		expect([sample.codedWidth, sample.codedHeight, sample.displayWidth, sample.displayHeight])
+			.toEqual([2, 2, 2, 2]);
+		expect(readRgb(sample)).toBe('RBRB');
+	});
+
+	test('toCanvasImageSource() turns raw data into a VideoFrame that closes after the current microtask', async () => {
+		using sample = new VideoSample(makeCoordinateData(2, 2), {
+			format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0,
+		});
+		const source = sample.toCanvasImageSource() as VideoFrame;
+		expect(source).toBeInstanceOf(VideoFrame);
+		const context = newContext(2, 2);
+		context.drawImage(source, 0, 0);
+		expect(readCoordinates(context)).toEqual(['0,0', '1,0', '0,1', '1,1']);
+
+		await Promise.resolve();
+		expect(source.format).toBe(null);
+	});
+
+	test('works with canvas sources when VideoFrame isn\'t available', async () => {
+		const globals = globalThis as { VideoFrame?: unknown };
+		const OriginalVideoFrame = globals.VideoFrame;
+		delete globals.VideoFrame;
+
+		try {
+			using sample = new VideoSample(makeCanvas(), {
+				timestamp: 1,
+				rotation: 90,
+				visibleRect: { left: 1, top: 0, width: 3, height: 2 },
+			});
+			expect(sample.format).toBe('RGBX');
+			expect([sample.codedWidth, sample.codedHeight, sample.displayWidth, sample.displayHeight])
+				.toEqual([3, 2, 2, 3]);
+			expect(sample.colorSpace.matrix).toBe('rgb');
+
+			const bytes = new Uint8Array(sample.allocationSize());
+			expect(await sample.copyTo(bytes)).toEqual([{ offset: 0, stride: 12 }]);
+			const red = [255, 0, 0, 255];
+			const blue = [0, 0, 255, 255];
+			expect([...bytes]).toEqual([...red, ...blue, ...blue, ...red, ...blue, ...blue]);
+
+			using clone = sample.clone();
+			expect([clone.format, clone.codedWidth, clone.rotation]).toEqual(['RGBX', 3, 90]);
+			expect(readRgb(clone)).toBe('RRBBBB');
+
+			using transformed = await sample.transform({ width: 4 });
+			expect([transformed.displayWidth, transformed.displayHeight, transformed.rotation]).toEqual([4, 6, 0]);
+		} finally {
+			globals.VideoFrame = OriginalVideoFrame;
+		}
+	});
+});
+
 describe('AudioSample matches AudioData', () => {
 	const makePair = (format: AudioFormat, frames: number, channels: number, seed: number) => {
 		const bytesPerSample = format.startsWith('u8') ? 1 : format.startsWith('s16') ? 2 : 4;
