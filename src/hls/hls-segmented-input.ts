@@ -189,7 +189,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let currentFirstSegment: HlsSegment | null = null;
 		let currentInitSegment: HlsSegment | null = null;
 		let lastByteRangeEnd: number | null = null;
+		let lastByteRangePath: string | null = null; // The resource the last byte range belongs to
 		let nextByteRange: { offset: number; length: number } | null = null;
+		let nextByteRangeIsImplicit = false;
 		let lastProgramDateTimeSeconds: number | null = null;
 
 		// Used for repeated parses where our job it is to only add the new segments
@@ -248,6 +250,23 @@ export class HlsSegmentedInput extends SegmentedInput {
 			}
 
 			if (!line.startsWith('#')) {
+				if (nextByteRange !== null) {
+					const path = joinPaths(this.rootPath, variables.substitute(line));
+
+					// "If o is not present, a previous Media Segment MUST appear in the Playlist file and MUST be a
+					// sub-range of the same media resource, or the Media Segment is undefined and the client MUST fail
+					// to parse the Playlist."
+					if (nextByteRangeIsImplicit && path !== lastByteRangePath) {
+						throw new Error(
+							'Invalid M3U8 file; #EXT-X-BYTERANGE without offset must follow a sub-range of the same'
+							+ ' resource.',
+						);
+					}
+
+					lastByteRangePath = path;
+					nextByteRangeIsImplicit = false;
+				}
+
 				if (!prevLastSegment) {
 					if (nextSegmentDuration === null) {
 						throw new Error('Invalid M3U8 file; a segment must be preceded by an #EXTINF tag.');
@@ -479,6 +498,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				setNextSequenceNumber(number);
 			} else if (line.startsWith(TAG_BYTERANGE)) {
 				const parsed = parseByteRange(line.slice(TAG_BYTERANGE.length));
+				nextByteRangeIsImplicit = parsed.offset === null;
 				if (parsed.offset === null) {
 					if (lastByteRangeEnd === null) {
 						throw new Error(
