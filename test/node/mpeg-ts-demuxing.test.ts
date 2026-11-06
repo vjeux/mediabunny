@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Conversion } from '../../src/conversion.js';
+import { Output } from '../../src/output.js';
+import { Mp4OutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +925,46 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS packets can be advanced from twice at once', async () => {
+	const bytes = fs.readFileSync(path.join(__dirname, '../public/0.ts'));
+
+	// Conversion does this at the trim end, looking ahead from the packet its packet iterator is advancing from
+	using conversionInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input: conversionInput,
+		output,
+		trim: { end: await conversionInput.getFirstTimestamp() + 1 },
+	});
+	await conversion.execute();
+
+	using outputInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect((await outputInput.getTracks()).map(x => x.type)).toEqual(['video', 'audio']);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	const timestamps: number[] = [];
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		timestamps.push(packet.timestamp);
+		if (timestamps.length === 30) {
+			break;
+		}
+	}
+
+	let packet = await sink.getFirstPacket();
+	for (let i = 1; i < 30; i++) {
+		assert(packet);
+		const [next, nextMetadata] = await Promise.all([
+			sink.getNextPacket(packet),
+			sink.getNextPacket(packet, { metadataOnly: true }),
+		]);
+		expect(next?.timestamp).toBe(timestamps[i]);
+		expect(nextMetadata?.timestamp).toBe(timestamps[i]);
+		packet = next;
+	}
 });
