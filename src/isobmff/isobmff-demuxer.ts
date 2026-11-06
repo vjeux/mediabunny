@@ -2937,7 +2937,9 @@ export class IsobmffDemuxer extends Demuxer {
 				let skippedEntryCount = 0;
 
 				for (let i = 0; i < entryCount; i++) {
-					const startChunkIndex = readU32Be(slice) - 1; // Convert to 0-indexed
+					// Convert to 0-indexed. Chunk numbers start at 1, so take 0 as 1 like FFmpeg does, rather than
+					// letting the first entry start at chunk -1, which doesn't exist
+					const startChunkIndex = Math.max(readU32Be(slice) - 1, 0);
 					const samplesPerChunk = readU32Be(slice);
 					const sampleDescriptionIndex = readU32Be(slice);
 
