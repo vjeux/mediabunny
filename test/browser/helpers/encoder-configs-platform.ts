@@ -111,24 +111,40 @@ const nativeVideoConfig = async (codec: ProbedVideoCodec, width: number, height:
 	} as const;
 };
 
-const readCenterLuma = async (frame: VideoFrame) => {
+const readLumas = async (frame: VideoFrame) => {
 	const buffer = new Uint8Array(frame.allocationSize());
 	const layout = await frame.copyTo(buffer);
 	const tight = layout[0]!.offset === 0 && layout[0]!.stride === frame.visibleRect!.width;
-	const row = Math.floor(frame.codedHeight / 2);
-	const column = Math.floor(frame.codedWidth / 2);
+	const width = frame.visibleRect!.width;
+	const row = Math.floor(frame.visibleRect!.height / 2);
 	const format = frame.format ?? '';
 
-	if (format.startsWith('RGB') || format.startsWith('BGR')) {
-		const offset = layout[0]!.offset + row * layout[0]!.stride + 4 * column;
-		const [red, green, blue] = format.startsWith('RGB')
-			? [buffer[offset]!, buffer[offset + 1]!, buffer[offset + 2]!]
-			: [buffer[offset + 2]!, buffer[offset + 1]!, buffer[offset]!];
-		return { luma: 16 + (65.481 * red + 128.553 * green + 24.966 * blue) / 255, tight: false };
-	}
+	const lumaAt = (column: number) => {
+		if (format.startsWith('RGB') || format.startsWith('BGR')) {
+			const offset = layout[0]!.offset + row * layout[0]!.stride + 4 * column;
+			const [red, green, blue] = format.startsWith('RGB')
+				? [buffer[offset]!, buffer[offset + 1]!, buffer[offset + 2]!]
+				: [buffer[offset + 2]!, buffer[offset + 1]!, buffer[offset]!];
+			return 16 + (65.481 * red + 128.553 * green + 24.966 * blue) / 255;
+		}
 
-	// Planar and semi-planar YUV formats all start with the luma plane
-	return { luma: buffer[layout[0]!.offset + row * layout[0]!.stride + column]!, tight };
+		// Planar and semi-planar YUV formats all start with the luma plane
+		return buffer[layout[0]!.offset + row * layout[0]!.stride + column]!;
+	};
+	const stretched = (value: number) => {
+		return frame.colorSpace.fullRange === false
+			? Math.min(Math.max(Math.round((value - 16) * 255 / 219), 0), 255)
+			: value;
+	};
+
+	return {
+		center: lumaAt(Math.floor(width / 2)),
+		halves: [stretched(lumaAt(Math.floor(width / 4))), stretched(lumaAt(Math.floor(3 * width / 4)))] as [
+			number,
+			number,
+		],
+		tight: tight && !format.startsWith('RGB') && !format.startsWith('BGR'),
+	};
 };
 
 type NativeRoundTrip = {
@@ -137,6 +153,11 @@ type NativeRoundTrip = {
 	chunkBytes: number;
 	decoderConfig: VideoDecoderConfig | null;
 	decodedLuma: number[];
+	/**
+	 * The luma at the middle of each decoded frame's left and right halves, stretched from limited to full range when
+	 * the frame says it's limited range, as alpha merging does.
+	 */
+	decodedHalves: [number, number][];
 	decodedColorSpaces: VideoColorSpaceInit[];
 	/** Whether every decoded frame's default copyTo layout starts its luma plane at 0, one visible row per stride. */
 	tightLayouts: boolean;
@@ -149,8 +170,11 @@ type NativeRoundTrip = {
 const nativeRoundTrip = async (options: {
 	config: VideoEncoderConfig;
 	encodeOptions?: VideoEncoderEncodeOptions;
-	/** Flat frames of a luma value, or textured ones like the tests' (a gradient with a moving bar). */
-	frames: { luma: number | 'textured'; colorSpace?: VideoColorSpaceInit }[];
+	/**
+	 * Flat frames of a luma value, textured ones like the tests' (a gradient with a moving bar), or frames whose left
+	 * and right halves have the given lumas.
+	 */
+	frames: { luma: number | 'textured' | [number, number]; colorSpace?: VideoColorSpaceInit }[];
 	decode?: boolean;
 	decoderColorSpace?: VideoColorSpaceInit;
 }): Promise<NativeRoundTrip | null> => {
@@ -165,6 +189,7 @@ const nativeRoundTrip = async (options: {
 		chunkBytes: 0,
 		decoderConfig: null,
 		decodedLuma: [],
+		decodedHalves: [],
 		decodedColorSpaces: [],
 		tightLayouts: true,
 	};
@@ -193,6 +218,12 @@ const nativeRoundTrip = async (options: {
 				for (let y = 0; y < height; y++) {
 					for (let x = 0; x < width; x++) {
 						data[y * width + x] = Math.abs(x - (i * 8) % width) < 4 ? 235 : 16 + ((x + 2 * y) % 200);
+					}
+				}
+			} else if (Array.isArray(luma)) {
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						data[y * width + x] = x < width / 2 ? luma[0] : luma[1];
 					}
 				}
 			} else {
@@ -236,8 +267,9 @@ const nativeRoundTrip = async (options: {
 		output: (frame) => {
 			const index = pending.length;
 			result.decodedColorSpaces[index] = frame.colorSpace.toJSON();
-			pending.push(readCenterLuma(frame).then(({ luma, tight }) => {
-				result.decodedLuma[index] = luma;
+			pending.push(readLumas(frame).then(({ center, halves, tight }) => {
+				result.decodedLuma[index] = center;
+				result.decodedHalves[index] = halves;
 				result.tightLayouts &&= tight;
 			}).finally(() => frame.close()));
 		},
@@ -429,27 +461,26 @@ const ALPHA_COLOR_SPACE: VideoColorSpaceInit = {
 };
 
 /**
- * Whether full-range flat frames of luma 255 and 64 come back through the platform's encoder and decoder within 10, at
- * 2 Mbps, in decoded frames whose default copyTo layout is tightly packed (as WebCodecs specifies, and as alpha merging
- * reads them). Alpha is encoded as the luma of a second, full-range stream, so alpha values can only be checked where
- * this holds.
+ * Whether frames with the alpha test's pattern, luma 255 on the left half and 64 on the right, tagged full range,
+ * come back through the platform's encoder and decoder at 2 Mbps the way the test checks them: above 245 and within
+ * 10 of 64, read as alpha merging reads them (limited range stretched out, decoded frames copied out tightly packed,
+ * as WebCodecs specifies). Alpha is encoded as the luma of a second, full-range stream, so alpha values can only be
+ * checked where this holds. WebKitGTK's VP9 encoder blurs the two halves together.
  */
-export const flatLumaSurvives = memoizeByKey(async (codec: ProbedVideoCodec) => {
-	const lumas = [255, 64];
+export const alphaPatternSurvives = memoizeByKey(async (codec: ProbedVideoCodec) => {
 	const roundTrip = await nativeRoundTrip({
-		config: {
-			codec: literalCodecString(codec, 160, 120),
-			width: 160,
-			height: 120,
-			bitrate: 2_000_000,
-		},
-		frames: lumas.map(luma => ({ luma, colorSpace: ALPHA_COLOR_SPACE })),
+		config: { codec: literalCodecString(codec, 160, 120), width: 160, height: 120, bitrate: 2_000_000 },
+		frames: Array.from({ length: 3 }, () => ({
+			luma: [255, 64] as [number, number],
+			colorSpace: ALPHA_COLOR_SPACE,
+		})),
 		decoderColorSpace: ALPHA_COLOR_SPACE,
 	});
 	return !!roundTrip
 		&& !roundTrip.failed
 		&& roundTrip.tightLayouts
-		&& lumas.every((luma, i) => Math.abs((roundTrip.decodedLuma[i] ?? -100) - luma) <= 10);
+		&& roundTrip.decodedHalves.length === 3
+		&& roundTrip.decodedHalves.every(([left, right]) => left > 245 && Math.abs(right - 64) < 10);
 });
 
 const sameColorSpace = (a: VideoColorSpaceInit | undefined | null, b: VideoColorSpaceInit) => {

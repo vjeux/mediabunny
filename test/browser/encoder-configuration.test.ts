@@ -33,7 +33,7 @@ import {
 	avcHonorsProfile,
 	avcKeepsEveryFrame,
 	colorSpaceSupport,
-	flatLumaSurvives,
+	alphaPatternSurvives,
 	hungCoderKinds,
 	nativeAudioEncode,
 	nativeSupportsPreferHardware,
@@ -591,7 +591,7 @@ describe('Encoder options', () => {
 		for (const codec of (await encodableVideoCodecs()).filter(x => x === 'vp8' || x === 'vp9' || x === 'av1')) {
 			// Alpha is encoded as the luma of a second stream, so its values depend on the platform's codec keeping
 			// luma
-			const alphaValuesSurvive = await flatLumaSurvives(codec);
+			const alphaValuesSurvive = await alphaPatternSurvives(codec);
 
 			for (const alpha of ['keep', 'discard'] as const) {
 				const result = await encodeVideo({
