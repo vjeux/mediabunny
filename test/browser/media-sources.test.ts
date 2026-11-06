@@ -473,6 +473,20 @@ test('VideoSampleSource, transform.frameRate is not thrown off by floating point
 	}
 });
 
+test.each([0, 0.3 - (0.1 + 0.2)])(
+	'VideoSampleSource, transform.frameRate puts a timestamp of %s on the first frame',
+	async (timestamp) => {
+		// 0.3 - (0.1 + 0.2) is -5.55e-17
+		const buffer = await encodeFrames(
+			{ codec: 'vp8', quality: new Quality('medium'), transform: { frameRate: 30 } },
+			[{ width: 100, height: 100, timestamp, duration: 1 / 30 }],
+		);
+
+		const samples = await readBackSamples(buffer);
+		expect(samples.map(x => x.timestamp)).toEqual([0]);
+	},
+);
+
 test('VideoSampleSource, transform.frameRate skipping and padding combined', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { frameRate: 10 } },

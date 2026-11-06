@@ -37,7 +37,6 @@ import {
 	last,
 	missingWebCodecsClassMessage,
 	promiseWithResolvers,
-	roundIfAlmostInteger,
 	roundToDivisor,
 	setInt24,
 	setIntervalUnthrottled,
@@ -251,11 +250,15 @@ export class EncodedVideoPacketSource extends VideoSource {
 
 /**
  * Floors the timestamp to the start of the frame it falls into at the given frame rate. Timestamps meant to sit exactly
- * on a frame boundary often land a hair below it due to floating point error (1/30 + 1/30 + ...), so those count as
- * being on the boundary.
+ * on a frame boundary often land a hair below it due to floating point error (1/30 + 1/30 + ..., or 0.3 - (0.1 + 0.2)
+ * for zero), so those count as being on the boundary. The tolerance is relative, but absolute around zero.
  */
 const floorToFrame = (timestamp: number, frameRate: number) => {
-	return Math.floor(roundIfAlmostInteger(timestamp * frameRate)) / frameRate;
+	const position = timestamp * frameRate;
+	const nearest = Math.round(position);
+	const snapped = Math.abs(position - nearest) < 1e-12 * Math.max(1, Math.abs(nearest)) ? nearest : position;
+
+	return Math.floor(snapped) / frameRate;
 };
 
 class VideoEncoderWrapper {
