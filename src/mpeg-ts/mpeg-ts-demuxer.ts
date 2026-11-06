@@ -2714,9 +2714,24 @@ class PacketReadingContext {
 
 						if (codec === 'avc') {
 							const headerBytes = chunk.subarray(payloadStart, payloadStart + AVC_SLICE_HEADER_PEEK_SIZE);
-							const firstMacroblockInSlice = readExpGolomb(new Bitstream(headerBytes));
-							startsNewPicture = !frameStartFound || firstMacroblockInSlice <= lastFirstMacroblockInSlice;
-							lastFirstMacroblockInSlice = firstMacroblockInSlice;
+
+							let firstMacroblockInSlice: number | null;
+							try {
+								firstMacroblockInSlice = readExpGolomb(new Bitstream(headerBytes));
+							} catch {
+								// A damaged slice header: more zeros than any first_mb_in_slice can start with
+								firstMacroblockInSlice = null;
+							}
+
+							if (firstMacroblockInSlice === null) {
+								// We can't tell if it begins a new picture, so let's keep it with the current one
+								// instead of giving up on the rest of the stream
+								startsNewPicture = !frameStartFound;
+							} else {
+								startsNewPicture = !frameStartFound
+									|| firstMacroblockInSlice <= lastFirstMacroblockInSlice;
+								lastFirstMacroblockInSlice = firstMacroblockInSlice;
+							}
 
 							if (startsNewPicture && avcFieldCoding) {
 								const field = readAvcSliceField(
