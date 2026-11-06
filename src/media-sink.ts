@@ -2319,12 +2319,21 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Internal state to accumulate a precise current timestamp based on audio durations, not the (potentially
 	// inaccurate) packet timestamps.
 	currentTimestamp: number | null = null;
-	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
+	// Where the audio decoded from the first packet passed to the WebCodecs decoder starts. Chromium does not respect
+	// negative packet timestamps, so we must do the fixin' ourselves.
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
-	// A Vorbis decoder outputs nothing for the first packet it gets, which only primes the window overlap. The first
-	// audio comes out of the second packet, so that's the one whose timestamp the output must start at.
-	primingPacketPending: boolean;
+	// By spec, each output carries the timestamp of the chunk it was decoded from, but Chromium instead counts up from
+	// the first chunk's timestamp, which loses any gap between packets. So there, we stamp each output with where the
+	// audio of its packet starts, kept here in decode order.
+	stampsOutputsItself = isChromium();
+	inputTimestamps: number[] = [];
+	// WebCodecs impls discard the Opus pre-skip (correct) but don't advance the timestamp (incorrect). These are the
+	// pre-skip and the part of it the decoder still has to discard from the packets to come, in Opus samples.
+	opusPreSkip: number;
+	remainingOpusPreSkip: number;
+	// A Vorbis decoder outputs nothing for the first packet it gets, which only primes the window overlap
+	vorbisPrimingPacketPending: boolean;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
@@ -2334,28 +2343,31 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	) {
 		super(onSample, onError);
 
-		this.primingPacketPending = codec === 'vorbis';
-
-		// WebCodecs impls discards the preskip (correct) but doesn't advance the timestamp (incorrect)
-		const opusPreSkip = codec === 'opus' && decoderConfig.description
-			? parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip / OPUS_SAMPLE_RATE
+		this.opusPreSkip = codec === 'opus' && decoderConfig.description
+			? parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip
 			: 0;
+		this.remainingOpusPreSkip = this.opusPreSkip;
+		this.vorbisPrimingPacketPending = codec === 'vorbis';
 
 		const sampleHandler = (sample: AudioSample) => {
 			if (sample.numberOfFrames === 0) {
 				// We skip zero-data (empty) AudioSamples. These are sometimes emitted, for example, by Firefox when it
-				// decodes Vorbis (at the start). They carry no audio, so they mustn't anchor the timestamps either.
+				// decodes Vorbis (at the start).
 				sample.close();
 				return;
 			}
 
 			let sampleTimestamp = sample.timestamp;
+			if (this.stampsOutputsItself && !this.customDecoder) {
+				// Should there be more outputs than packets, assume the audio continues seamlessly
+				sampleTimestamp = this.inputTimestamps.shift() ?? this.currentTimestamp ?? sampleTimestamp;
+			} else {
+				if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
+					this.timestampOffset = this.expectedFirstTimestamp - sampleTimestamp;
+				}
 
-			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
-				this.timestampOffset = this.expectedFirstTimestamp + opusPreSkip - sampleTimestamp;
+				sampleTimestamp += this.timestampOffset;
 			}
-
-			sampleTimestamp += this.timestampOffset;
 
 			if (
 				this.currentTimestamp === null
@@ -2444,10 +2456,20 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		} else {
 			assert(this.decoder);
 
-			if (this.primingPacketPending) {
-				this.primingPacketPending = false;
+			const opusPacketSamples = Math.round(packet.duration * OPUS_SAMPLE_RATE);
+			if (this.vorbisPrimingPacketPending) {
+				this.vorbisPrimingPacketPending = false;
+			} else if (opusPacketSamples > 0 && this.remainingOpusPreSkip >= opusPacketSamples) {
+				// The decoder discards this whole packet, so no output comes of it
+				this.remainingOpusPreSkip -= opusPacketSamples;
 			} else {
-				this.expectedFirstTimestamp ??= packet.timestamp;
+				const outputTimestamp = packet.timestamp + this.remainingOpusPreSkip / OPUS_SAMPLE_RATE;
+				this.remainingOpusPreSkip = 0;
+
+				this.expectedFirstTimestamp ??= outputTimestamp;
+				if (this.stampsOutputsItself) {
+					this.inputTimestamps.push(outputTimestamp);
+				}
 			}
 
 			this.decoder.decode(packet.toEncodedAudioChunk());
@@ -2465,7 +2487,10 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		this.currentTimestamp = null;
 		this.expectedFirstTimestamp = null;
 		this.timestampOffset = 0;
-		this.primingPacketPending = this.codec === 'vorbis';
+		this.inputTimestamps.length = 0;
+		// The decoder starts over after a flush
+		this.remainingOpusPreSkip = this.opusPreSkip;
+		this.vorbisPrimingPacketPending = this.codec === 'vorbis';
 	}
 
 	close() {
