@@ -99,7 +99,7 @@ const EXTENSIONS: Extension[] = [
 ];
 
 describe('Package manifests', () => {
-	test('Every entry point is a shipped file, with the types condition first', () => {
+	test('Every entry point is a shipped file, with the types conditions first', () => {
 		for (const dir of packageDirs) {
 			const pkg = readPackageJson(dir);
 			for (const entry of entryPaths(pkg)) {
@@ -110,12 +110,16 @@ describe('Package manifests', () => {
 				).toBe(true);
 			}
 
+			// "types" and versioned ones like "types@<5.8"
+			const isTypesCondition = (key: string) => key === 'types' || key.startsWith('types@');
 			const checkTypesFirst = (conditions: unknown) => {
 				if (conditions && typeof conditions === 'object') {
 					const keys = Object.keys(conditions);
-					if (keys.includes('types')) {
-						expect(keys[0], `${pkg.name}: "types" must come first in ${keys.join(', ')}`).toBe('types');
-					}
+					const typesKeyCount = keys.filter(isTypesCondition).length;
+					expect(
+						keys.slice(0, typesKeyCount).every(isTypesCondition),
+						`${pkg.name}: types conditions must come first in ${keys.join(', ')}`,
+					).toBe(true);
 					Object.values(conditions).forEach(checkTypesFirst);
 				}
 			};
