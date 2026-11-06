@@ -1696,6 +1696,31 @@ test.concurrent('Leading frames of an open GOP can be looked up by their own tim
 	expect((await sink.getPacket(23 / fps))?.timestamp).toBe(23 / fps);
 });
 
+test.concurrent('Packets at segment boundaries can be looked up when the segments overlap by a tick of rounding', async () => {
+	// 29.97 fps with a key frame every 30 frames: CMAF stores the second segment's last frame up to tick 691316 of
+	// 57600 Hz, but the third segment's key frame at tick 691315, since each segment's media is rounded on its own
+	const frameDuration = 1001 / 30000;
+	using input = await writeHlsFromPackets(
+		new CmafOutputFormat(),
+		Array.from({ length: 120 }, (_, i) => ({
+			timestamp: i * frameDuration,
+			duration: frameDuration,
+			type: i % 30 === 0 ? 'key' as const : 'delta' as const,
+		})),
+		[],
+	);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		if (packet.type === 'key') {
+			expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		}
+	}
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
