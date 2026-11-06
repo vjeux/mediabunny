@@ -157,6 +157,11 @@ type InternalTrack = {
 	editListPreviousSegmentDurations: number;
 	/** The media time offset of the main edit list entry (with media time !== -1) */
 	editListOffset: number;
+	/**
+	 * The smallest and largest composition time offset (presentation minus decode timestamp) seen in the fragments
+	 * read so far. They bound how far fragments interleave in presentation order.
+	 */
+	fragmentCompositionOffsetRange: { min: number; max: number } | null;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
@@ -264,8 +269,12 @@ type FragmentTrackData = {
 	track: InternalTrack;
 
 	// Kept as state for the presence of multiple trun boxes
-	currentTimestamp: number;
+	currentTimestamp: number; // The decode timestamp after the last sample once all trun boxes are read
 	currentOffset: number;
+
+	startDecodeTimestamp: number;
+	minCompositionOffset: number;
+	maxCompositionOffset: number;
 
 	startTimestamp: number;
 	endTimestamp: number;
@@ -560,6 +569,7 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentPositionCache: [],
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
+				fragmentCompositionOffsetRange: null,
 				encryptionInfo: foreignTrack.encryptionInfo,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
@@ -831,6 +841,11 @@ export class IsobmffDemuxer extends Demuxer {
 			const track = trackData.track;
 			const { fragmentPositionCache } = track;
 
+			track.fragmentCompositionOffsetRange = {
+				min: Math.min(track.fragmentCompositionOffsetRange?.min ?? Infinity, trackData.minCompositionOffset),
+				max: Math.max(track.fragmentCompositionOffsetRange?.max ?? -Infinity, trackData.maxCompositionOffset),
+			};
+
 			if (!trackData.startTimestampIsFinal) {
 				// It may be that some tracks don't define the base decode time, i.e. when the fragment begins. This
 				// we'll need to figure out the start timestamp another way. We'll compute the timestamp by accessing
@@ -1041,6 +1056,7 @@ export class IsobmffDemuxer extends Demuxer {
 					fragmentPositionCache: [],
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
+					fragmentCompositionOffsetRange: null,
 					encryptionInfo: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
@@ -2610,6 +2626,9 @@ export class IsobmffDemuxer extends Demuxer {
 						track,
 						currentTimestamp: 0,
 						currentOffset: track.currentFragmentState.baseDataOffset + (dataOffset ?? 0),
+						startDecodeTimestamp: 0,
+						minCompositionOffset: Infinity,
+						maxCompositionOffset: -Infinity,
 						startTimestamp: 0,
 						endTimestamp: 0,
 						firstKeyFrameTimestamp: null,
@@ -2658,6 +2677,10 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 
 					const isKeyFrame = !(sampleFlags & 0x00010000);
+
+					const { minCompositionOffset, maxCompositionOffset } = trackData;
+					trackData.minCompositionOffset = Math.min(minCompositionOffset, sampleCompositionTimeOffset);
+					trackData.maxCompositionOffset = Math.max(maxCompositionOffset, sampleCompositionTimeOffset);
 
 					trackData.samples.push({
 						presentationTimestamp: trackData.currentTimestamp + sampleCompositionTimeOffset,
@@ -3309,6 +3332,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestampInTimescale,
 			timestampInTimescale,
 			options,
+			false,
+			true,
 		);
 	}
 
@@ -3576,11 +3601,43 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 		// Whether the match must be a key frame, so that position cache entries without one can be skipped
 		requireKeyFrame = false,
+		// Whether the best match is the one with the latest presentation timestamp across all fragments. Fragments may
+		// interleave in presentation order (B-frames in fragments that don't start a GOP), so then the match found in
+		// one fragment is only final once no fragment before or after it can hold a later presentation timestamp.
+		matchByPresentationTimestamp = false,
 	): Promise<EncodedPacket | null> {
 		const { demuxer, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
 
 		let bestFragment: Fragment | null = null;
 		let bestSampleIndex = -1;
+
+		const getPresentationTimestamp = (fragment: Fragment, sampleIndex: number) => {
+			return fragment.trackData.get(this.internalTrack.id)!.samples[sampleIndex]!.presentationTimestamp;
+		};
+		const isBetterMatch = (fragment: Fragment, sampleIndex: number) => {
+			if (!bestFragment || !matchByPresentationTimestamp) {
+				return true;
+			}
+
+			const timestamp = getPresentationTimestamp(fragment, sampleIndex);
+			const bestTimestamp = getPresentationTimestamp(bestFragment, bestSampleIndex);
+			return timestamp > bestTimestamp
+				|| (timestamp === bestTimestamp && fragment.moofOffset > bestFragment.moofOffset);
+		};
+		// Samples in fragments after this one are decoded after its last sample, which bounds their presentation
+		const laterFragmentsArePresentedAfter = (trackData: FragmentTrackData, timestamp: number) => {
+			const offsetRange = this.internalTrack.fragmentCompositionOffsetRange;
+			assert(offsetRange);
+
+			return trackData.currentTimestamp + offsetRange.min > timestamp;
+		};
+		// Samples in fragments before this one are decoded before its first sample, which bounds their presentation
+		const earlierFragmentsArePresentedBefore = (trackData: FragmentTrackData, timestamp: number) => {
+			const offsetRange = this.internalTrack.fragmentCompositionOffsetRange;
+			assert(offsetRange);
+
+			return trackData.startDecodeTimestamp + offsetRange.max <= timestamp;
+		};
 
 		if (startFragment) {
 			const { sampleIndex, correctSampleFound } = getMatchInFragment(startFragment);
@@ -3640,11 +3697,20 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 
 			const scanStartPos = currentFragment ? currentFragment.moofOffset : currentPos;
+			// The first fragment of this scan holding the track
+			let firstTrackData = currentFragment?.trackData.get(this.internalTrack.id) ?? null;
 
 			while (currentPos < stopPos) {
 				if (currentFragment) {
 					const trackData = currentFragment.trackData.get(this.internalTrack.id);
-					if (trackData && trackData.startTimestamp > latestTimestamp) {
+					if (
+						trackData
+						&& (
+							matchByPresentationTimestamp
+								? laterFragmentsArePresentedAfter(trackData, latestTimestamp)
+								: trackData.startTimestamp > latestTimestamp
+						)
+					) {
 						// We're already past the upper bound, no need to keep searching
 						break;
 					}
@@ -3677,11 +3743,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 						break;
 					}
 
+					firstTrackData ??= currentFragment.trackData.get(this.internalTrack.id) ?? null;
+
 					const { sampleIndex, correctSampleFound } = getMatchInFragment(currentFragment);
-					if (correctSampleFound) {
+					if (correctSampleFound && !matchByPresentationTimestamp) {
 						return this.fetchPacketInFragment(currentFragment, sampleIndex, options);
 					}
-					if (sampleIndex !== -1) {
+					if (sampleIndex !== -1 && isBetterMatch(currentFragment, sampleIndex)) {
 						bestFragment = currentFragment;
 						bestSampleIndex = sampleIndex;
 					}
@@ -3690,12 +3758,27 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				currentPos = boxStartPos + boxInfo.totalSize;
 			}
 
-			if (lookupEntryPosition === null || (bestFragment && bestFragment.moofOffset >= lookupEntryPosition)) {
+			if (
+				lookupEntryPosition === null
+				|| (
+					bestFragment
+					&& bestFragment.moofOffset >= lookupEntryPosition
+					&& (
+						!matchByPresentationTimestamp
+						|| !firstTrackData
+						|| earlierFragmentsArePresentedBefore(
+							firstTrackData,
+							getPresentationTimestamp(bestFragment, bestSampleIndex),
+						)
+					)
+				)
+			) {
 				break;
 			}
 
-			// We found a lookup entry but no fragment from there on that satisfied the match. In this case, let's
-			// search again from the lookup entry preceding the fragments we just scanned.
+			// We found a lookup entry but no fragment from there on that satisfied the match (or, when matching by
+			// presentation timestamp, an earlier fragment may still hold a better one). In this case, let's search
+			// again from the lookup entry preceding the fragments we just scanned.
 			stopPos = scanStartPos; // So we don't read the same fragments again
 			startFragment = null;
 		}
@@ -4127,6 +4210,8 @@ const getNextKeyframeIndexForSample = (sampleTable: SampleTable, sampleIndex: nu
 };
 
 const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timestamp: number) => {
+	trackData.startDecodeTimestamp += timestamp;
+	trackData.currentTimestamp += timestamp;
 	trackData.startTimestamp += timestamp;
 	trackData.endTimestamp += timestamp;
 
