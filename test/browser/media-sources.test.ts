@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
@@ -731,3 +731,54 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test('MediaStreamVideoTrackSource, records every requested frame of a captureStream(0) canvas', async ({ skip }) => {
+	// Without a frame rate, frames can only be captured through MediaStreamTrackProcessor
+	if (typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackProcessor on the main thread (Chromium)');
+	}
+
+	const canvas = document.createElement('canvas');
+	canvas.width = 64;
+	canvas.height = 48;
+	document.body.appendChild(canvas);
+	const context = canvas.getContext('2d')!;
+
+	// A frame rate of 0 means the canvas only emits frames when requestFrame() is called
+	const track = canvas.captureStream(0).getVideoTracks()[0] as CanvasCaptureMediaStreamTrack & MediaStreamVideoTrack;
+	expect(track.getSettings().frameRate).toBe(0);
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const videoSource = new MediaStreamVideoTrackSource(track, {
+		codec: 'vp8',
+		quality: new Quality('low'),
+	});
+	let sourceError: unknown = null;
+	videoSource.errorPromise.catch((error) => {
+		sourceError = error;
+	});
+
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	for (let i = 0; i < 10; i++) {
+		context.fillStyle = `rgb(${i * 25}, 0, 0)`;
+		context.fillRect(0, 0, canvas.width, canvas.height);
+		track.requestFrame();
+		await new Promise(resolve => setTimeout(resolve, 50));
+	}
+
+	await output.finalize();
+	track.stop();
+	canvas.remove();
+
+	expect(sourceError).toBe(null);
+
+	const { input, track: videoTrack } = await readBackTrack(output.target.buffer!);
+	expect((await videoTrack.computePacketStats()).packetCount).toBe(10);
+	input.dispose();
+});
