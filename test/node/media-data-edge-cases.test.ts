@@ -1,5 +1,10 @@
-import { describe, expect, test } from 'vitest';
-import { AudioSample, VideoSample } from '../../src/sample.js';
+import { describe, expect, test, vi } from 'vitest';
+import {
+	AudioSample,
+	audioSampleToInterleavedFormat,
+	toInterleavedAudioFormat,
+	VideoSample,
+} from '../../src/sample.js';
 import { Input } from '../../src/input.js';
 import { BufferSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -375,5 +380,96 @@ describe('AudioSampleSink ranges and timestamps on PCM audio', () => {
 		const last = (await sink.getSample(0.5))!;
 		expect(last.timestamp).toBe(0.03);
 		last.close();
+	});
+});
+
+describe('AudioSample from AudioBuffer, format helpers and timestamp setters', () => {
+	// Node has no Web Audio API, so stand in the parts of AudioBuffer the conversion uses
+	class FakeAudioBuffer {
+		channels: Float32Array[];
+		constructor(public numberOfChannels: number, public length: number, public sampleRate: number) {
+			this.channels = Array.from({ length: numberOfChannels }, (_, c) => Float32Array.from(
+				{ length },
+				(_, i) => c + i / length,
+			));
+		}
+
+		copyFromChannel(destination: Float32Array, channel: number, offset: number) {
+			destination.set(this.channels[channel]!.subarray(offset, offset + destination.length));
+		}
+	}
+
+	test('large buffers are split into samples of at most 5 s of mono 48 kHz floats', () => {
+		vi.stubGlobal('AudioBuffer', FakeAudioBuffer);
+		try {
+			const buffer = new FakeAudioBuffer(2, 150_000, 48000);
+			const samples = AudioSample.fromAudioBuffer(buffer as unknown as AudioBuffer, 10);
+			// 240000 floats per sample, so 120000 stereo frames
+			expect(samples.map(s => [s.numberOfFrames, s.timestamp, s.format, s.numberOfChannels]))
+				.toEqual([[120_000, 10, 'f32-planar', 2], [30_000, 12.5, 'f32-planar', 2]]);
+
+			const right = new Float32Array(30_000);
+			samples[1]!.copyTo(right, { planeIndex: 1, format: 'f32-planar' });
+			expect([right[0], right[29_999]]).toEqual([buffer.channels[1]![120_000], buffer.channels[1]![149_999]]);
+
+			const fromGenerator = [...AudioSample._fromAudioBuffer(buffer as unknown as AudioBuffer, 0)];
+			expect(fromGenerator.map(s => [s.numberOfFrames, s.timestamp])).toEqual([[120_000, 0], [30_000, 2.5]]);
+			samples.concat(fromGenerator).forEach(s => s.close());
+
+			expect(() => AudioSample.fromAudioBuffer({} as AudioBuffer, 0)).toThrow(TypeError);
+			expect(() => [...AudioSample._fromAudioBuffer({} as AudioBuffer, 0)]).toThrow(TypeError);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	test('planar formats map to their interleaved counterparts; conversion keeps the samples', () => {
+		expect(['u8-planar', 's16-planar', 's32-planar', 'f32-planar', 'u8', 's16', 's32', 'f32']
+			.map(format => toInterleavedAudioFormat(format as AudioSampleFormat)))
+			.toEqual(['u8', 's16', 's32', 'f32', 'u8', 's16', 's32', 'f32']);
+
+		using planar = new AudioSample({
+			data: new Float32Array([0.5, -0.5, 0.25, -0.25]),
+			format: 'f32-planar',
+			numberOfChannels: 2,
+			sampleRate: 8000,
+			timestamp: 3,
+		});
+		using interleaved = audioSampleToInterleavedFormat(planar, 's16');
+		expect([interleaved.format, interleaved.numberOfFrames, interleaved.timestamp, interleaved.sampleRate])
+			.toEqual(['s16', 2, 3, 8000]);
+		const data = new Int16Array(4);
+		interleaved.copyTo(data, { planeIndex: 0, format: 's16' });
+		expect([...data]).toEqual([16384, 8192, -16384, -8192]); // Channel 0 is [0.5, -0.5], channel 1 [0.25, -0.25]
+	});
+
+	test('timestamp and duration setters validate their input', () => {
+		using audio = new AudioSample({
+			data: new Float32Array(4),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 4,
+			timestamp: 0,
+		});
+		audio.setTimestamp(-2.5);
+		expect([audio.timestamp, audio.microsecondTimestamp]).toEqual([-2.5, -2_500_000]);
+		expect(() => audio.setTimestamp(Infinity)).toThrow(TypeError);
+
+		using video = new VideoSample(new Uint8Array(16), {
+			format: 'RGBA',
+			codedWidth: 2,
+			codedHeight: 2,
+			timestamp: 0,
+			duration: 1,
+		});
+		video.setTimestamp(4);
+		video.setDuration(0.5);
+		expect([video.timestamp, video.duration, video.microsecondTimestamp, video.microsecondDuration])
+			.toEqual([4, 0.5, 4_000_000, 500_000]);
+		video.setDuration(0);
+		expect(video.duration).toBe(0);
+		expect(() => video.setTimestamp(NaN)).toThrow(TypeError);
+		expect(() => video.setDuration(-1)).toThrow(TypeError);
+		expect(() => video.setDuration(Infinity)).toThrow(TypeError);
 	});
 });
