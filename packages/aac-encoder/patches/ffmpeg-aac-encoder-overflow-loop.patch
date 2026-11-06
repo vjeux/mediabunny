@@ -1,0 +1,41 @@
+diff --git a/libavcodec/aacenc.c b/libavcodec/aacenc.c
+index 5b1e3ef..929ce04 100644
+--- a/libavcodec/aacenc.c
++++ b/libavcodec/aacenc.c
+@@ -1293,6 +1293,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
+     IndividualChannelStream *ics;
+     int i, its, ch, w, chans, tag, start_ch, ret, frame_bits;
+     int target_bits, rate_bits, too_many_bits, too_few_bits;
++    float entry_lambda;
+     int ms_mode = 0, is_mode = 0, tns_mode = 0, pred_mode = 0;
+     int chan_el_counter[4];
+     FFPsyWindowInfo windows[AAC_MAX_CHANNELS];
+@@ -1425,6 +1426,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
+     if ((ret = ff_alloc_packet(avctx, avpkt, 8192 * s->channels)) < 0)
+         return ret;
+     frame_bits = its = 0;
++    entry_lambda = s->lambda;
+     do {
+         init_put_bits(&s->pb, avpkt->data, avpkt->size);
+ 
+@@ -1624,7 +1626,7 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
+ 
+         if (   its == 0 /* for steady-state Q-scale tracking */
+             || (its < 5 && (frame_bits < too_few_bits || frame_bits > too_many_bits))
+-            || frame_bits >= 6144 * s->channels - 3  )
++            || (frame_bits >= 6144 * s->channels - 3 && its < 16)  )
+         {
+             float ratio = ((float)rate_bits) / frame_bits;
+ 
+@@ -1659,6 +1661,11 @@ static int aac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
+                 its++;
+             }
+         } else {
++            /* Overflow retries exhausted: lambda did not shrink the frame (the NMR coder does
++             * not follow it), so keep the frame, like the Q-scale path does, and do not carry
++             * the collapsed lambda over to the next frames */
++            if (frame_bits >= 6144 * s->channels - 3)
++                s->lambda = entry_lambda;
+             break;
+         }
+     } while (1);
