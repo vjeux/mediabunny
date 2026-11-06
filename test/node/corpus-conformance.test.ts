@@ -101,11 +101,13 @@ const expectTrack = async (track: InputTrack, expected: TrackExpectation) => {
 	}
 };
 
+const openFixture = (fixture: Fixture) => new Input({
+	source: new FilePathSource(path.join(__dirname, '..', 'public', fixture.file)),
+	formats: ALL_FORMATS,
+});
+
 const expectFixture = async (fixture: Fixture) => {
-	using input = new Input({
-		source: new FilePathSource(path.join(__dirname, '..', 'public', fixture.file)),
-		formats: ALL_FORMATS,
-	});
+	using input = openFixture(fixture);
 
 	expect((await input.getFormat()).name).toBe(fixture.format);
 
@@ -117,6 +119,16 @@ const expectFixture = async (fixture: Fixture) => {
 
 	if (fixture.durationUs !== undefined) {
 		expectUs(toUs(await input.computeDuration()), fixture.durationUs);
+	}
+
+	// The same lookups again, each on a fresh Input that hasn't read anything yet
+	for (let i = 0; i < fixture.tracks.length; i++) {
+		for (const [atUs, packetUs, keyPacketUs] of fixture.tracks[i]!.seeks ?? []) {
+			using coldInput = openFixture(fixture);
+			const sink = new EncodedPacketSink((await coldInput.getTracks())[i]!);
+			expectUs(toUs((await sink.getPacket(atUs / 1e6))!.timestamp), packetUs);
+			expectUs(toUs((await sink.getKeyPacket(atUs / 1e6))!.timestamp), keyPacketUs);
+		}
 	}
 };
 
@@ -630,7 +642,10 @@ const FIXTURES: Fixture[] = [
 			},
 		],
 	},
-	// ffmpeg -y $V $A $X264 $AAC -mpegts_flags +resend_headers -pat_period 0.1 $COMMON ffmpeg-ts-resend-headers.ts
+	// PAT, PMT and SDT repeat every ~20 ms (21 times each, instead of 8, 8 and 2 in ffmpeg-ts-default.ts), so tables
+	// keep coming between the PES packets; the packets themselves are the same as in ffmpeg-ts-default.ts
+	// ffmpeg -y $V $A $X264 $AAC -mpegts_flags +resend_headers -pat_period 0.02 -sdt_period 0.02 $COMMON
+	//   ffmpeg-ts-resend-headers.ts
 	{
 		file: 'ffmpeg-ts-resend-headers.ts',
 		format: 'MPEG Transport Stream',
