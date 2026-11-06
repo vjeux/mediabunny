@@ -2031,6 +2031,42 @@ test('Segmentation, variants of jittery live video end their segments at the sam
 	}
 });
 
+test('Segmentation, VOD keeps segments within the target duration when key frames land a bit late', async () => {
+	let playlist = '';
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			targetDuration: 2,
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			if (request.path.includes('playlist')) {
+				target.on('finalized', () => {
+					playlist = new TextDecoder().decode(target.buffer!);
+				});
+			}
+
+			return target;
+		}),
+	});
+	const video = videoSource();
+	output.addVideoTrack(video);
+	await output.start();
+
+	// 30 fps, a key frame every second; the ones at the 2 s boundaries land 10 ms late
+	for (let i = 0; i < 180; i++) {
+		const timestamp = i / 30 + (i % 60 === 0 && i > 0 ? 0.01 : 0);
+		const type = i % 30 === 0 ? 'key' : 'delta';
+		await video.add(new EncodedPacket(avcPacketData, type, timestamp, 1 / 30), avcMetadata);
+	}
+	await output.finalize();
+
+	// VOD playlists announce the ceiling of their longest segment as the target duration
+	expect(playlist).toContain('#EXT-X-TARGETDURATION:2\n');
+	const segmentDurations = [...playlist.matchAll(/#EXTINF:([\d.]+),/g)].map(match => Number(match[1]));
+	expect(Math.max(...segmentDurations)).toBeLessThanOrEqual(2);
+});
+
 test('write, onSegment, onPlaylist, onMaster events', async () => {
 	const onSegment = vi.fn();
 	const onPlaylist = vi.fn();
