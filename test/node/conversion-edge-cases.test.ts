@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -15,6 +15,7 @@ import {
 } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Quality } from '../../src/encode.js';
 
 const QUALITY = new Quality('high');
@@ -304,5 +305,117 @@ describe('Conversion invalidity explanations', () => {
 		const conversion = await convert(new WavOutputFormat(), { forceTranscode: true });
 		expect(conversion.isValid).toBe(true);
 		await conversion.execute();
+	});
+});
+
+describe('Conversion execution in Node (copy and PCM paths)', () => {
+	// VP8 frames at 0 and 20 ms, 10 ms PCM blocks at 0, 10, 20 and 30 ms
+	const avBytes = mkvFile({
+		trackEntries: [
+			ebml(
+				EBMLId.TrackEntry,
+				ebmlUint(EBMLId.TrackNumber, 1),
+				ebmlUint(EBMLId.TrackUID, 1),
+				ebmlUint(EBMLId.TrackType, 1),
+				ebmlString(EBMLId.CodecID, 'V_VP8'),
+				ebml(EBMLId.Video, ebmlUint(EBMLId.PixelWidth, 64), ebmlUint(EBMLId.PixelHeight, 48)),
+			),
+			ebml(
+				EBMLId.TrackEntry,
+				ebmlUint(EBMLId.TrackNumber, 2),
+				ebmlUint(EBMLId.TrackUID, 2),
+				ebmlUint(EBMLId.TrackType, 2),
+				ebmlString(EBMLId.CodecID, 'A_PCM/INT/LIT'),
+				ebml(
+					EBMLId.Audio,
+					ebmlFloat(EBMLId.SamplingFrequency, 8000),
+					ebmlUint(EBMLId.Channels, 1),
+					ebmlUint(EBMLId.BitDepth, 16),
+				),
+			),
+		],
+		rest: [ebml(
+			EBMLId.Cluster,
+			ebmlUint(EBMLId.Timestamp, 0),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 0, 0x80, VP8_KEY_FRAME)),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(2, 0, 0x80, new Array(160).fill(1))),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(2, 10, 0x80, new Array(160).fill(2))),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, 20, 0x00, [0x11, 0, 0])),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(2, 20, 0x80, new Array(160).fill(3))),
+			ebml(EBMLId.SimpleBlock, mkvSimpleBlock(2, 30, 0x80, new Array(160).fill(4))),
+		)],
+	});
+
+	const run = async (format: OutputFormat, options: Record<string, unknown> = {}) => {
+		const input = new Input({ source: new BufferSource(avBytes), formats: ALL_FORMATS });
+		const target = new BufferTarget();
+		const output = new Output({ format, target });
+		const conversion = await Conversion.init({ input, output, showWarnings: false, ...options } as never);
+		const progress: number[] = [];
+		conversion.onProgress = p => progress.push(p);
+		expect(conversion.isValid).toBe(true);
+		await conversion.execute();
+		await conversion.execute(); // A finished conversion is a no-op
+
+		using result = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		const tracks: string[][] = [];
+		for (const track of await result.getTracks()) {
+			const packets = [`${track.type}/${await track.getCodec()}`];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push(`${Math.round(packet.timestamp * 1000)}:${packet.byteLength}:${packet.type}`);
+			}
+			tracks.push(packets);
+		}
+		return { conversion, tracks, progress };
+	};
+
+	test.each([
+		['Matroska', () => new MkvOutputFormat()],
+		['MP4', () => new Mp4OutputFormat()],
+	])('copies VP8 and PCM into %s without decoding', async (_, format) => {
+		const { conversion, tracks, progress } = await run(format());
+		expect(conversion.utilizedTracks.length).toBe(2);
+		expect(conversion.discardedTracks).toEqual([]);
+		expect(tracks[0]).toEqual(['video/vp8', '0:10:key', '20:3:delta']);
+		expect(tracks[1]![0]).toBe('audio/pcm-s16');
+		expect(progress[0]).toBe(0);
+		expect(progress.at(-1)).toBe(1);
+		expect(progress.every((value, i) => i === 0 || value >= progress[i - 1]!)).toBe(true);
+	});
+
+	test('trimming drops the video track that would need decoding and cuts PCM at the boundaries', async () => {
+		const { conversion, tracks } = await run(new MkvOutputFormat(), { trim: { start: 0.01, end: 0.03 } });
+		const discarded = conversion.discardedTracks.map(x => [x.track.type, x.reason]);
+		expect(discarded).toEqual([['video', 'undecodable_source_codec']]);
+		expect(tracks).toEqual([['audio/pcm-s16', '0:160:key', '10:160:key']]);
+
+		const wav = await run(new WavOutputFormat(), { trim: { start: 0.005, end: 0.025 } });
+		expect(wav.conversion.discardedTracks.map(x => x.reason)).toEqual(['max_track_count_of_type_reached']);
+		expect(wav.tracks).toEqual([['audio/pcm-s16', '0:320:key']]);
+	});
+
+	test('PCM audio is resampled and re-encoded with the requested codec', async () => {
+		const resampled = await run(new WavOutputFormat(), { audio: { sampleRate: 16000 } });
+		expect(resampled.tracks).toEqual([['audio/pcm-s16', '0:1280:key']]);
+		const s32 = await run(new MkvOutputFormat(), { video: { discard: true }, audio: { codec: 'pcm-s32' } });
+		expect(s32.tracks).toEqual([['audio/pcm-s32', '0:1280:key']]);
+	});
+
+	test('unintentionally discarded tracks are reported with a warning unless showWarnings is false', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const init = (showWarnings?: boolean) => Conversion.init({
+				input: new Input({ source: new BufferSource(avBytes), formats: ALL_FORMATS }),
+				output: new Output({ format: new WavOutputFormat(), target: new BufferTarget() }),
+				showWarnings,
+			});
+			await init(false);
+			expect(warn).not.toHaveBeenCalled();
+			await init();
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0]![0]).toBe('Some tracks had to be discarded from the conversion:');
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });
