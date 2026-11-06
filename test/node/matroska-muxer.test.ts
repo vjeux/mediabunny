@@ -299,3 +299,32 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('WebM output leaves out the Matroska v4 track flags', async () => {
+	// FlagHearingImpaired, FlagVisualImpaired, FlagOriginal and FlagCommentary aren't WebM elements, and Chrome's WebM
+	// parser (MSE) rejects files that contain them
+	const mux = async (format: MkvOutputFormat) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source, {
+			disposition: { hearingImpaired: true, visuallyImpaired: true, original: true, commentary: true },
+		});
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', 0, 0.02), {
+			decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 },
+		});
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	const flagIds = [0x55ab, 0x55ac, 0x55ae, 0x55af];
+	const hasFlag = (bytes: Uint8Array, id: number) => bytes.some((byte, i) => {
+		return byte === id >> 8 && bytes[i + 1] === (id & 0xff) && bytes[i + 2] === 0x81 && bytes[i + 3] === 1;
+	});
+
+	const webm = await mux(new WebMOutputFormat());
+	expect(flagIds.map(id => hasFlag(webm, id))).toEqual([false, false, false, false]);
+
+	const mkv = await mux(new MkvOutputFormat());
+	expect(flagIds.map(id => hasFlag(mkv, id))).toEqual([true, true, true, true]);
+});
