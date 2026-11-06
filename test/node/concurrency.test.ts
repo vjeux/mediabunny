@@ -594,6 +594,57 @@ test.each([
 	}
 });
 
+/** Runs all operations at once on an input whose reads start failing at a seeded point. */
+const runWithFailingReads = async (bytes: Uint8Array, ops: ReadOp[], seed: number) => {
+	const rand = mulberry32(seed);
+	let readCount = 0;
+	const failAfter = 1 + Math.floor(rand() * 10);
+	const unhandledErrors: unknown[] = [];
+
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => bytes.length,
+			read: async (start, end) => {
+				await randomDelay(rand);
+				if (++readCount > failAfter && rand() < 0.5) {
+					throw new Error('Read failed.');
+				}
+
+				return bytes.slice(start, end);
+			},
+			prefetchProfile: (['none', 'fileSystem', 'network'] as const)[seed % 3],
+			// Errors of prefetching reads that no call waits for
+			handleUnhandledError: error => unhandledErrors.push(error),
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	// Hangs (and times out) if a call never settles
+	const outcomes = await Promise.all(ops.map(op => op.run(input).then(
+		() => 'resolved',
+		(error: unknown) => error instanceof Error && error.message === 'Read failed.'
+			? 'read failed'
+			: `rejected with ${String(error)}`,
+	)));
+
+	return { outcomes, unhandledErrors };
+};
+
+test.each([
+	'video.mp4',
+	'demo.webm',
+	'Toothsome-Meme.VBRv2.mp3',
+])('Read errors of a CustomSource reject the pending calls instead of hanging them: %s', async (fixture) => {
+	const bytes = await readFixture(fixture);
+	const ops = buildReadOps(await getReferencePackets(new BufferSource(bytes)), mulberry32(1));
+
+	for (let seed = 1; seed <= 3; seed++) {
+		const { outcomes, unhandledErrors } = await runWithFailingReads(bytes, ops, seed);
+		expect(outcomes.filter(x => x.startsWith('rejected')), `seed ${seed}`).toEqual([]);
+		expect(unhandledErrors.every(error => error instanceof Error && error.message === 'Read failed.')).toBe(true);
+	}
+});
+
 /**
  * A fetch() serving `bytes` after seeded delays, with response bodies arriving in seeded chunks. Range requests get a
  * 206 response unless `rangeSupport` is off, and with `failureRate`, bodies may break off midway.
