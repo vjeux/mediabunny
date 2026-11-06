@@ -152,6 +152,37 @@ test('reads frames outside the frame size range given in STREAMINFO', async () =
 	// Large frames stated, but small ones follow
 	const shrinking = [frame(0, true), frame(1, true), frame(2, false), frame(3, false), frame(4, true)];
 	expect(await read(1163, 1163, shrinking)).toEqual(layout(shrinking));
+
+	// A large last frame, which runs to the end of the file
+	const growingAtTheEnd = [frame(0, false), frame(1, false), frame(2, true)];
+	expect(await read(13, 13, growingAtTheEnd)).toEqual(layout(growingAtTheEnd));
+});
+
+test('trailing data after the last frame is cut off at the maximum frame size', async () => {
+	const filePath = path.join(__dirname, '..', 'public/sample.flac');
+	const file = new Uint8Array(await fs.readFile(filePath));
+	// The maximum frame size is a 24-bit field 7 bytes into STREAMINFO, which follows 'fLaC' and its block header
+	const maximumFrameSize = (file[8 + 7]! << 16) | (file[8 + 8]! << 8) | file[8 + 9]!;
+
+	const readPacketSizes = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const sizes: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			sizes.push(packet.byteLength);
+		}
+		return sizes;
+	};
+
+	// Like a trailing tag or junk, 64 KiB of zeros after the last frame
+	const sizes = await readPacketSizes(file);
+	const sizesWithTrailer = await readPacketSizes(new Uint8Array([...file, ...new Uint8Array(65536)]));
+
+	expect(sizesWithTrailer).toHaveLength(sizes.length);
+	expect(sizesWithTrailer.slice(0, -1)).toEqual(sizes.slice(0, -1));
+	expect(sizesWithTrailer.at(-1)).toBeLessThanOrEqual(maximumFrameSize + 16);
 });
 
 test('can get metadata-only packets', async () => {

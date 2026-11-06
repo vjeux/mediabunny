@@ -382,30 +382,39 @@ export class FlacDemuxer extends Demuxer {
 		// smallest frame up to the largest one the stream's block size and channel count allow.
 		let searchedAllSizes = effectiveMinFrameSize <= minimumFrameLength
 			&& effectiveMaxFrameSize >= maximumFrameLength;
+		// Where the packet ends if no frame follows it
+		let endIfNoFrameFollows: number | null = null;
 
 		while (true) {
 			if (slice.filePos > slice.end - minimumHeaderLength) {
 				if (!searchedAllSizes) {
 					searchedAllSizes = true;
 
+					const widerSliceLength = Math.max(effectiveMaxFrameSize, maximumFrameLength) + maximumHeaderLength;
 					const widerSlice = await this.reader.requestSliceRange(
 						startPos,
 						minimumHeaderLength,
-						Math.max(effectiveMaxFrameSize, maximumFrameLength) + maximumHeaderLength,
+						widerSliceLength,
 					);
 					assert(widerSlice);
+
+					// If the wider slice reaches the end of the file, the frame may run up to there. Otherwise, it's
+					// followed by something that isn't a frame (such as a trailing tag), so let's not include more of
+					// that than the STREAMINFO maximum allows.
+					const reachesEndOfFile = widerSlice.end - startPos < widerSliceLength;
+					endIfNoFrameFollows = reachesEndOfFile ? widerSlice.end : slice.end;
 
 					slice = widerSlice;
 					slice.filePos = startPos + minimumFrameLength;
 					continue;
 				}
 
-				// Reached end of the file, packet is over
+				// No frame follows, so the packet is over
 				return {
 					num: frameHeader.num,
 					blockSize: frameHeader.blockSize,
 					sampleRate: frameHeader.sampleRate,
-					size: slice.end - startPos,
+					size: (endIfNoFrameFollows ?? slice.end) - startPos,
 					isLastFrame: true,
 				};
 			}
