@@ -385,3 +385,39 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	expect(sample.format).toContain('A');
 	expect(sample.hasAlpha).toBe(true);
 });
+
+test('Encoding planar YUV frames with alpha keeps their color space', async () => {
+	// BT.601 full-range I420A frames, which take the CPU color/alpha splitting path
+	const width = 64;
+	const height = 64;
+	const data = new Uint8Array(width * height * 2.5).fill(128);
+
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	let colorSpace: VideoColorSpaceInit | undefined;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		alpha: 'keep',
+		onEncodedPacket: (packet, meta) => {
+			colorSpace ??= meta?.decoderConfig?.colorSpace;
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	for (let i = 0; i < 3; i++) {
+		using sample = new VideoSample(data, {
+			format: 'I420A',
+			codedWidth: width,
+			codedHeight: height,
+			timestamp: i / 10,
+			duration: 1 / 10,
+			colorSpace: { primaries: 'smpte170m', transfer: 'smpte170m', matrix: 'smpte170m', fullRange: true },
+		});
+		await videoSource.add(sample);
+	}
+
+	await output.finalize();
+
+	expect(colorSpace).toMatchObject({ matrix: 'smpte170m', fullRange: true });
+});
