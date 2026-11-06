@@ -443,6 +443,12 @@ export class EncodedPacketSink {
 
 const MAX_QUEUE_SIZE = 4;
 
+/**
+ * Timestamps this close count as equal when matching samples to query timestamps, so that rounding errors in the
+ * caller's timestamps (like a frame index times the frame duration) don't select the previous sample.
+ */
+const TIMESTAMP_EPSILON = 1e-10;
+
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
 > {
@@ -515,7 +521,7 @@ export abstract class BaseMediaSampleSink<
 		(async () => {
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
-				if (sample.timestamp >= endTimestamp) {
+				if (sample.timestamp >= endTimestamp - TIMESTAMP_EPSILON) {
 					ended = true;
 				}
 
@@ -525,7 +531,7 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				if (lastSample) {
-					if (sample.timestamp > startTimestamp) {
+					if (sample.timestamp > startTimestamp + TIMESTAMP_EPSILON) {
 						// We don't know ahead of time what the first first is. This is because the first first is the
 						// last first whose timestamp is less than or equal to the start timestamp. Therefore we need to
 						// wait for the first first after the start timestamp, and then we'll know that the previous
@@ -537,7 +543,7 @@ export abstract class BaseMediaSampleSink<
 					}
 				}
 
-				if (sample.timestamp >= startTimestamp) {
+				if (sample.timestamp >= startTimestamp - TIMESTAMP_EPSILON) {
 					sampleQueue.push(sample);
 					firstSampleQueued = true;
 				}
@@ -560,7 +566,7 @@ export abstract class BaseMediaSampleSink<
 			const packetSink = this._createPacketSink();
 			const preRollDuration = await this._getPreRollDuration();
 
-			const startPacket = await packetSink.getPacket(startTimestamp, packetRetrievalOptions);
+			const startPacket = await packetSink.getPacket(startTimestamp + TIMESTAMP_EPSILON, packetRetrievalOptions);
 			const keyPacket = await packetSink.getKeyPacket(
 				(startPacket?.timestamp ?? startTimestamp) - preRollDuration,
 				packetRetrievalOptions,
@@ -739,7 +745,7 @@ export abstract class BaseMediaSampleSink<
 				let heldSampleUses = 0;
 				while (
 					timestampsOfInterest.length > 0
-					&& sample.timestamp - timestampsOfInterest[0]! > 1e-10 // Give it a little epsilon
+					&& sample.timestamp - timestampsOfInterest[0]! > TIMESTAMP_EPSILON
 				) {
 					heldSampleUses++;
 					timestampsOfInterest.shift();
@@ -816,7 +822,8 @@ export abstract class BaseMediaSampleSink<
 					break;
 				}
 
-				const targetPacket = await packetSink.getPacket(timestamp, retrievalOptions);
+				// Also decode a sample that starts within the epsilon after the timestamp, since it's the answer
+				const targetPacket = await packetSink.getPacket(timestamp + TIMESTAMP_EPSILON, retrievalOptions);
 				let keyPacket = targetPacket && await packetSink.getKeyPacket(
 					targetPacket.timestamp - preRollDuration,
 					retrievalOptions,
