@@ -15,6 +15,7 @@ import {
 	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
 	parseModesFromVorbisSetupPacket,
+	parseOpusTocByte,
 } from '../codec-data';
 import {
 	AacCodecInfo,
@@ -26,6 +27,9 @@ import {
 	extractVideoCodecString,
 	MediaCodec,
 	OPUS_SAMPLE_RATE,
+	parsePcmCodec,
+	PCM_AUDIO_CODECS,
+	PcmAudioCodec,
 	PRORES_FOURCCS,
 	ProresFourCc,
 	VideoCodec,
@@ -319,6 +323,23 @@ const getVorbisInfo = (track: InternalTrack) => {
 
 	vorbisInfoCache.set(track, vorbisInfo);
 	return vorbisInfo;
+};
+
+/** Returns the number of samples in an audio packet, for codecs where the packet alone tells it. */
+const getPacketSampleCount = (track: InternalTrack, data: Uint8Array) => {
+	if (track.info?.type !== 'audio' || data.length === 0) {
+		return null;
+	}
+
+	const codec = track.info.codec;
+	if (codec === 'opus') {
+		return parseOpusTocByte(data).durationInSamples; // At 48 kHz, the sample rate of every Opus track
+	} else if (codec && (PCM_AUDIO_CODECS as readonly string[]).includes(codec)) {
+		const { sampleSize } = parsePcmCodec(codec as PcmAudioCodec);
+		return Math.floor(data.length / (sampleSize * track.info.numberOfChannels));
+	}
+
+	return null;
 };
 
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
@@ -858,6 +879,18 @@ export class MatroskaDemuxer extends Demuxer {
 							currentBlock.duration = track.defaultDuration;
 						} else {
 							// Handled by the lace resolution code
+						}
+					} else if (
+						currentBlock.lacing === BlockLacing.None
+						&& currentBlock.decoded
+						&& track.info?.type === 'audio'
+					) {
+						// There's no next block to take the duration from, but some codecs' packets tell their own
+						const sampleCount = getPacketSampleCount(track, currentBlock.data);
+						if (sampleCount !== null) {
+							currentBlock.duration = Math.round(
+								sampleCount / track.info.sampleRate * segment.timestampFactor,
+							);
 						}
 					}
 				}
