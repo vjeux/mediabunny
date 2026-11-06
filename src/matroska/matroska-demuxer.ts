@@ -1902,6 +1902,26 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.BlockGroup: {
 				if (!this.currentCluster) break;
 
+				// The other children (BlockDuration, ReferenceBlock, BlockAdditions) apply to the Block, which may
+				// come after them, so let's read it first
+				this.currentBlock = null;
+				const children = slice.slice(dataStartPos, size);
+				while (children.remainingLength >= MIN_HEADER_SIZE) {
+					const childStartPos = children.filePos;
+					const childHeader = readElementHeader(children);
+					if (!childHeader || childHeader.size === undefined) {
+						break;
+					}
+
+					if (childHeader.id === EBMLId.Block) {
+						children.filePos = childStartPos;
+						this.traverseElement(children);
+						break;
+					}
+
+					children.skip(childHeader.size);
+				}
+
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 
 				this.currentBlock = null;
@@ -1909,6 +1929,7 @@ export class MatroskaDemuxer extends Demuxer {
 
 			case EBMLId.Block: {
 				if (!this.currentCluster) break;
+				if (this.currentBlock) break; // Already read ahead of its siblings
 
 				const blockSlice = slice.slice(dataStartPos, size);
 
