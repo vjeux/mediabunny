@@ -22,9 +22,8 @@ import {
 } from './matroska/ebml';
 import { MatroskaDemuxer } from './matroska/matroska-demuxer';
 import { Mp3Demuxer } from './mp3/mp3-demuxer';
-import { MP3_FRAME_HEADER_SIZE, getXingOffset, INFO, XING } from '../shared/mp3-misc';
 import { ID3_V2_HEADER_SIZE, readId3V2Header } from './id3';
-import { readNextMp3FrameHeader } from './mp3/mp3-reader';
+import { readFirstMp3FrameHeader } from './mp3/mp3-reader';
 import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from './adts/adts-reader';
@@ -328,6 +327,11 @@ export class WebMInputFormat extends MatroskaInputFormat {
 	}
 }
 
+/** Whether the bytes are the start of an MPEG-1 or MPEG-2 program stream pack header. */
+const isMpegPackHeader = (bytes: Uint8Array) => bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x01
+	&& bytes[3] === 0xba
+	&& ((bytes[4]! & 0xf0) === 0x20 || (bytes[4]! & 0xc0) === 0x40); // MPEG-1 or MPEG-2 marker bits
+
 /**
  * Returns the position of the first non-zero byte at or after `pos`, looking at most `maxLength` bytes ahead (and
  * returning the position where it stopped if there's none).
@@ -380,52 +384,21 @@ export class Mp3InputFormat extends InputFormat {
 			currentPos = slice.filePos + id3V2Header.size;
 		}
 
+		// MPEG program streams (like VOB files) hold runs of MPEG audio frames in their packets, which the search below
+		// would find. They start with a pack header, which an MP3 file doesn't.
+		let packHeaderSlice = input._reader.requestSlice(currentPos, 5);
+		if (isThenable(packHeaderSlice)) packHeaderSlice = await packHeaderSlice;
+		if (packHeaderSlice && isMpegPackHeader(readBytes(packHeaderSlice, 5))) {
+			return false;
+		}
+
 		// Skip a run of zero bytes before the first frame, as found in files whose ID3v2 tag was stripped by zeroing it
 		// out in place. Zeros can't form a frame header; FFmpeg's mp3_read_probe skips them the same way.
 		currentPos = await skipZeroBytes(input._reader, currentPos, 2 ** 20);
 
-		const firstResult = await readNextMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
-		if (!firstResult) {
-			return false;
-		}
-
-		const firstHeader = firstResult.header;
-		const xingOffset = getXingOffset(firstHeader.mpegVersionId, firstHeader.channel);
-
-		let slice = input._reader.requestSlice(firstResult.startPos + xingOffset, 4);
-		if (isThenable(slice)) slice = await slice;
-		if (!slice) return false;
-
-		const word = readU32Be(slice);
-		const isXing = word === XING || word === INFO;
-
-		if (isXing) {
-			// Gotta be MP3
-			return true;
-		}
-
-		currentPos = firstResult.startPos + firstResult.header.totalSize;
-
-		// Fine, we found one frame header, but we're still not entirely sure this is MP3. Let's check if we can find
-		// another header right after it:
-		const secondResult = await readNextMp3FrameHeader(
-			input._reader,
-			currentPos,
-			currentPos + MP3_FRAME_HEADER_SIZE,
-		);
-		if (!secondResult) {
-			return false;
-		}
-
-		const secondHeader = secondResult.header;
-
-		// In a well-formed MP3 file, we'd expect these two frames to share some similarities:
-		if (firstHeader.channel !== secondHeader.channel || firstHeader.sampleRate !== secondHeader.sampleRate) {
-			return false;
-		}
-
-		// We have found two matching consecutive MP3 frames, a strong indicator that this is an MP3 file
-		return true;
+		// A Xing tag or two matching consecutive frames are a strong indicator that this is an MP3 file
+		const firstResult = await readFirstMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
+		return firstResult !== null;
 	}
 
 	/** @internal */
