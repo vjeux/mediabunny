@@ -2296,9 +2296,8 @@ class PacketReadingContext {
 			let packetStartPos: number | null = null;
 			let frameStartFound = false;
 			let lastFirstMacroblockInSlice = 0;
-			// Where the packet's access unit (its AUD) and picture start, and whether parameter sets come before them
+			// Where the packet's access unit (its AUD) starts, and whether parameter sets come before it
 			let accessUnitPos: number | null = null;
-			let picturePos: number | null = null;
 			let parameterSetFound = false;
 
 			while (true) {
@@ -2430,7 +2429,6 @@ class PacketReadingContext {
 								isFrameBoundary = true;
 							} else {
 								frameStartFound = true;
-								picturePos = startCodePos;
 							}
 						}
 					} else if (isAccessUnitStart && frameStartFound) {
@@ -2451,7 +2449,7 @@ class PacketReadingContext {
 						// End the packet at this start code (the next frame begins here)
 						const packetLength = startCodePos - packetStartPos;
 						this.seekTo(packetStartPos);
-						return this.supplyPacket(packetLength, 0, accessUnitPos, picturePos);
+						return this.supplyPacket(packetLength, 0, accessUnitPos);
 					}
 
 					i += startCodeLength;
@@ -2469,7 +2467,7 @@ class PacketReadingContext {
 
 				const packetLength = this.endPos - packetStartPos;
 				this.seekTo(packetStartPos);
-				return this.supplyPacket(packetLength, 0, accessUnitPos, picturePos);
+				return this.supplyPacket(packetLength, 0, accessUnitPos);
 			}
 		} else {
 			const codec = elementaryStream.info.codec;
@@ -2732,37 +2730,27 @@ class PacketReadingContext {
 	 * Supplies the context with a new encoded packet, beginning at the current position. For video, `accessUnitPos`
 	 * and `picturePos` are where the packet's AUD and picture start, if known.
 	 */
-	supplyPacket(
-		packetLength: number,
-		intrinsicDuration: number,
-		accessUnitPos: number | null = null,
-		picturePos: number | null = null,
-	) {
+	supplyPacket(packetLength: number, intrinsicDuration: number, accessUnitPos: number | null = null) {
 		const currentPesPacket = this.getCurrentPesPacket();
 		const hasUnusedPts = (pesPacket: PesPacket) => {
 			return pesPacket.pts !== null && pesPacket.sectionStartPos > this.lastPtsSectionStartPos;
 		};
 
-		// A PES packet's PTS belongs to the first access unit that begins in it. When parameter sets come in a PES
-		// packet of their own though, the packet starts before that, so let's look for the PES packet its AUD is in, or
-		// else one beginning before its picture. Failing that, take the PTS of the PES packet the packet starts in.
+		// A PES packet's PTS belongs to the first access unit that begins in it (H.222.0 2.4.3.7), like in FFmpeg and
+		// Chromium. When parameter sets come in a PES packet of their own though, the packet starts before its access
+		// unit (at its AUD), so let's look for the PES packet that one is in. Failing that, take the PTS of the PES
+		// packet the packet starts in.
 		let ptsPesPacket: PesPacket | null = null;
-		const accessUnitStartPos = accessUnitPos ?? this.currentPos;
-		let pesPacketPos = this.currentPesPacketPos;
-
-		for (let i = this.currentPesPacketIndex; i < this.pesPackets.length; i++) {
-			const pesPacket = this.pesPackets[i]!;
-			const pesPacketEndPos = pesPacketPos + pesPacket.data.byteLength;
-			if (pesPacketPos > (picturePos ?? accessUnitStartPos)) {
-				break;
+		if (accessUnitPos !== null) {
+			let pesPacketPos = this.currentPesPacketPos;
+			for (let i = this.currentPesPacketIndex; i < this.pesPackets.length; i++) {
+				const pesPacket = this.pesPackets[i]!;
+				pesPacketPos += pesPacket.data.byteLength;
+				if (pesPacketPos > accessUnitPos) {
+					ptsPesPacket = hasUnusedPts(pesPacket) ? pesPacket : null;
+					break;
+				}
 			}
-
-			if (pesPacketEndPos > accessUnitStartPos && hasUnusedPts(pesPacket)) {
-				ptsPesPacket = pesPacket;
-				break;
-			}
-
-			pesPacketPos = pesPacketEndPos;
 		}
 
 		if (!ptsPesPacket && hasUnusedPts(currentPesPacket)) {
