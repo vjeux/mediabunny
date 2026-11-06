@@ -73,7 +73,7 @@ import { FileSlice } from '../reader';
 import { Muxer } from '../muxer';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
-import { AttachedFile } from '../metadata';
+import { AttachedFile, formatMetadataDate } from '../metadata';
 import { Logging } from '../logging';
 import { VERSIONED_NAME } from '../version';
 
@@ -627,8 +627,11 @@ export class MatroskaMuxer extends Muxer {
 				}; break;
 
 				case 'date': {
-					addSimpleTag('DATE', value.toISOString().slice(0, 10));
-					writtenTags.add('DATE');
+					const dateString = formatMetadataDate(value);
+					if (dateString !== null) {
+						addSimpleTag('DATE', dateString);
+						writtenTags.add('DATE');
+					}
 				}; break;
 
 				case 'trackNumber': {
