@@ -41,12 +41,24 @@ describe('Codec strings in the browser', () => {
 		for (const fixture of AV1_FIXTURES) {
 			const av1CodecInfo = extractAv1CodecInfoFromPacket(hexToBytes(fixture.sequenceHeaderObu))!;
 			const codecString = extractVideoCodecString(videoTrackInfo({ codec: 'av1', av1CodecInfo }));
+			const [, profile, , bitDepth] = codecString.split('.');
+			// Only where the browser decodes this profile and bit depth at all (WebKitGTK decodes neither AV1's High
+			// and Professional profiles nor VP9 profiles 1 to 3)
+			if (!await isDecodable(`av01.${profile}.00M.${bitDepth}`)) {
+				continue;
+			}
+
 			expect(await isDecodable(codecString), `${fixture.name}: ${codecString}`).toBe(true);
 		}
 
 		for (const fixture of VP9_FIXTURES) {
 			const vp9CodecInfo = extractVp9CodecInfoFromPacket(hexToBytes(fixture.keyFrameStart))!;
 			const codecString = extractVideoCodecString(videoTrackInfo({ codec: 'vp9', vp9CodecInfo }));
+			const [, profile, , bitDepth] = codecString.split('.');
+			if (!await isDecodable(`vp09.${profile}.10.${bitDepth}`)) {
+				continue; // As above
+			}
+
 			expect(await isDecodable(codecString), `${fixture.name}: ${codecString}`).toBe(true);
 		}
 
