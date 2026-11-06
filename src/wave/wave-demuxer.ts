@@ -16,7 +16,6 @@ import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
-import { Logging } from '../logging';
 
 export enum WaveFormat {
 	PCM = 0x0001,
@@ -43,6 +42,8 @@ export class WaveDemuxer extends Demuxer {
 	trackBackings: WaveAudioTrackBacking[] = [];
 	lastKnownPacketIndex = 0;
 	metadataTags: MetadataTags = {};
+	/** Rethrown by getMetadataTags(), so that a broken tag can't make the audio unreadable */
+	id3Error: Error | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -334,8 +335,7 @@ export class WaveDemuxer extends Demuxer {
 				try {
 					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
 				} catch (error) {
-					// A broken tag must not make the audio unreadable; keep whatever frames were read before the error
-					Logging._warn('Skipping the rest of a malformed ID3 chunk:', error);
+					this.id3Error ??= error as Error;
 				}
 			}
 		}
@@ -384,6 +384,11 @@ export class WaveDemuxer extends Demuxer {
 
 	async getMetadataTags() {
 		await this.readMetadata();
+
+		if (this.id3Error) {
+			throw this.id3Error;
+		}
+
 		return this.metadataTags;
 	}
 }

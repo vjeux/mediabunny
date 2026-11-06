@@ -39,7 +39,6 @@ import {
 } from './flac-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
-import { Logging } from '../logging';
 
 type FlacAudioInfo = {
 	numberOfChannels: number;
@@ -75,6 +74,8 @@ export class FlacDemuxer extends Demuxer {
 	metadataPromise: Promise<void> | null = null;
 	trackBacking: FlacAudioTrackBacking | null = null;
 	metadataTags: MetadataTags = {};
+	/** Rethrown by getMetadataTags(), so that a broken tag can't make the audio unreadable */
+	id3Error: Error | null = null;
 
 	audioInfo: FlacAudioInfo | null = null;
 	lastLoadedPos: number | null = null;
@@ -91,6 +92,11 @@ export class FlacDemuxer extends Demuxer {
 
 	override async getMetadataTags(): Promise<MetadataTags> {
 		await this.readMetadata();
+
+		if (this.id3Error) {
+			throw this.id3Error;
+		}
+
 		return this.metadataTags;
 	}
 
@@ -128,8 +134,7 @@ export class FlacDemuxer extends Demuxer {
 				try {
 					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
 				} catch (error) {
-					// A broken tag must not make the audio unreadable; keep whatever frames were read before the error
-					Logging._warn('Skipping the rest of a malformed ID3v2 tag:', error);
+					this.id3Error ??= error as Error;
 				}
 
 				currentPos = headerSlice.filePos + id3V2Header.size;

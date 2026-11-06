@@ -1117,7 +1117,7 @@ test('A malformed ID3 tag keeps WAVE and FLAC files readable', async () => {
 		expect(track).not.toBeNull();
 		expect(await new EncodedPacketSink(track!).getFirstPacket()).not.toBeNull();
 
-		// The frames before the broken one are kept
-		expect((await input.getMetadataTags()).title).toBe('Title');
+		// Like for MP3 files, only reading the tags fails
+		await expect(input.getMetadataTags()).rejects.toThrow('Unsupported text encoding: 4');
 	}
 });
