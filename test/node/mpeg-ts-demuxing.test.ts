@@ -1931,3 +1931,29 @@ test('MPEG-TS packet durations with B-frames do not depend on how the packets we
 	expect((await sink.getPacket(Infinity))!.duration).toBe(lastPacket.duration);
 	expect(await track.computeDuration()).toBeCloseTo(1.4 + 1 / 30);
 });
+
+test('MPEG-TS with PIDs listed twice in the PMT', async () => {
+	// The PAT, PMT and audio packets of FFmpeg's FATE sample ac3/mp3ac325-4864-small.ts, a DVB capture. Its PMT lists
+	// the two audio PIDs as MPEG audio (stream_type 0x04) first, then again as private data with an AC-3 descriptor.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/pmt-duplicate-pids.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getAudioTracks();
+	expect(tracks.map(track => track.id)).toEqual([52, 53]);
+
+	// What ffprobe reads, as the later entries say
+	const results = await Promise.all(tracks.map(async (track) => {
+		const packets: [number, number][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([Math.round(packet.timestamp * 90_000), packet.data.byteLength]);
+		}
+
+		return [await track.getCodec(), await track.getNumberOfChannels(), packets];
+	}));
+	expect(results).toEqual([
+		['ac3', 6, [[3912633305, 1536], [3912636185, 1536], [3912639065, 1536], [3912641945, 1536], [3912644825, 906]]],
+		['ac3', 2, [[3912634060, 768], [3912636940, 768], [3912639820, 768], [3912642700, 768], [3912645580, 354]]],
+	]);
+});
