@@ -599,54 +599,129 @@ test.each([
 	}
 });
 
-/** Runs all operations at once on an input whose reads start failing at a seeded point. */
-const runWithFailingReads = async (bytes: Uint8Array, ops: ReadOp[], seed: number) => {
-	const rand = mulberry32(seed);
-	let readCount = 0;
-	const failAfter = 1 + Math.floor(rand() * 10);
-	const unhandledErrors: unknown[] = [];
+/**
+ * A CustomSource over `bytes` whose reads fail with "Read failed." while `shouldFail()` says so, after seeded delays.
+ * Errors of prefetching reads that no call waits for end up in `faults.unhandledErrors`.
+ */
+const makeFailingSource = (
+	bytes: Uint8Array,
+	rand: Rand,
+	options: { prefetchProfile: 'none' | 'fileSystem' | 'network'; maxCacheSize: number; shouldFail: () => boolean },
+) => {
+	const faults = { failedReads: 0, unhandledErrors: [] as unknown[] };
+	const source = new CustomSource({
+		getSize: () => bytes.length,
+		read: async (start, end) => {
+			await randomDelay(rand);
+			if (options.shouldFail()) {
+				faults.failedReads++;
+				throw new Error('Read failed.');
+			}
 
-	using input = new Input({
-		source: new CustomSource({
-			getSize: () => bytes.length,
-			read: async (start, end) => {
-				await randomDelay(rand);
-				if (++readCount > failAfter && rand() < 0.5) {
-					throw new Error('Read failed.');
-				}
-
-				return bytes.slice(start, end);
-			},
-			prefetchProfile: (['none', 'fileSystem', 'network'] as const)[seed % 3],
-			// Errors of prefetching reads that no call waits for
-			handleUnhandledError: error => unhandledErrors.push(error),
-		}),
-		formats: ALL_FORMATS,
+			return bytes.slice(start, end);
+		},
+		prefetchProfile: options.prefetchProfile,
+		maxCacheSize: options.maxCacheSize,
+		handleUnhandledError: error => faults.unhandledErrors.push(error),
 	});
 
-	// Hangs (and times out) if a call never settles
-	const outcomes = await Promise.all(ops.map(op => op.run(input).then(
-		() => 'resolved',
-		(error: unknown) => error instanceof Error && error.message === 'Read failed.'
-			? 'read failed'
-			: `rejected with ${String(error)}`,
-	)));
-
-	return { outcomes, unhandledErrors };
+	return { source, faults };
 };
 
-test.each([
-	'video.mp4',
-	'demo.webm',
-	'Toothsome-Meme.VBRv2.mp3',
-])('Read errors of a CustomSource reject the pending calls instead of hanging them: %s', async (fixture) => {
+const describeReadFailure = (error: unknown) => error instanceof Error && error.message === 'Read failed.'
+	? 'read failed'
+	: `rejected with ${String(error)}`;
+
+const readAllPackets = async (track: InputTrack) => {
+	try {
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			void packet;
+		}
+		return 'resolved';
+	} catch (error) {
+		return describeReadFailure(error);
+	}
+};
+
+const READ_ERROR_FIXTURES = ['video.mp4', 'demo.webm', 'Toothsome-Meme.VBRv2.mp3'];
+
+test.each(READ_ERROR_FIXTURES)('A failing first read rejects every call waiting for it: %s', async (fixture) => {
+	const bytes = await readFixture(fixture);
+	const ops = buildReadOps(await getReferencePackets(new BufferSource(bytes)), mulberry32(1));
+	let readCount = 0;
+	const { source, faults } = makeFailingSource(bytes, mulberry32(1), {
+		prefetchProfile: 'network',
+		maxCacheSize: 4096,
+		shouldFail: () => readCount++ === 0,
+	});
+	using input = new Input({ source, formats: ALL_FORMATS });
+
+	// All calls start at once and wait for the first read (format detection), which fails
+	const outcomes = await Promise.all(ops.map(op => op.run(input).then(() => 'resolved', describeReadFailure)));
+	expect(faults.failedReads).toBe(1);
+	expect(outcomes).toEqual(ops.map(() => 'read failed'));
+});
+
+test.each(READ_ERROR_FIXTURES)('A read error rejects the calls waiting for that data: %s', async (fixture) => {
+	const bytes = await readFixture(fixture);
+	let failing = false;
+	const { source, faults } = makeFailingSource(bytes, mulberry32(1), {
+		prefetchProfile: 'none',
+		maxCacheSize: 4096, // So that reading the packets needs new reads
+		shouldFail: () => failing,
+	});
+	using input = new Input({ source, formats: ALL_FORMATS });
+	const tracks = await input.getTracks();
+
+	// From now on, every read fails: iterating the packets of each track must reject with that error
+	failing = true;
+	expect(await Promise.all(tracks.map(readAllPackets))).toEqual(tracks.map(() => 'read failed'));
+	expect(faults.failedReads).toBeGreaterThan(0);
+	expect(faults.unhandledErrors.map(describeReadFailure).filter(x => x !== 'read failed')).toEqual([]);
+});
+
+/** Runs all operations at once on an input whose reads start failing, once its tracks are known, at random. */
+const runWithFailingReads = async (bytes: Uint8Array, ops: ReadOp[], seed: number) => {
+	const rand = mulberry32(seed);
+	let armed = false;
+	let failedOnce = false;
+	const { source, faults } = makeFailingSource(bytes, rand, {
+		// Without a prefetching network profile, so that reads are left after the tracks are known
+		prefetchProfile: (['none', 'fileSystem'] as const)[seed % 2]!,
+		maxCacheSize: 4096,
+		// The first read after arming fails for sure, the later ones at random
+		shouldFail: () => {
+			if (!armed) {
+				return false;
+			}
+			const fail = !failedOnce || rand() < 0.5;
+			failedOnce = true;
+			return fail;
+		},
+	});
+	using input = new Input({ source, formats: ALL_FORMATS });
+	await input.getTracks();
+	armed = true;
+
+	// Hangs (and times out) if a call never settles
+	const outcomes = await Promise.all(ops.map(op => op.run(input).then(() => 'resolved', describeReadFailure)));
+
+	return { outcomes, faults };
+};
+
+test.each(READ_ERROR_FIXTURES)('Read errors at seeded points reach a caller and hang nothing: %s', async (fixture) => {
 	const bytes = await readFixture(fixture);
 	const ops = buildReadOps(await getReferencePackets(new BufferSource(bytes)), mulberry32(1));
 
 	for (let seed = 1; seed <= 3; seed++) {
-		const { outcomes, unhandledErrors } = await runWithFailingReads(bytes, ops, seed);
-		expect(outcomes.filter(x => x.startsWith('rejected')), `seed ${seed}`).toEqual([]);
-		expect(unhandledErrors.every(error => error instanceof Error && error.message === 'Read failed.')).toBe(true);
+		const { outcomes, faults } = await runWithFailingReads(bytes, ops, seed);
+		const context = `seed ${seed}`;
+
+		expect(faults.failedReads, context).toBeGreaterThan(0);
+		// Every failure is the injected one, and it got to someone: a call waiting for it or handleUnhandledError
+		expect(outcomes.filter(x => x.startsWith('rejected')), context).toEqual([]);
+		expect(faults.unhandledErrors.map(describeReadFailure).filter(x => x !== 'read failed'), context).toEqual([]);
+		expect(outcomes.includes('read failed') || faults.unhandledErrors.length > 0, context).toBe(true);
 	}
 });
 
