@@ -2556,6 +2556,51 @@ test('Empty playlist bandwidth, medium quality default fallback', async () => {
 	expect(bandwidth).toBeGreaterThan(0);
 });
 
+test('A muxed track without packets is left out of the variant', async () => {
+	let masterText = '';
+	const targets = new Map<string, BufferTarget>();
+
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			onMaster: (text) => { masterText = text; },
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+
+			return target;
+		}),
+	});
+
+	// Like a conversion whose trim range ends before the audio starts
+	const video = videoSource();
+	output.addVideoTrack(video);
+	output.addAudioTrack(audioSource('mp3'));
+
+	await output.start();
+	await video.add(new EncodedPacket(avcPacketData, 'key', 0, 0.5), avcMetadata);
+	await video.add(new EncodedPacket(avcPacketData, 'delta', 0.5, 0.5), avcMetadata);
+	await output.finalize();
+
+	expect(masterText).toMatch(/CODECS="avc1\.[0-9A-Fa-f]+"/);
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			const target = targets.get(path);
+			assert(target);
+
+			return new BufferSource(target.buffer!);
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.type)).toEqual(['video']);
+	expect(await tracks[0]!.getCodec()).toBe('avc');
+	expect(await input.computeDuration()).toBe(1);
+});
+
 const testSparseTracksInSegments = async (hlsOptions: HlsOutputFormatOptions) => {
 	const targets = new Map<string, BufferTarget>();
 
