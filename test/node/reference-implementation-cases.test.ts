@@ -24,6 +24,7 @@ import {
 	deserializeHevcDecoderConfigurationRecord,
 	determineVideoPacketType,
 	extractAv1CodecInfoFromPacket,
+	extractAvcDecoderConfigurationRecord,
 	extractVp9CodecInfoFromPacket,
 	parseAvcSps,
 	parseHevcSps,
@@ -1722,5 +1723,23 @@ describe('web-platform-tests webcodecs/video-decoder.https.any.js and audio-deco
 			expect(rejectsAudio(config), JSON.stringify(config)).toBe(true);
 		}
 		expect(rejectsAudio({ codec: 'opus', ...format })).toBe(false);
+	});
+});
+
+describe('Chromium media/formats/mp4/h264_annex_b_to_avc_bitstream_converter_unittest.cc', () => {
+	test('REXT: a High profile SPS extension goes into the avcC extension', () => {
+		const chunk = annexB(
+			new Uint8Array([39, 100, 0, 31, 172, 86, 128, 80, 5, 186, 106, 12, 2, 12, 4]), // SPS
+			new Uint8Array([45, 208]), // SPS extension
+			new Uint8Array([40, 238, 60, 176]), // PPS
+			new Uint8Array([37, 184, 32, 1, 239, 27, 89, 188, 127, 248, 98, 186]), // IDR slice
+		);
+		const record = extractAvcDecoderConfigurationRecord(chunk)!;
+		expect(record).toMatchObject({ avcProfileIndication: 100, avcLevelIndication: 31, chromaFormat: 1 });
+		expect(record.sequenceParameterSets.map(toHex)).toEqual(['2764001fac56805005ba6a0c020c04']);
+		expect(record.pictureParameterSets.map(toHex)).toEqual(['28ee3cb0']);
+		expect(record.sequenceParameterSetExt!.map(toHex)).toEqual(['2dd0']);
+		// High profile extension: chroma_format, bit depths, then one SPS extension of 2 bytes
+		expect(toHex(serializeAvcDecoderConfigurationRecord(record)).endsWith('fdf8f80100022dd0')).toBe(true);
 	});
 });
