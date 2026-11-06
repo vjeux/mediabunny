@@ -303,6 +303,15 @@ describe('Tree shaking', () => {
 // The npm-packed packages, installed (offline) into a consumer project. Needs the full `npm run build` for the modules
 // and declarations, and takes a while, so it only runs with MEDIABUNNY_TEST_PACKAGING=1.
 describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packages', () => {
+	// Failures on main that open pull requests fix. The tests below assert that each one still happens exactly, so a
+	// flag has to be turned off in the same change as its fix, and anything else that goes wrong fails them too.
+	const KNOWN_FAILURES = {
+		'#314': true, // @mediabunny/server can't be loaded with require() and has its own copy of @mediabunny/prores
+		'#315': true, // Extensions loaded with require() register with a second copy of Mediabunny
+		'#319': true, // @types/dom-webcodecs 0.1.13 conflicts with the DOM lib of TypeScript 5.8+
+		'#320': true, // The declarations need Disposable, which only the esnext lib or @types/node declare
+	};
+
 	let project = '';
 
 	beforeAll(() => {
@@ -428,8 +437,12 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 				}
 				return (await isRegistered()) || 'not registered with this copy of Mediabunny';
 			});
-			if (roundtrip && results[name + ': registers'] === true) {
-				await check(name + ': encodes', roundtrip);
+			if (roundtrip) {
+				if (results[name + ': registers'] === true) {
+					await check(name + ': encodes', roundtrip);
+				} else {
+					results[name + ': encodes'] = 'skipped';
+				}
 			}
 		}
 		await check('@mediabunny/server: registers', async () => {
@@ -442,21 +455,42 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 		process.exit(0);
 	`;
 
-	const KNOWN_COMMONJS_FAILURES = new Map([
-		...EXTENSIONS.map(extension => [`@mediabunny/${extension.dir}: registers`, '#315'] as const),
-		['@mediabunny/server: registers', '#314'],
-	]);
+	const parseResults = (output: string) => JSON.parse(output.trim().split('\n').pop()!) as Record<string, unknown>;
 
-	const failuresIn = (output: string) => {
-		const { logged, ...results } = JSON.parse(output.trim().split('\n').pop()!) as Record<string, true | string> & {
-			logged: string[];
+	// The extensions whose encoder the checks above also run
+	const ENCODE_CHECKED = ['mp3-encoder', 'flac-encoder', 'ac3'];
+
+	// What the checks above report given the known failures. Compared exactly, so both a new failure and a known one
+	// that stopped happening fail the test.
+	const expectedNodeResults = (format: 'esm' | 'commonjs') => {
+		// The extensions' require() builds are their ESM builds, so from CommonJS they register with a second copy of
+		// Mediabunny, which warns that it was loaded twice
+		const secondCopy = format === 'commonjs' && KNOWN_FAILURES['#315'];
+		const results: Record<string, unknown> = {
+			'mediabunny: WAV encode and decode': true,
+			'mediabunny: file path target and source': true,
 		};
-		return {
-			failing: Object.entries(results)
-				.filter((entry): entry is [string, string] => entry[1] !== true)
-				.map(([key, value]) => `${key}: ${value}`),
-			logged,
-		};
+		for (const extension of EXTENSIONS) {
+			const name = `@mediabunny/${extension.dir}`;
+			results[`${name}: registers`] = secondCopy ? 'not registered with this copy of Mediabunny' : true;
+			if (ENCODE_CHECKED.includes(extension.dir)) {
+				results[`${name}: encodes`] = secondCopy ? 'skipped' : true;
+			}
+		}
+		// The server's bundles include @mediabunny/prores, so require() hits ESM-only turbores, and ESM loads a
+		// second copy of @mediabunny/prores
+		const serverFails = KNOWN_FAILURES['#314'];
+		results['@mediabunny/server: registers'] = format === 'commonjs' && serverFails
+			? 'ERR_PACKAGE_PATH_NOT_EXPORTED'
+			: true;
+		const logged: unknown[] = [];
+		if (secondCopy) {
+			logged.push(expect.stringMatching(/^\[WARNING\] Mediabunny was loaded twice\./));
+		}
+		if (format === 'esm' && serverFails) {
+			logged.push(expect.stringMatching(/^\[WARNING\] @mediabunny\/prores was loaded twice\./));
+		}
+		return { ...results, logged };
 	};
 
 	test('Node ESM consumers can use every package', () => {
@@ -466,10 +500,7 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 			`const load = name => import(name);`,
 			nodeChecks,
 		].join('\n'));
-		const { failing, logged } = failuresIn(runNode(['consumer.mjs'], project));
-		expect(failing).toEqual([]);
-		// Known: the server bundles its own copy of @mediabunny/prores (#314)
-		expect(logged.filter(line => !/@mediabunny\/prores was loaded twice/.test(line))).toEqual([]);
+		expect(parseResults(runNode(['consumer.mjs'], project))).toEqual(expectedNodeResults('esm'));
 	}, 120_000);
 
 	test('Node CommonJS consumers can use every package', () => {
@@ -479,19 +510,31 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 			nodeChecks,
 			`})();`,
 		].join('\n'));
-		const { failing, logged } = failuresIn(runNode(['consumer.cjs'], project));
-		expect(failing.filter(failure => !KNOWN_COMMONJS_FAILURES.has(failure.split(':').slice(0, 2).join(':'))))
-			.toEqual([]);
-		// The second copy of Mediabunny behind the known failures warns that it was loaded twice
-		expect(logged.filter(line => !/Mediabunny was loaded twice/.test(line))).toEqual([]);
+		expect(parseResults(runNode(['consumer.cjs'], project))).toEqual(expectedNodeResults('commonjs'));
 	}, 120_000);
 
-	const TS_SCENARIOS: { name: string; type: 'module' | 'commonjs'; options: ts.CompilerOptions }[] = [
+	type TsScenario = {
+		name: string;
+		type: 'module' | 'commonjs';
+		options: ts.CompilerOptions;
+		/** Only Mediabunny itself, without the extensions and the server (whose node-av needs @types/node) */
+		coreOnly?: boolean;
+	};
+
+	const ES2022_LIB = ['lib.es2022.d.ts', 'lib.dom.d.ts', 'lib.dom.iterable.d.ts'];
+	const TS_SCENARIOS: TsScenario[] = [
 		{ name: 'bundler', type: 'module',
 			options: { module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler } },
 		{ name: 'bundler, ES2022 lib', type: 'module',
-			options: { module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
-				lib: ['lib.es2022.d.ts', 'lib.dom.d.ts', 'lib.dom.iterable.d.ts'] } },
+			options: {
+				module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, lib: ES2022_LIB,
+			} },
+		// No @types/node (TypeScript 6+ includes none by default) and no esnext lib, so nothing declares Disposable
+		{ name: 'bundler, ES2022 lib, no @types/node', type: 'module', coreOnly: true,
+			options: {
+				module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, lib: ES2022_LIB,
+				types: [],
+			} },
 		{ name: 'bundler, strictest', type: 'module',
 			options: {
 				module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
@@ -509,38 +552,80 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 			options: { module: ts.ModuleKind.Node16, moduleResolution: ts.ModuleResolutionKind.Node16 } },
 	];
 
-	// Diagnostics with a known cause. Without skipLibCheck: #319 (@types/dom-webcodecs 0.1.13 vs the DOM lib of
-	// TypeScript 5.8+), #320 (Disposable without the esnext lib), node-av's import of its optional peer dependency
-	// werift. Under node16: CommonJS consumers resolve to ESM types (upstream #502), and the server's CommonJS-format
-	// declarations import those ESM types.
-	const KNOWN_DIAGNOSTICS = [
-		/^(@types\/dom-webcodecs\/|.*lib\.dom\.d\.ts)/,
-		/^mediabunny\/dist\/modules\/src\/(input|sample|source)\.d\.ts: TS(2304|2550)/,
-		/^node-av\/dist\/\S+: TS2307: Cannot find module 'werift'/,
-		/^consumer\.ts: TS1479/,
-		/^@mediabunny\/server\/dist\/modules\/src\/\S+: TS1479/,
-	];
+	// Diagnostics as `<file>: TS<code>: <message>`, with paths under node_modules relative to it. Each list is the
+	// exact set of the current failure, with the repository's TypeScript and dependencies.
+	const DIAGNOSTICS = {
+		// #319, without skipLibCheck
+		domWebcodecsConflicts: [
+			`@types/dom-webcodecs/webcodecs.generated.d.ts: TS2300: Duplicate identifier 'ImageBufferSource'.`,
+			`@types/dom-webcodecs/webcodecs.generated.d.ts: TS2374: Duplicate index signature for type 'number'.`,
+			`@types/dom-webcodecs/webcodecs.generated.d.ts: TS2717: Subsequent property declarations must have the`
+			+ ` same type.  Property 'data' must be of type 'BufferSource', but here has type`
+			+ ` 'AllowSharedBufferSource'.`,
+			`typescript/lib/lib.dom.d.ts: TS2300: Duplicate identifier 'ImageBufferSource'.`,
+			`typescript/lib/lib.dom.d.ts: TS2374: Duplicate index signature for type 'number'.`,
+		],
+		// #320, without skipLibCheck, @types/node and the esnext lib
+		missingDisposable: ['input', 'sample', 'sample', 'source'].flatMap(file => [
+			`mediabunny/dist/modules/src/${file}.d.ts: TS2304: Cannot find name 'Disposable'.`,
+			`mediabunny/dist/modules/src/${file}.d.ts: TS2550: Property 'dispose' does not exist on type`
+			+ ` 'SymbolConstructor'. Do you need to change your target library? Try changing the 'lib' compiler option`
+			+ ` to 'esnext' or later.`,
+		]),
+		// Not fixed by any PR: node-av's declarations import its optional peer dependency werift (without skipLibCheck)
+		werift: [
+			`node-av/dist/api/demuxer.d.ts: TS2307: Cannot find module 'werift' or its corresponding type`
+			+ ' declarations.',
+		],
+		// Not fixed by any PR, under node16 (TypeScript 5.8+'s nodenext allows require() of ESM): the server's
+		// declarations are CommonJS-format (its package.json has no "type") and import ESM declarations (without
+		// skipLibCheck)...
+		serverDeclarationsImportEsm: ['audio-sample', 'index', 'video-sample'].flatMap(file => [
+			'mediabunny', 'node-av',
+		].map(module => `@mediabunny/server/dist/modules/src/${file}.d.ts: TS1479: The current file is a CommonJS`
+			+ ` module whose imports will produce 'require' calls; however, the referenced file is an ECMAScript module`
+			+ ` and cannot be imported with 'require'. Consider writing a dynamic 'import("${module}")' call`
+			+ ' instead.')),
+		// ...and CommonJS consumers can't import Mediabunny's ESM declarations (upstream #502)
+		commonJsConsumer: [
+			`consumer.ts: TS1479: The current file is a CommonJS module whose imports will produce 'require' calls;`
+			+ ` however, the referenced file is an ECMAScript module and cannot be imported with 'require'. Consider`
+			+ ` writing a dynamic 'import("mediabunny")' call instead.   To convert this file to an ECMAScript module,`
+			+ ' change its file extension to \'.mts\' or create a local package.json file with `{ "type": "module" }`.',
+		],
+	};
+
+	const expectedDiagnostics = (scenario: TsScenario, skipLibCheck: boolean) => {
+		const node16 = scenario.options.moduleResolution === ts.ModuleResolutionKind.Node16;
+		const expected: string[] = [];
+		if (!skipLibCheck) {
+			if (KNOWN_FAILURES['#319']) {
+				expected.push(...DIAGNOSTICS.domWebcodecsConflicts);
+			}
+			if (KNOWN_FAILURES['#320'] && scenario.coreOnly) {
+				expected.push(...DIAGNOSTICS.missingDisposable);
+			}
+			if (!scenario.coreOnly) {
+				expected.push(...DIAGNOSTICS.werift);
+				if (node16) {
+					expected.push(...DIAGNOSTICS.serverDeclarationsImportEsm);
+				}
+			}
+		}
+		if (node16 && scenario.type === 'commonjs') {
+			expected.push(...DIAGNOSTICS.commonJsConsumer);
+		}
+		return expected.sort();
+	};
 
 	test('TypeScript consumers compile against the packed declarations', () => {
-		const consumer = `import {
+		const coreConsumer = `import {
 	Input, ALL_FORMATS, BufferSource, Output, Mp4OutputFormat, BufferTarget, AudioSampleSource, AudioSample,
 	canEncodeAudio, VideoSample, EncodedPacket, Conversion, MediaStreamVideoTrackSource, QUALITY_HIGH,
 	type AudioCodec, type InputVideoTrack,
 } from 'mediabunny';
-import { registerMp3Encoder } from '@mediabunny/mp3-encoder';
-import { registerAacEncoder } from '@mediabunny/aac-encoder';
-import { registerFlacEncoder } from '@mediabunny/flac-encoder';
-import { registerAc3Decoder, registerAc3Encoder } from '@mediabunny/ac3';
-import { registerDtsDecoder, registerDtsEncoder } from '@mediabunny/dts';
-import { registerTrueHdDecoder, registerTrueHdEncoder } from '@mediabunny/truehd';
-import { registerProresDecoder } from '@mediabunny/prores';
-import { registerMediabunnyServer, toAvFrame, AvFrameVideoSampleResource } from '@mediabunny/server';
 
-export const run = async (stream: MediaStream, frame: Parameters<typeof toAvFrame>[1]) => {
-	[registerMp3Encoder, registerAacEncoder, registerFlacEncoder, registerAc3Decoder, registerAc3Encoder,
-		registerDtsDecoder, registerDtsEncoder, registerTrueHdDecoder, registerTrueHdEncoder, registerProresDecoder]
-		.forEach(register => register());
-	registerMediabunnyServer();
+export const runCore = async (stream: MediaStream) => {
 	const input = new Input({ source: new BufferSource(new Uint8Array(16)), formats: ALL_FORMATS });
 	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
 	const source = new AudioSampleSource({ codec: 'aac', bitrate: QUALITY_HIGH });
@@ -557,21 +642,39 @@ export const run = async (stream: MediaStream, frame: Parameters<typeof toAvFram
 	await output.finalize();
 	const track: InputVideoTrack | null = await input.getPrimaryVideoTrack();
 	const codec: AudioCodec | null = (await input.getPrimaryAudioTrack())?.codec ?? null;
-	const videoSample = new VideoSample(new AvFrameVideoSampleResource(frame), { timestamp: 0 });
-	await toAvFrame(videoSample, frame);
 	const packet = new EncodedPacket(new Uint8Array(4), 'key', 0, 1);
 	const conversion = await Conversion.init({ input, output });
-	return [await canEncodeAudio('aac'), track, codec, packet.byteLength, conversion.isValid];
+	return [await canEncodeAudio('aac'), track, codec, packet.byteLength, conversion.isValid, VideoSample];
 };
 `;
-		const unexpected: string[] = [];
+		const fullConsumer = `${coreConsumer}
+import { registerMp3Encoder } from '@mediabunny/mp3-encoder';
+import { registerAacEncoder } from '@mediabunny/aac-encoder';
+import { registerFlacEncoder } from '@mediabunny/flac-encoder';
+import { registerAc3Decoder, registerAc3Encoder } from '@mediabunny/ac3';
+import { registerDtsDecoder, registerDtsEncoder } from '@mediabunny/dts';
+import { registerTrueHdDecoder, registerTrueHdEncoder } from '@mediabunny/truehd';
+import { registerProresDecoder } from '@mediabunny/prores';
+import { registerMediabunnyServer, toAvFrame, AvFrameVideoSampleResource } from '@mediabunny/server';
+
+export const runExtensions = async (frame: Parameters<typeof toAvFrame>[1]) => {
+	[registerMp3Encoder, registerAacEncoder, registerFlacEncoder, registerAc3Decoder, registerAc3Encoder,
+		registerDtsDecoder, registerDtsEncoder, registerTrueHdDecoder, registerTrueHdEncoder, registerProresDecoder]
+		.forEach(register => register());
+	registerMediabunnyServer();
+	const videoSample = new VideoSample(new AvFrameVideoSampleResource(frame), { timestamp: 0 });
+	await toAvFrame(videoSample, frame);
+};
+`;
+		const actual: Record<string, string[]> = {};
+		const expected: Record<string, string[]> = {};
 		for (const scenario of TS_SCENARIOS) {
 			for (const skipLibCheck of [false, true]) {
 				const name = `${scenario.name}, skipLibCheck ${skipLibCheck}`;
 				const dir = path.join(project, 'ts', name.replace(/\W+/g, '-'));
 				fs.mkdirSync(dir, { recursive: true });
 				fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ type: scenario.type }));
-				fs.writeFileSync(path.join(dir, 'consumer.ts'), consumer);
+				fs.writeFileSync(path.join(dir, 'consumer.ts'), scenario.coreOnly ? coreConsumer : fullConsumer);
 				const program = ts.createProgram({
 					rootNames: [path.join(dir, 'consumer.ts')],
 					options: {
@@ -584,19 +687,18 @@ export const run = async (stream: MediaStream, frame: Parameters<typeof toAvFram
 						...scenario.options,
 					},
 				});
-				for (const diagnostic of ts.getPreEmitDiagnostics(program)) {
+				actual[name] = ts.getPreEmitDiagnostics(program).map((diagnostic) => {
 					const file = diagnostic.file
 						? diagnostic.file.fileName.replace(/^.*\/node_modules\//, '').replace(dir + '/', '')
 						: '';
-					const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, ' ');
-					const text = `${file}: TS${diagnostic.code}: ${message}`;
-					if (!KNOWN_DIAGNOSTICS.some(known => known.test(text))) {
-						unexpected.push(`${name}: ${text.slice(0, 200)}`);
-					}
-				}
+					const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, ' ')
+						.replaceAll(project, '<project>');
+					return `${file}: TS${diagnostic.code}: ${message}`;
+				}).sort();
+				expected[name] = expectedDiagnostics(scenario, skipLibCheck);
 			}
 		}
-		expect(unexpected).toEqual([]);
+		expect(actual).toEqual(expected);
 	}, 300_000);
 
 	test('Browser bundles of the packed packages don\'t import Node built-ins', async () => {
