@@ -541,6 +541,25 @@ test('MPEG-TS transmuxed by FFmpeg', { timeout: 30_000 }, async () => {
 	expect(audioPacketStats.packetCount).toBe(235);
 });
 
+test('MPEG-TS AVC with an unreferenced SPS in front of the active one', async () => {
+	// The first access unit carries an extra SPS (id 1, 64x64) before the SPS its PPS and slices use (id 0, 130x98).
+	// Like FFmpeg's h264_parser, the track's properties must come from the SPS the first slice refers to. Made with:
+	// ffmpeg -f lavfi -i testsrc2=s=64x64 -frames:v 1 -c:v libx264 -x264-params sps-id=1 \
+	//   -bsf:v filter_units=pass_types=7 -f h264 sps-id1.h264
+	// ffmpeg -f lavfi -i testsrc2=s=130x98:r=25 -frames:v 3 -c:v libx264 -bf 0 -f h264 main.h264
+	// cat sps-id1.h264 main.h264 | ffmpeg -fflags +genpts -r 25 -f h264 -i - -c copy avc-unused-sps.ts
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/avc-unused-sps.ts')),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	expect(await track.getCodedWidth()).toBe(130);
+	expect(await track.getCodedHeight()).toBe(98);
+	expect(await track.getDisplayWidth()).toBe(130);
+	expect((await track.getDecoderConfig())!.codec).toBe('avc1.64000b');
+});
+
 test('MPEG-TS with HEVC video', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/hevc.ts')),

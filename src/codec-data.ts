@@ -290,12 +290,52 @@ export const concatAvcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDe
 	}
 };
 
+/**
+ * Finds the SPS that the first slice of a picture refers to (through the pic_parameter_set_id of its slice header and
+ * the seq_parameter_set_id of that PPS), among the parameter sets preceding the slice. Returns its index in `spsUnits`,
+ * or null if it can't be told.
+ */
+const findActiveAvcSpsIndex = (spsUnits: Uint8Array[], ppsUnits: Uint8Array[], firstSlice: Uint8Array) => {
+	try {
+		const readIds = (nalUnit: Uint8Array, skippedBits: number, count: number) => {
+			const bitstream = new Bitstream(removeEmulationPreventionBytes(nalUnit));
+			bitstream.skipBits(8 + skippedBits); // The NAL unit header and fixed-length fields
+			return Array.from({ length: count }, () => readExpGolomb(bitstream));
+		};
+
+		const ppsId = readIds(firstSlice, 0, 3)[2]!; // After first_mb_in_slice and slice_type
+
+		// A later parameter set with the same ID replaces an earlier one
+		let spsId: number | null = null;
+		for (const pps of ppsUnits) {
+			const [id, referencedSpsId] = readIds(pps, 0, 2);
+			if (id === ppsId) {
+				spsId = referencedSpsId!;
+			}
+		}
+
+		let index: number | null = null;
+		for (let i = 0; i < spsUnits.length; i++) {
+			if (readIds(spsUnits[i]!, 24, 1)[0] === spsId) { // After profile_idc, the constraint flags and level_idc
+				index = i;
+			}
+		}
+
+		return index;
+	} catch {
+		return null;
+	}
+};
+
 /** Builds an AvcDecoderConfigurationRecord from an AVC packet in Annex B format. */
 export const extractAvcDecoderConfigurationRecord = (packetData: Uint8Array): AvcDecoderConfigurationRecord | null => {
 	try {
 		const spsUnits: Uint8Array[] = [];
 		const ppsUnits: Uint8Array[] = [];
 		const spsExtUnits: Uint8Array[] = [];
+		let firstSlice: Uint8Array | null = null;
+		let spsCountBeforeSlice = 0;
+		let ppsCountBeforeSlice = 0;
 
 		for (const loc of iterateNalUnitsInAnnexB(packetData)) {
 			const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
@@ -308,6 +348,17 @@ export const extractAvcDecoderConfigurationRecord = (packetData: Uint8Array): Av
 				ppsUnits.push(nalUnit);
 			} else if (type === AvcNalUnitType.SPS_EXT && spsExtUnits.length < 255) {
 				spsExtUnits.push(nalUnit);
+			} else if (
+				firstSlice === null
+				&& (
+					type === AvcNalUnitType.NON_IDR_SLICE
+					|| type === AvcNalUnitType.SLICE_DPA
+					|| type === AvcNalUnitType.IDR
+				)
+			) {
+				firstSlice = nalUnit;
+				spsCountBeforeSlice = spsUnits.length;
+				ppsCountBeforeSlice = ppsUnits.length;
 			}
 		}
 
@@ -317,6 +368,17 @@ export const extractAvcDecoderConfigurationRecord = (packetData: Uint8Array): Av
 
 		if (ppsUnits.length === 0) {
 			return null;
+		}
+
+		// The SPS the picture uses comes first, so that its profile and level describe the record, and so that users of
+		// the first SPS (like the MPEG-TS demuxer, for the dimensions) get it. Other SPS stay in the record.
+		const activeSpsIndex = firstSlice && findActiveAvcSpsIndex(
+			spsUnits.slice(0, spsCountBeforeSlice),
+			ppsUnits.slice(0, ppsCountBeforeSlice),
+			firstSlice,
+		);
+		if (activeSpsIndex) {
+			spsUnits.unshift(...spsUnits.splice(activeSpsIndex, 1));
 		}
 
 		// Let's get the first SPS for profile and level information
