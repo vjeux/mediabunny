@@ -2079,6 +2079,34 @@ test('Key packet verification with timestamps beyond float precision', async () 
 	expect(packet!.timestamp).toBe(0);
 });
 
+test('Key packet verification in a big fragment of fake key frames', async () => {
+	// Each step back to the previous key frame used to scan all of the fragment's samples, making verification
+	// quadratic in their number
+	const sampleCount = 50_000;
+	const realKeyFrame = [0x00, 0x00, 0x00];
+	const fakeKeyFrame = [0x01, 0x00, 0x00];
+	const fragment = (dataOffset: number) => moof(
+		fullBox('tfhd', 0, 0x020038, u32(1), u32(1), u32(3), u32(0)), // Default duration 1, size 3, key frames
+		fullBox('tfdt', 0, 0, u32(0)),
+		fullBox('trun', 0, 0x000001, u32(sampleCount), u32(dataOffset)),
+	);
+	const moov = [
+		trak({ handler: 'vide', stbl: [stsd(videoSampleEntry('vp08')), ...emptyStbl().slice(1)] }),
+		box('mvex', trex(1)),
+	];
+	const data = concat(realKeyFrame, ...Array<Bytes>(sampleCount - 1).fill(fakeKeyFrame));
+	using input = new Input({
+		source: new BufferSource(mp4(moov, [fragment(fragment(0).length + 8), box('mdat', data)])),
+		formats: ALL_FORMATS,
+	});
+	const sink = new EncodedPacketSink((await input.getVideoTracks())[0]!);
+
+	const start = performance.now();
+	const packet = await sink.getKeyPacket(Infinity, { verifyKeyPackets: true });
+	expect(packet!.timestamp).toBe(0);
+	expect(performance.now() - start).toBeLessThan(1000);
+});
+
 test('PCM blocks not containing whole frames', async () => {
 	for (const channels of [2, 0]) {
 		const audioTrack = element(
