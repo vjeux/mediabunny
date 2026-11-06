@@ -265,8 +265,57 @@ describe('Video transforms', () => {
 	});
 });
 
+// The counting video is encoded at the 32 kbps that very-high quality gives 64x64 frames. WebKitGTK's AVC encoder
+// starves at that bitrate (its first frames come back as flat gray and repeat), so there, frame indices can't be read
+// back. Decided with WebCodecs alone: 8 flat gray 64x64 frames through a literal 32 kbps config must decode in order.
+const avcKeepsEveryFrameAt32Kbps = await (async () => {
+	const canvas = new OffscreenCanvas(64, 64);
+	const context = canvas.getContext('2d')!;
+	const chunks: EncodedVideoChunk[] = [];
+	let decoderConfig: VideoDecoderConfig | undefined;
+	const encoder = new VideoEncoder({
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			decoderConfig ??= meta?.decoderConfig;
+		},
+		error: () => {},
+	});
+	encoder.configure({ codec: 'avc1.42001f', width: 64, height: 64, bitrate: 32_000, framerate: 30 });
+	const levels = Array.from({ length: 8 }, (_, i) => i * 32 + 16);
+	levels.forEach((level, i) => {
+		context.fillStyle = `rgb(${level}, ${level}, ${level})`;
+		context.fillRect(0, 0, 64, 64);
+		const frame = new VideoFrame(canvas, { timestamp: Math.round(i * 1e6 / 30), duration: 33_333 });
+		encoder.encode(frame, { keyFrame: i === 0 });
+		frame.close();
+	});
+	await encoder.flush();
+	encoder.close();
+	if (!decoderConfig) {
+		return false;
+	}
+
+	const decoded: number[] = [];
+	const decoder = new VideoDecoder({
+		output: (frame) => {
+			const pixel = new OffscreenCanvas(8, 8).getContext('2d')!;
+			pixel.drawImage(frame, 0, 0, 8, 8);
+			decoded.push(pixel.getImageData(4, 4, 1, 1).data[0]!);
+			frame.close();
+		},
+		error: () => {},
+	});
+	decoder.configure(decoderConfig);
+	chunks.forEach(chunk => decoder.decode(chunk));
+	await decoder.flush();
+	decoder.close();
+	return decoded.length === levels.length && decoded.every((level, i) => Math.abs(level - levels[i]!) <= 8);
+})();
+
 describe('Frame rate conversion', () => {
-	test('converting to the same frame rate keeps every frame', async () => {
+	const testIfFramesSurvive = test.skipIf(!avcKeepsEveryFrameAt32Kbps);
+
+	testIfFramesSurvive('converting to the same frame rate keeps every frame', async () => {
 		const source = await createCountingVideo(30, 30);
 		using input = new Input({
 			source: new BufferSource(await convert(source, new Mp4OutputFormat(), { video: { frameRate: 30 } })),
@@ -279,7 +328,7 @@ describe('Frame rate conversion', () => {
 		expect(await readFrameIndices(track)).toEqual(Array.from({ length: 30 }, (_, i) => i % 8));
 	});
 
-	test('converting to a third of the frame rate keeps every third frame', async () => {
+	testIfFramesSurvive('converting to a third of the frame rate keeps every third frame', async () => {
 		const source = await createCountingVideo(30, 30);
 		using input = new Input({
 			source: new BufferSource(await convert(source, new Mp4OutputFormat(), { video: { frameRate: 10 } })),
@@ -292,7 +341,7 @@ describe('Frame rate conversion', () => {
 		expect(await track.computeDuration()).toBe(1);
 	});
 
-	test('converting to twice the frame rate shows every frame twice', async () => {
+	testIfFramesSurvive('converting to twice the frame rate shows every frame twice', async () => {
 		const source = await createCountingVideo(30, 30);
 		using input = new Input({
 			source: new BufferSource(await convert(source, new Mp4OutputFormat(), { video: { frameRate: 60 } })),
