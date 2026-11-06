@@ -17,7 +17,7 @@ import { Input } from '../../src/input.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { AttachedFile, MetadataTags } from '../../src/metadata.js';
+import { AttachedFile, MetadataTags, RichImageData } from '../../src/metadata.js';
 import { VERSIONED_NAME } from '../../src/version.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1088,6 +1088,10 @@ test('Creation time override in conversion', async () => {
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
 
+const bytesOf = (source: AllowSharedBufferSource) => ArrayBuffer.isView(source)
+	? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+	: new Uint8Array(source);
+
 test('Getters return copies that callers can modify without affecting the input', async () => {
 	for (const file of ['video.mp4', 'demo.webm', 'Toothsome-Meme.VBRv2.mp3']) {
 		using input = new Input({
@@ -1104,11 +1108,17 @@ test('Getters return copies that callers can modify without affecting the input'
 		tags.raw = {};
 		const config = (await track.getDecoderConfig())!;
 		config.codec = 'vp8';
+		const description = config.description && bytesOf(config.description).slice();
+		if (config.description) {
+			bytesOf(config.description).fill(0); // Changed in place
+		}
 		const disposition = await track.getDisposition();
 		disposition.default = !disposition.default;
 
 		expect((await input.getMetadataTags()).title, file).toBe(title);
 		expect((await track.getDecoderConfig())!.codec, file).toBe(codecString);
+		const freshDescription = (await track.getDecoderConfig())!.description;
+		expect(freshDescription && bytesOf(freshDescription), file).toEqual(description);
 		expect(await track.getCodecParameterString(), file).toBe(codecString);
 		expect(await input.getMimeType(), file).toBe(mimeType);
 		expect((await track.getDisposition()).default, file).toBe(!disposition.default);
@@ -1118,5 +1128,38 @@ test('Getters return copies that callers can modify without affecting the input'
 			ratio.num = 99;
 			expect((await track.getPixelAspectRatio()).num, file).not.toBe(99);
 		}
+	}
+
+	// Tags holding Dates, image bytes, attachments and binary raw values, changed in place
+	for (const format of [new Mp4OutputFormat(), new MkvOutputFormat()]) {
+		const output = new Output({ format, target: new BufferTarget() });
+		const track = createDummyAudioTrack('pcm-s16', output);
+		output.setMetadataTags({
+			date: new Date(Date.UTC(2024, 0, 2)),
+			creationTime: new Date(Date.UTC(2025, 0, 1)),
+			images: [{ data: new Uint8Array([1, 2, 3, 4]), mimeType: 'image/png', kind: 'coverFront' }],
+			raw: format instanceof MkvOutputFormat ? { CUSTOM_BINARY: new Uint8Array([5, 6, 7]) } : undefined,
+		});
+		await output.start();
+		await track.addPacket();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const original = await input.getMetadataTags();
+		const tags = await input.getMetadataTags();
+		tags.date!.setTime(0);
+		tags.creationTime!.setTime(0);
+		tags.images![0]!.data.fill(0);
+		for (const value of Object.values(tags.raw!)) {
+			if (value instanceof Uint8Array) {
+				value.fill(0);
+			} else if (value instanceof RichImageData || value instanceof AttachedFile) {
+				value.data.fill(0);
+			}
+		}
+
+		expect(await input.getMetadataTags()).toEqual(original);
+		expect(original.creationTime!.getTime()).toBe(Date.UTC(2025, 0, 1));
+		expect([...original.images![0]!.data]).toEqual([1, 2, 3, 4]);
 	}
 });

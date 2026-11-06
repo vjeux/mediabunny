@@ -29,6 +29,7 @@ import {
 	Rational,
 	roundToDivisor,
 	simplifyRational,
+	toUint8Array,
 	TransformationMatrix,
 } from './misc';
 import { TrackType } from './output';
@@ -848,11 +849,23 @@ export class InputVideoTrack extends InputTrack {
 	 * track's packets using a [`VideoDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder). Returns
 	 * null if the track's codec is unknown.
 	 */
-	async getDecoderConfig() {
-		// Copied so that changes made by the caller (e.g. before configuring their own decoder) don't leak into the
-		// input's own state
+	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
+		// Copied, description bytes included, so that changes made by the caller (e.g. before configuring their own
+		// decoder) don't leak into the input's own state
 		const config = await this._backing.getDecoderConfig();
-		return config && { ...config, colorSpace: config.colorSpace && { ...config.colorSpace } };
+		if (!config) {
+			return null;
+		}
+
+		const copy = { ...config };
+		if (config.description) {
+			copy.description = toUint8Array(config.description).slice();
+		}
+		if (config.colorSpace) {
+			copy.colorSpace = { ...config.colorSpace };
+		}
+
+		return copy;
 	}
 
 	async getCodecParameterString() {
@@ -1143,10 +1156,19 @@ export class InputAudioTrack extends InputTrack {
 	 * track's packets using an [`AudioDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/AudioDecoder). Returns
 	 * null if the track's codec is unknown.
 	 */
-	async getDecoderConfig() {
-		// Copied so that changes made by the caller don't leak into the input's own state
+	async getDecoderConfig(): Promise<AudioDecoderConfig | null> {
+		// Copied, description bytes included, so that changes made by the caller don't leak into the input's own state
 		const config = await this._backing.getDecoderConfig();
-		return config && { ...config };
+		if (!config) {
+			return null;
+		}
+
+		const copy = { ...config };
+		if (config.description) {
+			copy.description = toUint8Array(config.description).slice();
+		}
+
+		return copy;
 	}
 
 	async getCodecParameterString() {

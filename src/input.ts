@@ -8,7 +8,7 @@
 
 import { Demuxer, DurationMetadataRequestOptions } from './demuxer';
 import { InputFormat, InputFormatOptions, validateInputFormatOptions } from './input-format';
-import { MetadataTags } from './metadata';
+import { cloneMetadataTags } from './metadata';
 import {
 	InputAudioTrack,
 	InputAudioTrackBacking,
@@ -516,18 +516,9 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 */
 	async getMetadataTags() {
 		const demuxer = await this._getDemuxer();
-		const tags = await demuxer.getMetadataTags();
 
 		// Copied so that callers can't modify the input's own state
-		const copy: MetadataTags = { ...tags };
-		if (tags.images) {
-			copy.images = tags.images.map(image => ({ ...image }));
-		}
-		if (tags.raw) {
-			copy.raw = { ...tags.raw };
-		}
-
-		return copy;
+		return cloneMetadataTags(await demuxer.getMetadataTags());
 	}
 
 	/**
