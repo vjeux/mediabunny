@@ -8,7 +8,7 @@ import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -672,6 +672,35 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 	expect(await track.getFirstTimestamp()).toBe(1);
 	expect(await track.computeDuration()).toBe(2);
 	input.dispose();
+});
+
+test('AudioSampleSource, Opus encoding of 22.05 kHz audio keeps its timing', async () => {
+	// 1 s of silence with a 20 ms burst starting at 0.5 s. Chrome's Opus encoder resamples it to 48 kHz internally,
+	// which delays its output.
+	const sampleRate = 22050;
+	const data = new Float32Array(sampleRate);
+	const burstStart = sampleRate / 2;
+	for (let i = 0; i < sampleRate / 50; i++) {
+		data[burstStart + i] = 0.5 * Math.sin(2 * Math.PI * 1000 * i / sampleRate);
+	}
+	const sample = new AudioSample({ data, format: 'f32', sampleRate, numberOfChannels: 1, timestamp: 0 });
+	const buffer = await encodeAudio({ codec: 'opus', quality: new Quality('high') }, sample);
+
+	const { input, track } = await readBackAudioTrack(buffer);
+	let onset: number | null = null;
+	for await (using decoded of new AudioSampleSink(track).samples()) {
+		const values = new Float32Array(decoded.numberOfFrames);
+		decoded.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+		const index = values.findIndex(x => Math.abs(x) > 0.15);
+		if (index !== -1) {
+			onset = decoded.timestamp + index / decoded.sampleRate;
+			break;
+		}
+	}
+	input.dispose();
+
+	assert(onset !== null);
+	expect(onset).toBeCloseTo(0.5, 3);
 });
 
 const makeSineWave = (
