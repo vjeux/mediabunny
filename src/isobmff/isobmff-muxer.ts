@@ -1060,6 +1060,16 @@ export class IsobmffMuxer extends Muxer {
 			trackData.startTimestampOffset ??= sortedTimestamps[0]!;
 		}
 
+		// Regular files with a positive start show media time 0 after an empty edit, whose duration is in the movie
+		// timescale. Readers convert it to the nearest track tick, which can be one off from the first sample's own
+		// tick when the timescales differ; carrying that difference in the composition offsets puts every sample back
+		// on its nearest tick.
+		const offset = trackData.startTimestampOffset;
+		const emptyEditDuration = intoTimescale(offset, GLOBAL_TIMESCALE) / GLOBAL_TIMESCALE;
+		const emptyEditRemainder = !this.isFragmented && offset > 0
+			? intoTimescale(offset, trackData.timescale) - intoTimescale(emptyEditDuration, trackData.timescale)
+			: 0;
+
 		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
 			const sample = trackData.timestampProcessingQueue[i]!;
 
@@ -1072,8 +1082,9 @@ export class IsobmffMuxer extends Muxer {
 			// Each timestamp is rounded into the timescale exactly once, from its absolute value, so every sample
 			// lands on round(timestamp * timescale) whether it's written in a regular or a fragmented file
 			sample.decodeTimeInTimescale = intoTimescale(sample.decodeTimestamp, trackData.timescale);
-			sample.compositionTimeOffsetInTimescale
-				= intoTimescale(sample.timestamp, trackData.timescale) - sample.decodeTimeInTimescale;
+			sample.compositionTimeOffsetInTimescale = intoTimescale(sample.timestamp, trackData.timescale)
+				- sample.decodeTimeInTimescale
+				+ emptyEditRemainder;
 
 			const sampleCompositionTimeOffset = sample.compositionTimeOffsetInTimescale;
 			const durationInTimescale = intoTimescale(sample.duration, trackData.timescale);
