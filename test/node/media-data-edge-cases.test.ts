@@ -3,9 +3,9 @@ import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Input } from '../../src/input.js';
 import { BufferSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
-import { ebml, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/mutation-bytes.js';
+import { ebml, ebmlFloat, ebmlString, ebmlUint, mkvFile, mkvSimpleBlock } from './helpers/mutation-bytes.js';
 
 describe('EncodedPacketSink verifyKeyPackets', () => {
 	const vp9Frame = (frameType: number, showExisting = false) => {
@@ -239,5 +239,72 @@ describe('AudioSample copyTo and allocationSize validation', () => {
 		const u8 = new Uint8Array(8);
 		sample.copyTo(u8, { planeIndex: 0, format: 'u8' });
 		expect(u8[0]).toBe(128);
+	});
+});
+
+describe('AudioSampleSink ranges and timestamps on PCM audio', () => {
+	// Four 10 ms blocks of 8 kHz mono 16-bit PCM at 0, 10, 20 and 30 ms
+	const bytes = mkvFile({
+		trackEntries: [ebml(
+			EBMLId.TrackEntry,
+			ebmlUint(EBMLId.TrackNumber, 1),
+			ebmlUint(EBMLId.TrackUID, 1),
+			ebmlUint(EBMLId.TrackType, 2),
+			ebmlString(EBMLId.CodecID, 'A_PCM/INT/LIT'),
+			ebml(
+				EBMLId.Audio,
+				ebmlFloat(EBMLId.SamplingFrequency, 8000),
+				ebmlUint(EBMLId.Channels, 1),
+				ebmlUint(EBMLId.BitDepth, 16),
+			),
+		)],
+		rest: [ebml(
+			EBMLId.Cluster,
+			ebmlUint(EBMLId.Timestamp, 0),
+			...[0, 10, 20, 30].map((t, i) => {
+				return ebml(EBMLId.SimpleBlock, mkvSimpleBlock(1, t, 0x80, new Array(160).fill(i)));
+			}),
+		)],
+	});
+
+	const millis = async (samples: AsyncGenerator<AudioSample | null>) => {
+		const result: (number | null)[] = [];
+		for await (const sample of samples) {
+			result.push(sample ? Math.round(sample.timestamp * 1000) : null);
+			sample?.close();
+		}
+		return result;
+	};
+
+	test.each([
+		[0.015, 0.025, [10, 20]],
+		[0.015, undefined, [10, 20, 30]],
+		[undefined, 0.025, [0, 10, 20]],
+		[0.035, undefined, [30]],
+		[0.05, undefined, [30]], // starts with the last sample at or before the start
+		[0.01, 0.02, [10]],
+		[0.02, 0.02, []],
+		[0, 0.04, [0, 10, 20, 30]],
+		[0, Infinity, [0, 10, 20, 30]],
+	])('samples(%s, %s) yields the samples starting at %j ms', async (start, end, expected) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const sink = new AudioSampleSink((await input.getPrimaryAudioTrack())!);
+		expect(await millis(sink.samples(start, end))).toEqual(expected);
+	});
+
+	test('samplesAtTimestamps and getSample return the sample covering each timestamp', async () => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const sink = new AudioSampleSink((await input.getPrimaryAudioTrack())!);
+		expect(await millis(sink.samplesAtTimestamps([0.005, 0.005, 0.025, -1, 0.1, 0.0399, 0.012])))
+			.toEqual([0, 0, 20, null, 30, 30, 10]);
+
+		const sample = (await sink.getSample(0.012))!;
+		expect([sample.timestamp, sample.numberOfFrames, sample.numberOfChannels, sample.sampleRate])
+			.toEqual([0.01, 80, 1, 8000]);
+		sample.close();
+		expect(await sink.getSample(-0.5)).toBe(null);
+		const last = (await sink.getSample(0.5))!;
+		expect(last.timestamp).toBe(0.03);
+		last.close();
 	});
 });
