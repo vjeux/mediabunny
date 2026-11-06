@@ -823,6 +823,19 @@ export class VideoSample implements Disposable {
 	 * @returns The byte layout of the planes of the copied data.
 	 */
 	async copyTo(destination: AllowSharedBufferSource, options: VideoFrameCopyToOptions = {}): Promise<PlaneLayout[]> {
+		return this._copyTo(destination, options, true);
+	}
+
+	/**
+	 * `convertColorSpace` is false for samples returned by toRgbSample(), whose pixels are in the requested color
+	 * space already.
+	 * @internal
+	 */
+	async _copyTo(
+		destination: AllowSharedBufferSource,
+		options: VideoFrameCopyToOptions,
+		convertColorSpace: boolean,
+	): Promise<PlaneLayout[]> {
 		if (!isAllowSharedBufferSource(destination)) {
 			throw new TypeError('destination must be an ArrayBuffer or an ArrayBuffer view.');
 		}
@@ -845,7 +858,8 @@ export class VideoSample implements Disposable {
 		// between color spaces ourselves, so let VideoFrame do it when the sample's RGB data is in another one. Custom
 		// resources are left alone, since they convert colors in toRgbSample().
 		if (
-			options.format
+			convertColorSpace
+			&& options.format
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(this.format!)
 			&& !(this._data instanceof VideoSampleResource)
@@ -894,7 +908,8 @@ export class VideoSample implements Disposable {
 				}
 				// Note that we DON'T force the RGB format to be exactly what was requested; any RGB format will do
 
-				return await rgbSample.copyTo(destination, options); // 'await' is intentional here cuz of using
+				// 'await' is intentional here cuz of using
+				return await rgbSample._copyTo(destination, options, false);
 			} else {
 				if (typeof VideoFrame === 'undefined') {
 					throw new Error(
