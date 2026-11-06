@@ -6,6 +6,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource } from '../../src/source.js';
 import { analyzeInput, type MediaView } from './helpers/convmatrix-analysis.js';
 import { buildSyntheticInput, SYNTHETIC_INPUTS } from './helpers/convmatrix-inputs.js';
+import { audioDecodingResponds, decodesNatively, NATIVE_PROBES } from './helpers/convmatrix-probes.js';
 import {
 	AUDIO_ONLY_OUTPUTS,
 	runCell,
@@ -25,6 +26,9 @@ import {
 //
 // A default run covers every input with every output format. Set VITE_CONVERSION_MATRIX_FULL=1 for the full matrix
 // (more trims and boundary policies, every video and audio option on every input, more codecs; several minutes).
+//
+// Cells that decode FLAC or Vorbis run last, and only where WebCodecs decodes a tiny known-good stream of that codec:
+// on WebKitGTK, a FLAC or Vorbis decode stalls every later audio decode on the page.
 
 const FULL = !!(import.meta as unknown as { env: Record<string, string | undefined> })
 	.env['VITE_CONVERSION_MATRIX_FULL'];
@@ -46,17 +50,17 @@ const INPUT_INFO: InputInfo[] = SYNTHETIC_INPUTS.map(spec => ({
 
 // Files from elsewhere (B-frames, edit lists, odd start times, real codec settings), in the full matrix only. They
 // don't carry the generator's markers, so only timing and format are checked for them, on their first 3 seconds.
-const PUBLIC_INPUTS: { id: string; url: string }[] = FULL
+const PUBLIC_INPUTS: { id: string; url: string; audioCodec: string | null }[] = FULL
 	? [
-			{ id: 'mp4-b-frames-edit-list', url: '/edts.mp4' },
-			{ id: 'mp4-sar-b-frames', url: '/sar_2x1.mp4' },
-			{ id: 'mp4-rotated-51', url: '/rotate-buck-bunny.mp4' },
-			{ id: 'webm-vp9-opus-negative-start', url: '/demo.webm' },
-			{ id: 'ts-b-frames', url: '/0.ts' },
-			{ id: 'ogg-opus-preroll', url: '/preroll-test.opus' },
-			{ id: 'ogg-vorbis', url: '/vorbis-eos.ogg' },
-			{ id: 'adts-aac', url: '/sample3.aac' },
-			{ id: 'mp3-vbr-24k', url: '/Toothsome-Meme.VBRv2.mp3' },
+			{ id: 'mp4-b-frames-edit-list', url: '/edts.mp4', audioCodec: 'aac' },
+			{ id: 'mp4-sar-b-frames', url: '/sar_2x1.mp4', audioCodec: null },
+			{ id: 'mp4-rotated-51', url: '/rotate-buck-bunny.mp4', audioCodec: 'aac' },
+			{ id: 'webm-vp9-opus-negative-start', url: '/demo.webm', audioCodec: 'opus' },
+			{ id: 'ts-b-frames', url: '/0.ts', audioCodec: 'aac' },
+			{ id: 'ogg-opus-preroll', url: '/preroll-test.opus', audioCodec: 'opus' },
+			{ id: 'ogg-vorbis', url: '/vorbis-eos.ogg', audioCodec: 'vorbis' },
+			{ id: 'adts-aac', url: '/sample3.aac', audioCodec: 'aac' },
+			{ id: 'mp3-vbr-24k', url: '/Toothsome-Meme.VBRv2.mp3', audioCodec: 'mp3' },
 		]
 	: [];
 
@@ -261,11 +265,40 @@ const isKnownIssue = (cell: Cell, inView: MediaView, run: RunResult, issue: Issu
 	return false;
 };
 
-const runCells = async (bytes: Uint8Array, view: MediaView, cells: Cell[], markers: boolean) => {
+type DeferredCodec = 'flac' | 'vorbis';
+
+/** The codec a cell decodes that can stall the page's audio decoding, known from its input and options. */
+const deferredCodecOf = (cell: Cell, inputAudioCodec: string | null): DeferredCodec | null => {
+	if (inputAudioCodec === 'vorbis') {
+		return 'vorbis';
+	}
+	if (inputAudioCodec === 'flac' || cell.output === 'flac' || cell.options.audio?.codec === 'flac') {
+		return 'flac';
+	}
+
+	return null;
+};
+
+/** Cells whose output audio turned out to use a deferred codec, by codec and input. */
+const deferredAtRuntime = new Map<string, Cell[]>();
+
+const runCells = async (
+	bytes: Uint8Array,
+	view: MediaView,
+	cells: Cell[],
+	markers: boolean,
+	deferAudioCodecs: DeferredCodec[],
+) => {
 	const failures: string[] = [];
 
 	for (const cell of cells) {
-		const run = await runCell(bytes, cell);
+		const run = await runCell(bytes, cell, deferAudioCodecs);
+		if (run.deferredCodec !== null) {
+			const key = `${run.deferredCodec} ${cell.input}`;
+			deferredAtRuntime.set(key, [...deferredAtRuntime.get(key) ?? [], cell]);
+			continue;
+		}
+
 		const issues = verifyCell(cell, view, run, markers).filter(issue => !isKnownIssue(cell, view, run, issue));
 
 		if (cell.options.repeat && run.outputBytes) {
@@ -285,33 +318,58 @@ const runCells = async (bytes: Uint8Array, view: MediaView, cells: Cell[], marke
 	return failures;
 };
 
-describe('Conversion matrix', () => {
-	for (const info of INPUT_INFO) {
-		test(info.id, async () => {
-			const bytes = await buildSyntheticInput(SYNTHETIC_INPUTS.find(x => x.id === info.id)!);
+type MatrixInput = { id: string; audioCodec: string | null; markers: boolean; url: string | null };
+
+const MATRIX_INPUTS: MatrixInput[] = [
+	...SYNTHETIC_INPUTS.map(spec => ({ id: spec.id, audioCodec: spec.audio?.codec ?? null, markers: true, url: null })),
+	...PUBLIC_INPUTS.map(({ id, url, audioCodec }) => ({ id, audioCodec, markers: false, url })),
+];
+
+const loadedInputs = new Map<string, Promise<{ bytes: Uint8Array; view: MediaView; cells: Cell[] }>>();
+
+/** The input's bytes, its decoded view and its cells (loaded once). */
+const loadInput = (matrixInput: MatrixInput) => {
+	let promise = loadedInputs.get(matrixInput.id);
+	if (!promise) {
+		promise = (async () => {
+			const bytes = matrixInput.url === null
+				? await buildSyntheticInput(SYNTHETIC_INPUTS.find(x => x.id === matrixInput.id)!)
+				: new Uint8Array(await (await fetch(matrixInput.url)).arrayBuffer());
 			using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 			const view = await analyzeInput(input);
+			const cells = matrixInput.url === null
+				? CELLS.filter(x => x.input === matrixInput.id)
+				: publicCells({
+						id: matrixInput.id,
+						hasVideo: !!view.video,
+						hasAudio: !!view.audio,
+						start: await input.getFirstTimestamp(),
+					});
 
-			const failures = await runCells(bytes, view, CELLS.filter(x => x.input === info.id), true);
-			expect(failures).toEqual([]);
-		}, FULL ? 1_800_000 : 120_000);
+			return { bytes, view, cells };
+		})();
+		loadedInputs.set(matrixInput.id, promise);
 	}
 
-	for (const { id, url } of PUBLIC_INPUTS) {
-		test(id, async () => {
-			const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
-			using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-			const view = await analyzeInput(input);
-			const info: InputInfo = {
-				id,
-				hasVideo: !!view.video,
-				hasAudio: !!view.audio,
-				start: await input.getFirstTimestamp(),
-			};
+	return promise;
+};
 
-			const failures = await runCells(bytes, view, publicCells(info), false);
+const testTimeout = (matrixInput: MatrixInput) => (FULL || matrixInput.url !== null ? 1_800_000 : 300_000);
+
+describe('Conversion matrix', () => {
+	for (const matrixInput of MATRIX_INPUTS) {
+		// Every cell of a FLAC or Vorbis input decodes it
+		if (matrixInput.audioCodec === 'flac' || matrixInput.audioCodec === 'vorbis') {
+			continue;
+		}
+
+		test(matrixInput.id, async () => {
+			const { bytes, view, cells } = await loadInput(matrixInput);
+			const plainCells = cells.filter(cell => deferredCodecOf(cell, matrixInput.audioCodec) === null);
+
+			const failures = await runCells(bytes, view, plainCells, matrixInput.markers, ['flac', 'vorbis']);
 			expect(failures).toEqual([]);
-		}, 1_800_000);
+		}, testTimeout(matrixInput));
 	}
 });
 
@@ -323,11 +381,7 @@ describe('Conversion matrix oracle', () => {
 		change(copy);
 		return copy;
 	};
-	const getInput = async (id: string) => {
-		const bytes = await buildSyntheticInput(SYNTHETIC_INPUTS.find(x => x.id === id)!);
-		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-		return { bytes, view: await analyzeInput(input) };
-	};
+	const getInput = (id: string) => loadInput(MATRIX_INPUTS.find(x => x.id === id)!);
 
 	test('rejects wrong frames, timing, dimensions, beeps and progress', async () => {
 		const { bytes, view } = await getInput('mp4-avc-opus');
@@ -439,4 +493,89 @@ describe('Conversion matrix oracle', () => {
 			copy.outputState = 'finalized';
 		})))).toEqual(['cancel']);
 	});
+});
+
+// Last, the cells that decode FLAC, then those that decode Vorbis, where WebCodecs decodes them at all. After a failed
+// probe, the page's audio decoding may have stalled, so the Vorbis cells then also need it to still respond.
+let flacDecodes: Promise<boolean> | null = null;
+let vorbisDecodes: Promise<boolean> | null = null;
+let audioDecodingStalled: Promise<boolean> = Promise.resolve(false);
+
+const flacRuns = () => flacDecodes ??= decodesNatively(NATIVE_PROBES.flac).then((decodes) => {
+	if (!decodes) {
+		audioDecodingStalled = audioDecodingResponds().then(responds => !responds);
+	}
+	return decodes;
+});
+
+const vorbisRuns = async () => {
+	if (await audioDecodingStalled) {
+		return false;
+	}
+	return vorbisDecodes ??= decodesNatively(NATIVE_PROBES.vorbis).then((decodes) => {
+		if (!decodes) {
+			audioDecodingStalled = audioDecodingResponds().then(responds => !responds);
+		}
+		return decodes;
+	});
+};
+
+describe('Conversion matrix, FLAC', () => {
+	for (const matrixInput of MATRIX_INPUTS) {
+		if (matrixInput.audioCodec === null || matrixInput.audioCodec === 'vorbis') {
+			continue;
+		}
+
+		test(matrixInput.id, async ({ skip }) => {
+			if (!await flacRuns()) {
+				skip('WebCodecs doesn\'t decode FLAC here');
+			}
+
+			const { bytes, view, cells } = await loadInput(matrixInput);
+			const flacCells = [
+				...cells.filter(cell => deferredCodecOf(cell, matrixInput.audioCodec) === 'flac'),
+				...deferredAtRuntime.get(`flac ${matrixInput.id}`) ?? [],
+			];
+
+			const failures = await runCells(bytes, view, flacCells, matrixInput.markers, ['vorbis']);
+			expect(failures).toEqual([]);
+		}, testTimeout(matrixInput));
+	}
+});
+
+describe('Conversion matrix, Vorbis', () => {
+	for (const matrixInput of MATRIX_INPUTS) {
+		if (matrixInput.audioCodec !== 'vorbis') {
+			continue;
+		}
+
+		test(matrixInput.id, async ({ skip }) => {
+			if (!await vorbisRuns()) {
+				skip('WebCodecs doesn\'t decode Vorbis here, or the page\'s audio decoding stalled');
+			}
+
+			const { bytes, view, cells } = await loadInput(matrixInput);
+			const failures = await runCells(bytes, view, cells, matrixInput.markers, []);
+			expect(failures).toEqual([]);
+		}, testTimeout(matrixInput));
+	}
+
+	// Cells of other inputs whose output audio turned out to be Vorbis
+	test('Vorbis outputs', async ({ skip }) => {
+		const deferred = MATRIX_INPUTS.filter(x => deferredAtRuntime.has(`vorbis ${x.id}`));
+		if (deferred.length === 0) {
+			return;
+		}
+		if (!await vorbisRuns()) {
+			skip('WebCodecs doesn\'t decode Vorbis here, or the page\'s audio decoding stalled');
+		}
+
+		const failures: string[] = [];
+		for (const matrixInput of deferred) {
+			const { bytes, view } = await loadInput(matrixInput);
+			const cells = deferredAtRuntime.get(`vorbis ${matrixInput.id}`)!;
+			failures.push(...await runCells(bytes, view, cells, matrixInput.markers, []));
+		}
+		expect(failures).toEqual([]);
+	}, FULL ? 1_800_000 : 300_000);
 });

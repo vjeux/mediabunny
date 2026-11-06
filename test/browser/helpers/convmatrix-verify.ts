@@ -151,6 +151,8 @@ export type RunResult = {
 	progress: number[];
 	/** Whether the cell's `cancelAt` was reached, so that cancel() got called. */
 	cancelRequested: boolean;
+	/** Set when the output's audio codec was one of `deferAudioCodecs`, so the cell wasn't run. */
+	deferredCodec: string | null;
 	conversionState: string | null;
 	outputState: string | null;
 	startTimestamp: number;
@@ -159,7 +161,15 @@ export type RunResult = {
 	outputBytes: Uint8Array | null;
 };
 
-export const runCell = async (inputBytes: Uint8Array, cell: Cell): Promise<RunResult> => {
+/**
+ * Runs a cell. With `deferAudioCodecs`, a cell whose output audio would use one of these codecs isn't executed, for
+ * running later (decoding it can stall the page's audio decoding on some platforms).
+ */
+export const runCell = async (
+	inputBytes: Uint8Array,
+	cell: Cell,
+	deferAudioCodecs: string[] = [],
+): Promise<RunResult> => {
 	const result: RunResult = {
 		error: null,
 		isValid: null,
@@ -168,6 +178,7 @@ export const runCell = async (inputBytes: Uint8Array, cell: Cell): Promise<RunRe
 		outputCodecs: { video: null, audio: null },
 		progress: [],
 		cancelRequested: false,
+		deferredCodec: null,
 		conversionState: null,
 		outputState: null,
 		startTimestamp: 0,
@@ -209,6 +220,10 @@ export const runCell = async (inputBytes: Uint8Array, cell: Cell): Promise<RunRe
 			}
 		}
 		result.startTimestamp = conversion._startTimestamp;
+		if (result.outputCodecs.audio !== null && deferAudioCodecs.includes(result.outputCodecs.audio)) {
+			result.deferredCodec = result.outputCodecs.audio;
+			return result;
+		}
 		conversion.onProgress = (progress) => {
 			result.progress.push(progress);
 			if (cell.options.cancelAt !== undefined && progress >= cell.options.cancelAt && !result.cancelRequested) {
