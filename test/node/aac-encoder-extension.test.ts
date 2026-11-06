@@ -222,3 +222,42 @@ test('Conversion falls back to the closest encodable audio parameters', async ()
 	// An explicitly requested channel count is kept
 	expect(await convert(await createWav(2), { codec: 'aac', numberOfChannels: 1 })).toEqual(['aac', 1, 48000]);
 });
+
+test('AAC encoding of samples that hold NaN or infinite values', async () => {
+	registerAacEncoder();
+
+	const sampleRate = 48000;
+	const channels = 2;
+	const data = createSineWave(sampleRate, channels, 1);
+	data[1000] = NaN; // Like a glitch in a float WAV file or an unstable audio effect
+	data[30000] = Infinity;
+	data[30001] = -Infinity;
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const audioSource = new AudioSampleSource({ codec: 'aac', quality: new Quality({ bitrate: 128000 }) });
+	output.addAudioTrack(audioSource);
+
+	await output.start();
+	using sample = new AudioSample({
+		data,
+		format: 'f32',
+		numberOfChannels: channels,
+		sampleRate,
+		timestamp: 0,
+	});
+	await audioSource.add(sample);
+	audioSource.close();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBeCloseTo(1, 1);
+});
