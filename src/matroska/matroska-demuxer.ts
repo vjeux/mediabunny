@@ -160,6 +160,8 @@ enum BlockLacing {
 type ClusterBlock = {
 	timestamp: number;
 	duration: number;
+	/** Whether the block came with a BlockDuration, which can be 0. Without one, its duration is inferred. */
+	hasBlockDuration?: boolean;
 	isKeyFrame: boolean;
 	data: Uint8Array;
 	lacing: BlockLacing;
@@ -760,7 +762,7 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 
 				if (i < trackData.presentationTimestamps.length - 1) {
-					if (currentBlock.duration === 0) {
+					if (!currentBlock.hasBlockDuration) {
 						// Without a BlockDuration, a frame lasts the track's DefaultDuration, or else until the next
 						// block in presentation order (RFC 9559, BlockDuration). Laced blocks still span the gap to
 						// the next block, which their frames are spread over: frame count times DefaultDuration often
@@ -772,7 +774,7 @@ export class MatroskaDemuxer extends Demuxer {
 							? track.defaultDuration
 							: nextEntry.timestamp - currentBlock.timestamp;
 					}
-				} else if (currentBlock.duration === 0) {
+				} else if (!currentBlock.hasBlockDuration) {
 					if (track.defaultDuration != null) {
 						if (currentBlock.lacing === BlockLacing.None) {
 							currentBlock.duration = track.defaultDuration;
@@ -1808,6 +1810,7 @@ export class MatroskaDemuxer extends Demuxer {
 				if (!this.currentBlock) break;
 
 				this.currentBlock.duration = readUnsignedInt(slice, size);
+				this.currentBlock.hasBlockDuration = true;
 			}; break;
 
 			case EBMLId.ReferenceBlock: {
