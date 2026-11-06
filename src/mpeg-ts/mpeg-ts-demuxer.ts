@@ -178,6 +178,9 @@ type Section = {
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
+// How many PTS values at least to measure a video track's frame duration from
+const MIN_FRAME_DURATION_PTS_COUNT = 16;
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -1269,7 +1272,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	abstract getReorderSize(): number;
 
 	/**
-	 * Returns the time between frames, as the smallest gap between the presentation timestamps of the track's first
+	 * Returns the time between frames, as the median gap between the presentation timestamps of the track's first
 	 * PES packets. Since it doesn't depend on where reading started, it gives packets without a successor the same
 	 * duration however they were reached.
 	 */
@@ -1279,8 +1282,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			const firstSection = this.elementaryStream.firstSection;
 			assert(firstSection);
 
-			// Enough to see every frame of a reordering window in presentation order
-			const ptsCount = 2 * (this.getReorderSize() + 1) + 2;
+			// Enough to see every frame of a reordering window in presentation order, and not to be thrown off by a few
+			// irregular frames at the start
+			const ptsCount = Math.max(2 * (this.getReorderSize() + 1) + 2, MIN_FRAME_DURATION_PTS_COUNT);
 			const ptsValues: number[] = [];
 
 			let currentPos = firstSection.startPos;
@@ -1303,15 +1307,18 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 			ptsValues.sort((a, b) => a - b);
 
-			let frameDuration = Infinity;
+			const gaps: number[] = [];
 			for (let i = 1; i < ptsValues.length; i++) {
 				const gap = ptsValues[i]! - ptsValues[i - 1]!;
 				if (gap > 0) {
-					frameDuration = Math.min(frameDuration, gap);
+					gaps.push(gap);
 				}
 			}
 
-			return Number.isFinite(frameDuration) ? frameDuration : 0;
+			// The median, since frames the window ends before (reordering) make a few gaps too long, and variable frame
+			// rates make some too short
+			gaps.sort((a, b) => a - b);
+			return gaps[Math.floor((gaps.length - 1) / 2)] ?? 0;
 		})();
 	}
 

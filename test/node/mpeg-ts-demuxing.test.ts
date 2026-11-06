@@ -967,3 +967,47 @@ test('MPEG-TS packet durations with B-frames do not depend on how the packets we
 	expect((await sink.getPacket(Infinity))!.duration).toBe(lastPacket.duration);
 	expect(await track.computeDuration()).toBeCloseTo(1.4 + 1 / 30);
 });
+
+test('MPEG-TS gives the last frame of variable frame rate video a typical frame duration', async () => {
+	// Frames 17.7, 20.3 and 10.9 ms long at the start, then 29 ms ones (seen in HLS streams, where every segment's
+	// last frame has no successor)
+	using mp4 = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/cursed-vfr.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const timestamps = [0, 0.0177, 0.038, 0.0489];
+	while (timestamps.length < 24) {
+		timestamps.push(timestamps.at(-1)! + 0.029);
+	}
+
+	let i = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		const timestamp = timestamps[i]!;
+		const duration = i + 1 < timestamps.length ? timestamps[i + 1]! - timestamp : 0.029;
+		await source.add(
+			packet.clone({ timestamp, duration }),
+			i === 0 ? { decoderConfig: (await mp4Track.getDecoderConfig())! } : undefined,
+		);
+		if (++i === timestamps.length) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const lastPacket = await sink.getPacket(Infinity);
+	expect(lastPacket?.duration).toBeCloseTo(0.029);
+	expect(await track.computeDuration()).toBeCloseTo(timestamps.at(-1)! + 0.029);
+});
