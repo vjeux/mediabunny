@@ -409,6 +409,53 @@ export const av1DecodesNatively = memoize(async () => {
 	return !failed && outputs > 0;
 });
 
+/**
+ * Whether the platform's Opus decoder outputs 48 kHz for a stream encoded from 8 kHz input, as Chrome's does. Checked
+ * on 0.06 s of mono silence made by FFmpeg (-c:a libopus -b:a 16k, .ogg), with the input sample rate in its
+ * identification header set to 8000 and the 48 kHz decoder config Mediabunny's demuxers give Opus.
+ */
+export const opusDecodesAt48kHz = memoize(async () => {
+	if (typeof AudioDecoder === 'undefined') {
+		return false;
+	}
+
+	const description = fromBase64('T3B1c0hlYWQBATgBgLsAAAAAAA==');
+	new DataView(description.buffer).setUint32(12, 8000, true);
+	const config: AudioDecoderConfig = { codec: 'opus', sampleRate: 48000, numberOfChannels: 1, description };
+	const support = await withTimeout(AudioDecoder.isConfigSupported(config).then(x => !!x.supported, () => false));
+	if (!support?.value) {
+		return false;
+	}
+
+	const sampleRates: number[] = [];
+	let failed = false;
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			sampleRates.push(data.sampleRate);
+			data.close();
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+	try {
+		decoder.configure(config);
+		['eAvkwTbsxY2MSUaZpCaw', 'eAfJcifhROpV8fDA1d3pUmA=', 'eAfJecjJV8CiEiP672fzZMDg'].forEach((chunk, i) => {
+			decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: i * 20_000, data: fromBase64(chunk) }));
+		});
+		if (await withTimeout(decoder.flush()) === null) {
+			failed = true;
+		}
+	} catch {
+		failed = true;
+	}
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return !failed && sampleRates.length > 0 && sampleRates.every(x => x === 48000);
+});
+
 /** Whether the platform's own support query accepts a literal video config with prefer-hardware. */
 export const nativeSupportsPreferHardware = async (codec: keyof typeof literalCodecStrings) => {
 	if (typeof VideoEncoder === 'undefined') {

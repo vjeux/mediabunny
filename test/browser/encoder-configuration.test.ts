@@ -37,6 +37,7 @@ import {
 	nativeAudioContradicts,
 	nativeSupportsPreferHardware,
 	nativeVideoContradicts,
+	opusDecodesAt48kHz,
 	videoRoundTrips,
 	vp8MeetsBitrate,
 } from './helpers/encoder-configs-platform.js';
@@ -813,6 +814,10 @@ describe('Audio', () => {
 				expect(await track.getNumberOfChannels()).toBe(numberOfChannels);
 
 				const decoded = await decodeAudio(track);
+				if (await opusDecodesAt48kHz()) {
+					// Opus decodes at 48 kHz whatever the input rate was, though some decoders output the input rate
+					expect(decoded.sampleRate).toBe(48000);
+				}
 				// The click comes out where it went in, give or take a few milliseconds of encoder delay handling
 				expect(Math.abs(decoded.peakTime - 0.25)).toBeLessThan(0.007);
 				expect(decoded.end).toBeGreaterThan(0.96);
