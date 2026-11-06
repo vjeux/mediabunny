@@ -923,76 +923,88 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(thirdPacket.data.byteLength).toBe(4273);
 });
 
-test('MPEG-TS metadata reading gives up on declared streams that never show up', async () => {
-	// The PMT declares two AAC streams, but only the first one has any packets (like a recording that dropped a
-	// language). 5 minutes of it, one ADTS frame per PES packet and TS packet.
-	const packets: Uint8Array[] = [];
-	const continuityCounters = new Map<number, number>();
-	const pushPacket = (pid: number, payload: Uint8Array, isSection: boolean) => {
-		const packet = new Uint8Array(188).fill(0xff);
-		const cc = continuityCounters.get(pid) ?? 0;
-		continuityCounters.set(pid, (cc + 1) & 0xf);
-		packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff], 0);
-		if (isSection || payload.length === 184) {
-			packet[3] = 0x10 | cc;
-			packet.set(payload, 4);
-		} else {
-			packet[3] = 0x30 | cc; // Adaptation field stuffing
-			packet[4] = 183 - payload.length;
-			packet[5] = 0x00;
-			packet.set(payload, 188 - payload.length);
+test('MPEG-TS metadata reading gives up on declared streams that never show up, and finds late ones', async () => {
+	// The PMT declares two AAC streams. 20 minutes of the first one, one ADTS frame per PES packet and TS packet. The
+	// second one is either never sent (like a recording that dropped a language) or starts 3 minutes in.
+	const buildFile = (secondStreamStartFrame: number | null) => {
+		const packets: Uint8Array[] = [];
+		const continuityCounters = new Map<number, number>();
+		const pushPacket = (pid: number, payload: Uint8Array, isSection: boolean) => {
+			const packet = new Uint8Array(188).fill(0xff);
+			const cc = continuityCounters.get(pid) ?? 0;
+			continuityCounters.set(pid, (cc + 1) & 0xf);
+			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff], 0);
+			if (isSection || payload.length === 184) {
+				packet[3] = 0x10 | cc;
+				packet.set(payload, 4);
+			} else {
+				packet[3] = 0x30 | cc; // Adaptation field stuffing
+				packet[4] = 183 - payload.length;
+				packet[5] = 0x00;
+				packet.set(payload, 188 - payload.length);
+			}
+			packets.push(packet);
+		};
+		const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
+
+		pushPacket(0x0000, new Uint8Array(section([0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00])), true);
+		pushPacket(0x1000, new Uint8Array(section([
+			0x02, 0xb0, 0x17, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00,
+			0x0f, 0xe1, 0x00, 0xf0, 0x00, // AAC on PID 0x100
+			0x0f, 0xe1, 0x01, 0xf0, 0x00, // AAC on PID 0x101
+		])), true);
+
+		const adtsFrame = new Uint8Array(39); // LC, 48 kHz, stereo, 39 bytes
+		adtsFrame.set([0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc]);
+		const pushFrame = (pid: number, pts: number) => {
+			const pes = new Uint8Array(14 + adtsFrame.length);
+			pes.set([0, 0, 1, 0xc0, 0, 8 + adtsFrame.length, 0x84, 0x80, 5]);
+			pes.set([0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1], 9);
+			pes.set([(pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1], 12);
+			pes.set(adtsFrame, 14);
+			pushPacket(pid, pes, false);
+		};
+
+		const frameCount = Math.round(1200 * 48000 / 1024);
+		for (let i = 0; i < frameCount; i++) {
+			const pts = Math.round(i * 1024 * 90000 / 48000);
+			pushFrame(0x100, pts);
+			if (secondStreamStartFrame !== null && i >= secondStreamStartFrame) {
+				pushFrame(0x101, pts);
+			}
 		}
-		packets.push(packet);
+
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+		return bytes;
 	};
-	const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
 
-	pushPacket(0x0000, new Uint8Array(section([0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00])), true);
-	pushPacket(0x1000, new Uint8Array(section([
-		0x02, 0xb0, 0x17, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00,
-		0x0f, 0xe1, 0x00, 0xf0, 0x00, // AAC on PID 0x100
-		0x0f, 0xe1, 0x01, 0xf0, 0x00, // AAC on PID 0x101, never sent
-	])), true);
+	const getTracks = async (bytes: Uint8Array) => {
+		let bytesRead = 0;
+		using input = new Input({
+			source: new CustomSource({
+				getSize: () => bytes.byteLength,
+				read: (start, end) => {
+					bytesRead += end - start;
+					return bytes.subarray(start, end);
+				},
+			}),
+			formats: ALL_FORMATS,
+		});
 
-	const adtsFrame = new Uint8Array(39); // LC, 48 kHz, stereo, 39 bytes
-	adtsFrame.set([0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc]);
+		const tracks = await input.getTracks();
+		return {
+			bytesRead,
+			tracks: await Promise.all(tracks.map(async track => [track.id, await track.getFirstTimestamp()])),
+		};
+	};
 
-	const frameCount = Math.round(300 * 48000 / 1024);
-	for (let i = 0; i < frameCount; i++) {
-		const pts = Math.round(i * 1024 * 90000 / 48000);
-		const pes = new Uint8Array(14 + adtsFrame.length);
-		pes.set([0, 0, 1, 0xc0, 0, 8 + adtsFrame.length, 0x84, 0x80, 5]);
-		pes.set([0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1], 9);
-		pes.set([(pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1], 12);
-		pes.set(adtsFrame, 14);
-		pushPacket(0x100, pes, false);
-	}
+	const absent = buildFile(null);
+	const absentResult = await getTracks(absent);
+	expect(absentResult.tracks).toEqual([[0x100, 0]]);
+	// It stopped looking for the missing stream instead of reading the whole file
+	expect(absentResult.bytesRead).toBeLessThan(absent.byteLength / 3);
 
-	const bytes = new Uint8Array(188 * packets.length);
-	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
-
-	let maxEnd = 0;
-	using input = new Input({
-		source: new CustomSource({
-			getSize: () => bytes.byteLength,
-			read: (start, end) => {
-				maxEnd = Math.max(maxEnd, end);
-				return bytes.subarray(start, end);
-			},
-		}),
-		formats: ALL_FORMATS,
-	});
-
-	const tracks = await input.getTracks();
-	expect(tracks).toHaveLength(1);
-	expect(tracks[0]!.id).toBe(0x100);
-
-	// It stopped looking for the missing stream well before the end of the file
-	expect(maxEnd).toBeLessThan(bytes.byteLength / 2);
-
-	let packetCount = 0;
-	for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
-		expect(packet.byteLength).toBe(39);
-		packetCount++;
-	}
-	expect(packetCount).toBe(frameCount);
+	const late = buildFile(8400); // 179.2 s
+	expect((await getTracks(late)).tracks).toEqual([[0x100, 0], [0x101, 179.2]]);
 });
