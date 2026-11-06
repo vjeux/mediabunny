@@ -785,6 +785,12 @@ test('MPEG-TS files not starting with a whole packet', async () => {
 	const cut = await readPackets(file.subarray(1000));
 	expect(cut.length).toBeGreaterThan(expected.length - 5);
 	expect(cut.at(-1)).toEqual(expected.at(-1));
+
+	// Repeated bytes holding 0x47 line up at any even stride, but they aren't packet headers (an MP3 whose frames
+	// contain such padding, samples.ffmpeg.org trac/ticket3844/tuu_gekisinn.mp3, was taken for MPEG-TS)
+	const padding = new Uint8Array(2000).map((_, i) => (i % 2 === 0 ? 0x4f : 0x47));
+	using paddingInput = new Input({ source: new BufferSource(padding), formats: [MPEG_TS] });
+	await expect(paddingInput.getFormat()).rejects.toThrow('unsupported or unrecognizable');
 });
 
 test('MPEG-TS partial reading', async () => {

@@ -40,19 +40,21 @@ export const findTsPacketLayout = (bytes: Uint8Array): TsPacketLayout | null => 
 	}
 
 	// The file doesn't start with a whole packet. A stray 0x47 lining up by chance is likely enough with two packets,
-	// so require more of them here.
+	// so require more of them here. Like FFmpeg's probe, also require a valid adaptation_field_control in each header
+	// (00 is reserved), which rules out runs of repeated bytes holding 0x47, like the padding in some MP3 frames.
 	const REQUIRED_SYNC_BYTE_COUNT = 4;
 	const strides = [TS_PACKET_SIZE, TS_PACKET_SIZE + 16, TS_PACKET_SIZE + 4];
 
 	for (let offset = 0; offset < TS_PACKET_SIZE + 16; offset++) {
 		for (const stride of strides) {
-			if (offset + (REQUIRED_SYNC_BYTE_COUNT - 1) * stride >= bytes.length) {
+			if (offset + (REQUIRED_SYNC_BYTE_COUNT - 1) * stride + 3 >= bytes.length) {
 				continue;
 			}
 
 			let linesUp = true;
 			for (let i = 0; i < REQUIRED_SYNC_BYTE_COUNT; i++) {
-				if (bytes[offset + i * stride] !== 0x47) {
+				const pos = offset + i * stride;
+				if (bytes[pos] !== 0x47 || (bytes[pos + 3]! & 0x30) === 0) {
 					linesUp = false;
 					break;
 				}
