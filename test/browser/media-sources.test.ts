@@ -15,7 +15,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { EncodedPacketSink, VideoSampleSink, AudioSampleSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { assert, Rotation } from '../../src/misc.js';
+import { assert, Rotation, toDataView } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
 test('VideoSampleSource, normal usage', async () => {
@@ -992,6 +992,43 @@ test('canEncodeAudio only reports configs that encode audibly', async () => {
 
 		expect(peak, `${codec}, ${numberOfChannels} channels`).toBeGreaterThan(0.1);
 	}
+});
+
+test('AudioSampleSource, Opus encoding of 16 kHz audio keeps its timing', async () => {
+	const sampleRate = 16000;
+	const data = new Float32Array(sampleRate);
+	for (let i = 0; i < data.length; i++) {
+		data[i] = 0.1 * Math.sin(2 * Math.PI * 440 * i / sampleRate);
+	}
+	data[sampleRate / 4] = 0.9; // A click at 0.25 s
+
+	const buffer = await encodeAudio(
+		{ codec: 'opus', quality: new Quality('medium') },
+		new AudioSample({ data, format: 'f32', sampleRate, numberOfChannels: 1, timestamp: 0 }),
+	);
+
+	const { input, track } = await readBackAudioTrack(buffer);
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig?.description);
+	// RFC 7845 counts the pre-skip in 48 kHz samples: 312 is libopus's 6.5 ms lookahead
+	expect(toDataView(decoderConfig.description).getUint16(10, true)).toBe(312);
+
+	let peakTime = 0;
+	let peakValue = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+
+		for (let i = 0; i < values.length; i++) {
+			if (Math.abs(values[i]!) > peakValue) {
+				peakValue = Math.abs(values[i]!);
+				peakTime = sample.timestamp + i / sample.sampleRate;
+			}
+		}
+	}
+
+	expect(Math.abs(peakTime - 0.25)).toBeLessThan(0.001);
+	input.dispose();
 });
 
 const makeSineWave = (
