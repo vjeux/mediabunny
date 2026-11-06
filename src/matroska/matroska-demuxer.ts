@@ -234,6 +234,8 @@ type InternalTrack = {
 			type: 'video';
 			width: number;
 			height: number;
+			/** The pixels to remove at each edge (top, bottom, left, right) to get the visible frame. */
+			pixelCrop: [number, number, number, number];
 			displayWidth: number | null;
 			displayHeight: number | null;
 			displayUnit: number | null;
@@ -1201,8 +1203,18 @@ export class MatroskaDemuxer extends Demuxer {
 							this.currentTrack.info.displayWidth !== null
 							&& this.currentTrack.info.displayHeight !== null
 						) {
-							const num = this.currentTrack.info.displayWidth * this.currentTrack.info.height;
-							const den = this.currentTrack.info.displayHeight * this.currentTrack.info.width;
+							// The display size applies to the frame after cropping
+							const [cropTop, cropBottom, cropLeft, cropRight] = this.currentTrack.info.pixelCrop;
+							let visibleWidth = this.currentTrack.info.width - cropLeft - cropRight;
+							let visibleHeight = this.currentTrack.info.height - cropTop - cropBottom;
+							if (visibleWidth <= 0 || visibleHeight <= 0) {
+								// Cropping everything away makes no sense
+								visibleWidth = this.currentTrack.info.width;
+								visibleHeight = this.currentTrack.info.height;
+							}
+
+							const num = this.currentTrack.info.displayWidth * visibleHeight;
+							const den = this.currentTrack.info.displayHeight * visibleWidth;
 
 							if (num > 0 && den > 0) {
 								if (num > den) {
@@ -1336,6 +1348,7 @@ export class MatroskaDemuxer extends Demuxer {
 						type: 'video',
 						width: -1,
 						height: -1,
+						pixelCrop: [0, 0, 0, 0],
 						displayWidth: null,
 						displayHeight: null,
 						displayUnit: null,
@@ -1486,6 +1499,23 @@ export class MatroskaDemuxer extends Demuxer {
 				if (this.currentTrack?.info?.type !== 'video') break;
 
 				this.currentTrack.info.height = readUnsignedInt(slice, size);
+			}; break;
+
+			case EBMLId.PixelCropTop:
+			case EBMLId.PixelCropBottom:
+			case EBMLId.PixelCropLeft:
+			case EBMLId.PixelCropRight: {
+				if (this.currentTrack?.info?.type !== 'video') {
+					break;
+				}
+
+				const edges = [
+					EBMLId.PixelCropTop,
+					EBMLId.PixelCropBottom,
+					EBMLId.PixelCropLeft,
+					EBMLId.PixelCropRight,
+				];
+				this.currentTrack.info.pixelCrop[edges.indexOf(id)] = readUnsignedInt(slice, size);
 			}; break;
 
 			case EBMLId.DisplayWidth: {
