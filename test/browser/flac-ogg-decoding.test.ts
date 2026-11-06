@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { beforeEach, describe, expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -38,6 +38,49 @@ const decodeAll = async (bytes: Uint8Array | string) => {
 	return { samples: all, frames, channels, timestamps, sampleRate: await track.getSampleRate() };
 };
 
+/**
+ * Whether the browser really decodes the first packets of the file. WebKitGTK says it can decode FLAC and Vorbis but
+ * its GStreamer decoders then fail on or hang on them, so this decodes with its own decoder, with a time limit.
+ */
+const decodesFirstPackets = async (url: string) => {
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	if (!(await track.canDecode())) {
+		return false;
+	}
+
+	let failed = false;
+	const decoder = new AudioDecoder({
+		output: data => data.close(),
+		error: () => {
+			failed = true;
+		},
+	});
+	decoder.configure((await track.getDecoderConfig())!);
+	const sink = new EncodedPacketSink(track);
+	let packet = await sink.getFirstPacket();
+	for (let i = 0; packet && i < 8; i++) {
+		decoder.decode(packet.toEncodedAudioChunk());
+		packet = await sink.getNextPacket(packet);
+	}
+	const flushed = await Promise.race([
+		decoder.flush().then(() => true, () => false),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
+	]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return flushed && !failed;
+};
+const decodability = new Map<string, Promise<boolean>>();
+const reallyDecodes = (url: string) => {
+	if (!decodability.has(url)) {
+		decodability.set(url, decodesFirstPackets(url));
+	}
+	return decodability.get(url)!;
+};
+
 /** Undoes FLAC inter-channel decorrelation (RFC 9639 section 4.2). */
 const decorrelate = (assignment: number, a: number, b: number): [number, number] => {
 	if (assignment === 8) {
@@ -52,6 +95,10 @@ const decorrelate = (assignment: number, a: number, b: number): [number, number]
 };
 
 describe('FLAC decoding through WebCodecs', () => {
+	beforeEach(async ({ skip }) => {
+		skip(!(await reallyDecodes('/sample.flac')), 'FLAC doesn\'t really decode here');
+	});
+
 	test.each([
 		[1, 16, 0],
 		[2, 16, 1],
@@ -189,7 +236,8 @@ describe('Ogg decoding through WebCodecs', () => {
 	// framing bit
 	test.skipIf(navigator.userAgent.includes('Firefox'))(
 		'decodes /vorbis-eos.ogg identically after an Ogg remux',
-		async () => {
+		async ({ skip }) => {
+			skip(!(await reallyDecodes('/vorbis-eos.ogg')), 'Vorbis doesn\'t really decode here');
 			await expectIdenticalDecodeAfterRemux('/vorbis-eos.ogg');
 		},
 	);
@@ -205,7 +253,8 @@ describe('Ogg decoding through WebCodecs', () => {
 		expect(buffer.length).toBe(288000);
 	});
 
-	test('round-trips FLAC through the FLAC muxer and decodes it identically', async () => {
+	test('round-trips FLAC through the FLAC muxer and decodes it identically', async ({ skip }) => {
+		skip(!(await reallyDecodes('/sample.flac')), 'FLAC doesn\'t really decode here');
 		using input = new Input({ source: new UrlSource('/sample.flac'), formats: ALL_FORMATS });
 		const track = (await input.getPrimaryAudioTrack())!;
 		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
