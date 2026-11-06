@@ -5,7 +5,8 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
@@ -275,4 +276,58 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test('Decoded audio keeps the gaps between packets', async () => {
+	using input = new Input({
+		source: new UrlSource('/demo.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+
+	// Remux two seconds of the AAC track with a half-second gap in the middle
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		if (packet.timestamp >= 2) {
+			break;
+		}
+
+		const timestamp = packet.timestamp >= 1 ? packet.timestamp + 0.5 : packet.timestamp;
+		await source.add(packet.clone({ timestamp }), { decoderConfig });
+	}
+	await output.finalize();
+
+	using gappedInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const gappedTrack = await gappedInput.getPrimaryAudioTrack();
+	assert(gappedTrack);
+
+	const packetTimestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(gappedTrack).packets()) {
+		packetTimestamps.push(packet.timestamp);
+	}
+
+	// Each AAC packet decodes to one sample, which starts where the packet starts
+	const sampleTimestamps: number[] = [];
+	for await (using sample of new AudioSampleSink(gappedTrack).samples()) {
+		sampleTimestamps.push(sample.timestamp);
+	}
+
+	expect(sampleTimestamps).toHaveLength(packetTimestamps.length);
+	for (let i = 0; i < sampleTimestamps.length; i++) {
+		expect(sampleTimestamps[i]).toBeCloseTo(packetTimestamps[i]!, 4);
+	}
 });
