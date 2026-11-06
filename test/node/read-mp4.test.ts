@@ -324,9 +324,9 @@ test('Decoder config of a track with several sample descriptions', async () => {
 	expect((await track.getDecoderConfig())?.codec).toBe('avc1.42001e');
 });
 
-test('Encryption info from a sample description after the first', async () => {
-	// A clear lead whose clear sample description comes first: the track's decoder config comes from the first
-	// description, but the encryption info of the second must still be read
+test('Encryption info from a sample description other than the one in use', async () => {
+	// A clear lead whose clear sample description comes first: the first fragment uses the clear description, which
+	// the track's codec info comes from, but the second fragment's encrypted description must still be decryptable
 	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
 	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
 	const zeros = (count: number) => new Array<number>(count).fill(0);
@@ -366,21 +366,23 @@ test('Encryption info from a sample description after the first', async () => {
 		),
 		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
 	);
-	// The fragment uses the encrypted description
-	const traf = (dataOffset: number) => box('traf',
-		box('tfhd', u32(0x020002), u32(1), u32(2)),
-		box('tfdt', u32(0), u32(0)),
-		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(ciphertext.length)),
-		box('senc', u32(2), u32(1), iv, u16(1), u16(4), u32(plaintext.length - 4)),
-	);
-	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+	const fragment = (sequence: number, sampleDescriptionIndex: number, data: number[], extra: number[][]) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020002), u32(1), u32(sampleDescriptionIndex)),
+			box('tfdt', u32(0), u32(sequence - 1)),
+			box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(data.length)),
+			...extra,
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(sequence)), traf(0)).length;
+		return [...box('moof', box('mfhd', u32(0), u32(sequence)), traf(moofSize + 8)), ...box('mdat', data)];
+	};
 
 	using input = new Input({
 		source: new BufferSource(new Uint8Array([
 			...box('ftyp', ascii('iso6'), u32(0)),
 			...moov,
-			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
-			...box('mdat', ciphertext),
+			...fragment(1, 1, plaintext, []),
+			...fragment(2, 2, ciphertext, [box('senc', u32(2), u32(1), iv, u16(1), u16(4), u32(plaintext.length - 4))]),
 		])),
 		formats: ALL_FORMATS,
 		formatOptions: { isobmff: { resolveKeyId: () => key } },
@@ -389,6 +391,74 @@ test('Encryption info from a sample description after the first', async () => {
 	assert(track);
 
 	expect(await track.getInternalCodecId()).toBe('avc1');
-	const packet = await new EncodedPacketSink(track).getFirstPacket();
-	expect([...packet!.data]).toEqual(plaintext);
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual([plaintext, plaintext]);
+});
+
+test('Codec info from the sample description the samples use', async () => {
+	// Like samples.ffmpeg.org trac/ticket1762/counter-10mn_mp3_dash.mp4: a fragmented track has an AAC and an MP3
+	// description, trex refers to a description that doesn't exist, and the fragments use the MP3 one
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const mp4a = (objectTypeIndication: number, decoderSpecificInfo: number[]) => {
+		const dsi = decoderSpecificInfo.length > 0 ? [0x05, decoderSpecificInfo.length, ...decoderSpecificInfo] : [];
+		const decoderConfig = [0x04, 13 + dsi.length, objectTypeIndication, 0x15, ...zeros(11), ...dsi];
+		const esds = box('esds', zeros(4), [0x03, 3 + decoderConfig.length + 3, 0, 1, 0], decoderConfig, [6, 1, 2]);
+		return box('mp4a', zeros(6), u16(1), zeros(8), u16(1), u16(16), zeros(4), u32(44100 * 0x10000), esds);
+	};
+	const aac = mp4a(0x40, [0x12, 0x08]);
+	const mp3 = mp4a(0x6b, []);
+
+	const read = async (entries: number[][], trexIndex: number, tfhdIndex: number | null) => {
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(44100), u32(0), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(entries.length), ...entries),
+						box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+					)),
+				),
+			),
+			box('mvex', box('trex', u32(0), u32(1), u32(trexIndex), u32(1152), u32(0), u32(0))),
+		);
+		const tfhd = tfhdIndex === null
+			? box('tfhd', u32(0x020000), u32(1))
+			: box('tfhd', u32(0x020002), u32(1), u32(tfhdIndex));
+		const traf = (dataOffset: number) => box('traf', tfhd, box('tfdt', u32(0), u32(0)),
+			box('trun', u32(0x201), u32(1), u32(dataOffset), u32(4)));
+		const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([
+				...box('ftyp', ascii('iso6'), u32(0)),
+				...moov,
+				...box('sidx', zeros(24)),
+				...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+				...box('mdat', [0xff, 0xfb, 0x50, 0xc4]),
+			])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return track.getCodec();
+	};
+
+	expect(await read([aac, mp3], 1024, 2)).toBe('mp3'); // The fragments' tfhd
+	expect(await read([mp3, aac], 1024, 1)).toBe('mp3');
+	expect(await read([aac, mp3], 2, null)).toBe('mp3'); // trex
+	expect(await read([mp3, aac], 1, null)).toBe('mp3');
 });
