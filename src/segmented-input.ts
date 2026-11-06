@@ -503,7 +503,18 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 		await this.hydrate();
 
+		const visitedSegments = new Set<Segment>();
+		let lastFound: { packet: EncodedPacket; segment: Segment; track: InputTrack } | null = null;
+
 		while (currentSegment) {
+			if (lastFound && visitedSegments.has(currentSegment)) {
+				// We only move on to a later segment after finding a packet, so being back at a visited segment means
+				// the segments disagree: the later one's media starts at or before the timestamp, yet it has no packet
+				// for it. Settle for the packet found before instead of going back and forth forever.
+				return this.createAdjustedPacket(lastFound.packet, lastFound.segment, lastFound.track);
+			}
+			visitedSegments.add(currentSegment);
+
 			const input = this.segmentedInput.getInputForSegment(currentSegment);
 			const tracks = await input.getTracks();
 			const track = tracks.find(t => (
@@ -553,6 +564,8 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 				});
 				continue;
 			}
+
+			lastFound = { packet, segment: currentSegment, track };
 
 			// The playlist may claim the segment to be longer than its media actually is, in which case the timestamp
 			// can lie in the next segment instead. That's only possible if it lies past this segment's media.
