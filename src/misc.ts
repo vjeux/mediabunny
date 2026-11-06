@@ -1240,10 +1240,12 @@ const joinWindowsPaths = (basePath: FilePath, relativePath: FilePath) => {
 	let isRooted = base.isRooted;
 	let path: string;
 
-	// A drive-relative path (C:file) on the base path's drive is relative to the base path
-	const isOnBaseDrive = relative.device.length === 2 && relative.device.toLowerCase() === base.device.toLowerCase();
+	// A drive-relative path (C:file) continues from the base path if the base path is on that drive or names none
+	const continuesBasePath = relative.device.length === 2
+		&& !relative.isRooted
+		&& (base.device === '' || relative.device.toLowerCase() === base.device.toLowerCase());
 
-	if (relative.device && !(isOnBaseDrive && !relative.isRooted)) {
+	if (relative.device && !continuesBasePath) {
 		// Drive letters and UNC shares begin a path of their own
 		({ device, isRooted } = relative);
 		path = relative.rest;
@@ -1252,6 +1254,10 @@ const joinWindowsPaths = (basePath: FilePath, relativePath: FilePath) => {
 		isRooted = true;
 		path = relative.rest;
 	} else {
+		if (relative.device) {
+			device = relative.device;
+		}
+
 		const lastSeparator = Math.max(base.rest.lastIndexOf('/'), base.rest.lastIndexOf('\\'));
 		path = base.rest.slice(0, lastSeparator + 1) + relative.rest;
 	}
