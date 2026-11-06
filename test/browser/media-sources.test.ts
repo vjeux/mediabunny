@@ -1624,3 +1624,55 @@ const measureBeepToFlashOffset = async (hideMediaStreamTrackProcessor: boolean) 
 	expect(offsets.length).toBeGreaterThanOrEqual(4);
 	return offsets.reduce((a, b) => a + b, 0) / offsets.length;
 };
+
+// Safari exposes MediaStreamTrackProcessor only inside workers, so there, MediaStreamVideoTrackSource hands the track
+// to a worker. This path only exists in browsers like that.
+const workerHasTrackProcessor = () => new Promise<boolean>((resolve) => {
+	const code = 'postMessage(typeof MediaStreamTrackProcessor !== "undefined")';
+	const worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+	worker.addEventListener('message', (event: MessageEvent<boolean>) => {
+		worker.terminate();
+		resolve(event.data);
+	});
+});
+const usesWorkerTrackProcessor = typeof MediaStreamTrackProcessor === 'undefined' && await workerHasTrackProcessor();
+
+test.skipIf(!usesWorkerTrackProcessor)('MediaStreamVideoTrackSource, records through the worker path', async () => {
+	const canvas = document.createElement('canvas');
+	canvas.width = 160;
+	canvas.height = 120;
+	const context = canvas.getContext('2d')!;
+	let frame = 0;
+	const interval = setInterval(() => {
+		context.fillStyle = `hsl(${(frame++ * 30) % 360}, 100%, 50%)`;
+		context.fillRect(0, 0, canvas.width, canvas.height);
+	}, 20);
+
+	const track = canvas.captureStream(30).getVideoTracks()[0]!;
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new MediaStreamVideoTrackSource(track, { codec: 'avc', bitrate: 1e6 });
+	let sourceError: unknown = null;
+	source.errorPromise.catch((error: unknown) => {
+		sourceError = error;
+	});
+	output.addVideoTrack(source);
+
+	try {
+		await output.start(); // Threw a DataCloneError on WebKit, since tracks can only be transferred to workers
+		await new Promise(resolve => setTimeout(resolve, 500));
+		await output.finalize();
+	} finally {
+		clearInterval(interval);
+	}
+
+	expect(sourceError).toBe(null);
+	expect(track.readyState).toBe('live'); // The caller's track stays usable
+
+	const { input, track: videoTrack } = await readBackTrack(output.target.buffer!);
+	expect(await videoTrack.computeDuration()).toBeGreaterThan(0);
+	input.dispose();
+	track.stop();
+});
