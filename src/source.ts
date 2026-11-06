@@ -9,6 +9,7 @@
 import type { FileHandle } from 'node:fs/promises';
 import {
 	assert,
+	binarySearchExact,
 	binarySearchLessOrEqual,
 	clamp,
 	closedIntervalsOverlap,
@@ -2290,6 +2291,19 @@ type CacheEntry = {
 	age: number;
 };
 
+type OrchestratorCacheEntry = {
+	start: number;
+	end: number;
+	bytes: Uint8Array;
+	view: DataView;
+	/** The neighbors in the order of last use, so that the least recently used entry is found in O(1). */
+	lruOlder: OrchestratorCacheEntry | null;
+	lruNewer: OrchestratorCacheEntry | null;
+};
+
+const EVICTED_BYTES = new Uint8Array(0);
+const EVICTED_VIEW = toDataView(EVICTED_BYTES);
+
 type ReadWorker = {
 	startPos: number;
 	currentPos: number;
@@ -2314,7 +2328,15 @@ class ReadOrchestrator {
 	fileSize: number | null = null;
 	nextAge = 0; // Used for multiple things
 	workers: ReadWorker[] = [];
-	cache: CacheEntry[] = [];
+	cache: OrchestratorCacheEntry[] = [];
+	/**
+	 * Entries before this index have been evicted. When reading forward, the evicted entry is the first one, and
+	 * removing it from the array right away would be O(n); they're dropped in bulk instead.
+	 */
+	cacheStart = 0;
+	/** The ends of a list of the cache entries ordered by last use. */
+	lruOldestEntry: OrchestratorCacheEntry | null = null;
+	lruNewestEntry: OrchestratorCacheEntry | null = null;
 	currentCacheSize = 0;
 	disposed = false;
 	queuedReads: {
@@ -2348,12 +2370,12 @@ class ReadOrchestrator {
 
 		let result: MaybePromise<ReadResult | null> | null = null;
 
-		const innerCacheStartIndex = binarySearchLessOrEqual(this.cache, innerStart, x => x.start);
+		const innerCacheStartIndex = this.findCacheEntryIndex(innerStart);
 		const innerStartEntry = innerCacheStartIndex !== -1 ? this.cache[innerCacheStartIndex] : null;
 
 		// See if the read request can be satisfied by a single cache entry
 		if (innerStartEntry && innerStartEntry.start <= innerStart && innerEnd <= innerStartEntry.end) {
-			innerStartEntry.age = this.nextAge++;
+			this.markCacheEntryUsed(innerStartEntry);
 
 			result = {
 				bytes: innerStartEntry.bytes,
@@ -2363,7 +2385,7 @@ class ReadOrchestrator {
 			// Can't return yet though, still need to check if the prefetch range might lie outside the cached area
 		}
 
-		const outerCacheStartIndex = binarySearchLessOrEqual(this.cache, outerStart, x => x.start);
+		const outerCacheStartIndex = this.findCacheEntryIndex(outerStart);
 
 		const bytes = result ? null : new Uint8Array(innerEnd - innerStart);
 		let contiguousBytesWriteEnd = 0; // Used to track if the cache is able to completely cover the bytes
@@ -2410,7 +2432,7 @@ class ReadOrchestrator {
 						}
 					}
 				}
-				entry.age = this.nextAge++;
+				this.markCacheEntryUsed(entry);
 			}
 
 			if (lastEnd < outerEnd) {
@@ -2721,7 +2743,8 @@ class ReadOrchestrator {
 			end,
 			bytes,
 			view: toDataView(bytes),
-			age: this.nextAge++,
+			lruOlder: null,
+			lruNewer: null,
 		});
 		worker.currentPos += bytes.length;
 
@@ -2869,14 +2892,19 @@ class ReadOrchestrator {
 		}
 	}
 
-	insertIntoCache(entry: CacheEntry) {
+	insertIntoCache(entry: OrchestratorCacheEntry) {
 		if (this.options.maxCacheSize === 0) {
 			return; // No caching
 		}
 
 		let insertionIndex = binarySearchLessOrEqual(this.cache, entry.start, x => x.start) + 1;
+		if (insertionIndex < this.cacheStart) {
+			// The entry goes before evicted ones, so drop those first to keep the array sorted
+			this.dropEvictedCacheEntries();
+			insertionIndex = 0;
+		}
 
-		if (insertionIndex > 0) {
+		if (insertionIndex > this.cacheStart) {
 			const previous = this.cache[insertionIndex - 1]!;
 			if (previous.end >= entry.end) {
 				// Previous entry swallows the one to be inserted; we don't need to do anything
@@ -2900,10 +2928,12 @@ class ReadOrchestrator {
 				entry = previous;
 			} else {
 				this.cache.splice(insertionIndex, 0, entry);
+				this.appendToLruList(entry);
 				this.currentCacheSize += entry.bytes.length;
 			}
 		} else {
 			this.cache.splice(insertionIndex, 0, entry);
+			this.appendToLruList(entry);
 			this.currentCacheSize += entry.bytes.length;
 		}
 
@@ -2917,6 +2947,7 @@ class ReadOrchestrator {
 			if (entry.end >= next.end) {
 				// The inserted entry completely swallows the next entry
 				this.cache.splice(i, 1);
+				this.removeFromLruList(next);
 				this.currentCacheSize -= next.bytes.length;
 				i--;
 				continue;
@@ -2933,32 +2964,90 @@ class ReadOrchestrator {
 			entry.view = toDataView(joined);
 			entry.end = next.end;
 			this.cache.splice(i, 1);
+			this.removeFromLruList(next);
 
 			break; // After the join case, we're done: the next entry cannot possibly overlap with the inserted one.
 		}
 
 		// LRU eviction of cache entries
 		while (this.currentCacheSize > this.options.maxCacheSize) {
-			let oldestIndex = 0;
-			let oldestEntry = this.cache[0]!;
-
-			for (let i = 1; i < this.cache.length; i++) {
-				const entry = this.cache[i]!;
-
-				if (entry.age < oldestEntry.age) {
-					oldestIndex = i;
-					oldestEntry = entry;
-				}
-			}
+			const oldestEntry = this.lruOldestEntry;
+			assert(oldestEntry);
 
 			if (this.currentCacheSize - oldestEntry.bytes.length <= this.options.maxCacheSize) {
 				// Don't evict if it would shrink the cache below the max size
 				break;
 			}
 
-			this.cache.splice(oldestIndex, 1);
+			if (this.cache[this.cacheStart] === oldestEntry) {
+				this.cacheStart++;
+			} else {
+				let oldestIndex = binarySearchExact(this.cache, oldestEntry.start, x => x.start);
+				while (this.cache[oldestIndex] !== oldestEntry) {
+					oldestIndex++; // Empty or evicted entries can share a start with it
+				}
+				assert(oldestIndex < this.cache.length);
+
+				this.cache.splice(oldestIndex, 1);
+			}
+
+			this.removeFromLruList(oldestEntry);
 			this.currentCacheSize -= oldestEntry.bytes.length;
+			oldestEntry.bytes = EVICTED_BYTES;
+			oldestEntry.view = EVICTED_VIEW;
 		}
+
+		if (this.cacheStart > 0 && this.cacheStart >= this.cache.length / 2) {
+			this.dropEvictedCacheEntries();
+		}
+	}
+
+	/** Returns the index of the last cache entry starting at or before the position, or -1 if there is none. */
+	findCacheEntryIndex(position: number) {
+		const index = binarySearchLessOrEqual(this.cache, position, x => x.start);
+		return index < this.cacheStart ? -1 : index;
+	}
+
+	dropEvictedCacheEntries() {
+		this.cache.splice(0, this.cacheStart);
+		this.cacheStart = 0;
+	}
+
+	/** Makes the entry the most recently used one. */
+	markCacheEntryUsed(entry: OrchestratorCacheEntry) {
+		if (entry !== this.lruNewestEntry) {
+			this.removeFromLruList(entry);
+			this.appendToLruList(entry);
+		}
+	}
+
+	appendToLruList(entry: OrchestratorCacheEntry) {
+		entry.lruOlder = this.lruNewestEntry;
+		entry.lruNewer = null;
+
+		if (this.lruNewestEntry) {
+			this.lruNewestEntry.lruNewer = entry;
+		} else {
+			this.lruOldestEntry = entry;
+		}
+		this.lruNewestEntry = entry;
+	}
+
+	removeFromLruList(entry: OrchestratorCacheEntry) {
+		if (entry.lruOlder) {
+			entry.lruOlder.lruNewer = entry.lruNewer;
+		} else {
+			this.lruOldestEntry = entry.lruNewer;
+		}
+
+		if (entry.lruNewer) {
+			entry.lruNewer.lruOlder = entry.lruOlder;
+		} else {
+			this.lruNewestEntry = entry.lruOlder;
+		}
+
+		entry.lruOlder = null;
+		entry.lruNewer = null;
 	}
 
 	dispose() {
@@ -2984,6 +3073,9 @@ class ReadOrchestrator {
 
 		this.workers.length = 0;
 		this.cache.length = 0;
+		this.cacheStart = 0;
+		this.lruOldestEntry = null;
+		this.lruNewestEntry = null;
 		this.queuedReads.length = 0;
 		this.disposed = true;
 	}
