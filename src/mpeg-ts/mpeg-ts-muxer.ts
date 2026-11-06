@@ -82,7 +82,8 @@ export class MpegTsMuxer extends Muxer {
 
 	private trackDatas: MpegTsTrackData[] = [];
 	private tablesWritten = false;
-	private continuityCounters = new Map<number, number>();
+	/** Per PID. The segments of single-file HLS output share them, since together they make one transport stream. */
+	continuityCounters = new Map<number, number>();
 	private packetBuffer = new Uint8Array(TS_PACKET_SIZE);
 	private packetView = toDataView(this.packetBuffer);
 	private allTracksKnown = promiseWithResolvers();

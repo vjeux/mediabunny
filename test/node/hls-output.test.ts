@@ -2094,6 +2094,59 @@ test('Single-file mode', async () => {
 	expect(onSegment).toHaveBeenCalledTimes(1);
 });
 
+test('Single-file mode with MPEG-TS keeps continuity counters valid across segments', async () => {
+	let segmentTarget: BufferTarget | null = null;
+
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			singleFilePerPlaylist: true,
+		}),
+		target: new PathedTarget('', (request) => {
+			const target = new BufferTarget();
+			if (request.path.includes('segment')) {
+				segmentTarget = target;
+			}
+
+			return target;
+		}),
+	});
+
+	const source = videoSource();
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 12; i++) {
+		await source.add(new EncodedPacket(avcPacketData, i % 4 === 0 ? 'key' : 'delta', i / 2, 0), avcMetadata);
+	}
+	await output.finalize();
+
+	// Each segment's muxer starts its counters at 0, which is only valid as a marked discontinuity (H.222.0 2.4.3.3)
+	const bytes = new Uint8Array(segmentTarget!.buffer!);
+	const lastCounters = new Map<number, number>();
+	let tableCount = 0;
+
+	for (let pos = 0; pos < bytes.length; pos += 188) {
+		const pid = ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+		const adaptationFieldControl = (bytes[pos + 3]! >> 4) & 0x3;
+		const counter = bytes[pos + 3]! & 0xf;
+		const discontinuity = adaptationFieldControl >= 2 && bytes[pos + 4]! > 0 && (bytes[pos + 5]! & 0x80) !== 0;
+
+		if (pid === 0) {
+			tableCount++;
+		}
+
+		const lastCounter = lastCounters.get(pid);
+		if (lastCounter !== undefined && !discontinuity) {
+			expect(counter).toBe((lastCounter + 1) % 16);
+		}
+
+		lastCounters.set(pid, counter);
+	}
+
+	expect(tableCount).toBe(3);
+});
+
 test('Single-file mode with fragmented MP4 produces proper standalone segment file', async () => {
 	let playlistText: string | null = null;
 	let segmentBuffer: ArrayBuffer | null = null;
