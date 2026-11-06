@@ -2382,8 +2382,8 @@ const ComputeLayoutAndAllocationSize = (
 		computedLayout.sourceHeight = Math.ceil(Math.trunc(parsedRect.height || 0) / sampleHeight);
 		// Set computedLayout’s sourceLeftBytes...
 		computedLayout.sourceLeftBytes = Math.floor(Math.trunc(parsedRect.x || 0) / sampleWidth) * sampleBytes;
-		// Set computedLayout’s sourceWidthBytes...
-		computedLayout.sourceWidthBytes = Math.floor(Math.trunc(parsedRect.width || 0) / sampleWidth) * sampleBytes;
+		// Set computedLayout’s sourceWidthBytes... Rounded up, so odd widths keep the last chroma column
+		computedLayout.sourceWidthBytes = Math.ceil(Math.trunc(parsedRect.width || 0) / sampleWidth) * sampleBytes;
 
 		// If layout is not undefined:
 		if (layout !== undefined) {

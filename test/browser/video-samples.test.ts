@@ -203,6 +203,43 @@ test('copyTo and plane layouts', async () => {
 	}
 });
 
+test('copyTo with odd dimensions keeps the last chroma column', async () => {
+	// Same case as WPT's webcodecs/videoFrame-odd-size.any.js: a 3-wide I420 frame has 2-wide chroma planes
+	const buf = new Uint8Array([
+		1, 2, 3, 4, 5, 6, 7, 8, 9, // Y
+		10, 11, 12, 13, // U
+		14, 15, 16, 17, // V
+	]);
+	using sample = new VideoSample(buf, { format: 'I420', codedWidth: 3, codedHeight: 3, timestamp: 0 });
+
+	expect(sample.allocationSize()).toBe(buf.byteLength);
+	const data = new Uint8Array(buf.byteLength);
+	const layout = await sample.copyTo(data);
+	expect(layout).toEqual([{ offset: 0, stride: 3 }, { offset: 9, stride: 2 }, { offset: 13, stride: 2 }]);
+	expect([...data]).toEqual([...buf]);
+
+	// Must match what VideoFrame does with the same data, including for cropped rects
+	for (const format of ['I420', 'I422', 'NV12'] as const) {
+		const init = { format, codedWidth: 5, codedHeight: 3, timestamp: 0 };
+		const probe = new VideoFrame(new Uint8Array(64), init);
+		const pixels = Uint8Array.from({ length: probe.allocationSize() }, (_, i) => i);
+		probe.close();
+
+		using reference = new VideoSample(new VideoFrame(pixels, init));
+		using bufferSample = new VideoSample(pixels, init);
+
+		for (const options of [{}, { rect: { x: 2, y: 0, width: 3, height: 1 } }]) {
+			const expected = new Uint8Array(reference.allocationSize(options));
+			const expectedLayout = await reference.copyTo(expected, options);
+
+			expect(bufferSample.allocationSize(options)).toBe(expected.byteLength);
+			const actual = new Uint8Array(expected.byteLength);
+			expect(await bufferSample.copyTo(actual, options)).toEqual(expectedLayout);
+			expect([...actual]).toEqual([...expected]);
+		}
+	}
+});
+
 test('RGB conversion for ArrayBuffer-backed data', async () => {
 	// 2x2 RGBA image with distinct, easily-verifiable pixels
 	const src = new Uint8Array([
