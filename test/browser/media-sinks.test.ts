@@ -887,3 +887,40 @@ test('VP8 alt-ref frames do not shift the timestamps of the frames decoded after
 
 	expect(indices).toEqual([12, 15, 42, 45]);
 });
+
+test('Sample lookups agree on timestamps a rounding error before a frame', async () => {
+	using input = new Input({
+		source: new UrlSource('/video.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// Stepping through this 25 fps video in increments of 1 / 25 reaches 0.39999999999999997 for the frame at 0.4
+	let timestamp = 0;
+	for (let i = 0; i < 10; i++) {
+		timestamp += 1 / 25;
+	}
+	expect(timestamp).toBeLessThan(0.4);
+
+	const sink = new VideoSampleSink(track);
+	using sample = await sink.getSample(timestamp);
+	expect(sample?.timestamp).toBe(0.4);
+
+	for await (using sample of sink.samples(timestamp)) {
+		expect(sample.timestamp).toBe(0.4);
+		break;
+	}
+
+	// The end stays exclusive, so an empty range at a frame yields nothing
+	for await (using sample of sink.samples(0, 0)) {
+		expect.unreachable(`samples(0, 0) yielded the frame at ${sample.timestamp}`);
+	}
+
+	// The frame at 0.44 comes after the one at 0.4 in decode order, the frame at 0.48 before it. Both are found.
+	for await (using sample of sink.samplesAtTimestamps([0.44 - 1e-11, 0.48 - 1e-11])) {
+		assert(sample);
+		expect([0.44, 0.48]).toContain(sample.timestamp);
+	}
+});
