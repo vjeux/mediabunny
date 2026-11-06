@@ -178,6 +178,9 @@ type Section = {
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
+// How many PTS values at least to measure a video track's frame duration from
+const MIN_FRAME_DURATION_PTS_COUNT = 16;
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -1180,6 +1183,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	packetBuffers = new WeakMap<EncodedPacket, PacketBuffer>();
 	/** Used for recreating PacketBuffers if necessary. */
 	packetSectionStarts = new WeakMap<EncodedPacket, number>();
+	frameDuration: Promise<number> | null = null;
 
 	constructor(public elementaryStream: ElementaryStream) {}
 
@@ -1266,6 +1270,57 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 	abstract allPacketsAreKeyPackets(): boolean;
 	abstract getReorderSize(): number;
+
+	/**
+	 * Returns the time between frames, as the median gap between the presentation timestamps of the track's first
+	 * PES packets. Since it doesn't depend on where reading started, it gives packets without a successor the same
+	 * duration however they were reached.
+	 */
+	getFrameDuration() {
+		return this.frameDuration ??= (async () => {
+			const demuxer = this.elementaryStream.demuxer;
+			const firstSection = this.elementaryStream.firstSection;
+			assert(firstSection);
+
+			// Enough to see every frame of a reordering window in presentation order, and not to be thrown off by a few
+			// irregular frames at the start
+			const ptsCount = Math.max(2 * (this.getReorderSize() + 1) + 2, MIN_FRAME_DURATION_PTS_COUNT);
+			const ptsValues: number[] = [];
+
+			let currentPos = firstSection.startPos;
+			while (ptsValues.length < ptsCount) {
+				const packetHeader = await demuxer.readPacketHeader(currentPos);
+				if (!packetHeader) {
+					break;
+				}
+
+				if (packetHeader.pid === this.elementaryStream.pid && packetHeader.payloadUnitStartIndicator === 1) {
+					const section = await demuxer.readSection(currentPos, false);
+					const pesPacketHeader = section && readPesPacketHeader(demuxer, section, false);
+					if (pesPacketHeader && pesPacketHeader.pts !== null) {
+						ptsValues.push(pesPacketHeader.pts);
+					}
+				}
+
+				currentPos += demuxer.packetStride;
+			}
+
+			ptsValues.sort((a, b) => a - b);
+
+			const gaps: number[] = [];
+			for (let i = 1; i < ptsValues.length; i++) {
+				const gap = ptsValues[i]! - ptsValues[i - 1]!;
+				if (gap > 0) {
+					gaps.push(gap);
+				}
+			}
+
+			// The median, since frames the window ends before (reordering) make a few gaps too long, and variable frame
+			// rates make some too short
+			gaps.sort((a, b) => a - b);
+			return gaps[Math.floor((gaps.length - 1) / 2)] ?? 0;
+		})();
+	}
 
 	createEncodedPacket(
 		suppliedPacket: SuppliedPacket,
@@ -2679,8 +2734,12 @@ class PacketBuffer {
 
 		let duration: number;
 		if (presentationIndex === -1 || presentationIndex === this.presentationOrderPackets.length - 1) {
-			// The packet has no known successor (or isn't even placed yet when timestamps are messed up)
-			duration = this.lastDuration; // Reasonable heuristic
+			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). For video,
+			// whose frames may be reordered, the packets around it depend on where reading started, so use the
+			// track's frame duration.
+			duration = this.backing.elementaryStream.info.type === 'video'
+				? await this.backing.getFrameDuration()
+				: this.lastDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
 			duration = nextPacket.pts - packet.pts;
