@@ -648,7 +648,7 @@ test('Timestamps land on the nearest timescale tick in regular and fragmented fi
 
 test('Audio timestamps come back within half a sample when the track and movie timescales differ', async () => {
 	// A positive start makes regular files begin with an empty edit, whose duration is in the movie timescale (57600)
-	for (const sampleRate of [44100, 96000]) {
+	for (const sampleRate of [44100, 48000, 96000]) {
 		const timestamps = Array.from(
 			{ length: 40 },
 			(_, i) => 0.1799910361 + (1024 * i + [-0.4, 0.3, -0.2, 0.4, 0.1][i % 5]!) / sampleRate,
@@ -669,21 +669,33 @@ test('Audio timestamps come back within half a sample when the track and movie t
 						codec: 'mp4a.40.2',
 						numberOfChannels: 2,
 						sampleRate,
-						description: new Uint8Array(sampleRate === 44100 ? [0x12, 0x10] : [0x10, 0x10]),
+						description: new Uint8Array({ 44100: [0x12, 0x10], 48000: [0x11, 0x90], 96000: [0x10, 0x10] }[
+							sampleRate
+						]!),
 					},
 				});
 			}
 			await output.finalize();
 
-			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			// Constant-rate audio needs no composition offsets, which FFmpeg would read differently
+			const bytes = new Uint8Array(output.target.buffer!);
+			expect(bytes.some((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'ctts')).toBe(false);
+
+			using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 			const track = await input.getPrimaryAudioTrack();
 			assert(track);
 
-			let maxError = 0;
+			const errors: number[] = [];
 			for await (const packet of new EncodedPacketSink(track).packets()) {
-				maxError = Math.max(maxError, Math.abs(packet.timestamp - timestamps[packet.data[0]!]!) * sampleRate);
+				errors[packet.data[0]!] = Math.abs(packet.timestamp - timestamps[packet.data[0]!]!) * sampleRate;
 			}
-			expect(maxError).toBeLessThanOrEqual(0.5 + 1e-6);
+			expect(errors).toHaveLength(timestamps.length);
+
+			// Above the movie timescale, the empty edit can't always end on the start's own tick, so the first sample
+			// may be a tick further off
+			const [firstError, ...otherErrors] = errors;
+			expect(firstError).toBeLessThanOrEqual(fastStart === false && sampleRate > 57600 ? 1.5 : 0.5 + 1e-6);
+			expect(Math.max(...otherErrors)).toBeLessThanOrEqual(0.5 + 1e-6);
 		}
 	}
 });

@@ -41,6 +41,7 @@ import {
 import { formatSubtitleTimestamp } from '../subtitles';
 import { Writer } from '../writer';
 import {
+	getEmptyEdit,
 	getTrackMetadata,
 	GLOBAL_TIMESCALE,
 	intoTimescale,
@@ -524,7 +525,7 @@ export const edts = (trackData: IsobmffTrackData) => {
 	if (offset > 0) {
 		// Positive offset: empty segment at the start, then the full media afterwards
 
-		const startOffset = intoTimescale(offset, GLOBAL_TIMESCALE);
+		const startOffset = getEmptyEdit(offset, trackData.timescale).duration;
 		const mediaDuration = intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE);
 
 		const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration);
