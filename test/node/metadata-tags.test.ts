@@ -1086,3 +1086,28 @@ test('Creation time override in conversion', async () => {
 
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
+
+test('MP4 writes the description into the iTunes \'desc\' atom', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({ description: 'A song' });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.description).toBe('A song');
+	expect(readTags.raw!['desc']).toBe('A song'); // The atom iTunes and FFmpeg read
+	expect(readTags.raw!['©des']).toBeUndefined();
+});
