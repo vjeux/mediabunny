@@ -416,6 +416,8 @@ export type Mp4TrackOptions = {
 	co64?: boolean;
 	width?: number;
 	height?: number;
+	/** Extra boxes appended to the moov (metadata and such) */
+	moovExtra?: Uint8Array[];
 };
 
 /** Builds a single-track, non-fragmented MP4 (ftyp, moov, mdat) whose chunks follow the stsc layout. */
@@ -491,7 +493,7 @@ export const buildMp4 = (track: Mp4TrackOptions) => {
 			u32be(0), u32be(0), u32be(track.timescale), u32be(duration),
 			u32be(0x10000), u16be(0x100), new Uint8Array(10), matrix, new Uint8Array(24), u32be(2),
 		);
-		const moov = mp4Box('moov', mvhd, mp4Box('trak', tkhd, ...edts, mdia));
+		const moov = mp4Box('moov', mvhd, mp4Box('trak', tkhd, ...edts, mdia), ...(track.moovExtra ?? []));
 		const ftyp = mp4Box('ftyp', ascii('isom'), u32be(0x200), ascii('isomiso2mp41'));
 		return { ftyp, moov };
 	};
@@ -764,4 +766,24 @@ export const mp4SoundEntryV2 = (
 		u32be(1), // constLPCMFramesPerAudioPacket
 		...children,
 	);
+};
+
+/** An ilst item holding one 'data' box with the given well-known type. */
+export const mp4IlstItem = (name: string | number, type: number, payload: Uint8Array | number[] | string) => {
+	const bytes = typeof payload === 'string' ? new TextEncoder().encode(payload) : payload;
+	const nameBytes = typeof name === 'number' ? u32be(name) : ascii(name);
+	const data = mp4Box('data', u32be(type), u32be(0), bytes);
+	return concatBytes(u32be(8 + data.length), nameBytes, data);
+};
+
+/** A QuickTime-style moov meta box: hdlr 'mdta', a keys box and an ilst addressing the keys by 1-based index. */
+export const mp4MdtaMeta = (entries: [key: string, type: number, payload: Uint8Array | number[] | string][]) => {
+	const keys = mp4FullBox(
+		'keys', 0, 0,
+		u32be(entries.length),
+		...entries.map(([key]) => concatBytes(u32be(8 + key.length), ascii('mdta'), ascii(key))),
+	);
+	const ilst = mp4Box('ilst', ...entries.map(([, type, payload], i) => mp4IlstItem(i + 1, type, payload)));
+	const hdlr = mp4FullBox('hdlr', 0, 0, u32be(0), ascii('mdta'), new Uint8Array(12), [0]);
+	return mp4Box('meta', hdlr, keys, ilst);
 };

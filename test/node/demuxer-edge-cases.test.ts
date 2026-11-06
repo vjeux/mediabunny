@@ -19,10 +19,13 @@ import {
 	mkvSimpleBlock,
 	mp4Box,
 	mp4FullBox,
+	mp4IlstItem,
+	mp4MdtaMeta,
 	mp4SoundEntry,
 	mp4SoundEntryV2,
 	mp4VisualEntry,
 	u16be,
+	u32be,
 } from './helpers/mutation-bytes.js';
 
 const openBytes = (bytes: Uint8Array) => new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
@@ -354,6 +357,101 @@ describe('MP4 PCM sample entries', () => {
 			const wave = mp4Box('wave', mp4Box('frma', ascii(format)), mp4Box('enda', [0, 1]), new Uint8Array(8));
 			expect((await pcmCodec(mp4SoundEntry(format, 2, bits, 48000, wave), 2 * bits / 8)).codec).toBe(expected);
 		}
+	});
+});
+
+describe('MP4 metadata items', () => {
+	const withMetadata = async (moovExtra: Uint8Array[]) => {
+		const bytes = buildMp4({
+			handler: 'soun',
+			timescale: 1000,
+			sampleEntry: mp4SoundEntry('sowt', 1, 16, 8000),
+			samples: [new Uint8Array(2)],
+			stts: [[1, 1]],
+			stsc: [[1, 1]],
+			moovExtra,
+		});
+		using input = openBytes(bytes);
+		return await input.getMetadataTags();
+	};
+	const utf16be = (text: string) => [...text].flatMap(char => [0, char.charCodeAt(0)]);
+
+	test('QuickTime mdta keys (as Apple devices write them) map onto the tags', async () => {
+		const jpeg = [0xff, 0xd8, 0xff, 0xe0];
+		const tags = await withMetadata([mp4MdtaMeta([
+			['com.apple.quicktime.title', 1, 'A title'],
+			['com.apple.quicktime.description', 1, 'A description'],
+			['com.apple.quicktime.artist', 1, 'An artist'],
+			['com.apple.quicktime.album', 1, 'An album'],
+			['com.apple.quicktime.comment', 1, 'A comment'],
+			['com.apple.quicktime.genre', 1, 'A genre'],
+			['com.apple.quicktime.creationdate', 1, '2023-05-01T12:34:56+0200'],
+			['com.apple.quicktime.artwork', 13, jpeg],
+			['com.apple.quicktime.make', 1, 'Apple'],
+		])]);
+		expect(tags).toMatchObject({
+			title: 'A title',
+			description: 'A description',
+			artist: 'An artist',
+			album: 'An album',
+			comment: 'A comment',
+			genre: 'A genre',
+			date: new Date('2023-05-01T10:34:56Z'),
+		});
+		expect(tags.images).toEqual([{ data: new Uint8Array(jpeg), kind: 'coverFront', mimeType: 'image/jpeg' }]);
+		expect(tags.raw!['com.apple.quicktime.make']).toBe('Apple');
+	});
+
+	test('3GPP-style and iTunes item names map onto the tags; the first value of a tag wins', async () => {
+		const ilst = mp4Box(
+			'ilst',
+			mp4IlstItem('titl', 1, 'First title'),
+			mp4IlstItem('©nam', 1, 'Second title'),
+			mp4IlstItem('dscp', 2, utf16be('UTF-16 description')),
+			mp4IlstItem('albm', 1, 'Album'),
+			mp4IlstItem('aART', 1, 'Album artist'),
+			mp4IlstItem('©gen', 1, 'Genre'),
+			mp4IlstItem('©lyr', 1, 'Lyrics'),
+			mp4IlstItem('rldt', 1, '2015-06'),
+			mp4IlstItem('tmpo', 21, [0, 120]),
+			mp4IlstItem('trkn', 0, [0, 0, 0, 3, 0, 12, 0, 0]),
+			mp4IlstItem('disk', 0, [0, 0, 0, 1, 0, 2]),
+			mp4IlstItem('covr', 14, [0x89, 0x50, 0x4e, 0x47]),
+			mp4IlstItem('covr', 27, [0x42, 0x4d]),
+			mp4IlstItem('covr', 0, [1, 2, 3]),
+		);
+		const hdlr = mp4FullBox('hdlr', 0, 0, u32be(0), ascii('mdir'), new Uint8Array(12), [0]);
+		const meta = mp4FullBox('meta', 0, 0, hdlr, ilst);
+		const tags = await withMetadata([mp4Box('udta', meta)]);
+		expect(tags).toMatchObject({
+			title: 'First title',
+			description: 'UTF-16 description',
+			album: 'Album',
+			albumArtist: 'Album artist',
+			genre: 'Genre',
+			lyrics: 'Lyrics',
+			date: new Date('2015-06-01T00:00:00Z'),
+			beatsPerMinute: 120,
+			trackNumber: 3,
+			tracksTotal: 12,
+			discNumber: 1,
+			discsTotal: 2,
+		});
+		expect(tags.images!.map(image => image.mimeType)).toEqual(['image/png', 'image/bmp', 'image/*']);
+	});
+
+	test('a "track" string item gives the track number and total; invalid values are ignored', async () => {
+		const tags = await withMetadata([mp4MdtaMeta([['track', 1, '7/9']])]);
+		expect([tags.trackNumber, tags.tracksTotal]).toEqual([7, 9]);
+
+		const invalid = await withMetadata([mp4MdtaMeta([
+			['track', 1, '0/x'],
+			['tmpo', 21, [0, 0]],
+			['date', 1, 'not a date'],
+			['title', 0, [1, 2]],
+		])]);
+		expect([invalid.trackNumber, invalid.tracksTotal, invalid.beatsPerMinute, invalid.date, invalid.title])
+			.toEqual([undefined, undefined, undefined, undefined, undefined]);
 	});
 });
 
