@@ -1484,8 +1484,18 @@ export class HlsMuxer extends Muxer {
 		let groupIdTrackCount = 0;
 		let hasHadDefaultTrackInGroup = false;
 
+		// A variant without segments can't be played (and players often start with the cheapest variant), so it's left
+		// out unless no variant has any
+		const someVariantHasSegments = this.playlistDeclarations.some(
+			x => x.groupId === null && x.playlist.writtenSegments.length > 0,
+		);
+
 		for (const decl of this.playlistDeclarations) {
 			if (decl.groupId === null) {
+				if (someVariantHasSegments && decl.playlist.writtenSegments.length === 0) {
+					continue;
+				}
+
 				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
 					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
