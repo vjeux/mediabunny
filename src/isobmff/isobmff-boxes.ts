@@ -1787,6 +1787,10 @@ const metadataTagStringBoxShort = (name: string, value: string) => {
 	]);
 };
 
+// iTunes stores track and disc numbers in 16 bits, where 0 means unknown. Larger numbers are left out rather than
+// wrapped around.
+const numberOrUnknown = (value: number | undefined) => (value !== undefined && value <= 0xffff ? value : 0);
+
 const DATA_BOX_MIME_TYPE_MAP: Record<string, number> = {
 	'image/jpeg': 13,
 	'image/png': 14,
@@ -1840,7 +1844,8 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 			}; break;
 
 			case 'beatsPerMinute': {
-				if (!isMdta) {
+				// tmpo holds a signed 16-bit integer, so larger values would wrap around
+				if (!isMdta && value <= 0x7fff) {
 					pairs.push({ key: 'tmpo', value: box('data', [
 						u32(21), // Type indicator
 						u32(0), // Locale indicator
@@ -1882,26 +1887,32 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 
 					pairs.push({ key: 'track', value: dataStringBoxLong(string) });
 				} else {
-					pairs.push({ key: 'trkn', value: box('data', [
-						u32(0), // 8 bytes empty
-						u32(0),
-						u16(0), // Empty
-						u16(value),
-						u16(tags.tracksTotal ?? 0),
-						u16(0), // Empty
-					]) });
+					const trackNumber = numberOrUnknown(value);
+					const tracksTotal = numberOrUnknown(tags.tracksTotal);
+					if (trackNumber !== 0 || tracksTotal !== 0) {
+						pairs.push({ key: 'trkn', value: box('data', [
+							u32(0), // 8 bytes empty
+							u32(0),
+							u16(0), // Empty
+							u16(trackNumber),
+							u16(tracksTotal),
+							u16(0), // Empty
+						]) });
+					}
 				}
 			}; break;
 
 			case 'discNumber': {
-				if (!isMdta) {
+				const discNumber = numberOrUnknown(value);
+				const discsTotal = numberOrUnknown(tags.discsTotal);
+				if (!isMdta && (discNumber !== 0 || discsTotal !== 0)) {
 					// Only written for mdir
 					pairs.push({ key: 'disc', value: box('data', [
 						u32(0), // 8 bytes empty
 						u32(0),
 						u16(0), // Empty
-						u16(value),
-						u16(tags.discsTotal ?? 0),
+						u16(discNumber),
+						u16(discsTotal),
 						u16(0), // Empty
 					]) });
 				}
