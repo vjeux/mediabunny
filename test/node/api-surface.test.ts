@@ -268,7 +268,9 @@ describe('Instances and packages', () => {
 
 		for (const file of files) {
 			using input = new Input({ source: new BufferSource(readPublic(file)), formats: ALL_FORMATS });
-			for (const track of await input.getTracks()) {
+			const tracks = await input.getTracks();
+			expect(tracks.length, file).toBeGreaterThan(0);
+			for (const track of tracks) {
 				for (const getter of [...common, ...(track.isVideoTrack() ? video : audio)]) {
 					const method = `get${getter[0]!.toUpperCase()}${getter.slice(1)}`;
 					const record = track as unknown as Record<string, unknown>;
@@ -803,7 +805,9 @@ describe('Events and callback payloads', () => {
 			const tags = await input.getMetadataTags();
 			expect(tagFields, file).toEqual(expect.arrayContaining(Object.keys(tags)));
 
-			for (const track of await input.getTracks()) {
+			const tracks = await input.getTracks();
+			expect(tracks.length, file).toBeGreaterThan(0);
+			for (const track of tracks) {
 				const checks = [...common, ...(track.isVideoTrack() ? video : audio)];
 				for (const [method, check, args = []] of checks) {
 					const value = await (track as unknown as Record<string, (...args: unknown[]) => unknown>)[method]!(
@@ -912,12 +916,22 @@ describe('Events and callback payloads', () => {
 		await streamed.start();
 		await writeStreamed();
 		await streamed.finalize();
+		expect(chunks.length).toBeGreaterThan(0);
 		for (const chunk of chunks) {
 			expect(Object.keys(chunk).sort()).toEqual(['data', 'position', 'type']);
 			expect(chunk.type).toBe('write');
 			expect(chunk.data).toBeInstanceOf(Uint8Array);
 			expect(Number.isInteger(chunk.position)).toBe(true);
 		}
+		// The chunks put together at their positions are the file
+		const streamedBytes = new Uint8Array(Math.max(...chunks.map(chunk => chunk.position + chunk.data.byteLength)));
+		for (const chunk of chunks) {
+			streamedBytes.set(chunk.data, chunk.position);
+		}
+		using streamedInput = new Input({ source: new BufferSource(streamedBytes), formats: ALL_FORMATS });
+		const streamedTrack = (await streamedInput.getPrimaryVideoTrack())!;
+		expect(await streamedTrack.getCodec()).toBe('avc');
+		expect((await streamedTrack.computePacketStats()).packetCount).toBe(fixture.packets.length);
 
 		const segments: HlsOutputSegmentInfo[] = [];
 		const playlists: HlsOutputPlaylistInfo[] = [];
