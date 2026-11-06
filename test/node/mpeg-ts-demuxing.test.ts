@@ -18,6 +18,7 @@ import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js'
 import { BufferTarget } from '../../src/target.js';
 import { countMovedArrayElements } from './array-moves.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { InputTrack } from '../../src/input-track.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -946,8 +947,9 @@ test('MPEG-TS partial reading', async () => {
 
 	await input.getTracks();
 
-	// Not much of the file has been read since we only requested metadata
-	expect(maxEnd).toBeLessThanOrEqual(86480);
+	// Not much of the file has been read since we only requested metadata (up to the sync byte of the packet after the
+	// last one)
+	expect(maxEnd).toBeLessThanOrEqual(86481);
 });
 
 test('MPEG-TS init input without stream data', async () => {
@@ -2703,4 +2705,76 @@ test('MPEG-TS times frames without PTS by the frame rate in the SPS', async () =
 
 	expect(await readTimestamps(bytes)).toEqual([126000, 126188, 126375]);
 	expect(await readTimestamps(damaged)).toEqual([126000, 126188, 126375]);
+});
+
+test('MPEG-TS resyncs after bytes were added or lost', async () => {
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/mp3.ts')));
+
+	const readPackets = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const sink = new EncodedPacketSink(track);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of sink.packets()) {
+			packets.push(packet);
+		}
+
+		// Lookups find the same packets
+		for (const packet of packets.slice(-20)) {
+			expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+		}
+
+		return packets.map(x => x.timestamp);
+	};
+
+	/** Replaces `removedCount` bytes in the middle of a TS packet with `addedCount` ones. */
+	const damage = (removedCount: number, addedCount: number) => {
+		const pos = 188 * 372 + 64;
+		const result = new Uint8Array(bytes.length - removedCount + addedCount).fill(0x55);
+		result.set(bytes.subarray(0, pos));
+		result.set(bytes.subarray(pos + removedCount), pos + addedCount);
+		return result;
+	};
+
+	const original = await readPackets(bytes);
+	expect(original).toHaveLength(210);
+
+	// Like ffprobe, we get all frames back. Chromium's extra-nalu.ts test file has 24 stray bytes.
+	expect(await readPackets(damage(0, 1))).toEqual(original);
+	expect(await readPackets(damage(0, 24))).toEqual(original);
+	expect(await readPackets(damage(0, 500))).toEqual(original);
+
+	// Lost bytes damage a frame, but the ones after it are all there
+	expect((await readPackets(damage(1, 0))).slice(-100)).toEqual(original.slice(-100));
+	expect((await readPackets(damage(100, 0))).slice(-100)).toEqual(original.slice(-100));
+
+	// Junk at the end
+	const withJunk = new Uint8Array(bytes.length + 1000);
+	withJunk.set(bytes);
+	expect(await readPackets(withJunk)).toEqual(original);
+});
+
+test('MPEG-TS with stray bytes between packets', async () => {
+	// The first two packets (PAT and PMT), the 24 stray bytes after packet 556 and the 500 packets after them from
+	// Chromium's media/test/data/extra-nalu.ts
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/stray-bytes.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const readPackets = async (track: InputTrack | null) => {
+		assert(track);
+		const packets: [number, number][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([Math.round(packet.timestamp * 90_000), packet.data.byteLength]);
+		}
+
+		return packets;
+	};
+
+	// What ffprobe reads after the stray bytes (it merges the key frame with the PES packet holding its parameter sets)
+	expect(await readPackets(await input.getPrimaryAudioTrack())).toEqual([[199355326, 360], [199357416, 360]]);
+	expect((await readPackets(await input.getPrimaryVideoTrack()))[1]).toEqual([199367280, 17829]);
 });
