@@ -16,7 +16,7 @@ import { EncodedPacket } from '../../src/packet.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { AttachedFile, MetadataTags } from '../../src/metadata.js';
+import { AttachedFile, MetadataTags, RichImageData } from '../../src/metadata.js';
 import { VERSIONED_NAME } from '../../src/version.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1085,4 +1085,68 @@ test('Creation time override in conversion', async () => {
 	const nullReadTags = await nullInput.getMetadataTags();
 
 	expect(nullReadTags.creationTime).toBeUndefined();
+});
+
+test('MP4 with mdta format writes cover art under the QuickTime artwork key', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat({ metadataFormat: 'mdta' }),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({ images: songMetadata.images });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.images).toHaveLength(1);
+	expect(readTags.images![0]!.data).toEqual(coverArt);
+
+	// 'covr' is an ilst atom name; in a keys box, the artwork key is com.apple.quicktime.artwork (also read by FFmpeg)
+	expect(Object.keys(readTags.raw!)).toEqual(['com.apple.quicktime.artwork']);
+});
+
+test('Remuxing mdta tags whose cover was read under the iTunes key keeps a single cover', async () => {
+	const writeAndRead = async (tags: MetadataTags) => {
+		const output = new Output({
+			format: new Mp4OutputFormat({ metadataFormat: 'mdta' }),
+			target: new BufferTarget(),
+		});
+
+		output.setMetadataTags(tags);
+
+		const dummyTrack = createDummyAudioTrack('aac', output);
+
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+
+		const readTags = await input.getMetadataTags();
+		return readTags;
+	};
+
+	// What reading an mdta file with a 'covr' key gives (e.g. one written by earlier versions): the cover in both
+	// images and raw
+	const read = await writeAndRead({
+		images: [{ data: coverArt, mimeType: 'image/jpeg', kind: 'coverFront' }],
+		raw: { covr: new RichImageData(coverArt, 'image/jpeg') },
+	});
+	expect(read.images).toHaveLength(1);
+
+	const remuxed = await writeAndRead(read);
+	expect(remuxed.images).toHaveLength(1);
+	expect(Object.keys(remuxed.raw!)).toEqual(['com.apple.quicktime.artwork']);
 });
