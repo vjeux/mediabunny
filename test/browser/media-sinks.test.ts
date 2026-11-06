@@ -276,3 +276,110 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
+
+test('Decoded audio samples can be looked up by their own timestamps (Matroska)', async () => {
+	using input = new Input({
+		source: new UrlSource('/demo.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+	const samples: { timestamp: number; numberOfFrames: number }[] = [];
+	for await (using sample of sink.samples(0, 1)) {
+		samples.push({ timestamp: sample.timestamp, numberOfFrames: sample.numberOfFrames });
+	}
+
+	// Matroska stores packet timestamps in milliseconds, while decoded audio is timed by its sample count. Decoding
+	// from elsewhere can move a sample by up to that precision, but must not give the sample before it (20 ms earlier).
+	for (const { timestamp, numberOfFrames } of samples.slice(1)) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBeCloseTo(timestamp, 2);
+		expect(sample.numberOfFrames).toBe(numberOfFrames);
+
+		for await (using first of sink.samples(timestamp)) {
+			expect(first.timestamp).toBeCloseTo(timestamp, 2);
+			break;
+		}
+	}
+});
+
+test('Audio lookups stay sample-exact where packets sit on the sample grid', async () => {
+	// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet
+	// before it
+	for (const file of ['/Toothsome-Meme.VBRv2.mp3', '/sample.flac']) {
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sampleRate = await track.getSampleRate();
+
+		const packetSink = new EncodedPacketSink(track);
+		const packet = await packetSink.getPacket(1);
+		assert(packet);
+		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
+		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
+
+		const sink = new AudioSampleSink(track);
+		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
+		using sampleAt = await sink.getSample(packet.timestamp);
+		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
+
+		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
+			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+			break;
+		}
+	}
+});
+
+test('Sample ranges keep their exclusive end with timestamp tolerance', async () => {
+	// Video has no tolerance, PCM WAVE packets sit on the sample grid, Matroska audio is compared within a millisecond
+	const sinks = [
+		['/video.mp4', 'video'],
+		['/glitch-hop-is-dead.wav', 'audio'],
+		['/demo.webm', 'audio'],
+	] as const;
+
+	for (const [file, type] of sinks) {
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = type === 'video' ? await input.getPrimaryVideoTrack() : await input.getPrimaryAudioTrack();
+		assert(track);
+		const sink = track.isVideoTrack() ? new VideoSampleSink(track) : new AudioSampleSink(track);
+
+		const timestamps: number[] = [];
+		for await (using sample of sink.samples()) {
+			timestamps.push(sample.timestamp);
+			if (timestamps.length === 3) {
+				break;
+			}
+		}
+
+		// The first sample, at the start of an empty range, isn't yielded
+		const first = timestamps[0]!;
+		const emptyRange: number[] = [];
+		for await (using sample of sink.samples(first, first)) {
+			emptyRange.push(sample.timestamp);
+		}
+		expect(emptyRange, file).toEqual([]);
+
+		// A range ending at the third sample yields the first two
+		const third = timestamps[2];
+		assert(third !== undefined);
+		const range: number[] = [];
+		for await (using sample of sink.samples(first, third)) {
+			range.push(sample.timestamp);
+		}
+		expect(range, file).toEqual(timestamps.slice(0, 2));
+	}
+});
