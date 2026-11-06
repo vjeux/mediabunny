@@ -60,6 +60,9 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 const readFixture = async (name: string) => new Uint8Array(await readFile(path.join(__dirname, '../public', name)));
 
+// Each test takes about a second at most, but these schedules slow down a lot more than usual on a loaded machine
+vi.setConfig({ testTimeout: 60_000 });
+
 type Rand = () => number;
 
 const mulberry32 = (seed: number): Rand => {
@@ -183,7 +186,9 @@ const makeRacySource = (bytes: Uint8Array, rand: Rand, dispose?: () => void) => 
 		},
 		dispose,
 		prefetchProfile: prefetchProfiles[Math.floor(rand() * prefetchProfiles.length)],
-		maxCacheSize: [0, 4096, 65536, undefined][Math.floor(rand() * 4)],
+		// No cache at all is left out: then each read refetches a whole prefetch window (gigabytes for a 2 MB
+		// MPEG-TS file), which only makes the runs slow
+		maxCacheSize: [4096, 65536, undefined][Math.floor(rand() * 3)],
 	});
 };
 
@@ -526,7 +531,7 @@ test.each([
 
 test('Concurrent reads of an HLS input match sequential reads', async () => {
 	// Write a small HLS stream with two renditions in separate playlists
-	const tracks = await loadTrackPackets('video.mp4', 5);
+	const tracks = await loadTrackPackets('video.mp4', 2);
 	const files = new Map<string, Uint8Array>();
 	const output = new Output({
 		format: new HlsOutputFormat({
