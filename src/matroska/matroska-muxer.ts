@@ -157,6 +157,11 @@ export class MatroskaMuxer extends Muxer {
 
 	private trackDatas: MatroskaTrackData[] = [];
 	private allTracksKnown = promiseWithResolvers();
+	/**
+	 * Tracks whose closing we have processed. Unlike `source._closed`, which is set as soon as `close()` is called,
+	 * this is only set under the mutex, i.e. after the packets queued before the close have been added.
+	 */
+	private closedTracks = new Set<OutputTrack>();
 
 	private segment: EBMLElement | null = null;
 	private segmentInfo: EBMLElement | null = null;
@@ -827,7 +832,7 @@ export class MatroskaMuxer extends Muxer {
 
 	private allTracksAreKnown() {
 		for (const track of this.output.tracks) {
-			if (!track.source._closed && !this.trackDatas.some(x => x.track === track)) {
+			if (!this.closedTracks.has(track) && !this.trackDatas.some(x => x.track === track)) {
 				return false; // We haven't seen a sample from this open track yet
 			}
 		}
@@ -1502,6 +1507,8 @@ export class MatroskaMuxer extends Muxer {
 	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const release = await this.mutex.acquire();
+
+		this.closedTracks.add(track);
 
 		const trackData = this.trackDatas.find(x => x.track === track);
 		if (trackData) {
