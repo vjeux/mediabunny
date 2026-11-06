@@ -9,6 +9,7 @@ import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import {
 	deserializeAvcDecoderConfigurationRecord,
 	deserializeHevcDecoderConfigurationRecord,
@@ -63,11 +64,14 @@ test('Annex B to length-prefixed conversion, MP4', async () => {
 });
 
 // The Matroska codec mappings store V_MPEG4/ISO/AVC and V_MPEGH/ISO/HEVC length-prefixed, with the decoder
-// configuration record in CodecPrivate (WebKit's Matroska parser drops H.264 tracks without it).
+// configuration record in CodecPrivate (WebKit's Matroska parser drops H.264 tracks without it). The record comes from
+// the first packet, also when the decoder config was given to addVideoTrack ahead of time.
 test.each([
-	['annex-b-avc.mkv', 'avc'],
-	['hevc.ts', 'hevc'],
-] as const)('Annex B to length-prefixed conversion, Matroska (%s)', async (fileName, codec) => {
+	['annex-b-avc.mkv', 'avc', 'conversion'],
+	['hevc.ts', 'hevc', 'conversion'],
+	['annex-b-avc.mkv', 'avc', 'decoder config ahead of time'],
+	['hevc.ts', 'hevc', 'decoder config ahead of time'],
+] as const)('Annex B to length-prefixed conversion, Matroska (%s, %s, %s)', async (fileName, codec, mode) => {
 	using originalInput = new Input({
 		source: new FilePathSource(path.join(__dirname, '..', 'public', fileName)),
 		formats: ALL_FORMATS,
@@ -87,8 +91,24 @@ test.each([
 		target: new BufferTarget(),
 	});
 
-	const conversion = await Conversion.init({ input: originalInput, output, audio: { discard: true } });
-	await conversion.execute();
+	if (mode === 'conversion') {
+		const conversion = await Conversion.init({ input: originalInput, output, audio: { discard: true } });
+		await conversion.execute();
+	} else {
+		const source = new EncodedVideoPacketSource(codec);
+		output.addVideoTrack(source, { decoderConfig: originalDecoderConfig });
+		await output.start();
+
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(originalVideoTrack).packets()) {
+			await source.add(packet);
+			if (++packetCount === 10) {
+				break;
+			}
+		}
+
+		await output.finalize();
+	}
 
 	using newInput = new Input({
 		source: new BufferSource(output.target.buffer!),

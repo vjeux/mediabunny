@@ -123,8 +123,11 @@ type MatroskaTrackData = {
 		 * track metadata already hints at transparency.
 		 */
 		alphaMode: boolean | null;
-		/** Matroska stores AVC and HEVC length-prefixed, so Annex B packets need to be converted. */
-		requiresAnnexBTransformation: boolean;
+		/**
+		 * Matroska stores AVC and HEVC length-prefixed, so Annex B packets need to be converted. Null while it's not
+		 * known yet, which is until the first packet of a track whose decoder config came without a description.
+		 */
+		requiresAnnexBTransformation: boolean | null;
 	};
 } | {
 	track: OutputAudioTrack;
@@ -854,26 +857,6 @@ export class MatroskaMuxer extends Muxer {
 		assert(meta.decoderConfig.codedHeight !== undefined);
 
 		const decoderConfig = { ...meta.decoderConfig };
-		let requiresAnnexBTransformation = false;
-
-		if ((track.source._codec === 'avc' || track.source._codec === 'hevc') && !decoderConfig.description && packet) {
-			// The Matroska codec mappings store AVC and HEVC length-prefixed, with the decoder configuration record in
-			// CodecPrivate, but the missing description indicates Annex B. So, if the packet holds the parameter sets
-			// to build the record from, we convert. Otherwise, packets are written untouched like before.
-			let description: Uint8Array | null;
-			if (track.source._codec === 'avc') {
-				const record = extractAvcDecoderConfigurationRecord(packet.data);
-				description = record && serializeAvcDecoderConfigurationRecord(record);
-			} else {
-				const record = extractHevcDecoderConfigurationRecord(packet.data);
-				description = record && serializeHevcDecoderConfigurationRecord(record);
-			}
-
-			if (description) {
-				decoderConfig.description = description;
-				requiresAnnexBTransformation = true;
-			}
-		}
 
 		const displayAspectWidth = decoderConfig.displayAspectWidth;
 		const displayAspectHeight = decoderConfig.displayAspectHeight;
@@ -894,7 +877,7 @@ export class MatroskaMuxer extends Muxer {
 				aspectRatio,
 				decoderConfig,
 				alphaMode: track.metadata.canBeTransparent || (packet ? !!packet.sideData.alpha : null),
-				requiresAnnexBTransformation,
+				requiresAnnexBTransformation: false,
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
@@ -918,6 +901,14 @@ export class MatroskaMuxer extends Muxer {
 		} else if (track.source._codec === 'prores') {
 			// "The Private Data contains the FourCC as found in MP4 movies"
 			newTrackData.codecPrivate = textEncoder.encode(decoderConfig.codec);
+		} else if ((track.source._codec === 'avc' || track.source._codec === 'hevc') && !decoderConfig.description) {
+			// The Matroska codec mappings store AVC and HEVC length-prefixed, with the decoder configuration record in
+			// CodecPrivate, but the missing description indicates Annex B. The record is built from the parameter sets
+			// of the first packet, which comes later if the decoder config was provided ahead of time.
+			newTrackData.info.requiresAnnexBTransformation = null;
+			if (packet) {
+				this.resolveAnnexBTransformation(newTrackData, packet);
+			}
 		}
 
 		this.trackDatas.push(newTrackData);
@@ -928,6 +919,32 @@ export class MatroskaMuxer extends Muxer {
 		}
 
 		return newTrackData;
+	}
+
+	/**
+	 * Builds the decoder configuration record of an Annex B AVC/HEVC track from the parameter sets in its first packet.
+	 * If there are none, the packets are written untouched.
+	 */
+	private resolveAnnexBTransformation(trackData: MatroskaVideoTrackData, packet: EncodedPacket) {
+		if (trackData.info.requiresAnnexBTransformation !== null) {
+			return;
+		}
+
+		let description: Uint8Array | null;
+		if (trackData.track.source._codec === 'avc') {
+			const record = extractAvcDecoderConfigurationRecord(packet.data);
+			description = record && serializeAvcDecoderConfigurationRecord(record);
+		} else {
+			const record = extractHevcDecoderConfigurationRecord(packet.data);
+			description = record && serializeHevcDecoderConfigurationRecord(record);
+		}
+
+		trackData.info.requiresAnnexBTransformation = description !== null;
+		if (description) {
+			// The Tracks element isn't written yet: that only happens once every track has a block queued
+			trackData.info.decoderConfig = { ...trackData.info.decoderConfig, description };
+			trackData.codecPrivate = description;
+		}
 	}
 
 	private getAudioTrackData(track: OutputAudioTrack, packet: EncodedPacket | null, meta?: EncodedAudioChunkMetadata) {
@@ -1042,6 +1059,7 @@ export class MatroskaMuxer extends Muxer {
 		try {
 			const trackData = this.getVideoTrackData(track, packet, meta);
 			trackData.info.alphaMode ??= !!packet.sideData.alpha;
+			this.resolveAnnexBTransformation(trackData, packet);
 
 			let packetData = packet.data;
 			if (track.source._codec === 'prores') {
