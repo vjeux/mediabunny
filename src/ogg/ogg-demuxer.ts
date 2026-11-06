@@ -30,6 +30,7 @@ import { readBytes, Reader } from '../reader';
 import { buildOggMimeType, extractSampleMetadata, OggCodecInfo } from './ogg-misc';
 import {
 	findNextPageHeader,
+	isPageWithoutSegments,
 	MAX_PAGE_HEADER_SIZE,
 	MAX_PAGE_SIZE,
 	MIN_PAGE_HEADER_SIZE,
@@ -315,10 +316,7 @@ export class OggDemuxer extends Demuxer {
 			}
 
 			// The packet extends to the next page; let's find it
-			const nextPage = await this.readNextPage(
-				currentPage.headerStartPos + currentPage.totalSize,
-				startPage.serialNumber,
-			);
+			const nextPage = await this.readNextPage(currentPage);
 			if (!nextPage) {
 				return null;
 			}
@@ -364,10 +362,7 @@ export class OggDemuxer extends Demuxer {
 		}
 
 		// Otherwise, search for the next page belonging to the same bitstream
-		const nextPage = await this.readNextPage(
-			lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize,
-			lastPacket.endPage.serialNumber,
-		);
+		const nextPage = await this.readNextPage(lastPacket.endPage);
 		if (!nextPage) {
 			return null;
 		}
@@ -376,12 +371,17 @@ export class OggDemuxer extends Demuxer {
 	}
 
 	/**
-	 * Returns the first page of the given bitstream that starts at or after `pos`, skipping the pages of other
-	 * bitstreams. Where something other than a usable page sits between two pages (junk, or a page without segments),
-	 * it searches on for the next page of the bitstream, like libogg and FFmpeg do, instead of ending the stream there.
+	 * Returns the page of the same bitstream that follows the given page, skipping the pages of other bitstreams.
+	 * Where something other than a usable page sits between two pages (junk, or a page without segments), it searches
+	 * on for the next page of the bitstream, like libogg and FFmpeg do, instead of ending the stream there. That page
+	 * must continue the bitstream, though: if its sequence number shows that pages were lost, or that a new bitstream
+	 * with the same serial number started (as in a chained file whose previous link was cut off), the bitstream ends.
 	 */
-	async readNextPage(pos: number, serialNumber: number): Promise<Page | null> {
-		let currentPos = pos;
+	async readNextPage(previousPage: Page): Promise<Page | null> {
+		const serialNumber = previousPage.serialNumber;
+		let currentPos = previousPage.headerStartPos + previousPage.totalSize;
+		let skippedSomething = false;
+		let skippedPagesWithoutSegments = 0;
 
 		while (true) {
 			let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
@@ -392,15 +392,29 @@ export class OggDemuxer extends Demuxer {
 
 			const page = readPageHeader(slice);
 			if (page) {
-				if (page.serialNumber === serialNumber) {
-					return page;
+				if (page.serialNumber !== serialNumber) {
+					currentPos = page.headerStartPos + page.totalSize;
+					continue;
 				}
 
-				currentPos = page.headerStartPos + page.totalSize;
-				continue;
+				if (skippedSomething) {
+					// Pages without segments carry no data, but they may have used up sequence numbers
+					const sequenceNumberStep = page.sequenceNumber - previousPage.sequenceNumber;
+					if (sequenceNumberStep < 1 || sequenceNumberStep > 1 + skippedPagesWithoutSegments) {
+						return null;
+					}
+				}
+
+				return page;
 			}
 
-			// There's no page here, so scan forward for the next capture pattern of our bitstream
+			// There's no usable page here, so scan forward for the next capture pattern of our bitstream
+			skippedSomething = true;
+			slice.filePos = currentPos;
+			if (isPageWithoutSegments(slice, serialNumber)) {
+				skippedPagesWithoutSegments++;
+			}
+
 			let searchPos = currentPos + 1;
 			while (true) {
 				let searchSlice = this.reader.requestSliceRange(searchPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_SIZE);
