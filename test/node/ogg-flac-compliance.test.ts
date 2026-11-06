@@ -608,24 +608,12 @@ const readOpusInput = async (bytes: Uint8Array) => {
 };
 
 /** Builds an Ogg Opus stream page by page: [headerType, granule, packets][] */
-const buildOggOpus = (pagesSpec: [number, number, Uint8Array[]][], serial = 1234) => {
-	const parts: Uint8Array[] = [];
-	pagesSpec.forEach(([headerType, granule, packets], sequence) => {
-		const lacing: number[] = [];
-		for (const packet of packets) {
-			let remaining = packet.length;
-			while (remaining >= 255) {
-				lacing.push(255);
-				remaining -= 255;
-			}
-			lacing.push(remaining);
-		}
-		const body = new Uint8Array(packets.reduce((sum, packet) => sum + packet.length, 0));
-		let offset = 0;
-		for (const packet of packets) {
-			body.set(packet, offset);
-			offset += packet.length;
-		}
+type PageSpec = { headerType: number; granule: number; lacing: number[]; body: Uint8Array };
+
+/** Builds Ogg pages exactly as specified, so that a page may end or begin in the middle of a packet */
+const buildOggPages = (pagesSpec: PageSpec[], serial = 1234) => {
+	const parts = pagesSpec.map(({ headerType, granule, lacing, body }, sequence) => {
+		expect(lacing.reduce((a, b) => a + b, 0)).toBe(body.length);
 		const page = new Uint8Array(27 + lacing.length + body.length);
 		const view = new DataView(page.buffer);
 		page.set([0x4f, 0x67, 0x67, 0x53]); // 'OggS'
@@ -637,7 +625,7 @@ const buildOggOpus = (pagesSpec: [number, number, Uint8Array[]][], serial = 1234
 		page.set(lacing, 27);
 		page.set(body, 27 + lacing.length);
 		view.setUint32(22, oggCrc(page), true);
-		parts.push(page);
+		return page;
 	});
 	const total = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
 	let offset = 0;
@@ -647,6 +635,26 @@ const buildOggOpus = (pagesSpec: [number, number, Uint8Array[]][], serial = 1234
 	}
 	return total;
 };
+
+/** Lacing values of a complete packet */
+const lacingOf = (packetLength: number) => [
+	...Array<number>(Math.floor(packetLength / 255)).fill(255),
+	packetLength % 255,
+];
+
+/** Builds an Ogg Opus stream page by page, each page holding complete packets: [headerType, granule, packets][] */
+const buildOggOpus = (pagesSpec: [number, number, Uint8Array[]][], serial = 1234) => buildOggPages(
+	pagesSpec.map(([headerType, granule, packets]) => {
+		const body = new Uint8Array(packets.reduce((sum, packet) => sum + packet.length, 0));
+		let offset = 0;
+		for (const packet of packets) {
+			body.set(packet, offset);
+			offset += packet.length;
+		}
+		return { headerType, granule, lacing: packets.flatMap(packet => lacingOf(packet.length)), body };
+	}),
+	serial,
+);
 
 const opusTags = () => {
 	const vendor = new TextEncoder().encode('test');
@@ -735,13 +743,45 @@ describe('Reader: RFC 7845 (Ogg Opus)', () => {
 	});
 });
 
+const readPackets = async (bytes: Uint8Array) => {
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	return packets;
+};
+
 describe('Reader: RFC 3533 (Ogg)', () => {
 	test('§6: a packet continued on the next page (continued flag set) is reassembled', async () => {
-		const big = new Uint8Array(600).fill(5);
-		big[0] = 0xfc;
-		const bytes = buildOggOpus([[BOS, 0, [opusHead()]], [0, 0, [opusTags()]], [EOS, 960, [big]]]);
-		const result = (await readOpusInput(bytes))!;
-		expect(result.timestamps).toHaveLength(1);
+		// A 600-byte packet split across two pages: its first 510 bytes (two 255 lacing values, so unfinished) fill
+		// page 3, which completes no packet and so has granule position -1, and its last 90 bytes open page 4, which
+		// sets the continued-packet flag
+		const packet = new Uint8Array(600).map((_, i) => (i * 7 + 3) & 0xff);
+		packet[0] = 0xfc; // CELT fullband 20 ms, stereo, one frame: 960 samples
+		const head = opusHead();
+		const tags = opusTags();
+		const bytes = buildOggPages([
+			{ headerType: BOS, granule: 0, lacing: lacingOf(head.length), body: head },
+			{ headerType: 0, granule: 0, lacing: lacingOf(tags.length), body: tags },
+			{ headerType: 0, granule: -1, lacing: [255, 255], body: packet.subarray(0, 510) },
+			{ headerType: CONTINUED | EOS, granule: 960, lacing: [90], body: packet.subarray(510) },
+		]);
+
+		// The fixture really splits the packet, as an independent reassembly confirms
+		const pages = parseOggPages(bytes);
+		expect(pages.map(page => page.headerType)).toEqual([BOS, 0, 0, CONTINUED | EOS]);
+		expect(pages.map(page => page.lacing))
+			.toEqual([lacingOf(head.length), lacingOf(tags.length), [255, 255], [90]]);
+		const reassembled = oggPackets(pages)[2]!;
+		expect([reassembled.firstPage, reassembled.lastPage]).toEqual([2, 3]);
+		expect(reassembled.data).toEqual(packet);
+
+		const packets = await readPackets(bytes);
+		expect(packets).toHaveLength(1);
+		expect(packets[0]!.data).toEqual(packet);
+		expect(Math.round(packets[0]!.timestamp * 48000)).toBe(960 - 960 - 312); // Granule minus samples minus pre-skip
 	});
 
 	test('§6: pages of other logical bitstreams are skipped while reading one', async () => {
@@ -779,7 +819,7 @@ const parseFlac = (bytes: Uint8Array) => {
 	expect(new TextDecoder().decode(bytes.subarray(0, 4))).toBe('fLaC');
 	const blocks: FlacBlock[] = [];
 	let pos = 4;
-	while (true) {
+	while (pos + 4 <= bytes.length) { // Bounded, should the last-metadata-block flag be missing
 		const last = !!(bytes[pos]! & 0x80);
 		const type = bytes[pos]! & 0x7f;
 		const length = (bytes[pos + 1]! << 16) | (bytes[pos + 2]! << 8) | bytes[pos + 3]!;
@@ -789,6 +829,7 @@ const parseFlac = (bytes: Uint8Array) => {
 			break;
 		}
 	}
+	expect(blocks.at(-1)?.last).toBe(true);
 	return { blocks, framesStart: pos };
 };
 

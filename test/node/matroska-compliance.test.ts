@@ -351,6 +351,17 @@ const buildCorpus = async (): Promise<CorpusFile[]> => {
 };
 
 let corpus: CorpusFile[] = [];
+
+// Validating a whole file is the expensive part; every element test reads the same per-file results
+const violationCache = new Map<CorpusFile, ReturnType<typeof validateElementTable>>();
+const violationsOf = (file: CorpusFile) => {
+	let violations = violationCache.get(file);
+	if (!violations) {
+		violations = validateElementTable(file.tree, { webm: file.webm });
+		violationCache.set(file, violations);
+	}
+	return violations;
+};
 beforeAll(async () => {
 	corpus = await buildCorpus();
 });
@@ -405,7 +416,7 @@ describe('Writer: RFC 9559 Section 5 element table and RFC 8794 Section 11.1.6 c
 			const violations: string[] = [];
 			for (const file of corpus) {
 				occurrences += findAll(file.tree, name).length;
-				for (const violation of validateElementTable(file.tree, { webm: file.webm })) {
+				for (const violation of violationsOf(file)) {
 					if (violation.element === name) {
 						violations.push(`${file.name}: ${violation.clause}: ${violation.message}`);
 					}
@@ -420,7 +431,7 @@ describe('Writer: RFC 9559 Section 5 element table and RFC 8794 Section 11.1.6 c
 	);
 
 	test('RFC 8794 §11.1.6.4-§11.1.6.7: no element in any written file breaks the element table', () => {
-		const violations = corpus.flatMap(file => validateElementTable(file.tree, { webm: file.webm })
+		const violations = corpus.flatMap(file => violationsOf(file)
 			.map(violation => `${file.name}: ${violation.path}: ${violation.clause}: ${violation.message}`));
 		expect(violations).toEqual([]);
 	});
