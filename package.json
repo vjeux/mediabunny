@@ -75,8 +75,7 @@
     "url": "https://github.com/sponsors/Vanilagy"
   },
   "dependencies": {
-    "@types/dom-mediacapture-transform": "^0.1.11",
-    "@types/dom-webcodecs": "0.1.13"
+    "@types/dom-mediacapture-transform": "^0.1.11"
   },
   "devDependencies": {
     "@eslint/js": "^9.22.0",

@@ -7,7 +7,6 @@
  */
 
 /// <reference types="dom-mediacapture-transform" preserve="true" />
-/// <reference types="dom-webcodecs" preserve="true" />
 
 import { Logging } from './logging';
 
