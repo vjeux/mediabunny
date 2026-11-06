@@ -1289,15 +1289,98 @@ export const canEncodeAudio = async (
 
 		try {
 			const support = await AudioEncoder.isConfigSupported(encoderConfig);
-			return support.supported === true;
+			if (!support.supported) {
+				return false;
+			}
 		} catch {
 			// Can type-error when unknown config features are used
 			return false;
 		}
+
+		if (!isFirefox()) {
+			return true;
+		}
+
+		// Like for video, isConfigSupported on Firefox claims support for audio configs it can't actually encode: Opus
+		// with 3 or 4 channels fails once encoding starts, and Vorbis encodes everything as silence. Therefore, we
+		// encode a tone and check that it decodes back audibly.
+		return encodesAudibly(encoderConfig);
 	})();
 	canEncodeAudioMemo.set(key, promise);
 
 	return promise;
+};
+
+const encodesAudibly = async (config: AudioEncoderConfig) => {
+	const { numberOfChannels, sampleRate } = config;
+	const numberOfFrames = Math.round(sampleRate / 10);
+	const data = new Float32Array(numberOfFrames * numberOfChannels);
+	for (let i = 0; i < numberOfFrames; i++) {
+		const value = 0.5 * Math.sin(2 * Math.PI * 440 * i / sampleRate);
+		data.fill(value, i * numberOfChannels, (i + 1) * numberOfChannels);
+	}
+
+	const chunks: EncodedAudioChunk[] = [];
+	let decoderConfig = null as AudioDecoderConfig | null;
+	let failed = false as boolean;
+	let peak = 0;
+
+	const encoder = new AudioEncoder({
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			decoderConfig ??= meta?.decoderConfig ?? null;
+		},
+		error: () => failed = true,
+	});
+	const decoder = new AudioDecoder({
+		output: (audioData) => {
+			if (audioData.numberOfFrames > 0) {
+				const values = new Float32Array(audioData.numberOfFrames);
+				audioData.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+				for (const value of values) {
+					peak = Math.max(peak, Math.abs(value));
+				}
+			}
+			audioData.close();
+		},
+		error: () => failed = true,
+	});
+
+	try {
+		encoder.configure(config);
+		const audioData = new AudioData({
+			format: 'f32',
+			numberOfChannels,
+			sampleRate,
+			numberOfFrames,
+			timestamp: 0,
+			data,
+		});
+		encoder.encode(audioData);
+		audioData.close();
+		await encoder.flush();
+
+		if (!decoderConfig) {
+			return false;
+		}
+
+		decoder.configure(decoderConfig);
+		for (const chunk of chunks) {
+			decoder.decode(chunk);
+		}
+		await decoder.flush();
+	} catch {
+		return false;
+	} finally {
+		if (encoder.state !== 'closed') {
+			encoder.close();
+		}
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+	}
+
+	return !failed && peak > 0.1;
 };
 
 /**
