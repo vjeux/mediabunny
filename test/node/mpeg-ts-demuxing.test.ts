@@ -925,8 +925,9 @@ test('MPEG-TS with AUD-less video packets', async () => {
 
 test('MPEG-TS metadata reading gives up on declared streams that never show up, and finds late ones', async () => {
 	// The PMT declares two AAC streams. 20 minutes of the first one, one ADTS frame per PES packet and TS packet. The
-	// second one is either never sent (like a recording that dropped a language) or starts 3 minutes in.
-	const buildFile = (secondStreamStartFrame: number | null) => {
+	// second one is never sent (like a recording that dropped a language), starts 3 minutes in, or is only there for
+	// 5 seconds a minute in.
+	const buildFile = (secondStreamFrames: [number, number] | null) => {
 		const packets: Uint8Array[] = [];
 		const continuityCounters = new Map<number, number>();
 		const pushPacket = (pid: number, payload: Uint8Array, isSection: boolean) => {
@@ -969,7 +970,7 @@ test('MPEG-TS metadata reading gives up on declared streams that never show up, 
 		for (let i = 0; i < frameCount; i++) {
 			const pts = Math.round(i * 1024 * 90000 / 48000);
 			pushFrame(0x100, pts);
-			if (secondStreamStartFrame !== null && i >= secondStreamStartFrame) {
+			if (secondStreamFrames && i >= secondStreamFrames[0] && i < secondStreamFrames[1]) {
 				pushFrame(0x101, pts);
 			}
 		}
@@ -979,32 +980,47 @@ test('MPEG-TS metadata reading gives up on declared streams that never show up, 
 		return bytes;
 	};
 
-	const getTracks = async (bytes: Uint8Array) => {
+	const getTracks = async (bytes: Uint8Array, maxMissingStreamScanSize?: number) => {
 		let bytesRead = 0;
+		let readCount = 0;
 		using input = new Input({
 			source: new CustomSource({
 				getSize: () => bytes.byteLength,
 				read: (start, end) => {
 					bytesRead += end - start;
+					readCount++;
 					return bytes.subarray(start, end);
 				},
 			}),
 			formats: ALL_FORMATS,
 		});
 
+		if (maxMissingStreamScanSize !== undefined) {
+			((await input._getDemuxer()) as MpegTsDemuxer).maxMissingStreamScanSize = maxMissingStreamScanSize;
+		}
+
 		const tracks = await input.getTracks();
 		return {
 			bytesRead,
+			readCount,
 			tracks: await Promise.all(tracks.map(async track => [track.id, await track.getFirstTimestamp()])),
 		};
 	};
 
+	// Never sent: the file gets scanned for it in large chunks, instead of packet by packet (tens of thousands of
+	// reads), and only up to a limit
 	const absent = buildFile(null);
 	const absentResult = await getTracks(absent);
 	expect(absentResult.tracks).toEqual([[0x100, 0]]);
-	// It stopped looking for the missing stream instead of reading the whole file
-	expect(absentResult.bytesRead).toBeLessThan(absent.byteLength / 3);
+	expect(absentResult.readCount).toBeLessThan(2000);
+	const limitedResult = await getTracks(absent, 2 ** 20);
+	expect(limitedResult.tracks).toEqual([[0x100, 0]]);
+	expect(limitedResult.bytesRead).toBeLessThan(absent.byteLength / 3);
 
-	const late = buildFile(8400); // 179.2 s
+	const late = buildFile([8400, Infinity]); // 179.2 s
 	expect((await getTracks(late)).tracks).toEqual([[0x100, 0], [0x101, 179.2]]);
+
+	// Only there for a moment, between spots a sampling approach would look at
+	const brief = buildFile([2850, 3085]); // 60.8 s to 65.8 s
+	expect((await getTracks(brief)).tracks).toEqual([[0x100, 0], [0x101, 60.8]]);
 });

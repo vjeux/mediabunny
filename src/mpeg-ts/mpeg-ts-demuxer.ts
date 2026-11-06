@@ -101,14 +101,15 @@ const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expect
 
 /**
  * Declared streams can start a good while after the others (45 seconds in a Blu-ray excerpt whose DTS track starts
- * after its AC-3 track), but one that never shows up would have us read the whole file. So once we're this far into
- * the media (in PTS) without having seen a declared stream, we check a few spots later in the file for its packets,
- * and only keep looking for it if it's there.
+ * after its AC-3 track), and some are declared but never sent (recorders may drop some). Looking for them packet by
+ * packet is slow, so once we're this far into the media (in PTS) without having seen a declared stream, we scan ahead
+ * for its packets in large chunks instead.
  */
-const MISSING_STREAM_CHECK_DELAY = 10 * MPEG_TS_TIMESCALE;
-const MISSING_STREAM_CHECK_COUNT = 4;
-const MISSING_STREAM_CHECK_SIZE = 2 ** 19;
-/** When we can't do that check (the file size is unknown), how far into the media we look before giving up. */
+const MISSING_STREAM_SCAN_DELAY = 10 * MPEG_TS_TIMESCALE;
+const MISSING_STREAM_SCAN_CHUNK_SIZE = 2 ** 20;
+/** How far ahead (in bytes) we scan for missing streams before giving up on them. */
+const DEFAULT_MAX_MISSING_STREAM_SCAN_SIZE = 2 ** 28; // 256 MiB
+/** For sources of unknown size, how far into the media we look for missing streams before giving up on them. */
 const MAX_STREAM_START_DELAY = 120 * MPEG_TS_TIMESCALE;
 
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
@@ -200,6 +201,7 @@ export class MpegTsDemuxer extends Demuxer {
 	packetStride = -1;
 	sectionEndPositions: number[] = [];
 	seekChunkSize = 5 * 1024 * 1024; // 5 MiB, picked because most HLS segments are below this size
+	maxMissingStreamScanSize = DEFAULT_MAX_MISSING_STREAM_SCAN_SIZE;
 	minReferencePointByteDistance = -1;
 	timestampWrapInfo: TimestampWrapInfo | null = null;
 
@@ -243,9 +245,8 @@ export class MpegTsDemuxer extends Demuxer {
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
 			let firstPts: number | null = null;
-			// PIDs of missing streams we've already checked for later in the file, and those we found there
-			const checkedPids = new Set<number>();
-			const pidsFoundLater = new Set<number>();
+			// Where the scan for missing streams ends, once it has begun
+			let missingStreamScanEndPos: number | null = null;
 
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
@@ -273,22 +274,30 @@ export class MpegTsDemuxer extends Demuxer {
 							? pesPacketHeader.pts - firstPts
 							: 0;
 
-						if (delay > (fileSize !== null ? MISSING_STREAM_CHECK_DELAY : MAX_STREAM_START_DELAY)) {
-							const missingPids = this.elementaryStreams.filter(x => !x.initialized).map(x => x.pid);
-							const uncheckedPids = missingPids.filter(pid => !checkedPids.has(pid));
-
-							if (fileSize !== null && uncheckedPids.length > 0) {
-								const foundPids = await this.findPidsLaterInFile(uncheckedPids, currentPos, fileSize);
-								uncheckedPids.forEach(pid => checkedPids.add(pid));
-								foundPids.forEach(pid => pidsFoundLater.add(pid));
-							}
-
-							if (!missingPids.some(pid => pidsFoundLater.has(pid))) {
+						if (fileSize === null) {
+							if (delay > MAX_STREAM_START_DELAY) {
 								// The streams that still haven't shown up are declared, but don't seem to be in the
-								// file (recorders may drop some), so let's stop looking for them instead of reading
-								// it all
+								// file, so let's stop looking for them instead of reading it all
 								break;
 							}
+						} else if (delay > MISSING_STREAM_SCAN_DELAY) {
+							missingStreamScanEndPos ??= Math.min(fileSize, currentPos + this.maxMissingStreamScanSize);
+
+							const missingPids = this.elementaryStreams.filter(x => !x.initialized).map(x => x.pid);
+							const nextPos = await this.findNextPayloadUnitStart(
+								missingPids,
+								currentPos + this.packetStride,
+								missingStreamScanEndPos,
+							);
+							if (nextPos === null) {
+								// The streams that still haven't shown up are declared, but aren't in the file (or
+								// only far later), so let's stop looking for them
+								break;
+							}
+
+							// Continue where the next missing stream starts
+							currentPos = nextPos;
+							continue;
 						}
 					}
 
@@ -1014,46 +1023,44 @@ export class MpegTsDemuxer extends Demuxer {
 		};
 	}
 
-	/** Looks for packets of the given PIDs in a few spots spread over the file after `startPos`. */
-	async findPidsLaterInFile(pids: number[], startPos: number, fileSize: number) {
-		const found = new Set<number>();
+	/** Returns the position of the next TS packet that starts a payload unit on one of the given PIDs, if any. */
+	async findNextPayloadUnitStart(pids: number[], startPos: number, endPos: number) {
+		let pos = startPos;
 
-		for (let i = 1; i <= MISSING_STREAM_CHECK_COUNT && found.size < pids.length; i++) {
-			// The spots are evenly spread, the last one at the end of the file
-			const spotEnd = startPos + Math.floor((fileSize - startPos) * i / MISSING_STREAM_CHECK_COUNT);
-			const spotStart = Math.max(startPos, spotEnd - MISSING_STREAM_CHECK_SIZE);
-			const firstPacketPos = this.packetOffset
-				+ Math.ceil((spotStart - this.packetOffset) / this.packetStride) * this.packetStride;
-			const packetCount = Math.floor((spotEnd - firstPacketPos - TS_PACKET_SIZE) / this.packetStride) + 1;
-			if (packetCount <= 0) {
-				continue;
-			}
-
+		while (pos + TS_PACKET_SIZE <= endPos) {
+			const packetCount = Math.min(
+				Math.floor(MISSING_STREAM_SCAN_CHUNK_SIZE / this.packetStride),
+				Math.floor((endPos - pos - TS_PACKET_SIZE) / this.packetStride) + 1,
+			);
 			const length = (packetCount - 1) * this.packetStride + TS_PACKET_SIZE;
-			let slice = this.reader.requestSlice(firstPacketPos, length);
+
+			let slice = this.reader.requestSlice(pos, length);
 			if (isThenable(slice)) {
 				slice = await slice;
 			}
 			if (!slice) {
-				continue;
+				return null;
 			}
 
 			const bytes = readBytes(slice, length);
-			for (let j = 0; j < packetCount; j++) {
-				const offset = j * this.packetStride;
+			for (let i = 0; i < packetCount; i++) {
+				const offset = i * this.packetStride;
 				if (bytes[offset] !== 0x47) {
 					continue; // Not a packet
 				}
 
 				const pid = ((bytes[offset + 1]! & 0x1f) << 8) | bytes[offset + 2]!;
+				const payloadUnitStart = (bytes[offset + 1]! & 0x40) !== 0;
 				const hasPayload = (bytes[offset + 3]! & 0x10) !== 0;
-				if (hasPayload && pids.includes(pid)) {
-					found.add(pid);
+				if (payloadUnitStart && hasPayload && pids.includes(pid)) {
+					return pos + offset;
 				}
 			}
+
+			pos += packetCount * this.packetStride;
 		}
 
-		return found;
+		return null;
 	}
 
 	async readPacketHeader(pos: number): Promise<TsPacketHeader | null> {
