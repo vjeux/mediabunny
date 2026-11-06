@@ -1,5 +1,20 @@
 /* eslint-disable @stylistic/max-len */
-import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
+import {
+	ALL_FORMATS,
+	BufferSource,
+	BufferTarget,
+	EncodedAudioPacketSource,
+	EncodedVideoPacketSource,
+	EncodedPacketSink,
+	HlsOutputFormat,
+	Input,
+	InputAudioTrack,
+	InputVideoTrack,
+	MpegTsOutputFormat,
+	Output,
+	PathedTarget,
+	UrlSource,
+} from 'mediabunny';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
@@ -1443,6 +1458,64 @@ sample3.aac
 		expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
 
 		packet = await sink.getNextPacket(packet);
+	}
+});
+
+test.concurrent('Packets at segment boundaries can be looked up by their own timestamp', async () => {
+	// HLS written by Mediabunny. The first segment's audio runs past its video, so every later video segment starts
+	// slightly before its playlist timestamp.
+	const files = new Map<string, Uint8Array>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat() }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+			return target;
+		}),
+	});
+
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceVideoTrack = await sourceInput.getPrimaryVideoTrack();
+	const sourceAudioTrack = await sourceInput.getPrimaryAudioTrack();
+	assert(sourceVideoTrack && sourceAudioTrack);
+	const videoConfig = { decoderConfig: (await sourceVideoTrack.getDecoderConfig())! };
+	const audioConfig = { decoderConfig: (await sourceAudioTrack.getDecoderConfig())! };
+
+	const videoSource = new EncodedVideoPacketSource('avc');
+	const audioSource = new EncodedAudioPacketSource('aac');
+	output.addVideoTrack(videoSource);
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// Interleave the packets by timestamp
+	const videoPackets = new EncodedPacketSink(sourceVideoTrack).packets();
+	const audioPackets = new EncodedPacketSink(sourceAudioTrack).packets();
+	let video = await videoPackets.next();
+	let audio = await audioPackets.next();
+	while (!video.done || !audio.done) {
+		if (!video.done && (audio.done || video.value.timestamp <= audio.value.timestamp)) {
+			await videoSource.add(video.value, videoConfig);
+			video = await videoPackets.next();
+		} else if (!audio.done) {
+			await audioSource.add(audio.value, audioConfig);
+			audio = await audioPackets.next();
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new CustomPathedSource('playlist-1.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+		formats: HLS_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		if (packet.type === 'key') {
+			expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+		}
 	}
 });
 
