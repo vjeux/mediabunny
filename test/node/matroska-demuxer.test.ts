@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +83,73 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('EBML lacing with frame size differences of any width', async () => {
+	// The size differences are signed VINTs of up to 8 bytes; here a difference of 0 takes 1 or 5 bytes
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const float64 = (value: number) => {
+		const bytes = new Uint8Array(8);
+		new DataView(bytes.buffer).setFloat64(0, value);
+		return [...bytes];
+	};
+
+	const readFrameSizes = async (sizeDifference: number[]) => {
+		// Three frames of 320 bytes: frame count minus one, the first size (320 as a 2-byte VINT), one difference
+		const lace = [2, 0x41, 0x40, ...sizeDifference];
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+					element(EBMLId.DefaultDuration, [0x01, 0x31, 0x2d, 0x00]), // 20 ms
+					element(
+						EBMLId.Audio,
+						element(EBMLId.SamplingFrequency, float64(8000)),
+						element(EBMLId.Channels, [1]),
+						element(EBMLId.BitDepth, [16]),
+					),
+				)),
+				element(
+					EBMLId.Cluster,
+					element(EBMLId.Timestamp, [0]),
+					// Track 1, timestamp 0, key frame with EBML lacing
+					element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x86], lace, new Array<number>(960).fill(0)),
+				),
+			),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const sizes: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			sizes.push(packet.data.byteLength);
+		}
+		return sizes;
+	};
+
+	expect(await readFrameSizes([0xbf])).toEqual([320, 320, 320]); // 63, minus the bias of 2^6 - 1
+	expect(await readFrameSizes([0x0b, 0xff, 0xff, 0xff, 0xff])).toEqual([320, 320, 320]); // Bias 2^34 - 1
 });

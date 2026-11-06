@@ -921,7 +921,8 @@ export class MatroskaDemuxer extends Demuxer {
 
 						const unsignedDiff = diffResult;
 						const width = slice.bufferPos - startPos;
-						const bias = (1 << (width * 7 - 1)) - 1; // Typo-corrected version of 2^((7*n)-1)^-1
+						// 2^(7n - 1) - 1 (RFC 9559, 10.3.3), not with a bit shift, which wraps around past 4 bytes
+						const bias = 2 ** (width * 7 - 1) - 1;
 						const diff = unsignedDiff - bias;
 
 						currentSize += diff;
