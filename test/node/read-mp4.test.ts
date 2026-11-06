@@ -1,5 +1,6 @@
 import { createCipheriv } from 'node:crypto';
 import { expect, test } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -1663,4 +1664,32 @@ test('AAC whose esds box has no AudioSpecificConfig', async () => {
 		description: new Uint8Array([0x11, 0x90]), // AAC-LC, 48 kHz, stereo
 	});
 	expect(await input.getMimeType()).toBe('audio/mp4; codecs="mp4a.40.2"');
+});
+
+test('Video sample entries with zero dimensions', async () => {
+	// Some writers leave the sample entry's width and height at 0 (samples.ffmpeg.org
+	// archive/all/mov+h264+aac++mp4box_frag.mp4: 720×288 H.264). Like FFmpeg, take them from the SPS instead.
+	const readDimensions = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getVideoTracks())[0]!;
+		const decoderConfig = await track.getDecoderConfig();
+		return [
+			await track.getCodedWidth(),
+			await track.getCodedHeight(),
+			await track.getDisplayWidth(),
+			await track.getDisplayHeight(),
+			decoderConfig!.codedWidth,
+			decoderConfig!.codedHeight,
+		];
+	};
+
+	for (const name of ['sps-only-sar-h264.mp4', 'sps-only-sar-hevc.mp4']) {
+		const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public', name)));
+		const stsdPos = bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'stsd') - 4;
+		const sampleEntryPos = stsdPos + 16;
+		new DataView(bytes.buffer).setUint32(sampleEntryPos + 32, 0); // Width and height
+
+		// The SPS says 64×64 with a pixel aspect ratio that gives a display size of 64×114
+		expect(await readDimensions(bytes)).toEqual([64, 64, 64, 114, 64, 64]);
+	}
 });
