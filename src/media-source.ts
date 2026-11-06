@@ -2992,6 +2992,16 @@ export class AudioBufferSource extends AudioSource {
 }
 
 /**
+ * The largest deviation, in seconds, between where an audio chunk's capture timestamp puts it and the end of the
+ * audio before it, that is still treated as continuous audio. Capture timestamps jitter around the actual sample clock
+ * (Chrome stamps Web Audio-sourced tracks with the time a render callback ran, for example); filling these
+ * deviations with silence or cutting them would put audible gaps and clicks into continuous audio. Larger deviations
+ * are real gaps or drift between the sample clock and the system clock, and are corrected, which keeps the audio
+ * within this distance of its capture timestamps.
+ */
+const MAX_AUDIO_TIMESTAMP_JITTER = 0.04;
+
+/**
  * Options for {@link MediaStreamAudioTrackSource}.
  * @group Media sources
  * @public
@@ -3103,6 +3113,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let errored = false;
 		let lastSampleTimestamp: number | null = null;
 		let timestampOffset = 0;
+		let nextTimestamp: number | null = null; // Where the audio continues seamlessly
 
 		const onAudioSample = (audioSample: AudioSample) => {
 			if (errored) {
@@ -3153,13 +3164,39 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			lastSampleTimestamp = currentTimestamp;
 
+			let timestamp = currentTimestamp + timestampOffset;
+
+			if (nextTimestamp !== null) {
+				const deviation = timestamp - nextTimestamp;
+
+				if (Math.abs(deviation) <= MAX_AUDIO_TIMESTAMP_JITTER) {
+					timestamp = nextTimestamp; // Timestamp jitter; the audio itself is continuous
+				} else if (deviation < 0) {
+					// The sample clock ran ahead of the timestamps, so this audio overlaps audio that's already been
+					// added. Cut off the overlapping start to get back in sync.
+					const overlappingFrames = Math.round(-deviation * audioSample.sampleRate);
+					if (overlappingFrames >= audioSample.numberOfFrames) {
+						audioSample.close();
+						return;
+					}
+
+					const trimmed = audioSample.trim(overlappingFrames);
+					audioSample.close();
+					audioSample = trimmed;
+					timestamp = nextTimestamp;
+				}
+				// A larger positive deviation is a real gap, which the encoder fills with silence
+			}
+
+			nextTimestamp = timestamp + audioSample.duration;
+
 			if (this._encoder.getQueueSize() >= 8) {
-				// Drop data if the encoder is overloaded
+				// Drop data if the encoder is overloaded; the gap it leaves gets filled with silence
 				audioSample.close();
 				return;
 			}
 
-			audioSample.setTimestamp(currentTimestamp + timestampOffset);
+			audioSample.setTimestamp(timestamp);
 
 			void this._encoder.add(audioSample, true)
 				.catch((error) => {
