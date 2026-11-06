@@ -144,7 +144,7 @@ const output = new Output({
 // Add a video track backed by a canvas element
 const videoSource = new CanvasSource(canvas, {
     codec: 'avc',
-    bitrate: new Quality('high'),
+    quality: new Quality('high'),
 });
 output.addVideoTrack(videoSource);
 
@@ -158,7 +158,7 @@ const buffer = output.target.buffer; // Final MP4 file
 ### Convert files
 
 ```js
-import { Input, Output, Conversion, ALL_FORMATS, BlobSource, WebMOutputFormat } from 'mediabunny';
+import { Input, Output, Conversion, ALL_FORMATS, BlobSource, WebMOutputFormat, BufferTarget } from 'mediabunny';
 
 const input = new Input({
     source: new BlobSource(file),
