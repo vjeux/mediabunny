@@ -1086,3 +1086,30 @@ test('Creation time override in conversion', async () => {
 
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
+
+test('MP4 with mdta format writes cover art under the QuickTime artwork key', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat({ metadataFormat: 'mdta' }),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({ images: songMetadata.images });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.images).toHaveLength(1);
+	expect(readTags.images![0]!.data).toEqual(coverArt);
+
+	// 'covr' is an ilst atom name; in a keys box, the artwork key is com.apple.quicktime.artwork (also read by FFmpeg)
+	expect(Object.keys(readTags.raw!)).toEqual(['com.apple.quicktime.artwork']);
+});

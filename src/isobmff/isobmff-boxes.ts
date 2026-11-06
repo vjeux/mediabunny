@@ -1866,7 +1866,8 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 						continue;
 					}
 
-					pairs.push({ key: 'covr', value: box('data', [
+					// In a keys box, the QuickTime key for cover art is com.apple.quicktime.artwork
+					pairs.push({ key: isMdta ? 'com.apple.quicktime.artwork' : 'covr', value: box('data', [
 						u32(DATA_BOX_MIME_TYPE_MAP[image.mimeType] ?? 0), // Type indicator
 						u32(0), // Locale indicator
 						Array.from(image.data), // Kinda slow, hopefully temp
