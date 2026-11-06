@@ -127,3 +127,40 @@ test('FLAC with huge timestamps', async () => {
 
 	expect(firstPacket.timestamp).toBe(timestamp);
 });
+
+test('FLAC encoding at sample rates outside of the frame header table', async () => {
+	registerFlacEncoder();
+
+	// These have no frame header code of their own, but libFLAC writes them out explicitly
+	for (const sampleRate of [11025, 37800]) {
+		const output = new Output({
+			format: new FlacOutputFormat(),
+			target: new BufferTarget(),
+		});
+
+		const audioSource = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(audioSource);
+
+		await output.start();
+		using sample = new AudioSample({
+			data: createSineWave(sampleRate, 1, 1),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate,
+			timestamp: 0,
+		});
+		await audioSource.add(sample);
+		audioSource.close();
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getSampleRate()).toBe(sampleRate);
+		expect(await track.getNumberOfChannels()).toBe(1);
+		expect(await track.computeDuration()).toBe(1);
+	}
+});
