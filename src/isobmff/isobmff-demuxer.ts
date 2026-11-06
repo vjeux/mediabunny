@@ -1267,6 +1267,13 @@ export class IsobmffDemuxer extends Demuxer {
 						break;
 					}
 
+					if (i > 0) {
+						// The track's decoder config comes from the first sample description, like FFmpeg's primary
+						// extradata; later ones (e.g. from concatenated files) only apply to later samples
+						slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
+						continue;
+					}
+
 					track.internalCodecId = sampleBoxInfo.name;
 					const lowercaseBoxName = sampleBoxInfo.name.toLowerCase();
 

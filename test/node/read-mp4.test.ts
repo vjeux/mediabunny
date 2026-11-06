@@ -272,3 +272,53 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Decoder config of a track with several sample descriptions', async () => {
+	// Like concatenated files: chunk 1 uses the first description, chunk 2 the second
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const avc1 = (width: number, height: number, profile: number, level: number) => box('avc1', zeros(6), [0, 1],
+		zeros(16), [width >> 8, width & 0xff, height >> 8, height & 0xff], zeros(50),
+		box('avcC', [1, profile, 0, level, 0xff, 0xe0, 0]));
+
+	const moov = (chunkOffsets: number[]) => box('moov',
+		box('mvhd', zeros(12), u32(30), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(320 << 16), u32(240 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(30), u32(4), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(2), avc1(320, 240, 0x42, 0x1e), avc1(640, 480, 0x64, 0x1f)),
+					box('stts', u32(0), u32(1), u32(4), u32(1)),
+					box('stsc', u32(0), u32(2), u32(1), u32(2), u32(1), u32(2), u32(2), u32(2)),
+					box('stsz', u32(0), u32(3), u32(4)),
+					box('stco', u32(0), u32(2), ...chunkOffsets.map(u32)),
+				)),
+			),
+		),
+	);
+	const ftyp = box('ftyp', ascii('isom'), u32(0), ascii('isom'));
+	const dataStart = ftyp.length + moov([0, 0]).length + 8;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...ftyp,
+			...moov([dataStart, dataStart + 6]),
+			...box('mdat', zeros(12)),
+		])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getCodedWidth()).toBe(320);
+	expect(await track.getCodedHeight()).toBe(240);
+	expect((await track.getDecoderConfig())?.codec).toBe('avc1.42001e');
+});
