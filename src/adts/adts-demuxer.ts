@@ -51,6 +51,8 @@ export class AdtsDemuxer extends Demuxer {
 	firstFrameHeader: AdtsFrameHeader | null = null;
 	loadedSamples: Sample[] = [];
 	metadataTags: MetadataTags | null = null;
+	/** Whether metadataTags holds all tags, rather than the ones read before a parse error */
+	metadataTagsComplete = false;
 
 	trackBackings: AdtsAudioTrackBacking[] = [];
 
@@ -159,12 +161,12 @@ export class AdtsDemuxer extends Demuxer {
 		try {
 			await this.readMetadata();
 
-			if (this.metadataTags) {
+			// Tags that failed to parse are read again, so that every call fails, not just the first one
+			if (this.metadataTags && this.metadataTagsComplete) {
 				return this.metadataTags;
 			}
 
-			// Only cached once complete, so that a tag that fails to parse fails every call, not just the first one
-			const metadataTags: MetadataTags = {};
+			this.metadataTags = {};
 			let currentPos = 0;
 
 			while (true) {
@@ -181,13 +183,13 @@ export class AdtsDemuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				if (!contentSlice) break;
 
-				parseId3V2Tag(contentSlice, id3V2Header, metadataTags);
+				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
-			this.metadataTags = metadataTags;
-			return metadataTags;
+			this.metadataTagsComplete = true;
+			return this.metadataTags;
 		} finally {
 			release();
 		}

@@ -59,6 +59,8 @@ export class Mp3Demuxer extends Demuxer {
 	xingFrameHeaderPos: number | null = null;
 	loadedSamples: Sample[] = []; // All samples from the start of the file to lastLoadedPos
 	metadataTags: MetadataTags | null = null;
+	/** Whether metadataTags holds all tags, rather than the ones read before a parse error */
+	metadataTagsComplete = false;
 	xingData: {
 		isVbr: boolean;
 		frameCount: number | null;
@@ -230,12 +232,12 @@ export class Mp3Demuxer extends Demuxer {
 		try {
 			await this.readMetadata();
 
-			if (this.metadataTags) {
+			// Tags that failed to parse are read again, so that every call fails, not just the first one
+			if (this.metadataTags && this.metadataTagsComplete) {
 				return this.metadataTags;
 			}
 
-			// Only cached once complete, so that a tag that fails to parse fails every call, not just the first one
-			const metadataTags: MetadataTags = {};
+			this.metadataTags = {};
 			let currentPos = 0;
 			let id3V2HeaderFound = false;
 
@@ -255,7 +257,7 @@ export class Mp3Demuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				if (!contentSlice) break;
 
-				parseId3V2Tag(contentSlice, id3V2Header, metadataTags);
+				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
@@ -268,12 +270,12 @@ export class Mp3Demuxer extends Demuxer {
 
 				const tag = readAscii(slice, 3);
 				if (tag === 'TAG') {
-					parseId3V1Tag(slice, metadataTags);
+					parseId3V1Tag(slice, this.metadataTags);
 				}
 			}
 
-			this.metadataTags = metadataTags;
-			return metadataTags;
+			this.metadataTagsComplete = true;
+			return this.metadataTags;
 		} finally {
 			release();
 		}
