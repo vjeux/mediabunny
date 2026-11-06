@@ -524,8 +524,7 @@ export abstract class BaseMediaSampleSink<
 
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
-				// The sample at the start timestamp is yielded even if the range is shorter than the tolerance
-				if (sample.timestamp >= endTimestamp - tolerance && sample.timestamp > startTimestamp + tolerance) {
+				if (sample.timestamp >= endTimestamp) {
 					ended = true;
 				}
 
