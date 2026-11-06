@@ -768,6 +768,23 @@ export const setInt64 = (view: DataView, byteOffset: number, value: number, litt
  * Calls a function on each value spat out by an async generator. The reason for writing this manually instead of
  * using a generator function is that the generator function queues return() calls - here, we forward them immediately.
  */
+/**
+ * Makes the iterator serve one next() call at a time, like a generator does: concurrent calls then resolve in order,
+ * each with the value after the previous call's.
+ */
+export const serializeNextCalls = <T>(iterator: AsyncGenerator<T, void, unknown>) => {
+	const next = iterator.next.bind(iterator);
+	let lastCall: Promise<unknown> = Promise.resolve();
+
+	iterator.next = () => {
+		const result = lastCall.then(() => next());
+		lastCall = result.then(() => {}, () => {});
+		return result;
+	};
+
+	return iterator;
+};
+
 export const mapAsyncGenerator = <T, U>(
 	generator: AsyncGenerator<T, void, unknown>,
 	map: (t: T) => U,
