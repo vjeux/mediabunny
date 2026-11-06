@@ -5,12 +5,13 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
+import { AudioSample, AudioSampleCopyToOptions, VideoSample } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack } from '../../src/input-track.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -275,4 +276,56 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+// https://github.com/Vanilagy/mediabunny/issues/602
+test('Video whose AVC decoder config changes mid-stream decodes in full after muxing', async () => {
+	// Two clips with different parameter sets (High and Constrained Baseline), as when the browser replaces a
+	// failing hardware encoder with a software one
+	using firstInput = new Input({ source: new UrlSource('/avc-config-change-high.mp4'), formats: ALL_FORMATS });
+	using secondInput = new Input({ source: new UrlSource('/avc-config-change-baseline.mp4'), formats: ALL_FORMATS });
+	const firstTrack = (await firstInput.getPrimaryVideoTrack())!;
+	const secondTrack = (await secondInput.getPrimaryVideoTrack())!;
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 10 });
+	await output.start();
+
+	let meta: EncodedVideoChunkMetadata | undefined = { decoderConfig: (await firstTrack.getDecoderConfig())! };
+	for await (const packet of new EncodedPacketSink(firstTrack).packets()) {
+		await source.add(packet, meta);
+		meta = undefined;
+	}
+	meta = { decoderConfig: (await secondTrack.getDecoderConfig())! };
+	for await (const packet of new EncodedPacketSink(secondTrack).packets()) {
+		await source.add(packet.clone({ timestamp: packet.timestamp + 1 }), meta);
+		meta = undefined;
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const sink = new VideoSampleSink((await input.getPrimaryVideoTrack())!);
+	const secondSink = new VideoSampleSink(secondTrack);
+
+	const getPixels = (sample: VideoSample) => {
+		const context = new OffscreenCanvas(sample.displayWidth, sample.displayHeight).getContext('2d')!;
+		sample.draw(context, 0, 0);
+		return context.getImageData(0, 0, sample.displayWidth, sample.displayHeight).data;
+	};
+
+	let count = 0;
+	for await (using sample of sink.samples()) {
+		if (sample.timestamp >= 1) {
+			using expected = (await secondSink.getSample(sample.timestamp - 1))!;
+			expect(getPixels(sample)).toEqual(getPixels(expected));
+		}
+		count++;
+	}
+	expect(count).toBe(20);
+
+	// Decoding can also start at a later key frame of the second clip
+	using seeked = (await sink.getSample(1.7))!;
+	using expected = (await secondSink.getSample(0.7))!;
+	expect(getPixels(seeked)).toEqual(getPixels(expected));
 });

@@ -25,6 +25,7 @@ import {
 	isChromium,
 	popcount,
 	setUint24,
+	uint8ArraysAreEqual,
 	writeExpGolomb,
 } from './misc';
 import { Logging } from './logging';
@@ -1727,6 +1728,124 @@ export const deserializeHevcDecoderConfigurationRecord = (data: Uint8Array): Hev
 		return null;
 	}
 };
+
+/** Returns the NAL unit length size and the parameter set NAL units of an AVC or HEVC decoder configuration record. */
+const extractParameterSetsFromDescription = (codec: 'avc' | 'hevc', description: Uint8Array) => {
+	if (codec === 'avc') {
+		const record = deserializeAvcDecoderConfigurationRecord(description);
+		if (!record) {
+			return null;
+		}
+
+		return {
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			nalUnits: [
+				...record.sequenceParameterSets,
+				...(record.sequenceParameterSetExt ?? []),
+				...record.pictureParameterSets,
+			],
+		};
+	} else {
+		const record = deserializeHevcDecoderConfigurationRecord(description);
+		if (!record) {
+			return null;
+		}
+
+		const nalUnits: Uint8Array[] = [];
+		for (const type of [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT]) {
+			for (const array of record.arrays) {
+				if (array.nalUnitType === type) {
+					nalUnits.push(...array.nalUnits);
+				}
+			}
+		}
+
+		return {
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			nalUnits,
+		};
+	}
+};
+
+/**
+ * Carries mid-stream AVC/HEVC decoder configuration changes in-band, for containers that hold only one decoder
+ * configuration per track (the ISOBMFF sample entry, Matroska's CodecPrivate). Encoders emit a new configuration
+ * when their parameter sets change, for example when Chromium's VideoEncoder falls back from a hardware to a software
+ * encoder mid-stream; the new parameter sets are then only in the new description, not in the packets. Once a
+ * packet arrives with a description that differs from the stored one, every key packet from then on gets the current
+ * parameter sets in front of its first slice (unless it carries them itself), so decoders pick up the change, also
+ * when they start at a later key packet. Length prefixes are rewritten if the new description uses another size.
+ */
+export class InBandParameterSetWriter {
+	private readonly storedLengthSize: 1 | 2 | 3 | 4;
+	private lastDescriptionSource: AllowSharedBufferSource | null = null;
+	private currentDescription: Uint8Array;
+	private currentLengthSize: 1 | 2 | 3 | 4;
+	/** Null until the description changes for the first time. */
+	private parameterSets: Uint8Array[] | null = null;
+
+	constructor(private readonly codec: 'avc' | 'hevc', description: Uint8Array) {
+		const parsed = extractParameterSetsFromDescription(codec, description);
+		this.storedLengthSize = parsed?.lengthSize ?? 4;
+		this.currentDescription = description;
+		this.currentLengthSize = this.storedLengthSize;
+	}
+
+	/** Returns the data of the packet as it must be stored. */
+	process(packetData: Uint8Array, type: PacketType, description: AllowSharedBufferSource | undefined) {
+		let changed = false;
+
+		if (description && description !== this.lastDescriptionSource) {
+			this.lastDescriptionSource = description;
+
+			const bytes = toUint8Array(description);
+			if (!uint8ArraysAreEqual(bytes, this.currentDescription)) {
+				const parsed = extractParameterSetsFromDescription(this.codec, bytes);
+				if (parsed) {
+					this.currentDescription = bytes.slice();
+					this.currentLengthSize = parsed.lengthSize;
+					this.parameterSets = parsed.nalUnits.map(x => x.slice());
+					changed = true;
+				}
+			}
+		}
+
+		if (!this.parameterSets) {
+			return packetData;
+		}
+
+		const insertParameterSets = type === 'key' || changed;
+		if (!insertParameterSets && this.currentLengthSize === this.storedLengthSize) {
+			return packetData;
+		}
+
+		const getType = (nalUnit: Uint8Array) => this.codec === 'avc'
+			? extractNalUnitTypeForAvc(nalUnit[0]!)
+			: extractNalUnitTypeForHevc(nalUnit[0]!);
+		const isVcl = (nalUnitType: number) => this.codec === 'avc'
+			? nalUnitType >= AvcNalUnitType.NON_IDR_SLICE && nalUnitType <= AvcNalUnitType.IDR
+			: nalUnitType < 32;
+
+		const nalUnits: Uint8Array[] = [];
+		for (const loc of iterateNalUnitsInLengthPrefixed(packetData, this.currentLengthSize)) {
+			nalUnits.push(packetData.subarray(loc.offset, loc.offset + loc.length));
+		}
+
+		if (insertParameterSets) {
+			const presentTypes = new Set(nalUnits.filter(x => x.length > 0).map(getType));
+			const missing = this.parameterSets.filter(x => x.length > 0 && !presentTypes.has(getType(x)));
+
+			let insertionIndex = nalUnits.findIndex(x => x.length > 0 && isVcl(getType(x)));
+			if (insertionIndex === -1) {
+				insertionIndex = nalUnits.length;
+			}
+
+			nalUnits.splice(insertionIndex, 0, ...missing);
+		}
+
+		return concatNalUnitsInLengthPrefixed(nalUnits, this.storedLengthSize);
+	}
+}
 
 enum HevcNaluOrderState {
 	audAllowed,
