@@ -1821,7 +1821,7 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 			}; break;
 
 			case 'description': {
-				pairs.push({ key: isMdta ? 'description' : '©des', value: dataStringBoxLong(value) });
+				pairs.push({ key: isMdta ? 'description' : 'desc', value: dataStringBoxLong(value) });
 			}; break;
 
 			case 'artist': {
