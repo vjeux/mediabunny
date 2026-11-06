@@ -50,13 +50,23 @@ const extractSnippets = (page: string): Snippet[] => {
 
 const allSnippets = DOC_PAGES.flatMap(extractSnippets);
 
-// Divergences that open docs fixes address are exempted below. Each exemption ends with a fingerprint of the snippet or
-// table row it applies to, as that text is today, so it lapses as soon as the text changes: a corrected snippet is
-// checked like any other, and an exemption can't hide a later regression. Failure messages print the fingerprint.
+// A failure is a [key, message] pair. Divergences that open docs fixes address are waived by key below. A key ends with
+// a fingerprint of the snippet or table row, so a waiver only covers that exact text, and it must cover a failure the
+// check finds right now: once the docs are fixed, the check fails with "waiver no longer needed" until the waiver is
+// deleted, so the same text can't later regress unnoticed. Failure messages print their key.
+type Failure = [key: string, message: string];
+
 const fingerprint = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 12);
 
+const applyWaivers = (failures: Failure[], waivers: Set<string>) => ({
+	unwaived: failures.filter(([key]) => !waivers.has(key)).map(([key, message]) => `${message} [${key}]`),
+	unneeded: [...waivers]
+		.filter(waiver => !failures.some(([key]) => key === waiver))
+		.map(waiver => `waiver no longer needed: '${waiver}'`),
+});
+
 describe('Codec compatibility table', () => {
-	const IGNORED_CELLS = new Set([
+	const WAIVED_CELLS = new Set([
 		'pcm-f64 .wav fcc8a2bf2e1e',
 	]);
 
@@ -80,27 +90,28 @@ describe('Codec compatibility table', () => {
 		expect(header).toEqual(Object.keys(formats));
 
 		const documentedCodecs: string[] = [];
-		const mismatches: string[] = [];
+		const failures: Failure[] = [];
 
 		for (const row of rows.slice(2)) {
 			const cells = row.split('|').slice(1, -1).map(cell => cell.trim());
 			const codec = /`'([^']+)'`/.exec(cells[0]!)![1]!;
-			const rowFingerprint = fingerprint(row);
 			documentedCodecs.push(codec);
 
 			header.forEach((extension, i) => {
 				const documented = cells[i + 1] === '✓' || cells[i + 1] === '(✓)';
 				const supported = formats[extension]!.getSupportedCodecs().includes(codec as Mediabunny.MediaCodec);
-				if (documented !== supported && !IGNORED_CELLS.has(`${codec} ${extension} ${rowFingerprint}`)) {
-					mismatches.push(
-						`${codec} ${extension}: documented ${documented}, supported ${supported}`
-						+ ` (row ${rowFingerprint})`,
-					);
+				if (documented !== supported) {
+					failures.push([
+						`${codec} ${extension} ${fingerprint(row)}`,
+						`${codec} ${extension}: documented ${documented}, supported ${supported}`,
+					]);
 				}
 			});
 		}
 
-		expect(mismatches).toEqual([]);
+		const { unwaived, unneeded } = applyWaivers(failures, WAIVED_CELLS);
+		expect(unwaived).toEqual([]);
+		expect(unneeded).toEqual([]);
 		expect(documentedCodecs.sort()).toEqual(
 			[...Mediabunny.VIDEO_CODECS, ...Mediabunny.AUDIO_CODECS, ...Mediabunny.SUBTITLE_CODECS].sort(),
 		);
@@ -108,7 +119,7 @@ describe('Codec compatibility table', () => {
 });
 
 describe('Option types spelled out in the guides', () => {
-	const IGNORED_MISSING_FIELDS = new Set([
+	const WAIVED_MISSING_FIELDS = new Set([
 		'BlobSourceOptions.useStreamReader fbd327eb2175',
 		'MpegTsOutputFormatOptions.timestampOffset b9bf9c230ac5',
 		'HlsOutputFormatOptions.mediaTimestampBase c83c7df86912',
@@ -163,11 +174,23 @@ describe('Option types spelled out in the guides', () => {
 		}
 	}
 
+	const findMissingFields = ({ snippet, name, fields }: typeof documentedTypes[number]): Failure[] => {
+		const exportedFields = getExportedFields(name);
+		if (!exportedFields || EXCERPTED_TYPES.has(name)) {
+			return [];
+		}
+
+		return [...exportedFields]
+			.filter(field => !fields.includes(field))
+			.map(field => [`${name}.${field} ${fingerprint(snippet.code)}`, `${name} leaves out ${field}`]);
+	};
+
 	test('the guides spell out at least 20 option types', () => {
 		expect(documentedTypes.length).toBeGreaterThanOrEqual(20);
 	});
 
-	for (const { snippet, name, fields } of documentedTypes) {
+	for (const documentedType of documentedTypes) {
+		const { snippet, name, fields } = documentedType;
 		test(`${name} (${snippet.page}:${snippet.line}) lists exactly the exported fields`, () => {
 			const exportedFields = getExportedFields(name);
 			expect(exportedFields, `${name} is not exported`).not.toBeNull();
@@ -175,20 +198,19 @@ describe('Option types spelled out in the guides', () => {
 			const unknownFields = fields.filter(field => !exportedFields!.has(field));
 			expect(unknownFields, 'documented fields that don\'t exist').toEqual([]);
 
-			if (EXCERPTED_TYPES.has(name)) {
-				return;
-			}
-
-			const snippetFingerprint = fingerprint(snippet.code);
-			const missingFields = [...exportedFields!].filter(field => !fields.includes(field)
-				&& !IGNORED_MISSING_FIELDS.has(`${name}.${field} ${snippetFingerprint}`));
-			expect(missingFields, `exported fields the guide leaves out (snippet ${snippetFingerprint})`).toEqual([]);
+			const { unwaived } = applyWaivers(findMissingFields(documentedType), WAIVED_MISSING_FIELDS);
+			expect(unwaived, 'exported fields the guide leaves out').toEqual([]);
 		});
 	}
+
+	test('every missing-field waiver still covers a missing field', () => {
+		const failures = documentedTypes.flatMap(findMissingFields);
+		expect(applyWaivers(failures, WAIVED_MISSING_FIELDS).unneeded).toEqual([]);
+	});
 });
 
 describe('Snippet imports', () => {
-	const IGNORED_MISSING_IMPORTS = new Set([
+	const WAIVED_MISSING_IMPORTS = new Set([
 		'README.md BufferTarget 668e446e02e0',
 		'docs/guide/quick-start.md BufferTarget d1225810e0be',
 		'docs/guide/converting-media-files.md Quality e3481a83fcd2',
@@ -245,16 +267,18 @@ describe('Snippet imports', () => {
 		};
 		visit(sourceFile);
 
-		const snippetFingerprint = fingerprint(snippet.code);
-		return [...missing]
-			.filter(name => !IGNORED_MISSING_IMPORTS.has(`${snippet.page} ${name} ${snippetFingerprint}`));
+		return [...missing];
 	};
 
 	test('self-contained snippets import every Mediabunny export they use', () => {
-		const problems = allSnippets.flatMap(snippet => findMissingImports(snippet)
-			.map(name => `${snippet.page}:${snippet.line} uses ${name} without importing it`
-				+ ` (snippet ${fingerprint(snippet.code)})`));
-		expect(problems).toEqual([]);
+		const failures = allSnippets.flatMap(snippet => findMissingImports(snippet).map((name): Failure => [
+			`${snippet.page} ${name} ${fingerprint(snippet.code)}`,
+			`${snippet.page}:${snippet.line} uses ${name} without importing it`,
+		]));
+
+		const { unwaived, unneeded } = applyWaivers(failures, WAIVED_MISSING_IMPORTS);
+		expect(unwaived).toEqual([]);
+		expect(unneeded).toEqual([]);
 	});
 
 	test('finds a missing import', () => {
@@ -264,8 +288,13 @@ describe('Snippet imports', () => {
 			code: 'import { Output } from \'mediabunny\';\nnew Output({ target: new BufferTarget() });',
 		};
 		expect(findMissingImports(snippet)).toEqual(['BufferTarget']);
+	});
+});
 
-		// README.md has a BufferTarget exemption, but only for its current snippet text
-		expect(findMissingImports({ ...snippet, page: 'README.md' })).toEqual(['BufferTarget']);
+test('a waiver must cover a current failure', () => {
+	const failures: Failure[] = [['a', 'a failed'], ['b', 'b failed']];
+	expect(applyWaivers(failures, new Set(['a', 'c']))).toEqual({
+		unwaived: ['b failed [b]'],
+		unneeded: ['waiver no longer needed: \'c\''],
 	});
 });
