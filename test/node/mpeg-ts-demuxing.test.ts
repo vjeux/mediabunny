@@ -1000,8 +1000,13 @@ test('MPEG-TS with parameter sets in a PES packet of their own, without PTS', as
 	await expectLookupsToFindEachPacket(sink, packets);
 });
 
-/** Builds a transport stream with an AVC stream on PID 0x100 out of the given PES packets' access units. */
-const buildAvcTransportStream = (pesPackets: { pts: number | null; accessUnitCount: number }[]) => {
+/**
+ * Builds a transport stream with an AVC stream on PID 0x100 out of the given PES packets' access units (or just an AUD
+ * and parameter sets).
+ */
+const buildAvcTransportStream = (
+	pesPackets: { pts: number | null; accessUnitCount: number; parameterSetsOnly?: boolean }[],
+) => {
 	const startCode = [0, 0, 0, 1];
 	const aud = [...startCode, 0x09, 0xf0];
 	const sps = [
@@ -1032,8 +1037,8 @@ const buildAvcTransportStream = (pesPackets: { pts: number | null; accessUnitCou
 	]);
 
 	let frameIndex = 0;
-	for (const { pts, accessUnitCount } of pesPackets) {
-		const data: number[] = [];
+	for (const { pts, accessUnitCount, parameterSetsOnly } of pesPackets) {
+		const data: number[] = parameterSetsOnly ? [...aud, ...sps, ...pps] : [];
 		for (let i = 0; i < accessUnitCount; i++, frameIndex++) {
 			data.push(...aud, ...(frameIndex === 0 ? [...sps, ...pps] : []), ...slice(frameIndex === 0));
 		}
@@ -1094,4 +1099,36 @@ test('MPEG-TS times the frames of PES packets without PTS from the ones around t
 		{ pts: 102_000, accessUnitCount: 1 },
 		{ pts: null, accessUnitCount: 1 },
 	], 6);
+});
+
+test('MPEG-TS takes the PTS of the PES packet an access unit begins in', async () => {
+	// Like Chromium's extra-nalu.ts: a PES packet with only an AUD, the SPS and the PPS precedes the key frame's, and
+	// both have a PTS. The key frame's access unit begins at the AUD in its own PES packet, so that one's PTS is its
+	// (as in Chromium; FFmpeg takes the first one, which is the frame's DTS in that file).
+	using input = new Input({
+		source: new BufferSource(buildAvcTransportStream([
+			{ pts: 87_000, accessUnitCount: 0, parameterSetsOnly: true },
+			{ pts: 90_000, accessUnitCount: 1 },
+			{ pts: 93_000, accessUnitCount: 1 },
+		])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = await readAllPackets(sink);
+
+	expect(packets.map(x => Math.round(x.timestamp * 90_000))).toEqual([90_000, 93_000]);
+
+	// The first packet still holds the parameter sets before its AUD
+	const data = packets[0]!.data;
+	const nalUnitTypes: number[] = [];
+	for (let i = 0; i + 4 < data.length; i++) {
+		if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+			nalUnitTypes.push(data[i + 4]! & 0x1f);
+		}
+	}
+	expect(nalUnitTypes).toEqual([9, 7, 8, 9, 7, 8, 5]);
+	await expectLookupsToFindEachPacket(sink, packets);
 });
