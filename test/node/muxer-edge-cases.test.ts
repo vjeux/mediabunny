@@ -4,11 +4,12 @@ import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { Mp3OutputFormat, WavOutputFormat } from '../../src/output-format.js';
+import { Mp3OutputFormat, OggOutputFormat, WavOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
 
 describe('WAVE LIST INFO on output', () => {
 	const writeWave = async (tags: Parameters<Output['setMetadataTags']>[0]) => {
@@ -189,5 +190,102 @@ describe('WAVE output variants', () => {
 		expect(() => new WavOutputFormat({ metadataFormat: 'vorbis' as never })).toThrow(TypeError);
 		expect(() => new WavOutputFormat({ onHeader: 'no' as never })).toThrow(TypeError);
 		expect(() => new WavOutputFormat(null as never)).toThrow(TypeError);
+	});
+});
+
+describe('Ogg page layout on output', () => {
+	// OpusHead: version 1, mono, pre-skip 0, 48 kHz, gain 0, mapping family 0
+	const opusHead = new Uint8Array([
+		...[...'OpusHead'].map(c => c.charCodeAt(0)),
+		1, 1, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0,
+	]);
+	const opusPacket = (size: number, fill: number) => {
+		const data = new Uint8Array(size).fill(fill);
+		data[0] = 31 << 3; // CELT FB 20 ms, one frame
+		return data;
+	};
+
+	type Page = { headerType: number; granule: bigint; sequence: number; lacing: number[]; position: number };
+	const writeOgg = async (sizes: number[], options: ConstructorParameters<typeof OggOutputFormat>[0] = {}) => {
+		const target = new BufferTarget();
+		const callbacks: [number, number][] = [];
+		const format = new OggOutputFormat({
+			...options,
+			onPage: (data, position) => callbacks.push([data.length, position]),
+		});
+		const output = new Output({ format, target });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source);
+		await output.start();
+		const decoderConfig = { codec: 'opus', numberOfChannels: 1, sampleRate: 48000, description: opusHead };
+		const meta = { decoderConfig };
+		for (const [i, size] of sizes.entries()) {
+			await source.add(new EncodedPacket(opusPacket(size, i + 1), 'key', i * 0.02, 0.02), meta);
+		}
+		await output.finalize();
+		const bytes = new Uint8Array(target.buffer!);
+
+		const pages: Page[] = [];
+		const view = new DataView(bytes.buffer, bytes.byteOffset);
+		for (let pos = 0; pos < bytes.length;) {
+			expect(String.fromCharCode(...bytes.subarray(pos, pos + 4))).toBe('OggS');
+			const segments = bytes[pos + 26]!;
+			const lacing = [...bytes.subarray(pos + 27, pos + 27 + segments)];
+			pages.push({
+				headerType: bytes[pos + 5]!,
+				granule: view.getBigInt64(pos + 6, true),
+				sequence: view.getUint32(pos + 18, true),
+				lacing,
+				position: pos,
+			});
+			pos += 27 + segments + lacing.reduce((a, b) => a + b, 0);
+		}
+		expect(callbacks).toEqual(pages.map((page, i) => {
+			const end = pages[i + 1]?.position ?? bytes.length;
+			return [end - page.position, page.position];
+		}));
+		return { bytes, pages };
+	};
+
+	test('packets spanning pages continue them with -1 granules; 255-multiples end in a 0 lacing value', async () => {
+		const sizes = [100, 510, 70000, 30];
+		const { bytes, pages } = await writeOgg(sizes);
+		expect(pages.map(page => page.sequence)).toEqual(pages.map((_, i) => i));
+		expect(pages[0]!.headerType).toBe(2); // Beginning of stream (OpusHead)
+		expect(pages.at(-1)!.headerType & 4).toBe(4); // End of stream
+
+		const audioPages = pages.slice(2); // After OpusHead and OpusTags
+		const lacing = audioPages.flatMap(page => page.lacing);
+		expect(lacing.slice(0, 4)).toEqual([100, 255, 255, 0]);
+		// The 70000-byte packet needs 275 lacing values (274 of 255 and one of 130), so it continues on a second page
+		const spanning = audioPages.filter(page => page.lacing.length === 255);
+		expect(spanning.length).toBe(1);
+		expect(spanning[0]!.granule).toBe(2n * 960n); // The 510-byte packet is the last one finishing there
+		const continuation = audioPages[audioPages.indexOf(spanning[0]!) + 1]!;
+		expect(continuation.headerType & 1).toBe(1);
+		expect(pages.at(-1)!.granule).toBe(4n * 960n);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const read: number[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			read.push(packet.byteLength);
+		}
+		expect(read).toEqual(sizes);
+	});
+
+	test('maximumPageDuration flushes pages early; options are validated', async () => {
+		const sizes = Array.from({ length: 10 }, () => 50);
+		const { pages: unlimited } = await writeOgg(sizes);
+		const { pages: limited } = await writeOgg(sizes, { maximumPageDuration: 0.05 });
+		expect(unlimited.length).toBe(3); // OpusHead, OpusTags and one audio page
+		const audioPages = limited.slice(2);
+		expect(audioPages.length).toBeGreaterThan(3);
+		for (const page of audioPages) {
+			expect(page.lacing.length).toBeLessThanOrEqual(2); // At most 50 ms per page
+		}
+
+		expect(() => new OggOutputFormat({ maximumPageDuration: 0 })).toThrow(TypeError);
+		expect(() => new OggOutputFormat({ maximumPageDuration: '1' as never })).toThrow(TypeError);
+		expect(() => new OggOutputFormat({ onPage: 1 as never })).toThrow(TypeError);
 	});
 });
