@@ -1027,7 +1027,7 @@ export const esds = (trackData: IsobmffAudioTrackData) => {
 	}
 
 	bytes = [
-		...u16(1), // ES_ID = 1
+		...u16(0), // ES_ID = 0; ISO/IEC 14496-14 stores 0 here (filled in when streamed), and CMAF requires it
 		...u8(0x00), // flags etc = 0
 		...u8(0x04), // TAG(4) = ES Descriptor
 		...variableUnsignedInt(bytes.length),
