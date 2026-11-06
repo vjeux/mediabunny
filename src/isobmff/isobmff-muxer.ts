@@ -955,22 +955,26 @@ export class IsobmffMuxer extends Muxer {
 		const deltaInTimescale = intoTimescale(duration, trackData.timescale);
 		duration = deltaInTimescale / trackData.timescale;
 
-		if (deltaInTimescale > 0) {
-			const { sampleSize, silentValue } = parsePcmCodec(
-				trackData.info.decoderConfig.codec as PcmAudioCodec,
-			);
-			const samplesNeeded = deltaInTimescale * trackData.info.numberOfChannels;
-			const data = new Uint8Array(sampleSize * samplesNeeded).fill(silentValue);
+		const { sampleSize, silentValue } = parsePcmCodec(
+			trackData.info.decoderConfig.codec as PcmAudioCodec,
+		);
+
+		// Pad in samples of at most a second, so that long gaps don't allocate all their silence at once
+		for (let paddedFrames = 0; paddedFrames < deltaInTimescale;) {
+			const frames = Math.min(deltaInTimescale - paddedFrames, trackData.timescale);
+			const data = new Uint8Array(sampleSize * frames * trackData.info.numberOfChannels).fill(silentValue);
 
 			const paddingSample = this.createSampleForTrack(
 				trackData,
-				new Uint8Array(data.buffer),
-				timestamp,
-				duration,
+				data,
+				timestamp + paddedFrames / trackData.timescale,
+				frames / trackData.timescale,
 				'key',
 				0,
 			);
 			await this.registerSample(trackData, paddingSample);
+
+			paddedFrames += frames;
 		}
 
 		return duration;

@@ -1401,3 +1401,27 @@ test('PCM tracks with more frames than the sample tables count are rejected inst
 
 	await expect(mux()).rejects.toThrow(/more than 4294967295 PCM audio frames/);
 });
+
+test('Gaps between PCM packets are filled with silence a second at a time', async () => {
+	const target = new BufferTarget();
+	const writeSizes: number[] = [];
+	target.on('write', ({ start, end }) => writeSizes.push(end - start));
+
+	const output = new Output({ format: new MovOutputFormat({ fastStart: false }), target });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// One second of 8 kHz mono, a ten-minute gap, then another second
+	const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 };
+	await source.add(new EncodedPacket(new Uint8Array(16000), 'key', 0, 1), { decoderConfig });
+	await source.add(new EncodedPacket(new Uint8Array(16000), 'key', 601, 1));
+	await output.finalize();
+
+	// The padding used to be written as one 9.6 MB sample
+	expect(Math.max(...writeSizes)).toBe(16000);
+
+	using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBe(602);
+});
