@@ -446,6 +446,15 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 
 		reader.pos = nextFramePos;
 	}
+
+	// Without a recording time, fall back to the release time (ID3v2.4), like FFmpeg does
+	const releaseTime = tags.raw?.['TDRL'];
+	if (tags.date === undefined && typeof releaseTime === 'string') {
+		const date = new Date(releaseTime);
+		if (!Number.isNaN(date.getTime())) {
+			tags.date = date;
+		}
+	}
 };
 
 // https://id3.org/id3v2.3.0
