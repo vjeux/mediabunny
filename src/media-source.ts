@@ -1965,8 +1965,28 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		let errored = false;
 		let timestampOffset = 0;
 
+		// An ended track can't produce any more frames, so we close this source. Otherwise, the output would keep
+		// waiting for frames from this track, holding back the media of all other tracks until finalization.
+		const onTrackEnded = () => {
+			if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
+				return;
+			}
+
+			this.close();
+			this._closingPromise!.catch((error) => {
+				this._promiseWithResolvers.reject(error);
+			});
+		};
+
 		const tick = () => {
 			assert(frameRate !== null);
+
+			// A track stopped with track.stop() fires no 'ended' event, and sampling from a <video> element has no
+			// stream that could end, so check here. Otherwise, the last frame would be repeated until finalization.
+			if (this._track.readyState === 'ended') {
+				onTrackEnded();
+				return;
+			}
 
 			if (!this._lastVideoFrame) {
 				return;
@@ -2079,18 +2099,6 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				});
 		};
 
-		// An ended track can't produce any more frames, so we close this source. Otherwise, the output would keep
-		// waiting for frames from this track, holding back the media of all other tracks until finalization.
-		const onTrackEnded = () => {
-			if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
-				return;
-			}
-
-			this.close();
-			this._closingPromise!.catch((error) => {
-				this._promiseWithResolvers.reject(error);
-			});
-		};
 		this._trackEndedListener = onTrackEnded;
 		this._track.addEventListener('ended', onTrackEnded);
 
@@ -2124,6 +2132,14 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 					const message = event.data as MediaStreamTrackProcessorWorkerMessage;
 
 					if (message.type === 'videoFrame' && message.trackId === this._workerTrackId) {
+						if (this._track.readyState === 'ended') {
+							// The worker's copy of the track keeps running after track.stop(), which fires no 'ended'
+							// event
+							message.videoFrame.close();
+							onTrackEnded();
+							return;
+						}
+
 						onVideoFrame(message.videoFrame);
 					} else if (message.type === 'error' && message.trackId === this._workerTrackId) {
 						this._promiseWithResolvers.reject(message.error);
@@ -3692,6 +3708,12 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			this._scriptProcessorNode.onaudioprocess = (event) => {
+				// A track stopped with track.stop() fires no 'ended' event, and the node keeps delivering silence
+				if (this._track.readyState === 'ended') {
+					onTrackEnded();
+					return;
+				}
+
 				// The event only fires once the whole buffer has been captured, so its start was captured a buffer's
 				// duration ago (~93 ms for 4096 frames at 44.1 kHz). Placing it by the time of the event would put the
 				// audio that much too late relative to the other tracks.
