@@ -2011,6 +2011,26 @@ export class MatroskaDemuxer extends Demuxer {
 
 			case EBMLId.Tag: {
 				this.currentTagTargetIsMovie = true;
+
+				// Targets decides whether the SimpleTags apply to the movie, but it may come after them, so let's read
+				// it first
+				const children = slice.slice(dataStartPos, size);
+				while (children.remainingLength >= MIN_HEADER_SIZE) {
+					const childStartPos = children.filePos;
+					const childHeader = readElementHeader(children);
+					if (!childHeader || childHeader.size === undefined) {
+						break;
+					}
+
+					if (childHeader.id === EBMLId.Targets) {
+						children.filePos = childStartPos;
+						this.traverseElement(children);
+						break;
+					}
+
+					children.skip(childHeader.size);
+				}
+
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 			}; break;
 
