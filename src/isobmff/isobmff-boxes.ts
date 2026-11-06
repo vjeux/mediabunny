@@ -61,7 +61,7 @@ import {
 	parseEac3SyncFrame,
 	parseOpusIdentificationHeader,
 } from '../codec-data';
-import { MetadataTags, RichImageData } from '../metadata';
+import { formatMetadataDate, MetadataTags, RichImageData } from '../metadata';
 import { Bitstream } from '../../shared/bitstream';
 import { VERSIONED_NAME } from '../version';
 
@@ -1720,6 +1720,9 @@ const addQuickTimeMetadataTagBoxes = (boxes: Box[], tags: MetadataTags) => {
 	// https://exiftool.org/TagNames/QuickTime.html (QuickTime UserData Tags)
 	// For QuickTime files, metadata tags are dumped into the udta box
 
+	// Keys left out on purpose, which a raw tag may not fill in
+	const omittedKeys = new Set<string>();
+
 	for (const { key, value } of keyValueIterator(tags)) {
 		switch (key) {
 			case 'title': {
@@ -1747,7 +1750,12 @@ const addQuickTimeMetadataTagBoxes = (boxes: Box[], tags: MetadataTags) => {
 			}; break;
 
 			case 'date': {
-				boxes.push(metadataTagStringBoxShort('©day', value.toISOString().slice(0, 10)));
+				const dateString = formatMetadataDate(value);
+				if (dateString !== null) {
+					boxes.push(metadataTagStringBoxShort('©day', dateString));
+				} else {
+					omittedKeys.add('©day');
+				}
 			}; break;
 
 			case 'comment': {
@@ -1782,7 +1790,7 @@ const addQuickTimeMetadataTagBoxes = (boxes: Box[], tags: MetadataTags) => {
 	if (tags.raw) {
 		for (const key in tags.raw) {
 			const value = tags.raw[key];
-			if (value == null || key.length !== 4 || boxes.some(x => x.type === key)) {
+			if (value == null || key.length !== 4 || boxes.some(x => x.type === key) || omittedKeys.has(key)) {
 				continue;
 			}
 
@@ -1837,6 +1845,8 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 		key: string;
 		value: Box;
 	}[] = [];
+	// Keys left out on purpose, which a raw tag may not fill in
+	const omittedKeys = new Set<string>();
 
 	// https://exiftool.org/TagNames/QuickTime.html (QuickTime ItemList Tags)
 	// This is the metadata format used for MP4 files
@@ -1887,10 +1897,13 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 			}; break;
 
 			case 'date': {
-				pairs.push({
-					key: isMdta ? 'date' : '©day',
-					value: dataStringBoxLong(value.toISOString().slice(0, 10)),
-				});
+				const dateString = formatMetadataDate(value);
+				const dateKey = isMdta ? 'date' : '©day';
+				if (dateString !== null) {
+					pairs.push({ key: dateKey, value: dataStringBoxLong(dateString) });
+				} else {
+					omittedKeys.add(dateKey);
+				}
 			}; break;
 
 			case 'images': {
@@ -1976,6 +1989,7 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 				value == null
 				|| (!isMdta && (key.length !== 4 || ILST_UNSAFE_RAW_KEYS.has(key)))
 				|| pairs.some(x => x.key === key)
+				|| omittedKeys.has(key)
 			) {
 				continue;
 			}
