@@ -1074,6 +1074,21 @@ test.concurrent('#EXT-X-STREAM-INF tags without BANDWIDTH attribute are rejected
 	await expect(input.getTracks()).rejects.toThrow('BANDWIDTH');
 });
 
+test.concurrent('#EXT-X-STREAM-INF tags must be followed by a URI, not by another tag', async () => {
+	const text = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.64001f,mp4a.40.2"
+variant.m3u8
+`;
+
+	const input = new Input({
+		formats: ALL_FORMATS,
+		source: new CustomPathedSource('master.m3u8', () => new BufferSource(new TextEncoder().encode(text))),
+	});
+
+	await expect(input.getTracks()).rejects.toThrow('a URI must follow the #EXT-X-STREAM-INF tag');
+});
+
 test.concurrent('URI-less video and audio renditions inherit variant bandwidth', async () => {
 	const text = `#EXTM3U
 #EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="video",NAME="Source",AUTOSELECT=YES,DEFAULT=YES
