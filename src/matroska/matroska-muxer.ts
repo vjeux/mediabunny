@@ -71,7 +71,15 @@ import {
 	OPUS_SAMPLE_RATE,
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
-import { InBandParameterSetWriter } from '../codec-data';
+import {
+	InBandParameterSetWriter,
+	concatNalUnitsInLengthPrefixed,
+	extractAvcDecoderConfigurationRecord,
+	extractHevcDecoderConfigurationRecord,
+	iterateNalUnitsInAnnexB,
+	serializeAvcDecoderConfigurationRecord,
+	serializeHevcDecoderConfigurationRecord,
+} from '../codec-data';
 import { FileSlice } from '../reader';
 import { filterAv1SampleObus } from '../codec-data';
 import { Muxer } from '../muxer';
@@ -126,6 +134,8 @@ type MatroskaTrackData = {
 		 * track metadata already hints at transparency.
 		 */
 		alphaMode: boolean | null;
+		/** Matroska stores AVC and HEVC length-prefixed, so Annex B packets need to be converted. */
+		requiresAnnexBTransformation: boolean;
 	};
 	/** Keeps parameter sets of later AVC/HEVC decoder configs, since CodecPrivate only holds the first one. */
 	parameterSetWriter: InBandParameterSetWriter | null;
@@ -895,8 +905,30 @@ export class MatroskaMuxer extends Muxer {
 		assert(meta.decoderConfig.codedWidth !== undefined);
 		assert(meta.decoderConfig.codedHeight !== undefined);
 
-		const displayAspectWidth = meta.decoderConfig.displayAspectWidth;
-		const displayAspectHeight = meta.decoderConfig.displayAspectHeight;
+		const decoderConfig = { ...meta.decoderConfig };
+		let requiresAnnexBTransformation = false;
+
+		if ((track.source._codec === 'avc' || track.source._codec === 'hevc') && !decoderConfig.description && packet) {
+			// The Matroska codec mappings store AVC and HEVC length-prefixed, with the decoder configuration record in
+			// CodecPrivate, but the missing description indicates Annex B. So, if the packet holds the parameter sets
+			// to build the record from, we convert. Otherwise, packets are written untouched like before.
+			let description: Uint8Array | null;
+			if (track.source._codec === 'avc') {
+				const record = extractAvcDecoderConfigurationRecord(packet.data);
+				description = record && serializeAvcDecoderConfigurationRecord(record);
+			} else {
+				const record = extractHevcDecoderConfigurationRecord(packet.data);
+				description = record && serializeHevcDecoderConfigurationRecord(record);
+			}
+
+			if (description) {
+				decoderConfig.description = description;
+				requiresAnnexBTransformation = true;
+			}
+		}
+
+		const displayAspectWidth = decoderConfig.displayAspectWidth;
+		const displayAspectHeight = decoderConfig.displayAspectHeight;
 
 		const aspectRatio = displayAspectWidth === undefined || displayAspectHeight === undefined
 			? null
@@ -912,12 +944,13 @@ export class MatroskaMuxer extends Muxer {
 				width: meta.decoderConfig.codedWidth,
 				height: meta.decoderConfig.codedHeight,
 				aspectRatio,
-				decoderConfig: meta.decoderConfig,
+				decoderConfig,
 				alphaMode: track.metadata.canBeTransparent || (packet ? !!packet.sideData.alpha : null),
+				requiresAnnexBTransformation,
 			},
 			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
-			codecPrivate: meta.decoderConfig.description ?? null,
+			codecPrivate: decoderConfig.description ?? null,
 			closed: false,
 			parameterSetWriter: (track.source._codec === 'avc' || track.source._codec === 'hevc')
 				&& meta.decoderConfig.description
@@ -940,7 +973,7 @@ export class MatroskaMuxer extends Muxer {
 			);
 		} else if (track.source._codec === 'prores') {
 			// "The Private Data contains the FourCC as found in MP4 movies"
-			newTrackData.codecPrivate = textEncoder.encode(meta.decoderConfig.codec);
+			newTrackData.codecPrivate = textEncoder.encode(decoderConfig.codec);
 		}
 
 		this.trackDatas.push(newTrackData);
@@ -1100,6 +1133,19 @@ export class MatroskaMuxer extends Muxer {
 				);
 			} else if (track.source._codec === 'av1') {
 				packetData = filterAv1SampleObus(packetData);
+			} else if (trackData.info.requiresAnnexBTransformation) {
+				const nalUnits = [...iterateNalUnitsInAnnexB(packetData)]
+					.map(loc => packetData.subarray(loc.offset, loc.offset + loc.length));
+				if (nalUnits.length === 0) {
+					// It's not valid Annex B data
+					throw new Error(
+						'Failed to transform packet data. Make sure all packets are provided in Annex B format, as'
+						+ ' specified in ITU-T-REC-H.264 and ITU-T-REC-H.265.',
+					);
+				}
+
+				// In-band parameter sets are kept, like in the MP4 muxer, since they can change mid-stream
+				packetData = concatNalUnitsInLengthPrefixed(nalUnits, 4);
 			}
 
 			const isKeyFrame = packet.type === 'key';
