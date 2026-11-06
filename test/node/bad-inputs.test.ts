@@ -2093,6 +2093,77 @@ test('Ogg: Vorbis with zero sample rate', async () => {
 	await expectGracefulRead(file, /Invalid Vorbis identification header/);
 });
 
+test('Ogg: Gaps in granule positions', async () => {
+	const readPackets = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const packets: { timestamp: number; duration: number }[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			packets.push({ timestamp: packet.timestamp, duration: packet.duration });
+		}
+		return packets;
+	};
+	const lookUp = async (file: Uint8Array, timestamp: number) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		return (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp))?.timestamp;
+	};
+
+	// Ten 20 ms Opus packets per page, with a second missing before the fourth page, as in a capture with a dropout
+	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
+	for (let i = 0; i < 6; i++) {
+		pages.push(oggPacketsPage({
+			headerType: i === 5 ? 4 : 0,
+			granule: 312 + 9600 * (i + 1) + (i >= 3 ? 48000 : 0),
+			sequence: 2 + i,
+		}, Array<Bytes>(10).fill(OPUS_PACKET)));
+	}
+	const opusFile = concatList(pages);
+
+	const opusTimestamps = (await readPackets(opusFile)).map(x => x.timestamp);
+	expect(opusTimestamps).toHaveLength(60);
+	expect(opusTimestamps[29]).toBeCloseTo(0.58, 10);
+	expect(opusTimestamps[30]).toBeCloseTo(1.6, 10);
+	expect(opusTimestamps[59]).toBeCloseTo(2.18, 10);
+
+	// Lookups agree, and one within the gap returns the last packet before it
+	for (const timestamp of opusTimestamps) {
+		expect(await lookUp(opusFile, timestamp)).toBe(timestamp);
+	}
+	expect(await lookUp(opusFile, 1)).toBe(opusTimestamps[29]);
+
+	// The same in Vorbis, with a second missing before the sixth page of a file whose granule positions are off by
+	// a sample here and there, which isn't a gap
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	const gappedVorbisFile = vorbisFile.slice();
+	const view = new DataView(gappedVorbisFile.buffer);
+	for (let pos = 0, pageIndex = 0; pos < gappedVorbisFile.length; pageIndex++) {
+		const segmentCount = gappedVorbisFile[pos + 26]!;
+		const lacing = gappedVorbisFile.subarray(pos + 27, pos + 27 + segmentCount);
+		const pageSize = 27 + segmentCount + lacing.reduce((a, b) => a + b, 0);
+
+		if (pageIndex >= 5 && view.getInt32(pos + 10, true) === 0) {
+			view.setUint32(pos + 6, view.getUint32(pos + 6, true) + 44100, true);
+			view.setUint32(pos + 22, 0, true);
+			view.setUint32(pos + 22, oggCrc(gappedVorbisFile.subarray(pos, pos + pageSize)), true);
+		}
+
+		pos += pageSize;
+	}
+
+	const vorbisPackets = await readPackets(vorbisFile);
+	for (let i = 1; i < vorbisPackets.length; i++) {
+		const previous = vorbisPackets[i - 1]!;
+		expect(vorbisPackets[i]!.timestamp).toBeCloseTo(previous.timestamp + previous.duration, 10);
+	}
+
+	const gappedVorbisPackets = await readPackets(gappedVorbisFile);
+	expect(gappedVorbisPackets).toHaveLength(vorbisPackets.length);
+	const firstShifted = gappedVorbisPackets.findIndex((x, i) => x.timestamp !== vorbisPackets[i]!.timestamp);
+	expect(firstShifted).toBeGreaterThan(0);
+	for (let i = firstShifted; i < vorbisPackets.length; i++) {
+		expect(gappedVorbisPackets[i]!.timestamp).toBeCloseTo(vorbisPackets[i]!.timestamp + 1, 10);
+	}
+});
+
 const opusPages = (options: { pageCount?: number; lastEos?: boolean } = {}) => {
 	const pageCount = options.pageCount ?? 10;
 	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
