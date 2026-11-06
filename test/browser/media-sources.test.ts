@@ -822,3 +822,83 @@ test.each(['audio', 'video'] as const)(
 		expect(lateFragmentsBeforeFinalize).toBeGreaterThan(0);
 	},
 );
+
+test.for(['video', 'audio'] as const)(
+	'MediaStream sources, track.stop() closes the %s source when capturing without MediaStreamTrackProcessor',
+	async (kind, { skip }) => {
+		// Without MediaStreamTrackProcessor (Firefox, Safari), video is sampled from a <video> element and audio comes
+		// through a ScriptProcessorNode. Stopping a track with track.stop() fires no 'ended' event.
+		let track: MediaStreamVideoTrack | MediaStreamAudioTrack;
+		let audioContext: AudioContext | null = null;
+		let stopDrawing = () => {};
+		if (kind === 'video') {
+			const canvas = document.createElement('canvas');
+			canvas.width = 64;
+			canvas.height = 48;
+			document.body.appendChild(canvas);
+			const context = canvas.getContext('2d')!;
+			let frame = 0;
+			const drawInterval = setInterval(() => {
+				context.fillStyle = `rgb(${frame++ % 256}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+			}, 20);
+			stopDrawing = () => {
+				clearInterval(drawInterval);
+				canvas.remove();
+			};
+			track = canvas.captureStream(30).getVideoTracks()[0]!;
+		} else {
+			audioContext = new AudioContext();
+			await Promise.race([audioContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
+			if (audioContext.state !== 'running') {
+				await audioContext.close();
+				skip('Web Audio cannot run here without a user gesture');
+			}
+			const destination = audioContext.createMediaStreamDestination();
+			const oscillator = audioContext.createOscillator();
+			oscillator.connect(destination);
+			oscillator.start();
+			track = destination.stream.getAudioTracks()[0]!;
+		}
+
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const errors: unknown[] = [];
+		if (track.kind === 'video') {
+			const source = new MediaStreamVideoTrackSource(track, { codec: 'vp8', quality: new Quality('low') });
+			source.errorPromise.catch(error => errors.push(error));
+			output.addVideoTrack(source);
+		} else {
+			const source = new MediaStreamAudioTrackSource(track, { codec: 'opus', quality: new Quality('low') });
+			source.errorPromise.catch(error => errors.push(error));
+			output.addAudioTrack(source);
+		}
+
+		const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+		const processor = globals.MediaStreamTrackProcessor;
+		globals.MediaStreamTrackProcessor = undefined;
+		try {
+			await output.start();
+		} finally {
+			globals.MediaStreamTrackProcessor = processor;
+		}
+
+		await new Promise(resolve => setTimeout(resolve, 600));
+		track.stop();
+		await new Promise(resolve => setTimeout(resolve, 600));
+		await output.finalize();
+		stopDrawing();
+		await audioContext?.close();
+
+		expect(errors).toEqual([]);
+
+		// The recording ends where the track was stopped, instead of repeating the last frame (or silence) until
+		// finalize()
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const duration = await input.computeDuration();
+		expect(duration).toBeGreaterThan(0.3);
+		expect(duration).toBeLessThan(0.9);
+	},
+);
