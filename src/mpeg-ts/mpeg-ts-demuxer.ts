@@ -41,6 +41,7 @@ import {
 	extractNalUnitTypeForHevc,
 	iterateNalUnitsInAnnexB,
 	parseDtsFrame,
+	removeEmulationPreventionBytes,
 	parseDtsCoreFrameHeader,
 	parseDtsExssHeader,
 	DTS_CORE_FRAME_HEADER_SIZE,
@@ -1974,14 +1975,44 @@ type SuppliedPacket = {
 	randomAccessIndicator: number;
 };
 
-const containsSeiNalUnit = (codec: VideoCodec, data: Uint8Array) => {
+const RECOVERY_POINT_SEI_PAYLOAD_TYPE = 6; // The same in AVC and HEVC
+
+/** Whether the access unit carries a recovery point SEI message, which marks a random access point. */
+const containsRecoveryPointSei = (codec: VideoCodec, data: Uint8Array) => {
 	for (const loc of iterateNalUnitsInAnnexB(data)) {
 		const isSei = codec === 'avc'
 			? extractNalUnitTypeForAvc(data[loc.offset]!) === AvcNalUnitType.SEI
 			: extractNalUnitTypeForHevc(data[loc.offset]!) === HevcNalUnitType.PREFIX_SEI_NUT;
+		if (!isSei) {
+			continue;
+		}
 
-		if (isSei) {
-			return true;
+		const nalHeaderSize = codec === 'avc' ? 1 : 2;
+		const nalUnitPayload = data.subarray(loc.offset + nalHeaderSize, loc.offset + loc.length);
+		const bytes = removeEmulationPreventionBytes(nalUnitPayload);
+
+		// sei_rbsp(): sei_message()s until the rbsp_trailing_bits
+		let pos = 0;
+		while (pos < bytes.length && !(pos === bytes.length - 1 && bytes[pos] === 0x80)) {
+			let payloadType = 0;
+			while (bytes[pos] === 0xff) {
+				payloadType += 0xff;
+				pos++;
+			}
+			payloadType += bytes[pos++] ?? 0;
+
+			let payloadSize = 0;
+			while (bytes[pos] === 0xff) {
+				payloadSize += 0xff;
+				pos++;
+			}
+			payloadSize += bytes[pos++] ?? 0;
+
+			if (payloadType === RECOVERY_POINT_SEI_PAYLOAD_TYPE) {
+				return true;
+			}
+
+			pos += payloadSize;
 		}
 	}
 
@@ -2637,12 +2668,12 @@ class PacketReadingContext {
 
 			if (randomAccessIndicator === 1) {
 				// Some muxers set random_access_indicator on packets that aren't key frames (on every PES packet, or on
-				// the ones carrying a PCR). A picture that is neither IDR/IRAP nor comes with an SEI message (which a
-				// recovery point would need) can't be a random access point, so the flag lied and can't be trusted
-				// from here on.
+				// the ones carrying a PCR). A picture that is neither IDR/IRAP nor comes with a recovery point SEI
+				// message (as open-GOP and intra-refresh streams use) can't be a random access point, so the flag
+				// lied and can't be trusted from here on.
 				if (
 					determineVideoPacketType(codec, decoderConfig, data) !== 'key'
-					&& !containsSeiNalUnit(codec, data)
+					&& !containsRecoveryPointSei(codec, data)
 				) {
 					randomAccessIndicator = 0;
 					this.elementaryStream.canBeTrustedWithKeyPackets = false;

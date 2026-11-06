@@ -801,6 +801,67 @@ test('MPEG-TS init input without stream data', async () => {
 	expect(await audioTrack.getSampleRate()).toBe(48000);
 });
 
+test('MPEG-TS random_access_indicator on every frame with per-frame SEI messages', async () => {
+	// Every PES packet is flagged with random_access_indicator, and every frame carries an SEI message (a pic_timing
+	// one, as x264 writes with pic-struct, or broadcast caption data). Only the IDR frame and the frame with a recovery
+	// point SEI message are random access points.
+	const packets: Uint8Array[] = [];
+	const pushPes = (pid: number, payload: number[], randomAccess: boolean) => {
+		for (let i = 0; i < payload.length; i += 182) {
+			const chunk = payload.slice(i, i + 182);
+			const packet = new Uint8Array(188).fill(0xff);
+			const adaptationLength = 184 - chunk.length; // At least 2: length and flags
+			packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, 0x30, adaptationLength - 1], 0);
+			packet[5] = i === 0 && randomAccess ? 0x40 : 0x00;
+			packet.set(chunk, 4 + adaptationLength);
+			packets.push(packet);
+		}
+	};
+
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const aud = [0x09, 0xf0];
+	const picTimingSei = [0x06, 0x01, 0x02, 0x00, 0x00, 0x80]; // payloadType 1
+	const recoveryPointSei = [0x06, 0x01, 0x02, 0x00, 0x00, 0x06, 0x01, 0x80, 0x80]; // pic_timing, then payloadType 6
+	const idr = [0x65, 0x88, 0x84, 0x00, 0x33, ...new Array<number>(30).fill(0xaa)];
+	const slice = [0x41, 0x9a, 0x02, 0x04, ...new Array<number>(20).fill(0xaa)];
+	const nal = (nalUnit: number[]) => [0, 0, 0, 1, ...nalUnit];
+
+	pushPes(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0], false);
+	pushPes(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	], false);
+
+	const expectedTypes = ['key', 'delta', 'delta', 'delta', 'key', 'delta', 'delta', 'delta'];
+	expectedTypes.forEach((type, i) => {
+		const au = i === 0
+			? [aud, sps, pps, picTimingSei, idr]
+			: [aud, type === 'key' ? recoveryPointSei : picTimingSei, slice];
+		const pts = 3000 * i;
+		pushPes(0x100, [
+			0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff,
+			((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1, ...au.flatMap(nal),
+		], true);
+	});
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+	const types: string[] = [];
+	for await (const packet of sink.packets()) {
+		types.push(packet.type);
+	}
+
+	expect(types).toEqual(expectedTypes);
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
