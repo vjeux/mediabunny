@@ -977,6 +977,83 @@ test.concurrent('Live HLS', { timeout: 30_000 }, async () => {
 	expect(consoleSpy).not.toHaveBeenCalled();
 });
 
+test('Live playlists are not reloaded before a target duration has passed', async () => {
+	// "the client MUST wait for at least the target duration before attempting to reload the Playlist file again,
+	// measured from the last time the client began loading the Playlist file" (RFC 8216, Section 6.3.4)
+	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+
+	try {
+		let playlistReads = 0;
+		using input = new Input({
+			source: new CustomPathedSource('live.m3u8', ({ path }) => {
+				if (path === 'live.m3u8') {
+					playlistReads++;
+					return new BufferSource(new TextEncoder().encode('#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n0.ts\n'));
+				}
+
+				return new FilePathSource('./test/public/0.ts');
+			}),
+			formats: HLS_FORMATS,
+		});
+
+		// Loaded at time 0
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(playlistReads).toBe(1);
+
+		// 40 ms before the target duration has passed, a refresh is due soon, but must not happen yet
+		await vi.advanceTimersByTimeAsync(960);
+		const refreshIntervalPromise = videoTrack.getLiveRefreshInterval();
+		await vi.advanceTimersByTimeAsync(30);
+		expect(playlistReads).toBe(1);
+
+		await vi.advanceTimersByTimeAsync(20);
+		expect(await refreshIntervalPromise).toBe(1);
+		expect(playlistReads).toBe(2);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test('An unchanged live playlist is reloaded after half the target duration', async () => {
+	// "If the client reloads a Playlist file and finds that it has not changed, then it MUST wait for a period of
+	// one-half the target duration before retrying." (RFC 8216, Section 6.3.4)
+	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+
+	try {
+		const loadTimes: number[] = [];
+		using input = new Input({
+			source: new CustomPathedSource('live.m3u8', ({ path }) => {
+				if (path === 'live.m3u8') {
+					loadTimes.push(performance.now());
+					// Unchanged on the second load, a new segment on the third one
+					const segmentCount = loadTimes.length < 3 ? 1 : 2;
+					return new BufferSource(new TextEncoder().encode(
+						'#EXTM3U\n#EXT-X-TARGETDURATION:1\n' + '#EXTINF:1,\n0.ts\n'.repeat(segmentCount),
+					));
+				}
+
+				return new FilePathSource('./test/public/0.ts');
+			}),
+			formats: HLS_FORMATS,
+		});
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		const start = loadTimes[0]!;
+
+		for (const time of [1000, 1500, 2000, 2500]) {
+			await vi.advanceTimersByTimeAsync(start + time - performance.now());
+			expect(await videoTrack.getLiveRefreshInterval()).toBe(1);
+		}
+
+		// Unchanged at 1000 ms, so retried at 1500 ms; changed then, so not reloaded again before 2500 ms
+		expect(loadTimes.map(x => x - start)).toEqual([0, 1000, 1500, 2500]);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
 test.concurrent('Mp4InputFormat recognises a CMAF segment that starts with sidx', async () => {
 	const bytes = new Uint8Array(12);
 	new DataView(bytes.buffer).setUint32(0, 60); // box size
