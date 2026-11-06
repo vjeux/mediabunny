@@ -1132,3 +1132,28 @@ test('MPEG-TS takes the PTS of the PES packet an access unit begins in', async (
 	expect(nalUnitTypes).toEqual([9, 7, 8, 9, 7, 8, 5]);
 	await expectLookupsToFindEachPacket(sink, packets);
 });
+
+test('MPEG-TS with each access unit\'s AUD at the end of the previous PES packet', async () => {
+	// The PAT, PMT and video packets of the first 711 TS packets of samples.ffmpeg.org/archive/all/
+	// mpegts+h264+mp2++phil_crash_robots.ts. Every PES packet holds one picture (I, P, B, B, P, B, B, ... with a
+	// matching PTS and DTS), followed by the next access unit's AUD.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/aud-ends-pes.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = await readAllPackets(sink);
+
+	// Each picture takes the PTS of its own PES packet. Going by where the AUD is (like FFmpeg does) would give each
+	// one the PTS of the picture before it.
+	expect(packets.map(x => Math.round(x.timestamp * 90_000))).toEqual([
+		3600, 14400, 7200, 10800, 25200, 18000, 21600, 36000, 28800, 32400, 46800, 39600, 43200, 57600,
+	]);
+
+	for (const packet of packets) {
+		expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+	}
+});
