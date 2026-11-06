@@ -1105,7 +1105,10 @@ export class MpegTsDemuxer extends Demuxer {
 		}
 
 		let slice = this.reader.requestSlice(packetPos, length);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+
 		return slice ?? undefined;
 	}
 
