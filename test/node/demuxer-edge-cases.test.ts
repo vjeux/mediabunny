@@ -7,6 +7,7 @@ import { EncodedPacket } from '../../src/packet.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
 import {
 	adtsFrame,
+	annexB,
 	ascii,
 	buildAvcSps,
 	buildMp4,
@@ -752,6 +753,51 @@ describe('MPEG-TS demuxing', () => {
 		});
 		const info = await describeTrack(buildTs({ pes: [tsPes(0xc0, concatBytes(...frames), 0)] }));
 		expect(info.packets).toEqual(frames.map((_, i) => `${Math.round(i * 1024 / 48000 * 1e5) / 1e5}:67`));
+	});
+
+	test('lookups in a long H.264 stream land on the right frames and key frames', async () => {
+		// 60 frames at 25 fps starting at 1 s, a key frame every 10 frames, ~2 KB each so that lookups have to search
+		const sps = buildAvcSps({ profileIdc: 66, levelIdc: 30 });
+		const pps = [0x68, 0xce, 0x38, 0x80];
+		const counter = { value: 0 };
+		const frames = Array.from({ length: 60 }, (_, i) => {
+			const isKey = i % 10 === 0;
+			const slice = [isKey ? 0x65 : 0x41, 0x88, 0x84, ...new Array<number>(2000).fill((i & 0xff) | 1)];
+			const accessUnit = isKey ? annexB([0x09, 0xf0], sps, pps, slice) : annexB([0x09, 0xf0], slice);
+			const pts = 90000 + i * 3600;
+			return tsPackets(0x100, tsPes(0xe0, accessUnit, pts, pts), { counter });
+		});
+		const bytes = concatBytes(
+			tsPackets(0, tsPat([[1, 0x1000]])),
+			tsPackets(0x1000, tsPmt(1, [[0x1b, 0x100]])),
+			...frames,
+		);
+
+		using input = openBytes(bytes);
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect(await track.getCodec()).toBe('avc');
+		expect(await track.computeDuration()).toBeCloseTo(3.4, 10);
+		const sink = new EncodedPacketSink(track);
+		const frameIndex = (packet: EncodedPacket | null) => packet && Math.round((packet.timestamp - 1) / 0.04);
+
+		let count = 0;
+		for await (const packet of sink.packets()) {
+			expect([frameIndex(packet), packet.type]).toEqual([count, count % 10 === 0 ? 'key' : 'delta']);
+			count++;
+		}
+		expect(count).toBe(60);
+
+		for (let i = 0; i < 60; i += 7) {
+			for (const t of [1 + i * 0.04, 1 + i * 0.04 + 0.02]) {
+				expect(frameIndex(await sink.getPacket(t))).toBe(i);
+				expect(frameIndex(await sink.getKeyPacket(t))).toBe(i - (i % 10));
+			}
+		}
+		expect(await sink.getPacket(0.5)).toBe(null);
+		expect(frameIndex(await sink.getPacket(10))).toBe(59);
+		const middle = (await sink.getPacket(1.5))!;
+		expect(frameIndex(await sink.getNextKeyPacket(middle))).toBe(20);
+		expect(frameIndex(await sink.getNextPacket(middle))).toBe(13);
 	});
 
 	test('the network PID entry in the PAT and unknown stream types are skipped', async () => {
