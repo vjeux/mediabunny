@@ -234,7 +234,8 @@ export class Mp3Demuxer extends Demuxer {
 				return this.metadataTags;
 			}
 
-			this.metadataTags = {};
+			// Only cached once complete, so that a tag that fails to parse fails every call, not just the first one
+			const metadataTags: MetadataTags = {};
 			let currentPos = 0;
 			let id3V2HeaderFound = false;
 
@@ -254,7 +255,7 @@ export class Mp3Demuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				if (!contentSlice) break;
 
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				parseId3V2Tag(contentSlice, id3V2Header, metadataTags);
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
@@ -267,11 +268,12 @@ export class Mp3Demuxer extends Demuxer {
 
 				const tag = readAscii(slice, 3);
 				if (tag === 'TAG') {
-					parseId3V1Tag(slice, this.metadataTags);
+					parseId3V1Tag(slice, metadataTags);
 				}
 			}
 
-			return this.metadataTags;
+			this.metadataTags = metadataTags;
+			return metadataTags;
 		} finally {
 			release();
 		}

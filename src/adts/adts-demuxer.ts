@@ -163,7 +163,8 @@ export class AdtsDemuxer extends Demuxer {
 				return this.metadataTags;
 			}
 
-			this.metadataTags = {};
+			// Only cached once complete, so that a tag that fails to parse fails every call, not just the first one
+			const metadataTags: MetadataTags = {};
 			let currentPos = 0;
 
 			while (true) {
@@ -180,12 +181,13 @@ export class AdtsDemuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				if (!contentSlice) break;
 
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				parseId3V2Tag(contentSlice, id3V2Header, metadataTags);
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
-			return this.metadataTags;
+			this.metadataTags = metadataTags;
+			return metadataTags;
 		} finally {
 			release();
 		}
