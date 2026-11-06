@@ -760,24 +760,8 @@ export class MpegTsDemuxer extends Demuxer {
 								elementaryStream.info.numberOfChannels
 									= AC3_ACMOD_CHANNEL_COUNTS[frameInfo.acmod]! + frameInfo.lfeon;
 								elementaryStream.info.sampleRate = AC3_SAMPLE_RATES[frameInfo.fscod]!;
-							} else if (
-								elementaryStream.info.codec === 'eac3'
-								&& isAc3FamilyFrame(context.suppliedPacket.data)
-							) {
-								// Blu-ray's Dolby Digital Plus streams carry an AC-3 frame as the core of each frame,
-								// and E-AC-3 data extending it in dependent substreams after it
-								const frameInfo = parseAc3SyncFrame(context.suppliedPacket.data);
-								if (!frameInfo || frameInfo.fscod === 3) {
-									throw new Error(
-										'Invalid E-AC-3 audio stream; could not read AC-3 core frame from first'
-										+ ' packet.',
-									);
-								}
-
-								elementaryStream.info.numberOfChannels
-									= AC3_ACMOD_CHANNEL_COUNTS[frameInfo.acmod]! + frameInfo.lfeon;
-								elementaryStream.info.sampleRate = AC3_SAMPLE_RATES[frameInfo.fscod]!;
 							} else if (elementaryStream.info.codec === 'eac3') {
+								// For Blu-ray's Dolby Digital Plus, this is an AC-3 frame (the core of each frame)
 								const frameInfo = parseEac3SyncFrame(context.suppliedPacket.data);
 								if (!frameInfo) {
 									throw new Error(

@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Conversion } from '../../src/conversion.js';
+import { Output } from '../../src/output.js';
+import { Mp4OutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -856,6 +860,27 @@ test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3
 		expect(packets.map(packet => [packet.timestamp, packet.duration, packet.byteLength])).toEqual(
 			[0, 1, 2, 3, 4, 5, 6, 7].map(i => [0.032 * i, 0.032, frameSize]),
 		);
+
+		// The packets can be copied to MP4, whose dec3 box describes the AC-3 core
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+
+		using mp4Input = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+		const mp4AudioTrack = await mp4Input.getPrimaryAudioTrack();
+		assert(mp4AudioTrack);
+		expect(await mp4AudioTrack.getCodec()).toBe('eac3');
+		expect(await mp4AudioTrack.getNumberOfChannels()).toBe(2);
+		expect(await mp4AudioTrack.getSampleRate()).toBe(48000);
+
+		const mp4Packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(mp4AudioTrack).packets()) {
+			mp4Packets.push(packet);
+		}
+		expect(mp4Packets.map(packet => packet.byteLength)).toEqual(new Array<number>(8).fill(frameSize));
 	}
 });
 
