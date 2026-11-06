@@ -1554,3 +1554,57 @@ test('MPEG-TS track language and audio type come from the ISO 639 language descr
 		expect(disposition.visuallyImpaired).toBe(visuallyImpaired);
 	}
 });
+
+test('MPEG-TS reading one track after another stays linear', async () => {
+	// Two AAC streams with one PES packet per TS packet, interleaved. Reading the second track used to insert each of
+	// its section ends into the middle of a sorted array holding the first track's, which took quadratic time.
+	const count = 80_000;
+	const tsPacket = (pid: number, payload: number[]) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		const adaptationFieldLength = 183 - payload.length;
+		packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, 0x30, adaptationFieldLength, 0x00]);
+		packet.set(payload, 188 - payload.length);
+		return packet;
+	};
+	const streams = [0x100, 0x101].flatMap(pid => [0x0f, 0xe0 | (pid >> 8), pid & 0xff, 0xf0, 0x00]);
+	const adtsFrame = [0xff, 0xf1, 0x50, 0x80, 0x01, 0x1f, 0xfc, 0x00];
+
+	const file = new Uint8Array(188 * (2 + 2 * count));
+	file.set(tsPacket(0, [0, 0x00, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]), 0);
+	file.set(tsPacket(0x1000, [
+		0, 0x02, 0xb0, 13 + streams.length, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, ...streams, 0, 0, 0, 0,
+	]), 188);
+	for (let i = 0; i < count; i++) {
+		const pts = 90_000 + Math.round(i * 1024 * 90_000 / 44_100);
+		const pes = [
+			0, 0, 1, 0xc0, 0, 8 + adtsFrame.length, 0x80, 0x80, 5,
+			0x21 | ((Math.floor(pts / 2 ** 30) % 8) << 1),
+			(pts >> 22) & 0xff,
+			(((pts >> 15) & 0x7f) << 1) | 1,
+			(pts >> 7) & 0xff,
+			((pts & 0x7f) << 1) | 1,
+			...adtsFrame,
+		];
+		file.set(tsPacket(0x100, pes), 188 * (2 + 2 * i));
+		file.set(tsPacket(0x101, pes), 188 * (3 + 2 * i));
+	}
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const tracks = await input.getAudioTracks();
+	expect(tracks).toHaveLength(2);
+
+	const durations: number[] = [];
+	for (const track of tracks) {
+		const start = performance.now();
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+			void packet;
+			packetCount++;
+		}
+		durations.push(performance.now() - start);
+		expect(packetCount).toBeGreaterThan(count - 2);
+	}
+
+	// Both tracks span the same bytes, so reading the second one shouldn't take much longer than the first
+	expect(durations[1]!).toBeLessThan(2 * durations[0]! + 100);
+});
