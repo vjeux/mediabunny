@@ -15,6 +15,7 @@ import { isRecordStringString } from './misc';
  *
  * - For MP4/QuickTime files, the metadata refers to the data in `'moov'`-level `'udta'` and `'meta'` atoms.
  * - For WebM/Matroska files, the metadata refers to the Tags and Attachments elements whose target is 50 (MOVIE).
+ * WebM output leaves out Attachments (images and attached files), which WebM doesn't support.
  * - For MP3 files, the metadata refers to the ID3v2 or ID3v1 tags.
  * - For Ogg files, there is no global metadata so instead, the metadata refers to the combined metadata of all tracks,
  * in Vorbis-style comment headers.
