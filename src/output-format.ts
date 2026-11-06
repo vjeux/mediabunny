@@ -478,6 +478,13 @@ export class MovOutputFormat extends IsobmffOutputFormat {
 		];
 	}
 
+	override getSupportedTrackCounts(): TrackCountLimits {
+		return {
+			...super.getSupportedTrackCounts(),
+			subtitle: { min: 0, max: 0 }, // No subtitle codecs are supported
+		};
+	}
+
 	/** @internal */
 	override _codecUnsupportedHint(codec: MediaCodec) {
 		if (new Mp4OutputFormat().getSupportedCodecs().includes(codec)) {
