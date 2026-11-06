@@ -1006,6 +1006,54 @@ test.concurrent('#EXT-X-I-FRAME-STREAM-INF tags are parsed properly', async () =
 	expect(await tracks[0]!.hasOnlyKeyPackets()).toBe(true);
 });
 
+test.concurrent('#EXT-X-ENDLIST can appear anywhere in a media playlist', async () => {
+	const countPackets = async (track: InputVideoTrack) => {
+		const sink = new EncodedPacketSink(track);
+		let count = 0;
+		for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+			count++;
+		}
+		return count;
+	};
+
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/0.ts'), formats: ALL_FORMATS });
+	const sourceVideoTrack = await sourceInput.getPrimaryVideoTrack();
+	assert(sourceVideoTrack);
+	const packetsPerSegment = await countPackets(sourceVideoTrack);
+
+	// "It MAY occur anywhere in the Media Playlist file" (RFC 8216, Section 4.3.3.4): before, between and after the
+	// two segments
+	for (const position of [0, 1, 2]) {
+		const lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:5'];
+		for (let i = 0; i <= 2; i++) {
+			if (i === position) {
+				lines.push('#EXT-X-ENDLIST');
+			}
+			if (i === 1) {
+				lines.push('#EXT-X-DISCONTINUITY');
+			}
+			if (i < 2) {
+				lines.push('#EXTINF:5,', '0.ts');
+			}
+		}
+		const playlist = lines.join('\n') + '\n';
+
+		using input = new Input({
+			source: new CustomPathedSource('playlist.m3u8', ({ path }) => path === 'playlist.m3u8'
+				? new BufferSource(new TextEncoder().encode(playlist))
+				: new FilePathSource('./test/public/0.ts')),
+			formats: HLS_FORMATS,
+		});
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.isLive()).toBe(false);
+		expect(await videoTrack.getDurationFromMetadata()).toBe(10);
+
+		expect(await countPackets(videoTrack)).toBe(2 * packetsPerSegment);
+	}
+});
+
 test.concurrent('#EXT-X-I-FRAME-STREAM-INF tags without BANDWIDTH attribute are rejected', async () => {
 	const text = `#EXTM3U
 #EXT-X-I-FRAME-STREAM-INF:CODECS="avc1.4D401E",RESOLUTION=480x270,URI="7f2459cb12854fdbbc7ec1e7279da179/f74fb10563564130a4702743d64112a3/index_11.m3u8"

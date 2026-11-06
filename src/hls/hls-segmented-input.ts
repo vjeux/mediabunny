@@ -558,8 +558,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 				this.refreshInterval = clamp(duration, 0.5, 3600); // Clamped for safety
 			} else if (line === TAG_ENDLIST) {
+				// "It MAY occur anywhere in the Media Playlist file", so keep reading the segments that follow it
 				this.streamHasEnded = true;
-				break; // No need to keep reading after this
 			} else if (line.startsWith(TAG_PLAYLIST_TYPE)) {
 				const type = line.slice(TAG_PLAYLIST_TYPE.length).toLowerCase();
 
