@@ -303,7 +303,8 @@ describe('Opus in Ogg (RFC 7845)', () => {
 			expectedDurations.push(frame, 2 * frame, 2 * frame);
 			// Code 3 carries an explicit frame count; a packet may hold at most 120 ms (RFC 6716 section 3.2.5)
 			const maxFrames = 5760 / frame;
-			for (const count of [1, 3, maxFrames]) {
+			for (const count of new Set([1, Math.min(3, maxFrames), maxFrames])) {
+				expect(count * frame).toBeLessThanOrEqual(5760);
 				packets.push(buildOpusPacket(config, 3, count));
 				expectedDurations.push(count * frame);
 			}
@@ -321,6 +322,28 @@ describe('Opus in Ogg (RFC 7845)', () => {
 			expectedStart += duration;
 			return start;
 		}));
+	});
+
+	test('reads on past malformed packets declaring more than 120 ms', async () => {
+		// RFC 6716 section 3.2.5 caps a packet at 120 ms, which code 3 frame counts can exceed: 3 frames of 60 ms
+		// (configurations 3, 7 and 11), or up to 63 frames of 20 ms. Such packets are invalid, so their duration isn't
+		// pinned here, but reading must go on, with timestamps that don't go backwards.
+		const packets = [
+			buildOpusPacket(1, 0), // A valid 20 ms packet
+			buildOpusPacket(3, 3, 3), // 3 × 60 ms
+			buildOpusPacket(19, 3, 63), // 63 × 20 ms
+			buildOpusPacket(1, 0),
+		];
+		const bytes = buildOpusStream({ preSkip: 0, pages: [{ packets }] });
+
+		const read = await readTrackPackets(bytes);
+		expect(read).toHaveLength(packets.length);
+		for (const [i, packet] of read.entries()) {
+			expect(Number.isFinite(packet.timestamp) && Number.isFinite(packet.duration)).toBe(true);
+			if (i > 0) {
+				expect(packet.timestamp).toBeGreaterThanOrEqual(read[i - 1]!.timestamp);
+			}
+		}
 	});
 
 	test('starts the stream later when the first page granule exceeds its samples, as in live captures', async () => {
