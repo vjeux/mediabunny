@@ -1565,6 +1565,7 @@ const colorAlphaSplitterWorkerCode = () => {
 			visibleRect,
 			timestamp: sourceFrame.timestamp,
 			duration: sourceFrame.duration ?? undefined,
+			colorSpace: sourceFrame.colorSpace.toJSON(),
 			transfer: [colorBuffer.buffer],
 		};
 		const alphaInit = {
