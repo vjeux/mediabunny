@@ -2014,25 +2014,43 @@ const assembleSlice = (start: number, end: number, parts: SlicePart[]): ReadResu
 	};
 };
 
-type PrefetchProfile = (start: number, end: number, workers: ReadWorker[]) => {
+/**
+ * Returns the range to load for a read of [start, end). The data loaded around the read has to fit into the cache
+ * (`maxCacheSize`); otherwise, it's evicted before it's read and then requested again.
+ */
+type PrefetchProfile = (start: number, end: number, workers: ReadWorker[], maxCacheSize: number) => {
 	start: number;
 	end: number;
 };
 
+/** The largest power of 2 not above `x`, or 0 if `x` is below 1. */
+const floorToPowerOf2 = (x: number) => x < 1 ? 0 : 2 ** Math.floor(Math.log2(x));
+
 const PREFETCH_PROFILES = {
 	none: (start, end) => ({ start, end }),
-	fileSystem: (start, end) => {
-		const padding = 2 ** 16;
+	fileSystem: (start, end, workers, maxCacheSize) => {
+		const padding = Math.min(2 ** 16, floorToPowerOf2(maxCacheSize / 4));
+		if (padding === 0) {
+			return { start, end };
+		}
 
 		start = Math.floor((start - padding) / padding) * padding;
 		end = Math.ceil((end + padding) / padding) * padding;
 
 		return { start, end };
 	},
-	network: (start, end, workers) => {
+	network: (start, end, workers, maxCacheSize) => {
+		// What's loaded ahead of the read has to fit into the cache next to what's being read
+		const maxLoadAhead = floorToPowerOf2(maxCacheSize / 2);
+		if (maxLoadAhead === 0) {
+			return { start, end };
+		}
+
 		// Add a slight bit of start padding because backwards reading is painful
-		const paddingStart = 2 ** 16;
-		start = Math.max(0, Math.floor((start - paddingStart) / paddingStart) * paddingStart);
+		const paddingStart = Math.min(2 ** 16, floorToPowerOf2(maxLoadAhead / 2));
+		if (paddingStart > 0) {
+			start = Math.max(0, Math.floor((start - paddingStart) / paddingStart) * paddingStart);
+		}
 
 		// Remote resources have extreme latency (relatively speaking), so the benefit from intelligent
 		// prefetching is great. The network prefetch strategy is as follows: When we notice
@@ -2042,7 +2060,7 @@ const PREFETCH_PROFILES = {
 		// is small. Or, we're repeatedly doing a sequential access pattern (common in media files), in which
 		// case we can become more and more confident to prefetch more and more data.
 		for (const worker of workers) {
-			const maxExtensionAmount = 8 * 2 ** 20; // 8 MiB
+			const maxExtensionAmount = Math.min(8 * 2 ** 20 /* 8 MiB */, maxLoadAhead);
 
 			// When the read region cross the threshold point, we trigger a prefetch. This point is typically
 			// in the middle of the worker's read region, or a fixed offset from the end if the region has grown
@@ -2068,7 +2086,7 @@ const PREFETCH_PROFILES = {
 			}
 		}
 
-		end = Math.max(end, start + URL_SOURCE_MIN_LOAD_AMOUNT);
+		end = Math.max(end, start + Math.min(URL_SOURCE_MIN_LOAD_AMOUNT, maxLoadAhead));
 
 		return {
 			start,
@@ -2149,7 +2167,12 @@ class ReadOrchestrator {
 	): MaybePromise<ReadResult | null> {
 		assert(!this.disposed);
 
-		const prefetchRange = this.options.prefetchProfile(innerStart, innerEnd, this.workers);
+		const prefetchRange = this.options.prefetchProfile(
+			innerStart,
+			innerEnd,
+			this.workers,
+			this.options.maxCacheSize,
+		);
 		const outerStart = Math.max(prefetchRange.start, minReadPosition);
 		const outerEnd = Math.min(prefetchRange.end, this.fileSize ?? Infinity, maxReadPosition);
 		assert(outerStart <= innerStart && innerEnd <= outerEnd);
