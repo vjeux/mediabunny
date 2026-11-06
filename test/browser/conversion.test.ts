@@ -17,11 +17,12 @@ import { BufferTarget, PathedTarget } from '../../src/target.js';
 import { Conversion, ConversionCanceledError, ConversionOptions } from '../../src/conversion.js';
 import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
 import { InputVideoTrack } from '../../src/input-track.js';
-import { CanvasSource, EncodedAudioPacketSource } from '../../src/media-source.js';
+import { CanvasSource, EncodedAudioPacketSource, VideoSampleSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
+import { VideoSample } from '../../src/sample.js';
 
 test('Rotation is baked in when rerendering', async () => {
 	using input = new Input({
@@ -1487,4 +1488,70 @@ test('Transcoding odd-sized video to AVC rounds its dimensions up to even ones',
 	expect(await videoTrack.getCodec()).toBe('avc');
 	expect(await videoTrack.getCodedWidth()).toBe(322);
 	expect(await videoTrack.getCodedHeight()).toBe(242);
+});
+
+/** Makes a 2 s WebM whose frames take some bits to encode, and transcodes it to VP8, returning the bitrate. */
+const transcodeToVp8 = async (frameRate: number, quality: Quality) => {
+	const width = 320;
+	const height = 180;
+	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const sourceVideo = new VideoSampleSource({ codec: 'vp9', quality: new Quality({ bitrate: 2_000_000 }) });
+	sourceOutput.addVideoTrack(sourceVideo, { frameRate });
+	await sourceOutput.start();
+
+	const addFrame = async (i: number) => {
+		const data = new Uint8Array(width * height * 3 / 2).fill(128);
+		for (let y = 0; y < height; y++) {
+			for (let x = 0; x < width; x++) {
+				data[y * width + x] = 128 + 60 * Math.sin(x * 0.05 + i * 0.3) * Math.cos(y * 0.07 - i * 0.2)
+					+ ((x * 7 + y * 13 + i * 31) % 9) - 4;
+			}
+		}
+
+		using sample = new VideoSample(data, {
+			format: 'I420',
+			codedWidth: width,
+			codedHeight: height,
+			timestamp: i / frameRate,
+			duration: 1 / frameRate,
+		});
+		await sourceVideo.add(sample);
+	};
+
+	for (let i = 0; i < 2 * frameRate; i++) {
+		await addFrame(i);
+	}
+	await sourceOutput.finalize();
+
+	using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		video: { codec: 'vp8', quality },
+	});
+	await conversion.execute();
+
+	using newInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await newInput.getPrimaryVideoTrack();
+	assert(track);
+
+	return (await track.computePacketStats()).averageBitrate;
+};
+
+test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }, async () => {
+	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }));
+	expect(averageBitrate).toBeGreaterThan(0.7 * 300_000);
+	expect(averageBitrate).toBeLessThan(1.3 * 300_000);
+});
+
+test('Transcoding 60 fps video with a quality level gets twice the bitrate of 30 fps', {
+	timeout: 30_000,
+}, async () => {
+	// Quality levels are meant for up to 30 fps, and 60 fps has always ended up with twice the bitrate (before
+	// encoders were told the frame rate, because they assumed 30 fps)
+	const bitrate30 = await transcodeToVp8(30, new Quality('medium'));
+	const bitrate60 = await transcodeToVp8(60, new Quality('medium'));
+	expect(bitrate60 / bitrate30).toBeGreaterThan(1.6);
+	expect(bitrate60 / bitrate30).toBeLessThan(2.4);
 });

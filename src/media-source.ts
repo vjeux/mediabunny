@@ -192,6 +192,12 @@ export abstract class VideoSource extends MediaSource {
 	declare _connectedTrack: OutputVideoTrack | null;
 	/** @internal */
 	override readonly _codec: VideoCodec;
+	/**
+	 * The rate at which frames are expected to come in, if whoever feeds this source knows it. Encoders are told this
+	 * frame rate when neither the encoding config nor the track metadata specify one.
+	 * @internal
+	 */
+	_frameRateHint: number | null = null;
 
 	/** Internal constructor. */
 	constructor(codec: VideoCodec) {
@@ -705,7 +711,12 @@ class VideoEncoderWrapper {
 				height: videoSample.codedHeight,
 				squarePixelWidth: videoSample.squarePixelWidth,
 				squarePixelHeight: videoSample.squarePixelHeight,
-				framerate: this.source._connectedTrack?.metadata.frameRate,
+				// Encoders split the bitrate across frames based on this rate (browsers assume 30 Hz without it), so
+				// pass whichever rate the frames are known to come in at
+				framerate: this.encodingConfig.transform?.frameRate
+					?? this.source._connectedTrack?.metadata.frameRate
+					?? this.source._frameRateHint
+					?? undefined,
 			});
 
 			// Try the candidate configs in order of preference until we find one that is supported
@@ -1870,6 +1881,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				? settingsFrameRate
 				: null;
 		}
+		this._frameRateHint = frameRate !== null && Number.isFinite(frameRate) && frameRate > 0 ? frameRate : null;
 
 		this._abortController = new AbortController();
 
