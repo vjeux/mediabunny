@@ -258,11 +258,16 @@ export class OggDemuxer extends Demuxer {
 			return;
 		}
 
+		const header = parseOpusIdentificationHeader(firstPacket.data);
+		if (header.outputChannelCount === 0) {
+			// https://datatracker.ietf.org/doc/html/rfc7845#section-5.1: "This MUST NOT be zero."
+			throw new Error('Invalid Opus identification header: channel count must not be 0.');
+		}
+
 		bitstream.codecInfo.codec = 'opus';
 		bitstream.description = firstPacket.data;
 		bitstream.lastMetadataPacket = secondPacket;
 
-		const header = parseOpusIdentificationHeader(firstPacket.data);
 		bitstream.numberOfChannels = header.outputChannelCount;
 		bitstream.sampleRate = OPUS_SAMPLE_RATE; // Always the same
 
