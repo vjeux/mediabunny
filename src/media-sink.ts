@@ -1157,12 +1157,15 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
 					// that information is genuinely lost, like the color matrix for example. Chromium has other code
 					// paths where it just fills the missing values with a hardcoded default, so we do the exact same
-					// thing here, with the same hardcoded defaults:
+					// thing here, with the same hardcoded defaults. The exception is the matrix of VP8, which is
+					// always BT.601 (RFC 6386, section 9.2), and of VP9 without a color space, which FFmpeg and
+					// Chromium's own media pipeline also treat as BT.601.
 					this.decoderConfig = {
 						...this.decoderConfig,
 						colorSpace: {
 							primaries: this.decoderConfig.colorSpace?.primaries ?? 'bt709',
-							matrix: this.decoderConfig.colorSpace?.matrix ?? 'bt709',
+							matrix: this.decoderConfig.colorSpace?.matrix
+								?? (codec === 'vp8' || codec === 'vp9' ? 'smpte170m' : 'bt709'),
 							transfer: this.decoderConfig.colorSpace?.transfer ?? 'bt709',
 							fullRange: this.decoderConfig.colorSpace?.fullRange ?? false,
 						},
