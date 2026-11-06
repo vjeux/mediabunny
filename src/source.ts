@@ -18,6 +18,7 @@ import {
 	isFirefox,
 	isThenable,
 	isWebKit,
+	MAX_FILE_IO_SIZE,
 	MaybePromise,
 	mergeRequestInit,
 	normalizeHeaders,
@@ -1567,7 +1568,8 @@ export class FilePathSource extends PathedSource {
 					const { bytesRead } = await this._fileHandle.read(
 						buffer,
 						bytesFilled,
-						buffer.length - bytesFilled,
+						// Node rejects reads of 2 GiB or more, and Linux reads at most 0x7ffff000 bytes at once
+						Math.min(buffer.length - bytesFilled, MAX_FILE_IO_SIZE),
 						start + bytesFilled,
 					);
 					if (bytesRead === 0) {
