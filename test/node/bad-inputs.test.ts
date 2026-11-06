@@ -1956,6 +1956,25 @@ test('WAV: Block alignment not matching the channel count', async () => {
 	await expectGracefulDecode(wav([fmtChunk({ channels: 3, blockAlign: 4 }), dataChunk()]));
 });
 
+test('WAV: Block alignment not matching the sample size', async () => {
+	// The duration and timestamps used to go by the block alignment, while the samples are decoded by their bit depth
+	for (const blockAlign of [2, 8]) {
+		using input = new Input({
+			source: new BufferSource(wav([fmtChunk({ blockAlign }), dataChunk()])),
+			formats: ALL_FORMATS,
+		});
+		expect(await input.computeDuration()).toBe(1);
+
+		let frameCount = 0;
+		for await (const sample of new AudioSampleSink((await input.getAudioTracks())[0]!).samples()) {
+			expect(Math.round(sample.timestamp * 44100)).toBe(frameCount);
+			frameCount += sample.numberOfFrames;
+			sample.close();
+		}
+		expect(frameCount).toBe(44100);
+	}
+});
+
 const wav = (chunks: Bytes[], riffType = 'RIFF') => {
 	const body = concatList(chunks);
 	return concat(ascii(riffType), u32le(4 + body.length), ascii('WAVE'), body);
