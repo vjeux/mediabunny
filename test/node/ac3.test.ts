@@ -11,9 +11,10 @@ import { Conversion } from '../../src/conversion.js';
 import { AC3_REGISTRATION_DESCRIPTOR, EAC3_REGISTRATION_DESCRIPTOR } from '../../src/codec-data.js';
 import { canEncode, Quality } from '../../src/encode.js';
 import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
-import { AudioSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { AudioSample } from '../../src/sample.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { registerAc3Decoder, registerAc3Encoder } from '@mediabunny/ac3';
 import { assert } from '../../src/misc.js';
 
@@ -493,4 +494,44 @@ test('writes E-AC-3 syncframes with fewer than six blocks as 1536-sample MP4 sam
 	}
 
 	expect(timestamps).toEqual([-240, 528, 1296, 2064, 2832, 3600, 4368]);
+});
+
+test('combines E-AC-3 syncframes into one MP4 sample only across contiguous timestamps', async () => {
+	using originalInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/eac3-three-block-frames.mkv')),
+		formats: ALL_FORMATS,
+	});
+
+	const originalTrack = (await originalInput.getPrimaryAudioTrack())!;
+	const decoderConfig = (await originalTrack.getDecoderConfig())!;
+	const packetSink = new EncodedPacketSink(originalTrack);
+	const first = (await packetSink.getFirstPacket())!;
+	const second = (await packetSink.getNextPacket(first))!;
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedAudioPacketSource('eac3');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// Two 3-block syncframes with a gap of almost a second between them
+	await source.add(new EncodedPacket(first.data, 'key', 0, 768 / 48000), { decoderConfig });
+	await source.add(new EncodedPacket(second.data, 'key', 1, 768 / 48000));
+	await output.finalize();
+
+	using newInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const newTrack = (await newInput.getPrimaryAudioTrack())!;
+
+	const packets = [];
+	for await (const packet of new EncodedPacketSink(newTrack).packets()) {
+		packets.push([packet.timestamp, packet.data.byteLength]);
+	}
+
+	expect(packets).toEqual([[0, 3072], [1, 3072]]);
+	expect(await newTrack.computeDuration()).toBeCloseTo(1 + 768 / 48000);
 });

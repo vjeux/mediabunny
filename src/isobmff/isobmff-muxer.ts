@@ -787,12 +787,19 @@ export class IsobmffMuxer extends Muxer {
 
 			if (track.source._codec === 'eac3') {
 				// An E-AC-3 sample holds six audio blocks (1536 samples, ETSI TS 102 366 F.2), so syncframes with fewer
-				// blocks are combined until there are six.
+				// blocks are combined until there are six. A syncframe that doesn't start where the group ends (within
+				// half a block) ends the group early instead, so that timestamp gaps are kept.
 				const blocks = countEac3AudioBlocks(packetData);
 				const pending = trackData.info.pendingEac3;
 
-				if (pending && (blocks === null || pending.blocks + blocks > 6)) {
-					await this.writePendingEac3Sample(trackData);
+				if (pending) {
+					const blockDuration = 256 / trackData.info.sampleRate;
+					const pendingEnd = pending.timestamp + pending.blocks * blockDuration;
+					const isContiguous = Math.abs(timestamp - pendingEnd) <= blockDuration / 2;
+
+					if (blocks === null || pending.blocks + blocks > 6 || !isContiguous) {
+						await this.writePendingEac3Sample(trackData);
+					}
 				}
 
 				if (blocks !== null && blocks < 6) {
