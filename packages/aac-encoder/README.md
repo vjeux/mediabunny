@@ -104,6 +104,7 @@ export MEDIABUNNY_ROOT=$PWD
 
 # Build FFmpeg
 cd $FFMPEG_PATH
+git apply $MEDIABUNNY_ROOT/packages/aac-encoder/patches/ffmpeg-aac-encoder-overflow-loop.patch
 emmake make distclean
 emconfigure ./configure \
     --target-os=none \
@@ -162,10 +163,10 @@ Then, the complete JavaScript package can be built alongside the rest of Mediabu
 
 The build artifacts included in this repo, which are also the ones bundled into the published package, were built with exactly the commands above, from:
 
-- FFmpeg [`60a2818f76dcd1fee3155b1791304af104a0fc1b`](https://github.com/FFmpeg/FFmpeg/commit/60a2818f76dcd1fee3155b1791304af104a0fc1b) (`n9.1-dev-2902-g60a2818f76d`), unmodified
+- FFmpeg [`60a2818f76dcd1fee3155b1791304af104a0fc1b`](https://github.com/FFmpeg/FFmpeg/commit/60a2818f76dcd1fee3155b1791304af104a0fc1b) (`n9.1-dev-2902-g60a2818f76d`), with [`patches/ffmpeg-aac-encoder-overflow-loop.patch`](./patches/ffmpeg-aac-encoder-overflow-loop.patch) applied (a frame that doesn't fit the decoder buffer is quantized more coarsely until it does, instead of being retried forever or written out too big)
 - Emscripten 4.0.21 (`d6f42310010ddec0753a69bab01a4b33aae255b7`)
 - `src/bridge.c` of this package
 
-SHA-256 of the WASM binary inlined in `build/aac.js`: `4123d56ed650255a14535d8438680a78df67ae9324e4874a88becfb37bf18c66`
+SHA-256 of the WASM binary inlined in `build/aac.js`: `c7773e9a4f28151ed151f68a6a2cd965ad3cb04f71f11c8d70ed60cd18f22823`
 
 FFmpeg is licensed under the LGPL v2.1 or later; this build enables no GPL, version 3 or nonfree components. Its license files are in [`licenses/ffmpeg`](./licenses/ffmpeg). To use a modified FFmpeg, rebuild using the steps above.
