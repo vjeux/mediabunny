@@ -487,6 +487,29 @@ test.each([0, 0.3 - (0.1 + 0.2)])(
 	},
 );
 
+test.each([10, 1800000000])(
+	'VideoSampleSource, transform.frameRate puts a timestamp 1 ms before the frame at %s s in the frame before',
+	async (boundary) => {
+		// Only floating point error may be snapped away, also at Unix-epoch-scale timestamps
+		const timestamps: number[] = [];
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const videoSource = new VideoSampleSource({
+			codec: 'vp8',
+			quality: new Quality('medium'),
+			transform: { frameRate: 30 },
+			onEncodedSample: sample => timestamps.push(sample.timestamp),
+		});
+		output.addVideoTrack(videoSource, { isRelativeToUnixEpoch: true });
+		await output.start();
+
+		using sample = new VideoSample(makeCanvas(100, 100), { timestamp: boundary - 0.001, duration: 1 / 30 });
+		await videoSource.add(sample);
+		await output.finalize();
+
+		expect(timestamps[0]).toBe((boundary * 30 - 1) / 30);
+	},
+);
+
 test('VideoSampleSource, transform.frameRate skipping and padding combined', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { frameRate: 10 } },
