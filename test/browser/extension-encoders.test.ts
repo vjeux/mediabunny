@@ -1,10 +1,11 @@
-import { describe, expect, test } from 'vitest';
+import { beforeEach, describe, expect, test } from 'vitest';
 import { registerAacEncoder } from '@mediabunny/aac-encoder';
 import { registerMp3Encoder } from '@mediabunny/mp3-encoder';
 import { registerFlacEncoder } from '@mediabunny/flac-encoder';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
 import { FlacOutputFormat, Mp3OutputFormat, OutputFormat } from '../../src/output-format.js';
 import { AudioCodec } from '../../src/codec.js';
 import { channelToneMap, createTones, decodeTrack, encodeAudio, triangle } from './helpers/l13-audio.js';
@@ -58,7 +59,64 @@ const roundTrip = async (
 
 const identity = (n: number) => [...Array(n).keys()];
 
-describe('AAC encoder output, decoded by the browser', () => {
+// WebKitGTK's GStreamer decoders scramble the timestamps that follow a negative one (they flip the playback direction
+// of their segment), and the AAC and MP3 encoder delays are signaled through a negative first timestamp
+const negativeTimestampsDecodeCorrectly = await (async () => {
+	const timestamps: number[] = [];
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			timestamps.push(data.timestamp);
+			data.close();
+		},
+		error: () => {},
+	});
+	decoder.configure({ codec: 'pcm-s16', sampleRate: 48000, numberOfChannels: 1 });
+	for (const timestamp of [-20000, 0, 20000]) {
+		decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp, data: new Uint8Array(1920) }));
+	}
+	await decoder.flush();
+	decoder.close();
+	return timestamps.join() === '-20000,0,20000';
+})();
+
+/**
+ * Whether the browser really decodes FLAC: WebKitGTK says it can, but its GStreamer decoder then fails or hangs. This
+ * decodes the first packets of a file with its own decoder, with a time limit.
+ */
+const decodesFlac = async () => {
+	using input = new Input({ source: new UrlSource('/sample.flac'), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	if (!(await track.canDecode())) {
+		return false;
+	}
+
+	let failed = false;
+	const decoder = new AudioDecoder({
+		output: data => data.close(),
+		error: () => {
+			failed = true;
+		},
+	});
+	decoder.configure((await track.getDecoderConfig())!);
+	const sink = new EncodedPacketSink(track);
+	let packet = await sink.getFirstPacket();
+	for (let i = 0; packet && i < 8; i++) {
+		decoder.decode(packet.toEncodedAudioChunk());
+		packet = await sink.getNextPacket(packet);
+	}
+	const flushed = await Promise.race([
+		decoder.flush().then(() => true, () => false),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
+	]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return flushed && !failed;
+};
+let flacDecodes: Promise<boolean> | null = null;
+
+describe.skipIf(!negativeTimestampsDecodeCorrectly)('AAC encoder output, decoded by the browser', () => {
 	test('keeps every channel in place (1, 2, 5, 6 and 8 channels)', async () => {
 		for (const numberOfChannels of [1, 2, 5, 6, 8]) {
 			const { channelMap } = await roundTrip('aac', numberOfChannels, 48000, 64000 * numberOfChannels);
@@ -74,7 +132,7 @@ describe('AAC encoder output, decoded by the browser', () => {
 	});
 });
 
-describe('MP3 encoder output, decoded by the browser', () => {
+describe.skipIf(!negativeTimestampsDecodeCorrectly)('MP3 encoder output, decoded by the browser', () => {
 	test('keeps both channels in place and starts on time at every MPEG version', async () => {
 		for (const [numberOfChannels, sampleRate, bitrate] of [
 			[1, 44100, 128000],
@@ -98,6 +156,11 @@ describe('MP3 encoder output, decoded by the browser', () => {
 });
 
 describe('FLAC encoder output, decoded by the browser', () => {
+	beforeEach(async ({ skip }) => {
+		flacDecodes ??= decodesFlac();
+		skip(!(await flacDecodes), 'FLAC doesn\'t really decode here');
+	});
+
 	const PERIODS = [218, 145, 109, 873, 87, 73, 61, 53];
 
 	test('is bit-exact for 16-bit input, in FLAC files and in MP4', async () => {
