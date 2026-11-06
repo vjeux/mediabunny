@@ -15,6 +15,7 @@ import {
 	Mp4OutputFormat,
 	Output,
 } from '../../src/index.js';
+import { iterateNalUnitsInLengthPrefixed } from '../../src/codec-data.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -472,4 +473,74 @@ test('Fragments whose sample description changes the parameter sets', async () =
 		nal(slices[1]!),
 		[...nal(sps[1]!), ...nal(pps[1]!), ...nal(slices[2]!)],
 	]);
+});
+
+test('Sample descriptions with NAL unit length prefixes of different sizes', async () => {
+	// Prefixes are only ever widened, to the largest size among the descriptions, so a 300-byte NAL unit keeps its
+	// length even when the decoder config's own description uses 1-byte prefixes
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const hex = (text: string) => text.match(/../g)!.map(x => parseInt(x, 16));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const entry = (record: number[]) => box('avc1', zeros(6), u16(1), zeros(16), u16(128), u16(128), zeros(50),
+		box('avcC', record));
+
+	for (const smallLengthSize of [1, 2]) {
+		// 4-byte prefixes
+		const first = hex('0164000cffe100196764000cacd941011b011000000300100000030320f14299600100'
+			+ '0668ebe3cb22c0fdf8f800');
+		const second = hex('0164000bffe100186764000bacd942046c0440000003004000000c83c50a65800100'
+			+ '0668ebe3cb22c0fdf8f800');
+		second[4] = 0xfc | (smallLengthSize - 1);
+
+		const largeNalUnit = [0x65, ...new Array<number>(299).fill(0xaa)];
+		// The first chunk uses the description with small prefixes, so that one gives the decoder config
+		const samples = [[...(smallLengthSize === 1 ? [3] : u16(3)), 0x65, 1, 1], [...u32(300), ...largeNalUnit]];
+		const moov = (chunkOffsets: number[]) => box('moov',
+			box('mvhd', zeros(12), u32(25), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(128 << 16), u32(128 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(25), u32(2), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(2), entry(first), entry(second)),
+						box('stts', u32(0), u32(1), u32(2), u32(1)),
+						box('stsc', u32(0), u32(2), u32(1), u32(1), u32(2), u32(2), u32(1), u32(1)),
+						box('stsz', u32(0), u32(0), u32(2), ...samples.map(x => u32(x.length))),
+						box('stco', u32(0), u32(2), ...chunkOffsets.map(u32)),
+					)),
+				),
+			),
+		);
+		const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+		const dataStart = ftyp.length + moov([0, 0]).length + 8;
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([
+				...ftyp,
+				...moov([dataStart, dataStart + samples[0]!.length]),
+				...box('mdat', ...samples),
+			])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const description = (await track.getDecoderConfig())!.description as Uint8Array;
+		expect(description[4]! & 0b11).toBe(3); // 4-byte prefixes
+
+		const sink = new EncodedPacketSink(track);
+		const packet = await sink.getPacket(0.04);
+		assert(packet);
+		const nalUnits = [...iterateNalUnitsInLengthPrefixed(packet.data, 4)];
+		expect(nalUnits.map(x => x.length).at(-1)).toBe(300);
+		expect((await sink.getPacket(0.04, { metadataOnly: true }))?.byteLength).toBe(packet.byteLength);
+	}
 });

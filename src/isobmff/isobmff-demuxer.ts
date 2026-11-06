@@ -3865,7 +3865,9 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				codec: extractVideoCodecString(this.internalTrack.info),
 				codedWidth: this.internalTrack.info.width,
 				codedHeight: this.internalTrack.info.height,
-				description: this.internalTrack.info.codecDescription ?? undefined,
+				description: getInBandParameterSets(this.internalTrack)?.description
+					?? this.internalTrack.info.codecDescription
+					?? undefined,
 				colorSpace: this.internalTrack.info.colorSpace,
 			};
 
@@ -3971,8 +3973,13 @@ const getKeyframeSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleU
 };
 
 type InBandParameterSets = {
-	/** The NAL unit length size of the decoder config */
+	/**
+	 * The NAL unit length size of every packet: the largest among the sample descriptions, since narrowing could
+	 * truncate NAL unit lengths
+	 */
 	lengthSize: 1 | 2 | 3 | 4;
+	/** The decoder config's avcC/hvcC record, with that length size */
+	description: Uint8Array;
 	bySampleDescription: Map<number, { parameterSets: Uint8Array; lengthSize: 1 | 2 | 3 | 4 }>;
 };
 
@@ -4026,23 +4033,36 @@ const getInBandParameterSets = (track: InternalTrack) => {
 		return null;
 	}
 
+	const parsedRecords = records.map(record => record && parseRecord(record));
+	const lengthSize = Math.max(
+		config.lengthSize,
+		...parsedRecords.map(parsed => parsed?.lengthSize ?? 1),
+	) as 1 | 2 | 3 | 4;
+
+	let description = configDescription;
+	if (lengthSize !== config.lengthSize) {
+		// lengthSizeMinusOne is in the low two bits of byte 4 of avcC and of byte 21 of hvcC
+		description = configDescription.slice();
+		const lengthSizePos = info.codec === 'avc' ? 4 : 21;
+		description[lengthSizePos] = (description[lengthSizePos]! & 0xfc) | (lengthSize - 1);
+	}
+
 	const bySampleDescription: InBandParameterSets['bySampleDescription'] = new Map();
-	records.forEach((record, i) => {
-		const parsed = record && parseRecord(record);
+	parsedRecords.forEach((parsed, i) => {
 		if (parsed) {
 			bySampleDescription.set(i + 1, {
-				parameterSets: concatNalUnitsInLengthPrefixed(parsed.nalUnits, config.lengthSize),
+				parameterSets: concatNalUnitsInLengthPrefixed(parsed.nalUnits, lengthSize),
 				lengthSize: parsed.lengthSize,
 			});
 		}
 	});
 
-	return track.inBandParameterSets = { lengthSize: config.lengthSize, bySampleDescription };
+	return track.inBandParameterSets = { lengthSize, description, bySampleDescription };
 };
 
 /**
- * Whether a sample's NAL unit length prefixes get converted to the decoder config's size, which makes the packet's size
- * depend on its NAL units: then even a metadata-only packet needs the sample's data to know its size.
+ * Whether a sample's NAL unit length prefixes get widened to the packets' size, which makes the packet's size depend on
+ * its NAL units: then even a metadata-only packet needs the sample's data to know its size.
  */
 const inBandParameterSetsNeedData = (track: InternalTrack, sampleDescriptionIndex: number) => {
 	const inBand = getInBandParameterSets(track);
@@ -4051,8 +4071,8 @@ const inBandParameterSetsNeedData = (track: InternalTrack, sampleDescriptionInde
 };
 
 /**
- * Prepends a key sample's own parameter sets when the track's sample descriptions differ in them, converting NAL unit
- * length prefixes to the decoder config's size if needed. For metadata-only packets, only computes the size (from the
+ * Prepends a key sample's own parameter sets when the track's sample descriptions differ in them, widening NAL unit
+ * length prefixes to the packets' size if needed. For metadata-only packets, only computes the size (from the
  * data when inBandParameterSetsNeedData says so) and returns no data.
  */
 const applyInBandParameterSets = (
