@@ -609,8 +609,9 @@ export class MatroskaMuxer extends Muxer {
 					const dateString = formatMetadataDate(value);
 					if (dateString !== null) {
 						addSimpleTag('DATE', dateString);
-						writtenTags.add('DATE');
 					}
+					// Marked as written even when left out, so that a raw tag can't bring the date back
+					writtenTags.add('DATE');
 				}; break;
 
 				case 'trackNumber': {

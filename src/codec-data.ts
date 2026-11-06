@@ -2887,6 +2887,8 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	commentHeaderParts.push(currentBuffer);
 
 	const writtenTags: string[] = [];
+	// Keys left out on purpose, which a raw tag may not fill in
+	const omittedTags: string[] = [];
 	const addCommentTag = (key: string, value: string) => {
 		const joined = `${key}=${value}`;
 		const encoded = textEncoder.encode(joined);
@@ -2931,6 +2933,8 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 				const dateString = formatMetadataDate(value);
 				if (dateString !== null) {
 					addCommentTag('DATE', dateString);
+				} else {
+					omittedTags.push('DATE');
 				}
 			}; break;
 
@@ -3024,7 +3028,7 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	if (tags.raw) {
 		for (const key in tags.raw) {
 			const value = tags.raw[key] ?? tags.raw[key.toLowerCase()];
-			if (key === 'vendor' || value == null || writtenTags.includes(key)) {
+			if (key === 'vendor' || value == null || writtenTags.includes(key) || omittedTags.includes(key)) {
 				continue;
 			}
 

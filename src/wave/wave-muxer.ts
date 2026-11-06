@@ -276,8 +276,9 @@ export class WaveMuxer extends Muxer {
 					const dateString = formatMetadataDate(value);
 					if (dateString !== null) {
 						writeInfoTag('ICRD', dateString);
-						writtenTags.add('ICRD');
 					}
+					// Marked as written even when left out, so that a raw tag can't bring the date back
+					writtenTags.add('ICRD');
 				}; break;
 
 				case 'comment': {

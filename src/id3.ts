@@ -764,8 +764,9 @@ export class Id3V2Writer {
 					const dateString = formatMetadataDate(value);
 					if (dateString !== null) {
 						this.writeId3V2TextFrame('TDRC', dateString);
-						writtenTags.add('TDRC');
 					}
+					// Marked as written even when left out, so that a raw tag can't bring the date back
+					writtenTags.add('TDRC');
 				}; break;
 
 				case 'beatsPerMinute': {
