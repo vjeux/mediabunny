@@ -291,8 +291,9 @@ const deferredCodecOf = (cell: Cell, inputAudioCodec: string | null): DeferredCo
 /** Cells whose output audio turned out to use a deferred codec, by codec and input. */
 const deferredAtRuntime = new Map<string, Cell[]>();
 
-// Codecs whose encoders delay the audio (priming, Opus pre-skip), which containers signal with timestamps before zero
-const PRIMED_AUDIO_CODECS = ['opus', 'aac'];
+// Codecs whose encoders delay the audio (AAC priming, Opus pre-skip, the MP3 encoder delay), which Mediabunny signals
+// with timestamps before zero
+const PRIMED_AUDIO_CODECS = ['opus', 'aac', 'mp3'];
 
 /** Why the platform can't run a matrix input at all (building it, or decoding it to know what it holds). */
 const getInputSkipReason = (matrixInput: MatrixInput, support: PlatformSupport) => {
@@ -309,8 +310,8 @@ const getInputSkipReason = (matrixInput: MatrixInput, support: PlatformSupport) 
 	return null;
 };
 
-/** Why the platform can't run a cell, from the conversion's track decisions. */
-const getCellSkipReason = (cell: Cell, support: PlatformSupport) => (run: RunResult) => {
+/** Why the platform can't run a cell, from the conversion's track decisions and the input's key frames. */
+const getCellSkipReason = (cell: Cell, support: PlatformSupport, inView: MediaView) => (run: RunResult) => {
 	const audioCodec = run.outputCodecs.audio;
 	if (run.copied.audio === false && audioCodec === 'opus' && !support.opusEncoding) {
 		return 'Opus encoding';
@@ -330,6 +331,17 @@ const getCellSkipReason = (cell: Cell, support: PlatformSupport) => (run: RunRes
 	if ((PRIMED_AUDIO_CODECS.includes(audioCodec ?? '') || trimmedCopy) && !support.negativeTimestamps) {
 		return 'decoding past negative timestamps';
 	}
+	// A video copy that starts at a key frame before the trim start puts the frames before it at negative
+	// timestamps ('shrink' leaves those frames out)
+	const policy = (typeof cell.options.copy === 'object' && cell.options.copy.boundaryPolicy) || 'expand';
+	if (run.copied.video === true && inView.video && policy === 'expand') {
+		const keys = inView.video.verifiedKeyPacketTimestamps;
+		const startKey = keys.filter(t => t <= run.startTimestamp + 1e-9).at(-1) ?? keys[0];
+		const startsBeforeTrim = startKey !== undefined && startKey < run.startTimestamp - 1e-6;
+		if (startsBeforeTrim && !support.negativeVideoTimestamps[run.outputCodecs.video ?? '']) {
+			return 'decoding video past negative timestamps';
+		}
+	}
 	return null;
 };
 
@@ -346,7 +358,7 @@ const runCells = async (
 	const result: CellsResult = { failures: [], skipReasons: [], ran: 0 };
 
 	for (const cell of cells) {
-		const getSkipReason = getCellSkipReason(cell, support);
+		const getSkipReason = getCellSkipReason(cell, support, view);
 		const run = await runCell(bytes, cell, deferAudioCodecs, getSkipReason);
 		if (run.deferredCodec !== null) {
 			const key = `${run.deferredCodec} ${cell.input}`;
@@ -494,7 +506,8 @@ describe('Conversion matrix oracle', () => {
 	};
 	/** Runs a baseline cell, or skips the test where the platform can't run it. */
 	const runBaseline = async (bytes: Uint8Array, cell: Cell, context: TestContext) => {
-		const run = await runCell(bytes, cell, [], getCellSkipReason(cell, await getPlatformSupport()));
+		const { view } = await getInput(cell.input);
+		const run = await runCell(bytes, cell, [], getCellSkipReason(cell, await getPlatformSupport(), view));
 		if (run.skipReason !== null) {
 			context.skip(`WebCodecs fails here on ${run.skipReason}`);
 		}

@@ -4,13 +4,18 @@
 // - its GStreamer decoders fail on FLAC and hang on Vorbis, and after either, every later audio decode on the page
 //   stalls (isConfigSupported() included);
 // - its AudioEncoder stamps every chunk with the timestamp of the input it came from;
-// - its decoders scramble the timestamps that follow a negative one (as encoder priming makes them);
+// - its decoders scramble the timestamps that follow a negative one (as encoder priming and copies trimmed into a
+//   GOP make them);
 // - its AV1 decoder fails, and its AVC encoder drops frames at low bitrates.
 // The FLAC and Vorbis streams are 0.1 s of silence made by FFmpeg, read with ffprobe -show_streams -show_packets
 // -show_data:
 //   flac    -c:a flac (16 kHz mono; "fLaC" + the STREAMINFO block)
 //   vorbis  -c:a libvorbis -q:a -1 (16 kHz mono; the Xiph-laced headers)
-// and the AV1 one is the keyframe of 0.4 s of black 64x64 video, -c:v libaom-av1 -cpu-used 8 -crf 50 (-f obu).
+// and the video ones are the first frame of 0.4 s of black 64x64 video:
+//   avc     -c:v libx264 -x264-params keyint=30:bframes=0 (.mp4; avcC, the IDR without its SEI)
+//   vp8     -c:v libvpx -b:v 50k (.webm)
+//   vp9     -c:v libvpx-vp9 -b:v 50k (.webm)
+//   av1     -c:v libaom-av1 -cpu-used 8 -crf 50 (-f obu, with its sequence header)
 
 type NativeProbe = { codec: string; sampleRate: number; description: string; chunks: string[] };
 
@@ -148,7 +153,77 @@ export const audioDecodingResponds = async () => {
 	return settled !== null;
 };
 
-const AV1_KEYFRAME = 'EgAKCgAAAAKv/5tfIAgyDRAAuoAAAkAAAAPOF7o=';
+type ProbedVideoCodec = 'avc' | 'vp8' | 'vp9' | 'av1';
+
+const VIDEO_KEYFRAMES: Record<ProbedVideoCodec, { codec: string; description?: string; chunk: string }> = {
+	avc: {
+		codec: 'avc1.64000a',
+		description: 'AWQACv/hABZnZAAKrLQhNgIgAAADACAAAAeB4kTUAQAEaO8Py/34+AA=',
+		chunk: 'AAAAImWIhAv/zfge5+dNGJXY/99lBqplGekvDAt4kBWRdmF/jqw=',
+	},
+	vp8: { codec: 'vp8', chunk: '8AIAnQEqQABAAABHCIWFiIWEiAICAAZwPEJgCrIg9zAA/v+rUIA=' },
+	vp9: { codec: 'vp09.00.10.08', chunk: 'gkmDQgAD8AP2ADgkHBhCAAAwYAAAZz///1mvETuzAA==' },
+	av1: { codec: 'av01.0.00M.08', chunk: 'EgAKCgAAAAKv/5tfIAgyDRAAuoAAAkAAAAPOF7o=' },
+};
+
+/** Decodes the codec's keyframe once per timestamp; gives the output timestamps, or null if decoding failed. */
+const decodeKeyframes = async (codec: ProbedVideoCodec, timestamps: number[]) => {
+	if (typeof VideoDecoder === 'undefined') {
+		return null;
+	}
+
+	const keyframe = VIDEO_KEYFRAMES[codec];
+	const config: VideoDecoderConfig = {
+		codec: keyframe.codec,
+		codedWidth: 64,
+		codedHeight: 64,
+		description: keyframe.description !== undefined ? fromBase64(keyframe.description) : undefined,
+	};
+	const support = await withTimeout(
+		VideoDecoder.isConfigSupported(config).then(x => !!x.supported, () => false),
+		1000,
+	);
+	if (!support?.value) {
+		return null;
+	}
+
+	const outputs: number[] = [];
+	let failed = false;
+	const decoder = new VideoDecoder({
+		output: (frame) => {
+			outputs.push(frame.timestamp);
+			frame.close();
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+	try {
+		decoder.configure(config);
+		for (const timestamp of timestamps) {
+			decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp, data: fromBase64(keyframe.chunk) }));
+		}
+		if (await withTimeout(decoder.flush(), 3000) === null) {
+			failed = true;
+		}
+	} catch {
+		failed = true;
+	}
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return failed ? null : outputs;
+};
+
+/** Whether WebCodecs decodes the codec's keyframe. */
+export const videoDecodes = async (codec: ProbedVideoCodec) => (await decodeKeyframes(codec, [0]))?.length === 1;
+
+/** Whether decoded video keeps the timestamps that follow a negative one (the keyframe at -40, 0 and 40 ms). */
+export const negativeVideoTimestampsDecode = async (codec: ProbedVideoCodec) => {
+	const timestamps = await decodeKeyframes(codec, [-40_000, 0, 40_000]);
+	return timestamps?.join() === '-40000,0,40000';
+};
 
 /** Whether WebCodecs encodes a multi-frame input with timestamps that advance from chunk to chunk. */
 export const audioEncodingWorks = async (codec: 'opus' | 'mp4a.40.2') => {
@@ -234,48 +309,6 @@ export const negativeTimestampsDecode = async () => {
 	return !failed && timestamps.join() === '-20000,0,20000';
 };
 
-/** Whether WebCodecs decodes an AV1 keyframe. */
-export const av1Decodes = async () => {
-	if (typeof VideoDecoder === 'undefined') {
-		return false;
-	}
-
-	const config: VideoDecoderConfig = { codec: 'av01.0.00M.08', codedWidth: 64, codedHeight: 64 };
-	const support = await withTimeout(
-		VideoDecoder.isConfigSupported(config).then(x => !!x.supported, () => false),
-		1000,
-	);
-	if (!support?.value) {
-		return false;
-	}
-
-	let outputs = 0;
-	let failed = false;
-	const decoder = new VideoDecoder({
-		output: (frame) => {
-			outputs++;
-			frame.close();
-		},
-		error: () => {
-			failed = true;
-		},
-	});
-	try {
-		decoder.configure(config);
-		decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data: fromBase64(AV1_KEYFRAME) }));
-		if (await withTimeout(decoder.flush(), 3000) === null) {
-			failed = true;
-		}
-	} catch {
-		failed = true;
-	}
-	if (decoder.state !== 'closed') {
-		decoder.close();
-	}
-
-	return !failed && outputs > 0;
-};
-
 /** Whether 8 flat gray 64x64 frames through a literal 32 kbps AVC config all come back, in order. */
 export const avcKeepsEveryFrame = async () => {
 	if (typeof VideoEncoder === 'undefined' || typeof VideoDecoder === 'undefined') {
@@ -354,6 +387,7 @@ export type PlatformSupport = {
 	opusEncoding: boolean;
 	aacEncoding: boolean;
 	negativeTimestamps: boolean;
+	negativeVideoTimestamps: Record<string, boolean>;
 	av1Decoding: boolean;
 	avcEncoding: boolean;
 };
@@ -361,10 +395,18 @@ export type PlatformSupport = {
 let platformSupport: Promise<PlatformSupport> | null = null;
 
 /** The probes that can't stall the page (all but FLAC and Vorbis), run once. */
-export const getPlatformSupport = () => platformSupport ??= (async () => ({
-	opusEncoding: await audioEncodingWorks('opus'),
-	aacEncoding: await audioEncodingWorks('mp4a.40.2'),
-	negativeTimestamps: await negativeTimestampsDecode(),
-	av1Decoding: await av1Decodes(),
-	avcEncoding: await avcKeepsEveryFrame(),
-}))();
+export const getPlatformSupport = () => platformSupport ??= (async () => {
+	const negativeVideoTimestamps: Record<string, boolean> = {};
+	for (const codec of Object.keys(VIDEO_KEYFRAMES) as ProbedVideoCodec[]) {
+		negativeVideoTimestamps[codec] = await negativeVideoTimestampsDecode(codec);
+	}
+
+	return {
+		opusEncoding: await audioEncodingWorks('opus'),
+		aacEncoding: await audioEncodingWorks('mp4a.40.2'),
+		negativeTimestamps: await negativeTimestampsDecode(),
+		negativeVideoTimestamps,
+		av1Decoding: await videoDecodes('av1'),
+		avcEncoding: await avcKeepsEveryFrame(),
+	};
+})();
