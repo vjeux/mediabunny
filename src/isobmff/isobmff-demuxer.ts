@@ -1588,10 +1588,15 @@ export class IsobmffDemuxer extends Demuxer {
 						} else if (codecName === 'mlpa') {
 							track.info.codec = 'truehd';
 						} else if (codecName === 'twos') {
+							// Like FFmpeg, also accept 24 and 32-bit samples, which QuickTime would label in24/in32
 							if (sampleSize === 8) {
 								track.info.codec = 'pcm-s8';
 							} else if (sampleSize === 16) {
 								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s16' : 'pcm-s16be';
+							} else if (sampleSize === 24) {
+								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s24' : 'pcm-s24be';
+							} else if (sampleSize === 32) {
+								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s32' : 'pcm-s32be';
 							} else {
 								Logging._warn(`Unsupported sample size ${sampleSize} for codec 'twos'.`);
 								track.info.codec = null;
@@ -1601,6 +1606,10 @@ export class IsobmffDemuxer extends Demuxer {
 								track.info.codec = 'pcm-s8';
 							} else if (sampleSize === 16) {
 								track.info.codec = 'pcm-s16';
+							} else if (sampleSize === 24) {
+								track.info.codec = 'pcm-s24';
+							} else if (sampleSize === 32) {
+								track.info.codec = 'pcm-s32';
 							} else {
 								Logging._warn(`Unsupported sample size ${sampleSize} for codec 'sowt'.`);
 								track.info.codec = null;
