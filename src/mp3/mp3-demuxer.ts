@@ -247,7 +247,9 @@ export class Mp3Demuxer extends Demuxer {
 
 		while (pos + frameHeaderSize <= contentEnd) {
 			let slice = this.reader.requestSlice(pos, frameHeaderSize);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			if (!slice) {
 				return;
 			}
@@ -276,7 +278,9 @@ export class Mp3Demuxer extends Demuxer {
 			}
 
 			let bodySlice = this.reader.requestSlice(bodyPos, Math.min(size, contentEnd - bodyPos));
-			if (isThenable(bodySlice)) bodySlice = await bodySlice;
+			if (isThenable(bodySlice)) {
+				bodySlice = await bodySlice;
+			}
 			if (!bodySlice) {
 				return;
 			}
