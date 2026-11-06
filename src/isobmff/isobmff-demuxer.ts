@@ -52,6 +52,8 @@ import {
 	HevcNalUnitType,
 	parseAvcSps,
 	parseHevcSps,
+	iterateNalUnitsInLengthPrefixed,
+	concatNalUnitsInLengthPrefixed,
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
@@ -85,6 +87,7 @@ import {
 	HEX_STRING_REGEX,
 	EMPTY_COLOR_SPACE,
 	colorSpaceIsComplete,
+	uint8ArraysAreEqual,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import {
@@ -172,6 +175,10 @@ type InternalTrack = {
 	firstChunkSampleDescriptionIndex: number | null;
 	/** The entries of the track's 'seig' sample group description, which fragments can refer to. */
 	encryptionGroups: SampleGroupEncryption[];
+	/** The avcC or hvcC record of each sample description (by index), if it has one. */
+	sampleDescriptionRecords: (Uint8Array | null)[];
+	/** Parameter sets to send in band, computed on first use; see getInBandParameterSets. */
+	inBandParameterSets?: InBandParameterSets | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
@@ -312,6 +319,7 @@ type FragmentTrackData = {
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	/** Whether the samples use an encrypted sample description */
 	isEncrypted: boolean;
+	sampleDescriptionIndex: number;
 };
 
 type FragmentTrackSample = {
@@ -826,6 +834,7 @@ export class IsobmffDemuxer extends Demuxer {
 				sampleDescriptionStates: [],
 				firstChunkSampleDescriptionIndex: null,
 				encryptionGroups: foreignTrack.encryptionGroups,
+				sampleDescriptionRecords: foreignTrack.sampleDescriptionRecords,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
 				encryptedSampleDescriptions: foreignTrack.encryptedSampleDescriptions,
@@ -1473,6 +1482,7 @@ export class IsobmffDemuxer extends Demuxer {
 					sampleDescriptionStates: [],
 					firstChunkSampleDescriptionIndex: null,
 					encryptionGroups: [],
+					sampleDescriptionRecords: [],
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
 					encryptedSampleDescriptions: [],
@@ -1720,12 +1730,16 @@ export class IsobmffDemuxer extends Demuxer {
 						slice.skip(4 + 4 + 4 + 2 + 32 + 2 + 2);
 
 						track.frmaCodecString = null;
+						const descriptionBefore = track.info.codecDescription;
 						this.readContiguousBoxes(
 							slice.slice(
 								slice.filePos,
 								(sampleBoxStartPos + sampleBoxInfo.totalSize) - slice.filePos,
 							),
 						);
+						track.sampleDescriptionRecords[i] = track.info.codecDescription !== descriptionBefore
+							? track.info.codecDescription
+							: null;
 
 						const codecName = lowercaseBoxName === 'encv'
 							? track.frmaCodecString
@@ -3243,6 +3257,7 @@ export class IsobmffDemuxer extends Demuxer {
 							track,
 							track.currentFragmentState.sampleDescriptionIndex ?? 1,
 						),
+						sampleDescriptionIndex: track.currentFragmentState.sampleDescriptionIndex ?? 1,
 					};
 					this.currentFragment.trackData.set(track.id, trackData);
 				}
@@ -4205,6 +4220,17 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 		}
 
+		const withParameterSets = applyInBandParameterSets(
+			this.internalTrack,
+			options.metadataOnly ? null : data,
+			sampleInfo.sampleSize,
+			sampleInfo.sampleDescriptionIndex,
+			sampleInfo.isKeyFrame,
+		);
+		if (withParameterSets.data) {
+			data = withParameterSets.data;
+		}
+
 		const timestamp = (sampleInfo.presentationTimestamp - this.internalTrack.editListOffset)
 			/ this.internalTrack.timescale;
 		const duration = sampleInfo.duration / this.internalTrack.timescale;
@@ -4214,7 +4240,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestamp,
 			duration,
 			sampleIndex,
-			sampleInfo.sampleSize,
+			withParameterSets.byteLength,
 		);
 
 		this.packetToSampleIndex.set(packet, sampleIndex);
@@ -4259,6 +4285,17 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 		}
 
+		const withParameterSets = applyInBandParameterSets(
+			this.internalTrack,
+			options.metadataOnly ? null : data,
+			fragmentSample.byteSize,
+			trackData.sampleDescriptionIndex,
+			fragmentSample.isKeyFrame,
+		);
+		if (withParameterSets.data) {
+			data = withParameterSets.data;
+		}
+
 		const timestamp = (fragmentSample.presentationTimestamp - this.internalTrack.editListOffset)
 			/ this.internalTrack.timescale;
 		const duration = fragmentSample.duration / this.internalTrack.timescale;
@@ -4268,7 +4305,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestamp,
 			duration,
 			fragment.moofOffset + sampleIndex,
-			fragmentSample.byteSize,
+			withParameterSets.byteLength,
 		);
 
 		this.packetToFragmentLocation.set(packet, { fragment, sampleIndex });
@@ -4710,6 +4747,114 @@ const getKeyframeSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleU
 		const index = binarySearchLessOrEqual(sampleTable.keySampleIndices, sampleIndex, x => x);
 		return sampleTable.keySampleIndices[index] ?? -1;
 	}
+};
+
+type InBandParameterSets = {
+	/** The NAL unit length size of the decoder config */
+	lengthSize: 1 | 2 | 3 | 4;
+	bySampleDescription: Map<number, { parameterSets: Uint8Array; lengthSize: 1 | 2 | 3 | 4 }>;
+};
+
+/**
+ * The decoder config of an AVC or HEVC track has the parameter sets of one sample description only, but FFmpeg starts
+ * a new sample description when they change mid-stream. Like Chromium, which inserts the parameter sets of the sample's
+ * own description into every key frame, we then send each description's parameter sets in band.
+ */
+const getInBandParameterSets = (track: InternalTrack) => {
+	if (track.inBandParameterSets !== undefined) {
+		return track.inBandParameterSets;
+	}
+
+	track.inBandParameterSets = null;
+	const info = track.info;
+	if (info?.type !== 'video' || (info.codec !== 'avc' && info.codec !== 'hevc') || !info.codecDescription) {
+		return null;
+	}
+
+	const configDescription = info.codecDescription;
+	const records = track.sampleDescriptionRecords;
+	if (!records.some(record => record && !uint8ArraysAreEqual(record, configDescription))) {
+		return null; // All descriptions share the decoder config's parameter sets
+	}
+
+	const parseRecord = (record: Uint8Array) => {
+		if (info.codec === 'avc') {
+			const avcRecord = deserializeAvcDecoderConfigurationRecord(record);
+			return avcRecord && {
+				nalUnits: [...avcRecord.sequenceParameterSets, ...avcRecord.pictureParameterSets],
+				lengthSize: (avcRecord.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			};
+		} else {
+			const hevcRecord = deserializeHevcDecoderConfigurationRecord(record);
+			const parameterSetTypes: number[] = [
+				HevcNalUnitType.VPS_NUT,
+				HevcNalUnitType.SPS_NUT,
+				HevcNalUnitType.PPS_NUT,
+			];
+			return hevcRecord && {
+				nalUnits: hevcRecord.arrays
+					.filter(x => parameterSetTypes.includes(x.nalUnitType))
+					.flatMap(x => x.nalUnits),
+				lengthSize: (hevcRecord.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			};
+		}
+	};
+
+	const config = parseRecord(configDescription);
+	if (!config) {
+		return null;
+	}
+
+	const bySampleDescription: InBandParameterSets['bySampleDescription'] = new Map();
+	records.forEach((record, i) => {
+		const parsed = record && parseRecord(record);
+		if (parsed) {
+			bySampleDescription.set(i + 1, {
+				parameterSets: concatNalUnitsInLengthPrefixed(parsed.nalUnits, config.lengthSize),
+				lengthSize: parsed.lengthSize,
+			});
+		}
+	});
+
+	return track.inBandParameterSets = { lengthSize: config.lengthSize, bySampleDescription };
+};
+
+/**
+ * Prepends a key sample's own parameter sets when the track's sample descriptions differ in them, converting NAL unit
+ * length prefixes to the decoder config's size if needed. Without data (metadata only), only computes the size.
+ */
+const applyInBandParameterSets = (
+	track: InternalTrack,
+	data: Uint8Array | null,
+	byteLength: number,
+	sampleDescriptionIndex: number,
+	isKeyFrame: boolean,
+) => {
+	const inBand = getInBandParameterSets(track);
+	const description = inBand?.bySampleDescription.get(sampleDescriptionIndex);
+	if (!inBand || !description) {
+		return { data, byteLength };
+	}
+
+	if (data && description.lengthSize !== inBand.lengthSize) {
+		const bytes = data;
+		const nalUnits = [...iterateNalUnitsInLengthPrefixed(bytes, description.lengthSize)]
+			.map(location => bytes.subarray(location.offset, location.offset + location.length));
+		data = concatNalUnitsInLengthPrefixed(nalUnits, inBand.lengthSize);
+	}
+
+	if (isKeyFrame) {
+		if (data) {
+			const result = new Uint8Array(description.parameterSets.byteLength + data.byteLength);
+			result.set(description.parameterSets, 0);
+			result.set(data, description.parameterSets.byteLength);
+			data = result;
+		} else {
+			byteLength += description.parameterSets.byteLength;
+		}
+	}
+
+	return { data, byteLength: data ? data.byteLength : byteLength };
 };
 
 type SampleInfo = {
