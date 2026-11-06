@@ -112,6 +112,61 @@ describe('VideoSample from raw pixels: init validation', () => {
 	});
 });
 
+describe('VideoSample from raw pixels: copyTo', () => {
+	// 4x4 I420: 16 luma bytes, then 2x2 U and 2x2 V
+	const i420 = new Uint8Array([...Array.from({ length: 16 }, (_, i) => i), 100, 101, 102, 103, 200, 201, 202, 203]);
+
+	test('copies I420 planes tightly packed by default and reports their layout', async () => {
+		using sample = new VideoSample(i420, { format: 'I420', codedWidth: 4, codedHeight: 4, timestamp: 0 });
+		expect(sample.allocationSize()).toBe(24);
+		const dest = new Uint8Array(24);
+		const layout = await sample.copyTo(dest);
+		expect(layout).toEqual([{ offset: 0, stride: 4 }, { offset: 16, stride: 2 }, { offset: 20, stride: 2 }]);
+		expect([...dest]).toEqual([...i420]);
+	});
+
+	test('copies a sub-rectangle of every plane', async () => {
+		using sample = new VideoSample(i420, { format: 'I420', codedWidth: 4, codedHeight: 4, timestamp: 0 });
+		const rect = { x: 2, y: 2, width: 2, height: 2 };
+		expect(sample.allocationSize({ rect })).toBe(6);
+		const dest = new Uint8Array(6);
+		const layout = await sample.copyTo(dest, { rect });
+		expect(layout).toEqual([{ offset: 0, stride: 2 }, { offset: 4, stride: 1 }, { offset: 5, stride: 1 }]);
+		expect([...dest]).toEqual([10, 11, 14, 15, 103, 203]);
+	});
+
+	test('honors a destination layout with padded strides', async () => {
+		using sample = new VideoSample(i420, { format: 'I420', codedWidth: 4, codedHeight: 4, timestamp: 0 });
+		const layout = [{ offset: 0, stride: 6 }, { offset: 24, stride: 3 }, { offset: 30, stride: 3 }];
+		// Each plane spans stride * height bytes, padding of its last row included (WebCodecs allocation size)
+		expect(sample.allocationSize({ layout })).toBe(36);
+		const dest = new Uint8Array(36).fill(0xee);
+		expect(await sample.copyTo(dest, { layout })).toEqual(layout);
+		expect([...dest.subarray(0, 12)]).toEqual([0, 1, 2, 3, 0xee, 0xee, 4, 5, 6, 7, 0xee, 0xee]);
+		expect([...dest.subarray(24, 30)]).toEqual([100, 101, 0xee, 102, 103, 0xee]);
+		expect([...dest.subarray(30, 36)]).toEqual([200, 201, 0xee, 202, 203, 0xee]);
+	});
+
+	test.each([
+		['RGBA', 'BGRA', [10, 20, 30, 40], [30, 20, 10, 40]],
+		['BGRA', 'RGBA', [10, 20, 30, 40], [30, 20, 10, 40]],
+		['RGBX', 'RGBA', [10, 20, 30, 40], [10, 20, 30, 255]],
+		['BGRX', 'RGBA', [10, 20, 30, 40], [30, 20, 10, 255]],
+		['RGBX', 'BGRX', [10, 20, 30, 40], [30, 20, 10, 40]],
+		['RGBA', 'RGBX', [10, 20, 30, 40], [10, 20, 30, 40]],
+	] as const)('copying %s pixels as %s swaps channels and fills alpha', async (from, to, pixel, expected) => {
+		using sample = new VideoSample(new Uint8Array([...pixel, ...pixel]), {
+			format: from,
+			codedWidth: 2,
+			codedHeight: 1,
+			timestamp: 0,
+		});
+		const dest = new Uint8Array(8);
+		await sample.copyTo(dest, { format: to });
+		expect([...dest]).toEqual([...expected, ...expected]);
+	});
+});
+
 describe('AudioSample copyTo and allocationSize validation', () => {
 	// 4 frames of stereo f32 (interleaved): L0 R0 L1 R1 ...
 	const makeSample = () => new AudioSample({
