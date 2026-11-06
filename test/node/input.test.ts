@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { Input, UnsupportedInputFormatError } from '../../src/input.js';
 import { ADTS, ALL_FORMATS, FLAC, MP3, OGG, WAVE } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
+import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -39,22 +41,6 @@ test('MP3 detection does not claim files of other containers', async () => {
 	using movInput = new Input({ source: new BufferSource(mov), formats: [MP3, WAVE, FLAC, OGG, ADTS] });
 	await expect(movInput.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
 
-	// A WAVE file holding MPEG audio frames is still read as WAVE, as it would be with ALL_FORMATS
-	const frames = new Uint8Array(3 * 417);
-	for (let i = 0; i < 3; i++) {
-		frames.set([0xff, 0xfb, 0x90, 0x00], i * 417);
-	}
-	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
-	const u32le = (value: number) => [value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, value >>> 24];
-	const fmt = [1, 0, 2, 0, ...u32le(44100), ...u32le(44100 * 4), 4, 0, 16, 0]; // PCM, stereo, 16-bit
-	const wav = new Uint8Array([
-		...ascii('RIFF'), ...u32le(4 + 8 + fmt.length + 8 + frames.length), ...ascii('WAVE'),
-		...ascii('fmt '), ...u32le(fmt.length), ...fmt,
-		...ascii('data'), ...u32le(frames.length), ...frames,
-	]);
-	using wavInput = new Input({ source: new BufferSource(wav), formats: [MP3, WAVE] });
-	expect(await wavInput.getFormat()).toBe(WAVE);
-
 	// MPEG-TS whose first packet holds small MP3 frames (8 kbps at 16 kHz, 36 bytes each) back to back
 	const ts = new Uint8Array(5 * 188);
 	for (let i = 0; i < 5; i++) {
@@ -68,8 +54,41 @@ test('MP3 detection does not claim files of other containers', async () => {
 
 	// But MP3 data that merely holds 0x47 at the starts of the first two 188-byte packets (cut out of a stream, say)
 	// is still MP3, since MPEG-TS has a sync byte at the start of every packet
+	const frames = new Uint8Array(3 * 417);
+	for (let i = 0; i < 3; i++) {
+		frames.set([0xff, 0xfb, 0x90, 0x00], i * 417);
+	}
 	const mp3 = new Uint8Array([0x47, ...frames]);
 	mp3[188] = 0x47;
 	using mp3Input = new Input({ source: new BufferSource(mp3), formats: [MP3] });
 	expect(await mp3Input.getFormat()).toBe(MP3);
+});
+
+test('Reads MP3 streams wrapped in RIFF', async () => {
+	// "RIFF MP3": a RIFF header with form type 'RMP3' and a 'data' chunk holding a plain MP3 stream, an old Windows
+	// wrapper still found as .mp3/.rmp3. FFmpeg reads these as MP3 too.
+	const frameCount = 40;
+	const mp3 = new Uint8Array(frameCount * 417);
+	for (let i = 0; i < frameCount; i++) {
+		mp3.set([0xff, 0xfb, 0x90, 0x00], i * 417);
+	}
+
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const u32le = (value: number) => [value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, value >>> 24];
+	const rmp3 = new Uint8Array([
+		...ascii('RIFF'), ...u32le(12 + mp3.length), ...ascii('RMP3'),
+		...ascii('data'), ...u32le(mp3.length), ...mp3,
+	]);
+
+	using input = new Input({ source: new BufferSource(rmp3), formats: ALL_FORMATS });
+	expect(await input.getFormat()).toBe(MP3);
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+		expect(packet.data).toEqual(mp3.subarray(packetCount * 417, (packetCount + 1) * 417));
+		packetCount++;
+	}
+	expect(packetCount).toBe(frameCount);
 });

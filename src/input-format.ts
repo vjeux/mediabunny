@@ -350,7 +350,10 @@ const startsWithMpegTsPackets = (bytes: Uint8Array, offset: number, packetSize: 
 	return packetCount >= 2;
 };
 
-/** Whether the bytes start like an ISOBMFF/QuickTime, Matroska, RIFF, Ogg, FLAC or MPEG-TS file. */
+/**
+ * Whether the bytes start like an ISOBMFF/QuickTime, Matroska, Ogg, FLAC or MPEG-TS file. RIFF files aren't included:
+ * some hold a plain MP3 stream (RIFF MP3, MP3 in WAVE), which reads fine as MP3.
+ */
 const startsWithOtherContainerSignature = (bytes: Uint8Array) => {
 	const view = toDataView(bytes);
 	const ascii = (start: number, length: number) => String.fromCharCode(...bytes.subarray(start, start + length));
@@ -361,7 +364,7 @@ const startsWithOtherContainerSignature = (bytes: Uint8Array) => {
 	if (bytes.length >= 4 && view.getUint32(0) === EBMLId.EBML) {
 		return true;
 	}
-	if (['RIFF', 'RIFX', 'RF64', 'OggS', 'fLaC'].includes(ascii(0, 4))) {
+	if (['OggS', 'fLaC'].includes(ascii(0, 4))) {
 		return true;
 	}
 
