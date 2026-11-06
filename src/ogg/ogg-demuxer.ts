@@ -384,7 +384,9 @@ export class OggDemuxer extends Demuxer {
 	/** Whether the page's checksum matches. Only checked where reading on past garbage, as that's rare. */
 	async pageChecksumIsValid(page: Page) {
 		let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		return !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
 	}
 
@@ -436,7 +438,9 @@ export class OggDemuxer extends Demuxer {
 			let searchPos = currentPos + 1;
 			while (true) {
 				let searchSlice = this.reader.requestSliceRange(searchPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_SIZE);
-				if (isThenable(searchSlice)) searchSlice = await searchSlice;
+				if (isThenable(searchSlice)) {
+					searchSlice = await searchSlice;
+				}
 				if (!searchSlice) {
 					return null;
 				}
