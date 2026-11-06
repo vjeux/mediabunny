@@ -17,6 +17,7 @@ import {
 	assert,
 	clamp,
 	promiseWithResolvers,
+	Queue,
 	setInt64,
 	toDataView,
 	toUint8Array,
@@ -90,7 +91,7 @@ type OggTrackData = {
 	internalSampleRate: number;
 	codecInfo: OggCodecInfo;
 	vorbisLastBlocksize: number | null;
-	packetQueue: Packet[];
+	packetQueue: Queue<Packet>;
 	startOffsetInSamples: number | null;
 	currentTimestampInSamples: number;
 	/** Maps packet timestamps (in samples) onto `currentTimestampInSamples`. */
@@ -191,7 +192,7 @@ export class OggMuxer extends Muxer {
 				opusInfo: null,
 			},
 			vorbisLastBlocksize: null,
-			packetQueue: [],
+			packetQueue: new Queue(),
 			startOffsetInSamples: null,
 			currentTimestampInSamples: 0,
 			timestampOffsetInSamples: 0,
@@ -480,10 +481,10 @@ export class OggMuxer extends Muxer {
 
 				if (
 					trackData.packetQueue.length > 0
-					&& trackData.packetQueue[0]!.timestampInSamples < minTimestamp
+					&& trackData.packetQueue.peek()!.timestampInSamples < minTimestamp
 				) {
 					trackWithMinTimestamp = trackData;
-					minTimestamp = trackData.packetQueue[0]!.timestampInSamples;
+					minTimestamp = trackData.packetQueue.peek()!.timestampInSamples;
 				}
 			}
 
