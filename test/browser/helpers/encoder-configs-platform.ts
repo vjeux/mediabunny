@@ -137,13 +137,23 @@ const readLumas = async (frame: VideoFrame) => {
 			: value;
 	};
 
+	// As alpha merging reads it: tightly packed whatever the returned layout says (WebKitGTK's copyTo reports a tight
+	// layout but writes VP9 rows at a padded stride), from R for RGB formats
+	const isRgb = format.startsWith('RGB') || format.startsWith('BGR');
+	const rOffset = format.startsWith('RGB') ? 0 : 2;
+	const halfMean = (from: number, to: number) => {
+		let sum = 0;
+		for (let x = from; x < to; x++) {
+			sum += stretched(isRgb ? buffer[4 * (row * width + x) + rOffset]! : buffer[row * width + x]!);
+		}
+		return sum / (to - from);
+	};
+	const half = Math.floor(width / 2);
+
 	return {
-		center: lumaAt(Math.floor(width / 2)),
-		halves: [stretched(lumaAt(Math.floor(width / 4))), stretched(lumaAt(Math.floor(3 * width / 4)))] as [
-			number,
-			number,
-		],
-		tight: tight && !format.startsWith('RGB') && !format.startsWith('BGR'),
+		center: lumaAt(half),
+		halves: [halfMean(0, half), halfMean(half, 2 * half)] as [number, number],
+		tight: tight && !isRgb,
 	};
 };
 
@@ -154,8 +164,9 @@ type NativeRoundTrip = {
 	decoderConfig: VideoDecoderConfig | null;
 	decodedLuma: number[];
 	/**
-	 * The luma at the middle of each decoded frame's left and right halves, stretched from limited to full range when
-	 * the frame says it's limited range, as alpha merging does.
+	 * The mean luma of each half of each decoded frame's middle row, read the way alpha merging reads alpha frames:
+	 * copied out with the default layout, taken as tightly packed, and stretched from limited to full range when the
+	 * frame says it's limited range.
 	 */
 	decodedHalves: [number, number][];
 	decodedColorSpaces: VideoColorSpaceInit[];
@@ -462,10 +473,10 @@ const ALPHA_COLOR_SPACE: VideoColorSpaceInit = {
 
 /**
  * Whether frames with the alpha test's pattern, luma 255 on the left half and 64 on the right, tagged full range,
- * come back through the platform's encoder and decoder at 2 Mbps the way the test checks them: above 245 and within
- * 10 of 64, read as alpha merging reads them (limited range stretched out, decoded frames copied out tightly packed,
- * as WebCodecs specifies). Alpha is encoded as the luma of a second, full-range stream, so alpha values can only be
- * checked where this holds. WebKitGTK's VP9 encoder blurs the two halves together.
+ * come back through the platform's encoder and decoder at 2 Mbps the way the test checks them: the mean of each half of
+ * the middle row above 245 and within 10 of 64, read as alpha merging reads them (see decodedHalves). Alpha is encoded
+ * as the luma of a second, full-range stream, so alpha values can only be checked where this holds. WebKitGTK's copyTo
+ * scrambles the rows of decoded VP9 frames.
  */
 export const alphaPatternSurvives = memoizeByKey(async (codec: ProbedVideoCodec) => {
 	const roundTrip = await nativeRoundTrip({
