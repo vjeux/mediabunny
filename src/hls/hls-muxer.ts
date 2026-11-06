@@ -77,6 +77,8 @@ const toHlsCodecString = (codecString: string, segmentFormat: OutputFormat) => {
 type HlsTrackData = {
 	track: OutputTrack;
 	packets: EncodedPacket[];
+	/** Whether a packet was ever added to the track, which then appears in the playlist's segments */
+	hasPackets: boolean;
 	playlist: Playlist;
 	// We must store it on the TrackData, reading it directly from the track leads to async race conditions!
 	closed: boolean;
@@ -636,6 +638,7 @@ export class HlsMuxer extends Muxer {
 		trackData = {
 			track,
 			packets: [],
+			hasPackets: false,
 			playlist: playlists[0]!,
 			closed: false,
 			info: {
@@ -666,6 +669,7 @@ export class HlsMuxer extends Muxer {
 		trackData = {
 			track,
 			packets: [],
+			hasPackets: false,
 			playlist: playlists[0]!,
 			closed: false,
 			info: {
@@ -702,6 +706,7 @@ export class HlsMuxer extends Muxer {
 			}
 
 			trackData.packets.push(packet);
+			trackData.hasPackets = true;
 			this.firstPacketTimestamp ??= packet.timestamp;
 
 			if (playlist.currentSegmentStartTimestamp === null) {
@@ -732,6 +737,7 @@ export class HlsMuxer extends Muxer {
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
 			trackData.packets.push(packet);
+			trackData.hasPackets = true;
 			this.firstPacketTimestamp ??= packet.timestamp;
 
 			if (playlist.currentSegmentStartTimestamp === null) {
@@ -1572,8 +1578,18 @@ export class HlsMuxer extends Muxer {
 				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
 					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
+				// CODECS lists the formats present in the segments (RFC 8216, 4.3.4.2), so once the playlist is
+				// complete, tracks that never got a packet are left out (readers would look for them in vain), unless
+				// no track of the variant has any
+				const tracksWithPackets = decl.playlist.tracks.filter(
+					track => this.trackDatas.some(x => x.track === track && x.hasPackets),
+				);
+				const isComplete = !this.isLive || decl.playlist.done;
+				const codecTracks = isComplete && tracksWithPackets.length > 0
+					? tracksWithPackets
+					: decl.playlist.tracks;
 				const codecs: string[] = [];
-				for (const track of decl.playlist.tracks) {
+				for (const track of codecTracks) {
 					const trackData = this.trackDatas.find(x => x.track === track);
 					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
 					codecs.push(toHlsCodecString(codecString, decl.playlist.segmentFormat));
