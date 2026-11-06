@@ -68,6 +68,7 @@ import {
 	validateAudioChunkMetadata,
 	validateSubtitleMetadata,
 	validateVideoChunkMetadata,
+	OPUS_SAMPLE_RATE,
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
 import { FileSlice } from '../reader';
@@ -970,6 +971,23 @@ export class MatroskaMuxer extends Muxer {
 				outputNumberOfChannels: numberOfChannels,
 			});
 			requiresAdtsStripping = true;
+		}
+
+		if (track.source._codec === 'opus' && !decoderConfig.description && decoderConfig.numberOfChannels <= 2) {
+			// Matroska requires the Opus identification header as CodecPrivate. With up to two channels (channel
+			// mapping family 0), it can be built from the config; its pre-skip matches the CodecDelay written below.
+			const preSkip = packet ? Math.round(Math.max(-packet.timestamp, 0) * OPUS_SAMPLE_RATE) : 0;
+			const header = new Uint8Array(19);
+			const view = new DataView(header.buffer);
+			view.setUint32(0, 0x4f707573, false); // 'Opus'
+			view.setUint32(4, 0x48656164, false); // 'Head'
+			view.setUint8(8, 1); // Version
+			view.setUint8(9, decoderConfig.numberOfChannels);
+			view.setUint16(10, preSkip, true);
+			view.setUint32(12, decoderConfig.sampleRate, true); // Input sample rate
+			view.setInt16(16, 0, true); // Output gain
+			view.setUint8(18, 0); // Channel mapping family
+			decoderConfig.description = header;
 		}
 
 		const newTrackData: MatroskaAudioTrackData = {
