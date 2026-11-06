@@ -489,6 +489,11 @@ export abstract class BaseMediaSampleSink<
 		validateTimestamp(startTimestamp);
 		validateTimestamp(endTimestamp);
 
+		if (endTimestamp <= startTimestamp) {
+			// The end is exclusive, so the range is empty (just like for packet iteration)
+			return (async function* () {})();
+		}
+
 		const sampleQueue: MediaSample[] = [];
 		let firstSampleQueued = false;
 		let lastSample: MediaSample | null = null;
