@@ -363,3 +363,71 @@ test('Opus timestamp gaps are filled with packet loss concealment', async () => 
 	expect(decodedFrames).toBeGreaterThan(1.1 * 48000);
 	expect(lastSampleEnd).toBeCloseTo(1.12, 9);
 });
+
+test('Opus timestamp gaps in multichannel audio are filled with valid multistream packets', async () => {
+	// Quadraphonic Opus made of two coupled (stereo) streams: each packet holds a self-delimited Opus packet for the
+	// first stream followed by a regular one for the second (RFC 7845, section 3). The streams' packets are taken
+	// from a stereo file, whose packets each hold one 20 ms frame (code 0).
+	using sourceInput = new Input({ source: new UrlSource('/preroll-test.opus'), formats: ALL_FORMATS });
+	const stereoPackets: Uint8Array[] = [];
+	for await (const packet of new EncodedPacketSink((await sourceInput.getPrimaryAudioTrack())!).packets()) {
+		stereoPackets.push(packet.data);
+		if (stereoPackets.length === 14) {
+			break;
+		}
+	}
+
+	const selfDelimited = (packet: Uint8Array) => {
+		const frameLength = packet.length - 1;
+		const lengthBytes = frameLength < 252
+			? [frameLength]
+			: [252 + (frameLength - 252) % 4, Math.floor((frameLength - 252) / 4)];
+		return new Uint8Array([packet[0]!, ...lengthBytes, ...packet.subarray(1)]);
+	};
+	const quadPacket = (i: number) => new Uint8Array([
+		...selfDelimited(stereoPackets[2 * i + 1]!),
+		...stereoPackets[2 * i + 2]!,
+	]);
+
+	const opusHead = new Uint8Array([
+		0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, // 'OpusHead'
+		1, 4, 0x38, 1, 0x80, 0xbb, 0, 0, 0, 0, // Version 1, 4 channels, pre-skip 312, 48 kHz, no gain
+		1, 2, 2, 0, 1, 2, 3, // Mapping family 1: 2 streams, both coupled, channels in order
+	]);
+	const decoderConfig = { codec: 'opus', numberOfChannels: 4, sampleRate: 48000, description: opusHead };
+
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const audioSource = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// 20 ms packets with a 1 s gap after the third one
+	const timestamps = [0, 0.02, 0.04, 1.06, 1.08, 1.1];
+	for (let i = 0; i < timestamps.length; i++) {
+		await audioSource.add(
+			new EncodedPacket(quadPacket(i), 'key', timestamps[i]!, 0.02),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+	audioSource.close();
+	await output.finalize();
+	assert(output.target.buffer);
+
+	using input = new Input({ source: new BufferSource(output.target.buffer), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getNumberOfChannels()).toBe(4);
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	for (const timestamp of timestamps) {
+		expect(packets.some(x => Math.abs(x.timestamp - timestamp) < 1e-9 && x.byteLength > 100)).toBe(true);
+	}
+
+	// Every packet decodes, including the synthesized ones, which would otherwise fail the decoder
+	let decodedFrames = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		decodedFrames += sample.numberOfFrames;
+	}
+	expect(decodedFrames).toBeGreaterThan(1.1 * 48000);
+});
