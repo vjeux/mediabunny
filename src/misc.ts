@@ -1713,6 +1713,10 @@ export class ConcurrentRunner {
 	parallelism: number;
 
 	constructor(parallelism: number) {
+		if (!(Number.isInteger(parallelism) && parallelism >= 1) && parallelism !== Infinity) {
+			throw new TypeError('parallelism must be a positive integer or Infinity.');
+		}
+
 		this.parallelism = parallelism;
 	}
 
@@ -1734,15 +1738,20 @@ export class ConcurrentRunner {
 	 * Throws if the runner is errored.
 	 */
 	async run(fn: () => Promise<unknown>) {
+		if (typeof fn !== 'function') {
+			throw new TypeError('fn must be a function.');
+		}
+
 		if (this._errored) {
 			await Promise.race(this._queue); // Will surface the error
 		}
 
-		while (this._queue.length >= this.parallelism) {
+		// Racing an empty queue would never settle, so a free runner always starts the function
+		while (this._queue.length > 0 && this._queue.length >= this.parallelism) {
 			await Promise.race(this._queue);
 		}
 
-		const promise = fn();
+		const promise = Promise.resolve(fn());
 		this._queue.push(promise);
 
 		void promise
