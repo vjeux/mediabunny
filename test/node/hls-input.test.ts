@@ -1052,6 +1052,18 @@ test.concurrent('#EXT-X-ENDLIST can appear anywhere in a media playlist', async 
 
 		expect(await countPackets(videoTrack)).toBe(2 * packetsPerSegment);
 	}
+
+	// Lines after the tag that aren't a segment's URI are ignored, like before, e.g. an error page a server appended
+	const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n</body></html>\n';
+	using input = new Input({
+		source: new CustomPathedSource('playlist.m3u8', ({ path }) => path === 'playlist.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new FilePathSource('./test/public/0.ts')),
+		formats: HLS_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await countPackets(videoTrack)).toBe(packetsPerSegment);
 });
 
 test.concurrent('#EXT-X-I-FRAME-STREAM-INF tags without BANDWIDTH attribute are rejected', async () => {
