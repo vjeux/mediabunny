@@ -1501,6 +1501,25 @@ export class MatroskaDemuxer extends Demuxer {
 					info: null,
 				};
 
+				// The Video and Audio elements only get read once the track type is known, but TrackType may come
+				// after them, so let's read it first
+				const children = slice.slice(dataStartPos, size);
+				while (children.remainingLength >= MIN_HEADER_SIZE) {
+					const childStartPos = children.filePos;
+					const childHeader = readElementHeader(children);
+					if (!childHeader || childHeader.size === undefined) {
+						break;
+					}
+
+					if (childHeader.id === EBMLId.TrackType) {
+						children.filePos = childStartPos;
+						this.traverseElement(children);
+						break;
+					}
+
+					children.skip(childHeader.size);
+				}
+
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 
 				// Check if track was disabled during parsing (e.g., by FlagEnabled being 0)
@@ -1693,7 +1712,7 @@ export class MatroskaDemuxer extends Demuxer {
 				if (!this.currentTrack) break;
 
 				const type = readUnsignedInt(slice, size);
-				if (type === 1) {
+				if (type === 1 && this.currentTrack.info?.type !== 'video') {
 					this.currentTrack.info = {
 						type: 'video',
 						width: -1,
@@ -1712,7 +1731,7 @@ export class MatroskaDemuxer extends Demuxer {
 						alphaMode: false,
 						proresFormat: null,
 					};
-				} else if (type === 2) {
+				} else if (type === 2 && this.currentTrack.info?.type !== 'audio') {
 					this.currentTrack.info = {
 						type: 'audio',
 						numberOfChannels: 1, // Default value
