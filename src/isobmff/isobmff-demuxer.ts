@@ -4216,6 +4216,10 @@ const resolveEncryptionAuxInfo = async (
 		const entrySize = aux.defaultSampleInfoSize > 0
 			? aux.defaultSampleInfoSize
 			: aux.sampleSizes![i]!;
+		const entryEndPos = slice.filePos + entrySize;
+		if (entrySize < ivSize || entrySize === ivSize + 1) {
+			throw new Error('Invalid file: sample auxiliary information doesn\'t match its size in saiz.');
+		}
 
 		const iv = new Uint8Array(16);
 		if (ivSize > 0) {
@@ -4229,6 +4233,10 @@ const resolveEncryptionAuxInfo = async (
 		let subsamples: { clearLen: number; protectedLen: number }[] | null = null;
 		if (entrySize > ivSize) {
 			const subsampleCount = readU16Be(slice);
+			if (entryEndPos - slice.filePos < 6 * subsampleCount) {
+				throw new Error('Invalid file: sample auxiliary information doesn\'t match its size in saiz.');
+			}
+
 			subsamples = [];
 			for (let j = 0; j < subsampleCount; j++) {
 				const clearLen = readU16Be(slice);
@@ -4238,6 +4246,7 @@ const resolveEncryptionAuxInfo = async (
 		}
 
 		entries.push({ iv, subsamples });
+		slice.filePos = entryEndPos;
 	}
 
 	aux.resolved = entries;
