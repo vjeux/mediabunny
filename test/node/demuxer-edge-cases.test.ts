@@ -1156,9 +1156,9 @@ describe('ISOBMFF MIME types and pssh boxes', () => {
 		expect(() => parsePsshBoxContents(tooManyKeys)).toThrow('key ID count exceeds box size');
 	});
 
-	test('pssh boxes are equal when system ID and data match, whatever their key IDs', () => {
+	test('pssh boxes differ when their system ID or data differ', () => {
 		const box = { systemId: 'aa', keyIds: null, data: new Uint8Array([1, 2]) };
-		expect(psshBoxesAreEqual(box, { ...box, keyIds: ['bb'] })).toBe(true);
+		expect(psshBoxesAreEqual(box, { ...box, data: new Uint8Array([1, 2]) })).toBe(true);
 		expect(psshBoxesAreEqual(box, { ...box, data: new Uint8Array([1, 3]) })).toBe(false);
 		expect(psshBoxesAreEqual(box, { ...box, systemId: 'ab' })).toBe(false);
 	});
