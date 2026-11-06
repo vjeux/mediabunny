@@ -475,13 +475,14 @@ class VideoEncoderWrapper {
 					if (x instanceof VideoSample) {
 						mappedSamples.push(x);
 					} else if (typeof VideoFrame !== 'undefined' && x instanceof VideoFrame) {
-						mappedSamples.push(new VideoSample(x));
+						mappedSamples.push(new VideoSample(x, { encodeOptions: videoSample.encodeOptions }));
 					} else {
 						// Calling the VideoSample constructor here will automatically handle input validation for us
 						// (it throws for any non-legal argument).
 						mappedSamples.push(new VideoSample(x as CanvasImageSource, {
 							timestamp: videoSample.timestamp,
 							duration: videoSample.duration,
+							encodeOptions: videoSample.encodeOptions,
 						}));
 					}
 				}
