@@ -3,7 +3,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
-import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
+import { AudioBufferSink, AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -333,4 +333,41 @@ test('Empty packets are skipped when decoding', async () => {
 		sample.close();
 	}
 	expect(audioSampleCount).toBeGreaterThan(30);
+});
+
+test('Empty PCM packets are skipped when decoding', async () => {
+	// PCM doesn't go through a decoder, so it needs its own check: samples and AudioBuffers can't have zero frames
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array([1, 0, 2, 0]), 'key', 0, 2 / 48000), {
+		decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 },
+	});
+	await source.add(new EncodedPacket(new Uint8Array(0), 'key', 2 / 48000, 0));
+	await source.add(new EncodedPacket(new Uint8Array([5]), 'key', 2 / 48000, 0)); // Less than one frame
+	await source.add(new EncodedPacket(new Uint8Array([3, 0, 4, 0]), 'key', 2 / 48000, 2 / 48000));
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+
+	const packetSizes: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packetSizes.push(packet.byteLength);
+	}
+	expect(packetSizes).toEqual([4, 0, 1, 4]);
+
+	const sampleFrames: number[] = [];
+	for await (const sample of new AudioSampleSink(track).samples()) {
+		sampleFrames.push(sample.numberOfFrames);
+		sample.close();
+	}
+	expect(sampleFrames).toEqual([2, 2]);
+
+	const bufferFrames: number[] = [];
+	for await (const { buffer } of new AudioBufferSink(track).buffers()) {
+		bufferFrames.push(buffer.length);
+	}
+	expect(bufferFrames).toEqual([2, 2]);
 });

@@ -2625,6 +2625,10 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		const numberOfFrames = Math.floor(
 			packet.byteLength / this.decoderConfig.numberOfChannels / this.inputSampleSize,
 		);
+		if (numberOfFrames === 0) {
+			// Empty packets (MP4 allows zero-size samples) hold no audio, and samples can't have zero frames
+			return;
+		}
 
 		const outputBufferSize = numberOfFrames * this.decoderConfig.numberOfChannels * this.outputSampleSize;
 		const outputBuffer = new ArrayBuffer(outputBufferSize);
