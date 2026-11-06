@@ -397,6 +397,35 @@ test('UrlSource resumes sequential mode at the start its 206 response states', a
 	}
 });
 
+test('UrlSource learns the size from where a 206 body without a total really starts', async () => {
+	const data = new Uint8Array(3_000_000);
+	const server = http.createServer((req, res) => {
+		// The range starts at the MiB boundary before the requested position, and the total size is unknown
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		const start = requested - (requested % 2 ** 20);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/*`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const source = new UrlSource(`http://localhost:${address.port}/data.bin`);
+		using ref = source.ref();
+		await new Reader(ref.source).requestSlice(2_500_123, 16);
+
+		expect(await source.getSize()).toBe(data.length);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
 ) => {

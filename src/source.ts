@@ -1011,7 +1011,10 @@ export class UrlSource extends PathedSource {
 					// less data than was requested. In practice, it seems most servers don't do this though, and the
 					// Content-Length header actually contains the length until the end of the file.
 					// A non-206 response always spans the entire resource, no matter what range we asked for.
-					const basePos = response.status === 206 ? worker.currentPos : 0;
+					// A 206 body starts where its Content-Range says, which may lie before the requested position
+					const basePos = response.status === 206
+						? (parseContentRange(response.headers.get('Content-Range'))?.start ?? worker.currentPos)
+						: 0;
 					this._orchestrator.supplyFileSize(basePos + Number(contentLength));
 				}
 			}
