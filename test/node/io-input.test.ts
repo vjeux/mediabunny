@@ -206,14 +206,23 @@ describe('Format detection', () => {
 		}
 	});
 
-	test('the first format in the list that accepts the file wins', async () => {
-		// Two MP3 frames 1 byte in, whose payload puts MPEG-TS sync bytes at offsets 0 and 188
-		const bytes = concat([0x47], mp3Frame(), mp3Frame());
-		bytes[188] = 0x47;
+	test('detection stops at the first format in the list that accepts the file', async () => {
+		// Let two formats accept anything, so that only their order decides
+		const mp3Accepts = vi.spyOn(MP3, '_canReadInput').mockResolvedValue(true);
+		const adtsAccepts = vi.spyOn(ADTS, '_canReadInput').mockResolvedValue(true);
+		try {
+			const bytes = createRandomBytes(1000, 15);
+			expect(await detect(bytes, [MP3, ADTS])).toBe(MP3);
+			expect(adtsAccepts).not.toHaveBeenCalled();
+			expect(await detect(bytes, [ADTS, MP3])).toBe(ADTS);
+			expect(await detect(bytes, [WAVE, FLAC, MP3, ADTS])).toBe(MP3); // The ones that reject are skipped
+			expect(mp3Accepts).toHaveBeenCalledTimes(2);
+		} finally {
+			mp3Accepts.mockRestore();
+			adtsAccepts.mockRestore();
+		}
 
-		expect(await detect(bytes, [MP3, MPEG_TS])).toBe(MP3);
-		expect(await detect(bytes, [MPEG_TS, MP3])).toBe(MPEG_TS);
-		expect(await detect(bytes, [WAVE, FLAC])).toBeNull();
+		expect(await detect(concat(mp3Frame(), mp3Frame(), mp3Frame()), [WAVE, FLAC])).toBeNull();
 	});
 
 	test('MATROSKA and WEBM each only accept their own DocType', async () => {
