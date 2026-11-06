@@ -415,8 +415,12 @@ export class FlacDemuxer extends Demuxer {
 				// https://github.com/Vanilagy/mediabunny/issues/194
 
 				if (this.blockingBit === 0) {
-					// Case A: If the stream is fixed block size, this is the frame number, which increments by 1
-					if (nextFrameHeader.num - frameHeader.num !== 1) {
+					// Case A: If the stream is fixed block size, this is the frame number, which increments by 1.
+					// Encoders predating FLAC 1.2 (such as Flake) wrote variable block size streams without setting
+					// the blocking strategy bit, with sample numbers in place of frame numbers (RFC 9639, Appendix
+					// B.1), so let's accept those too, like FFmpeg does.
+					const difference = nextFrameHeader.num - frameHeader.num;
+					if (difference !== 1 && difference !== frameHeader.blockSize) {
 						slice.filePos = positionBeforeReading;
 						continue;
 					}
