@@ -58,7 +58,6 @@ import { PacketRetrievalOptions } from '../media-sink';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import {
 	assert,
-	binarySearchExact,
 	binarySearchLessOrEqual,
 	COLOR_PRIMARIES_MAP_INVERSE,
 	findLastIndex,
@@ -186,7 +185,7 @@ export class MpegTsDemuxer extends Demuxer {
 	trackBackingEntries: InputTrackBacking[] = [];
 	packetOffset = 0;
 	packetStride = -1;
-	sectionEndPositions: number[] = [];
+	sectionEndPositions = new Set<number>();
 	seekChunkSize = 5 * 1024 * 1024; // 5 MiB, picked because most HLS segments are below this size
 	minReferencePointByteDistance = -1;
 	timestampWrapInfo: TimestampWrapInfo | null = null;
@@ -931,7 +930,7 @@ export class MpegTsDemuxer extends Demuxer {
 			}
 
 			// Check if we already know this is a section end
-			const isKnownSectionEnd = binarySearchExact(this.sectionEndPositions, endPos, x => x) !== -1;
+			const isKnownSectionEnd = this.sectionEndPositions.has(endPos);
 			if (isKnownSectionEnd) {
 				mustAddSectionEnd = false;
 				break;
@@ -939,8 +938,7 @@ export class MpegTsDemuxer extends Demuxer {
 		}
 
 		if (mustAddSectionEnd) {
-			const index = binarySearchLessOrEqual(this.sectionEndPositions, endPos, x => x);
-			this.sectionEndPositions.splice(index + 1, 0, endPos);
+			this.sectionEndPositions.add(endPos);
 		}
 
 		if (!firstPacket) {
