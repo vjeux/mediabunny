@@ -378,7 +378,9 @@ export class OggDemuxer extends Demuxer {
 			}
 
 			let slice = this.reader.requestSlice(firstByteOffset, 1);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			if (!slice || position.startPage.lacingValues[position.startSegmentIndex] === 0) {
 				break;
 			}
