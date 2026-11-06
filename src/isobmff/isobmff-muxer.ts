@@ -1048,6 +1048,28 @@ export class IsobmffMuxer extends Muxer {
 
 		const sortedTimestamps = trackData.timestampProcessingQueue.map(x => x.timestamp).sort((a, b) => a - b);
 
+		if (nextSample === undefined && trackData.closed && !this.isFragmented) {
+			// The track's last presented sample lasts until the next sample in decode order begins (its decode slot),
+			// both for us and for readers. When B-frames follow it in decode order, that's where they begin, not where
+			// the sample ends, so its own duration would be lost. Delay their decode times to keep it. Not done for
+			// fragmented files, where FFmpeg shifts the whole track by the largest negative composition offset.
+			const queue = trackData.timestampProcessingQueue;
+			let lastPresentedIndex = 0;
+			for (let i = 1; i < queue.length; i++) {
+				if (queue[i]!.timestamp >= queue[lastPresentedIndex]!.timestamp) {
+					lastPresentedIndex = i;
+				}
+			}
+
+			if (lastPresentedIndex < queue.length - 1) {
+				const shift = sortedTimestamps[lastPresentedIndex]! + queue[lastPresentedIndex]!.duration
+					- sortedTimestamps[lastPresentedIndex + 1]!;
+				for (let i = lastPresentedIndex + 1; i < queue.length; i++) {
+					sortedTimestamps[i]! += shift;
+				}
+			}
+		}
+
 		if (this.isFragmented) {
 			trackData.startTimestampOffset ??= Math.min(sortedTimestamps[0]!, 0);
 		} else {
