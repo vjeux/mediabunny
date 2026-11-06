@@ -2045,3 +2045,86 @@ describe('WebVTT subtitle tracks', () => {
 		]);
 	});
 });
+
+describe('Randomized round trips', () => {
+	// Deterministic PRNG (mulberry32)
+	const random = (seed: number) => () => {
+		seed = seed + 0x6d2b79f5 | 0;
+		let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+		t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+
+	const randomVideoPackets = (rnd: () => number, start: number) => {
+		const fps = [24, 25, 30, 60][Math.floor(rnd() * 4)]!;
+		const bFrames = Math.floor(rnd() * 3);
+		const packets: TestPacket[] = [];
+		let time = start;
+		const gops = 1 + Math.floor(rnd() * 4);
+		for (let gop = 0; gop < gops; gop++) {
+			const length = 1 + Math.floor(rnd() * 20);
+			// Decode order: the key frame, then each anchor followed by the B-frames it precedes in presentation
+			const order = [0];
+			for (let i = 1; i < length;) {
+				const anchor = Math.min(i + bFrames, length - 1);
+				order.push(anchor);
+				for (let b = i; b < anchor; b++) {
+					order.push(b);
+				}
+				i = anchor + 1;
+			}
+			order.forEach((frame, i) => packets.push({
+				type: i === 0 ? 'key' : 'delta',
+				timestamp: time + frame / fps,
+				duration: 1 / fps,
+				size: 8 + Math.floor(rnd() * 40),
+			}));
+			time += length / fps;
+		}
+		return packets;
+	};
+
+	test('random multi-track files keep every packet\'s data, timestamp and type in every mode', async () => {
+		for (let seed = 1; seed <= 150; seed++) {
+			const rnd = random(seed);
+			const mode = ['false', 'in-memory', 'reserve', 'fragmented', 'mov'][Math.floor(rnd() * 5)]!;
+			const start = () => [0, 0, 0.5, -0.3, 2][Math.floor(rnd() * 5)]!;
+			const tracks: TrackSpec[] = [];
+			const videoCount = Math.floor(rnd() * 3);
+			const audioCount = (videoCount === 0 ? 1 : 0) + Math.floor(rnd() * 3);
+			for (let i = 0; i < videoCount; i++) {
+				const packets = randomVideoPackets(rnd, start());
+				tracks.push({ kind: 'video', packets, metadata: { maximumPacketCount: packets.length } });
+			}
+			for (let i = 0; i < audioCount; i++) {
+				const packets = audioPackets(1 + Math.floor(rnd() * 120), { start: start(), size: 12 });
+				tracks.push({ kind: 'audio', packets, metadata: { maximumPacketCount: packets.length } });
+			}
+
+			const fastStart = mode === 'false' ? false : mode as 'in-memory' | 'reserve' | 'fragmented';
+			const minimumFragmentDuration = [0, 0.5, 2][Math.floor(rnd() * 3)];
+			const format = mode === 'mov'
+				? new MovOutputFormat()
+				: new Mp4OutputFormat({ fastStart, minimumFragmentDuration });
+			const { bytes } = await mux(tracks, { format });
+
+			using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+			const inputTracks = await input.getTracks();
+			expect(inputTracks).toHaveLength(tracks.length);
+			for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+				const expected = tracks[trackIndex]!.packets;
+				let count = 0;
+				for await (const packet of new EncodedPacketSink(inputTracks[trackIndex]!).packets()) {
+					const view = new DataView(packet.data.buffer, packet.data.byteOffset);
+					expect(view.getUint8(2)).toBe(trackIndex);
+					const original = expected[view.getUint32(3)]!;
+					expect(packet.timestamp).toBeCloseTo(original.timestamp, 3);
+					expect(packet.type).toBe(original.type ?? 'key');
+					expect(packet.data.byteLength).toBe(original.size);
+					count++;
+				}
+				expect(count).toBe(expected.length);
+			}
+		}
+	});
+});
