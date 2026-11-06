@@ -28,13 +28,14 @@ import {
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readBytes, Reader } from '../reader';
-import { buildOggMimeType, extractSampleMetadata, OggCodecInfo, oggPageChecksumMatches } from './ogg-misc';
+import { buildOggMimeType, extractSampleMetadata, OggCodecInfo } from './ogg-misc';
 import {
 	findNextPageHeader,
 	MAX_PAGE_HEADER_SIZE,
 	MAX_PAGE_SIZE,
 	MIN_PAGE_HEADER_SIZE,
 	Page,
+	pageChecksumMatches,
 	readPageHeader,
 } from './ogg-reader';
 
@@ -303,7 +304,7 @@ export class OggDemuxer extends Demuxer {
 		if (result === undefined) {
 			let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
 			if (isThenable(slice)) slice = await slice;
-			result = !!slice && oggPageChecksumMatches(readBytes(slice, page.totalSize));
+			result = !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
 			this.pageIntactness.set(page.headerStartPos, result);
 		}
 
