@@ -1,4 +1,5 @@
 /* eslint-disable @stylistic/max-len */
+import fs from 'node:fs';
 import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
@@ -1318,6 +1319,44 @@ test.concurrent('#EXT-X-DEFINE QUERYPARAM variables can be IMPORTed into media p
 
 	expect(requestedPaths).toContain(expectedMediaPlaylistPath);
 	expect(requestedPaths).toContain(expectedSegmentPath);
+});
+
+test.concurrent('Disposing the input releases the sources of every segment it read', async () => {
+	let playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:3\n';
+	for (let i = 0; i < 8; i++) {
+		playlist += `${i > 0 ? '#EXT-X-DISCONTINUITY\n' : ''}#EXTINF:2.4,\nsegment-${i}.ts\n`;
+	}
+	playlist += '#EXT-X-ENDLIST\n';
+
+	const segmentData = new Uint8Array(await fs.promises.readFile('./test/public/mp3.ts'));
+	const disposedPaths: string[] = [];
+	class TrackedSource extends BufferSource {
+		constructor(private path: string) {
+			super(segmentData);
+		}
+
+		override _dispose() {
+			disposedPaths.push(this.path);
+		}
+	}
+
+	const input = new Input({
+		source: new CustomPathedSource('playlist.m3u8', ({ path }) => path === 'playlist.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new TrackedSource(path)),
+		formats: HLS_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	const sink = new EncodedPacketSink(audioTrack);
+	for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+		// Read everything
+	}
+
+	input.dispose();
+	await new Promise(resolve => setTimeout(resolve, 10)); // Disposal completes asynchronously
+	expect(disposedPaths.sort()).toEqual(Array.from({ length: 8 }, (_, i) => `segment-${i}.ts`));
 });
 
 test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {

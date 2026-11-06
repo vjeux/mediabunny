@@ -71,6 +71,8 @@ export abstract class SegmentedInput {
 		age: number;
 	}[] = [];
 
+	evictedInputs: WeakRef<Input>[] = [];
+
 	trackBackingsPromise: Promise<InputTrackBacking[]> | null = null;
 	firstSegment: Segment | null = null;
 
@@ -214,11 +216,32 @@ export abstract class SegmentedInput {
 		return promise;
 	}
 
+	/**
+	 * Keeps track of an input that dropped out of the cache. It may still be in use (by packets read from it), so it's
+	 * only disposed together with this input, unless garbage collection gets to it first.
+	 */
+	trackEvictedInput(input: Input) {
+		if (typeof WeakRef === 'undefined') {
+			return;
+		}
+
+		if (this.evictedInputs.length >= 64) {
+			this.evictedInputs = this.evictedInputs.filter(x => x.deref());
+		}
+
+		this.evictedInputs.push(new WeakRef(input));
+	}
+
 	dispose() {
 		for (const entry of this.inputCache) {
 			entry.input.dispose();
 		}
 		this.inputCache.length = 0;
+
+		for (const ref of this.evictedInputs) {
+			ref.deref()?.dispose();
+		}
+		this.evictedInputs.length = 0;
 	}
 }
 
