@@ -1,3 +1,4 @@
+import { createCipheriv } from 'node:crypto';
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -321,4 +322,73 @@ test('Decoder config of a track with several sample descriptions', async () => {
 	expect(await track.getCodedWidth()).toBe(320);
 	expect(await track.getCodedHeight()).toBe(240);
 	expect((await track.getDecoderConfig())?.codec).toBe('avc1.42001e');
+});
+
+test('Encryption info from a sample description after the first', async () => {
+	// A clear lead whose clear sample description comes first: the track's decoder config comes from the first
+	// description, but the encryption info of the second must still be read
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const key = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+	const keyId = zeros(16).map((_, i) => 0x10 + i);
+	const iv = [1, 2, 3, 4, 5, 6, 7, 8];
+
+	const plaintext = Array.from({ length: 40 }, (_, i) => i);
+	const counter = Buffer.alloc(16);
+	counter.set(iv);
+	const ciphertext = [...plaintext.slice(0, 4), ...createCipheriv('aes-128-ctr', key, counter).update(
+		Buffer.from(plaintext.slice(4)),
+	)];
+
+	const avcC = box('avcC', [1, 0x42, 0, 0x1e, 0xff, 0xe0, 0]);
+	const avc1 = box('avc1', zeros(24), [0, 64, 0, 64], zeros(50), avcC);
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), avcC, box('sinf', box('frma', ascii('avc1')),
+		box('schm', zeros(4), ascii('cenc'), u32(0x10000)), box('schi', box('tenc', zeros(4), [0, 0, 1, 8], keyId))));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(2), avc1, encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	// The fragment uses the encrypted description
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020002), u32(1), u32(2)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(ciphertext.length)),
+		box('senc', u32(2), u32(1), iv, u16(1), u16(4), u32(plaintext.length - 4)),
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', ciphertext),
+		])),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => key } },
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	expect(await track.getInternalCodecId()).toBe('avc1');
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	expect([...packet!.data]).toEqual(plaintext);
 });

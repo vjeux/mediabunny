@@ -1259,19 +1259,13 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(3); // Flags
 
 				const entries = readU32Be(slice);
+				let firstEntryState: Partial<InternalTrack> | null = null;
 
 				for (let i = 0; i < entries; i++) {
 					const sampleBoxStartPos = slice.filePos;
 					const sampleBoxInfo = readBoxHeader(slice);
 					if (!sampleBoxInfo) {
 						break;
-					}
-
-					if (i > 0) {
-						// The track's decoder config comes from the first sample description, like FFmpeg's primary
-						// extradata; later ones (e.g. from concatenated files) only apply to later samples
-						slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
-						continue;
 					}
 
 					track.internalCodecId = sampleBoxInfo.name;
@@ -1508,6 +1502,22 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
+
+					if (i === 0) {
+						firstEntryState = {
+							info: { ...track.info },
+							internalCodecId: track.internalCodecId,
+							maxBitrate: track.maxBitrate,
+							avgBitrate: track.avgBitrate,
+						};
+					}
+				}
+
+				if (firstEntryState && entries > 1) {
+					// The track's decoder config comes from the first sample description, like FFmpeg's primary
+					// extradata; later ones (e.g. from concatenated files) only apply to later samples. They're still
+					// read for what applies to the whole track, like the encryption info of a clear lead's copy.
+					Object.assign(track, firstEntryState);
 				}
 			}; break;
 
