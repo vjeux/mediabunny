@@ -16,6 +16,7 @@ import {
 	Output,
 	PathedTarget,
 	UrlSource,
+	Mp4OutputFormat,
 } from 'mediabunny';
 import fs from 'node:fs';
 import { createCipheriv } from 'node:crypto';
@@ -2258,6 +2259,95 @@ media.m3u8
 	using liveInput = createInput(livePlaylist);
 	const liveTracks = await liveInput.getTracks();
 	expect(await Promise.all(liveTracks.map(x => x.getLiveRefreshInterval()))).toEqual([2, 2]);
+});
+
+test.concurrent('fMP4 I-frame playlists only hold their I-frames', async () => {
+	// Fragmented MP4 with one fragment per GOP, like Apple's segmenter writes it for I-frame playlists
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration: 0 }),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source, { frameRate: 30 });
+	await output.start();
+	for (let i = 0; i < 90; i++) {
+		const isKey = i % 30 === 0;
+		await source.add(
+			new EncodedPacket(new Uint8Array(isKey ? 1000 : 100), isKey ? 'key' : 'delta', i / 30, 1 / 30),
+			{ decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } },
+		);
+	}
+	await output.finalize();
+
+	const file = new Uint8Array(output.target.buffer!);
+	const view = new DataView(file.buffer);
+	let initSize = 0;
+	const fragments: { offset: number; moofSize: number; size: number }[] = [];
+	for (let offset = 0; offset < file.length; offset += view.getUint32(offset)) {
+		const type = new TextDecoder().decode(file.subarray(offset + 4, offset + 8));
+		if (type === 'moov') {
+			initSize = offset + view.getUint32(offset);
+		} else if (type === 'moof') {
+			const moofSize = view.getUint32(offset);
+			fragments.push({ offset, moofSize, size: moofSize + view.getUint32(offset + moofSize) });
+		}
+	}
+	expect(fragments).toHaveLength(3);
+
+	// An I-frame segment spans its fragment's moof and the I-frame's data, but not the rest of the mdat
+	const createPlaylist = (iFramesOnly: boolean) => [
+		'#EXTM3U',
+		'#EXT-X-TARGETDURATION:1',
+		'#EXT-X-VERSION:7',
+		'#EXT-X-PLAYLIST-TYPE:VOD',
+		...(iFramesOnly ? ['#EXT-X-I-FRAMES-ONLY'] : []),
+		`#EXT-X-MAP:URI="main.mp4",BYTERANGE="${initSize}@0"`,
+		...fragments.flatMap(fragment => [
+			'#EXTINF:1,',
+			`#EXT-X-BYTERANGE:${iFramesOnly ? fragment.moofSize + 8 + 1000 : fragment.size}@${fragment.offset}`,
+			'main.mp4',
+		]),
+		'#EXT-X-ENDLIST',
+	].join('\n');
+	const files: Record<string, Uint8Array> = {
+		'master.m3u8': new TextEncoder().encode(`#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=100000,CODECS="vp09.00.10.08"
+main.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=30000,CODECS="vp09.00.10.08",URI="iframes.m3u8"
+`),
+		'main.m3u8': new TextEncoder().encode(createPlaylist(false)),
+		'iframes.m3u8': new TextEncoder().encode(createPlaylist(true)),
+		'main.mp4': file,
+	};
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files[path]!)),
+		formats: ALL_FORMATS,
+	});
+
+	const iFrameTrack = (await input.getVideoTracks())[1];
+	assert(iFrameTrack);
+	expect(await iFrameTrack.hasOnlyKeyPackets()).toBe(true);
+
+	const sink = new EncodedPacketSink(iFrameTrack);
+	const packets: number[] = [];
+	for await (const packet of sink.packets()) {
+		packets.push(packet.timestamp);
+	}
+	expect(packets).toEqual([0, 1, 2]);
+
+	for (const timestamp of [0.5, 1.5, 2.9]) {
+		const packet = await sink.getPacket(timestamp);
+		expect(packet?.timestamp).toBe(Math.floor(timestamp));
+		expect(packet?.type).toBe('key');
+		expect((await sink.getPacket(timestamp, { metadataOnly: true }))?.timestamp).toBe(Math.floor(timestamp));
+	}
+
+	const metadataPackets: number[] = [];
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		metadataPackets.push(packet.timestamp);
+	}
+	expect(metadataPackets).toEqual([0, 1, 2]);
 });
 
 const fetchBytes = async (url: string) => {
