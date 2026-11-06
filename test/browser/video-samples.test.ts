@@ -6,7 +6,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Quality } from '../../src/encode.js';
 import { PacketType } from '../../src/packet.js';
-import { Rotation } from '../../src/misc.js';
+import { isChromium, Rotation } from '../../src/misc.js';
 
 test('allocationSize', async () => {
 	{
@@ -339,6 +339,63 @@ test('RGB conversion for ArrayBuffer-backed data', async () => {
 			30, 20, 10, 255, 60, 50, 40, 255,
 			90, 80, 70, 255, 120, 110, 100, 255,
 		]);
+	}
+});
+
+test('RGB conversion for ArrayBuffer-backed data converts into the target color space', async () => {
+	const data = new Uint8Array([200, 100, 50, 255, 0, 255, 0, 255]);
+	const displayP3 = {
+		primaries: 'smpte432' as VideoColorPrimaries,
+		transfer: 'iec61966-2-1' as VideoTransferCharacteristics,
+		matrix: 'rgb' as VideoMatrixCoefficients,
+		fullRange: true,
+	};
+
+	// Same results as VideoFrame, for sRGB and Display P3 data
+	for (const colorSpace of [undefined, displayP3]) {
+		const init = { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0, colorSpace } as const;
+		using sample = new VideoSample(data, init);
+		const frame = new VideoFrame(data, init);
+		const optionSets: VideoFrameCopyToOptions[] = [
+			{ format: 'RGBA' },
+			{ format: 'BGRA', colorSpace: 'srgb' },
+			{ format: 'RGBA', colorSpace: 'display-p3' },
+			{ format: 'BGRX', colorSpace: 'display-p3' },
+		];
+		for (const options of optionSets) {
+			const expected = new Uint8Array(8);
+			await frame.copyTo(expected, options);
+			const actual = new Uint8Array(8);
+			await sample.copyTo(actual, options);
+			expect([...actual], JSON.stringify({ colorSpace, options })).toEqual([...expected]);
+		}
+		frame.close();
+	}
+
+	// A visible rect that doesn't start at the origin: R, G, B, orange cropped to G, B
+	const pixels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 128, 0, 255]);
+	const croppedInit = { format: 'RGBA', codedWidth: 4, codedHeight: 1, timestamp: 0 } as const;
+	using cropped = new VideoSample(pixels, { ...croppedInit, visibleRect: { left: 1, top: 0, width: 2, height: 1 } });
+	const croppedFrame = new VideoFrame(pixels, { ...croppedInit, visibleRect: { x: 1, y: 0, width: 2, height: 1 } });
+	const croppedOptionSets: VideoFrameCopyToOptions[] = [
+		{ format: 'RGBA', colorSpace: 'display-p3' },
+		{ format: 'BGRA', colorSpace: 'display-p3', rect: { x: 1, y: 0, width: 1, height: 1 } },
+	];
+	for (const options of croppedOptionSets) {
+		const expected = new Uint8Array(croppedFrame.allocationSize(options));
+		await croppedFrame.copyTo(expected, options);
+		const actual = new Uint8Array(cropped.allocationSize(options));
+		await cropped.copyTo(actual, options);
+		expect([...actual], JSON.stringify(options)).toEqual([...expected]);
+	}
+	croppedFrame.close();
+
+	// E.g. sRGB orange as Display P3 (Firefox's VideoFrame doesn't convert color spaces in copyTo())
+	if (isChromium()) {
+		using srgbSample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0 });
+		const p3Bytes = new Uint8Array(8);
+		await srgbSample.copyTo(p3Bytes, { format: 'RGBA', colorSpace: 'display-p3' });
+		[187, 105, 62].forEach((value, i) => expect(Math.abs(p3Bytes[i]! - value)).toBeLessThanOrEqual(2));
 	}
 });
 
