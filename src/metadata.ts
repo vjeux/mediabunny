@@ -218,10 +218,6 @@ export const validateMetadataTags = (tags: MetadataTags) => {
 	if (tags.date !== undefined && (!(tags.date instanceof Date) || Number.isNaN(tags.date.getTime()))) {
 		throw new TypeError('tags.date, when provided, must be a valid Date.');
 	}
-	if (tags.date !== undefined && (tags.date.getUTCFullYear() < 0 || tags.date.getUTCFullYear() > 9999)) {
-		// Every format stores the date as YYYY-MM-DD; toISOString uses the expanded ±YYYYYY form for other years
-		throw new TypeError('tags.date, when provided, must lie within the years 0 to 9999.');
-	}
 	if (
 		tags.creationTime !== undefined
 		&& tags.creationTime !== null
@@ -283,6 +279,19 @@ export const validateMetadataTags = (tags: MetadataTags) => {
 			}
 		}
 	}
+};
+
+/**
+ * Formats a date as YYYY-MM-DD, the shape every format stores dates in. Returns null for years outside 0 to 9999,
+ * which those fields can't hold (toISOString uses the expanded ±YYYYYY form for them).
+ */
+export const formatMetadataDate = (date: Date) => {
+	const year = date.getUTCFullYear();
+	if (year < 0 || year > 9999) {
+		return null;
+	}
+
+	return date.toISOString().slice(0, 10);
 };
 
 export const metadataTagsAreEmpty = (tags: MetadataTags) => {
