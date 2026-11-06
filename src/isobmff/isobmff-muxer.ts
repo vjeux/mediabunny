@@ -51,6 +51,7 @@ import {
 	parseOpusTocByte,
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
+	filterAv1SampleObus,
 } from '../codec-data';
 import { buildIsobmffMimeType, TIMESTAMP_OFFSET } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
@@ -723,6 +724,8 @@ export class IsobmffMuxer extends Muxer {
 				// We don't strip things like SPS or PPS NALUs here, mainly because they can also appear in the middle
 				// of a stream and potentially modify the parameters of it. So, let's just leave them in to be sure.
 				packetData = concatNalUnitsInLengthPrefixed(nalUnits, 4);
+			} else if (track.source._codec === 'av1') {
+				packetData = filterAv1SampleObus(packetData);
 			}
 
 			this.validateTimestamp(

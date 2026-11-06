@@ -2062,6 +2062,69 @@ export const iterateAv1PacketObus = function* (packet: Uint8Array) {
 };
 
 /**
+ * Removes the OBUs that AV1-ISOBMFF (section 2.4) and the Matroska AV1 mapping say samples should not contain (temporal
+ * delimiters, redundant frame headers, padding) or must not contain (tile lists), like FFmpeg's ff_av1_filter_obus.
+ * Returns the packet unchanged if there is nothing to remove or if it can't be parsed.
+ */
+export const filterAv1SampleObus = (packet: Uint8Array) => {
+	const kept: Uint8Array[] = [];
+	let removedAny = false;
+	let pos = 0;
+
+	while (pos < packet.length) {
+		const header = packet[pos]!;
+		const obuType = (header >> 3) & 0b1111;
+		const obuExtension = (header >> 2) & 1;
+		const obuHasSizeField = (header >> 1) & 1;
+
+		let payloadStart = pos + 1 + obuExtension;
+		let payloadSize = 0;
+		if (obuHasSizeField) {
+			for (let i = 0; ; i++) {
+				if (payloadStart >= packet.length || i === 8) {
+					return packet; // Malformed size field
+				}
+
+				const byte = packet[payloadStart++]!;
+				payloadSize += (byte & 0x7f) * 2 ** (7 * i);
+				if (!(byte & 0x80)) {
+					break;
+				}
+			}
+		} else {
+			payloadSize = packet.length - payloadStart;
+		}
+
+		const end = payloadStart + payloadSize;
+		if (end > packet.length) {
+			return packet; // Truncated OBU
+		}
+
+		// 2 = OBU_TEMPORAL_DELIMITER, 7 = OBU_REDUNDANT_FRAME_HEADER, 8 = OBU_TILE_LIST, 15 = OBU_PADDING
+		if (obuType === 2 || obuType === 7 || obuType === 8 || obuType === 15) {
+			removedAny = true;
+		} else {
+			kept.push(packet.subarray(pos, end));
+		}
+
+		pos = end;
+	}
+
+	if (!removedAny || kept.length === 0) {
+		return packet;
+	}
+
+	const result = new Uint8Array(kept.reduce((total, obu) => total + obu.byteLength, 0));
+	let offset = 0;
+	for (const obu of kept) {
+		result.set(obu, offset);
+		offset += obu.byteLength;
+	}
+
+	return result;
+};
+
+/**
  * When AV1 codec information is not provided by the container, we can still try to extract the information by digging
  * into the AV1 bitstream.
  */

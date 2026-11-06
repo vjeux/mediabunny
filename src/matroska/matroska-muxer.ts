@@ -70,6 +70,7 @@ import {
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
 import { FileSlice } from '../reader';
+import { filterAv1SampleObus } from '../codec-data';
 import { Muxer } from '../muxer';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
@@ -1019,6 +1020,8 @@ export class MatroskaMuxer extends Muxer {
 				// Trim off the frame container atom header. FFmpeg does this too and cites the "Matroska spec" as the
 				// reason, despite the spec not saying anything about this.
 				packetData = packetData.subarray(8);
+			} else if (track.source._codec === 'av1') {
+				packetData = filterAv1SampleObus(packetData);
 			}
 
 			const isKeyFrame = packet.type === 'key';
