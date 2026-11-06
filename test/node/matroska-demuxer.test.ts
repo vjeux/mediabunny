@@ -158,3 +158,62 @@ test('getPacket finds the first block of a cluster that starts before the previo
 		expect(packet?.timestamp).toBe(timestamp);
 	}
 });
+
+test('getPacket finds B-frames that straddle a cluster boundary', async () => {
+	// Clusters cut mid-GOP, as FFmpeg does in live mode or at its cluster size/time limits: the first cluster ends
+	// with the P frame at 120 ms, the B-frames presented before it (40, 80 ms) start the next cluster
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const matroskaFile = (...segmentChildren: number[][]) => new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, [...'matroska'].map(x => x.charCodeAt(0)))),
+		...element(EBMLId.Segment, segmentChildren.flat()),
+	]);
+
+	const block = (timestamp: number, key = false) => element(
+		EBMLId.SimpleBlock,
+		[0x81, (timestamp >> 8) & 0xff, timestamp & 0xff, key ? 0x80 : 0, 1],
+	);
+	const file = matroskaFile(
+		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+		element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [1]),
+			element(EBMLId.CodecID, [...'V_VP8'].map(x => x.charCodeAt(0))),
+			element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00]), // 40 ms
+			element(EBMLId.Video, element(EBMLId.PixelWidth, [16]), element(EBMLId.PixelHeight, [16])),
+		)),
+		element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), block(0, true), block(120)),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [40]),
+			block(0), block(40), block(200), block(120), block(160),
+		),
+	);
+
+	const timestamps = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24];
+	for (const order of [timestamps, [...timestamps].reverse()]) {
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const sink = new EncodedPacketSink(track);
+		for (const timestamp of order) {
+			expect((await sink.getPacket(timestamp))!.timestamp).toBe(timestamp);
+		}
+	}
+});
