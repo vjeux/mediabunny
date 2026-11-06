@@ -10,8 +10,11 @@ import {
 	adtsFrame,
 	annexB,
 	ascii,
+	av1SequenceHeaderObu,
 	buildAvcSps,
 	buildFragmentedMp4,
+	buildHevcPps,
+	buildHevcSps,
 	buildMp4,
 	concatBytes,
 	ebml,
@@ -1161,5 +1164,51 @@ describe('ISOBMFF MIME types and pssh boxes', () => {
 		expect(psshBoxesAreEqual(box, { ...box, data: new Uint8Array([1, 2]) })).toBe(true);
 		expect(psshBoxesAreEqual(box, { ...box, data: new Uint8Array([1, 3]) })).toBe(false);
 		expect(psshBoxesAreEqual(box, { ...box, systemId: 'ab' })).toBe(false);
+	});
+});
+
+describe('Matroska decoder configs taken from the first packet', () => {
+	const mkvWithFrame = (codecId: string, frame: Uint8Array) => mkvFile({
+		trackEntries: [mkvVideoTrack(codecId, [ebmlUint(EBMLId.PixelWidth, 1280), ebmlUint(EBMLId.PixelHeight, 720)])],
+		rest: [mkvCluster(0, mkvSimpleBlock(1, 0, 0x80, frame))],
+	});
+
+	test('HEVC without CodecPrivate is described by the parameter sets in its first packet', async () => {
+		const vps = [0x40, 0x01, 0x0c, 0x01, 0xff, 0xff];
+		const sps = buildHevcSps({
+			width: 1280,
+			height: 720,
+			profileIdc: 2,
+			compatibilityFlags: 0x20000000,
+			levelIdc: 120,
+			bitDepthLuma: 10,
+			bitDepthChroma: 10,
+			vui: { videoSignal: { fullRange: false, colour: [9, 16, 9] } },
+		});
+		const frame = annexB(vps, sps, buildHevcPps(false, false), [0x26, 0x01, 0xaf, 0x09, 0x40]);
+		using input = openBytes(mkvWithFrame('V_MPEGH/ISO/HEVC', frame));
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect(await track.getDecoderConfig()).toEqual({
+			codec: 'hev1.2.4.L120.90', // Annex B stays in band, hence hev1 and no description
+			codedWidth: 1280,
+			codedHeight: 720,
+			colorSpace: { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false },
+		});
+	});
+
+	test('AV1 without CodecPrivate is described by the sequence header in its first packet', async () => {
+		const frame = concatBytes(
+			[0x12, 0x00], // Temporal delimiter
+			av1SequenceHeaderObu({ profile: 0, level: 9, highBitdepth: true, colour: [9, 16, 9], fullRange: true }),
+			[0x32, 0x02, 0x10, 0x00], // Frame OBU
+		);
+		using input = openBytes(mkvWithFrame('V_AV1', frame));
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect(await track.getDecoderConfig()).toEqual({
+			codec: 'av01.0.09M.10.0.110.09.16.09.1',
+			codedWidth: 1280,
+			codedHeight: 720,
+			colorSpace: { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: true },
+		});
 	});
 });
