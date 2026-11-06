@@ -61,6 +61,7 @@ import {
 	u16,
 	u24,
 	u32,
+	u64,
 	udtaText,
 	utf8,
 	visualSampleEntry,
@@ -85,6 +86,12 @@ const collect = async (track: InputTrack, metadataOnly = true) => {
 		packets.push(packet);
 	}
 	return packets;
+};
+
+/** Runs `fn` with an input that's disposed afterwards (keeps `using` out of loop bodies) */
+const withInput = async (bytes: Uint8Array, fn: (input: Input) => Promise<void>) => {
+	using input = open(bytes);
+	await fn(input);
 };
 
 /** [timestamp, duration, key/delta, byte length] per packet, in decode order */
@@ -286,8 +293,10 @@ describe('Movie and track headers', () => {
 		const creationTime = Date.UTC(2024, 1, 29, 12, 30, 15) / 1000 + 2082844800; // Seconds since 1904
 
 		for (const version of [0, 1]) {
-			using input = open(buildMp4({ tracks: [videoTrack()], mvhd: { version, creationTime } }));
-			expect((await input.getMetadataTags()).creationTime).toEqual(new Date(Date.UTC(2024, 1, 29, 12, 30, 15)));
+			await withInput(buildMp4({ tracks: [videoTrack()], mvhd: { version, creationTime } }), async (input) => {
+				const tags = await input.getMetadataTags();
+				expect(tags.creationTime).toEqual(new Date(Date.UTC(2024, 1, 29, 12, 30, 15)));
+			});
 		}
 
 		using input = open(buildMp4({ tracks: [videoTrack()], mvhd: { creationTime: 0 } }));
@@ -312,15 +321,16 @@ describe('Movie and track headers', () => {
 
 	test('maps timestamps exactly for unusual timescales', async () => {
 		for (const timescale of [1, 600, 90000, 2 ** 31 - 1]) {
-			using input = open(buildMp4({
+			await withInput(buildMp4({
 				tracks: [videoTrack({ timescale, samples: samples(4, Math.max(1, Math.floor(timescale / 10))) })],
-			}));
-			const track = await firstVideoTrack(input);
-			const duration = Math.max(1, Math.floor(timescale / 10));
+			}), async (input) => {
+				const track = await firstVideoTrack(input);
+				const duration = Math.max(1, Math.floor(timescale / 10));
 
-			expect(await track.getTimeResolution()).toBe(timescale);
-			const timestamps = (await collect(track)).map(x => x.timestamp);
-			expect(timestamps).toEqual([0, 1, 2, 3].map(i => i * duration / timescale));
+				expect(await track.getTimeResolution()).toBe(timescale);
+				const timestamps = (await collect(track)).map(x => x.timestamp);
+				expect(timestamps).toEqual([0, 1, 2, 3].map(i => i * duration / timescale));
+			});
 		}
 	});
 
@@ -347,12 +357,13 @@ describe('Movie and track headers', () => {
 		];
 
 		for (const [matrix, rotation, flip] of cases) {
-			using input = open(buildMp4({ tracks: [videoTrack({ tkhd: { matrix } })] }));
-			const track = await firstVideoTrack(input);
+			await withInput(buildMp4({ tracks: [videoTrack({ tkhd: { matrix } })] }), async (input) => {
+				const track = await firstVideoTrack(input);
 
-			expect(await track.getRotation()).toBe(rotation);
-			expect(await track.getFlip()).toBe(flip);
-			expect(await track.getTransformationMatrix()).toEqual(matrix);
+				expect(await track.getRotation()).toBe(rotation);
+				expect(await track.getFlip()).toBe(flip);
+				expect(await track.getTransformationMatrix()).toEqual(matrix);
+			});
 		}
 	});
 
@@ -776,16 +787,16 @@ describe('Sample tables', () => {
 		const expected = [[0, 1, 'K'], [3, 1, 'D'], [1, 1, 'D'], [2, 1, 'D']];
 
 		for (const [version, offsets] of [[0, [1, 3, 0, 0]], [1, [0, 2, -1, -1]]] as const) {
-			using input = open(buildMp4({
+			await withInput(buildMp4({
 				tracks: [videoTrack({
 					timescale: 1,
 					samples: samples(4, 1, { compositionOffsets: [...offsets], keyFrames: i => i === 0 }),
 					cttsVersion: version,
 					edits: version === 0 ? elst([[4000, 1, 1]]) : undefined,
 				})],
-			}));
-
-			expect((await describePackets(await firstVideoTrack(input))).map(x => x.slice(0, 3))).toEqual(expected);
+			}), async (input) => {
+				expect((await describePackets(await firstVideoTrack(input))).map(x => x.slice(0, 3))).toEqual(expected);
+			});
 		}
 	});
 
@@ -825,11 +836,12 @@ describe('Sample tables', () => {
 				stbl: (_, defaults) => [defaults.stts, stz2(fieldSize, sizes), defaults.stsc, defaults.stco],
 			});
 
-			using input = open(buildMp4({ tracks: [track] }));
-			const packets = await collect(await firstVideoTrack(input), false);
-			expect(packets.map(x => x.byteLength)).toEqual(sizes);
-			const expected = samples(sizes.length, 1, { size: i => sizes[i]! });
-			expect(packets.map(x => [...x.data])).toEqual(expected.map(x => x.data));
+			await withInput(buildMp4({ tracks: [track] }), async (input) => {
+				const packets = await collect(await firstVideoTrack(input), false);
+				expect(packets.map(x => x.byteLength)).toEqual(sizes);
+				const expected = samples(sizes.length, 1, { size: i => sizes[i]! });
+				expect(packets.map(x => [...x.data])).toEqual(expected.map(x => x.data));
+			});
 		}
 	});
 
@@ -1084,7 +1096,7 @@ describe('Fragmented files', () => {
 			const videoSamples = fragSamples(3, 40);
 			const audioSamples = fragSamples(4, 1024, 3).map(x => ({ ...x, flags: SAMPLE_FLAGS_SYNC }));
 			const writeDataOffset = base !== 'explicit-data'; // Otherwise the data starts right at the base
-			using input = open(buildFragmentedMp4({
+			await withInput(buildFragmentedMp4({
 				tracks: [
 					videoInit(),
 					{ handlerType: 'soun', trackId: 2, timescale: 44100, sampleEntries: [mp4a()] },
@@ -1093,12 +1105,12 @@ describe('Fragmented files', () => {
 					{ trackId: 1, base, baseMediaDecodeTime: 0, truns: [{ samples: videoSamples, writeDataOffset }] },
 					{ trackId: 2, base, baseMediaDecodeTime: 0, truns: [{ samples: audioSamples, writeDataOffset }] },
 				]],
-			}));
-
-			const video = await collect(await firstVideoTrack(input), false);
-			const audio = await collect(await firstAudioTrack(input), false);
-			expect(video.map(x => [...x.data])).toEqual(videoSamples.map(x => x.data));
-			expect(audio.map(x => [...x.data])).toEqual(audioSamples.map(x => x.data));
+			}), async (input) => {
+				const video = await collect(await firstVideoTrack(input), false);
+				const audio = await collect(await firstAudioTrack(input), false);
+				expect(video.map(x => [...x.data])).toEqual(videoSamples.map(x => x.data));
+				expect(audio.map(x => [...x.data])).toEqual(audioSamples.map(x => x.data));
+			});
 		}
 	});
 
@@ -1121,7 +1133,7 @@ describe('Fragmented files', () => {
 
 	test('reads tfdt version 0 and version 1, including 64-bit decode times', async () => {
 		for (const [tfdtVersion, baseMediaDecodeTime] of [[0, 2 ** 32 - 1000], [1, 2 ** 40]] as const) {
-			using input = open(buildFragmentedMp4({
+			await withInput(buildFragmentedMp4({
 				tracks: [videoInit()],
 				fragments: [[{
 					trackId: 1,
@@ -1129,12 +1141,12 @@ describe('Fragmented files', () => {
 					baseMediaDecodeTime,
 					truns: [{ samples: fragSamples(2, 40) }],
 				}]],
-			}));
-
-			expect((await collect(await firstVideoTrack(input))).map(x => x.timestamp)).toEqual([
-				baseMediaDecodeTime / 1000,
-				(baseMediaDecodeTime + 40) / 1000,
-			]);
+			}), async (input) => {
+				expect((await collect(await firstVideoTrack(input))).map(x => x.timestamp)).toEqual([
+					baseMediaDecodeTime / 1000,
+					(baseMediaDecodeTime + 40) / 1000,
+				]);
+			});
 		}
 	});
 
@@ -1231,16 +1243,39 @@ describe('Fragmented files', () => {
 		});
 
 		for (const withMfra of [false, true]) {
-			using input = open(build(withMfra));
-			const sink = new EncodedPacketSink(await firstVideoTrack(input));
+			await withInput(build(withMfra), async (input) => {
+				const sink = new EncodedPacketSink(await firstVideoTrack(input));
 
-			expect((await sink.getKeyPacket(2.5, { metadataOnly: true }))?.timestamp).toBe(2.4);
-			expect((await sink.getPacket(2.5, { metadataOnly: true }))?.timestamp).toBeCloseTo(2.48, 10);
-			expect((await sink.getPacket(0.03, { metadataOnly: true }))?.timestamp).toBe(0);
-			expect((await sink.getKeyPacket(1.99, { metadataOnly: true }))?.timestamp).toBe(1.6);
-			expect((await sink.getPacket(Infinity, { metadataOnly: true }))?.timestamp).toBeCloseTo(3.16, 10);
-			expect(await sink.getPacket(-0.1, { metadataOnly: true })).toBeNull();
+				expect((await sink.getKeyPacket(2.5, { metadataOnly: true }))?.timestamp).toBe(2.4);
+				expect((await sink.getPacket(2.5, { metadataOnly: true }))?.timestamp).toBeCloseTo(2.48, 10);
+				expect((await sink.getPacket(0.03, { metadataOnly: true }))?.timestamp).toBe(0);
+				expect((await sink.getKeyPacket(1.99, { metadataOnly: true }))?.timestamp).toBe(1.6);
+				expect((await sink.getPacket(Infinity, { metadataOnly: true }))?.timestamp).toBeCloseTo(3.16, 10);
+				expect(await sink.getPacket(-0.1, { metadataOnly: true })).toBeNull();
+			});
 		}
+	});
+
+	test('skips sidx, emsg, prft and free boxes between fragments', async () => {
+		const init = buildInit({ tracks: [videoInit()] });
+		const between = [
+			fullBox('sidx', 1, 0, u32(1), u32(1000), u64(0), u64(0), u16(0), u16(1), u32(100), u32(400), u32(1 << 31)),
+			fullBox('emsg', 0, 0, ascii('urn:test\0'), ascii('1\0'), u32(1000), u32(0), u32(0xffff), u32(1), [1, 2, 3]),
+			fullBox('prft', 1, 0, u32(1), u64(0), u64(0)),
+			box('free', zeros(5)),
+		].flat();
+		const bytes = [...init, ...between];
+		for (let i = 0; i < 3; i++) {
+			bytes.push(...buildFragment(i + 1, [
+				{ trackId: 1, baseMediaDecodeTime: i * 120, truns: [{ samples: fragSamples(3, 40) }] },
+			], bytes.length));
+			bytes.push(...between);
+		}
+
+		using input = open(new Uint8Array(bytes));
+		const track = await firstVideoTrack(input);
+		const timestamps = (await collect(track, false)).map(x => x.timestamp);
+		expect(timestamps).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8].map(i => i * 0.04));
 	});
 
 	test('reads a media segment through its init segment', async () => {
