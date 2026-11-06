@@ -61,6 +61,10 @@ const MIN_CHUNK_DURATION = 0.5; // In seconds
 export type Sample = {
 	timestamp: number;
 	decodeTimestamp: number;
+	/** The decode timestamp in the track's timescale, rounded from the absolute timestamp. */
+	decodeTimeInTimescale: number;
+	/** Presentation minus decode time in the track's timescale, each rounded from the absolute timestamp. */
+	compositionTimeOffsetInTimescale: number;
 	duration: number;
 	data: Uint8Array | null;
 	size: number;
@@ -180,6 +184,45 @@ export const getTrackMetadata = (trackData: IsobmffTrackData) => {
 export const intoTimescale = (timeInSeconds: number, timescale: number, round = true) => {
 	const value = timeInSeconds * timescale;
 	return round ? Math.round(value) : value;
+};
+
+/**
+ * Picks the duration of the empty edit that delays a regular file's track by a positive start offset. The edit is in
+ * the movie timescale, and readers convert it to the nearest tick of the track's timescale, so it's chosen to land on
+ * the start's own nearest tick. Returns that duration and the track tick readers will start the media at.
+ */
+export const getEmptyEdit = (startOffset: number, timescale: number) => {
+	const exactTarget = startOffset * timescale;
+	const target = intoTimescale(startOffset, timescale); // The tick every other sample is rounded to the same way
+	const nearest = intoTimescale(startOffset, GLOBAL_TIMESCALE);
+
+	// When the track timescale is at most the movie's, one of these converts back to the target tick. Above it, there
+	// may be none; then the tick closest to the start is used, preferring one below it.
+	let best = nearest;
+	let bestStart = Math.round(nearest * timescale / GLOBAL_TIMESCALE);
+	const score = (start: number, exactStart: number) => [
+		start === target ? 0 : 1, // The target tick first
+		Math.abs(start - exactTarget), // Then the closest tick
+		start > exactTarget ? 1 : 0, // Then the tick below
+		Math.abs(exactStart - start), // Then the duration closest to the tick's center
+	];
+	let bestScore = score(bestStart, nearest * timescale / GLOBAL_TIMESCALE);
+	for (let duration = Math.max(0, nearest - 2); duration <= nearest + 2; duration++) {
+		const exactStart = duration * timescale / GLOBAL_TIMESCALE;
+		const start = Math.round(exactStart);
+		const candidateScore = score(start, exactStart);
+		const index = candidateScore.findIndex((value, i) => value !== bestScore[i]);
+		if (index !== -1 && candidateScore[index]! < bestScore[index]!) {
+			best = duration;
+			bestStart = start;
+			bestScore = candidateScore;
+		}
+	}
+
+	return {
+		duration: best,
+		startInTimescale: bestStart,
+	};
 };
 
 export const presentationSpan = (trackData: IsobmffTrackData) => {
@@ -999,6 +1042,8 @@ export class IsobmffMuxer extends Muxer {
 		const sample: Sample = {
 			timestamp,
 			decodeTimestamp: timestamp, // This may be refined later
+			decodeTimeInTimescale: intoTimescale(timestamp, trackData.timescale), // This may be refined later
+			compositionTimeOffsetInTimescale: 0, // This may be refined later
 			duration,
 			data,
 			size: data.byteLength,
@@ -1063,16 +1108,21 @@ export class IsobmffMuxer extends Muxer {
 			// model it.
 			sample.decodeTimestamp = sortedTimestamps[i]!;
 
-			const sampleCompositionTimeOffset
-				= intoTimescale(sample.timestamp - sample.decodeTimestamp, trackData.timescale);
+			// Each timestamp is rounded into the timescale exactly once, from its absolute value, so every sample
+			// lands on round(timestamp * timescale) whether it's written in a regular or a fragmented file
+			sample.decodeTimeInTimescale = intoTimescale(sample.decodeTimestamp, trackData.timescale);
+			sample.compositionTimeOffsetInTimescale
+				= intoTimescale(sample.timestamp, trackData.timescale) - sample.decodeTimeInTimescale;
+
+			const sampleCompositionTimeOffset = sample.compositionTimeOffsetInTimescale;
 			const durationInTimescale = intoTimescale(sample.duration, trackData.timescale);
 
 			if (trackData.lastTimescaleUnits !== null) {
 				assert(trackData.lastSample);
 
-				const timescaleUnits = intoTimescale(sample.decodeTimestamp, trackData.timescale, false);
-				const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
-				assert(delta >= 0);
+				// Never negative, except right after an empty edit that ends a tick or two after the first sample's own
+				// tick (track timescale above the movie's): samples within those ticks then share its decode time
+				const delta = Math.max(0, sample.decodeTimeInTimescale - trackData.lastTimescaleUnits);
 
 				trackData.lastTimescaleUnits += delta;
 				trackData.lastSample.timescaleUnitsToNextSample = delta;
@@ -1129,8 +1179,11 @@ export class IsobmffMuxer extends Muxer {
 					}
 				}
 			} else {
-				// Decode timestamp of the first sample
-				trackData.lastTimescaleUnits = intoTimescale(sample.decodeTimestamp, trackData.timescale, false);
+				// Decode timestamp of the first sample. In regular files with a positive start, that's where readers
+				// place the end of the empty edit: the start's own tick, unless the timescale exceeds the movie's.
+				trackData.lastTimescaleUnits = !this.isFragmented && trackData.startTimestampOffset > 0
+					? getEmptyEdit(trackData.startTimestampOffset, trackData.timescale).startInTimescale
+					: sample.decodeTimeInTimescale;
 
 				if (!this.isFragmented) {
 					trackData.timeToSampleTable.push({
@@ -1159,8 +1212,7 @@ export class IsobmffMuxer extends Muxer {
 			// the last sample's duration in each fragment be "0" for fragmented files. The guess we make here is
 			// actually correct most of the time, since typically, no delta frame with a lower timestamp follows the key
 			// frame (although it can happen).
-			const timescaleUnits = intoTimescale(nextSample.timestamp, trackData.timescale, false);
-			const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
+			const delta = intoTimescale(nextSample.timestamp, trackData.timescale) - trackData.lastTimescaleUnits;
 			trackData.lastSample.timescaleUnitsToNextSample = delta;
 		}
 	}

@@ -41,6 +41,7 @@ import {
 import { formatSubtitleTimestamp } from '../subtitles';
 import { Writer } from '../writer';
 import {
+	getEmptyEdit,
 	getTrackMetadata,
 	GLOBAL_TIMESCALE,
 	intoTimescale,
@@ -524,7 +525,7 @@ export const edts = (trackData: IsobmffTrackData) => {
 	if (offset > 0) {
 		// Positive offset: empty segment at the start, then the full media afterwards
 
-		const startOffset = intoTimescale(offset, GLOBAL_TIMESCALE);
+		const startOffset = getEmptyEdit(offset, trackData.timescale).duration;
 		const mediaDuration = intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE);
 
 		const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration);
@@ -1546,9 +1547,15 @@ export const tfhd = (trackData: IsobmffTrackData) => {
  */
 export const tfdt = (trackData: IsobmffTrackData) => {
 	assert(trackData.currentChunk);
+	assert(trackData.startTimestampOffset !== null);
+
+	// Taken from the same rounded decode times as the sample durations, so fragments line up with each other
+	const firstSample = trackData.currentChunk.samples[0]!;
+	const baseMediaDecodeTime = firstSample.decodeTimeInTimescale
+		- intoTimescale(trackData.startTimestampOffset, trackData.timescale);
 
 	return fullBox('tfdt', 1, 0, [
-		u64(intoTimescale(trackData.currentChunk.startTimestamp, trackData.timescale)), // Base Media Decode Time
+		u64(baseMediaDecodeTime), // Base Media Decode Time
 	]);
 };
 
@@ -1560,7 +1567,7 @@ export const trun = (trackData: IsobmffTrackData) => {
 	const allSampleSizes = trackData.currentChunk.samples.map(x => x.size);
 	const allSampleFlags = trackData.currentChunk.samples.map(fragmentSampleFlags);
 	const allSampleCompositionTimeOffsets = trackData.currentChunk.samples
-		.map(x => intoTimescale(x.timestamp - x.decodeTimestamp, trackData.timescale));
+		.map(x => x.compositionTimeOffsetInTimescale);
 
 	const uniqueSampleDurations = new Set(allSampleDurations);
 	const uniqueSampleSizes = new Set(allSampleSizes);

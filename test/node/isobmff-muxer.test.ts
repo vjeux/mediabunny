@@ -602,6 +602,149 @@ test('Chunks written in chronological order, no Fast Start', async () => {
 	await testChunkOrder(false);
 });
 
+test('Timestamps land on the nearest timescale tick in regular and fragmented files alike', async () => {
+	const timescale = 57600; // The default video timescale, used when no frame rate is given
+
+	// Timestamps in ticks: key frames only, then key + P + B frames in decode order
+	const cases: { ticks: number[]; types: ('key' | 'delta')[] }[] = [
+		{ ticks: [0.6, 11.1], types: ['key', 'key'] },
+		{ ticks: [0.4, 15.6, 35.7], types: ['key', 'key', 'key'] },
+		{ ticks: [0.4, 20.6, 10.3, 40.6, 30.3], types: ['key', 'delta', 'delta', 'delta', 'delta'] },
+	];
+
+	for (const { ticks, types } of cases) {
+		for (const fastStart of [false, 'fragmented'] as const) {
+			const output = new Output({
+				format: new Mp4OutputFormat({ fastStart, minimumFragmentDuration: 0 }),
+				target: new BufferTarget(),
+			});
+			const source = new EncodedVideoPacketSource('vp9');
+			output.addVideoTrack(source);
+			await output.start();
+
+			for (const [i, tick] of ticks.entries()) {
+				const packet = new EncodedPacket(new Uint8Array([i]), types[i]!, tick / timescale, 10 / timescale);
+				await source.add(packet, {
+					decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+				});
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			const readTicks: number[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				readTicks[packet.data[0]!] = packet.timestamp * timescale;
+			}
+
+			// Regular files used to round the first timestamp's fraction twice (0.6 + 10.5 -> 1 + 11 = 12), and both
+			// layouts rounded the composition offsets separately from the decode times
+			expect(readTicks.map(x => Math.round(x * 1000) / 1000)).toEqual(ticks.map(x => Math.round(x)));
+		}
+	}
+});
+
+test('Audio timestamps come back within half a sample when the track and movie timescales differ', async () => {
+	// A positive start makes regular files begin with an empty edit, whose duration is in the movie timescale (57600)
+	for (const sampleRate of [44100, 48000, 96000]) {
+		const timestamps = Array.from(
+			{ length: 40 },
+			(_, i) => 0.1799910361 + (1024 * i + [-0.4, 0.3, -0.2, 0.4, 0.1][i % 5]!) / sampleRate,
+		);
+
+		for (const fastStart of [false, 'fragmented'] as const) {
+			const output = new Output({
+				format: new Mp4OutputFormat({ fastStart, minimumFragmentDuration: 0 }),
+				target: new BufferTarget(),
+			});
+			const source = new EncodedAudioPacketSource('aac');
+			output.addAudioTrack(source);
+			await output.start();
+
+			for (const [i, timestamp] of timestamps.entries()) {
+				await source.add(new EncodedPacket(new Uint8Array([i]), 'key', timestamp, 1024 / sampleRate), {
+					decoderConfig: {
+						codec: 'mp4a.40.2',
+						numberOfChannels: 2,
+						sampleRate,
+						description: new Uint8Array({ 44100: [0x12, 0x10], 48000: [0x11, 0x90], 96000: [0x10, 0x10] }[
+							sampleRate
+						]!),
+					},
+				});
+			}
+			await output.finalize();
+
+			// Constant-rate audio needs no composition offsets, which FFmpeg would read differently
+			const bytes = new Uint8Array(output.target.buffer!);
+			expect(bytes.some((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'ctts')).toBe(false);
+
+			using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+			const track = await input.getPrimaryAudioTrack();
+			assert(track);
+
+			const errors: number[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				errors[packet.data[0]!] = Math.abs(packet.timestamp - timestamps[packet.data[0]!]!) * sampleRate;
+			}
+			expect(errors).toHaveLength(timestamps.length);
+
+			// Above the movie timescale, the empty edit can't always end on the start's own tick, so the first sample
+			// may be a tick further off
+			const [firstError, ...otherErrors] = errors;
+			expect(firstError).toBeLessThanOrEqual(fastStart === false && sampleRate > 57600 ? 1.5 : 0.5 + 1e-6);
+			expect(Math.max(...otherErrors)).toBeLessThanOrEqual(0.5 + 1e-6);
+		}
+	}
+});
+
+test('Audio above the movie timescale whose first packets are less than a tick apart still muxes', async () => {
+	// At 96 kHz, no empty edit converts back to these starts' own ticks (9601) in the reader: the closest ones end a
+	// tick before (from 0.1000065 s) or after (from 9601.4 / 96000 s) the start
+	const cases = [
+		[0.1000065, 0.1000065, 0.1000065 + 1024 / 96000],
+		[0.1000065, 0.1000065 + 0.3 / 96000],
+		[9601.4 / 96000, 9601.4 / 96000, 9601.4 / 96000 + 1024 / 96000],
+	];
+	for (const timestamps of cases) {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('aac');
+		output.addAudioTrack(source);
+		await output.start();
+
+		for (const [i, timestamp] of timestamps.entries()) {
+			await source.add(new EncodedPacket(new Uint8Array([i]), 'key', timestamp, 1024 / 96000), {
+				decoderConfig: {
+					codec: 'mp4a.40.2',
+					numberOfChannels: 2,
+					sampleRate: 96000,
+					description: new Uint8Array([0x10, 0x10]),
+				},
+			});
+		}
+		await output.finalize(); // Used to fail an assertion on a negative decode delta
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const ticks: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			ticks[packet.data[0]!] = Math.round(packet.timestamp * 96000);
+		}
+		expect(ticks).toHaveLength(timestamps.length);
+
+		// Packets within a tick of the start may be a tick off; the rest land on their own ticks
+		const expected = timestamps.map(timestamp => Math.round(timestamp * 96000));
+		for (const [i, tick] of ticks.entries()) {
+			const withinATickOfStart = timestamps[i]! - timestamps[0]! < 1 / 96000;
+			expect(Math.abs(tick - expected[i]!)).toBeLessThanOrEqual(withinATickOfStart ? 1 : 0);
+		}
+	}
+});
+
 test('Chunks written in chronological order, in-memory Fast Start', async () => {
 	await testChunkOrder('in-memory');
 });
