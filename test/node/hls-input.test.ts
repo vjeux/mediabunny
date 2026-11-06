@@ -1075,6 +1075,49 @@ test.concurrent('Missing media tag codec', async () => {
 	expect([...new Set(await Promise.all(tracks.map(x => x.getCodec())))]).toEqual(['aac', 'avc']);
 });
 
+test.concurrent('Only one Content Steering Pathway of a multivariant playlist is used', async () => {
+	// The same two variants on two Pathways (CDNs). "Content Steering allows content producers to group redundant
+	// Variant Streams into 'Pathways'" (RFC 8216bis, Section 7); without steering support, one Pathway is used: the
+	// one EXT-X-CONTENT-STEERING starts with, or else the first one.
+	const checkPathway = async (steeringTag: string, expectedPathway: string) => {
+		const master = `#EXTM3U
+${steeringTag}
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.64000d,mp4a.40.2",PATHWAY-ID="cdn-a"
+a/high.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64000d,mp4a.40.2",PATHWAY-ID="cdn-a"
+a/low.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.64000d,mp4a.40.2",PATHWAY-ID="cdn-b"
+b/high.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64000d,mp4a.40.2",PATHWAY-ID="cdn-b"
+b/low.m3u8
+`;
+		const mediaPlaylist = '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n';
+
+		const requestedPaths: string[] = [];
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => {
+				requestedPaths.push(path);
+				if (path.endsWith('.m3u8')) {
+					return new BufferSource(new TextEncoder().encode(path === 'master.m3u8' ? master : mediaPlaylist));
+				}
+
+				return new FilePathSource('./test/public/0.ts');
+			}),
+			formats: HLS_FORMATS,
+		});
+
+		expect(await input.getTracks()).toHaveLength(4); // Two variants with video and audio each
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await new EncodedPacketSink(videoTrack).getFirstPacket()).not.toBeNull();
+		expect(requestedPaths.slice(1).every(path => path.startsWith(`${expectedPathway}/`))).toBe(true);
+	};
+
+	await checkPathway('', 'a');
+	await checkPathway('#EXT-X-CONTENT-STEERING:SERVER-URI="steering.json",PATHWAY-ID="cdn-b"', 'b');
+});
+
 test.concurrent('Circular/recursive HLS is forbidden', async () => {
 	const text = `#EXTM3U
 #EXT-X-VERSION=3
