@@ -25,7 +25,15 @@ import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
-import { assert, computeRationalApproximation, last, promiseWithResolvers, Rational, simplifyRational } from '../misc';
+import {
+	assert,
+	computeRationalApproximation,
+	last,
+	promiseWithResolvers,
+	Rational,
+	roundToDivisor,
+	simplifyRational,
+} from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
@@ -733,11 +741,21 @@ export class IsobmffMuxer extends Muxer {
 				packet.timestamp,
 				packet.type === 'key',
 			);
+
+			let timestamp = packet.timestamp;
+			let duration = packet.duration;
+
+			if (track.metadata.frameRate !== undefined) {
+				// Constrain the time values to the frame rate; the timescale alone only does so for integer frame rates
+				timestamp = roundToDivisor(timestamp, track.metadata.frameRate);
+				duration = roundToDivisor(duration, track.metadata.frameRate);
+			}
+
 			const internalSample = this.createSampleForTrack(
 				trackData,
 				packetData,
-				packet.timestamp,
-				packet.duration,
+				timestamp,
+				duration,
 				packet.type,
 				0,
 			);
