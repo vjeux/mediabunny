@@ -8,6 +8,7 @@ import {
 	MpegTsOutputFormat,
 	OutputFormat,
 	WavOutputFormat,
+	WebMOutputFormat,
 } from '../../src/output-format.js';
 import { Output, OutputTrackGroup } from '../../src/output.js';
 import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
@@ -1460,3 +1461,30 @@ const testReservedFastStart = async (
 		expect(maximumPacketCount).toBeLessThanOrEqual(2 * packetCount + 64);
 	}
 };
+
+test('Transcoding odd-sized video to AVC rounds its dimensions up to even ones', async () => {
+	// Like a screen recording of an odd-sized window
+	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const canvas = new OffscreenCanvas(321, 241);
+	canvas.getContext('2d')!.fillRect(0, 0, 321, 241);
+	const canvasSource = new CanvasSource(canvas, { codec: 'vp9', quality: new Quality('medium') });
+	sourceOutput.addVideoTrack(canvasSource);
+	await sourceOutput.start();
+	for (let i = 0; i < 5; i++) {
+		await canvasSource.add(i / 10, 1 / 10);
+	}
+	await sourceOutput.finalize();
+
+	using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, video: { codec: 'avc' }, showWarnings: false });
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = await result.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await videoTrack.getCodec()).toBe('avc');
+	expect(await videoTrack.getCodedWidth()).toBe(322);
+	expect(await videoTrack.getCodedHeight()).toBe(242);
+});
