@@ -8,7 +8,7 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import * as nodeAlias from './node';
-import { assert, EventEmitter, FilePath, isWebKit, MaybePromise } from './misc';
+import { assert, EventEmitter, FilePath, isWebKit, MAX_FILE_IO_SIZE, MaybePromise } from './misc';
 
 const node = typeof nodeAlias !== 'undefined'
 	? nodeAlias // Aliasing it prevents some bundler warnings
@@ -733,7 +733,23 @@ export class FilePathTarget extends Target {
 			},
 			write: async (chunk) => {
 				assert(this._fileHandle);
-				await this._fileHandle.write(chunk.data, 0, chunk.data.byteLength, chunk.position);
+
+				// Node rejects writes of 2 GiB or more, and a write may write fewer bytes than asked for (Linux writes
+				// at most 0x7ffff000), so write in pieces until everything is written
+				let bytesWritten = 0;
+				while (bytesWritten < chunk.data.byteLength) {
+					const result = await this._fileHandle.write(
+						chunk.data,
+						bytesWritten,
+						Math.min(chunk.data.byteLength - bytesWritten, MAX_FILE_IO_SIZE),
+						chunk.position + bytesWritten,
+					);
+					if (result.bytesWritten === 0) {
+						throw new Error(`Couldn't write to ${filePath}.`);
+					}
+
+					bytesWritten += result.bytesWritten;
+				}
 			},
 			close: async () => {
 				if (this._fileHandle) {

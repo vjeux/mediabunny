@@ -16,6 +16,7 @@ import {
 	isNumber,
 	isThenable,
 	isWebKit,
+	MAX_FILE_IO_SIZE,
 	MaybePromise,
 	mergeRequestInit,
 	normalizeHeaders,
@@ -1418,7 +1419,23 @@ export class FilePathSource extends PathedSource {
 				assert(this._fileHandle);
 
 				const buffer = new Uint8Array(end - start);
-				await this._fileHandle.read(buffer, 0, end - start, start);
+
+				// Node rejects reads of 2 GiB or more, and a read may return fewer bytes than asked for (Linux returns
+				// at most 0x7ffff000), so read in pieces until the buffer is full
+				let bytesFilled = 0;
+				while (bytesFilled < buffer.length) {
+					const { bytesRead } = await this._fileHandle.read(
+						buffer,
+						bytesFilled,
+						Math.min(buffer.length - bytesFilled, MAX_FILE_IO_SIZE),
+						start + bytesFilled,
+					);
+					if (bytesRead === 0) {
+						break; // End of file
+					}
+
+					bytesFilled += bytesRead;
+				}
 
 				return buffer;
 			},

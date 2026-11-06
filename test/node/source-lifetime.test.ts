@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { Input, InputDisposedError } from '../../src/input.js';
 import { ALL_FORMATS, MP4 } from '../../src/input-format.js';
 import { promiseWithResolvers } from '../../src/misc.js';
-import { readFile } from 'node:fs/promises';
+import { readFile, rm, truncate, writeFile } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import os from 'node:os';
 import { setImmediate } from 'node:timers/promises';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -145,4 +147,47 @@ test('CustomSource releases stream readers after read errors', async () => {
 	});
 	await expect(input.getFormat()).rejects.toBe(error);
 	expect(stream.locked).toBe(false);
+});
+
+test('FilePathSource reads of 2 GiB or more are split into reads Node accepts', async () => {
+	// Node rejects file reads of 2 GiB or more, and Linux transfers at most 0x7ffff000 bytes per call. A sparse file of
+	// that size, read through a stand-in file handle that behaves like that without touching the buffer.
+	const size = 2 ** 31 + 2 ** 20;
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-read-${process.pid}.bin`);
+	await writeFile(filePath, new Uint8Array(0));
+	await truncate(filePath, size);
+
+	try {
+		const source = new FilePathSource(filePath);
+		expect(await source.getSize()).toBe(size);
+
+		const realHandle = source._fileHandle!;
+		const calls: { offset: number; length: number; position: number }[] = [];
+		source._fileHandle = {
+			read: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				calls.push({ offset, length, position });
+				return { bytesRead: Math.min(length, 0x7ffff000), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		const bytes = await source._customSource._options.read(0, size) as Uint8Array;
+		expect(bytes.byteLength).toBe(size);
+
+		// The reads cover the whole range, each one picking up where the previous one stopped
+		let pos = 0;
+		for (const call of calls) {
+			expect(call.offset).toBe(pos);
+			expect(call.position).toBe(pos);
+			pos += Math.min(call.length, 0x7ffff000);
+		}
+		expect(pos).toBe(size);
+
+		source._dispose();
+	} finally {
+		await rm(filePath);
+	}
 });

@@ -160,6 +160,9 @@ export const last = <T>(arr: T[]) => {
 	return arr && arr[arr.length - 1];
 };
 
+/** The most bytes to read or write in one file system call (Node rejects 2 GiB or more). */
+export const MAX_FILE_IO_SIZE = 2 ** 30;
+
 export const isU32 = (value: number) => {
 	return value >= 0 && value < 2 ** 32;
 };
