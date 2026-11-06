@@ -1529,6 +1529,10 @@ test('MediaStreamAudioTrackSource, the Web Audio fallback keeps audio in sync li
 }) => {
 	// Without MediaStreamTrackProcessor (Firefox, Safari), audio is captured through a ScriptProcessorNode. Record the
 	// same beeps and flashes both ways and compare where the beeps land relative to the flashes.
+	if (typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackProcessor on the main thread (Chromium) to compare against');
+	}
+
 	const withProcessor = await measureBeepToFlashOffset(false);
 	const withFallback = await measureBeepToFlashOffset(true);
 	if (withProcessor === null || withFallback === null) {
