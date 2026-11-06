@@ -256,13 +256,27 @@ const buildAdaptationField = (options: AdaptationFieldOptions | undefined, total
 	}
 
 	let flags = 0;
-	if (options?.discontinuity) flags |= 0x80;
-	if (options?.randomAccess) flags |= 0x40;
-	if (options?.priority) flags |= 0x20;
-	if (options?.pcr !== undefined) flags |= 0x10;
-	if (options?.opcr !== undefined) flags |= 0x08;
-	if (options?.spliceCountdown !== undefined) flags |= 0x04;
-	if (options?.privateData) flags |= 0x02;
+	if (options?.discontinuity) {
+		flags |= 0x80;
+	}
+	if (options?.randomAccess) {
+		flags |= 0x40;
+	}
+	if (options?.priority) {
+		flags |= 0x20;
+	}
+	if (options?.pcr !== undefined) {
+		flags |= 0x10;
+	}
+	if (options?.opcr !== undefined) {
+		flags |= 0x08;
+	}
+	if (options?.spliceCountdown !== undefined) {
+		flags |= 0x04;
+	}
+	if (options?.privateData) {
+		flags |= 0x02;
+	}
 	field[1] = flags;
 
 	let offset = 2;
@@ -301,10 +315,18 @@ export const minimumAdaptationFieldLength = (options: AdaptationFieldOptions | u
 	}
 
 	let length = 2;
-	if (options.pcr !== undefined) length += 6;
-	if (options.opcr !== undefined) length += 6;
-	if (options.spliceCountdown !== undefined) length += 1;
-	if (options.privateData) length += 1 + options.privateData.byteLength;
+	if (options.pcr !== undefined) {
+		length += 6;
+	}
+	if (options.opcr !== undefined) {
+		length += 6;
+	}
+	if (options.spliceCountdown !== undefined) {
+		length += 1;
+	}
+	if (options.privateData) {
+		length += 1 + options.privateData.byteLength;
+	}
 	return length;
 };
 
