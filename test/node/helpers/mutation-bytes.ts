@@ -1154,3 +1154,131 @@ export const av1SequenceHeaderObu = (options: Av1SequenceHeaderOptions) => {
 	const payload = w.toBytes();
 	return concatBytes([0x0a, payload.length], payload);
 };
+
+export type Mp4FragmentRun = {
+	/** trun flags beyond the data offset (0x1), which is always written */
+	sampleFields: { duration?: boolean; size?: boolean; flags?: boolean; compositionOffset?: boolean };
+	firstSampleFlags?: number;
+	samples: { duration?: number; flags?: number; compositionOffset?: number; data: Uint8Array }[];
+};
+
+export type Mp4Fragment = {
+	baseMediaDecodeTime: number;
+	tfdtVersion?: 0 | 1;
+	defaults?: { duration?: number; size?: number; flags?: number };
+	runs: Mp4FragmentRun[];
+};
+
+/**
+ * Builds a single-track fragmented MP4: an empty moov with trex defaults (and an optional mehd), then one moof + mdat
+ * per fragment. Data offsets are relative to the moof (default-base-is-moof).
+ */
+export const buildFragmentedMp4 = (options: {
+	handler: 'soun' | 'vide';
+	timescale: number;
+	sampleEntry: Uint8Array;
+	trex: { duration: number; size: number; flags: number };
+	fragmentDuration?: number;
+	fragments: Mp4Fragment[];
+}) => {
+	const emptyTable = (type: string) => mp4FullBox(type, 0, 0, u32be(0));
+	const stbl = mp4Box(
+		'stbl',
+		mp4FullBox('stsd', 0, 0, u32be(1), options.sampleEntry),
+		emptyTable('stts'),
+		emptyTable('stsc'),
+		mp4FullBox('stsz', 0, 0, u32be(0), u32be(0)),
+		emptyTable('stco'),
+	);
+	const mediaHeader = options.handler === 'soun'
+		? mp4FullBox('smhd', 0, 0, u32be(0))
+		: mp4FullBox('vmhd', 0, 1, new Uint8Array(8));
+	const dinf = mp4Box('dinf', mp4FullBox('dref', 0, 0, u32be(1), mp4FullBox('url ', 0, 1)));
+	const minf = mp4Box('minf', mediaHeader, dinf, stbl);
+	const mdhd = mp4FullBox(
+		'mdhd', 0, 0,
+		u32be(0), u32be(0), u32be(options.timescale), u32be(0), u16be(0x55c4), u16be(0),
+	);
+	const hdlr = mp4FullBox('hdlr', 0, 0, u32be(0), ascii(options.handler), new Uint8Array(12), [0]);
+	const matrix = [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000].flatMap(v => u32be(v));
+	const tkhd = mp4FullBox(
+		'tkhd', 0, 3,
+		u32be(0), u32be(0), u32be(1), u32be(0), u32be(0),
+		new Uint8Array(8), u16be(0), u16be(0), u16be(options.handler === 'soun' ? 0x0100 : 0), u16be(0),
+		matrix,
+		u32be(options.handler === 'vide' ? 640 * 0x10000 : 0),
+		u32be(options.handler === 'vide' ? 480 * 0x10000 : 0),
+	);
+	const mvhd = mp4FullBox(
+		'mvhd', 0, 0,
+		u32be(0), u32be(0), u32be(options.timescale), u32be(0),
+		u32be(0x10000), u16be(0x100), new Uint8Array(10), matrix, new Uint8Array(24), u32be(2),
+	);
+	const trex = mp4FullBox(
+		'trex', 0, 0,
+		u32be(1), u32be(1), u32be(options.trex.duration), u32be(options.trex.size), u32be(options.trex.flags),
+	);
+	const mvex = mp4Box(
+		'mvex',
+		...(options.fragmentDuration !== undefined ? [mp4FullBox('mehd', 0, 0, u32be(options.fragmentDuration))] : []),
+		trex,
+	);
+	const moov = mp4Box('moov', mvhd, mp4Box('trak', tkhd, mp4Box('mdia', mdhd, hdlr, minf)), mvex);
+	const ftyp = mp4Box('ftyp', ascii('iso6'), u32be(0), ascii('iso6mp41'));
+
+	const parts: Uint8Array[] = [ftyp, moov];
+	options.fragments.forEach((fragment, index) => {
+		const buildMoof = (dataStart: number) => {
+			let runDataOffset = dataStart;
+			const truns = fragment.runs.map((run) => {
+				const { sampleFields } = run;
+				const flags = 0x000001
+					| (run.firstSampleFlags !== undefined ? 0x000004 : 0)
+					| (sampleFields.duration ? 0x000100 : 0)
+					| (sampleFields.size ? 0x000200 : 0)
+					| (sampleFields.flags ? 0x000400 : 0)
+					| (sampleFields.compositionOffset ? 0x000800 : 0);
+				const box = mp4FullBox(
+					'trun', 1, flags,
+					u32be(run.samples.length),
+					u32be(runDataOffset),
+					...(run.firstSampleFlags !== undefined ? [u32be(run.firstSampleFlags)] : []),
+					...run.samples.map(sample => [
+						...(sampleFields.duration ? u32be(sample.duration!) : []),
+						...(sampleFields.size ? u32be(sample.data.length) : []),
+						...(sampleFields.flags ? u32be(sample.flags!) : []),
+						...(sampleFields.compositionOffset ? u32be(sample.compositionOffset! >>> 0) : []),
+					]),
+				);
+				runDataOffset += run.samples.reduce((sum, sample) => sum + sample.data.length, 0);
+				return box;
+			});
+			const defaults = fragment.defaults ?? {};
+			const tfhdFlags = 0x020000
+				| (defaults.duration !== undefined ? 0x08 : 0)
+				| (defaults.size !== undefined ? 0x10 : 0)
+				| (defaults.flags !== undefined ? 0x20 : 0);
+			const tfhd = mp4FullBox(
+				'tfhd', 0, tfhdFlags,
+				u32be(1),
+				...(defaults.duration !== undefined ? [u32be(defaults.duration)] : []),
+				...(defaults.size !== undefined ? [u32be(defaults.size)] : []),
+				...(defaults.flags !== undefined ? [u32be(defaults.flags)] : []),
+			);
+			const tfdt = fragment.tfdtVersion === 1
+				? mp4FullBox(
+						'tfdt', 1, 0,
+						u32be(Math.floor(fragment.baseMediaDecodeTime / 2 ** 32)),
+						u32be(fragment.baseMediaDecodeTime >>> 0),
+					)
+				: mp4FullBox('tfdt', 0, 0, u32be(fragment.baseMediaDecodeTime));
+			return mp4Box('moof', mp4FullBox('mfhd', 0, 0, u32be(index + 1)), mp4Box('traf', tfhd, tfdt, ...truns));
+		};
+		// The mdat payload starts right after the moof and the mdat header
+		const sizeProbe = buildMoof(0);
+		const moof = buildMoof(sizeProbe.length + 8);
+		const data = concatBytes(...fragment.runs.flatMap(run => run.samples.map(sample => sample.data)));
+		parts.push(moof, mp4Box('mdat', data));
+	});
+	return concatBytes(...parts);
+};

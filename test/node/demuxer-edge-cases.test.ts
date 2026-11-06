@@ -10,6 +10,7 @@ import {
 	annexB,
 	ascii,
 	buildAvcSps,
+	buildFragmentedMp4,
 	buildMp4,
 	concatBytes,
 	ebml,
@@ -22,6 +23,7 @@ import {
 	mkvFile,
 	mkvSimpleBlock,
 	mp4Box,
+	Mp4FragmentRun,
 	mp4FullBox,
 	mp4IlstItem,
 	mp4MdtaMeta,
@@ -1011,5 +1013,98 @@ describe('FLAC frame parsing', () => {
 			frames,
 		});
 		expect(await packetsOf(bytes)).toEqual(['0+1000:29', '1000+500:29', '1500+2000:29']);
+	});
+});
+
+describe('Fragmented MP4 track runs', () => {
+	const sps = buildAvcSps({ profileIdc: 66, levelIdc: 30, widthInMbs: 20, heightInMapUnits: 15 });
+	const pps = [0x68, 0xce, 0x3c, 0x80];
+	const avcC = mp4Box('avcC', [1, 66, 0xc0, 30, 0xff, 0xe1], u16be(sps.length), sps, [1], u16be(pps.length), pps);
+	const sampleEntry = mp4VisualEntry('avc1', 320, 240, avcC);
+	const sample = (i: number, size = 6) => {
+		const data = new Uint8Array(size);
+		data.set([0, 0, 0, size - 4, 0x41, i]);
+		return data;
+	};
+	const SYNC = 0x02000000;
+	const NON_SYNC = 0x01010000;
+
+	const read = async (bytes: Uint8Array) => {
+		using input = openBytes(bytes);
+		const track = (await input.getPrimaryVideoTrack())!;
+		const packets: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			const [start, length] = [Math.round(packet.timestamp * 1000), Math.round(packet.duration * 1000)];
+			packets.push(`${packet.data[5]}@${start}+${length}${packet.type[0]}`);
+		}
+		return { packets, duration: await track.computeDuration() };
+	};
+
+	test('per-sample fields, first sample flags and composition offsets across two fragments', async () => {
+		const bytes = buildFragmentedMp4({
+			handler: 'vide',
+			timescale: 1000,
+			sampleEntry,
+			trex: { duration: 1, size: 1, flags: NON_SYNC },
+			fragments: [0, 1].map(f => ({
+				baseMediaDecodeTime: f * 400,
+				tfdtVersion: f === 1 ? 1 as const : 0 as const,
+				runs: [{
+					sampleFields: { duration: true, size: true, flags: true, compositionOffset: true },
+					firstSampleFlags: SYNC,
+					samples: [
+						// I P B B in decode order; signed offsets put the B frames before the P frame
+						{ duration: 100, flags: NON_SYNC, compositionOffset: 0, data: sample(4 * f, 7) },
+						{ duration: 100, flags: NON_SYNC, compositionOffset: 200, data: sample(4 * f + 1, 8) },
+						{ duration: 100, flags: NON_SYNC, compositionOffset: -100, data: sample(4 * f + 2, 9) },
+						{ duration: 100, flags: NON_SYNC, compositionOffset: -100, data: sample(4 * f + 3, 6) },
+					],
+				}],
+			})),
+		});
+		const { packets } = await read(bytes);
+		expect(packets).toEqual([
+			'0@0+100k', '1@300+100d', '2@100+100d', '3@200+100d',
+			'4@400+100k', '5@700+100d', '6@500+100d', '7@600+100d',
+		]);
+	});
+
+	test('samples fall back to tfhd defaults, then to trex defaults', async () => {
+		const run = (from: number, count: number): Mp4FragmentRun => ({
+			sampleFields: {},
+			samples: Array.from({ length: count }, (_, i) => ({ data: sample(from + i, 10) })),
+		});
+		const bytes = buildFragmentedMp4({
+			handler: 'vide',
+			timescale: 1000,
+			sampleEntry,
+			trex: { duration: 50, size: 10, flags: SYNC },
+			fragmentDuration: 400,
+			fragments: [
+				{ baseMediaDecodeTime: 0, runs: [run(0, 2)] },
+				// Two runs in one fragment, with fragment-level defaults
+				{
+					baseMediaDecodeTime: 100,
+					defaults: { duration: 150, flags: NON_SYNC },
+					runs: [run(2, 1), run(3, 1)],
+				},
+			],
+		});
+		const { packets } = await read(bytes);
+		expect(packets).toEqual(['0@0+50k', '1@50+50k', '2@100+150d', '3@250+150d']);
+	});
+
+	test('zero trex values still count as defaults for fields a run leaves out', async () => {
+		const bytes = buildFragmentedMp4({
+			handler: 'vide',
+			timescale: 1000,
+			sampleEntry,
+			trex: { duration: 0, size: 0, flags: 0 },
+			fragments: [{
+				baseMediaDecodeTime: 0,
+				runs: [{ sampleFields: { duration: true, size: true }, samples: [{ duration: 10, data: sample(0) }] }],
+			}],
+		});
+		expect((await read(bytes)).packets).toEqual(['0@0+10k']);
 	});
 });
