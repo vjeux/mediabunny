@@ -229,6 +229,21 @@ test('UrlSource in sequential mode downloads lazily and aborts the response on d
 	}
 }, 10_000);
 
+test('UrlSource rejects Range headers it cannot map onto the resource', () => {
+	for (const range of ['bytes=-500', 'bytes=0-99,200-299', 'bytes=500-100', 'items=0-9']) {
+		expect(() => new UrlSource('https://example.com/a.mp4', { requestInit: { headers: { Range: range } } }))
+			.toThrow(new TypeError(
+				`Unsupported Range header '${range}': only 'bytes=<start>-' and 'bytes=<start>-<end>'`
+				+ ` (with end >= start) can be mapped onto the resource.`,
+			));
+		expect(() => new UrlSource(new Request('https://example.com/a.mp4', { headers: { Range: range } })))
+			.toThrow(TypeError);
+	}
+
+	expect(() => new UrlSource('https://example.com/a.mp4', { requestInit: { headers: { Range: 'bytes=100-' } } }))
+		.not.toThrow();
+});
+
 test('UrlSource reads the full decoded body of a compressed response', async () => {
 	const text = 'Some playlist text\n'.repeat(256);
 	const content = Buffer.from(text);
