@@ -7,10 +7,10 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { MovOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, TextSubtitleSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -749,4 +749,16 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
+});
+
+test('MOV reports that it takes no subtitle tracks', () => {
+	const format = new MovOutputFormat();
+	expect(format.getSupportedSubtitleCodecs()).toEqual([]);
+	expect(format.getSupportedTrackCounts().subtitle).toEqual({ min: 0, max: 0 });
+	expect(new Mp4OutputFormat().getSupportedTrackCounts().subtitle.max).toBeGreaterThan(0);
+
+	const output = new Output({ format, target: new BufferTarget() });
+	expect(() => output.addSubtitleTrack(new TextSubtitleSource('webvtt'))).toThrow(
+		'MOV does not support subtitle tracks.',
+	);
 });
