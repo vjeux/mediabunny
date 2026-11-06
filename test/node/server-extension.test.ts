@@ -921,7 +921,8 @@ describe('Video', async () => {
 	});
 
 	test('ProRes conversion roundtrip', { timeout: 30_000 }, async () => {
-		await conversionRoundtrip('prores');
+		// Encoding the whole clip as ProRes takes 30 CPU-seconds, which can exceed the timeout under parallel load
+		await conversionRoundtrip('prores', 1);
 	});
 
 	const conversionRoundtrip = async (codec: VideoCodec, duration?: number) => {
