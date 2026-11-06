@@ -287,3 +287,19 @@ const flushMicrotasks = async (iterations = 10) => {
 		await Promise.resolve();
 	}
 };
+
+test('parallelism must be a positive integer or Infinity, also when changed later', async () => {
+	for (const parallelism of [0, -1, 1.5, NaN]) {
+		expect(() => new ConcurrentRunner(parallelism)).toThrow(
+			new TypeError('parallelism must be a positive integer or Infinity.'),
+		);
+	}
+	expect(() => new ConcurrentRunner(Infinity)).not.toThrow();
+
+	// Once nothing is in flight, waiting for a free slot would wait forever
+	const runner = new ConcurrentRunner(1);
+	runner.parallelism = 0;
+	await expect(runner.run(async () => {})).rejects.toThrow(
+		new TypeError('parallelism must be a positive integer or Infinity.'),
+	);
+});

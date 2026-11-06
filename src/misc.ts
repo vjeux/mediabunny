@@ -1670,6 +1670,12 @@ export class EventEmitter<TEvents extends Record<string, unknown>> {
 
 export const ceilToMultipleOfTwo = (value: number) => Math.ceil(value / 2) * 2;
 
+const validateParallelism = (parallelism: number) => {
+	if (!((Number.isInteger(parallelism) && parallelism >= 1) || parallelism === Infinity)) {
+		throw new TypeError('parallelism must be a positive integer or Infinity.');
+	}
+};
+
 /**
  * Utility class for running async functions in parallel up to a certain level of parallelism. Can be used to apply
  * backpressure only if the concurrency level would be exceeded.
@@ -1690,6 +1696,7 @@ export class ConcurrentRunner {
 	parallelism: number;
 
 	constructor(parallelism: number) {
+		validateParallelism(parallelism);
 		this.parallelism = parallelism;
 	}
 
@@ -1711,6 +1718,10 @@ export class ConcurrentRunner {
 	 * Throws if the runner is errored.
 	 */
 	async run(fn: () => Promise<unknown>) {
+		// The field can be changed at any time. Below 1, a run would wait for a free slot forever once nothing is in
+		// flight anymore (Promise.race of an empty queue never settles).
+		validateParallelism(this.parallelism);
+
 		if (this._errored) {
 			await Promise.race(this._queue); // Will surface the error
 		}
