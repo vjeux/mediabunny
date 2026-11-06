@@ -935,6 +935,27 @@ test('Matroska: Xiph lacing running out of data', async () => {
 	);
 });
 
+test('Matroska: Vorbis CodecPrivate with unterminated Xiph lacing', async () => {
+	// Computing the pre-roll used to scan past the end of the CodecPrivate forever, and asserted without one
+	const getPreRollDuration = async (codecPrivate: number[] | null) => {
+		const track = element(
+			EBMLId.TrackEntry,
+			uintElement(EBMLId.TrackNumber, 1),
+			uintElement(EBMLId.TrackType, 2),
+			element(EBMLId.CodecID, ascii('A_VORBIS')),
+			codecPrivate ? element(EBMLId.CodecPrivate, codecPrivate) : [],
+			element(EBMLId.Audio, element(EBMLId.SamplingFrequency, float64(48000)), uintElement(EBMLId.Channels, 2)),
+		);
+		const file = matroska(info(), tracks(track), cluster(0, simpleBlock(1, 0, 0x80)));
+
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		return (await input.getAudioTracks())[0]!.getPreRollDuration();
+	};
+
+	expect(await getPreRollDuration([2, 0xff, 0xff, 0xff])).toBe(4096 / 48000);
+	expect(await getPreRollDuration(null)).toBe(4096 / 48000);
+});
+
 test('Matroska: Laced block without data', async () => {
 	await expectGracefulRead(
 		matroska(info(), tracks(videoTrack(1)), cluster(0, simpleBlock(1, 0, 0x84, []))),
