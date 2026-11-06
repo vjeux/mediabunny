@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 /* eslint-disable @stylistic/max-len */
 import {
 	ALL_FORMATS,
@@ -1417,6 +1418,71 @@ missing.ts
 	expect((await sink.getPacket(7))?.timestamp).toBe(Math.max(...firstHalf));
 	expect(await videoTrack.getDurationFromMetadata()).toBe(20);
 	expect(requestedPaths).not.toContain('missing.ts');
+});
+
+test.concurrent('I-frame segments read their PAT and PMT from the start of the resource', async () => {
+	// Like the I-frame playlists of Apple's segmenter: the resource starts with its PAT and PMT (bytes 0 to 375 of
+	// 0.ts), and the I-frame segment spans the key frame, which starts at byte 376 and ends in the first TS packet of
+	// the next video PES packet (at 24628). A null packet inside the PES packet stands in for the packets of other
+	// PIDs that real streams interleave.
+	const ts = new Uint8Array(await fs.promises.readFile('./test/public/0.ts'));
+	const nullPacket = new Uint8Array(188).fill(0xff);
+	nullPacket.set([0x47, 0x1f, 0xff, 0x10]);
+	const resource = new Uint8Array([
+		...ts.subarray(0, 564),
+		...nullPacket,
+		...ts.subarray(564, 24628 + 188),
+	]);
+
+	const files = new Map<string, string | Uint8Array>([
+		['master.m3u8', `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.64001f,mp4a.40.2"
+main.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=40000,CODECS="avc1.64001f",URI="iframes.m3u8"
+`],
+		['main.m3u8', `#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXTINF:5,
+0.ts
+#EXT-X-ENDLIST
+`],
+		['iframes.m3u8', `#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:5
+#EXT-X-I-FRAMES-ONLY
+#EXTINF:5,
+#EXT-X-BYTERANGE:${resource.length - 376}@376
+resource.ts
+#EXT-X-ENDLIST
+`],
+		['0.ts', ts],
+		['resource.ts', resource],
+	]);
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			const file = files.get(path)!;
+			return new BufferSource(typeof file === 'string' ? new TextEncoder().encode(file) : file);
+		}),
+		formats: HLS_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	const iFrameTrack = tracks[2];
+	assert(iFrameTrack?.isVideoTrack());
+	expect(await iFrameTrack.hasOnlyKeyPackets()).toBe(true);
+
+	// The I-frame segment holds the same key frame as the main playlist
+	const keyFrame = await new EncodedPacketSink(tracks[0]!).getFirstPacket();
+	const sink = new EncodedPacketSink(iFrameTrack);
+	const packet = await sink.getFirstPacket();
+	expect(packet?.type).toBe('key');
+	expect(packet?.timestamp).toBe(0);
+	expect(packet?.data).toEqual(keyFrame?.data);
+	expect((await iFrameTrack.getDecoderConfig())?.codec).toMatch(/^avc1\./);
+
+	// Input-wide queries cover the I-frame track too
+	expect(await input.computeDuration()).toBeGreaterThan(4.9);
 });
 
 test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {
