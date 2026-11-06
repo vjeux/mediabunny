@@ -1126,6 +1126,13 @@ export class VideoSample implements Disposable {
 		if (this._closed) {
 			throw new Error('VideoSample is closed.');
 		}
+		if (typeof VideoFrame === 'undefined') {
+			// Drawing and transforming samples that aren't backed by a canvas go through here too
+			throw new Error(
+				'This VideoSample needs to be converted to a VideoFrame (e.g. to draw or transform it), but VideoFrame'
+				+ ' is not available in this environment.',
+			);
+		}
 
 		assert(this._data !== null);
 
