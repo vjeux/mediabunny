@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from 'vitest';
@@ -1546,14 +1547,16 @@ test('Ogg: Page chain jumping over the page found by bisection', async () => {
 	});
 	const payload = new Uint8Array(2000).fill(0xf8);
 	payload.set(hiddenPage, 1180);
-
-	await expectGracefulRead(concat(
+	const file = concat(
 		oggPacketsPage({ headerType: 2 }, [opusHead()]),
 		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
 		oggPage({ granule: 1920, sequence: 2, lacing: Array<number>(8).fill(250), data: payload }),
 		oggPage({ headerType: 1, granule: -1, sequence: 4, lacing: [255], data: zeros(255) }),
 		zeros(100),
-	));
+	);
+
+	expect(evaluateWithDeadline(file, 'input => input.computeDuration()')).toBeCloseTo(0.0335);
+	await expectGracefulRead(file);
 });
 
 test('Ogg: Short Opus identification header', async () => {
@@ -2152,6 +2155,33 @@ const expectGracefulRead = async (fileOrSource: Uint8Array | Source, expectedErr
 	if (expectedError) {
 		expect(errors.some(x => expectedError.test(x))).toBe(true);
 	}
+};
+
+// A synchronous infinite loop stalls the whole file, since the test timeout can't fire while the event loop is blocked.
+// Reads that once looped like that run in a child process with a deadline instead, so that a regression fails fast.
+const evaluateWithDeadline = (file: Uint8Array, readFunction: string) => {
+	const script = `import(${JSON.stringify(new URL('../../src/index.ts', import.meta.url).href)}).then(async (mb) => {
+		const source = new mb.BufferSource(require('node:fs').readFileSync(0));
+		const input = new mb.Input({ source, formats: mb.ALL_FORMATS });
+		console.log(JSON.stringify(await (${readFunction})(input)));
+	});`;
+
+	let output: string;
+	try {
+		output = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
+			input: file,
+			encoding: 'utf8',
+			timeout: 10_000,
+		});
+	} catch (error) {
+		if ((error as { code?: string }).code === 'ETIMEDOUT') {
+			throw new Error('The read hung (killed after 10 s).');
+		}
+
+		throw error;
+	}
+
+	return JSON.parse(output.trim().split('\n').pop()!) as unknown;
 };
 
 // The file size stays unknown
