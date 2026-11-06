@@ -92,19 +92,29 @@ test('Copying into the sample\'s own pixel format, for VideoFrame- and ArrayBuff
 		using rawSample = new VideoSample(data, init);
 		using frameSample = new VideoSample(frame);
 
+		const crop = { x: 2, y: 0, width: 2, height: 2 };
 		const optionSets: VideoFrameCopyToOptions[] = [
 			{ format },
 			{ format, colorSpace: 'srgb' },
-			{ format, rect: { x: 2, y: 0, width: 2, height: 2 } },
+			{ format, rect: crop },
+			// Dictionary members may be inherited
+			Object.assign(Object.create({ rect: crop }) as VideoFrameCopyToOptions, { format }),
+			new (class {
+				format = format;
+				get rect() {
+					return crop;
+				}
+			})(),
 		];
 		for (const options of optionSets) {
+			const label = `${format} ${JSON.stringify(options)} rect ${JSON.stringify(options.rect)}`;
 			const expected = new Uint8Array(rawSample.allocationSize(options));
 			const expectedLayout = await rawSample.copyTo(expected, options);
 
-			expect(frameSample.allocationSize(options), `${format} ${JSON.stringify(options)}`).toBe(expected.length);
+			expect(frameSample.allocationSize(options), label).toBe(expected.length);
 			const actual = new Uint8Array(expected.length);
-			expect(await frameSample.copyTo(actual, options)).toEqual(expectedLayout);
-			expect(actual).toEqual(expected);
+			expect(await frameSample.copyTo(actual, options), label).toEqual(expectedLayout);
+			expect(actual, label).toEqual(expected);
 		}
 	}
 });

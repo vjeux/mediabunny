@@ -2004,7 +2004,8 @@ const toNativeCopyToOptions = (frame: VideoFrame, options: VideoFrameCopyToOptio
 		&& options.format === frame.format
 		&& !['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
 	) {
-		return { ...options, format: undefined, colorSpace: undefined };
+		// Picked one by one, since dictionary members may be inherited (e.g. getters), which a spread would drop
+		return { rect: options.rect, layout: options.layout };
 	}
 
 	return options;
