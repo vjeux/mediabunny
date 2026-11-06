@@ -282,6 +282,37 @@ test('flush waits for all in-flight tasks', async () => {
 	expect(completed.sort()).toEqual([0, 1, 2]);
 });
 
+test('rejects parallelism values that would hang or disable the limit', async () => {
+	for (const parallelism of [0, -1, NaN, 1.5, '2', null]) {
+		expect(() => new ConcurrentRunner(parallelism as number)).toThrow(
+			new TypeError('parallelism must be a positive integer or Infinity.'),
+		);
+	}
+
+	const unlimited = new ConcurrentRunner(Infinity);
+	await unlimited.run(async () => {});
+	await unlimited.flush();
+
+	// Shrinking the limit at runtime must not leave run() waiting on an empty queue forever
+	const runner = new ConcurrentRunner(1);
+	runner.parallelism = 0;
+	let ran = false;
+	await runner.run(async () => {
+		ran = true;
+	});
+	expect(ran).toBe(true);
+});
+
+test('run validates its argument and accepts synchronous functions', async () => {
+	const runner = new ConcurrentRunner(1);
+	await expect(runner.run('task' as never)).rejects.toThrow(new TypeError('fn must be a function.'));
+
+	await runner.run((() => 42) as never);
+	await runner.flush();
+	expect(runner.inFlightCount).toBe(0);
+	expect(runner.errored).toBe(false);
+});
+
 const flushMicrotasks = async (iterations = 10) => {
 	for (let i = 0; i < iterations; i++) {
 		await Promise.resolve();
