@@ -33,7 +33,7 @@ import {
 	TAG_STREAM_INF,
 } from './hls-misc';
 import { HlsSegmentedInput } from './hls-segmented-input';
-import { SegmentedInputTrackDeclaration } from '../segmented-input';
+import { Segment, SegmentedInputTrackDeclaration } from '../segmented-input';
 import { PathedSource } from '../source';
 
 type InternalTrack = {
@@ -581,7 +581,7 @@ export class HlsDemuxer extends Demuxer {
 		return this.trackBackings;
 	}
 
-	getMediaOffsetForDiscontinuity(discontinuityNumber: number) {
+	getMediaOffsetForDiscontinuity(discontinuityNumber: number, requester: HlsSegmentedInput | null = null) {
 		let promise = this.mediaOffsets.get(discontinuityNumber);
 		if (promise) {
 			return promise;
@@ -594,12 +594,28 @@ export class HlsDemuxer extends Demuxer {
 			// PDT is used) and that discontinuities don't mess with overall timestamp continuity.
 			const referenceSegmentedInput = this.getReferenceSegmentedInput();
 
-			let segment = await referenceSegmentedInput.getFirstSegment();
+			const referenceFirstSegment = await referenceSegmentedInput.getFirstSegment();
+			let segment = referenceFirstSegment;
 			while (segment && segment.discontinuityNumber < discontinuityNumber) {
 				segment = await referenceSegmentedInput.getNextSegment(segment, {});
 			}
 
 			if (!segment || segment.discontinuityNumber !== discontinuityNumber) {
+				if (
+					requester
+					&& requester !== referenceSegmentedInput
+					&& referenceFirstSegment
+					&& referenceFirstSegment.discontinuityNumber > discontinuityNumber
+				) {
+					// The reference's live window has already moved past this discontinuity, while the requesting
+					// playlist still lists it. Discontinuity boundaries line up across playlists (RFC 8216, 6.2.4), so
+					// the requesting playlist's next discontinuity, which can be synchronized, anchors this one.
+					const offset = await this.getMediaOffsetFromNextDiscontinuity(discontinuityNumber, requester);
+					if (offset !== null) {
+						return offset;
+					}
+				}
+
 				throw new Error(
 					`The reference playlist contains no segment in discontinuity ${discontinuityNumber}, so the`
 					+ ' discontinuity can\'t be synchronized across tracks. If you think this is a bug, please raise an'
@@ -619,8 +635,56 @@ export class HlsDemuxer extends Demuxer {
 			return segment.timestamp - (rawTimestampOffset + await track.getFirstTimestamp());
 		})();
 		this.mediaOffsets.set(discontinuityNumber, promise);
+		// Another playlist may still be able to anchor the discontinuity
+		promise.catch(() => {
+			if (this.mediaOffsets.get(discontinuityNumber) === promise) {
+				this.mediaOffsets.delete(discontinuityNumber);
+			}
+		});
 
 		return promise;
+	}
+
+	/**
+	 * Derives a discontinuity's media offset from a playlist that also lists the next discontinuity: the discontinuity
+	 * ends where that one begins, so its segments are placed before the next one's first segment by their durations.
+	 */
+	private async getMediaOffsetFromNextDiscontinuity(discontinuityNumber: number, playlist: HlsSegmentedInput) {
+		let first = await playlist.getFirstSegment();
+		while (first && first.discontinuityNumber < discontinuityNumber) {
+			first = await playlist.getNextSegment(first, { skipLiveWait: true });
+		}
+		if (!first || first.discontinuityNumber !== discontinuityNumber) {
+			return null;
+		}
+
+		let next: Segment | null = first;
+		while (next && next.discontinuityNumber === discontinuityNumber) {
+			next = await playlist.getNextSegment(next, { skipLiveWait: true });
+		}
+		if (!next) {
+			return null;
+		}
+
+		// Where the next discontinuity's first segment begins on the global timeline
+		const nextInput = playlist.getInputForSegment(next);
+		const nextTracks = await nextInput.getTracks();
+		const nextTrack = nextTracks.find(x => x.type === 'video') ?? nextTracks[0];
+		if (!nextTrack) {
+			return null;
+		}
+		const nextStart = await nextTrack.getFirstTimestamp() + await playlist.getMediaOffset(next, nextInput);
+
+		const firstInput = playlist.getInputForSegment(first);
+		const rawTimestampOffset = await playlist.getRawTimestampOffset(firstInput) ?? 0;
+		const firstTracks = await firstInput.getTracks();
+		const firstTrack = firstTracks.find(x => x.type === 'video') ?? firstTracks[0];
+		if (!firstTrack) {
+			return null;
+		}
+
+		const firstMediaStart = rawTimestampOffset + await firstTrack.getFirstTimestamp();
+		return nextStart - (next.timestamp - first.timestamp) - firstMediaStart;
 	}
 
 	getReferenceSegmentedInput() {

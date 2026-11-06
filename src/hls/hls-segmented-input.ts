@@ -822,7 +822,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 	}
 
 	getMediaOffsetForDiscontinuity(discontinuityNumber: number) {
-		return this.demuxer.getMediaOffsetForDiscontinuity(discontinuityNumber);
+		return this.demuxer.getMediaOffsetForDiscontinuity(discontinuityNumber, this);
 	}
 
 	getFirstSegmentTimestampOffset() {
