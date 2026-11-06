@@ -2359,6 +2359,18 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 			let sampleTimestamp = sample.timestamp;
 			if (this.stampsOutputsItself && !this.customDecoder) {
+				// Some packets decode to nothing (discard padding, for example), so pair this output with the queued
+				// packet start closest to where the audio continues instead of just the next one
+				if (this.currentTimestamp !== null) {
+					const current = this.currentTimestamp;
+					while (
+						this.inputTimestamps.length > 1
+						&& Math.abs(this.inputTimestamps[1]! - current) <= Math.abs(this.inputTimestamps[0]! - current)
+					) {
+						this.inputTimestamps.shift();
+					}
+				}
+
 				// Should there be more outputs than packets, assume the audio continues seamlessly
 				sampleTimestamp = this.inputTimestamps.shift() ?? this.currentTimestamp ?? sampleTimestamp;
 			} else {

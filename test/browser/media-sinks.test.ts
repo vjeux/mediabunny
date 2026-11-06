@@ -331,3 +331,42 @@ test('Decoded audio keeps the gaps between packets', async () => {
 		expect(sampleTimestamps[i]).toBeCloseTo(packetTimestamps[i]!, 4);
 	}
 });
+
+test('Decoded audio stays in order when a packet decodes to nothing', async () => {
+	// Some packets decode to no audio at all (discard padding, for example); simulate one by dropping its output
+	const OriginalAudioDecoder = globalThis.AudioDecoder;
+	let outputCount = 0;
+	globalThis.AudioDecoder = class extends OriginalAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			super({
+				output: (data) => {
+					if (outputCount++ === 10) {
+						data.close();
+						return;
+					}
+
+					init.output(data);
+				},
+				error: init.error,
+			});
+		}
+	};
+
+	try {
+		using input = new Input({
+			source: new UrlSource('/vorbis-eos.ogg'), // Vorbis, so packet durations vary
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		let previousEnd = -Infinity;
+		for await (using sample of new AudioSampleSink(track).samples(0, 2)) {
+			expect(sample.timestamp).toBeGreaterThan(previousEnd - 1e-6); // No overlaps
+			previousEnd = sample.timestamp + sample.duration;
+		}
+	} finally {
+		globalThis.AudioDecoder = OriginalAudioDecoder;
+	}
+});
