@@ -1795,6 +1795,11 @@ test('MediaStreamAudioTrackSource, timestamp jitter adds no silence, real gaps s
 });
 
 test('MediaStreamAudioTrackSource, a busy main thread loses no audio', async ({ skip }) => {
+	// Audio captured through a ScriptProcessorNode (without MediaStreamTrackProcessor) runs on the main thread itself
+	if (typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackProcessor on the main thread (Chromium)');
+	}
+
 	const audioContext = new AudioContext({ sampleRate: 48000 });
 	await Promise.race([audioContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
 	if (audioContext.state !== 'running') {
@@ -1855,7 +1860,13 @@ test('MediaStreamAudioTrackSource, a busy main thread loses no audio', async ({ 
 	expect(missingMs).toBeLessThan(60);
 });
 
-test('MediaStreamAudioTrackSource, audio behind a busy encoder is kept, but not if captured while paused', async () => {
+test('MediaStreamAudioTrackSource, audio behind a busy encoder is kept, but not if captured while paused', async ({
+	skip,
+}) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator (Chromium)');
+	}
+
 	// An encoder that holds on to everything until released, so that audio piles up behind it
 	let releaseEncoder!: () => void;
 	const encoderReleased = new Promise<void>((resolve) => {
