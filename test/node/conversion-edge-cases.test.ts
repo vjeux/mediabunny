@@ -1,6 +1,7 @@
+import path from 'node:path';
 import { describe, expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output, OutputTrackGroup } from '../../src/output.js';
 import {
@@ -417,5 +418,50 @@ describe('Conversion execution in Node (copy and PCM paths)', () => {
 		} finally {
 			warn.mockRestore();
 		}
+	});
+});
+
+describe('Ogg remuxing', () => {
+	test.each(['vorbis-eos.ogg', 'preroll-test.opus'])('%s is copied packet for packet, shifted', async (name) => {
+		const input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public', name)),
+			formats: ALL_FORMATS,
+		});
+		const target = new BufferTarget();
+		const output = new Output({ format: new OggOutputFormat(), target });
+		// Ogg starts at zero, so the negative start (decoder delay) can only be kept by shifting
+		const conversion = await Conversion.init({
+			input,
+			output,
+			tags: { title: 'Remuxed', artist: 'Someone' },
+			copy: { shiftTolerance: 0.1 },
+			showWarnings: false,
+		});
+		expect(conversion.isValid).toBe(true);
+		await conversion.execute();
+
+		const inputTrack = (await input.getPrimaryAudioTrack())!;
+		const shift = -(await inputTrack.getFirstTimestamp());
+		expect(shift).toBeGreaterThan(0);
+		using result = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		expect(await result.getMetadataTags()).toMatchObject({ title: 'Remuxed', artist: 'Someone' });
+		const outputTrack = (await result.getPrimaryAudioTrack())!;
+		expect(await outputTrack.getCodec()).toBe(await inputTrack.getCodec());
+		expect(await outputTrack.getNumberOfChannels()).toBe(await inputTrack.getNumberOfChannels());
+		expect(await outputTrack.getSampleRate()).toBe(await inputTrack.getSampleRate());
+
+		const original = [];
+		for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
+			original.push(packet);
+		}
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
+			const source = original[count++]!;
+			expect(packet.timestamp).toBeCloseTo(source.timestamp + shift, 9);
+			expect(packet.duration).toBeCloseTo(source.duration, 9);
+			expect(packet.data).toEqual(source.data);
+		}
+		expect(count).toBe(original.length);
+		input.dispose();
 	});
 });
