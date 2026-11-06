@@ -6,8 +6,8 @@ import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { BufferTarget, NullTarget } from '../../src/target.js';
+import { MovOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -749,4 +749,28 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
+});
+
+test('PCM tracks with more frames than the sample tables count are rejected instead of wrapping around', async () => {
+	// Non-fragmented files store PCM as one sample per frame, and stts/stsz count samples in 32 bits. This is 2^32
+	// frames of 8-bit mono (24.9 hours at 48 kHz); the packets are views into one buffer and the target drops them.
+	const buffer = new Uint8Array(2 ** 26);
+	const output = new Output({
+		format: new MovOutputFormat({ fastStart: false }),
+		target: new NullTarget(),
+	});
+	const source = new EncodedAudioPacketSource('pcm-u8');
+	output.addAudioTrack(source);
+	await output.start();
+
+	const decoderConfig = { codec: 'pcm-u8', numberOfChannels: 1, sampleRate: 48000 };
+	const mux = async () => {
+		for (let i = 0; i < 64; i++) {
+			const timestamp = i * buffer.length / 48000;
+			await source.add(new EncodedPacket(buffer, 'key', timestamp, buffer.length / 48000), { decoderConfig });
+		}
+		await output.finalize();
+	};
+
+	await expect(mux()).rejects.toThrow(/more than 4294967295 PCM audio frames/);
 });
