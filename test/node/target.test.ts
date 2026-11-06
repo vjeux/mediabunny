@@ -1,3 +1,5 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
@@ -8,6 +10,7 @@ import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
+import { FilePathTarget } from '../../src/target.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -40,6 +43,29 @@ test('BufferTarget onFinalize callback', async () => {
 	expect(received).toBe(output.target.buffer);
 	expect(asyncCallbackDone).toBe(true);
 	expect(output.target.buffer!.byteLength).toBeGreaterThan(0);
+});
+
+test('FilePathTarget leaves the file alone until there is something to write', async () => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mediabunny-'));
+	const filePath = path.join(directory, 'existing.mp4');
+	await fs.writeFile(filePath, new Uint8Array(100));
+
+	// Rejected options, then a target that's never used
+	expect(() => new FilePathTarget(filePath, { chunkSize: 100 })).toThrow(TypeError);
+	new FilePathTarget(filePath);
+	await new Promise(resolve => setTimeout(resolve, 50));
+	expect((await fs.stat(filePath)).size).toBe(100);
+
+	// Writing still replaces the file
+	using input = new Input({ source: new FilePathSource(samplePath), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new FilePathTarget(filePath) });
+	const conversion = await Conversion.init({ input, output });
+	await conversion.execute();
+
+	using written = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+	expect(await written.computeDuration()).toBeCloseTo(await input.computeDuration(), 1);
+
+	await fs.rm(directory, { recursive: true });
 });
 
 test('BufferTarget internal buffer transfer on finalize', async () => {
