@@ -161,3 +161,59 @@ test('frameRate snapping in HLS keeps video in sync with audio', async () => {
 		}
 	}
 });
+
+const readHlsVideoPackets = async (files: Map<string, BufferTarget>) => {
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!.buffer!)),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	return packets;
+};
+
+test('frameRate in HLS keeps fragmented MP4 video exactly on the frame grid', async () => {
+	for (const frameRate of [30, 30000 / 1001, 24000 / 1001]) {
+		const files = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat() }),
+			target: new PathedTarget('master.m3u8', ({ path }) => {
+				const target = new BufferTarget();
+				files.set(path, target);
+				return target;
+			}),
+		});
+
+		const videoSource = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(videoSource, { frameRate });
+		await output.start();
+
+		for (let i = 0; i < 10; i++) {
+			await videoSource.add(
+				new EncodedPacket(
+					i === 0 ? AVC_KEY_FRAME : AVC_DELTA_FRAME,
+					i === 0 ? 'key' : 'delta',
+					i / frameRate,
+					1 / frameRate,
+				),
+				i === 0 ? { decoderConfig: { codec: 'avc1.42c00a', codedWidth: 96, codedHeight: 64 } } : undefined,
+			);
+		}
+
+		await output.finalize();
+
+		// The segments need a timescale that holds the frame duration exactly (1001/30000 s at 29.97 fps)
+		const packets = await readHlsVideoPackets(files);
+		expect(packets).toHaveLength(10);
+		for (const [i, packet] of packets.entries()) {
+			expect(Math.abs(packet.timestamp - i / frameRate)).toBeLessThan(5e-7);
+		}
+		const durations = new Set(packets.slice(0, -1).map(packet => Math.round(packet.duration * 1e9)));
+		expect([...durations]).toEqual([Math.round(1e9 / frameRate)]);
+	}
+});
