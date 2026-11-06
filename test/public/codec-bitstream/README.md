@@ -1,4 +1,4 @@
-Fixtures of `test/browser/codec-bitstream.test.ts`, made with FFmpeg 8.0 (libx264, libvpx, libaom, libfdk_aac,
+Fixtures of `test/browser/codec-bitstream-differential.test.ts`, made with FFmpeg 8.0 (libx264, libvpx, libaom, libfdk_aac,
 libopus, libvorbis, libmp3lame):
 
 - `h264-high10.mp4`: `ffmpeg -f lavfi -i testsrc2=s=64x48:r=25,format=yuv420p10le -frames:v 6 -c:v libx264 -preset fast -profile:v high10 h264-high10.mp4`
