@@ -17,7 +17,6 @@ import {
 	extractAudioCodecString,
 	extractColorSpace,
 	extractVideoCodecString,
-	VP9_LEVEL_TABLE,
 } from '../../src/codec.js';
 import { parseAacAudioSpecificConfig } from '../../shared/aac-misc.js';
 import {
@@ -41,10 +40,11 @@ import {
 	Vp9KeyFrameParams,
 } from './helpers/l31-bitstream-gen.js';
 
-// Differential tests of the codec bitstream parsers: random but spec-valid headers are generated, and what Mediabunny
-// derives from them is compared against the values they were written with, run through the arithmetic of the
-// respective spec. The generators were cross-checked against FFmpeg's CBS parsers (trace_headers) on thousands of
-// headers each; the mismatches that remain on main are listed below, each fixed elsewhere.
+// Differential tests of the codec bitstream parsers: random headers following the syntax of their spec are generated,
+// and what Mediabunny derives from them is compared against the values they were written with, run through the
+// arithmetic of the respective spec. The expectations don't come from Mediabunny's own tables. The generators were
+// cross-checked against FFmpeg's CBS parsers (trace_headers) on thousands of headers each; the mismatches that remain
+// on main are listed below, each fixed elsewhere.
 
 type KnownDivergence<T> = { reason: string; applies: (params: T) => boolean };
 
@@ -320,8 +320,32 @@ describe('VP9 key frame headers', () => {
 		},
 	];
 
-	// matrix_coefficients for color_space, as FFmpeg's vp9.c maps it
-	const MATRIX_COEFFICIENTS = [2, 5, 1, 6, 7, 9, 2, 0];
+	// VP9 bitstream spec, Annex A: the maximum luma picture size of every level
+	const LEVEL_PICTURE_SIZES: [level: number, maxLumaPictureSize: number][] = [
+		[10, 36864], [11, 73728], [20, 122880], [21, 245760], [30, 552960], [31, 983040], [40, 2228224],
+		[41, 2228224], [50, 8912896], [51, 8912896], [52, 8912896], [60, 35651584], [61, 35651584], [62, 35651584],
+	];
+
+	// A key frame header has neither the frame rate nor the bitrate, so the level can only follow from the picture
+	// size: the lowest level that holds it. No level holds a larger picture; Mediabunny reports the highest one then
+	// (FFmpeg's vpcc.c writes 0, an unknown level).
+	const expectedLevel = (width: number, height: number) => {
+		return LEVEL_PICTURE_SIZES.find(([, maxSize]) => width * height <= maxSize)?.[0] ?? 62;
+	};
+
+	// color_space (7.2.2) names a standard, and these are its ISO/IEC 23001-8 code points (primaries, transfer and
+	// matrix). Unspecified (2) is always allowed for the primaries and transfer: BT.601 doesn't pin one set of
+	// primaries (625 or 525 lines), and a BT.2020 stream may well carry PQ or HLG, which only the container says.
+	const COLOR_SPACES: { primaries: number[]; transfer: number[]; matrix: number }[] = [
+		{ primaries: [2], transfer: [2], matrix: 2 }, // CS_UNKNOWN
+		{ primaries: [2, 5, 6], transfer: [2, 1, 6], matrix: 5 }, // CS_BT_601 (5 and 6 are the same matrix)
+		{ primaries: [2, 1], transfer: [2, 1], matrix: 1 }, // CS_BT_709
+		{ primaries: [2, 6], transfer: [2, 6, 1], matrix: 6 }, // CS_SMPTE_170
+		{ primaries: [2, 7], transfer: [2, 7], matrix: 7 }, // CS_SMPTE_240
+		{ primaries: [2, 9], transfer: [2, 14, 15], matrix: 9 }, // CS_BT_2020 (non-constant luminance, per the note)
+		{ primaries: [2], transfer: [2], matrix: 2 }, // CS_RESERVED
+		{ primaries: [2, 1], transfer: [2, 13], matrix: 0 }, // CS_RGB (sRGB)
+	];
 
 	test('Every derived field and the vp09 codec string of 500 random key frames', () => {
 		const rng = createRng(8);
@@ -340,23 +364,32 @@ describe('VP9 key frame headers', () => {
 				continue;
 			}
 
-			const pictureSize = params.width * params.height;
-			const level = (VP9_LEVEL_TABLE.find(x => pictureSize <= x.maxPictureSize) ?? VP9_LEVEL_TABLE.at(-1)!).level;
+			const level = expectedLevel(params.width, params.height);
 			// VP codec ISOBMFF chromaSubsampling: 1 = 4:2:0 (co-located), 2 = 4:2:2, 3 = 4:4:4
 			const chromaSubsampling = params.subsamplingX ? (params.subsamplingY ? 1 : 2) : 3;
+			const colorSpace = COLOR_SPACES[params.colorSpace]!;
 			mismatches.push(...diffFields(`#${i}`, info, {
 				profile: params.profile,
 				level,
 				bitDepth: params.bitDepth,
 				chromaSubsampling,
 				videoFullRangeFlag: params.colorRange,
-				matrixCoefficients: MATRIX_COEFFICIENTS[params.colorSpace],
+				matrixCoefficients: colorSpace.matrix,
 			}));
 
-			// VP codec ISOBMFF "Codecs Parameter String", without the all-default trailing fields
+			if (!colorSpace.primaries.includes(info.colourPrimaries)) {
+				mismatches.push(`#${i}: primaries ${info.colourPrimaries} for color_space ${params.colorSpace}`);
+			}
+
+			if (!colorSpace.transfer.includes(info.transferCharacteristics)) {
+				mismatches.push(`#${i}: transfer ${info.transferCharacteristics} for color_space ${params.colorSpace}`);
+			}
+
+			// VP codec ISOBMFF "Codecs Parameter String", without the all-default trailing fields (with the primaries
+			// and transfer checked above)
 			const pad = (value: number) => value.toString().padStart(2, '0');
 			let expected = `vp09.${pad(params.profile)}.${pad(level)}.${pad(params.bitDepth)}`;
-			const colour = [info.colourPrimaries, info.transferCharacteristics, info.matrixCoefficients];
+			const colour = [info.colourPrimaries, info.transferCharacteristics, colorSpace.matrix];
 			const optional = `.${[chromaSubsampling, ...colour, params.colorRange].map(pad).join('.')}`;
 			if (optional !== '.01.01.01.01.00') {
 				expected += optional;
@@ -374,6 +407,35 @@ describe('VP9 key frame headers', () => {
 
 		expect(checked).toBeGreaterThan(400);
 		expect(mismatches).toEqual([]);
+	});
+
+	test('Level at the picture size limits of Annex A', () => {
+		// The example frame sizes of Annex A fill each limit exactly; one more row needs the next larger limit
+		const SIZES_AT_LIMITS: [width: number, height: number][] = [
+			[256, 144], [384, 192], [480, 256], [640, 384], [1080, 512], [1280, 768], [2048, 1088], [4096, 2176],
+			[8192, 4352],
+		];
+
+		const rng = createRng(13);
+		for (const [width, height] of SIZES_AT_LIMITS) {
+			for (const rows of [height, height + 1]) {
+				let frame = randomVp9KeyFrame(rng, { width, height: rows });
+				while (KNOWN_DIVERGENCES.some(x => x.applies(frame.params))) {
+					frame = randomVp9KeyFrame(rng, { width, height: rows });
+				}
+
+				const level = extractVp9CodecInfoFromPacket(frame.data)?.level;
+				const expected = expectedLevel(width, rows);
+				expect({ width, height: rows, level }).toEqual({ width, height: rows, level: expected });
+			}
+		}
+
+		// Spot checks of the table lookup itself
+		expect(expectedLevel(256, 144)).toBe(10);
+		expect(expectedLevel(256, 145)).toBe(11);
+		expect(expectedLevel(2048, 1089)).toBe(50);
+		expect(expectedLevel(8192, 4352)).toBe(60);
+		expect(expectedLevel(8192, 4353)).toBe(62);
 	});
 });
 

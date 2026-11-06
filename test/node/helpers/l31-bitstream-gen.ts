@@ -1,6 +1,7 @@
-// Generators of random, spec-valid codec bitstream headers, with the values every field was written with. Each
-// generator follows the syntax tables of its spec; the H.264/H.265/AV1/VP9 ones were cross-checked against FFmpeg's
-// trace_headers bitstream filter (CBS) on thousands of outputs.
+// Generators of random codec bitstream headers, with the values every field was written with. Each generator follows
+// the syntax tables of its spec (some fields also take reserved values, like VP9's color_space 6, to check that they're
+// tolerated); the H.264/H.265/AV1/VP9 ones were cross-checked against FFmpeg's trace_headers bitstream filter (CBS) on
+// thousands of outputs.
 
 export class BitWriter {
 	bits: number[] = [];
@@ -1175,7 +1176,7 @@ export type Vp9KeyFrameParams = {
 	height: number;
 };
 
-export const randomVp9KeyFrame = (rng: Rng) => {
+export const randomVp9KeyFrame = (rng: Rng, size?: { width: number; height: number }) => {
 	const writer = new BitWriter();
 	const profile = rng.int(0, 3);
 	writer.u(2, 2); // frame_marker
@@ -1220,8 +1221,8 @@ export const randomVp9KeyFrame = (rng: Rng) => {
 		writer.flag(0); // reserved_zero
 	}
 
-	const width = rng.pick([1, 2, 63, 64, 352, 1280, 1920, 4096, 8192, 16384]);
-	const height = rng.pick([1, 2, 47, 48, 288, 720, 1080, 2160, 4352, 8704]);
+	const width = size?.width ?? rng.pick([1, 2, 63, 64, 352, 1280, 1920, 4096, 8192, 16384]);
+	const height = size?.height ?? rng.pick([1, 2, 47, 48, 288, 720, 1080, 2160, 4352, 8704]);
 	writer.u(16, width - 1);
 	writer.u(16, height - 1);
 	writer.flag(0); // render_and_frame_size_different
