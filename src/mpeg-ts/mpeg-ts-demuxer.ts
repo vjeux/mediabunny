@@ -202,9 +202,10 @@ const getVideoFrameDuration = (info: Extract<ElementaryStream['info'], { type: '
 		return null;
 	}
 
-	// Some encoders write a clock that isn't the frame rate (like 1411200000 Hz), so only take plausible frame rates
+	// Some encoders write a clock that isn't the frame rate (like 1411200000 Hz, or the 90 kHz MPEG-TS clock), so only
+	// take frame rates up to 2000 fps (high-speed cameras record at 240 to 960 fps)
 	const frameDuration = ticksPerFrame * timingInfo.numUnitsInTick * MPEG_TS_TIMESCALE / timingInfo.timeScale;
-	return frameDuration >= MPEG_TS_TIMESCALE / 300 && frameDuration <= MPEG_TS_TIMESCALE ? frameDuration : null;
+	return frameDuration >= MPEG_TS_TIMESCALE / 2000 && frameDuration <= MPEG_TS_TIMESCALE ? frameDuration : null;
 };
 
 // Covers an AVC slice header up to pic_order_cnt_lsb, with room for emulation prevention bytes

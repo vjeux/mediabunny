@@ -1243,3 +1243,29 @@ test('MPEG-TS with a file that starts in the middle of an access unit', async ()
 		]);
 	}
 });
+
+test('MPEG-TS times frames without PTS by the frame rate in the SPS', async () => {
+	// 3 frames of x264 output at 480 fps, its PES packets without a PTS but the first (made with `ffmpeg -f lavfi -i
+	// testsrc=size=64x64:rate=480 -frames:v 3 -c:v libx264 -bf 0 -f mpegts`)
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/high-frame-rate.ts')));
+
+	const readTimestamps = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packets = await readAllPackets(new EncodedPacketSink(track));
+		return packets.map(x => Math.round(x.timestamp * 90_000));
+	};
+
+	const damaged = bytes.slice();
+	let pesPacketCount = 0;
+	for (let pos = 0; pos < damaged.length; pos += 188) {
+		const pid = ((damaged[pos + 1]! & 0x1f) << 8) | damaged[pos + 2]!;
+		if (pid === 0x100 && damaged[pos + 1]! & 0x40 && ++pesPacketCount > 1) {
+			damaged[pos + 4 + ((damaged[pos + 3]! & 0x20) ? 1 + damaged[pos + 4]! : 0) + 7]! &= 0x3f;
+		}
+	}
+
+	expect(await readTimestamps(bytes)).toEqual([126000, 126188, 126375]);
+	expect(await readTimestamps(damaged)).toEqual([126000, 126188, 126375]);
+});
