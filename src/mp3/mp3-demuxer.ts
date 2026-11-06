@@ -39,7 +39,7 @@ import {
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
-import { readNextMp3FrameHeader } from './mp3-reader';
+import { readFirstMp3FrameHeader, readNextMp3FrameHeader } from './mp3-reader';
 import { readAscii, readBytes, Reader, readU32Be } from '../reader';
 
 type Sample = {
@@ -122,12 +122,15 @@ export class Mp3Demuxer extends Demuxer {
 			}
 		}
 
-		const result = await readNextMp3FrameHeader(
-			this.reader,
-			this.lastLoadedPos,
-			this.reader.fileSize,
-			this.firstFrameHeader,
-		);
+		const result = this.firstFrameHeader
+			? await readNextMp3FrameHeader(
+				this.reader,
+				this.lastLoadedPos,
+				this.reader.fileSize,
+				this.firstFrameHeader,
+			)
+			// Nothing to compare against yet, so make sure we don't start off with a false sync
+			: await readFirstMp3FrameHeader(this.reader, this.lastLoadedPos, this.reader.fileSize);
 		if (!result) {
 			this.lastSampleLoaded = true;
 			return;
