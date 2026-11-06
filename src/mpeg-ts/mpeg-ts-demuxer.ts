@@ -491,6 +491,22 @@ const readPacketFields = (bytes: Uint8Array): TsPacket => {
 	};
 };
 
+/**
+ * How far past a PAT or PMT that isn't in effect yet we look for one that is, before taking it anyway. PSI tables
+ * repeat at least every half second in broadcasts (DVB), which this covers even at high bitrates.
+ */
+const MAX_TABLE_NOT_IN_EFFECT_DISTANCE = 2 ** 22; // 4 MiB
+
+/**
+ * Checks the current_next_indicator of the PSI section starting after the pointer_field of the given packet payload.
+ * A section with 0 is the next version of its table, sent ahead of the switch, which isn't in effect yet.
+ */
+const psiSectionIsInEffect = (payload: Uint8Array) => {
+	// table_id, section_length, and the table_id_extension (transport_stream_id or program_number) come before it
+	const sectionStart = 1 + (payload[0] ?? 0);
+	return ((payload[sectionStart + 5] ?? 1) & 0x01) === 1;
+};
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -583,9 +599,26 @@ export class MpegTsDemuxer extends Demuxer {
 				this.sectionEndPositions.clear();
 				return true;
 			};
+			// PAT and PMT sections that only apply later are skipped while we look for the ones in effect (like in
+			// FFmpeg). If none turns up, we go back to the first one we skipped and take it after all.
+			let firstTableNotInEffectPos: number | null = null;
+			let takesTablesNotInEffect = false;
 
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
+
+				if (
+					!hasProgramMap
+					&& firstTableNotInEffectPos !== null
+					&& !takesTablesNotInEffect
+					&& (!packetHeader || currentPos - firstTableNotInEffectPos > MAX_TABLE_NOT_IN_EFFECT_DISTANCE)
+				) {
+					// A muxer that leaves current_next_indicator clear, or a capture that ends before the switch
+					currentPos = firstTableNotInEffectPos;
+					takesTablesNotInEffect = true;
+					continue;
+				}
+
 				if (!packetHeader) {
 					if (await adoptInitProgramMap()) {
 						continue;
@@ -688,15 +721,23 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 				}
 
-				if (
-					(section.pid === 0 && !hasProgramAssociationTable)
-					|| (!hasProgramMap && (programMapPids.has(section.pid) || isProbablyProgramMap))
-				) {
+				const isTable = (section.pid === 0 && !hasProgramAssociationTable)
+					|| (!hasProgramMap && (programMapPids.has(section.pid) || isProbablyProgramMap));
+				if (isTable) {
 					await this.completePsiSection(section);
 				}
 
-				if (section.pid === 0 && !hasProgramAssociationTable) {
-					const intactSection = await this.findIntactPsiSection(section, PROGRAM_ASSOCIATION_TABLE_ID);
+				const isInEffect = takesTablesNotInEffect || psiSectionIsInEffect(section.payload);
+				if (isTable && !isInEffect) {
+					firstTableNotInEffectPos ??= currentPos;
+				}
+
+				if (section.pid === 0 && !hasProgramAssociationTable && isInEffect) {
+					const intactSection = await this.findIntactPsiSection(
+						section,
+						PROGRAM_ASSOCIATION_TABLE_ID,
+						takesTablesNotInEffect,
+					);
 					const bitstream = new Bitstream(intactSection.payload);
 					const pointerField = bitstream.readAlignedByte();
 
@@ -722,10 +763,14 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					hasProgramAssociationTable = true;
-				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap) {
+				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap && isInEffect) {
 					// Broadcast captures often carry several programs. We present just one, so let's use the first one
 					// whose PMT shows up (some programs listed in the PAT may not even be in the capture).
-					const intactSection = await this.findIntactPsiSection(section, PROGRAM_MAP_TABLE_ID);
+					const intactSection = await this.findIntactPsiSection(
+						section,
+						PROGRAM_MAP_TABLE_ID,
+						takesTablesNotInEffect,
+					);
 					const bitstream = new Bitstream(intactSection.payload);
 					const pointerField = bitstream.readAlignedByte();
 
@@ -1543,7 +1588,7 @@ export class MpegTsDemuxer extends Demuxer {
 	 * check if the given one doesn't, like FFmpeg skips damaged sections. Some muxers write bad CRCs though, so if
 	 * there's no intact copy, we go with the given one.
 	 */
-	async findIntactPsiSection(section: Section, tableId: number): Promise<Section> {
+	async findIntactPsiSection(section: Section, tableId: number, takesTablesNotInEffect = false): Promise<Section> {
 		// The table ID to look for comes from the PID, since the damage may well be in the first copy's pointer_field
 		// or table_id
 		if (psiSectionIsIntact(section.payload) && getPsiTableId(section.payload) === tableId) {
@@ -1567,7 +1612,12 @@ export class MpegTsDemuxer extends Demuxer {
 
 				if (packetHeader.pid === section.pid) {
 					const copy = await this.readSection(pos, true, true);
-					if (copy && getPsiTableId(copy.payload) === tableId) {
+					// The next version of the table (current_next_indicator 0) is another table, not a copy
+					if (
+						copy
+						&& getPsiTableId(copy.payload) === tableId
+						&& (takesTablesNotInEffect || psiSectionIsInEffect(copy.payload))
+					) {
 						if (psiSectionIsIntact(copy.payload)) {
 							return copy;
 						}
