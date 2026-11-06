@@ -465,3 +465,50 @@ describe('Ogg remuxing', () => {
 		input.dispose();
 	});
 });
+
+describe('Audio-only remuxing', () => {
+	test.each([
+		['Toothsome-Meme.VBRv2.mp3', () => new Mp3OutputFormat()],
+		['sample3.aac', () => new AdtsOutputFormat()],
+		['sample.flac', () => new FlacOutputFormat()],
+		['glitch-hop-is-dead.wav', () => new WavOutputFormat()],
+	])('%s keeps every packet', async (name, format) => {
+		const filePath = path.join(__dirname, '..', 'public', name);
+		const input = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+		const target = new BufferTarget();
+		const output = new Output({ format: format(), target });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			tags: { title: 'Remuxed' },
+			copy: { shiftTolerance: 0.1 },
+			showWarnings: false,
+		});
+		expect(conversion.isValid).toBe(true);
+		await conversion.execute();
+
+		const inputTrack = (await input.getPrimaryAudioTrack())!;
+		using result = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		expect((await result.getMetadataTags()).title).toBe('Remuxed');
+		const outputTrack = (await result.getPrimaryAudioTrack())!;
+		expect(await outputTrack.getCodec()).toBe(await inputTrack.getCodec());
+
+		const original = [];
+		for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
+			original.push(packet);
+		}
+		let count = 0;
+		let shift: number | null = null;
+		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
+			const source = original[count++]!;
+			// Formats without a way to store the encoder delay may shift everything to start at zero
+			shift ??= packet.timestamp - source.timestamp;
+			expect(packet.timestamp).toBeCloseTo(source.timestamp + shift, 9);
+			expect(packet.duration).toBeCloseTo(source.duration, 9);
+			expect(packet.data).toEqual(source.data);
+		}
+		expect(count).toBe(original.length);
+		expect(shift).toBeGreaterThanOrEqual(0);
+		input.dispose();
+	});
+});
