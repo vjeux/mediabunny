@@ -173,14 +173,16 @@ describe('Playlist syntax', () => {
 		expect(await videoTrack!.getFirstTimestamp()).toBe(0);
 	});
 
-	test('ignores everything after #EXT-X-ENDLIST', async () => {
+	test('stops reloading a playlist once it has #EXT-X-ENDLIST', async () => {
 		const files = await writeTsStream();
-		const playlist = readText(files, 'playlist-1.m3u8');
-		const uris = getSegmentUris(playlist);
+		using memory = readVariant(files, readText(files, 'playlist-1.m3u8'));
+		const { input, requests } = memory;
 
-		using input = readVariant(files, playlist + `#EXTINF:2,\n${uris[0]}\nnot-a-valid-line\n`).input;
-		const { video } = await getTrackPackets(input);
-		expect(video).toHaveLength(VIDEO_PACKET_COUNT);
+		const videoTrack = await input.getPrimaryVideoTrack();
+		expect(await videoTrack!.isLive()).toBe(false);
+		expect(await videoTrack!.getLiveRefreshInterval()).toBeNull();
+		expect(await readPackets(videoTrack!)).toHaveLength(VIDEO_PACKET_COUNT);
+		expect(requests.filter(path => path === 'variant.m3u8')).toHaveLength(1);
 	});
 
 	test('treats a VOD playlist type as ended even without #EXT-X-ENDLIST', async () => {
