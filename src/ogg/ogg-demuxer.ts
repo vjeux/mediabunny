@@ -827,6 +827,12 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			const nextPage = slice && readPageHeader(slice);
 			if (!nextPage) {
 				// There's junk between the pages, so we can't walk any further. Let's just jump to the page we know.
+				// Pages we walked past it belong to a broken chain; drop them so the list stays in file order, which
+				// stepping back through it relies on.
+				while (previousPages.length > 0 && last(previousPages)!.headerStartPos >= lowPage.headerStartPos) {
+					previousPages.pop();
+				}
+
 				currentPage = lowPage;
 				previousPages.push(lowPage);
 				break;
