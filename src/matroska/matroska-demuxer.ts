@@ -1750,7 +1750,9 @@ export class MatroskaDemuxer extends Demuxer {
 
 			case EBMLId.Block: {
 				if (!this.currentCluster) break;
-				if (this.currentBlock) break; // Already read ahead of its siblings
+				if (this.currentBlock) {
+					break; // Already read ahead of its siblings
+				}
 
 				const blockSlice = slice.slice(dataStartPos, size);
 
