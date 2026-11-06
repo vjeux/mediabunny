@@ -24,7 +24,7 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../codec-data';
 import { Bitstream } from '../../shared/bitstream';
-import { assert, promiseWithResolvers, setUint24, toDataView, toUint8Array } from '../misc';
+import { assert, promiseWithResolvers, Queue, setUint24, toDataView, toUint8Array } from '../misc';
 import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputTrack, OutputVideoTrack } from '../output';
 import { MpegTsOutputFormat } from '../output-format';
@@ -57,7 +57,7 @@ type MpegTsTrackData = {
 	streamId: number;
 	codecString: string;
 	timestampProcessingQueue: QueuedPacket[];
-	packetQueue: QueuedPacket[];
+	packetQueue: Queue<QueuedPacket>;
 	inputIsAnnexB: boolean | null;
 	inputIsAdts: boolean | null;
 	avcDecoderConfig: AvcDecoderConfigurationRecord | null;
@@ -138,7 +138,7 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
-			packetQueue: [],
+			packetQueue: new Queue(),
 			inputIsAnnexB: null,
 			inputIsAdts: null,
 			avcDecoderConfig: null,
@@ -209,7 +209,7 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
-			packetQueue: [],
+			packetQueue: new Queue(),
 			inputIsAnnexB: null,
 			inputIsAdts: null,
 			avcDecoderConfig: null,
@@ -519,10 +519,10 @@ export class MpegTsMuxer extends Muxer {
 
 				if (
 					trackData.packetQueue.length > 0
-					&& trackData.packetQueue[0]!.presentationTimestamp < minTimestamp
+					&& trackData.packetQueue.peek()!.presentationTimestamp < minTimestamp
 				) {
 					trackWithMinTimestamp = trackData;
-					minTimestamp = trackData.packetQueue[0]!.presentationTimestamp;
+					minTimestamp = trackData.packetQueue.peek()!.presentationTimestamp;
 				}
 			}
 
