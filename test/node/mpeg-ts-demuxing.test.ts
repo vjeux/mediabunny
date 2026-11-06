@@ -754,6 +754,35 @@ test('MPEG-TS with E-AC-3 audio (System B)', async () => {
 	expect(count).toBeGreaterThan(0);
 });
 
+test('MPEG-TS with E-AC-3 audio in a Blu-ray (BDAV) stream', async () => {
+	// ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -c:a eac3 -b:a 96k -mpegts_m2ts_mode 1 -f mpegts
+	// eac3-bluray.m2ts (192-byte packets, 'HDMV' program registration, stream_type 0x84)
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/eac3-bluray.m2ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+
+	expect(await audioTrack.getCodec()).toBe('eac3');
+	expect(await audioTrack.getInternalCodecId()).toBe(0x84);
+	expect(await audioTrack.getDecoderConfig()).toEqual({
+		codec: 'ec-3',
+		numberOfChannels: 1,
+		sampleRate: 48000,
+	});
+
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+		expect(packet.data[0]).toBe(0x0b);
+		expect(packet.data[1]).toBe(0x77);
+		count++;
+	}
+
+	expect(count).toBe(32); // As counted by ffprobe
+});
+
 test('MPEG-TS partial reading', async () => {
 	const fullPath = path.join(__dirname, '../public/193039199_mp4_h264_aac_fhd_7.ts');
 	const buffer = await fs.promises.readFile(fullPath);
