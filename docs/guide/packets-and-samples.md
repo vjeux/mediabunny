@@ -95,13 +95,14 @@ constructor(
     duration: number, // in seconds
     sequenceNumber?: number,
     byteLength?: number,
+    sideData?: EncodedPacketSideData,
 );
 ```
 
 When creating a packet for a given codec, you *must* adhere to the data format specified in the [Mediabunny Codec Registry](/codec-registry/overview).
 
 ::: info
-You probably won't ever need to set `sequenceNumber` or `byteLength` in the constructor.
+You probably won't ever need to set `sequenceNumber` or `byteLength` in the constructor. `sideData` carries additional data, such as the encoded alpha frame of a transparent video; see [`EncodedPacketSideData`](../api/EncodedPacketSideData).
 :::
 
 For example, here we're creating a packet from some encoded video data:
@@ -606,7 +607,7 @@ Because the meaning of `planeIndex` depends on which format is being used for ex
 
 For example, here we're extracting the entire audio data as `f32`:
 ```ts
-const options = { planeIndex: 0, format: 'f32' };
+const options = { planeIndex: 0, format: 'f32' } as const;
 const bytesNeeded = audioSample.allocationSize(options);
 const data = new Float32Array(bytesNeeded / 4);
 audioSample.copyTo(data, options);
