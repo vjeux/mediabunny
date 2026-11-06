@@ -23,7 +23,11 @@ import {
 	writeHls,
 	WriteHlsOptions,
 } from './helpers/hls-fixtures.js';
-import { validateMediaPlaylist, validateMultivariantPlaylist } from './helpers/hls-playlist-validator.js';
+import {
+	MediaPlaylistInfo,
+	validateMediaPlaylist,
+	validateMultivariantPlaylist,
+} from './helpers/hls-playlist-validator.js';
 
 // The source media (see loadSourceMedia) has 225 video and 390 audio packets
 const VIDEO_PACKET_COUNT = 225;
@@ -130,29 +134,52 @@ describe('Playlist validity', () => {
 	});
 
 	test('writes valid playlists for every step of a live stream', async () => {
+		// 36 s of video with a key frame every 1.92 s: segments of 1.92 s, and of 1.32 s at the end of each repetition
+		const maxLiveSegmentCount = 4;
 		const recorded = await writeAndRecord({
-			format: { segmentFormat: new MpegTsOutputFormat(), live: true, maxLiveSegmentCount: 3 },
+			format: { segmentFormat: new MpegTsOutputFormat(), live: true, maxLiveSegmentCount },
+			audio: false,
+			repeat: 4,
 		});
 		expectValidPlaylists(recorded);
 
 		const infos = recorded.playlists.map(x => validateMediaPlaylist(x.text).info);
-		expect(infos.length).toBeGreaterThan(3);
+		const getDuration = (info: MediaPlaylistInfo) => info.segments.reduce((sum, x) => sum + x.duration, 0);
 
-		// The target duration never changes; segments slide out at the front and the media sequence follows
 		for (let i = 0; i < infos.length; i++) {
-			expect(infos[i]!.targetDuration).toBe(2);
-			expect(infos[i]!.segments.length).toBeLessThanOrEqual(3);
-			expect(infos[i]!.ended).toBe(i === infos.length - 1);
-			expect(infos[i]!.playlistType).toBeNull();
+			const info = infos[i]!;
+			const minDuration = 3 * info.targetDuration!;
+
+			// The target duration never changes, and only the last playlist ends
+			expect(info.targetDuration).toBe(2);
+			expect(info.ended).toBe(i === infos.length - 1);
+			expect(info.playlistType).toBeNull();
+
+			// "The server MUST NOT remove a Media Segment from a Playlist file without an EXT-X-ENDLIST tag if that
+			// would produce a Playlist whose duration is less than three times the target duration." (RFC 8216,
+			// Section 6.2.2)
+			if (!info.ended && info.mediaSequence > 0) {
+				expect(getDuration(info)).toBeGreaterThanOrEqual(minDuration);
+			}
+
+			// Beyond maxLiveSegmentCount, a playlist only keeps segments it can't drop without falling below that
+			if (info.segments.length > maxLiveSegmentCount) {
+				expect(getDuration(info) - info.segments[0]!.duration).toBeLessThan(minDuration);
+			}
+
+			// Segments slide out at the front, and the media sequence counts them
 			if (i > 0) {
-				const removed = infos[i]!.mediaSequence - infos[i - 1]!.mediaSequence;
+				const previous = infos[i - 1]!;
+				const removed = info.mediaSequence - previous.mediaSequence;
 				expect(removed).toBeGreaterThanOrEqual(0);
-				const previousSegments = infos[i - 1]!.segments;
-				if (removed < previousSegments.length) {
-					expect(infos[i]!.segments[0]!.uri).toBe(previousSegments[removed]!.uri);
+				if (removed < previous.segments.length) {
+					expect(info.segments[0]!.uri).toBe(previous.segments[removed]!.uri);
 				}
 			}
 		}
+
+		// Segments did slide out while the stream was live
+		expect(infos.some(info => !info.ended && info.mediaSequence > 0)).toBe(true);
 	});
 
 	test.each([
@@ -518,17 +545,37 @@ describe('Paths and callbacks', () => {
 	});
 
 	test('calls onSegmentPopped for segments leaving a live playlist', async () => {
+		const maxLiveSegmentCount = 2;
 		const popped: string[] = [];
-		await writeHls({
+		const recorded = await writeAndRecord({
 			format: {
 				segmentFormat: new MpegTsOutputFormat(),
 				live: true,
-				maxLiveSegmentCount: 2,
+				maxLiveSegmentCount,
 				onSegmentPopped: path => popped.push(path),
 			},
 		});
 
-		expect(popped).toEqual(['segment-1-1.ts', 'segment-1-2.ts', 'segment-1-3.ts']);
+		// Exactly the segments that left the playlist were popped, oldest first
+		const segmentNumber = (path: string) => Number(/^segment-1-(\d+)\.ts$/.exec(path)![1]);
+		const allSegments = [...recorded.files.keys()]
+			.filter(path => path.startsWith('segment-'))
+			.sort((a, b) => segmentNumber(a) - segmentNumber(b));
+		const final = validateMediaPlaylist(recorded.playlists.at(-1)!.text).info;
+
+		expect(popped.length).toBeGreaterThan(0);
+		expect(popped).toEqual(allSegments.slice(0, final.mediaSequence));
+		expect(final.segments.map(x => x.uri)).toEqual(allSegments.slice(final.mediaSequence));
+
+		// Popping stops at maxLiveSegmentCount, unless fewer segments would span less than three target durations
+		// (RFC 8216, Section 6.2.2)
+		for (const { text } of recorded.playlists) {
+			const info = validateMediaPlaylist(text).info;
+			if (info.segments.length > maxLiveSegmentCount) {
+				const duration = info.segments.reduce((sum, x) => sum + x.duration, 0);
+				expect(duration - info.segments[0]!.duration).toBeLessThan(3 * info.targetDuration!);
+			}
+		}
 	});
 
 	test('writes URIs relative to the playlist that contains them', async () => {
