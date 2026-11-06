@@ -27,13 +27,17 @@ export const readNextMp3FrameHeader = async (
 	header: Mp3FrameHeader;
 	startPos: number;
 } | null> => {
-	const CHUNK_SIZE = 2 ** 16; // So we don't need to grab thousands of slices
+	// The header is usually right at startPos, so start small and only grow the chunks when we need to search for it;
+	// large chunks are there so we don't need to grab thousands of slices
+	const MAX_CHUNK_SIZE = 2 ** 16;
+	let chunkSize = 2 ** 8;
 	let currentPos = startPos;
 
 	while (until === null || currentPos < until) {
 		const maxLength = until !== null
-			? Math.min(CHUNK_SIZE, until - currentPos)
-			: CHUNK_SIZE;
+			? Math.min(chunkSize, until - currentPos)
+			: chunkSize;
+		chunkSize = Math.min(2 * chunkSize, MAX_CHUNK_SIZE);
 
 		let slice = reader.requestSliceRange(currentPos, MP3_FRAME_HEADER_SIZE, maxLength);
 		if (isThenable(slice)) slice = await slice;
