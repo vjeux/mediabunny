@@ -2319,10 +2319,14 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Internal state to accumulate a precise current timestamp based on audio durations, not the (potentially
 	// inaccurate) packet timestamps.
 	currentTimestamp: number | null = null;
-	// The timestamps at which the audio of the packets passed to the WebCodecs decoder starts, in decode order. By
-	// spec, each output carries the timestamp of the chunk it was decoded from, but Chromium instead counts up from
-	// the first chunk's timestamp (and doesn't respect negative ones), so it loses any gap between packets. Thus, we
-	// stamp each output with the timestamp of its chunk ourselves.
+	// Where the audio decoded from the first packet passed to the WebCodecs decoder starts. Chromium does not respect
+	// negative packet timestamps, so we must do the fixin' ourselves.
+	expectedFirstTimestamp: number | null = null;
+	timestampOffset = 0;
+	// By spec, each output carries the timestamp of the chunk it was decoded from, but Chromium instead counts up from
+	// the first chunk's timestamp, which loses any gap between packets. So there, we stamp each output with where the
+	// audio of its packet starts, kept here in decode order.
+	stampsOutputsItself = isChromium();
 	inputTimestamps: number[] = [];
 	// WebCodecs impls discard the Opus pre-skip (correct) but don't advance the timestamp (incorrect). These are the
 	// pre-skip and the part of it the decoder still has to discard from the packets to come, in Opus samples.
@@ -2353,10 +2357,17 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				return;
 			}
 
-			const sampleTimestamp = this.customDecoder
-				? sample.timestamp
+			let sampleTimestamp = sample.timestamp;
+			if (this.stampsOutputsItself && !this.customDecoder) {
 				// Should there be more outputs than packets, assume the audio continues seamlessly
-				: this.inputTimestamps.shift() ?? this.currentTimestamp ?? sample.timestamp;
+				sampleTimestamp = this.inputTimestamps.shift() ?? this.currentTimestamp ?? sampleTimestamp;
+			} else {
+				if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
+					this.timestampOffset = this.expectedFirstTimestamp - sampleTimestamp;
+				}
+
+				sampleTimestamp += this.timestampOffset;
+			}
 
 			if (
 				this.currentTimestamp === null
@@ -2452,8 +2463,13 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				// The decoder discards this whole packet, so no output comes of it
 				this.remainingOpusPreSkip -= opusPacketSamples;
 			} else {
-				this.inputTimestamps.push(packet.timestamp + this.remainingOpusPreSkip / OPUS_SAMPLE_RATE);
+				const outputTimestamp = packet.timestamp + this.remainingOpusPreSkip / OPUS_SAMPLE_RATE;
 				this.remainingOpusPreSkip = 0;
+
+				this.expectedFirstTimestamp ??= outputTimestamp;
+				if (this.stampsOutputsItself) {
+					this.inputTimestamps.push(outputTimestamp);
+				}
 			}
 
 			this.decoder.decode(packet.toEncodedAudioChunk());
@@ -2469,6 +2485,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		}
 
 		this.currentTimestamp = null;
+		this.expectedFirstTimestamp = null;
+		this.timestampOffset = 0;
 		this.inputTimestamps.length = 0;
 		// The decoder starts over after a flush
 		this.remainingOpusPreSkip = this.opusPreSkip;
