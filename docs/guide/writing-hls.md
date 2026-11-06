@@ -130,7 +130,7 @@ const output = new Output({
 		'master.m3u8',
 		async ({ path, mimeType }) => {
 			const { writable, readable } = new TransformStream<
-				Uint8Array, Uint8Array,
+				Uint8Array, Uint8Array
 			>();
 
 			const url = `/upload?file=${encodeURIComponent(path)}`;
@@ -351,12 +351,10 @@ The above code will emit a media playlist like this:
 
 #EXTINF:2,
 #EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.000Z
-segments-1-1.ts
-
+segment-1-1.ts
 #EXTINF:2,
 #EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:02.000Z
-segments-1-2.ts
-
+segment-1-2.ts
 ...
 ```
 
@@ -422,7 +420,7 @@ video-2.m3u8
 To maintain the "every video track can be paired with every audio track" configuration, the audio tracks have been extracted into a media rendition group via `#EXT-X-MEDIA`.
 
 :::info
-Note that tracks in a media rendition group should differ in metadata. Thus, when creating tracks in this configuration, make sure to provide metadata options like `language` or `name` to differentiate the tracks.
+Note that tracks in a media rendition group should differ in metadata. Thus, when creating tracks in this configuration, make sure to provide metadata options like `languageCode` or `name` to differentiate the tracks.
 :::
 
 #### Codec alternatives
