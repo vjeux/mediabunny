@@ -1269,34 +1269,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	abstract getReorderSize(): number;
 
 	/**
-	 * Returns the start of the `count`-th PES packet with a PTS before the given position, but not before the track's
-	 * first one.
-	 */
-	async findPesPacketBefore(pos: number, count: number) {
-		const demuxer = this.elementaryStream.demuxer;
-		const firstSection = this.elementaryStream.firstSection;
-		assert(firstSection);
-
-		let currentPos = pos;
-		while (count > 0 && currentPos > firstSection.startPos) {
-			currentPos -= demuxer.packetStride;
-
-			const packetHeader = await demuxer.readPacketHeader(currentPos);
-			assert(packetHeader);
-
-			if (packetHeader.pid === this.elementaryStream.pid && packetHeader.payloadUnitStartIndicator === 1) {
-				const section = await demuxer.readSection(currentPos, false);
-				const pesPacketHeader = section && readPesPacketHeader(demuxer, section, false);
-				if (pesPacketHeader && pesPacketHeader.pts !== null) {
-					count--;
-				}
-			}
-		}
-
-		return currentPos;
-	}
-
-	/**
 	 * Returns the time between frames, as the smallest gap between the presentation timestamps of the track's first
 	 * PES packets. Since it doesn't depend on where reading started, it gives packets without a successor the same
 	 * duration however they were reached.
@@ -1417,15 +1389,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		}
 
 		const demuxer = this.elementaryStream.demuxer;
-
-		// With frames being reordered, the packets presented around the next one may come before the current one in the
-		// stream, so start reading early enough to get its duration right (like packet lookups do)
-		const reorderSize = this.getReorderSize();
-		const startPos = reorderSize > 0
-			? await this.findPesPacketBefore(sectionStartPos, reorderSize + 1)
-			: sectionStartPos;
-
-		const section = await demuxer.readSection(startPos, true);
+		const section = await demuxer.readSection(sectionStartPos, true);
 		assert(section);
 
 		const pesPacket = readPesPacket(demuxer, section, true);

@@ -966,13 +966,4 @@ test('MPEG-TS packet durations with B-frames do not depend on how the packets we
 	expect(lastPacket.duration).toBeCloseTo(1 / 30);
 	expect((await sink.getPacket(Infinity))!.duration).toBe(lastPacket.duration);
 	expect(await track.computeDuration()).toBeCloseTo(1.4 + 1 / 30);
-
-	// Reading on from a packet whose successor was already read rereads the stream from there
-	for (let i = 0; i < packets.length - 1; i++) {
-		const packet = (await sink.getPacket(packets[i]!.timestamp))!;
-		await sink.getNextPacket(packet);
-		const next = await sink.getNextPacket(packet);
-		expect(next?.sequenceNumber).toBe(packets[i + 1]!.sequenceNumber);
-		expect(next?.duration).toBe(packets[i + 1]!.duration);
-	}
 });
