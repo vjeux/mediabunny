@@ -1360,6 +1360,64 @@ test.concurrent('#EXT-X-DEFINE QUERYPARAM variables can be IMPORTed into media p
 	expect(requestedPaths).toContain(expectedSegmentPath);
 });
 
+test.concurrent('Segments marked with #EXT-X-GAP are not loaded', async () => {
+	const playlist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:5
+#EXTINF:5,
+0.ts
+#EXT-X-DISCONTINUITY
+#EXT-X-GAP
+#EXTINF:5,
+missing.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:5,
+0.ts
+#EXT-X-GAP
+#EXTINF:5,
+missing.ts
+#EXT-X-ENDLIST
+`;
+	const requestedPaths: string[] = [];
+
+	using input = new Input({
+		source: new CustomPathedSource('playlist.m3u8', ({ path }) => {
+			requestedPaths.push(path);
+
+			if (path === 'playlist.m3u8') {
+				return new BufferSource(new TextEncoder().encode(playlist));
+			}
+			if (path === '0.ts') {
+				return new FilePathSource('./test/public/0.ts');
+			}
+
+			// Gap segments needn't exist on the server
+			throw new Error(`404 Not Found: ${path}`);
+		}),
+		formats: HLS_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const sink = new EncodedPacketSink(videoTrack);
+
+	const timestamps: number[] = [];
+	for await (const packet of sink.packets()) {
+		timestamps.push(packet.timestamp);
+	}
+
+	// The media of both segments, with a hole where the gap is
+	const firstHalf = timestamps.slice(0, timestamps.length / 2);
+	const secondHalf = timestamps.slice(timestamps.length / 2);
+	expect(Math.min(...firstHalf)).toBe(0);
+	expect(Math.max(...firstHalf)).toBeLessThan(5);
+	expect(Math.min(...secondHalf)).toBe(10);
+
+	expect((await sink.getPacket(7))?.timestamp).toBe(Math.max(...firstHalf));
+	expect(await videoTrack.getDurationFromMetadata()).toBe(20);
+	expect(requestedPaths).not.toContain('missing.ts');
+});
+
 test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {
 	const cases = [
 		{
