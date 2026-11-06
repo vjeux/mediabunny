@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Output, VideoTrackMetadata, AudioTrackMetadata } from '../../src/output.js';
 import {
 	CmafOutputFormat,
@@ -47,6 +50,8 @@ import {
 	readTrun,
 	readVisualSampleEntry,
 } from './helpers/isobmff-mux-boxes.js';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 const MOVIE_TIMESCALE = 57600;
 const SECONDS_FROM_1904_TO_1970 = 2_082_844_800;
@@ -1033,6 +1038,21 @@ describe('Video sample entries', () => {
 		expect(await av1CFor('av01.1.05M.08.0.000.01.01.01.0')).toEqual([0x81, 0x25, 0x00, 0x00]);
 	});
 
+	test('ProRes in MOV uses the codec\'s four-character code and a depth of 32 for 4444', async () => {
+		for (const [codec, depth] of [['apcn', 24], ['ap4h', 32], ['ap4x', 32]] as const) {
+			const { bytes, boxes } = await mux([{
+				kind: 'video',
+				codec: 'prores',
+				config: { codec, codedWidth: 64, codedHeight: 64 },
+				packets: videoPackets(2),
+			}], { format: new MovOutputFormat() });
+			const entry = sampleEntry(boxes);
+			expect(entry.type).toBe(codec);
+			expect(readVisualSampleEntry(bytes, entry).depth).toBe(depth);
+			expect(entry.children.map(child => child.type)).toEqual(['btrt']); // No decoder configuration box
+		}
+	});
+
 	test('colr is nclx with a full range flag in MP4, nclc in MOV, and absent without color info', async () => {
 		const config: VideoDecoderConfig = {
 			...VP9_CONFIG,
@@ -1287,6 +1307,40 @@ describe('Audio sample entries', () => {
 		entry = sampleEntry(file.boxes);
 		expect(entry.type).toBe('ec-3');
 		expect([...boxPayload(file.bytes, findBox(entry.children, 'dec3'))]).toEqual([0x0e, 0x00, 0x20, 0x0f, 0x00]);
+	});
+
+	test('AC-3, E-AC-3, DTS and TrueHD config boxes survive a remux byte for byte', async () => {
+		for (const [file, configBox] of [
+			['ac3.mp4', 'dac3'], ['eac3.mp4', 'dec3'], ['toothsome-dts.mp4', 'ddts'], ['truehd.mp4', 'dmlp'],
+		] as const) {
+			const sourceBytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public', file)));
+			using input = new Input({ source: new BufferSource(sourceBytes), formats: ALL_FORMATS });
+			const track = (await input.getPrimaryAudioTrack())!;
+			const codec = (await track.getCodec())!;
+			const decoderConfig = (await track.getDecoderConfig())!;
+
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new EncodedAudioPacketSource(codec);
+			output.addAudioTrack(source);
+			await output.start();
+			let count = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				await source.add(packet, { decoderConfig });
+				if (++count === 10) {
+					break;
+				}
+			}
+			await output.finalize();
+
+			const bytes = new Uint8Array(output.target.buffer!);
+			const written = sampleEntry(parseBoxes(bytes));
+			const original = sampleEntry(parseBoxes(sourceBytes));
+			expect(written.type).toBe(original.type);
+			expect(readAudioSampleEntry(bytes, written).channelCount)
+				.toBe(readAudioSampleEntry(sourceBytes, original).channelCount);
+			expect(boxPayload(bytes, findBox(written.children, configBox)))
+				.toEqual(boxPayload(sourceBytes, findBox(original.children, configBox)));
+		}
 	});
 
 	test('16-bit PCM in MP4 uses ipcm with a pcmC box describing the sample format', async () => {
