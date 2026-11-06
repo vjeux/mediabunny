@@ -939,6 +939,21 @@ const setUpSegmentationEnvironment = async (options: {
 	};
 };
 
+test('Segmentation, packets still queued when the track closes', async () => {
+	const env = await setUpSegmentationEnvironment({ audio: true });
+
+	await env.addAudioPacket(0, 0.5);
+	// Not awaited, so these are still waiting for the playlist when the track gets closed
+	const pending = [env.addAudioPacket(0.5, 0.5), env.addAudioPacket(1, 0.5)];
+	env.audioSource!.close();
+
+	await Promise.all(pending);
+	await env.output.finalize();
+
+	expect(env.segmentCount).toBe(1);
+	expect(await env.lastSegmentAudioTimestamps).toEqual([0, 0.5, 1]);
+});
+
 test('Segmentation, empty', async () => {
 	const env = await setUpSegmentationEnvironment({ video: true });
 
