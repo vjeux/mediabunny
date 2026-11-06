@@ -2023,8 +2023,8 @@ export class EncodedAudioPacketSource extends AudioSource {
 
 export const PCM_ENCODER_PACKET_SIZE = 2048; // In frames
 
-// Silence fed to audio encoders before flushing them, and how far past the input's end a packet may start and still be
-// kept (to allow for some uncompensated encoder delay)
+// Silence fed to Opus encoders with non-48 kHz input before flushing them, and how far past the input's end a packet
+// may start and still be kept (to allow for the uncompensated delay of the encoder's resampler)
 const END_PADDING_DURATION = 0.05;
 const END_PADDING_SLACK = 0.01;
 
@@ -2673,10 +2673,15 @@ class AudioEncoderWrapper {
 					await this.emitPcmScratchPacket();
 				}
 
-				if (this.encoder?.state === 'configured' && this.lastAudioDataParams) {
-					// Encoders that resample internally hold back their last few milliseconds of input at flush (for
-					// example Chrome's Opus encoder with anything but 48 kHz), so push them out with some silence.
-					// Packets holding nothing but that silence are dropped again.
+				if (
+					this.encoder?.state === 'configured'
+					&& this.encodingConfig.codec === 'opus'
+					&& this.lastAudioDataParams
+					&& this.lastAudioDataParams.sampleRate !== OPUS_SAMPLE_RATE
+				) {
+					// Opus encoders resample anything but 48 kHz internally, and Chrome's holds back the last few
+					// milliseconds of input at flush, so push them out with some silence. Packets holding nothing but
+					// that silence are dropped again.
 					const { format, numberOfChannels, sampleRate } = this.lastAudioDataParams;
 					const numberOfFrames = Math.ceil(END_PADDING_DURATION * sampleRate);
 					const data = new Uint8Array(getBytesPerSample(format) * numberOfFrames * numberOfChannels);
