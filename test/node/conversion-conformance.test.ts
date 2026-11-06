@@ -521,6 +521,82 @@ describe('PCM audio transcoding', () => {
 	});
 });
 
+describe('Audio sample sources', () => {
+	const sampleRate = 48000;
+	const createSample = (timestamp: number, frames: number, value: number) => new AudioSample({
+		data: new Float32Array(frames).fill(value),
+		format: 'f32',
+		numberOfChannels: 1,
+		sampleRate,
+		timestamp,
+	});
+
+	const encode = async (samples: AudioSample[]) => {
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'pcm-s16' });
+		output.addAudioTrack(source);
+		await output.start();
+		for (const sample of samples) {
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		return (await decodeAudio(output.target.buffer!)).channels[0]!;
+	};
+
+	test('a gap of 64 frames or more between samples is filled with silence', async () => {
+		const channel = await encode([createSample(0, 4800, 0.25), createSample(0.11, 4800, 0.5)]);
+
+		expect(channel.length).toBe(4800 + 480 + 4800);
+		expect(channel[4799]).toBeCloseTo(0.25, 3);
+		expect(channel.subarray(4800, 5280).every(x => x === 0)).toBe(true);
+		expect(channel[5280]).toBeCloseTo(0.5, 3);
+	});
+
+	test('smaller gaps are closed up', async () => {
+		const channel = await encode([createSample(0, 4800, 0.25), createSample(0.1005, 4800, 0.5)]);
+
+		expect(channel.length).toBe(9600);
+		expect(channel[4799]).toBeCloseTo(0.25, 3);
+		expect(channel[4800]).toBeCloseTo(0.5, 3);
+	});
+
+	test('resampling many small samples stays continuous and sample-accurate', async () => {
+		const inputSampleRate = 44100;
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'pcm-f32', transform: { sampleRate } });
+		output.addAudioTrack(source);
+		await output.start();
+
+		// 2 s in 128-frame pieces, like an AudioWorklet delivers them
+		const sampleCount = Math.round(2 * inputSampleRate / 128);
+		for (let i = 0; i < sampleCount; i++) {
+			const data = new Float32Array(128)
+				.map((_, j) => 0.5 * Math.sin(2 * Math.PI * 440 * (i * 128 + j) / inputSampleRate));
+			await source.add(new AudioSample({
+				data,
+				format: 'f32',
+				numberOfChannels: 1,
+				sampleRate: inputSampleRate,
+				timestamp: i * 128 / inputSampleRate,
+			}));
+		}
+		await output.finalize();
+
+		const decoded = await decodeAudio(output.target.buffer!);
+		const channel = decoded.channels[0]!;
+		expect(decoded.sampleRate).toBe(sampleRate);
+		expect(Math.abs(channel.length - sampleCount * 128 * sampleRate / inputSampleRate)).toBeLessThanOrEqual(1);
+
+		let maxError = 0;
+		for (let i = 100; i < channel.length - 100; i++) {
+			const ideal = 0.5 * Math.sin(2 * Math.PI * 440 * i / sampleRate);
+			maxError = Math.max(maxError, Math.abs(channel[i]! - ideal));
+		}
+		expect(maxError).toBeLessThan(0.005);
+	});
+});
+
 describe('Output', () => {
 	const pcmSample = (timestamp: number) => new AudioSample({
 		data: new Float32Array(480),
