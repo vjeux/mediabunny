@@ -467,7 +467,8 @@ test('transform with flip metadata and additional rotation', async () => {
 	expect(pixelAt(pixels, 4, 3, 0)).toEqual([3, 0]);
 });
 
-test('VideoFrame rotation and flip become sample metadata', async () => {
+// Firefox's VideoFrame has no rotation or flip (it bakes an image's orientation into the pixels)
+test.runIf('rotation' in VideoFrame.prototype)('VideoFrame rotation and flip become sample metadata', async () => {
 	// A JPEG with EXIF orientation 6 (how phones store portrait photos): stored as 8x4, displayed as 4x8
 	const canvas = new OffscreenCanvas(8, 4);
 	const ctx = canvas.getContext('2d')!;
