@@ -417,3 +417,53 @@ const captureLogs = () => {
 		},
 	};
 };
+
+test('UrlSource with a small cache only requests what fits into it', async () => {
+	// Prefetching more than the cache holds evicts the data before it's read, so it got requested again on nearly every
+	// read
+	const file = new Uint8Array(fs.readFileSync(path.join(__dirname, '..', 'public/0.ts')));
+	let requestCount = 0;
+	let transferredBytes = 0;
+	const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+		requestCount++;
+		const range = /bytes=(\d+)-/.exec(new Headers(init?.headers).get('Range') ?? '');
+		const start = Number(range?.[1] ?? 0);
+		let pos = start;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (pos >= file.length) {
+					controller.close();
+					return;
+				}
+
+				const chunk = file.slice(pos, pos + 16384);
+				transferredBytes += chunk.length;
+				pos += chunk.length;
+				controller.enqueue(chunk);
+			},
+		});
+
+		return new Response(body, {
+			status: 206,
+			headers: { 'Content-Range': `bytes ${start}-${file.length - 1}/${file.length}` },
+		});
+	}) as typeof fetch;
+
+	using input = new Input({
+		source: new UrlSource('https://example.com/0.ts', { fetchFn, maxCacheSize: 2 ** 16 }),
+		formats: ALL_FORMATS,
+	});
+
+	let packetCount = 0;
+	for (const track of await input.getTracks()) {
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			void packet;
+			packetCount++;
+		}
+	}
+
+	expect(packetCount).toBe(532);
+	// Main made 28k requests, transferring 13.8 GB of this 1.9 MB file
+	expect(requestCount).toBeLessThan(1000);
+	expect(transferredBytes).toBeLessThan(10 * file.length);
+});
