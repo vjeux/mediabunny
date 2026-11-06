@@ -809,3 +809,53 @@ test('CanvasSink rejects null options like other non-objects', async () => {
 		expect(() => new CanvasSink(track, options as never)).toThrow(new TypeError('options must be an object.'));
 	}
 });
+
+test('VP8 alt-ref frames do not shift the timestamps of the frames decoded after them', async () => {
+	// Two-pass libvpx stores its alt-ref frames as invisible packets of their own. Each frame shows its index as a 4x4
+	// grid of 16x16 cells (bit b in cell b, white = 1):
+	// ffmpeg -f lavfi -i "color=s=64x64:r=30:d=2,format=yuv420p,
+	//   geq=lum='if(bitand(N\,pow(2\,floor(X/16)+4*floor(Y/16)))\,235\,16)':cb=128:cr=128"
+	//   -c:v libvpx -b:v 100k -auto-alt-ref 1 -lag-in-frames 25 -g 30 -pass 1 -f null -
+	// and the same with -pass 2 vp8-alt-ref.webm
+	using input = new Input({
+		source: new UrlSource('/vp8-alt-ref.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const readFrameIndex = async (sample: VideoSample) => {
+		const pixels = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+		await sample.copyTo(pixels, { format: 'RGBA' });
+
+		let index = 0;
+		for (let bit = 0; bit < 16; bit++) {
+			const x = (bit % 4) * 16 + 8;
+			const y = Math.floor(bit / 4) * 16 + 8;
+			if (pixels[(y * 64 + x) * 4]! > 128) {
+				index |= 1 << bit;
+			}
+		}
+
+		return index;
+	};
+	const frameTimestamp = (index: number) => Math.round(index * 1000 / 30) / 1000;
+
+	const sink = new VideoSampleSink(track);
+	const frames: { index: number; timestamp: number }[] = [];
+	for await (using sample of sink.samples()) {
+		frames.push({ index: await readFrameIndex(sample), timestamp: sample.timestamp });
+	}
+
+	expect(frames.map(x => x.index)).toEqual([...Array(60).keys()]);
+	expect(frames.map(x => x.timestamp)).toEqual(frames.map(x => frameTimestamp(x.index)));
+
+	const indices: number[] = [];
+	for await (using sample of sink.samplesAtTimestamps([0.4, 0.5, 1.4, 1.5])) {
+		assert(sample);
+		indices.push(await readFrameIndex(sample));
+	}
+
+	expect(indices).toEqual([12, 15, 42, 45]);
+});
