@@ -87,7 +87,9 @@ export class AdtsDemuxer extends Demuxer {
 				MIN_ADTS_FRAME_HEADER_SIZE,
 				MAX_ADTS_FRAME_HEADER_SIZE,
 			);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			if (!slice) {
 				this.lastSampleLoaded = true;
 				return;
@@ -98,7 +100,9 @@ export class AdtsDemuxer extends Demuxer {
 				// ID3v2 tags sit not only at the start of the file but can also come in between frames (like timed
 				// metadata in HLS packed audio), so let's skip them
 				let id3Slice = this.reader.requestSlice(this.lastLoadedPos, ID3_V2_HEADER_SIZE);
-				if (isThenable(id3Slice)) id3Slice = await id3Slice;
+				if (isThenable(id3Slice)) {
+					id3Slice = await id3Slice;
+				}
 				if (!id3Slice) {
 					this.lastSampleLoaded = true;
 					return;

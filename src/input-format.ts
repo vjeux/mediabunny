@@ -562,8 +562,12 @@ export class AdtsInputFormat extends InputFormat {
 		const skipId3V2Tags = async (pos: number) => {
 			while (true) {
 				let slice = input._reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
-				if (isThenable(slice)) slice = await slice;
-				if (!slice) break;
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					break;
+				}
 
 				const id3V2Header = readId3V2Header(slice);
 				if (!id3V2Header) {
