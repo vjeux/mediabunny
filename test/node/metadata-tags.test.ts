@@ -700,10 +700,33 @@ const writeWithDummyTrack = async (format: OutputFormat, codec: AudioCodec, tags
 	await output.finalize();
 	return output.target.buffer!;
 };
-const writeFlacFromFixture = async (tags: MetadataTags) => {
-	const fixturePath = path.join(__dirname, '../public/sample.flac');
+/** Writes MPEG-1 Layer III frames of 417 bytes (128 kbit/s, 44.1 kHz) back to back, like a real stream. */
+const writeMp3Frames = async (format: OutputFormat, tags: MetadataTags) => {
+	const output = new Output({ format, target: new BufferTarget() });
+	output.setMetadataTags(tags);
+	const source = new EncodedAudioPacketSource('mp3');
+	output.addAudioTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 10; i++) {
+		const data = new Uint8Array(417);
+		data.set([0xff, 0xfb, 0x90, 0x00]);
+		const decoderConfig = { codec: 'mp3', numberOfChannels: 2, sampleRate: 44100 };
+		await source.add(
+			new EncodedPacket(data, 'key', i * 1152 / 44100, 1152 / 44100),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+
+	await output.finalize();
+	return output.target.buffer!;
+};
+
+/** Copies a real file of the format into a new one with the given tags. */
+const writeFromFixture = async (fixtureName: string, format: OutputFormat, tags: MetadataTags) => {
+	const fixturePath = path.join(__dirname, '../public', fixtureName);
 	using fixture = new Input({ source: new FilePathSource(fixturePath), formats: ALL_FORMATS });
-	const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+	const output = new Output({ format, target: new BufferTarget() });
 	const conversion = await Conversion.init({ input: fixture, output, tags });
 	await conversion.execute();
 	return output.target.buffer!;
@@ -723,21 +746,22 @@ test('A same-format conversion leaves out an unrepresentable date instead of cop
 		return { inputYear, tags: await converted.getMetadataTags() };
 	};
 
-	// A null codec means the file is made from the FLAC fixture instead of a dummy track
-	const cases: [string, () => OutputFormat, AudioCodec | null, string][] = [
-		['MP4', () => new Mp4OutputFormat(), 'opus', '©day'],
-		['MOV', () => new MovOutputFormat(), 'pcm-s16', '©day'],
-		['MKV', () => new MkvOutputFormat(), 'opus', 'DATE'],
-		['MP3', () => new Mp3OutputFormat(), 'mp3', 'TDRC'],
-		['FLAC', () => new FlacOutputFormat(), null, 'DATE'], // Same Vorbis comment writer as Ogg
-		['WAVE', () => new WavOutputFormat(), 'pcm-s16', 'ICRD'],
+	// Where the demuxer checks the stream, the audio has to be a valid one rather than a dummy packet
+	type Writer = (format: OutputFormat, tags: MetadataTags) => Promise<ArrayBuffer>;
+	const dummy = (codec: AudioCodec): Writer => (format, tags) => writeWithDummyTrack(format, codec, tags);
+	const flacFixture: Writer = (format, tags) => writeFromFixture('sample.flac', format, tags);
+	const cases: [string, () => OutputFormat, Writer, string][] = [
+		['MP4', () => new Mp4OutputFormat(), dummy('opus'), '©day'],
+		['MOV', () => new MovOutputFormat(), dummy('pcm-s16'), '©day'],
+		['MKV', () => new MkvOutputFormat(), dummy('opus'), 'DATE'],
+		['MP3', () => new Mp3OutputFormat(), writeMp3Frames, 'TDRC'],
+		['FLAC', () => new FlacOutputFormat(), flacFixture, 'DATE'], // Same Vorbis comment writer as Ogg
+		['WAVE', () => new WavOutputFormat(), dummy('pcm-s16'), 'ICRD'],
 	];
-	for (const [name, format, codec, dateKey] of cases) {
+	for (const [name, format, write, dateKey] of cases) {
 		// A date tag such as Mediabunny itself wrote for years past 9999 before
 		const writtenTags: MetadataTags = { title: 'Title', raw: { [dateKey]: '+010000-01' } };
-		const bytes = codec === null
-			? await writeFlacFromFixture(writtenTags)
-			: await writeWithDummyTrack(format(), codec, writtenTags);
+		const bytes = await write(format(), writtenTags);
 		const { inputYear, tags } = await convertToSameFormat(bytes, format());
 		expect(inputYear, name).toBe(10000);
 		expect(tags.title, name).toBe('Title');
@@ -750,7 +774,7 @@ test('A left-out date can\'t come back through a raw date tag in another letter 
 	// Vorbis comment field names are case-insensitive, and Mediabunny reads Matroska tag names that way too
 	const writers: [string, (tags: MetadataTags) => Promise<ArrayBuffer>][] = [
 		['MKV', tags => writeWithDummyTrack(new MkvOutputFormat(), 'opus', tags)],
-		['FLAC', writeFlacFromFixture],
+		['FLAC', tags => writeFromFixture('sample.flac', new FlacOutputFormat(), tags)],
 	];
 	for (const [name, write] of writers) {
 		const readBack = async (tags: MetadataTags) => {
