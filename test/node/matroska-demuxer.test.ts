@@ -835,3 +835,52 @@ test('Cluster without a Timestamp', async () => {
 
 	expect(packets.map(x => x.timestamp)).toEqual([0, 0.032]);
 });
+
+test('Unknown-size Cues and cue points', async () => {
+	// Livestreamed WebM, as written by browsers (Chromium's media/test/data/bear-320x240-live.webm): the clusters, the
+	// Cues and every CuePoint inside it have an unknown size
+	const element = (id: number[], ...parts: ArrayLike<number>[]) => {
+		const content = parts.flatMap(part => Array.from(part));
+		const size = [0x01, 0, 0, 0, 0, 0, content.length >> 8, content.length & 0xff]; // 8-byte vint
+		return [...id, ...size, ...content];
+	};
+	const unknownSizeElement = (id: number[], ...parts: ArrayLike<number>[]) => {
+		return [...id, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, ...parts.flatMap(part => Array.from(part))];
+	};
+	const cluster = (timestamp: number) => unknownSizeElement(
+		[0x1f, 0x43, 0xb6, 0x75],
+		element([0xe7], [timestamp]),
+		element([0xa3], [0x81, 0, 0, 0x80, 0x10, 0x02, 0x00]), // SimpleBlock: track 1, key frame
+	);
+	const bytes = new Uint8Array([
+		...element([0x1a, 0x45, 0xdf, 0xa3], element([0x42, 0x82], [...'webm'].map(char => char.charCodeAt(0)))),
+		...unknownSizeElement([0x18, 0x53, 0x80, 0x67],
+			element([0x15, 0x49, 0xa9, 0x66], element([0x2a, 0xd7, 0xb1], [0x0f, 0x42, 0x40])), // 1 ms ticks
+			element([0x16, 0x54, 0xae, 0x6b], element([0xae],
+				element([0xd7], [1]), // TrackNumber
+				element([0x83], [1]), // TrackType: video
+				element([0x86], [...'V_VP8'].map(char => char.charCodeAt(0))),
+				element([0xe0], element([0xb0], [16]), element([0xba], [16])),
+			)),
+			cluster(0),
+			cluster(40),
+			unknownSizeElement([0x1c, 0x53, 0xbb, 0x6b], unknownSizeElement(
+				[0xbb],
+				element([0xb3], [0]), // CueTime
+				unknownSizeElement([0xb7], element([0xf7], [1]), element([0xf1], [0])),
+			)),
+		),
+	]);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const timestamps: number[] = [];
+	for await (const packet of sink.packets()) {
+		timestamps.push(packet.timestamp);
+	}
+	expect(timestamps).toEqual([0, 0.04]);
+	expect((await sink.getPacket(Infinity))!.timestamp).toBe(0.04);
+});
