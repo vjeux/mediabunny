@@ -24,6 +24,7 @@ import {
 	AC3_SAMPLES_PER_FRAME,
 	AvcDecoderConfigurationRecord,
 	AvcNalUnitType,
+	AvcSpsInfo,
 	determineVideoPacketType,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
@@ -45,6 +46,8 @@ import {
 	DTS_CORE_FRAME_HEADER_SIZE,
 	DTS_EXSS_HEADER_PREFIX_SIZE,
 	DTS_EXSS_MAX_HEADER_SIZE,
+	iterateNalUnitsInAnnexB,
+	removeEmulationPreventionBytes,
 	VuiTimingInfo,
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
@@ -201,6 +204,96 @@ const getVideoFrameDuration = (info: Extract<ElementaryStream['info'], { type: '
 
 	const frameDuration = ticksPerFrame * timingInfo.numUnitsInTick * MPEG_TS_TIMESCALE / timingInfo.timeScale;
 	return frameDuration > 0 && frameDuration <= MPEG_TS_TIMESCALE ? frameDuration : null;
+};
+
+// Covers an AVC slice header up to pic_order_cnt_lsb, with room for emulation prevention bytes
+const AVC_SLICE_HEADER_POC_PEEK_SIZE = 32;
+
+/** Reads pic_order_cnt_lsb from the first slice of an AVC access unit, for picture order count type 0. */
+const readAvcPicOrderCntLsb = (data: Uint8Array, sps: AvcSpsInfo) => {
+	for (const loc of iterateNalUnitsInAnnexB(data)) {
+		const nalHeader = data[loc.offset]!;
+		const nalUnitType = extractNalUnitTypeForAvc(nalHeader);
+		if (nalUnitType !== AvcNalUnitType.NON_IDR_SLICE && nalUnitType !== AvcNalUnitType.IDR) {
+			continue;
+		}
+
+		const end = loc.offset + Math.min(loc.length, 1 + AVC_SLICE_HEADER_POC_PEEK_SIZE);
+		const bytes = removeEmulationPreventionBytes(data.subarray(loc.offset + 1, end));
+		const bitstream = new Bitstream(bytes);
+		const isIdr = nalUnitType === AvcNalUnitType.IDR;
+
+		try {
+			readExpGolomb(bitstream); // first_mb_in_slice
+			readExpGolomb(bitstream); // slice_type
+			readExpGolomb(bitstream); // pic_parameter_set_id
+			if (sps.separateColourPlaneFlag) {
+				bitstream.skipBits(2); // colour_plane_id
+			}
+
+			bitstream.skipBits(sps.log2MaxFrameNumMinus4 + 4); // frame_num
+			if (!sps.frameMbsOnlyFlag && bitstream.readBits(1)) { // field_pic_flag
+				bitstream.skipBits(1); // bottom_field_flag
+			}
+
+			if (isIdr) {
+				readExpGolomb(bitstream); // idr_pic_id
+			}
+
+			const picOrderCntLsb = bitstream.readBits(sps.log2MaxPicOrderCntLsbMinus4 + 4);
+			if (bitstream.pos > 8 * bytes.length) {
+				return null;
+			}
+
+			return { picOrderCntLsb, isIdr, isReference: (nalHeader >> 5) !== 0 };
+		} catch {
+			return null;
+		}
+	}
+
+	return null;
+};
+
+/**
+ * Derives the picture order counts of consecutive AVC access units (in decode order), relative to the first one. An
+ * IDR picture after the first one starts the picture order over: it and the ones after it get null. Returns null if a
+ * slice header can't be read.
+ */
+const getAvcPicOrderCnts = (packets: { data: Uint8Array }[], sps: AvcSpsInfo) => {
+	const maxPicOrderCntLsb = 2 ** (sps.log2MaxPicOrderCntLsbMinus4 + 4);
+	const picOrderCnts: (number | null)[] = [];
+	let prevMsb = 0;
+	let prevLsb: number | null = null;
+	let wasReset = false;
+
+	for (const packet of packets) {
+		const result = readAvcPicOrderCntLsb(packet.data, sps);
+		if (!result) {
+			return null;
+		}
+
+		wasReset ||= result.isIdr && prevLsb !== null;
+		if (wasReset) {
+			picOrderCnts.push(null);
+			continue;
+		}
+
+		const lsb = result.picOrderCntLsb;
+		let msb = prevMsb;
+		if (prevLsb !== null && lsb < prevLsb && prevLsb - lsb >= maxPicOrderCntLsb / 2) {
+			msb += maxPicOrderCntLsb;
+		} else if (prevLsb !== null && lsb > prevLsb && lsb - prevLsb > maxPicOrderCntLsb / 2) {
+			msb -= maxPicOrderCntLsb;
+		}
+
+		picOrderCnts.push(msb + lsb);
+		if (result.isReference || prevLsb === null) {
+			prevMsb = msb;
+			prevLsb = lsb;
+		}
+	}
+
+	return picOrderCnts;
 };
 
 export class MpegTsDemuxer extends Demuxer {
@@ -2756,11 +2849,15 @@ class PacketBuffer {
 	pendingPackets: TimedSuppliedPacket[] = [];
 	/** The last packet with a timestamp of its own */
 	lastTimedPacket: TimedSuppliedPacket | null = null;
+	/** The packet with a timestamp of its own right before that one, if no packets without one came between them */
+	timedPacketBeforeLast: TimedSuppliedPacket | null = null;
 	/** How many packets after `lastTimedPacket` were given a timestamp */
 	untimedPacketCount = 0;
 	/** The time per packet between the last two packets with a timestamp of their own, if it went forward */
 	timedPacketSpacing: number | null = null;
 	defaultFrameDuration: number | null = null;
+	/** The SPS of an AVC stream with picture order counts in its slice headers, if this is one */
+	avcSpsInfo: AvcSpsInfo | null | undefined = undefined;
 
 	constructor(backing: MpegTsTrackBacking, context: PacketReadingContext) {
 		this.backing = backing;
@@ -2883,8 +2980,13 @@ class PacketBuffer {
 		}
 
 		const previousTimedPacket = this.lastTimedPacket;
+		const pictureOrderTimestamps = previousTimedPacket && nextTimedPacket && this.untimedPacketCount === 0
+			? this.getTimestampsFromPictureOrder(previousTimedPacket, packets, nextTimedPacket)
+			: null;
 
-		if (
+		if (pictureOrderTimestamps) {
+			packets.forEach((packet, i) => packet.pts = Math.round(pictureOrderTimestamps[i]!));
+		} else if (
 			previousTimedPacket
 			&& nextTimedPacket
 			&& this.untimedPacketCount === 0
@@ -2920,12 +3022,79 @@ class PacketBuffer {
 		} else if (!previousTimedPacket) {
 			// Let the packets after these continue from them
 			this.lastTimedPacket = timedPackets.at(-1)!;
+			this.timedPacketBeforeLast = null;
 			this.untimedPacketCount = 0;
 		}
 	}
 
+	/**
+	 * For AVC with picture order counts in its slice headers, places the packets between two timed ones by their
+	 * picture order, which also works when frames are reordered (B-frames). Returns null if that can't be done.
+	 */
+	getTimestampsFromPictureOrder(
+		previous: TimedSuppliedPacket,
+		packets: SuppliedPacket[],
+		next: TimedSuppliedPacket,
+	) {
+		if (this.avcSpsInfo === undefined) {
+			const info = this.backing.elementaryStream.info;
+			const sps = info.type === 'video' ? info.avcCodecInfo?.sequenceParameterSets[0] : undefined;
+			const spsInfo = sps ? parseAvcSps(sps) : null;
+			this.avcSpsInfo = spsInfo?.picOrderCntType === 0 ? spsInfo : null;
+		}
+
+		const sps = this.avcSpsInfo;
+		if (!sps) {
+			return null;
+		}
+
+		const picOrderCnts = getAvcPicOrderCnts([previous, ...packets, next], sps);
+		if (!picOrderCnts) {
+			return null;
+		}
+
+		let ticksPerPicOrderCnt: number;
+		const previousPicOrderCnt = picOrderCnts[0] ?? null;
+		const nextPicOrderCnt = picOrderCnts[picOrderCnts.length - 1] ?? null;
+		if (previousPicOrderCnt === null) {
+			return null;
+		}
+
+		if (nextPicOrderCnt !== null) {
+			ticksPerPicOrderCnt = (next.pts - previous.pts) / (nextPicOrderCnt - previousPicOrderCnt);
+		} else {
+			// The next packet starts the picture order over (an IDR picture), so measure the time per picture order
+			// count on the two timed packets before instead
+			const before = this.timedPacketBeforeLast;
+			const pair = before && getAvcPicOrderCnts([before, previous], sps);
+			const beforePicOrderCnt = pair?.[0] ?? null;
+			const pairPreviousPicOrderCnt = pair?.[1] ?? null;
+			if (!before || beforePicOrderCnt === null || pairPreviousPicOrderCnt === null) {
+				return null;
+			}
+
+			ticksPerPicOrderCnt = (previous.pts - before.pts) / (pairPreviousPicOrderCnt - beforePicOrderCnt);
+		}
+
+		if (!(ticksPerPicOrderCnt > 0) || !Number.isFinite(ticksPerPicOrderCnt)) {
+			return null;
+		}
+
+		const result: number[] = [];
+		for (const picOrderCnt of picOrderCnts.slice(1, -1)) {
+			if (picOrderCnt === null) {
+				return null;
+			}
+
+			result.push(previous.pts + (picOrderCnt - previousPicOrderCnt) * ticksPerPicOrderCnt);
+		}
+
+		return result;
+	}
+
 	setLastTimedPacket(packet: TimedSuppliedPacket) {
 		const previous = this.lastTimedPacket;
+		this.timedPacketBeforeLast = this.untimedPacketCount === 0 ? previous : null;
 		this.timedPacketSpacing = previous && packet.pts > previous.pts
 			? (packet.pts - previous.pts) / (this.untimedPacketCount + 1)
 			: null;

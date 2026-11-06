@@ -171,7 +171,7 @@ export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
 
-const removeEmulationPreventionBytes = (data: Uint8Array) => {
+export const removeEmulationPreventionBytes = (data: Uint8Array) => {
 	const result = new Uint8Array(data.length); // The result can only be shorter
 	const len = data.length;
 	let resultLength = 0;
@@ -518,6 +518,10 @@ export type AvcSpsInfo = {
 	constraintFlags: number;
 	levelIdc: number;
 	frameMbsOnlyFlag: number;
+	separateColourPlaneFlag: number;
+	log2MaxFrameNumMinus4: number;
+	picOrderCntType: number;
+	log2MaxPicOrderCntLsbMinus4: number;
 	chromaFormatIdc: number;
 	bitDepthLumaMinus8: number;
 	bitDepthChromaMinus8: number;
@@ -638,11 +642,12 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			}
 		}
 
-		readExpGolomb(bitstream); // log2_max_frame_num_minus4
+		const log2MaxFrameNumMinus4 = readExpGolomb(bitstream);
 
 		const picOrderCntType = readExpGolomb(bitstream);
+		let log2MaxPicOrderCntLsbMinus4 = 0;
 		if (picOrderCntType === 0) {
-			readExpGolomb(bitstream); // log2_max_pic_order_cnt_lsb_minus4
+			log2MaxPicOrderCntLsbMinus4 = readExpGolomb(bitstream);
 		} else if (picOrderCntType === 1) {
 			bitstream.skipBits(1); // delta_pic_order_always_zero_flag
 			readSignedExpGolomb(bitstream); // offset_for_non_ref_pic
@@ -838,6 +843,10 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			constraintFlags,
 			levelIdc,
 			frameMbsOnlyFlag,
+			separateColourPlaneFlag,
+			log2MaxFrameNumMinus4,
+			picOrderCntType,
+			log2MaxPicOrderCntLsbMinus4,
 			chromaFormatIdc,
 			bitDepthLumaMinus8,
 			bitDepthChromaMinus8,

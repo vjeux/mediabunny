@@ -1157,3 +1157,72 @@ test('MPEG-TS with each access unit\'s AUD at the end of the previous PES packet
 		expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
 	}
 });
+
+test('MPEG-TS places B-frames without PTS by their picture order', async () => {
+	// The PAT, PMT and video packets of the first 717 TS packets of samples.ffmpeg.org/A-codecs/AAC/freetv_aac_latm.ts
+	// (25 fps, I P B B B P B B B ...). Each PES packet of B-frames only has a PTS for the first one.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/b-frames-without-pts.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = await readAllPackets(sink);
+	const ticks = packets.map(x => Math.round(x.timestamp * 90_000) - Math.round(packets[0]!.timestamp * 90_000));
+
+	// The B-frames without PTS follow the one with it, 40 ms apart (FFmpeg's decoder puts them there too)
+	expect(ticks.slice(0, 9)).toEqual([0, 14404, 3600, 7201, 10802, 28807, 18004, 21605, 25206]);
+
+	// In presentation order, the frames are a frame duration apart, give or take the source's jitter
+	const sorted = [...ticks].sort((a, b) => a - b);
+	for (let i = 1; i < sorted.length; i++) {
+		expect(Math.abs(sorted[i]! - sorted[i - 1]! - 3600)).toBeLessThanOrEqual(15);
+	}
+
+	for (const packet of packets) {
+		expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+	}
+});
+
+test('MPEG-TS restores the timestamps of damaged PES headers in streams with B-frames', async () => {
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/0.ts')));
+
+	const readVideoTimestamps = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const timestamps = new Map<number, number>();
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.set(packet.sequenceNumber, Math.round(packet.timestamp * 90_000));
+		}
+
+		return timestamps;
+	};
+
+	// Clear PTS_DTS_flags of the 2nd to 40th video PES packet, every third one
+	const damaged = bytes.slice();
+	let pesPacketIndex = 0;
+	for (let pos = 0; pos < damaged.length; pos += 188) {
+		const pid = ((damaged[pos + 1]! & 0x1f) << 8) | damaged[pos + 2]!;
+		if (pid !== 0x100 || !(damaged[pos + 1]! & 0x40)) {
+			continue;
+		}
+
+		pesPacketIndex++;
+		if (pesPacketIndex >= 2 && pesPacketIndex <= 40 && pesPacketIndex % 3 === 0) {
+			const payloadStart = pos + 4 + ((damaged[pos + 3]! & 0x20) ? 1 + damaged[pos + 4]! : 0);
+			damaged[payloadStart + 7]! &= 0x3f;
+		}
+	}
+
+	// The picture order counts in the slice headers tell where the frames go, B-frames included
+	const original = await readVideoTimestamps(bytes);
+	const restored = await readVideoTimestamps(damaged);
+	expect([...restored.keys()]).toEqual([...original.keys()]);
+	for (const [sequenceNumber, timestamp] of original) {
+		expect(Math.abs(restored.get(sequenceNumber)! - timestamp)).toBeLessThanOrEqual(1);
+	}
+});
