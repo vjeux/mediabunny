@@ -101,6 +101,22 @@ export const extractSampleMetadata = (
 	};
 };
 
+/** Whether the packet is a header packet rather than an audio packet. */
+export const isHeaderPacket = (codecInfo: OggCodecInfo, data: Uint8Array) => {
+	if (codecInfo.codec === 'opus') {
+		// 'OpusHead' or 'OpusTags'
+		return data.length >= 8
+			&& data[0] === 0x4f && data[1] === 0x70 && data[2] === 0x75 && data[3] === 0x73
+			&& (
+				(data[4] === 0x48 && data[5] === 0x65 && data[6] === 0x61 && data[7] === 0x64)
+				|| (data[4] === 0x54 && data[5] === 0x61 && data[6] === 0x67 && data[7] === 0x73)
+			);
+	}
+
+	// Vorbis audio packets start with a zero bit, header packets with packet type 1, 3 or 5
+	return data.length > 0 && (data[0]! & 1) === 1;
+};
+
 export const buildOggMimeType = (info: {
 	codecStrings: string[];
 }) => {
