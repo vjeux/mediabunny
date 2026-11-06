@@ -192,23 +192,36 @@ export const intoTimescale = (timeInSeconds: number, timescale: number, round = 
  * the start's own nearest tick. Returns that duration and the track tick readers will start the media at.
  */
 export const getEmptyEdit = (startOffset: number, timescale: number) => {
-	const target = intoTimescale(startOffset, timescale);
+	const exactTarget = startOffset * timescale;
+	const target = intoTimescale(startOffset, timescale); // The tick every other sample is rounded to the same way
 	const nearest = intoTimescale(startOffset, GLOBAL_TIMESCALE);
 
-	// When the track timescale is at most the movie's, one of these converts back to the target tick exactly
+	// When the track timescale is at most the movie's, one of these converts back to the target tick. Above it, there
+	// may be none; then the tick closest to the start is used, preferring one below it.
 	let best = nearest;
-	let bestDistance = Infinity;
+	let bestStart = Math.round(nearest * timescale / GLOBAL_TIMESCALE);
+	const score = (start: number, exactStart: number) => [
+		start === target ? 0 : 1, // The target tick first
+		Math.abs(start - exactTarget), // Then the closest tick
+		start > exactTarget ? 1 : 0, // Then the tick below
+		Math.abs(exactStart - start), // Then the duration closest to the tick's center
+	];
+	let bestScore = score(bestStart, nearest * timescale / GLOBAL_TIMESCALE);
 	for (let duration = Math.max(0, nearest - 2); duration <= nearest + 2; duration++) {
-		const distance = Math.abs(duration * timescale / GLOBAL_TIMESCALE - target);
-		if (distance < bestDistance - 1e-9) {
+		const exactStart = duration * timescale / GLOBAL_TIMESCALE;
+		const start = Math.round(exactStart);
+		const candidateScore = score(start, exactStart);
+		const index = candidateScore.findIndex((value, i) => value !== bestScore[i]);
+		if (index !== -1 && candidateScore[index]! < bestScore[index]!) {
 			best = duration;
-			bestDistance = distance;
+			bestStart = start;
+			bestScore = candidateScore;
 		}
 	}
 
 	return {
 		duration: best,
-		startInTimescale: Math.round(best * timescale / GLOBAL_TIMESCALE),
+		startInTimescale: bestStart,
 	};
 };
 
@@ -1107,10 +1120,11 @@ export class IsobmffMuxer extends Muxer {
 			if (trackData.lastTimescaleUnits !== null) {
 				assert(trackData.lastSample);
 
-				const delta = sample.decodeTimeInTimescale - trackData.lastTimescaleUnits;
-				assert(delta >= 0);
+				// Never negative, except right after an empty edit that ends a tick or two after the first sample's own
+				// tick (track timescale above the movie's): samples within those ticks then share its decode time
+				const delta = Math.max(0, sample.decodeTimeInTimescale - trackData.lastTimescaleUnits);
 
-				trackData.lastTimescaleUnits = sample.decodeTimeInTimescale;
+				trackData.lastTimescaleUnits += delta;
 				trackData.lastSample.timescaleUnitsToNextSample = delta;
 
 				if (!this.isFragmented) {

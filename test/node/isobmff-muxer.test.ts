@@ -700,6 +700,51 @@ test('Audio timestamps come back within half a sample when the track and movie t
 	}
 });
 
+test('Audio above the movie timescale whose first packets are less than a tick apart still muxes', async () => {
+	// At 96 kHz, no empty edit converts back to these starts' own ticks (9601) in the reader: the closest ones end a
+	// tick before (from 0.1000065 s) or after (from 9601.4 / 96000 s) the start
+	const cases = [
+		[0.1000065, 0.1000065, 0.1000065 + 1024 / 96000],
+		[0.1000065, 0.1000065 + 0.3 / 96000],
+		[9601.4 / 96000, 9601.4 / 96000, 9601.4 / 96000 + 1024 / 96000],
+	];
+	for (const timestamps of cases) {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('aac');
+		output.addAudioTrack(source);
+		await output.start();
+
+		for (const [i, timestamp] of timestamps.entries()) {
+			await source.add(new EncodedPacket(new Uint8Array([i]), 'key', timestamp, 1024 / 96000), {
+				decoderConfig: {
+					codec: 'mp4a.40.2',
+					numberOfChannels: 2,
+					sampleRate: 96000,
+					description: new Uint8Array([0x10, 0x10]),
+				},
+			});
+		}
+		await output.finalize(); // Used to fail an assertion on a negative decode delta
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const ticks: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			ticks[packet.data[0]!] = Math.round(packet.timestamp * 96000);
+		}
+		expect(ticks).toHaveLength(timestamps.length);
+
+		// Packets within a tick of the start may be a tick off; the rest land on their own ticks
+		const expected = timestamps.map(timestamp => Math.round(timestamp * 96000));
+		for (const [i, tick] of ticks.entries()) {
+			const withinATickOfStart = timestamps[i]! - timestamps[0]! < 1 / 96000;
+			expect(Math.abs(tick - expected[i]!)).toBeLessThanOrEqual(withinATickOfStart ? 1 : 0);
+		}
+	}
+});
+
 test('Chunks written in chronological order, in-memory Fast Start', async () => {
 	await testChunkOrder('in-memory');
 });
