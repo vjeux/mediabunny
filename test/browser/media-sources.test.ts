@@ -1,16 +1,19 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamAudioTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
+import { CustomAudioEncoder, customAudioEncoders, registerEncoder } from '../../src/custom-coder.js';
+import { EncodedPacket } from '../../src/packet.js';
+import { AudioCodec } from '../../src/codec.js';
 
 test('VideoSampleSource, normal usage', async () => {
 	const buffer = await encodeFrames(
@@ -731,3 +734,169 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test('MediaStreamAudioTrackSource, a busy main thread loses no audio', async ({ skip }) => {
+	// Audio captured through a ScriptProcessorNode (without MediaStreamTrackProcessor) runs on the main thread itself
+	if (typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackProcessor on the main thread (Chromium)');
+	}
+
+	const audioContext = new AudioContext({ sampleRate: 48000 });
+	await Promise.race([audioContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
+	if (audioContext.state !== 'running') {
+		await audioContext.close();
+		skip('Web Audio cannot run here without a user gesture');
+	}
+
+	// A continuous tone, rendered off the main thread
+	const destination = audioContext.createMediaStreamDestination();
+	const oscillator = audioContext.createOscillator();
+	oscillator.frequency.value = 441;
+	const gain = audioContext.createGain();
+	gain.gain.value = 0.5;
+	oscillator.connect(gain).connect(destination);
+	oscillator.start();
+	const track = destination.stream.getAudioTracks()[0]!;
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(track, { codec: 'opus', quality: new Quality('high') });
+	const errors: unknown[] = [];
+	audioSource.errorPromise.catch(error => errors.push(error));
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	await new Promise(resolve => setTimeout(resolve, 500));
+	const stallStart = performance.now();
+	while (performance.now() - stallStart < 300) {
+		// A long task keeping the main thread busy for 300 ms
+	}
+	await new Promise(resolve => setTimeout(resolve, 500));
+
+	await output.finalize();
+	track.stop();
+	await audioContext.close();
+	expect(errors).toEqual([]);
+
+	// Count the 2 ms stretches in which the tone is missing
+	const { input, track: audioTrack } = await readBackAudioTrack(output.target.buffer!);
+	let missingMs = 0;
+	let toneStarted = false;
+	for await (using sample of new AudioSampleSink(audioTrack).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		for (let i = 0; i + 96 <= data.length; i += 96) {
+			const peak = Math.max(...data.subarray(i, i + 96).map(Math.abs));
+			if (peak > 0.3) {
+				toneStarted = true;
+			} else if (toneStarted && peak < 0.05) {
+				missingMs += 2;
+			}
+		}
+	}
+	input.dispose();
+
+	expect(missingMs).toBeLessThan(60);
+});
+
+test('MediaStreamAudioTrackSource, audio behind a busy encoder is kept, but not if captured while paused', async ({
+	skip,
+}) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator (Chromium)');
+	}
+
+	// An encoder that holds on to everything until released, so that audio piles up behind it
+	let releaseEncoder!: () => void;
+	const encoderReleased = new Promise<void>((resolve) => {
+		releaseEncoder = resolve;
+	});
+	class StalledPcmEncoder extends CustomAudioEncoder {
+		static override supports(codec: AudioCodec) {
+			return codec === 'pcm-f32';
+		}
+
+		init() {}
+
+		async encode(audioSample: AudioSample) {
+			await encoderReleased;
+			const data = new Float32Array(audioSample.numberOfFrames);
+			audioSample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+			this.onPacket(
+				new EncodedPacket(new Uint8Array(data.buffer), 'key', audioSample.timestamp, audioSample.duration),
+				{ decoderConfig: { codec: 'pcm-f32', sampleRate: audioSample.sampleRate, numberOfChannels: 1 } },
+			);
+		}
+
+		flush() {}
+		close() {}
+	}
+	registerEncoder(StalledPcmEncoder);
+
+	try {
+		const generator = new MediaStreamTrackGenerator({ kind: 'audio' });
+		const writer = generator.writable.getWriter();
+		const output = new Output({
+			format: new WavOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const audioSource = new MediaStreamAudioTrackSource(generator as unknown as MediaStreamAudioTrack, {
+			codec: 'pcm-f32',
+		});
+		const errors: unknown[] = [];
+		audioSource.errorPromise.catch(error => errors.push(error));
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		// 10 ms chunks of a constant value: 0.25 before the pause, 0.75 during it, 0.5 after it
+		let chunks = 0;
+		const writeChunk = async (value: number) => {
+			await writer.write(new AudioData({
+				format: 'f32-planar',
+				sampleRate: 48000,
+				numberOfChannels: 1,
+				numberOfFrames: 480,
+				timestamp: 10000 * chunks++,
+				data: new Float32Array(480).fill(value),
+			}));
+			await new Promise(resolve => setTimeout(resolve, 12)); // Lets the chunk arrive at the source
+		};
+		for (let i = 0; i < 10; i++) {
+			await writeChunk(0.25);
+		}
+		audioSource.pause();
+		for (let i = 0; i < 3; i++) {
+			await writeChunk(0.75);
+		}
+		audioSource.resume();
+		releaseEncoder();
+		for (let i = 0; i < 3; i++) {
+			await writeChunk(0.5);
+		}
+		await new Promise(resolve => setTimeout(resolve, 50));
+		await output.finalize();
+		await writer.close();
+		expect(errors).toEqual([]);
+
+		const frameCounts = new Map<number, number>();
+		const { input, track } = await readBackAudioTrack(output.target.buffer!);
+		for await (using sample of new AudioSampleSink(track).samples()) {
+			const data = new Float32Array(sample.numberOfFrames);
+			sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+			for (const value of data) {
+				frameCounts.set(value, (frameCounts.get(value) ?? 0) + 1);
+			}
+		}
+		input.dispose();
+
+		// All ten chunks from before the pause, although the encoder could only take eight of them at first
+		expect(frameCounts.get(0.25)).toBe(4800);
+		expect(frameCounts.get(0.75)).toBeUndefined();
+		expect(frameCounts.get(0.5)).toBeGreaterThan(0);
+	} finally {
+		releaseEncoder();
+		customAudioEncoders.splice(customAudioEncoders.indexOf(StalledPcmEncoder), 1);
+	}
+});
