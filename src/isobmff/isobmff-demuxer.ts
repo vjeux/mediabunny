@@ -2565,7 +2565,7 @@ export class IsobmffDemuxer extends Demuxer {
 				const sampleFlagsPresent = Boolean(flags & 0x000400);
 				const sampleCompositionTimeOffsetsPresent = Boolean(flags & 0x000800);
 
-				const sampleCount = readU32Be(slice);
+				let sampleCount = readU32Be(slice);
 
 				const { defaultSampleDuration, defaultSampleSize, defaultSampleFlags } = track.currentFragmentState;
 				if (
@@ -2579,12 +2579,6 @@ export class IsobmffDemuxer extends Demuxer {
 					throw new Error('Invalid trun box: sample values are missing and there are no defaults.');
 				}
 
-				this.currentFragment.sampleCount += sampleCount;
-				if (this.currentFragment.sampleCount > 2 ** 20) {
-					// Safety measure
-					throw new Error('Too many (> 2^20) samples in fragment.');
-				}
-
 				let dataOffset: number | null = null;
 				if (dataOffsetPresent) {
 					dataOffset = readI32Be(slice);
@@ -2592,6 +2586,22 @@ export class IsobmffDemuxer extends Demuxer {
 				let firstSampleFlags: number | null = null;
 				if (firstSampleFlagsPresent) {
 					firstSampleFlags = readU32Be(slice);
+				}
+
+				const entrySize = 4 * [
+					sampleDurationPresent,
+					sampleSizePresent,
+					sampleFlagsPresent,
+					sampleCompositionTimeOffsetsPresent,
+				].filter(Boolean).length;
+				if (entrySize > 0) {
+					sampleCount = capEntryCount(sampleCount, slice, boxEndPos, entrySize);
+				}
+
+				this.currentFragment.sampleCount += sampleCount;
+				if (this.currentFragment.sampleCount > 2 ** 20) {
+					// Safety measure
+					throw new Error('Too many (> 2^20) samples in fragment.');
 				}
 
 				let trackData: FragmentTrackData;

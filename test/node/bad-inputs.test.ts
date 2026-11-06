@@ -660,6 +660,27 @@ test('MP4: Boxes claiming more entries than they hold', async () => {
 		expect(track).toBeDefined();
 		expect(await new EncodedPacketSink(track!).getFirstPacket()).not.toBeNull();
 	}
+
+	// The same for a fragment's trun (Firefox's dom/media/test/crashtests/1414444.mp4): 2 of 10 claimed sample sizes
+	const fragmented = mp4(fragmentedMoov(), [
+		moof(
+			fullBox('tfhd', 0, 0x020000, u32(1)),
+			fullBox('tfdt', 0, 0, u32(0)),
+			fullBox('trun', 0, 0x000200, u32(10), u32(4), u32(4)),
+		),
+		box('mdat', zeros(8)),
+	]);
+
+	await expectGracefulRead(fragmented);
+
+	using fragmentedInput = new Input({ source: new BufferSource(fragmented), formats: ALL_FORMATS });
+	const fragmentedTrack = (await fragmentedInput.getVideoTracks())[0]!;
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(fragmentedTrack).packets()) {
+		expect(packet.byteLength).toBe(4);
+		packetCount++;
+	}
+	expect(packetCount).toBe(2);
 });
 
 const mp4 = (moovChildren: Bytes[], after: Bytes[] = []) => concat(
