@@ -1989,6 +1989,99 @@ segment-1-1.ts
 	);
 });
 
+test('Segmentation, variants of jittery live video end their segments at the same key frames', async () => {
+	const playlists: string[] = [];
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			targetDuration: 1,
+			live: true,
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			if (request.path.includes('playlist')) {
+				target.on('finalized', () => {
+					playlists.push(new TextDecoder().decode(target.buffer!));
+				});
+			}
+
+			return target;
+		}),
+	});
+
+	// Two renditions of the same capture, like two video sources on one camera track
+	const high = videoSource();
+	const low = videoSource();
+	output.addVideoTrack(high);
+	output.addVideoTrack(low);
+	await output.start();
+
+	// 30 fps with up to 30 ms of timestamp jitter. Both encoders force a key frame on the first frame of every second
+	// (keyFrameInterval: 1), the high one also on a scene cut in the middle of every second.
+	for (let i = 0; i < 150; i++) {
+		const timestamp = i / 30 + ((i * 7919) % 31) / 1000;
+		const isForcedKeyFrame = i % 30 === 0;
+		const isSceneCut = i % 30 === 17;
+		await high.add(
+			new EncodedPacket(avcPacketData, isForcedKeyFrame || isSceneCut ? 'key' : 'delta', timestamp, 1 / 30),
+			avcMetadata,
+		);
+		await low.add(
+			new EncodedPacket(avcPacketData, isForcedKeyFrame ? 'key' : 'delta', timestamp, 1 / 30),
+			avcMetadata,
+		);
+	}
+
+	await output.finalize();
+
+	const getSegmentDurations = (playlist: string) => [...playlist.matchAll(/#EXTINF:([\d.]+),/g)]
+		.map(match => Number(match[1]));
+	const finalPlaylists = playlists.filter(playlist => playlist.includes('#EXT-X-ENDLIST'));
+	expect(finalPlaylists).toHaveLength(2);
+	const [durations, otherDurations] = finalPlaylists.map(getSegmentDurations);
+	expect(durations).toHaveLength(5);
+	expect(durations).toEqual(otherDurations);
+	for (const duration of durations!) {
+		expect(Math.round(duration)).toBe(1);
+	}
+});
+
+test('Segmentation, VOD keeps segments within the target duration when key frames land a bit late', async () => {
+	let playlist = '';
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			targetDuration: 2,
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			if (request.path.includes('playlist')) {
+				target.on('finalized', () => {
+					playlist = new TextDecoder().decode(target.buffer!);
+				});
+			}
+
+			return target;
+		}),
+	});
+	const video = videoSource();
+	output.addVideoTrack(video);
+	await output.start();
+
+	// 30 fps, a key frame every second; the ones at the 2 s boundaries land 10 ms late
+	for (let i = 0; i < 180; i++) {
+		const timestamp = i / 30 + (i % 60 === 0 && i > 0 ? 0.01 : 0);
+		const type = i % 30 === 0 ? 'key' : 'delta';
+		await video.add(new EncodedPacket(avcPacketData, type, timestamp, 1 / 30), avcMetadata);
+	}
+	await output.finalize();
+
+	// VOD playlists announce the ceiling of their longest segment as the target duration
+	expect(playlist).toContain('#EXT-X-TARGETDURATION:2\n');
+	const segmentDurations = [...playlist.matchAll(/#EXTINF:([\d.]+),/g)].map(match => Number(match[1]));
+	expect(Math.max(...segmentDurations)).toBeLessThanOrEqual(2);
+});
+
 test('write, onSegment, onPlaylist, onMaster events', async () => {
 	const onSegment = vi.fn();
 	const onPlaylist = vi.fn();
