@@ -193,7 +193,6 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let nextByteRange: { offset: number; length: number } | null = null;
 		let lastProgramDateTimeSeconds: number | null = null;
 		let iFramesOnly = false;
-		const resourceInitSegments = new Map<string, HlsSegment>();
 
 		// Used for repeated parses where our job it is to only add the new segments
 		let prevLastSegment = last(this.segments) ?? null;
@@ -278,29 +277,25 @@ export class HlsSegmentedInput extends SegmentedInput {
 					};
 
 					let initSegment = currentInitSegment;
-					if (!initSegment && iFramesOnly && !currentKey && location.offset > 0) {
+					if (!initSegment && !currentFirstSegment && iFramesOnly && !currentKey && location.offset > 0) {
 						// "The byte range of an I-frame segment with an EXT-X-BYTERANGE tag applied to it MUST NOT
 						// include its Media Initialization Section; clients can assume that the Media Initialization
 						// Section is defined by the EXT-X-MAP tag, or is located between the start of the resource and
 						// the offset of the first I-frame segment in that resource."
-						initSegment = resourceInitSegments.get(fullPath) ?? null;
-
-						if (!initSegment) {
-							initSegment = {
-								index: -1,
-								timestamp: accumulatedTime,
-								unixEpochTimestamp: accumulatedUnixTime,
-								discontinuityNumber: nextDiscontinuityNumber,
-								firstSegment: null,
-								sequenceNumber: null,
-								location: { path: fullPath, offset: 0, length: location.offset },
-								duration: 0,
-								encryption: null,
-								initSegment: null,
-								lastProgramDateTimeSeconds,
-							};
-							resourceInitSegments.set(fullPath, initSegment);
-						}
+						// The following segments get it through this first one, like they get stream info from it.
+						initSegment = {
+							index: -1,
+							timestamp: accumulatedTime,
+							unixEpochTimestamp: accumulatedUnixTime,
+							discontinuityNumber: nextDiscontinuityNumber,
+							firstSegment: null,
+							sequenceNumber: null,
+							location: { path: fullPath, offset: 0, length: location.offset },
+							duration: 0,
+							encryption: null,
+							initSegment: null,
+							lastProgramDateTimeSeconds,
+						};
 					}
 
 					const segment: HlsSegment = {

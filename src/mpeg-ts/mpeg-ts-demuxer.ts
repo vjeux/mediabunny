@@ -268,6 +268,9 @@ export class MpegTsDemuxer extends Demuxer {
 
 				hasProgramMap = true;
 				currentPos = this.packetOffset;
+				// The first pass read sections as contiguous, which cuts PES packets short at the first packet of
+				// another PID, so the section ends it recorded can't be trusted
+				this.sectionEndPositions.length = 0;
 				return true;
 			};
 
