@@ -275,6 +275,20 @@ export class OggDemuxer extends Demuxer {
 	async readPacket(startPage: Page, startSegmentIndex: number): Promise<Packet | null> {
 		assert(startSegmentIndex < startPage.lacingValues.length);
 
+		if (startSegmentIndex === 0 && startPage.headerType & 0x01) {
+			// No packet starts at the beginning of a page that continues one: its first segments end a packet whose
+			// start was lost, as when pages are missing. Like FFmpeg, let's skip that orphaned end and read the packet
+			// after it.
+			const orphanEndIndex = startPage.lacingValues.findIndex(x => x < 255);
+			const nextPosition = await this.findNextPacketStart({
+				data: PLACEHOLDER_DATA,
+				endPage: startPage,
+				endSegmentIndex: orphanEndIndex === -1 ? startPage.lacingValues.length - 1 : orphanEndIndex,
+			});
+
+			return nextPosition && this.readPacket(nextPosition.startPage, nextPosition.startSegmentIndex);
+		}
+
 		let startDataOffset = 0;
 		for (let i = 0; i < startSegmentIndex; i++) {
 			startDataOffset += startPage.lacingValues[i]!;
@@ -850,7 +864,8 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		if (currentPage.headerStartPos === startPosition.startPage.headerStartPos) {
 			currentTimestampInSamples = firstTimestampInSamples;
 			currentTimestampIsCorrect = true;
-			currentSegmentIndex = 0;
+			// Not 0: the page may begin with the end of the last header packet, which readPacket wouldn't read there
+			currentSegmentIndex = startPosition.startSegmentIndex;
 		} else {
 			// Holds since lowPage, if not the start page, came out of the bisection, which skips such pages
 			assert(currentPage.granulePosition !== -1);
@@ -888,9 +903,26 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				const endPosition = findPreviousPacketEndPosition(previousPages, currentPage, currentSegmentIndex);
 				assert(endPosition);
 
-				const startPosition = findPacketStartPosition(
+				let startPosition = findPacketStartPosition(
 					previousPages, endPosition.page, endPosition.segmentIndex,
 				);
+				if (
+					startPosition
+					&& startPosition.segmentIndex === 0
+					&& startPosition.page.headerType & 0x01
+				) {
+					// Found to start on a page that continues a packet, the packet is the orphaned end of a packet
+					// whose start was lost, which isn't read as a packet. Let's anchor on the packet before it instead.
+					const previousEndPosition = findPreviousPacketEndPosition(previousPages, startPosition.page, 0);
+					startPosition = previousEndPosition && findPacketStartPosition(
+						previousPages, previousEndPosition.page, previousEndPosition.segmentIndex,
+					);
+					if (previousEndPosition && startPosition) {
+						endPage = previousEndPosition.page;
+						endSegmentIndex = previousEndPosition.segmentIndex;
+					}
+				}
+
 				if (startPosition) {
 					currentPage = startPosition.page;
 					currentSegmentIndex = startPosition.segmentIndex;
