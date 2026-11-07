@@ -4,6 +4,7 @@ import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -11,6 +12,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +926,142 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate TS packets', async () => {
+	// Found by L80. A capture that lost TS packets (UDP, weak reception) leaves frames with holes, which don't decode:
+	// with WebCodecs, the decoder then fails altogether. So like for the packets the demodulator marks with
+	// transport_error_indicator, such frames are left out, which the continuity counters tell (H.222.0 2.4.3.3). A
+	// TS packet sent twice (allowed once, with the same counter) is discarded instead of being read twice. 20 frames of
+	// a 64x64 x264 stream (SPS and PPS, then stub slices of 600 bytes, so each frame spans several TS packets, with
+	// bytes that differ from one TS packet to the next).
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 20; i++) {
+		const sliceData = Array.from({ length: 600 }, (_, j) => 0x20 + (7 * j + i) % 0x60);
+		const slice = nalUnit([i === 0 ? 0x65 : 0x41, 0x88, ...sliceData]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(i === 0 ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				i === 0 ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+	const tsPackets = Array.from({ length: bytes.length / 188 }, (_, i) => bytes.slice(188 * i, 188 * (i + 1)));
+
+	const readFrames = async (packets: Uint8Array[]) => {
+		const data = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => data.set(packet, 188 * i));
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const frames: { timestamp: number; data: Uint8Array }[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			frames.push({ timestamp: packet.timestamp, data: packet.data });
+		}
+		return frames;
+	};
+
+	const clean = await readFrames(tsPackets);
+	expect(clean).toHaveLength(20);
+	const expectFrames = async (packets: Uint8Array[], missingFrames: number[]) => {
+		expect(await readFrames(packets)).toEqual(clean.filter((_, i) => !missingFrames.includes(i)));
+	};
+
+	// The index of each frame's first TS packet (the video's PID is 0x100)
+	const isVideo = (packet: Uint8Array) => (((packet[1]! & 0x1f) << 8) | packet[2]!) === 0x100;
+	const frameStarts = tsPackets.flatMap((packet, i) => (isVideo(packet) && packet[1]! & 0x40 ? [i] : []));
+	expect(frameStarts).toHaveLength(20);
+
+	// Frame 5 loses its second TS packet, frame 7 its last one, frame 9 gets its second sent twice, frame 11 its
+	// first, and frame 13's second has transport_error_indicator set and garbage in it
+	const damaged = tsPackets.flatMap((packet, i) => {
+		if (i === frameStarts[5]! + 1 || i === frameStarts[8]! - 1) {
+			return [];
+		} else if (i === frameStarts[9]! + 1 || i === frameStarts[11]) {
+			return [packet, packet];
+		} else if (i === frameStarts[13]! + 1) {
+			const garbage = packet.map((byte, j) => (j < 4 ? byte : (j * 37) & 0xff));
+			garbage[1]! |= 0x80;
+			return [garbage];
+		}
+		return [packet];
+	});
+	await expectFrames(damaged, [5, 7, 13]);
+
+	// Muxers that never increment the counters, or that also count packets without payload, lose nothing
+	const setCounter = (packet: Uint8Array, counter: number) => {
+		const copy = packet.slice();
+		copy[3] = (copy[3]! & 0xf0) | (counter & 0xf);
+		return copy;
+	};
+	await expectFrames(tsPackets.map(packet => (isVideo(packet) ? setCounter(packet, 0) : packet)), []);
+
+	let counter = 0;
+	const countingPacketsWithoutPayload = tsPackets.flatMap((packet, i) => {
+		if (!isVideo(packet)) {
+			return [packet];
+		}
+
+		const result = [setCounter(packet, counter++)];
+		if (i === frameStarts[15]! + 1) {
+			// A packet with just an adaptation field, which wrongly increments the counter
+			const adaptationOnly = new Uint8Array(188).fill(0xff);
+			adaptationOnly.set([0x47, 0x01, 0x00, 0x20, 183, 0x00]);
+			result.push(setCounter(adaptationOnly, counter++));
+		}
+		return result;
+	});
+	await expectFrames(countingPacketsWithoutPayload, []);
+});
+
+test('MPEG-TS drops only the video frame that lost a TS packet when PES packets begin mid-frame', async () => {
+	// In 0.ts, each video PES packet begins with the end of the previous frame, then the next frame's AUD. Losing a TS
+	// packet in the middle of one must cost that frame only, not the end of the previous one.
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/0.ts')));
+	const readFrames = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: [MPEG_TS] });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const frames: [number, string][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			frames.push([packet.timestamp, createHash('sha1').update(packet.data).digest('hex')]);
+		}
+		return frames;
+	};
+
+	const clean = await readFrames(bytes);
+	expect(clean).toHaveLength(298);
+
+	// The 10th TS packet of the video PES packet that holds most of frame 21 (PID 0x100)
+	let pesCount = 0;
+	let lostPos = -1;
+	for (let pos = 0; pos < bytes.length && lostPos === -1; pos += 188) {
+		if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && bytes[pos + 1]! & 0x40) {
+			if (pesCount++ === 21) {
+				let count = 0;
+				for (let next = pos; ; next += 188) {
+					if ((((bytes[next + 1]! & 0x1f) << 8) | bytes[next + 2]!) === 0x100 && ++count === 10) {
+						lostPos = next;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	const damaged = new Uint8Array([...bytes.subarray(0, lostPos), ...bytes.subarray(lostPos + 188)]);
+	expect(await readFrames(damaged)).toEqual(clean.filter((_, i) => i !== 21));
 });
