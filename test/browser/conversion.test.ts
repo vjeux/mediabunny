@@ -19,7 +19,7 @@ import { InputVideoTrack } from '../../src/input-track.js';
 import { CanvasSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
 
 test('Rotation is baked in when rerendering', async () => {
@@ -1460,3 +1460,80 @@ const testReservedFastStart = async (
 		expect(maximumPacketCount).toBeLessThanOrEqual(2 * packetCount + 64);
 	}
 };
+
+test('Audio whose sample rate and channel count change mid-stream converts with the first part\'s', async () => {
+	// An HLS stream whose second segment, after a discontinuity, has other audio parameters, like an inserted ad: 1 s
+	// of 48 kHz mono, then 1 s of 44.1 kHz stereo
+	const writeSegment = async (url: string, offset: number) => {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig);
+
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('aac');
+		output.addAudioTrack(source);
+		await output.start();
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			if (packet.timestamp < 0) {
+				continue;
+			}
+			if (packet.timestamp >= 1) {
+				break;
+			}
+
+			await source.add(packet.clone({ timestamp: packet.timestamp + offset }), { decoderConfig });
+		}
+		await output.finalize();
+
+		return output.target.buffer!;
+	};
+
+	const segments = new Map([
+		['a.ts', await writeSegment('/demo.mp4', 0)],
+		['b.ts', await writeSegment('/sample3.aac', 1)],
+	]);
+	segments.set('stream.m3u8', new TextEncoder().encode([
+		'#EXTM3U',
+		'#EXT-X-VERSION:3',
+		'#EXT-X-TARGETDURATION:1',
+		'#EXTINF:1.0,',
+		'a.ts',
+		'#EXT-X-DISCONTINUITY',
+		'#EXTINF:1.0,',
+		'b.ts',
+		'#EXT-X-ENDLIST',
+	].join('\n')).buffer);
+
+	// At the first part's sample rate, and at another one, which the encoder resamples to
+	for (const sampleRate of [48000, 22050]) {
+		using input = new Input({
+			source: new CustomPathedSource('stream.m3u8', ({ path }) => new BufferSource(segments.get(path)!)),
+			formats: ALL_FORMATS,
+		});
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, audio: { sampleRate }, showWarnings: false });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryAudioTrack();
+		assert(track);
+		expect(await track.getSampleRate()).toBe(sampleRate);
+		expect(await track.getNumberOfChannels()).toBe(1);
+		expect(await track.computeDuration()).toBeCloseTo(2, 1);
+
+		// Both parts come out audible, the second one resampled and downmixed
+		for (const [start, end] of [[0.2, 0.8], [1.2, 1.8]]) {
+			let sum = 0;
+			let count = 0;
+			for await (using sample of new AudioSampleSink(track).samples(start, end)) {
+				const data = new Float32Array(sample.numberOfFrames);
+				sample.copyTo(data, { planeIndex: 0, format: 'f32' });
+				sum += data.reduce((total, x) => total + x * x, 0);
+				count += data.length;
+			}
+			expect(Math.sqrt(sum / count)).toBeGreaterThan(0.01);
+		}
+	}
+});
