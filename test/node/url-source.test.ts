@@ -397,6 +397,66 @@ const startRangelessServer = async (
 	};
 };
 
+test('UrlSource retries requests that failed with a transient HTTP status', async () => {
+	const data = new Uint8Array(1000).map((_, i) => i & 0xff);
+	let failures: number[] = [];
+	const server = http.createServer((req, res) => {
+		const status = failures.shift();
+		if (status !== undefined) {
+			res.writeHead(status);
+			res.end();
+			return;
+		}
+
+		const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+		const read = async (statuses: number[], retry = true) => {
+			failures = [...statuses];
+			const attempts: number[] = [];
+			using ref = new UrlSource(url, {
+				getRetryDelay: (previousAttempts) => {
+					attempts.push(previousAttempts);
+					return retry ? 0 : null;
+				},
+			}).ref();
+
+			try {
+				const slice = await new Reader(ref.source).requestSlice(0, 4);
+				return { attempts, result: [...readBytes(slice!, 4)] };
+			} catch (error) {
+				return { attempts, result: String(error) };
+			}
+		};
+
+		// Server errors, timeouts and rate limiting can go away, so they're retried like network errors...
+		expect(await read([503, 429, 502])).toEqual({ attempts: [1, 2, 3], result: [0, 1, 2, 3] });
+		// ...as long as the retry policy wants to
+		expect(await read([503], false)).toEqual({
+			attempts: [1],
+			result: `Error: Error fetching ${url}: 503 Service Unavailable`,
+		});
+		// Other failures are final
+		expect(await read([404])).toEqual({ attempts: [], result: `Error: Error fetching ${url}: 404 Not Found` });
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
