@@ -209,3 +209,33 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('Matroska Language elements hold bibliographic ISO 639-2 codes', async () => {
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const german = new EncodedAudioPacketSource('pcm-s16');
+	const english = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(german, { languageCode: 'deu' });
+	output.addAudioTrack(english, { languageCode: 'eng' });
+	await output.start();
+
+	const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 };
+	for (const source of [german, english]) {
+		await source.add(new EncodedPacket(new Uint8Array(960), 'key', 0, 0.01), { decoderConfig });
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	// RFC 9559, section 12: the element uses the bibliographic form ("ger", not "deu")
+	const languageElements: string[] = [];
+	for (let i = 0; i + 7 <= bytes.length; i++) {
+		if (bytes[i] === 0x22 && bytes[i + 1] === 0xb5 && bytes[i + 2] === 0x9c && bytes[i + 3] === 0x83) {
+			languageElements.push(String.fromCharCode(...bytes.subarray(i + 4, i + 7)));
+		}
+	}
+	expect(languageElements).toEqual(['ger', 'eng']);
+
+	// Reading gives back the terminology codes
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const languageCodes = await Promise.all((await input.getTracks()).map(track => track.getLanguageCode()));
+	expect(languageCodes).toEqual(['deu', 'eng']);
+});
