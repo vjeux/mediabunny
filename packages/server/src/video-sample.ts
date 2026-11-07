@@ -296,12 +296,17 @@ export const transformVideoSample = async (
 	const hasAlpha = /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|ayuv|vuya)/.test(pixelFormatName);
 
 	if (description.alpha === 'discard' && hasAlpha) {
-		// Like the canvas transformer, paint the frame (including transparent padding) onto black, then drop the alpha
-		// channel, letting FFmpeg pick the closest format without one
+		// Like the canvas transformer, paint the frame (including transparent padding) onto black, keeping the pixel
+		// format, now with every pixel opaque. The blending runs in the source's chroma subsampling, and in at least 10
+		// bits for high-bit-depth sources, the most the overlay filter does.
+		const yuvMatch = /^yuva(420|422|444)p(\d+)?/.exec(pixelFormatName);
+		const blendFormat = yuvMatch
+			? `yuv${yuvMatch[1]}${yuvMatch[2] ? 'p10' : ''}`
+			: /^(rgba|bgra|argb|abgr)/.test(pixelFormatName) ? 'rgb' : 'auto';
+
 		graphDescription = `[in]${chain.join(',')},split[fg][copy];`
 			+ '[copy]drawbox=t=fill:c=black:replace=1[bg];'
-			+ '[bg][fg]overlay=format=auto,format=pix_fmts=rgb0|bgr0|yuv420p|yuv422p|yuv444p'
-			+ '|yuv420p10le|yuv422p10le|yuv444p10le|yuv420p12le|yuv422p12le|yuv444p12le[out]';
+			+ `[bg][fg]overlay=format=${blendFormat},format=pix_fmts=${pixelFormatName}[out]`;
 	}
 
 	const graph = new NodeAv.FilterGraph();

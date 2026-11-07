@@ -1779,9 +1779,9 @@ describe('Video', async () => {
 			using kept = await sample.transform({ alpha: 'keep' });
 			expect((await readPixels(kept))[3]).toBe(0);
 
-			// Like the canvas transformer, 'discard' paints the frame onto black and makes every pixel opaque
+			// Like the canvas transformer, 'discard' paints the frame onto black, making every pixel opaque
 			using discarded = await sample.transform({ alpha: 'discard' });
-			expect(discarded.format).toBe('RGBX');
+			expect(discarded.format).toBe('RGBA');
 			const pixels = await readPixels(discarded);
 			expect([...pixels.subarray(0, 4)]).toEqual([0, 0, 0, 255]);
 			expect([...pixels.subarray(8, 12)]).toEqual([0, 255, 0, 255]);
@@ -1791,31 +1791,42 @@ describe('Video', async () => {
 			expect([...(await readPixels(letterboxed)).subarray(0, 4)]).toEqual([0, 0, 0, 255]);
 		});
 
-		test('alpha: \'discard\' on YUV with alpha', async () => {
-			// 16x16 I420A: white, transparent on the left half
+		test.each([
+			['I420A', 8],
+			['I420AP10', 10],
+			['I444AP12', 12],
+		] as const)('alpha: \'discard\' on %s', async (format, bitDepth) => {
+			// 16x16, white, transparent on the left half
 			const width = 16;
 			const height = 16;
-			const data = new Uint8Array(width * height * 2 + (width / 2) * (height / 2) * 2);
-			data.fill(235, 0, width * height); // Y
-			data.fill(128, width * height, width * height + (width / 2) * (height / 2) * 2); // U, V
-			const alpha = data.subarray(width * height + (width / 2) * (height / 2) * 2);
+			const chromaSize = format.startsWith('I420') ? (width / 2) * (height / 2) : width * height;
+			const max = 2 ** bitDepth - 1;
+			const values = bitDepth === 8
+				? new Uint8Array(width * height * 2 + chromaSize * 2)
+				: new Uint16Array(width * height * 2 + chromaSize * 2);
+			values.fill(Math.round(235 / 255 * max), 0, width * height); // Y
+			values.fill(Math.round(128 / 255 * max), width * height, width * height + chromaSize * 2); // U, V
+			const alpha = values.subarray(width * height + chromaSize * 2);
 			for (let y = 0; y < height; y++) {
 				alpha.fill(0, y * width, y * width + width / 2);
-				alpha.fill(255, y * width + width / 2, (y + 1) * width);
+				alpha.fill(max, y * width + width / 2, (y + 1) * width);
 			}
-			using sample = new VideoSample(data, {
-				format: 'I420A',
+			using sample = new VideoSample(new Uint8Array(values.buffer), {
+				format,
 				codedWidth: width,
 				codedHeight: height,
 				timestamp: 0,
 			});
 
-			using discarded = await sample.transform({ alpha: 'discard' });
-			expect(discarded.format).toBe('I420');
+			// The format (and bit depth) stays, with every pixel opaque
+			using discarded = await sample.transform({ width: 32, height: 32, fit: 'fill', alpha: 'discard' });
+			expect(discarded.format).toBe(format);
 
-			const rgba = await readRgba(discarded);
-			expectColor(getColorAt(rgba, width, 2, 8), [0, 0, 0]);
-			expectColor(getColorAt(rgba, width, 13, 8), [255, 255, 255]);
+			const rgba = new Uint8Array(32 * 32 * 4);
+			await discarded.copyTo(rgba, { format: 'RGBA' });
+			expectColor(getColorAt(rgba, 32, 4, 16), [0, 0, 0]);
+			expectColor(getColorAt(rgba, 32, 27, 16), [255, 255, 255]);
+			expect(rgba.filter((_, i) => i % 4 === 3).every(value => value === 255)).toBe(true);
 		});
 
 		test('VideoSample transformation via Conversion API', async () => {
