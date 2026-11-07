@@ -685,10 +685,10 @@ Not setting `getRetryDelay` will lead to the default being used:
 - If a CORS error is suspected (`fetch()` did reject even though `navigator.onLine` is true and origin is different), no further retries will be made.
 
 ::: warning
-The default only compares the origin of the URL you pass with your own. If a URL of the same origin redirects to another origin whose server doesn't allow cross-origin requests (a presigned object storage URL, say), `fetch()` fails just like it does on a network error, and the default keeps retrying forever. If your URLs may redirect like that, pass a `getRetryDelay` that gives up at some point:
+The default only compares the origin of the URL you pass with your own. If a URL of the same origin redirects to another origin whose server doesn't allow cross-origin requests (a presigned object storage URL, say), `fetch()` fails just like it does on a network error, and the default keeps retrying forever. If your URLs may redirect like that, pass a `getRetryDelay` that gives up after some failed attempts:
 ```ts
 const source = new UrlSource('/media/video.mp4', {
-	// Retry up to 5 times with exponential backoff, then give up
+	// Retry a failed request up to 5 times with exponential backoff, then give up
 	getRetryDelay: previousAttempts => previousAttempts <= 5 ? Math.min(2 ** previousAttempts, 16) : null,
 });
 ```
