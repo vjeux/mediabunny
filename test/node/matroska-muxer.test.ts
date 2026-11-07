@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -209,3 +209,78 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('Opus gets an identification header as CodecPrivate, with the CodecDelay as its pre-skip', async () => {
+	// The Matroska Opus mapping requires the OpusHead in CodecPrivate (packets remuxed from MPEG-TS, say, come without
+	// one), and a CodecDelay equal to its pre-skip: the samples a decoder drops at the start. Any other start is left
+	// to the block timestamps.
+	type Options = { configBeforeStart?: boolean; description?: Uint8Array };
+	const muxAndRead = async (firstTimestamp: number, { configBeforeStart, description }: Options) => {
+		const decoderConfig = { codec: 'opus', numberOfChannels: 2, sampleRate: 44100, description };
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source, configBeforeStart ? { decoderConfig } : {});
+		await output.start();
+		for (let i = 0; i < 3; i++) {
+			await source.add(
+				new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', firstTimestamp + 0.02 * i, 0.02),
+				i === 0 ? { decoderConfig } : undefined,
+			);
+		}
+		await output.finalize();
+		const bytes = new Uint8Array(output.target.buffer!);
+
+		// CodecDelay, in nanoseconds
+		const delayIndex = bytes.findIndex((byte, i) => byte === 0x56 && bytes[i + 1] === 0xaa);
+		let codecDelay = 0;
+		for (let i = 0; delayIndex !== -1 && i < (bytes[delayIndex + 2]! & 0x7f); i++) {
+			codecDelay = codecDelay * 256 + bytes[delayIndex + 3 + i]!;
+		}
+
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const config = await track.getDecoderConfig();
+		return {
+			description: config!.description && [...new Uint8Array(config!.description as ArrayBuffer)],
+			codecDelay,
+			firstTimestamp: await track.getFirstTimestamp(),
+		};
+	};
+
+	const opusHead = (preSkip: number) => [
+		...[...'OpusHead'].map(x => x.charCodeAt(0)),
+		1, 2, preSkip & 0xff, preSkip >> 8, 0x44, 0xac, 0, 0, 0, 0, 0,
+	];
+
+	const check = async (firstTimestamp: number, preSkip: number, options: Options = {}) => {
+		const result = await muxAndRead(firstTimestamp, options);
+		expect(result.description).toEqual(opusHead(preSkip));
+		expect(result.codecDelay).toBe(Math.round(preSkip * 1e9 / 48000));
+		// Read back within a tick (1 ms), as readers round CodecDelay to whole ticks
+		expect(Math.abs(result.firstTimestamp - firstTimestamp)).toBeLessThan(0.0015);
+	};
+
+	// Nothing says to drop samples, so a generated header has a pre-skip of 0, and a negative start stays negative
+	await check(0, 0);
+	await check(-0.0065, 0);
+	await check(-0.0065, 0, { configBeforeStart: true }); // The decoder config is known before the first packet
+	await check(-2, 0);
+
+	// A given header keeps its pre-skip, whatever the start
+	const description = new Uint8Array(opusHead(312));
+	await check(0.1, 312, { description });
+	await check(-0.0065, 312, { description });
+	await check(-0.1, 312, { description });
+	await check(-20, 312, { description });
+
+	// Block timestamps can't go below -32.768 s, so rather than losing the packets of an earlier start, the CodecDelay
+	// then covers it as a whole
+	const farStart = await muxAndRead(-40, { description });
+	expect(farStart.description).toEqual(opusHead(312));
+	expect(farStart.codecDelay).toBe(40_000_000_000);
+	expect(Math.abs(farStart.firstTimestamp - -40)).toBeLessThan(0.0015);
+});
