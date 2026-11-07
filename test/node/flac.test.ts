@@ -88,6 +88,23 @@ test('can do random access', async () => {
 	expect(priorPacket.data.byteLength).toBe(6877);
 	expect(priorPacket.sequenceNumber).toBe(32);
 	expect(priorPacket.duration).toBe(0.09287981859410431);
+
+	// Cold lookups at each packet's own timestamp return that packet. In floating point, a packet's start plus its
+	// duration can come out larger than the next packet's start, which is computed from the summed sample counts (three
+	// times in the first 40 packets of this file).
+	const lookUpCold = async (timestamp: number) => {
+		using freshInput = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+		const freshTrack = await freshInput.getPrimaryAudioTrack();
+		assert(freshTrack);
+		return (await new EncodedPacketSink(freshTrack).getPacket(timestamp, { metadataOnly: true }))?.timestamp;
+	};
+	for await (const packet of packetSink.packets(undefined, undefined, { metadataOnly: true })) {
+		const { timestamp, sequenceNumber } = packet;
+		if (sequenceNumber === 40) {
+			break;
+		}
+		expect(await lookUpCold(timestamp)).toBe(timestamp);
+	}
 });
 
 test('can get metadata-only packets', async () => {
