@@ -211,6 +211,9 @@ const readAc3SyncHeader = (bytes: Uint8Array) => {
 	return bytes[0] === 0x0b && bytes[1] === 0x77 ? { frameSize: 0, rate: 0 } : null;
 };
 
+/** How many PES packets further back a lookup may look when the PES packets it read have no packet it is after */
+const MAX_LOOKUP_WINDOW_EXTENSION = 4;
+
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
@@ -1675,7 +1678,38 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				}
 			}
 
-			return retrieveEncodedPacket(currentPesHeader.sectionStartPos, p => p.pts <= searchPts);
+			let packet = await retrieveEncodedPacket(currentPesHeader.sectionStartPos, p => p.pts <= searchPts);
+
+			// When PES packets don't start with frames, the frame a lookup is after can start in a PES packet before
+			// the window, like the last complete one when the end of the file cuts off the frames that start in the
+			// window. Widen it then.
+			for (let i = 0; !packet && i < MAX_LOOKUP_WINDOW_EXTENSION; i++) {
+				let pos = currentPesHeader.sectionStartPos - demuxer.packetStride;
+				let previousHeader: TimestampedPesPacketHeader | null = null;
+				for (; pos >= demuxer.packetOffset && !previousHeader; pos -= demuxer.packetStride) {
+					const packetHeader = await demuxer.readPacketHeader(pos);
+					if (!packetHeader) {
+						break;
+					}
+
+					if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
+						const section = await demuxer.readSection(pos, false);
+						const header = section && readPesPacketHeader(demuxer, section, false);
+						if (header && header.pts !== null) {
+							previousHeader = header as TimestampedPesPacketHeader;
+						}
+					}
+				}
+
+				if (!previousHeader) {
+					break;
+				}
+
+				currentPesHeader = previousHeader;
+				packet = await retrieveEncodedPacket(currentPesHeader.sectionStartPos, p => p.pts <= searchPts);
+			}
+
+			return packet;
 		} else {
 			// Key packet lookup case. Slightly harder since the starting chunk may not have a key packet at all, which
 			// means we might need to search the previous chunks until we find something.
@@ -1997,6 +2031,8 @@ const maybeInsertReferencePacket = (
 
 type SuppliedPacket = {
 	pts: number;
+	/** The duration the packet's own data implies (audio frames), or 0 */
+	intrinsicDuration: number;
 	data: Uint8Array;
 	sequenceNumber: number;
 	sectionStartPos: number;
@@ -2727,6 +2763,7 @@ class PacketReadingContext {
 
 		this.suppliedPacket = {
 			pts,
+			intrinsicDuration,
 			data,
 			sequenceNumber,
 			sectionStartPos,
@@ -2779,8 +2816,9 @@ class PacketBuffer {
 
 		let duration: number;
 		if (presentationIndex === -1 || presentationIndex === this.presentationOrderPackets.length - 1) {
-			// The packet has no known successor (or isn't even placed yet when timestamps are messed up)
-			duration = this.lastDuration; // Reasonable heuristic
+			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). Without a
+			// previous duration either (a lookup that only found this packet), take the one its data implies.
+			duration = this.lastDuration || packet.intrinsicDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
 			duration = nextPacket.pts - packet.pts;
