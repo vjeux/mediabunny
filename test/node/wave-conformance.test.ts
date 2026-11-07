@@ -181,9 +181,9 @@ describe('WAVE format chunk', () => {
 
 	test('rejects formats and bit depths it can\'t decode', async () => {
 		const cases: [FmtOptions, string][] = [
-			// ADPCM and MP3
+			// MS and IMA ADPCM
 			[{ formatTag: 0x0002, bitsPerSample: 4, blockAlign: 1024, cbSize: 0 }, 'WAVE codec (format tag 2)'],
-			[{ formatTag: 0x0055, bitsPerSample: 0, blockAlign: 1, cbSize: 0 }, 'WAVE codec (format tag 85)'],
+			[{ formatTag: 0x0011, bitsPerSample: 4, blockAlign: 1024, cbSize: 0 }, 'WAVE codec (format tag 17)'],
 			[
 				{ bitsPerSample: 16, extensible: { validBits: 16, channelMask: 3, subFormat: 0x0002 } },
 				'Unsupported WAVE codec (format tag 2)',
