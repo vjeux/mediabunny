@@ -2280,10 +2280,9 @@ export class CanvasSink {
 	 * @param endTimestamp - The timestamp in seconds at which to stop yielding canvases (exclusive).
 	 * @param options - Options used for the underlying packet retrieval.
 	 */
-	async* canvases(startTimestamp?: number, endTimestamp?: number, options?: PacketRetrievalOptions) {
-		await this._ensureInit();
-		yield* mapAsyncGenerator(
-			this._videoSampleSink.samples(startTimestamp, endTimestamp, options),
+	canvases(startTimestamp?: number, endTimestamp?: number, options?: PacketRetrievalOptions) {
+		return this._mapSamplesToCanvases(
+			() => this._videoSampleSink.samples(startTimestamp, endTimestamp, options),
 			sample => this._videoSampleToWrappedCanvas(sample),
 		);
 	}
@@ -2300,12 +2299,79 @@ export class CanvasSink {
 	 * @param timestamps - An iterable or async iterable of timestamps in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
 	 */
-	async* canvasesAtTimestamps(timestamps: AnyIterable<number>, options?: PacketRetrievalOptions) {
-		await this._ensureInit();
-		yield* mapAsyncGenerator(
-			this._videoSampleSink.samplesAtTimestamps(timestamps, options),
+	canvasesAtTimestamps(timestamps: AnyIterable<number>, options?: PacketRetrievalOptions) {
+		return this._mapSamplesToCanvases(
+			() => this._videoSampleSink.samplesAtTimestamps(timestamps, options),
 			sample => sample && this._videoSampleToWrappedCanvas(sample),
 		);
+	}
+
+	/**
+	 * Maps the video samples of the iterator the function creates to canvases. Like an async generator function, it
+	 * starts (initializing the sink, then creating the sample iterator, which starts decoding) on the first next().
+	 * But unlike one, it doesn't queue a return() call behind a pending next() (one waiting for the next timestamp,
+	 * for example), which would only free the samples' decoder once that resolves, if ever.
+	 * @internal
+	 */
+	_mapSamplesToCanvases<T, U>(
+		createSamples: () => AsyncGenerator<T, void, unknown>,
+		map: (sample: T) => U,
+	): AsyncGenerator<U, void, unknown> {
+		let samples: AsyncGenerator<T, void, unknown> | null = null;
+		let done = false;
+
+		const canvases: AsyncGenerator<U, void, unknown> = {
+			next: async () => {
+				if (!done && !samples) {
+					try {
+						await this._ensureInit();
+					} catch (error) {
+						done = true;
+						throw error;
+					}
+				}
+
+				if (done) {
+					return { value: undefined, done: true };
+				}
+
+				samples ??= createSamples();
+				const result = await samples.next();
+				if (result.done) {
+					return { value: undefined, done: true };
+				}
+
+				return { value: map(result.value), done: false };
+			},
+			return: async () => {
+				done = true;
+				await samples?.return();
+
+				return { value: undefined, done: true };
+			},
+			throw: async (error: unknown) => {
+				done = true;
+				await samples?.return();
+
+				throw error;
+			},
+			[Symbol.asyncIterator]() {
+				return this;
+			},
+		};
+
+		if (typeof Symbol.asyncDispose === 'symbol') {
+			// Like an async generator, the iterator can be declared with `await using`
+			Object.defineProperty(canvases, Symbol.asyncDispose, {
+				value: async () => {
+					await canvases.return();
+				},
+				writable: true,
+				configurable: true,
+			});
+		}
+
+		return canvases;
 	}
 }
 
