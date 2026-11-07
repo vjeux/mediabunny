@@ -658,22 +658,6 @@ test('AudioSampleSource, resampled to 44100 Hz', async () => {
 	input.dispose();
 });
 
-test('AudioSampleSource, resampled stereo with non-zero start timestamp', async () => {
-	const sample = makeSineWave(48000, 2, 1, 1);
-	const buffer = await encodeAudio(
-		{ codec: 'pcm-s16', transform: { numberOfChannels: 2 } },
-		sample,
-	);
-
-	const { input, track } = await readBackAudioTrack(buffer);
-	expect(await track.getNumberOfChannels()).toBe(2);
-	expect(await track.getSampleRate()).toBe(48000);
-
-	expect(await track.getFirstTimestamp()).toBe(1);
-	expect(await track.computeDuration()).toBe(2);
-	input.dispose();
-});
-
 test.each([
 	['s16', 'pcm-s16', Int16Array.from([16384, 20000, 32767, -32768, -16384, 1, -1, 0])],
 	['u8', 'pcm-u8', Uint8Array.from([0, 1, 64, 127, 128, 129, 192, 255])],
@@ -697,6 +681,22 @@ test.each([
 
 	const data = output.target.buffer!.slice(44); // After the canonical 44-byte header
 	expect([...(format === 's16' ? new Int16Array(data) : new Uint8Array(data))]).toEqual([...values]);
+});
+
+test('AudioSampleSource, resampled stereo with non-zero start timestamp', async () => {
+	const sample = makeSineWave(48000, 2, 1, 1);
+	const buffer = await encodeAudio(
+		{ codec: 'pcm-s16', transform: { numberOfChannels: 2 } },
+		sample,
+	);
+
+	const { input, track } = await readBackAudioTrack(buffer);
+	expect(await track.getNumberOfChannels()).toBe(2);
+	expect(await track.getSampleRate()).toBe(48000);
+
+	expect(await track.getFirstTimestamp()).toBe(1);
+	expect(await track.computeDuration()).toBe(2);
+	input.dispose();
 });
 
 const makeSineWave = (
