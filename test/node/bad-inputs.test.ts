@@ -201,6 +201,47 @@ test('MP4: stsc with alternating chunk indices', async () => {
 	})]));
 });
 
+test('MP4: stsc entry starting at chunk 0', async () => {
+	// The first chunk became chunk -1, whose offset doesn't exist, so the packets came out without their data
+	const stbl = (dataOffset: number) => [
+		stsd(videoSampleEntry()), stts([[2, 1]]), stsc([[0, 2, 1]]), stsz([4, 4]), stco([dataOffset]),
+	];
+	const header = mp4([trak({ handler: 'vide', stbl: stbl(0) })]);
+	const file = mp4(
+		[trak({ handler: 'vide', stbl: stbl(header.length + 8) })],
+		[box('mdat', [1, 2, 3, 4, 5, 6, 7, 8])],
+	);
+
+	expect(await packetData(file)).toEqual([[1, 2, 3, 4], [5, 6, 7, 8]]);
+
+	// A whole table numbered from 0: chunks of 1, 2 and 2 samples
+	const zeroBasedStbl = (dataOffset: number) => [
+		stsd(videoSampleEntry()),
+		stts([[5, 1]]),
+		stsc([[0, 1, 1], [1, 2, 1]]),
+		stsz([4, 4, 4, 4, 4]),
+		stco([dataOffset, dataOffset + 4, dataOffset + 12]),
+	];
+	const zeroBasedHeader = mp4([trak({ handler: 'vide', stbl: zeroBasedStbl(0) })]);
+	const zeroBasedFile = mp4(
+		[trak({ handler: 'vide', stbl: zeroBasedStbl(zeroBasedHeader.length + 8) })],
+		[box('mdat', Array.from({ length: 20 }, (_, i) => i + 1))],
+	);
+	expect(await packetData(zeroBasedFile)).toEqual([
+		[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20],
+	]);
+});
+
+const packetData = async (file: Uint8Array) => {
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getTracks())[0]!);
+	const data: number[][] = [];
+	for await (const packet of sink.packets()) {
+		data.push([...packet.data]);
+	}
+	return data;
+};
+
 test('MP4: Single chunk with many samples', async () => {
 	// Computing a sample's offset in its chunk used to be linear, making iteration quadratic
 	const sampleCount = 100_000;
