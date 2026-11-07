@@ -145,6 +145,9 @@ export class Reader {
 	}
 }
 
+/** Thrown for reads outside of a slice, which means that the file's structures claim more bytes than they hold. */
+export class SliceRangeError extends RangeError {}
+
 export class FileSlice {
 	/** The current position in the backing buffer. Do not modify directly, prefer `.skip()` instead. */
 	bufferPos: number;
@@ -198,7 +201,7 @@ export class FileSlice {
 	/** Creates a new subslice of this slice whose byte range must be contained within this slice. */
 	slice(filePos: number, length = this.end - filePos) {
 		if (filePos < this.start || filePos + length > this.end) {
-			throw new RangeError('Slicing outside of original slice.');
+			throw new SliceRangeError('Slicing outside of original slice.');
 		}
 
 		return new FileSlice(
@@ -213,7 +216,7 @@ export class FileSlice {
 
 const checkIsInRange = (slice: FileSlice, bytesToRead: number) => {
 	if (bytesToRead < 0 || slice.filePos < slice.start || slice.filePos + bytesToRead > slice.end) {
-		throw new RangeError(
+		throw new SliceRangeError(
 			`Tried reading [${slice.filePos}, ${slice.filePos + bytesToRead}), but slice is`
 			+ ` [${slice.start}, ${slice.end}). This is likely an internal error, please report it alongside the file`
 			+ ` that caused it.`,
