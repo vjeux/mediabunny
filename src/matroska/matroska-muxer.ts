@@ -100,6 +100,8 @@ type ClusterBlock = {
 type MatroskaTrackData = {
 	chunkQueue: InternalMediaChunk[];
 	lastWrittenMsTimestamp: number | null;
+	/** The latest timestamp among the track's packets so far, in seconds. */
+	maxPacketTimestamp: number | null;
 	codecPrivate: AllowSharedBufferSource | null;
 	closed: boolean;
 } & ({
@@ -865,6 +867,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
+			maxPacketTimestamp: null,
 			codecPrivate: meta.decoderConfig.description ?? null,
 			closed: false,
 		};
@@ -956,6 +959,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
+			maxPacketTimestamp: null,
 			codecPrivate: decoderConfig.description ?? null,
 			closed: false,
 		};
@@ -989,6 +993,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
+			maxPacketTimestamp: null,
 			codecPrivate: textEncoder.encode(meta.config.description),
 			closed: false,
 		};
@@ -1032,6 +1037,24 @@ export class MatroskaMuxer extends Muxer {
 				timestamp = roundToDivisor(timestamp, track.metadata.frameRate);
 				duration = roundToDivisor(duration, track.metadata.frameRate);
 			}
+
+			// Blocks are timestamped in whole milliseconds, so a frame following the latest one by less than that (like
+			// after a trim that starts just before a frame) would land on the same timestamp. Push it to the next
+			// millisecond instead, as long as that's still within the frame, so that timestamps can't drift.
+			const previousTimestamp = trackData.maxPacketTimestamp;
+			if (
+				previousTimestamp !== null
+				&& timestamp > previousTimestamp
+				&& Math.round(1000 * timestamp) <= Math.round(1000 * previousTimestamp)
+			) {
+				const pushedTimestamp = (Math.round(1000 * previousTimestamp) + 1) / 1000;
+				const end = timestamp + duration;
+				if (pushedTimestamp < end) {
+					timestamp = pushedTimestamp;
+					duration = end - pushedTimestamp;
+				}
+			}
+			trackData.maxPacketTimestamp = Math.max(previousTimestamp ?? -Infinity, timestamp);
 
 			const additions = trackData.info.alphaMode
 				? packet.sideData.alpha ?? null

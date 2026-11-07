@@ -209,3 +209,47 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('Video frames less than a millisecond apart get distinct block timestamps', async () => {
+	// Block timestamps are whole milliseconds. A trimmed transcode starts with the frame straddling the trim start,
+	// which may then last a fraction of a millisecond.
+	const muxAndRead = async (frames: [number, number][]) => {
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source);
+		await output.start();
+		for (const [i, [timestamp, duration]] of frames.entries()) {
+			await source.add(
+				new EncodedPacket(new Uint8Array([i]), i === 0 ? 'key' : 'delta', timestamp, duration),
+				i === 0 ? { decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 } } : undefined,
+			);
+		}
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array(output.target.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+		return timestamps;
+	};
+
+	// 60 fps from a trim start 0.27 ms before a frame: the second frame goes to the next millisecond
+	const frames: [number, number][] = [[0, 0.00027]];
+	for (let i = 0; i < 5; i++) {
+		frames.push([0.00027 + i / 60, 1 / 60]);
+	}
+	expect(await muxAndRead(frames)).toEqual([0, 0.001, 0.017, 0.034, 0.05, 0.067]);
+
+	// Frames shorter than a millisecond can't all get their own timestamp, but they don't drift
+	const fastFrames: [number, number][] = Array.from({ length: 120 }, (_, i) => [i / 1200, 1 / 1200]);
+	const timestamps = await muxAndRead(fastFrames);
+	expect(timestamps).toHaveLength(120);
+	expect(timestamps.at(-1)).toBeCloseTo(119 / 1200, 3);
+});
