@@ -57,6 +57,32 @@ test('can loop over all samples', async () => {
 	expect(lastSampleTimestamp).toBe(19.690521541950112);
 });
 
+test('can compute the duration while reading the packets', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/sample.flac')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const readTimestamps = async () => {
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+		return timestamps;
+	};
+
+	// Both at the same time, as when a player starts reading while it computes the duration to show
+	const [duration, timestamps] = await Promise.all([track.computeDuration(), readTimestamps()]);
+	expect(duration).toBe(19.714285714285715);
+	expect(timestamps).toHaveLength(213);
+
+	// And the packet index is still right afterwards
+	expect(await track.computeDuration()).toBe(19.714285714285715);
+	expect(await readTimestamps()).toEqual(timestamps);
+});
+
 test('can do random access', async () => {
 	const filePath = path.join(__dirname, '..', 'public/sample.flac');
 	using input = new Input({
