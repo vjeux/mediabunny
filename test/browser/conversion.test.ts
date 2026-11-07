@@ -898,6 +898,25 @@ test('Pre-signaled pause signal', async () => {
 	expect(conversion.state).toBe('done');
 });
 
+test('onProgress reports the processed time from the start of the trim region', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, trim: { start: 2, end: 4 } });
+
+	const processedTimes: number[] = [];
+	conversion.onProgress = (progress, processedTime) => {
+		processedTimes.push(processedTime);
+	};
+	await conversion.execute();
+
+	expect(processedTimes[0]).toBe(0);
+	expect(processedTimes.at(-1)).toBeGreaterThanOrEqual(2);
+	expect(processedTimes.at(-1)).toBeLessThan(2.1);
+	for (let i = 1; i < processedTimes.length; i++) {
+		expect(processedTimes[i]).toBeGreaterThanOrEqual(processedTimes[i - 1]!);
+	}
+});
+
 test('Resizing at various scale factors', async () => {
 	// The source is 1080p. 720p downscales by less than 2x, 240p downscales by more than 2x (which kicks in the manual
 	// mipmapping path), and 1440p upscales.
@@ -1460,22 +1479,3 @@ const testReservedFastStart = async (
 		expect(maximumPacketCount).toBeLessThanOrEqual(2 * packetCount + 64);
 	}
 };
-
-test('onProgress reports the processed time from the start of the trim region', async () => {
-	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
-	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
-	const conversion = await Conversion.init({ input, output, trim: { start: 2, end: 4 } });
-
-	const processedTimes: number[] = [];
-	conversion.onProgress = (progress, processedTime) => {
-		processedTimes.push(processedTime);
-	};
-	await conversion.execute();
-
-	expect(processedTimes[0]).toBe(0);
-	expect(processedTimes.at(-1)).toBeGreaterThanOrEqual(2);
-	expect(processedTimes.at(-1)).toBeLessThan(2.1);
-	for (let i = 1; i < processedTimes.length; i++) {
-		expect(processedTimes[i]).toBeGreaterThanOrEqual(processedTimes[i - 1]!);
-	}
-});
