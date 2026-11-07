@@ -127,6 +127,10 @@ const HDPR_FORMAT_IDENTIFIER = 0x48445052;
 // 'DTS1', 'DTS2' and 'DTS3' all share this prefix
 const DTS_FORMAT_IDENTIFIER_PREFIX = 0x44545300;
 
+// The 'AC-3' and 'EAC3' format identifiers
+const AC3_FORMAT_IDENTIFIER = 0x41432d33;
+const EAC3_FORMAT_IDENTIFIER = 0x45414333;
+
 // Stream types that only mean E-AC-3 or DTS within a Blu-ray-derived program, and what they map to
 const BLU_RAY_STREAM_TYPES = new Map<number, MpegTsStreamType>([
 	[MpegTsStreamType.BLU_RAY_EAC3, MpegTsStreamType.EAC3_SYSTEM_A],
@@ -614,9 +618,12 @@ export class MpegTsDemuxer extends Demuxer {
 								hasDtsDescriptor = true;
 							} else if (descriptorTag === REGISTRATION_DESCRIPTOR_TAG && descriptorLength >= 4) {
 								// DTS uses 'DTS1', 'DTS2' and 'DTS3' to also signal the stream's frame size,
-								// which we work out from the bitstream anyway
+								// which we work out from the bitstream anyway. A private data stream may also be named
+								// AC-3 or E-AC-3 this way instead of with a DVB descriptor (FFmpeg reads both).
 								const formatIdentifier = bitstream.readBits(32);
 								hasDtsDescriptor ||= (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
+								hasAc3Descriptor ||= formatIdentifier === AC3_FORMAT_IDENTIFIER;
+								hasEac3Descriptor ||= formatIdentifier === EAC3_FORMAT_IDENTIFIER;
 							} else if (descriptorTag === ISO_639_LANGUAGE_DESCRIPTOR_TAG && descriptorLength >= 4) {
 								// Dual-mono audio may list a second language, but the first one is what describes the
 								// stream as a whole. Some muxers write it in upper case.
