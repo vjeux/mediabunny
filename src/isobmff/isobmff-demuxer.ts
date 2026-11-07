@@ -140,6 +140,8 @@ type InternalTrack = {
 	languageCode: string;
 	sampleTableByteOffset: number | null; // null when the track's sample table is another file (ominous ik 👀)
 	sampleTable: SampleTable | null;
+	/** The encryption info of each sample description (stsd entry), which can each have their own key ID */
+	encryptionInfos: (TrackEncryptionInfo | null)[];
 	fragmentLookupTable: FragmentLookupTableEntry[];
 	currentFragmentState: FragmentTrackState | null;
 	/**
@@ -276,6 +278,7 @@ type FragmentTrackData = {
 	startTimestampIsFinal: boolean;
 	trunSampleCounts: number[];
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
+	sampleDescriptionIndex: number;
 };
 
 type FragmentTrackSample = {
@@ -553,6 +556,7 @@ export class IsobmffDemuxer extends Demuxer {
 				languageCode: foreignTrack.languageCode,
 				sampleTableByteOffset: null,
 				sampleTable: null,
+				encryptionInfos: foreignTrack.encryptionInfos,
 				fragmentLookupTable: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
@@ -1034,6 +1038,7 @@ export class IsobmffDemuxer extends Demuxer {
 					languageCode: UNDETERMINED_LANGUAGE,
 					sampleTableByteOffset: -1,
 					sampleTable: null,
+					encryptionInfos: [],
 					fragmentLookupTable: [],
 					currentFragmentState: null,
 					fragmentPositionCache: [],
@@ -1267,6 +1272,11 @@ export class IsobmffDemuxer extends Demuxer {
 						break;
 					}
 
+					// Each sample description can have its own encryption info (sinf), with its own key ID. The
+					// track's is the last one's, as before.
+					const previousEncryptionInfo = track.encryptionInfo;
+					track.encryptionInfo = null;
+
 					track.internalCodecId = sampleBoxInfo.name;
 					const lowercaseBoxName = sampleBoxInfo.name.toLowerCase();
 
@@ -1499,6 +1509,9 @@ export class IsobmffDemuxer extends Demuxer {
 							Logging._warn(`Unsupported audio codec (sample entry type '${sampleBoxInfo.name}').`);
 						}
 					}
+
+					track.encryptionInfos.push(track.encryptionInfo);
+					track.encryptionInfo ??= previousEncryptionInfo;
 
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
 				}
@@ -2605,6 +2618,7 @@ export class IsobmffDemuxer extends Demuxer {
 						startTimestampIsFinal: false,
 						trunSampleCounts: [],
 						encryptionAuxInfo: null,
+						sampleDescriptionIndex: track.currentFragmentState.sampleDescriptionIndex ?? 1,
 					};
 					this.currentFragment.trackData.set(track.id, trackData);
 				}
@@ -3458,7 +3472,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 				sampleEncryption ??= getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
 				if (sampleEncryption) {
-					data = await decryptSample(this.internalTrack, sampleEncryption, data, null);
+					data = await decryptSample(
+						this.internalTrack,
+						sampleEncryption,
+						data,
+						null,
+						getSampleDescriptionEncryptionInfo(this.internalTrack, sampleInfo.sampleDescriptionIndex),
+					);
 				}
 			}
 		}
@@ -3508,7 +3528,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				const sampleEncryption = fragmentSample.encryption
 					?? getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
 				if (sampleEncryption) {
-					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment);
+					data = await decryptSample(
+						this.internalTrack,
+						sampleEncryption,
+						data,
+						fragment,
+						getSampleDescriptionEncryptionInfo(this.internalTrack, trackData.sampleDescriptionIndex),
+					);
 				}
 			}
 		}
@@ -3915,6 +3941,7 @@ type SampleInfo = {
 	sampleSize: number;
 	chunkOffset: number;
 	isKeyFrame: boolean;
+	sampleDescriptionIndex: number;
 };
 
 const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInfo | null => {
@@ -3976,7 +4003,13 @@ const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInf
 		isKeyFrame: sampleTable.keySampleIndices
 			? binarySearchExact(sampleTable.keySampleIndices, sampleIndex, x => x) !== -1
 			: true,
+		sampleDescriptionIndex: chunkEntry.sampleDescriptionIndex,
 	};
+};
+
+/** `index` is 1-based. The encryption info of that sample description, or else the track's. */
+const getSampleDescriptionEncryptionInfo = (track: InternalTrack, index: number) => {
+	return track.encryptionInfos[index - 1] ?? track.encryptionInfo;
 };
 
 const performPresentationTimeLookup = (
@@ -4260,9 +4293,9 @@ const decryptSample = async (
 	sampleEncryption: SampleEncryptionInfo,
 	data: Uint8Array,
 	fragment: Fragment | null,
+	encryptionInfo = track.encryptionInfo,
 ): Promise<Uint8Array> => {
-	assert(track.encryptionInfo);
-	const encryptionInfo = track.encryptionInfo;
+	assert(encryptionInfo);
 	if (encryptionInfo.defaultKid === null) {
 		throw new Error('Invalid file: encrypted track is missing its tenc box.');
 	}
