@@ -30,6 +30,7 @@ import {
 	AnyIterable,
 	assert,
 	assertNever,
+	audioDecoderConfigsAreEqual,
 	CallSerializer,
 	clamp,
 	colorSpaceIsComplete,
@@ -2323,13 +2324,26 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
 
+	/** The decoder config the decoder currently takes packets with; packets can need another one than the track's. */
+	currentDecoderConfig: AudioDecoderConfig;
+	/** The sample rate of the samples the decoder currently emits, which timestamps are rounded to. */
+	outputSampleRate: number;
+	/** A decoder config switch in progress, and the packets waiting for it, in decode order */
+	switchPromise: Promise<void> | null = null;
+	pendingPackets: EncodedPacket[] = [];
+	closed = false;
+
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
 		onError: (error: unknown) => unknown,
-		codec: AudioCodec,
-		decoderConfig: AudioDecoderConfig,
+		public codec: AudioCodec,
+		public decoderConfig: AudioDecoderConfig,
+		public getPacketDecoderConfig: (packet: EncodedPacket) => AudioDecoderConfig | null = () => null,
 	) {
 		super(onSample, onError);
+
+		this.currentDecoderConfig = decoderConfig;
+		this.outputSampleRate = decoderConfig.sampleRate;
 
 		// WebCodecs impls discards the preskip (correct) but doesn't advance the timestamp (incorrect)
 		const opusPreSkip = codec === 'opus' && decoderConfig.description
@@ -2364,35 +2378,20 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			}
 
 			// Round the timestamp to the sample rate
-			const sampleRate = decoderConfig.sampleRate;
+			const sampleRate = this.outputSampleRate;
 			sample.setTimestamp(Math.round(preciseTimestamp * sampleRate) / sampleRate);
 
 			onSample(sample);
 		};
+		this.sampleHandler = sampleHandler;
 
 		const MatchingCustomDecoder = customAudioDecoders.find(x => x.supports(codec, decoderConfig));
 		if (MatchingCustomDecoder) {
-			// @ts-expect-error "Can't create instance of abstract class 🤓"
-			this.customDecoder = new MatchingCustomDecoder() as CustomAudioDecoder;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.codec = codec;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.config = decoderConfig;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.onSample = (sample) => {
-				if (!(sample instanceof AudioSample)) {
-					throw new TypeError('The argument passed to onSample must be an AudioSample.');
-				}
-
-				sampleHandler(sample);
-			};
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.onError = (error) => {
-				onError(error);
-			};
+			const customDecoder = this.createCustomDecoder(MatchingCustomDecoder, decoderConfig);
+			this.customDecoder = customDecoder;
 
 			void this.customDecoderCallSerializer
-				.call(() => this.customDecoder!.init())
+				.call(() => customDecoder.init())
 				.catch(error => onError(error));
 		} else {
 			const stack = new Error('Decoding error').stack;
@@ -2419,18 +2418,120 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 	getDecodeQueueSize() {
 		if (this.customDecoder) {
-			return this.customDecoderQueueSize;
+			return this.customDecoderQueueSize + this.pendingPackets.length;
 		} else {
 			assert(this.decoder);
-			return this.decoder.decodeQueueSize;
+			return this.decoder.decodeQueueSize + this.pendingPackets.length;
+		}
+	}
+
+	sampleHandler: (sample: AudioSample) => void;
+
+	createCustomDecoder(MatchingCustomDecoder: typeof CustomAudioDecoder, decoderConfig: AudioDecoderConfig) {
+		// @ts-expect-error "Can't create instance of abstract class 🤓"
+		const customDecoder = new MatchingCustomDecoder() as CustomAudioDecoder;
+		// @ts-expect-error It's technically readonly
+		customDecoder.codec = this.codec;
+		// @ts-expect-error It's technically readonly
+		customDecoder.config = decoderConfig;
+		// @ts-expect-error It's technically readonly
+		customDecoder.onSample = (sample) => {
+			if (!(sample instanceof AudioSample)) {
+				throw new TypeError('The argument passed to onSample must be an AudioSample.');
+			}
+
+			this.sampleHandler(sample);
+		};
+		// @ts-expect-error It's technically readonly
+		customDecoder.onError = (error) => {
+			this.onError(error);
+		};
+
+		return customDecoder;
+	}
+
+	/**
+	 * Switches the decoder to another config once the packets decoded so far have been flushed out. This happens when
+	 * packets need another decoder config than the track's, such as HLS segments after a discontinuity with a new init
+	 * section (an ad break with another sample rate or channel count). Reconfiguring only after the flush has finished
+	 * keeps decoders from losing the previous config's last output (WebKit's does when configure() follows flush()).
+	 */
+	async switchDecoderConfig(decoderConfig: AudioDecoderConfig) {
+		let switched = false;
+		try {
+			// Emits the previous config's samples and restarts the timeline, so that the new config's audio starts at
+			// its first packet's timestamp instead of where the previous audio ended
+			await this.flushDecoder();
+			if (this.closed) {
+				return;
+			}
+
+			this.currentDecoderConfig = decoderConfig;
+			this.outputSampleRate = decoderConfig.sampleRate;
+
+			const MatchingCustomDecoder = customAudioDecoders.find(x => x.supports(this.codec, decoderConfig));
+			if (this.decoder && !MatchingCustomDecoder) {
+				this.decoder.configure(decoderConfig);
+			} else if (this.customDecoder && MatchingCustomDecoder) {
+				const previousDecoder = this.customDecoder;
+				const nextDecoder = this.createCustomDecoder(MatchingCustomDecoder, decoderConfig);
+				this.customDecoder = nextDecoder;
+
+				await this.customDecoderCallSerializer.call(async () => {
+					await previousDecoder.close();
+					await nextDecoder.init();
+				});
+			} else {
+				throw new Error(
+					'The audio decoder config changes mid-track in a way that needs a switch between a custom decoder'
+					+ ' and the built-in one, which isn\'t supported.',
+				);
+			}
+
+			switched = true;
+		} catch (error) {
+			if (!this.closed) {
+				this.onError(error);
+			}
+		} finally {
+			this.switchPromise = null;
+			const packets = this.pendingPackets;
+			this.pendingPackets = [];
+
+			if (switched) {
+				for (const packet of packets) {
+					this.decode(packet);
+				}
+			}
+
+			this.onDequeue?.();
 		}
 	}
 
 	decode(packet: EncodedPacket) {
+		if (this.switchPromise) {
+			// Decoded once the switch has finished, in order
+			this.pendingPackets.push(packet);
+			return;
+		}
+
+		const decoderConfig = this.getPacketDecoderConfig(packet) ?? this.decoderConfig;
+		if (decoderConfig !== this.currentDecoderConfig) {
+			if (audioDecoderConfigsAreEqual(decoderConfig, this.currentDecoderConfig)) {
+				// The same config in another object, such as the next segment of an ad break: keep the decoder's state
+				this.currentDecoderConfig = decoderConfig;
+			} else {
+				this.pendingPackets.push(packet);
+				this.switchPromise = this.switchDecoderConfig(decoderConfig);
+				return;
+			}
+		}
+
 		if (this.customDecoder) {
+			const customDecoder = this.customDecoder;
 			this.customDecoderQueueSize++;
 			void this.customDecoderCallSerializer
-				.call(() => this.customDecoder!.decode(packet))
+				.call(() => customDecoder.decode(packet))
 				.catch(error => this.onError(error))
 				.finally(() => {
 					this.customDecoderQueueSize--;
@@ -2445,6 +2546,14 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 
 	async flush() {
+		while (this.switchPromise) {
+			await this.switchPromise;
+		}
+
+		await this.flushDecoder();
+	}
+
+	async flushDecoder() {
 		if (this.customDecoder) {
 			await this.customDecoderCallSerializer.call(() => this.customDecoder!.flush());
 		} else {
@@ -2458,6 +2567,9 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 
 	close() {
+		this.closed = true;
+		this.pendingPackets.length = 0;
+
 		if (this.customDecoder) {
 			void this.customDecoderCallSerializer.call(() => this.customDecoder!.close());
 		} else {
@@ -2701,7 +2813,14 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			const backing = this._track._backing;
+			return new AudioDecoderWrapper(
+				onSample,
+				onError,
+				codec,
+				decoderConfig,
+				packet => (backing.getDecoderConfigForPacket?.(packet) ?? null) as AudioDecoderConfig | null,
+			);
 		}
 	}
 

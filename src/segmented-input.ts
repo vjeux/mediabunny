@@ -19,7 +19,7 @@ import {
 	InputVideoTrackBacking,
 } from './input-track';
 import { PacketRetrievalOptions } from './media-sink';
-import { arrayCount, assert, MaybePromise, roundToDivisor } from './misc';
+import { arrayCount, assert, audioDecoderConfigsAreEqual, MaybePromise, roundToDivisor } from './misc';
 import { EncodedPacket } from './packet';
 
 export type SegmentedInputMetadata = {
@@ -233,6 +233,11 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	decl: SegmentedInputTrackDeclaration;
 	number: number;
 	packetInfos = new WeakMap<EncodedPacket, PacketInfo>();
+	/** Decoder configs of packets that need another one than the track's */
+	packetDecoderConfigs = new WeakMap<EncodedPacket, AudioDecoderConfig>();
+	segmentAudioDecoderConfigs = new WeakMap<InputTrack, Promise<AudioDecoderConfig | null>>();
+	/** One object per distinct decoder config, so that segments sharing a config share the object */
+	distinctAudioDecoderConfigs: AudioDecoderConfig[] = [];
 
 	hydrationPromise: Promise<void> | null = null;
 	firstInputTrack: InputTrack | null = null;
@@ -385,7 +390,52 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			sourcePacket: packet,
 		});
 
+		if (this.decl.type === 'audio') {
+			const decoderConfig = await this.getSegmentAudioDecoderConfig(track);
+			if (decoderConfig) {
+				this.packetDecoderConfigs.set(modified, decoderConfig);
+			}
+		}
+
 		return modified;
+	}
+
+	/**
+	 * The audio decoder config of a segment's track when it differs from the first segment's, which is the track's
+	 * decoder config: a new init section after a discontinuity (such as an ad break) can bring another sample rate,
+	 * channel count or AudioSpecificConfig.
+	 */
+	getSegmentAudioDecoderConfig(track: InputTrack) {
+		let promise = this.segmentAudioDecoderConfigs.get(track);
+		if (!promise) {
+			promise = (async () => {
+				assert(this.firstInputTrack);
+				if (track === this.firstInputTrack) {
+					return null;
+				}
+
+				const firstConfig = await this.firstInputTrack._backing.getDecoderConfig() as AudioDecoderConfig | null;
+				const config = await track._backing.getDecoderConfig() as AudioDecoderConfig | null;
+				if (!firstConfig || !config || audioDecoderConfigsAreEqual(firstConfig, config)) {
+					return null;
+				}
+
+				const existing = this.distinctAudioDecoderConfigs.find(x => audioDecoderConfigsAreEqual(x, config));
+				if (existing) {
+					return existing;
+				}
+
+				this.distinctAudioDecoderConfigs.push(config);
+				return config;
+			})();
+			this.segmentAudioDecoderConfigs.set(track, promise);
+		}
+
+		return promise;
+	}
+
+	getDecoderConfigForPacket(packet: EncodedPacket) {
+		return this.packetDecoderConfigs.get(packet) ?? null;
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
