@@ -1276,18 +1276,23 @@ export class HlsMuxer extends Muxer {
 			}
 
 			if (this.isLive) {
+				const poppedSegments: PlaylistSegment[] = [];
 				while (playlist.writtenSegments.length > this.maxLiveSegmentCount) {
-					const popped = playlist.writtenSegments.shift()!;
+					poppedSegments.push(playlist.writtenSegments.shift()!);
 					playlist.mediaSequence++;
-
-					if (!this.singleFilePerPlaylist) {
-						assert(popped.info);
-						this.format._options.onSegmentPopped?.(popped.path, popped.info);
-					}
 				}
 
 				await this.writePlaylist(playlist);
 				await this.tryWriteMasterPlaylist();
+
+				// Popped segments are reported only once a playlist without them has been written, since their files
+				// may get deleted in response
+				if (!this.singleFilePerPlaylist) {
+					for (const popped of poppedSegments) {
+						assert(popped.info);
+						this.format._options.onSegmentPopped?.(popped.path, popped.info);
+					}
+				}
 			}
 		}
 	}

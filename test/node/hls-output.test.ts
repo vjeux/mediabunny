@@ -3140,6 +3140,55 @@ test('Live mode, maxLiveSegmentCount with singleFilePerPlaylist', async () => {
 	expect(extinfCount).toBe(2);
 });
 
+test('Live mode, onSegmentPopped fires once no published playlist lists the segment anymore', async () => {
+	let publishedPlaylist = '';
+	const everListed = new Set<string>();
+	const listedWhenPopped: boolean[] = [];
+	const poppedPaths: string[] = [];
+
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			live: true,
+			maxLiveSegmentCount: 2,
+			onSegmentPopped: (path) => {
+				// The docs suggest deleting the segment file in response, so the playlist being served right now must
+				// not list it anymore (found by L62)
+				listedWhenPopped.push(publishedPlaylist.split('\n').includes(path));
+				poppedPaths.push(path);
+			},
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => {
+				if (request.path === 'playlist-1.m3u8') {
+					publishedPlaylist = new TextDecoder().decode(target.buffer!);
+					for (const line of publishedPlaylist.split('\n')) {
+						if (line && !line.startsWith('#')) {
+							everListed.add(line);
+						}
+					}
+				}
+			});
+			return target;
+		}),
+	});
+
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 24; i++) {
+		await source.add(new EncodedPacket(avcPacketData, i % 4 === 0 ? 'key' : 'delta', i / 2, 0.5), avcMetadata);
+	}
+	await output.finalize();
+
+	// Every popped segment was published before, and none is listed by the playlist being served when it's popped
+	expect(poppedPaths).toEqual(['segment-1-1.ts', 'segment-1-2.ts', 'segment-1-3.ts', 'segment-1-4.ts']);
+	expect(poppedPaths.every(path => everListed.has(path))).toBe(true);
+	expect(listedWhenPopped).toEqual(poppedPaths.map(() => false));
+});
+
 test('Append-only stream', async () => {
 	const writes = new Map<string, number>();
 
