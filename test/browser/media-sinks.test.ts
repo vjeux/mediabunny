@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
@@ -371,4 +371,40 @@ test('Frame lookups in a stream without B-frames stay exact when the reorder dep
 
 	using sample = await sink.getSample(timestamps[20]!);
 	expect(sample?.timestamp).toBe(timestamps[20]);
+});
+
+test('Frame lookups at the live edge of a stream return without waiting for it to go on', async () => {
+	// A live HLS stream (no EXT-X-ENDLIST) whose next segment never comes, as when its encoder stopped. Segments made
+	// with ffmpeg -f lavfi -i testsrc2=size=160x120:rate=25:duration=2 -c:v libx264 -g 12 -bf 2 -f hls -hls_time 0.5
+	const playlist = [
+		'#EXTM3U',
+		'#EXT-X-VERSION:3',
+		'#EXT-X-TARGETDURATION:1',
+		'#EXT-X-MEDIA-SEQUENCE:0',
+		'#EXTINF:0.96,',
+		'segment0.ts',
+		'#EXTINF:0.48,',
+		'segment1.ts',
+		'#EXTINF:0.48,',
+		'segment2.ts',
+	].join('\n');
+	using input = new Input({
+		source: new CustomPathedSource('index.m3u8', ({ path }) => path === 'index.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new UrlSource('/hls-live/' + path)),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new VideoSampleSink(track);
+
+	// Decoding ahead of the frame (for its reorder depth) must not wait for packets past the live edge
+	for (const timestamp of [1.68, 1.84, 1.88]) {
+		const sample = await Promise.race([
+			sink.getSample(timestamp),
+			new Promise<null>(resolve => setTimeout(() => resolve(null), 3000)),
+		]);
+		expect(sample?.timestamp, `frame at ${timestamp}`).toBe(timestamp);
+		sample?.close();
+	}
 });

@@ -820,7 +820,11 @@ export abstract class BaseMediaSampleSink<
 			const getLastPacketToDecode = async (targetPacket: EncodedPacket) => {
 				let packet = targetPacket;
 				for (let i = 0; i < reorderDepth; i++) {
-					const nextPacket = await packetSink.getNextPacket(packet, { ...options, metadataOnly: true });
+					// Without waiting for a live stream to go on, which can take forever
+					const nextPacket = await packetSink.getNextPacket(
+						packet,
+						{ ...options, metadataOnly: true, skipLiveWait: true },
+					);
 					if (!nextPacket) {
 						break;
 					}
