@@ -197,3 +197,38 @@ test('Fragmented MP4 duration metadata', async () => {
 	view.setUint32(moov, view.getUint32(moov) + 16);
 	expect(await readDurations(withMehd)).toEqual([2.5, 2]);
 });
+
+test('Fragmented MP4 duration metadata with a damaged sample table', async () => {
+	// Two fragmented PCM tracks, the second of which has an stts box claiming 1000 entries that aren't there
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target: new BufferTarget() });
+	const sources = [new EncodedAudioPacketSource('pcm-s16'), new EncodedAudioPacketSource('pcm-s16')];
+	for (const source of sources) {
+		output.addAudioTrack(source);
+	}
+	await output.start();
+	for (let i = 0; i < 50; i++) {
+		for (const source of sources) {
+			await source.add(new EncodedPacket(new Uint8Array(320), 'key', i * 0.02, 0.02), {
+				decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 },
+			});
+		}
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const sttsPositions: number[] = [];
+	for (let i = 0; i + 4 <= bytes.byteLength; i++) {
+		if (new TextDecoder().decode(bytes.subarray(i, i + 4)) === 'stts') {
+			sttsPositions.push(i);
+		}
+	}
+	new DataView(bytes.buffer).setUint32(sttsPositions[1]! + 8, 1000); // The entry count, after version and flags
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tracks = await input.getTracks();
+	expect(await tracks[0]!.computeDuration()).toBeCloseTo(1, 5);
+
+	// Unknown, as before, rather than an error
+	expect(await tracks[1]!.getDurationFromMetadata()).toBe(null);
+	expect(await input.getDurationFromMetadata()).toBe(null);
+});

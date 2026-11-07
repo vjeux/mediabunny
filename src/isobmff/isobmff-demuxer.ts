@@ -3201,7 +3201,14 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				return demuxer.fragmentedMovieDurationInTimescale / demuxer.movieTimescale;
 			}
 
-			if (sampleTableIsEmpty(demuxer.getSampleTableForTrack(track))) {
+			let hasSamplesInMoov: boolean | null = null;
+			try {
+				hasSamplesInMoov = !sampleTableIsEmpty(demuxer.getSampleTableForTrack(track));
+			} catch {
+				// A sample table that can't be read (a damaged file) leaves it to the mdhd box, as before
+			}
+
+			if (hasSamplesInMoov === false) {
 				// All of the samples are in fragments, so the mdhd box has nothing to describe; Chromium's muxer even
 				// writes milliseconds there. Like Chromium, fall back to the mvhd box's duration.
 				return demuxer.movieDurationInTimescale > 0
