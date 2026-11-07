@@ -126,53 +126,88 @@ const MAX_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 22; // 4 MiB
 const NON_AUDIO_PRIVATE_DATA_DESCRIPTOR_TAGS = new Set<number>([0x45, 0x46, 0x56, 0x59, 0x66, 0x6f, 0xfd]);
 
 /**
- * Works out the codec of an audio stream that doesn't say what it is (a private data stream without descriptors, as
- * FFmpeg's m2ts mode writes AAC) from the frame at the start of its first PES packet. Only frames that the code
- * reading the stream's first frame accepts count.
+ * The codec, size and sample rate (or its code) of the audio frame whose header starts the bytes, for telling the codec
+ * of a stream that doesn't say what it is. Only headers that the code reading the stream's first frame accepts count.
  */
-const getAudioCodecFromPayload = (data: Uint8Array): AudioCodec | null => {
-	if (data.byteLength < MAX_ADTS_FRAME_HEADER_SIZE) {
+const probeAudioFrame = (bytes: Uint8Array): { codec: AudioCodec; frameSize: number; rate: number } | null => {
+	if (bytes.byteLength < MAX_ADTS_FRAME_HEADER_SIZE) {
 		return null;
 	}
 
-	if (data[0] === 0x0b && data[1] === 0x77) {
+	if (bytes[0] === 0x0b && bytes[1] === 0x77) {
 		// AC-3 and E-AC-3 tell themselves apart by their bsid
-		const bsid = data[5]! >> 3;
+		const bsid = bytes[5]! >> 3;
 		if (bsid <= 8) {
-			const frameInfo = parseAc3SyncFrame(data);
-			return frameInfo && frameInfo.fscod !== 3 ? 'ac3' : null;
+			const fscod = bytes[4]! >> 6;
+			const frmsizecod = bytes[4]! & 0x3f;
+			if (fscod === 3 || frmsizecod > 37 || !parseAc3SyncFrame(bytes)) {
+				return null;
+			}
+
+			return { codec: 'ac3', frameSize: AC3_FRAME_SIZES[3 * frmsizecod + fscod]!, rate: fscod };
 		} else if (bsid >= 11 && bsid <= 16) {
-			const frameInfo = parseEac3SyncFrame(data);
-			return frameInfo && getEac3SampleRate(frameInfo) !== null ? 'eac3' : null;
+			const frameInfo = parseEac3SyncFrame(bytes);
+			const sampleRate = frameInfo && getEac3SampleRate(frameInfo);
+			if (!sampleRate) {
+				return null;
+			}
+
+			const frmsiz = ((bytes[2]! & 0x07) << 8) | bytes[3]!;
+			return { codec: 'eac3', frameSize: (frmsiz + 1) * 2, rate: sampleRate };
 		}
 
 		return null;
 	}
 
-	if (data[0] === 0x7f && data[1] === 0xfe && data[2] === 0x80 && data[3] === 0x01) {
-		return parseDtsFrame(data) ? 'dts' : null;
+	if (bytes[0] === 0x7f && bytes[1] === 0xfe && bytes[2] === 0x80 && bytes[3] === 0x01) {
+		const frameInfo = parseDtsFrame(bytes);
+		return frameInfo && { codec: 'dts', frameSize: frameInfo.frameSize, rate: frameInfo.sampleRate };
 	}
 
-	if (data[0] === 0xff && (data[1]! & 0xf6) === 0xf0) {
+	if (bytes[0] === 0xff && (bytes[1]! & 0xf6) === 0xf0) {
 		// ADTS: a sample rate, a channel configuration, a frame length that holds the header, and one raw data block
-		const samplingFrequencyIndex = (data[2]! >> 2) & 0x0f;
-		const channelConfiguration = ((data[2]! & 0x01) << 2) | (data[3]! >> 6);
-		const frameLength = ((data[3]! & 0x03) << 11) | (data[4]! << 3) | (data[5]! >> 5);
-		const headerSize = data[1]! & 0x01 ? MAX_ADTS_FRAME_HEADER_SIZE - 2 : MAX_ADTS_FRAME_HEADER_SIZE;
-		const rawDataBlockCount = (data[6]! & 0x03) + 1;
-		return samplingFrequencyIndex < aacFrequencyTable.length
-			&& channelConfiguration !== 0
-			&& frameLength >= headerSize
-			&& rawDataBlockCount === 1
-			? 'aac'
-			: null;
+		const samplingFrequencyIndex = (bytes[2]! >> 2) & 0x0f;
+		const channelConfiguration = ((bytes[2]! & 0x01) << 2) | (bytes[3]! >> 6);
+		const frameLength = ((bytes[3]! & 0x03) << 11) | (bytes[4]! << 3) | (bytes[5]! >> 5);
+		const headerSize = bytes[1]! & 0x01 ? MAX_ADTS_FRAME_HEADER_SIZE - 2 : MAX_ADTS_FRAME_HEADER_SIZE;
+		const rawDataBlockCount = (bytes[6]! & 0x03) + 1;
+		if (
+			samplingFrequencyIndex >= aacFrequencyTable.length
+			|| channelConfiguration === 0
+			|| frameLength < headerSize
+			|| rawDataBlockCount !== 1
+		) {
+			return null;
+		}
+
+		return { codec: 'aac', frameSize: frameLength, rate: samplingFrequencyIndex };
 	}
 
-	if (data[0] === 0xff && (data[1]! & 0xe0) === 0xe0) {
-		return readMp3FrameHeader(readU32Be(FileSlice.tempFromBytes(data)), data.byteLength).header ? 'mp3' : null;
+	if (bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0) {
+		const header = readMp3FrameHeader(readU32Be(FileSlice.tempFromBytes(bytes)), bytes.byteLength).header;
+		return header && { codec: 'mp3', frameSize: header.totalSize, rate: header.sampleRate };
 	}
 
 	return null;
+};
+
+/**
+ * Works out the codec of an audio stream that doesn't say what it is (a private data stream without descriptors, as
+ * FFmpeg's m2ts mode writes AAC) from its first PES packet. Like FFmpeg's probes, one header isn't enough: the next
+ * frame's header must follow with the same codec and sample rate, unless the frame fills the PES packet exactly.
+ */
+const getAudioCodecFromPayload = (data: Uint8Array): AudioCodec | null => {
+	const frame = probeAudioFrame(data);
+	if (!frame || frame.frameSize <= 0 || frame.frameSize > data.byteLength) {
+		return null;
+	}
+
+	if (frame.frameSize === data.byteLength) {
+		return frame.codec;
+	}
+
+	const nextFrame = probeAudioFrame(data.subarray(frame.frameSize));
+	return nextFrame && nextFrame.codec === frame.codec && nextFrame.rate === frame.rate ? frame.codec : null;
 };
 
 type ElementaryStream = {
@@ -296,6 +331,11 @@ export class MpegTsDemuxer extends Demuxer {
 			let privateDataProbeEndPos: number | null = null;
 
 			while (true) {
+				if (privateDataProbeEndPos !== null && currentPos >= privateDataProbeEndPos) {
+					// The private data streams that don't say what they hold didn't show up as audio we know
+					break;
+				}
+
 				const packetHeader = await this.readPacketHeader(currentPos);
 				if (!packetHeader) {
 					break;
@@ -909,10 +949,7 @@ export class MpegTsDemuxer extends Demuxer {
 					privateDataProbeEndPos ??= currentPos + MAX_PRIVATE_DATA_PROBE_DISTANCE;
 				}
 
-				const isDone = hasProgramMap && (
-					this.elementaryStreams.every(x => x.initialized)
-					|| (privateDataProbeEndPos !== null && currentPos >= privateDataProbeEndPos)
-				);
+				const isDone = hasProgramMap && this.elementaryStreams.every(x => x.initialized);
 				if (isDone) {
 					break;
 				}

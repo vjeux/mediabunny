@@ -1035,3 +1035,107 @@ test('MPEG-TS tells the audio codec of a private data stream without descriptors
 	}
 	expect(await readAudio(privateData)).toEqual({ codec: null, count: 0 });
 });
+
+test('MPEG-TS gives up on private data streams without descriptors that hold no audio', async () => {
+	// From L46's review. mp3.ts (one MP3 stream) with extra stream_type 0x06 entries in its PMT, without descriptors
+	const crc32 = (data: Uint8Array) => {
+		let crc = 0xffffffff;
+		for (const byte of data) {
+			crc ^= byte << 24;
+			for (let k = 0; k < 8; k++) {
+				crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
+			}
+		}
+		return crc >>> 0;
+	};
+	const withPrivateStreams = (extraPids: number[], extraPackets: Uint8Array[], nullPacketCount: number) => {
+		const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/mp3.ts')));
+		const pidAt = (pos: number) => ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+		const packets: Uint8Array[] = [];
+		let pmtPid = -1;
+		let patched = false;
+		for (let pos = 0; pos + 188 <= bytes.length; pos += 188) {
+			const packet = bytes.slice(pos, pos + 188);
+			const sectionStart = 5 + packet[4]!;
+			if (pidAt(pos) === 0 && pmtPid === -1) {
+				pmtPid = ((packet[sectionStart + 10]! & 0x1f) << 8) | packet[sectionStart + 11]!;
+			} else if (pidAt(pos) === pmtPid && packet[1]! & 0x40 && !patched) {
+				const sectionLength = ((packet[sectionStart + 1]! & 0x0f) << 8) | packet[sectionStart + 2]!;
+				const body = [...packet.subarray(sectionStart + 3, sectionStart + 3 + sectionLength - 4)];
+				for (const pid of extraPids) {
+					body.push(0x06, 0xe0 | (pid >> 8), pid & 0xff, 0xf0, 0x00);
+				}
+				const newLength = body.length + 4;
+				const section = [packet[sectionStart]!, 0xb0 | (newLength >> 8), newLength & 0xff, ...body];
+				const crc = crc32(new Uint8Array(section));
+				section.push(crc >>> 24, (crc >> 16) & 0xff, (crc >> 8) & 0xff, crc & 0xff);
+				packet.fill(0xff, sectionStart);
+				packet.set(section, sectionStart);
+				patched = true;
+				packets.push(packet, ...extraPackets);
+				continue;
+			}
+			packets.push(packet);
+		}
+
+		const nullPacket = new Uint8Array(188).fill(0xff);
+		nullPacket.set([0x47, 0x1f, 0xff, 0x10]);
+		for (let i = 0; i < nullPacketCount; i++) {
+			packets.push(nullPacket);
+		}
+
+		const file = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => file.set(packet, 188 * i));
+		return file;
+	};
+	const open = (file: Uint8Array) => {
+		const counter = { bytes: 0 };
+		const input = new Input({
+			source: new CustomSource({
+				getSize: () => file.byteLength,
+				read: (start, end) => {
+					counter.bytes += end - start;
+					return file.subarray(start, end);
+				},
+			}),
+			formats: ALL_FORMATS,
+		});
+		return { input, counter };
+	};
+
+	// A stream that never carries a PES packet doesn't make the metadata scan read the whole file (16 MiB of null
+	// packets after the content)
+	const withEmptyStream = open(withPrivateStreams([0x1ff0], [], 16 * 2 ** 20 / 188));
+	expect(await withEmptyStream.input.getTracks()).toHaveLength(1);
+	expect(withEmptyStream.counter.bytes).toBeLessThan(8 * 2 ** 20); // 4 MiB past the MP3 stream's setup
+	withEmptyStream.input.dispose();
+
+	// A stream whose first PES packet merely starts with an ADTS-like header, followed by random data, stays out
+	let seed = 1;
+	const random = () => (seed = (seed * 1103515245 + 12345) >>> 0) >>> 24;
+	const fakePesPacket = (counter: number, isStart: boolean) => {
+		const packet = new Uint8Array(188);
+		packet.set([0x47, (isStart ? 0x40 : 0) | 0x1f, 0xf1, 0x10 | counter]);
+		let pos = 4;
+		if (isStart) {
+			const pesHeader = [0, 0, 1, 0xc0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1];
+			packet.set([...pesHeader, 0xff, 0xf1, 0x4c, 0x80, 0x2e, 0x7f, 0xfc], 4); // Then an ADTS header
+			pos = 25;
+		}
+		for (; pos < 188; pos++) {
+			packet[pos] = random();
+		}
+		return packet;
+	};
+	const withFakeAudio = open(withPrivateStreams(
+		[0x1ff1],
+		[fakePesPacket(0, true), fakePesPacket(1, false), fakePesPacket(2, true), fakePesPacket(3, false)],
+		0,
+	));
+	const tracks = await withFakeAudio.input.getTracks();
+	expect(tracks).toHaveLength(1);
+	for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
+		expect(packet.byteLength).toBeGreaterThan(0);
+	}
+	withFakeAudio.input.dispose();
+});
