@@ -659,6 +659,51 @@ test('Conversion metadata tags, fields removed by the tags function stay removed
 	expect(totals.tracksTotal).toBeUndefined();
 });
 
+test('Reading tags that fail to parse midway leaves plain data properties', async () => {
+	const accessorFields = (tags: object) => Object.entries(Object.getOwnPropertyDescriptors(tags))
+		.filter(([, descriptor]) => !('value' in descriptor)) // Accessor properties have a getter and setter instead
+		.map(([key]) => key);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+
+	// An ID3v2.4 tag whose TIT2 and TPE1 frames are fine, but whose TALB frame uses the undefined text encoding 4, so
+	// the reader throws in the middle of it
+	const frame = (id: string, body: number[]) => [...ascii(id), 0, 0, 0, body.length, 0, 0, ...body];
+	const frames = [
+		...frame('TIT2', [0, ...ascii('Title')]),
+		...frame('TPE1', [0, ...ascii('Artist')]),
+		...frame('TALB', [4, ...ascii('Bad')]),
+	];
+	const tag = [...ascii('ID3'), 4, 0, 0, 0, 0, 0, frames.length, ...frames];
+	const mp3 = new Uint8Array([...tag, ...readFileSync(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3'))]);
+
+	using mp3Input = new Input({ source: new BufferSource(mp3), formats: ALL_FORMATS });
+	await expect(mp3Input.getMetadataTags()).rejects.toThrow('Unsupported text encoding: 4');
+	const demuxerTags = async (input: Input) => {
+		const demuxer = await input._getDemuxer();
+		return (demuxer as unknown as { metadataTags: MetadataTags }).metadataTags;
+	};
+	const mp3Tags = await demuxerTags(mp3Input);
+	expect(mp3Tags.title).toBe('Title');
+	expect(accessorFields(mp3Tags)).toEqual([]);
+
+	// An MP4 udta whose last item claims a longer string than the file holds
+	const output = new Output({ format: new Mp4OutputFormat({ metadataFormat: 'udta' }), target: new BufferTarget() });
+	output.setMetadataTags({ title: 'Title', artist: 'Artist' });
+	const dummyTrack = createDummyAudioTrack('aac', output);
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+	const mp4 = new Uint8Array(output.target.buffer!);
+	const artistPos = Buffer.from(mp4).lastIndexOf(Buffer.from('\u00a9ART', 'latin1'));
+	mp4.set([0xff, 0xff], artistPos + 4);
+
+	using mp4Input = new Input({ source: new BufferSource(mp4), formats: ALL_FORMATS });
+	await mp4Input.getMetadataTags().catch(() => {});
+	const mp4Tags = await demuxerTags(mp4Input);
+	expect(mp4Tags.title).toBe('Title');
+	expect(accessorFields(mp4Tags)).toEqual([]);
+});
+
 test('Read and write metadata, ADTS', async () => {
 	const originalInput = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/sample3.aac')),

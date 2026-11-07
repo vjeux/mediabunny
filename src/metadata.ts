@@ -309,30 +309,42 @@ const RAW_BACKED_FIELDS = [
 ] as const satisfies (keyof MetadataTags)[];
 
 type MetadataTagFieldWatch = {
-	/** The values of the fields that were already set, which are now accessed through the watch */
+	/** The raw tag being read, or null if there's none */
+	rawKey: string | null;
+	/** The values of the fields that were already set, which go through the getters and setters meanwhile */
 	values: Map<keyof MetadataTags, unknown>;
-	/** Which of those fields the reader read or wrote */
+	/** The getters installed, to tell whether a field still has one */
+	getters: Map<keyof MetadataTags, () => unknown>;
+	/** Which of the watched fields the reader read or wrote */
 	accessed: Set<keyof MetadataTags>;
 };
 
+/** The watch open on each tags object */
+const openMetadataTagFieldWatches = new WeakMap<MetadataTags, MetadataTagFieldWatch>();
+
 /**
- * Starts watching which normalized fields a reader uses while it reads one raw tag. Readers keep a field's first value
- * (`??=`), so a raw tag for a field that an earlier tag block or key already set doesn't change it, but it still reads
- * it. So the fields already set get accessors that note every read and write; their values don't change.
+ * Starts watching which normalized fields a reader uses while it reads the raw tag with the given key. Readers keep a
+ * field's first value (`??=`), so a raw tag for a field that an earlier tag block or key already set doesn't change
+ * it, but the reader still reads it. So until unwatchMetadataTagFields, the fields already set temporarily become
+ * getters and setters that note every read and write; their values don't change.
  */
-export const watchMetadataTagFields = (tags: MetadataTags) => {
-	const watch: MetadataTagFieldWatch = { values: new Map(), accessed: new Set() };
+export const watchMetadataTagFields = (tags: MetadataTags, rawKey: string | null) => {
+	unwatchMetadataTagFields(tags); // In case a reader left one open
+
+	const watch: MetadataTagFieldWatch = { rawKey, values: new Map(), getters: new Map(), accessed: new Set() };
 	for (const field of RAW_BACKED_FIELDS) {
 		if (tags[field] === undefined) {
 			continue;
 		}
 
+		const get = () => {
+			watch.accessed.add(field);
+			return watch.values.get(field);
+		};
 		watch.values.set(field, tags[field]);
+		watch.getters.set(field, get);
 		Object.defineProperty(tags, field, {
-			get: () => {
-				watch.accessed.add(field);
-				return watch.values.get(field);
-			},
+			get,
 			set: (value: unknown) => {
 				watch.accessed.add(field);
 				watch.values.set(field, value);
@@ -342,26 +354,29 @@ export const watchMetadataTagFields = (tags: MetadataTags) => {
 		});
 	}
 
-	return watch;
+	openMetadataTagFieldWatches.set(tags, watch);
 };
 
 /**
- * Ends the watch and records the fields the given raw tag was read into: the watched fields the reader used and the
- * fields it set. The watched fields become plain properties again, in place, so that the order of the keys stays the
- * same.
+ * Ends the watch open on the given tags, if any: turns the watched fields back into plain data properties, in place so
+ * that the order of the keys stays the same, and records which fields the raw tag was read into (the watched fields
+ * the reader used, and those it set). Readers that can throw midway also call it in a `finally`.
  */
-export const recordRawMetadataTagFields = (
-	tags: MetadataTags,
-	rawKey: string | null,
-	watch: MetadataTagFieldWatch,
-) => {
+export const unwatchMetadataTagFields = (tags: MetadataTags) => {
+	const watch = openMetadataTagFieldWatches.get(tags);
+	if (!watch) {
+		return;
+	}
+
+	openMetadataTagFieldWatches.delete(tags);
 	for (const [field, value] of watch.values) {
-		if (Object.getOwnPropertyDescriptor(tags, field)?.get) {
+		// Unless something replaced or removed the property meanwhile
+		if (Object.getOwnPropertyDescriptor(tags, field)?.get === watch.getters.get(field)) {
 			Object.defineProperty(tags, field, { value, writable: true, enumerable: true, configurable: true });
 		}
 	}
 
-	if (rawKey === null || !tags.raw) {
+	if (watch.rawKey === null || !tags.raw) {
 		return;
 	}
 
@@ -383,10 +398,10 @@ export const recordRawMetadataTagFields = (
 		rawMetadataTagFields.set(tags.raw, fieldsByRawKey);
 	}
 
-	let recorded = fieldsByRawKey.get(rawKey);
+	let recorded = fieldsByRawKey.get(watch.rawKey);
 	if (!recorded) {
 		recorded = new Set();
-		fieldsByRawKey.set(rawKey, recorded);
+		fieldsByRawKey.set(watch.rawKey, recorded);
 	}
 
 	for (const field of fields) {

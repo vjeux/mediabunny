@@ -8,7 +8,7 @@
 
 import { decodeSynchsafe, encodeSynchsafe } from '../shared/mp3-misc';
 import { Logging } from './logging';
-import { MetadataTags, recordRawMetadataTagFields, watchMetadataTagFields } from './metadata';
+import { MetadataTags, unwatchMetadataTagFields, watchMetadataTagFields } from './metadata';
 import {
 	coalesceIndex,
 	TextDecoder,
@@ -164,6 +164,15 @@ export const readId3V2Header = (slice: FileSlice): Id3V2Header | null => {
 };
 
 export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
+	try {
+		parseId3V2Frames(slice, header, tags);
+	} finally {
+		// A frame that fails to parse mustn't leave the fields watched
+		unwatchMetadataTagFields(tags);
+	}
+};
+
+const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
 	// https://id3.org/id3v2.3.0
 
 	if (![2, 3, 4].includes(header.majorVersion)) {
@@ -243,7 +252,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			}
 		};
 
-		const watch = watchMetadataTagFields(tags);
+		watchMetadataTagFields(tags, frame.id);
 		tags.raw ??= {};
 		if (frame.id === 'TXXX') {
 			const txxx = tags.raw['TXXX'] ??= {};
@@ -445,7 +454,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			}; break;
 		}
 
-		recordRawMetadataTagFields(tags, frame.id, watch);
+		unwatchMetadataTagFields(tags);
 		reader.pos = nextFramePos;
 	}
 };

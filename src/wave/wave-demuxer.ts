@@ -14,7 +14,7 @@ import { PacketRetrievalOptions } from '../media-sink';
 import {
 	DEFAULT_TRACK_DISPOSITION,
 	MetadataTags,
-	recordRawMetadataTagFields,
+	unwatchMetadataTagFields,
 	watchMetadataTagFields,
 } from '../metadata';
 import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
@@ -250,7 +250,7 @@ export class WaveDemuxer extends Demuxer {
 				value += String.fromCharCode(bytes[i]!);
 			}
 
-			const watch = watchMetadataTagFields(this.metadataTags);
+			watchMetadataTagFields(this.metadataTags, chunkName);
 			this.metadataTags.raw ??= {};
 			this.metadataTags.raw[chunkName] = value;
 
@@ -314,7 +314,7 @@ export class WaveDemuxer extends Demuxer {
 				}; break;
 			}
 
-			recordRawMetadataTagFields(this.metadataTags, chunkName, watch);
+			unwatchMetadataTagFields(this.metadataTags);
 
 			currentPos += 8 + chunkSize + (chunkSize & 1); // Handle padding
 		}
