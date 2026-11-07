@@ -292,9 +292,12 @@ test('VP8 alt-ref frames do not shift the timestamps of the frames decoded after
 	const track = await input.getPrimaryVideoTrack();
 	assert(track);
 
-	const readFrameIndex = async (sample: VideoSample) => {
-		const pixels = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
-		await sample.copyTo(pixels, { format: 'RGBA' });
+	// Drawn rather than read with copyTo({ format: 'RGBA' }), which WebKitGTK doesn't convert from YUV
+	const canvas = new OffscreenCanvas(64, 64);
+	const context = canvas.getContext('2d')!;
+	const readFrameIndex = (sample: VideoSample) => {
+		sample.draw(context, 0, 0);
+		const pixels = context.getImageData(0, 0, 64, 64).data;
 
 		let index = 0;
 		for (let bit = 0; bit < 16; bit++) {
@@ -312,7 +315,7 @@ test('VP8 alt-ref frames do not shift the timestamps of the frames decoded after
 	const sink = new VideoSampleSink(track);
 	const frames: { index: number; timestamp: number }[] = [];
 	for await (using sample of sink.samples()) {
-		frames.push({ index: await readFrameIndex(sample), timestamp: sample.timestamp });
+		frames.push({ index: readFrameIndex(sample), timestamp: sample.timestamp });
 	}
 
 	expect(frames.map(x => x.index)).toEqual([...Array(60).keys()]);
@@ -321,7 +324,7 @@ test('VP8 alt-ref frames do not shift the timestamps of the frames decoded after
 	const indices: number[] = [];
 	for await (using sample of sink.samplesAtTimestamps([0.4, 0.5, 1.4, 1.5])) {
 		assert(sample);
-		indices.push(await readFrameIndex(sample));
+		indices.push(readFrameIndex(sample));
 	}
 
 	expect(indices).toEqual([12, 15, 42, 45]);
