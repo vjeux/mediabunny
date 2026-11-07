@@ -12,7 +12,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
-import { AudioSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { AudioSample } from '../../src/sample.js';
 import { canEncode, Quality } from '../../src/encode.js';
 import { registerDtsDecoder, registerDtsEncoder } from '@mediabunny/dts';
@@ -194,6 +194,42 @@ test('Random access into DTS decodes the same audio as decoding from the start',
 		}));
 		expect(maxDifference, `frame ${i}`).toBeLessThan(1e-3); // -60 dBFS
 	}
+});
+
+test('DTS pre-roll spans the same core frames in a track signaled at 96 kHz', async () => {
+	// DTS 96/24 and DTS-HD streams extend a 48 kHz core, while MP4 and Matroska signal the extended rate
+	using sourceInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'dts-adpcm.mp4')),
+		formats: ALL_FORMATS,
+	});
+
+	const sourceTrack = await sourceInput.getPrimaryAudioTrack();
+	assert(sourceTrack);
+	const decoderConfig = await sourceTrack.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('dts');
+	output.addAudioTrack(source);
+	await output.start();
+
+	let meta: EncodedAudioChunkMetadata | undefined = { decoderConfig: { ...decoderConfig, sampleRate: 96000 } };
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		await source.add(packet, meta);
+		meta = undefined;
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	expect(await track.getSampleRate()).toBe(96000);
+	expect(await track.getPreRollDuration()).toBe(await sourceTrack.getPreRollDuration());
 });
 
 test('Encode with the extension', async () => {
