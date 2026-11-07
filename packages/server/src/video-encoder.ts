@@ -51,9 +51,12 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
 };
 
-/** Whether a pixel format has an alpha plane, going by FFmpeg's names for them (yuva420p, gbrap10le, rgba...). */
+/**
+ * Whether a pixel format has an alpha plane, going by FFmpeg's names for them (yuva420p, gbrap10le). Packed RGBA
+ * formats don't count: hardware encoders like h264_nvenc take them as input without being able to store alpha.
+ */
 const pixelFormatHasAlpha = (format: NodeAv.AVPixelFormat) => {
-	return /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|ayuv|vuya)/.test(NodeAv.avGetPixFmtName(format) ?? '');
+	return /^(yuva|gbrap)/.test(NodeAv.avGetPixFmtName(format) ?? '');
 };
 
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
