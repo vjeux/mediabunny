@@ -763,27 +763,27 @@ describe('Argument validation', () => {
 });
 
 describe('Track pairing', () => {
-	test('Tracks of one file pair with each other, but not with themselves or other files', async () => {
+	test('Video and audio tracks of one file pair, but not with themselves or other files', async () => {
 		using input = await makeMultiTrackInput();
 		using otherInput = openInput('clicks-aac.m4a');
 
-		const [a, b] = await input.getVideoTracks();
+		const [a] = await input.getVideoTracks();
 		const [x] = await input.getAudioTracks();
 		const otherTrack = await otherInput.getPrimaryAudioTrack();
-		assert(a && b && x && otherTrack);
+		assert(a && x && otherTrack);
 
 		expect(a.canBePairedWith(a)).toBe(false);
-		expect(a.canBePairedWith(b)).toBe(true);
 		expect(a.canBePairedWith(x)).toBe(true);
+		expect(x.canBePairedWith(a)).toBe(true);
 		expect(x.canBePairedWith(otherTrack)).toBe(false);
 		expect(() => a.canBePairedWith({} as never)).toThrow(TypeError);
 
-		expect((await a.getPairableTracks()).map(t => t.number)).toEqual([2, 3, 1, 2]);
-		expect(await a.getPairableVideoTracks()).toHaveLength(2);
+		expect((await a.getPairableTracks()).filter(t => t.isAudioTrack()).map(t => t.number)).toEqual([1, 2]);
 		expect(await a.getPairableAudioTracks()).toHaveLength(2);
+		expect(await x.getPairableVideoTracks()).toHaveLength(3);
 		expect(await a.hasPairableAudioTrack()).toBe(true);
-		expect(await a.hasPairableVideoTrack(async t => (await t.getName()) === 'C')).toBe(true);
-		expect(await a.hasPairableVideoTrack(async t => (await t.getName()) === 'A')).toBe(false);
+		expect(await x.hasPairableVideoTrack(async t => (await t.getName()) === 'C')).toBe(true);
+		expect(await x.hasPairableVideoTrack(async t => (await t.getName()) === 'Z')).toBe(false);
 		expect(await (await a.getPrimaryPairableAudioTrack())!.getName()).toBe('Y');
 		expect(await (await x.getPrimaryPairableVideoTrack())!.getName()).toBe('C');
 
