@@ -47,6 +47,7 @@ import {
 	concatNalUnitsInLengthPrefixed,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
+	HevcNalUnitType,
 	iterateNalUnitsInAnnexB,
 	parseOpusTocByte,
 	serializeAvcDecoderConfigurationRecord,
@@ -502,7 +503,11 @@ export class IsobmffMuxer extends Muxer {
 			decoderConfig.description = serializeHevcDecoderConfigurationRecord(decoderConfigurationRecord);
 			requiresAnnexBTransformation = true;
 			sampleEntryParameterSets = decoderConfigurationRecord.arrays
-				.filter(array => array.arrayCompleteness)
+				.filter(array => (
+					array.nalUnitType === HevcNalUnitType.VPS_NUT
+					|| array.nalUnitType === HevcNalUnitType.SPS_NUT
+					|| array.nalUnitType === HevcNalUnitType.PPS_NUT
+				))
 				.flatMap(array => array.nalUnits.map(withoutTrailingZeros));
 		}
 

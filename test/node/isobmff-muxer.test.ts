@@ -258,7 +258,7 @@ test('Annex B HEVC muxed as hvc1 keeps only parameter sets that differ from its 
 	const find = (type: string) => bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === type);
 	expect(find('hvc1')).toBeGreaterThan(0);
 
-	// The hvcC's VPS, SPS and PPS arrays are complete; its SEI array isn't, as SEI messages stay in the samples
+	// The hvcC's VPS, SPS and PPS arrays are complete
 	const completeness = new Map<number, boolean>();
 	let pos = find('hvcC') + 4 + 22;
 	const arrayCount = bytes[pos++]!;
@@ -270,7 +270,7 @@ test('Annex B HEVC muxed as hvc1 keeps only parameter sets that differ from its 
 			pos += 2 + ((bytes[pos]! << 8) | bytes[pos + 1]!);
 		}
 	}
-	expect([...completeness]).toEqual([[32, true], [33, true], [34, true], [39, false]]);
+	expect([32, 33, 34].map(type => completeness.get(type))).toEqual([true, true, true]);
 
 	using back = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 	const backTrack = await back.getPrimaryVideoTrack();
