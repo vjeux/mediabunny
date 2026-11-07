@@ -13,6 +13,7 @@ import {
 	AudioCodec,
 	MediaCodec,
 	NON_PCM_AUDIO_CODECS,
+	OPUS_SAMPLE_RATE,
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
@@ -20,6 +21,8 @@ import {
 	VideoCodec,
 } from './codec';
 import { FlacMuxer } from './flac/flac-muxer';
+import { parseOpusIdentificationHeader } from './codec-data';
+import { EncodedPacket } from './packet';
 import { IsobmffMuxer } from './isobmff/isobmff-muxer';
 import { MatroskaMuxer } from './matroska/matroska-muxer';
 import { MediaSource } from './media-source';
@@ -31,8 +34,26 @@ import { MpegTsMuxer } from './mpeg-ts/mpeg-ts-muxer';
 import { WaveMuxer } from './wave/wave-muxer';
 import { HlsMuxer } from './hls/hls-muxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
-import { MaybePromise, FilePath, isNumber, toArray } from './misc';
+import { MaybePromise, FilePath, isNumber, toArray, toUint8Array } from './misc';
 import { Target } from './target';
+
+const getOpusPreSkipDuration = (decoderConfig: AudioDecoderConfig) => {
+	if (!decoderConfig.description) {
+		return null;
+	}
+
+	return parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip / OPUS_SAMPLE_RATE;
+};
+
+/**
+ * Returns the codec's priming if the given leading duration is that priming. Allows for timestamps rounded to the
+ * millisecond, like Matroska's.
+ */
+const matchPriming = (primingDuration: number, codecPriming: number | null) => {
+	return codecPriming !== null && codecPriming > 0 && Math.abs(primingDuration - codecPriming) <= 0.001
+		? codecPriming
+		: null;
+};
 
 /**
  * Specifies an inclusive range of integers.
@@ -101,6 +122,19 @@ export abstract class OutputFormat {
 	 * - `null` - Not applicable since the container doesn't support timestamped media at all.
 	 */
 	abstract get negativeTimestampSupport(): 'full' | 'prefer-non-negative' | 'none' | null;
+
+	/**
+	 * For a copied audio track whose first packet starts the given number of seconds before zero: the exact priming
+	 * duration, in seconds, that this format signals for it (like the Opus pre-skip), so that the track can keep that
+	 * start instead of needing a non-negative one. `null` if it can't.
+	 * @internal
+	 */
+	_getSignalableAudioPriming(
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	): number | null {
+		return null;
+	}
 
 	/**
 	 * Whether this output format, as configured, requires {@link BaseTrackMetadata.maximumPacketCount} to be set in
@@ -615,6 +649,14 @@ export class MkvOutputFormat extends OutputFormat {
 	get negativeTimestampSupport() {
 		return 'prefer-non-negative' as const;
 	}
+
+	/** @internal */
+	override _getSignalableAudioPriming(
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	) {
+		// The muxer writes a negative start as the CodecDelay, which for Opus has to be the pre-skip (RFC 9559)
+		return codec === 'opus' ? matchPriming(primingDuration, getOpusPreSkipDuration(decoderConfig)) : null;
+	}
 }
 
 /**
@@ -963,6 +1005,24 @@ export class OggOutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return 'none' as const;
+	}
+
+	/** @internal */
+	override _getSignalableAudioPriming(
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	) {
+		// The muxer puts granule position zero at the end of the pre-skip (Opus), or anywhere within the first packet,
+		// which decodes to nothing (Vorbis)
+		if (codec === 'opus') {
+			return matchPriming(primingDuration, getOpusPreSkipDuration(decoderConfig));
+		} else if (codec === 'vorbis') {
+			// Any start within the first packet
+			return primingDuration <= firstPacket.duration + 0.001
+				? Math.min(primingDuration, firstPacket.duration)
+				: null;
+		} else {
+			return null;
+		}
 	}
 }
 
