@@ -38,6 +38,7 @@ import {
 	OutputFormat,
 } from '../output-format';
 import { Writer } from '../writer';
+import { MpegTsOutputFormat } from '../output-format';
 import { EncodedPacket } from '../packet';
 import { SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
@@ -1033,7 +1034,7 @@ export class HlsMuxer extends Muxer {
 				} else {
 					// Create the output for this segment
 					output = new Output({
-						format: playlist.segmentFormat,
+						format: toSegmentOutputFormat(playlist.segmentFormat),
 						target: new PathedTarget(
 							fullSegmentPath,
 							async (request: TargetRequest) => {
@@ -1752,6 +1753,16 @@ const validateInitPath = (path: string) => {
 			'Init paths cannot contain line feed, carriage return, or double quote characters.',
 		);
 	}
+};
+
+const toSegmentOutputFormat = (format: OutputFormat) => {
+	if (format instanceof MpegTsOutputFormat && format._options.timestampOffset) {
+		// All segment media starts at mediaTimestampBase. An extra offset would only move the MPEG-TS segments, away
+		// from the packed audio and CMAF segments of other playlists, which players align them with.
+		return new MpegTsOutputFormat({ ...format._options, timestampOffset: 0 });
+	}
+
+	return format;
 };
 
 const toPlaylistInfo = (playlist: Playlist): HlsOutputPlaylistInfo => {
