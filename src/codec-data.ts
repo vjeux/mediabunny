@@ -2750,11 +2750,10 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 
 		const key = string.slice(0, separatorIndex).toUpperCase();
 		const value = string.slice(separatorIndex + 1);
-
 		const previousValuesOfKey = previousValues.get(key);
 		const previousIndex = previousValuesOfKey?.indexOf(value) ?? -1;
 		if (previousIndex !== -1) {
-			previousValuesOfKey!.splice(previousIndex, 1);
+			previousValuesOfKey!.splice(previousIndex, 1); // Already read from another logical stream
 			continue;
 		}
 
