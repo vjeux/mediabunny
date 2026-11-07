@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { encodesVideo } from './helpers/platform-probes.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { NullTarget } from '../../src/target.js';
@@ -72,10 +73,14 @@ test('Odd video dimensions pass for VP9', async () => {
 	await source.add(sample);
 });
 
-test('Odd video dimensions encodability checks', async () => {
+test('Odd video dimensions encodability checks', async ({ skip }) => {
 	expect(await canEncodeVideo('avc', { width: 1920, height: 1081 })).toBe(false);
 	expect(await canEncodeVideo('hevc', { width: 1920, height: 1081 })).toBe(false);
 	expect(await canEncodeVideo('vp8', { width: 1920, height: 1081 })).toBe(true);
 	expect(await canEncodeVideo('vp9', { width: 1920, height: 1081 })).toBe(true);
+	skip(
+		!await encodesVideo({ codec: 'av01.0.08M.08', width: 1920, height: 1080, bitrate: 5_000_000 }),
+		'the platform has no AV1 encoder (native probe)',
+	);
 	expect(await canEncodeVideo('av1', { width: 1920, height: 1081 })).toBe(true);
 });

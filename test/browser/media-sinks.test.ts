@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { decodesPastNegativeTimestamps } from './helpers/platform-probes.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -110,7 +111,9 @@ test('Fallback sample past the end survives iterator return', async () => {
 	sample.close();
 });
 
-test('Audio decoder pre-roll (AAC)', async () => {
+const NEGATIVE_TIMESTAMPS_SKIP_NOTE = 'the platform\'s audio decoders scramble negative timestamps (native probe)';
+
+test('Audio decoder pre-roll (AAC)', async ({ skip }) => {
 	using input = new Input({
 		source: new UrlSource('/demo.mp4'),
 		formats: ALL_FORMATS,
@@ -121,11 +124,13 @@ test('Audio decoder pre-roll (AAC)', async () => {
 
 	expect(await track.getCodec()).toBe('aac');
 	expect(await track.getPreRollDuration()).toBe(1024 / await track.getSampleRate());
+	// The file starts before zero (the AAC priming)
+	skip(!await decodesPastNegativeTimestamps(), NEGATIVE_TIMESTAMPS_SKIP_NOTE);
 
 	await testAudioDecoderPreRoll(track, -90);
 });
 
-test('Audio decoder pre-roll (Opus)', async () => {
+test('Audio decoder pre-roll (Opus)', async ({ skip }) => {
 	using input = new Input({
 		source: new UrlSource('/preroll-test.opus'),
 		formats: ALL_FORMATS,
@@ -136,6 +141,8 @@ test('Audio decoder pre-roll (Opus)', async () => {
 
 	expect(await track.getCodec()).toBe('opus');
 	expect(await track.getPreRollDuration()).toBe(OPUS_PRE_ROLL_DURATION);
+	// The file starts before zero (the Opus pre-skip)
+	skip(!await decodesPastNegativeTimestamps(), NEGATIVE_TIMESTAMPS_SKIP_NOTE);
 
 	await testAudioDecoderPreRoll(track, -90);
 });
