@@ -4,7 +4,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
-import { assert, colorSpaceIsComplete, isChromium } from '../../src/misc.js';
+import { assert, colorSpaceIsComplete } from '../../src/misc.js';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -250,9 +250,34 @@ test('VP8 and untagged VP9 decode with the BT.601 matrix', async ({ skip }) => {
 	//   if(lt(X,48),41,128)))':cb='if(lt(X,8),90,if(lt(X,16),54,if(lt(X,24),240,128)))':cr='if(lt(X,8),240,
 	//   if(lt(X,16),34,if(lt(X,24),110,128)))'" -c:v libvpx-vp9 -lossless 1 vp9-untagged-bars.webm
 	// (and -c:v libvpx -b:v 5M -qmin 0 -qmax 4 vp8-bars.webm). VP8 is always BT.601 (RFC 6386, section 9.2), and
-	// FFmpeg and Chrome's <video> render VP9 that signals no color space (CS_UNKNOWN) as BT.601 too. (Firefox renders
-	// such VP9 as BT.709 on its own, which is why it's only checked in Chromium.)
-	const paths = isChromium() ? ['/vp8-bars.webm', '/vp9-untagged-bars.webm'] : ['/vp8-bars.webm'];
+	// FFmpeg and Chrome's <video> render VP9 that signals no color space (CS_UNKNOWN) as BT.601 too. Some browsers
+	// (Firefox) ignore the decoder config's matrix for such VP9 and use BT.709 regardless, so VP9 is only checked
+	// where a plain VideoDecoder (not Mediabunny's) renders it with the BT.601 matrix of its config.
+	const decoderAppliesConfigMatrix = async () => {
+		using input = new Input({ source: new UrlSource('/vp9-untagged-bars.webm'), formats: ALL_FORMATS });
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		const { codec } = (await videoTrack.getDecoderConfig())!;
+		const packet = (await new EncodedPacketSink(videoTrack).getFirstPacket())!;
+
+		const frames: VideoFrame[] = [];
+		// Errors reject flush()
+		const decoder = new VideoDecoder({ output: frame => frames.push(frame), error: () => {} });
+		decoder.configure({
+			codec,
+			colorSpace: { matrix: 'smpte170m', primaries: 'bt709', transfer: 'bt709', fullRange: false },
+		});
+		decoder.decode(packet.toEncodedVideoChunk());
+		await decoder.flush();
+		decoder.close();
+		const frame = frames[0]!;
+
+		const rgba = new Uint8Array(frame.allocationSize({ format: 'RGBA' }));
+		await frame.copyTo(rgba, { format: 'RGBA' });
+		frame.close();
+		// The green channel of the red bar: 0 with the BT.601 matrix, 24 with BT.709
+		return rgba[(32 * 64 + 8) * 4 + 1]! <= 4;
+	};
+	const paths = ['/vp8-bars.webm', ...(await decoderAppliesConfigMatrix() ? ['/vp9-untagged-bars.webm'] : [])];
 	for (const path of paths) {
 		using input = new Input({ source: new UrlSource(path), formats: ALL_FORMATS });
 		const videoTrack = (await input.getPrimaryVideoTrack())!;
