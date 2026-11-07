@@ -81,6 +81,8 @@ export class FlacDemuxer extends Demuxer {
 
 	readingMutex = new AsyncMutex();
 	lastSampleLoaded = false;
+	/** Keys of the raw metadata tags read from the Vorbis comment block; the others come from ID3v2 tags */
+	vorbisRawMetadataTagKeys = new Set<string>();
 
 	constructor(input: Input) {
 		super(input);
@@ -101,6 +103,12 @@ export class FlacDemuxer extends Demuxer {
 
 	async getMimeType() {
 		return 'audio/flac';
+	}
+
+	override async getId3RawMetadataTagKeys() {
+		await this.readMetadata();
+		const keys = Object.keys(this.metadataTags.raw ?? {});
+		return new Set(keys.filter(key => !this.vorbisRawMetadataTagKeys.has(key)));
 	}
 
 	async readMetadata() {
@@ -234,10 +242,16 @@ export class FlacDemuxer extends Demuxer {
 							);
 						}
 
+						const rawKeysBefore = new Set(Object.keys(this.metadataTags.raw ?? {}));
 						readVorbisComments(
 							readBytes(vorbisCommentBlock, size),
 							this.metadataTags,
 						);
+						for (const key of Object.keys(this.metadataTags.raw ?? {})) {
+							if (!rawKeysBefore.has(key)) {
+								this.vorbisRawMetadataTagKeys.add(key);
+							}
+						}
 
 						break;
 					}

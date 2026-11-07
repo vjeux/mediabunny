@@ -52,7 +52,7 @@ import {
 	Rotation,
 } from './misc';
 import { Output, OutputTrackGroup } from './output';
-import { Mp4OutputFormat } from './output-format';
+import { Mp4OutputFormat, WavOutputFormat } from './output-format';
 import { EncodedPacket } from './packet';
 import {
 	AudioSample,
@@ -1183,6 +1183,18 @@ export class Conversion {
 				// If the input and output formats aren't the same, copying over raw metadata tags makes no sense and
 				// only results in junk tags, so let's cut them out.
 				delete outputTags.raw;
+			} else if (rawTagsAreUnchanged && outputTags.raw) {
+				// WAVE and FLAC files can also carry ID3v2 tags, whose frames end up among the raw tags too. Only keep
+				// the raw tags of the kind the output writes, since the others would turn into junk tags as well.
+				const id3Keys = await (await this.input._getDemuxer()).getId3RawMetadataTagKeys();
+				const outputWritesId3 = this.output.format instanceof WavOutputFormat
+					&& this.output.format._options.metadataFormat === 'id3';
+
+				if (id3Keys.size > 0 || outputWritesId3) {
+					outputTags.raw = Object.fromEntries(
+						Object.entries(outputTags.raw).filter(([key]) => id3Keys.has(key) === outputWritesId3),
+					);
+				}
 			}
 
 			this.output.setMetadataTags(outputTags);
