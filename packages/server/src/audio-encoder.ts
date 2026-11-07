@@ -46,6 +46,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	inputParametersKey: string | null = null;
 	resamplerInputSampleRate: number | null = null;
 	nextResamplerPts: bigint | null = null;
+	flacBitsPerSample: 16 | 24 = 16;
 	packetEmitted = false;
 	adtsHeaderTemplate: AdtsHeaderTemplate | null = null;
 
@@ -99,7 +100,10 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 		this.avCodec = codec;
 
-		await this.createCodecContext();
+		if (this.codec !== 'flac') {
+			// FLAC's bit depth follows the first sample, so its context is created then
+			await this.createCodecContext();
+		}
 	}
 
 	async createCodecContext() {
@@ -112,6 +116,12 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		if (this.codec === 'truehd') {
 			// The first listed format is 16-bit, which would needlessly truncate what's supposed to be lossless
 			sampleFormat = NodeAv.AV_SAMPLE_FMT_S32P;
+		} else if (this.codec === 'flac') {
+			// Like @mediabunny/flac-encoder: 16-bit for 8- and 16-bit input, 24-bit otherwise
+			sampleFormat = this.flacBitsPerSample === 24 ? NodeAv.AV_SAMPLE_FMT_S32 : NodeAv.AV_SAMPLE_FMT_S16;
+			if (this.flacBitsPerSample === 24) {
+				codecContext.bitsPerRawSample = 24;
+			}
 		} else if (this.avCodec.sampleFormats && !this.avCodec.sampleFormats.includes(NodeAv.AV_SAMPLE_FMT_FLTP)) {
 			// Use a format that's supported
 			sampleFormat = this.avCodec.sampleFormats[0]!;
@@ -150,6 +160,11 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 	async encode(audioSample: AudioSample): Promise<void> {
 		if (this.codecContext === null) {
+			if (this.codec === 'flac') {
+				const format = audioSample.format;
+				this.flacBitsPerSample = format.startsWith('u8') || format.startsWith('s16') ? 16 : 24;
+			}
+
 			await this.createCodecContext();
 			assert(this.codecContext);
 		}
