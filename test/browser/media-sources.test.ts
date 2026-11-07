@@ -336,6 +336,38 @@ test('VideoSampleSource, transform.process receives pre-transformed frames', asy
 	input.dispose();
 });
 
+test('VideoSampleSource, transform.process keeps the encode options of the input sample', async () => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const packetTypes: string[] = [];
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('medium'),
+		transform: {
+			// Returns non-sample data, which inherits the input sample's timing and encode options
+			process: (sample) => {
+				const canvas = new OffscreenCanvas(100, 100);
+				sample.draw(canvas.getContext('2d')!, 0, 0);
+				return canvas;
+			},
+		},
+		onEncodedPacket: packet => packetTypes.push(packet.type),
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	for (let i = 0; i < 4; i++) {
+		using sample = new VideoSample(makeCanvas(100, 100), {
+			timestamp: i / 30,
+			duration: 1 / 30,
+			encodeOptions: { keyFrame: true },
+		});
+		await videoSource.add(sample);
+	}
+
+	await output.finalize();
+	expect(packetTypes).toEqual(['key', 'key', 'key', 'key']);
+});
+
 test('VideoSampleSource, transform.process drops all frames after the first', async () => {
 	let frameIndex = 0;
 
