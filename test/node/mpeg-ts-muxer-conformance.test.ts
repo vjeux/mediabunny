@@ -185,15 +185,39 @@ describe('MPEG-TS muxer: transport stream structure', () => {
 
 		const [pmt] = parseSections(packets, 0x1000);
 		expect(pmt).toMatchObject({ tableId: 0x02, tableIdExtension: 1, crcOk: true });
-		expect(parsePmt(pmt!)).toEqual({
+		const { pcrPid, ...program } = parsePmt(pmt!);
+		expect(program).toEqual({
 			programNumber: 1,
-			pcrPid: 0x1fff,
 			programDescriptors: new Uint8Array(0),
 			streams: [
 				{ streamType: 0x1b, pid: 0x100, descriptors: new Uint8Array(0) },
 				{ streamType: 0x0f, pid: 0x101, descriptors: new Uint8Array(0) },
 			],
 		});
+
+		// PCR_PID is either 0x1FFF (no PCR), or the PID of a track carrying PCRs, starting no later than its first PES
+		// packet. The clock runs forward (modulo 2^33, like the timestamps), and is no later than the first PES
+		// packet's decode time when it arrives.
+		const pcrPackets = packets.filter(packet => packet.adaptation?.pcr != null);
+		if (pcrPid === 0x1fff) {
+			expect(pcrPackets).toEqual([]);
+		} else {
+			expect([0x100, 0x101]).toContain(pcrPid);
+			expect(pcrPackets.length).toBeGreaterThan(0);
+			expect(pcrPackets.every(packet => packet.pid === pcrPid)).toBe(true);
+
+			const firstPesPacket = packets.find(packet => packet.pid === pcrPid && packet.payloadUnitStart)!;
+			expect(pcrPackets[0]!.index).toBeLessThanOrEqual(firstPesPacket.index);
+
+			const isForward = (from: number, to: number) => (((to - from) % 2 ** 33) + 2 ** 33) % 2 ** 33 < 2 ** 32;
+			const pcrValues = pcrPackets.map(packet => packet.adaptation!.pcr!);
+			for (let i = 1; i < pcrValues.length; i++) {
+				expect(isForward(pcrValues[i - 1]!, pcrValues[i]!)).toBe(true);
+			}
+
+			const firstPes = parsePesPackets(packets, pcrPid)[0]!;
+			expect(isForward(pcrValues[0]!, firstPes.dts ?? firstPes.pts!)).toBe(true);
+		}
 	});
 
 	test('declares each codec with its stream type, registration descriptor and PES stream_id', async () => {
