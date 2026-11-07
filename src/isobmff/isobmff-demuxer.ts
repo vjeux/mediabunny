@@ -417,9 +417,9 @@ export class IsobmffDemuxer extends Demuxer {
 					const majorBrand = readAscii(slice, 4);
 					this.isQuickTime = majorBrand === 'qt  ';
 				} else if (boxInfo.name === 'moov') {
-					// Found moov, load it
-
-					let moovSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
+					// Found moov, load it. If the file is cut off inside it (an interrupted download, say) or its size
+					// goes past the end of the file, take what's there: the boxes before that point are complete.
+					let moovSlice = this.reader.requestSliceRange(slice.filePos, 0, boxInfo.contentSize);
 					if (isThenable(moovSlice)) moovSlice = await moovSlice;
 					if (!moovSlice) break;
 
@@ -932,6 +932,19 @@ export class IsobmffDemuxer extends Demuxer {
 
 		try {
 			while (slice.filePos - startIndex <= slice.length - MIN_BOX_HEADER_SIZE) {
+				const fileSize = this.reader.fileSizeNonStrict;
+				if (fileSize !== null) {
+					const startPos = slice.filePos;
+					const boxInfo = readBoxHeader(slice);
+					slice.filePos = startPos;
+
+					if (boxInfo && startPos + boxInfo.totalSize > fileSize) {
+						// The file is cut off inside this box, so its content is incomplete. Like FFmpeg, keep the
+						// boxes before it.
+						break;
+					}
+				}
+
 				const foundBox = this.traverseBox(slice);
 
 				if (!foundBox) {
