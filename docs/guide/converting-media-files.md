@@ -215,7 +215,7 @@ If `width` or `height` is used in conjunction with `rotate`, `flip` or `crop`, t
 
 If you want to apply max/min constraints to a video's dimensions, check out [track-specific options](#track-specific-options).
 
-In the rare case that the input video changes size over time, the `fit` field can be used to control the size change behavior (see [`VideoEncodingConfig`](./media-sources#video-encoding-config)). When unset, the behavior is `'passThrough'`.
+In the rare case that the input video changes size over time, the `fit` field can be used to control the size change behavior (see [`VideoEncodingConfig`](./media-sources#video-encoding-config)). When unset, the behavior is `'passThrough'`. Setting `fit` without both `width` and `height` makes the video be transcoded so that it applies. When `width` and `height` equal the input's size, the video may still be copied, keeping its size changes; set `forceTranscode` to prevent that.
 
 ### Rotating and flipping video
 
