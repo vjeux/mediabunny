@@ -2,6 +2,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import {
 	AdtsOutputFormat,
+	CmafOutputFormat,
 	HlsOutputFormat,
 	MkvOutputFormat,
 	Mp4OutputFormat,
@@ -16,7 +17,7 @@ import { BufferTarget, PathedTarget } from '../../src/target.js';
 import { Conversion, ConversionCanceledError, ConversionOptions } from '../../src/conversion.js';
 import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
 import { InputVideoTrack } from '../../src/input-track.js';
-import { CanvasSource, EncodedAudioPacketSource } from '../../src/media-source.js';
+import { CanvasSource, EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
@@ -818,6 +819,54 @@ test('Blank execute', async () => {
 
 	await conversion.execute();
 	expect(conversion.state).toBe('done');
+});
+
+test('Canceling a conversion of a live input waiting at its live edge rejects execute()', async () => {
+	// A live HLS stream (no #EXT-X-ENDLIST) whose next segment never comes
+	const files = new Map<string, BufferTarget>();
+	const hlsOutput = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat() }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			files.set(request.path, target);
+			return target;
+		}),
+	});
+	const videoSource = new EncodedVideoPacketSource('vp8');
+	hlsOutput.addVideoTrack(videoSource);
+	await hlsOutput.start();
+	for (let i = 0; i < 12; i++) {
+		await videoSource.add(new EncodedPacket(new Uint8Array(100), i % 4 === 0 ? 'key' : 'delta', i / 2, 0.5), {
+			decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 },
+		});
+	}
+	await hlsOutput.finalize();
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			const bytes = new Uint8Array(files.get(path)!.buffer!);
+			if (!path.endsWith('.m3u8')) {
+				return new BufferSource(bytes);
+			}
+
+			const playlist = new TextDecoder().decode(bytes);
+			const livePlaylist = playlist.replace('#EXT-X-ENDLIST\n', '').replace('#EXT-X-PLAYLIST-TYPE:VOD\n', '');
+			return new BufferSource(new TextEncoder().encode(livePlaylist));
+		}),
+		formats: ALL_FORMATS,
+	});
+	expect(await (await input.getPrimaryVideoTrack())!.isLive()).toBe(true);
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	const executePromise = conversion.execute().then(() => 'resolved', (error: Error) => error.name);
+	await new Promise(resolve => setTimeout(resolve, 1000)); // Let it reach the live edge
+
+	await conversion.cancel();
+	expect(await Promise.race([
+		executePromise,
+		new Promise(resolve => setTimeout(() => resolve('pending'), 1000)),
+	])).toBe('ConversionCanceledError');
 });
 
 test('Stepwise until', async () => {
