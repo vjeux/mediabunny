@@ -147,6 +147,23 @@ test('Format detection is tried again after a failed read', async () => {
 	const readsAfterDetection = reads;
 	await expect(unsupported.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
 	expect(reads).toBe(readsAfterDetection);
+
+	// Neither does a disposed input: one disposed during detection keeps saying so
+	const disposed = new Input({
+		source: new CustomSource({
+			getSize: () => videoBytes.length,
+			read: async (start, end) => {
+				await new Promise(resolve => setTimeout(resolve, 50));
+				return videoBytes.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	const detection = disposed.getFormat();
+	disposed.dispose();
+	await expect(detection).rejects.toThrow(InputDisposedError);
+	await expect(disposed.getFormat()).rejects.toThrow(InputDisposedError);
+	await expect(disposed.getTracks()).rejects.toThrow(InputDisposedError);
 });
 
 test('CustomSource releases stream readers after successful reads', async () => {
