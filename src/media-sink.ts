@@ -2395,7 +2395,9 @@ export class CanvasSink {
 			flip: this._flip,
 			crop: this._crop,
 			targetIsFresh: canvasIsNew,
-			fillBlack: !this._alpha && isFirefox(),
+			// WebKit doesn't support { alpha: false } on 2D contexts and keeps transparent pixels, so on Firefox and
+			// WebKit, emulate the opaque canvas by painting a black background
+			fillBlack: !this._alpha && (isFirefox() || isWebKit()),
 		});
 
 		const result = {
