@@ -644,6 +644,46 @@ test('AudioSampleSource, remixed to mono', async () => {
 	input.dispose();
 });
 
+// Needs the platform's AAC encoder (Windows, macOS; not Chromium on Linux)
+const aacEncodable = await AudioEncoder.isConfigSupported({
+	codec: 'mp4a.40.2',
+	numberOfChannels: 2,
+	sampleRate: 48000,
+	bitrate: 128_000,
+}).then(support => support.supported === true, () => false);
+
+test.skipIf(!aacEncodable)('AudioSampleSource, AAC encoding keeps the start of the audio', async () => {
+	// Some platform encoders silence the first samples they get (WebKit's the first 1024, Windows' Media Foundation
+	// encoder about 512), which must not cut off a sound that starts right away
+	const sampleRate = 48000;
+	const data = new Float32Array(2 * sampleRate / 2);
+	for (let i = 0; i < data.length / 2; i++) {
+		data[2 * i] = data[2 * i + 1] = 0.5 * Math.sin(2 * Math.PI * 1000 * i / sampleRate);
+	}
+
+	const buffer = await encodeAudio(
+		{ codec: 'aac', quality: new Quality('high') },
+		new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate, timestamp: 0 }),
+	);
+
+	const { input, track } = await readBackAudioTrack(buffer);
+	const { AudioSampleSink } = await import('../../src/media-sink.js');
+	let peak = 0;
+	for await (using sample of new AudioSampleSink(track).samples(0, 0.05)) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+		for (let i = 0; i < values.length; i++) {
+			const time = sample.timestamp + i / sample.sampleRate;
+			if (time >= 0 && time < 256 / sampleRate) {
+				peak = Math.max(peak, Math.abs(values[i]!));
+			}
+		}
+	}
+
+	expect(peak).toBeGreaterThan(0.3); // The first 256 samples carry the sine
+	input.dispose();
+});
+
 test('AudioSampleSource, resampled to 44100 Hz', async () => {
 	const sample = makeSineWave(48000, 2, 1);
 	const buffer = await encodeAudio(
