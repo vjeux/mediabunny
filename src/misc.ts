@@ -929,7 +929,13 @@ export const retriedFetch = async (
 			}
 
 			attempts++;
-			const retryDelayInSeconds = getRetryDelay(attempts, error, url);
+			let retryDelayInSeconds: number | null;
+			try {
+				retryDelayInSeconds = getRetryDelay(attempts, error, url);
+			} catch (policyError) {
+				void response?.body?.cancel().catch(() => {});
+				throw policyError;
+			}
 
 			if (retryDelayInSeconds === null) {
 				if (response) {

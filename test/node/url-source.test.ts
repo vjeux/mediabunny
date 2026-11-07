@@ -480,6 +480,53 @@ test('UrlSource retries requests that failed with a transient HTTP status', asyn
 	}
 });
 
+test('UrlSource frees the response of a transient HTTP status when its retry policy fails', async () => {
+	let openConnections = 0;
+	const server = http.createServer((req, res) => {
+		// Big enough that the client doesn't take in the whole body by itself
+		const body = Buffer.alloc(200_000, 0x20);
+		res.writeHead(503, { 'Content-Length': body.length });
+		res.end(body);
+	});
+	server.on('connection', (socket) => {
+		openConnections++;
+		socket.on('close', () => openConnections--);
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+
+		const policies: [() => number, string][] = [
+			[() => {
+				throw new Error('Policy failed');
+			}, 'Policy failed'],
+			[() => -1, 'Retry delay must be a non-negative finite number.'],
+		];
+		for (const [getRetryDelay, message] of policies) {
+			for (let i = 0; i < 10; i++) {
+				const input = new Input({
+					source: new UrlSource(`http://localhost:${address.port}/data.bin`, { getRetryDelay }),
+					formats: ALL_FORMATS,
+				});
+				await expect(input.getFormat()).rejects.toThrow(message);
+				input.dispose();
+			}
+
+			// The failed responses' connections get closed, instead of staying open with their unread bodies
+			await new Promise(resolve => setTimeout(resolve, 1000));
+			expect(openConnections, message).toBeLessThanOrEqual(2);
+		}
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
