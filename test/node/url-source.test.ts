@@ -400,7 +400,9 @@ const startRangelessServer = async (
 test('UrlSource retries requests that failed with a transient HTTP status', async () => {
 	const data = new Uint8Array(1000).map((_, i) => i & 0xff);
 	let failures: number[] = [];
+	let requestCount = 0;
 	const server = http.createServer((req, res) => {
+		requestCount++;
 		const status = failures.shift();
 		if (status !== undefined) {
 			res.writeHead(status);
@@ -425,10 +427,11 @@ test('UrlSource retries requests that failed with a transient HTTP status', asyn
 		const url = `http://localhost:${address.port}/data.bin`;
 		const read = async (statuses: number[], retry = true) => {
 			failures = [...statuses];
-			const attempts: number[] = [];
+			const attempts: [number, unknown][] = [];
 			using ref = new UrlSource(url, {
-				getRetryDelay: (previousAttempts) => {
-					attempts.push(previousAttempts);
+				getRetryDelay: (previousAttempts, error) => {
+					// The error carries the status, so that policies can tell this apart from a network error
+					attempts.push([previousAttempts, (error as { status?: unknown }).status]);
 					return retry ? 0 : null;
 				},
 			}).ref();
@@ -442,14 +445,34 @@ test('UrlSource retries requests that failed with a transient HTTP status', asyn
 		};
 
 		// Server errors, timeouts and rate limiting can go away, so they're retried like network errors...
-		expect(await read([503, 429, 502])).toEqual({ attempts: [1, 2, 3], result: [0, 1, 2, 3] });
+		expect(await read([503, 429, 502])).toEqual({ attempts: [[1, 503], [2, 429], [3, 502]], result: [0, 1, 2, 3] });
 		// ...as long as the retry policy wants to
 		expect(await read([503], false)).toEqual({
-			attempts: [1],
+			attempts: [[1, 503]],
 			result: `Error: Error fetching ${url}: 503 Service Unavailable`,
 		});
 		// Other failures are final
 		expect(await read([404])).toEqual({ attempts: [], result: `Error: Error fetching ${url}: 404 Not Found` });
+
+		// The default policy gives up on a server that keeps answering such a status, after 5 retries (15.5 seconds of
+		// waiting, which this test skips), while it retries network errors indefinitely
+		const defaultPolicy = new UrlSource(url)._getRetryDelay;
+		const delays: (number | null)[] = [];
+		failures = new Array<number>(100).fill(503);
+		requestCount = 0;
+		using ref = new UrlSource(url, {
+			getRetryDelay: (previousAttempts, error, source) => {
+				const delay = defaultPolicy(previousAttempts, error, source);
+				delays.push(delay);
+				return delay === null ? null : 0;
+			},
+		}).ref();
+		await expect(new Reader(ref.source).requestSlice(0, 4)).rejects.toThrow(
+			`Error fetching ${url}: 503 Service Unavailable`,
+		);
+		expect(delays).toEqual([0.5, 1, 2, 4, 8, null]);
+		expect(requestCount).toBe(6);
+		expect(defaultPolicy(100, new TypeError('fetch failed'), url)).toBe(16);
 	} finally {
 		logs.stop();
 		server.closeAllConnections();

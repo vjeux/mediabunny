@@ -914,9 +914,13 @@ export const retriedFetch = async (
 				return response;
 			}
 
-			throw new Error(
-				`Error fetching ${url instanceof Request ? url.url : String(url)}: ${response.status}`
-				+ ` ${response.statusText}`,
+			// The status lets retry policies tell this apart from a network error
+			throw Object.assign(
+				new Error(
+					`Error fetching ${url instanceof Request ? url.url : String(url)}: ${response.status}`
+					+ ` ${response.statusText}`,
+				),
+				{ status: response.status },
 			);
 		} catch (error) {
 			if (shouldStop()) {
