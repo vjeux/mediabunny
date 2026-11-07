@@ -1006,6 +1006,8 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	sampleQueue: VideoSample[] = []; // Safari-specific thing, check usage.
 	currentPacketIndex = 0;
 	raslSkipped = false; // For HEVC stuff
+	firstPacketTimestamp = 0;
+	leadingPicturesSkipped = false; // For AVC stuff
 
 	// Alpha stuff
 	alphaDecoder: VideoDecoder | null = null;
@@ -1171,6 +1173,22 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			}
 
 			this.raslSkipped = true;
+		}
+
+		// The AVC counterpart: decoding that starts at an open-GOP I-frame (a recovery point) can't reconstruct the
+		// leading pictures that follow it but are presented before it. Some decoders (Firefox's) drop them, which would
+		// throw off the timestamp assignment below, so let's drop them ourselves. They're never needed when starting
+		// here since they lie before the start.
+		if (this.codec === 'avc') {
+			if (this.currentPacketIndex === 0) {
+				this.firstPacketTimestamp = packet.timestamp;
+			} else if (!this.leadingPicturesSkipped) {
+				if (packet.timestamp < this.firstPacketTimestamp) {
+					return; // Drop
+				}
+
+				this.leadingPicturesSkipped = true;
+			}
 		}
 
 		if (this.customDecoder) {
@@ -1563,6 +1581,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 
 		this.currentPacketIndex = 0;
 		this.raslSkipped = false;
+		this.leadingPicturesSkipped = false;
 	}
 
 	close() {
