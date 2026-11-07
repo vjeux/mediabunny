@@ -2698,7 +2698,11 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		const decoderConfig = await this._track.getDecoderConfig();
 		assert(codec && decoderConfig);
 
-		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
+		if (
+			(PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)
+			// Custom decoders take precedence over the built-in PCM decoder, just like custom encoders do
+			&& !customAudioDecoders.some(x => x.supports(codec, decoderConfig))
+		) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
 			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
