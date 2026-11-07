@@ -311,7 +311,8 @@ test('Video tracks whose samples are all sync samples only have key packets', as
 });
 
 test('An invalid stss entry of 0 does not make a video track only have key packets', async () => {
-	// Ten samples, all key frames but the last, with an extra stss entry 0 (entries are 1-based)
+	// Ten samples, all key frames but the last, with an extra stss entry 0 at the end (entries are 1-based; a table
+	// starting at 0 would count from 0)
 	const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
 	const source = new EncodedVideoPacketSource('vp9');
 	output.addVideoTrack(source);
@@ -323,14 +324,15 @@ test('An invalid stss entry of 0 does not make a video track only have key packe
 	}
 	await output.finalize();
 
-	// Insert the entry, growing stss and its ancestors by 4 bytes. The moov box comes last, so no offsets change.
+	// Append the entry, growing stss and its ancestors by 4 bytes. The moov box comes last, so no offsets change.
 	const bytes = new Uint8Array(output.target.buffer!);
 	const view = new DataView(bytes.buffer);
 	const findBox = (name: string) => bytes.findIndex(
 		(_, i) => new TextDecoder().decode(bytes.subarray(i + 4, i + 8)) === name,
 	);
 	const stss = findBox('stss');
-	const damaged = new Uint8Array([...bytes.subarray(0, stss + 16), 0, 0, 0, 0, ...bytes.subarray(stss + 16)]);
+	const stssEnd = stss + view.getUint32(stss);
+	const damaged = new Uint8Array([...bytes.subarray(0, stssEnd), 0, 0, 0, 0, ...bytes.subarray(stssEnd)]);
 	const damagedView = new DataView(damaged.buffer);
 	damagedView.setUint32(stss + 12, view.getUint32(stss + 12) + 1); // Entry count
 	for (const name of ['stss', 'stbl', 'minf', 'mdia', 'trak', 'moov']) {
