@@ -1087,7 +1087,7 @@ export class UrlSource extends PathedSource {
 					const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
 					if (retryDelayInSeconds !== null) {
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
-						await wait(1000 * retryDelayInSeconds);
+						await wait(1000 * retryDelayInSeconds, abortController.signal);
 
 						break;
 					} else {
@@ -1128,7 +1128,7 @@ export class UrlSource extends PathedSource {
 						}
 
 						Logging._error('Retrying range request that ended without delivering any data.');
-						await wait(1000 * retryDelayInSeconds);
+						await wait(1000 * retryDelayInSeconds, abortController.signal);
 
 						break;
 					} else {
@@ -1179,7 +1179,7 @@ export class UrlSource extends PathedSource {
 						}
 
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
-						await wait(1000 * retryDelayInSeconds);
+						await wait(1000 * retryDelayInSeconds, this._sequentialAbortController?.signal);
 
 						this._sequentialAbortController = new AbortController();
 						if (this._disposed) {
