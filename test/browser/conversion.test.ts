@@ -997,7 +997,7 @@ test('Packet copy, delta frame trim, shrink', async () => {
 		},
 		expectedTimeOffset: 1.5,
 		videoStartTimestamp: 0.5,
-		videoEndTimestamp: 1.02, // Due to MP4 not being able to express a different duration for the last packet
+		videoEndTimestamp: 1, // The last presented packet is shrunk to end at the trim end
 		audioStartTimestamp: -0.028 + 2 * 1024 / 48000,
 		audioEndTimestamp: 1.0173333333333334 - 1024 / 48000,
 	});

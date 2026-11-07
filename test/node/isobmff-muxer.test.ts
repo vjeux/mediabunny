@@ -721,6 +721,120 @@ test('Reserved Fast Start with a B-frame GOP completed before all tracks are kno
 	expect(timestamps).toEqual(videoTimestamps);
 });
 
+test('The last presented frame keeps its duration when B-frames follow it in decode order', async () => {
+	// Presentation times in decode order: I P B B, and a B-pyramid tail like x264's (I P B b b P B B), where the last
+	// P frame is presented last
+	const gops = [[0, 0.12, 0.04, 0.08], [0, 0.16, 0.08, 0.04, 0.12, 0.28, 0.20, 0.24]];
+
+	for (const timestamps of gops) {
+		const lastPresented = timestamps.indexOf(Math.max(...timestamps));
+
+		for (const fastStart of [false, 'in-memory'] as const) {
+			for (const heldDuration of [0.04, 0.5]) {
+				const output = new Output({ format: new Mp4OutputFormat({ fastStart }), target: new BufferTarget() });
+				const source = new EncodedVideoPacketSource('vp9');
+				output.addVideoTrack(source);
+				await output.start();
+
+				for (const [i, timestamp] of timestamps.entries()) {
+					const duration = i === lastPresented ? heldDuration : 0.04;
+					const type = i === 0 ? 'key' : 'delta';
+					const packet = new EncodedPacket(new Uint8Array([i]), type, timestamp, duration);
+					await source.add(packet, {
+						decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+					});
+				}
+				await output.finalize();
+
+				const bytes = new Uint8Array(output.target.buffer!);
+				using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+				const track = await input.getPrimaryVideoTrack();
+				assert(track);
+
+				const packets: { timestamp: number; duration: number }[] = [];
+				for await (const packet of new EncodedPacketSink(track).packets()) {
+					packets[packet.data[0]!] = { timestamp: packet.timestamp, duration: packet.duration };
+				}
+				expect(packets.map(x => x.timestamp)).toEqual(timestamps);
+				// Was 0.04, the time up to the next decoded frame
+				expect(packets[lastPresented]!.duration).toBeCloseTo(heldDuration, 6);
+				expect(await track.computeDuration()).toBeCloseTo(timestamps[lastPresented]! + heldDuration, 6);
+
+				if (heldDuration > 0.04) {
+					// FFmpeg takes the decode time shift for negative composition offsets from all ctts entries but the
+					// last two, so the trailing frames must not need more of it than the earlier ones give
+					const ctts = bytes.findIndex(
+						(_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'ctts',
+					);
+					const view = toDataView(bytes);
+					const offsets = Array.from(
+						{ length: view.getUint32(ctts + 8) },
+						(_, i) => view.getInt32(ctts + 16 + 8 * i),
+					);
+					expect(Math.min(...offsets)).toBeGreaterThanOrEqual(0);
+				}
+			}
+		}
+	}
+});
+
+test('A track ends where its metadata says when an earlier frame declares a later end', async () => {
+	// I P B in decode order, where the B-frame's declared end (0.04 + 0.2) is past the last presented frame's (0.13)
+	const packets = [[0, 0.04], [0.12, 0.01], [0.04, 0.2]] as const;
+
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (const [i, [timestamp, duration]] of packets.entries()) {
+		const packet = new EncodedPacket(new Uint8Array([i]), i === 0 ? 'key' : 'delta', timestamp, duration);
+		await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// The movie and track durations cover the latest declared end, and so do the samples now
+	expect(await track.getDurationFromMetadata()).toBeCloseTo(0.24, 6);
+	expect(await track.computeDuration()).toBeCloseTo(0.24, 6);
+});
+
+test('B-frame streams that hold nothing keep their layout, however long', { timeout: 120_000 }, async () => {
+	// P B B mini-GOPs in decode order, timestamps index * (1 / fps), every frame lasting 1 / fps
+	const write = async (frameCount: number, fps: number, keyInterval: number) => {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+
+		const data = new Uint8Array(1);
+		const frame = 1 / fps;
+		for (let k = 0; k < frameCount / 3; k++) {
+			for (const j of k === 0 ? [0, 2, 1] : [2, 0, 1]) {
+				const index = 3 * k + j;
+				const isKey = index % keyInterval === 0 && (k === 0 || j === 2);
+				await source.add(
+					new EncodedPacket(data, isKey ? 'key' : 'delta', index * frame, frame),
+					{ decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } },
+				);
+			}
+		}
+		await output.finalize();
+
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	// Floating-point noise in the last frame's end used to count as a hold, adding an edit list
+	const bytes = await write(33, 30, 1000);
+	expect(bytes.some((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'edts')).toBe(false);
+
+	// About 220,000 ctts entries, which used to overflow the call stack
+	expect((await write(330_000, 25, 250)).byteLength).toBeGreaterThan(0);
+});
+
 test('Fragmented MP4 preserves interior key packets', async () => {
 	const target = new BufferTarget();
 	const output = new Output({

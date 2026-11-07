@@ -93,6 +93,8 @@ export type IsobmffTrackData = {
 	lastTimescaleUnits: number | null;
 	lastSample: Sample | null;
 	startTimestampOffset: number | null;
+	/** Added to every composition time offset (in the track timescale), compensated by the edit list's media time. */
+	compositionTimeOffsetShift: number;
 
 	finalizedChunks: Chunk[];
 	currentChunk: Chunk | null;
@@ -524,6 +526,7 @@ export class IsobmffMuxer extends Muxer {
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
 			lastTimescaleUnits: null,
+			compositionTimeOffsetShift: 0,
 			lastSample: null,
 			startTimestampOffset: null,
 			finalizedChunks: [],
@@ -632,6 +635,7 @@ export class IsobmffMuxer extends Muxer {
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
 			lastTimescaleUnits: null,
+			compositionTimeOffsetShift: 0,
 			lastSample: null,
 			startTimestampOffset: null,
 			finalizedChunks: [],
@@ -677,6 +681,7 @@ export class IsobmffMuxer extends Muxer {
 			timeToSampleTable: [],
 			compositionTimeOffsetTable: [],
 			lastTimescaleUnits: null,
+			compositionTimeOffsetShift: 0,
 			lastSample: null,
 			startTimestampOffset: null,
 			finalizedChunks: [],
@@ -1047,6 +1052,41 @@ export class IsobmffMuxer extends Muxer {
 		}
 
 		const sortedTimestamps = trackData.timestampProcessingQueue.map(x => x.timestamp).sort((a, b) => a - b);
+
+		if (nextSample === undefined && trackData.closed && !this.isFragmented) {
+			// The track's last presented sample lasts until the next sample in decode order begins (its decode slot),
+			// both for us and for readers. When B-frames follow it in decode order, that's where they begin, not where
+			// the sample ends, so its own duration would be lost. Delay their decode times to keep it. Not done for
+			// fragmented files, where FFmpeg shifts the whole track by the largest negative composition offset.
+			const queue = trackData.timestampProcessingQueue;
+			let lastPresentedIndex = 0;
+			for (let i = 1; i < queue.length; i++) {
+				if (queue[i]!.timestamp >= queue[lastPresentedIndex]!.timestamp) {
+					lastPresentedIndex = i;
+				}
+			}
+
+			if (lastPresentedIndex < queue.length - 1) {
+				// The slot runs to the latest end any sample declares, which the movie and track durations use too.
+				// That's normally the last presented sample's own end, but an earlier one may declare a later end.
+				let end = -Infinity;
+				for (const samples of [trackData.samples, queue]) {
+					for (const sample of samples) {
+						end = Math.max(end, sample.timestamp + sample.duration);
+					}
+				}
+
+				const shift = sortedTimestamps[lastPresentedIndex]! + end - queue[lastPresentedIndex]!.timestamp
+					- sortedTimestamps[lastPresentedIndex + 1]!;
+
+				// Differences below half a tick are rounding noise, not a different duration
+				if (intoTimescale(shift, trackData.timescale) !== 0) {
+					for (let i = lastPresentedIndex + 1; i < queue.length; i++) {
+						sortedTimestamps[i]! += shift;
+					}
+				}
+			}
+		}
 
 		if (this.isFragmented) {
 			trackData.startTimestampOffset ??= Math.min(sortedTimestamps[0]!, 0);
@@ -1623,6 +1663,36 @@ export class IsobmffMuxer extends Muxer {
 		}
 	}
 
+	/**
+	 * FFmpeg derives the decode time shift that keeps negative composition offsets from putting presentation before
+	 * decode time from all ctts entries but the last two (mov_read_ctts), so when the last ones are more negative than
+	 * the rest, as when a short video ends with B-frames, it reads those samples with pts < dts. In that case, make
+	 * every offset non-negative instead, moving media time 0 by the same amount in the edit list, the way FFmpeg
+	 * itself writes B-frame delay.
+	 */
+	private avoidUncoveredNegativeCompositionTimeOffsets(trackData: IsobmffTrackData) {
+		const table = trackData.compositionTimeOffsetTable;
+
+		let minOffset = 0;
+		let minCoveredOffset = 0;
+		for (let i = 0; i < table.length; i++) {
+			const offset = table[i]!.sampleCompositionTimeOffset;
+			minOffset = Math.min(minOffset, offset);
+			if (i < table.length - 2) {
+				minCoveredOffset = Math.min(minCoveredOffset, offset);
+			}
+		}
+
+		if (minOffset >= minCoveredOffset) {
+			return;
+		}
+
+		for (const entry of table) {
+			entry.sampleCompositionTimeOffset -= minOffset;
+		}
+		trackData.compositionTimeOffsetShift = -minOffset;
+	}
+
 	/** Finalizes the file, making it ready for use. Must be called after all video and audio chunks have been added. */
 	async finalize() {
 		const release = await this.mutex.acquire();
@@ -1638,6 +1708,10 @@ export class IsobmffMuxer extends Muxer {
 			}
 
 			this.processTimestamps(trackData);
+
+			if (!this.isFragmented) {
+				this.avoidUncoveredNegativeCompositionTimeOffsets(trackData);
+			}
 		}
 
 		await this.interleaveSamples(true);
