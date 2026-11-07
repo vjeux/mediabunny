@@ -393,6 +393,11 @@ class VideoEncoderWrapper {
 
 				videoSample = transformed;
 				shouldClose = true;
+
+				if (this.closed) {
+					// The source got closed (or the output canceled) while the frame was being transformed
+					return;
+				}
 			} else {
 				// If no canvas is needed, we still need to record the output dimensions for the first frame
 				if (this.outputWidth === null || this.outputHeight === null) {
@@ -417,6 +422,10 @@ class VideoEncoderWrapper {
 					} else {
 						// Pad the gap by repeating the previous frame
 						await this.padFrameRate(alignedTimestamp, encodeOptions);
+
+						if (this.closed) {
+							return;
+						}
 					}
 				}
 
@@ -511,6 +520,12 @@ class VideoEncoderWrapper {
 		try {
 			for (const sampleToEncode of samplesToEncode) {
 				if (!this.encoderInitialized) {
+					if (this.closed) {
+						// The source got closed (or the output canceled) while we were awaiting, e.g. the process
+						// function, so don't create an encoder nothing would close anymore
+						break;
+					}
+
 					if (!this.ensureEncoderPromise) {
 						this.ensureEncoder(sampleToEncode);
 					}
@@ -674,6 +689,11 @@ class VideoEncoderWrapper {
 		const frameDifference = Math.round((until - this.frameRateLastTimestamp!) * frameRate);
 
 		for (let i = 1; i < frameDifference; i++) {
+			if (this.closed || !this.frameRateLastSample) {
+				// The source got closed (or the output canceled) while we were encoding the previous repeat
+				return;
+			}
+
 			using sample = this.frameRateLastSample.clone();
 			sample.setTimestamp(this.frameRateLastTimestamp! + i / frameRate);
 			sample.setDuration(1 / frameRate);
@@ -2194,6 +2214,12 @@ class AudioEncoderWrapper {
 	private async encodeSample(audioSample: AudioSample, shouldClose: boolean) {
 		try {
 			if (!this.encoderInitialized) {
+				if (this.closed) {
+					// The source got closed (or the output canceled) while we were awaiting, e.g. the process
+					// function, so don't create an encoder nothing would close anymore
+					return;
+				}
+
 				if (!this.ensureEncoderPromise) {
 					this.ensureEncoder(audioSample);
 				}
@@ -2248,6 +2274,11 @@ class AudioEncoderWrapper {
 						});
 
 						await this.encodeSample(fillSample, true); // Recursive call
+
+						if (this.closed) {
+							// The source got closed (or the output canceled) while the gap was being filled
+							return;
+						}
 					}
 
 					this.lastEndSampleIndex += audioSample.numberOfFrames;
