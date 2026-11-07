@@ -86,12 +86,12 @@ export class EncodedPacket {
 			);
 		}
 
-		if (byteLength === undefined) {
-			byteLength = data.byteLength;
-		}
-
 		if (!(data instanceof Uint8Array)) {
 			throw new TypeError('data must be a Uint8Array.');
+		}
+
+		if (byteLength === undefined) {
+			byteLength = data.byteLength;
 		}
 		if (type !== 'key' && type !== 'delta') {
 			throw new TypeError('type must be either "key" or "delta".');
