@@ -336,20 +336,6 @@ test('VideoSampleSource, transform.process receives pre-transformed frames', asy
 	input.dispose();
 });
 
-test.each([
-	['vp9', { width: 45, height: 81, fit: 'fill' }, [45, 81]],
-	['vp9', { crop: { left: 10, top: 10, width: 45, height: 81 } }, [45, 81]],
-	['avc', { crop: { left: 10, top: 10, width: 45, height: 81 } }, [46, 82]], // AVC needs even dimensions
-] as const)('VideoSampleSource, %s keeps transformed sizes it can encode (%o)', async (codec, transform, size) => {
-	const buffer = await encodeFrames(
-		{ codec, quality: new Quality('medium'), transform },
-		[{ width: 100, height: 100 }, { width: 100, height: 100 }],
-	);
-
-	const samples = await readBackSamples(buffer);
-	expect(samples.map(x => [x.codedWidth, x.codedHeight])).toEqual([size, size]);
-});
-
 test('VideoSampleSource, transform.process drops all frames after the first', async () => {
 	let frameIndex = 0;
 
@@ -403,6 +389,20 @@ test('VideoSampleSource, transform.process expands every frame into two', async 
 		expect(samples[i]!.timestamp).toBe(i * d);
 		expect(samples[i]!.duration).toBe(d);
 	}
+});
+
+test.each([
+	['vp9', { width: 45, height: 81, fit: 'fill' }, [45, 81]],
+	['vp9', { crop: { left: 10, top: 10, width: 45, height: 81 } }, [45, 81]],
+	['avc', { crop: { left: 10, top: 10, width: 45, height: 81 } }, [46, 82]], // AVC needs even dimensions
+] as const)('VideoSampleSource, %s keeps transformed sizes it can encode (%o)', async (codec, transform, size) => {
+	const buffer = await encodeFrames(
+		{ codec, quality: new Quality('medium'), transform },
+		[{ width: 100, height: 100 }, { width: 100, height: 100 }],
+	);
+
+	const samples = await readBackSamples(buffer);
+	expect(samples.map(x => [x.codedWidth, x.codedHeight])).toEqual([size, size]);
 });
 
 test('VideoSampleSource, transform.frameRate normalizes variable-rate input to fixed rate', async () => {
