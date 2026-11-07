@@ -100,6 +100,14 @@ const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expect
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
+const CA_DESCRIPTOR_TAG = 0x09;
+
+/**
+ * How far past the first PMT of a program we can't read anything from we look for another program, as the PMTs of
+ * some programs listed in the PAT may never show up. DVB repeats each PMT at least every half second, which this covers
+ * at up to 130 Mbit/s.
+ */
+const MAX_PROGRAM_SEARCH_SIZE = 2 ** 23; // 8 MiB
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
 const HDMV_FORMAT_IDENTIFIER = 0x48444d56;
@@ -232,9 +240,34 @@ export class MpegTsDemuxer extends Demuxer {
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
 
+			// The programs whose PMT has shown up, and the first one of them we couldn't read anything from, which we
+			// only fall back to if we find no better one
+			const seenProgramMapPids = new Set<number>();
+			let fallbackProgram: { pmtPos: number; streams: ElementaryStream[] } | null = null;
+
+			// Uses the fallback program, going back to its PMT to read its streams from there
+			const useFallbackProgram = () => {
+				if (hasProgramMap || !fallbackProgram) {
+					return false;
+				}
+
+				this.elementaryStreams.push(...fallbackProgram.streams);
+				hasProgramMap = true;
+				currentPos = fallbackProgram.pmtPos;
+				return true;
+			};
+
 			while (true) {
+				if (fallbackProgram && currentPos - fallbackProgram.pmtPos > MAX_PROGRAM_SEARCH_SIZE) {
+					useFallbackProgram();
+				}
+
 				const packetHeader = await this.readPacketHeader(currentPos);
 				if (!packetHeader) {
+					if (useFallbackProgram()) {
+						continue;
+					}
+
 					break;
 				}
 
@@ -259,6 +292,10 @@ export class MpegTsDemuxer extends Demuxer {
 					!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
 				);
 				if (!section) {
+					if (useFallbackProgram()) {
+						continue;
+					}
+
 					break;
 				}
 
@@ -313,7 +350,9 @@ export class MpegTsDemuxer extends Demuxer {
 					hasProgramAssociationTable = true;
 				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap) {
 					// Broadcast captures often carry several programs. We present just one, so let's use the first one
-					// whose PMT shows up (some programs listed in the PAT may not even be in the capture).
+					// whose PMT shows up (some programs listed in the PAT may not even be in the capture) and that has
+					// a stream we can read: pay-TV programs are scrambled, and radio ones may only have unsupported
+					// streams.
 					const bitstream = new Bitstream(section.payload);
 					const pointerField = bitstream.readAlignedByte();
 
@@ -336,13 +375,17 @@ export class MpegTsDemuxer extends Demuxer {
 					// descriptor is what tells us we're looking at a Blu-ray-derived stream.
 					const programInfoEndPos = bitstream.pos + 8 * programInfoLength;
 					let isBluRayProgram = false;
+					// Conditional access means the program's packets are scrambled
+					let isScrambledProgram = false;
 
 					while (bitstream.pos < programInfoEndPos) {
 						const descriptorTag = bitstream.readBits(8);
 						const descriptorLength = bitstream.readBits(8);
 						const descriptorEndPos = bitstream.pos + 8 * descriptorLength;
 
-						if (descriptorTag === REGISTRATION_DESCRIPTOR_TAG && descriptorLength >= 4) {
+						if (descriptorTag === CA_DESCRIPTOR_TAG) {
+							isScrambledProgram = true;
+						} else if (descriptorTag === REGISTRATION_DESCRIPTOR_TAG && descriptorLength >= 4) {
 							const formatIdentifier = bitstream.readBits(32);
 							isBluRayProgram ||= formatIdentifier === HDMV_FORMAT_IDENTIFIER
 								|| formatIdentifier === HDPR_FORMAT_IDENTIFIER;
@@ -352,6 +395,9 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					bitstream.pos = programInfoEndPos;
+
+					const streams: ElementaryStream[] = [];
+					const scrambledPids = new Set<number>();
 
 					while (8 * (sectionLength + BYTES_BEFORE_SECTION_LENGTH) - bitstream.pos > BITS_IN_CRC_32) {
 						const streamType = bitstream.readBits(8);
@@ -371,7 +417,9 @@ export class MpegTsDemuxer extends Demuxer {
 							const descriptorLength = bitstream.readBits(8);
 							const descriptorEndPos = bitstream.pos + 8 * descriptorLength;
 
-							if (descriptorTag === 0x6a) {
+							if (descriptorTag === CA_DESCRIPTOR_TAG) {
+								scrambledPids.add(elementaryPid);
+							} else if (descriptorTag === 0x6a) {
 								hasAc3Descriptor = true;
 							} else if (descriptorTag === 0x7a || descriptorTag === 0xcc) {
 								hasEac3Descriptor = true;
@@ -502,7 +550,7 @@ export class MpegTsDemuxer extends Demuxer {
 						}
 
 						if (info) {
-							this.elementaryStreams.push({
+							streams.push({
 								demuxer: this,
 								pid: elementaryPid,
 								streamType,
@@ -515,7 +563,22 @@ export class MpegTsDemuxer extends Demuxer {
 						}
 					}
 
-					hasProgramMap = true;
+					seenProgramMapPids.add(section.pid);
+
+					if (!isScrambledProgram && streams.some(stream => !scrambledPids.has(stream.pid))) {
+						this.elementaryStreams.push(...streams);
+						hasProgramMap = true;
+					} else {
+						fallbackProgram ??= { pmtPos: currentPos, streams };
+
+						if (
+							hasProgramAssociationTable
+							&& [...programMapPids].every(pid => seenProgramMapPids.has(pid))
+						) {
+							// We've seen all programs, so there's no better one to find
+							useFallbackProgram();
+						}
+					}
 				} else {
 					const elementaryStream = this.elementaryStreams.find(x => x.pid === section.pid);
 					outer:
