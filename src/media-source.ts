@@ -1692,6 +1692,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		let errored = false;
 		let lastSampleTimestamp: number | null = null;
 		let timestampOffset = 0;
+		let lastAddedTimestamp: number | null = null; // Capture timestamp of the last frame handed to the encoder
 
 		const tick = () => {
 			assert(frameRate !== null);
@@ -1792,12 +1793,21 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 
 			lastSampleTimestamp = currentTimestamp;
 
+			if (lastAddedTimestamp !== null && currentTimestamp <= lastAddedTimestamp) {
+				// Capture timestamps don't always increase (see https://crbug.com/618407). A frame stamped no later
+				// than the one before it would break the order of the packets: a key frame from before the previous
+				// GOP is rejected by the muxer, which fails the whole recording. So drop it.
+				videoFrame.close();
+				return;
+			}
+
 			if (this._encoder.getQueueSize() >= 8) {
 				// Drop frames if the encoder is overloaded
 				videoFrame.close();
 				return;
 			}
 
+			lastAddedTimestamp = currentTimestamp;
 			const sample = new VideoSample(videoFrame, {
 				timestamp: currentTimestamp + timestampOffset,
 			});
