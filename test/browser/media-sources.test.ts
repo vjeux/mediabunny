@@ -63,11 +63,13 @@ test('AudioSampleSource, the encoder priming measurement skips empty decoder out
 		output.addAudioTrack(source);
 		await output.start();
 
+		// Stereo at 24 kHz, which no other test encodes, as the measurement only runs for the first encoder of a
+		// configuration on the page
 		using sample = new AudioSample({
-			data: new Float32Array(960),
+			data: new Float32Array(2 * 480),
 			format: 'f32',
-			numberOfChannels: 1,
-			sampleRate: 48000,
+			numberOfChannels: 2,
+			sampleRate: 24000,
 			timestamp: 0,
 		});
 		await source.add(sample);
