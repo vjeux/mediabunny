@@ -1450,11 +1450,7 @@ sample3.aac
 	assert(audioTrack);
 
 	const sink = new EncodedPacketSink(audioTrack);
-	const firstPacket = await sink.getFirstPacket();
-	assert(firstPacket);
-
-	// Starting from the second packet, since the first one starts before the segment's playlist timestamp after rounding
-	let packet = await sink.getNextPacket(firstPacket);
+	let packet = await sink.getFirstPacket();
 	for (let i = 0; i < 20; i++) {
 		assert(packet);
 		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
@@ -1662,6 +1658,42 @@ test.concurrent('Packets can be looked up by their own timestamp when their trac
 	for (let packet = firstPacket; packet; packet = await sink.getNextPacket(packet)) {
 		expect((await sink.getPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
 		expect((await sink.getKeyPacket(packet.timestamp))?.timestamp).toBe(packet.timestamp);
+	}
+});
+
+test.concurrent('Packets before the first segment\'s playlist timestamp can be looked up', async () => {
+	// Like AAC priming in FFmpeg-made HLS: the audio starts 21 ms before the video, so before the first segment's
+	// playlist timestamp. Looked up on fresh inputs, video first and audio first, since a lookup used to work only
+	// once another one had learned the segments' timestamp offset.
+	const check = async (segmentFormat: MpegTsOutputFormat | CmafOutputFormat, audioFirst: boolean) => {
+		using input = await writeHlsFromPackets(
+			segmentFormat,
+			Array.from({ length: 60 }, (_, i) => ({
+				timestamp: i / 30,
+				duration: 1 / 30,
+				type: i % 30 === 0 ? 'key' as const : 'delta' as const,
+			})),
+			Array.from({ length: 90 }, (_, i) => ({ timestamp: -0.021 + i * 1024 / 48000, duration: 1024 / 48000 })),
+		);
+
+		const tracks = await input.getTracks();
+		const orderedTracks = audioFirst ? [...tracks].reverse() : tracks;
+		expect(orderedTracks[0]!.type).toBe(audioFirst ? 'audio' : 'video');
+
+		for (const track of orderedTracks) {
+			const sink = new EncodedPacketSink(track);
+			const firstPacket = await sink.getFirstPacket();
+			assert(firstPacket);
+			const firstTimestamp = await track.getFirstTimestamp();
+			expect(firstTimestamp).toBe(firstPacket.timestamp);
+			expect((await sink.getPacket(firstTimestamp))?.timestamp).toBe(firstTimestamp);
+			expect((await sink.getKeyPacket(firstTimestamp))?.timestamp).toBe(firstTimestamp);
+		}
+	};
+
+	for (const audioFirst of [false, true]) {
+		await check(new MpegTsOutputFormat(), audioFirst);
+		await check(new CmafOutputFormat(), audioFirst);
 	}
 });
 

@@ -497,6 +497,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		let currentSegment = await this.segmentedInput.getSegmentAt(timestamp, {
 			skipLiveWait: options.skipLiveWait,
 		});
+
+		// The media may start before the first segment's timestamp
+		currentSegment ??= await this.segmentedInput.getFirstSegment({});
+
 		if (!currentSegment) {
 			return null;
 		}
