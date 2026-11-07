@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
@@ -656,6 +656,31 @@ test('AudioSampleSource, resampled to 44100 Hz', async () => {
 	expect(await track.getSampleRate()).toBe(44100);
 	expect(await track.computeDuration()).toBe(1);
 	input.dispose();
+});
+
+test.each([
+	['s16', 'pcm-s16', Int16Array.from([16384, 20000, 32767, -32768, -16384, 1, -1, 0])],
+	['u8', 'pcm-u8', Uint8Array.from([0, 1, 64, 127, 128, 129, 192, 255])],
+] as const)('AudioSampleSource, PCM encoding of %s AudioData is lossless', async (format, codec, values) => {
+	// Like an app wrapping its own PCM data in AudioData
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const audioSource = new AudioSampleSource({ codec });
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	using sample = new AudioSample(new AudioData({
+		format,
+		sampleRate: 48000,
+		numberOfChannels: 1,
+		numberOfFrames: values.length,
+		timestamp: 0,
+		data: values,
+	}));
+	await audioSource.add(sample);
+	await output.finalize();
+
+	const data = output.target.buffer!.slice(44); // After the canonical 44-byte header
+	expect([...(format === 's16' ? new Int16Array(data) : new Uint8Array(data))]).toEqual([...values]);
 });
 
 test('AudioSampleSource, resampled stereo with non-zero start timestamp', async () => {
