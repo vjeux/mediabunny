@@ -759,6 +759,13 @@ test('AudioSampleSource, Opus starting before zero keeps its audio in WebM and M
 		const track = await input.getPrimaryAudioTrack();
 		assert(track);
 
+		const description = (await track.getDecoderConfig())?.description;
+		assert(description);
+		const header = ArrayBuffer.isView(description)
+			? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+			: new Uint8Array(description);
+		const preSkip = header[10]! | (header[11]! << 8); // OpusHead
+
 		let firstTimestamp: number | null = null;
 		let frames = 0;
 		for await (const sample of new AudioSampleSink(track).samples()) {
@@ -766,12 +773,53 @@ test('AudioSampleSource, Opus starting before zero keeps its audio in WebM and M
 			frames += sample.numberOfFrames;
 			sample.close();
 		}
-		return { firstTimestamp, frames };
+		return { firstTimestamp, frames, preSkip };
 	};
 
+	// Whether the platform's Opus decoder trims the pre-skip from its output, as Chromium's and Firefox's do. WebKit's
+	// (GStreamer) shifts its output by the pre-skip instead, so the decoded audio starts that much earlier there.
+	const decoderTrimsPreSkip = async () => {
+		const chunks: EncodedAudioChunk[] = [];
+		let decoderConfig: AudioDecoderConfig | undefined;
+		const encoder = new AudioEncoder({
+			output: (chunk, meta) => {
+				chunks.push(chunk);
+				decoderConfig ??= meta?.decoderConfig;
+			},
+			error: (error) => {
+				throw error;
+			},
+		});
+		encoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+		const data = new Float32Array(4800);
+		encoder.encode(new AudioData({
+			format: 'f32', sampleRate: 48000, numberOfChannels: 1, numberOfFrames: 4800, timestamp: 0, data,
+		}));
+		await encoder.flush();
+		encoder.close();
+
+		let firstFrames = 0;
+		const decoder = new AudioDecoder({
+			output: (audioData) => {
+				firstFrames ||= audioData.numberOfFrames;
+				audioData.close();
+			},
+			error: (error) => {
+				throw error;
+			},
+		});
+		decoder.configure(decoderConfig ?? { codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+		decoder.decode(chunks[0]!);
+		await decoder.flush();
+		decoder.close();
+
+		return firstFrames < 960; // A 20 ms packet
+	};
+	const trimsPreSkip = await decoderTrimsPreSkip();
+
 	for (const format of [new WebMOutputFormat(), new MkvOutputFormat()]) {
-		const { firstTimestamp, frames } = await decode(await encode(format));
-		expect(firstTimestamp).toBeCloseTo(-0.5, 2);
+		const { firstTimestamp, frames, preSkip } = await decode(await encode(format));
+		expect(firstTimestamp).toBeCloseTo(-0.5 - (trimsPreSkip ? 0 : preSkip / 48000), 2);
 		expect(frames).toBeGreaterThanOrEqual(48000);
 	}
 });
