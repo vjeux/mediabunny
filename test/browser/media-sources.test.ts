@@ -674,7 +674,56 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 	input.dispose();
 });
 
-test('AudioSampleSource, Opus encoding of 16 kHz audio keeps its timing', async () => {
+let opusTimestampsFollowAudioResult: Promise<boolean> | null = null;
+
+/**
+ * Whether the platform's Opus encoder stamps its chunks along the audio, checked with WebCodecs alone. WebKitGTK's
+ * gives every chunk the timestamp of the audio data it came from (and its decoder shifts by the pre-skip instead of
+ * trimming it), so the timing of encoded Opus can't be checked there.
+ */
+const opusTimestampsFollowAudio = () => opusTimestampsFollowAudioResult ??= (async () => {
+	const config: AudioEncoderConfig = { codec: 'opus', sampleRate: 16000, numberOfChannels: 1, bitrate: 32_000 };
+
+	try {
+		if (!(await AudioEncoder.isConfigSupported(config)).supported) {
+			return false;
+		}
+
+		const timestamps: number[] = [];
+		const encoder = new AudioEncoder({
+			output: (chunk) => {
+				timestamps.push(chunk.timestamp);
+			},
+			error: () => {},
+		});
+		encoder.configure(config);
+		const data = new AudioData({
+			format: 'f32',
+			sampleRate: 16000,
+			numberOfChannels: 1,
+			numberOfFrames: 8000,
+			timestamp: 0,
+			data: new Float32Array(8000),
+		});
+		encoder.encode(data);
+		data.close();
+		await encoder.flush();
+		encoder.close();
+
+		// Half a second of audio comes out as about 25 chunks of 20 ms
+		return timestamps.length > 1
+			&& timestamps.every((timestamp, i) => i === 0 || timestamp > timestamps[i - 1]!)
+			&& timestamps[timestamps.length - 1]! >= 300_000;
+	} catch {
+		return false;
+	}
+})();
+
+test('AudioSampleSource, Opus encoding of 16 kHz audio keeps its timing', async ({ skip }) => {
+	if (!await opusTimestampsFollowAudio()) {
+		skip('The platform\'s Opus encoder doesn\'t stamp its chunks along the audio');
+	}
+
 	const sampleRate = 16000;
 	const data = new Float32Array(sampleRate);
 	for (let i = 0; i < data.length; i++) {
