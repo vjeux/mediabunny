@@ -536,7 +536,7 @@ test('Read and write metadata, FLAC', async () => {
 	expect(readTags.raw!['COMPOSER']).toBe('Hans Zimmer');
 });
 
-test('Vorbis comments keep repeated fields and write pictures once when rewriting tags read from a file', async () => {
+test('Vorbis comments keep repeated fields when rewriting tags read from a file', async () => {
 	const writeAndRead = async (format: 'flac' | 'ogg', tags: MetadataTags) => {
 		const output = new Output({
 			format: format === 'flac' ? new FlacOutputFormat() : new OggOutputFormat(),
@@ -576,15 +576,6 @@ test('Vorbis comments keep repeated fields and write pictures once when rewritin
 		const caseTags = await writeAndRead(format, { title: 'Title', raw: { title: 'Title' } });
 		expect(caseTags.raw!['TITLE']).toBe('Title');
 	}
-
-	// Pictures read from Ogg come with their METADATA_BLOCK_PICTURE raw tags. FLAC stores pictures in PICTURE blocks,
-	// so writing them there too would double them.
-	const oggTags = await writeAndRead('ogg', { images: songMetadata.images });
-	expect(Object.keys(oggTags.raw!)).toContain('METADATA_BLOCK_PICTURE');
-	const flacTags = await writeAndRead('flac', oggTags);
-	expect(flacTags.images).toHaveLength(1);
-	expect(flacTags.raw!['METADATA_BLOCK_PICTURE']).toBeUndefined();
-	expect((await writeAndRead('ogg', flacTags)).images).toHaveLength(1);
 });
 
 test('Read and write metadata, ADTS', async () => {

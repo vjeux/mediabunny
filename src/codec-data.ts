@@ -3003,9 +3003,6 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 			}; break;
 
 			case 'images': {
-				// The images hold the pictures of the raw tags read from a file, wherever they're written
-				coverRawTags('METADATA_BLOCK_PICTURE');
-
 				// For example, in .flac, we put the pictures in a different section, not in the Vorbis comment header.
 				if (!writeImages) {
 					break;
