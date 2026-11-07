@@ -1140,6 +1140,7 @@ test('Leave out raw ID3v2.3 date frames that contradict the written date, MP3', 
 	for (const frames of [
 		[textFrame('TYER', '2021'), textFrame('TDAT', '2304')], // As `ffmpeg -id3v2_version 3` writes a whole date
 		[textFrame('TYER', '2021')], // A year alone
+		[textFrame('TYER', '2021'), textFrame('TDAT', '2304'), textFrame('TIME', '1530')],
 		[textFrame('TDAT', '2304'), textFrame('TYER', '2021')],
 	]) {
 		const body = frames.flat();
