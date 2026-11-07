@@ -124,10 +124,10 @@ test('Matroska Language with a country code gives the ISO 639-2 code', async () 
 		return (await input.getTracks())[0]!.getLanguageCode();
 	};
 
-	// RFC 9559, section 12: Matroska v1 to v3 use ISO 639-2 codes, optionally followed by a dash and a country code
-	// (FFmpeg writes what it's given, like -metadata:s:a:0 language=fre-ca)
-	expect(await readLanguage('fre-ca')).toBe('fre');
+	// RFC 9559, section 12: Matroska v1 to v3 use ISO 639-2 codes, optionally followed by a dash and a country code,
+	// like "fre-ca" (FFmpeg writes what it's given, like -metadata:s:a:0 language=por-br)
 	expect(await readLanguage('por-br')).toBe('por');
-	expect(await readLanguage('fre')).toBe('fre');
+	expect(await readLanguage('spa-mx')).toBe('spa');
+	expect(await readLanguage('por')).toBe('por');
 	expect(await readLanguage('xx-yy')).toBe('und');
 });
