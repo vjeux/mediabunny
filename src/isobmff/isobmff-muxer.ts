@@ -949,6 +949,7 @@ export class IsobmffMuxer extends Muxer {
 
 				inlineTimestampRegex.lastIndex = 0;
 				const containsTimestamp = inlineTimestampRegex.test(cue.text);
+				const isFirstSampleOfCue = !trackData.cueToSourceId.has(cue);
 
 				const endTimestamp = cue.timestamp + cue.duration;
 				let sourceId = trackData.cueToSourceId.get(cue);
@@ -959,8 +960,8 @@ export class IsobmffMuxer extends Muxer {
 					trackData.cueToSourceId.set(cue, sourceId);
 				}
 
-				if (cue.notes) {
-					// Any notes/comments are included in a special vtta box
+				if (cue.notes && isFirstSampleOfCue) {
+					// Any notes/comments are included in a special vtta box, once, before the cue's first sample
 					const box = vtta(cue.notes);
 					this.auxBoxWriter.writeBox(box);
 				}
