@@ -2438,6 +2438,16 @@ describe('Audio', async () => {
 		expect(sampleCount).toBeGreaterThan(0);
 	};
 
+	test('Vorbis is not claimed past eight channels', () => {
+		// Encoding would succeed, but with every channel past the eighth silent
+		expect(NodeAvAudioEncoder.supports('vorbis', {
+			codec: 'vorbis',
+			numberOfChannels: 10,
+			sampleRate: 48000,
+			bitrate: 640000,
+		})).toBe(false);
+	});
+
 	test('Custom AudioSample resource', async () => {
 		using input = new Input({
 			source: new FilePathSource('./test/public/trim-buck-bunny-ffmpeg.ts'),
@@ -2472,6 +2482,37 @@ describe('Audio', async () => {
 		sample.copyTo(buf, { planeIndex: 5 });
 		sample.copyTo(buf, { format: 'f32', planeIndex: 0 });
 	});
+
+	test('AvFrameAudioSampleResource with more than 8 planar channels', () => {
+		const frame = createPlanarAudioFrame(10, 64);
+		const planes = frame.extendedData;
+		assert(planes);
+		planes.forEach((plane, i) => plane.fill(i));
+
+		using sample = new AudioSample(new AvFrameAudioSampleResource(frame));
+		const lastPlane = new Uint8Array(sample.allocationSize({ planeIndex: 9 }));
+		sample.copyTo(lastPlane, { planeIndex: 9 });
+
+		expect([...new Set(lastPlane)]).toEqual([9]);
+	});
+
+	const createPlanarAudioFrame = (numberOfChannels: number, numberOfFrames: number) => {
+		const frame = new NodeAv.Frame();
+		frame.alloc();
+		frame.format = NodeAv.AV_SAMPLE_FMT_FLTP;
+		frame.nbSamples = numberOfFrames;
+		frame.sampleRate = 44100;
+		frame.channelLayout = {
+			nbChannels: numberOfChannels,
+			order: NodeAv.AV_CHANNEL_ORDER_UNSPEC,
+			mask: 0n,
+		};
+
+		const ret = frame.allocBuffer();
+		NodeAv.FFmpegError.throwIfError(ret, 'allocBuffer');
+
+		return frame;
+	};
 
 	test('toAvFrame with f32 AudioSample', async () => {
 		const sampleRate = 48000;
@@ -2540,5 +2581,30 @@ describe('Audio', async () => {
 		const u8 = toUint8Array(frame.data[0]!);
 		const plane = new Float32Array(u8.buffer, u8.byteOffset, largeData.length);
 		expect(plane[plane.length - 1]).toBe(0.25);
+	});
+
+	test('toAvFrame with more than 8 planar channels', async () => {
+		const numberOfChannels = 10;
+		const planeSize = 64 * Float32Array.BYTES_PER_ELEMENT;
+		const data = new Uint8Array(numberOfChannels * planeSize);
+		for (let i = 0; i < numberOfChannels; i++) {
+			data.fill(i, i * planeSize, (i + 1) * planeSize);
+		}
+
+		using sample = new AudioSample({
+			data,
+			format: 'f32-planar',
+			numberOfChannels,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+
+		using frame = new NodeAv.Frame();
+		frame.alloc();
+		await toAvFrame(sample, frame);
+
+		const planes = frame.extendedData;
+		assert(planes);
+		expect(planes.map(plane => [...new Set(plane)])).toEqual([[0], [1], [2], [3], [4], [5], [6], [7], [8], [9]]);
 	});
 });
