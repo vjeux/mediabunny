@@ -986,3 +986,59 @@ test('MPEG-TS finds frames that come before a run of B-frames longer than the re
 		expect(await track.computeDuration() - start).toBeCloseTo(frameCount / 25);
 	}
 });
+
+test('MPEG-TS lookups find field pictures behind long runs of B-fields', async () => {
+	// From L25's and L80's reviews, like FFmpeg's spatial_direct_mode_is_not_implemented.ts sample: interlaced H.264
+	// (frame_mbs_only_flag 0, a reorder depth of 4 frames) whose fields come in PES packets of their own, each anchor
+	// field pair followed in decode order by 14 B-fields shown before it. The SPS and PPS are that sample's.
+	const sps = [0x67, 0x64, 0x00, 0x28, 0xac, 0x72, 0x94, 0x07, 0x80, 0x44, 0x7d, 0xe0, 0x2d, 0x40, 0x40, 0x40, 0x7c,
+		0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xca, 0x50];
+	const pps = [0x68, 0xfa, 0x42, 0x5c, 0x30];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+
+	// Fields at 50 per second: an I field pair, then groups of 16 fields in decode order: the anchor pair, then B-field
+	// pairs in hierarchical order
+	const fieldNumbers = [0, 1];
+	for (let group = 0; group < 3; group++) {
+		const base = 2 + 16 * group;
+		fieldNumbers.push(...[14, 15, 6, 7, 2, 3, 0, 1, 4, 5, 10, 11, 8, 9, 12, 13].map(x => base + x));
+	}
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 50 });
+	await output.start();
+	for (let i = 0; i < fieldNumbers.length; i++) {
+		const sliceData = Array.from({ length: 300 }, (_, j) => 0x20 + (7 * j + i) % 0x60);
+		const slice = nalUnit([i < 2 ? 0x65 : 0x41, 0x88, ...sliceData]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(i === 0 ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				i < 2 ? 'key' : 'delta',
+				fieldNumbers[i]! / 50,
+				1 / 50,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1088 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	expect(packets.map(x => Math.round(x.timestamp * 50))).toEqual(fieldNumbers);
+
+	// A cold lookup at each field's timestamp finds that field
+	for (const packet of packets) {
+		using coldInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const coldTrack = await coldInput.getPrimaryVideoTrack();
+		assert(coldTrack);
+		const found = await new EncodedPacketSink(coldTrack).getPacket(packet.timestamp);
+		expect(found?.timestamp).toBe(packet.timestamp);
+	}
+});

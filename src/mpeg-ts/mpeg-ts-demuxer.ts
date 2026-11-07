@@ -143,6 +143,8 @@ type ElementaryStream = {
 		 * (num_reorder_frames, sps_max_num_reorder_pics)
 		 */
 		reorderFrameCount: number;
+		/** Whether frames can be coded as two field pictures, which can come as packets of their own (AVC) */
+		hasFieldPictures: boolean;
 	} | {
 		type: 'audio';
 		codec: AudioCodec;
@@ -469,6 +471,7 @@ export class MpegTsDemuxer extends Demuxer {
 									squarePixelHeight: -1,
 									reorderSize: -1,
 									reorderFrameCount: -1,
+									hasFieldPictures: false,
 								};
 							}; break;
 
@@ -661,6 +664,7 @@ export class MpegTsDemuxer extends Demuxer {
 									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
 									// Without bitstream_restriction_flag, inferred as MaxDpbFrames
 									elementaryStream.info.reorderFrameCount = spsInfo.numReorderFrames;
+									elementaryStream.info.hasFieldPictures = !spsInfo.frameMbsOnlyFlag;
 
 									break;
 								} else if (elementaryStream.info.codec === 'hevc') {
@@ -1323,6 +1327,8 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	abstract allPacketsAreKeyPackets(): boolean;
 	abstract getReorderSize(): number;
 	abstract getReorderFrameCount(): number;
+	/** How many packets a frame can take: two for video whose fields can come as packets of their own */
+	abstract getPacketsPerFrame(): number;
 
 	createEncodedPacket(
 		suppliedPacket: SuppliedPacket,
@@ -1689,7 +1695,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			const rewindByOnePesPacket = async () => {
 				let pos = windowStart.sectionStartPos - demuxer.packetStride;
 
-				while (pos >= demuxer.packetOffset) {
+				while (pos >= firstPesPacketHeader.sectionStartPos) {
 					const packetHeader = await demuxer.readPacketHeader(pos);
 					if (!packetHeader) {
 						return false;
@@ -1710,7 +1716,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					pos -= demuxer.packetStride;
 				}
 
-				return false; // We've hit the start of the file, there's nothing more to rewind
+				return false; // We've hit the start of the track, there's nothing more to rewind
 			};
 
 			for (let i = 0; i < reorderSize + 1; i++) {
@@ -1735,7 +1741,8 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				&& (retrieval.nextPts === null || retrieval.nextPts - retrieval.pts > retrieval.minInterval)
 			) {
 				let rewound = false;
-				for (let i = 0; i < MAX_CONSECUTIVE_B_FRAMES; i++) {
+				const maxCount = this.getPacketsPerFrame() * MAX_CONSECUTIVE_B_FRAMES;
+				for (let i = 0; i < maxCount; i++) {
 					if (
 						lookupWindowIsComplete(visitedPts, searchPts, reorderFrameCount)
 						|| !await rewindByOnePesPacket()
@@ -1984,11 +1991,17 @@ class MpegTsVideoTrackBacking extends MpegTsTrackBacking implements InputVideoTr
 	}
 
 	override getReorderSize(): number {
-		return this.elementaryStream.info.reorderSize;
+		return this.elementaryStream.info.reorderSize * this.getPacketsPerFrame();
 	}
 
 	override getReorderFrameCount(): number {
-		return this.elementaryStream.info.reorderFrameCount;
+		// A field can come before both fields of each of these frames, and its own second field
+		const count = this.elementaryStream.info.reorderFrameCount;
+		return count >= 0 && this.getPacketsPerFrame() === 2 ? 2 * count + 1 : count;
+	}
+
+	override getPacketsPerFrame(): number {
+		return this.elementaryStream.info.hasFieldPictures ? 2 : 1;
 	}
 }
 
@@ -2026,6 +2039,10 @@ class MpegTsAudioTrackBacking extends MpegTsTrackBacking implements InputAudioTr
 
 	override getReorderFrameCount(): number {
 		return 0;
+	}
+
+	override getPacketsPerFrame(): number {
+		return 1;
 	}
 }
 
