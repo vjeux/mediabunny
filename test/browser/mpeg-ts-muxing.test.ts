@@ -10,6 +10,7 @@ import { Quality } from '../../src/encode.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { assert } from '../../src/misc.js';
 import { Conversion } from '../../src/conversion.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 test('MPEG-TS output format', async () => {
 	const format = new MpegTsOutputFormat();
@@ -802,3 +803,45 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 		}).toEqual(expectedPacket);
 	}
 };
+
+test('MPEG-TS muxing with B-frames keeps DTS at or before PTS', async () => {
+	// Decode timestamps were the sorted presentation timestamps as is, so every B-frame was decoded after it was due
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// Two GOPs in decode order, presentation times given in frames
+	const frames = [0, 3, 1, 2, 6, 4, 5, 7, 10, 8, 9];
+	for (let i = 0; i < frames.length; i++) {
+		const isKey = i === 0 || i === 7;
+		const data = new Uint8Array([0, 0, 0, 1, isKey ? 0x65 : 0x41, 0x88]);
+		await source.add(new EncodedPacket(data, isKey ? 'key' : 'delta', frames[i]! / 30, 1 / 30), {
+			decoderConfig: { codec: 'avc1.42001f', codedWidth: 16, codedHeight: 16 },
+		});
+	}
+
+	await output.finalize();
+
+	// The PTS and DTS of the video PES packets (negative ones are written modulo 2^33)
+	const bytes = new Uint8Array(output.target.buffer!);
+	const readTimestamp = (pos: number) => {
+		const value = ((bytes[pos]! >> 1) & 0x07) * 2 ** 30 + (bytes[pos + 1]! << 22) + ((bytes[pos + 2]! >> 1) << 15)
+			+ (bytes[pos + 3]! << 7) + (bytes[pos + 4]! >> 1);
+		return value >= 2 ** 32 ? value - 2 ** 33 : value;
+	};
+	const timestamps: { pts: number; dts: number }[] = [];
+	for (let pos = 0; pos < bytes.length; pos += 188) {
+		if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && bytes[pos + 1]! & 0x40) {
+			const headerPos = pos + 4 + (bytes[pos + 3]! & 0x20 ? 1 + bytes[pos + 4]! : 0);
+			timestamps.push({ pts: readTimestamp(headerPos + 9), dts: readTimestamp(headerPos + 14) });
+		}
+	}
+
+	expect(timestamps.map(x => x.pts)).toEqual(frames.map(x => 3000 * x));
+	expect(timestamps.map(x => x.dts)).toEqual([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(x => 3000 * x));
+});
