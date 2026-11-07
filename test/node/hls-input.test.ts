@@ -2,6 +2,7 @@
 import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
+import { InputDisposedError } from '../../src/input.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
 import { CustomPathedSource, FilePathSource } from '../../src/source.js';
 import { createAes128CbcDecryptStream } from '../../src/aes.js';
@@ -1187,6 +1188,46 @@ test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with buffer keys'
 	const lastPacket = await sink.getPacket(Infinity);
 	assert(lastPacket);
 	expect(lastPacket.timestamp + lastPacket.duration).toBe(60);
+});
+
+test.concurrent('HLS metadata reads after dispose() throw InputDisposedError', async () => {
+	// "all future read operations will fail [...] Disallowed and canceled operations will throw an InputDisposedError"
+	// (Input.dispose). Packet reads already do.
+	const mediaPlaylist = '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n';
+	const multivariantPlaylist = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64000d,mp4a.40.2"\nmedia.m3u8\n';
+
+	const openInput = (rootPlaylist: string) => new Input({
+		source: new CustomPathedSource('index.m3u8', ({ path }) => path.endsWith('.ts')
+			? new FilePathSource('./test/public/0.ts')
+			: new BufferSource(new TextEncoder().encode(path === 'index.m3u8' ? rootPlaylist : mediaPlaylist))),
+		formats: HLS_FORMATS,
+	});
+
+	const check = async (rootPlaylist: string) => {
+		const input = openInput(rootPlaylist);
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		input.dispose();
+
+		await expect(new EncodedPacketSink(videoTrack).getFirstPacket()).rejects.toBeInstanceOf(InputDisposedError);
+		await expect(videoTrack.getDurationFromMetadata()).rejects.toBeInstanceOf(InputDisposedError);
+		await expect(input.getDurationFromMetadata()).rejects.toBeInstanceOf(InputDisposedError);
+	};
+
+	await check(mediaPlaylist);
+	await check(multivariantPlaylist);
+
+	// Durations computed from the packets of a variant whose tracks were only listed, which used to never settle
+	const input = openInput(multivariantPlaylist);
+	const tracks = await input.getTracks();
+	input.dispose();
+
+	const settle = (promise: Promise<unknown>) => Promise.race([promise, rejectAfter(2000, 'Did not settle')]);
+	await expect(settle(input.getFirstTimestamp())).rejects.toBeInstanceOf(InputDisposedError);
+	for (const track of tracks) {
+		await expect(settle(track.computeDuration())).rejects.toBeInstanceOf(InputDisposedError);
+	}
+	await expect(settle(input.computeDuration())).rejects.toBeInstanceOf(InputDisposedError);
 });
 
 test.concurrent('Widevine HLS passes #EXT-X-KEY PSSH boxes to key resolver', async () => {
