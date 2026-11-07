@@ -10,7 +10,7 @@ import { BufferTarget, NullTarget } from '../../src/target.js';
 import { CmafOutputFormat, Mp4OutputFormat, WebMOutputFormat, MovOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, TextSubtitleSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { IsobmffMuxer } from '../../src/isobmff/isobmff-muxer.js';
 
@@ -1227,4 +1227,16 @@ test('esds ES_Descriptor is written with ES_ID 0', async () => {
 	}
 	pos++;
 	expect((bytes[pos]! << 8) | bytes[pos + 1]!).toBe(0);
+});
+
+test('MOV reports that it takes no subtitle tracks', () => {
+	const format = new MovOutputFormat();
+	expect(format.getSupportedSubtitleCodecs()).toEqual([]);
+	expect(format.getSupportedTrackCounts().subtitle).toEqual({ min: 0, max: 0 });
+	expect(new Mp4OutputFormat().getSupportedTrackCounts().subtitle.max).toBeGreaterThan(0);
+
+	const output = new Output({ format, target: new BufferTarget() });
+	expect(() => output.addSubtitleTrack(new TextSubtitleSource('webvtt'))).toThrow(
+		'MOV does not support subtitle tracks.',
+	);
 });
