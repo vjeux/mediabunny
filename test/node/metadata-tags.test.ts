@@ -644,6 +644,36 @@ test('Conversion metadata tags, fields removed by the tags function stay removed
 	expect(id3Flac.title).toBeUndefined();
 	expect(id3Flac.album).toBe('Samples files');
 
+	// An ID3v2.3-style date split into the year (TYER) and the day and month (TDAT)
+	const output = new Output({ format: new WavOutputFormat({ metadataFormat: 'id3' }), target: new BufferTarget() });
+	output.setMetadataTags({ title: 'Title', raw: { TYER: '2021', TDAT: '2304' } });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(4096), 'key', 0, 1024 / 44100), {
+		decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+	});
+	await output.finalize();
+
+	using dateInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const dateOutput = new Output({
+		format: new WavOutputFormat({ metadataFormat: 'id3' }),
+		target: new BufferTarget(),
+	});
+	const dateConversion = await Conversion.init({
+		input: dateInput,
+		output: dateOutput,
+		showWarnings: false,
+		tags: inputTags => ({ ...inputTags, date: undefined }),
+	});
+	await dateConversion.execute();
+	using dateResult = new Input({ source: new BufferSource(dateOutput.target.buffer!), formats: ALL_FORMATS });
+	const withoutDate = await dateResult.getMetadataTags();
+	expect(withoutDate.title).toBe('Title');
+	expect(withoutDate.date).toBeUndefined();
+	expect(withoutDate.raw!['TYER']).toBeUndefined();
+	expect(withoutDate.raw!['TDAT']).toBeUndefined();
+
 	// Vorbis comments with the track total both in TRACKNUMBER and in TRACKTOTAL
 	using flacInput = new Input({ source: new BufferSource(flac), formats: ALL_FORMATS });
 	const flacOutput = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });

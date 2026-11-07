@@ -376,7 +376,7 @@ export const unwatchMetadataTagFields = (tags: MetadataTags) => {
 		}
 	}
 
-	if (watch.rawKey === null || !tags.raw) {
+	if (watch.rawKey === null) {
 		return;
 	}
 
@@ -388,7 +388,15 @@ export const unwatchMetadataTagFields = (tags: MetadataTags) => {
 		const value = tags[field];
 		return value !== undefined && !(Array.isArray(value) && value.length === 0);
 	});
-	if (fields.length === 0) {
+	recordRawMetadataTagFields(tags, watch.rawKey, fields);
+};
+
+/**
+ * Records that the raw tag with the given key was read into the given fields. For readers that set a field after
+ * reading its raw tags, out of reach of the watch.
+ */
+export const recordRawMetadataTagFields = (tags: MetadataTags, rawKey: string, fields: (keyof MetadataTags)[]) => {
+	if (!tags.raw || fields.length === 0) {
 		return;
 	}
 
@@ -398,10 +406,10 @@ export const unwatchMetadataTagFields = (tags: MetadataTags) => {
 		rawMetadataTagFields.set(tags.raw, fieldsByRawKey);
 	}
 
-	let recorded = fieldsByRawKey.get(watch.rawKey);
+	let recorded = fieldsByRawKey.get(rawKey);
 	if (!recorded) {
 		recorded = new Set();
-		fieldsByRawKey.set(watch.rawKey, recorded);
+		fieldsByRawKey.set(rawKey, recorded);
 	}
 
 	for (const field of fields) {
