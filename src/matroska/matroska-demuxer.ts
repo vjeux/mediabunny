@@ -1854,6 +1854,7 @@ export class MatroskaDemuxer extends Demuxer {
 				// TagLanguage and TagDefault decide which of several values with the same name wins, but they may come
 				// after the value, so let's read them first
 				let language: string | null = null;
+				let languageBcp47: string | null = null;
 				let isDefault = true;
 				const children = slice.slice(dataStartPos, size);
 				while (children.remainingLength >= MIN_HEADER_SIZE) {
@@ -1863,13 +1864,16 @@ export class MatroskaDemuxer extends Demuxer {
 					}
 
 					const childEnd = children.filePos + childHeader.size;
-					if (childHeader.id === EBMLId.TagLanguage || childHeader.id === EBMLId.TagLanguageBCP47) {
+					if (childHeader.id === EBMLId.TagLanguage) {
 						language = readUnicodeString(children, childHeader.size);
+					} else if (childHeader.id === EBMLId.TagLanguageBCP47) {
+						languageBcp47 = readUnicodeString(children, childHeader.size);
 					} else if (childHeader.id === EBMLId.TagDefault) {
 						isDefault = childHeader.size === 0 || readBytes(children, childHeader.size).some(x => x !== 0);
 					}
 					children.filePos = childEnd;
 				}
+				language = languageBcp47 ?? language; // When TagLanguageBCP47 is there, TagLanguage MUST be ignored
 				this.currentSimpleTagLanguage = language && language !== 'und' ? language : null;
 				this.currentSimpleTagIsDefault = isDefault;
 

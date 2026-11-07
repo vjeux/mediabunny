@@ -127,6 +127,13 @@ test('Of several SimpleTags with the same name, the default one wins', async () 
 				simpleTag('TITLE', tagString('Title')),
 				// The only value, in another language (given after the value)
 				simpleTag('ALBUM', tagString('Album'), tagLanguage('fre')),
+				// TagLanguageBCP47 takes precedence over TagLanguage
+				simpleTag(
+					'COMMENT',
+					element(EBMLId.TagLanguageBCP47, utf8('de')),
+					tagLanguage('fre'),
+					tagString('Kommentar'),
+				),
 			)),
 		),
 	]);
@@ -146,5 +153,7 @@ test('Of several SimpleTags with the same name, the default one wins', async () 
 		'TITLE': 'Title',
 		'ALBUM': 'Album',
 		'ALBUM-fre': 'Album',
+		'COMMENT-de': 'Kommentar',
 	});
+	expect(tags.raw!['COMMENT-fre']).toBe(undefined);
 });
