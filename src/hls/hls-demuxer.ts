@@ -17,7 +17,15 @@ import {
 import { PacketRetrievalOptions } from '../media-sink';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { TrackType } from '../output';
-import { arrayArgmin, assert, joinPaths, MaybePromise, TransformationMatrix, UNDETERMINED_LANGUAGE } from '../misc';
+import {
+	arrayArgmin,
+	assert,
+	bcp47ToIso639Dash2LanguageCode,
+	joinPaths,
+	MaybePromise,
+	TransformationMatrix,
+	UNDETERMINED_LANGUAGE,
+} from '../misc';
 import { EncodedPacket } from '../packet';
 import { readAllLines } from '../reader';
 import {
@@ -1031,14 +1039,8 @@ const preprocessLanguageCode = (code: string | null) => {
 		return UNDETERMINED_LANGUAGE;
 	}
 
-	const languageSubtag = code.split('-')[0];
-	if (!languageSubtag) {
-		return UNDETERMINED_LANGUAGE;
-	}
-
-	// Technically invalid, for now: The language subtag might be a language code from ISO 639-1,
-	// ISO 639-2, ISO 639-3, ISO 639-5 or some other thing (source: Wikipedia). But, `languageCode` is
-	// documented as ISO 639-2. Changing the definition would be a breaking change. This will get
-	// cleaned up in the future by defining languageCode to be BCP 47 instead.
-	return languageSubtag;
+	// `languageCode` is documented as ISO 639-2, while LANGUAGE is a BCP 47 tag (RFC 8216, 4.3.4.1), which uses the
+	// two-letter ISO 639-1 codes where they exist: "en", not "eng". (This will get cleaned up in the future by
+	// defining languageCode to be BCP 47 instead.)
+	return bcp47ToIso639Dash2LanguageCode(code);
 };
