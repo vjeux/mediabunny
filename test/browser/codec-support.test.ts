@@ -4,7 +4,14 @@ import { extractAv1CodecInfoFromPacket, extractVp9CodecInfoFromPacket, parseAvcS
 import { canDecodeAudio, canDecodeVideo } from '../../src/decode.js';
 import { canEncodeAudio, canEncodeVideo, Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { AV1_FIXTURES, AVC_SPS_FIXTURES, hexToBytes, VP9_FIXTURES } from '../node/helpers/codecs-fixtures.js';
+import {
+	AV1_FIXTURES,
+	AVC_SPS_FIXTURES,
+	FLAC_DESCRIPTION,
+	hexToBytes,
+	VORBIS_DESCRIPTION,
+	VP9_FIXTURES,
+} from '../node/helpers/codecs-fixtures.js';
 
 type VideoTrackInfo = Parameters<typeof extractVideoCodecString>[0];
 
@@ -99,9 +106,17 @@ describe('Codec strings in the browser', () => {
 			expect(await canDecodeVideo(codec), codec).toBe(await isDecodable(codecString, 1280, 720));
 		}
 
-		// Vorbis and FLAC need a description, which is made up for the query
-		for (const codec of ['vorbis', 'flac'] as const) {
-			expect(await canDecodeAudio(codec), codec).toBe(true);
+		// Vorbis and FLAC need a description, which the queries make up. What the browser says for a real one decides
+		// what they must answer.
+		const realDescriptions = [['vorbis', VORBIS_DESCRIPTION], ['flac', FLAC_DESCRIPTION]] as const;
+		for (const [codec, description] of realDescriptions) {
+			const support = await AudioDecoder.isConfigSupported({
+				codec,
+				numberOfChannels: 2,
+				sampleRate: 48000,
+				description,
+			});
+			expect(await canDecodeAudio(codec), codec).toBe(!!support.supported);
 		}
 
 		// Where the browser encodes AVC at all, the query says so, but not for odd dimensions, which AVC encoders need
