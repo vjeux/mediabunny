@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +925,113 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS reads AAC declared as private data without descriptors, as FFmpeg\'s m2ts mode writes it', async () => {
+	// Made with FFmpeg 8.0.3, which writes the AAC as stream_type 0x06 without any descriptor in .m2ts files:
+	// ffmpeg -f lavfi -i testsrc2=size=160x120:rate=25:duration=1
+	//   -f lavfi -i sine=frequency=440:sample_rate=48000:duration=1
+	//   -c:v libx264 -preset ultrafast -c:a aac -b:a 32k aac-private-data.m2ts
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/aac-private-data.m2ts')),
+		formats: ALL_FORMATS,
+	});
+
+	expect(await input.getVideoTracks()).toHaveLength(1);
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('aac');
+	expect(await track.getSampleRate()).toBe(48000);
+	expect(await track.getNumberOfChannels()).toBe(1);
+
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		expect(packet.byteLength).toBeGreaterThan(0);
+		count++;
+	}
+	expect(count).toBe(48); // As ffprobe counts
+});
+
+test('MPEG-TS tells the audio codec of a private data stream without descriptors from its payload', async () => {
+	// 30 AAC frames (48 kHz stereo) with stub payloads
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 30; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(100).fill(0x11), 'key', i * 1024 / 48000, 1024 / 48000),
+			i === 0
+				? {
+						decoderConfig: {
+							codec: 'mp4a.40.2',
+							numberOfChannels: 2,
+							sampleRate: 48000,
+							description: new Uint8Array([0x11, 0x90]),
+						},
+					}
+				: undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const crc32 = (data: Uint8Array) => {
+		let crc = 0xffffffff;
+		for (const byte of data) {
+			crc ^= byte << 24;
+			for (let k = 0; k < 8; k++) {
+				crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
+			}
+		}
+		return crc >>> 0;
+	};
+
+	// Turns the PMT's stream_type for the AAC (0x0f) into private data (0x06), like FFmpeg's m2ts mode writes it
+	const declareAsPrivateData = (data: Uint8Array) => {
+		const copy = data.slice();
+		for (let pos = 0; pos < copy.length; pos += 188) {
+			const section = copy.subarray(pos + 5 + copy[pos + 4]!); // After the pointer field
+			if (!(copy[pos + 1]! & 0x40) || section[0] !== 0x02) {
+				continue;
+			}
+
+			const sectionLength = ((section[1]! & 0x0f) << 8) | section[2]!;
+			const programInfoLength = ((section[10]! & 0x0f) << 8) | section[11]!;
+			const streamTypePos = 12 + programInfoLength;
+			expect(section[streamTypePos]).toBe(0x0f);
+			section[streamTypePos] = 0x06;
+			const crcPos = 3 + sectionLength - 4;
+			new DataView(section.buffer, section.byteOffset).setUint32(crcPos, crc32(section.subarray(0, crcPos)));
+		}
+		return copy;
+	};
+
+	const readAudio = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		if (!track) {
+			return { codec: null, count: 0 };
+		}
+
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			count += packet.byteLength > 0 ? 1 : 0;
+		}
+		return { codec: await track.getCodec(), count };
+	};
+
+	expect(await readAudio(bytes)).toEqual({ codec: 'aac', count: 30 });
+	const privateData = declareAsPrivateData(bytes);
+	expect(await readAudio(privateData)).toEqual({ codec: 'aac', count: 30 });
+
+	// A payload that isn't audio we know leaves the stream out, as before
+	for (let pos = 0; pos < privateData.length; pos += 188) {
+		const pesStart = pos + 4 + (privateData[pos + 3]! & 0x20 ? 1 + privateData[pos + 4]! : 0);
+		if (privateData[pos + 1]! & 0x40 && privateData[pesStart + 3] === 0xc0) {
+			privateData[pesStart + 9 + privateData[pesStart + 8]!] = 0x00; // The first frame's sync word
+			break;
+		}
+	}
+	expect(await readAudio(privateData)).toEqual({ codec: null, count: 0 });
 });
