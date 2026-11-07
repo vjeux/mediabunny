@@ -140,6 +140,8 @@ type InternalTrack = {
 	languageCode: string;
 	sampleTableByteOffset: number | null; // null when the track's sample table is another file (ominous ik 👀)
 	sampleTable: SampleTable | null;
+	/** The encryption info of each sample description (stsd entry), which can each have their own key ID */
+	encryptionInfos: (TrackEncryptionInfo | null)[];
 	fragmentLookupTable: FragmentLookupTableEntry[];
 	currentFragmentState: FragmentTrackState | null;
 	/**
@@ -161,6 +163,11 @@ type InternalTrack = {
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
+	/**
+	 * Whether each sample description (stsd entry) is an encrypted one. A track may also have clear ones, which
+	 * clear lead samples use (Shaka Packager, for example).
+	 */
+	encryptedSampleDescriptions: boolean[];
 	/** In bits per second, from the btrt box if present. */
 	maxBitrate: number | null;
 	avgBitrate: number | null;
@@ -276,6 +283,9 @@ type FragmentTrackData = {
 	startTimestampIsFinal: boolean;
 	trunSampleCounts: number[];
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
+	/** Whether the samples use an encrypted sample description */
+	isEncrypted: boolean;
+	sampleDescriptionIndex: number;
 };
 
 type FragmentTrackSample = {
@@ -362,6 +372,8 @@ export class IsobmffDemuxer extends Demuxer {
 	fragmentSummaries = new Map<number, FragmentSummary>(); // Keyed by moof offset
 
 	decryptionKeyCache = new Map<string, Promise<Uint8Array>>();
+	/** Whether the file has CENC sample groups ('seig'), which can mark samples as unprotected */
+	hasEncryptionSampleGroups = false;
 	boxNestingDepth = 0;
 
 	constructor(input: Input) {
@@ -553,6 +565,7 @@ export class IsobmffDemuxer extends Demuxer {
 				languageCode: foreignTrack.languageCode,
 				sampleTableByteOffset: null,
 				sampleTable: null,
+				encryptionInfos: foreignTrack.encryptionInfos,
 				fragmentLookupTable: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
@@ -561,6 +574,7 @@ export class IsobmffDemuxer extends Demuxer {
 				encryptionInfo: foreignTrack.encryptionInfo,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
+				encryptedSampleDescriptions: foreignTrack.encryptedSampleDescriptions,
 				maxBitrate: foreignTrack.maxBitrate,
 				avgBitrate: foreignTrack.avgBitrate,
 				info: foreignTrack.info,
@@ -1034,6 +1048,7 @@ export class IsobmffDemuxer extends Demuxer {
 					languageCode: UNDETERMINED_LANGUAGE,
 					sampleTableByteOffset: -1,
 					sampleTable: null,
+					encryptionInfos: [],
 					fragmentLookupTable: [],
 					currentFragmentState: null,
 					fragmentPositionCache: [],
@@ -1042,6 +1057,7 @@ export class IsobmffDemuxer extends Demuxer {
 					encryptionInfo: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
+					encryptedSampleDescriptions: [],
 					maxBitrate: null,
 					avgBitrate: null,
 				} satisfies InternalTrack as InternalTrack;
@@ -1267,8 +1283,14 @@ export class IsobmffDemuxer extends Demuxer {
 						break;
 					}
 
+					// Each sample description can have its own encryption info (sinf), with its own key ID. The
+					// track's is the last one's, as before.
+					const previousEncryptionInfo = track.encryptionInfo;
+					track.encryptionInfo = null;
+
 					track.internalCodecId = sampleBoxInfo.name;
 					const lowercaseBoxName = sampleBoxInfo.name.toLowerCase();
+					track.encryptedSampleDescriptions.push(lowercaseBoxName === 'encv' || lowercaseBoxName === 'enca');
 
 					if (track.info.type === 'video') {
 						slice.skip(6 * 1 + 2 + 2 + 2 + 3 * 4);
@@ -1499,6 +1521,9 @@ export class IsobmffDemuxer extends Demuxer {
 							Logging._warn(`Unsupported audio codec (sample entry type '${sampleBoxInfo.name}').`);
 						}
 					}
+
+					track.encryptionInfos.push(track.encryptionInfo);
+					track.encryptionInfo ??= previousEncryptionInfo;
 
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
 				}
@@ -2605,6 +2630,11 @@ export class IsobmffDemuxer extends Demuxer {
 						startTimestampIsFinal: false,
 						trunSampleCounts: [],
 						encryptionAuxInfo: null,
+						isEncrypted: sampleDescriptionIsEncrypted(
+							track,
+							track.currentFragmentState.sampleDescriptionIndex ?? 1,
+						),
+						sampleDescriptionIndex: track.currentFragmentState.sampleDescriptionIndex ?? 1,
 					};
 					this.currentFragment.trackData.set(track.id, trackData);
 				}
@@ -3103,6 +3133,21 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 				}
 			}; break;
+
+			default: {
+				// Sample groups (sbgp, sgpd) aren't read, but whether there are CENC ones ('seig'), which can mark
+				// samples as unprotected, matters for samples without encryption info
+				if (
+					(boxInfo.name === 'sbgp' || boxInfo.name === 'sgpd')
+					&& this.currentTrack?.encryptionInfo
+					&& boxInfo.contentSize >= 8
+				) {
+					slice.skip(4); // Version + flags
+					if (readAscii(slice, 4) === 'seig') {
+						this.hasEncryptionSampleGroups = true;
+					}
+				}
+			};
 		}
 
 		slice.filePos = boxEndPos;
@@ -3459,6 +3504,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				sampleEncryption ??= getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
 				if (sampleEncryption) {
 					data = await decryptSample(this.internalTrack, sampleEncryption, data, null);
+				} else {
+					assertUnprotectedSample(
+						this.internalTrack,
+						getSampleDescriptionEncryptionInfo(this.internalTrack, sampleInfo.sampleDescriptionIndex)!,
+						sampleDescriptionIsEncrypted(this.internalTrack, sampleInfo.sampleDescriptionIndex),
+					);
 				}
 			}
 		}
@@ -3509,6 +3560,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					?? getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
 				if (sampleEncryption) {
 					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment);
+				} else {
+					assertUnprotectedSample(
+						this.internalTrack,
+						getSampleDescriptionEncryptionInfo(this.internalTrack, trackData.sampleDescriptionIndex)!,
+						trackData.isEncrypted,
+					);
 				}
 			}
 		}
@@ -3915,6 +3972,7 @@ type SampleInfo = {
 	sampleSize: number;
 	chunkOffset: number;
 	isKeyFrame: boolean;
+	sampleDescriptionIndex: number;
 };
 
 const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInfo | null => {
@@ -3976,7 +4034,13 @@ const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInf
 		isKeyFrame: sampleTable.keySampleIndices
 			? binarySearchExact(sampleTable.keySampleIndices, sampleIndex, x => x) !== -1
 			: true,
+		sampleDescriptionIndex: chunkEntry.sampleDescriptionIndex,
 	};
+};
+
+/** `index` is 1-based. The encryption info of that sample description, or else the track's. */
+const getSampleDescriptionEncryptionInfo = (track: InternalTrack, index: number) => {
+	return track.encryptionInfos[index - 1] ?? track.encryptionInfo;
 };
 
 const performPresentationTimeLookup = (
@@ -4154,6 +4218,11 @@ const capEntryCounts = (entries: { startIndex: number; count: number }[], sample
 	}
 };
 
+/** `index` is 1-based. Descriptions of a track that we couldn't classify count as encrypted. */
+const sampleDescriptionIsEncrypted = (track: InternalTrack, index: number) => {
+	return track.encryptionInfo !== null && track.encryptedSampleDescriptions[index - 1] !== false;
+};
+
 const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
 	if (track.currentFragmentState) {
 		return track.currentFragmentState.encryptionAuxInfo ??= {
@@ -4325,6 +4394,28 @@ const decryptSample = async (
 		return decryptCtr(keyBytes, encryptionInfo, sampleEncryption, data);
 	} else {
 		return decryptCbcs(keyBytes, encryptionInfo, sampleEncryption, data);
+	}
+};
+
+/**
+ * For a sample of an encrypted track without encryption info (no senc, saiz/saio or constant IV), throws if it's
+ * protected, since its IV is lost, rather than letting the ciphertext pass as media data. Samples of a clear sample
+ * description (clear lead), or that tenc or sample groups can make unprotected, are left alone.
+ */
+const assertUnprotectedSample = (
+	track: InternalTrack,
+	encryptionInfo: TrackEncryptionInfo,
+	usesEncryptedSampleDescription: boolean,
+) => {
+	if (
+		usesEncryptedSampleDescription
+		&& encryptionInfo.defaultIsProtected !== false
+		&& !track.demuxer.hasEncryptionSampleGroups
+	) {
+		throw new Error(
+			'Encrypted media samples have no encryption info (senc box, or saiz and saio boxes), so they can\'t be'
+			+ ' decrypted.',
+		);
 	}
 };
 
