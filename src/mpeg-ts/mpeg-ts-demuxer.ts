@@ -2862,6 +2862,16 @@ class PacketReadingContext {
 		const sequenceNumber = sectionStartPos + (this.currentPos - this.currentPesPacketPos);
 		const data = this.readBytes(packetLength);
 
+		if (hole !== undefined) {
+			// A video frame that lost data
+			if (this.dropsRestOfGop()) {
+				this.extendDroppedRange(sequenceNumber);
+			}
+
+			this.skipPacket();
+			return;
+		}
+
 		let randomAccessIndicator = currentPesPacket.randomAccessIndicator;
 
 		if (randomAccessIndicator === 0 && !this.elementaryStream.canBeTrustedWithKeyPackets) {
@@ -2882,37 +2892,9 @@ class PacketReadingContext {
 			}
 		}
 
-		if (this.elementaryStream.info.type === 'video' && hole !== undefined && !this.dropsRestOfGop()) {
-			this.skipPacket(); // Just this frame
-			return;
-		}
-
-		if (
-			this.elementaryStream.info.type === 'video'
-			&& (hole !== undefined || (this.droppedRange && randomAccessIndicator !== 1))
-		) {
-			// The frames after one that lost data can refer to it, and with WebCodecs, a frame whose reference is
-			// missing can make the decoder fail just like a damaged one. So drop every frame up to the next key frame,
-			// and remember that for the contexts that start in between.
-			const endSequenceNumber = this.getCurrentPesPacket().sectionStartPos
-				+ (this.currentPos - this.currentPesPacketPos);
-			if (this.droppedRange) {
-				this.droppedRange.end = Math.max(this.droppedRange.end, endSequenceNumber);
-			} else {
-				const ranges = this.elementaryStream.droppedRanges;
-				this.droppedRange = ranges.find(x => x.start <= sequenceNumber && sequenceNumber <= x.end) ?? null;
-				if (this.droppedRange) {
-					this.droppedRange.end = Math.max(this.droppedRange.end, endSequenceNumber);
-				} else {
-					this.droppedRange = { start: sequenceNumber, end: endSequenceNumber };
-					ranges.splice(
-						binarySearchLessOrEqual(ranges, sequenceNumber, x => x.start) + 1,
-						0,
-						this.droppedRange,
-					);
-				}
-			}
-
+		if (this.droppedRange && randomAccessIndicator !== 1) {
+			// Still dropping, up to the next key frame
+			this.extendDroppedRange(sequenceNumber);
 			this.skipPacket();
 			return;
 		}
@@ -2953,6 +2935,27 @@ class PacketReadingContext {
 		}
 
 		return stream.dropsRestOfGop;
+	}
+
+	/**
+	 * Drops the video packet that was just read (starting at the sequence number), as part of a stretch running up to
+	 * the next key frame: the frames after one that lost data can refer to it, and with WebCodecs, a frame whose
+	 * reference is missing can make the decoder fail just like a damaged one. The stretch is recorded so that contexts
+	 * starting inside it (lookups) drop the same packets.
+	 */
+	extendDroppedRange(sequenceNumber: number) {
+		const endSequenceNumber = this.getCurrentPesPacket().sectionStartPos
+			+ (this.currentPos - this.currentPesPacketPos);
+		if (!this.droppedRange) {
+			const ranges = this.elementaryStream.droppedRanges;
+			this.droppedRange = ranges.find(x => x.start <= sequenceNumber && sequenceNumber <= x.end) ?? null;
+			if (!this.droppedRange) {
+				this.droppedRange = { start: sequenceNumber, end: endSequenceNumber };
+				ranges.splice(binarySearchLessOrEqual(ranges, sequenceNumber, x => x.start) + 1, 0, this.droppedRange);
+			}
+		}
+
+		this.droppedRange.end = Math.max(this.droppedRange.end, endSequenceNumber);
 	}
 
 	/** Moves on from a packet that is left out. */
