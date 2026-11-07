@@ -981,7 +981,8 @@ export const esds = (trackData: IsobmffAudioTrackData) => {
 			objectTypeIndication = 0x40;
 		}; break;
 		case 'mp3': {
-			objectTypeIndication = 0x6b;
+			// MPEG-1 audio only goes from 32 kHz up; the lower rates are MPEG-2 (and MPEG-2.5) audio, ISO/IEC 13818-3
+			objectTypeIndication = trackData.info.sampleRate < 32000 ? 0x69 : 0x6b;
 		}; break;
 		case 'vorbis': {
 			objectTypeIndication = 0xdd;
