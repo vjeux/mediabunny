@@ -212,7 +212,8 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 test('Opus gets an identification header as CodecPrivate, with the CodecDelay as its pre-skip', async () => {
 	// The Matroska Opus mapping requires the OpusHead in CodecPrivate (packets remuxed from MPEG-TS, say, come without
-	// one), and a CodecDelay equal to its pre-skip, which holds the negative start (in 48 kHz samples)
+	// one), and a CodecDelay equal to its pre-skip: the samples a decoder drops at the start. Any other start is left
+	// to the block timestamps.
 	type Options = { configBeforeStart?: boolean; description?: Uint8Array };
 	const muxAndRead = async (firstTimestamp: number, { configBeforeStart, description }: Options) => {
 		const decoderConfig = { codec: 'opus', numberOfChannels: 2, sampleRate: 44100, description };
@@ -263,16 +264,15 @@ test('Opus gets an identification header as CodecPrivate, with the CodecDelay as
 		expect(Math.abs(result.firstTimestamp - firstTimestamp)).toBeLessThan(0.0015);
 	};
 
+	// Nothing says to drop samples, so a generated header has a pre-skip of 0, and a negative start stays negative
 	await check(0, 0);
-	await check(-0.0065, 312);
-	await check(-0.0065, 312, { configBeforeStart: true }); // The decoder config is known before the first packet
-	// The pre-skip can't hold more than 65535 samples; the rest of a longer delay stays in the block timestamps
-	await check(-2, 65535);
+	await check(-0.0065, 0);
+	await check(-0.0065, 0, { configBeforeStart: true }); // The decoder config is known before the first packet
+	await check(-2, 0);
 
-	// A given header keeps its pre-skip, which only grows to cover an earlier start (in a copy of the header)
+	// A given header keeps its pre-skip, whatever the start
 	const description = new Uint8Array(opusHead(312));
 	await check(0.1, 312, { description });
 	await check(-0.0065, 312, { description });
-	await check(-0.1, 4800, { description });
-	expect([...description]).toEqual(opusHead(312));
+	await check(-0.1, 312, { description });
 });

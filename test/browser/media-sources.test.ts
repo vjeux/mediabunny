@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
@@ -8,7 +8,7 @@ import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -731,3 +731,47 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test('AudioSampleSource, Opus starting before zero keeps its audio in WebM and Matroska', async () => {
+	// The pre-skip only covers the encoder's priming; the audio before zero must come back when decoded
+	const encode = async (format: WebMOutputFormat | MkvOutputFormat) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', bitrate: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+		for (let i = 0; i < 10; i++) {
+			const sample = new AudioSample({
+				data: new Float32Array(4800).map((_, j) => 0.1 * Math.sin(j / 10)), // 0.1 s
+				format: 'f32',
+				numberOfChannels: 1,
+				sampleRate: 48000,
+				timestamp: -0.5 + 0.1 * i,
+			});
+			await source.add(sample);
+			sample.close();
+		}
+		await output.finalize();
+		return output.target.buffer!;
+	};
+
+	const decode = async (buffer: ArrayBuffer) => {
+		using input = new Input({ source: new BufferSource(buffer), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		let firstTimestamp: number | null = null;
+		let frames = 0;
+		for await (const sample of new AudioSampleSink(track).samples()) {
+			firstTimestamp ??= sample.timestamp;
+			frames += sample.numberOfFrames;
+			sample.close();
+		}
+		return { firstTimestamp, frames };
+	};
+
+	for (const format of [new WebMOutputFormat(), new MkvOutputFormat()]) {
+		const { firstTimestamp, frames } = await decode(await encode(format));
+		expect(firstTimestamp).toBeCloseTo(-0.5, 2);
+		expect(frames).toBeGreaterThanOrEqual(48000);
+	}
+});
