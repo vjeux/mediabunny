@@ -444,7 +444,9 @@ describe('File type, movie and track headers', () => {
 		const vp9: TrackSpec = { kind: 'video', packets: videoPackets(3) };
 
 		let file = await mux([avc]);
-		expect(readFtyp(file.bytes, file.boxes[0]!)).toEqual({
+		const avcFtyp = readFtyp(file.bytes, file.boxes[0]!);
+		// AVC/HEVC may also list 'iso4', for the version 1 ctts their B-frames get
+		expect({ ...avcFtyp, compatibleBrands: avcFtyp.compatibleBrands.filter(x => x !== 'iso4') }).toEqual({
 			majorBrand: 'isom', minorVersion: 0x200, compatibleBrands: ['isom', 'avc1', 'mp41'],
 		});
 
