@@ -718,6 +718,28 @@ describe('Video', async () => {
 		await encode('vp9', 321, 241);
 	});
 
+	test('Converting to AVC with an odd-sized crop still rounds to even dimensions', async () => {
+		using input = new Input({ source: new FilePathSource('test/public/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			trim: { end: 0.2 },
+			audio: { discard: true },
+			video: { codec: 'avc', crop: { left: 3, top: 3, width: 641, height: 361 } },
+		});
+
+		// The frames are resized to 642x362 for AVC, so the odd crop size mustn't rule AVC out
+		expect(conversion.discardedTracks.filter(x => x.track.type === 'video').map(x => x.reason)).toEqual([]);
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getCodec()).toBe('avc');
+		expect([await track.getCodedWidth(), await track.getCodedHeight()]).toEqual([642, 362]);
+	});
+
 	test('Non-square pixels encode and decode #1', async () => {
 		await encodeDecodeTest('avc', { displayWidth: 2 * 1280, displayHeight: 720 }, async (packet, meta, i) => {
 			if (i === 0) {
