@@ -1,6 +1,8 @@
 import { expect, test } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
@@ -12,6 +14,7 @@ import { AudioSample } from '../../src/sample.js';
 import { PcmAudioCodec } from '../../src/codec.js';
 import { toUint8Array, uint8ArraysAreEqual } from '../../src/misc.js';
 import { fromAlaw, fromUlaw, toAlaw, toUlaw } from '../../src/pcm.js';
+import { Conversion, ConversionAudioOptions } from '../../src/conversion.js';
 
 // All of these span the full value range of their format
 const u8Data = Uint8Array.from({ length: 256 }, (_, i) => i);
@@ -282,3 +285,39 @@ const expectG711FileRoundtrip = async (codec: 'ulaw' | 'alaw', decodeCodeword: (
 	expect(frameOffset).toBe(data.length);
 	expect(decoded).toEqual(data);
 };
+
+const convertToWave = async (audio: ConversionAudioOptions) => {
+	using input = new Input({
+		source: new FilePathSource(
+			path.join(fileURLToPath(new URL('.', import.meta.url)), '../public/glitch-hop-is-dead.wav'),
+		),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, audio, trim: { end: 1 }, showWarnings: false });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await result.getPrimaryAudioTrack())!;
+	using sample = (await new AudioSampleSink(track).getSample(0.5))!;
+	const data = new Float32Array(sample.numberOfFrames);
+	sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+
+	return { codec: await track.getCodec(), data };
+};
+
+test.each([
+	['s32', 'pcm-s32'],
+	['f32', 'pcm-f32'],
+	['u8', 'pcm-u8'],
+] as const)('Conversion into WAVE with sampleFormat %s writes %s', async (sampleFormat, expectedCodec) => {
+	const result = await convertToWave({ sampleFormat });
+	expect(result.codec).toBe(expectedCodec);
+
+	const reference = await convertToWave({ forceTranscode: true });
+	expect(reference.codec).toBe('pcm-s16'); // The default without a sample format
+	if (sampleFormat !== 'u8') {
+		// The 16-bit source survives these exactly
+		expect(result.data).toEqual(reference.data);
+	}
+});
