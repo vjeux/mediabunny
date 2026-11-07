@@ -47,6 +47,7 @@ import {
 	concatNalUnitsInLengthPrefixed,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
+	extractNalUnitTypeForHevc,
 	HevcNalUnitType,
 	iterateNalUnitsInAnnexB,
 	parseOpusTocByte,
@@ -225,6 +226,11 @@ const withoutTrailingZeros = (nalUnit: Uint8Array) => {
 };
 
 const isSameNalUnit = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((byte, i) => byte === b[i]);
+
+const isHevcParameterSet = (nalUnit: Uint8Array) => {
+	const type = extractNalUnitTypeForHevc(nalUnit[0]!);
+	return type === HevcNalUnitType.VPS_NUT || type === HevcNalUnitType.SPS_NUT || type === HevcNalUnitType.PPS_NUT;
+};
 
 export class IsobmffMuxer extends Muxer {
 	format: IsobmffOutputFormat;
@@ -503,11 +509,7 @@ export class IsobmffMuxer extends Muxer {
 			decoderConfig.description = serializeHevcDecoderConfigurationRecord(decoderConfigurationRecord);
 			requiresAnnexBTransformation = true;
 			sampleEntryParameterSets = decoderConfigurationRecord.arrays
-				.filter(array => (
-					array.nalUnitType === HevcNalUnitType.VPS_NUT
-					|| array.nalUnitType === HevcNalUnitType.SPS_NUT
-					|| array.nalUnitType === HevcNalUnitType.PPS_NUT
-				))
+				.filter(array => array.nalUnits.length > 0 && isHevcParameterSet(array.nalUnits[0]!))
 				.flatMap(array => array.nalUnits.map(withoutTrailingZeros));
 		}
 
@@ -749,15 +751,25 @@ export class IsobmffMuxer extends Muxer {
 
 				// Parameter sets can appear in the middle of a stream and modify its parameters, so they're generally
 				// left in. But 'hvc1' declares that its sample entry holds every HEVC parameter set (with
-				// array_completeness), so in-band copies identical to those are dropped, as FFmpeg does. Ones that
-				// differ are kept.
+				// array_completeness), so in-band copies identical to those are dropped, as FFmpeg does, as long as the
+				// stream hasn't changed them. From the first one that differs on, all of them stay in-band: decoders
+				// keep the last parameter sets they parsed, so a later copy of the original ones isn't redundant.
 				const { sampleEntryParameterSets } = trackData.info;
 				if (sampleEntryParameterSets.length > 0) {
-					const remaining = nalUnits.filter(nalUnit => !sampleEntryParameterSets.some(
+					const isSampleEntryParameterSet = (nalUnit: Uint8Array) => sampleEntryParameterSets.some(
 						parameterSet => isSameNalUnit(parameterSet, withoutTrailingZeros(nalUnit)),
+					);
+					const changesParameterSets = nalUnits.some(nalUnit => (
+						isHevcParameterSet(nalUnit) && !isSampleEntryParameterSet(nalUnit)
 					));
-					if (remaining.length > 0) {
-						nalUnits = remaining;
+
+					if (changesParameterSets) {
+						trackData.info.sampleEntryParameterSets = [];
+					} else {
+						const remaining = nalUnits.filter(nalUnit => !isSampleEntryParameterSet(nalUnit));
+						if (remaining.length > 0) {
+							nalUnits = remaining;
+						}
 					}
 				}
 

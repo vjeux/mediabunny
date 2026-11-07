@@ -222,7 +222,7 @@ test('Non-zero start timestamp, fragmented MP4', async () => {
 	expect(durations).toEqual([0.1, 0.1, 0.1, 0.1]);
 });
 
-test('Annex B HEVC muxed as hvc1 keeps only parameter sets that differ from its sample entry\'s', async () => {
+test('Annex B HEVC muxed as hvc1 keeps parameter sets in-band only once the stream changes them', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/hevc.ts')),
 		formats: ALL_FORMATS,
@@ -247,11 +247,14 @@ test('Annex B HEVC muxed as hvc1 keeps only parameter sets that differ from its 
 	}
 	assert(keyPacket);
 
-	// Another key frame that repeats the VPS and PPS but changes the SPS
-	const data = keyPacket.data.slice();
-	const sps = [...iterateNalUnitsInAnnexB(data)].find(nalUnit => ((data[nalUnit.offset]! >> 1) & 0x3f) === 33)!;
-	data[sps.offset + 6] = data[sps.offset + 6] === 0xaa ? 0x55 : 0xaa;
-	await source.add(new EncodedPacket(data, 'key', end, keyPacket.duration), { decoderConfig });
+	// Another key frame that repeats the VPS and PPS but changes the SPS (same ID), then one with the original SPS
+	const changed = keyPacket.data.slice();
+	const sps = [...iterateNalUnitsInAnnexB(changed)].find(x => ((changed[x.offset]! >> 1) & 0x3f) === 33)!;
+	changed[sps.offset + 6] = changed[sps.offset + 6] === 0xaa ? 0x55 : 0xaa;
+	await source.add(new EncodedPacket(changed, 'key', end, keyPacket.duration), { decoderConfig });
+	await source.add(new EncodedPacket(keyPacket.data, 'key', end + keyPacket.duration, keyPacket.duration), {
+		decoderConfig,
+	});
 	await output.finalize();
 
 	const bytes = new Uint8Array(output.target.buffer!);
@@ -285,9 +288,12 @@ test('Annex B HEVC muxed as hvc1 keeps only parameter sets that differ from its 
 		nalUnitTypes.push(types);
 	}
 
-	// Copies identical to the sample entry's parameter sets are dropped (they used to stay), the changed SPS stays
+	// Copies identical to the sample entry's parameter sets are dropped (they used to stay)
 	expect(nalUnitTypes[0]).toEqual([35, 39, 20]);
-	expect(nalUnitTypes.at(-1)).toEqual([35, 33, 39, 20]);
+	// Once the SPS changed, all parameter sets stay in-band, including the switch back to the original SPS, which
+	// decoders would otherwise decode with the changed one
+	expect(nalUnitTypes.at(-2)).toEqual([35, 32, 33, 34, 39, 20]);
+	expect(nalUnitTypes.at(-1)).toEqual([35, 32, 33, 34, 39, 20]);
 });
 
 test('Negative start timestamps, regular MP4', async () => {
