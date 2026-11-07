@@ -192,6 +192,8 @@ export type ConversionVideoOptions = {
 	height?: number;
 	/**
 	 * The fitting algorithm in case both width and height are set, or if the input video changes its size over time.
+	 * Setting it without both width and height makes the video be transcoded so that it applies to size changes; when
+	 * width and height equal the input's size, the video may still be copied, keeping its size changes.
 	 *
 	 * - `'fill'` will stretch the image to fill the entire box, potentially altering aspect ratio.
 	 * - `'contain'` will contain the entire image within the box while preserving aspect ratio. This may lead to
@@ -1571,7 +1573,13 @@ export class Conversion {
 			// metadata after the output has already started. Should be possible with API changes in v2, though!
 			|| (totalRotation !== 0 && !canUseRotationMetadata)
 			|| (totalFlip && !canUseRotationMetadata)
-			|| !!crop;
+			|| !!crop
+			// Without both width and height, fit's only role is the handling of size changes over time, which only
+			// a transcode can apply
+			|| (
+				trackOptions.fit !== undefined
+				&& (trackOptions.width === undefined || trackOptions.height === undefined)
+			);
 
 		let copyStartPacket: EncodedPacket | null = null;
 
