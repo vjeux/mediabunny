@@ -8,7 +8,7 @@ import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -673,6 +673,90 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 	expect(await track.computeDuration()).toBe(2);
 	input.dispose();
 });
+
+// Whether this browser's Opus encoder keeps the end of its input in place when it's followed by 50 ms of silence, as
+// Mediabunny pads it. Decided with WebCodecs alone: a click 0.5 ms before the end of 1 s of 48 kHz audio must come back
+// at its time from an encode and decode (WebKitGTK's encoder gives every packet timestamp 0 and loses 13 ms)
+const opusEncoderKeepsPaddedEnd = await (async () => {
+	const sampleRate = 48000;
+	const encoderConfig = { codec: 'opus', numberOfChannels: 1, sampleRate, bitrate: 128_000 };
+	if (!(await AudioEncoder.isConfigSupported(encoderConfig)).supported) {
+		return false;
+	}
+
+	const chunks: EncodedAudioChunk[] = [];
+	let decoderConfig: AudioDecoderConfig | undefined;
+	const encoder = new AudioEncoder({
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			decoderConfig ??= meta?.decoderConfig;
+		},
+		error: () => {},
+	});
+	encoder.configure(encoderConfig);
+	const data = new Float32Array(sampleRate * 1.05);
+	data[sampleRate - 24] = 1;
+	const audioData = new AudioData({
+		data, format: 'f32', numberOfChannels: 1, numberOfFrames: data.length, sampleRate, timestamp: 0,
+	});
+	encoder.encode(audioData);
+	audioData.close();
+	await encoder.flush();
+	encoder.close();
+	if (!decoderConfig) {
+		return false;
+	}
+
+	let peak = 0;
+	let peakTime = -Infinity;
+	const decoder = new AudioDecoder({
+		output: (decoded) => {
+			const values = new Float32Array(decoded.numberOfFrames);
+			if (values.length > 0) {
+				decoded.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+			}
+			for (let i = 0; i < values.length; i++) {
+				if (Math.abs(values[i]!) > peak) {
+					peak = Math.abs(values[i]!);
+					peakTime = decoded.timestamp / 1e6 + i / decoded.sampleRate;
+				}
+			}
+			decoded.close();
+		},
+		error: () => {},
+	});
+	decoder.configure(decoderConfig);
+	chunks.forEach(chunk => decoder.decode(chunk));
+	await decoder.flush();
+	decoder.close();
+	return peak > 0.5 && Math.abs(peakTime - (sampleRate - 24) / sampleRate) < 0.005;
+})();
+
+test.skipIf(!opusEncoderKeepsPaddedEnd)(
+	'AudioSampleSource, Opus encoding of 44.1 kHz audio keeps its last milliseconds',
+	async () => {
+		// The encoder resamples to 48 kHz internally. A click 0.5 ms before the end of 1 s of audio must survive.
+		const sampleRate = 44100;
+		const data = new Float32Array(sampleRate);
+		data[sampleRate - 22] = 1;
+
+		const buffer = await encodeAudio(
+			{ codec: 'opus', quality: new Quality('high') },
+			new AudioSample({ data, format: 'f32', numberOfChannels: 1, sampleRate, timestamp: 0 }),
+		);
+
+		const { input, track } = await readBackAudioTrack(buffer);
+		let peak = 0;
+		for await (using sample of new AudioSampleSink(track).samples(0.9)) {
+			const values = new Float32Array(sample.numberOfFrames);
+			sample.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+			peak = Math.max(peak, ...values.map(Math.abs));
+		}
+
+		expect(peak).toBeGreaterThan(0.5);
+		input.dispose();
+	},
+);
 
 const makeSineWave = (
 	sampleRate: number,

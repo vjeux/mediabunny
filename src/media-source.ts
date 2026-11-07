@@ -2023,6 +2023,11 @@ export class EncodedAudioPacketSource extends AudioSource {
 
 export const PCM_ENCODER_PACKET_SIZE = 2048; // In frames
 
+// Silence fed to Opus encoders with non-48 kHz input before flushing them, and how far past the input's end a packet
+// may start and still be kept (to allow for the uncompensated delay of the encoder's resampler)
+const END_PADDING_DURATION = 0.05;
+const END_PADDING_SLACK = 0.01;
+
 class AudioEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
 	private encoderInitialized = false;
@@ -2046,6 +2051,16 @@ class AudioEncoderWrapper {
 	private customEncoderQueueSize = 0;
 
 	private lastEndSampleIndex: number | null = null;
+
+	// Tracks the audio passed to the WebCodecs encoder, needed for the padding at the end (see flushAndClose)
+	private lastAudioDataParams: {
+		format: AudioSampleFormat;
+		numberOfChannels: number;
+		sampleRate: number;
+	} | null = null;
+
+	private inputEndTimestamp = -Infinity;
+	private endPaddingAdded = false;
 
 	private resampler: AudioResampler | null = null;
 
@@ -2283,6 +2298,13 @@ class AudioEncoderWrapper {
 				this.encoder.encode(audioData);
 				audioData.close();
 
+				this.lastAudioDataParams = {
+					format: audioSample.format,
+					numberOfChannels: audioSample.numberOfChannels,
+					sampleRate: audioSample.sampleRate,
+				};
+				this.inputEndTimestamp = Math.max(this.inputEndTimestamp, audioSample.timestamp + audioSample.duration);
+
 				if (shouldClose) {
 					audioSample.close();
 				}
@@ -2504,6 +2526,11 @@ class AudioEncoderWrapper {
 							opusPreSkip = 0;
 						}
 
+						if (this.endPaddingAdded && packet.timestamp >= this.inputEndTimestamp + END_PADDING_SLACK) {
+							// Only holds the silence added at the end, see flushAndClose
+							return;
+						}
+
 						this.encodingConfig.onEncodedPacket?.(packet, meta);
 						this.lastMuxerPromise
 							= this.muxer!.addEncodedAudioPacket(this.source._connectedTrack!, packet, meta)
@@ -2644,6 +2671,35 @@ class AudioEncoderWrapper {
 
 				if (this.pcmScratchFrames > 0) {
 					await this.emitPcmScratchPacket();
+				}
+
+				if (
+					this.encoder?.state === 'configured'
+					&& this.encodingConfig.codec === 'opus'
+					&& this.lastAudioDataParams
+					&& this.lastAudioDataParams.sampleRate !== OPUS_SAMPLE_RATE
+				) {
+					// Opus encoders resample anything but 48 kHz internally, and Chrome's holds back the last few
+					// milliseconds of input at flush, so push them out with some silence. Packets holding nothing but
+					// that silence are dropped again.
+					const { format, numberOfChannels, sampleRate } = this.lastAudioDataParams;
+					const numberOfFrames = Math.ceil(END_PADDING_DURATION * sampleRate);
+					const data = new Uint8Array(getBytesPerSample(format) * numberOfFrames * numberOfChannels);
+					if (format === 'u8' || format === 'u8-planar') {
+						data.fill(2 ** 7); // Fill it with the silent value
+					}
+
+					const audioData = new AudioData({
+						data,
+						format,
+						numberOfChannels,
+						numberOfFrames,
+						sampleRate,
+						timestamp: Math.round(1e6 * this.inputEndTimestamp),
+					});
+					this.encoder.encode(audioData);
+					audioData.close();
+					this.endPaddingAdded = true;
 				}
 			}
 
