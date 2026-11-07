@@ -449,6 +449,11 @@ test('ArrayBuffer-backed samples accept the SharedArrayBuffer of shared WebAssem
 	const bytes = new Uint8Array(16);
 	await sample.copyTo(bytes);
 	expect(bytes).toEqual(pixels);
+
+	// Merely tagging an object as a SharedArrayBuffer doesn't make it one
+	const fake = { [Symbol.toStringTag]: 'SharedArrayBuffer', byteLength: 16 };
+	expect(() => new VideoSample(fake as never, { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 }))
+		.toThrow('Invalid data type');
 });
 
 test('drawWithFit with rotation, flip and crop', () => {

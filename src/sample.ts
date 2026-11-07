@@ -90,7 +90,17 @@ if (typeof FinalizationRegistry !== 'undefined') {
  * isolation, shared WebAssembly memory still is one.
  */
 const isSharedArrayBuffer = (value: unknown): value is SharedArrayBuffer => {
-	return Object.prototype.toString.call(value) === '[object SharedArrayBuffer]';
+	if (Object.prototype.toString.call(value) !== '[object SharedArrayBuffer]') {
+		return false;
+	}
+
+	try {
+		// The brand can be faked with Symbol.toStringTag, but only real buffers can back a DataView
+		new DataView(value as ArrayBufferLike, 0, 0);
+		return true;
+	} catch {
+		return false;
+	}
 };
 
 /**
