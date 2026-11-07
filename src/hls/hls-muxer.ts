@@ -1499,12 +1499,18 @@ export class HlsMuxer extends Muxer {
 				let peakDeclBitrate = 0;
 				let maxRefAverageBitrate = 0;
 
+				// The variant's own playlist can be the URI-less rendition of the group it references, in which case
+				// the group's renditions take the place of the variant's own media instead of adding to it
+				const ownPlaylistIsReferenced = decl.references.some(x => x.playlist === decl.playlist);
+
 				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
-					const firstTrack = firstRef.playlist.tracks[0]!;
-					const trackData = this.trackDatas.find(x => x.track === firstTrack);
-					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
-					codecs.push(toHlsCodecString(codecString));
+					if (!ownPlaylistIsReferenced) {
+						const firstRef = decl.references[0]!;
+						const firstTrack = firstRef.playlist.tracks[0]!;
+						const trackData = this.trackDatas.find(x => x.track === firstTrack);
+						const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
+						codecs.push(toHlsCodecString(codecString));
+					}
 
 					for (const ref of decl.references) {
 						assert(ref.playlist.peakBitrate !== null);
@@ -1514,8 +1520,10 @@ export class HlsMuxer extends Muxer {
 				}
 
 				assert(decl.playlist.peakBitrate !== null);
-				const totalPeakBitrate = decl.playlist.peakBitrate + peakDeclBitrate;
-				const totalAverageBitrate = (decl.playlist.averageBitrate ?? 0) + maxRefAverageBitrate;
+				const ownPeakBitrate = ownPlaylistIsReferenced ? 0 : decl.playlist.peakBitrate;
+				const ownAverageBitrate = ownPlaylistIsReferenced ? 0 : (decl.playlist.averageBitrate ?? 0);
+				const totalPeakBitrate = ownPeakBitrate + peakDeclBitrate;
+				const totalAverageBitrate = ownAverageBitrate + maxRefAverageBitrate;
 
 				if (!firstVariantWritten) {
 					masterPlaylistText += '\n';
