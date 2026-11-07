@@ -19,7 +19,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource, CustomPathedSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
-import { canEncodeAudio, getFirstEncodableAudioCodec, Quality } from '../../src/encode.js';
+import { getFirstEncodableAudioCodec, Quality } from '../../src/encode.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 
@@ -27,22 +27,53 @@ import { assert } from '../../src/misc.js';
 // decoding. AAC smears a click over a few samples but keeps its peak in place, so the peak's position tells whether
 // encoder delay (priming) and container timing were handled correctly.
 
+// A configuration the platform AAC encoders take (Media Foundation only accepts 96, 128, 160 and 192 kbps)
+const NATIVE_AAC_PROBE_CONFIG = {
+	codec: 'mp4a.40.2',
+	sampleRate: 48000,
+	numberOfChannels: 2,
+	bitrate: 128_000,
+} satisfies AudioEncoderConfig;
+
 // Must be checked before the extension is registered, so that it reflects the platform's own AudioEncoder (Media
-// Foundation on Windows, AudioToolbox on macOS; Chrome on Linux has none)
-const nativeAacEncoding = await canEncodeAudio('aac');
+// Foundation on Windows, AudioToolbox on macOS; Chrome on Linux has none). Asks the platform directly so that the skip
+// doesn't depend on Mediabunny's own support query.
+const nativeAacEncoding = await (async () => {
+	if (typeof AudioEncoder === 'undefined') {
+		return false;
+	}
+
+	try {
+		const support = await AudioEncoder.isConfigSupported(NATIVE_AAC_PROBE_CONFIG);
+		return support.supported === true;
+	} catch {
+		return false;
+	}
+})();
 
 // WebKitGTK's GStreamer AudioEncoder stamps every chunk with the timestamp of the input it came from, so there, the
 // encoded timing can't be right
 const nativeAacTimestampsAdvance = nativeAacEncoding && await (async () => {
 	const timestamps: number[] = [];
 	const encoder = new AudioEncoder({ output: chunk => timestamps.push(chunk.timestamp), error: () => {} });
-	encoder.configure({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 1, bitrate: 64000 });
-	encoder.encode(new AudioData({
-		format: 'f32-planar', sampleRate: 48000, numberOfChannels: 1, numberOfFrames: 4800, timestamp: 0,
-		data: new Float32Array(4800),
-	}));
-	await encoder.flush();
-	encoder.close();
+
+	try {
+		encoder.configure(NATIVE_AAC_PROBE_CONFIG);
+		const audioData = new AudioData({
+			format: 'f32-planar', sampleRate: 48000, numberOfChannels: 2, numberOfFrames: 4800, timestamp: 0,
+			data: new Float32Array(2 * 4800),
+		});
+		encoder.encode(audioData);
+		audioData.close();
+		await encoder.flush();
+	} catch {
+		return false;
+	} finally {
+		if (encoder.state !== 'closed') {
+			encoder.close();
+		}
+	}
+
 	return timestamps.length > 1 && new Set(timestamps).size === timestamps.length;
 })();
 
