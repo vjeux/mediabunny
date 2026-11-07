@@ -272,3 +272,117 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Missing tfdt and tfra with positive composition offsets', async () => {
+	// IPBB fragments with FFmpeg-style composition offsets, so each one is presented one frame past its decode end
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const moof = (dataOffset: number) => box('moof', box('traf',
+		box('tfhd', u32(0x020000), u32(1)), // Default base is moof
+		box('trun', u32(0x000801), u32(4), u32(dataOffset), u32(1), u32(3), u32(0), u32(0)),
+	));
+	const fragment = [...moof(moof(0).length + 8), ...box('mdat', zeros(4))];
+
+	const file = new Uint8Array([
+		...box('ftyp', ascii('isom'), u32(0), ascii('isom')),
+		...box('moov',
+			box('mvhd', zeros(12), u32(1), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(1), u32(0), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(1), box('vp08', zeros(24), [0, 64, 0, 64], zeros(50))),
+						box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+					)),
+				),
+			),
+			box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(1), u32(0))),
+		),
+		...fragment,
+		...fragment,
+		...fragment,
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sink = new EncodedPacketSink(track);
+	const timestamps: number[] = [];
+	for await (const packet of sink.packets()) {
+		timestamps.push(packet.timestamp);
+	}
+
+	expect(timestamps).toEqual([1, 4, 2, 3, 5, 8, 6, 7, 9, 12, 10, 11]);
+});
+
+test('Fragments without tfdt continue from the decode end of the fragment right before them', async () => {
+	// I0 P2 B1 I3 with one frame of composition delay, one sample per fragment, no tfdt. The third fragment (B1) is
+	// presented before the second one (P2), so the position cache, which only takes fragments in presentation
+	// order, doesn't hold the second one.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const frames = [{ pts: 0, key: true }, { pts: 2, key: false }, { pts: 1, key: false }, { pts: 3, key: true }];
+	const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(50),
+		box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+			box('edts', box('elst', zeros(4), u32(1), u32(160), u32(40), [0, 1, 0, 0])), // Media time 40: the delay
+			box('mdia',
+				box('mdhd', zeros(12), u32(1000), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', zeros(4), u32(1), avc1),
+					box('stts', zeros(8)),
+					box('stsc', zeros(8)),
+					box('stsz', zeros(12)),
+					box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', zeros(4), u32(1), u32(1), zeros(12))),
+	);
+	const fragments = frames.map((frame, i) => {
+		const flags = frame.key ? 0x02000000 : 0x01010000;
+		const moof = (dataOffset: number) => box('moof', box('mfhd', zeros(4), u32(i + 1)), box('traf',
+			box('tfhd', [0, 2, 0, 0], u32(1)), // Default base is moof
+			box('trun', [0, 0, 0x0f, 0x01], u32(1), u32(dataOffset), u32(40), u32(10), u32(flags),
+				u32((frame.pts + 1 - i) * 40)),
+		));
+		return [...moof(moof(0).length + 8), ...box('mdat', zeros(10))];
+	});
+	const ftyp = box('ftyp', ascii('iso6'), u32(0), ascii('iso6'));
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...ftyp, ...moov, ...fragments.flat()])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		timestamps.push(packet.timestamp);
+	}
+	expect(timestamps).toEqual([0, 0.08, 0.04, 0.12]);
+});
