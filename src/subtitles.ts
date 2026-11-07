@@ -80,7 +80,9 @@ export class SubtitleParser {
 			const endTime = parseSubtitleTimestamp(match[3]!);
 			const duration = endTime - startTime;
 
-			const body = text.slice(bodyStart, bodyEnd).trim();
+			// Lines holding only whitespace belong to the cue text too, as only an empty line ends a cue (W3C WebVTT
+			// parser); just drop the line break that ends the text
+			const body = text.slice(bodyStart, bodyEnd).replace(/\n+$/, '');
 
 			text = text.slice(bodyEnd).trimStart();
 			cueBlockHeaderRegex.lastIndex = 0;
