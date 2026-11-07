@@ -1128,6 +1128,48 @@ test('Conversion metadata tags, default case', async () => {
 	expect(readTags.images![0]!.data).toEqual(coverArt);
 });
 
+test('Vorbis comments keep repeated fields when rewriting tags read from a file', async () => {
+	const writeAndRead = async (format: 'flac' | 'ogg', tags: MetadataTags) => {
+		const output = new Output({
+			format: format === 'flac' ? new FlacOutputFormat() : new OggOutputFormat(),
+			target: new BufferTarget(),
+		});
+		output.setMetadataTags(tags);
+		const dummyTrack = createDummyAudioTrack(format === 'flac' ? 'flac' : 'opus', output);
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+
+	for (const format of ['flac', 'ogg'] as const) {
+		// Fields repeat, as for several artists (RFC 9639, appendix D.2.3), when written by MusicBrainz Picard or
+		// mutagen, for example
+		const tags = await writeAndRead(format, {
+			raw: { ARTIST: ['Artist A', 'Artist B'], GENRE: ['Jazz', 'Bebop'], TITLE: 'Title' },
+		});
+		expect(tags.artist).toBe('Artist A');
+		expect(tags.raw!['ARTIST']).toEqual(['Artist A', 'Artist B']);
+
+		// Writing the tags read, as a conversion does, keeps every value
+		const rewrittenTags = await writeAndRead(format, tags);
+		expect(rewrittenTags.artist).toBe('Artist A');
+		expect(rewrittenTags.raw!['ARTIST']).toEqual(['Artist A', 'Artist B']);
+		expect(rewrittenTags.raw!['GENRE']).toEqual(['Jazz', 'Bebop']);
+		expect(rewrittenTags.raw!['TITLE']).toBe('Title');
+
+		// A changed normalized tag replaces the field's values
+		const changedTags = await writeAndRead(format, { ...tags, artist: 'Someone Else' });
+		expect(changedTags.raw!['ARTIST']).toBe('Someone Else');
+
+		// Field names are case-insensitive, so a raw tag doesn't repeat the field of a normalized one
+		const caseTags = await writeAndRead(format, { title: 'Title', raw: { title: 'Title' } });
+		expect(caseTags.raw!['TITLE']).toBe('Title');
+	}
+});
+
 test('Conversion metadata tags, modified', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
