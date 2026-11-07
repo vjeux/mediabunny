@@ -33,7 +33,7 @@ test('Disposing after failed format detection does not emit an unhandled rejecti
 	expect(unhandledRejections).toEqual([]);
 });
 
-test('Input track-list methods reject values that are not InputTracks', async () => {
+test('Input track-list methods take read-only lists and reject values that are not InputTracks', async () => {
 	using input = new Input({ source: new BufferSource(readPublic('video.mp4')), formats: ALL_FORMATS });
 	const [videoTrack] = await input.getTracks();
 
@@ -47,6 +47,12 @@ test('Input track-list methods reject values that are not InputTracks', async ()
 
 	// Null entries, as returned by getPrimaryAudioTrack() on video-only files, stay allowed
 	expect(await input.computeDuration([videoTrack!, null as never])).toBe(5);
+
+	// The methods only read the list, so read-only lists type-check and work
+	const frozen = Object.freeze(await input.getTracks());
+	expect(await input.getFirstTimestamp(frozen)).toBe(await input.getFirstTimestamp());
+	expect(await input.computeDuration(frozen)).toBe(await input.computeDuration());
+	expect(await input.getDurationFromMetadata(frozen)).toBe(await input.getDurationFromMetadata());
 });
 
 test('Duration and packet stats options are validated like PacketRetrievalOptions', async () => {

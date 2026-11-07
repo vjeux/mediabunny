@@ -337,7 +337,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * Note that this method is potentially expensive for inputs with many tracks (such as HLS manifests), since it
 	 * probes every track.
 	 */
-	async getFirstTimestamp(tracks?: InputTrack[]) {
+	async getFirstTimestamp(tracks?: readonly InputTrack[]) {
 		tracks ??= await this.getTracks();
 		validateTrackList(tracks);
 
@@ -367,7 +367,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * ends. If you want to query the current duration of the media, set {@link PacketRetrievalOptions.skipLiveWait}
 	 * to `true` in the options.
 	 */
-	async computeDuration(tracks?: InputTrack[], options?: PacketRetrievalOptions) {
+	async computeDuration(tracks?: readonly InputTrack[], options?: PacketRetrievalOptions) {
 		if (options !== undefined) {
 			validatePacketRetrievalOptions(options);
 		}
@@ -396,7 +396,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * ends. If you want to query the current duration of the media, set
 	 * {@link DurationMetadataRequestOptions.skipLiveWait} to `true` in the options.
 	 */
-	async getDurationFromMetadata(tracks?: InputTrack[], options?: DurationMetadataRequestOptions) {
+	async getDurationFromMetadata(tracks?: readonly InputTrack[], options?: DurationMetadataRequestOptions) {
 		if (options !== undefined) {
 			validateDurationMetadataRequestOptions(options);
 		}
@@ -567,7 +567,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	}
 }
 
-const validateTrackList = (tracks: (InputTrack | null)[]) => {
+const validateTrackList = (tracks: readonly (InputTrack | null)[]) => {
 	if (!Array.isArray(tracks) || tracks.some(track => track !== null && !(track instanceof InputTrack))) {
 		throw new TypeError('tracks, when provided, must be an array of InputTrack.');
 	}
