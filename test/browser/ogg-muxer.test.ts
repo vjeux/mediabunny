@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { Output } from '../../src/output.js';
 import { OggOutputFormat } from '../../src/output-format.js';
 import { BufferTarget, NullTarget } from '../../src/target.js';
@@ -61,6 +61,42 @@ test('maximumPageDuration option', async () => {
 
 	expect(pageCountWithoutOption).toBe(3);
 	expect(pageCountWithOption).toBe(23); // It created more pages
+});
+
+test('Cover art is base64-encoded in bulk', async () => {
+	const image = new Uint8Array(2 ** 20).map((_, i) => (i * 2654435761) >>> 24);
+	image.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(source);
+	output.setMetadataTags({ images: [{ data: image, mimeType: 'image/png', kind: 'coverFront' }] });
+	await output.start();
+
+	// Building the base64 string one character at a time makes V8 keep a rope of a million cons strings, so an
+	// 8 MiB cover took about 600 MB of memory to mux
+	const fromCharCode = vi.spyOn(String, 'fromCharCode');
+	const decoderConfig = {
+		codec: 'opus',
+		numberOfChannels: 2,
+		sampleRate: 48000,
+		description: new Uint8Array([
+			0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0,
+		]),
+	};
+	for (let i = 0; i < 10; i++) {
+		await source.add(new EncodedPacket(new Uint8Array([0xfc, 0, 0]), 'key', i * 0.02, 0.02), { decoderConfig });
+	}
+	await output.finalize();
+	expect(fromCharCode.mock.calls.length).toBeLessThan(10_000);
+	fromCharCode.mockRestore();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const tags = await input.getMetadataTags();
+	const readImage = tags.images![0]!.data;
+	// Compared directly, as toEqual compares a million elements one by one
+	expect(readImage.length).toBe(image.length);
+	expect(readImage.every((byte, i) => byte === image[i])).toBe(true);
 });
 
 test('Multi-frame Opus packets', async () => {
