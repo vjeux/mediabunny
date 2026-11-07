@@ -12,7 +12,7 @@ import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { PacketRetrievalOptions } from '../media-sink';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
-import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
+import { assert, createUtcDate, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
@@ -291,8 +291,9 @@ export class WaveDemuxer extends Demuxer {
 
 				case 'YEAR': {
 					const year = Number.parseInt(value, 10);
-					if (Number.isInteger(year) && year > 0) {
-						this.metadataTags.date ??= new Date(year, 0, 1);
+					const date = createUtcDate(year);
+					if (year > 0 && !Number.isNaN(date.getTime())) {
+						this.metadataTags.date ??= date;
 					}
 				}; break;
 
