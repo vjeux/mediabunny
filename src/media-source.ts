@@ -514,13 +514,13 @@ class VideoEncoderWrapper {
 
 		try {
 			for (const sampleToEncode of samplesToEncode) {
-				if (this.closed) {
-					// The source got closed (or the output canceled) while we were awaiting, e.g. the process function,
-					// so don't create an encoder nothing would close anymore
-					break;
-				}
-
 				if (!this.encoderInitialized) {
+					if (this.closed) {
+						// The source got closed (or the output canceled) while we were awaiting, e.g. the process
+						// function, so don't create an encoder nothing would close anymore
+						break;
+					}
+
 					if (!this.ensureEncoderPromise) {
 						this.ensureEncoder(sampleToEncode);
 					}
@@ -2208,13 +2208,13 @@ class AudioEncoderWrapper {
 	 */
 	private async encodeSample(audioSample: AudioSample, shouldClose: boolean) {
 		try {
-			if (this.closed) {
-				// The source got closed (or the output canceled) while we were awaiting, e.g. the process function,
-				// so don't create an encoder nothing would close anymore
-				return;
-			}
-
 			if (!this.encoderInitialized) {
+				if (this.closed) {
+					// The source got closed (or the output canceled) while we were awaiting, e.g. the process
+					// function, so don't create an encoder nothing would close anymore
+					return;
+				}
+
 				if (!this.ensureEncoderPromise) {
 					this.ensureEncoder(audioSample);
 				}
