@@ -19,7 +19,7 @@ import {
 	InputVideoTrackBacking,
 } from './input-track';
 import { PacketRetrievalOptions } from './media-sink';
-import { arrayCount, assert, MaybePromise, roundIfAlmostInteger, roundToDivisor } from './misc';
+import { arrayCount, assert, MaybePromise, roundToDivisor } from './misc';
 import { EncodedPacket } from './packet';
 
 export type SegmentedInputMetadata = {
@@ -221,6 +221,17 @@ export abstract class SegmentedInput {
 		this.inputCache.length = 0;
 	}
 }
+
+/**
+ * The tick of the given time resolution at or before a timestamp. A timestamp within floating-point noise of a tick
+ * (a few ulps, as when it was computed along another path) counts as that tick. A looser tolerance, like
+ * roundIfAlmostInteger's, would also swallow real offsets of microseconds on Unix-epoch timelines.
+ */
+const getTickAtOrBefore = (timestamp: number, timeResolution: number) => {
+	const ticks = timestamp * timeResolution;
+	const rounded = Math.round(ticks);
+	return Math.abs(ticks - rounded) <= 4 * Number.EPSILON * Math.abs(ticks) ? rounded : Math.floor(ticks);
+};
 
 type PacketInfo = {
 	segment: Segment;
@@ -635,7 +646,7 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 			// Segments are muxed separately, so the end of one segment's media and the start of the next one's can
 			// overlap by a tick: the last packet's end and the next packet's start get rounded independently
-			const timestampTick = Math.floor(roundIfAlmostInteger(timestamp * timeResolution));
+			const timestampTick = getTickAtOrBefore(timestamp, timeResolution);
 			let mayLieInNextSegment = timestampTick >= Math.round(lastPacketEnd * timeResolution) - 1;
 
 			if (!mayLieInNextSegment) {
@@ -708,7 +719,7 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		// packet can be reported at `timestamp` while lying up to half a tick after `timestamp - mediaOffset`, so we
 		// look up the point halfway between the last tick at or before `timestamp` and the next one instead.
 		const timeResolution = await track.getTimeResolution();
-		const tick = Math.floor(roundIfAlmostInteger(timestamp * timeResolution));
+		const tick = getTickAtOrBefore(timestamp, timeResolution);
 		let packet = await getPacket((tick + 0.5) / timeResolution - mediaOffset);
 
 		// Compared in ticks, since the timestamp may be a reported timestamp computed along another path, off in its

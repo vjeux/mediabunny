@@ -1460,6 +1460,36 @@ sample3.aac
 	}
 });
 
+test.concurrent('Packet lookups don\'t return a packet that starts after the timestamp on Unix-epoch timelines', async () => {
+	// sample3.aac (44.1 kHz) at a program date time near 1970 and in 2026. A timestamp 3 µs (0.13 ticks) before a
+	// packet is a real offset, not floating-point noise, even though the 2026 timeline's timestamps are ~1.8e9.
+	const check = async (dateTime: string) => {
+		const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:10\n'
+			+ `#EXT-X-PROGRAM-DATE-TIME:${dateTime}\n#EXTINF:10,\nsample3.aac\n#EXT-X-ENDLIST\n`;
+		using input = new Input({
+			source: new CustomPathedSource('playlist.m3u8', ({ path }) => path === 'playlist.m3u8'
+				? new BufferSource(new TextEncoder().encode(playlist))
+				: new FilePathSource('./test/public/sample3.aac')),
+			formats: HLS_FORMATS,
+		});
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(audioTrack);
+
+		const sink = new EncodedPacketSink(audioTrack);
+		let packet = await sink.getFirstPacket();
+		for (let i = 0; i < 20; i++) {
+			assert(packet);
+			const previousPacket = packet;
+			packet = await sink.getNextPacket(packet);
+			assert(packet);
+			expect((await sink.getPacket(packet.timestamp - 3e-6))?.timestamp).toBe(previousPacket.timestamp);
+		}
+	};
+
+	await check('1970-01-01T00:00:00.000Z');
+	await check('2026-01-01T00:00:00.000Z');
+});
+
 test.concurrent('Packets at segment boundaries can be looked up by their own timestamp', async () => {
 	// HLS written by Mediabunny. The first segment's audio runs past its video, so every later video segment starts
 	// slightly before its playlist timestamp.
