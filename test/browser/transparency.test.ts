@@ -444,16 +444,25 @@ test('Decoded frames with alpha keep the color space of the color stream', async
 });
 
 test('Decoded frames with alpha keep the display size of the color stream', async () => {
-	// 64x32 VP9 with alpha and a 2:1 pixel aspect ratio (display size 128x32), made with FFmpeg 7.0.2:
+	// The same 64x32 VP9 video with a 2:1 pixel aspect ratio (display size 128x32), with and without alpha, made with
+	// FFmpeg 7.0.2:
 	// ffmpeg -f lavfi -i "testsrc2=s=64x32:d=0.5:r=10,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':
 	//   cr='cr(X,Y)':a='X*4'" -vf setsar=2/1 -c:v libvpx-vp9 -pix_fmt yuva420p -b:v 1M vp9-alpha-anamorphic.webm
-	using input = new Input({ source: new UrlSource('/vp9-alpha-anamorphic.webm'), formats: ALL_FORMATS });
-	const videoTrack = (await input.getPrimaryVideoTrack())!;
-	expect(await videoTrack.getDisplayWidth()).toBe(128);
+	// ffmpeg -f lavfi -i "testsrc2=s=64x32:d=0.5:r=10" -vf setsar=2/1 -c:v libvpx-vp9 -b:v 1M vp9-anamorphic.webm
+	const firstSample = async (path: string) => {
+		using input = new Input({ source: new UrlSource(path), formats: ALL_FORMATS });
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		expect(await videoTrack.getDisplayWidth()).toBe(128);
+		return (await new VideoSampleSink(videoTrack).getSample(0))!;
+	};
 
-	const sink = new VideoSampleSink(videoTrack);
-	using sample = (await sink.getSample(0))!;
-	expect(sample.hasAlpha).toBe(true); // Went through the alpha merger
-	expect([sample.displayWidth, sample.displayHeight]).toEqual([128, 32]);
-	expect(sample.pixelAspectRatio).toEqual({ num: 2, den: 1 });
+	using withAlpha = await firstSample('/vp9-alpha-anamorphic.webm');
+	using withoutAlpha = await firstSample('/vp9-anamorphic.webm');
+	expect(withAlpha.hasAlpha).toBe(true); // Went through the alpha merger
+
+	// Merging in the alpha must not change the display size (which is 128x32 where the decoder applies the configured
+	// display aspect: Chrome, Firefox)
+	expect([withAlpha.displayWidth, withAlpha.displayHeight])
+		.toEqual([withoutAlpha.displayWidth, withoutAlpha.displayHeight]);
+	expect(withAlpha.pixelAspectRatio).toEqual(withoutAlpha.pixelAspectRatio);
 });
