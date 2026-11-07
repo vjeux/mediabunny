@@ -278,15 +278,67 @@ test('appendOnly writes correct STREAMINFO header', async () => {
 	assert(target.buffer);
 	const bytes = new Uint8Array(target.buffer);
 
-	// STREAMINFO: min_block=16, max_block=65535, min_frame=0, max_frame=0
+	// STREAMINFO: min_block=4096, max_block=4096, min_frame=0, max_frame=0. The fixed block size of the frames is
+	// stated as both the minimum and maximum (RFC 9639, section 8.2); libFLAC can't seek in the file otherwise.
 	expect(bytes.slice(8, 18)).toEqual(new Uint8Array([
-		// minimum_block_size=16
-		0x00, 0x10,
-		// maximum_block_size=65535
-		0xFF, 0xFF,
+		// minimum_block_size=4096
+		0x10, 0x00,
+		// maximum_block_size=4096
+		0x10, 0x00,
 		// minimum_frame_size=0
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	]));
+
+	// A stream with a variable block size keeps the full valid range of block sizes, as its frames' block sizes can't
+	// be known beforehand. Here, mono 16-bit 44.1 kHz frames of 576 and 1152 samples, numbered by their first sample.
+	const crc8 = (data: number[]) => data.reduce((crc, byte) => {
+		crc ^= byte;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+		}
+		return crc;
+	}, 0);
+	const crc16 = (data: number[]) => data.reduce((crc, byte) => {
+		crc ^= byte << 8;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x8000 ? ((crc << 1) ^ 0x8005) & 0xffff : (crc << 1) & 0xffff;
+		}
+		return crc;
+	}, 0);
+	const variableFrame = (sampleNumber: number, blockSize: number) => {
+		const codedNumber = sampleNumber < 0x80
+			? [sampleNumber]
+			: [0xc0 | (sampleNumber >> 6), 0x80 | (sampleNumber & 0x3f)];
+		// Uncommon 16-bit block size, 44.1 kHz, mono, 16 bits per sample, then a constant subframe
+		const header = [0xff, 0xf9, 0x79, 0x08, ...codedNumber, (blockSize - 1) >> 8, (blockSize - 1) & 0xff];
+		const frame = [...header, crc8(header), 0x00, 0x12, 0x34];
+		const crc = crc16(frame);
+		return [...frame, crc >> 8, crc & 0xff];
+	};
+	const streamInfo = new Uint8Array(34);
+	const view = new DataView(streamInfo.buffer);
+	view.setUint16(0, 576);
+	view.setUint16(2, 1152);
+	view.setUint32(10, (44100 << 12) | (0 << 9) | (15 << 4)); // 44.1 kHz, mono, 16 bits per sample
+	view.setUint32(14, 576 + 1152 + 576);
+	const variableFile = new Uint8Array([
+		0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34, ...streamInfo,
+		...variableFrame(0, 576), ...variableFrame(576, 1152), ...variableFrame(1728, 576),
+	]);
+
+	using variableInput = new Input({ source: new BufferSource(variableFile), formats: ALL_FORMATS });
+	const variableTarget = new BufferTarget();
+	const variableOutput = new Output({
+		format: new FlacOutputFormat({ appendOnly: true }),
+		target: variableTarget,
+	});
+	const variableConversion = await Conversion.init({ input: variableInput, output: variableOutput });
+	await variableConversion.execute();
+
+	assert(variableTarget.buffer);
+	const variableBytes = new Uint8Array(variableTarget.buffer);
+	expect(variableBytes.slice(8, 12)).toEqual(new Uint8Array([0x00, 0x10, 0xff, 0xff])); // 16 and 65535
+	expect([...variableBytes.subarray(42, 44)]).toEqual([0xff, 0xf9]); // The first frame, of a variable block size
 });
 
 test('can read a FLAC file with leading ID3v2 tags', async () => {
