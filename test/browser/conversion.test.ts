@@ -800,6 +800,27 @@ test('Track capacity works correctly with composable conversions', async () => {
 	expect(conversion.discardedTracks[0]!.reason).toBe('max_track_count_reached');
 });
 
+test('Track capacity works correctly with composable conversions initialized concurrently', async () => {
+	using input = new Input({
+		source: new UrlSource('/video.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({ format: new AdtsOutputFormat(), target: new BufferTarget() });
+	const conversions = await Promise.all([0, 1].map(() => Conversion.init({
+		input,
+		output,
+		composable: true,
+		video: { discard: true },
+		showWarnings: false,
+	})));
+
+	// ADTS has room for a single track: one conversion gets it, the other discards its audio track
+	expect(output.tracks).toHaveLength(1);
+	expect(conversions.map(x => x.utilizedTracks.length)).toEqual([1, 0]);
+	expect(conversions[1]!.discardedTracks.map(x => x.reason)).toContain('max_track_count_reached');
+});
+
 test('Blank execute', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
