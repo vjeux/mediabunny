@@ -51,6 +51,8 @@ const input = new Input({
 });
 ```
 
+Each format only matches its own files, so list every format you want to accept: `MATROSKA` and `WEBM` don't open each other's files, and neither do `MP4` and `QTFF`.
+
 You can also use them for checking the actual format of an `Input`:
 ```ts
 import { MP3 } from 'mediabunny';
@@ -91,7 +93,7 @@ In addition to singletons, input format classes are structured hierarchically:
 
 This means you can also perform input format checks using `instanceof` instead of `===` comparisons. For example:
 ```ts
-import { Mp3InputFormat } from 'mediabunny';
+import { Mp3InputFormat, MatroskaInputFormat, IsobmffInputFormat } from 'mediabunny';
 
 // Check if the file is MP3:
 (await input.getFormat()) instanceof Mp3InputFormat;
