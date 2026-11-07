@@ -123,6 +123,7 @@ import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
 import { Logging } from '../logging';
+import { ID3_V1_GENRES } from '../id3';
 
 const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
 
@@ -3098,11 +3099,22 @@ export class IsobmffDemuxer extends Demuxer {
 						}; break;
 
 						case '©gen':
-						case 'gnre':
 						case 'com.apple.quicktime.genre':
 						case 'genre': {
 							if (typeof data === 'string') {
 								this.metadataTags.genre ??= data;
+							}
+						}; break;
+
+						case 'gnre': {
+							// Holds a 16-bit ID3v1 genre number plus one, though some writers put text there
+							if (typeof data === 'string') {
+								this.metadataTags.genre ??= data;
+							} else if (data instanceof Uint8Array && data.length >= 2) {
+								const genre = ID3_V1_GENRES[toDataView(data).getUint16(0, false) - 1];
+								if (genre !== undefined) {
+									this.metadataTags.genre ??= genre;
+								}
 							}
 						}; break;
 
