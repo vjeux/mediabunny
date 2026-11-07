@@ -303,6 +303,11 @@ export class FlacMuxer extends Muxer {
 			readCodedNumber(slice); // num
 			const blockSize = readBlockSize(slice, blockSizeOrUncommon);
 
+			if (!this.format._options.appendOnly) {
+				this.blockSizes.push(blockSize);
+				this.frameSizes.push(packet.data.length);
+			}
+
 			if (this.declaredFixedBlockSize !== null && blockSize > this.declaredFixedBlockSize) {
 				// Decoders such as FFmpeg's drop frames larger than STREAMINFO's maximum block size, which was already
 				// written, so let's fail instead of writing audio that would be lost. A shorter frame (as where streams
@@ -312,11 +317,6 @@ export class FlacMuxer extends Muxer {
 					+ ` written declares a fixed block size of ${this.declaredFixedBlockSize} samples, taken from the`
 					+ ' decoder config. To join streams with different block sizes, disable appendOnly.',
 				);
-			}
-
-			if (!this.format._options.appendOnly) {
-				this.blockSizes.push(blockSize);
-				this.frameSizes.push(packet.data.length);
 			}
 
 			const startPos = this.writer.getPos();
