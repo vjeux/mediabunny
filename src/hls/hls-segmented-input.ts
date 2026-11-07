@@ -95,6 +95,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 	neverRemovesSegments = false;
 	lastSegmentUpdateTime = -Infinity;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
+	/** Whether the segments come with more than one init section, as far as checked */
+	multipleInitSections = false;
+	initSectionsCheckedCount = 0;
 	segmentTimestampOffsetPromise: Promise<number> | null = null;
 
 	constructor(
@@ -920,5 +923,27 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 	getTimestampWrapPeriod() {
 		return TIMESTAMP_MODULUS / MPEG_TS_TIMESCALE;
+	}
+
+	override hasMultipleInitSections() {
+		// Segments only ever get appended, so only the new ones need a look
+		const firstInitSegment = this.segments[0]?.initSegment ?? null;
+		while (!this.multipleInitSections && this.initSectionsCheckedCount < this.segments.length) {
+			const initSegment = this.segments[this.initSectionsCheckedCount]!.initSegment;
+			this.initSectionsCheckedCount++;
+
+			const sameInitSection = initSegment === firstInitSegment || (
+				initSegment !== null
+				&& firstInitSegment !== null
+				&& initSegment.location.path === firstInitSegment.location.path
+				&& initSegment.location.offset === firstInitSegment.location.offset
+				&& initSegment.location.length === firstInitSegment.location.length
+			);
+			if (!sameInitSection) {
+				this.multipleInitSections = true;
+			}
+		}
+
+		return this.multipleInitSections;
 	}
 }
