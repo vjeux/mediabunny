@@ -42,6 +42,8 @@ export class WaveDemuxer extends Demuxer {
 	trackBackings: WaveAudioTrackBacking[] = [];
 	lastKnownPacketIndex = 0;
 	metadataTags: MetadataTags = {};
+	metadataChunks: WaveMetadataChunk[] = [];
+	metadataChunksPromise: Promise<void> | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -114,10 +116,18 @@ export class WaveDemuxer extends Demuxer {
 					dataChunkSize = readU64(ds64Slice, littleEndian);
 
 					totalFileSize = Math.min(riffChunkSize + 8, this.reader.fileSize ?? Infinity);
-				} else if (chunkId === 'LIST') {
-					await this.parseListChunk(startPos, chunkSize, littleEndian);
-				} else if (chunkId === 'ID3 ' || chunkId === 'id3 ') {
-					await this.parseId3Chunk(startPos, chunkSize);
+				} else if (chunkId === 'LIST' || chunkId === 'ID3 ' || chunkId === 'id3 ') {
+					const metadataChunk = { id: chunkId, pos: startPos, size: chunkSize, littleEndian };
+
+					if (this.reader.fileSize === null) {
+						// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep
+						// what's behind, so their metadata chunks are read right away
+						await this.parseMetadataChunk(metadataChunk);
+					} else {
+						// Metadata chunks can hold large pictures and only the metadata tags need them, so they're read
+						// later (see getMetadataTags), not to get the track
+						this.metadataChunks.push(metadataChunk);
+					}
 				}
 
 				currentPos = startPos + chunkSize + (chunkSize & 1); // Handle padding
@@ -214,6 +224,14 @@ export class WaveDemuxer extends Demuxer {
 			sampleSizeInBytes: Math.ceil(bitsPerSample / 8),
 			blockSizeInBytes: blockAlign,
 		};
+	}
+
+	private async parseMetadataChunk(chunk: WaveMetadataChunk) {
+		if (chunk.id === 'LIST') {
+			await this.parseListChunk(chunk.pos, chunk.size, chunk.littleEndian);
+		} else {
+			await this.parseId3Chunk(chunk.pos, chunk.size);
+		}
 	}
 
 	private async parseListChunk(startPos: number, size: number, littleEndian: boolean) {
@@ -377,6 +395,14 @@ export class WaveDemuxer extends Demuxer {
 
 	async getMetadataTags() {
 		await this.readMetadata();
+
+		await (this.metadataChunksPromise ??= (async () => {
+			// In file order, as the first value read for a field wins
+			for (const chunk of this.metadataChunks) {
+				await this.parseMetadataChunk(chunk);
+			}
+		})());
+
 		return this.metadataTags;
 	}
 }
@@ -595,3 +621,11 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		return this.getNextPacket(packet, options);
 	}
 }
+
+/** A LIST or ID3 chunk, which is only read for the metadata tags. */
+type WaveMetadataChunk = {
+	id: string;
+	pos: number;
+	size: number;
+	littleEndian: boolean;
+};
