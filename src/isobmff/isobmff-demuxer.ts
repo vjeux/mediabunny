@@ -118,7 +118,14 @@ import {
 	readU8,
 	readAscii,
 } from '../reader';
-import { DEFAULT_TRACK_DISPOSITION, MetadataTags, RichImageData, TrackDisposition } from '../metadata';
+import {
+	DEFAULT_TRACK_DISPOSITION,
+	MetadataTags,
+	recordRawMetadataTagFields,
+	RichImageData,
+	snapshotMetadataTagFields,
+	TrackDisposition,
+} from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
@@ -2792,6 +2799,7 @@ export class IsobmffDemuxer extends Demuxer {
 				const iterator = this.iterateContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 
 				for (const { boxInfo, slice } of iterator) {
+					const fieldsBefore = snapshotMetadataTagFields(this.metadataTags);
 					if (boxInfo.name !== 'meta' && !this.currentTrack) {
 						const startPos = slice.filePos;
 						this.metadataTags.raw ??= {};
@@ -2873,6 +2881,10 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 					}
+
+					if (boxInfo.name !== 'meta' && !this.currentTrack) {
+						recordRawMetadataTagFields(this.metadataTags, boxInfo.name, fieldsBefore);
+					}
 				}
 			}; break;
 
@@ -2942,6 +2954,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 					const data = readDataBox(slice);
 
+					const fieldsBefore = snapshotMetadataTagFields(this.metadataTags);
 					this.metadataTags.raw ??= {};
 					this.metadataTags.raw[metadataKey] ??= data;
 
@@ -3101,6 +3114,8 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 					}
+
+					recordRawMetadataTagFields(this.metadataTags, metadataKey, fieldsBefore);
 				}
 			}; break;
 		}

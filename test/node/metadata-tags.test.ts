@@ -19,6 +19,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { AttachedFile, MetadataTags } from '../../src/metadata.js';
 import { VERSIONED_NAME } from '../../src/version.js';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { AudioCodec, buildAudioCodecString } from '../../src/codec.js';
 import { Conversion } from '../../src/conversion.js';
@@ -534,6 +535,65 @@ test('Read and write metadata, FLAC', async () => {
 
 	expect(readTags.raw!['vendor']).toBe(VERSIONED_NAME);
 	expect(readTags.raw!['COMPOSER']).toBe('Hans Zimmer');
+});
+
+test('Conversion metadata tags, fields removed by the tags function stay removed', async () => {
+	type Format = Mp4OutputFormat | MkvOutputFormat | WavOutputFormat | FlacOutputFormat;
+	const convert = async (bytes: Uint8Array, format: Format) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			showWarnings: false,
+			// The way the docs remove a field
+			tags: inputTags => ({ ...inputTags, artist: undefined, comment: undefined, images: [] }),
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await result.getMetadataTags();
+	};
+
+	// Same-format conversions copy the raw tags over, which mustn't bring the removed fields back
+	for (const [makeFormat, codec] of [
+		[() => new Mp4OutputFormat(), 'aac'],
+		[() => new MkvOutputFormat(), 'aac'],
+		[() => new WavOutputFormat(), 'pcm-s16'],
+		[() => new WavOutputFormat({ metadataFormat: 'id3' }), 'pcm-s16'],
+	] as const) {
+		const output = new Output({ format: makeFormat(), target: new BufferTarget() });
+		output.setMetadataTags({
+			title: 'Title',
+			artist: 'Artist',
+			comment: 'Comment',
+			images: [{ data: coverArt, mimeType: 'image/jpeg', kind: 'coverFront' }],
+		});
+		const source = new EncodedAudioPacketSource(codec);
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(4096), 'key', 0, 1024 / 44100), {
+			decoderConfig: codec === 'aac'
+				// AAC-LC, 44.1 kHz, stereo
+				? { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, description: new Uint8Array([18, 16]) }
+				: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+		});
+		await output.finalize();
+
+		const tags = await convert(new Uint8Array(output.target.buffer!), makeFormat());
+		expect(tags.title).toBe('Title');
+		expect(tags.artist).toBeUndefined();
+		expect(tags.comment).toBeUndefined();
+		expect(tags.images ?? []).toEqual([]);
+	}
+
+	// FLAC (Vorbis comments)
+	const flac = new Uint8Array(readFileSync(path.join(__dirname, '../public/sample.flac')));
+	const tags = await convert(flac, new FlacOutputFormat());
+	expect(tags.title).toBe('The Happy Meeting');
+	expect(tags.artist).toBeUndefined();
+	expect(tags.raw!['ARTIST']).toBeUndefined();
+	expect(tags.raw!['ALBUM']).toBe('Samples files');
 });
 
 test('Read and write metadata, ADTS', async () => {

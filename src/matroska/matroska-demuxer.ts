@@ -37,7 +37,14 @@ import {
 	InputTrackBacking,
 	InputVideoTrackBacking,
 } from '../input-track';
-import { AttachedFile, DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
+import {
+	AttachedFile,
+	DEFAULT_TRACK_DISPOSITION,
+	MetadataTags,
+	recordRawMetadataTagFields,
+	snapshotMetadataTagFields,
+	TrackDisposition,
+} from '../metadata';
 import { PacketRetrievalOptions } from '../media-sink';
 import {
 	assert,
@@ -1871,6 +1878,7 @@ export class MatroskaDemuxer extends Demuxer {
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 
 				const tags = this.currentSegment.metadataTags;
+				const fieldsBefore = snapshotMetadataTagFields(tags);
 
 				if (this.currentAttachedFile.fileUid && this.currentAttachedFile.fileData) {
 					// All attached files get surfaced in the `raw` metadata tags
@@ -1905,6 +1913,10 @@ export class MatroskaDemuxer extends Demuxer {
 						name: this.currentAttachedFile.fileName ?? undefined,
 						description: this.currentAttachedFile.fileDescription ?? undefined,
 					});
+				}
+
+				if (this.currentAttachedFile.fileUid) {
+					recordRawMetadataTagFields(tags, this.currentAttachedFile.fileUid.toString(), fieldsBefore);
 				}
 
 				this.currentAttachedFile = null;
@@ -2062,6 +2074,7 @@ export class MatroskaDemuxer extends Demuxer {
 		if (!this.currentSegment?.metadataTags) return;
 
 		const metadataTags = this.currentSegment.metadataTags;
+		const fieldsBefore = snapshotMetadataTagFields(metadataTags);
 		metadataTags.raw ??= {};
 		metadataTags.raw[name] ??= value;
 
@@ -2142,6 +2155,8 @@ export class MatroskaDemuxer extends Demuxer {
 				}; break;
 			}
 		}
+
+		recordRawMetadataTagFields(metadataTags, name, fieldsBefore);
 	}
 
 	getDurationFromMetadata(segment: Segment) {

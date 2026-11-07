@@ -29,7 +29,7 @@ import {
 } from './misc';
 import { Logging } from './logging';
 import { PacketType } from './packet';
-import { MetadataTags } from './metadata';
+import { MetadataTags, recordRawMetadataTagFields, snapshotMetadataTagFields } from './metadata';
 import { AC3_SAMPLE_RATES, EAC3_REDUCED_SAMPLE_RATES } from '../shared/ac3-misc';
 import { Bitstream } from '../shared/bitstream';
 import { TRUEHD_MAJOR_SYNC_WORD } from '../shared/truehd-misc';
@@ -2738,6 +2738,7 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 		const key = string.slice(0, separatorIndex).toUpperCase();
 		const value = string.slice(separatorIndex + 1);
 
+		const fieldsBefore = snapshotMetadataTagFields(metadataTags);
 		metadataTags.raw ??= {};
 		if (Array.isArray(metadataTags.raw[key])) {
 			(metadataTags.raw[key] as string[]).push(value);
@@ -2867,6 +2868,8 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 				}
 			}; break;
 		}
+
+		recordRawMetadataTagFields(metadataTags, key, fieldsBefore);
 	}
 };
 

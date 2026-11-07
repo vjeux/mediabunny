@@ -300,6 +300,47 @@ export const metadataTagsAreEmpty = (tags: MetadataTags) => {
 		&& (tags.raw === undefined || Object.keys(tags.raw).length === 0);
 };
 
+/** For the raw tags a demuxer read, which normalized fields each raw tag was read into (used by conversions). */
+const rawMetadataTagFields = new WeakMap<NonNullable<MetadataTags['raw']>, Map<string, Set<keyof MetadataTags>>>();
+
+/** Notes the values of the normalized fields, to tell afterwards which ones a raw tag was read into. */
+export const snapshotMetadataTagFields = (tags: MetadataTags) => {
+	const snapshot: Record<string, unknown> = { ...tags, images: tags.images?.length };
+	delete snapshot['raw'];
+	return snapshot;
+};
+
+/** Records which normalized fields changed since the snapshot as the ones the given raw tag was read into. */
+export const recordRawMetadataTagFields = (tags: MetadataTags, rawKey: string, snapshot: Record<string, unknown>) => {
+	if (!tags.raw) {
+		return;
+	}
+
+	const current = snapshotMetadataTagFields(tags);
+	for (const field of Object.keys(current) as (keyof MetadataTags)[]) {
+		if (current[field] === snapshot[field]) {
+			continue;
+		}
+
+		let fieldsByRawKey = rawMetadataTagFields.get(tags.raw);
+		if (!fieldsByRawKey) {
+			fieldsByRawKey = new Map();
+			rawMetadataTagFields.set(tags.raw, fieldsByRawKey);
+		}
+
+		let fields = fieldsByRawKey.get(rawKey);
+		if (!fields) {
+			fields = new Set();
+			fieldsByRawKey.set(rawKey, fields);
+		}
+
+		fields.add(field);
+	}
+};
+
+/** Returns which normalized fields each of the given raw tags was read into, if a demuxer recorded it. */
+export const getRawMetadataTagFields = (raw: NonNullable<MetadataTags['raw']>) => rawMetadataTagFields.get(raw);
+
 /**
  * Specifies a track's disposition, i.e. information about its intended usage.
  * @public
