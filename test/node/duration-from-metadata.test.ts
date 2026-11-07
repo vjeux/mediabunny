@@ -135,6 +135,27 @@ test('MP3 duration metadata with a Xing/Info frame count of 0', async () => {
 	expect(await metadataDuration('Info', 0)).toBeCloseTo(duration, 6);
 	// Which for a VBR stream it can't
 	expect(await metadataDuration('Xing', 0)).toBe(null);
+
+	// A frame count whose frames hold fewer samples than the delays, like one MPEG-2 frame of 576 samples, gives 0
+	const mpeg2Frame = () => {
+		const bytes = new Uint8Array(208); // MPEG-2 Layer III, 64 kbps, 22.05 kHz, mono
+		bytes.set([0xff, 0xf3, 0x80, 0xc0]);
+		return bytes;
+	};
+	const header = mpeg2Frame();
+	const view = new DataView(header.buffer);
+	header.set([...'Info'].map(char => char.charCodeAt(0)), 4 + 9); // Behind the side information
+	view.setUint32(4 + 9 + 4, 0x3); // Frame count and byte count present
+	view.setUint32(4 + 9 + 8, 1);
+	view.setUint32(4 + 9 + 12, 2 * 208);
+	header.set([...'LAME3.100'].map(char => char.charCodeAt(0)), 4 + 9 + 16);
+	header.set([576 >> 4, (576 & 0xf) << 4], 4 + 9 + 16 + 21);
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...header, ...mpeg2Frame()])),
+		formats: ALL_FORMATS,
+	});
+	expect(await input.getDurationFromMetadata()).toBe(0);
 });
 
 test('ADTS AAC duration metadata', async () => {

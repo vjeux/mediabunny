@@ -321,6 +321,13 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	async getDurationFromMetadata() {
+		const duration = await this.getDurationFromHeaders();
+		// Never below 0, even when the frames hold fewer samples than the encoder and decoder delays (like a single
+		// MPEG-2 frame of 576 samples does)
+		return duration === null ? null : Math.max(duration, 0);
+	}
+
+	private async getDurationFromHeaders() {
 		const demuxer = this.demuxer;
 
 		assert(demuxer.firstFrameHeader !== null);
