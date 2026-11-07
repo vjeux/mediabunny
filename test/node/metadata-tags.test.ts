@@ -688,6 +688,27 @@ test('Conversion metadata tags, default case', async () => {
 	expect(readTags.images![0]!.data).toEqual(coverArt);
 });
 
+test('Conversion metadata tags, ID3v2 year that isn\'t a year', async () => {
+	// The fixture's ID3v2.3 tag has the TYER "20190103": a whole date where the four-digit year belongs, as some
+	// taggers write it
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/oversized-id3.wav')),
+		formats: ALL_FORMATS,
+	});
+
+	const tags = await input.getMetadataTags();
+	expect(tags.raw?.['TYER']).toBe('20190103');
+	expect(tags.date).toBeUndefined(); // FFmpeg doesn't make a date of it either
+
+	// Copying the tags used to throw, as they held an Invalid Date
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	await conversion.execute();
+
+	using converted = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect((await converted.getMetadataTags()).date).toBeUndefined();
+});
+
 test('Conversion metadata tags, modified', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),

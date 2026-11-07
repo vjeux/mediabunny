@@ -364,7 +364,9 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			case 'TYER':
 			case 'TYE': {
 				const yearText = reader.readId3V2EncodingAndText(frameEndPos);
-				const year = Number.parseInt(yearText, 10);
+				const parsedYear = Number.parseInt(yearText, 10);
+				// Only a year that makes a valid date counts, unlike a whole date ("20190103") where the year belongs
+				const year = Number.isNaN(new Date(String(parsedYear)).getTime()) ? NaN : parsedYear;
 
 				if (Number.isInteger(year)) {
 					tags.date ??= new Date(String(year)); // String so that it parses as UTC
