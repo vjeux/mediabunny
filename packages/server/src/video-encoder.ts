@@ -72,6 +72,20 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
+		const { width, height } = config;
+		if (codec === 'hevc' && (width < 16 || height < 16)) {
+			// libx265 refuses to open for frames under 16 pixels in either dimension
+			return false;
+		}
+		if (codec === 'vp8' && (width > 16383 || height > 16383)) {
+			// VP8 frame headers store the dimensions in 14 bits (RFC 6386, section 9.1)
+			return false;
+		}
+		if (codec === 'avc' && (width > 16384 || height > 16384)) {
+			// libx264 refuses to open past 16384 pixels in either dimension
+			return false;
+		}
+
 		if (config.bitrateMode === 'quantizer') {
 			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 		}
