@@ -466,6 +466,19 @@ export const tkhd = (
 	const needsU64 = !isU32(creationTime) || !isU32(durationInGlobalTimescale);
 	const u32OrU64 = needsU64 ? u64 : u32;
 
+	// For video, the track size is its presentation size: in MP4, anamorphic video is given its display width, as
+	// FFmpeg does. QuickTime keeps the pixel size (as does FFmpeg's MOV mode).
+	let width = 0;
+	let height = 0;
+	if (trackData.type === 'video') {
+		const { num, den } = trackData.info.pixelAspectRatio;
+		const presentationWidth = trackData.info.width * num / den;
+		width = !trackData.muxer.isQuickTime && presentationWidth > 0 && presentationWidth < 2 ** 16
+			? presentationWidth
+			: trackData.info.width;
+		height = trackData.info.height;
+	}
+
 	let matrix: TransformationMatrix;
 	if (trackData.type === 'video' && trackData.track.metadata.transformationMatrix) {
 		matrix = trackData.track.metadata.transformationMatrix;
@@ -478,7 +491,14 @@ export const tkhd = (
 			scaleMatrix(flip ? -1 : 1, 1),
 		);
 
-		matrix = centeredTransformationMatrix(linear, trackData.info.width, trackData.info.height);
+		// The matrix applies to the image at its presentation size
+		matrix = centeredTransformationMatrix(linear, width, height);
+
+		// Its translation is signed 16.16, though: if it doesn't fit, keep the pixel size, as before
+		if (width !== trackData.info.width && Math.max(Math.abs(matrix[6]), Math.abs(matrix[7])) >= 2 ** 15) {
+			width = trackData.info.width;
+			matrix = centeredTransformationMatrix(linear, width, height);
+		}
 	} else {
 		matrix = IDENTITY_MATRIX;
 	}
@@ -511,8 +531,8 @@ export const tkhd = (
 		fixed_8_8(trackData.type === 'audio' ? 1 : 0), // Volume
 		u16(0), // Reserved
 		matrixToBytes(matrix), // Matrix
-		fixed_16_16(trackData.type === 'video' ? trackData.info.width : 0), // Track width
-		fixed_16_16(trackData.type === 'video' ? trackData.info.height : 0), // Track height
+		fixed_16_16(width), // Track width
+		fixed_16_16(height), // Track height
 	]);
 };
 
