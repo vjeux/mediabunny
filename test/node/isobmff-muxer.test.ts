@@ -680,7 +680,6 @@ test('Reserved Fast Start rejects a maximum packet count beyond u32', async () =
 	await expect(output.start()).rejects.toThrow('exceeds the maximum');
 });
 
-// This used to cause an assertion failure in the box writing code
 test('Fragmented MP4 keeps the start offset of a track starting after the first fragment could be cut', async () => {
 	// The avcC of video.mp4, so that a real SPS is parsed; the packet payloads are stubs
 	const avcDescription = new Uint8Array([
@@ -741,6 +740,7 @@ test('Fragmented MP4 keeps the start offset of a track starting after the first 
 	expect(await muxStaggered(0)).toEqual([-0.5, -0.02]);
 });
 
+// This used to cause an assertion failure in the box writing code
 test('Reserved Fast Start with a B-frame GOP completed before all tracks are known', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat({ fastStart: 'reserve' }),
