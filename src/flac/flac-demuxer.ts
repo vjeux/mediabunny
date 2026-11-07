@@ -234,10 +234,24 @@ export class FlacDemuxer extends Demuxer {
 							);
 						}
 
+						// The Vorbis comment block is FLAC's own tag container (RFC 9639, section 8.6), so its tags
+						// take precedence over those of an ID3v2 tag that some tools put in front of the stream, as
+						// in FFmpeg
+						const vorbisCommentTags: MetadataTags = {};
 						readVorbisComments(
 							readBytes(vorbisCommentBlock, size),
-							this.metadataTags,
+							vorbisCommentTags,
 						);
+
+						for (const key of Object.keys(vorbisCommentTags) as (keyof MetadataTags)[]) {
+							if (key === 'raw') {
+								this.metadataTags.raw = { ...this.metadataTags.raw, ...vorbisCommentTags.raw };
+							} else if (key === 'images') {
+								(this.metadataTags.images ??= []).push(...vorbisCommentTags.images!);
+							} else {
+								(this.metadataTags as Record<string, unknown>)[key] = vorbisCommentTags[key];
+							}
+						}
 
 						break;
 					}
