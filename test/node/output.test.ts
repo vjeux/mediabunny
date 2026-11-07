@@ -90,8 +90,78 @@ class FailingInitVideoEncoder extends CustomVideoEncoder {
 	}
 }
 
+// An encoder whose initialization only finishes when released, like one hanging in a platform codec
+const hangingEncoder = { release: null as (() => void) | null };
+const releaseHangingEncoder = () => {
+	hangingEncoder.release?.();
+	hangingEncoder.release = null;
+};
+
+class HangingInitAudioEncoder extends CustomAudioEncoder {
+	static override supports(codec: AudioCodec) {
+		return codec === 'opus' && failingEncodersActive;
+	}
+
+	async init() {
+		failingEncoderCalls.push('init');
+		await new Promise<void>(resolve => hangingEncoder.release = resolve);
+	}
+
+	encode() {
+		failingEncoderCalls.push('encode');
+	}
+
+	flush() {
+		failingEncoderCalls.push('flush');
+	}
+
+	close() {
+		failingEncoderCalls.push('close');
+	}
+}
+
 registerEncoder(FailingInitAudioEncoder);
 registerEncoder(FailingInitVideoEncoder);
+registerEncoder(HangingInitAudioEncoder);
+
+test('Canceling doesn\'t wait for an encoder initialization that hangs, and closes the encoder after it', async () => {
+	failingEncodersActive = true;
+	failingEncoderCalls.length = 0;
+	releaseHangingEncoder();
+
+	try {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+
+		using sample = new AudioSample({
+			data: new Float32Array(960),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		const addPromise = source.add(sample).catch(() => {});
+		await new Promise(resolve => setTimeout(resolve, 10));
+		expect(failingEncoderCalls).toEqual(['init']);
+
+		const canceled = await Promise.race([
+			output.cancel().then(() => true),
+			new Promise(resolve => setTimeout(() => resolve(false), 2000)),
+		]);
+		expect(canceled).toBe(true);
+
+		// Once the initialization finishes, the encoder gets closed without encoding anything
+		releaseHangingEncoder();
+		await addPromise;
+		await new Promise(resolve => setTimeout(resolve, 10));
+		expect(failingEncoderCalls).toEqual(['init', 'close']);
+	} finally {
+		releaseHangingEncoder();
+		failingEncodersActive = false;
+	}
+});
 
 test.each(['audio', 'video'] as const)(
 	'A failed %s encoder initialization makes finalize() fail, without flushing the encoder',

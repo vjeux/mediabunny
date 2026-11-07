@@ -1083,8 +1083,15 @@ class VideoEncoderWrapper {
 	}
 
 	async flushAndClose(forceClose: boolean) {
-		// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
-		await this.ensureEncoderPromise?.catch(() => {});
+		// When force closing, don't wait for an initialization that may never finish (one hanging in a platform codec,
+		// say), but close the encoder once it does
+		const closeEncoderLater = forceClose && !!this.ensureEncoderPromise && !this.encoderInitialized;
+		if (closeEncoderLater) {
+			void this.ensureEncoderPromise!.then(() => this.flushAndClose(true), () => {}).catch(() => {});
+		} else {
+			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
+			await this.ensureEncoderPromise?.catch(() => {});
+		}
 
 		try {
 			if (!forceClose) {
@@ -1122,8 +1129,10 @@ class VideoEncoderWrapper {
 			this.frameRateLastSample = null;
 
 			if (this.customEncoder) {
-				await this.customEncoderCallSerializer.call(() => this.customEncoder!.close())
-					.catch((error: unknown) => this.setError(error));
+				if (!closeEncoderLater) {
+					await this.customEncoderCallSerializer.call(() => this.customEncoder!.close())
+						.catch((error: unknown) => this.setError(error));
+				}
 			} else if (this.encoder) {
 				if (this.encoder.state !== 'closed') {
 					this.encoder.close();
@@ -2644,8 +2653,15 @@ class AudioEncoderWrapper {
 	}
 
 	async flushAndClose(forceClose: boolean) {
-		// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
-		await this.ensureEncoderPromise?.catch(() => {});
+		// When force closing, don't wait for an initialization that may never finish (one hanging in a platform codec,
+		// say), but close the encoder once it does
+		const closeEncoderLater = forceClose && !!this.ensureEncoderPromise && !this.encoderInitialized;
+		if (closeEncoderLater) {
+			void this.ensureEncoderPromise!.then(() => this.flushAndClose(true), () => {}).catch(() => {});
+		} else {
+			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
+			await this.ensureEncoderPromise?.catch(() => {});
+		}
 
 		try {
 			if (!forceClose) {
@@ -2677,8 +2693,10 @@ class AudioEncoderWrapper {
 			this.resampler = null;
 
 			if (this.customEncoder) {
-				await this.customEncoderCallSerializer.call(() => this.customEncoder!.close())
-					.catch((error: unknown) => this.setError(error));
+				if (!closeEncoderLater) {
+					await this.customEncoderCallSerializer.call(() => this.customEncoder!.close())
+						.catch((error: unknown) => this.setError(error));
+				}
 			} else if (this.encoder && this.encoder.state !== 'closed') {
 				this.encoder.close();
 			}
