@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test } from 'vitest';
+import { beforeAll, describe, expect, test, vi } from 'vitest';
 import { registerMediabunnyServer } from '@mediabunny/server';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
@@ -1784,6 +1784,29 @@ describe('Video', async () => {
 			await conversion.execute();
 		});
 	});
+});
+
+test('Hardware detection runs with FFmpeg logging silenced', async () => {
+	// Probing logs an FFmpeg error for every hardware API that isn't there, which would reach stderr whatever
+	// Mediabunny's log level. A fresh module instance, so the hardware context hasn't been detected and cached yet.
+	vi.resetModules();
+	const { getHardwareContext } = await import('../../packages/server/src/misc.js');
+
+	const levelBefore = NodeAv.Log.getLevel();
+	const levelsDuringDetection: number[] = [];
+	const spy = vi.spyOn(NodeAv.HardwareContext, 'auto').mockImplementation(() => {
+		levelsDuringDetection.push(NodeAv.Log.getLevel());
+		return null;
+	});
+
+	try {
+		getHardwareContext();
+	} finally {
+		spy.mockRestore();
+	}
+
+	expect(levelsDuringDetection).toEqual([NodeAv.AV_LOG_QUIET]);
+	expect(NodeAv.Log.getLevel()).toBe(levelBefore);
 });
 
 describe('Audio', async () => {

@@ -37,7 +37,15 @@ export const getHardwareContext = (): NodeAv.HardwareContext | null => {
 	}
 
 	if (cachedHardwareContext === undefined) {
-		cachedHardwareContext = NodeAv.HardwareContext.auto();
+		// Probing logs an FFmpeg error for every hardware API that isn't there (CUDA, VAAPI, Vulkan, OpenCL and AMF on
+		// a typical GPU-less server), so keep FFmpeg quiet while it runs
+		const logLevel = NodeAv.Log.getLevel();
+		NodeAv.Log.setLevel(NodeAv.AV_LOG_QUIET);
+		try {
+			cachedHardwareContext = NodeAv.HardwareContext.auto();
+		} finally {
+			NodeAv.Log.setLevel(logLevel);
+		}
 	}
 	return cachedHardwareContext;
 };
