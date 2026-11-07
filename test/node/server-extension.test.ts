@@ -32,7 +32,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
+import { buildQuantizerEncodeOptions, canEncodeVideo, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
@@ -472,6 +472,68 @@ describe('Video', async () => {
 
 			expect(buf[0]).toBeGreaterThan(250); // Quasi-white
 		});
+	});
+
+	test('AV1 support stops at the sizes libsvtav1 can encode', async () => {
+		// With a target bitrate, libsvtav1 can't open below 64 pixels in either dimension
+		expect(await canEncodeVideo('av1', { width: 64, height: 64, bitrate: 1e6 })).toBe(true);
+		expect(await canEncodeVideo('av1', { width: 63, height: 64, bitrate: 1e6 })).toBe(false);
+		expect(await canEncodeVideo('av1', { width: 1920, height: 32, bitrate: 1e6 })).toBe(false);
+
+		// A quality is encoded in constant-quantizer mode, where libsvtav1's flush hangs forever for some sizes below
+		// 32 pixels
+		const quality = new Quality('medium');
+		expect(await canEncodeVideo('av1', { width: 63, height: 64, bitrate: quality })).toBe(true);
+		expect(await canEncodeVideo('av1', { width: 16, height: 1080, bitrate: quality })).toBe(false);
+
+		const quantizerConfig = (width: number, height: number) => ({
+			codec: buildVideoCodecString('av1', width, height, 1e6, false),
+			width,
+			height,
+			bitrateMode: 'quantizer',
+		} satisfies VideoEncoderConfig);
+		expect(NodeAvVideoEncoder.supports('av1', quantizerConfig(32, 32))).toBe(true);
+		expect(NodeAvVideoEncoder.supports('av1', quantizerConfig(16, 1080))).toBe(false);
+
+		const encoder = new NodeAvVideoEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'av1';
+		// @ts-expect-error Readonly
+		encoder.config = quantizerConfig(16, 16);
+		await expect(encoder.init()).rejects.toThrow('needs at least 32 pixels');
+	});
+
+	test('AV1 encoding of a tiny video fails instead of hanging', { timeout: 15_000 }, async () => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'av1', quality: new Quality('medium') });
+		output.addVideoTrack(source);
+		await output.start();
+
+		const encode = async () => {
+			for (let i = 0; i < 3; i++) {
+				const sample = new VideoSample(new Uint8Array(16 * 16 * 4).fill(128), {
+					format: 'RGBX',
+					codedWidth: 16,
+					codedHeight: 16,
+					timestamp: i / 10,
+					duration: 0.1,
+				});
+				await source.add(sample);
+				sample.close();
+			}
+			await output.finalize();
+		};
+
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
+		const hang = new Promise<never>((_, reject) => {
+			timeoutId = setTimeout(() => reject(new Error('The AV1 encode hung.')), 5000);
+		});
+
+		try {
+			await expect(Promise.race([encode(), hang])).rejects.not.toThrow('The AV1 encode hung.');
+		} finally {
+			clearTimeout(timeoutId);
+		}
 	});
 
 	const QUANTIZER_TEST_CODECS = [
