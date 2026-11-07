@@ -32,7 +32,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
+import { buildQuantizerEncodeOptions, canEncodeVideo, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
@@ -558,6 +558,87 @@ describe('Video', async () => {
 		expect(packets.map(x => x.timestamp)).toEqual(sampleTimestamps);
 
 		await encoder.close();
+	});
+
+	test('ProRes is only encoded at widths whose chroma prores_ks encodes in full', async () => {
+		// Encodes one frame of a uniform color as ProRes, decodes the packet with FFmpeg's ProRes decoder, and returns
+		// whether the last chroma column of the middle row came through
+		const encodeAndCheckLastChromaColumn = async (width: number, alpha: 'keep' | 'discard') => {
+			const height = 16;
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'prores', quality: new Quality('medium'), alpha });
+			output.addVideoTrack(source);
+
+			try {
+				await output.start();
+				const data = new Uint8Array(width * height * 4);
+				for (let i = 0; i < width * height; i++) {
+					data.set([20, 120, 60, 200], 4 * i);
+				}
+				const sample = new VideoSample(data, {
+					format: 'RGBA',
+					codedWidth: width,
+					codedHeight: height,
+					timestamp: 0,
+					duration: 1 / 30,
+				});
+				try {
+					await source.add(sample);
+				} finally {
+					sample.close();
+				}
+				await output.finalize();
+			} catch {
+				await output.cancel();
+				return 'declined';
+			}
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			const encodedPacket = await new EncodedPacketSink(track).getFirstPacket();
+			assert(encodedPacket);
+
+			const decoderCodec = NodeAv.Codec.findDecoder(NodeAv.AV_CODEC_ID_PRORES);
+			assert(decoderCodec);
+			const decoder = new NodeAv.CodecContext();
+			decoder.allocContext3(decoderCodec);
+			NodeAv.FFmpegError.throwIfError(await decoder.open2(decoderCodec), 'open2');
+			const packet = new NodeAv.Packet();
+			packet.alloc();
+			packet.data = Buffer.from(encodedPacket.data);
+			NodeAv.FFmpegError.throwIfError(await decoder.sendPacket(packet), 'sendPacket');
+			const frame = new NodeAv.Frame();
+			frame.alloc();
+			NodeAv.FFmpegError.throwIfError(await decoder.receiveFrame(frame), 'receiveFrame');
+
+			// The chroma planes hold 16-bit samples, a column per pixel for 4:4:4, one per two pixels for 4:2:2
+			const isYuv422 = NodeAv.avGetPixFmtName(frame.format as NodeAv.AVPixelFormat)?.includes('422');
+			const chromaWidth = isYuv422 ? Math.ceil(width / 2) : width;
+			const row = frame.data![1]!.subarray((height / 2) * frame.linesize[1]!);
+			const lastTwo = [row.readUInt16LE(2 * (chromaWidth - 2)), row.readUInt16LE(2 * (chromaWidth - 1))];
+
+			frame.free();
+			packet.free();
+			decoder.freeContext();
+			return lastTwo[0] === lastTwo[1] ? 'intact' : 'last chroma column lost';
+		};
+
+		const cases: [width: number, alpha: 'keep' | 'discard', outcome: string][] = [
+			// 4:2:2, where prores_ks would zero the last chroma column of an odd width
+			[33, 'discard', 'declined'],
+			[34, 'discard', 'intact'],
+			// With alpha, it's 4:4:4
+			[33, 'keep', 'intact'],
+		];
+		for (const [width, alpha, outcome] of cases) {
+			expect({ width, alpha, outcome: await encodeAndCheckLastChromaColumn(width, alpha) })
+				.toEqual({ width, alpha, outcome });
+		}
+
+		// canEncodeVideo, which doesn't take alpha into account, agrees for frames without it
+		expect(await canEncodeVideo('prores', { width: 33, height: 16 })).toBe(false);
+		expect(await canEncodeVideo('prores', { width: 34, height: 16 })).toBe(true);
 	});
 
 	test('ProRes Proxy encode', async () => {

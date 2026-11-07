@@ -76,6 +76,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 		}
 
+		if (codec === 'prores' && config.width % 2 === 1 && config.alpha !== 'keep') {
+			// Without alpha, ProRes is encoded as 4:2:2, and prores_ks only encodes floor(width / 2) chroma columns,
+			// zeroing the last one of odd-width frames (a green line along the right edge)
+			return false;
+		}
+
 		return (
 			codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
 			|| codec === 'prores'
