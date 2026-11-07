@@ -1519,6 +1519,12 @@ export class HlsOutputFormat extends OutputFormat {
 	}
 
 	get negativeTimestampSupport() {
+		if ((this._options.mediaTimestampBase ?? 10) > 0) {
+			// The muxer moves all media onto the positive media timestamp base, measured from the first packet, so
+			// negative timestamps (encoder priming, B-frames, tracks starting a bit earlier) never reach the segments
+			return 'full' as const;
+		}
+
 		const formats = toArray(this._options.segmentFormat);
 
 		// Return the lowest baseline across all segment formats

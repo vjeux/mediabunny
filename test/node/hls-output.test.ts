@@ -22,6 +22,7 @@ import {
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { HlsMuxer } from '../../src/hls/hls-muxer.js';
 import { AudioCodec, VideoCodec } from '../../src/codec.js';
+import { Conversion } from '../../src/conversion.js';
 import { EncodedPacket, PacketType } from '../../src/packet.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
@@ -2451,6 +2452,55 @@ test('Sparse tracks in segments, fragmented MP4 + single file', async () => {
 		segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }),
 		singleFilePerPlaylist: true,
 	});
+});
+
+test('Conversion copies AAC with encoder priming into HLS segments', async () => {
+	// The AAC track of an ordinary MP4 starts with a priming packet before zero. The HLS muxer moves all media onto the
+	// positive mediaTimestampBase, so negative timestamps never reach the segments and the track can be copied instead
+	// of being re-encoded (or dropped, where no AAC encoder exists, like here)
+	const convertDemo = async (segmentFormat: HlsOutputFormatOptions['segmentFormat'], keepVideo: boolean) => {
+		const targets = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				targets.set(request.path, target);
+				return target;
+			}),
+		});
+		const conversion = await Conversion.init({
+			input: new Input({ source: new FilePathSource('./test/public/demo.mp4'), formats: ALL_FORMATS }),
+			output,
+			video: { discard: !keepVideo },
+			trim: { end: 2 },
+			showWarnings: false,
+		});
+
+		return { conversion, targets };
+	};
+
+	// MPEG-TS segments: both tracks are copied, and the priming keeps the audio 1024 samples ahead of the video
+	const { conversion, targets } = await convertDemo(new MpegTsOutputFormat(), true);
+	expect(conversion.discardedTracks.map(x => `${x.track.type}: ${x.reason}`)).toEqual([]);
+	expect(conversion.output.tracks.map(x => x.source.constructor.name))
+		.toEqual(['EncodedVideoPacketSource', 'EncodedAudioPacketSource']);
+	await conversion.execute();
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(targets.get(path)!.buffer!)),
+		formats: ALL_FORMATS,
+	});
+	const videoStart = await (await input.getPrimaryVideoTrack())!.getFirstTimestamp();
+	const audioStart = await (await input.getPrimaryAudioTrack())!.getFirstTimestamp();
+	expect(audioStart - videoStart).toBeCloseTo(-1024 / 48000, 6);
+
+	// ADTS segments, whose format has no timestamps at all
+	const adts = await convertDemo(new AdtsOutputFormat(), false);
+	expect(adts.conversion.utilizedTracks.map(x => x.type)).toEqual(['audio']);
+
+	// Without a positive base, negative timestamps would reach the segments
+	const zeroBaseFormat = new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), mediaTimestampBase: 0 });
+	expect(zeroBaseFormat.negativeTimestampSupport).toBe('prefer-non-negative');
 });
 
 test('Opus codec string in master playlist', async () => {
