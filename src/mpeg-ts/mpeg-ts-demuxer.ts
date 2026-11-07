@@ -8,8 +8,13 @@
 
 import { TrackType } from '../output';
 import { SAMPLES_PER_AAC_FRAME } from '../adts/adts-demuxer';
-import { MAX_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
-import { aacChannelMap, aacFrequencyTable } from '../../shared/aac-misc';
+import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
+import {
+	aacChannelMap,
+	aacFrequencyTable,
+	getAacProgramConfigElementChannelCount,
+	readAdtsProgramConfigElement,
+} from '../../shared/aac-misc';
 import {
 	AacCodecInfo,
 	AudioCodec,
@@ -724,8 +729,28 @@ export class MpegTsDemuxer extends Demuxer {
 									isMpeg2: false,
 									objectType: header.objectType,
 								};
-								elementaryStream.info.numberOfChannels
-									= aacChannelMap[header.channelConfiguration]!;
+
+								if (header.channelConfiguration === 0) {
+									// The channel layout comes from the PCE at the start of the frame's raw data block
+									const headerSize = header.crcCheck === null
+										? MIN_ADTS_FRAME_HEADER_SIZE
+										: MAX_ADTS_FRAME_HEADER_SIZE;
+									const result = readAdtsProgramConfigElement(
+										context.suppliedPacket.data.subarray(headerSize, header.frameLength),
+									);
+									if (!result) {
+										throw new Error(
+											'Invalid AAC audio stream; ADTS frames with channel configuration 0 must'
+											+ ' begin with a program config element.',
+										);
+									}
+
+									elementaryStream.info.numberOfChannels
+										= getAacProgramConfigElementChannelCount(result.programConfigElement);
+								} else {
+									elementaryStream.info.numberOfChannels
+										= aacChannelMap[header.channelConfiguration]!;
+								}
 								elementaryStream.info.sampleRate
 									= aacFrequencyTable[header.samplingFrequencyIndex]!;
 							} else if (elementaryStream.info.codec === 'mp3') {

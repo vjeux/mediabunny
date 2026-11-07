@@ -6,7 +6,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { aacChannelMap, aacFrequencyTable } from '../../shared/aac-misc';
+import {
+	aacChannelMap,
+	aacFrequencyTable,
+	getAacProgramConfigElementChannelCount,
+	readAdtsProgramConfigElement,
+} from '../../shared/aac-misc';
 import { AudioCodec } from '../codec';
 import { Demuxer } from '../demuxer';
 import {
@@ -49,6 +54,7 @@ export class AdtsDemuxer extends Demuxer {
 
 	metadataPromise: Promise<void> | null = null;
 	firstFrameHeader: AdtsFrameHeader | null = null;
+	numberOfChannels: number | null = null;
 	loadedSamples: Sample[] = [];
 	metadataTags: MetadataTags | null = null;
 
@@ -73,7 +79,30 @@ export class AdtsDemuxer extends Demuxer {
 			}
 
 			// There has to be a frame if this demuxer got selected
-			assert(this.firstFrameHeader);
+			const header = this.firstFrameHeader;
+			assert(header);
+
+			if (header.channelConfiguration === 0) {
+				// The channel layout comes from the PCE at the start of the frame's raw data block
+				const headerSize = header.crcCheck === null ? MIN_ADTS_FRAME_HEADER_SIZE : MAX_ADTS_FRAME_HEADER_SIZE;
+				let slice = this.reader.requestSlice(header.startPos + headerSize, header.frameLength - headerSize);
+				if (isThenable(slice)) slice = await slice;
+				if (!slice) {
+					throw new Error('Invalid ADTS file: the first frame is cut off.');
+				}
+
+				const result = readAdtsProgramConfigElement(readBytes(slice, header.frameLength - headerSize));
+				if (!result) {
+					throw new Error(
+						'Invalid ADTS file: frames with channel configuration 0 must begin with a program config'
+						+ ' element.',
+					);
+				}
+
+				this.numberOfChannels = getAacProgramConfigElementChannelCount(result.programConfigElement);
+			} else {
+				this.numberOfChannels = aacChannelMap[header.channelConfiguration]!;
+			}
 
 			// Create the single audio track
 			this.trackBackings = [new AdtsAudioTrackBacking(this)];
@@ -258,12 +287,8 @@ class AdtsAudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	getNumberOfChannels() {
-		assert(this.demuxer.firstFrameHeader);
-
-		const numberOfChannels = aacChannelMap[this.demuxer.firstFrameHeader.channelConfiguration];
-		assert(numberOfChannels !== undefined);
-
-		return numberOfChannels;
+		assert(this.demuxer.numberOfChannels !== null);
+		return this.demuxer.numberOfChannels;
 	}
 
 	getSampleRate() {

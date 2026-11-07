@@ -2875,6 +2875,7 @@ const fixAudioDecoderConfig = (
 				objectType,
 				outputNumberOfChannels: decoderConfig.numberOfChannels,
 				outputSampleRate: decoderConfig.sampleRate,
+				programConfigElement: null,
 			});
 		}
 	}

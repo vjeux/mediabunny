@@ -55,7 +55,14 @@ import {
 	inlineTimestampRegex,
 	parseSubtitleTimestamp,
 } from '../subtitles';
-import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
+import {
+	aacChannelMap,
+	aacFrequencyTable,
+	AacProgramConfigElement,
+	buildAacAudioSpecificConfig,
+	getAacProgramConfigElementChannelCount,
+	readAdtsProgramConfigElement,
+} from '../../shared/aac-misc';
 import {
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
@@ -929,17 +936,31 @@ export class MatroskaMuxer extends Muxer {
 				);
 			}
 
-			const sampleRate = aacFrequencyTable[adtsFrame.samplingFrequencyIndex];
-			const numberOfChannels = aacChannelMap[adtsFrame.channelConfiguration];
+			let numberOfChannels: number;
+			let programConfigElement: AacProgramConfigElement | null = null;
+			if (adtsFrame.channelConfiguration === 0) {
+				// The channel layout is described by a PCE in the frame, which has to move into CodecPrivate
+				const headerSize = adtsFrame.crcCheck === null
+					? MIN_ADTS_FRAME_HEADER_SIZE
+					: MAX_ADTS_FRAME_HEADER_SIZE;
+				const result = readAdtsProgramConfigElement(packet.data.subarray(headerSize));
+				if (!result) {
+					throw new Error(
+						'ADTS frames with channel configuration 0 must begin with a program config element.',
+					);
+				}
 
-			if (sampleRate === undefined || numberOfChannels === undefined) {
-				throw new Error('Invalid ADTS frame header.');
+				programConfigElement = result.programConfigElement;
+				numberOfChannels = getAacProgramConfigElementChannelCount(programConfigElement);
+			} else {
+				numberOfChannels = aacChannelMap[adtsFrame.channelConfiguration]!;
 			}
 
 			decoderConfig.description = buildAacAudioSpecificConfig({
 				objectType: adtsFrame.objectType,
-				outputSampleRate: sampleRate,
+				outputSampleRate: aacFrequencyTable[adtsFrame.samplingFrequencyIndex]!,
 				outputNumberOfChannels: numberOfChannels,
+				programConfigElement,
 			});
 			requiresAdtsStripping = true;
 		}
@@ -1064,6 +1085,14 @@ export class MatroskaMuxer extends Muxer {
 					? MIN_ADTS_FRAME_HEADER_SIZE
 					: MAX_ADTS_FRAME_HEADER_SIZE;
 				packetData = packetData.subarray(headerLength);
+
+				if (adtsFrame.channelConfiguration === 0) {
+					// CodecPrivate already carries the PCE
+					const programConfigElement = readAdtsProgramConfigElement(packetData);
+					if (programConfigElement) {
+						packetData = packetData.subarray(programConfigElement.size);
+					}
+				}
 			}
 
 			const isKeyFrame = packet.type === 'key';
