@@ -2382,27 +2382,21 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				// audio can run a little longer or shorter than them, so the audio just continues. Only where a
 				// packet's audio starts at least 0.1 s after both the previous packet's audio ends and where the
 				// decoded audio has got to (a gap, as FFmpeg's aresample defines it with min_hard_comp) does it skip
-				// ahead. Where packet timestamps are exact, a gap of this output's length is enough, as long as no
-				// queued packet was passed over just now (outputs and packets would have come apart). It never moves
-				// back, which would play audio twice.
+				// ahead. Where packet timestamps are exact, 20 ms is enough (more than they're ever off, less than the
+				// video delay that FFmpeg's fragmented MP4 puts before the second audio packet), as long as no queued
+				// packet was passed over just now (outputs and packets would have come apart). It never moves back,
+				// which would play audio twice.
 				const queued = this.queuedOutputs.shift();
-				const startsGap = (length: number) => {
-					// Give or take half a sample
-					const minLength = length - 0.5 / sample.sampleRate;
-					return queued !== undefined
-						&& this.expectedQueuedTimestamp !== null
-						&& this.currentTimestamp !== null
-						&& queued - this.expectedQueuedTimestamp >= minLength
-						&& queued - this.currentTimestamp >= minLength;
-				};
-
+				const minGap = this.packetTimestampsAreExact && !skippedQueuedOutputs ? 0.02 : 0.1;
 				if (this.currentTimestamp === null) {
 					this.currentTimestamp = queued ?? sample.timestamp;
 				} else if (
-					startsGap(0.1)
-					|| (this.packetTimestampsAreExact && !skippedQueuedOutputs && startsGap(sample.duration))
+					queued !== undefined
+					&& this.expectedQueuedTimestamp !== null
+					&& queued - this.expectedQueuedTimestamp >= minGap
+					&& queued - this.currentTimestamp >= minGap
 				) {
-					this.currentTimestamp = queued!;
+					this.currentTimestamp = queued;
 				}
 
 				this.expectedQueuedTimestamp = (queued ?? this.expectedQueuedTimestamp ?? this.currentTimestamp)
