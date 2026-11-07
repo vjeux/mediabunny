@@ -130,6 +130,8 @@ type MatroskaTrackData = {
 		 */
 		requiresAdtsStripping: boolean;
 		codecDelay: number | null; // in seconds
+		/** The pre-skip of the Opus identification header, in seconds, if there is one. */
+		opusPreSkip: number | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -948,7 +950,7 @@ export class MatroskaMuxer extends Muxer {
 		// Matroska requires the Opus identification header as CodecPrivate, and a CodecDelay equal to its pre-skip (the
 		// samples a decoder drops at the start). A start before that is left to the (then negative) block timestamps,
 		// as growing the pre-skip to cover it would drop real audio.
-		let codecDelay: number | null = null;
+		let opusPreSkip: number | null = null;
 		if (track.source._codec === 'opus') {
 			if (!decoderConfig.description && decoderConfig.numberOfChannels <= 2) {
 				// With up to two channels (channel mapping family 0), the header can be built from the config. Nothing
@@ -968,7 +970,7 @@ export class MatroskaMuxer extends Muxer {
 
 			const header = decoderConfig.description && toUint8Array(decoderConfig.description);
 			if (header && header.length >= 19 && String.fromCharCode(...header.subarray(0, 8)) === 'OpusHead') {
-				codecDelay = (header[10]! | (header[11]! << 8)) / OPUS_SAMPLE_RATE;
+				opusPreSkip = (header[10]! | (header[11]! << 8)) / OPUS_SAMPLE_RATE;
 			}
 		}
 
@@ -980,7 +982,8 @@ export class MatroskaMuxer extends Muxer {
 				sampleRate: meta.decoderConfig.sampleRate,
 				decoderConfig,
 				requiresAdtsStripping,
-				codecDelay,
+				codecDelay: null,
+				opusPreSkip,
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
@@ -1096,6 +1099,22 @@ export class MatroskaMuxer extends Muxer {
 
 			const isKeyFrame = packet.type === 'key';
 			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
+
+			if (trackData.info.codecDelay === null && trackData.info.opusPreSkip !== null) {
+				// The CodecDelay is the Opus pre-skip, so an earlier start makes negative block timestamps. These can't
+				// go below MIN_CLUSTER_TIMESTAMP_MS, though, and rather than losing packets beyond that, the CodecDelay
+				// then covers the whole start.
+				const preSkip = trackData.info.opusPreSkip;
+				if (Math.round(1000 * (packet.timestamp + preSkip)) >= MIN_CLUSTER_TIMESTAMP_MS) {
+					trackData.info.codecDelay = preSkip;
+				} else {
+					trackData.info.codecDelay = -packet.timestamp;
+					Logging._warn(
+						'Opus audio starts too far before zero for the CodecDelay to equal its pre-skip, as Matroska'
+						+ ' requires; the CodecDelay covers the whole start instead.',
+					);
+				}
+			}
 
 			// A negative start (like from encoder priming) is expressed this way.
 			trackData.info.codecDelay ??= Math.max(-packet.timestamp, 0);

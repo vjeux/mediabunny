@@ -275,4 +275,12 @@ test('Opus gets an identification header as CodecPrivate, with the CodecDelay as
 	await check(0.1, 312, { description });
 	await check(-0.0065, 312, { description });
 	await check(-0.1, 312, { description });
+	await check(-20, 312, { description });
+
+	// Block timestamps can't go below -32.768 s, so rather than losing the packets of an earlier start, the CodecDelay
+	// then covers it as a whole
+	const farStart = await muxAndRead(-40, { description });
+	expect(farStart.description).toEqual(opusHead(312));
+	expect(farStart.codecDelay).toBe(40_000_000_000);
+	expect(Math.abs(farStart.firstTimestamp - -40)).toBeLessThan(0.0015);
 });
