@@ -153,6 +153,40 @@ test('Decode with the extension', async () => {
 	expect(sampleCount).toBe(packetCount);
 });
 
+// DTS:X from FFmpeg's FATE suite: ffmpeg -i dts/dtsx_7.1.4_24bit.dts -c copy -fflags +bitexact dtsx-7.1.4.mkv. The
+// decoder outputs 12 channels (7.1.4), more than AVFrame.data has room for.
+test('Decode the four height channels of DTS:X', async () => {
+	registerDtsDecoder();
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'dtsx-7.1.4.mkv')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	let numberOfChannels = 0;
+	const peaks: number[] = [];
+
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		numberOfChannels = sample.numberOfChannels;
+		for (let i = 0; i < numberOfChannels; i++) {
+			const plane = new Float32Array(sample.numberOfFrames);
+			sample.copyTo(plane, { format: 'f32-planar', planeIndex: i });
+			for (const value of plane) {
+				peaks[i] = Math.max(peaks[i] ?? 0, Math.abs(value));
+			}
+		}
+	}
+
+	expect(numberOfChannels).toBe(12);
+	// The bed, whose loudest channel is the center at 0.064
+	expect(Math.max(...peaks.slice(0, 8))).toBeLessThan(0.07);
+	// The heights, which are quiet too (they came out as full-scale noise when read from past the end of data)
+	expect(Math.max(...peaks.slice(8))).toBeLessThan(0.01);
+});
+
 test('Encode with the extension', async () => {
 	registerDtsEncoder();
 
