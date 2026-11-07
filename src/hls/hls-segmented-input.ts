@@ -73,7 +73,8 @@ export type HlsEncryptionInfo = {
 	keyFormat: string;
 } | {
 	method: 'SAMPLE-AES' | 'SAMPLE-AES-CTR';
-	psshBox: PsshBox | null;
+	/** From the keys of all KEYFORMATs that apply */
+	psshBoxes: PsshBox[];
 };
 
 export type HlsSegmentLocation = {
@@ -184,6 +185,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let accumulatedUnixTime: number | null = null;
 		let nextSegmentDuration: number | null = null;
 		let currentKey: HlsEncryptionInfo | null = null;
+		// The SAMPLE-AES keys of different KEYFORMATs (one per DRM system) apply together (RFC 8216, 4.3.2.4)
+		const psshBoxesByKeyFormat = new Map<string, PsshBox | null>();
 		let nextSequenceNumber = 0;
 		let nextDiscontinuityNumber = 0;
 		let currentFirstSegment: HlsSegment | null = null;
@@ -389,6 +392,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 				if (method === 'NONE') {
 					currentKey = null;
+					psshBoxesByKeyFormat.clear();
 				} else if (method === 'AES-128') {
 					const uri = attributes.get('uri');
 					if (!uri) {
@@ -427,6 +431,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						iv,
 						keyFormat,
 					};
+					psshBoxesByKeyFormat.clear();
 				} else if (method === 'SAMPLE-AES' || method === 'SAMPLE-AES-CTR') {
 					const uri = attributes.get('uri');
 					if (!uri) {
@@ -458,9 +463,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 						}
 					}
 
+					psshBoxesByKeyFormat.set(keyFormat, psshBox);
 					currentKey = {
 						method,
-						psshBox,
+						psshBoxes: [...psshBoxesByKeyFormat.values()].filter((x): x is PsshBox => x !== null),
 					};
 				} else {
 					throw new Error(
@@ -680,19 +686,18 @@ export class HlsSegmentedInput extends SegmentedInput {
 							hlsSegment.encryption.method === 'SAMPLE-AES'
 							|| hlsSegment.encryption.method === 'SAMPLE-AES-CTR'
 						)
-						|| !hlsSegment.encryption.psshBox
 					) {
 						return this.input._formatOptions.isobmff!.resolveKeyId!(options);
 					}
 
 					let psshBoxes = options.psshBoxes;
-					const { psshBox } = hlsSegment.encryption;
-
-					if (
-						(psshBox.keyIds === null || psshBox.keyIds.includes(options.keyId))
-						&& !psshBoxes.some(x => psshBoxesAreEqual(x, psshBox))
-					) {
-						psshBoxes = [...psshBoxes, psshBox];
+					for (const psshBox of hlsSegment.encryption.psshBoxes) {
+						if (
+							(psshBox.keyIds === null || psshBox.keyIds.includes(options.keyId))
+							&& !psshBoxes.some(x => psshBoxesAreEqual(x, psshBox))
+						) {
+							psshBoxes = [...psshBoxes, psshBox];
+						}
 					}
 
 					return this.input._formatOptions.isobmff!.resolveKeyId!({ ...options, psshBoxes });
