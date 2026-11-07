@@ -133,6 +133,7 @@ test('Matroska LanguageBCP47 gives an ISO 639-2 language code', async () => {
 	expect(await readLanguage(language('ger'), languageBcp47('de-CH'))).toBe('deu');
 	expect(await readLanguage(languageBcp47('zh-Hans'))).toBe('zho');
 	expect(await readLanguage(languageBcp47('EN'))).toBe('eng');
+	expect(await readLanguage(languageBcp47('jw'))).toBe('jav'); // Deprecated for jv
 	// A three-letter language subtag stays as it is, anything else is undetermined
 	expect(await readLanguage(language('ger'), languageBcp47('gsw-CH'))).toBe('gsw');
 	expect(await readLanguage(languageBcp47('x-private'))).toBe('und');
