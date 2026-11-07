@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
 import { assert, toUint8Array } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
-import { BufferSource, CustomSource, FilePathSource } from '../../src/source.js';
+import { BufferSource, CustomSource, FilePathSource, ReadableStreamSource } from '../../src/source.js';
 import { ALL_FORMATS, FLAC } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
@@ -189,6 +189,49 @@ test('reads the track without loading the embedded pictures', async () => {
 	expect(tags.images).toHaveLength(1);
 	expect(tags.images![0]!.data.byteLength).toBe(imageSize);
 	expect(tags.images![0]!.kind).toBe('coverFront');
+});
+
+test('reads the embedded pictures of a stream after its packets', async () => {
+	// sample.flac with a front cover added as a PICTURE block right after STREAMINFO
+	const flac = new Uint8Array(await fs.readFile(path.join(__dirname, '..', 'public/sample.flac')));
+	const mimeType = new TextEncoder().encode('image/png');
+	const image = new Uint8Array(1000).fill(7);
+	const picture = new Uint8Array(32 + mimeType.length + image.length);
+	const view = new DataView(picture.buffer);
+	view.setUint32(0, 3); // Front cover
+	view.setUint32(4, mimeType.length);
+	picture.set(mimeType, 8);
+	view.setUint32(8 + mimeType.length + 20, image.length);
+	picture.set(image, 32 + mimeType.length);
+
+	const streamInfoEnd = 4 + 4 + 34;
+	const bytes = new Uint8Array(flac.length + 4 + picture.length);
+	bytes.set(flac.subarray(0, streamInfoEnd), 0);
+	bytes.set([6, picture.length >> 16, (picture.length >> 8) & 0xff, picture.length & 0xff], streamInfoEnd);
+	bytes.set(picture, streamInfoEnd + 4);
+	bytes.set(flac.subarray(streamInfoEnd), streamInfoEnd + 4 + picture.length);
+
+	// A stream longer than the cache, which only keeps what's recent, as for a fetch() body of a hi-res rip
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (let i = 0; i < bytes.length; i += 65536) {
+				controller.enqueue(bytes.slice(i, i + 65536));
+			}
+			controller.close();
+		},
+	});
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 256 * 1024 }),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		void packet;
+	}
+
+	const tags = await input.getMetadataTags();
+	expect(tags.images!.filter(image => image.kind === 'coverFront' && image.data.length === 1000)).toHaveLength(1);
 });
 
 test('can re-mux a .flac', async () => {

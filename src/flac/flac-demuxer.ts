@@ -246,9 +246,16 @@ export class FlacDemuxer extends Demuxer {
 						break;
 					}
 					case FlacBlockType.PICTURE: {
+						if (this.reader.fileSize === null) {
+							// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep
+							// what's behind, so their pictures are read right away
+							await this.readPictureBlock(currentPos, size);
+							break;
+						}
+
 						// Pictures can be large and only the metadata tags need them, so they're read later (see
 						// readPictures), not to get the track
-						if (this.reader.fileSize !== null && currentPos + size > this.reader.fileSize) {
+						if (currentPos + size > this.reader.fileSize) {
 							throw new Error(
 								`Picture block at position ${currentPos} exceeds the file. Corrupted file.`,
 							);
