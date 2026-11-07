@@ -251,6 +251,8 @@ export class EncodedVideoPacketSource extends VideoSource {
 
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
+	/** Resolved once the wrapper is closed, so that nothing keeps waiting for an encoder that may never come. */
+	private closedSignal = promiseWithResolvers();
 	private encoderInitialized = false;
 	private encoder: VideoEncoder | null = null;
 	private encoderConfig: VideoEncoderConfig | null = null;
@@ -522,7 +524,11 @@ class VideoEncoderWrapper {
 					// code paths are calling this method: It's important that the call that
 					// initialized the encoder go through this code first.
 					if (!this.encoderInitialized) {
-						await this.ensureEncoderPromise;
+						// Racing the close: an initialization may never finish (one hanging in a platform codec, say)
+						await Promise.race([this.ensureEncoderPromise, this.closedSignal.promise]);
+						if (this.closed) {
+							break;
+						}
 					}
 				}
 				assert(this.encoderInitialized);
@@ -1110,6 +1116,7 @@ class VideoEncoderWrapper {
 			// This cleanup must also run when padding or flushing threw (e.g. due to an encoder error), otherwise
 			// samples, frames and encoders would be left dangling
 			this.closed = true;
+			this.closedSignal.resolve();
 
 			this.frameRateLastSample?.close();
 			this.frameRateLastSample = null;
@@ -2025,6 +2032,8 @@ export const PCM_ENCODER_PACKET_SIZE = 2048; // In frames
 
 class AudioEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
+	/** Resolved once the wrapper is closed, so that nothing keeps waiting for an encoder that may never come. */
+	private closedSignal = promiseWithResolvers();
 	private encoderInitialized = false;
 	private encoder: AudioEncoder | null = null;
 	private muxer: Muxer | null = null;
@@ -2204,7 +2213,11 @@ class AudioEncoderWrapper {
 				// calling this method: It's important that the call that initialized the encoder go through this
 				// code first.
 				if (!this.encoderInitialized) {
-					await this.ensureEncoderPromise;
+					// Racing the close: an initialization may never finish (one hanging in a platform codec, say)
+					await Promise.race([this.ensureEncoderPromise, this.closedSignal.promise]);
+					if (this.closed) {
+						return;
+					}
 				}
 			}
 			assert(this.encoderInitialized);
@@ -2660,6 +2673,7 @@ class AudioEncoderWrapper {
 			// This cleanup must also run when flushing threw (e.g. due to an encoder error), otherwise the encoder
 			// would be left dangling
 			this.closed = true;
+			this.closedSignal.resolve();
 			this.resampler = null;
 
 			if (this.customEncoder) {
