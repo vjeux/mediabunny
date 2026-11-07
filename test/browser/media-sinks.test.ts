@@ -276,3 +276,19 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
+
+test('HLS: video after a discontinuity with a new EXT-X-MAP decodes with its own parameter sets', async () => {
+	// Two x264 encodes with different SPS/PPS (64x48 baseline, then 96x96 high), the way an ad break stitched into a
+	// stream brings its own init section
+	using input = new Input({ source: new UrlSource('/hls-disc/disc.m3u8'), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sizes: string[] = [];
+	for await (const sample of new VideoSampleSink(videoTrack).samples()) {
+		sizes.push(`${sample.codedWidth}x${sample.codedHeight}`);
+		sample.close();
+	}
+
+	expect(sizes).toEqual([...Array<string>(10).fill('64x48'), ...Array<string>(10).fill('96x96')]);
+});

@@ -19,8 +19,15 @@ import {
 	InputVideoTrackBacking,
 } from './input-track';
 import { PacketRetrievalOptions } from './media-sink';
-import { arrayCount, assert, MaybePromise, roundToDivisor } from './misc';
-import { EncodedPacket } from './packet';
+import { arrayCount, assert, MaybePromise, roundToDivisor, toUint8Array, uint8ArraysAreEqual } from './misc';
+import { EncodedPacket, PLACEHOLDER_DATA } from './packet';
+import {
+	concatNalUnitsInLengthPrefixed,
+	deserializeAvcDecoderConfigurationRecord,
+	deserializeHevcDecoderConfigurationRecord,
+	HevcNalUnitType,
+	iterateNalUnitsInLengthPrefixed,
+} from './codec-data';
 
 export type SegmentedInputMetadata = {
 	name: string | null;
@@ -228,11 +235,38 @@ type PacketInfo = {
 	sourcePacket: EncodedPacket;
 };
 
+type InBandParameterSets = {
+	/** The segment's parameter sets, length-prefixed like the packets the decoder config describes */
+	parameterSets: Uint8Array;
+	/** The NAL unit length size of the segment's own packets */
+	lengthSize: 1 | 2 | 3 | 4;
+	/** The NAL unit length size the decoder config (the first segment's) declares */
+	targetLengthSize: 1 | 2 | 3 | 4;
+};
+
+const parseParameterSets = (codec: 'avc' | 'hevc', description: Uint8Array) => {
+	if (codec === 'avc') {
+		const record = deserializeAvcDecoderConfigurationRecord(description);
+		return record && {
+			nalUnits: [...record.sequenceParameterSets, ...record.pictureParameterSets],
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+		};
+	} else {
+		const record = deserializeHevcDecoderConfigurationRecord(description);
+		const parameterSetTypes: number[] = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+		return record && {
+			nalUnits: record.arrays.filter(x => parameterSetTypes.includes(x.nalUnitType)).flatMap(x => x.nalUnits),
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+		};
+	}
+};
+
 class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	segmentedInput: SegmentedInput;
 	decl: SegmentedInputTrackDeclaration;
 	number: number;
 	packetInfos = new WeakMap<EncodedPacket, PacketInfo>();
+	inBandParameterSets = new WeakMap<InputTrack, Promise<InBandParameterSets | null>>();
 
 	hydrationPromise: Promise<void> | null = null;
 	firstInputTrack: InputTrack | null = null;
@@ -369,15 +403,43 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		// If we didn't do this then sequence numbers would exceed Number.MAX_SAFE_INTEGER for Unix-timestamped segments
 		const segmentTimestampRelativeToFirst = segment.timestamp - this.segmentedInput.firstSegment.timestamp;
 
-		const modified = packet.clone({
-			timestamp: roundToDivisor(
+		let data = packet.data;
+		let byteLength = packet.byteLength;
+		const inBand = await this.getInBandParameterSets(track);
+		if (inBand) {
+			let source = packet;
+			if (packet.isMetadataOnly && inBand.lengthSize !== inBand.targetLengthSize) {
+				// Converted length prefixes make the size depend on the NAL units, so a metadata-only packet needs them
+				// too
+				const fullPacket = await track._backing.getPacket(packet.timestamp, {});
+				if (fullPacket && fullPacket.sequenceNumber === packet.sequenceNumber) {
+					source = fullPacket;
+				}
+			}
+
+			if (!source.isMetadataOnly) {
+				const bytes = this.applyInBandParameterSets(source.data, packet.type === 'key', inBand);
+				byteLength = bytes.byteLength;
+				data = packet.isMetadataOnly ? PLACEHOLDER_DATA : bytes;
+			} else if (packet.type === 'key') {
+				byteLength += inBand.parameterSets.byteLength;
+			}
+		}
+
+		const modified = new EncodedPacket(
+			data,
+			packet.type,
+			roundToDivisor(
 				packet.timestamp + mediaOffset,
 				await track.getTimeResolution(),
 			),
+			packet.duration,
 			// The 1e8 assumes a max of 100 MB per second, highly unlikely to be hit, so this should guarantee
 			// monotonically increasing sequence numbers across segments.
-			sequenceNumber: Math.floor(1e8 * segmentTimestampRelativeToFirst) + packet.sequenceNumber,
-		});
+			Math.floor(1e8 * segmentTimestampRelativeToFirst) + packet.sequenceNumber,
+			byteLength,
+			packet.sideData,
+		);
 
 		this.packetInfos.set(modified, {
 			segment,
@@ -386,6 +448,78 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		});
 
 		return modified;
+	}
+
+	/**
+	 * The decoder config is the first segment's, but a later segment can come with its own init section whose parameter
+	 * sets differ (a new EXT-X-MAP after a discontinuity, such as an ad break from another encoder). Like Chromium does
+	 * for a new init segment, that segment's parameter sets are then sent in band, in front of each of its key packets.
+	 */
+	getInBandParameterSets(track: InputTrack) {
+		let promise = this.inBandParameterSets.get(track);
+		if (!promise) {
+			promise = (async (): Promise<InBandParameterSets | null> => {
+				assert(this.firstInputTrack);
+				if (track === this.firstInputTrack || !track.isVideoTrack()) {
+					return null;
+				}
+
+				const codec = await track.getCodec();
+				if (codec !== 'avc' && codec !== 'hevc') {
+					return null;
+				}
+
+				const firstConfig = await this.firstInputTrack._backing.getDecoderConfig() as VideoDecoderConfig | null;
+				const config = await track._backing.getDecoderConfig();
+				if (!firstConfig?.description || !config?.description) {
+					return null; // Annex B packets carry their parameter sets in band already
+				}
+
+				const firstDescription = toUint8Array(firstConfig.description);
+				const description = toUint8Array(config.description);
+				if (uint8ArraysAreEqual(firstDescription, description)) {
+					return null;
+				}
+
+				const first = parseParameterSets(codec, firstDescription);
+				const own = parseParameterSets(codec, description);
+				if (!first || !own) {
+					return null;
+				}
+
+				return {
+					parameterSets: concatNalUnitsInLengthPrefixed(own.nalUnits, first.lengthSize),
+					lengthSize: own.lengthSize,
+					targetLengthSize: first.lengthSize,
+				};
+			})();
+			this.inBandParameterSets.set(track, promise);
+		}
+
+		return promise;
+	}
+
+	applyInBandParameterSets(data: Uint8Array, isKey: boolean, inBand: InBandParameterSets) {
+		let bytes = data;
+		if (inBand.lengthSize !== inBand.targetLengthSize) {
+			const nalUnits = [...iterateNalUnitsInLengthPrefixed(data, inBand.lengthSize)]
+				.map(location => data.subarray(location.offset, location.offset + location.length));
+			if (nalUnits.some(nalUnit => nalUnit.byteLength >= 2 ** (8 * inBand.targetLengthSize))) {
+				throw new Error(
+					'A NAL unit is too large for the NAL unit length size of the first segment\'s decoder config.',
+				);
+			}
+			bytes = concatNalUnitsInLengthPrefixed(nalUnits, inBand.targetLengthSize);
+		}
+
+		if (!isKey) {
+			return bytes;
+		}
+
+		const result = new Uint8Array(inBand.parameterSets.byteLength + bytes.byteLength);
+		result.set(inBand.parameterSets, 0);
+		result.set(bytes, inBand.parameterSets.byteLength);
+		return result;
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {

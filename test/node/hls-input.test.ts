@@ -6,6 +6,8 @@ import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
 import { CustomPathedSource, FilePathSource } from '../../src/source.js';
 import { createAes128CbcDecryptStream } from '../../src/aes.js';
 import { Reader } from '../../src/reader.js';
+import { concatNalUnitsInLengthPrefixed, deserializeAvcDecoderConfigurationRecord, deserializeHevcDecoderConfigurationRecord } from '../../src/codec-data.js';
+import { readFileSync } from 'node:fs';
 
 // A lot of test cases taken from:
 // https://github.com/video-dev/hls.js/blob/master/tests/test-streams.js
@@ -1405,6 +1407,80 @@ b.ts
 
 	expect(types.length).toBeGreaterThan(0);
 	expect(types.every(type => type === 'key')).toBe(true);
+});
+
+test.concurrent('A new EXT-X-MAP after a discontinuity sends its parameter sets in band', async () => {
+	// test/public/hls-disc: 64x48, then a discontinuity to 96x96 with its own init section, from x264 (baseline, then
+	// high) and from x265
+	const cases = [
+		{ playlist: 'disc.m3u8', first: 'a', second: 'b', codec: 'avc' },
+		{ playlist: 'hevc-disc.m3u8', first: 'ha', second: 'hb', codec: 'hevc' },
+	] as const;
+
+	for (const { playlist, first, second, codec } of cases) {
+		using input = new Input({
+			source: new CustomPathedSource(`./test/public/hls-disc/${playlist}`, ({ path }) => new FilePathSource(path)),
+			formats: ALL_FORMATS,
+		});
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.getCodec()).toBe(codec);
+		const packets = [];
+		for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+			packets.push(packet);
+		}
+
+		// Each segment read on its own, as one fragmented MP4 file
+		const readFile = async (name: string) => {
+			const bytes = Buffer.concat([
+				readFileSync(`./test/public/hls-disc/${name}_init.mp4`),
+				readFileSync(`./test/public/hls-disc/${name}_0.m4s`),
+			]);
+			using file = new Input({ source: new BufferSource(new Uint8Array(bytes)), formats: ALL_FORMATS });
+			const track = (await file.getPrimaryVideoTrack())!;
+			const filePackets = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				filePackets.push(packet);
+			}
+			return { packets: filePackets, description: new Uint8Array((await track.getDecoderConfig())!.description as ArrayBuffer) };
+		};
+		const a = await readFile(first);
+		const b = await readFile(second);
+		expect(packets).toHaveLength(a.packets.length + b.packets.length);
+
+		// The decoder config stays the first init section's, and its segment's packets are untouched
+		expect(new Uint8Array((await videoTrack.getDecoderConfig())!.description as ArrayBuffer)).toEqual(a.description);
+		expect(packets.slice(0, a.packets.length).map(x => x.data)).toEqual(a.packets.map(x => x.data));
+
+		// The second segment's key frame carries its parameter sets (length-prefixed, from its avcC/hvcC) in front
+		const getParameterSets = (description: Uint8Array) => {
+			if (codec === 'avc') {
+				const record = deserializeAvcDecoderConfigurationRecord(description)!;
+				return [...record.sequenceParameterSets, ...record.pictureParameterSets];
+			}
+
+			return deserializeHevcDecoderConfigurationRecord(description)!.arrays
+				.filter(x => [32, 33, 34].includes(x.nalUnitType)) // VPS, SPS, PPS
+				.flatMap(x => x.nalUnits);
+		};
+		const parameterSets = getParameterSets(b.description);
+		expect(parameterSets).not.toEqual(getParameterSets(a.description));
+		const bPackets = packets.slice(a.packets.length);
+		expect(bPackets[0]!.type).toBe('key');
+		expect(bPackets[0]!.data).toEqual(new Uint8Array([
+			...concatNalUnitsInLengthPrefixed(parameterSets, 4),
+			...b.packets[0]!.data,
+		]));
+		expect(bPackets.slice(1).map(x => x.data)).toEqual(b.packets.slice(1).map(x => x.data));
+
+		// Metadata-only packets report the same sizes
+		const metadataSizes: number[] = [];
+		for await (const packet of new EncodedPacketSink(videoTrack).packets(undefined, undefined, { metadataOnly: true })) {
+			metadataSizes.push(packet.byteLength);
+		}
+		expect(metadataSizes).toEqual(packets.map(x => x.byteLength));
+		expect(packets.every(x => x.byteLength === x.data.byteLength)).toBe(true);
+	}
 });
 
 const fetchBytes = async (url: string) => {
