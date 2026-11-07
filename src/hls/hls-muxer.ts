@@ -109,9 +109,12 @@ type Playlist = {
 		 * segments file which is also a perfectly valid standalone fMP4 valid.
 		 */
 		fragmentedIsobmffOutput: FragmentedIsobmffOutput | null;
-		/** The MPEG-TS continuity counters, which go on from one segment to the next in the file */
-		continuityCounters: Map<number, number>;
 	} | null;
+	/**
+	 * The MPEG-TS continuity counters, which go on from one segment to the next: players read the segments as one
+	 * transport stream, also when they're separate files
+	 */
+	continuityCounters: Map<number, number>;
 
 	// For HLS, having a single mutex is too coarse. Every playlist is basically independent and therefore we can have
 	// a per-playlist mutex instead of a per-muxer one. This means two packets from different playlists coming in don't
@@ -502,6 +505,7 @@ export class HlsMuxer extends Muxer {
 				mediaSequence: 0,
 				done: false,
 				singleFile: null,
+				continuityCounters: new Map(),
 				mutex: new AsyncMutex(),
 			};
 			this.playlists.push(playlist);
@@ -997,7 +1001,6 @@ export class HlsMuxer extends Muxer {
 						nextOffset: 0,
 						info: segmentInfo,
 						fragmentedIsobmffOutput,
-						continuityCounters: new Map(),
 					};
 				} else {
 					relativeSegmentPath = playlist.singleFile.path;
@@ -1163,9 +1166,10 @@ export class HlsMuxer extends Muxer {
 						}
 					}
 
-					if (playlist.singleFile && output._muxer instanceof MpegTsMuxer) {
+					if (output._muxer instanceof MpegTsMuxer) {
 						// The segments make up one transport stream, so its continuity counters must not start over
-						output._muxer.continuityCounters = playlist.singleFile.continuityCounters;
+						// (like in FFmpeg's HLS muxer; Apple's HLS authoring spec 7.2 requires them to be sequential)
+						output._muxer.continuityCounters = playlist.continuityCounters;
 					}
 
 					await output.start();
