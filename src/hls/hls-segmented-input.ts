@@ -669,7 +669,23 @@ export class HlsSegmentedInput extends SegmentedInput {
 				return cachedKey;
 			}
 
-			const key = (async () => resolveKeyId(options))();
+			const key = (async () => {
+				const result = await resolveKeyId(options);
+
+				// Checked here already (like the demuxer does), so that a result that isn't a key is tried again like a
+				// failure instead of being kept
+				if (!(
+					(typeof result === 'string' && /^[0-9a-fA-F]{32}$/.test(result))
+					|| (result instanceof Uint8Array && result.byteLength === 16)
+				)) {
+					throw new TypeError(
+						'resolveKeyId must return a 32-character hex string or a 16-byte Uint8Array containing the'
+						+ ' decryption key.',
+					);
+				}
+
+				return result;
+			})();
 			cache.set(options.keyId, key);
 
 			// A failed resolution is tried again by the next segment that needs the key, as before

@@ -1215,7 +1215,7 @@ test.concurrent('resolveKeyId runs once per key ID, not once per segment', async
 	].join('\n'));
 
 	let resolveCount = 0;
-	let failuresLeft = 0;
+	let failNext: (() => string) | null = null;
 	const openInput = () => new Input({
 		source: new CustomPathedSource('https://example.com/playlist.m3u8', ({ path }) => new BufferSource(
 			path.endsWith('.m3u8')
@@ -1225,12 +1225,9 @@ test.concurrent('resolveKeyId runs once per key ID, not once per segment', async
 		formats: ALL_FORMATS,
 		formatOptions: { isobmff: { resolveKeyId: () => {
 			resolveCount++;
-			if (failuresLeft > 0) {
-				failuresLeft--;
-				throw new Error('License server unavailable');
-			}
-
-			return key;
+			const fail = failNext;
+			failNext = null;
+			return fail ? fail() : key;
 		} } },
 	});
 
@@ -1244,16 +1241,23 @@ test.concurrent('resolveKeyId runs once per key ID, not once per segment', async
 	expect(packets).toEqual(new Array(6).fill(plaintext));
 	expect(resolveCount).toBe(1);
 
-	// A failed resolution isn't kept: the next segment that needs the key tries again
-	resolveCount = 0;
-	failuresLeft = 1;
-	using retryInput = openInput();
-	const retryTrack = await retryInput.getPrimaryVideoTrack();
-	assert(retryTrack);
-	const sink = new EncodedPacketSink(retryTrack);
-	await expect(sink.getFirstPacket()).rejects.toThrow('License server unavailable');
-	expect([...(await sink.getPacket(0.3))!.data]).toEqual(plaintext);
-	expect(resolveCount).toBe(2);
+	// A failed resolution isn't kept, nor a result that isn't a key (e.g. a license server's error message): the next
+	// segment that needs the key tries again
+	const checkRetry = async (fail: () => string, error: string) => {
+		resolveCount = 0;
+		failNext = fail;
+		using retryInput = openInput();
+		const retryTrack = await retryInput.getPrimaryVideoTrack();
+		assert(retryTrack);
+		const sink = new EncodedPacketSink(retryTrack);
+		await expect(sink.getFirstPacket()).rejects.toThrow(error);
+		expect([...(await sink.getPacket(0.3))!.data]).toEqual(plaintext);
+		expect(resolveCount).toBe(2);
+	};
+	await checkRetry(() => {
+		throw new Error('License server unavailable');
+	}, 'License server unavailable');
+	await checkRetry(() => 'not a key', 'resolveKeyId must return');
 });
 
 test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with buffer keys', async () => {
