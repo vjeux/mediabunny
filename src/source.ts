@@ -138,10 +138,7 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 			assert(size !== undefined);
 
 			return size;
-		})().catch((error: unknown) => {
-			this._sizePromise = null; // So that a later call can try again
-			throw error;
-		});
+		})();
 	}
 
 	/**
@@ -392,10 +389,7 @@ export class CustomPathedSource extends PathedSource {
 				};
 
 				if (isThenable(result)) {
-					this._rootRequest = result.then(handle, (error: unknown) => {
-						this._rootRequest = null; // So that a later read can try again
-						throw error;
-					});
+					this._rootRequest = result.then(handle);
 				} else {
 					handle(result);
 					assert(this._root);
