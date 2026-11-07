@@ -927,8 +927,8 @@ test('MPEG-TS with AUD-less video packets', async () => {
 test('MPEG-TS skips metadata streams, like the ID3 timed metadata of HLS, without a note', async () => {
 	// Apple's timed metadata for HLS: ID3 tags in PES packets (stream_id 0xBD) of a stream_type 0x15 stream, described
 	// by a metadata_pointer_descriptor in the program info and a metadata_descriptor in the stream info. Made here by
-	// adding such a stream (PID 0x101), with one ID3 tag, to the AC-3 audio of ac3.ts (PID 0x100). An MPEG-2 video
-	// stream (stream_type 0x02, PID 0x102), whose codec isn't supported, still gets its note.
+	// adding such a stream (PID 0x101), with one ID3 tag, to the AC-3 audio of ac3.ts (PID 0x100), next to an MPEG-2
+	// video stream (stream_type 0x02, PID 0x102), whose codec isn't supported.
 	const crc32 = (bytes: number[]) => {
 		let crc = 0xffffffff;
 		for (const byte of bytes) {
@@ -1011,7 +1011,7 @@ test('MPEG-TS skips metadata streams, like the ID3 timed metadata of HLS, withou
 	expect(actual.audioPackets.length).toBeGreaterThan(0);
 	expect(actual.audioPackets.map(x => [x.timestamp, x.byteLength]))
 		.toEqual(expected.audioPackets.map(x => [x.timestamp, x.byteLength]));
-	expect(notes.filter(x => x.includes('stream_type'))).toEqual([
-		'Note: MPEG-TS streams with stream_type 0x2 are not currently supported.',
-	]);
+	// No note for the metadata stream. (Unsupported codecs, like MPEG-2 video, get theirs only once per process, so
+	// whether that one shows up here depends on the tests before.)
+	expect(notes.filter(x => x.includes('stream_type 0x15'))).toEqual([]);
 });
