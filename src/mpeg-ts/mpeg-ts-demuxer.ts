@@ -64,13 +64,16 @@ import {
 	COLOR_PRIMARIES_MAP_INVERSE,
 	findLastIndex,
 	floorToMultiple,
+	getDisplayAspect,
 	isThenable,
 	isIso639Dash2LanguageCode,
 	IDENTITY_MATRIX,
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
+	Rational,
 	readExpGolomb,
 	roundIfAlmostInteger,
+	simplifyRational,
 	toDataView,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
 	TransformationMatrix,
@@ -165,6 +168,8 @@ type ElementaryStream = {
 		height: number;
 		squarePixelWidth: number;
 		squarePixelHeight: number;
+		/** Exact, unlike the square pixel size */
+		pixelAspectRatio: Rational;
 		reorderSize: number;
 		/** How to find the field of a slice, for AVC streams that may contain field pictures. */
 		avcFieldCoding: AvcFieldCoding | null;
@@ -669,6 +674,7 @@ export class MpegTsDemuxer extends Demuxer {
 									height: -1,
 									squarePixelWidth: -1,
 									squarePixelHeight: -1,
+									pixelAspectRatio: { num: 1, den: 1 },
 									reorderSize: -1,
 									avcFieldCoding: null,
 								};
@@ -855,8 +861,10 @@ export class MpegTsDemuxer extends Demuxer {
 
 										elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
 										elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
+										elementaryStream.info.pixelAspectRatio = { num: 1, den: 1 };
 
 										if (num > 0 && den > 0) {
+											elementaryStream.info.pixelAspectRatio = simplifyRational({ num, den });
 											if (num > den) {
 												elementaryStream.info.squarePixelWidth = Math.round(
 													elementaryStream.info.width * num / den,
@@ -919,8 +927,10 @@ export class MpegTsDemuxer extends Demuxer {
 
 										elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
 										elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
+										elementaryStream.info.pixelAspectRatio = { num: 1, den: 1 };
 
 										if (num > 0 && den > 0) {
+											elementaryStream.info.pixelAspectRatio = simplifyRational({ num, den });
 											if (num > den) {
 												elementaryStream.info.squarePixelWidth = Math.round(
 													elementaryStream.info.width * num / den,
@@ -971,14 +981,16 @@ export class MpegTsDemuxer extends Demuxer {
 									colorSpace: elementaryStream.info.colorSpace,
 								};
 
-								if (
-									elementaryStream.info.width !== elementaryStream.info.squarePixelWidth
-									|| elementaryStream.info.height !== elementaryStream.info.squarePixelHeight
-								) {
+								const displayAspect = getDisplayAspect(
+									elementaryStream.info.width,
+									elementaryStream.info.height,
+									elementaryStream.info.pixelAspectRatio,
+								);
+								if (displayAspect) {
 									elementaryStream.info.decoderConfig.displayAspectWidth
-									= elementaryStream.info.squarePixelWidth;
+									= displayAspect.displayAspectWidth;
 									elementaryStream.info.decoderConfig.displayAspectHeight
-									= elementaryStream.info.squarePixelHeight;
+									= displayAspect.displayAspectHeight;
 								}
 
 								elementaryStream.initialized = true;
@@ -2420,6 +2432,10 @@ class MpegTsVideoTrackBacking extends MpegTsTrackBacking implements InputVideoTr
 
 	getSquarePixelHeight() {
 		return this.elementaryStream.info.squarePixelHeight;
+	}
+
+	getPixelAspectRatio() {
+		return this.elementaryStream.info.pixelAspectRatio;
 	}
 
 	getTransformationMatrix(): TransformationMatrix {
