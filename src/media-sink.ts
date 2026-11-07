@@ -361,6 +361,9 @@ export class EncodedPacketSink {
 		// The queue should always be big enough to hold 1 second worth of packets
 		const maxQueueSize = () => Math.max(2, timestamps.length);
 
+		// Disposing the input ends the iteration like return() does, so that the pump stops waiting for the consumer
+		let onInputDisposed: (() => void) | null = null;
+
 		// The following is the "pump" process that keeps pumping packets into the queue
 		(async () => {
 			let packet = startPacket ?? await this.getFirstPacket(options);
@@ -392,11 +395,15 @@ export class EncodedPacketSink {
 				hasOutOfBandError = true;
 				onQueueNotEmpty();
 			}
+		}).finally(() => {
+			if (onInputDisposed) {
+				this._track.input._disposeCallbacks.delete(onInputDisposed);
+			}
 		});
 
 		const track = this._track;
 
-		return {
+		const iterator: AsyncGenerator<EncodedPacket, void, unknown> = {
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -426,6 +433,8 @@ export class EncodedPacketSink {
 			},
 			async return() {
 				terminated = true;
+				// No longer needed
+				packetQueue.length = 0;
 				onQueueDequeue();
 				onQueueNotEmpty();
 
@@ -438,6 +447,11 @@ export class EncodedPacketSink {
 				return this;
 			},
 		};
+
+		onInputDisposed = () => void iterator.return();
+		track.input._disposeCallbacks.add(onInputDisposed);
+
+		return iterator;
 	}
 }
 

@@ -5,13 +5,13 @@ import { fileURLToPath } from 'node:url';
 import { Input, InputDisposedError } from '../../src/input.js';
 import { ALL_FORMATS, MP4 } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
-import { AudioSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { AudioSample } from '../../src/sample.js';
 import { CustomAudioDecoder, registerDecoder } from '../../src/custom-coder.js';
 import { AudioCodec } from '../../src/codec.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { readFile } from 'node:fs/promises';
-import { setImmediate, setTimeout } from 'node:timers/promises';
+import { setImmediate } from 'node:timers/promises';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -207,14 +207,45 @@ test.each([
 
 		// The sink decodes ahead until its queue is full, then waits for the consumer, which stops here and just
 		// disposes the input (a player being torn down, for example), found by lane L57
-		await setTimeout(50);
+		await new Promise(resolve => setTimeout(resolve, 50));
 		expect(countingDecoderSamples.length).toBeGreaterThan(1);
 		input.dispose();
-		await setTimeout(50);
+		await new Promise(resolve => setTimeout(resolve, 50));
 
 		expect(countingDecoderCloseCount).toBe(1);
 		expect(countingDecoderSamples.filter(sample => !sample._closed)).toHaveLength(0);
 		await expect(iterator.next()).rejects.toThrow(InputDisposedError);
+	} finally {
+		countingDecoderActive = false;
+	}
+});
+
+test('Finished and returned iterators stop listening for the input being disposed', async () => {
+	countingDecoderActive = true;
+
+	try {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packetSink = new EncodedPacketSink(track);
+		for await (const packet of packetSink.packets(undefined, undefined, { metadataOnly: true })) {
+			expect(packet.isMetadataOnly).toBe(true);
+		}
+
+		const packets = packetSink.packets();
+		await packets.next();
+		await packets.return();
+
+		const samples = new AudioSampleSink(track).samples();
+		(await samples.next()).value?.close();
+		await samples.return();
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(input._disposeCallbacks.size).toBe(0);
 	} finally {
 		countingDecoderActive = false;
 	}
