@@ -2323,8 +2323,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
-	// The timestamp of a packet the decoder emits nothing for (libfaac's priming, see getDiscardedPacketTimestamp)
-	discardedPacketTimestamp: number | null = null;
+	// The sequence number of a packet the decoder emits nothing for (libfaac's priming, see getDiscardedPacket)
+	discardedPacketSequenceNumber: number | null = null;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
@@ -2443,7 +2443,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			assert(this.decoder);
 
 			// The first output comes from the packet after a discarded one
-			if (packet.timestamp !== this.discardedPacketTimestamp) {
+			if (packet.sequenceNumber !== this.discardedPacketSequenceNumber) {
 				this.expectedFirstTimestamp ??= packet.timestamp;
 			}
 
@@ -2665,16 +2665,17 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 }
 
-const discardedPacketTimestamps = new WeakMap<InputAudioTrack, Promise<number | null>>();
+const discardedPackets = new WeakMap<InputAudioTrack, Promise<number | null>>();
 
 /**
- * Gets the timestamp of the track's first packet if the platform's decoder emits nothing for it. FFmpeg's AAC decoder
- * (in Chromium and Firefox) discards the first frame of AAC from libfaac as encoder priming, and Chromium then stamps
- * the next frame's audio with the first packet's timestamp, unless that's negative. Whether the decoder discards the
- * frame depends on which one the platform uses, so it's asked of the decoder itself, once per track.
+ * Gets the sequence number of the track's first packet if the platform's decoder emits nothing for it. FFmpeg's AAC
+ * decoder (in Chromium and Firefox) discards the first frame of AAC from libfaac as encoder priming, and Chromium then
+ * stamps the next frame's audio with the first packet's timestamp, unless that's negative. Whether the decoder discards
+ * the frame depends on which one the platform uses, so it's asked of the decoder itself, once per track. The packet is
+ * told by its sequence number, since the next one can share its timestamp.
  */
-const getDiscardedPacketTimestamp = (track: InputAudioTrack, decoderConfig: AudioDecoderConfig) => {
-	let result = discardedPacketTimestamps.get(track);
+const getDiscardedPacket = (track: InputAudioTrack, decoderConfig: AudioDecoderConfig) => {
+	let result = discardedPackets.get(track);
 	if (!result) {
 		result = (async () => {
 			if (decoderConfig.codec.split('.')[0] !== 'mp4a') {
@@ -2682,7 +2683,7 @@ const getDiscardedPacketTimestamp = (track: InputAudioTrack, decoderConfig: Audi
 			}
 
 			const firstPacket = await new EncodedPacketSink(track).getFirstPacket();
-			if (!firstPacket || !hasLibfaacSignature(firstPacket.data)) {
+			if (!firstPacket || firstPacket.sequenceNumber < 0 || !hasLibfaacSignature(firstPacket.data)) {
 				return null;
 			}
 
@@ -2698,8 +2699,13 @@ const getDiscardedPacketTimestamp = (track: InputAudioTrack, decoderConfig: Audi
 			try {
 				decoder.configure(decoderConfig);
 				decoder.decode(firstPacket.toEncodedAudioChunk());
-				await decoder.flush();
-				return outputCount === 0 ? firstPacket.timestamp : null;
+
+				// Nothing is known of a decoder that doesn't finish, as if it kept the frame
+				const finished = await Promise.race([
+					decoder.flush().then(() => true),
+					new Promise<boolean>(resolve => setTimeout(() => resolve(false), 3000)),
+				]);
+				return finished && outputCount === 0 ? firstPacket.sequenceNumber : null;
 			} catch {
 				return null;
 			} finally {
@@ -2708,7 +2714,7 @@ const getDiscardedPacketTimestamp = (track: InputAudioTrack, decoderConfig: Audi
 				}
 			}
 		})();
-		discardedPacketTimestamps.set(track, result);
+		discardedPackets.set(track, result);
 	}
 
 	return result;
@@ -2759,7 +2765,7 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		} else {
 			const decoder = new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
 			if (decoder.decoder) {
-				decoder.discardedPacketTimestamp = await getDiscardedPacketTimestamp(this._track, decoderConfig);
+				decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, decoderConfig);
 			}
 
 			return decoder;

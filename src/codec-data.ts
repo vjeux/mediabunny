@@ -3907,11 +3907,17 @@ const getDtsChannelCount = (channelLayout: number) => {
 };
 
 /**
- * Tells whether an AAC frame starts with the fill element in which libfaac names itself (in the first frame it
- * encodes). FFmpeg's AAC decoder, which Chromium and Firefox use, discards the first frame of such AAC as encoder
- * priming. It's read as FFmpeg reads it: an EXT_FILL extension payload, then 13 bits, then "libfaac <major>.<minor>".
+ * Tells whether an AAC frame (raw, or with its ADTS header) starts with the fill element in which libfaac names itself
+ * (in the first frame it encodes). FFmpeg's AAC decoder, which Chromium and Firefox use, discards the first frame of
+ * such AAC as encoder priming. It's read as FFmpeg reads it: an EXT_FILL extension payload, then 13 bits, then
+ * "libfaac <major>.<minor>".
  */
 export const hasLibfaacSignature = (frame: Uint8Array) => {
+	if (frame.length >= 7 && frame[0] === 0xff && (frame[1]! & 0xf0) === 0xf0) {
+		// An ADTS header, with a CRC unless protection_absent is set
+		frame = frame.subarray((frame[1]! & 1) ? 7 : 9);
+	}
+
 	const bitstream = new Bitstream(frame);
 	if (bitstream.getBitsLeft() < 32 || bitstream.readBits(3) !== 6) { // ID_FIL
 		return false;
