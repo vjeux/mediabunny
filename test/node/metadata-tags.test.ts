@@ -245,6 +245,38 @@ test('Read and write metadata, MP4 with mdta format', async () => {
 	expect(readTags.raw!['bytes']).toEqual(new Uint8Array([2, 3, 4, 5]));
 });
 
+test('MP4 writes cover art not tagged as the front cover when there\'s no front cover', async () => {
+	const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+	const writeAndRead = async (images: NonNullable<MetadataTags['images']>, metadataFormat: 'mdir' | 'mdta') => {
+		const output = new Output({ format: new Mp4OutputFormat({ metadataFormat }), target: new BufferTarget() });
+		output.setMetadataTags({ images });
+
+		const dummyTrack = createDummyAudioTrack('aac', output);
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const readTags = await input.getMetadataTags();
+		return readTags.images?.map(image => image.data) ?? [];
+	};
+
+	for (const metadataFormat of ['mdir', 'mdta'] as const) {
+		// FFmpeg tags the covers it writes as "other" (ID3 APIC/FLAC PICTURE type 0), which are read as 'unknown'.
+		// Such images used to be dropped, leaving no artwork at all.
+		expect(await writeAndRead([{ data: png, mimeType: 'image/png', kind: 'unknown' }], metadataFormat))
+			.toEqual([png]);
+		expect(await writeAndRead([{ data: coverArt, mimeType: 'image/jpeg', kind: 'coverBack' }], metadataFormat))
+			.toEqual([coverArt]);
+
+		// With a front cover, only front covers are written, as before
+		expect(await writeAndRead([
+			{ data: coverArt, mimeType: 'image/jpeg', kind: 'coverFront' },
+			{ data: png, mimeType: 'image/png', kind: 'unknown' },
+		], metadataFormat)).toEqual([coverArt]);
+	}
+});
+
 test('Read MOV metadata tags, ilst with keys', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/trunc-buck-bunny.mov')),
