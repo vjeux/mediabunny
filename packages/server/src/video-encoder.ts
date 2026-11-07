@@ -51,6 +51,22 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
 };
 
+/**
+ * Whether libsvtav1 can encode frames of this size. With a target bitrate, it refuses to open below 64 pixels in either
+ * dimension ("Adaptive quantization can not be turned OFF when RC ON"). In constant-quantizer mode, its flush hangs
+ * forever for frames up to 24 pixels wide, and for frames up to 24 pixels high that are wider than 64 pixels
+ * (measured; SVT-AV1 documents no such limit).
+ */
+const av1SizeIsSupported = (config: VideoEncoderConfig) => {
+	const { width, height } = config;
+
+	if (config.bitrateMode === 'quantizer') {
+		return width > 24 && (height > 24 || width <= 64);
+	}
+
+	return width >= 64 && height >= 64;
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -72,6 +88,10 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
+		if (codec === 'av1' && !av1SizeIsSupported(config)) {
+			return false;
+		}
+
 		if (config.bitrateMode === 'quantizer') {
 			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 		}
@@ -83,6 +103,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}
 
 	async init(): Promise<void> {
+		if (this.codec === 'av1' && !av1SizeIsSupported(this.config)) {
+			// Fail right away instead of failing to open, or hanging, later
+			throw new Error(
+				`AV1 encoding of ${this.config.width}x${this.config.height} video isn't supported`
+				+ (this.config.bitrateMode === 'quantizer' ? ' in constant-quantizer mode.' : ' with a bitrate.'),
+			);
+		}
+
 		this.frame = new NodeAv.Frame();
 		this.frame.alloc();
 		this.frame.timeBase = new NodeAv.Rational(1, 1e6);
