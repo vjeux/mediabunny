@@ -15,7 +15,7 @@ import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 test('MPEG-TS input format', async () => {
-	expect(MPEG_TS.mimeType).toBe('video/MP2T');
+	expect(MPEG_TS.mimeType).toBe('video/mp2t');
 	expect(MPEG_TS.name).toBe('MPEG Transport Stream');
 });
 
@@ -26,8 +26,8 @@ test('MPEG-TS metadata reading', async () => {
 	});
 
 	expect(await input.getFormat()).toBe(MPEG_TS);
-	expect((await input.getFormat()).mimeType).toBe('video/MP2T');
-	expect(await input.getMimeType()).toBe('video/MP2T; codecs="avc1.640020, mp4a.40.2"');
+	expect((await input.getFormat()).mimeType).toBe('video/mp2t');
+	expect(await input.getMimeType()).toBe('video/mp2t; codecs="avc1.640020, mp4a.40.2"');
 
 	const tracks = await input.getTracks();
 	expect(tracks).toHaveLength(2);

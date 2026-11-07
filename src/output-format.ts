@@ -1218,7 +1218,7 @@ export class MpegTsOutputFormat extends OutputFormat {
 	}
 
 	get mimeType() {
-		return 'video/MP2T';
+		return 'video/mp2t';
 	}
 
 	getSupportedCodecs(): MediaCodec[] {
