@@ -135,6 +135,67 @@ test('Picture links are not read as images', async () => {
 	expect(readTags.images ?? []).toHaveLength(0);
 });
 
+test('Picture links survive copies to the same format and aren\'t written as images in others', async () => {
+	const link = new TextEncoder().encode('https://example.com/cover.jpg');
+	const images: MetadataTags['images'] = [
+		{ data: link, mimeType: '-->', kind: 'coverFront' },
+		songMetadata.images![0]!,
+	];
+	type Format = FlacOutputFormat | OggOutputFormat | Mp4OutputFormat | MkvOutputFormat;
+	const convert = async (source: BufferSource | FilePathSource, format: Format, tags?: MetadataTags) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, tags });
+		await conversion.execute();
+		return output.target.buffer!;
+	};
+	const readTags = async (bytes: ArrayBuffer) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+	// The media types of the METADATA_BLOCK_PICTURE raw tags, which hold FLAC PICTURE blocks
+	const rawPictureMediaTypes = (tags: MetadataTags) => {
+		const value = tags.raw?.['METADATA_BLOCK_PICTURE'];
+		return (Array.isArray(value) ? value : value === undefined ? [] : [value]).map((value) => {
+			const bytes = Uint8Array.from(atob(value as string), char => char.charCodeAt(0));
+			const length = new DataView(bytes.buffer).getUint32(4);
+			return new TextDecoder().decode(bytes.subarray(8, 8 + length));
+		});
+	};
+	const expectOnlyTheCover = (tags: MetadataTags) => {
+		expect(tags.images).toHaveLength(1);
+		expect(tags.images![0]!.data).toEqual(coverArt);
+	};
+
+	// FLAC: converted again with the tags read, the link is kept. Converted to MP4 and Matroska, it's not an image.
+	const flac = await convert(
+		new FilePathSource(path.join(__dirname, '..', 'public/sample.flac')),
+		new FlacOutputFormat(),
+		{ images },
+	);
+	const convertedFlacTags = await readTags(await convert(new BufferSource(flac), new FlacOutputFormat()));
+	expectOnlyTheCover(convertedFlacTags);
+	expect(rawPictureMediaTypes(convertedFlacTags)).toEqual(['-->']);
+	expectOnlyTheCover(await readTags(await convert(new BufferSource(flac), new Mp4OutputFormat())));
+	expectOnlyTheCover(await readTags(await convert(new BufferSource(flac), new MkvOutputFormat())));
+
+	// Ogg: the same, with the tags read written again
+	const writeOgg = async (tags: MetadataTags) => {
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		output.setMetadataTags(tags);
+		const dummyTrack = createDummyAudioTrack('opus', output);
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+		return output.target.buffer!;
+	};
+	const ogg = await writeOgg({ images });
+	const copiedOggTags = await readTags(await writeOgg(await readTags(ogg)));
+	expectOnlyTheCover(copiedOggTags);
+	expect(rawPictureMediaTypes(copiedOggTags).sort()).toEqual(['-->', 'image/jpeg']);
+	expectOnlyTheCover(await readTags(await convert(new BufferSource(ogg), new Mp4OutputFormat())));
+});
+
 test('Read and write metadata, MP4', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),

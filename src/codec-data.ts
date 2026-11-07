@@ -2874,6 +2874,28 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 	}
 };
 
+/**
+ * Returns the METADATA_BLOCK_PICTURE values among the raw tags that hold a link to a picture (media type "-->")
+ * instead of a picture. These aren't among the images, so they're written from the raw tags.
+ */
+export const getRawPictureLinks = (tags: MetadataTags) => {
+	const value = tags.raw?.['METADATA_BLOCK_PICTURE'];
+	const values = Array.isArray(value) ? value as unknown[] : [value];
+
+	return values.filter((value): value is string => {
+		if (typeof value !== 'string') {
+			return false;
+		}
+
+		try {
+			const bytes = base64ToBytes(value);
+			return toDataView(bytes).getUint32(4, false) === 3 && textDecoder.decode(bytes.subarray(8, 11)) === '-->';
+		} catch {
+			return false;
+		}
+	});
+};
+
 export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags, writeImages: boolean) => {
 	// https://datatracker.ietf.org/doc/html/rfc7845#section-5.2
 
@@ -3007,6 +3029,12 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 
 					const encoded = bytesToBase64(buffer);
 					addCommentTag('METADATA_BLOCK_PICTURE', encoded);
+				}
+
+				// The raw METADATA_BLOCK_PICTURE tags are left out once the images are written, but picture links
+				// aren't among those
+				for (const link of getRawPictureLinks(tags)) {
+					addCommentTag('METADATA_BLOCK_PICTURE', link);
 				}
 			}; break;
 
