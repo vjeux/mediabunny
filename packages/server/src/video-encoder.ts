@@ -176,8 +176,16 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.sampleAspectRatio = new NodeAv.Rational(pixelAspectRatio.num, pixelAspectRatio.den);
 
 		if (this.config.bitrateMode === 'constant') {
-			codecContext.rcMinRate = codecContext.bitRate;
-			codecContext.rcMaxRate = codecContext.bitRate;
+			if (this.avCodec.name === 'libsvtav1') {
+				// SVT-AV1 only does CBR with its low-delay prediction structure, and refuses a maximum bitrate
+				// outside of CRF mode, which FFmpeg would pass on from rcMaxRate
+				codecContext.setOption('svtav1-params', 'rc=2:pred-struct=1');
+			} else {
+				codecContext.rcMinRate = codecContext.bitRate;
+				codecContext.rcMaxRate = codecContext.bitRate;
+				// libx264 and libx265 ignore the maximum rate without a buffer size: one second's worth
+				codecContext.rcBufferSize = Number(codecContext.bitRate);
+			}
 		}
 
 		const isRealtime = this.config.latencyMode === 'realtime';
