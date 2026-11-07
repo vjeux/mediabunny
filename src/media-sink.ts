@@ -50,6 +50,7 @@ import {
 	toAsyncIterator,
 	toDataView,
 	toUint8Array,
+	uint8ArraysAreEqual,
 	validateAnyIterable,
 } from './misc';
 import { EncodedPacket } from './packet';
@@ -938,6 +939,13 @@ export abstract class BaseMediaSampleSink<
 	}
 }
 
+const videoDecoderConfigsAreEqual = (a: VideoDecoderConfig, b: VideoDecoderConfig) => a.codec === b.codec
+	&& a.codedWidth === b.codedWidth
+	&& a.codedHeight === b.codedHeight
+	&& (a.description && b.description
+		? uint8ArraysAreEqual(toUint8Array(a.description), toUint8Array(b.description))
+		: !a.description === !b.description);
+
 class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	decoder: VideoDecoder | null = null;
 
@@ -969,6 +977,15 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	// Needed for a Chromium for Android workaround
 	frameCopyContext: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
 
+	/** The track's decoder config, as passed in */
+	trackDecoderConfig: VideoDecoderConfig;
+	/** The decoder config the decoder currently takes packets with; packets can need another one than the track's. */
+	currentDecoderConfig: VideoDecoderConfig;
+	/** A decoder config switch in progress, and the packets waiting for it, in decode order */
+	switchPromise: Promise<void> | null = null;
+	pendingPackets: EncodedPacket[] = [];
+	closed = false;
+
 	constructor(
 		onSample: (sample: VideoSample) => unknown,
 		onError: (error: unknown) => unknown,
@@ -977,32 +994,20 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		public rotation: Rotation,
 		public flip: boolean,
 		public timeResolution: number,
+		public getPacketDecoderConfig: (packet: EncodedPacket) => VideoDecoderConfig | null = () => null,
 	) {
 		super(onSample, onError);
 
+		this.trackDecoderConfig = decoderConfig;
+		this.currentDecoderConfig = decoderConfig;
+
 		const MatchingCustomDecoder = customVideoDecoders.find(x => x.supports(codec, decoderConfig));
 		if (MatchingCustomDecoder) {
-			// @ts-expect-error "Can't create instance of abstract class 🤓"
-			this.customDecoder = new MatchingCustomDecoder() as CustomVideoDecoder;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.codec = codec;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.config = decoderConfig;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.onSample = (sample) => {
-				if (!(sample instanceof VideoSample)) {
-					throw new TypeError('The argument passed to onSample must be a VideoSample.');
-				}
-
-				this.finalizeAndEmitSample(sample);
-			};
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.onError = (error) => {
-				onError(error);
-			};
+			const customDecoder = this.createCustomDecoder(MatchingCustomDecoder, decoderConfig);
+			this.customDecoder = customDecoder;
 
 			void this.customDecoderCallSerializer
-				.call(() => this.customDecoder!.init())
+				.call(() => customDecoder.init())
 				.catch(error => onError(error));
 		} else {
 			const colorHandler = (frame: VideoFrame) => {
@@ -1017,55 +1022,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				}
 			};
 
-			if (isChromium()) {
-				if (codec === 'avc' && this.decoderConfig.description) {
-					const record = deserializeAvcDecoderConfigurationRecord(
-						toUint8Array(this.decoderConfig.description),
-					);
-					if (record && record.sequenceParameterSets.length > 0) {
-						const sps = parseAvcSps(record.sequenceParameterSets[0]!);
-						if (sps) {
-							if (sps.frameMbsOnlyFlag === 0) {
-								// Chromium has/had a bug with playing interlaced AVC
-								// (https://issues.chromium.org/issues/456919096) which can be worked around by
-								// requesting that software decoding be used. So, here we peek into the AVC description,
-								// if present, and switch to software decoding if we find interlaced content.
-								this.decoderConfig = {
-									...this.decoderConfig,
-									hardwareAcceleration: 'prefer-software',
-								};
-							}
-
-							if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
-								// Modify the SPS to fix potential loss of B frames
-								record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
-								this.decoderConfig = {
-									...this.decoderConfig,
-									description: serializeAvcDecoderConfigurationRecord(record),
-								};
-							}
-						}
-					}
-				}
-
-				if (!colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
-					// Found via https://github.com/remotion-dev/remotion/issues/10841.
-					// If the color space is incomplete (which is often that it's just partially filled), Chromium has
-					// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
-					// that information is genuinely lost, like the color matrix for example. Chromium has other code
-					// paths where it just fills the missing values with a hardcoded default, so we do the exact same
-					// thing here, with the same hardcoded defaults:
-					this.decoderConfig = {
-						...this.decoderConfig,
-						colorSpace: {
-							primaries: this.decoderConfig.colorSpace?.primaries ?? 'bt709',
-							matrix: this.decoderConfig.colorSpace?.matrix ?? 'bt709',
-							transfer: this.decoderConfig.colorSpace?.transfer ?? 'bt709',
-							fullRange: this.decoderConfig.colorSpace?.fullRange ?? false,
-						},
-					};
-				}
-			}
+			this.applyChromiumDecoderConfigWorkarounds();
 
 			const stack = new Error('Decoding error').stack;
 
@@ -1089,20 +1046,179 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		}
 	}
 
+	/** Adapts the decoder config to work around bugs in Chromium's decoders. */
+	applyChromiumDecoderConfigWorkarounds() {
+		if (isChromium()) {
+			if (this.codec === 'avc' && this.decoderConfig.description) {
+				const record = deserializeAvcDecoderConfigurationRecord(
+					toUint8Array(this.decoderConfig.description),
+				);
+				if (record && record.sequenceParameterSets.length > 0) {
+					const sps = parseAvcSps(record.sequenceParameterSets[0]!);
+					if (sps) {
+						if (sps.frameMbsOnlyFlag === 0) {
+							// Chromium has/had a bug with playing interlaced AVC
+							// (https://issues.chromium.org/issues/456919096) which can be worked around by
+							// requesting that software decoding be used. So, here we peek into the AVC description,
+							// if present, and switch to software decoding if we find interlaced content.
+							this.decoderConfig = {
+								...this.decoderConfig,
+								hardwareAcceleration: 'prefer-software',
+							};
+						}
+
+						if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+							// Modify the SPS to fix potential loss of B frames
+							record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
+							this.decoderConfig = {
+								...this.decoderConfig,
+								description: serializeAvcDecoderConfigurationRecord(record),
+							};
+						}
+					}
+				}
+			}
+
+			if (!colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
+				// Found via https://github.com/remotion-dev/remotion/issues/10841.
+				// If the color space is incomplete (which is often that it's just partially filled), Chromium has
+				// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
+				// that information is genuinely lost, like the color matrix for example. Chromium has other code
+				// paths where it just fills the missing values with a hardcoded default, so we do the exact same
+				// thing here, with the same hardcoded defaults:
+				this.decoderConfig = {
+					...this.decoderConfig,
+					colorSpace: {
+						primaries: this.decoderConfig.colorSpace?.primaries ?? 'bt709',
+						matrix: this.decoderConfig.colorSpace?.matrix ?? 'bt709',
+						transfer: this.decoderConfig.colorSpace?.transfer ?? 'bt709',
+						fullRange: this.decoderConfig.colorSpace?.fullRange ?? false,
+					},
+				};
+			}
+		}
+	}
+
+	createCustomDecoder(MatchingCustomDecoder: typeof CustomVideoDecoder, decoderConfig: VideoDecoderConfig) {
+		// @ts-expect-error "Can't create instance of abstract class 🤓"
+		const customDecoder = new MatchingCustomDecoder() as CustomVideoDecoder;
+		// @ts-expect-error It's technically readonly
+		customDecoder.codec = this.codec;
+		// @ts-expect-error It's technically readonly
+		customDecoder.config = decoderConfig;
+		// @ts-expect-error It's technically readonly
+		customDecoder.onSample = (sample) => {
+			if (!(sample instanceof VideoSample)) {
+				throw new TypeError('The argument passed to onSample must be a VideoSample.');
+			}
+
+			this.finalizeAndEmitSample(sample);
+		};
+		// @ts-expect-error It's technically readonly
+		customDecoder.onError = (error) => {
+			this.onError(error);
+		};
+
+		return customDecoder;
+	}
+
 	getDecodeQueueSize() {
 		if (this.customDecoder) {
-			return this.customDecoderQueueSize;
+			return this.customDecoderQueueSize + this.pendingPackets.length;
 		} else {
 			assert(this.decoder);
 
 			return Math.max(
 				this.decoder.decodeQueueSize,
 				this.alphaDecoder?.decodeQueueSize ?? 0,
-			);
+			) + this.pendingPackets.length;
+		}
+	}
+
+	/**
+	 * Switches the decoder to another config at a key packet, once the packets decoded so far have been flushed out.
+	 * This happens when packets need another decoder config than the track's, such as HLS segments after a
+	 * discontinuity with a new init section (an ad break from another encoder). Their key packets also carry their
+	 * parameter sets in band, but not every decoder applies those (WebKit's doesn't apply a new resolution).
+	 */
+	async switchDecoderConfig(decoderConfig: VideoDecoderConfig) {
+		let switched = false;
+		try {
+			await this.flushDecoders();
+			if (this.closed) {
+				return;
+			}
+
+			this.currentDecoderConfig = decoderConfig;
+
+			const MatchingCustomDecoder = customVideoDecoders.find(x => x.supports(this.codec, decoderConfig));
+			if (this.decoder && !MatchingCustomDecoder) {
+				this.decoderConfig = decoderConfig;
+				this.applyChromiumDecoderConfigWorkarounds();
+				this.decoder.configure(this.decoderConfig);
+
+				if (this.alphaDecoder) {
+					// Set up again with the new config by the next packet with alpha data
+					this.alphaDecoder.close();
+					this.alphaDecoder = null;
+				}
+			} else if (this.customDecoder && MatchingCustomDecoder) {
+				const previousDecoder = this.customDecoder;
+				const nextDecoder = this.createCustomDecoder(MatchingCustomDecoder, decoderConfig);
+				this.customDecoder = nextDecoder;
+				this.decoderConfig = decoderConfig;
+
+				await this.customDecoderCallSerializer.call(async () => {
+					await previousDecoder.close();
+					await nextDecoder.init();
+				});
+			} else {
+				throw new Error(
+					'The video decoder config changes mid-track in a way that needs a switch between a custom decoder'
+					+ ' and the built-in one, which isn\'t supported.',
+				);
+			}
+
+			switched = true;
+		} catch (error) {
+			if (!this.closed) {
+				this.onError(error);
+			}
+		} finally {
+			this.switchPromise = null;
+			const packets = this.pendingPackets;
+			this.pendingPackets = [];
+
+			if (switched) {
+				for (const packet of packets) {
+					this.decode(packet);
+				}
+			}
+
+			this.onDequeue?.();
 		}
 	}
 
 	decode(packet: EncodedPacket) {
+		if (this.switchPromise) {
+			// Decoded once the switch has finished, in order
+			this.pendingPackets.push(packet);
+			return;
+		}
+
+		const decoderConfig = this.getPacketDecoderConfig(packet) ?? this.trackDecoderConfig;
+		if (decoderConfig !== this.currentDecoderConfig) {
+			if (videoDecoderConfigsAreEqual(decoderConfig, this.currentDecoderConfig)) {
+				// The same config in another object: keep the decoder's state
+				this.currentDecoderConfig = decoderConfig;
+			} else if (packet.type === 'key') {
+				// A decoder can only start over at a key packet; packets before it stay with the current config
+				this.pendingPackets.push(packet);
+				this.switchPromise = this.switchDecoderConfig(decoderConfig);
+				return;
+			}
+		}
+
 		if (this.codec === 'hevc' && this.currentPacketIndex > 0 && !this.raslSkipped) {
 			if (this.hasHevcRaslPicture(packet.data)) {
 				return; // Drop
@@ -1458,6 +1574,14 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	async flush() {
+		while (this.switchPromise) {
+			await this.switchPromise;
+		}
+
+		await this.flushDecoders();
+	}
+
+	async flushDecoders() {
 		if (this.customDecoder) {
 			await this.customDecoderCallSerializer.call(() => this.customDecoder!.flush());
 		} else {
@@ -1496,6 +1620,9 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	close() {
+		this.closed = true;
+		this.pendingPackets.length = 0;
+
 		if (this.customDecoder) {
 			void this.customDecoderCallSerializer.call(() => this.customDecoder!.close());
 		} else {
@@ -1935,7 +2062,38 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 			optimizeForLatency: this._decoderOptions.optimizeForLatency,
 		};
 
-		return new VideoDecoderWrapper(onSample, onError, codec, decoderConfig, rotation, flip, timeResolution);
+		// Packets that need another decoder config than the track's get the same decoder options
+		const backing = this._track._backing;
+		const packetDecoderConfigs = new WeakMap<VideoDecoderConfig, VideoDecoderConfig>();
+		const getPacketDecoderConfig = (packet: EncodedPacket) => {
+			const config = backing.getDecoderConfigForPacket?.(packet) as VideoDecoderConfig | null | undefined;
+			if (!config) {
+				return null;
+			}
+
+			let withOptions = packetDecoderConfigs.get(config);
+			if (!withOptions) {
+				withOptions = {
+					...config,
+					hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
+					optimizeForLatency: this._decoderOptions.optimizeForLatency,
+				};
+				packetDecoderConfigs.set(config, withOptions);
+			}
+
+			return withOptions;
+		};
+
+		return new VideoDecoderWrapper(
+			onSample,
+			onError,
+			codec,
+			decoderConfig,
+			rotation,
+			flip,
+			timeResolution,
+			getPacketDecoderConfig,
+		);
 	}
 
 	/** @internal */
