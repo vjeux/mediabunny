@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
+import { decodesFlac } from './helpers/platform-probes.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AudioSampleSource } from '../../src/media-source.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
@@ -11,7 +12,9 @@ import { BufferSource } from '../../src/source.js';
 import { BufferTarget } from '../../src/target.js';
 import { registerFlacEncoder } from '@mediabunny/flac-encoder';
 
-test('FLAC encoder, 24-bit', async () => {
+test('FLAC encoder, 24-bit', async ({ skip }) => {
+	// The encoded file is checked by decoding it with the platform's FLAC decoder
+	skip(!await decodesFlac(), 'the platform can\'t decode FLAC (native probe)');
 	registerFlacEncoder();
 
 	const sampleRate = 48000;
@@ -33,7 +36,9 @@ test('FLAC encoder, 24-bit', async () => {
 	expect(sample.format).toBe('s32');
 });
 
-test('FLAC encoder, 16-bit', async () => {
+test('FLAC encoder, 16-bit', async ({ skip }) => {
+	// The encoded file is checked by decoding it with the platform's FLAC decoder
+	skip(!await decodesFlac(), 'the platform can\'t decode FLAC (native probe)');
 	registerFlacEncoder();
 
 	const sampleRate = 48000;
