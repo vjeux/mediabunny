@@ -622,9 +622,9 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
 		const videoSource = new MediaStreamVideoTrackSource(tracks.videoTrack, lowVp8);
 		const audioSource = new MediaStreamAudioTrackSource(tracks.audioTrack, lowOpus);
-		const errors: unknown[] = [];
-		videoSource.errorPromise.catch(error => errors.push(error));
-		audioSource.errorPromise.catch(error => errors.push(error));
+		const videoErrors: unknown[] = [];
+		videoSource.errorPromise.catch(error => videoErrors.push(error));
+		const audioError = audioSource.errorPromise.catch((error: unknown) => error);
 		output.addVideoTrack(videoSource);
 		output.addAudioTrack(audioSource);
 		await output.start();
@@ -638,17 +638,23 @@ describe.skipIf(!hasTrackGenerator)('Lifecycle', () => {
 			await sleep(10);
 		}
 
-		await output.finalize();
+		// Reported while recording, not only at the end
+		const configurationError = await audioError;
+		expect(String(configurationError)).toMatch(/not supported/);
+
+		// Like other encoder errors, it may also fail finalize(); otherwise, the file has the video without the audio
+		const finalizeError = await output.finalize().then(() => null, (error: unknown) => error);
 		await tracks.videoWriter.close();
 		await tracks.audioWriter.close();
 
-		expect(errors).toHaveLength(1);
-		expect(String(errors[0])).toMatch(/not supported/);
-
-		// The video got recorded regardless
-		const analysis = await analyzeRecording(output.target.buffer!);
-		expect(analysis.videoEnd).toBeGreaterThan(0.05);
-		expect(analysis.audioEnd).toBe(null);
+		expect(videoErrors).toEqual([]);
+		if (finalizeError !== null) {
+			expect(finalizeError).toBe(configurationError);
+		} else {
+			const analysis = await analyzeRecording(output.target.buffer!);
+			expect(analysis.videoEnd).toBeGreaterThan(0.05);
+			expect(analysis.audioEnd).toBe(null);
+		}
 	});
 
 	test('a mid-stream audio format change surfaces through errorPromise', async () => {
