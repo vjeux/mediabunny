@@ -22,6 +22,8 @@ import {
 	HevcNalUnitType,
 	iterateNalUnitsInAnnexB,
 	iterateNalUnitsInLengthPrefixed,
+	parseAvcSps,
+	parseHevcSps,
 } from '../codec-data';
 import { Bitstream } from '../../shared/bitstream';
 import { assert, promiseWithResolvers, setUint24, toDataView, toUint8Array } from '../misc';
@@ -32,6 +34,7 @@ import { EncodedPacket } from '../packet';
 import { Writer } from '../writer';
 import {
 	buildMpegTsMimeType,
+	MPEG_TS_TIMESCALE,
 	MpegTsStreamType,
 	secondsToMpegTsTimestamp,
 	TS_PACKET_SIZE,
@@ -48,6 +51,9 @@ const VIDEO_STREAM_ID_BASE = 0xE0;
 const AUDIO_STREAM_ID_BASE = 0xC0;
 
 const AVC_AUD_NAL = new Uint8Array([0x09, 0xF0]);
+
+// More than the deepest reordering AVC and HEVC allow (16 frames), for streams reordering further than they say
+const MAX_REORDER_DEPTH = 64;
 const HEVC_AUD_NAL = new Uint8Array([0x46, 0x01]);
 
 type MpegTsTrackData = {
@@ -57,6 +63,14 @@ type MpegTsTrackData = {
 	streamId: number;
 	codecString: string;
 	timestampProcessingQueue: QueuedPacket[];
+	/** How many frames the stream reorders at most, as its SPS says (if it does) */
+	reorderFrameCount: number | null;
+	/** How many frames DTS are behind PTS, once known */
+	reorderDepth: number | null;
+	/** The last presentation timestamps (in 90 kHz ticks, in presentation order) of the packets given a DTS */
+	presentationTicksHistory: number[];
+	/** The last DTS given out, in 90 kHz ticks */
+	lastDecodeTicks: number;
 	packetQueue: QueuedPacket[];
 	inputIsAnnexB: boolean | null;
 	inputIsAdts: boolean | null;
@@ -71,6 +85,7 @@ type MpegTsTrackData = {
 type QueuedPacket = {
 	data: Uint8Array;
 	presentationTimestamp: number;
+	duration: number;
 	decodeTimestamp: number | null;
 	isKeyframe: boolean;
 };
@@ -138,6 +153,10 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
+			reorderFrameCount: null,
+			reorderDepth: null,
+			presentationTicksHistory: [],
+			lastDecodeTicks: -Infinity,
 			packetQueue: [],
 			inputIsAnnexB: null,
 			inputIsAdts: null,
@@ -209,6 +228,10 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
+			reorderFrameCount: null,
+			reorderDepth: null,
+			presentationTicksHistory: [],
+			lastDecodeTicks: -Infinity,
 			packetQueue: [],
 			inputIsAnnexB: null,
 			inputIsAdts: null,
@@ -254,6 +277,7 @@ export class MpegTsMuxer extends Muxer {
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
 				presentationTimestamp: packet.timestamp,
+				duration: packet.duration,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -287,6 +311,7 @@ export class MpegTsMuxer extends Muxer {
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
 				presentationTimestamp: packet.timestamp,
+				duration: packet.duration,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -319,12 +344,49 @@ export class MpegTsMuxer extends Muxer {
 					trackData.hevcDecoderConfig = deserializeHevcDecoderConfigurationRecord(bytes);
 				}
 			}
+
+			trackData.reorderFrameCount = this.getReorderFrameCount(trackData, packet.data, codec as 'avc' | 'hevc');
 		}
 
 		if (trackData.inputIsAnnexB) {
 			return this.prepareAnnexBVideoPacket(packet.data, codec as 'avc' | 'hevc');
 		} else {
 			return this.prepareLengthPrefixedVideoPacket(trackData, packet, codec as 'avc' | 'hevc');
+		}
+	}
+
+	/**
+	 * Returns how many frames the stream reorders at most, as its SPS says: AVC's num_reorder_frames (only when it's
+	 * given, the inferred one can be much larger than what's used) or HEVC's sps_max_num_reorder_pics.
+	 */
+	private getReorderFrameCount(trackData: MpegTsTrackData, data: Uint8Array, codec: 'avc' | 'hevc') {
+		let sps = codec === 'avc'
+			? trackData.avcDecoderConfig?.sequenceParameterSets[0]
+			: trackData.hevcDecoderConfig?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
+
+		if (!sps && trackData.inputIsAnnexB) {
+			for (const loc of iterateNalUnitsInAnnexB(data)) {
+				const nalUnit = data.subarray(loc.offset, loc.offset + loc.length);
+				const isSps = codec === 'avc'
+					? extractNalUnitTypeForAvc(nalUnit[0]!) === AvcNalUnitType.SPS
+					: extractNalUnitTypeForHevc(nalUnit[0]!) === HevcNalUnitType.SPS_NUT;
+				if (isSps) {
+					sps = nalUnit;
+					break;
+				}
+			}
+		}
+
+		if (!sps) {
+			return null;
+		}
+
+		if (codec === 'avc') {
+			const info = parseAvcSps(sps);
+			return info?.bitstreamRestrictionFlag ? info.numReorderFrames : null;
+		} else {
+			const info = parseHevcSps(sps);
+			return info ? info.maxDecFrameBuffering - 1 : null; // That's sps_max_num_reorder_pics + 1
 		}
 	}
 
@@ -473,21 +535,66 @@ export class MpegTsMuxer extends Muxer {
 	}
 
 	private async flushTimestampQueue(trackData: MpegTsTrackData, alsoInterleave = true) {
-		if (trackData.timestampProcessingQueue.length === 0) {
+		const queue = trackData.timestampProcessingQueue;
+		if (queue.length === 0) {
 			return;
 		}
 
-		const sortedTimestamps = trackData.timestampProcessingQueue
-			.map(packet => packet.presentationTimestamp)
-			.sort((a, b) => a - b);
+		// Everything is worked out in whole ticks of the timestamps as written, so that remuxing gives the same DTS
+		const presentationTicks = queue.map(
+			packet => Math.round((packet.presentationTimestamp + this.timestampOffset) * MPEG_TS_TIMESCALE),
+		);
+		const presentationOrder = presentationTicks
+			.map((_, i) => i)
+			.sort((a, b) => presentationTicks[a]! - presentationTicks[b]! || a - b);
 
-		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
-			const queuedPacket = trackData.timestampProcessingQueue[i]!;
-			queuedPacket.decodeTimestamp = sortedTimestamps[i]!;
-			trackData.packetQueue.push(queuedPacket);
+		// How many frames shown earlier a frame is decoded after at most
+		let depth = 0;
+		presentationOrder.forEach((decodeIndex, presentationIndex) => {
+			depth = Math.max(depth, decodeIndex - presentationIndex);
+		});
+
+		// Like FFmpeg, start with the reordering the SPS announces, so that a GOP reordering deeper than the first ones
+		// doesn't need a larger delay later on. A track that ends with its first GOP has no later ones.
+		const isWholeTrack = trackData.closed && trackData.lastDecodeTicks === -Infinity;
+		const startDepth = isWholeTrack ? 0 : (trackData.reorderDepth ?? trackData.reorderFrameCount ?? 0);
+		const reorderDepth = Math.max(startDepth, depth);
+		trackData.reorderDepth = reorderDepth;
+
+		// Each DTS is the PTS of the frame shown that many frames earlier, which keeps DTS <= PTS (an expectation for
+		// many players) and increasing, also with irregular frame timing. Before the first frames, DTS go back at the
+		// frame rate.
+		const history = trackData.presentationTicksHistory;
+		const sortedTicks = [...history, ...presentationOrder.map(i => presentationTicks[i]!)];
+		let frameDuration = Infinity;
+		for (let i = 1; i < sortedTicks.length; i++) {
+			const gap = sortedTicks[i]! - sortedTicks[i - 1]!;
+			if (gap > 0) {
+				frameDuration = Math.min(frameDuration, gap);
+			}
+		}
+		if (frameDuration === Infinity) {
+			frameDuration = Math.round(queue[0]!.duration * MPEG_TS_TIMESCALE);
 		}
 
-		trackData.timestampProcessingQueue.length = 0;
+		for (let i = 0; i < queue.length; i++) {
+			const index = history.length + i - reorderDepth;
+			let decodeTicks = index >= 0 ? sortedTicks[index]! : sortedTicks[0]! + index * frameDuration;
+
+			if (decodeTicks <= trackData.lastDecodeTicks) {
+				// A GOP reordering deeper than the ones before, or timestamps less than a tick apart: keep DTS
+				// increasing, without passing the PTS while that's possible
+				const last = trackData.lastDecodeTicks;
+				decodeTicks = Math.max(last, Math.min(last + 1, presentationTicks[i]!));
+			}
+
+			trackData.lastDecodeTicks = decodeTicks;
+			queue[i]!.decodeTimestamp = decodeTicks / MPEG_TS_TIMESCALE - this.timestampOffset;
+			trackData.packetQueue.push(queue[i]!);
+		}
+
+		trackData.presentationTicksHistory = sortedTicks.slice(-MAX_REORDER_DEPTH);
+		queue.length = 0;
 
 		if (alsoInterleave) {
 			await this.interleavePackets();
