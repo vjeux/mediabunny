@@ -190,6 +190,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let currentInitSegment: HlsSegment | null = null;
 		let lastByteRangeEnd: number | null = null;
 		let nextByteRange: { offset: number; length: number } | null = null;
+		let endListSeen = false;
+		let extinfPending = false; // Whether an #EXTINF tag awaits its segment's URI
 		let lastProgramDateTimeSeconds: number | null = null;
 
 		// Used for repeated parses where our job it is to only add the new segments
@@ -248,6 +250,14 @@ export class HlsSegmentedInput extends SegmentedInput {
 			}
 
 			if (!line.startsWith('#')) {
+				if (endListSeen && !extinfPending) {
+					// Like FFmpeg, ignore lines after #EXT-X-ENDLIST that aren't a segment's URI, such as an error page
+					// a server appended
+					continue;
+				}
+
+				extinfPending = false;
+
 				if (!prevLastSegment) {
 					if (nextSegmentDuration === null) {
 						throw new Error('Invalid M3U8 file; a segment must be preceded by an #EXTINF tag.');
@@ -311,6 +321,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 			}
 
 			if (line.startsWith(TAG_EXTINF)) {
+				extinfPending = true;
+
 				if (prevLastSegment) {
 					continue;
 				}
@@ -558,8 +570,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 				this.refreshInterval = clamp(duration, 0.5, 3600); // Clamped for safety
 			} else if (line === TAG_ENDLIST) {
+				// "It MAY occur anywhere in the Media Playlist file", so keep reading the segments that follow it
 				this.streamHasEnded = true;
-				break; // No need to keep reading after this
+				endListSeen = true;
 			} else if (line.startsWith(TAG_PLAYLIST_TYPE)) {
 				const type = line.slice(TAG_PLAYLIST_TYPE.length).toLowerCase();
 
