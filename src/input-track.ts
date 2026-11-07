@@ -18,7 +18,7 @@ import { determineAudioPacketType, determineVideoPacketType } from './codec-data
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
 import { Input } from './input';
 import { Logging } from './logging';
-import { EncodedPacketSink, PacketRetrievalOptions } from './media-sink';
+import { EncodedPacketSink, PacketRetrievalOptions, validatePacketRetrievalOptions } from './media-sink';
 import {
 	assert,
 	extractRotationFromMatrix,
@@ -361,6 +361,10 @@ export abstract class InputTrack {
 	 * in the options.
 	 */
 	async computeDuration(options?: PacketRetrievalOptions) {
+		if (options !== undefined) {
+			validatePacketRetrievalOptions(options);
+		}
+
 		const lastPacket = await this._backing.getPacket(Infinity, { metadataOnly: true, ...options });
 		const result = (lastPacket?.timestamp ?? 0) + (lastPacket?.duration ?? 0);
 
@@ -378,6 +382,8 @@ export abstract class InputTrack {
 	 * {@link DurationMetadataRequestOptions.skipLiveWait} to `true` in the options.
 	 */
 	async getDurationFromMetadata(options: DurationMetadataRequestOptions = {}) {
+		validateDurationMetadataRequestOptions(options);
+
 		return this._backing.getDurationFromMetadata(options);
 	}
 
@@ -394,6 +400,10 @@ export abstract class InputTrack {
 	 * {@link PacketRetrievalOptions.skipLiveWait} to `true` in the options.
 	 */
 	async computePacketStats(targetPacketCount = Infinity, options?: PacketRetrievalOptions): Promise<PacketStats> {
+		if (!isNumber(targetPacketCount) || targetPacketCount < 0) {
+			throw new TypeError('targetPacketCount must be a non-negative number.');
+		}
+
 		const sink = new EncodedPacketSink(this);
 
 		let startTimestamp = Infinity;
@@ -470,6 +480,8 @@ export abstract class InputTrack {
 	 * down the results.
 	 */
 	async getPairableTracks(query?: InputTrackQuery<InputTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getTracks(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -480,6 +492,8 @@ export abstract class InputTrack {
 	 * narrow down the results.
 	 */
 	async getPairableVideoTracks(query?: InputTrackQuery<InputVideoTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getVideoTracks(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -490,6 +504,8 @@ export abstract class InputTrack {
 	 * narrow down the results.
 	 */
 	async getPairableAudioTracks(query?: InputTrackQuery<InputAudioTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getAudioTracks(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -497,6 +513,8 @@ export abstract class InputTrack {
 
 	/** Returns the primary track that can be paired with this track, optionally steered by the provided query. */
 	async getPrimaryPairableVideoTrack(query?: InputTrackQuery<InputVideoTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getPrimaryVideoTrack(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -504,6 +522,8 @@ export abstract class InputTrack {
 
 	/** Returns the primary track that can be paired with this track, optionally steered by the provided query. */
 	async getPrimaryPairableAudioTrack(query?: InputTrackQuery<InputAudioTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getPrimaryAudioTrack(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -544,6 +564,15 @@ export abstract class InputTrack {
 		);
 	}
 }
+
+export const validateDurationMetadataRequestOptions = (options: DurationMetadataRequestOptions) => {
+	if (!options || typeof options !== 'object') {
+		throw new TypeError('options must be an object.');
+	}
+	if (options.skipLiveWait !== undefined && typeof options.skipLiveWait !== 'boolean') {
+		throw new TypeError('options.skipLiveWait, when defined, must be a boolean.');
+	}
+};
 
 const requireSync = <T>(value: MaybePromise<T>, getterName: string, asyncName: string): T => {
 	if (isThenable(value)) {
