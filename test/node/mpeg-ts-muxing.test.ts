@@ -95,7 +95,9 @@ test('MPEG-TS muxing knows its tracks from the decoder configs declared with the
 	await output.start();
 
 	const timeout = new Promise<string>(resolve => setTimeout(() => resolve('unresolved after 500 ms'), 500));
-	expect(await Promise.race([output.getMimeType(), timeout])).toBe('video/MP2T; codecs="avc1.64001f, mp4a.40.2"');
+	// (MIME types are case-insensitive: #619 lowercases the type)
+	const mimeType = await Promise.race([output.getMimeType(), timeout]);
+	expect(mimeType.toLowerCase()).toBe('video/mp2t; codecs="avc1.64001f, mp4a.40.2"');
 
 	await output.finalize();
 
