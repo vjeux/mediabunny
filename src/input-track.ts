@@ -29,6 +29,7 @@ import {
 	Rational,
 	roundToDivisor,
 	simplifyRational,
+	toUint8Array,
 	TransformationMatrix,
 } from './misc';
 import { TrackType } from './output';
@@ -315,16 +316,17 @@ export abstract class InputTrack {
 	}
 
 	/** Returns the track's disposition, i.e. information about its intended usage. */
-	async getDisposition() {
-		return this._backing.getDisposition();
+	async getDisposition(): Promise<TrackDisposition> {
+		// Copied so that callers can't modify the input's own state
+		return { ...await this._backing.getDisposition() };
 	}
 
 	/**
 	 * The track's disposition, i.e. information about its intended usage.
 	 * @deprecated Use {@link InputTrack.getDisposition} instead.
 	 */
-	get disposition() {
-		return requireSync(this._backing.getDisposition(), 'disposition', 'getDisposition');
+	get disposition(): TrackDisposition {
+		return { ...requireSync(this._backing.getDisposition(), 'disposition', 'getDisposition') };
 	}
 
 	/**
@@ -759,13 +761,15 @@ export class InputVideoTrack extends InputTrack {
 	 * Returns the pixel aspect ratio of the track's frames as a rational number in its reduced form. Most videos use
 	 * square pixels (1:1).
 	 */
-	async getPixelAspectRatio() {
+	async getPixelAspectRatio(): Promise<Rational> {
 		// Potential minor async race condition here if called twice, but doesn't matter since the computation is
 		// so cheap
-		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
+		this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			(await this.getSquarePixelWidth()) * (await this.getCodedHeight()),
 			(await this.getSquarePixelHeight()) * (await this.getCodedWidth()),
 		);
+
+		return { ...this._pixelAspectRatioCache };
 	}
 
 	/**
@@ -773,13 +777,15 @@ export class InputVideoTrack extends InputTrack {
 	 * square pixels (1:1).
 	 * @deprecated Use {@link InputVideoTrack.getPixelAspectRatio} instead.
 	 */
-	get pixelAspectRatio() {
-		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
+	get pixelAspectRatio(): Rational {
+		this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			requireSync(this._backing.getSquarePixelWidth(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedHeight(), 'pixelAspectRatio', 'getPixelAspectRatio'),
 			requireSync(this._backing.getSquarePixelHeight(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedWidth(), 'pixelAspectRatio', 'getPixelAspectRatio'),
 		);
+
+		return { ...this._pixelAspectRatioCache };
 	}
 
 	/** Returns the display width of the track's frames in pixels, after aspect ratio adjustment and rotation. */
@@ -872,8 +878,23 @@ export class InputVideoTrack extends InputTrack {
 	 * track's packets using a [`VideoDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder). Returns
 	 * null if the track's codec is unknown.
 	 */
-	async getDecoderConfig() {
-		return this._backing.getDecoderConfig();
+	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
+		// Copied, description bytes included, so that changes made by the caller (e.g. before configuring their own
+		// decoder) don't leak into the input's own state
+		const config = await this._backing.getDecoderConfig();
+		if (!config) {
+			return null;
+		}
+
+		const copy = { ...config };
+		if (config.description) {
+			copy.description = toUint8Array(config.description).slice();
+		}
+		if (config.colorSpace) {
+			copy.colorSpace = { ...config.colorSpace };
+		}
+
+		return copy;
 	}
 
 	async getCodecParameterString() {
@@ -1164,8 +1185,19 @@ export class InputAudioTrack extends InputTrack {
 	 * track's packets using an [`AudioDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/AudioDecoder). Returns
 	 * null if the track's codec is unknown.
 	 */
-	async getDecoderConfig() {
-		return this._backing.getDecoderConfig();
+	async getDecoderConfig(): Promise<AudioDecoderConfig | null> {
+		// Copied, description bytes included, so that changes made by the caller don't leak into the input's own state
+		const config = await this._backing.getDecoderConfig();
+		if (!config) {
+			return null;
+		}
+
+		const copy = { ...config };
+		if (config.description) {
+			copy.description = toUint8Array(config.description).slice();
+		}
+
+		return copy;
 	}
 
 	async getCodecParameterString() {
