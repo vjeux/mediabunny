@@ -2643,7 +2643,9 @@ class PacketReadingContext {
 		this.seekTo(pos);
 
 		let remaining = this.ensureBuffered(frameSize + nextHeaderSize);
-		if (isThenable(remaining)) remaining = await remaining;
+		if (isThenable(remaining)) {
+			remaining = await remaining;
+		}
 
 		let result: boolean;
 		if (remaining >= frameSize + nextHeaderSize) {
