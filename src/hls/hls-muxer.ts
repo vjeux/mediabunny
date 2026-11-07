@@ -14,6 +14,7 @@ import {
 	arrayArgmax,
 	assert,
 	AsyncMutex,
+	extractRotationFromMatrix,
 	findLastIndex,
 	joinPaths,
 	textEncoder,
@@ -1546,9 +1547,15 @@ export class HlsMuxer extends Muxer {
 						let height = decoderConfig.displayAspectHeight ?? decoderConfig.codedHeight;
 
 						if (width !== undefined && height !== undefined) {
+							// The segments only display the frames rotated if their format stores the rotation. A
+							// transformation matrix takes precedence over `rotation`, like in the muxers.
+							const { rotation, transformationMatrix } = videoTrack.metadata;
+							const displayRotation = transformationMatrix
+								? extractRotationFromMatrix(transformationMatrix)
+								: rotation ?? 0;
 							if (
-								videoTrack.metadata.rotation !== undefined
-								&& videoTrack.metadata.rotation % 180 === 90
+								decl.playlist.segmentFormat.supportsVideoTransformationMetadata
+								&& displayRotation % 180 === 90
 							) {
 								[width, height] = [height, width];
 							}
