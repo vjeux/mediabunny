@@ -1221,10 +1221,15 @@ export class IsobmffMuxer extends Muxer {
 					return otherTrackData.closed;
 				});
 
+				// The first fragment comes with the moov box, whose edit lists need the start offset of every track
+				const startOffsetsKnown = this.wroteFragmentedHeader
+					|| this.trackDatas.every(x => x.startTimestampOffset !== null || x.closed);
+
 				if (
 					currentChunkDuration >= this.minimumFragmentDuration
 					&& keyFrameQueuedEverywhere
 					&& sample.timestamp > this.maxWrittenTimestamp
+					&& startOffsetsKnown
 				) {
 					beginNewChunk = true;
 					await this.finalizeFragment();

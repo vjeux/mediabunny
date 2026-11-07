@@ -681,6 +681,66 @@ test('Reserved Fast Start rejects a maximum packet count beyond u32', async () =
 });
 
 // This used to cause an assertion failure in the box writing code
+test('Fragmented MP4 keeps the start offset of a track starting after the first fragment could be cut', async () => {
+	// The avcC of video.mp4, so that a real SPS is parsed; the packet payloads are stubs
+	const avcDescription = new Uint8Array([
+		0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x1e, 0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02,
+		0x27, 0xe5, 0xc0, 0x5b, 0x81, 0x01, 0x02, 0xd2, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x19,
+		0x07, 0x8c, 0x18, 0xcb, 0x01, 0x00, 0x06, 0x68, 0xeb, 0xe0, 0x8c, 0xb2, 0x2c, 0xfd, 0xf8, 0xf8, 0x00,
+	]);
+
+	const muxStaggered = async (minimumFragmentDuration: number) => {
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration }),
+			target: new BufferTarget(),
+		});
+		const video = new EncodedVideoPacketSource('avc');
+		const audio = new EncodedAudioPacketSource('opus');
+		output.addVideoTrack(video);
+		output.addAudioTrack(audio);
+		await output.start();
+
+		// Video starts at -0.5 s (a key frame every other frame), the Opus track at -0.02 s; added in timestamp order
+		const packets: { timestamp: number; isVideo: boolean; index: number }[] = [];
+		for (let i = 0; i < 60; i++) {
+			packets.push({ timestamp: -0.5 + i / 30, isVideo: true, index: i });
+			packets.push({ timestamp: -0.02 + i * 0.02, isVideo: false, index: i });
+		}
+		packets.sort((a, b) => a.timestamp - b.timestamp);
+
+		const videoConfig = { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080, description: avcDescription };
+		const audioConfig = { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 };
+		for (const { timestamp, isVideo, index } of packets) {
+			if (isVideo) {
+				const data = new Uint8Array([0, 0, 0, 2, 0x65, 0x88]);
+				const packet = new EncodedPacket(data, index % 2 === 0 ? 'key' : 'delta', timestamp, 1 / 30);
+				await video.add(packet, index === 0 ? { decoderConfig: videoConfig } : undefined);
+			} else {
+				const packet = new EncodedPacket(new Uint8Array([0xfc, 0xff, 0xfe]), 'key', timestamp, 0.02);
+				await audio.add(packet, index === 0 ? { decoderConfig: audioConfig } : undefined);
+			}
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const firstTimestamps: number[] = [];
+		for (const track of await input.getTracks()) {
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				firstTimestamps.push(packet.timestamp);
+				break;
+			}
+		}
+		return firstTimestamps;
+	};
+
+	// With the default fragment duration, no fragment is cut before the audio track is underway
+	expect(await muxStaggered(1)).toEqual([-0.5, -0.02]);
+
+	// With short fragments, the moov went out before the audio track's start offset was known: it had no edit list,
+	// and its audio was read back from 0
+	expect(await muxStaggered(0)).toEqual([-0.5, -0.02]);
+});
+
 test('Reserved Fast Start with a B-frame GOP completed before all tracks are known', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat({ fastStart: 'reserve' }),
