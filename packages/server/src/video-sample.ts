@@ -234,6 +234,22 @@ export const copyVideoSampleToAvFrame = async (sample: VideoSample, frame: NodeA
 	return lastBuffer;
 };
 
+/**
+ * Whether FFmpeg's exact crop misplaces the chroma of a pixel format at odd horizontal offsets. It moves each chroma
+ * plane by (x * bytes per sample) >> chroma subsampling bytes (vf_crop.c), which only works for 1-byte samples, so
+ * semi-planar formats (NV12, P010...) and planar formats above 8 bits with horizontally subsampled chroma break.
+ */
+const hasInexactOddCrop = (pixelFormatName: string) => {
+	return /^(nv(12|21|16|20)|p[02]\d\d|yuva?42[02]p\d)/.test(pixelFormatName);
+};
+
+/** What those formats are cropped as instead: 8-bit planar 4:2:0 or 4:2:2, or 4:4:4 at the same bit depth. */
+const EXACT_CROP_FORMAT_FILTER = 'format=pix_fmts=' + [
+	'yuv420p', 'yuv422p',
+	'yuv444p', 'yuv444p9le', 'yuv444p10le', 'yuv444p12le', 'yuv444p14le', 'yuv444p16le',
+	'yuva444p', 'yuva444p9le', 'yuva444p10le', 'yuva444p12le', 'yuva444p16le',
+].join('|');
+
 export const transformVideoSample = async (
 	sample: VideoSample,
 	description: VideoSampleTransformationDescription,
@@ -275,8 +291,16 @@ export const transformVideoSample = async (
 		chain.push('hflip');
 	}
 
-	// exact=1, as the crop filter otherwise rounds the offsets and the size down to the chroma subsampling (to even
-	// numbers for 4:2:0)
+	// The crops are exact (exact=1), since the crop filter otherwise rounds the offsets and the size down to the
+	// chroma subsampling (to even numbers for 4:2:0). For the formats where an exact crop at an odd horizontal offset
+	// misplaces the chroma, convert to one where it doesn't first, and back at the end.
+	const srcPixelFormatName = NodeAv.avGetPixFmtName(srcFrame.format as NodeAv.AVPixelFormat) ?? '';
+	const convertForCrop = hasInexactOddCrop(srcPixelFormatName)
+		&& (Math.round(description.crop.left) % 2 !== 0 || description.fit === 'cover');
+	if (convertForCrop) {
+		chain.push(EXACT_CROP_FORMAT_FILTER);
+	}
+
 	chain.push(`crop=${Math.round(description.crop.width)}:${Math.round(description.crop.height)}`
 		+ `:${Math.round(description.crop.left)}:${Math.round(description.crop.top)}:exact=1`);
 
@@ -288,6 +312,10 @@ export const transformVideoSample = async (
 	} else if (description.fit === 'cover') {
 		chain.push(`scale=${description.width}:${description.height}:force_original_aspect_ratio=increase`);
 		chain.push(`crop=${description.width}:${description.height}:exact=1`);
+	}
+
+	if (convertForCrop) {
+		chain.push(`format=${srcPixelFormatName}`);
 	}
 
 	chain.push('setsar=1');
