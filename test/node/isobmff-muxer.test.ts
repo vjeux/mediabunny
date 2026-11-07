@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
+import { MovOutputFormat } from '../../src/output-format.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
@@ -301,6 +302,73 @@ const testNegativeTimestampRoundTrip = async (
 		});
 	}
 };
+
+test('MP4 writes track dispositions as Track Kind Boxes with DASH roles', async () => {
+	const writeTrack = async (
+		format: Mp4OutputFormat | MovOutputFormat,
+		metadata: Parameters<Output['addAudioTrack']>[1],
+	) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source, metadata);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 0.02), {
+			decoderConfig: { codec: 'opus', numberOfChannels: 1, sampleRate: 48000 },
+		});
+		await output.finalize();
+
+		// Collects the scheme URI and value of every kind box in a track's udta
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = toDataView(bytes);
+		const kinds: string[] = [];
+		const walk = (start: number, end: number) => {
+			for (let pos = start; pos + 8 <= end;) {
+				const size = view.getUint32(pos);
+				if (size < 8) {
+					break;
+				}
+
+				const type = String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+				if (type === 'moov' || type === 'trak' || type === 'udta') {
+					walk(pos + 8, pos + size);
+				} else if (type === 'kind') {
+					const text = new TextDecoder().decode(bytes.subarray(pos + 12, pos + size));
+					kinds.push(text.split('\0', 2).join(' '));
+				}
+				pos += size;
+			}
+		};
+		walk(0, bytes.byteLength);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return { kinds, name: await track.getName() };
+	};
+
+	// The roles FFmpeg writes for these dispositions (and reads back); 'original' has no DASH role. These used to be
+	// dropped, leaving only tkhd's enabled flag.
+	const disposition = {
+		commentary: true,
+		hearingImpaired: true,
+		visuallyImpaired: true,
+		forced: true,
+		original: true,
+	};
+	expect(await writeTrack(new Mp4OutputFormat(), { name: 'Commentary', disposition })).toEqual({
+		kinds: [
+			'urn:mpeg:dash:role:2011 caption',
+			'urn:mpeg:dash:role:2011 commentary',
+			'urn:mpeg:dash:role:2011 description',
+			'urn:mpeg:dash:role:2011 forced-subtitle',
+		],
+		name: 'Commentary',
+	});
+
+	// Nothing for other tracks, nor in QuickTime files, as with FFmpeg
+	expect(await writeTrack(new Mp4OutputFormat(), {})).toEqual({ kinds: [], name: null });
+	expect(await writeTrack(new MovOutputFormat(), { disposition })).toEqual({ kinds: [], name: null });
+});
 
 test('PCM audio', async () => {
 	const output = new Output({
