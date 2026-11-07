@@ -903,6 +903,10 @@ class VideoEncoderWrapper {
 
 			this.encoderInitialized = true;
 		})();
+
+		// An initialization error has to stick like encoding errors do, so that it also fails finalize(), even when the
+		// add() that started the initialization wasn't awaited
+		this.ensureEncoderPromise.catch((error: unknown) => this.setError(error));
 	}
 
 	private createWebCodecsEncoders() {
@@ -1182,6 +1186,9 @@ class VideoEncoderWrapper {
 	}
 
 	async flushAndClose(forceClose: boolean) {
+		// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
+		await this.ensureEncoderPromise?.catch(() => {});
+
 		try {
 			if (!forceClose) {
 				this.checkForEncoderError();
@@ -2966,6 +2973,10 @@ class AudioEncoderWrapper {
 
 			this.encoderInitialized = true;
 		})();
+
+		// An initialization error has to stick like encoding errors do, so that it also fails finalize(), even when the
+		// add() that started the initialization wasn't awaited
+		this.ensureEncoderPromise.catch((error: unknown) => this.setError(error));
 	}
 
 	private initPcmEncoder() {
@@ -3071,6 +3082,9 @@ class AudioEncoderWrapper {
 	}
 
 	async flushAndClose(forceClose: boolean) {
+		// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
+		await this.ensureEncoderPromise?.catch(() => {});
+
 		try {
 			if (!forceClose) {
 				this.checkForEncoderError();
