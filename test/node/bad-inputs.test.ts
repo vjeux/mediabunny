@@ -1843,6 +1843,99 @@ test('Ogg: Page claiming to extend past the end of the file', async () => {
 	await expectGracefulRead(concat(...opusPages({ pageCount: 20 }), fakePage));
 });
 
+test('Ogg: Continuation pages after lost pages', async () => {
+	const describePacket = (packet: { timestamp: number; byteLength: number; sequenceNumber: number }) => ({
+		timestamp: packet.timestamp,
+		byteLength: packet.byteLength,
+		sequenceNumber: packet.sequenceNumber,
+	});
+	const readPackets = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+		const packets = [];
+		for await (const packet of sink.packets()) {
+			packets.push(describePacket(packet));
+		}
+
+		// Lookups of the packets' own timestamps, each on a fresh input
+		const lookups = [];
+		for (const packet of packets) {
+			using lookupInput = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+			const lookupSink = new EncodedPacketSink((await lookupInput.getPrimaryAudioTrack())!);
+			lookups.push(describePacket((await lookupSink.getPacket(packet.timestamp))!));
+		}
+
+		return { packets, lookups };
+	};
+	const headerPages = [
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+	];
+	const orphanedEnd = zeros(10); // The end of a packet whose start was on a lost page
+
+	// With page 3 lost, page 4 continues a packet whose start is missing. Like FFmpeg, the orphaned end is skipped,
+	// rather than read as a packet of its own.
+	const afterLostPage = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ granule: 312 + 960, sequence: 2 }, [OPUS_PACKET]),
+		oggPacketsPage({ headerType: 1 | 4, granule: 312 + 2880, sequence: 4 }, [orphanedEnd, OPUS_PACKET]),
+	]));
+	expect(afterLostPage.packets.map(x => x.byteLength)).toEqual([3, 3]);
+	expect(afterLostPage.lookups).toEqual(afterLostPage.packets);
+
+	// The same where the orphaned end spans a whole page, and at the start of the stream
+	const acrossPages = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ granule: 312 + 960, sequence: 2 }, [OPUS_PACKET]),
+		oggPage({ headerType: 1, granule: -1, sequence: 4, lacing: [255], data: zeros(255) }),
+		oggPacketsPage({ headerType: 1 | 4, granule: 312 + 2880, sequence: 5 }, [orphanedEnd, OPUS_PACKET]),
+	]));
+	expect(acrossPages.packets.map(x => x.byteLength)).toEqual([3, 3]);
+	expect(acrossPages.lookups).toEqual(acrossPages.packets);
+
+	const atStart = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ headerType: 1, granule: 312 + 960, sequence: 3 }, [orphanedEnd, OPUS_PACKET]),
+		oggPacketsPage({ headerType: 4, granule: 312 + 1920, sequence: 4 }, [OPUS_PACKET]),
+	]));
+	expect(atStart.packets.map(x => x.byteLength)).toEqual([3, 3]);
+	expect(atStart.lookups).toEqual(atStart.packets);
+
+	// Where nothing but the orphaned end is on the page, its granule position still places the packets after it, and
+	// lookups never return a packet after the timestamp
+	const orphanOnly = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ granule: 312 + 960, sequence: 2 }, [OPUS_PACKET]),
+		oggPacketsPage({ headerType: 1, granule: 312 + 1920, sequence: 4 }, [orphanedEnd]),
+		oggPacketsPage({ granule: 312 + 2880, sequence: 5 }, [OPUS_PACKET]),
+		oggPacketsPage({ headerType: 4, granule: 312 + 3840, sequence: 6 }, [OPUS_PACKET, OPUS_PACKET]),
+	]));
+	expect(orphanOnly.packets.map(x => x.byteLength)).toEqual([3, 3, 3, 3]);
+	for (const [i, lookup] of orphanOnly.lookups.entries()) {
+		expect(lookup.byteLength).toBe(3);
+		expect(lookup.timestamp).toBeLessThanOrEqual(orphanOnly.packets[i]!.timestamp);
+	}
+
+	// Without lost pages, a page continuing a packet is read as before, here the first audio page, which begins with
+	// the end of the comment header
+	const tags = opusTags([ascii(`A=${'x'.repeat(600)}`)]);
+	const intact = await readPackets(concatList([
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPage({ granule: -1, sequence: 1, lacing: [255, 255], data: tags.subarray(0, 510) }),
+		oggPage({
+			headerType: 1,
+			granule: 312 + 9600,
+			sequence: 2,
+			lacing: [tags.length - 510, ...Array<number>(10).fill(3)],
+			data: concatList([tags.subarray(510), ...Array<Bytes>(10).fill(OPUS_PACKET)]),
+		}),
+		oggPacketsPage({ headerType: 4, granule: 312 + 19200, sequence: 3 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+	]));
+	const intactTimestamps = intact.packets.map(x => Math.round(x.timestamp * 48000));
+	expect(intactTimestamps).toEqual(Array.from({ length: 20 }, (_, i) => 960 * i));
+	expect(intact.lookups).toEqual(intact.packets);
+});
+
 test('Ogg: Garbage between pages', async () => {
 	const pages = opusPages({ pageCount: 40 });
 	await expectGracefulRead(concatList(pages.flatMap((page, i) => i >= 2 ? [page, zeros(8)] : [page])));
