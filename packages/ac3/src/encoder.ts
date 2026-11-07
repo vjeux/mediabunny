@@ -17,13 +17,33 @@ import { sendCommand, refWorker, unrefWorker } from './worker-client';
 import { assert } from './shared';
 import { AC3_SAMPLE_RATES, EAC3_REDUCED_SAMPLE_RATES } from '../../../shared/ac3-misc';
 
+// The valid AC-3 bitrates
+const AC3_BITRATES = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640]
+	.map(kbps => kbps * 1000);
+
+// FFmpeg's AC-3 encoder rounds the requested bitrate to the closest valid one, the lower one on a tie
+const roundToAc3Bitrate = (bitrate: number) => {
+	return AC3_BITRATES.reduce((closest, x) => Math.abs(x - bitrate) < Math.abs(closest - bitrate) ? x : closest);
+};
+
 /**
- * The lowest bitrate for each channel count at which FFmpeg's bit allocation fits full-scale square and sawtooth waves,
- * about the hardest signals for it: below that, it fails the encode for them. Each is the lowest AC-3 bitrate at least
- * 16 kbps above the highest one that failed in measurements, so AC-3's rounding to the closest valid bitrate can't
- * take a bitrate below it. Mono works at any bitrate, and FFmpeg can't encode more than 6 channels.
+ * The lowest bitrate at which FFmpeg's bit allocation fits real content (sine tones and music, measured with this
+ * extension's encoder) and every higher one does too, by codec, sample rate and channel count (the index, up to 6).
+ * Below it, the encode fails with "Bit allocation failed" for such content. 0 means no failure down to the lowest
+ * bitrate measured.
  */
-const MIN_BITRATES: Record<number, number> = { 2: 56000, 3: 56000, 4: 80000, 5: 96000, 6: 96000 };
+const MIN_BITRATES: Record<'ac3' | 'eac3', Record<number, number[]>> = {
+	ac3: {
+		32000: [0, 0, 0, 0, 40000, 48000, 48000],
+		44100: [0, 0, 0, 0, 56000, 64000, 64000],
+		48000: [0, 0, 40000, 40000, 56000, 80000, 80000],
+	},
+	eac3: {
+		32000: [0, 0, 0, 0, 40000, 48000, 48000],
+		44100: [0, 0, 32000, 32000, 56000, 64000, 64000],
+		48000: [0, 0, 32000, 40000, 56000, 72000, 72000],
+	},
+};
 
 class Ac3Encoder extends CustomAudioEncoder {
 	private ctx = 0;
@@ -42,12 +62,19 @@ class Ac3Encoder extends CustomAudioEncoder {
 			? [...AC3_SAMPLE_RATES, ...EAC3_REDUCED_SAMPLE_RATES]
 			: AC3_SAMPLE_RATES;
 
-		return (codec === 'ac3' || codec === 'eac3')
-			&& config.numberOfChannels >= 1
-			&& config.numberOfChannels <= 8
-			&& sampleRates.includes(config.sampleRate)
-			&& config.bitrate !== undefined
-			&& config.bitrate >= (MIN_BITRATES[config.numberOfChannels] ?? 0);
+		if (
+			(codec !== 'ac3' && codec !== 'eac3')
+			|| config.numberOfChannels < 1
+			|| config.numberOfChannels > 6 // FFmpeg's encoders top out at 5.1
+			|| !sampleRates.includes(config.sampleRate)
+			|| config.bitrate === undefined
+		) {
+			return false;
+		}
+
+		// E-AC-3 takes the requested bitrate as it is
+		const bitrate = codec === 'ac3' ? roundToAc3Bitrate(config.bitrate) : config.bitrate;
+		return bitrate >= (MIN_BITRATES[codec][config.sampleRate]?.[config.numberOfChannels] ?? 0);
 	}
 
 	async init() {
