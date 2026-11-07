@@ -327,17 +327,18 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		let frameCount = demuxer.xingData?.frameCount ?? null;
 		const streamSize = demuxer.xingData?.fileSize ?? null;
 
-		const audioEndPos = frameCount !== null && streamSize
-			? await findAudioEndBeforeTrailingTags(demuxer.reader)
-			: null;
-		if (audioEndPos !== null && streamSize) {
-			// When the audio goes well beyond the stream that the Xing/Info header describes, the file holds more
-			// than that stream (like MP3s joined with `cat`), and the header's frame count only covers its start.
-			// Like FFmpeg, which then goes by the bitrate, don't use it. A file whose audio ends well before that was
-			// cut off, and keeps the frame count.
+		if (frameCount !== null && streamSize && demuxer.reader.fileSize !== null) {
+			// When the file goes well beyond the stream that the Xing/Info header describes (by more than 1/16, like
+			// FFmpeg checks) and more MP3 audio follows that stream, the file holds more than it (like MP3s joined
+			// with `cat`), and the header's frame count only covers its start. Like FFmpeg, which then goes by the
+			// bitrate, don't use it. Tags or other data behind the stream don't count, and a file that ends well
+			// before the stream's end was cut off and keeps the frame count.
 			assert(demuxer.xingFrameHeaderPos !== null);
-			const audioSize = audioEndPos - demuxer.xingFrameHeaderPos;
-			if (audioSize - streamSize > streamSize / 16) {
+			const streamEndPos = demuxer.xingFrameHeaderPos + streamSize;
+			if (
+				demuxer.reader.fileSize - streamEndPos > streamSize / 16
+				&& await mp3AudioFollows(demuxer.reader, streamEndPos)
+			) {
 				frameCount = null;
 			}
 		}
@@ -522,45 +523,49 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 	}
 }
 
-const APE_TAG_FOOTER_SIZE = 32;
+/** How far behind the end of a stream the next one may start, like after some junk between joined files */
+const MAX_GAP_BETWEEN_JOINED_STREAMS = 4096;
 
-/** Returns where the audio of an MP3 file ends, before any APEv2 and ID3v1 tags at its end. */
-const findAudioEndBeforeTrailingTags = async (reader: Reader) => {
-	if (reader.fileSize === null) {
-		return null;
+/**
+ * Whether more MP3 audio starts at the given position (or a little behind it), possibly behind the ID3 tags of the next
+ * file: a frame with another one right behind it.
+ */
+const mp3AudioFollows = async (reader: Reader, pos: number) => {
+	assert(reader.fileSize !== null);
+
+	// Skip the ID3v1 tag that ends a joined file, and the ID3v2 tags that start the next one
+	while (pos + ID3_V2_HEADER_SIZE <= reader.fileSize) {
+		let slice = reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) {
+			return false;
+		}
+
+		if (readAscii(slice, 3) === 'TAG') {
+			pos += ID3_V1_TAG_SIZE;
+			continue;
+		}
+
+		slice.filePos = pos;
+		const id3V2Header = readId3V2Header(slice);
+		if (!id3V2Header) {
+			break;
+		}
+
+		pos += ID3_V2_HEADER_SIZE + id3V2Header.size;
 	}
 
-	let endPos = reader.fileSize;
-
-	if (endPos >= ID3_V1_TAG_SIZE) {
-		let slice = reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
-		if (isThenable(slice)) {
-			slice = await slice;
-		}
-
-		if (slice && readAscii(slice, 3) === 'TAG') {
-			endPos -= ID3_V1_TAG_SIZE;
-		}
+	const frame = await readNextMp3FrameHeader(
+		reader,
+		pos,
+		Math.min(pos + MAX_GAP_BETWEEN_JOINED_STREAMS, reader.fileSize),
+	);
+	if (!frame) {
+		return false;
 	}
 
-	// APEv2 tags end with a 32-byte footer and sit in front of any ID3v1 tag
-	if (endPos >= APE_TAG_FOOTER_SIZE) {
-		let slice = reader.requestSlice(endPos - APE_TAG_FOOTER_SIZE, APE_TAG_FOOTER_SIZE);
-		if (isThenable(slice)) {
-			slice = await slice;
-		}
-
-		if (slice && readAscii(slice, 8) === 'APETAGEX') {
-			const view = toDataView(readBytes(slice, 24));
-			const tagSize = view.getUint32(4, true); // Includes the footer, but not the header
-			const hasHeader = (view.getUint32(12, true) & (1 << 31)) !== 0;
-
-			const tagStartPos = endPos - tagSize - (hasHeader ? APE_TAG_FOOTER_SIZE : 0);
-			if (tagStartPos >= 0) {
-				endPos = tagStartPos;
-			}
-		}
-	}
-
-	return endPos;
+	// A frame header found in tags or other data is very unlikely to be followed by a second one
+	const nextFramePos = frame.startPos + frame.header.totalSize;
+	const nextFrame = await readNextMp3FrameHeader(reader, nextFramePos, nextFramePos + 1);
+	return nextFrame !== null;
 };

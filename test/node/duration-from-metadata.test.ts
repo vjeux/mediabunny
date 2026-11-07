@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ALL_FORMATS, BufferSource, Input, FilePathSource } from '../../src/index.js';
@@ -129,22 +130,72 @@ test('MP3 duration metadata of joined files, where the Xing/Info header only cov
 		view.setUint32(4 + 17 + 12, (frameCount + 1) * 417);
 		return [info, ...Array.from({ length: frameCount }, frame)];
 	};
-	const metadataDuration = async (frames: Uint8Array[]) => {
-		const bytes = new Uint8Array(frames.length * 417);
-		frames.forEach((frame, i) => bytes.set(frame, i * 417));
+	const metadataDuration = async (parts: Uint8Array[]) => {
+		const bytes = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+		let offset = 0;
+		for (const part of parts) {
+			bytes.set(part, offset);
+			offset += part.length;
+		}
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 		return await input.getDurationFromMetadata();
 	};
+	const ascii = (text: string) => new Uint8Array([...text].map(char => char.charCodeAt(0)));
+	const id3V1Tag = new Uint8Array(128);
+	id3V1Tag.set(ascii('TAGTitle'));
+	// An ID3v2.4 tag with a footer, as appended at the end of a file, holding a TIT2 frame and padding
+	const appendedId3V2Tag = new Uint8Array(10 + 65536 + 10);
+	appendedId3V2Tag.set([...ascii('ID3'), 4, 0, 0x10, 0, 4, 0, 0]);
+	appendedId3V2Tag.set([...ascii('TIT2'), 0, 0, 0, 6, 0, 0, 0, ...ascii('Title')], 10);
+	appendedId3V2Tag.set([...ascii('3DI'), 4, 0, 0x10, 0, 4, 0, 0], 10 + 65536);
+	const lyrics3V2Tag = (() => {
+		const block = `LYRICSBEGININD00003110LYR30000${'x'.repeat(30000)}`;
+		return ascii(`${block}${String(block.length).padStart(6, '0')}LYRICS200`);
+	})();
 
 	// One stream: its header's frame count
-	expect(await metadataDuration(stream(383))).toBeCloseTo(383 * 1152 / 44100, 6);
+	const tenSeconds = 383 * 1152 / 44100;
+	expect(await metadataDuration(stream(383))).toBeCloseTo(tenSeconds, 6);
 
 	// 1 s, then 10 s without a header (`cat ad.mp3 episode.mp3`, as with podcast ad insertion). FFmpeg detects an
 	// "invalid concatenated file" (the file is over 1/16 larger than the header's byte count) and goes by the bitrate.
-	expect(await metadataDuration([...stream(38), ...stream(383).slice(1)])).toBeCloseTo(421 * 1152 / 44100, 1);
+	const elevenSeconds = 421 * 1152 / 44100;
+	expect(await metadataDuration([...stream(38), ...stream(383).slice(1)])).toBeCloseTo(elevenSeconds, 1);
+	// Also when the first file ends with an ID3v1 tag and the second one starts with an ID3v2 tag
+	const id3V2Tag = appendedId3V2Tag.slice(0, 20 + 6);
+	id3V2Tag.set([...ascii('ID3'), 4, 0, 0, 0, 0, 0, 16]);
+	expect(await metadataDuration([...stream(38), id3V1Tag, id3V2Tag, ...stream(383)])).toBeCloseTo(elevenSeconds, 1);
+
+	// Tags or other data behind a single stream don't make it joined: an ID3v1 tag behind a Lyrics3v2 tag, as Winamp
+	// and Mp3tag write them, an appended ID3v2 tag, or junk
+	for (const trailer of [[lyrics3V2Tag, id3V1Tag], [appendedId3V2Tag], [new Uint8Array(20000)]]) {
+		expect(await metadataDuration([...stream(383), ...trailer])).toBeCloseTo(tenSeconds, 6);
+	}
 
 	// A file cut off within the stream still gets the header's frame count
-	expect(await metadataDuration(stream(383).slice(0, 200))).toBeCloseTo(383 * 1152 / 44100, 6);
+	expect(await metadataDuration(stream(383).slice(0, 200))).toBeCloseTo(tenSeconds, 6);
+});
+
+test('MP3 duration metadata ignores a Lyrics3v2 tag at the end of the file', async () => {
+	// A VBR file with a Xing header, then a Lyrics3v2 tag and an ID3v1 tag, as Winamp and Mp3tag write them
+	const mp3 = new Uint8Array(readFileSync(publicPath('Toothsome-Meme.VBRv2.mp3')));
+	const encoder = new TextEncoder();
+	const block = `LYRICSBEGININD00003110LYR30000${'x'.repeat(30000)}`;
+	const lyrics3 = encoder.encode(`${block}${String(block.length).padStart(6, '0')}LYRICS200`);
+	const id3V1 = new Uint8Array(128);
+	id3V1.set(encoder.encode('TAGTitle'));
+
+	const withTags = new Uint8Array(mp3.length + lyrics3.length + id3V1.length);
+	withTags.set(mp3, 0);
+	withTags.set(lyrics3, mp3.length);
+	withTags.set(id3V1, mp3.length + lyrics3.length);
+
+	using plain = new Input({ source: new BufferSource(mp3), formats: ALL_FORMATS });
+	const expected = await plain.getDurationFromMetadata();
+	expect(expected).not.toBeNull(); // The Xing header's frame count
+
+	using tagged = new Input({ source: new BufferSource(withTags), formats: ALL_FORMATS });
+	expect(await tagged.getDurationFromMetadata()).toBe(expected);
 });
 
 test('MP3 duration metadata', async () => {
