@@ -15,6 +15,7 @@ import {
 	determineVideoPacketType,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
+	hasLibfaacSignature,
 	HevcNalUnitType,
 	iterateAvcNalUnits,
 	iterateHevcNalUnits,
@@ -2322,6 +2323,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
+	// The timestamp of a packet the decoder emits nothing for (libfaac's priming, see getDiscardedPacketTimestamp)
+	discardedPacketTimestamp: number | null = null;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
@@ -2439,7 +2442,11 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		} else {
 			assert(this.decoder);
 
-			this.expectedFirstTimestamp ??= packet.timestamp;
+			// The first output comes from the packet after a discarded one
+			if (packet.timestamp !== this.discardedPacketTimestamp) {
+				this.expectedFirstTimestamp ??= packet.timestamp;
+			}
+
 			this.decoder.decode(packet.toEncodedAudioChunk());
 		}
 	}
@@ -2658,6 +2665,55 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 }
 
+const discardedPacketTimestamps = new WeakMap<InputAudioTrack, Promise<number | null>>();
+
+/**
+ * Gets the timestamp of the track's first packet if the platform's decoder emits nothing for it. FFmpeg's AAC decoder
+ * (in Chromium and Firefox) discards the first frame of AAC from libfaac as encoder priming, and Chromium then stamps
+ * the next frame's audio with the first packet's timestamp, unless that's negative. Whether the decoder discards the
+ * frame depends on which one the platform uses, so it's asked of the decoder itself, once per track.
+ */
+const getDiscardedPacketTimestamp = (track: InputAudioTrack, decoderConfig: AudioDecoderConfig) => {
+	let result = discardedPacketTimestamps.get(track);
+	if (!result) {
+		result = (async () => {
+			if (decoderConfig.codec.split('.')[0] !== 'mp4a') {
+				return null;
+			}
+
+			const firstPacket = await new EncodedPacketSink(track).getFirstPacket();
+			if (!firstPacket || !hasLibfaacSignature(firstPacket.data)) {
+				return null;
+			}
+
+			let outputCount = 0;
+			const decoder = new AudioDecoder({
+				output: (data) => {
+					outputCount++;
+					data.close();
+				},
+				error: () => {},
+			});
+
+			try {
+				decoder.configure(decoderConfig);
+				decoder.decode(firstPacket.toEncodedAudioChunk());
+				await decoder.flush();
+				return outputCount === 0 ? firstPacket.timestamp : null;
+			} catch {
+				return null;
+			} finally {
+				if (decoder.state !== 'closed') {
+					decoder.close();
+				}
+			}
+		})();
+		discardedPacketTimestamps.set(track, result);
+	}
+
+	return result;
+};
+
 /**
  * Sink for retrieving decoded audio samples from an audio track.
  * @group Media sinks
@@ -2701,7 +2757,12 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			const decoder = new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			if (decoder.decoder) {
+				decoder.discardedPacketTimestamp = await getDiscardedPacketTimestamp(this._track, decoderConfig);
+			}
+
+			return decoder;
 		}
 	}
 
