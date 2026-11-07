@@ -952,6 +952,7 @@ export class IsobmffMuxer extends Muxer {
 
 				const endTimestamp = cue.timestamp + cue.duration;
 				let sourceId = trackData.cueToSourceId.get(cue);
+				const isFirstSampleOfCue = sourceId === undefined;
 				if (sourceId === undefined && sampleEnd < endTimestamp) {
 					// We know this cue will appear in more than one sample, therefore we need to mark it with a
 					// unique ID
@@ -959,8 +960,8 @@ export class IsobmffMuxer extends Muxer {
 					trackData.cueToSourceId.set(cue, sourceId);
 				}
 
-				if (cue.notes) {
-					// Any notes/comments are included in a special vtta box
+				if (cue.notes && isFirstSampleOfCue) {
+					// Any notes/comments are included in a special vtta box, once, before the cue's first sample
 					const box = vtta(cue.notes);
 					this.auxBoxWriter.writeBox(box);
 				}
