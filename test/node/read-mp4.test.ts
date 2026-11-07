@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createCipheriv } from 'node:crypto';
 import {
 	ALL_FORMATS,
 	BufferSource,
@@ -548,4 +549,76 @@ test('Packet lookup by timestamp is the same however many fragments were read be
 			return lookUp(sink, timestamps);
 		})).toEqual(expected);
 	}
+});
+
+test('Clear lead samples of an encrypted track stay unencrypted', async () => {
+	// Shaka Packager's default 5 s clear lead: the stsd holds an encrypted (encv) and a clear (avc1) entry, and clear
+	// fragments select the clear one through the tfhd's sample description index
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
+	const iv = Buffer.from('0f0e0d0c0b0a09080706050403020100', 'hex');
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const visualSampleEntry = (type: string, ...children: number[][]) => box(type,
+		zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(12), [0, 1], zeros(32), [0, 24, 0xff, 0xff],
+		box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]), ...children,
+	);
+	const sinf = box('sinf', box('frma', ascii('avc1')), box('schm', u32(0), ascii('cbcs'), u32(0x10000)), box('schi',
+		box('tenc', u32(1 << 24), [0, 0x19, 1, 0], zeros(16), [16], [...iv]), // Pattern 1:9, constant IV
+	));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(2), visualSampleEntry('encv', sinf), visualSampleEntry('avc1')),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	const plaintext = [0, 0, 0, 161, 0x65, ...zeros(160).map((_, i) => i)]; // One NAL unit
+	const ciphertext = [...plaintext]; // cbcs 1:9 only encrypts the first 16-byte block after the 5 clear bytes
+	ciphertext.splice(5, 16, ...createCipheriv('aes-128-cbc', key, iv).setAutoPadding(false)
+		.update(Buffer.from(plaintext.slice(5, 21))));
+
+	const fragment = (sequenceNumber: number, sampleDescriptionIndex: number, data: number[]) => {
+		const moof = (dataOffset: number) => box('moof', box('mfhd', u32(0), u32(sequenceNumber)), box('traf',
+			box('tfhd', u32(0x020002), u32(1), u32(sampleDescriptionIndex)),
+			box('tfdt', u32(0), u32(sequenceNumber - 1)),
+			box('trun', u32(0x701), u32(1), u32(dataOffset), u32(1), u32(data.length), u32(0)),
+			...(sampleDescriptionIndex === 1 ? [box('senc', u32(2), u32(1), [0, 1, 0, 5], u32(160))] : []),
+		));
+		return [...moof(moof(0).length + 8), ...box('mdat', data)];
+	};
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...fragment(1, 2, plaintext), // Clear lead
+			...fragment(2, 1, ciphertext),
+		])),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => key.toString('hex') } },
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual([plaintext, plaintext]);
 });
