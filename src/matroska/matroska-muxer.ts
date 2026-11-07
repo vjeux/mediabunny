@@ -1154,10 +1154,6 @@ export class MatroskaMuxer extends Muxer {
 		}
 	}
 
-	/**
-	 * Due to [a bug in Chromium](https://bugs.chromium.org/p/chromium/issues/detail?id=1377842), VP9 streams often
- 	 * lack color space information. This method patches in that information.
-	 */
 	/** Converts a read-only external chunk into an internal one for easier use. */
 	private createInternalChunk(
 		data: Uint8Array,
