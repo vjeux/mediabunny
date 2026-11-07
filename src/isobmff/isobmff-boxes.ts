@@ -917,6 +917,16 @@ export const soundSampleDescription = (
 		version = 1;
 	}
 
+	let sampleRate = trackData.info.sampleRate;
+	if (trackData.track.source._codec === 'flac') {
+		// FLAC-in-ISOBMFF stores rates above 65535 Hz as their greatest expressible regular division (48 kHz for 96 and
+		// 192 kHz), or else as 65535 Hz. Readers take the actual rate from dfLa.
+		while (sampleRate > 0xffff && sampleRate % 2 === 0) {
+			sampleRate /= 2;
+		}
+		sampleRate = Math.min(sampleRate, 0xffff);
+	}
+
 	if (version === 0) {
 		contents = [
 			Array(6).fill(0), // Reserved
@@ -931,7 +941,7 @@ export const soundSampleDescription = (
 			trackData.track.source._codec === 'truehd'
 				? u32(trackData.info.sampleRate) // TrueHD stores the sample rate as a plain integer
 				: [
-						u16(trackData.info.sampleRate < 2 ** 16 ? trackData.info.sampleRate : 0), // Sample rate (upper)
+						u16(sampleRate < 2 ** 16 ? sampleRate : 0), // Sample rate (upper)
 						u16(0), // Sample rate (lower)
 					],
 		];
@@ -948,7 +958,7 @@ export const soundSampleDescription = (
 			u16(Math.min(sampleSizeInBits, 16)), // Sample size (bits)
 			i16(compressionId), // Compression ID
 			u16(0), // Packet size
-			u16(trackData.info.sampleRate < 2 ** 16 ? trackData.info.sampleRate : 0), // Sample rate (upper)
+			u16(sampleRate < 2 ** 16 ? sampleRate : 0), // Sample rate (upper)
 			u16(0), // Sample rate (lower)
 			isPcmCodec
 				? [
