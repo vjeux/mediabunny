@@ -288,6 +288,47 @@ test('AC-3 encoding', async () => {
 	expect(await track.computeDuration()).toBeCloseTo(2, 1);
 });
 
+test('AC-3 and E-AC-3 encode a NaN or infinite sample like silence or full scale', async () => {
+	registerAc3Encoder();
+
+	const encode = async (codec: 'ac3' | 'eac3', data: Float32Array) => {
+		const packets: Uint8Array[] = [];
+		const output = new Output({
+			format: new Mp4OutputFormat(),
+			target: new BufferTarget(),
+		});
+		const audioSource = new AudioSampleSource({
+			codec,
+			quality: new Quality({ bitrate: 192000 }),
+			onEncodedPacket: packet => packets.push(packet.data),
+		});
+		output.addAudioTrack(audioSource);
+
+		await output.start();
+		const sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate: 48000, timestamp: 0 });
+		await audioSource.add(sample);
+		sample.close();
+		await output.finalize();
+
+		return packets;
+	};
+
+	// FFmpeg's MDCT turns a non-finite sample into silence for the blocks around it, so it has to be encoded like the
+	// conversion to integer samples maps it: NaN to silence, infinities to full scale
+	for (const codec of ['ac3', 'eac3'] as const) {
+		for (const [value, replacement] of [[NaN, 0], [Infinity, 1], [-Infinity, -1]] as const) {
+			const withValue = createSineWave(48000, 2, 1);
+			withValue[20000] = value;
+			const withReplacement = createSineWave(48000, 2, 1);
+			withReplacement[20000] = replacement;
+
+			const packets = await encode(codec, withValue);
+			expect(packets.length).toBeGreaterThan(0);
+			expect(packets, `${codec}, ${value}`).toEqual(await encode(codec, withReplacement));
+		}
+	}
+});
+
 test('E-AC-3 encoding', async () => {
 	registerAc3Encoder();
 
