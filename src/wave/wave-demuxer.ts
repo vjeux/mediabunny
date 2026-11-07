@@ -150,7 +150,7 @@ export class WaveDemuxer extends Demuxer {
 		let formatTag = readU16(slice, littleEndian);
 		const numChannels = readU16(slice, littleEndian);
 		const sampleRate = readU32(slice, littleEndian);
-		slice.skip(4); // Bytes per second
+		const bytesPerSecond = readU32(slice, littleEndian);
 		const blockAlign = readU16(slice, littleEndian);
 
 		if (numChannels === 0 || sampleRate === 0 || blockAlign === 0) {
@@ -207,12 +207,22 @@ export class WaveDemuxer extends Demuxer {
 			);
 		}
 
+		const sampleSizeInBytes = Math.ceil(bitsPerSample / 8);
+
+		// Some writers get the block align wrong, so the frames' size goes by the bit depth (like FFmpeg computes the
+		// duration). A larger block align is only believed when the byte rate agrees with it, as for 24-bit samples
+		// in 4-byte containers (written by Adobe Audition, say).
+		const minBlockSize = numChannels * sampleSizeInBytes;
+		const blockSizeInBytes = blockAlign >= minBlockSize && bytesPerSecond === sampleRate * blockAlign
+			? blockAlign
+			: minBlockSize;
+
 		this.audioInfo = {
 			format: formatTag,
 			numberOfChannels: numChannels,
 			sampleRate,
-			sampleSizeInBytes: Math.ceil(bitsPerSample / 8),
-			blockSizeInBytes: blockAlign,
+			sampleSizeInBytes,
+			blockSizeInBytes,
 		};
 	}
 
