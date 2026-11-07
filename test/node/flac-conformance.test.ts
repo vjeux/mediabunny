@@ -866,16 +866,17 @@ describe('FLAC muxer', () => {
 		);
 	});
 
-	test('writes a loose STREAMINFO in append-only mode', async () => {
+	test('writes STREAMINFO without frame sizes or a total in append-only mode', async () => {
 		const { bytes: input, frames } = sourceFile();
 		let onFrameCalls = 0;
 		const output = await remuxToFlac(input, { appendOnly: true, onFrame: () => onFrameCalls++ });
 		const { blocks, audioStart } = parseMetadataBlocks(output);
 
 		expect(onFrameCalls).toBe(4);
-		expect(parseStreamInfo(blocks[0]!.data)).toEqual({
-			minimumBlockSize: 16,
-			maximumBlockSize: 65535,
+		// Written before the frames, STREAMINFO can't know their sizes or the total, but its block sizes must at least
+		// bound the frames' (4096 samples, the last frame excluded)
+		const streamInfo = parseStreamInfo(blocks[0]!.data);
+		expect(streamInfo).toMatchObject({
 			minimumFrameSize: 0,
 			maximumFrameSize: 0,
 			sampleRate: 48000,
@@ -884,6 +885,8 @@ describe('FLAC muxer', () => {
 			totalSamples: 0,
 			md5: Array<number>(16).fill(0),
 		});
+		expect(streamInfo.minimumBlockSize).toBeLessThanOrEqual(4096);
+		expect(streamInfo.maximumBlockSize).toBeGreaterThanOrEqual(4096);
 		expect(output.subarray(audioStart)).toEqual(concatBytes(frames));
 
 		// The demuxer copes with the unknown values
