@@ -305,7 +305,57 @@ test('Granule positions of full pages', async () => {
 	}
 });
 
-test('Opus timestamp gaps are filled with packet loss concealment', async () => {
+/**
+ * Decodes the packets with WebCodecs alone, never with Mediabunny, to tell what the platform's own decoder does with
+ * them, so that a Mediabunny failure on a capable platform fails instead of skipping. Returns the number of frames
+ * decoded, or null if the platform can't decode them.
+ */
+const decodeNatively = async (config: AudioDecoderConfig, packets: EncodedPacket[]) => {
+	try {
+		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
+			return null;
+		}
+	} catch {
+		return null;
+	}
+
+	let frames = 0;
+	let failed = false;
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			frames += data.numberOfFrames;
+			data.close();
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+	try {
+		decoder.configure(config);
+		for (const packet of packets) {
+			decoder.decode(new EncodedAudioChunk({
+				type: 'key',
+				timestamp: Math.round(packet.timestamp * 1e6),
+				duration: Math.round(packet.duration * 1e6),
+				data: packet.data,
+			}));
+		}
+		// A decoder that fails may also never settle
+		failed ||= !await Promise.race([
+			decoder.flush().then(() => true, () => false),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+		]);
+	} catch {
+		failed = true;
+	}
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return failed ? null : frames;
+};
+
+test('Opus timestamp gaps are filled with packet loss concealment', async ({ skip }) => {
 	// Ogg Opus has no timestamps besides granule positions, which must advance by exactly the samples in the packets
 	// (RFC 7845, section 4.1). So a gap, as left by lost or paused packets, has to be filled with packets of empty
 	// frames, or all later audio would be pulled forward.
@@ -353,7 +403,17 @@ test('Opus timestamp gaps are filled with packet loss concealment', async () => 
 	}
 	expect(await track.computeDuration()).toBeCloseTo(1.12, 9);
 
-	// The empty frames decode to concealment, so the decoded audio spans the gap
+	// The empty frames decode to concealment, so the decoded audio spans the gap. It ends where the platform's decoder
+	// puts the end: Chrome's discards the pre-skip from its first output, but WebKitGTK's keeps it, which shows in what
+	// it makes of the first packet alone.
+	const firstPacketFrames = await decodeNatively(
+		decoderConfig,
+		[new EncodedPacket(sourcePackets[1]!.data, 'key', 0, 0.02)],
+	);
+	skip(firstPacketFrames === null, 'the platform can\'t decode Opus (native probe)');
+	const preSkip = 312; // That of preroll-test.opus
+	const keptPreSkip = firstPacketFrames! - (960 - preSkip);
+
 	let decodedFrames = 0;
 	let lastSampleEnd = 0;
 	for await (using sample of new AudioSampleSink(track).samples()) {
@@ -361,10 +421,10 @@ test('Opus timestamp gaps are filled with packet loss concealment', async () => 
 		lastSampleEnd = sample.timestamp + sample.duration;
 	}
 	expect(decodedFrames).toBeGreaterThan(1.1 * 48000);
-	expect(lastSampleEnd).toBeCloseTo(1.12, 9);
+	expect(lastSampleEnd).toBeCloseTo(1.12 + keptPreSkip / 48000, 9);
 });
 
-test('Opus timestamp gaps in multichannel audio are filled with valid multistream packets', async () => {
+test('Opus timestamp gaps in multichannel audio are filled with valid multistream packets', async ({ skip }) => {
 	// Quadraphonic Opus made of two coupled (stereo) streams: each packet holds a self-delimited Opus packet for the
 	// first stream followed by a regular one for the second (RFC 7845, section 3). The streams' packets are taken
 	// from a stereo file, whose packets each hold one 20 ms frame (code 0).
@@ -424,7 +484,11 @@ test('Opus timestamp gaps in multichannel audio are filled with valid multistrea
 		expect(packets.some(x => Math.abs(x.timestamp - timestamp) < 1e-9 && x.byteLength > 100)).toBe(true);
 	}
 
-	// Every packet decodes, including the synthesized ones, which would otherwise fail the decoder
+	// Every packet decodes, including the synthesized ones, which would otherwise fail the decoder. That's wherever the
+	// platform can decode multichannel Opus at all (WebKitGTK can't), as its own decoder shows on the real packets.
+	const realPackets = timestamps.map((timestamp, i) => new EncodedPacket(quadPacket(i), 'key', timestamp, 0.02));
+	const nativelyDecodable = await decodeNatively(decoderConfig, realPackets) !== null;
+	skip(!nativelyDecodable, 'the platform can\'t decode multichannel Opus (native probe)');
 	let decodedFrames = 0;
 	for await (using sample of new AudioSampleSink(track).samples()) {
 		decodedFrames += sample.numberOfFrames;
