@@ -359,3 +359,98 @@ test('MP3 in a QuickTime sample table that counts decoded samples', async () => 
 	}
 	expect(packets).toEqual(frames.map((_, i) => [i * 576 / 16000, 576 / 16000, 144, i]));
 });
+
+test('MP2 audio in a QuickTime .mp2 sample entry', async () => {
+	// FFmpeg's MOV muxer writes MPEG-1/2 Layer II audio (e.g. from DVB broadcasts) as a .mp2 sample entry
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (options: {
+		sampleRate: number;
+		frames: number[][];
+		sampleEntryExtra: number[];
+		version: number;
+		stbl: (dataStart: number) => number[][];
+	}) => {
+		const sampleEntry = box('.mp2',
+			zeros(6), u16(1), // Data reference index
+			u16(options.version), zeros(6),
+			u16(2), u16(16), u16(0xffff), u16(0), u32(options.sampleRate * 0x10000),
+			options.sampleEntryExtra,
+		);
+		const moov = (dataStart: number) => box('moov',
+			box('mvhd', zeros(12), u32(options.sampleRate), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(options.sampleRate), u32(0), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl', box('stsd', u32(0), u32(1), sampleEntry), ...options.stbl(dataStart))),
+				),
+			),
+		);
+		const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+		const dataStart = ftyp.length + moov(0).length + 8;
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...moov(dataStart), ...box('mdat', ...options.frames)])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packets: number[][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([packet.timestamp, packet.duration, packet.byteLength, packet.data[4]!]);
+		}
+		return {
+			codec: await track.getCodec(),
+			sampleRate: await track.getSampleRate(),
+			numberOfChannels: await track.getNumberOfChannels(),
+			packets,
+		};
+	};
+
+	// As FFmpeg writes it: one sample per frame (MPEG-1, 48 kHz, 192 kbit/s, 576 bytes)
+	const frames48 = Array.from({ length: 2 }, (_, i) => [0xff, 0xfd, 0xa4, 0x00, i, ...zeros(571)]);
+	expect(await read({
+		sampleRate: 48000,
+		frames: frames48,
+		version: 0,
+		sampleEntryExtra: [],
+		stbl: dataStart => [
+			box('stts', u32(0), u32(1), u32(2), u32(1152)),
+			box('stsc', u32(0), u32(1), u32(1), u32(2), u32(1)),
+			box('stsz', u32(0), u32(576), u32(2)),
+			box('stco', u32(0), u32(1), u32(dataStart)),
+		],
+	})).toEqual({
+		codec: 'mp3',
+		sampleRate: 48000,
+		numberOfChannels: 2,
+		packets: [[0, 0.024, 576, 0], [0.024, 0.024, 576, 1]],
+	});
+
+	// In a sample table that counts decoded samples, with two frames per packet (MPEG-2, 24 kHz, 64 kbit/s, 384
+	// bytes). Layer II frames hold 1152 samples at this rate too.
+	const frames24 = Array.from({ length: 4 }, (_, i) => [0xff, 0xf5, 0x84, 0x00, i, ...zeros(379)]);
+	expect((await read({
+		sampleRate: 24000,
+		frames: frames24,
+		version: 1,
+		sampleEntryExtra: [...u32(2304), ...u32(384), ...u32(768), ...u32(2)], // 2 frames per packet
+		stbl: dataStart => [
+			box('stts', u32(0), u32(1), u32(4608), u32(1)),
+			box('stsc', u32(0), u32(1), u32(1), u32(4608), u32(1)),
+			box('stsz', u32(0), u32(1), u32(4608)),
+			box('stco', u32(0), u32(1), u32(dataStart)),
+		],
+	})).packets).toEqual(frames24.map((_, i) => [i * 1152 / 24000, 1152 / 24000, 384, i]));
+});

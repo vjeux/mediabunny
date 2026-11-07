@@ -747,8 +747,10 @@ export class IsobmffDemuxer extends Demuxer {
 			let { samplesPerPacket, bytesPerFrame } = internalTrack.info.soundPacketLayout;
 
 			if (internalTrack.info.codec === 'mp3') {
-				// Packets can hold several MP3 frames, which are of the same size in such constant-bitrate files
-				const frameSamples = internalTrack.info.sampleRate >= 32000 ? 1152 : 576;
+				// Packets can hold several MP3 frames, which are of the same size in such constant-bitrate files.
+				// Layer II frames always hold 1152 samples, Layer III ones 576 at the MPEG-2 and 2.5 sample rates.
+				const isLayer2 = internalTrack.internalCodecId === '.mp2';
+				const frameSamples = isLayer2 || internalTrack.info.sampleRate >= 32000 ? 1152 : 576;
 				const framesPerPacket = samplesPerPacket / frameSamples;
 				if (Number.isInteger(framesPerPacket) && framesPerPacket > 1 && bytesPerFrame % framesPerPacket === 0) {
 					samplesPerPacket = frameSamples;
@@ -1454,8 +1456,10 @@ export class IsobmffDemuxer extends Demuxer {
 						// developer.apple.com/documentation/quicktime-file-format/sound_sample_descriptions/
 						if (codecName === 'mp4a') {
 							// The codec is set by the esds box
-						} else if (codecName === '.mp3' || codecName === 'ms\u0000u') {
-							// QuickTime's MP3 sample entries: kFullMPEGLay3Format and the older kMPEGLayer3Format
+						} else if (codecName === '.mp3' || codecName === 'ms\u0000u' || codecName === '.mp2') {
+							// QuickTime's MP3 sample entries (kFullMPEGLay3Format and the older kMPEGLayer3Format),
+							// and its MPEG-1/2 Layer II one, which FFmpeg writes for MP2. Like MPEG-1 audio in an esds
+							// box, all of them are 'mp3'.
 							track.info.codec = 'mp3';
 						} else if (codecName === 'opus') {
 							track.info.codec = 'opus';
