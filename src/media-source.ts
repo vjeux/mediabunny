@@ -370,10 +370,12 @@ class VideoEncoderWrapper {
 					appliedFit = sizeChangeBehavior;
 				}
 
+				// AVC, HEVC and others require even dimensions; these codecs encode any size
+				const anySize = config.codec === 'vp8' || config.codec === 'vp9' || config.codec === 'av1';
 				const transformed = await videoSample.transform({
 					width: targetWidth,
 					height: targetHeight,
-					roundDimensionsTo: 2,
+					roundDimensionsTo: anySize ? 1 : 2,
 					crop: config.transform?.crop,
 					rotate: config.transform?.rotate,
 					flip: config.transform?.flip,
