@@ -895,7 +895,9 @@ export class UrlSource extends PathedSource {
 	/** @internal */
 	_getFileSize(): number | null | undefined {
 		if (!this._fileSizeDetermined) {
-			return this._length !== null ? this._length : undefined;
+			// The resource may end before the end of the Range window (RFC 9110 reads such a last-pos as "up to the
+			// end"), so the window's length only becomes the size once a response confirms the resource's
+			return undefined;
 		}
 
 		const baseSize = this._sequentialBacking
