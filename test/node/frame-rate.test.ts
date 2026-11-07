@@ -1,7 +1,20 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_FORMATS, Input, FilePathSource, EncodedPacketSink } from '../../src/index.js';
+import {
+	ALL_FORMATS,
+	BufferSource,
+	BufferTarget,
+	EncodedPacket,
+	EncodedPacketSink,
+	EncodedVideoPacketSource,
+	FilePathSource,
+	Input,
+	MkvOutputFormat,
+	Mp4OutputFormat,
+	Output,
+	OutputFormat,
+} from '../../src/index.js';
 import { findUnderlyingFrameRate } from '../../src/input-track.js';
 import { assert } from '../../src/misc.js';
 
@@ -56,6 +69,25 @@ test('findUnderlyingFrameRate with 24/1.001 FPS at 1000 Hz time resolution (60 m
 test('findUnderlyingFrameRate with 30 FPS at 1000 Hz starting at 1e9 seconds', () => {
 	const ticks = makeTicks(30, 1000, { startTime: 1e9 });
 	expect(findUnderlyingFrameRate(ticks, 1000)).toBe(30);
+});
+
+test('findUnderlyingFrameRate with millisecond-rounded timestamps at a finer time resolution', () => {
+	// Timestamps from Matroska/WebM keep their rounding to whole milliseconds when copied into MP4 or MPEG-TS, and must
+	// give the same frame rate as they do at 1000 Hz
+	for (const resolution of [1000, 15360, 90000]) {
+		for (const frameRate of [30, 24000 / 1001, 60]) {
+			const ticks = makeTicks(frameRate, resolution, {
+				quantize: x => Math.round(Math.round(x * 1000 / resolution) * resolution / 1000),
+			});
+			expect(findUnderlyingFrameRate(ticks, resolution), `${frameRate} at ${resolution} Hz`).toBe(frameRate);
+		}
+
+		// Jittered timestamps stay variable
+		const jitteredTicks = makeTicks(30, resolution, {
+			quantize: x => Math.round(Math.round(x * 1000 / resolution + 5 * Math.sin(x)) * resolution / 1000),
+		});
+		expect(findUnderlyingFrameRate(jitteredTicks, resolution)).toBe(null);
+	}
 });
 
 test('findUnderlyingFrameRate with irregular timestamps yields null', () => {
@@ -160,6 +192,41 @@ const getSortedTrackTicks = async (filePath: string) => {
 
 	return { ticks: new Float64Array(dedupedTicks), timeResolution };
 };
+
+/** Writes 30 fps video whose timestamps were rounded to whole milliseconds, as Matroska/WebM stores them. */
+const writeMillisecondRoundedVideo = async (format: OutputFormat) => {
+	const output = new Output({ format, target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 90; i++) {
+		const timestamp = Math.round(i * 1000 / 30) / 1000;
+		const packet = new EncodedPacket(new Uint8Array([0x82, 0x49, 0x83, 0x42, 0x00]), 'key', timestamp, 0.033);
+		await source.add(packet, {
+			decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 320, codedHeight: 240 },
+		});
+	}
+	await output.finalize();
+
+	return output.target.buffer!;
+};
+
+test('computeFrameRateMetrics gives millisecond-rounded video the same frame rate in Matroska and MP4', async () => {
+	// Found by lane L55. MP4 stores the copied timestamps in a finer timescale, which used to make them look variable.
+	for (const format of [new MkvOutputFormat(), new Mp4OutputFormat()]) {
+		using input = new Input({
+			source: new BufferSource(await writeMillisecondRoundedVideo(format)),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const metrics = await track.computeFrameRateMetrics({ targetPacketCount: Infinity });
+		expect(metrics.underlyingFrameRate, format.constructor.name).toBe(30);
+		expect(metrics.frameRateIsConstant, format.constructor.name).toBe(true);
+	}
+});
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const publicPath = (file: string) => path.join(__dirname, '../public', file);

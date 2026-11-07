@@ -1430,6 +1430,31 @@ export const queryInputTracks = async <T extends InputTrack>(
 };
 
 /**
+ * If all timestamps lie on a whole-millisecond grid that's coarser than the time resolution, returns the grid's step
+ * in ticks, otherwise 0. Matroska/WebM (all MediaRecorder recordings, for example) and FLV store milliseconds, and
+ * the timestamps keep that rounding when the packets are copied into a container with a finer timescale, such as MP4
+ * or MPEG-TS.
+ */
+const getMillisecondGridTicks = (ticks: Float64Array, resolution: number) => {
+	const gridTicks = resolution / 1000;
+	if (gridTicks < 4) {
+		// Too few ticks per millisecond to tell whether the timestamps sit on the grid
+		return 0;
+	}
+
+	for (let i = 1; i < ticks.length; i++) {
+		// Relative to the first timestamp, so that a constant offset doesn't matter. Both were rounded to a tick, so
+		// the offset can be up to a tick off the grid.
+		const offset = ticks[i]! - ticks[0]!;
+		if (Math.abs(offset - gridTicks * Math.round(offset / gridTicks)) > 1 + 1e-9) {
+			return 0;
+		}
+	}
+
+	return gridTicks;
+};
+
+/**
  * Estimates the underlying CFR-like frame rate from timestamp deltas.
  *
  * Each delta is modeled as an integer multiple of one frame period, allowing dropped frames and a small number of
@@ -1441,7 +1466,6 @@ export const findUnderlyingFrameRate = (
 ): number | null => {
 	const MAX_DENOMINATOR = 1_000_000;
 	const MIN_INLIER_RATIO = 0.98;
-	const DELTA_TOLERANCE = 1 + 1e-9;
 	const MAX_EFFECTIVE_FRAME_SPAN = 1000;
 
 	const KNOWN_FRAME_RATES = [
@@ -1467,6 +1491,13 @@ export const findUnderlyingFrameRate = (
 	if (ticks.length < 2) {
 		return null;
 	}
+
+	// With timestamps rounded to ticks, the gaps of a constant frame rate take two values a tick apart. Timestamps that
+	// were rounded to whole milliseconds before give gaps a millisecond apart instead, each also up to a tick off from
+	// the rounding to ticks. Allowing for that gives the same frames the same frame rate as in a millisecond-based
+	// container.
+	const gridTicks = getMillisecondGridTicks(ticks, resolution);
+	const DELTA_TOLERANCE = (gridTicks > 0 ? gridTicks + 2 : 1) + 1e-9;
 
 	const gaps = new Float64Array(ticks.length - 1);
 
@@ -1544,7 +1575,7 @@ export const findUnderlyingFrameRate = (
 	period = totalTicks / totalFrames;
 
 	// Don't let arbitrarily long files force arbitrarily precise rational reconstruction from microscopic clock drift.
-	const uncertainty = 1 / Math.min(
+	const uncertainty = (1 + gridTicks) / Math.min(
 		totalFrames,
 		MAX_EFFECTIVE_FRAME_SPAN,
 	);
