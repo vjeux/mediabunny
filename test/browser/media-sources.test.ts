@@ -674,9 +674,9 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 	input.dispose();
 });
 
-// Whether this browser's Opus encoder keeps the end of its input when it's followed by 50 ms of silence, as Mediabunny
-// pads it. Decided with WebCodecs alone: a click 0.5 ms before the end of 1 s of 48 kHz audio must survive an
-// encode and decode (WebKitGTK's encoder drops its tail regardless)
+// Whether this browser's Opus encoder keeps the end of its input in place when it's followed by 50 ms of silence, as
+// Mediabunny pads it. Decided with WebCodecs alone: a click 0.5 ms before the end of 1 s of 48 kHz audio must come back
+// at its time from an encode and decode (WebKitGTK's encoder gives every packet timestamp 0 and loses 13 ms)
 const opusEncoderKeepsPaddedEnd = await (async () => {
 	const sampleRate = 48000;
 	const encoderConfig = { codec: 'opus', numberOfChannels: 1, sampleRate, bitrate: 128_000 };
@@ -708,14 +708,20 @@ const opusEncoderKeepsPaddedEnd = await (async () => {
 	}
 
 	let peak = 0;
+	let peakTime = -Infinity;
 	const decoder = new AudioDecoder({
 		output: (decoded) => {
 			const values = new Float32Array(decoded.numberOfFrames);
 			if (values.length > 0) {
 				decoded.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
 			}
+			for (let i = 0; i < values.length; i++) {
+				if (Math.abs(values[i]!) > peak) {
+					peak = Math.abs(values[i]!);
+					peakTime = decoded.timestamp / 1e6 + i / decoded.sampleRate;
+				}
+			}
 			decoded.close();
-			peak = Math.max(peak, ...values.map(Math.abs));
 		},
 		error: () => {},
 	});
@@ -723,7 +729,7 @@ const opusEncoderKeepsPaddedEnd = await (async () => {
 	chunks.forEach(chunk => decoder.decode(chunk));
 	await decoder.flush();
 	decoder.close();
-	return peak > 0.5;
+	return peak > 0.5 && Math.abs(peakTime - (sampleRate - 24) / sampleRate) < 0.005;
 })();
 
 test.skipIf(!opusEncoderKeepsPaddedEnd)(
