@@ -71,6 +71,7 @@ import {
 	OPUS_SAMPLE_RATE,
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
+import { InBandParameterSetWriter } from '../codec-data';
 import { FileSlice } from '../reader';
 import { Muxer } from '../muxer';
 import { Writer } from '../writer';
@@ -118,6 +119,8 @@ type MatroskaTrackData = {
 		 */
 		alphaMode: boolean | null;
 	};
+	/** Keeps parameter sets of later AVC/HEVC decoder configs, since CodecPrivate only holds the first one. */
+	parameterSetWriter: InBandParameterSetWriter | null;
 } | {
 	track: OutputAudioTrack;
 	type: 'audio';
@@ -909,6 +912,10 @@ export class MatroskaMuxer extends Muxer {
 			lastWrittenMsTimestamp: null,
 			codecPrivate: meta.decoderConfig.description ?? null,
 			closed: false,
+			parameterSetWriter: (track.source._codec === 'avc' || track.source._codec === 'hevc')
+				&& meta.decoderConfig.description
+				? new InBandParameterSetWriter(track.source._codec, toUint8Array(meta.decoderConfig.description))
+				: null,
 		};
 
 		if (track.source._codec === 'vp9') {
@@ -1089,6 +1096,12 @@ export class MatroskaMuxer extends Muxer {
 				// Trim off the frame container atom header. FFmpeg does this too and cites the "Matroska spec" as the
 				// reason, despite the spec not saying anything about this.
 				packetData = packetData.subarray(8);
+			} else if (trackData.parameterSetWriter) {
+				packetData = trackData.parameterSetWriter.process(
+					packetData,
+					packet.type,
+					meta?.decoderConfig?.description,
+				);
 			}
 
 			const isKeyFrame = packet.type === 'key';
