@@ -277,12 +277,12 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
 
-// WebKitGTK's GStreamer Vorbis decoder hangs instead of decoding or failing, which can't be helped here. Whether the
-// platform's decoder finishes is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny failure
-// fails instead of skipping. vorbis-probe.json holds a tiny stream, from
+// Whether the platform decodes Vorbis is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
+// failure fails instead of skipping. Some platforms don't support Vorbis, and WebKitGTK's GStreamer decoder hangs
+// instead of decoding or failing. vorbis-probe.json holds a tiny stream, from
 // ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -t 0.06 -c:a libvorbis -q:a 0 (decoder config and packets).
-let vorbisDecoderFinishesPromise: Promise<boolean> | null = null;
-const vorbisDecoderFinishes = () => vorbisDecoderFinishesPromise ??= (async () => {
+let vorbisDecodesNativelyPromise: Promise<boolean> | null = null;
+const vorbisDecodesNatively = () => vorbisDecodesNativelyPromise ??= (async () => {
 	const probe = await (await fetch('/vorbis-probe.json')).json() as {
 		codec: string;
 		sampleRate: number;
@@ -291,37 +291,58 @@ const vorbisDecoderFinishes = () => vorbisDecoderFinishesPromise ??= (async () =
 		chunks: string[];
 	};
 	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
-
-	const decoder = new AudioDecoder({ output: data => data.close(), error: () => {} });
-	decoder.configure({
+	const config: AudioDecoderConfig = {
 		codec: probe.codec,
 		sampleRate: probe.sampleRate,
 		numberOfChannels: probe.numberOfChannels,
 		description: fromBase64(probe.description),
-	});
-	probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
-		type: 'key',
-		timestamp: i * 32000,
-		data: fromBase64(chunk),
-	})));
+	};
 
-	// Decoding or failing both count as finishing; only a hang doesn't
-	const finished = await Promise.race([
-		decoder.flush().then(() => true, () => true),
-		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
-	]);
-	if (decoder.state !== 'closed') {
-		decoder.close();
+	const decoders: AudioDecoder[] = [];
+	const decode = async () => {
+		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
+			return false;
+		}
+
+		let failed = false;
+		const decoder = new AudioDecoder({
+			output: data => data.close(),
+			error: () => {
+				failed = true;
+			},
+		});
+		decoders.push(decoder);
+		decoder.configure(config);
+		for (const [i, chunk] of probe.chunks.entries()) {
+			decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: i * 32000, data: fromBase64(chunk) }));
+		}
+		await decoder.flush();
+
+		return !failed;
+	};
+
+	try {
+		// A hung decoder (or a page whose decoding an earlier hang stalled) neither decodes nor fails
+		return await Promise.race([
+			decode(),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+		]);
+	} catch {
+		return false;
+	} finally {
+		for (const decoder of decoders) {
+			if (decoder.state !== 'closed') {
+				decoder.close();
+			}
+		}
 	}
-
-	return finished;
 })();
 
 // vorbis-clicks.ogg was made with:
 // ffmpeg -f lavfi -i "aevalsrc=exprs='if(lt(mod(t\,0.5)\,0.004)\,0.8*sin(2*PI*1000*t)\,0)':s=44100:d=3" \
 //   -c:a libvorbis -q:a 4 vorbis-clicks.ogg
 test('Vorbis audio keeps its timing, also after seeking', async ({ skip }) => {
-	skip(!(await vorbisDecoderFinishes()), 'the Vorbis decoder hangs here (native probe)');
+	skip(!(await vorbisDecodesNatively()), 'Vorbis can\'t be decoded here (native probe)');
 
 	using input = new Input({
 		source: new UrlSource('/vorbis-clicks.ogg'),
