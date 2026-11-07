@@ -330,19 +330,18 @@ describe('VP9 key frame headers', () => {
 		})?.[0] ?? 62;
 	};
 
+	// Until #487 lands, main picks the level from the picture size alone, which is too low for frames wider or taller
+	// than that level allows. That value is accepted besides the correct one, but nothing else.
+	const acceptedLevels = (width: number, height: number) => {
+		const levelFromSizeAlone = LEVEL_LIMITS.find(([, maxSize]) => width * height <= maxSize)?.[0] ?? 62;
+		return [expectedLevel(width, height), levelFromSizeAlone];
+	};
+
 	const KNOWN_DIVERGENCES: KnownDivergence<Vp9KeyFrameParams>[] = [
 		{
 			// bug-fix-mania: "VP9 RGB reserved bit" (profiles 1 and 3 have reserved_zero after CS_RGB too)
 			reason: 'RGB in profiles 1 and 3',
 			applies: params => params.colorSpace === 7,
-		},
-		{
-			// #487: on main, the level only follows from the picture size, without the maximum width and height
-			reason: 'frames wider or taller than the level of their picture size allows',
-			applies: ({ width, height }) => {
-				const levelFromSize = LEVEL_LIMITS.find(([, maxSize]) => width * height <= maxSize)?.[0] ?? 62;
-				return levelFromSize !== expectedLevel(width, height);
-			},
 		},
 	];
 
@@ -377,7 +376,8 @@ describe('VP9 key frame headers', () => {
 				continue;
 			}
 
-			const level = expectedLevel(params.width, params.height);
+			const accepted = acceptedLevels(params.width, params.height);
+			const level = accepted.includes(info.level) ? info.level : accepted[0]!;
 			// VP codec ISOBMFF chromaSubsampling: 1 = 4:2:0 (co-located), 2 = 4:2:2, 3 = 4:4:4
 			const chromaSubsampling = params.subsamplingX ? (params.subsamplingY ? 1 : 2) : 3;
 			const colorSpace = COLOR_SPACES[params.colorSpace]!;
@@ -418,7 +418,7 @@ describe('VP9 key frame headers', () => {
 			}
 		}
 
-		expect(checked).toBeGreaterThan(450);
+		expect(checked).toBeGreaterThan(800);
 		expect(mismatches).toEqual([]);
 	});
 
@@ -443,8 +443,10 @@ describe('VP9 key frame headers', () => {
 					continue;
 				}
 
+				// These sizes are within every level's maximum width and height, so there's only one correct level
 				const level = extractVp9CodecInfoFromPacket(frame.data)?.level;
 				const expected = expectedLevel(width, rows);
+				expect(acceptedLevels(width, rows)).toEqual([expected, expected]);
 				expect({ width, height: rows, level }).toEqual({ width, height: rows, level: expected });
 				checked++;
 			}
