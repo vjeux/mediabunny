@@ -29,6 +29,7 @@ import { BufferSource, CustomPathedSource, FilePathSource } from '../../src/sour
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Logging } from '../../src/logging.js';
 const videoSource = (codec: VideoCodec = 'avc') => new EncodedVideoPacketSource(codec);
 const audioSource = (codec: AudioCodec = 'aac') => new EncodedAudioPacketSource(codec);
 
@@ -3353,6 +3354,60 @@ test('Cross-variant timestamps, CMAF', async () => {
 	await testCrossVariantTimestamps({
 		segmentFormat: new CmafOutputFormat(),
 	});
+});
+
+test('Cross-variant timestamps, packed audio next to MPEG-TS with a timestampOffset', async ({ onTestFinished }) => {
+	// The setup from the docs, packaging audio into .aac and video into .ts files. All segment media starts at
+	// mediaTimestampBase, so an offset given to the MPEG-TS format must not move the video away from the audio. It's
+	// ignored, with one warning saying so.
+	const warnings: string[] = [];
+	onTestFinished(Logging.on('warn', args => warnings.push(args.map(String).join(' '))));
+
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: [new AdtsOutputFormat(), new MpegTsOutputFormat({ timestampOffset: 10 })],
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+			return target;
+		}),
+	});
+
+	// The groups aren't paired, so the tracks land in different variant streams
+	const video = videoSource();
+	const audio = audioSource();
+	output.addVideoTrack(video, { group: new OutputTrackGroup() });
+	output.addAudioTrack(audio, { group: new OutputTrackGroup() });
+	await output.start();
+
+	// Video starts at 1 second, audio (back-to-back AAC frames) half a second earlier
+	for (let i = 0; i < 8; i++) {
+		await video.add(new EncodedPacket(avcPacketData, i % 4 === 0 ? 'key' : 'delta', 1 + 0.5 * i, 0.5), avcMetadata);
+	}
+	const frameDuration = 1024 / 48000;
+	for (let i = 0; i * frameDuration < 4; i++) {
+		await audio.add(new EncodedPacket(aacPacketData, 'key', 0.5 + i * frameDuration, frameDuration), aacMetadata);
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			const target = targets.get(path);
+			assert(target);
+			return new BufferSource(target.buffer!);
+		}),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(videoTrack && audioTrack);
+
+	// The video is the reference, so its first packet lands at 0
+	expect((await new EncodedPacketSink(videoTrack).getFirstPacket())?.timestamp).toBe(0);
+	expect((await new EncodedPacketSink(audioTrack).getFirstPacket())?.timestamp).toBeCloseTo(-0.5, 3);
+	expect(warnings.filter(x => x.includes('timestampOffset'))).toHaveLength(1);
 });
 
 const testCrossVariantTimestamps = async (hlsOptions: HlsOutputFormatOptions) => {
