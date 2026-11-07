@@ -985,10 +985,10 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 	const frameStarts = tsPackets.flatMap((packet, i) => (isVideo(packet) && packet[1]! & 0x40 ? [i] : []));
 	expect(frameStarts).toHaveLength(20);
 
-	// Frame 5 loses its second TS packet, frame 9 gets its second sent twice, frame 11 its first, and frame 13's
-	// second has transport_error_indicator set and garbage in it
+	// Frame 5 loses its second TS packet, frame 7 its last one, frame 9 gets its second sent twice, frame 11 its
+	// first, and frame 13's second has transport_error_indicator set and garbage in it
 	const damaged = tsPackets.flatMap((packet, i) => {
-		if (i === frameStarts[5]! + 1) {
+		if (i === frameStarts[5]! + 1 || i === frameStarts[8]! - 1) {
 			return [];
 		} else if (i === frameStarts[9]! + 1 || i === frameStarts[11]) {
 			return [packet, packet];
@@ -999,7 +999,7 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 		}
 		return [packet];
 	});
-	await expectFrames(damaged, [5, 13]);
+	await expectFrames(damaged, [5, 7, 13]);
 
 	// Muxers that never increment the counters, or that also count packets without payload, lose nothing, not even
 	// identical TS packets in a row, which are data there (like in frame 3, here made of the same byte throughout)
@@ -1059,6 +1059,8 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 		return copy;
 	});
 	expect(await readFrames([...firstFile, ...secondFile])).toEqual(clean);
+	// Even without the PAT and PMT, since the first file's last PES packet ends with stuffing, as complete ones do
+	expect(await readFrames([...firstFile, ...secondFile.slice(2)])).toEqual(clean);
 });
 
 test('MPEG-TS drops only the video frame that lost a TS packet when PES packets begin mid-frame', async () => {

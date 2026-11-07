@@ -185,8 +185,50 @@ type Section = {
 	firstPacketHasErrors: boolean;
 };
 
+/**
+ * Whether a section has all its data, as far as can be told: a bounded PES packet has its length, an unbounded one
+ * ends with stuffing.
+ */
+const sectionLooksComplete = (chunks: Uint8Array[], byteLength: number, lastPacketWithPayload: TsPacket | null) => {
+	const start = chunks[0];
+	if (start && start.length >= 6 && start[0] === 0 && start[1] === 0 && start[2] === 1) {
+		const pesPacketLength = (start[4]! << 8) | start[5]!;
+		if (pesPacketLength > 0) {
+			return byteLength >= 6 + pesPacketLength;
+		}
+	}
+
+	return !!lastPacketWithPayload && hasStuffing(lastPacketWithPayload);
+};
+
 /** How far ahead to look for the next packet of a PID, to tell a duplicate packet */
 const MAX_DUPLICATE_CHECK_PACKET_COUNT = 1024;
+
+/**
+ * Whether the TS packet's adaptation field holds stuffing bytes, which is how muxers make a PES packet end on a TS
+ * packet boundary. Only a PES packet whose data fills its last TS packet exactly ends without.
+ */
+const hasStuffing = (packet: TsPacket) => {
+	if (!(packet.adaptationFieldControl & 0b10)) {
+		return false;
+	}
+
+	const length = packet.body[0]!;
+	if (length === 0) {
+		return true; // The length byte itself is the stuffing
+	}
+
+	const flags = packet.body[1]!;
+	let usedLength = 1 + (flags & 0x10 ? 6 : 0) + (flags & 0x08 ? 6 : 0) + (flags & 0x04 ? 1 : 0);
+	if (flags & 0x02) {
+		usedLength += 1 + (packet.body[1 + usedLength] ?? 0); // transport_private_data
+	}
+	if (flags & 0x01) {
+		usedLength += 1 + (packet.body[1 + usedLength] ?? 0); // adaptation_field_extension
+	}
+
+	return length > usedLength;
+};
 
 /** For sections and PES packets without holes, so that they don't need an array of their own */
 const NO_HOLES: readonly number[] = Object.freeze([]);
@@ -203,6 +245,11 @@ export class MpegTsDemuxer extends Demuxer {
 	packetOffset = 0;
 	packetStride = -1;
 	sectionEndPositions: number[] = [];
+	/**
+	 * End positions of sections after which TS packets of their PID went missing. Reading a section again stops at its
+	 * known end without reaching the next packet that tells.
+	 */
+	sectionEndsBeforeMissingPackets = new Set<number>();
 	seekChunkSize = 5 * 1024 * 1024; // 5 MiB, picked because most HLS segments are below this size
 	minReferencePointByteDistance = -1;
 	timestampWrapInfo: TimestampWrapInfo | null = null;
@@ -892,6 +939,9 @@ export class MpegTsDemuxer extends Demuxer {
 		let lastContinuityCounter = -1;
 		let lastPayload: Uint8Array | null = null;
 		let packetsWithoutPayloadCount = 0;
+		let lastPacketWithPayload: TsPacket | null = null;
+		// Whether a PAT came since the section's last packet, like at the start of a file joined to the previous one
+		let sawPatSinceLastPacket = false;
 
 		while (true) {
 			const packet = await this.readPacket(currentPos);
@@ -909,6 +959,7 @@ export class MpegTsDemuxer extends Demuxer {
 				if (contiguous) {
 					break; // End of section
 				} else {
+					sawPatSinceLastPacket ||= packet.pid === 0;
 					continue; // Ignore this packet
 				}
 			}
@@ -941,9 +992,7 @@ export class MpegTsDemuxer extends Demuxer {
 						// A copy of the previous packet (only a PCR may differ), allowed once, which must be discarded
 						isDuplicate = true;
 						keepsPayload = false;
-					} else if (packet.payloadUnitStartIndicator === 0) {
-						// Only inside the section: at the start of the next one, a jump can as well be the join of two
-						// files whose counters both start over, like concatenated HLS segments
+					} else {
 						const discontinuityIndicator = adaptationFieldLength > 1 && !!(packet.body[1]! & 0x80);
 						const packetsWentMissing = !discontinuityIndicator
 							// Some muxers count the packets without payload too
@@ -951,8 +1000,21 @@ export class MpegTsDemuxer extends Demuxer {
 							// And some never increment the counter, which then says nothing
 							&& counter !== lastContinuityCounter;
 
-						if (packetsWentMissing) {
+						if (packet.payloadUnitStartIndicator === 0) {
+							if (packetsWentMissing) {
+								(holes ??= []).push(chunksByteLength);
+							}
+						} else if (
+							packetsWentMissing
+							// At the start of the next section, a jump can as well be the join of two files whose
+							// counters both start over (like concatenated HLS segments), where the section is complete
+							// and the second file starts with a PAT
+							&& !sawPatSinceLastPacket
+							&& !sectionLooksComplete(chunks, chunksByteLength, lastPacketWithPayload)
+						) {
+							// The packets of the section's end went missing
 							(holes ??= []).push(chunksByteLength);
+							this.sectionEndsBeforeMissingPackets.add(endPos);
 						}
 					}
 				}
@@ -966,6 +1028,7 @@ export class MpegTsDemuxer extends Demuxer {
 				if (payload) {
 					lastContinuityCounter = packet.continuityCounter;
 					lastPayload = payload;
+					lastPacketWithPayload = packet;
 					packetsWithoutPayloadCount = 0;
 				} else {
 					packetsWithoutPayloadCount++;
@@ -981,6 +1044,7 @@ export class MpegTsDemuxer extends Demuxer {
 				chunks.push(payload);
 				chunksByteLength += payload.byteLength;
 			}
+			sawPatSinceLastPacket = false;
 
 			endPos = currentPos;
 
@@ -994,6 +1058,9 @@ export class MpegTsDemuxer extends Demuxer {
 			const isKnownSectionEnd = binarySearchExact(this.sectionEndPositions, endPos, x => x) !== -1;
 			if (isKnownSectionEnd) {
 				mustAddSectionEnd = false;
+				if (this.sectionEndsBeforeMissingPackets.has(endPos)) {
+					(holes ??= []).push(chunksByteLength);
+				}
 				break;
 			}
 		}
