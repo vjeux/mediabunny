@@ -249,6 +249,18 @@ export class EncodedVideoPacketSource extends VideoSource {
 	}
 }
 
+/** H.264 and HEVC encoders only take even dimensions, since they encode 4:2:0. */
+const hasOddH26xDimension = (codec: VideoCodec, width: number, height: number) => {
+	return (codec === 'avc' || codec === 'hevc') && (width % 2 === 1 || height % 2 === 1);
+};
+
+const oddH26xDimensionError = (codec: VideoCodec, width: number, height: number) => {
+	return new Error(
+		`The dimensions ${width}x${height} are not supported for codec '${codec}'; both width and height must be even`
+		+ ` numbers. Make sure to round your dimensions to the nearest even number.`,
+	);
+};
+
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
 	private encoderInitialized = false;
@@ -727,17 +739,10 @@ class VideoEncoderWrapper {
 					candidateConfig.latencyMode = 'quality';
 				}
 
-				const hasOddDimension = candidateConfig.width % 2 === 1 || candidateConfig.height % 2 === 1;
-				if (
-					hasOddDimension
-					&& (this.encodingConfig.codec === 'avc' || this.encodingConfig.codec === 'hevc')
-				) {
+				const { codec } = this.encodingConfig;
+				if (hasOddH26xDimension(codec, candidateConfig.width, candidateConfig.height)) {
 					// Throw a special error for this case as it gets hit often
-					throw new Error(
-						`The dimensions ${candidateConfig.width}x${candidateConfig.height} are not supported for codec`
-						+ ` '${this.encodingConfig.codec}'; both width and height must be even numbers. Make sure to`
-						+ ` round your dimensions to the nearest even number.`,
-					);
+					throw oddH26xDimensionError(codec, candidateConfig.width, candidateConfig.height);
 				}
 
 				try {
@@ -752,6 +757,12 @@ class VideoEncoderWrapper {
 			}
 
 			if (!selected) {
+				const { width, height } = candidates[0]!.config;
+				if (hasOddH26xDimension(this.encodingConfig.codec, width, height)) {
+					// Also when no custom encoder takes these dimensions, which says more than a missing VideoEncoder
+					throw oddH26xDimensionError(this.encodingConfig.codec, width, height);
+				}
+
 				if (typeof VideoEncoder === 'undefined') {
 					throw new Error(missingWebCodecsClassMessage('VideoEncoder'));
 				}

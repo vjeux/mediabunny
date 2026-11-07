@@ -32,7 +32,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
+import { buildQuantizerEncodeOptions, canEncodeVideo, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
@@ -682,6 +682,40 @@ describe('Video', async () => {
 		expect(maxAlpha).toBeLessThan(4095);
 		expect(Math.abs(minAlpha - 4095 / 2)).toBeLessThan(32);
 		expect(Math.abs(maxAlpha - 4095 / 2)).toBeLessThan(32);
+	});
+
+	test('Odd-sized AVC and HEVC are unencodable with a clear error, like in browsers', async () => {
+		const encode = async (codec: VideoCodec, width: number, height: number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec, quality: new Quality('medium') });
+			output.addVideoTrack(source);
+			await output.start();
+
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(128), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			try {
+				await source.add(sample);
+			} finally {
+				sample.close();
+			}
+			await output.finalize();
+		};
+
+		// libx264 and libx265 encode 4:2:0, which needs even dimensions
+		for (const codec of ['avc', 'hevc'] as const) {
+			expect({ codec, canEncode: await canEncodeVideo(codec, { width: 321, height: 241 }) })
+				.toEqual({ codec, canEncode: false });
+			await expect(encode(codec, 321, 241)).rejects.toThrow('both width and height must be even numbers');
+			expect(await canEncodeVideo(codec, { width: 322, height: 242 })).toBe(true);
+		}
+
+		expect(await canEncodeVideo('vp9', { width: 321, height: 241 })).toBe(true);
+		await encode('vp9', 321, 241);
 	});
 
 	test('Non-square pixels encode and decode #1', async () => {
