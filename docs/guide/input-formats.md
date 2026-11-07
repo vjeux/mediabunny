@@ -51,6 +51,8 @@ const input = new Input({
 });
 ```
 
+Each format only matches its own files, so list every format you want to accept: `MATROSKA` and `WEBM` don't open each other's files, and neither do `MP4` and `QTFF`.
+
 You can also use them for checking the actual format of an `Input`:
 ```ts
 import { MP3 } from 'mediabunny';
