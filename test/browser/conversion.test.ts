@@ -1464,31 +1464,87 @@ const testReservedFastStart = async (
 };
 
 /** Makes a 2 s WebM whose frames take some bits to encode, and transcodes it to VP8, returning the bitrate. */
+const WAVE_WIDTH = 320;
+const WAVE_HEIGHT = 180;
+
+/** Frame i of a moving, slightly noisy wave pattern, as I420 data */
+const waveFrameData = (i: number) => {
+	const data = new Uint8Array(WAVE_WIDTH * WAVE_HEIGHT * 3 / 2).fill(128);
+	for (let y = 0; y < WAVE_HEIGHT; y++) {
+		for (let x = 0; x < WAVE_WIDTH; x++) {
+			data[y * WAVE_WIDTH + x] = 128 + 60 * Math.sin(x * 0.05 + i * 0.3) * Math.cos(y * 0.07 - i * 0.2)
+				+ ((x * 7 + y * 13 + i * 31) % 9) - 4;
+		}
+	}
+
+	return data;
+};
+
+let vp8MeetsBitrateResult: Promise<boolean> | null = null;
+
+/**
+ * Whether the platform's VP8 encoder, told the frame rate, meets an explicit bitrate on the wave frames at 60 fps,
+ * checked with WebCodecs alone. WebKitGTK's ignores the bitrate.
+ */
+const vp8MeetsBitrate = () => vp8MeetsBitrateResult ??= (async () => {
+	const config: VideoEncoderConfig = {
+		codec: 'vp8',
+		width: WAVE_WIDTH,
+		height: WAVE_HEIGHT,
+		bitrate: 300_000,
+		framerate: 60,
+	};
+
+	try {
+		if (!(await VideoEncoder.isConfigSupported(config)).supported) {
+			return false;
+		}
+
+		let bytes = 0;
+		const encoder = new VideoEncoder({
+			output: (chunk) => {
+				bytes += chunk.byteLength;
+			},
+			error: () => {},
+		});
+		encoder.configure(config);
+		for (let i = 0; i < 120; i++) {
+			const frame = new VideoFrame(waveFrameData(i), {
+				format: 'I420',
+				codedWidth: WAVE_WIDTH,
+				codedHeight: WAVE_HEIGHT,
+				timestamp: Math.round(i * 1e6 / 60),
+				duration: Math.round(1e6 / 60),
+			});
+			encoder.encode(frame, { keyFrame: i === 0 });
+			frame.close();
+		}
+		await encoder.flush();
+		encoder.close();
+
+		// Two seconds of video
+		const bitrate = bytes * 8 / 2;
+		return bitrate > 0.7 * 300_000 && bitrate < 1.3 * 300_000;
+	} catch {
+		return false;
+	}
+})();
+
 const transcodeToVp8 = async (
 	frameRate: number,
 	quality: Quality,
 	process?: (sample: VideoSample) => VideoSample | null,
 ) => {
-	const width = 320;
-	const height = 180;
 	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
 	const sourceVideo = new VideoSampleSource({ codec: 'vp9', quality: new Quality({ bitrate: 2_000_000 }) });
 	sourceOutput.addVideoTrack(sourceVideo, { frameRate });
 	await sourceOutput.start();
 
 	const addFrame = async (i: number) => {
-		const data = new Uint8Array(width * height * 3 / 2).fill(128);
-		for (let y = 0; y < height; y++) {
-			for (let x = 0; x < width; x++) {
-				data[y * width + x] = 128 + 60 * Math.sin(x * 0.05 + i * 0.3) * Math.cos(y * 0.07 - i * 0.2)
-					+ ((x * 7 + y * 13 + i * 31) % 9) - 4;
-			}
-		}
-
-		using sample = new VideoSample(data, {
+		using sample = new VideoSample(waveFrameData(i), {
 			format: 'I420',
-			codedWidth: width,
-			codedHeight: height,
+			codedWidth: WAVE_WIDTH,
+			codedHeight: WAVE_HEIGHT,
 			timestamp: i / frameRate,
 			duration: 1 / frameRate,
 		});
@@ -1516,7 +1572,11 @@ const transcodeToVp8 = async (
 	return (await track.computePacketStats()).averageBitrate;
 };
 
-test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }, async () => {
+test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }, async ({ skip }) => {
+	if (!await vp8MeetsBitrate()) {
+		skip('The platform\'s VP8 encoder doesn\'t meet an explicit bitrate');
+	}
+
 	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }));
 	expect(averageBitrate).toBeGreaterThan(0.7 * 300_000);
 	expect(averageBitrate).toBeLessThan(1.3 * 300_000);
@@ -1524,7 +1584,11 @@ test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }
 
 test('Transcoding 60 fps video whose process function drops every other frame keeps the requested bitrate', {
 	timeout: 30_000,
-}, async () => {
+}, async ({ skip }) => {
+	if (!await vp8MeetsBitrate()) {
+		skip('The platform\'s VP8 encoder doesn\'t meet an explicit bitrate');
+	}
+
 	// The output runs at 30 fps, so the input's 60 fps must not be what the encoder budgets for
 	let index = 0;
 	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }), (sample) => {
