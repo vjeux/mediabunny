@@ -44,6 +44,8 @@ while (notDone) {
 }
 ```
 
+Misuse that `add` can detect right away, such as invalid arguments or adding data after the output has been finalized or canceled, throws synchronously instead of rejecting the returned promise.
+
 ### Video encoding config
 
 All video sources that handle encoding internally require you to specify a `VideoEncodingConfig`, specifying the codec configuration to use:
