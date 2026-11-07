@@ -7,6 +7,7 @@
  */
 
 import { AES_128_BLOCK_SIZE, createAes128CbcDecryptStream } from '../aes';
+import { DurationMetadataRequestOptions } from '../demuxer';
 import { ENCRYPTION_KEY_CACHE_GROUP, Input } from '../input';
 import { Segment, SegmentedInput, SegmentedInputTrackDeclaration, SegmentRetrievalOptions } from '../segmented-input';
 import {
@@ -36,6 +37,7 @@ import {
 	TAG_DISCONTINUITY_SEQUENCE,
 	TAG_ENDLIST,
 	TAG_EXTINF,
+	TAG_GAP,
 	TAG_KEY,
 	TAG_MAP,
 	TAG_MEDIA_SEQUENCE,
@@ -96,6 +98,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 	lastSegmentUpdateTime = -Infinity;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
 	segmentTimestampOffsetPromise: Promise<number> | null = null;
+	/** Total duration of the gap segments after the last segment in the list, which they aren't part of. */
+	trailingGapDuration = 0;
 
 	constructor(
 		demuxer: HlsDemuxer,
@@ -183,6 +187,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let accumulatedTime = 0;
 		let accumulatedUnixTime: number | null = null;
 		let nextSegmentDuration: number | null = null;
+		let nextSegmentIsGap = false;
 		let currentKey: HlsEncryptionInfo | null = null;
 		let nextSequenceNumber = 0;
 		let nextDiscontinuityNumber = 0;
@@ -194,6 +199,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 		// Used for repeated parses where our job it is to only add the new segments
 		let prevLastSegment = last(this.segments) ?? null;
+		this.trailingGapDuration = 0; // Gap segments after the last known segment get parsed again
 
 		const parseByteRange = (content: string) => {
 			const atIndex = content.indexOf('@');
@@ -288,18 +294,26 @@ export class HlsSegmentedInput extends SegmentedInput {
 						lastProgramDateTimeSeconds,
 					};
 
-					currentFirstSegment ??= segment;
 					accumulatedTime += nextSegmentDuration;
 					if (accumulatedUnixTime !== null) {
 						accumulatedUnixTime += nextSegmentDuration;
 					}
 
-					this.segments.push(segment);
+					// "The EXT-X-GAP tag indicates that the segment URI to which it applies does not contain media data
+					// and SHOULD NOT be loaded by clients." Such a segment only takes up time.
+					if (nextSegmentIsGap) {
+						this.trailingGapDuration += nextSegmentDuration;
+					} else {
+						currentFirstSegment ??= segment;
+						this.segments.push(segment);
+						this.trailingGapDuration = 0;
+					}
 				} else {
 					// We're still seeing segments we already know about
 				}
 
 				nextSegmentDuration = null;
+				nextSegmentIsGap = false;
 
 				if (nextByteRange === null) {
 					lastByteRangeEnd = null;
@@ -514,9 +528,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 					// one or more Media Segment URIs, the client SHOULD extrapolate
 					// backward from that tag (using EXTINF durations and/or media
 					// timestamps) to associate dates with those segments."
-					const lastSegment = last(this.segments)!;
-					const lastSegmentEnd = lastSegment.timestamp + lastSegment.duration;
-					const offset = dateTimeSeconds - lastSegmentEnd;
+					// The accumulated time is where the last segment (possibly a gap) ends
+					const offset = dateTimeSeconds - accumulatedTime;
 
 					for (const segment of this.segments) {
 						segment.unixEpochTimestamp = segment.timestamp + offset;
@@ -532,6 +545,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 				if (offsetTimestampsByDateTime) {
 					accumulatedTime = dateTimeSeconds; // Snap the accumulated time into Unix space
 				}
+			} else if (line === TAG_GAP) {
+				nextSegmentIsGap = true;
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
 				// Counted even for known segments since the discontinuity number is absolute, derived from the
@@ -578,6 +593,11 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (!headerRead) {
 			throw new Error('Invalid M3U8 file; no #EXTM3U header.');
 		}
+	}
+
+	override async getDurationFromMetadata(options: DurationMetadataRequestOptions) {
+		const duration = await super.getDurationFromMetadata(options);
+		return duration === null ? null : duration + this.trailingGapDuration;
 	}
 
 	async getFirstSegment() {
