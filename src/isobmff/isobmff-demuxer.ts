@@ -733,6 +733,23 @@ export class IsobmffDemuxer extends Demuxer {
 			sampleTable.sampleCount = newSampleSizes.length;
 		}
 
+		// A file cut off in its media data (an interrupted download, say) still describes the samples it lost. Like
+		// reading the packets one after the other, the track ends before the first sample whose data isn't there.
+		const fileSize = this.reader.fileSizeNonStrict;
+		if (fileSize !== null) {
+			const sampleCount = countSamplesWithData(sampleTable, fileSize);
+			if (sampleCount < sampleTable.sampleCount) {
+				sampleTable.sampleCount = sampleCount;
+				capEntryCounts(sampleTable.sampleTimingEntries, sampleCount);
+				capEntryCounts(sampleTable.sampleCompositionTimeOffsets, sampleCount);
+
+				const keySampleIndices = sampleTable.keySampleIndices;
+				while (keySampleIndices && keySampleIndices.length > 0 && last(keySampleIndices)! >= sampleCount) {
+					keySampleIndices.pop();
+				}
+			}
+		}
+
 		if (sampleTable.sampleCompositionTimeOffsets.length > 0) {
 			// Presentation order differs from decode order. Let's prepare the offset entries for timestamped-keyed
 			// random access later
@@ -2392,6 +2409,22 @@ export class IsobmffDemuxer extends Demuxer {
 					const trackData = this.currentFragment.trackData.get(this.currentTrack.id);
 					cond:
 					if (trackData) {
+						// Like for sample tables, the fragment ends before the first sample whose data is cut off
+						const fileSize = this.reader.fileSizeNonStrict;
+						const sampleCount = fileSize === null
+							? -1
+							: trackData.samples.findIndex(sample => sample.byteOffset + sample.byteSize > fileSize);
+						if (sampleCount !== -1) {
+							trackData.samples.length = sampleCount;
+
+							let remainingSampleCount = sampleCount;
+							trackData.trunSampleCounts = trackData.trunSampleCounts.map((count) => {
+								const keptCount = Math.min(count, remainingSampleCount);
+								remainingSampleCount -= keptCount;
+								return keptCount;
+							});
+						}
+
 						if (trackData.samples.length === 0) {
 							// Don't associate the fragment with the track if it has no samples, this simplifies
 							// other code
@@ -4141,6 +4174,37 @@ const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Ration
 
 const sampleTableIsEmpty = (sampleTable: SampleTable) => {
 	return sampleTable.sampleSizes.length === 0;
+};
+
+/** Counts the samples before the first one whose data goes past the end of the file. */
+const countSamplesWithData = (sampleTable: SampleTable, fileSize: number) => {
+	const { sampleToChunk, chunkOffsets, sampleSizes, sampleCount } = sampleTable;
+	const getSampleSize = (sampleIndex: number) => sampleSizes[Math.min(sampleIndex, sampleSizes.length - 1)]!;
+
+	for (let i = 0; i < sampleToChunk.length; i++) {
+		const chunkEntry = sampleToChunk[i]!;
+		const chunkCount = Math.min(sampleToChunk[i + 1]?.startChunkIndex ?? Infinity, chunkOffsets.length)
+			- chunkEntry.startChunkIndex;
+
+		for (let j = 0; j < chunkCount; j++) {
+			const startSampleIndex = chunkEntry.startSampleIndex + j * chunkEntry.samplesPerChunk;
+			const endSampleIndex = Math.min(startSampleIndex + chunkEntry.samplesPerChunk, sampleCount);
+			let offset = chunkOffsets[chunkEntry.startChunkIndex + j]!;
+
+			for (let sampleIndex = startSampleIndex; sampleIndex < endSampleIndex; sampleIndex++) {
+				offset += getSampleSize(sampleIndex);
+				if (offset > fileSize) {
+					return sampleIndex;
+				}
+			}
+
+			if (endSampleIndex >= sampleCount) {
+				return sampleCount;
+			}
+		}
+	}
+
+	return sampleCount;
 };
 
 const capEntryCounts = (entries: { startIndex: number; count: number }[], sampleCount: number) => {
