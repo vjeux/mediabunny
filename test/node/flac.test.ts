@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
-import { assert, toUint8Array } from '../../src/misc.js';
+import { assert, toDataView, toUint8Array } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS, FLAC } from '../../src/input-format.js';
@@ -12,6 +12,8 @@ import { BufferTarget } from '../../src/target.js';
 import { FlacOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { VERSIONED_NAME } from '../../src/version.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -259,6 +261,77 @@ test('can re-mux a .flac', async () => {
 	expect(otherInputDecoderConfig).toEqual(otherOutputDecoderConfig);
 });
 
+const computeCrc8 = (data: number[]) => data.reduce((crc, byte) => {
+	crc ^= byte;
+	for (let i = 0; i < 8; i++) {
+		crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+	}
+	return crc;
+}, 0);
+const computeCrc16 = (data: number[]) => data.reduce((crc, byte) => {
+	crc ^= byte << 8;
+	for (let i = 0; i < 8; i++) {
+		crc = crc & 0x8000 ? ((crc << 1) ^ 0x8005) & 0xffff : (crc << 1) & 0xffff;
+	}
+	return crc;
+}, 0);
+
+test('appendOnly refuses frames larger than the fixed block size it declared', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/sample.flac')),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryAudioTrack())!;
+	const decoderConfig = (await track.getDecoderConfig())!;
+	const frames: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		frames.push(packet);
+	}
+	expect(frames.at(-1)!.duration).toBeLessThan(4096 / 44100); // A short last frame
+
+	// A silent 8192-sample frame (44.1 kHz, stereo, 16-bit, constant subframes), as a stream encoded with a larger
+	// block size than sample.flac's 4096 holds it
+	const largeFrameHeader = [0xff, 0xf8, 0xd9, 0x18, 3];
+	const largeFrameBytes = [...largeFrameHeader, computeCrc8(largeFrameHeader), 0, 0, 0, 0, 0, 0];
+	const largeFrameCrc = computeCrc16(largeFrameBytes);
+	const largeFrame = new EncodedPacket(
+		new Uint8Array([...largeFrameBytes, largeFrameCrc >> 8, largeFrameCrc & 0xff]),
+		'key',
+		3 * 4096 / 44100,
+		8192 / 44100,
+	);
+
+	const mux = async (packets: EncodedPacket[], appendOnly: boolean) => {
+		const target = new BufferTarget();
+		const output = new Output({ format: new FlacOutputFormat({ appendOnly }), target });
+		const source = new EncodedAudioPacketSource('flac');
+		output.addAudioTrack(source);
+		await output.start();
+		for (const packet of packets) {
+			await source.add(packet, { decoderConfig });
+		}
+		await output.finalize();
+		assert(target.buffer);
+		return new Uint8Array(target.buffer);
+	};
+
+	// The STREAMINFO written up front declares the fixed block size of 4096, so a larger frame can't follow: decoders
+	// such as FFmpeg's would drop it
+	await expect(mux([...frames.slice(0, 3), largeFrame], true)).rejects.toThrow(/frame of 8192 samples/);
+
+	// Without appendOnly, STREAMINFO is written last and bounds all frames
+	const joined = await mux([...frames.slice(0, 3), largeFrame], false);
+	expect(toDataView(joined).getUint16(10)).toBe(8192);
+
+	// A shorter frame, as where streams with a short last frame are joined, is fine
+	const shortFrame = frames.at(-1)!;
+	const joinedAtShortFrame = await mux([
+		shortFrame.clone({ timestamp: 0 }),
+		...frames.slice(0, 2).map(x => x.clone({ timestamp: x.timestamp + shortFrame.duration })),
+	], true);
+	expect(toDataView(joinedAtShortFrame).getUint16(8)).toBe(4096);
+});
+
 test('appendOnly writes correct STREAMINFO header', async () => {
 	const filePath = path.join(__dirname, '..', 'public/sample.flac');
 	using input = new Input({
@@ -278,15 +351,53 @@ test('appendOnly writes correct STREAMINFO header', async () => {
 	assert(target.buffer);
 	const bytes = new Uint8Array(target.buffer);
 
-	// STREAMINFO: min_block=16, max_block=65535, min_frame=0, max_frame=0
+	// STREAMINFO: min_block=4096, max_block=4096, min_frame=0, max_frame=0. The fixed block size of the frames is
+	// stated as both the minimum and maximum (RFC 9639, section 8.2); libFLAC can't seek in the file otherwise.
 	expect(bytes.slice(8, 18)).toEqual(new Uint8Array([
-		// minimum_block_size=16
-		0x00, 0x10,
-		// maximum_block_size=65535
-		0xFF, 0xFF,
+		// minimum_block_size=4096
+		0x10, 0x00,
+		// maximum_block_size=4096
+		0x10, 0x00,
 		// minimum_frame_size=0
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	]));
+
+	// A stream with a variable block size keeps the full valid range of block sizes, as its frames' block sizes can't
+	// be known beforehand. Here, mono 16-bit 44.1 kHz frames of 576 and 1152 samples, numbered by their first sample.
+	const variableFrame = (sampleNumber: number, blockSize: number) => {
+		const codedNumber = sampleNumber < 0x80
+			? [sampleNumber]
+			: [0xc0 | (sampleNumber >> 6), 0x80 | (sampleNumber & 0x3f)];
+		// Uncommon 16-bit block size, 44.1 kHz, mono, 16 bits per sample, then a constant subframe
+		const header = [0xff, 0xf9, 0x79, 0x08, ...codedNumber, (blockSize - 1) >> 8, (blockSize - 1) & 0xff];
+		const frame = [...header, computeCrc8(header), 0x00, 0x12, 0x34];
+		const crc = computeCrc16(frame);
+		return [...frame, crc >> 8, crc & 0xff];
+	};
+	const streamInfo = new Uint8Array(34);
+	const view = new DataView(streamInfo.buffer);
+	view.setUint16(0, 576);
+	view.setUint16(2, 1152);
+	view.setUint32(10, (44100 << 12) | (0 << 9) | (15 << 4)); // 44.1 kHz, mono, 16 bits per sample
+	view.setUint32(14, 576 + 1152 + 576);
+	const variableFile = new Uint8Array([
+		0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34, ...streamInfo,
+		...variableFrame(0, 576), ...variableFrame(576, 1152), ...variableFrame(1728, 576),
+	]);
+
+	using variableInput = new Input({ source: new BufferSource(variableFile), formats: ALL_FORMATS });
+	const variableTarget = new BufferTarget();
+	const variableOutput = new Output({
+		format: new FlacOutputFormat({ appendOnly: true }),
+		target: variableTarget,
+	});
+	const variableConversion = await Conversion.init({ input: variableInput, output: variableOutput });
+	await variableConversion.execute();
+
+	assert(variableTarget.buffer);
+	const variableBytes = new Uint8Array(variableTarget.buffer);
+	expect(variableBytes.slice(8, 12)).toEqual(new Uint8Array([0x00, 0x10, 0xff, 0xff])); // 16 and 65535
+	expect([...variableBytes.subarray(42, 44)]).toEqual([0xff, 0xf9]); // The first frame, of a variable block size
 });
 
 test('can read a FLAC file with leading ID3v2 tags', async () => {
