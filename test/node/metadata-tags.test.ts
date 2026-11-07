@@ -1086,3 +1086,38 @@ test('Creation time override in conversion', async () => {
 
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
+
+test('Leave out raw ID3v2.3 date frames next to the written date, MP3', async () => {
+	const mp3Frame = new Uint8Array(417); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
+	mp3Frame.set([0xff, 0xfb, 0x90, 0x64]);
+
+	const writeAndRead = async (tags: MetadataTags) => {
+		const output = new Output({ format: new Mp3OutputFormat(), target: new BufferTarget() });
+		output.setMetadataTags(tags);
+		const source = new EncodedAudioPacketSource('mp3');
+		output.addAudioTrack(source);
+		await output.start();
+		for (let i = 0; i < 3; i++) {
+			await source.add(new EncodedPacket(mp3Frame, 'key', i * 1152 / 44100, 1152 / 44100), {
+				decoderConfig: { codec: 'mp3', numberOfChannels: 2, sampleRate: 44100 },
+			});
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+
+	// Raw frames as read from an ID3v2.3 tag, which stores the date as the year, "DDMM", "HHMM" and free text
+	const raw = { TIT2: 'Title', TYER: '2021', TDAT: '2304', TIME: '1200', TRDA: '23rd April 2021' };
+
+	// ID3v2.4, which the writer writes, replaced those by TDRC, so they'd contradict a new date
+	const withDate = await writeAndRead({ date: new Date('1999-01-01T00:00:00Z'), raw });
+	expect(withDate.date).toEqual(new Date('1999-01-01T00:00:00Z'));
+	expect(withDate.raw).toMatchObject({ TIT2: 'Title', TDRC: '1999-01-01' });
+	expect(Object.keys(withDate.raw!).filter(key => ['TYER', 'TDAT', 'TIME', 'TRDA'].includes(key))).toEqual([]);
+
+	// Without a date, they're copied as before
+	const withoutDate = await writeAndRead({ raw });
+	expect(withoutDate.raw).toMatchObject(raw);
+});

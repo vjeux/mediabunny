@@ -808,6 +808,14 @@ export class Id3V2Writer {
 			}
 		}
 
+		// ID3v2.4 replaced ID3v2.3's date frames by TDRC, so raw ones from an ID3v2.3 tag mustn't stay next to the date
+		// written above, which they'd contradict
+		if (writtenTags.has('TDRC')) {
+			for (const frameId of ['TYER', 'TDAT', 'TIME', 'TRDA']) {
+				writtenTags.add(frameId);
+			}
+		}
+
 		if (metadata.raw) {
 			for (const key in metadata.raw) {
 				const value = metadata.raw[key];
