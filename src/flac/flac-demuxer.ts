@@ -15,6 +15,7 @@ import {
 	assert,
 	AsyncMutex,
 	binarySearchLessOrEqual,
+	bytesToBase64,
 	isThenable,
 	textDecoder,
 	UNDETERMINED_LANGUAGE,
@@ -302,6 +303,20 @@ export class FlacDemuxer extends Demuxer {
 							pictureBlock.skip(4 + 4 + 4 + 4);
 							const dataLength = readU32Be(pictureBlock);
 							const data = readBytes(pictureBlock, dataLength);
+
+							if (mediaType === '-->') {
+								// The data is a link to the picture (RFC 9639, section 8.8), not the picture. It's kept
+								// among the raw tags instead, as the METADATA_BLOCK_PICTURE comment of the same
+								// content that holds pictures in Ogg, which the muxers write back.
+								pictureBlock.filePos = currentPos;
+								const link = bytesToBase64(readBytes(pictureBlock, size));
+								const raw = this.metadataTags.raw ??= {};
+								const existing = raw['METADATA_BLOCK_PICTURE'];
+								raw['METADATA_BLOCK_PICTURE'] = typeof existing === 'string'
+									? [existing, link]
+									: Array.isArray(existing) ? [...existing as string[], link] : link;
+								break;
+							}
 
 							this.metadataTags.images ??= [];
 							this.metadataTags.images.push({
