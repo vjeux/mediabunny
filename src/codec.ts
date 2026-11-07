@@ -1066,7 +1066,7 @@ export const inferCodecFromCodecString = (codecString: string): MediaCodec | nul
 		return 'opus';
 	} else if (codecString === 'vorbis') {
 		return 'vorbis';
-	} else if (codecString === 'flac') {
+	} else if (codecString === 'flac' || codecString === 'fLaC' /* HLS variant */) {
 		return 'flac';
 	} else if (codecString === 'ac-3' || codecString === 'ac3') {
 		return 'ac3';

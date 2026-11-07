@@ -50,6 +50,12 @@ const toHlsCodecString = (codecString: string) => {
 	if (codecString === 'opus') {
 		return 'Opus';
 	}
+	if (codecString === 'flac') {
+		return 'fLaC';
+	}
+	if (codecString === 'mp3' || codecString === 'mp4a.69' || codecString === 'mp4a.6B' || codecString === 'mp4a.6b') {
+		return 'mp4a.40.34';
+	}
 
 	return codecString;
 };
