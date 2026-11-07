@@ -16,54 +16,25 @@ import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 test('AudioSampleSource, encoding starts even when measuring the encoder\'s priming hangs', async () => {
 	// The measurement decodes the encoder's output, and some platform decoders never finish flushing (WebKitGTK's
 	// Vorbis decoder). Emulated by an AudioDecoder whose flush() never settles
+	let decoderCount = 0;
 	const RealAudioDecoder = AudioDecoder;
 	globalThis.AudioDecoder = class extends RealAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			super(init);
+			decoderCount++;
+		}
+
 		override flush() {
 			return new Promise<void>(() => {});
 		}
 	};
 
-	try {
+	const encode = async () => {
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
 		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
 		output.addAudioTrack(source);
 		await output.start();
 
-		using sample = new AudioSample({
-			data: new Float32Array(960),
-			format: 'f32',
-			numberOfChannels: 1,
-			sampleRate: 48000,
-			timestamp: 0,
-		});
-		const encoding = (async () => {
-			await source.add(sample);
-			await output.finalize();
-			return 'finalized';
-		})();
-
-		expect(await Promise.race([
-			encoding,
-			new Promise(resolve => setTimeout(() => resolve('hung'), 8000)),
-		])).toBe('finalized');
-	} finally {
-		globalThis.AudioDecoder = RealAudioDecoder;
-	}
-
-	// The timed-out measurement isn't remembered: the next encoder measures again
-	let decoderCreated = false;
-	globalThis.AudioDecoder = class extends RealAudioDecoder {
-		constructor(init: AudioDecoderInit) {
-			super(init);
-			decoderCreated = true;
-		}
-	};
-
-	try {
-		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
-		output.addAudioTrack(source);
-		await output.start();
 		using sample = new AudioSample({
 			data: new Float32Array(960),
 			format: 'f32',
@@ -73,12 +44,24 @@ test('AudioSampleSource, encoding starts even when measuring the encoder\'s prim
 		});
 		await source.add(sample);
 		await output.finalize();
+		return 'finalized';
+	};
+
+	try {
+		for (let i = 1; i <= 2; i++) {
+			expect(await Promise.race([
+				encode(),
+				new Promise(resolve => setTimeout(() => resolve('hung'), 6000)),
+			])).toBe('finalized');
+
+			// The timed-out measurement isn't remembered, so the next encoder measures again (and nothing stays cached
+			// for the tests after this one)
+			expect(decoderCount).toBe(i);
+		}
 	} finally {
 		globalThis.AudioDecoder = RealAudioDecoder;
 	}
-
-	expect(decoderCreated).toBe(true);
-}, 10_000);
+}, 15_000);
 
 test('VideoSampleSource, normal usage', async () => {
 	const buffer = await encodeFrames(
