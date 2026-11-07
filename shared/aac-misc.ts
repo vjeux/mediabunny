@@ -103,6 +103,13 @@ export const parseAacAudioSpecificConfig = (bytes: Uint8Array | null): AacAudioS
 
 			programConfigElement = readAacProgramConfigElement(bitstream);
 			numberOfChannels = getAacProgramConfigElementChannelCount(programConfigElement);
+
+			// A PCE cut off by the end of the config (as when there's none at all) or without any channels can't
+			// describe the layout, so the channel count is left for the container to give
+			if (bitstream.getBitsLeft() < 0 || numberOfChannels === 0) {
+				programConfigElement = null;
+				numberOfChannels = null;
+			}
 		}
 	}
 
