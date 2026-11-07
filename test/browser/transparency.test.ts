@@ -257,60 +257,11 @@ test('Can encode video with alternating transparency', async () => {
 	}
 });
 
-test('Can encode transparent video with odd dimensions', async () => {
-	const output = new Output({
-		format: new WebMOutputFormat(),
-		target: new BufferTarget(),
-	});
-
-	const canvas = new OffscreenCanvas(641, 479);
-	const context = canvas.getContext('2d', { alpha: true })!;
-	context.fillStyle = '#ff000080';
-	context.fillRect(0, 0, canvas.width, canvas.height);
-
-	const source = new CanvasSource(canvas, {
-		codec: 'vp9',
-		quality: new Quality('high'),
-		alpha: 'keep',
-	});
-	output.addVideoTrack(source);
-
-	await output.start();
-	await source.add(0, 1);
-	await output.finalize();
-
-	using input = new Input({
-		source: new BufferSource(output.target.buffer!),
-		formats: ALL_FORMATS,
-	});
-	const videoTrack = (await input.getPrimaryVideoTrack())!;
-	expect(await videoTrack.getDisplayWidth()).toBe(641);
-	expect(await videoTrack.getDisplayHeight()).toBe(479);
-	expect(await videoTrack.canBeTransparent()).toBe(true);
-
-	using sample = (await new VideoSampleSink(videoTrack).getSample(0))!;
-	expect(sample.hasAlpha).toBe(true);
-
-	// The last row and column keep their alpha too
-	const readbackContext = new OffscreenCanvas(641, 479).getContext('2d')!;
-	sample.draw(readbackContext, 0, 0);
-	expect(readbackContext.getImageData(640, 478, 1, 1).data[3]).toBeGreaterThan(100);
-});
-
-test('Can encode transparent YUV frames with odd dimensions', async () => {
-	// Decoders (like the ProRes one) hand out I420A frames with a padded coded size and an odd visible rect
-	const width = 161;
-	const height = 91;
-	const codedWidth = 176;
-	const codedHeight = 96;
-	const lumaSize = codedWidth * codedHeight;
-	const chromaSize = (codedWidth / 2) * (codedHeight / 2);
-	const data = new Uint8Array(2 * lumaSize + 2 * chromaSize);
-	data.fill(81, 0, lumaSize); // Red
-	data.fill(90, lumaSize, lumaSize + chromaSize);
-	data.fill(240, lumaSize + chromaSize, lumaSize + 2 * chromaSize);
-	data.fill(160, lumaSize + 2 * chromaSize); // Alpha
-
+/**
+ * Encodes a frame with alpha, decodes it again and reads it back through a canvas: the size, and the pixels in the
+ * middle and at the edges (top right, bottom left, bottom right).
+ */
+const roundTripTransparentFrame = async (makeSample: () => VideoSample) => {
 	const output = new Output({
 		format: new WebMOutputFormat(),
 		target: new BufferTarget(),
@@ -321,17 +272,9 @@ test('Can encode transparent YUV frames with odd dimensions', async () => {
 		alpha: 'keep',
 	});
 	output.addVideoTrack(source);
-	await output.start();
 
-	const frame = new VideoFrame(data, {
-		format: 'I420A',
-		codedWidth,
-		codedHeight,
-		visibleRect: { x: 0, y: 0, width, height },
-		timestamp: 0,
-		duration: 1e6,
-	});
-	using inputSample = new VideoSample(frame);
+	await output.start();
+	using inputSample = makeSample();
 	await source.add(inputSample);
 	await output.finalize();
 
@@ -340,21 +283,88 @@ test('Can encode transparent YUV frames with odd dimensions', async () => {
 		formats: ALL_FORMATS,
 	});
 	const videoTrack = (await input.getPrimaryVideoTrack())!;
-	expect(await videoTrack.getDisplayWidth()).toBe(width);
-	expect(await videoTrack.getDisplayHeight()).toBe(height);
+	const width = await videoTrack.getDisplayWidth();
+	const height = await videoTrack.getDisplayHeight();
 
 	using sample = (await new VideoSampleSink(videoTrack).getSample(0))!;
-	expect(sample.hasAlpha).toBe(true);
+	const context = new OffscreenCanvas(width, height).getContext('2d')!;
+	sample.draw(context, 0, 0);
+	const pixel = (x: number, y: number) => [...context.getImageData(x, y, 1, 1).data];
 
-	// Including the last row and column. Read through copyTo, as Firefox draws non-opaque RGBA frames with wrong colors
-	// (https://bugzilla.mozilla.org/show_bug.cgi?id=2079836)
-	const pixels = new Uint8Array(width * height * 4);
-	await sample.copyTo(pixels, { format: 'RGBA' });
-	const [red, green, , alpha] = pixels.subarray(pixels.length - 4);
-	expect(alpha).toBeGreaterThan(130);
-	expect(alpha).toBeLessThan(190);
-	expect(red).toBeGreaterThan(150);
-	expect(green).toBeLessThan(80);
+	return {
+		width,
+		height,
+		canBeTransparent: await videoTrack.canBeTransparent(),
+		hasAlpha: sample.hasAlpha,
+		middle: pixel(width >> 1, height >> 1),
+		edges: [pixel(width - 1, 0), pixel(0, height - 1), pixel(width - 1, height - 1)],
+	};
+};
+
+// The edges of an odd-sized frame must come out like those of an even-sized one. Compared with that rather than with
+// fixed values, since some platforms already lose the bottom rows of transparent frames when decoding them (WebKitGTK),
+// and Firefox draws non-opaque frames with wrong colors (https://bugzilla.mozilla.org/show_bug.cgi?id=2079836).
+const expectSameEdges = (odd: number[][], even: number[][]) => {
+	for (let i = 0; i < odd.length; i++) {
+		for (let channel = 0; channel < 4; channel++) {
+			expect(Math.abs(odd[i]![channel]! - even[i]![channel]!), `edge ${i}, channel ${channel}`).toBeLessThan(16);
+		}
+	}
+};
+
+test('Can encode transparent video with odd dimensions', async () => {
+	const makeCanvasSample = (width: number, height: number) => () => {
+		const canvas = new OffscreenCanvas(width, height);
+		const context = canvas.getContext('2d', { alpha: true })!;
+		context.fillStyle = '#ff000080';
+		context.fillRect(0, 0, width, height);
+		return new VideoSample(canvas, { timestamp: 0, duration: 1 });
+	};
+
+	const odd = await roundTripTransparentFrame(makeCanvasSample(641, 479));
+	expect([odd.width, odd.height]).toEqual([641, 479]);
+	expect(odd.canBeTransparent).toBe(true);
+	expect(odd.hasAlpha).toBe(true);
+	expect(odd.middle[3]).toBeGreaterThan(100);
+	expect(odd.middle[3]).toBeLessThan(160);
+
+	const even = await roundTripTransparentFrame(makeCanvasSample(640, 480));
+	expectSameEdges(odd.edges, even.edges);
+});
+
+test('Can encode transparent YUV frames with odd dimensions', async () => {
+	// Decoders (like the ProRes one) hand out I420A frames with a padded coded size and a visible rect
+	const makeYuvaSample = (width: number, height: number) => () => {
+		const codedWidth = 176;
+		const codedHeight = 96;
+		const lumaSize = codedWidth * codedHeight;
+		const chromaSize = (codedWidth / 2) * (codedHeight / 2);
+		const data = new Uint8Array(2 * lumaSize + 2 * chromaSize);
+		data.fill(81, 0, lumaSize); // Red
+		data.fill(90, lumaSize, lumaSize + chromaSize);
+		data.fill(240, lumaSize + chromaSize, lumaSize + 2 * chromaSize);
+		data.fill(160, lumaSize + 2 * chromaSize); // Alpha
+
+		return new VideoSample(new VideoFrame(data, {
+			format: 'I420A',
+			codedWidth,
+			codedHeight,
+			visibleRect: { x: 0, y: 0, width, height },
+			timestamp: 0,
+			duration: 1e6,
+		}));
+	};
+
+	const odd = await roundTripTransparentFrame(makeYuvaSample(161, 91));
+	expect([odd.width, odd.height]).toEqual([161, 91]);
+	expect(odd.canBeTransparent).toBe(true);
+	expect(odd.hasAlpha).toBe(true);
+	expect(odd.middle[3]).toBeGreaterThan(130);
+	expect(odd.middle[3]).toBeLessThan(190);
+	expect(odd.middle[0]).toBeGreaterThan(odd.middle[1]! + 50); // Still red
+
+	const even = await roundTripTransparentFrame(makeYuvaSample(160, 90));
+	expectSameEdges(odd.edges, even.edges);
 });
 
 test('Positive encodability check with alpha', async () => {
