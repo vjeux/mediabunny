@@ -927,12 +927,30 @@ describe('Writer: RFC 9639 (FLAC)', () => {
 		}
 	});
 
-	test('§8.2: append-only output declares the full block size range and unknown frame sizes and total', async () => {
+	test('§8.2: append-only block sizes bound every frame; frame sizes and total are exact or 0', async () => {
+		// STREAMINFO is written before any frame. A fixed block size stream declares its block size as both minimum
+		// and maximum; only a variable block size stream may declare looser bounds, such as the full 16-65535 range
+		// (Section 8.2, Appendix B.1). Frame sizes and the total sample count may be 0 ("not known").
 		const bytes = await build(new FlacOutputFormat({ appendOnly: true }),
 			output => addCopiedTrack(output, 'sample.flac', index => index < 5));
 		const info = readStreaminfo(parseFlac(bytes).blocks[0]!.data);
-		expect([info.minBlockSize, info.maxBlockSize, info.minFrameSize, info.maxFrameSize, info.totalSamples])
-			.toEqual([16, 65535, 0, 0, 0]);
+		expect(info.minBlockSize).toBeGreaterThanOrEqual(16);
+		expect(info.maxBlockSize).toBeLessThanOrEqual(65535);
+		expect(info.minBlockSize).toBeLessThanOrEqual(info.maxBlockSize);
+
+		const frames = await flacFrames(bytes);
+		expect(frames).toHaveLength(5);
+		frames.forEach((frame, i) => {
+			expect(frame.blockSize).toBeLessThanOrEqual(info.maxBlockSize);
+			if (i < frames.length - 1) {
+				expect(frame.blockSize).toBeGreaterThanOrEqual(info.minBlockSize);
+			}
+		});
+
+		const frameSizes = frames.map(frame => frame.data.length);
+		expect([0, Math.min(...frameSizes)]).toContain(info.minFrameSize);
+		expect([0, Math.max(...frameSizes)]).toContain(info.maxFrameSize);
+		expect([0, frames.reduce((sum, frame) => sum + frame.blockSize, 0)]).toContain(info.totalSamples);
 	});
 
 	test('§8.6: at most one VORBIS_COMMENT block, with field names of printable ASCII other than "="', () => {
