@@ -705,6 +705,18 @@ const DEFAULT_RETRY_DELAY
 const warnedOrigins = new Set<string>();
 
 /**
+ * Whether the body of a response has a content coding, in which case its Content-Range and Content-Length count
+ * encoded bytes. "identity" isn't one: RFC 9110 reserves it as a synonym for "no encoding".
+ */
+const hasContentCoding = (response: Response) => {
+	const value = response.headers.get('Content-Encoding');
+	return value !== null && value.split(',').some((coding) => {
+		const normalized = coding.trim().toLowerCase();
+		return normalized !== '' && normalized !== 'identity';
+	});
+};
+
+/**
  * Options for {@link UrlSource}.
  * @group Input sources
  * @public
@@ -990,7 +1002,7 @@ export class UrlSource extends PathedSource {
 				// Content-Range/Length fields are meaningless if Content-Encoding is present: they count encoded
 				// bytes, while the reader addresses decoded ones. This holds for 206 responses too - some CDNs do
 				// answer range requests with a content coding, stating the compressed total (stupid!)
-				&& !response.headers.has('Content-Encoding')
+				&& !hasContentCoding(response)
 				// CORS requests may have Content-Encoding but they hide it from us
 				&& (response.status === 206 || response.type === 'basic')
 			) {
