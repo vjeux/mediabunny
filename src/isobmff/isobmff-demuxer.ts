@@ -1348,7 +1348,8 @@ export class IsobmffDemuxer extends Demuxer {
 						}
 
 						track.info.numberOfChannels = channelCount;
-						track.info.sampleRate = sampleRate;
+						// A sample rate that doesn't fit is written as 0, making the media timescale our best guess
+						track.info.sampleRate = sampleRate || track.timescale;
 
 						track.frmaCodecString = null;
 						this.readContiguousBoxes(
