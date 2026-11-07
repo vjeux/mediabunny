@@ -66,6 +66,16 @@ const decodesProfile = async (codecString: string) => {
 	return !!support.supported;
 };
 
+/** Whether the browser decodes AAC at all (Firefox without the system's FFmpeg doesn't). */
+const decodesAudioCodec = async (codecString: string, sampleRate: number, numberOfChannels: number) => {
+	if (!codecString.startsWith('mp4a.')) {
+		return true;
+	}
+
+	const support = await AudioDecoder.isConfigSupported({ codec: codecString, sampleRate, numberOfChannels });
+	return !!support.supported;
+};
+
 // Whether the platform can decode something is decided with WebCodecs alone, never with Mediabunny, so that a
 // Mediabunny failure on a capable platform fails instead of skipping. isConfigSupported() isn't enough: WebKitGTK says
 // it decodes codecs that its GStreamer decoders then fail on or hang on. Each probe is a decoder config and the first
@@ -344,6 +354,7 @@ test.for(AUDIO_FIXTURES)(
 		expect(await track.getCodecParameterString()).toBe(codecString);
 		expect(await track.getSampleRate()).toBe(sampleRate);
 		expect(await track.getNumberOfChannels()).toBe(numberOfChannels);
+		skip(!(await decodesAudioCodec(codecString, sampleRate, numberOfChannels)), 'the browser can\'t decode AAC');
 		expect(await track.canDecode()).toBe(true);
 		await skipIfIncapable(fileName, skip);
 
