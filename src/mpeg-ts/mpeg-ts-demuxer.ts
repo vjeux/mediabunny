@@ -212,8 +212,8 @@ const sectionLooksComplete = (chunks: Uint8Array[], byteLength: number, lastPack
 const MAX_DUPLICATE_CHECK_PACKET_COUNT = 1024;
 
 /**
- * Whether the TS packet's adaptation field holds stuffing bytes, which is how muxers make a PES packet end on a TS
- * packet boundary. Only a PES packet whose data fills its last TS packet exactly ends without.
+ * Whether the TS packet's adaptation field pads it, which is how muxers make a PES packet end on a TS packet boundary.
+ * Only a PES packet whose data fills its last TS packet exactly ends without.
  */
 const hasStuffing = (packet: TsPacket) => {
 	if (!(packet.adaptationFieldControl & 0b10)) {
@@ -226,6 +226,10 @@ const hasStuffing = (packet: TsPacket) => {
 	}
 
 	const flags = packet.body[1]!;
+	if ((flags & 0x1f) === 0) {
+		return true; // Without optional fields, the adaptation field is there to pad (2 bytes or more)
+	}
+
 	let usedLength = 1 + (flags & 0x10 ? 6 : 0) + (flags & 0x08 ? 6 : 0) + (flags & 0x04 ? 1 : 0);
 	if (flags & 0x02) {
 		usedLength += 1 + (packet.body[1 + usedLength] ?? 0); // transport_private_data
