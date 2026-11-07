@@ -272,3 +272,16 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('MP4 language stored as a bibliographic ISO 639-2 code', async () => {
+	// ffmpeg -f lavfi -i sine=d=0.05 -c:a aac -b:a 32k -ac 1 -metadata:s:a:0 language=ger -fflags +bitexact
+	// -map_metadata -1 language-ger.mp4: FFmpeg stores the code it's given, though the mdhd box is meant to hold the
+	// terminology code ("deu"), which languageCode is too
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/language-ger.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getLanguageCode()).toBe('deu');
+});
