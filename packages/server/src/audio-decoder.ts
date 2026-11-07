@@ -16,6 +16,7 @@ export class NodeAvAudioDecoder extends CustomAudioDecoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
 	codecContext: NodeAv.CodecContext | null = null;
+	nextPts: bigint | null = null;
 
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	static override supports(codec: AudioCodec, config: AudioDecoderConfig): boolean {
@@ -98,6 +99,16 @@ export class NodeAvAudioDecoder extends CustomAudioDecoder {
 		}
 
 		clone.timeBase = new NodeAv.Rational(1, this.config.sampleRate);
+
+		// When one packet holds several frames (like an E-AC-3 MP4 sample made of several syncframes), only the first
+		// frame gets the packet's timestamp, so the others continue where the previous frame ended
+		if (clone.pts === NodeAv.AV_NOPTS_VALUE && this.nextPts !== null) {
+			clone.pts = this.nextPts;
+		}
+		this.nextPts = clone.pts === NodeAv.AV_NOPTS_VALUE
+			? null
+			: clone.pts + BigInt(Math.round(clone.nbSamples * this.config.sampleRate / clone.sampleRate));
+
 		this.onSample(new AudioSample(new AvFrameAudioSampleResource(clone)));
 	}
 
@@ -120,6 +131,7 @@ export class NodeAvAudioDecoder extends CustomAudioDecoder {
 		}
 
 		this.codecContext.flushBuffers();
+		this.nextPts = null;
 	}
 
 	close(): MaybePromise<void> {
