@@ -499,6 +499,13 @@ export abstract class BaseMediaSampleSink<
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
 
+		// On a live stream that doesn't go on, waiting for packets never ends, so the pump stops waiting once the
+		// iteration has ended, to free the decoder
+		const { promise: terminatedPromise, resolve: onTerminated } = promiseWithResolvers();
+		const unlessTerminated = <T>(promise: Promise<T>) => {
+			return Promise.race([promise, terminatedPromise.then(() => null)]);
+		};
+
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
 		// the consumer.
@@ -560,11 +567,17 @@ export abstract class BaseMediaSampleSink<
 			const packetSink = this._createPacketSink();
 			const preRollDuration = await this._getPreRollDuration();
 
-			const startPacket = await packetSink.getPacket(startTimestamp, packetRetrievalOptions);
-			const keyPacket = await packetSink.getKeyPacket(
-				(startPacket?.timestamp ?? startTimestamp) - preRollDuration,
-				packetRetrievalOptions,
-			) ?? await packetSink.getFirstKeyPacket(packetRetrievalOptions);
+			const startPacket = await unlessTerminated(packetSink.getPacket(startTimestamp, packetRetrievalOptions));
+			let keyPacket: EncodedPacket | null = null;
+			if (!terminated) {
+				keyPacket = await unlessTerminated(packetSink.getKeyPacket(
+					(startPacket?.timestamp ?? startTimestamp) - preRollDuration,
+					packetRetrievalOptions,
+				)) ?? await unlessTerminated(packetSink.getFirstKeyPacket(packetRetrievalOptions));
+			}
+			if (terminated) {
+				return;
+			}
 
 			let currentPacket: EncodedPacket | null = keyPacket;
 
@@ -577,7 +590,7 @@ export abstract class BaseMediaSampleSink<
 			const endPacket = undefined;
 
 			const packets = packetSink.packets(keyPacket ?? undefined, endPacket, packetRetrievalOptions);
-			await packets.next(); // Skip the start packet as we already have it
+			await unlessTerminated(packets.next()); // Skip the start packet as we already have it
 
 			while (currentPacket && !ended && !this._track.input._disposed) {
 				if (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE) {
@@ -588,8 +601,8 @@ export abstract class BaseMediaSampleSink<
 
 				decoder.decode(currentPacket);
 
-				const packetResult = await packets.next();
-				if (packetResult.done) {
+				const packetResult = await unlessTerminated(packets.next());
+				if (!packetResult || packetResult.done) {
 					break;
 				}
 
@@ -636,6 +649,7 @@ export abstract class BaseMediaSampleSink<
 						// nothing can ever close.
 						terminated = true;
 						ended = true;
+						onTerminated();
 						closeSamples();
 						throw new InputDisposedError();
 					} else if (terminated) {
@@ -643,6 +657,7 @@ export abstract class BaseMediaSampleSink<
 					} else if (hasOutOfBandError) {
 						terminated = true;
 						ended = true;
+						onTerminated();
 						closeSamples();
 						throw outOfBandError;
 					} else if (sampleQueue.length > 0) {
@@ -659,6 +674,7 @@ export abstract class BaseMediaSampleSink<
 			async return() {
 				terminated = true;
 				ended = true;
+				onTerminated();
 				onQueueDequeue();
 				onQueueNotEmpty();
 				closeSamples();
@@ -689,6 +705,13 @@ export abstract class BaseMediaSampleSink<
 		let decoderIsFlushed = false;
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
+
+		// On a live stream that doesn't go on, waiting for packets never ends, so the pump stops waiting once the
+		// iteration has ended, to free the decoder
+		const { promise: terminatedPromise, resolve: onTerminated } = promiseWithResolvers();
+		const unlessTerminated = <T>(promise: Promise<T>) => {
+			return Promise.race([promise, terminatedPromise.then(() => null)]);
+		};
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -788,7 +811,12 @@ export abstract class BaseMediaSampleSink<
 						break;
 					}
 
-					const nextPacket = await packetSink.getNextPacket(currentPacket, retrievalOptions);
+					const nextPacket: EncodedPacket | null = await unlessTerminated(
+						packetSink.getNextPacket(currentPacket, retrievalOptions),
+					);
+					if (terminated) {
+						break;
+					}
 					if (!nextPacket) {
 						throw new Error('Internal error: couldn\'t get next packet when one was expected.');
 					}
@@ -816,17 +844,20 @@ export abstract class BaseMediaSampleSink<
 					break;
 				}
 
-				const targetPacket = await packetSink.getPacket(timestamp, retrievalOptions);
-				let keyPacket = targetPacket && await packetSink.getKeyPacket(
+				const targetPacket = await unlessTerminated(packetSink.getPacket(timestamp, retrievalOptions));
+				let keyPacket = targetPacket && await unlessTerminated(packetSink.getKeyPacket(
 					targetPacket.timestamp - preRollDuration,
 					retrievalOptions,
-				);
-				if (targetPacket && !keyPacket) {
+				));
+				if (targetPacket && !keyPacket && !terminated) {
 					// The track doesn't reach back far enough for the full pre-roll, so this is the best we can do
-					const firstKeyPacket = await packetSink.getFirstKeyPacket(retrievalOptions);
+					const firstKeyPacket = await unlessTerminated(packetSink.getFirstKeyPacket(retrievalOptions));
 					if (firstKeyPacket && firstKeyPacket.timestamp <= targetPacket.timestamp) {
 						keyPacket = firstKeyPacket;
 					}
+				}
+				if (terminated) {
+					break;
 				}
 
 				if (!targetPacket || !keyPacket) {
@@ -900,12 +931,14 @@ export abstract class BaseMediaSampleSink<
 						// iteration here - otherwise, the pump keeps queueing decoded samples that
 						// nothing can ever close.
 						terminated = true;
+						onTerminated();
 						closeSamples();
 						throw new InputDisposedError();
 					} else if (terminated) {
 						return { value: undefined, done: true };
 					} else if (hasOutOfBandError) {
 						terminated = true;
+						onTerminated();
 						closeSamples();
 						throw outOfBandError;
 					} else if (sampleQueue.length > 0) {
@@ -922,6 +955,7 @@ export abstract class BaseMediaSampleSink<
 			},
 			async return() {
 				terminated = true;
+				onTerminated();
 				onQueueDequeue();
 				onQueueNotEmpty();
 				closeSamples();
