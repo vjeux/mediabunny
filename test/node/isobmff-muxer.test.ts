@@ -6,7 +6,7 @@ import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { BufferTarget } from '../../src/target.js';
+import { BufferTarget, PathedTarget } from '../../src/target.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
@@ -262,6 +262,31 @@ test('Conversion fails instead of hanging when a closing track overruns the rese
 		new Promise(resolve => setTimeout(() => resolve('hung'), 5000)),
 	]);
 	expect(outcome).toMatch(/Track #2 has already reached the maximum packet count/);
+});
+
+test('An output whose start() failed rejects packets and finalize() instead of hanging', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new PathedTarget('out.mp4', async () => {
+			throw new Error('Could not create target');
+		}),
+	});
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+
+	await expect(output.start()).rejects.toThrow('Could not create target');
+
+	const settles = (promise: Promise<unknown>) => Promise.race([
+		promise.then(() => 'resolved', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('hung'), 2000)),
+	]);
+	expect(await settles((async () => source.add(
+		new EncodedPacket(new Uint8Array(400), 'key', 0, 0.01),
+		{ decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 48000 } },
+	))())).toBe('rejected');
+	expect(await settles(output.finalize())).toBe('rejected');
+	// Nothing can use the output anymore
+	expect(output.state).toBe('canceled');
 });
 
 test('Negative start timestamps, regular MP4', async () => {

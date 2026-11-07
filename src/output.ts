@@ -941,13 +941,25 @@ export class Output<
 			// We want to call muxer.start immediately, so we avoid using an await here
 			const releasePromise = this._mutex.acquire();
 
+			let startFailed = false;
+			let startError: unknown = null;
+
 			try {
 				await this._muxer.start();
 
 				const promises = this.tracks.map(track => track.source._start());
 				await Promise.all(promises);
+			} catch (error) {
+				startFailed = true;
+				startError = error;
 			} finally {
 				(await releasePromise)();
+			}
+
+			if (startFailed) {
+				// The muxer is in an undefined state now, so don't let anything use the output anymore
+				await this.cancel().catch(() => {});
+				throw startError;
 			}
 		})();
 	}
