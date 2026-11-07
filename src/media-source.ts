@@ -35,6 +35,7 @@ import {
 	isFirefox,
 	isThenable,
 	isWebKit,
+	isWindowsChromium,
 	last,
 	missingWebCodecsClassMessage,
 	promiseWithResolvers,
@@ -2518,7 +2519,7 @@ class AudioEncoderWrapper {
 				});
 				this.encoder.configure(encoderConfig);
 
-				if (this.encodingConfig.codec === 'aac' && isWebKit()) {
+				if (this.encodingConfig.codec === 'aac' && aacEncoderSilencesLeadingSamples()) {
 					encodeAacSilencePrefix(this.encoder, format, numberOfChannels, sampleRate, timestamp);
 				}
 			}
@@ -2758,7 +2759,7 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 		try {
 			encoder.configure(encoderConfig);
 
-			if (codec === 'aac' && isWebKit()) {
+			if (codec === 'aac' && aacEncoderSilencesLeadingSamples()) {
 				encodeAacSilencePrefix(encoder, format, numberOfChannels, sampleRate, 0);
 			}
 
@@ -2812,7 +2813,14 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 	return promise;
 };
 
-/** Works around https://bugs.webkit.org/show_bug.cgi?id=328491 */
+/**
+ * Whether the platform's AAC encoder silences the start of what it encodes: WebKit's swallows the first 1024 samples
+ * (https://bugs.webkit.org/show_bug.cgi?id=328491), and Windows' Media Foundation encoder, as used by Chromium, about
+ * the first 512.
+ */
+const aacEncoderSilencesLeadingSamples = () => isWebKit() || isWindowsChromium();
+
+/** Encodes a frame of silence ahead of the actual audio, for encoders that silence the start of what they encode. */
 const encodeAacSilencePrefix = (
 	encoder: AudioEncoder,
 	format: AudioSampleFormat, // Must match the format of the actual audio data for this workaround to work

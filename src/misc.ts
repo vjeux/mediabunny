@@ -1024,6 +1024,16 @@ export const isChromium = () => {
 	);
 };
 
+let isWindowsChromiumCache: boolean | null = null;
+/** Chromium on Windows, whose platform codecs are Media Foundation's. */
+export const isWindowsChromium = () => {
+	if (isWindowsChromiumCache !== null) {
+		return isWindowsChromiumCache;
+	}
+
+	return isWindowsChromiumCache = isChromium() && /Windows/.test(navigator.userAgent);
+};
+
 let chromiumVersionCache: number | null = null;
 export const getChromiumVersion = () => {
 	if (chromiumVersionCache !== null) {
