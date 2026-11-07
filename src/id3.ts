@@ -163,6 +163,18 @@ export const readId3V2Header = (slice: FileSlice): Id3V2Header | null => {
 	return { majorVersion, revision, flags, size };
 };
 
+// The metadata tags whose date was taken from a release time (TDRL), which a recording time found in a later tag still
+// replaces (callers parse consecutive tags into the same object)
+const datesFromReleaseTime = new WeakSet<MetadataTags>();
+
+/** Sets the date, unless one was already found. Only a date taken from a release time gets replaced. */
+const setId3V2Date = (tags: MetadataTags, date: Date) => {
+	if (tags.date === undefined || datesFromReleaseTime.has(tags)) {
+		tags.date = date;
+		datesFromReleaseTime.delete(tags);
+	}
+};
+
 export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
 	// https://id3.org/id3v2.3.0
 
@@ -357,7 +369,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				const date = new Date(dateText);
 
 				if (!Number.isNaN(date.getTime())) {
-					tags.date ??= date;
+					setId3V2Date(tags, date);
 				}
 			}; break;
 
@@ -367,7 +379,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				const year = Number.parseInt(yearText, 10);
 
 				if (Number.isInteger(year)) {
-					tags.date ??= new Date(String(year)); // String so that it parses as UTC
+					setId3V2Date(tags, new Date(String(year))); // String so that it parses as UTC
 				}
 			}; break;
 
@@ -445,6 +457,16 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 		}
 
 		reader.pos = nextFramePos;
+	}
+
+	// Without a recording time, fall back to the release time (ID3v2.4), like FFmpeg does
+	const releaseTime = tags.raw?.['TDRL'];
+	if (tags.date === undefined && typeof releaseTime === 'string') {
+		const date = new Date(releaseTime);
+		if (!Number.isNaN(date.getTime())) {
+			tags.date = date;
+			datesFromReleaseTime.add(tags);
+		}
 	}
 };
 
