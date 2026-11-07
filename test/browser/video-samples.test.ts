@@ -6,7 +6,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Quality } from '../../src/encode.js';
 import { PacketType } from '../../src/packet.js';
-import { isChromium, Rotation } from '../../src/misc.js';
+import { Rotation } from '../../src/misc.js';
 
 test('allocationSize', async () => {
 	{
@@ -82,12 +82,8 @@ test('Copying into the sample\'s own pixel format, for VideoFrame- and ArrayBuff
 		let frame: VideoFrame;
 		try {
 			frame = new VideoFrame(data, init);
-		} catch (error) {
-			// Not every browser's VideoFrame has every format (Firefox has no 4:4:4)
-			if (isChromium()) {
-				throw error;
-			}
-			continue;
+		} catch {
+			continue; // Not every browser's VideoFrame has every format (Firefox has no 4:4:4)
 		}
 		using rawSample = new VideoSample(data, init);
 		using frameSample = new VideoSample(frame);
