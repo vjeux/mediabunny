@@ -602,7 +602,10 @@ export class StreamTarget extends Target {
 
 	/** @internal */
 	async _close() {
-		return this._streamWriter?.close();
+		// Closing waits for every queued write to complete first, which never happens if the sink has stalled (an
+		// upload over a hung connection, say). Canceling mustn't depend on the sink, so the stream closes in the
+		// background.
+		void this._streamWriter?.close().catch(() => {});
 	}
 }
 
@@ -773,7 +776,8 @@ export class FilePathTarget extends Target {
 
 	/** @internal */
 	async _close() {
-		return this._streamTarget._close();
+		// Writes to the file do complete, so wait until its handle is closed, as documented
+		await this._streamTarget._streamWriter?.close();
 	}
 
 	/** @internal */
