@@ -481,17 +481,35 @@ test('UrlSource retries requests that failed with a transient HTTP status', asyn
 });
 
 test('UrlSource frees the response of a transient HTTP status when its retry policy fails', async () => {
-	let openConnections = 0;
+	// Far too big for the client to take in by itself, so a response whose body is neither read nor cancelled keeps
+	// its connection busy for good
+	const body = Buffer.alloc(32 * 2 ** 20, 0x20);
+	const openSockets = new Set<http.IncomingMessage['socket']>();
+	const controlSockets = new Set<http.IncomingMessage['socket']>();
 	const server = http.createServer((req, res) => {
-		// Big enough that the client doesn't take in the whole body by itself
-		const body = Buffer.alloc(200_000, 0x20);
+		const sockets = req.url === '/control' ? controlSockets : openSockets;
+		if (!sockets.has(req.socket)) {
+			sockets.add(req.socket);
+			req.socket.on('close', () => sockets.delete(req.socket));
+		}
+
 		res.writeHead(503, { 'Content-Length': body.length });
 		res.end(body);
 	});
-	server.on('connection', (socket) => {
-		openConnections++;
-		socket.on('close', () => openConnections--);
-	});
+	// Keeps every response referenced, so that garbage collection can't free a forgotten one behind the test's back
+	const responses: Response[] = [];
+	const fetchFn = (async (...args: Parameters<typeof fetch>) => {
+		const response = await fetch(...args);
+		responses.push(response);
+		return response;
+	}) as typeof fetch;
+	// Waits until all connections of the failed responses are closed, however long the system takes for that
+	const allClosed = async () => {
+		for (const deadline = Date.now() + 10_000; openSockets.size > 0 && Date.now() < deadline;) {
+			await new Promise(resolve => setTimeout(resolve, 20));
+		}
+		return openSockets.size === 0;
+	};
 
 	await new Promise<void>(resolve => server.listen(0, resolve));
 	const logs = captureLogs();
@@ -500,6 +518,9 @@ test('UrlSource frees the response of a transient HTTP status when its retry pol
 		const address = server.address();
 		assert(address && typeof address !== 'string');
 
+		// Control: a response whose body is left alone keeps its connection open
+		const control = await fetch(`http://localhost:${address.port}/control`);
+
 		const policies: [() => number, string][] = [
 			[() => {
 				throw new Error('Policy failed');
@@ -507,25 +528,31 @@ test('UrlSource frees the response of a transient HTTP status when its retry pol
 			[() => -1, 'Retry delay must be a non-negative finite number.'],
 		];
 		for (const [getRetryDelay, message] of policies) {
+			const inputs: Input[] = [];
 			for (let i = 0; i < 10; i++) {
 				const input = new Input({
-					source: new UrlSource(`http://localhost:${address.port}/data.bin`, { getRetryDelay }),
+					source: new UrlSource(`http://localhost:${address.port}/data.bin`, { fetchFn, getRetryDelay }),
 					formats: ALL_FORMATS,
 				});
+				inputs.push(input);
 				await expect(input.getFormat()).rejects.toThrow(message);
-				input.dispose();
 			}
 
-			// The failed responses' connections get closed, instead of staying open with their unread bodies
-			await new Promise(resolve => setTimeout(resolve, 1000));
-			expect(openConnections, message).toBeLessThanOrEqual(2);
+			// The failed responses get cancelled, which closes their connections, even while the inputs are still
+			// around (disposing them would abort the requests anyway)
+			expect(await allClosed(), message).toBe(true);
+			inputs.forEach(input => input.dispose());
 		}
+
+		expect(responses).toHaveLength(20);
+		expect(controlSockets.size).toBe(1);
+		await control.body?.cancel();
 	} finally {
 		logs.stop();
 		server.closeAllConnections();
 		server.close();
 	}
-});
+}, 60_000);
 
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
