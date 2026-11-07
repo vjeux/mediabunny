@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { VideoSample } from '../../src/sample.js';
+import { VideoSample, registerVideoSampleTransformer } from '../../src/sample.js';
 import { VideoSampleSource } from '../../src/media-source.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
@@ -614,6 +614,30 @@ const encodeAndAssertPacketTypes = async (
 
 	await output.finalize();
 };
+
+test('Registered transformers defer on undefined and must return VideoSamples', async () => {
+	// A plain-JS transformer that only handles one size, falling off the end otherwise (like the docs' stub)
+	registerVideoSampleTransformer(((sample: VideoSample, description: { width: number }) => {
+		if (description.width === 1000) {
+			return sample.clone();
+		}
+	}) as never);
+	// One that returns something other than a VideoSample, for one marker timestamp
+	registerVideoSampleTransformer(((sample: VideoSample) => {
+		return sample.timestamp === 5151 ? {} : null;
+	}) as never);
+
+	const canvas = new OffscreenCanvas(4, 4);
+	canvas.getContext('2d')!.fillRect(0, 0, 4, 4);
+	using sample = new VideoSample(canvas, { timestamp: 0 });
+	using transformed = await sample.transform({ width: 2, height: 2, fit: 'fill' });
+	expect(transformed).toBeInstanceOf(VideoSample);
+	expect([transformed.displayWidth, transformed.displayHeight]).toEqual([2, 2]);
+
+	using marked = new VideoSample(canvas, { timestamp: 5151 });
+	await expect(marked.transform({ width: 2, height: 2, fit: 'fill' }))
+		.rejects.toThrow('registerVideoSampleTransformer');
+});
 
 test('Treat non-standard VideoFrame color space values as unknown', () => {
 	const frame = new VideoFrame(new Uint8Array(16), { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 });
