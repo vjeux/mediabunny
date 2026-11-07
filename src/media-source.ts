@@ -168,8 +168,11 @@ export abstract class MediaSource {
 				return;
 			}
 
-			connectedTrack.output._muxer.onTrackClose(connectedTrack);
+			await connectedTrack.output._muxer.onTrackClose(connectedTrack);
 		})();
+
+		// Closing errors surface once the output is finalized or canceled, so don't let them go unhandled until then
+		this._closingPromise.catch(() => {});
 	}
 
 	/** @internal */

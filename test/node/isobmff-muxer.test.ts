@@ -221,6 +221,49 @@ test('Non-zero start timestamp, fragmented MP4', async () => {
 	expect(durations).toEqual([0.1, 0.1, 0.1, 0.1]);
 });
 
+test('Conversion fails instead of hanging when a closing track overruns the reserved packet count', async () => {
+	// 16 s of copyable video and PCM audio
+	const inputOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('vp8');
+	const audioSource = new EncodedAudioPacketSource('pcm-s16');
+	inputOutput.addVideoTrack(videoSource);
+	inputOutput.addAudioTrack(audioSource);
+	await inputOutput.start();
+	for (let i = 0; i < 160; i++) {
+		await videoSource.add(new EncodedPacket(new Uint8Array(100), i % 10 === 0 ? 'key' : 'delta', i / 10, 0.1), {
+			decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 },
+		});
+		await audioSource.add(new EncodedPacket(new Uint8Array(9600), 'key', i / 10, 0.1), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 },
+		});
+	}
+	await inputOutput.finalize();
+
+	using input = new Input({ source: new BufferSource(inputOutput.target.buffer!), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		audio: {
+			codec: 'pcm-s16',
+			// Doubles the audio, more than the estimated maximum packet count allows. When the copied video track
+			// closes, the audio waiting to be interleaved with it overruns that count
+			process: (sample) => {
+				const repeat = sample.clone();
+				repeat.setTimestamp(sample.timestamp + sample.duration);
+				return [sample, repeat];
+			},
+		},
+		showWarnings: false,
+	});
+
+	const outcome = await Promise.race([
+		conversion.execute().then(() => 'done', (error: unknown) => String(error)),
+		new Promise(resolve => setTimeout(() => resolve('hung'), 5000)),
+	]);
+	expect(outcome).toMatch(/Track #2 has already reached the maximum packet count/);
+});
+
 test('Negative start timestamps, regular MP4', async () => {
 	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1, false);
 });

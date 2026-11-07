@@ -1554,29 +1554,30 @@ export class IsobmffMuxer extends Muxer {
 		return upperBound;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const release = await this.mutex.acquire();
 
-		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			trackData.closed = true;
+		try {
+			const trackData = this.trackDatas.find(x => x.track === track);
+			if (trackData) {
+				trackData.closed = true;
 
-			if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
-				await this.processWebVTTCues(trackData, Infinity);
+				if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
+					await this.processWebVTTCues(trackData, Infinity);
+				}
+
+				this.processTimestamps(trackData);
 			}
 
-			this.processTimestamps(trackData);
+			if (this.allTracksAreKnown()) {
+				this.allTracksKnown.resolve();
+			}
+
+			// Since a track is now closed, we may be able to write out chunks that were previously waiting
+			await this.interleaveSamples();
+		} finally {
+			release();
 		}
-
-		if (this.allTracksAreKnown()) {
-			this.allTracksKnown.resolve();
-		}
-
-		// Since a track is now closed, we may be able to write out chunks that were previously waiting
-		await this.interleaveSamples();
-
-		release();
 	}
 
 	ensureOneEnabledTrack() {

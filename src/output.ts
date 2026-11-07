@@ -986,7 +986,8 @@ export class Output<
 			const release = await this._mutex.acquire();
 
 			try {
-				const promises = this.tracks.map(x => x.source._flushOrWaitForOngoingClose(true)); // Force close
+				// Force close. Errors don't matter anymore at this point, we just want everything released.
+				const promises = this.tracks.map(x => x.source._flushOrWaitForOngoingClose(true).catch(() => {}));
 				await Promise.all(promises);
 
 				await Promise.all([...this._unfinalizedTargets].map(target => target._close()));

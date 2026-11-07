@@ -576,7 +576,6 @@ export class HlsMuxer extends Muxer {
 		return true;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const trackData = this.trackDatas.find(x => x.track === track);
 		if (trackData) {
