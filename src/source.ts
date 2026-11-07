@@ -672,24 +672,28 @@ const DEFAULT_RETRY_DELAY
 				error.message.includes('Failed to fetch') // Chrome
 				|| error.message.includes('Load failed') // Safari
 				|| error.message.includes('NetworkError when attempting to fetch resource') // Firefox
-			)
-			// CORS only happens in browser environments, which have a location in windows and workers alike
-			&& typeof location !== 'undefined';
+			);
 
 		if (couldBeCorsError) {
+			let ownOrigin: string | null = null;
 			let originOfSrc: string | null = null;
 			// Checking if the origin is different, because only then a CORS error could originate
 			try {
-				originOfSrc = new URL(src instanceof Request ? src.url : src, location.href).origin;
+				// CORS only happens in browser environments, which have a location in windows and workers alike
+				// (elsewhere, reading it may even throw, like in Deno without --location)
+				if (typeof location !== 'undefined') {
+					ownOrigin = location.origin;
+					originOfSrc = new URL(src instanceof Request ? src.url : src, location.href).origin;
+				}
 			} catch {
-				// URL parse failed
+				// No location, or the URL parse failed
 			}
 
 			// If user is offline, it is probably not a CORS error.
 			const isOnline
 			= typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
 
-			if (isOnline && originOfSrc !== null && originOfSrc !== location.origin) {
+			if (isOnline && originOfSrc !== null && originOfSrc !== ownOrigin) {
 				Logging._warn(
 					`Request will not be retried because a CORS error was suspected due to different origins. You can`
 					+ ` modify this behavior by providing your own function for the 'getRetryDelay' option.`,
