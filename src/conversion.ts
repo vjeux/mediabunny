@@ -1928,7 +1928,11 @@ export class Conversion {
 					const clampedStartTimestamp = Math.max(this._startTimestamp, sample.timestamp);
 					const clampedEndTimestamp = Math.min(this._endTimestamp, sample.timestamp + sample.duration);
 
-					if (clampedStartTimestamp >= clampedEndTimestamp) {
+					if (
+						clampedStartTimestamp > clampedEndTimestamp
+						// Zero-duration samples are still part of the trim region when they lie within it
+						|| (clampedStartTimestamp === clampedEndTimestamp && sample.duration > 0)
+					) {
 						// Wholly out of the trim region
 						continue;
 					}
