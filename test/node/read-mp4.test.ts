@@ -273,10 +273,14 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
 
-test('Display aspect ratio from a tkhd presentation size of another shape', async () => {
-	// A 320x240 video track whose tkhd box gives its visual presentation size. WebKit's test file test-par-16-9.mp4
-	// presents it at 426.67x240 with no pasp box and no ratio in the SPS; FFmpeg (mov_read_trak) takes a pixel aspect
-	// ratio of 213:160 from that, and Chromium (MP4StreamParser) a 16:9 display aspect ratio.
+test('Display aspect ratio from the tkhd box', async () => {
+	// A 320x240 video track with no pasp box and no ratio in the SPS. Its tkhd box can still give its shape, as FFmpeg
+	// reads it:
+	// - through its visual presentation size (mov_read_trak). WebKit's test file test-par-16-9.mp4 presents 320x240
+	//   at 426.67x240, which FFmpeg takes as a pixel aspect ratio of 213:160, and Chromium (MP4StreamParser) as a 16:9
+	//   display aspect ratio.
+	// - first, through a display matrix that scales the axes unevenly (mov_read_tkhd), as in QuickTime's "scrunch"
+	//   (like FFmpeg's FATE file white_zombie_scrunch-part.mov). The scale then moves out of the matrix.
 	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
 	const zeros = (count: number) => new Array<number>(count).fill(0);
 	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
@@ -284,17 +288,28 @@ test('Display aspect ratio from a tkhd presentation size of another shape', asyn
 		const bytes = contents.flat();
 		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
 	};
-	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const matrixBytes = (matrix: number[]) => matrix.flatMap(
+		(x, i) => u32(Math.round(x * 2 ** (i % 3 === 2 ? 30 : 16))),
+	);
+	const identity = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 
-	const read = async (presentationSize: number[], pasp?: [number, number]) => {
+	const read = async (
+		presentationSize: number[],
+		{ pasp, trackMatrix = identity, movieMatrix = identity }: {
+			pasp?: [number, number];
+			trackMatrix?: number[];
+			movieMatrix?: number[];
+		} = {},
+	) => {
 		const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [1, 64, 0, 240], zeros(50),
 			box('avcC', [1, 0x4d, 0x40, 0x0d, 0xff, 0xe0, 0x00]), // No SPS, so no ratio from there
 			...(pasp ? [box('pasp', u32(pasp[0]), u32(pasp[1]))] : []));
 		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
 		const moov = box('moov',
-			box('mvhd', zeros(12), u32(1000), u32(1000), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('mvhd', zeros(12), u32(1000), u32(1000), u32(0x10000), [1, 0], zeros(10), matrixBytes(movieMatrix),
+				zeros(28)),
 			box('trak',
-				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(1000), zeros(16), matrix,
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(1000), zeros(16), matrixBytes(trackMatrix),
 					...presentationSize.map(x => u32(Math.round(x * 0x10000)))),
 				box('mdia',
 					box('mdhd', zeros(12), u32(1000), u32(1000), [0x55, 0xc4, 0, 0]),
@@ -316,15 +331,47 @@ test('Display aspect ratio from a tkhd presentation size of another shape', asyn
 		});
 		const track = await input.getPrimaryVideoTrack();
 		assert(track);
-		return [await track.getCodedWidth(), await track.getSquarePixelWidth(), await track.getSquarePixelHeight()];
+		return {
+			squarePixelSize: [await track.getSquarePixelWidth(), await track.getSquarePixelHeight()],
+			matrix: await track.getTransformationMatrix(),
+		};
 	};
+	const squarePixelSize = async (...args: Parameters<typeof read>) => (await read(...args)).squarePixelSize;
 
-	expect(await read([426.6667, 240])).toEqual([320, 426, 240]);
-	expect(await read([320, 300])).toEqual([320, 320, 300]); // Never shrunk, only heightened
+	// The presentation size
+	expect(await squarePixelSize([426.6667, 240])).toEqual([426, 240]);
+	expect(await squarePixelSize([320, 300])).toEqual([320, 300]); // Never shrunk, only heightened
 	// Square pixels: the same shape, a shape within 1%, a pasp box (which wins, like in FFmpeg), and a size whose
 	// integer parts are 0 (tkhd fields shifted by one entry, as in Chromium's agtm-metadata-*.mp4 test files)
-	expect(await read([320, 240])).toEqual([320, 320, 240]);
-	expect(await read([321, 240])).toEqual([320, 320, 240]);
-	expect(await read([426.6667, 240], [1, 1])).toEqual([320, 320, 240]);
-	expect(await read([0.25, 1 / 1024])).toEqual([320, 320, 240]);
+	expect(await squarePixelSize([320, 240])).toEqual([320, 240]);
+	expect(await squarePixelSize([321, 240])).toEqual([320, 240]);
+	expect(await squarePixelSize([426.6667, 240], { pasp: [1, 1] })).toEqual([320, 240]);
+	expect(await squarePixelSize([0.25, 1 / 1024])).toEqual([320, 240]);
+
+	// A display matrix that scales the axes unevenly, which comes before the presentation size
+	expect(await read([320, 240], { trackMatrix: [2, 0, 0, 0, 1, 0, 0, 0, 1] })).toEqual({
+		squarePixelSize: [640, 240],
+		matrix: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+	});
+	expect(await read([320, 240], { trackMatrix: [-1, 0, 0, 0, 2, 0, 320, 0, 1] })).toEqual({
+		squarePixelSize: [320, 480],
+		matrix: [-1, 0, 0, 0, 1, 0, 320, 0, 1], // Still flipped
+	});
+	expect(await read([320, 240], { movieMatrix: [1.5, 0, 0, 0, 1, 0, 0, 0, 1] })).toEqual({
+		squarePixelSize: [480, 240],
+		matrix: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+	});
+	expect(await squarePixelSize([426.6667, 240], { trackMatrix: [2, 0, 0, 0, 1, 0, 0, 0, 1] })).toEqual([640, 240]);
+	// Left alone: a uniform scale, a pasp box, and a quarter turn (where FFmpeg's ratio, of the matrix's column
+	// lengths, is the inverse of the one the matrix gives the frame)
+	for (const [trackMatrix, pasp] of [
+		[[2, 0, 0, 0, 2, 0, 0, 0, 1]],
+		[[2, 0, 0, 0, 1, 0, 0, 0, 1], [1, 1]],
+		[[0, 2, 0, -1, 0, 0, 240, 0, 1]],
+	] as [number[], [number, number]?][]) {
+		expect(await read([320, 240], { trackMatrix, pasp })).toEqual({
+			squarePixelSize: [320, 240],
+			matrix: trackMatrix,
+		});
+	}
 });

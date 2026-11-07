@@ -1067,6 +1067,7 @@ export class IsobmffDemuxer extends Demuxer {
 					&& track.sampleTableByteOffset !== -1
 				) {
 					if (track.info.type === 'video' && track.info.width !== -1) {
+						applyDisplayMatrixAspectRatio(track);
 						applyPresentationSizeAspectRatio(track);
 						const videoTrack = track as InternalVideoTrack;
 						track.trackBacking = new IsobmffVideoTrackBacking(videoTrack);
@@ -3883,6 +3884,55 @@ class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudio
 		})();
 	}
 }
+
+/**
+ * Without a pasp box or a pixel aspect ratio in the bitstream, a display matrix that scales the axes unevenly
+ * (QuickTime's "scrunch") gives the pixel aspect ratio, as FFmpeg (mov_read_tkhd) takes it, before the tkhd
+ * presentation size. The scale then moves out of the matrix, so that the square pixel size and the matrix don't both
+ * apply it.
+ */
+const applyDisplayMatrixAspectRatio = (track: InternalTrack) => {
+	const info = track.info;
+	const [a, b, , c, d] = track.matrix;
+	if (
+		info?.type !== 'video'
+		|| track.hasPaspBox
+		|| info.squarePixelWidth !== info.width
+		|| info.squarePixelHeight !== info.height
+		|| !(info.width > 0 && info.height > 0)
+		// Only for matrices that don't rotate the frame: with a quarter turn, FFmpeg's ratio (of the matrix's column
+		// lengths) is the inverse of the one the matrix gives the frame
+		|| b !== 0
+		|| c !== 0
+	) {
+		return;
+	}
+
+	const horizontalScale = Math.abs(a);
+	const verticalScale = Math.abs(d);
+	if (
+		!(horizontalScale > 0 && verticalScale > 0 && horizontalScale < 256 && verticalScale < 256)
+		|| Math.abs(horizontalScale / verticalScale - 1) <= 0.01
+	) {
+		return;
+	}
+
+	// The scales are multiples of 2^-32 (16.16 fixed-point numbers, or products of two)
+	applySpsPixelAspectRatio(track, {
+		num: Math.round(horizontalScale * 2 ** 32),
+		den: Math.round(verticalScale * 2 ** 32),
+	});
+
+	// Keep the uniform part of the scale, like for matrices that scale both axes the same
+	const matrix: TransformationMatrix = [...track.matrix];
+	const smaller = Math.min(horizontalScale, verticalScale);
+	const larger = Math.max(horizontalScale, verticalScale);
+	const row = horizontalScale > verticalScale ? 0 : 3;
+	for (let i = row; i < row + 3; i++) {
+		matrix[i] = matrix[i]! * smaller / larger;
+	}
+	track.matrix = matrix;
+};
 
 /**
  * Without a pasp box or a pixel aspect ratio in the bitstream, a tkhd presentation size of another shape than the coded
