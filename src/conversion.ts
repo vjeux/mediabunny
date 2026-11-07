@@ -2332,11 +2332,13 @@ export class Conversion {
 				let firstNumberOfChannels: number | null = null;
 				let firstSampleRate: number | null = null;
 				let resampler: AudioResampler | null = null;
+				let resamplerInputEnd: number | null = null;
 
 				const flushResampler = async () => {
 					if (resampler) {
 						await resampler.finalize();
 						resampler = null;
+						resamplerInputEnd = null;
 					}
 				};
 
@@ -2370,6 +2372,18 @@ export class Conversion {
 							pump, resampledSample, source, outputTrackId, () => lastSampleTimestamp,
 						),
 					});
+
+					// The resampler places samples by timestamp and adds up overlapping frames, so timestamps a few
+					// frames off (like rounded ones) would double or drop frames: a click. Keep these samples back to
+					// back, like the encoder does with the samples it gets directly.
+					if (
+						resamplerInputEnd !== null
+						&& Math.abs(sample.timestamp - resamplerInputEnd) * sample.sampleRate < 64
+					) {
+						sample.setTimestamp(resamplerInputEnd);
+					}
+					resamplerInputEnd = sample.timestamp + sample.duration;
+
 					await resampler.add(sample);
 				};
 
