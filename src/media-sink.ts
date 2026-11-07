@@ -12,6 +12,7 @@ import {
 	AvcNalUnitType,
 	concatAvcNalUnits,
 	deserializeAvcDecoderConfigurationRecord,
+	deserializeHevcDecoderConfigurationRecord,
 	determineVideoPacketType,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
@@ -19,6 +20,7 @@ import {
 	iterateAvcNalUnits,
 	iterateHevcNalUnits,
 	parseAvcSps,
+	parseHevcSps,
 	parseOpusIdentificationHeader,
 	sanitizeHevcPacketForChromium,
 	serializeAvcDecoderConfigurationRecord,
@@ -469,6 +471,13 @@ export abstract class BaseMediaSampleSink<
 > {
 	/** @internal */
 	abstract _track: InputTrack;
+	/**
+	 * How many packets can follow a frame in decode order but come before it in presentation order.
+	 * @internal
+	 */
+	async _getReorderDepth() {
+		return 0;
+	}
 
 	/** @internal */
 	abstract _createDecoder(
@@ -758,6 +767,7 @@ export abstract class BaseMediaSampleSink<
 
 			const packetSink = this._createPacketSink();
 			const preRollDuration = await this._getPreRollDuration();
+			const reorderDepth = await this._getReorderDepth();
 			let lastPacket: EncodedPacket | null = null;
 			let lastTimestamp = -Infinity;
 			let lastKeyPacket: EncodedPacket | null = null;
@@ -798,6 +808,29 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				lastDecodedPacket = currentPacket;
+			};
+
+			// The sequence number of the last packet to decode for a target packet. With B-frames, frames presented
+			// before the target can come after it in decode order, up to the reorder depth. That usually doesn't
+			// matter, but where packet timestamps are in decode order (MP4 without composition offsets, as written by
+			// `ffmpeg -i raw.h264 -c copy`), frames get the decoded packets' timestamps in sorted order (see
+			// VideoDecoderWrapper), which is only right if every frame presented up to the target was decoded.
+			const getLastPacketToDecode = async (targetPacket: EncodedPacket) => {
+				let packet = targetPacket;
+				for (let i = 0; i < reorderDepth; i++) {
+					const nextPacket = await packetSink.getNextPacket(packet, { ...options, metadataOnly: true });
+					if (!nextPacket) {
+						break;
+					}
+					if (nextPacket.timestamp < packet.timestamp) {
+						// Timestamps are in presentation order, so the frames keep their own
+						return targetPacket.sequenceNumber;
+					}
+
+					packet = nextPacket;
+				}
+
+				return packet.sequenceNumber;
 			};
 
 			const flushDecoder = async () => {
@@ -858,7 +891,7 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				timestampsOfInterest.push(timestamp);
-				maxSequenceNumber = Math.max(targetPacket.sequenceNumber, maxSequenceNumber);
+				maxSequenceNumber = Math.max(await getLastPacketToDecode(targetPacket), maxSequenceNumber);
 
 				lastPacket = targetPacket;
 				lastTimestamp = timestamp;
@@ -1941,6 +1974,55 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 	/** @internal */
 	_createPacketSink() {
 		return new EncodedPacketSink(this._track);
+	}
+
+	/** @internal */
+	override async _getReorderDepth() {
+		const codec = await this._track.getCodec();
+		if (codec !== 'avc' && codec !== 'hevc') {
+			return 0;
+		}
+
+		const decoderConfig = await this._track.getDecoderConfig();
+		assert(decoderConfig);
+
+		let sps: Uint8Array | null = null;
+		if (decoderConfig.description) {
+			const description = toUint8Array(decoderConfig.description);
+			sps = codec === 'avc'
+				? deserializeAvcDecoderConfigurationRecord(description)?.sequenceParameterSets[0] ?? null
+				: deserializeHevcDecoderConfigurationRecord(description)?.arrays
+					.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0] ?? null;
+		} else {
+			// Annex B, where the parameter sets are in the key packets
+			const keyPacket = await this._createPacketSink().getFirstKeyPacket();
+			if (keyPacket) {
+				const nalUnits = codec === 'avc'
+					? iterateAvcNalUnits(keyPacket.data, decoderConfig)
+					: iterateHevcNalUnits(keyPacket.data, decoderConfig);
+				for (const loc of nalUnits) {
+					const type = codec === 'avc'
+						? extractNalUnitTypeForAvc(keyPacket.data[loc.offset]!)
+						: extractNalUnitTypeForHevc(keyPacket.data[loc.offset]!);
+					if (type === (codec === 'avc' ? AvcNalUnitType.SPS : HevcNalUnitType.SPS_NUT)) {
+						sps = keyPacket.data.subarray(loc.offset, loc.offset + loc.length);
+						break;
+					}
+				}
+			}
+		}
+
+		if (codec === 'avc') {
+			const spsInfo = sps && parseAvcSps(sps);
+			if (spsInfo && spsInfo.profileIdc === 66) {
+				return 0; // Baseline profile has no B-frames
+			}
+
+			return spsInfo?.numReorderFrames ?? 16; // 16 is the most frames a decoder can hold back
+		} else {
+			const spsInfo = sps && parseHevcSps(sps);
+			return spsInfo ? spsInfo.maxDecFrameBuffering - 1 : 16; // That's sps_max_num_reorder_pics + 1
+		}
 	}
 
 	/** @internal */

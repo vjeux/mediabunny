@@ -8,7 +8,7 @@ import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
+import { AudioSample, AudioSampleCopyToOptions, VideoSample } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack } from '../../src/input-track.js';
 
@@ -275,4 +275,52 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test.each([
+	['with', false],
+	['without', true],
+])('Looking up H.264 frames gives the frames samples() gives, %s composition offsets', async (_, stripOffsets) => {
+	const bytes = new Uint8Array(await (await fetch('/video.mp4')).arrayBuffer()); // H.264 with B-frames
+	if (stripOffsets) {
+		// What `ffmpeg -i in.h264 -c copy out.mp4` writes for a raw H.264 stream with B-frames: no ctts, so the
+		// timestamps are in decode order, and Chromium's frames get them in sorted order. Found by lane L64.
+		let ctts = 0;
+		while (String.fromCharCode(...bytes.subarray(ctts, ctts + 4)) !== 'ctts') {
+			ctts++;
+		}
+		bytes.set([0x66, 0x72, 0x65, 0x65], ctts); // 'free'
+	}
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new VideoSampleSink(track);
+
+	// A small picture of the frame, to tell frames apart
+	const getSignature = (sample: VideoSample) => {
+		const canvas = new OffscreenCanvas(8, 8);
+		const context = canvas.getContext('2d')!;
+		sample.draw(context, 0, 0, 8, 8);
+		return context.getImageData(0, 0, 8, 8).data.filter((_, i) => i % 4 === 1).join(',');
+	};
+
+	const signatures = new Map<number, string>();
+	for await (using sample of sink.samples()) {
+		signatures.set(sample.timestamp, getSignature(sample));
+	}
+
+	const timestamps = [...signatures.keys()].filter((_, i) => i % 5 === 2);
+	for (const timestamp of timestamps) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBe(timestamp);
+		expect(getSignature(sample), `frame at ${timestamp}`).toBe(signatures.get(timestamp));
+	}
+
+	let index = 0;
+	for await (using sample of sink.samplesAtTimestamps(timestamps)) {
+		assert(sample);
+		expect(getSignature(sample)).toBe(signatures.get(timestamps[index++]!));
+	}
 });
