@@ -2,7 +2,6 @@ import { describe, expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { VideoSampleSink } from '../../src/media-sink.js';
-import { isFirefox } from '../../src/misc.js';
 import { VideoSample } from '../../src/sample.js';
 import { UrlSource } from '../../src/source.js';
 import {
@@ -65,15 +64,6 @@ const supportsFormat = (format: string) => {
 		return false;
 	}
 };
-
-const testedFormats = () => YUV_FORMATS.filter((format) => {
-	// Firefox's own conversion of NV12 frames reads the wrong chroma samples
-	return supportsFormat(format) && !(format === 'NV12' && isFirefox());
-});
-const testedMatrices = () => MATRICES.filter((matrix) => {
-	// Firefox converts 'bt470bg' frames with the BT.709 matrix
-	return !(matrix === 'bt470bg' && isFirefox());
-});
 
 /** Code values of the patch at (x, y), scaled to the format's bit depth: [y, u, v, a]. */
 const patchValues = (format: string, x: number, y: number) => {
@@ -167,8 +157,51 @@ const expectMatchingColors = (
 	expect(maxAlphaError, message).toBeLessThanOrEqual(1);
 };
 
+/**
+ * Converts a frame like makeSample's (opaque, limited range) with the browser alone, not Mediabunny, and checks the
+ * result against the oracle. Cases the browser itself gets wrong can't be checked through it.
+ */
+const nativeConversionMatches = async (format: string, matrix: MatrixName, via: 'copyTo' | 'drawImage') => {
+	if (!supportsFormat(format)) {
+		return false;
+	}
+
+	const { data, layout } = buildYuvFrame(format, WIDTH, HEIGHT, (x, y) => patchValues(format, x, y));
+	const frame = new VideoFrame(data, {
+		format: format as VideoPixelFormat,
+		codedWidth: WIDTH,
+		codedHeight: HEIGHT,
+		timestamp: 0,
+		layout,
+		colorSpace: {
+			matrix: matrix as VideoMatrixCoefficients,
+			primaries: 'bt709',
+			transfer: 'bt709',
+			fullRange: false,
+		},
+	});
+
+	try {
+		let rgba: Uint8Array | Uint8ClampedArray;
+		if (via === 'copyTo') {
+			rgba = new Uint8Array(WIDTH * HEIGHT * 4);
+			await frame.copyTo(rgba, { format: 'RGBA', colorSpace: 'srgb' });
+		} else {
+			const context = new OffscreenCanvas(WIDTH, HEIGHT).getContext('2d', { willReadFrequently: true })!;
+			context.drawImage(frame, 0, 0);
+			rgba = context.getImageData(0, 0, WIDTH, HEIGHT).data;
+		}
+
+		return measureColors(rgba, format, matrix, false, false).withinTolerances;
+	} catch {
+		return false;
+	} finally {
+		frame.close();
+	}
+};
+
 // WebKitGTK's VideoFrame.copyTo() doesn't convert YUV frames to RGBA, and its drawImage() converts them a few LSB off
-// (beyond the tolerances above, which are Chrome's), so there, the browser can't be the reference. Both probes use the
+// (beyond the tolerances above, which are Chrome's), so there, the browser can't be the reference. All probes use the
 // browser's own APIs only, never Mediabunny, so that a broken Mediabunny can't turn its tests into skips.
 const nativeYuvToRgbaWorks = await (async () => {
 	const frame = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
@@ -179,32 +212,32 @@ const nativeYuvToRgbaWorks = await (async () => {
 	frame.close();
 	return rgba[3] === 255 && rgba[7] === 255;
 })();
-const nativeDrawIsPrecise = (() => {
-	const { data, layout } = buildYuvFrame('I420', WIDTH, HEIGHT, (x, y) => patchValues('I420', x, y));
-	const frame = new VideoFrame(data, {
-		format: 'I420',
-		codedWidth: WIDTH,
-		codedHeight: HEIGHT,
-		timestamp: 0,
-		layout,
-		colorSpace: { matrix: 'bt709', primaries: 'bt709', transfer: 'bt709', fullRange: false },
-	});
-	const context = new OffscreenCanvas(WIDTH, HEIGHT).getContext('2d', { willReadFrequently: true })!;
-	context.drawImage(frame, 0, 0);
-	frame.close();
-	return measureColors(context.getImageData(0, 0, WIDTH, HEIGHT).data, 'I420', 'bt709', false, false)
-		.withinTolerances;
-})();
+const nativeDrawIsPrecise = await nativeConversionMatches('I420', 'bt709', 'drawImage');
+
+type NativeCases = { nv12: boolean; bt470bg: boolean };
+
+// Firefox's own conversions read the wrong chroma samples of NV12 frames and use the BT.709 matrix for 'bt470bg'
+const probeNativeCases = async (via: 'copyTo' | 'drawImage'): Promise<NativeCases> => ({
+	nv12: await nativeConversionMatches('NV12', 'bt709', via),
+	bt470bg: await nativeConversionMatches('I420', 'bt470bg', via),
+});
+const copyToCases = await probeNativeCases('copyTo');
+const drawCases = await probeNativeCases('drawImage');
+
+const testedFormats = (cases: NativeCases) => YUV_FORMATS.filter((format) => {
+	return supportsFormat(format) && (format !== 'NV12' || cases.nv12);
+});
+const testedMatrices = (cases: NativeCases) => MATRICES.filter(matrix => matrix !== 'bt470bg' || cases.bt470bg);
 
 describe('YUV to RGB conversion', () => {
 	test.skipIf(!nativeYuvToRgbaWorks)(
 		'copyTo() follows the matrix and range of every YUV format, keeping alpha straight',
 		async () => {
-			const formats = testedFormats();
+			const formats = testedFormats(copyToCases);
 			expect(formats).toContain('I420');
 
 			for (const format of formats) {
-				for (const matrix of testedMatrices()) {
+				for (const matrix of testedMatrices(copyToCases)) {
 					for (const fullRange of [false, true]) {
 						using sample = makeSample(format, matrix, fullRange);
 						const rgba = new Uint8Array(WIDTH * HEIGHT * 4);
@@ -221,8 +254,8 @@ describe('YUV to RGB conversion', () => {
 		const context = canvas.getContext('2d', { willReadFrequently: true })!;
 
 		// Opaque formats only, as canvases store premultiplied colors
-		for (const format of testedFormats().filter(format => !yuvFormatInfo(format).alpha)) {
-			for (const matrix of testedMatrices()) {
+		for (const format of testedFormats(drawCases).filter(format => !yuvFormatInfo(format).alpha)) {
+			for (const matrix of testedMatrices(drawCases)) {
 				for (const fullRange of [false, true]) {
 					using sample = makeSample(format, matrix, fullRange);
 					context.clearRect(0, 0, WIDTH, HEIGHT);
