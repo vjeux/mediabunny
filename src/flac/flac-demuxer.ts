@@ -78,6 +78,9 @@ export class FlacDemuxer extends Demuxer {
 	audioInfo: FlacAudioInfo | null = null;
 	lastLoadedPos: number | null = null;
 	blockingBit: number | null = null;
+	/** Positions and sizes of the picture blocks, which are only read for the metadata tags */
+	pictureBlocks: { pos: number; size: number }[] = [];
+	picturesPromise: Promise<void> | null = null;
 
 	readingMutex = new AsyncMutex();
 	lastSampleLoaded = false;
@@ -89,6 +92,7 @@ export class FlacDemuxer extends Demuxer {
 	}
 
 	override async getMetadataTags(): Promise<MetadataTags> {
+		await this.readPictures();
 		await this.readMetadata();
 		return this.metadataTags;
 	}
@@ -242,51 +246,23 @@ export class FlacDemuxer extends Demuxer {
 						break;
 					}
 					case FlacBlockType.PICTURE: {
-						// Parse picture block
-						// https://www.rfc-editor.org/rfc/rfc9639.html#name-picture
-						let pictureBlock = this.reader.requestSlice(
-							currentPos,
-							size,
-						);
-						if (isThenable(pictureBlock)) pictureBlock = await pictureBlock;
+						if (this.reader.fileSize === null) {
+							// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep
+							// what's behind, so their pictures are read right away
+							await this.readPictureBlock(currentPos, size);
+							break;
+						}
 
-						if (!pictureBlock) {
+						// Pictures can be large and only the metadata tags need them, so they're read later (see
+						// readPictures), not to get the track
+						if (currentPos + size > this.reader.fileSize) {
 							throw new Error(
 								`Picture block at position ${currentPos} exceeds the file. Corrupted file.`,
 							);
 						}
 
-						try {
-							const pictureType = readU32Be(pictureBlock);
-							const mediaTypeLength = readU32Be(pictureBlock);
-							const mediaType = textDecoder.decode(
-								readBytes(pictureBlock, mediaTypeLength),
-							);
-							const descriptionLength = readU32Be(pictureBlock);
-							const description = textDecoder.decode(
-								readBytes(pictureBlock, descriptionLength),
-							);
-							// Skip width, height, color depth, number of indexed colors
-							pictureBlock.skip(4 + 4 + 4 + 4);
-							const dataLength = readU32Be(pictureBlock);
-							const data = readBytes(pictureBlock, dataLength);
-
-							this.metadataTags.images ??= [];
-							this.metadataTags.images.push({
-								data,
-								mimeType: mediaType,
-								// https://www.rfc-editor.org/rfc/rfc9639.html#table13
-								kind:
-									pictureType === 3
-										? 'coverFront'
-										: pictureType === 4
-											? 'coverBack'
-											: 'unknown',
-								description,
-							});
-						} catch {
-							// The lengths inside the block are off, so it's a malformed picture; let's just skip it
-						}
+						this.pictureBlocks.push({ pos: currentPos, size });
+						this.metadataTags.images ??= []; // Keeps the place of the images among the tags
 						break;
 					}
 					default:
@@ -306,6 +282,71 @@ export class FlacDemuxer extends Demuxer {
 				throw new Error('Missing STREAMINFO metadata block! Corrupted FLAC file.');
 			}
 		})());
+	}
+
+	/** Reads the metadata and then the picture blocks found in it. */
+	async readPictures() {
+		await this.readMetadata();
+
+		return (this.picturesPromise ??= (async () => {
+			for (const { pos, size } of this.pictureBlocks) {
+				await this.readPictureBlock(pos, size);
+			}
+
+			if (this.metadataTags.images?.length === 0) {
+				delete this.metadataTags.images; // The pictures were all malformed
+			}
+		})());
+	}
+
+	async readPictureBlock(currentPos: number, size: number) {
+		// Parse picture block
+		// https://www.rfc-editor.org/rfc/rfc9639.html#name-picture
+		let pictureBlock = this.reader.requestSlice(
+			currentPos,
+			size,
+		);
+		if (isThenable(pictureBlock)) {
+			pictureBlock = await pictureBlock;
+		}
+
+		if (!pictureBlock) {
+			throw new Error(
+				`Picture block at position ${currentPos} exceeds the file. Corrupted file.`,
+			);
+		}
+
+		try {
+			const pictureType = readU32Be(pictureBlock);
+			const mediaTypeLength = readU32Be(pictureBlock);
+			const mediaType = textDecoder.decode(
+				readBytes(pictureBlock, mediaTypeLength),
+			);
+			const descriptionLength = readU32Be(pictureBlock);
+			const description = textDecoder.decode(
+				readBytes(pictureBlock, descriptionLength),
+			);
+			// Skip width, height, color depth, number of indexed colors
+			pictureBlock.skip(4 + 4 + 4 + 4);
+			const dataLength = readU32Be(pictureBlock);
+			const data = readBytes(pictureBlock, dataLength);
+
+			this.metadataTags.images ??= [];
+			this.metadataTags.images.push({
+				data,
+				mimeType: mediaType,
+				// https://www.rfc-editor.org/rfc/rfc9639.html#table13
+				kind:
+					pictureType === 3
+						? 'coverFront'
+						: pictureType === 4
+							? 'coverBack'
+							: 'unknown',
+				description,
+			});
+		} catch {
+			// The lengths inside the block are off, so it's a malformed picture; let's just skip it
+		}
 	}
 
 	async readNextFlacFrame(startPos: number): Promise<NextFlacFrameResult | null> {
