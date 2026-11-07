@@ -536,7 +536,9 @@ const mp3AudioFollows = async (reader: Reader, pos: number) => {
 	// Skip the ID3v1 tag that ends a joined file, and the ID3v2 tags that start the next one
 	while (pos + ID3_V2_HEADER_SIZE <= reader.fileSize) {
 		let slice = reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		if (!slice) {
 			return false;
 		}
