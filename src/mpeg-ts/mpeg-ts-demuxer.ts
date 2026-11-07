@@ -2868,8 +2868,9 @@ class PacketReadingContext {
 		const sequenceNumber = sectionStartPos + (this.currentPos - this.currentPesPacketPos);
 		const data = this.readBytes(packetLength);
 
-		if (hole !== undefined) {
-			// A video frame that lost data
+		if (hole !== undefined && this.elementaryStream.info.decoderConfig) {
+			// A video frame that lost data. (While the stream is being set up, it's kept: setup only reads its
+			// parameter sets, which come first, and key frames can't be told yet to drop up to the next one.)
 			if (this.dropsRestOfGop()) {
 				this.extendDroppedRange(sequenceNumber);
 			}
