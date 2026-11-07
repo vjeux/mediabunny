@@ -949,10 +949,10 @@ export class IsobmffMuxer extends Muxer {
 
 				inlineTimestampRegex.lastIndex = 0;
 				const containsTimestamp = inlineTimestampRegex.test(cue.text);
+				const isFirstSampleOfCue = !trackData.cueToSourceId.has(cue);
 
 				const endTimestamp = cue.timestamp + cue.duration;
 				let sourceId = trackData.cueToSourceId.get(cue);
-				const isFirstSampleOfCue = sourceId === undefined;
 				if (sourceId === undefined && sampleEnd < endTimestamp) {
 					// We know this cue will appear in more than one sample, therefore we need to mark it with a
 					// unique ID
