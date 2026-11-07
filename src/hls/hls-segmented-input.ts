@@ -76,6 +76,8 @@ export type HlsEncryptionInfo = {
 	psshBox: PsshBox | null;
 };
 
+type ResolveKeyId = NonNullable<NonNullable<InputFormatOptions['isobmff']>['resolveKeyId']>;
+
 export type HlsSegmentLocation = {
 	path: string;
 	offset: number;
@@ -654,6 +656,33 @@ export class HlsSegmentedInput extends SegmentedInput {
 		return this.segments[index - 1] ?? null;
 	}
 
+	/**
+	 * Makes a resolveKeyId callback run once per key ID for the whole HLS input, as its contract says, although every
+	 * segment is read by an Input (with a key cache) of its own.
+	 */
+	private cacheKeys(resolveKeyId: ResolveKeyId): ResolveKeyId {
+		const cache = this.demuxer.decryptionKeyCache;
+
+		return (options) => {
+			const cachedKey = cache.get(options.keyId);
+			if (cachedKey) {
+				return cachedKey;
+			}
+
+			const key = (async () => resolveKeyId(options))();
+			cache.set(options.keyId, key);
+
+			// A failed resolution is tried again by the next segment that needs the key, as before
+			key.catch(() => {
+				if (cache.get(options.keyId) === key) {
+					cache.delete(options.keyId);
+				}
+			});
+
+			return key;
+		};
+	}
+
 	getInputForSegment(segment: Segment): Input {
 		const hlsSegment = segment as HlsSegment;
 
@@ -673,7 +702,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 			isobmff: {
 				...this.input._formatOptions.isobmff,
 				// Intercept calls to resolveKeyId to inject our psshBox knowledge into it
-				resolveKeyId: this.input._formatOptions.isobmff?.resolveKeyId && ((options) => {
+				resolveKeyId: this.input._formatOptions.isobmff?.resolveKeyId && this.cacheKeys((options) => {
 					if (
 						!hlsSegment.encryption
 						|| !(

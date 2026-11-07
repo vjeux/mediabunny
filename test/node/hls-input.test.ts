@@ -1156,6 +1156,106 @@ test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with string keys'
 	expect(lastPacket.timestamp + lastPacket.duration).toBe(60);
 });
 
+test.concurrent('resolveKeyId runs once per key ID, not once per segment', async () => {
+	// A SAMPLE-AES-CTR (cenc) playlist of 6 fMP4 segments that all use the same key. Every segment is read by an Input
+	// of its own, but resolveKeyId is "invoked for each key ID required", which may be a request to a license server.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = hexStringToBytes('00112233445566778899aabbccddeeff');
+	const cryptoKey = await crypto.subtle.importKey('raw', key, 'AES-CTR', false, ['encrypt']);
+	const encrypt = async (iv: number[], data: number[]) => [...new Uint8Array(await crypto.subtle.encrypt(
+		{ name: 'AES-CTR', counter: new Uint8Array([...iv, ...zeros(8)]), length: 64 },
+		cryptoKey,
+		new Uint8Array(data),
+	))];
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const encv = box(
+		'encv', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(12), [0, 1], zeros(32), [0, 24, 0xff, 0xff],
+		box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+		box('sinf', box('frma', ascii('avc1')), box('schm', u32(0), ascii('cenc'), u32(0x10000)),
+			box('schi', box('tenc', u32(0), [0, 0, 1, 8], zeros(16)))),
+	);
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl', box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)))),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const plaintext = [0, 0, 0, 12, 0x65, ...zeros(12)];
+	// A one-sample fragment, encrypted with the given IV
+	const fragment = async (index: number) => {
+		const iv = [...zeros(7), index];
+		const ciphertext = await encrypt(iv, plaintext);
+		const moof = (dataOffset: number) => box('moof', box('mfhd', u32(0), u32(index + 1)), box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(index)),
+			box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(ciphertext.length)),
+			box('senc', u32(0), u32(1), iv),
+		));
+		return [...moof(moof(0).length + 8), ...box('mdat', ciphertext)];
+	};
+	const init = new Uint8Array([...box('ftyp', ascii('iso6'), u32(0)), ...moov]);
+	const segments = await Promise.all([0, 1, 2, 3, 4, 5].map(async i => new Uint8Array(await fragment(i))));
+	const playlist = new TextEncoder().encode([
+		'#EXTM3U', '#EXT-X-VERSION:6', '#EXT-X-TARGETDURATION:1', '#EXT-X-PLAYLIST-TYPE:VOD',
+		'#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="skd://key",KEYFORMAT="com.example"', '#EXT-X-MAP:URI="init.mp4"',
+		...segments.flatMap((_, i) => ['#EXTINF:0.1,', `${i}.m4s`]), '#EXT-X-ENDLIST',
+	].join('\n'));
+
+	let resolveCount = 0;
+	let failuresLeft = 0;
+	const openInput = () => new Input({
+		source: new CustomPathedSource('https://example.com/playlist.m3u8', ({ path }) => new BufferSource(
+			path.endsWith('.m3u8')
+				? playlist
+				: path.endsWith('init.mp4') ? init : segments[Number(/(\d+)\.m4s$/.exec(path)![1])]!,
+		)),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => {
+			resolveCount++;
+			if (failuresLeft > 0) {
+				failuresLeft--;
+				throw new Error('License server unavailable');
+			}
+
+			return key;
+		} } },
+	});
+
+	using input = openInput();
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual(new Array(6).fill(plaintext));
+	expect(resolveCount).toBe(1);
+
+	// A failed resolution isn't kept: the next segment that needs the key tries again
+	resolveCount = 0;
+	failuresLeft = 1;
+	using retryInput = openInput();
+	const retryTrack = await retryInput.getPrimaryVideoTrack();
+	assert(retryTrack);
+	const sink = new EncodedPacketSink(retryTrack);
+	await expect(sink.getFirstPacket()).rejects.toThrow('License server unavailable');
+	expect([...(await sink.getPacket(0.3))!.data]).toEqual(plaintext);
+	expect(resolveCount).toBe(2);
+});
+
 test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with buffer keys', async () => {
 	const keyMap = new Map([
 		['4d97930a3d7b55fa81d0028653f5e499', hexStringToBytes('429ec76475e7a952d224d8ef867f12b6')],

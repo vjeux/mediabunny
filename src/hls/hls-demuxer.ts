@@ -70,6 +70,8 @@ const MAX_MEDIA_TAGS = 256;
 
 export class HlsDemuxer extends Demuxer {
 	metadataPromise: Promise<void> | null = null;
+	/** Decryption keys by key ID, for all segments, each of which is read by an Input (with a key cache) of its own */
+	decryptionKeyCache = new Map<string, Promise<string | Uint8Array>>();
 	trackBackings: InputTrackBacking[] | null = null;
 	internalTracks: InternalTrack[] | null = null;
 	segmentedInputs: HlsSegmentedInput[] = [];
