@@ -63,14 +63,15 @@ test('Rotation is baked in when rerendering', async () => {
 	expect(await track.getRotation()).toBe(0);
 });
 
-test.each([
-	// 32x32 solid (200, 200, 200), VP9 profile 1 GBR 4:4:4, as FFmpeg makes lossless VP9 from RGB sources:
-	// ffmpeg -f lavfi -i "color=0xc8c8c8:s=32x32:r=10:d=0.2,format=gbrp" -c:v libvpx-vp9 -lossless 1
-	['/vp9-gbr-lossless.webm', [200, 200, 200]],
-	// 32x32 solid (48, 128, 192), AV1 GBR 4:4:4:
-	// ffmpeg -f lavfi -i "color=0x3080c0:s=32x32:r=10:d=0.2,format=gbrp" -c:v libaom-av1 -cpu-used 8 -crf 0
-	['/av1-gbr-lossless.mkv', [48, 128, 192]],
-])('Transcoding GBR-coded video (identity matrix) keeps its colors: %s', async (url, color) => {
+// Whether this browser can decode a file's video at all, decided by VideoDecoder.isConfigSupported (WebKitGTK can't
+// decode VP9 profile 1 or AV1 4:4:4, say)
+const decodesVideoNatively = async (url: string) => {
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const decoderConfig = await (await input.getPrimaryVideoTrack())?.getDecoderConfig();
+	return !!decoderConfig && (await VideoDecoder.isConfigSupported(decoderConfig)).supported === true;
+};
+
+const testGbrTranscode = async (url: string, color: readonly number[]) => {
 	const firstPixel = async (input: Input) => {
 		using sample = (await new VideoSampleSink((await input.getPrimaryVideoTrack())!).getSample(0))!;
 		const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
@@ -96,7 +97,23 @@ test.each([
 			expect(Math.abs(pixel[i]! - color[i]!)).toBeLessThan(15);
 		}
 	}
-});
+};
+
+for (const [url, color] of [
+	// 32x32 solid (200, 200, 200), VP9 profile 1 GBR 4:4:4, as FFmpeg makes lossless VP9 from RGB sources:
+	// ffmpeg -f lavfi -i "color=0xc8c8c8:s=32x32:r=10:d=0.2,format=gbrp" -c:v libvpx-vp9 -lossless 1
+	['/vp9-gbr-lossless.webm', [200, 200, 200]],
+	// 32x32 solid (48, 128, 192), AV1 GBR 4:4:4:
+	// ffmpeg -f lavfi -i "color=0x3080c0:s=32x32:r=10:d=0.2,format=gbrp" -c:v libaom-av1 -cpu-used 8 -crf 0
+	['/av1-gbr-lossless.mkv', [48, 128, 192]],
+] as const) {
+	test.skipIf(!(await decodesVideoNatively(url)))(
+		`Transcoding GBR-coded video (identity matrix) keeps its colors: ${url}`,
+		async () => {
+			await testGbrTranscode(url, color);
+		},
+	);
+}
 
 test('Flip is forwarded as metadata when copying', async () => {
 	const buffer = await encodeFlippedVideo();
