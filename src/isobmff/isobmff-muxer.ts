@@ -441,6 +441,14 @@ export class IsobmffMuxer extends Muxer {
 		assert(decoderConfig.codedWidth !== undefined);
 		assert(decoderConfig.codedHeight !== undefined);
 
+		// The sample entry stores the pixel size in 16-bit fields (FFmpeg rejects larger sizes the same way)
+		if (decoderConfig.codedWidth > 0xffff || decoderConfig.codedHeight > 0xffff) {
+			throw new Error(
+				`Video of ${decoderConfig.codedWidth}x${decoderConfig.codedHeight} pixels can't be stored in MP4/MOV,`
+				+ ' which holds at most 65535x65535.',
+			);
+		}
+
 		let requiresAnnexBTransformation = false;
 
 		if (track.source._codec === 'avc' && !decoderConfig.description) {
