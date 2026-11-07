@@ -479,6 +479,43 @@ export class Mp3InputFormat extends InputFormat {
 }
 
 /**
+ * Format tags of MPEG audio in WAVE ("RIFF MP3", as written by Windows' ACM codecs or FFmpeg): layers I and II, and
+ * layer III. The data chunk of such a file holds a plain MPEG audio stream.
+ */
+const WAVE_MPEG_AUDIO_FORMAT_TAGS = [0x0050, 0x0055];
+
+/** Reads the format tag in the "fmt " chunk of a WAVE file, or returns null if no such chunk precedes the data. */
+const readWaveFormatTag = async (input: Input, littleEndian: boolean) => {
+	let pos = 12;
+
+	// Few chunks come before the data, so looking at a bounded number of them is enough
+	for (let i = 0; i < 64; i++) {
+		let slice = input._reader.requestSlice(pos, 10);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return null;
+		}
+
+		const chunkId = readAscii(slice, 4);
+		const bytes = readBytes(slice, 6);
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const chunkSize = view.getUint32(0, littleEndian);
+
+		if (chunkId === 'fmt ') {
+			return view.getUint16(4, littleEndian);
+		} else if (chunkId === 'data') {
+			return null;
+		}
+
+		pos += 8 + chunkSize + (chunkSize & 1);
+	}
+
+	return null;
+};
+
+/**
  * WAVE file format, based on RIFF.
  *
  * Do not instantiate this class; use the {@link WAVE} singleton instead.
@@ -501,7 +538,14 @@ export class WaveInputFormat extends InputFormat {
 		slice.skip(4);
 
 		const format = readAscii(slice, 4);
-		return format === 'WAVE';
+		if (format !== 'WAVE') {
+			return false;
+		}
+
+		// MPEG audio in WAVE is left to the MP3 format, which reads the plain MPEG audio stream in the data chunk; the
+		// WAVE demuxer doesn't support it
+		const formatTag = await readWaveFormatTag(input, riffType !== 'RIFX');
+		return formatTag === null || !WAVE_MPEG_AUDIO_FORMAT_TAGS.includes(formatTag);
 	}
 
 	/** @internal */
