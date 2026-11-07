@@ -233,6 +233,37 @@ test('Wholly negative timestamps, regular MP4', async () => {
 	await testNegativeTimestampRoundTrip([-1, -0.9, -0.8, -0.7, -0.6], 0.1, false);
 });
 
+test('AV1 keeps its sequence header in av1C when the decoder config has no color space', async () => {
+	// Sequence header OBU of a 320x240 libaom key frame, followed by the start of its frame OBU
+	const sequenceHeaderObu = new Uint8Array([0x0a, 0x0b, 0, 0, 0, 0x04, 0x3c, 0xff, 0xbc, 0xda, 0xf9, 0x00, 0x40]);
+	const packetData = new Uint8Array([...sequenceHeaderObu, 0x32, 0x04, 0x10, 0x00, 0x00, 0x00]);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('av1');
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(packetData, 'key', 0, 1 / 30), {
+		decoderConfig: { codec: 'av01.0.00M.08', codedWidth: 320, codedHeight: 240 },
+	});
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const text = new TextDecoder('latin1').decode(bytes);
+	const av1C = text.indexOf('av1C') + 4;
+	const av1CSize = toDataView(bytes).getUint32(av1C - 8);
+
+	// AV1-ISOBMFF §2.3.4: "When configOBUs does not contain a Sequence Header OBU, a colr box with a colour_type set to
+	// nclx SHALL be present". There was neither: configOBUs was always empty. Now it holds the sequence header, as
+	// FFmpeg writes it.
+	expect(text.includes('colr')).toBe(false);
+	expect([...bytes.subarray(av1C, av1C - 8 + av1CSize)]).toEqual([0x81, 0x00, 0x0c, 0x00, ...sequenceHeaderObu]);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getCodecParameterString()).toBe('av01.0.00M.08');
+});
+
 test('Wholly negative timestamps, fragmented MP4', async () => {
 	await testNegativeTimestampRoundTrip([-1, -0.9, -0.8, -0.7, -0.6], 0.1, true);
 });
