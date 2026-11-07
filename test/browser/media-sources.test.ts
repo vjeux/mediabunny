@@ -537,8 +537,12 @@ test('VideoSampleSource, transform.frameRate works with process', async () => {
 	input.dispose();
 });
 
-test('VideoSampleSource, frame rate normalization doesn\'t repeat key frame requests on padded frames', async () => {
-	const keyFrameTimestamps = async (requestVia: 'add' | 'sample', frameRate?: number) => {
+test('VideoSampleSource, frame rate normalization puts a key frame request on the first frame showing it', async () => {
+	const keyFrameTimestamps = async (
+		requestVia: 'add' | 'sample',
+		frames: { timestamp: number; duration: number; keyFrame?: boolean }[],
+		frameRate?: number,
+	) => {
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
 		const source = new VideoSampleSource({
 			codec: 'vp9',
@@ -549,18 +553,17 @@ test('VideoSampleSource, frame rate normalization doesn\'t repeat key frame requ
 		output.addVideoTrack(source);
 		await output.start();
 
-		// 10 frames at 10 fps; only the one at 0.5 s asks for a key frame
 		const canvas = new OffscreenCanvas(48, 48);
 		const context = canvas.getContext('2d')!;
-		for (let i = 0; i < 10; i++) {
-			context.fillStyle = `rgb(${i * 20}, 0, 0)`;
+		for (const [i, frame] of frames.entries()) {
+			context.fillStyle = `rgb(${(i * 20) % 256}, 0, 0)`;
 			context.fillRect(0, 0, 48, 48);
 			const sample = new VideoSample(canvas, {
-				timestamp: i / 10,
-				duration: 1 / 10,
-				encodeOptions: requestVia === 'sample' && i === 5 ? { keyFrame: true } : undefined,
+				timestamp: frame.timestamp,
+				duration: frame.duration,
+				encodeOptions: requestVia === 'sample' && frame.keyFrame ? { keyFrame: true } : undefined,
 			});
-			await source.add(sample, requestVia === 'add' && i === 5 ? { keyFrame: true } : undefined);
+			await source.add(sample, requestVia === 'add' && frame.keyFrame ? { keyFrame: true } : undefined);
 			sample.close();
 		}
 		await output.finalize();
@@ -580,11 +583,30 @@ test('VideoSampleSource, frame rate normalization doesn\'t repeat key frame requ
 		return timestamps;
 	};
 
-	// Normalized to 30 fps, each input frame is followed by two repeats, which aren't the frame that asked
-	expect(await keyFrameTimestamps('add', 30)).toEqual([0, 0.5]);
-	expect(await keyFrameTimestamps('sample', 30)).toEqual([0, 0.5]);
-	expect(await keyFrameTimestamps('add')).toEqual([0, 0.5]);
-	expect(await keyFrameTimestamps('sample')).toEqual([0, 0.5]);
+	// 10 fps, with a key frame requested for the frame at 0.5 s
+	const tenFps = Array.from({ length: 10 }, (_, i) => ({ timestamp: i / 10, duration: 1 / 10, keyFrame: i === 5 }));
+	// Like a screen capture that only emits frames on change: the frame at 0.05 s takes the first 10 fps slot from the
+	// one at 0 s, and nothing changes until 0.3 s, so its picture first shows at 0.1 s, as padding
+	const onChange = [
+		{ timestamp: 0, duration: 0.05 },
+		{ timestamp: 0.05, duration: 0.25, keyFrame: true },
+		{ timestamp: 0.3, duration: 0.1 },
+		{ timestamp: 0.4, duration: 0.1 },
+	];
+	// 32 fps down to 8 fps: the frame at 0.15625 s that asks for a key frame is dropped, so the next one shown takes it
+	const thirtyTwoFps = Array.from({ length: 32 }, (_, i) => ({
+		timestamp: i / 32,
+		duration: 1 / 32,
+		keyFrame: i === 5,
+	}));
+
+	for (const requestVia of ['add', 'sample'] as const) {
+		// Normalized to 30 fps, each input frame is followed by two repeats, which aren't the frame that asked
+		expect(await keyFrameTimestamps(requestVia, tenFps, 30)).toEqual([0, 0.5]);
+		expect(await keyFrameTimestamps(requestVia, tenFps)).toEqual([0, 0.5]);
+		expect(await keyFrameTimestamps(requestVia, onChange, 10)).toEqual([0, 0.1]);
+		expect(await keyFrameTimestamps(requestVia, thirtyTwoFps, 8)).toEqual([0, 0.25]);
+	}
 });
 
 const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {
