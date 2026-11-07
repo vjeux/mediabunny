@@ -859,6 +859,8 @@ export class Output<
 			}
 		}
 
+		this.format._validateTrack(track);
+
 		this.tracks.push(track);
 		track.source._connectedTrack = track;
 

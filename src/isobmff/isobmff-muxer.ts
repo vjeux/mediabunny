@@ -52,7 +52,7 @@ import {
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
 } from '../codec-data';
-import { buildIsobmffMimeType, TIMESTAMP_OFFSET } from './isobmff-misc';
+import { buildIsobmffMimeType, TIMESTAMP_OFFSET, validateIsobmffVideoSize } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
 
 export const GLOBAL_TIMESCALE = 57600; // LCM of a bunch of common frame rates (24, 25, 30, 60, 144, ...)
@@ -440,6 +440,9 @@ export class IsobmffMuxer extends Muxer {
 		const decoderConfig = { ...meta.decoderConfig };
 		assert(decoderConfig.codedWidth !== undefined);
 		assert(decoderConfig.codedHeight !== undefined);
+
+		// Sizes declared with the track were already checked when it was added
+		validateIsobmffVideoSize(decoderConfig.codedWidth, decoderConfig.codedHeight);
 
 		let requiresAnnexBTransformation = false;
 
