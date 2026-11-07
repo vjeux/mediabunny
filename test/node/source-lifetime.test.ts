@@ -1,8 +1,8 @@
 import { expect, test, vi } from 'vitest';
-import { CustomSource, FilePathSource } from '../../src/source.js';
+import { CustomPathedSource, CustomSource, FilePathSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Input, InputDisposedError } from '../../src/input.js';
+import { Input, InputDisposedError, UnsupportedInputFormatError } from '../../src/input.js';
 import { ALL_FORMATS, MP4 } from '../../src/input-format.js';
 import { promiseWithResolvers } from '../../src/misc.js';
 import { readFile } from 'node:fs/promises';
@@ -108,6 +108,63 @@ test.each([
 			controller.close();
 		}
 	}
+});
+
+test('Format detection, source sizes and pathed source roots are tried again after a failed read', async () => {
+	const videoBytes = new Uint8Array(await readFile(path.join(__dirname, '../public/video.mp4')));
+	// The first call fails, like a request hitting a 503 or a dropped connection
+	const failOnce = () => {
+		let failed = false;
+		return () => {
+			if (!failed) {
+				failed = true;
+				throw new Error('Transient failure');
+			}
+		};
+	};
+	const makeSource = (failRead: () => void, failGetSize: () => void) => new CustomSource({
+		getSize: () => {
+			failGetSize();
+			return videoBytes.length;
+		},
+		read: (start, end) => {
+			failRead();
+			return videoBytes.subarray(start, end);
+		},
+	});
+
+	using input = new Input({ source: makeSource(failOnce(), () => {}), formats: ALL_FORMATS });
+	await expect(input.getFormat()).rejects.toThrow('Transient failure');
+	expect(await input.getFormat()).toBe(MP4);
+
+	const source = makeSource(() => {}, failOnce());
+	await expect(source.getSize()).rejects.toThrow('Transient failure');
+	expect(await source.getSize()).toBe(videoBytes.length);
+
+	const failRootRequest = failOnce();
+	const pathedSource = new CustomPathedSource('video.mp4', async () => {
+		failRootRequest();
+		return makeSource(() => {}, () => {});
+	});
+	await expect(pathedSource.getSize()).rejects.toThrow('Transient failure');
+	expect(await pathedSource.getSize()).toBe(videoBytes.length);
+
+	// An unsupported format doesn't get better though, so it's not tried again
+	let reads = 0;
+	using unsupported = new Input({
+		source: new CustomSource({
+			getSize: () => 4,
+			read: () => {
+				reads++;
+				return new Uint8Array(4);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	await expect(unsupported.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
+	const readsAfterDetection = reads;
+	await expect(unsupported.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
+	expect(reads).toBe(readsAfterDetection);
 });
 
 test('CustomSource releases stream readers after successful reads', async () => {
