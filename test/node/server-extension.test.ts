@@ -6,7 +6,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, last, toUint8Array } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { NodeAvVideoDecoder } from '../../packages/server/src/video-decoder.js';
-import { NodeAvVideoEncoder } from '../../packages/server/src/video-encoder.js';
+import { getAlphaPixelFormat, NodeAvVideoEncoder } from '../../packages/server/src/video-encoder.js';
 import { NodeAvAudioDecoder } from '../../packages/server/src/audio-decoder.js';
 import { NodeAvAudioEncoder } from '../../packages/server/src/audio-encoder.js';
 import { AudioSample, VideoSample, VideoSampleColorSpace } from '../../src/sample.js';
@@ -485,6 +485,49 @@ describe('Video', async () => {
 		}, async (sample) => {
 			expect(sample.format).toBe('I420');
 		}, true);
+	});
+
+	test('Pixel format for alpha: \'keep\'', () => {
+		// prores_videotoolbox (macOS) only takes alpha packed, as ayuv64le or bgra
+		expect(getAlphaPixelFormat('prores', [
+			NodeAv.AV_PIX_FMT_VIDEOTOOLBOX,
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_NV12,
+			NodeAv.AV_PIX_FMT_AYUV64LE,
+			NodeAv.AV_PIX_FMT_UYVY422,
+			NodeAv.AV_PIX_FMT_P010LE,
+			NodeAv.AV_PIX_FMT_BGRA,
+		])).toBe(NodeAv.AV_PIX_FMT_AYUV64LE);
+
+		// h264_nvenc takes RGBA input, but AVC can't carry alpha
+		expect(getAlphaPixelFormat('avc', [
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_NV12,
+			NodeAv.AV_PIX_FMT_P010LE,
+			NodeAv.AV_PIX_FMT_YUV444P,
+			NodeAv.AV_PIX_FMT_YUV444P16LE,
+			NodeAv.AV_PIX_FMT_BGR0,
+			NodeAv.AV_PIX_FMT_BGRA,
+			NodeAv.AV_PIX_FMT_RGBA,
+		])).toBeNull();
+
+		// libvpx-vp9, prores_ks and libsvtav1
+		expect(getAlphaPixelFormat('vp9', [
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_YUVA420P,
+			NodeAv.AV_PIX_FMT_YUV444P,
+			NodeAv.AV_PIX_FMT_YUVA444P,
+			NodeAv.AV_PIX_FMT_GBRAP,
+		])).toBe(NodeAv.AV_PIX_FMT_YUVA420P);
+		expect(getAlphaPixelFormat('prores', [
+			NodeAv.AV_PIX_FMT_YUV422P10LE,
+			NodeAv.AV_PIX_FMT_YUV444P10LE,
+			NodeAv.AV_PIX_FMT_YUVA444P10LE,
+		])).toBe(NodeAv.AV_PIX_FMT_YUVA444P10LE);
+		expect(getAlphaPixelFormat('av1', [
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_YUV420P10LE,
+		])).toBeNull();
 	});
 
 	const QUANTIZER_TEST_CODECS = [
