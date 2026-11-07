@@ -768,10 +768,12 @@ export class MatroskaDemuxer extends Demuxer {
 						// the next block, which their frames are spread over: frame count times DefaultDuration often
 						// doesn't fit the block timestamps (rounded to the timestamp scale, or a DefaultDuration that
 						// is really the block's duration), and the frames would overlap the next block.
+						// The DefaultDuration is rounded to whole ticks, so that durations stay multiples of the time
+						// resolution like the timestamps.
 						const nextEntry = trackData.presentationTimestamps[i + 1]!;
 						const isLaced = currentBlock.lacing !== BlockLacing.None;
 						currentBlock.duration = track.defaultDuration !== null && !isLaced
-							? track.defaultDuration
+							? Math.round(track.defaultDuration)
 							: nextEntry.timestamp - currentBlock.timestamp;
 					}
 				} else if (!currentBlock.hasBlockDuration) {

@@ -118,6 +118,15 @@ test('Blocks last their BlockDuration or the DefaultDuration, not until the next
 		for await (const packet of new EncodedPacketSink(track).packets()) {
 			durations.push(packet.duration);
 		}
+
+		// Durations are whole multiples of the time resolution, like the timestamps. (Not checked for the last block
+		// of the cluster, which takes the DefaultDuration in an older code path.)
+		const resolution = await track.getTimeResolution();
+		for (const duration of durations.slice(0, -1)) {
+			const ticks = duration * resolution;
+			expect(Math.abs(ticks - Math.round(ticks))).toBeLessThan(1e-9);
+		}
+
 		return durations;
 	};
 
@@ -125,11 +134,11 @@ test('Blocks last their BlockDuration or the DefaultDuration, not until the next
 	const withGap = await readBackDurations([0, 0.033, 0.066, 0.2, 0.233], { alpha: true });
 	expect(withGap.map(duration => Math.round(duration * 1000))).toEqual([33, 33, 33, 33, 33]);
 
-	// The millisecond timestamps of 30 fps video used to give durations of 33 and 34 ms instead of the DefaultDuration
-	const constantRate = await readBackDurations([0, 1, 2, 3, 4].map(i => i / 30), { frameRate: 30 });
-	for (const duration of constantRate.slice(0, -1)) {
-		expect(duration).toBeCloseTo(1 / 30, 6);
-	}
+	// The millisecond timestamps of 29.97 fps video used to give durations of 33 and 34 ms instead of the
+	// DefaultDuration of 33.3667 ms, which is 33 ms in whole ticks of the 1 ms timestamp scale
+	const ntscTimestamps = [0, 1, 2, 3, 4].map(i => i * 1001 / 30000);
+	const constantRate = await readBackDurations(ntscTimestamps, { frameRate: 30000 / 1001 });
+	expect(constantRate.slice(0, -1)).toEqual([0.033, 0.033, 0.033, 0.033]);
 });
 
 // Builders for hand-made Matroska files. Every element gets an 8-byte size.
