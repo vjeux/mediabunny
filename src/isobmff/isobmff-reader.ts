@@ -20,6 +20,10 @@ export const readBoxHeader = (slice: FileSlice) => {
 
 	const hasLargeSize = totalSize === 1;
 	if (hasLargeSize) {
+		if (slice.remainingLength < 8) {
+			return null; // The 64-bit size is cut off
+		}
+
 		totalSize = readU64Be(slice);
 		headerSize = 16;
 	}
