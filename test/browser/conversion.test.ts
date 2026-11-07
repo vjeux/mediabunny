@@ -874,6 +874,39 @@ test('Pause signal', async () => {
 	expect(conversion.state).toBe('done');
 });
 
+test.each(['video', 'audio'] as const)(
+	'A pause requested while %s processing drops every sample still pauses the conversion',
+	async (type) => {
+		// Like a voice activity filter that drops everything until speech starts
+		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const controller = new AbortController();
+		let calls = 0;
+		let dropAll = true;
+		const process = <T>(sample: T) => {
+			calls++;
+			controller.abort();
+			return dropAll ? null : sample;
+		};
+
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: type === 'video' ? { process } : { discard: true },
+			audio: type === 'audio' ? { process } : { discard: true },
+		});
+
+		await conversion.execute({ pauseSignal: controller.signal });
+		expect(conversion.state).toBe('idle');
+		expect(calls).toBe(1);
+
+		dropAll = false;
+		await conversion.execute();
+		expect(conversion.state).toBe('done');
+		expect(calls).toBeGreaterThan(1);
+	},
+);
+
 test('Pre-signaled pause signal', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
@@ -1460,36 +1493,3 @@ const testReservedFastStart = async (
 		expect(maximumPacketCount).toBeLessThanOrEqual(2 * packetCount + 64);
 	}
 };
-
-test.each(['video', 'audio'] as const)(
-	'A pause requested while %s processing drops every sample still pauses the conversion',
-	async (type) => {
-		// Like a voice activity filter that drops everything until speech starts
-		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
-		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
-		const controller = new AbortController();
-		let calls = 0;
-		let dropAll = true;
-		const process = <T>(sample: T) => {
-			calls++;
-			controller.abort();
-			return dropAll ? null : sample;
-		};
-
-		const conversion = await Conversion.init({
-			input,
-			output,
-			video: type === 'video' ? { process } : { discard: true },
-			audio: type === 'audio' ? { process } : { discard: true },
-		});
-
-		await conversion.execute({ pauseSignal: controller.signal });
-		expect(conversion.state).toBe('idle');
-		expect(calls).toBe(1);
-
-		dropAll = false;
-		await conversion.execute();
-		expect(conversion.state).toBe('done');
-		expect(calls).toBeGreaterThan(1);
-	},
-);
