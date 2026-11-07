@@ -157,6 +157,8 @@ type InternalTrack = {
 	/** The media time offset of the main edit list entry (with media time !== -1) */
 	editListOffset: number;
 	hasEditList: boolean;
+	/** For AAC, the decoded sample rate when it differs from info.sampleRate (implicit SBR; see the esds box) */
+	aacOutputSampleRate?: number;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
@@ -449,9 +451,8 @@ export class IsobmffDemuxer extends Demuxer {
 							// Without an edit list, iTunes-style files only declare the encoder delay in iTunSMPB,
 							// which FFmpeg applies just like an edit list's media time. It counts output samples, which
 							// for HE-AAC are at twice the rate of the core coder that the media timescale may follow.
-							const outputSampleRate = track.info.sampleRate > 0
-								? track.info.sampleRate
-								: track.timescale;
+							const outputSampleRate = track.aacOutputSampleRate
+								?? (track.info.sampleRate > 0 ? track.info.sampleRate : track.timescale);
 							track.editListOffset = Math.round(this.iTunesPriming * track.timescale / outputSampleRate);
 						}
 					}
@@ -1863,7 +1864,21 @@ export class IsobmffDemuxer extends Demuxer {
 							track.info.numberOfChannels = audioSpecificConfig.outputNumberOfChannels;
 						}
 						if (audioSpecificConfig.outputSampleRate !== null) {
+							const sampleEntryRate = track.info.sampleRate;
+							const coreRate = audioSpecificConfig.coreSampleRate;
 							track.info.sampleRate = audioSpecificConfig.outputSampleRate;
+
+							// With implicit SBR signaling, the AudioSpecificConfig only describes the AAC-LC core coder
+							// (at up to 24 kHz), and the decoder doubles the rate once it finds SBR data in the stream.
+							// Writers then give the output rate in the sample entry or the media timescale.
+							if (
+								audioSpecificConfig.objectType === 2
+								&& audioSpecificConfig.outputSampleRate === coreRate
+								&& coreRate <= 24000
+								&& (sampleEntryRate === 2 * coreRate || track.timescale === 2 * coreRate)
+							) {
+								track.aacOutputSampleRate = 2 * coreRate;
+							}
 						}
 					}
 				}

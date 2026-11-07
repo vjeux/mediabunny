@@ -298,12 +298,16 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 			box('data', u32(1), u32(0), ascii(smpb))),
 	)));
 
-	// HE-AAC: the media timescale may follow the core coder, at half the output sample rate
-	const build = (edts: number[], heAac = false) => {
-		const timescale = heAac ? 22050 : 44100;
-		const audioSpecificConfig = heAac
-			? [0x2b, 0x92, 0x08, 0x00] // Explicit SBR, 22050 Hz core, 44100 Hz output, stereo
-			: [0x12, 0x10]; // AAC-LC, 44100 Hz, stereo
+	type Layout = 'lc' | 'explicit-sbr-core-timescale' | 'implicit-sbr-output-timescale';
+	const build = (edts: number[], layout: Layout = 'lc') => {
+		// HE-AAC: the media timescale may follow the core coder at half the output rate (Nero, afconvert) or the output
+		// rate (FFmpeg). With implicit SBR signaling, the AudioSpecificConfig only describes the core coder.
+		const timescale = layout === 'explicit-sbr-core-timescale' ? 22050 : 44100;
+		const audioSpecificConfig = {
+			'lc': [0x12, 0x10], // AAC-LC, 44100 Hz, stereo
+			'explicit-sbr-core-timescale': [0x2b, 0x92, 0x08, 0x00], // SBR, 22050 Hz core, 44100 Hz output, stereo
+			'implicit-sbr-output-timescale': [0x13, 0x90], // AAC-LC, 22050 Hz, stereo
+		}[layout];
 		const moov = (chunkOffset: number) => box('moov',
 			box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
 			box('trak',
@@ -336,7 +340,8 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 
 	expect(await firstTimestamp(build([]))).toBeCloseTo(-2112 / 44100, 12);
 	// iTunSMPB counts output samples
-	expect(await firstTimestamp(build([], true))).toBeCloseTo(-2112 / 44100, 12);
+	expect(await firstTimestamp(build([], 'explicit-sbr-core-timescale'))).toBeCloseTo(-2112 / 44100, 12);
+	expect(await firstTimestamp(build([], 'implicit-sbr-output-timescale'))).toBeCloseTo(-2112 / 44100, 12);
 
 	// An edit list takes precedence over iTunSMPB
 	const edts = box('edts', box('elst', zeros(4), u32(1), u32(4096 - 1024), u32(1024), u32(0x10000)));
