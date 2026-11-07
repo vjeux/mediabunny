@@ -161,6 +161,47 @@ export const readMetadataStringShort = (slice: FileSlice) => {
 	return textDecoder.decode(bytes);
 };
 
+/**
+ * Reads an iTunes freeform ('----') item, which holds 'mean' (a reverse-DNS domain) and 'name' boxes before its
+ * data box. Returns null if either name part is missing.
+ */
+export const readFreeformMetadataItem = (slice: FileSlice, contentSize: number) => {
+	const endPos = slice.filePos + Math.min(contentSize, slice.remainingLength);
+	let mean: string | null = null;
+	let name: string | null = null;
+	let data: ReturnType<typeof readDataBox> = null;
+
+	while (endPos - slice.filePos >= MIN_BOX_HEADER_SIZE) {
+		const startPos = slice.filePos;
+		const header = readBoxHeader(slice);
+		if (!header || startPos + header.totalSize > endPos) {
+			break;
+		}
+
+		if ((header.name === 'mean' || header.name === 'name') && header.contentSize >= 4) {
+			slice.skip(4); // Version and flags
+			const value = textDecoder.decode(readBytes(slice, header.contentSize - 4));
+
+			if (header.name === 'mean') {
+				mean = value;
+			} else {
+				name = value;
+			}
+		} else if (header.name === 'data' && data === null) {
+			slice.filePos = startPos;
+			data = readDataBox(slice);
+		}
+
+		slice.filePos = startPos + header.totalSize;
+	}
+
+	if (mean === null || name === null) {
+		return null;
+	}
+
+	return { mean, name, data };
+};
+
 export const readDataBox = (slice: FileSlice) => {
 	if (slice.remainingLength < MIN_BOX_HEADER_SIZE) {
 		return null;
