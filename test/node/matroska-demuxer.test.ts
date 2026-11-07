@@ -138,5 +138,5 @@ test('Matroska LanguageBCP47 gives an ISO 639-2 language code', async () => {
 	expect(await readLanguage(language('ger'), languageBcp47('gsw-CH'))).toBe('gsw');
 	expect(await readLanguage(languageBcp47('x-private'))).toBe('und');
 	// Control: Language alone
-	expect(await readLanguage(language('fre'))).toBe('fre');
+	expect(await readLanguage(language('spa'))).toBe('spa');
 });
