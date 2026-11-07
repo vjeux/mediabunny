@@ -46,8 +46,8 @@ const getOpusPreSkipDuration = (decoderConfig: AudioDecoderConfig) => {
 };
 
 /**
- * Returns the codec's priming if the given leading duration is that priming. Allows for timestamps rounded to the
- * millisecond, like Matroska's.
+ * Returns the codec's priming if the given leading duration of a source is that priming. Allows for sources that round
+ * timestamps to the millisecond, like Matroska.
  */
 const matchPriming = (primingDuration: number, codecPriming: number | null) => {
 	return codecPriming !== null && codecPriming > 0 && Math.abs(primingDuration - codecPriming) <= 0.001
@@ -124,9 +124,9 @@ export abstract class OutputFormat {
 	abstract get negativeTimestampSupport(): 'full' | 'prefer-non-negative' | 'none' | null;
 
 	/**
-	 * For a copied audio track whose first packet starts the given number of seconds before zero: the exact priming
-	 * duration, in seconds, that this format signals for it (like the Opus pre-skip), so that the track can keep that
-	 * start instead of needing a non-negative one. `null` if it can't.
+	 * For a copied audio track whose first packet starts the given number of seconds before zero (where its audible
+	 * part begins): the exact priming duration, in seconds, that this format signals for it (like the Opus pre-skip),
+	 * so that the track can keep that start instead of needing a non-negative one. `null` if it can't.
 	 * @internal
 	 */
 	_getSignalableAudioPriming(
@@ -1016,8 +1016,8 @@ export class OggOutputFormat extends OutputFormat {
 		if (codec === 'opus') {
 			return matchPriming(primingDuration, getOpusPreSkipDuration(decoderConfig));
 		} else if (codec === 'vorbis') {
-			// Any start within the first packet
-			return primingDuration <= firstPacket.duration + 0.001
+			// Any start within the first packet, allowing for rounded sources
+			return primingDuration > 0 && primingDuration <= firstPacket.duration + 0.001
 				? Math.min(primingDuration, firstPacket.duration)
 				: null;
 		} else {
