@@ -821,6 +821,24 @@ test('Track capacity works correctly with composable conversions initialized con
 	expect(conversions[1]!.discardedTracks.map(x => x.reason)).toContain('max_track_count_reached');
 });
 
+test('Two non-composable conversions initialized concurrently can\'t both claim one output', async () => {
+	using input = new Input({
+		source: new UrlSource('/video.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const results = await Promise.allSettled([
+		Conversion.init({ input, output, showWarnings: false }),
+		Conversion.init({ input, output, showWarnings: false }),
+	]);
+
+	// Like when initialized one after the other, the second one finds the output taken
+	expect(results.map(x => x.status)).toEqual(['fulfilled', 'rejected']);
+	expect(String((results[1] as PromiseRejectedResult).reason)).toMatch(/must be fresh/);
+	expect(output.tracks).toHaveLength(2);
+});
+
 test('Blank execute', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),

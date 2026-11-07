@@ -641,6 +641,12 @@ const PACKET_STATS_PACKET_COUNT = 256;
 const outputTrackAdditionMutexes = new WeakMap<Output, AsyncMutex>();
 
 /**
+ * Outputs that conversions were initialized on. They aren't fresh anymore, even while those conversions haven't added
+ * their tracks yet.
+ */
+const claimedOutputs = new WeakSet<Output>();
+
+/**
  * An input track that was discarded (excluded) from a {@link Conversion} alongside the discard reason.
  * @group Conversion
  * @public
@@ -884,6 +890,8 @@ export class Conversion {
 				options.output.tracks.length > 0
 				|| Object.keys(options.output._metadataTags).length > 0
 				|| options.output.state !== 'pending'
+				// Another conversion that is still initializing has no tracks on it yet
+				|| claimedOutputs.has(options.output)
 			) {
 				throw new TypeError('options.output must be fresh: no tracks or metadata tags added and not started.');
 			}
@@ -961,6 +969,8 @@ export class Conversion {
 		this._composable = composable;
 		this.input = options.input;
 		this.output = options.output;
+
+		claimedOutputs.add(options.output);
 	}
 
 	/** @internal */
