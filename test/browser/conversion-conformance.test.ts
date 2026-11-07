@@ -167,11 +167,22 @@ const readFrameIndices = async (track: InputTrack) => {
 	return indices;
 };
 
+// Whether this browser has an AVC encoder at all, which the source videos of the transform, frame rate and process
+// tests are encoded with (Firefox has none without a system FFmpeg). Decided by VideoEncoder.isConfigSupported
+const avcEncodable = await (async () => {
+	try {
+		const config = { codec: 'avc1.42001f', width: 320, height: 180, bitrate: 2e6 };
+		return (await VideoEncoder.isConfigSupported(config)).supported === true;
+	} catch {
+		return false;
+	}
+})();
+
 // Quality levels give small frames small bitrates, at which WebKitGTK's AVC encoder (OpenH264) flattens colors and
 // drops frames, so conversions that re-encode frames to read back their colors ask for an ample bitrate
 const AMPLE_VIDEO_QUALITY = new Quality({ bitrate: 2e6 });
 
-describe('Video transforms', () => {
+describe.skipIf(!avcEncodable)('Video transforms', () => {
 	test('a width alone keeps the aspect ratio, rounded to even dimensions', async () => {
 		const source = await createQuadrantVideo(320, 180);
 		const result = await inspectFirstFrame(await convert(source, new Mp4OutputFormat(), {
@@ -274,7 +285,7 @@ describe('Video transforms', () => {
 // The counting video is encoded at the 32 kbps that very-high quality gives 64x64 frames. WebKitGTK's AVC encoder
 // starves at that bitrate (its first frames come back as flat gray and repeat), so there, frame indices can't be read
 // back. Decided with WebCodecs alone: 8 flat gray 64x64 frames through a literal 32 kbps config must decode in order.
-const avcKeepsEveryFrameAt32Kbps = await (async () => {
+const avcKeepsEveryFrameAt32Kbps = avcEncodable && await (async () => {
 	const canvas = new OffscreenCanvas(64, 64);
 	const context = canvas.getContext('2d')!;
 	const chunks: EncodedVideoChunk[] = [];
@@ -316,7 +327,7 @@ const avcKeepsEveryFrameAt32Kbps = await (async () => {
 	await decoder.flush();
 	decoder.close();
 	return decoded.length === levels.length && decoded.every((level, i) => Math.abs(level - levels[i]!) <= 8);
-})();
+})().catch(() => false);
 
 describe('Frame rate conversion', () => {
 	const testIfFramesSurvive = test.skipIf(!avcKeepsEveryFrameAt32Kbps);
@@ -411,7 +422,7 @@ describe('Key frames', () => {
 	});
 });
 
-describe('Process callbacks', () => {
+describe.skipIf(!avcEncodable)('Process callbacks', () => {
 	test('returning null drops a frame and returning an array emits several', async () => {
 		const source = await createCountingVideo(10, 10);
 		const buffer = await convert(source, new Mp4OutputFormat(), {
