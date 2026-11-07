@@ -10,8 +10,8 @@ import { Output } from '../../src/output.js';
 import { BufferTarget, NullTarget } from '../../src/target.js';
 import { CmafOutputFormat, Mp4OutputFormat, WebMOutputFormat, MovOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
+import { TextSubtitleSource, EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { assert, toDataView } from '../../src/misc.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource, TextSubtitleSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { IsobmffMuxer } from '../../src/isobmff/isobmff-muxer.js';
 
@@ -261,6 +261,42 @@ test('Non-zero start timestamp, regular MP4', async () => {
 
 	expect(timestamps).toEqual([1, 1.1, 1.2, 1.3]);
 	expect(durations).toEqual([0.1, 0.1, 0.1, 0.1]);
+});
+
+test('A NOTE before a WebVTT cue that spans several samples is written once', async () => {
+	const mdatBoxes = async (text: string) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new TextSubtitleSource('webvtt');
+		output.addSubtitleTrack(source);
+		await output.start();
+		await source.add(text);
+		await output.finalize();
+
+		// The samples are runs of top-level boxes in the mdat
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = toDataView(bytes);
+		const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+		let pos = 0;
+		while (type(pos) !== 'mdat') {
+			pos += view.getUint32(pos);
+		}
+		const end = pos + view.getUint32(pos);
+		const boxes: string[] = [];
+		for (pos += 8; pos < end; pos += view.getUint32(pos)) {
+			const text = new TextDecoder().decode(bytes.subarray(pos + 8, pos + view.getUint32(pos)));
+			boxes.push(type(pos) === 'vtta' ? `vtta:${text}` : type(pos));
+		}
+		return boxes;
+	};
+
+	// A (1-5 s) overlaps B (2-3 s), so A is split over the samples 1-2, 2-3 and 3-5 (ISO/IEC 14496-30). Its NOTE
+	// belongs to the cue, not to each sample, and was repeated in each of them; GPAC (MP4Box) writes it once too.
+	const prefix = 'WEBVTT\n\n00:00.000 --> 00:00.500\nX\n\nNOTE about A\n\n00:01.000 --> 00:05.000\nA\n';
+	const split = await mdatBoxes(prefix + '\n00:02.000 --> 00:03.000\nB\n');
+	expect(split.filter(box => box.startsWith('vtta'))).toEqual(['vtta:NOTE about A\n\n']);
+
+	const single = await mdatBoxes(prefix);
+	expect(single.filter(box => box.startsWith('vtta'))).toEqual(['vtta:NOTE about A\n\n']);
 });
 
 test('Non-zero start timestamp, fragmented MP4', async () => {
