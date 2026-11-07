@@ -84,6 +84,8 @@ import {
 	HEX_STRING_REGEX,
 	EMPTY_COLOR_SPACE,
 	colorSpaceIsComplete,
+	getDisplayAspect,
+	simplifyRational,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import {
@@ -173,6 +175,8 @@ type InternalTrack = {
 		height: number;
 		squarePixelWidth: number;
 		squarePixelHeight: number;
+		/** Exact, unlike the square pixel size */
+		pixelAspectRatio: Rational;
 		codec: VideoCodec | null;
 		codecDescription: Uint8Array | null;
 		colorSpace: VideoColorSpaceInit;
@@ -1208,6 +1212,7 @@ export class IsobmffDemuxer extends Demuxer {
 						height: -1,
 						squarePixelWidth: -1,
 						squarePixelHeight: -1,
+						pixelAspectRatio: { num: 1, den: 1 },
 						codec: null,
 						codecDescription: null,
 						colorSpace: { ...EMPTY_COLOR_SPACE },
@@ -1277,6 +1282,7 @@ export class IsobmffDemuxer extends Demuxer {
 						track.info.height = readU16Be(slice);
 						track.info.squarePixelWidth = track.info.width;
 						track.info.squarePixelHeight = track.info.height;
+						track.info.pixelAspectRatio = { num: 1, den: 1 };
 
 						slice.skip(4 + 4 + 4 + 2 + 32 + 2 + 2);
 
@@ -1740,6 +1746,7 @@ export class IsobmffDemuxer extends Demuxer {
 					// The ratio may already be set by the SPS, but the pasp box wins
 					track.info.squarePixelWidth = track.info.width;
 					track.info.squarePixelHeight = track.info.height;
+					track.info.pixelAspectRatio = simplifyRational({ num, den });
 
 					if (num > den) {
 						track.info.squarePixelWidth = Math.round(track.info.width * num / den);
@@ -3708,6 +3715,10 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 		return this.internalTrack.info.squarePixelHeight;
 	}
 
+	getPixelAspectRatio() {
+		return this.internalTrack.info.pixelAspectRatio;
+	}
+
 	getTransformationMatrix(): TransformationMatrix {
 		return [...this.internalTrack.matrix];
 	}
@@ -3807,12 +3818,11 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				colorSpace: this.internalTrack.info.colorSpace,
 			};
 
-			if (
-				this.internalTrack.info.width !== this.internalTrack.info.squarePixelWidth
-				|| this.internalTrack.info.height !== this.internalTrack.info.squarePixelHeight
-			) {
-				config.displayAspectWidth = this.internalTrack.info.squarePixelWidth;
-				config.displayAspectHeight = this.internalTrack.info.squarePixelHeight;
+			const { width, height, pixelAspectRatio } = this.internalTrack.info;
+			const displayAspect = getDisplayAspect(width, height, pixelAspectRatio);
+			if (displayAspect) {
+				config.displayAspectWidth = displayAspect.displayAspectWidth;
+				config.displayAspectHeight = displayAspect.displayAspectHeight;
 			}
 
 			return config;
@@ -4130,6 +4140,7 @@ const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Ration
 		return;
 	}
 
+	info.pixelAspectRatio = simplifyRational({ num, den });
 	if (num > den) {
 		info.squarePixelWidth = Math.round(info.width * num / den);
 		info.squarePixelHeight = info.height;

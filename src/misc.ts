@@ -1379,6 +1379,28 @@ export const simplifyRational = (rational: Rational): Rational => {
 };
 
 /**
+ * The display aspect for a decoder config of frames with the given coded size and pixel aspect ratio. As Mediabunny's
+ * demuxers always gave it, it's the frame size in square pixels when that's a whole number of pixels. Otherwise, it's
+ * the exact display aspect ratio in its reduced form (WebCodecs defines the two fields as a ratio): a rounded size
+ * would change the pixel aspect ratio of anything derived from it, such as the pasp box of a remux.
+ */
+export const getDisplayAspect = (width: number, height: number, pixelAspectRatio: Rational) => {
+	const { num, den } = pixelAspectRatio;
+	if (!(num > 0 && den > 0) || num === den || !(width > 0 && height > 0)) {
+		return null;
+	}
+
+	if (num > den && (width * num) % den === 0) {
+		return { displayAspectWidth: width * num / den, displayAspectHeight: height };
+	} else if (num < den && (height * den) % num === 0) {
+		return { displayAspectWidth: width, displayAspectHeight: height * den / num };
+	}
+
+	const displayAspectRatio = simplifyRational({ num: width * num, den: height * den });
+	return { displayAspectWidth: displayAspectRatio.num, displayAspectHeight: displayAspectRatio.den };
+};
+
+/**
  * Specifies a rectangular region where all quantities must be non-negative integers.
  * @group Miscellaneous
  * @public

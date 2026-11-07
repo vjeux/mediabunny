@@ -587,6 +587,8 @@ export interface InputVideoTrackBacking extends InputTrackBacking {
 	getCodedHeight(): MaybePromise<number>;
 	getSquarePixelWidth(): MaybePromise<number>;
 	getSquarePixelHeight(): MaybePromise<number>;
+	/** The exact pixel aspect ratio, if known; otherwise, it's derived from the (rounded) square pixel size. */
+	getPixelAspectRatio?(): MaybePromise<Rational | null>;
 	getMetadataDisplayWidth?(): MaybePromise<number | null>;
 	getMetadataDisplayHeight?(): MaybePromise<number | null>;
 	getTransformationMatrix(): MaybePromise<TransformationMatrix>;
@@ -733,6 +735,11 @@ export class InputVideoTrack extends InputTrack {
 	async getPixelAspectRatio() {
 		// Potential minor async race condition here if called twice, but doesn't matter since the computation is
 		// so cheap
+		const exact = await this._backing.getPixelAspectRatio?.();
+		if (exact) {
+			return this._pixelAspectRatioCache ??= toPixelAspectRatio(exact.num, exact.den);
+		}
+
 		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			(await this.getSquarePixelWidth()) * (await this.getCodedHeight()),
 			(await this.getSquarePixelHeight()) * (await this.getCodedWidth()),
@@ -745,6 +752,13 @@ export class InputVideoTrack extends InputTrack {
 	 * @deprecated Use {@link InputVideoTrack.getPixelAspectRatio} instead.
 	 */
 	get pixelAspectRatio() {
+		const exact = this._backing.getPixelAspectRatio
+			? requireSync(this._backing.getPixelAspectRatio(), 'pixelAspectRatio', 'getPixelAspectRatio')
+			: null;
+		if (exact) {
+			return this._pixelAspectRatioCache ??= toPixelAspectRatio(exact.num, exact.den);
+		}
+
 		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			requireSync(this._backing.getSquarePixelWidth(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedHeight(), 'pixelAspectRatio', 'getPixelAspectRatio'),

@@ -3607,3 +3607,39 @@ const testTimestampWraparound = async (
 		expect(timestamps[i]).toBeCloseTo(start + 0.5 * i, 4);
 	}
 };
+
+test('RESOLUTION with a display aspect given as a ratio or as a size', async () => {
+	// WebCodecs defines displayAspectWidth/Height as a ratio, in any units: a size in pixels is the RESOLUTION, while a
+	// ratio scales the coded size
+	const masterResolution = async (displayAspect: [number, number] | null) => {
+		let masterText = '';
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new MpegTsOutputFormat(),
+				onMaster: (text) => {
+					masterText = text;
+				},
+			}),
+			target: new PathedTarget('', () => new BufferTarget()),
+		});
+		const source = videoSource();
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(avcPacketData, 'key', 0, 1), {
+			decoderConfig: {
+				...avcMetadata.decoderConfig!,
+				...(displayAspect && { displayAspectWidth: displayAspect[0], displayAspectHeight: displayAspect[1] }),
+			},
+		});
+		await output.finalize();
+
+		return /RESOLUTION=(\d+x\d+)/.exec(masterText)?.[1];
+	};
+
+	expect(await masterResolution(null)).toBe('1280x720');
+	expect(await masterResolution([1920, 720])).toBe('1920x720'); // 2:1 pixels, as a size
+	expect(await masterResolution([8, 3])).toBe('1920x720'); // The same as a ratio
+	expect(await masterResolution([16, 9])).toBe('1280x720');
+	expect(await masterResolution([1280, 1440])).toBe('1280x1440'); // 1:2 pixels
+	expect(await masterResolution([1920, 1080])).toBe('1920x1080'); // A display size of another scale
+});
