@@ -4,11 +4,11 @@ import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { Quality } from '../../src/encode.js';
+import { canEncodeAudio, Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -672,6 +672,38 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 	expect(await track.getFirstTimestamp()).toBe(1);
 	expect(await track.computeDuration()).toBe(2);
 	input.dispose();
+});
+
+test('canEncodeAudio only reports configs that encode audibly', async () => {
+	// Firefox and WebKitGTK claim support for Opus with 3 or 4 channels but fail to encode it
+	for (const numberOfChannels of [2, 3, 4, 6]) {
+		if (!await canEncodeAudio('opus', { numberOfChannels })) {
+			continue;
+		}
+
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const audioSource = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(audioSource);
+		await output.start();
+		const sample = makeSineWave(48000, numberOfChannels, 0.5);
+		await audioSource.add(sample);
+		sample.close();
+		await output.finalize();
+
+		const { input, track } = await readBackAudioTrack(output.target.buffer!);
+		let peak = 0;
+		for await (const decoded of new AudioSampleSink(track).samples()) {
+			const values = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+			decoded.close();
+			for (const value of values) {
+				peak = Math.max(peak, Math.abs(value));
+			}
+		}
+		input.dispose();
+
+		expect(peak, `${numberOfChannels} channels`).toBeGreaterThan(0.1);
+	}
 });
 
 const makeSineWave = (
