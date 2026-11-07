@@ -29,7 +29,8 @@ test('Encrypted MP4 without senc', async () => {
 test('Decode a VP9 MP4 recording from MediaRecorder', async (context) => {
 	// Chrome writes level 0 into the vpcC box of these recordings
 	const mimeType = 'video/mp4;codecs=vp9';
-	if (!MediaRecorder.isTypeSupported(mimeType)) {
+	// WebKit's WPE port has no MediaRecorder
+	if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported(mimeType)) {
 		context.skip();
 	}
 
