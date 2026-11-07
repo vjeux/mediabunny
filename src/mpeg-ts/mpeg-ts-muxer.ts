@@ -24,7 +24,7 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../codec-data';
 import { Bitstream } from '../../shared/bitstream';
-import { assert, promiseWithResolvers, setUint24, toDataView, toUint8Array } from '../misc';
+import { assert, promiseWithResolvers, setUint24, toDataView, toUint8Array, UNDETERMINED_LANGUAGE } from '../misc';
 import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputTrack, OutputVideoTrack } from '../output';
 import { MpegTsOutputFormat } from '../output-format';
@@ -797,15 +797,47 @@ const PAT_SECTION = new Uint8Array(16);
 	view.setUint32(12, computeMpegTsCrc32(PAT_SECTION.subarray(0, 12)), false); // CRC_32
 }
 
+const getEsDescriptors = (trackData: MpegTsTrackData) => {
+	const descriptors: Uint8Array[] = [];
+
+	if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
+		descriptors.push(AC3_REGISTRATION_DESCRIPTOR);
+	} else if (trackData.streamType === MpegTsStreamType.EAC3_SYSTEM_A) {
+		descriptors.push(EAC3_REGISTRATION_DESCRIPTOR);
+	}
+
+	const { languageCode, disposition } = trackData.track.metadata;
+	// audio_type values per ISO/IEC 13818-1, mapped like FFmpeg does
+	const audioType = disposition?.hearingImpaired
+		? 0x02
+		: disposition?.visuallyImpaired
+			? 0x03
+			: 0x00;
+
+	if ((languageCode !== undefined && languageCode !== UNDETERMINED_LANGUAGE) || audioType !== 0x00) {
+		const language = languageCode ?? UNDETERMINED_LANGUAGE;
+		descriptors.push(new Uint8Array([
+			0x0a, // ISO_639_language_descriptor
+			4,
+			language.charCodeAt(0),
+			language.charCodeAt(1),
+			language.charCodeAt(2),
+			audioType,
+		]));
+	}
+
+	return descriptors;
+};
+
 const buildPmt = (trackDatas: MpegTsTrackData[]) => {
+	const esDescriptors = trackDatas.map(getEsDescriptors);
+
 	let totalEsBytes = 0;
-	for (const trackData of trackDatas) {
+	for (const descriptors of esDescriptors) {
 		totalEsBytes += 5;
 
-		if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
-			totalEsBytes += AC3_REGISTRATION_DESCRIPTOR.length;
-		} else if (trackData.streamType === MpegTsStreamType.EAC3_SYSTEM_A) {
-			totalEsBytes += EAC3_REGISTRATION_DESCRIPTOR.length;
+		for (const descriptor of descriptors) {
+			totalEsBytes += descriptor.length;
 		}
 	}
 
@@ -824,24 +856,21 @@ const buildPmt = (trackDatas: MpegTsTrackData[]) => {
 	view.setUint16(10, 0xF000, false); // reserved=1111, program_info_length=0
 
 	let offset = 12;
-	for (const trackData of trackDatas) {
+	for (let i = 0; i < trackDatas.length; i++) {
+		const trackData = trackDatas[i]!;
+		const descriptors = esDescriptors[i]!;
+
 		section[offset++] = trackData.streamType; // stream_type
 		view.setUint16(offset, 0xE000 | (trackData.pid & 0x1FFF), false); // reserved=111, elementary_PID
 		offset += 2;
 
-		if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
-			view.setUint16(offset, 0xF000 | AC3_REGISTRATION_DESCRIPTOR.length, false);
-			offset += 2;
-			section.set(AC3_REGISTRATION_DESCRIPTOR, offset);
-			offset += AC3_REGISTRATION_DESCRIPTOR.length;
-		} else if (trackData.streamType === MpegTsStreamType.EAC3_SYSTEM_A) {
-			view.setUint16(offset, 0xF000 | EAC3_REGISTRATION_DESCRIPTOR.length, false);
-			offset += 2;
-			section.set(EAC3_REGISTRATION_DESCRIPTOR, offset);
-			offset += EAC3_REGISTRATION_DESCRIPTOR.length;
-		} else {
-			view.setUint16(offset, 0xF000, false); // reserved=1111, ES_info_length=0
-			offset += 2;
+		const esInfoLength = descriptors.reduce((sum, descriptor) => sum + descriptor.length, 0);
+		view.setUint16(offset, 0xF000 | esInfoLength, false); // reserved=1111, ES_info_length
+		offset += 2;
+
+		for (const descriptor of descriptors) {
+			section.set(descriptor, offset);
+			offset += descriptor.length;
 		}
 	}
 
