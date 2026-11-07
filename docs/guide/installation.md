@@ -24,7 +24,9 @@ bun add mediabunny
 ::: info
 Requires any JavaScript environment that can run ECMAScript 2021 or later. Mediabunny is expected to be run in modern browsers. For types, TypeScript 5.7 or later is required.
 
-Mediabunny's type declarations use types from TypeScript's `DOM` and `ESNext` libraries (such as `HTMLCanvasElement` and `Disposable`), so include both in your tsconfig's `lib`, also in Node, Bun and Deno projects. From TypeScript 5.8 on, also enable `skipLibCheck`, because the `DOM` library then declares some of the same WebCodecs types as Mediabunny's `@types/dom-webcodecs` dependency:
+Mediabunny's type declarations use types from TypeScript's `DOM` library (such as `HTMLCanvasElement` and `AudioBuffer`), so include `"DOM"` in your tsconfig's `lib`, also in Node, Bun and Deno projects. Without it, the declarations don't type-check, and enabling `skipLibCheck` instead only hides that: the types that depend on it silently become `any`. In a Web Worker project, use `"WebWorker"` instead of `"DOM"` and enable `skipLibCheck`; DOM-only types such as `HTMLCanvasElement` and `AudioBuffer` then become `any`.
+
+The declarations also use `Disposable` from the `ESNext` library, so include `"ESNext"` too. On TypeScript 5.8 or later, also enable `skipLibCheck`: the `DOM` library there re-declares some of the WebCodecs types from Mediabunny's `@types/dom-webcodecs` dependency. For example:
 ```json
 {
 	"compilerOptions": {
@@ -33,7 +35,6 @@ Mediabunny's type declarations use types from TypeScript's `DOM` and `ESNext` li
 	}
 }
 ```
-Without these libraries, the declarations don't type-check, and with `skipLibCheck` alone the types that depend on them silently become `any`. In a Web Worker project, use `"WebWorker"` instead of `"DOM"` and enable `skipLibCheck`; DOM-only types such as `HTMLCanvasElement` and `AudioBuffer` then become `any`.
 :::
 
 Then, simply import it like this:
