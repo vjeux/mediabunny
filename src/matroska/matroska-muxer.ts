@@ -100,8 +100,17 @@ type ClusterBlock = {
 type MatroskaTrackData = {
 	chunkQueue: InternalMediaChunk[];
 	lastWrittenMsTimestamp: number | null;
-	/** The latest timestamp among the track's packets so far, in seconds. */
-	maxPacketTimestamp: number | null;
+	/** For video tracks, see addEncodedVideoPacket. */
+	blockTimestampState: {
+		/** The latest timestamp among the track's packets so far, in seconds. */
+		maxPacketTimestamp: number;
+		/** The latest block timestamp so far, in milliseconds. */
+		maxBlockMsTimestamp: number;
+		/** Whether a packet came with a timestamp below the latest one (B-frames). */
+		reordered: boolean;
+		/** Recent packets moved to a later millisecond than their own. */
+		movedPackets: { timestamp: number; msTimestamp: number }[];
+	} | null;
 	codecPrivate: AllowSharedBufferSource | null;
 	closed: boolean;
 } & ({
@@ -867,7 +876,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
-			maxPacketTimestamp: null,
+			blockTimestampState: null,
 			codecPrivate: meta.decoderConfig.description ?? null,
 			closed: false,
 		};
@@ -959,7 +968,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
-			maxPacketTimestamp: null,
+			blockTimestampState: null,
 			codecPrivate: decoderConfig.description ?? null,
 			closed: false,
 		};
@@ -993,7 +1002,7 @@ export class MatroskaMuxer extends Muxer {
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
-			maxPacketTimestamp: null,
+			blockTimestampState: null,
 			codecPrivate: textEncoder.encode(meta.config.description),
 			closed: false,
 		};
@@ -1038,23 +1047,7 @@ export class MatroskaMuxer extends Muxer {
 				duration = roundToDivisor(duration, track.metadata.frameRate);
 			}
 
-			// Blocks are timestamped in whole milliseconds, so a frame following the latest one by less than that (like
-			// after a trim that starts just before a frame) would land on the same timestamp. Push it to the next
-			// millisecond instead, as long as that's still within the frame, so that timestamps can't drift.
-			const previousTimestamp = trackData.maxPacketTimestamp;
-			if (
-				previousTimestamp !== null
-				&& timestamp > previousTimestamp
-				&& Math.round(1000 * timestamp) <= Math.round(1000 * previousTimestamp)
-			) {
-				const pushedTimestamp = (Math.round(1000 * previousTimestamp) + 1) / 1000;
-				const end = timestamp + duration;
-				if (pushedTimestamp < end) {
-					timestamp = pushedTimestamp;
-					duration = end - pushedTimestamp;
-				}
-			}
-			trackData.maxPacketTimestamp = Math.max(previousTimestamp ?? -Infinity, timestamp);
+			({ timestamp, duration } = this.assignVideoBlockTimestamp(trackData, timestamp, duration));
 
 			const additions = trackData.info.alphaMode
 				? packet.sideData.alpha ?? null
@@ -1068,6 +1061,61 @@ export class MatroskaMuxer extends Muxer {
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * Blocks are timestamped in whole milliseconds, so a frame following the latest one by less than that (like after a
+	 * trim that starts just before a frame) would land on the same timestamp. While the track's timestamps keep
+	 * increasing, such a frame goes to the millisecond after the latest block instead, as long as that's within the
+	 * frame and at most a millisecond past its own; otherwise it shares the latest block's timestamp. Frames are never
+	 * moved before a frame presented earlier, also after the track turns out to have B-frames, when no more frames are
+	 * moved ahead.
+	 */
+	private assignVideoBlockTimestamp(trackData: MatroskaVideoTrackData, timestamp: number, duration: number) {
+		const ownMsTimestamp = Math.round(1000 * timestamp);
+		let msTimestamp = ownMsTimestamp;
+		const state = trackData.blockTimestampState;
+
+		if (!state) {
+			trackData.blockTimestampState = {
+				maxPacketTimestamp: timestamp,
+				maxBlockMsTimestamp: msTimestamp,
+				reordered: false,
+				movedPackets: [],
+			};
+			return { timestamp, duration };
+		}
+
+		state.reordered ||= timestamp < state.maxPacketTimestamp;
+		if (!state.reordered) {
+			if (msTimestamp <= state.maxBlockMsTimestamp) {
+				const nextMsTimestamp = state.maxBlockMsTimestamp + 1;
+				const canMove = timestamp > state.maxPacketTimestamp
+					&& nextMsTimestamp <= ownMsTimestamp + 1
+					&& nextMsTimestamp / 1000 < timestamp + duration;
+				msTimestamp = canMove ? nextMsTimestamp : state.maxBlockMsTimestamp;
+			}
+		} else {
+			for (const moved of state.movedPackets) {
+				if (moved.timestamp < timestamp) {
+					msTimestamp = Math.max(msTimestamp, moved.msTimestamp);
+				}
+			}
+		}
+
+		state.maxPacketTimestamp = Math.max(state.maxPacketTimestamp, timestamp);
+		state.maxBlockMsTimestamp = Math.max(state.maxBlockMsTimestamp, msTimestamp);
+
+		if (msTimestamp === ownMsTimestamp) {
+			return { timestamp, duration };
+		}
+
+		// Moved packets only matter to the frames presented within a millisecond or so after them, which arrive soon
+		state.movedPackets = state.movedPackets.filter(x => x.timestamp > state.maxPacketTimestamp - 10);
+		state.movedPackets.push({ timestamp, msTimestamp });
+
+		const end = timestamp + duration;
+		return { timestamp: msTimestamp / 1000, duration: Math.max(end - msTimestamp / 1000, 0) };
 	}
 
 	async addEncodedAudioPacket(track: OutputAudioTrack, packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) {
