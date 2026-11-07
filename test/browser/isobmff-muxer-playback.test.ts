@@ -133,9 +133,23 @@ const playFile = async (mimeType: string, bytes: Uint8Array) => {
 	return { duration, size, currentTime: video.currentTime };
 };
 
+/** Whether the browser itself can encode the AV1 the tests use; some, like Safari, have no WebCodecs AV1 encoder. */
+const browserEncodesAv1 = async () => {
+	try {
+		const config = { codec: 'av01.0.00M.08', width: 320, height: 240, bitrate: 500_000 };
+		return (await VideoEncoder.isConfigSupported(config)).supported === true;
+	} catch {
+		return false;
+	}
+};
+
 describe('Chrome plays muxed ISOBMFF files', () => {
 	for (const videoCodec of ['avc', 'vp9', 'av1'] as const) {
-		test(`fragmented ${videoCodec} + Opus loads through MSE and plays to the end`, async () => {
+		test(`fragmented ${videoCodec} + Opus loads through MSE and plays to the end`, async ({ skip }) => {
+			if (videoCodec === 'av1' && !await browserEncodesAv1()) {
+				skip('No WebCodecs AV1 encoder in this browser');
+			}
+
 			const { mimeType, bytes } = await encode({
 				format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration: 0.5 }),
 				videoCodec,
@@ -148,7 +162,11 @@ describe('Chrome plays muxed ISOBMFF files', () => {
 			expect(currentTime).toBeCloseTo(1, 1);
 		});
 
-		test(`regular ${videoCodec} + Opus MP4 plays as a file`, async () => {
+		test(`regular ${videoCodec} + Opus MP4 plays as a file`, async ({ skip }) => {
+			if (videoCodec === 'av1' && !await browserEncodesAv1()) {
+				skip('No WebCodecs AV1 encoder in this browser');
+			}
+
 			const { mimeType, bytes } = await encode({
 				format: new Mp4OutputFormat({ fastStart: 'in-memory' }),
 				videoCodec,
