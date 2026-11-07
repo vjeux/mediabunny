@@ -3,13 +3,13 @@
   "author": "Vanilagy",
   "version": "1.65.2",
   "description": "Apple ProRes decoder extension for Mediabunny, based on TurboRes.",
-  "main": "./dist/bundles/mediabunny-prores.mjs",
+  "main": "./dist/bundles/mediabunny-prores.cjs",
   "module": "./dist/bundles/mediabunny-prores.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
     "types": "./dist/modules/src/index.d.ts",
     "import": "./dist/bundles/mediabunny-prores.mjs",
-    "require": "./dist/bundles/mediabunny-prores.mjs"
+    "require": "./dist/bundles/mediabunny-prores.cjs"
   },
   "files": [
     "README.md",
