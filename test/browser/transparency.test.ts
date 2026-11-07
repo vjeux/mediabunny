@@ -386,7 +386,20 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	expect(sample.hasAlpha).toBe(true);
 });
 
-test('Encoding semi-transparent canvas content keeps the colors unpremultiplied', async () => {
+test('Encoding semi-transparent canvas content keeps the colors unpremultiplied', async ({ skip }) => {
+	// WebKitGTK's VideoFrame.copyTo() returns YUV planes unconverted when asked for RGBA, so the colors can't be read
+	// back there. This probes the browser itself, not Mediabunny.
+	const probe = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
+		format: 'I420',
+		codedWidth: 2,
+		codedHeight: 2,
+		timestamp: 0,
+	});
+	const probeRgba = new Uint8Array(16);
+	await probe.copyTo(probeRgba, { format: 'RGBA' }).catch(() => {});
+	probe.close();
+	skip(probeRgba[3] !== 255, 'VideoFrame.copyTo() does not convert YUV to RGBA here');
+
 	const canvas = new OffscreenCanvas(64, 32);
 	const context = canvas.getContext('2d')!;
 	context.fillStyle = 'rgba(255, 64, 0, 0.5)';
