@@ -1490,6 +1490,14 @@ export class HlsMuxer extends Muxer {
 		const variantsWithSegments = this.playlistDeclarations.filter(
 			x => x.groupId === null && x.playlist.writtenSegments.length > 0,
 		);
+		// A rendition without URI lives in its variant's own playlist. When that playlist is empty and the variant is
+		// written as a variant of another rendition (see below), the rendition would stand for that other rendition's
+		// media, so it's left out: it holds nothing
+		const isEmptyRenditionInVariantPlaylist = (decl: PlaylistDeclaration) => decl.noUri
+			&& decl.playlist.writtenSegments.length === 0
+			&& this.playlistDeclarations.some(
+				x => x.groupId === decl.groupId && x.playlist.writtenSegments.length > 0,
+			);
 		const isLeftOut = (decl: PlaylistDeclaration) => variantsWithSegments.length > 0
 			&& decl.playlist.writtenSegments.length === 0
 			&& !decl.references.some(ref => ref.playlist.writtenSegments.length > 0
@@ -1505,7 +1513,7 @@ export class HlsMuxer extends Muxer {
 					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
 				// A variant kept only for its renditions (its own playlist has no segments) is written as a variant of
-				// those renditions alone, so that no #EXT-X-STREAM-INF points to an empty playlist (which the reader
+				// one of those renditions, so that no #EXT-X-STREAM-INF points to an empty playlist (which the reader
 				// could then take as its reference, and which wouldn't present the same content as the other variants)
 				const renditionWithSegments = decl.playlist.writtenSegments.length === 0
 					? decl.references.find(ref => ref.playlist.writtenSegments.length > 0) ?? null
@@ -1530,6 +1538,10 @@ export class HlsMuxer extends Muxer {
 					codecs.push(toHlsCodecString(codecString));
 
 					for (const ref of decl.references) {
+						if (renditionWithSegments && ref.playlist.writtenSegments.length === 0) {
+							continue;
+						}
+
 						assert(ref.playlist.peakBitrate !== null);
 						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
 						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
@@ -1561,7 +1573,7 @@ export class HlsMuxer extends Muxer {
 
 				masterPlaylistText += `,CODECS="${codecs.join(',')}"`;
 
-				const videoTrack = ownTracks.find(x => x.isVideoTrack());
+				const videoTrack = (renditionWithSegments?.playlist.tracks ?? ownTracks).find(x => x.isVideoTrack());
 				if (videoTrack?.isVideoTrack()) {
 					const trackData = this.trackDatas.find(x => x.track === videoTrack) as
 						HlsVideoTrackData | undefined;
@@ -1612,6 +1624,10 @@ export class HlsMuxer extends Muxer {
 				}
 			} else {
 				assert(decl.playlist.tracks.length === 1);
+
+				if (isEmptyRenditionInVariantPlaylist(decl)) {
+					continue;
+				}
 
 				const track = decl.playlist.tracks[0]!;
 				const type = track.type;

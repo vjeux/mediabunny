@@ -3839,3 +3839,53 @@ test('An HLS output whose second pairing has no video segments stays readable', 
 		expect(await new EncodedPacketSink(audioResult).getFirstPacket()).not.toBeNull();
 	}
 });
+
+test('A URI-less rendition with an empty playlist is left out when its variant uses another rendition', async () => {
+	for (const kind of ['video', 'audio'] as const) {
+		const targets = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat() }),
+			target: new PathedTarget('master.m3u8', ({ path }) => {
+				const target = new BufferTarget();
+				targets.set(path, target);
+				return target;
+			}),
+		});
+
+		// The different names put both (unpaired) tracks into one group, whose first rendition has no URI: its media
+		// is in the variant's own playlist. That first track never gets a packet.
+		const video = videoSource();
+		const audio = audioSource();
+		if (kind === 'video') {
+			output.addVideoTrack(videoSource(), { name: 'Empty', decoderConfig: avcMetadata.decoderConfig });
+			output.addVideoTrack(video, { name: 'Main' });
+		} else {
+			output.addAudioTrack(audioSource(), { name: 'Empty', decoderConfig: aacMetadata.decoderConfig });
+			output.addAudioTrack(audio, { name: 'Main' });
+		}
+
+		await output.start();
+
+		for (let i = 0; i < 4; i++) {
+			if (kind === 'video') {
+				await video.add(new EncodedPacket(avcPacketData, 'key', i * 0.5, 0.5), avcMetadata);
+			} else {
+				await audio.add(new EncodedPacket(aacPacketData, 'key', i * 0.5, 0.5), aacMetadata);
+			}
+		}
+
+		await output.finalize();
+
+		const masterText = new TextDecoder().decode(targets.get('master.m3u8')!.buffer!);
+		expect(masterText).not.toContain('NAME="Empty"');
+		expect(masterText.match(/#EXT-X-STREAM-INF:/g)).toHaveLength(1);
+
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(targets.get(path)!.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const tracks = kind === 'video' ? await input.getVideoTracks() : await input.getAudioTracks();
+		expect(await Promise.all(tracks.map(x => x.getName()))).toEqual(['Main']);
+		expect((await new EncodedPacketSink(tracks[0]!).getFirstPacket())?.timestamp).toBe(0);
+	}
+});
