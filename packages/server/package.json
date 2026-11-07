@@ -38,7 +38,7 @@
     "@mediabunny/prores": "^1.65.2"
   },
   "peerDependencies": {
-    "mediabunny": "^1.45.0"
+    "mediabunny": "^1.56.0"
   },
   "keywords": [
     "server",
