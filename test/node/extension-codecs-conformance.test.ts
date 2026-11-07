@@ -14,6 +14,7 @@ import { AudioCodec } from '../../src/codec.js';
 import { toUint8Array } from '../../src/misc.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { AudioSample } from '../../src/sample.js';
+import type { EncodedPacket } from '../../src/packet.js';
 import { NodeAvAudioDecoder } from '../../packages/server/src/audio-decoder.js';
 import {
 	channelToneMap,
@@ -60,6 +61,17 @@ const decodeBytes = async (bytes: Uint8Array) => {
 };
 
 const identity = (n: number) => [...Array(n).keys()];
+
+// Every packet holds a whole frame, except that the last one can end early, where the input does (the silence that
+// fills up its frame isn't part of the audio)
+const expectFrameDuration = (packet: EncodedPacket, frameDuration: number, isLast: boolean) => {
+	if (isLast) {
+		expect(packet.duration).toBeGreaterThan(0);
+		expect(packet.duration).toBeLessThanOrEqual(frameDuration + 1e-9);
+	} else {
+		expect(packet.duration).toBeCloseTo(frameDuration, 10);
+	}
+};
 
 describe('AC-3 and E-AC-3', () => {
 	test('decodes FFmpeg-encoded 5.1 AC-3 in WAV channel order', async () => {
@@ -121,7 +133,7 @@ describe('AC-3 and E-AC-3', () => {
 			input.dispose();
 
 			expect(packets.length).toBeGreaterThan(0);
-			for (const packet of packets) {
+			for (const [i, packet] of packets.entries()) {
 				const frame = parseAc3Frame(packet.data);
 				expect(frame.bsid).toBe(8);
 				expect(frame.sampleRate).toBe(sampleRate);
@@ -130,7 +142,7 @@ describe('AC-3 and E-AC-3', () => {
 				expect(frame.lfeon).toBe(numberOfChannels === 6 ? 1 : 0);
 				// One syncframe per packet, sized as the frmsizecod says
 				expect(frame.frameBytes).toBe(packet.data.byteLength);
-				expect(packet.duration).toBeCloseTo(1536 / sampleRate, 10);
+				expectFrameDuration(packet, 1536 / sampleRate, i === packets.length - 1);
 			}
 		}
 	});
@@ -233,7 +245,7 @@ describe('DTS', () => {
 			const { input, packets } = await readAudioPackets(bytes);
 			input.dispose();
 
-			for (const packet of packets) {
+			for (const [i, packet] of packets.entries()) {
 				const frame = parseDtsFrame(packet.data);
 				expect(frame.samples).toBe(512);
 				expect(frame.frameBytes).toBe(packet.data.byteLength);
@@ -241,7 +253,7 @@ describe('DTS', () => {
 				expect(frame.amode).toBe(amode);
 				expect(frame.lfe).toBe(numberOfChannels === 6);
 				expect(frame.channels).toBe(numberOfChannels);
-				expect(packet.duration).toBeCloseTo(512 / sampleRate, 10);
+				expectFrameDuration(packet, 512 / sampleRate, i === packets.length - 1);
 			}
 		}
 	});
@@ -533,8 +545,8 @@ describe('MP3 encoder', () => {
 			// LAME's 576 samples plus the decoder's 529
 			expect(packets[0]!.timestamp).toBeCloseTo(-1105 / sampleRate, 6);
 			const frameSamples = sampleRate >= 32000 ? 1152 : 576;
-			for (const packet of packets) {
-				expect(packet.duration).toBeCloseTo(frameSamples / sampleRate, 10);
+			for (const [i, packet] of packets.entries()) {
+				expectFrameDuration(packet, frameSamples / sampleRate, i === packets.length - 1);
 			}
 		}
 	});
