@@ -581,7 +581,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 	}
 
 	async getFirstSegment() {
-		if (this.segments.length === 0) {
+		if (this.segments.length === 0 && !this.streamHasEnded) {
 			await this.runUpdateSegments();
 		}
 
@@ -589,7 +589,11 @@ export class HlsSegmentedInput extends SegmentedInput {
 	}
 
 	async getSegmentAt(timestamp: number, options: SegmentRetrievalOptions) {
-		if (this.segments.length === 0) {
+		if (
+			this.segments.length === 0
+			&& !this.streamHasEnded
+			&& !(options.skipLiveWait && this.getRemainingWaitTimeMs() > 0)
+		) {
 			await this.runUpdateSegments();
 		}
 
@@ -830,7 +834,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 			const firstSegment = await this.getFirstSegment();
 			assert(firstSegment);
 
-			const referenceSegmentedInput = this.demuxer.getReferenceSegmentedInput();
+			const referenceSegmentedInput = await this.demuxer.getTimelineSegmentedInput();
 			if (this === referenceSegmentedInput) {
 				return 0;
 			}
