@@ -2,13 +2,13 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -731,3 +731,100 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+/**
+ * Records frames with the given capture timestamps (in microseconds) through a MediaStreamVideoTrackSource, handing
+ * them over through a stand-in MediaStreamTrackProcessor, and returns the error the recording failed with, if any, and
+ * the timestamps of the recorded packets.
+ */
+const recordCaptureTimestamps = async (timestamps: number[]) => {
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const originalProcessor = globals.MediaStreamTrackProcessor;
+	globals.MediaStreamTrackProcessor = class {
+		readable = new ReadableStream<VideoFrame>({
+			start: (c) => {
+				controller = c;
+			},
+		});
+	};
+
+	const track = document.createElement('canvas').captureStream(0).getVideoTracks()[0]!;
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new MediaStreamVideoTrackSource(
+		track,
+		{ codec: 'vp8', quality: new Quality('low'), keyFrameInterval: 0.5 },
+		{ frameRate: null },
+	);
+	const errors: unknown[] = [];
+	videoSource.errorPromise.catch(error => errors.push(error));
+	output.addVideoTrack(videoSource);
+	try {
+		await output.start();
+	} finally {
+		globals.MediaStreamTrackProcessor = originalProcessor;
+	}
+
+	const canvas = new OffscreenCanvas(64, 48);
+	const context = canvas.getContext('2d')!;
+	for (const [i, timestamp] of timestamps.entries()) {
+		context.fillStyle = `rgb(${10 * i}, 0, 0)`;
+		context.fillRect(0, 0, canvas.width, canvas.height);
+		const frame = new VideoFrame(canvas, { timestamp });
+		try {
+			controller.enqueue(frame);
+		} catch {
+			// The source stopped reading, after an error
+			frame.close();
+			break;
+		}
+		await new Promise(resolve => setTimeout(resolve, 10));
+	}
+
+	const finalizeError = await output.finalize().then(() => null, (error: unknown) => error);
+	track.stop();
+	if (finalizeError !== null || errors.length > 0) {
+		return { error: finalizeError ?? errors[0], packetTimestamps: [] };
+	}
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const packetTimestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink((await input.getPrimaryVideoTrack())!).packets()) {
+		packetTimestamps.push(packet.timestamp);
+	}
+
+	return { error: null, packetTimestamps };
+};
+
+// 24 frames at 30 FPS
+const regularCaptureTimestamps = Array.from({ length: 24 }, (_, i) => 1e9 + Math.round(1e6 * i / 30));
+
+test('MediaStreamVideoTrackSource, a frame stamped back across a key frame is dropped', async ({ skip }) => {
+	if (typeof VideoEncoder === 'undefined') {
+		skip('Needs VideoEncoder');
+	}
+
+	// Frame 15 is captured at 0.502 s, and frame 16 stamped 4 ms earlier, on the other side of the 0.5 s key frame
+	const timestamps = regularCaptureTimestamps.map((timestamp, i) => {
+		return i === 15 ? 1e9 + 502000 : i === 16 ? 1e9 + 498000 : timestamp;
+	});
+	const { error, packetTimestamps } = await recordCaptureTimestamps(timestamps);
+	expect(error).toBe(null);
+	expect(packetTimestamps).toHaveLength(23);
+	for (let i = 1; i < packetTimestamps.length; i++) {
+		expect(packetTimestamps[i]!).toBeGreaterThan(packetTimestamps[i - 1]!);
+	}
+});
+
+test('MediaStreamVideoTrackSource, increasing capture timestamps keep every frame', async ({ skip }) => {
+	if (typeof VideoEncoder === 'undefined') {
+		skip('Needs VideoEncoder');
+	}
+
+	const { error, packetTimestamps } = await recordCaptureTimestamps(regularCaptureTimestamps);
+	expect(error).toBe(null);
+	expect(packetTimestamps).toHaveLength(24);
+});
