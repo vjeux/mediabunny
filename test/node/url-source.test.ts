@@ -142,6 +142,52 @@ test('UrlSource resumes with correct data when the connection dies in sequential
 	}
 });
 
+test('UrlSource passes a growing attempt count to getRetryDelay while responses keep dying', async () => {
+	const data = new Uint8Array(2 ** 20).map((_, i) => i & 0xff);
+
+	for (const honorRanges of [true, false]) {
+		let requestCount = 0;
+		const server = http.createServer((req, res) => {
+			res.on('error', () => {});
+			const start = honorRanges ? Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0) : 0;
+			res.writeHead(honorRanges ? 206 : 200, {
+				...(honorRanges && { 'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}` }),
+				'Content-Length': data.length - start,
+			});
+
+			// The first response delivers some data; every response dies after a moment. Without range support,
+			// each response sends the same first bytes again, which are no new data.
+			if (requestCount++ === 0 || !honorRanges) {
+				res.write(data.subarray(start, start + 1000));
+			}
+			res.flushHeaders();
+			setTimeout(() => res.destroy(), 10);
+		});
+
+		await new Promise<void>(resolve => server.listen(0, resolve));
+		const logs = captureLogs();
+
+		try {
+			const address = server.address();
+			assert(address && typeof address !== 'string');
+			const attempts: number[] = [];
+			using ref = new UrlSource(`http://localhost:${address.port}/data.bin`, {
+				getRetryDelay: (previousAttempts) => {
+					attempts.push(previousAttempts);
+					return previousAttempts >= 3 || attempts.length >= 10 ? null : 0;
+				},
+			}).ref();
+
+			await expect(async () => new Reader(ref.source).requestSlice(0, 500_000)).rejects.toThrow();
+			expect(attempts, honorRanges ? 'range requests' : 'sequential mode').toEqual([1, 2, 3]);
+		} finally {
+			logs.stop();
+			server.closeAllConnections();
+			server.close();
+		}
+	}
+});
+
 test('UrlSource with maxCacheSize: Infinity allows random access against a rangeless server', async () => {
 	const server = await startRangelessServer();
 	const logs = captureLogs();

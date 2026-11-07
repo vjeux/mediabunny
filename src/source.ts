@@ -947,7 +947,8 @@ export class UrlSource extends PathedSource {
 
 	/** @internal */
 	private async _runWorker(worker: ReadWorker) {
-		let consecutiveEmptyResponses = 0;
+		// Responses in a row that failed or ended without getting us any further, for getRetryDelay
+		let consecutiveFailedResponses = 0;
 
 		// The outer loop is for resuming a request if it dies mid-response
 		while (true) {
@@ -1084,7 +1085,12 @@ export class UrlSource extends PathedSource {
 						throw error;
 					}
 
-					const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
+					if (worker.currentPos > responseStartPos) {
+						consecutiveFailedResponses = 0; // This response still got us further before it failed
+					}
+					consecutiveFailedResponses++;
+
+					const retryDelayInSeconds = this._getRetryDelay(consecutiveFailedResponses, error, this._url);
 					if (retryDelayInSeconds !== null) {
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
 						await wait(1000 * retryDelayInSeconds);
@@ -1115,14 +1121,14 @@ export class UrlSource extends PathedSource {
 
 						if (worker.currentPos > responseStartPos) {
 							// Response still moved us forward; keep going immediately
-							consecutiveEmptyResponses = 0;
+							consecutiveFailedResponses = 0;
 							break;
 						}
 
 						// The response didn't get us any further, so back off instead of hammering the server
-						consecutiveEmptyResponses++;
+						consecutiveFailedResponses++;
 						const error = new Error('Range response ended without delivering any data.');
-						const retryDelayInSeconds = this._getRetryDelay(consecutiveEmptyResponses, error, this._url);
+						const retryDelayInSeconds = this._getRetryDelay(consecutiveFailedResponses, error, this._url);
 						if (retryDelayInSeconds === null) {
 							throw error;
 						}
@@ -1160,6 +1166,8 @@ export class UrlSource extends PathedSource {
 		let currentReader = body.getReader();
 		let streamPosition = 0;
 		let skipRemaining = 0;
+		// Responses in a row that failed before delivering new data, for getRetryDelay
+		let consecutiveFailedResponses = 0;
 
 		const wrappedStream = new ReadableStream<Uint8Array>({
 			pull: async (controller) => {
@@ -1173,7 +1181,8 @@ export class UrlSource extends PathedSource {
 							throw error;
 						}
 
-						const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
+						consecutiveFailedResponses++;
+						const retryDelayInSeconds = this._getRetryDelay(consecutiveFailedResponses, error, this._url);
 						if (retryDelayInSeconds === null) {
 							throw error;
 						}
@@ -1241,6 +1250,7 @@ export class UrlSource extends PathedSource {
 					}
 
 					streamPosition += chunk.length;
+					consecutiveFailedResponses = 0;
 					controller.enqueue(chunk);
 
 					return;
