@@ -276,3 +276,35 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
+
+// vorbis-clicks.ogg was made with:
+// ffmpeg -f lavfi -i "aevalsrc=exprs='if(lt(mod(t\,0.5)\,0.004)\,0.8*sin(2*PI*1000*t)\,0)':s=44100:d=3" \
+//   -c:a libvorbis -q:a 4 vorbis-clicks.ogg
+test('Vorbis audio keeps its timing, also after seeking', async () => {
+	using input = new Input({
+		source: new UrlSource('/vorbis-clicks.ogg'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+
+	// A 1 kHz tone burst starts every 0.5 seconds
+	const findBurst = async (startTimestamp?: number) => {
+		for await (using sample of sink.samples(startTimestamp)) {
+			const index = getSampleData(sample).findIndex(x => Math.abs(x) > 0.3);
+			if (index !== -1) {
+				return sample.timestamp + index / sample.sampleRate;
+			}
+		}
+
+		return null;
+	};
+
+	expect(await findBurst()).toBeCloseTo(0, 3);
+	expect(await findBurst(0.9)).toBeCloseTo(1, 3);
+	expect(await findBurst(1.45)).toBeCloseTo(1.5, 3);
+	expect(await findBurst(2.2)).toBeCloseTo(2.5, 3);
+});
