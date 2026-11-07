@@ -1281,3 +1281,26 @@ test('ftyp lists the brands that AV1 tracks and roll sample groups require', asy
 	expect(fragmented).toContain('av01');
 	expect(fragmented).toContain('iso6'); // Includes sample group support
 });
+
+test('Sample durations that exceed 32 bits are rejected instead of wrapping around', async () => {
+	const muxWithGap = async (fastStart: false | 'fragmented') => {
+		const output = new Output({
+			target: new BufferTarget(),
+			format: new Mp4OutputFormat({ fastStart, minimumFragmentDuration: 1e9 }),
+		});
+
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source);
+		await output.start();
+
+		const decoderConfig = { codec: 'vp8', codedWidth: 320, codedHeight: 180 };
+		await source.add(new EncodedPacket(new Uint8Array(1), 'key', 0, 1), { decoderConfig });
+		await source.add(new EncodedPacket(new Uint8Array(1), 'key', 1, 1));
+		// 30 hours later: more than 2^32 units of the track timescale, which used to wrap to ~9.3 hours
+		await source.add(new EncodedPacket(new Uint8Array(1), 'key', 30 * 3600, 1));
+		await output.finalize();
+	};
+
+	await expect(muxWithGap(false)).rejects.toThrow(/more than an MP4\/MOV sample duration can hold/);
+	await expect(muxWithGap('fragmented')).rejects.toThrow(/more than an MP4\/MOV sample duration can hold/);
+});
