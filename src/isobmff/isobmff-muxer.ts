@@ -35,6 +35,7 @@ import {
 	simplifyRational,
 	Queue,
 	toUint8Array,
+	isU32,
 } from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
@@ -188,6 +189,17 @@ export const getTrackMetadata = (trackData: IsobmffTrackData) => {
 	}
 
 	return metadata;
+};
+
+/** Sample durations (stts, trun) are 32-bit; larger values would silently wrap around. */
+const validateSampleDuration = (trackData: IsobmffTrackData, timescaleUnits: number) => {
+	if (!isU32(timescaleUnits)) {
+		throw new Error(
+			`Track #${trackData.track.id} has a sample lasting ${timescaleUnits / trackData.timescale} seconds`
+			+ ` (up to the next sample), which is more than an MP4/MOV sample duration can hold`
+			+ ` (${2 ** 32 - 1} units of the track's timescale, ${trackData.timescale}).`,
+		);
+	}
 };
 
 export const intoTimescale = (timeInSeconds: number, timescale: number, round = true) => {
@@ -1110,6 +1122,9 @@ export class IsobmffMuxer extends Muxer {
 			const sampleCompositionTimeOffset
 				= intoTimescale(sample.timestamp - sample.decodeTimestamp, trackData.timescale);
 			const durationInTimescale = intoTimescale(sample.duration, trackData.timescale);
+			if (!this.isFragmented) {
+				validateSampleDuration(trackData, durationInTimescale);
+			}
 
 			if (trackData.lastTimescaleUnits !== null) {
 				assert(trackData.lastSample);
@@ -1117,6 +1132,9 @@ export class IsobmffMuxer extends Muxer {
 				const timescaleUnits = intoTimescale(sample.decodeTimestamp, trackData.timescale, false);
 				const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
 				assert(delta >= 0);
+				if (!this.isFragmented) {
+					validateSampleDuration(trackData, delta);
+				}
 
 				trackData.lastTimescaleUnits += delta;
 				trackData.lastSample.timescaleUnitsToNextSample = delta;
@@ -1469,6 +1487,7 @@ export class IsobmffMuxer extends Muxer {
 			trackData.currentChunk.startTimestamp -= trackData.startTimestampOffset;
 
 			for (const sample of trackData.currentChunk.samples) {
+				validateSampleDuration(trackData, sample.timescaleUnitsToNextSample);
 				currentPos += sample.size;
 
 				sample.timestamp -= trackData.startTimestampOffset;
