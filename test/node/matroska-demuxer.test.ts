@@ -233,3 +233,94 @@ test('getPacket finds B-frames in a cluster that starts before the cluster prece
 	const control = makeFile(cluster(0, 0), cluster(160, 160, 80, 40, 120));
 	expect(await lookUp(control, [0, 0.04, 0.08, 0.12, 0.16])).toEqual([0, 0.04, 0.08, 0.12, 0.16]);
 });
+
+test('getPacket in a long GOP with B-frames doesn\'t rescan the clusters since its key frame', async () => {
+	// 5 minutes at 25 fps with a single key frame (x264 keyint=infinite, long screen recordings), B-frames (decode
+	// order I0 P3 B1 B2 P6 B4 B5 ...), 8 blocks per cluster, 200-byte frames, no Cues (piped output)
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+
+	const frameCount = 7500;
+	const order: number[] = [0];
+	for (let i = 3; i < frameCount; i += 3) {
+		order.push(i, i - 2, i - 1);
+	}
+
+	const clusters: number[][] = [];
+	for (let i = 0; i < order.length; i += 8) {
+		const timestamps = order.slice(i, i + 8).map(n => n * 40);
+		const base = timestamps[0]!;
+		clusters.push(element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [(base >>> 16) & 0xff, (base >>> 8) & 0xff, base & 0xff]),
+			...timestamps.map(timestamp => element(EBMLId.SimpleBlock, [
+				0x81,
+				((timestamp - base) >> 8) & 0xff,
+				(timestamp - base) & 0xff,
+				timestamp === 0 ? 0x80 : 0,
+				...new Array<number>(200).fill(1),
+			])),
+		));
+	}
+
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [1]),
+				element(EBMLId.CodecID, ascii('V_MPEG4/ISO/AVC')),
+				element(EBMLId.Video, element(EBMLId.PixelWidth, [16]), element(EBMLId.PixelHeight, [16])),
+			)),
+			...clusters,
+		),
+	]);
+
+	let bytesRead = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => file.byteLength,
+			read: (start, end) => {
+				bytesRead += end - start;
+				return file.subarray(start, end);
+			},
+			maxCacheSize: 2 ** 16,
+		}),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	// Learn every cluster
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		void packet;
+	}
+
+	bytesRead = 0;
+	let seed = 1;
+	for (let i = 0; i < 100; i++) {
+		seed = (seed * 16807) % 2147483647;
+		const timestamp = (seed % 299000) / 1000;
+		const packet = await sink.getPacket(timestamp, { metadataOnly: true });
+		// Frames are 40 ms apart, so the match is at most 40 ms before the timestamp
+		expect(timestamp - packet!.timestamp).toBeLessThan(0.04 + 1e-9);
+		expect(packet!.timestamp).toBeLessThanOrEqual(timestamp + 1e-9);
+	}
+
+	// A lookup needs the clusters around the timestamp (a few KiB each), not all of them since the key frame (about
+	// 830 KiB per lookup on average)
+	expect(bytesRead / 100).toBeLessThan(64 * 1024);
+}, 120_000);
