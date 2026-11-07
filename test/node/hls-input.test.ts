@@ -1320,10 +1320,10 @@ test.concurrent('#EXT-X-DEFINE QUERYPARAM variables can be IMPORTed into media p
 	expect(requestedPaths).toContain(expectedSegmentPath);
 });
 
-test.concurrent('A live media playlist without segments yet is waited on', async () => {
+test.concurrent('A live media playlist without segments yet is waited on', { timeout: 15_000 }, async () => {
 	// A live stream that just started: the first fetch of its playlist has no segments yet. Loaded directly, and
-	// through a multivariant playlist.
-	for (const rootPath of ['live.m3u8', 'master.m3u8']) {
+	// through a multivariant playlist. Each waits for one reload of the playlist, a target duration (1 s) later.
+	const check = async (rootPath: string) => {
 		let playlistFetches = 0;
 
 		using input = new Input({
@@ -1353,7 +1353,9 @@ test.concurrent('A live media playlist without segments yet is waited on', async
 		assert(videoTrack);
 		expect(await videoTrack.getFirstTimestamp()).toBe(0);
 		expect(playlistFetches).toBe(2);
-	}
+	};
+
+	await Promise.all([check('live.m3u8'), check('master.m3u8')]);
 });
 
 test.concurrent('Media playlist tags in a multivariant playlist are ignored', async () => {
