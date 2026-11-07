@@ -15,7 +15,7 @@ import {
 	DEFAULT_TRACK_DISPOSITION,
 	MetadataTags,
 	recordRawMetadataTagFields,
-	setAsideMetadataTagFields,
+	watchMetadataTagFields,
 } from '../metadata';
 import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
@@ -250,7 +250,7 @@ export class WaveDemuxer extends Demuxer {
 				value += String.fromCharCode(bytes[i]!);
 			}
 
-			const setAside = setAsideMetadataTagFields(this.metadataTags);
+			const watch = watchMetadataTagFields(this.metadataTags);
 			this.metadataTags.raw ??= {};
 			this.metadataTags.raw[chunkName] = value;
 
@@ -314,7 +314,7 @@ export class WaveDemuxer extends Demuxer {
 				}; break;
 			}
 
-			recordRawMetadataTagFields(this.metadataTags, chunkName, setAside);
+			recordRawMetadataTagFields(this.metadataTags, chunkName, watch);
 
 			currentPos += 8 + chunkSize + (chunkSize & 1); // Handle padding
 		}

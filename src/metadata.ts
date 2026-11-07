@@ -307,66 +307,90 @@ const RAW_BACKED_FIELDS = [
 	'title', 'description', 'artist', 'album', 'albumArtist', 'trackNumber', 'tracksTotal', 'discNumber', 'discsTotal',
 	'beatsPerMinute', 'genre', 'date', 'lyrics', 'comment', 'images',
 ] as const satisfies (keyof MetadataTags)[];
-type RawBackedFields = Pick<MetadataTags, typeof RAW_BACKED_FIELDS[number]>;
 
-/**
- * Empties the normalized fields of the tags before a raw tag is read into them, so that afterwards every field the
- * raw tag sets shows, even one that an earlier raw tag already set (readers keep the first value with `??=`). The
- * fields stay in place (as undefined), so that the order of the tags' keys doesn't change.
- */
-export const setAsideMetadataTagFields = (tags: MetadataTags) => {
-	const fields: RawBackedFields = {};
-	for (const field of RAW_BACKED_FIELDS) {
-		if (tags[field] !== undefined) {
-			(fields as Record<string, unknown>)[field] = tags[field];
-			tags[field] = undefined;
-		}
-	}
-
-	return fields;
+type MetadataTagFieldWatch = {
+	/** The values of the fields that were already set, which are now accessed through the watch */
+	values: Map<keyof MetadataTags, unknown>;
+	/** Which of those fields the reader read or wrote */
+	accessed: Set<keyof MetadataTags>;
 };
 
 /**
- * Records the fields the given raw tag was read into (if any), then puts the set-aside fields back, which keep their
- * value; images are added to the earlier ones.
+ * Starts watching which normalized fields a reader uses while it reads one raw tag. Readers keep a field's first value
+ * (`??=`), so a raw tag for a field that an earlier tag block or key already set doesn't change it, but it still reads
+ * it. So the fields already set get accessors that note every read and write; their values don't change.
  */
-export const recordRawMetadataTagFields = (tags: MetadataTags, rawKey: string | null, setAside: RawBackedFields) => {
-	if (rawKey !== null && tags.raw) {
-		let fieldsByRawKey = rawMetadataTagFields.get(tags.raw);
-		if (!fieldsByRawKey) {
-			fieldsByRawKey = new Map();
-			rawMetadataTagFields.set(tags.raw, fieldsByRawKey);
-		}
-
-		for (const field of RAW_BACKED_FIELDS) {
-			const value = tags[field];
-			if (value === undefined || (Array.isArray(value) && value.length === 0)) {
-				continue;
-			}
-
-			let fields = fieldsByRawKey.get(rawKey);
-			if (!fields) {
-				fields = new Set();
-				fieldsByRawKey.set(rawKey, fields);
-			}
-
-			fields.add(field);
-		}
-	}
-
+export const watchMetadataTagFields = (tags: MetadataTags) => {
+	const watch: MetadataTagFieldWatch = { values: new Map(), accessed: new Set() };
 	for (const field of RAW_BACKED_FIELDS) {
-		const earlier = setAside[field];
-		if (earlier === undefined) {
+		if (tags[field] === undefined) {
 			continue;
 		}
 
-		if (field === 'images') {
-			const images = earlier as AttachedImage[];
-			images.push(...(tags.images ?? []));
-			tags.images = images;
-		} else {
-			(tags as Record<string, unknown>)[field] = earlier;
+		watch.values.set(field, tags[field]);
+		Object.defineProperty(tags, field, {
+			get: () => {
+				watch.accessed.add(field);
+				return watch.values.get(field);
+			},
+			set: (value: unknown) => {
+				watch.accessed.add(field);
+				watch.values.set(field, value);
+			},
+			enumerable: true,
+			configurable: true,
+		});
+	}
+
+	return watch;
+};
+
+/**
+ * Ends the watch and records the fields the given raw tag was read into: the watched fields the reader used and the
+ * fields it set. The watched fields become plain properties again, in place, so that the order of the keys stays the
+ * same.
+ */
+export const recordRawMetadataTagFields = (
+	tags: MetadataTags,
+	rawKey: string | null,
+	watch: MetadataTagFieldWatch,
+) => {
+	for (const [field, value] of watch.values) {
+		if (Object.getOwnPropertyDescriptor(tags, field)?.get) {
+			Object.defineProperty(tags, field, { value, writable: true, enumerable: true, configurable: true });
 		}
+	}
+
+	if (rawKey === null || !tags.raw) {
+		return;
+	}
+
+	const fields = RAW_BACKED_FIELDS.filter((field) => {
+		if (watch.values.has(field)) {
+			return watch.accessed.has(field);
+		}
+
+		const value = tags[field];
+		return value !== undefined && !(Array.isArray(value) && value.length === 0);
+	});
+	if (fields.length === 0) {
+		return;
+	}
+
+	let fieldsByRawKey = rawMetadataTagFields.get(tags.raw);
+	if (!fieldsByRawKey) {
+		fieldsByRawKey = new Map();
+		rawMetadataTagFields.set(tags.raw, fieldsByRawKey);
+	}
+
+	let recorded = fieldsByRawKey.get(rawKey);
+	if (!recorded) {
+		recorded = new Set();
+		fieldsByRawKey.set(rawKey, recorded);
+	}
+
+	for (const field of fields) {
+		recorded.add(field);
 	}
 };
 

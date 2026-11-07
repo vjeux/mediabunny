@@ -123,8 +123,8 @@ import {
 	MetadataTags,
 	recordRawMetadataTagFields,
 	RichImageData,
-	setAsideMetadataTagFields,
 	TrackDisposition,
+	watchMetadataTagFields,
 } from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
@@ -2800,7 +2800,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				for (const { boxInfo, slice } of iterator) {
 					const isMovieTag = boxInfo.name !== 'meta' && !this.currentTrack;
-					const setAside = isMovieTag ? setAsideMetadataTagFields(this.metadataTags) : null;
+					const watch = isMovieTag ? watchMetadataTagFields(this.metadataTags) : null;
 					if (isMovieTag) {
 						const startPos = slice.filePos;
 						this.metadataTags.raw ??= {};
@@ -2883,8 +2883,8 @@ export class IsobmffDemuxer extends Demuxer {
 						}; break;
 					}
 
-					if (setAside) {
-						recordRawMetadataTagFields(this.metadataTags, boxInfo.name, setAside);
+					if (watch) {
+						recordRawMetadataTagFields(this.metadataTags, boxInfo.name, watch);
 					}
 				}
 			}; break;
@@ -2955,7 +2955,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 					const data = readDataBox(slice);
 
-					const setAside = setAsideMetadataTagFields(this.metadataTags);
+					const watch = watchMetadataTagFields(this.metadataTags);
 					this.metadataTags.raw ??= {};
 					this.metadataTags.raw[metadataKey] ??= data;
 
@@ -3116,7 +3116,7 @@ export class IsobmffDemuxer extends Demuxer {
 						}; break;
 					}
 
-					recordRawMetadataTagFields(this.metadataTags, metadataKey, setAside);
+					recordRawMetadataTagFields(this.metadataTags, metadataKey, watch);
 				}
 			}; break;
 		}

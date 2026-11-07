@@ -8,7 +8,7 @@
 
 import { decodeSynchsafe, encodeSynchsafe } from '../shared/mp3-misc';
 import { Logging } from './logging';
-import { MetadataTags, recordRawMetadataTagFields, setAsideMetadataTagFields } from './metadata';
+import { MetadataTags, recordRawMetadataTagFields, watchMetadataTagFields } from './metadata';
 import {
 	coalesceIndex,
 	TextDecoder,
@@ -243,7 +243,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			}
 		};
 
-		const setAside = setAsideMetadataTagFields(tags);
+		const watch = watchMetadataTagFields(tags);
 		tags.raw ??= {};
 		if (frame.id === 'TXXX') {
 			const txxx = tags.raw['TXXX'] ??= {};
@@ -445,7 +445,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			}; break;
 		}
 
-		recordRawMetadataTagFields(tags, frame.id, setAside);
+		recordRawMetadataTagFields(tags, frame.id, watch);
 		reader.pos = nextFramePos;
 	}
 };
