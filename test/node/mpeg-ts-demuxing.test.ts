@@ -991,6 +991,71 @@ test('MPEG-TS with several programs skips the ones it can\'t read anything from'
 	expect(await readTracks([partlyScrambled])).toEqual([[0x106, 3]]);
 });
 
+test('MPEG-TS with several programs keeps interleaved PES packets whole when the choice waits', async () => {
+	// The PAT lists two programs, but only the PMT of the first, which has a CA descriptor (over packets that aren't
+	// scrambled), is in the file, so the choice waits for the end of the file. Its two AAC streams have 300-byte frames
+	// spanning two TS packets each, interleaved as in broadcast captures.
+	const packets: Uint8Array[] = [];
+	const counters = new Map<number, number>();
+	const pushPacket = (pid: number, payload: number[], payloadUnitStart: boolean) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		const counter = counters.get(pid) ?? 0;
+		counters.set(pid, (counter + 1) & 0xf);
+		const stuffing = 184 - payload.length;
+		const adaptationFieldControl = stuffing > 0 ? 0x30 : 0x10;
+		packet.set([0x47, (payloadUnitStart ? 0x40 : 0) | (pid >> 8), pid & 0xff, adaptationFieldControl | counter]);
+		if (stuffing > 0) {
+			packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+		}
+		packet.set(payload, 4 + stuffing);
+		packets.push(packet);
+	};
+	const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
+	const caDescriptor = [0x09, 0x04, 0x0b, 0x00, 0xff, 0xf0];
+
+	pushPacket(0x0000, section([0x00, 0xb0, 0x11, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 2, 0xf0, 0x01]), true);
+	const pmtBody = [
+		0, 1, 0xc1, 0, 0, 0xe1, 0x01, 0xf0, caDescriptor.length, ...caDescriptor,
+		0x0f, 0xe1, 0x01, 0xf0, 0x00,
+		0x0f, 0xe1, 0x02, 0xf0, 0x00,
+	];
+	pushPacket(0x1000, section([0x02, 0xb0, pmtBody.length + 4, ...pmtBody]), true);
+
+	const frameLength = 300;
+	const pes = (pts: number) => [
+		0, 0, 1, 0xc0, ((8 + frameLength) >> 8) & 0xff, (8 + frameLength) & 0xff, 0x84, 0x80, 5,
+		0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+		0xff, 0xf1, 0x4c, 0x80, (frameLength >> 3) & 0xff, ((frameLength & 7) << 5) | 0x1f, 0xfc, // ADTS
+		...new Array<number>(frameLength - 7).fill(0x11),
+	];
+	for (let i = 0; i < 6; i++) {
+		const first = pes(1920 * i);
+		const second = pes(1920 * i);
+		pushPacket(0x101, first.slice(0, 184), true);
+		pushPacket(0x102, second.slice(0, 184), true);
+		pushPacket(0x101, first.slice(184), false);
+		pushPacket(0x102, second.slice(184), false);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.id)).toEqual([0x101, 0x102]);
+	for (const track of tracks) {
+		const sizes: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			sizes.push(packet.byteLength);
+		}
+		expect(sizes).toEqual(new Array<number>(6).fill(frameLength));
+	}
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
