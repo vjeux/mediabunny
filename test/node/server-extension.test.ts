@@ -551,6 +551,47 @@ describe('Video', async () => {
 		])).toBeNull();
 	});
 
+	test.each([
+		['avc', 10],
+		['avc', 1],
+		['vp9', 10],
+		['vp9', 1],
+		['hevc', 10],
+		['hevc', 1],
+		['av1', 10],
+		['av1', 1],
+	] as [VideoCodec, number][])('%s key frames only at a keyFrameInterval of %i s', async (codec, interval) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec, quality: new Quality('low'), keyFrameInterval: interval });
+		output.addVideoTrack(source, { frameRate: 30 });
+		await output.start();
+
+		// 3 s at 30 fps of a slowly changing gray
+		for (let i = 0; i < 90; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 1.5).fill(100 + i), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+		const keyFrameTimestamps: number[] = [];
+		for await (const packet of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+			if (packet.type === 'key') {
+				keyFrameTimestamps.push(Math.round(packet.timestamp * 30) / 30);
+			}
+		}
+
+		// The encoder adds no key frames of its own, as with WebCodecs encoders
+		expect(keyFrameTimestamps).toEqual(interval === 10 ? [0] : [0, 1, 2]);
+	});
+
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },
