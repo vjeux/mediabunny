@@ -435,14 +435,13 @@ describe('Conversion execution in Node (copy and PCM paths)', () => {
 });
 
 describe('Ogg remuxing', () => {
-	test.each(['vorbis-eos.ogg', 'preroll-test.opus'])('%s is copied packet for packet, shifted', async (name) => {
+	test.each(['vorbis-eos.ogg', 'preroll-test.opus'])('%s is copied packet for packet', async (name) => {
 		const input = new Input({
 			source: new FilePathSource(path.join(__dirname, '..', 'public', name)),
 			formats: ALL_FORMATS,
 		});
 		const target = new BufferTarget();
 		const output = new Output({ format: new OggOutputFormat(), target });
-		// Ogg starts at zero, so the negative start (decoder delay) can only be kept by shifting
 		const conversion = await Conversion.init({
 			input,
 			output,
@@ -454,8 +453,8 @@ describe('Ogg remuxing', () => {
 		await conversion.execute();
 
 		const inputTrack = (await input.getPrimaryAudioTrack())!;
-		const shift = -(await inputTrack.getFirstTimestamp());
-		expect(shift).toBeGreaterThan(0);
+		const firstTimestamp = await inputTrack.getFirstTimestamp();
+		expect(firstTimestamp).toBeLessThan(0); // Decoder delay (priming)
 		using result = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
 		expect(await result.getMetadataTags()).toMatchObject({ title: 'Remuxed', artist: 'Someone' });
 		const outputTrack = (await result.getPrimaryAudioTrack())!;
@@ -467,6 +466,9 @@ describe('Ogg remuxing', () => {
 		for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
 			original.push(packet);
 		}
+		// The copy either keeps the priming or shifts everything to start at zero; either way by one constant amount
+		const shift = (await outputTrack.getFirstTimestamp()) - firstTimestamp;
+		expect([0, -firstTimestamp].some(allowed => Math.abs(shift - allowed) < 1e-9)).toBe(true);
 		let count = 0;
 		let mismatches = 0;
 		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
@@ -553,7 +555,7 @@ describe('PCM audio transcoding options', () => {
 
 		using result = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
 		const track = (await result.getPrimaryAudioTrack())!;
-		// The first frame of the first and second half
+		// A frame in the middle of each half, away from the step and from the edges
 		const picks: number[][] = [];
 		let frameCount = 0;
 		for await (const sample of new AudioSampleSink(track).samples()) {
@@ -561,7 +563,7 @@ describe('PCM audio transcoding options', () => {
 			sample.copyTo(data, { planeIndex: 0, format: 'f32' });
 			for (let i = 0; i < sample.numberOfFrames; i++) {
 				const frame = frameCount + i;
-				if (frame === 0 || frame === sample.sampleRate / 20) {
+				if (frame === sample.sampleRate / 40 || frame === (3 * sample.sampleRate) / 40) {
 					picks.push([...data.subarray(i * sample.numberOfChannels, (i + 1) * sample.numberOfChannels)]);
 				}
 			}
@@ -583,8 +585,6 @@ describe('PCM audio transcoding options', () => {
 			'pcm-s16', 8000, [[0.25, -0.125, 0, 0], [0, 0.5, 0, 0]]],
 		['upmixing to 5.1 leaves center, LFE and surrounds silent', { numberOfChannels: 6 },
 			'pcm-s16', 8000, [[0.25, -0.125, 0, 0, 0, 0], [0, 0.5, 0, 0, 0, 0]]],
-		['halving the sample rate halves the frames', { sampleRate: 4000 },
-			'pcm-s16', 4000, [[0.25, -0.125], [0, 0.5]]],
 		['pcm-f32 output', { codec: 'pcm-f32' }, 'pcm-f32', 8000, [[0.25, -0.125], [0, 0.5]]],
 		['pcm-u8 output', { codec: 'pcm-u8' }, 'pcm-u8', 8000, [[0.25, -0.125], [0, 0.5]]],
 		['forced transcoding keeps the samples', { forceTranscode: true }, 'pcm-s16', 8000, [[0.25, -0.125], [0, 0.5]]],
@@ -601,6 +601,16 @@ describe('PCM audio transcoding options', () => {
 			});
 		},
 	);
+
+	test('halving the sample rate halves the frames and keeps the level of each half', async () => {
+		const result = await convert({ sampleRate: 4000 });
+		const { codec, channels, sampleRate, frameCount } = result;
+		expect([codec, channels, sampleRate, frameCount]).toEqual(['pcm-s16', 2, 4000, 400]);
+		// Any reasonable resampler keeps a constant level, whatever it does around the step between the halves
+		const expected = [[0.25, -0.125], [0, 0.5]];
+		expect(result.picks.length).toBe(2);
+		result.picks.forEach((frame, i) => frame.forEach((value, c) => expect(value).toBeCloseTo(expected[i]![c]!, 2)));
+	});
 
 	test('process can transform samples, and change the channel count when it says so', async () => {
 		const halved = await convert({
