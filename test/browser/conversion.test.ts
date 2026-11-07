@@ -63,6 +63,41 @@ test('Rotation is baked in when rerendering', async () => {
 	expect(await track.getRotation()).toBe(0);
 });
 
+test.each([
+	// 32x32 solid (200, 200, 200), VP9 profile 1 GBR 4:4:4, as FFmpeg makes lossless VP9 from RGB sources:
+	// ffmpeg -f lavfi -i "color=0xc8c8c8:s=32x32:r=10:d=0.2,format=gbrp" -c:v libvpx-vp9 -lossless 1
+	['/vp9-gbr-lossless.webm', [200, 200, 200]],
+	// 32x32 solid (48, 128, 192), AV1 GBR 4:4:4:
+	// ffmpeg -f lavfi -i "color=0x3080c0:s=32x32:r=10:d=0.2,format=gbrp" -c:v libaom-av1 -cpu-used 8 -crf 0
+	['/av1-gbr-lossless.mkv', [48, 128, 192]],
+])('Transcoding GBR-coded video (identity matrix) keeps its colors: %s', async (url, color) => {
+	const firstPixel = async (input: Input) => {
+		using sample = (await new VideoSampleSink((await input.getPrimaryVideoTrack())!).getSample(0))!;
+		const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+		await sample.copyTo(rgba, { format: 'RGBA' });
+		return [...rgba.subarray(0, 3)];
+	};
+
+	for (const [createFormat, codec] of [
+		[() => new Mp4OutputFormat(), 'avc'],
+		[() => new WebMOutputFormat(), 'vp8'],
+		[() => new WebMOutputFormat(), 'vp9'],
+	] as const) {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		expect((await (await input.getPrimaryVideoTrack())!.getColorSpace()).matrix).toBe('rgb');
+
+		const output = new Output({ format: createFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video: { codec, forceTranscode: true } });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const pixel = await firstPixel(result);
+		for (let i = 0; i < 3; i++) {
+			expect(Math.abs(pixel[i]! - color[i]!)).toBeLessThan(15);
+		}
+	}
+});
+
 test('Flip is forwarded as metadata when copying', async () => {
 	const buffer = await encodeFlippedVideo();
 	using input = new Input({
@@ -1461,38 +1496,3 @@ const testReservedFastStart = async (
 		expect(maximumPacketCount).toBeLessThanOrEqual(2 * packetCount + 64);
 	}
 };
-
-test.each([
-	// 32x32 solid (200, 200, 200), VP9 profile 1 GBR 4:4:4, as FFmpeg makes lossless VP9 from RGB sources:
-	// ffmpeg -f lavfi -i "color=0xc8c8c8:s=32x32:r=10:d=0.2,format=gbrp" -c:v libvpx-vp9 -lossless 1
-	['/vp9-gbr-lossless.webm', [200, 200, 200]],
-	// 32x32 solid (48, 128, 192), AV1 GBR 4:4:4:
-	// ffmpeg -f lavfi -i "color=0x3080c0:s=32x32:r=10:d=0.2,format=gbrp" -c:v libaom-av1 -cpu-used 8 -crf 0
-	['/av1-gbr-lossless.mkv', [48, 128, 192]],
-])('Transcoding GBR-coded video (identity matrix) keeps its colors: %s', async (url, color) => {
-	const firstPixel = async (input: Input) => {
-		using sample = (await new VideoSampleSink((await input.getPrimaryVideoTrack())!).getSample(0))!;
-		const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
-		await sample.copyTo(rgba, { format: 'RGBA' });
-		return [...rgba.subarray(0, 3)];
-	};
-
-	for (const [createFormat, codec] of [
-		[() => new Mp4OutputFormat(), 'avc'],
-		[() => new WebMOutputFormat(), 'vp8'],
-		[() => new WebMOutputFormat(), 'vp9'],
-	] as const) {
-		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
-		expect((await (await input.getPrimaryVideoTrack())!.getColorSpace()).matrix).toBe('rgb');
-
-		const output = new Output({ format: createFormat(), target: new BufferTarget() });
-		const conversion = await Conversion.init({ input, output, video: { codec, forceTranscode: true } });
-		await conversion.execute();
-
-		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-		const pixel = await firstPixel(result);
-		for (let i = 0; i < 3; i++) {
-			expect(Math.abs(pixel[i]! - color[i]!)).toBeLessThan(15);
-		}
-	}
-});
