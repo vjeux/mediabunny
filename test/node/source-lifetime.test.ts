@@ -2,7 +2,7 @@ import { expect, test, vi } from 'vitest';
 import { CustomSource, FilePathSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Input, InputDisposedError } from '../../src/input.js';
+import { Input, InputDisposedError, UnsupportedInputFormatError } from '../../src/input.js';
 import { ALL_FORMATS, MP4 } from '../../src/input-format.js';
 import { promiseWithResolvers } from '../../src/misc.js';
 import { readFile } from 'node:fs/promises';
@@ -108,6 +108,62 @@ test.each([
 			controller.close();
 		}
 	}
+});
+
+test('Format detection is tried again after a failed read', async () => {
+	const videoBytes = new Uint8Array(await readFile(path.join(__dirname, '../public/video.mp4')));
+	// The first read fails, like a request hitting a 503 or a dropped connection
+	let failed = false;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => videoBytes.length,
+			read: (start, end) => {
+				if (!failed) {
+					failed = true;
+					throw new Error('Transient failure');
+				}
+
+				return videoBytes.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	await expect(input.getFormat()).rejects.toThrow('Transient failure');
+	expect(await input.getFormat()).toBe(MP4);
+
+	// An unsupported format doesn't get better though, so it's not tried again
+	let reads = 0;
+	using unsupported = new Input({
+		source: new CustomSource({
+			getSize: () => 4,
+			read: () => {
+				reads++;
+				return new Uint8Array(4);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	await expect(unsupported.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
+	const readsAfterDetection = reads;
+	await expect(unsupported.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
+	expect(reads).toBe(readsAfterDetection);
+
+	// Neither does a disposed input: one disposed during detection keeps saying so
+	const disposed = new Input({
+		source: new CustomSource({
+			getSize: () => videoBytes.length,
+			read: async (start, end) => {
+				await new Promise(resolve => setTimeout(resolve, 50));
+				return videoBytes.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	const detection = disposed.getFormat();
+	disposed.dispose();
+	await expect(detection).rejects.toThrow(InputDisposedError);
+	await expect(disposed.getFormat()).rejects.toThrow(InputDisposedError);
+	await expect(disposed.getTracks()).rejects.toThrow(InputDisposedError);
 });
 
 test('CustomSource releases stream readers after successful reads', async () => {
