@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
@@ -324,4 +324,57 @@ test('HLS: audio after a discontinuity with a new EXT-X-MAP decodes with its own
 	const adSample = await sink.getSample(1.5);
 	expect(adSample?.sampleRate).toBe(22050);
 	adSample?.close();
+});
+
+test('HLS: an ad break of several segments sharing an init section decodes like the ad alone', async () => {
+	const segment = (init: string, name: string, discontinuity: boolean) =>
+		`${discontinuity ? '#EXT-X-DISCONTINUITY\n' : ''}#EXT-X-MAP:URI="${init}"\n#EXTINF:1.0,\n${name}\n`;
+	const playlist = (body: string) => `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n${body}#EXT-X-ENDLIST\n`;
+
+	// Channel 0 of every decoded sample at 22.05 kHz (the ad's rate), concatenated
+	const decodeAd = async (text: string) => {
+		using input = new Input({
+			source: new CustomPathedSource('p.m3u8', ({ path }) => (path === 'p.m3u8'
+				? new BufferSource(new TextEncoder().encode(text))
+				: new UrlSource('/hls-disc-audio/' + path))),
+			formats: ALL_FORMATS,
+		});
+		const chunks: Float32Array[] = [];
+		for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+			if (sample.sampleRate === 22050) {
+				const data = new Float32Array(sample.numberOfFrames);
+				sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+				chunks.push(data);
+			}
+			sample.close();
+		}
+		const result = new Float32Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
+		let offset = 0;
+		for (const chunk of chunks) {
+			result.set(chunk, offset);
+			offset += chunk.length;
+		}
+		return result;
+	};
+
+	// Content (48 kHz stereo), then an ad break (22.05 kHz mono) of two segments with the same init section: the
+	// decoder switches once, and keeps its state between the ad's segments
+	const withContent = await decodeAd(playlist(
+		segment('c_init.mp4', 'c_0.m4s', false)
+		+ segment('d_init.mp4', 'd_0.m4s', true)
+		+ segment('d_init.mp4', 'd_0.m4s', true),
+	));
+	// The same two ad segments without content before them: no switch at all
+	const alone = await decodeAd(playlist(
+		segment('d_init.mp4', 'd_0.m4s', false)
+		+ segment('d_init.mp4', 'd_0.m4s', true),
+	));
+
+	expect(withContent.length).toBe(alone.length);
+	expect(alone.length).toBe(2 * 23 * 1024);
+	let maxDifference = 0;
+	for (let i = 0; i < alone.length; i++) {
+		maxDifference = Math.max(maxDifference, Math.abs(withContent[i]! - alone[i]!));
+	}
+	expect(maxDifference).toBeLessThan(1e-4);
 });

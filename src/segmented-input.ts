@@ -19,7 +19,7 @@ import {
 	InputVideoTrackBacking,
 } from './input-track';
 import { PacketRetrievalOptions } from './media-sink';
-import { arrayCount, assert, MaybePromise, roundToDivisor, toUint8Array, uint8ArraysAreEqual } from './misc';
+import { arrayCount, assert, audioDecoderConfigsAreEqual, MaybePromise, roundToDivisor } from './misc';
 import { EncodedPacket } from './packet';
 
 export type SegmentedInputMetadata = {
@@ -227,13 +227,6 @@ type PacketInfo = {
 	track: InputTrack;
 	sourcePacket: EncodedPacket;
 };
-
-const audioDecoderConfigsAreEqual = (a: AudioDecoderConfig, b: AudioDecoderConfig) => a.codec === b.codec
-	&& a.sampleRate === b.sampleRate
-	&& a.numberOfChannels === b.numberOfChannels
-	&& (a.description && b.description
-		? uint8ArraysAreEqual(toUint8Array(a.description), toUint8Array(b.description))
-		: !a.description === !b.description);
 
 class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	segmentedInput: SegmentedInput;

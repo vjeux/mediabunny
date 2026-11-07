@@ -1184,6 +1184,14 @@ export const uint8ArraysAreEqual = (a: Uint8Array, b: Uint8Array) => {
 	return true;
 };
 
+/** Whether two audio decoder configs describe the same decoding: codec string, sample rate, channels, description. */
+export const audioDecoderConfigsAreEqual = (a: AudioDecoderConfig, b: AudioDecoderConfig) => a.codec === b.codec
+	&& a.sampleRate === b.sampleRate
+	&& a.numberOfChannels === b.numberOfChannels
+	&& (a.description && b.description
+		? uint8ArraysAreEqual(toUint8Array(a.description), toUint8Array(b.description))
+		: !a.description === !b.description);
+
 export const polyfillSymbolDispose = () => {
 	// https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-2.html
 	// @ts-expect-error Readonly

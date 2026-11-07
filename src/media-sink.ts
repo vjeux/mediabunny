@@ -30,6 +30,7 @@ import {
 	AnyIterable,
 	assert,
 	assertNever,
+	audioDecoderConfigsAreEqual,
 	CallSerializer,
 	clamp,
 	colorSpaceIsComplete,
@@ -2487,7 +2488,12 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	decode(packet: EncodedPacket) {
 		const decoderConfig = this.getPacketDecoderConfig(packet) ?? this.decoderConfig;
 		if (decoderConfig !== this.currentDecoderConfig) {
-			this.switchDecoderConfig(decoderConfig);
+			if (audioDecoderConfigsAreEqual(decoderConfig, this.currentDecoderConfig)) {
+				// The same config in another object, such as the next segment of an ad break: keep the decoder's state
+				this.currentDecoderConfig = decoderConfig;
+			} else {
+				this.switchDecoderConfig(decoderConfig);
+			}
 		}
 
 		if (this.customDecoder) {
