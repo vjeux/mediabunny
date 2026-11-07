@@ -241,8 +241,9 @@ export abstract class InputTrack {
 	}
 
 	/**
-	 * Returns the ISO 639-2/T language code for this track. If the language is unknown, this resolves to `'und'`
-	 * (undetermined).
+	 * Returns the ISO 639-2 language code for this track, as stored in the file: Matroska uses the bibliographic form
+	 * (e.g. `'ger'`), MP4 usually the terminology form (e.g. `'deu'`). If the language is unknown, this resolves to
+	 * `'und'` (undetermined).
 	 */
 	async getLanguageCode() {
 		return this._backing.getLanguageCode();
@@ -356,7 +357,8 @@ export abstract class InputTrack {
 	}
 
 	/**
-	 * Returns the end timestamp of the last packet of this track, in seconds.
+	 * Returns the end timestamp of the last packet of this track, in seconds, rounded to the track's time resolution
+	 * (see {@link InputTrack.getTimeResolution}).
 	 *
 	 * By default, when the underlying media is live, this method will only resolve once the live stream ends. If you
 	 * want to query the current end timestamp of the stream, set {@link PacketRetrievalOptions.skipLiveWait} to `true`

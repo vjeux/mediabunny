@@ -156,7 +156,9 @@ track.type; // => 'video' | 'audio' | 'subtitle';
 track.isVideoTrack(); // => boolean
 track.isAudioTrack(); // => boolean
 
-// Retrieve the track's language as an ISO 639-2/T language code.
+// Retrieve the track's language as an ISO 639-2 language code, as stored in the
+// file: Matroska uses the bibliographic form (e.g. 'ger'), MP4 usually the
+// terminology form (e.g. 'deu').
 // Resolves to 'und' (undetermined) if the language isn't known.
 await track.getLanguageCode(); // => string
 
@@ -173,7 +175,7 @@ await track.getBitrate(); // => number | null
 // The track's average bitrate, if exposed by the file metadata:
 await track.getAverageBitrate(); // => number | null
 
-// Whether all packets in the track are key packets:
+// Whether the track's metadata says that all its packets are key packets:
 await track.hasOnlyKeyPackets(); // => boolean
 
 // Whether the track is currently live (meaning new media data is still being added):
@@ -211,7 +213,7 @@ You can compute the track's specific duration in seconds like so:
 ```ts
 await track.computeDuration(); // => 1902.4615
 ```
-Analogous to the `Input`'s duration, this is identical to the end timestamp of the last sample. A track's duration may be shorter than the `Input`'s total duration if the `Input` has multiple tracks which differ in length.
+Analogous to the `Input`'s duration, this is the end timestamp of the last sample, rounded to the track's time resolution (see below). A track's duration may be shorter than the `Input`'s total duration if the `Input` has multiple tracks which differ in length.
 
 You can also retrieve the approximate duration based on metadata in the file:
 ```ts
@@ -236,9 +238,11 @@ Another metric related to track timing info is its *time resolution*, which is g
 ```ts
 await track.getTimeResolution(); // => 24
 ```
-Intuitively, this is the maximum possible "frame rate" of the track (assuming that no two samples have the same timestamp). Mathematically, if $x$ is equal to a track's time resolution, then all timestamps and durations of that track can be expressed as:
+Intuitively, this is the maximum possible "frame rate" of the track (assuming that no two samples have the same timestamp). Mathematically, if $x$ is equal to a track's time resolution, then all timestamps of that track can be expressed as:
 
 $$ \frac{k}{x},\quad k \in \mathbb{Z} $$
+
+Packet durations can be finer than that: Matroska's `DefaultDuration`, for example, has nanosecond precision.
 
 ::: info
 This field only gives an upper bound on a track's frame rate. To determine a video track's actual frame rate based on its frames, compute its [frame rate metrics](#frame-rate-metrics).
@@ -609,7 +613,7 @@ This source is backed by an underlying [`Blob`](https://developer.mozilla.org/en
 import { BlobSource } from 'mediabunny';
 
 fileInput.addEventListener('change', (event) => {
-	const file = event.target.files[0];
+	const file = (event.target as HTMLInputElement).files![0];
 	const source = new BlobSource(file);
 });
 ```
