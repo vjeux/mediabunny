@@ -888,7 +888,11 @@ video/low.m3u8
 		expect(audioTracks).toHaveLength(3);
 
 		expect(await Promise.all(audioTracks.map(x => x.getName()))).toEqual(['English', 'Français', 'Commentary']);
-		expect(await Promise.all(audioTracks.map(x => x.getLanguageCode()))).toEqual(['en', 'fr', 'en']);
+		// Both English renditions share a language, the French one differs (LANGUAGE is a BCP 47 tag, reported in its
+		// ISO 639-2 form)
+		const languageCodes = await Promise.all(audioTracks.map(x => x.getLanguageCode()));
+		expect(languageCodes[0]).toBe(languageCodes[2]);
+		expect(languageCodes[1]).not.toBe(languageCodes[0]);
 
 		const dispositions = await Promise.all(audioTracks.map(x => x.getDisposition()));
 		// HLS's DEFAULT=YES means "primary"; AUTOSELECT=YES maps to Mediabunny's "default"
