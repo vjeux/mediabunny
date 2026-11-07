@@ -281,6 +281,37 @@ export const fullBox = (
 );
 
 /**
+ * A FullBox holding a header of 32-bit fields followed by a table of fixed-size entries, written straight into bytes.
+ * Built as nested number arrays (what box() takes), tables with an entry per sample would cost about 200 bytes of
+ * short-lived memory per entry when finalizing long files.
+ */
+const tableFullBox = (
+	type: string,
+	version: number,
+	flags: number,
+	header: number[],
+	entryCount: number,
+	entrySize: number,
+	writeEntry: (view: DataView, offset: number, index: number) => void,
+): Box => {
+	const headerSize = 4 * (1 + header.length);
+	const contents = new Uint8Array(headerSize + entryCount * entrySize);
+	const view = toDataView(contents);
+
+	view.setUint8(0, version);
+	view.setUint8(1, flags >> 16);
+	view.setUint16(2, flags);
+	for (let i = 0; i < header.length; i++) {
+		view.setUint32(4 * (i + 1), header[i]!);
+	}
+	for (let i = 0; i < entryCount; i++) {
+		writeEntry(view, headerSize + i * entrySize, i);
+	}
+
+	return { type, contents };
+};
+
+/**
  * File Type Compatibility Box: Allows the reader to determine whether this is a type of file that the
  * reader understands.
  */
@@ -1258,24 +1289,33 @@ export const txtC = (textConfig: Uint8Array) => fullBox('txtC', 0, 0, [
  * will be grouped.
  */
 export const stts = (trackData: IsobmffTrackData) => {
-	return fullBox('stts', 0, 0, [
-		u32(trackData.timeToSampleTable.length), // Number of entries
-		trackData.timeToSampleTable.map(x => [ // Time-to-sample table
-			u32(x.sampleCount), // Sample count
-			u32(x.sampleDelta), // Sample duration
-		]),
-	]);
+	const table = trackData.timeToSampleTable;
+
+	return tableFullBox('stts', 0, 0, [
+		table.length, // Number of entries
+	], table.length, 8, (view, offset, i) => {
+		// Time-to-sample table
+		view.setUint32(offset, table[i]!.sampleCount); // Sample count
+		view.setUint32(offset + 4, table[i]!.sampleDelta); // Sample duration
+	});
 };
 
 /** Sync Sample Box: Identifies the key frames in the media, marking the random access points within a stream. */
 export const stss = (trackData: IsobmffTrackData) => {
 	if (trackData.samples.every(x => x.type === 'key')) return null; // No stss box -> every frame is a key frame
 
-	const keySamples = [...trackData.samples.entries()].filter(([, sample]) => sample.type === 'key');
-	return fullBox('stss', 0, 0, [
-		u32(keySamples.length), // Number of entries
-		keySamples.map(([index]) => u32(index + 1)), // Sync sample table
-	]);
+	const keySampleNumbers: number[] = [];
+	for (let i = 0; i < trackData.samples.length; i++) {
+		if (trackData.samples[i]!.type === 'key') {
+			keySampleNumbers.push(i + 1);
+		}
+	}
+
+	return tableFullBox('stss', 0, 0, [
+		keySampleNumbers.length, // Number of entries
+	], keySampleNumbers.length, 4, (view, offset, i) => {
+		view.setUint32(offset, keySampleNumbers[i]!); // Sync sample table
+	});
 };
 
 /**
@@ -1307,27 +1347,35 @@ export const stsz = (trackData: IsobmffTrackData) => {
 		]);
 	}
 
-	return fullBox('stsz', 0, 0, [
-		u32(0), // Sample size (0 means non-constant size)
-		u32(trackData.samples.length), // Number of entries
-		trackData.samples.map(x => u32(x.size)), // Sample size table
-	]);
+	const samples = trackData.samples;
+	return tableFullBox('stsz', 0, 0, [
+		0, // Sample size (0 means non-constant size)
+		samples.length, // Number of entries
+	], samples.length, 4, (view, offset, i) => {
+		view.setUint32(offset, samples[i]!.size); // Sample size table
+	});
 };
 
 /** Chunk Offset Box: Identifies the location of each chunk of data in the media's data stream, relative to the file. */
 export const stco = (trackData: IsobmffTrackData) => {
-	if (trackData.finalizedChunks.length > 0 && last(trackData.finalizedChunks)!.offset! >= 2 ** 32) {
+	const chunks = trackData.finalizedChunks;
+
+	if (chunks.length > 0 && last(chunks)!.offset! >= 2 ** 32) {
 		// If the file is large, use the co64 box
-		return fullBox('co64', 0, 0, [
-			u32(trackData.finalizedChunks.length), // Number of entries
-			trackData.finalizedChunks.map(x => u64(x.offset!)), // Chunk offset table
-		]);
+		return tableFullBox('co64', 0, 0, [
+			chunks.length, // Number of entries
+		], chunks.length, 8, (view, offset, i) => {
+			// Chunk offset table
+			view.setUint32(offset, Math.floor(chunks[i]!.offset! / 2 ** 32));
+			view.setUint32(offset + 4, chunks[i]!.offset!);
+		});
 	}
 
-	return fullBox('stco', 0, 0, [
-		u32(trackData.finalizedChunks.length), // Number of entries
-		trackData.finalizedChunks.map(x => u32(x.offset!)), // Chunk offset table
-	]);
+	return tableFullBox('stco', 0, 0, [
+		chunks.length, // Number of entries
+	], chunks.length, 4, (view, offset, i) => {
+		view.setUint32(offset, chunks[i]!.offset!); // Chunk offset table
+	});
 };
 
 /**
@@ -1336,13 +1384,15 @@ export const stco = (trackData: IsobmffTrackData) => {
  * composition time offset will be grouped.
  */
 export const ctts = (trackData: IsobmffTrackData) => {
-	return fullBox('ctts', 1, 0, [
-		u32(trackData.compositionTimeOffsetTable.length), // Number of entries
-		trackData.compositionTimeOffsetTable.map(x => [ // Time-to-sample table
-			u32(x.sampleCount), // Sample count
-			i32(x.sampleCompositionTimeOffset), // Sample offset
-		]),
-	]);
+	const table = trackData.compositionTimeOffsetTable;
+
+	return tableFullBox('ctts', 1, 0, [
+		table.length, // Number of entries
+	], table.length, 8, (view, offset, i) => {
+		// Composition-time-to-sample table
+		view.setUint32(offset, table[i]!.sampleCount); // Sample count
+		view.setInt32(offset + 4, table[i]!.sampleCompositionTimeOffset); // Sample offset
+	});
 };
 
 /**
