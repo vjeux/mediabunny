@@ -1844,6 +1844,13 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		this._trackEndedListener = onTrackEnded;
 		this._track.addEventListener('ended', onTrackEnded);
 
+		if (this._track.readyState === 'ended') {
+			// The track ended before the recording started (a screen share stopped right away, for example). There's
+			// nothing to capture from it, and MediaStreamTrackProcessor can't even be created for an ended track.
+			onTrackEnded();
+			return;
+		}
+
 		if (typeof MediaStreamTrackProcessor !== 'undefined') {
 			// We can do it here directly, perfect
 			const processor = new MediaStreamTrackProcessor({ track: this._track });
@@ -3226,6 +3233,13 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		};
 		this._trackEndedListener = onTrackEnded;
 		this._track.addEventListener('ended', onTrackEnded);
+
+		if (this._track.readyState === 'ended') {
+			// The track ended before the recording started (a microphone unplugged right away, for example). There's
+			// nothing to capture from it, and MediaStreamTrackProcessor can't even be created for an ended track.
+			onTrackEnded();
+			return;
+		}
 
 		if (typeof MediaStreamTrackProcessor !== 'undefined') {
 			// Great, MediaStreamTrackProcessor is supported, this is the preferred way of doing things

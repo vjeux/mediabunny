@@ -925,3 +925,65 @@ test.for(['video', 'audio'] as const)(
 		expect(duration).toBeLessThan(0.9);
 	},
 );
+
+test.for(['video', 'audio'] as const)(
+	'MediaStream sources, an already-ended %s track closes its source instead of failing start()',
+	async (endedKind, { skip }) => {
+		if (typeof MediaStreamTrackGenerator === 'undefined') {
+			skip('Needs MediaStreamTrackGenerator (Chromium)');
+		}
+
+		const videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
+		const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
+		(endedKind === 'video' ? videoGenerator : audioGenerator).stop();
+
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new MediaStreamVideoTrackSource(
+			videoGenerator as unknown as MediaStreamVideoTrack,
+			{ codec: 'vp8', quality: new Quality('low') },
+			{ frameRate: null },
+		);
+		const audioSource = new MediaStreamAudioTrackSource(audioGenerator as unknown as MediaStreamAudioTrack, {
+			codec: 'opus',
+			quality: new Quality('low'),
+		});
+		const errors: unknown[] = [];
+		videoSource.errorPromise.catch(error => errors.push(error));
+		audioSource.errorPromise.catch(error => errors.push(error));
+		output.addVideoTrack(videoSource);
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		// The other track records as usual
+		const canvas = new OffscreenCanvas(64, 48);
+		const context = canvas.getContext('2d')!;
+		const videoWriter = endedKind === 'audio' ? videoGenerator.writable.getWriter() : null;
+		const audioWriter = endedKind === 'video' ? audioGenerator.writable.getWriter() : null;
+		for (let i = 0; i < 30; i++) {
+			if (videoWriter) {
+				context.fillStyle = `rgb(${8 * i}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+				await videoWriter.write(new VideoFrame(canvas, { timestamp: 33333 * i }));
+			} else {
+				await audioWriter!.write(new AudioData({
+					format: 'f32-planar',
+					sampleRate: 48000,
+					numberOfChannels: 1,
+					numberOfFrames: 480,
+					timestamp: 10000 * i,
+					data: new Float32Array(480),
+				}));
+			}
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		await output.finalize();
+
+		expect(errors).toEqual([]);
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const tracks = await input.getTracks();
+		expect(tracks.map(track => track.type)).toEqual([endedKind === 'video' ? 'audio' : 'video']);
+	},
+);
