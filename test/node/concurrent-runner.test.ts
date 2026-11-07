@@ -7,11 +7,17 @@ import {
 	AudioCodec,
 	AudioSample,
 	AudioSampleSink,
+	AudioSampleSource,
+	BufferTarget,
 	CustomAudioDecoder,
+	CustomAudioEncoder,
 	EncodedPacket,
 	FilePathSource,
 	Input,
+	Output,
 	registerDecoder,
+	registerEncoder,
+	WebMOutputFormat,
 } from '../../src/index.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -221,6 +227,56 @@ test('A custom decoder that fails gets closed, without an unhandled rejection', 
 	} finally {
 		process.off('unhandledRejection', onUnhandled);
 	}
+});
+
+test('A custom encoder whose flush() fails makes finalize() reject, and gets closed', async () => {
+	// Registered encoders are global, and this is the only test in this file that encodes Opus
+	let flushCalls = 0;
+	let closeCalls = 0;
+	class FlushFailingOpusEncoder extends CustomAudioEncoder {
+		static override supports(codec: AudioCodec) {
+			return codec === 'opus';
+		}
+
+		init() {}
+
+		encode(sample: AudioSample) {
+			this.onPacket(
+				new EncodedPacket(new Uint8Array([0xfc, 0xff, 0xfe]), 'key', sample.timestamp, sample.duration),
+				{ decoderConfig: { codec: 'opus', sampleRate: 48000, numberOfChannels: 1 } },
+			);
+		}
+
+		flush() {
+			flushCalls++;
+			// Like a WebAssembly encoder failing on its last frames
+			throw new Error('Flush failed');
+		}
+
+		close() {
+			closeCalls++;
+		}
+	}
+	registerEncoder(FlushFailingOpusEncoder);
+
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const source = new AudioSampleSource({ codec: 'opus', bitrate: 64000 });
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 4; i++) {
+		using sample = new AudioSample({
+			data: new Float32Array(960),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: i * 0.02,
+		});
+		await source.add(sample);
+	}
+
+	await expect(output.finalize()).rejects.toThrow('Flush failed');
+	expect(flushCalls).toBe(1);
+	expect(closeCalls).toBe(1);
 });
 
 test('errored task surfaces on the next run call', async () => {

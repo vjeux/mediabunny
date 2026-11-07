@@ -1095,7 +1095,8 @@ class VideoEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush());
+					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
+						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder && !this.encodersReclaimed) {
 					// These are wired in series, therefore they must also be flushed in series
 					await this.encoder.flush();
@@ -2651,7 +2652,8 @@ class AudioEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush());
+					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
+						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder) {
 					await this.encoder.flush();
 				}
