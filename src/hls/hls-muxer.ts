@@ -356,23 +356,33 @@ export class HlsMuxer extends Muxer {
 		// Video tracks that can't be paired with any other track always live on the top-level, the question is just if
 		// they need to be separated into #EXT-X-MEDIA tags or not
 		if (unpairedVideoTracks.length > 0) {
-			const uniqueMetadata = new Set(unpairedVideoTracks.map(getMetadataKeyForTrack));
+			// Key-packets-only tracks are standalone I-frame streams, so they can't be renditions within a group
+			const iFrameTracks = unpairedVideoTracks.filter(x => x.isVideoTrack() && x.metadata.hasOnlyKeyPackets);
+			const groupableTracks = unpairedVideoTracks.filter(x => !iFrameTracks.includes(x));
+			const uniqueMetadata = new Set(groupableTracks.map(getMetadataKeyForTrack));
 
 			if (uniqueMetadata.size > 1) {
 				// They differ in metadata, emit as group
 				const group: typeof groups[number] = {
-					key: unpairedVideoTracks.map(x => x.id).join('-'),
+					key: groupableTracks.map(x => x.id).join('-'),
 					name: 'video-' + (groups.length + 1),
-					tracks: unpairedVideoTracks,
+					tracks: groupableTracks,
 					needsEmit: true,
 					firstNoUri: true,
 				};
 				groups.push(group);
 
 				variantStreams.push({
-					tracks: [unpairedVideoTracks[0]!],
+					tracks: [groupableTracks[0]!],
 					linkedGroup: group,
 				});
+
+				for (const track of iFrameTracks) {
+					variantStreams.push({
+						tracks: [track],
+						linkedGroup: null,
+					});
+				}
 			} else {
 				for (const track of unpairedVideoTracks) {
 					variantStreams.push({
