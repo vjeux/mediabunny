@@ -45,6 +45,13 @@ const readTrackPackets = async (bytes: Uint8Array, trackIndex = 0) => {
 	return packets;
 };
 
+// Compares packet data directly: toEqual compares byte arrays element by element, which takes seconds for large packets
+const expectSameBytes = (actual: Uint8Array[], expected: Uint8Array[]) => {
+	expect(actual.map(x => x.length)).toEqual(expected.map(x => x.length));
+	const firstMismatch = actual.findIndex((bytes, i) => !bytes.every((byte, j) => byte === expected[i]![j]));
+	expect(firstMismatch).toBe(-1);
+};
+
 /** [timestamp, duration] in 48 kHz samples, plus the size of each packet. */
 const layout48k = (packets: EncodedPacket[]) => packets.map(packet => [
 	Math.round(packet.timestamp * 48000),
@@ -776,7 +783,7 @@ describe('Ogg muxer', () => {
 
 		// And the packets come back unchanged, with the same timing
 		const read = await readTrackPackets(bytes);
-		expect(read.map(x => x.data)).toEqual(packets.map(x => x.data));
+		expectSameBytes(read.map(x => x.data), packets.map(x => x.data));
 		expect(read.map(x => x.timestamp)).toEqual(packets.map(x => x.timestamp));
 		expect(read.map(x => x.duration)).toEqual(packets.map(x => x.duration));
 	});
