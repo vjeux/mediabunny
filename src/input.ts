@@ -444,12 +444,16 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		query &&= toValidatedInputTrackQuery(query);
 
 		const merged = mergeInputTrackQueries(query, {
-			sortBy: async t => [
-				prefer((await t.getDisposition()).default),
-				prefer(await t.hasPairableAudioTrack()),
-				prefer(!(await t.hasOnlyKeyPackets())),
-				desc(await t.getBitrate()),
-			],
+			sortBy: async (t) => {
+				const disposition = await t.getDisposition();
+				return [
+					prefer(disposition.primary),
+					prefer(disposition.default),
+					prefer(await t.hasPairableAudioTrack()),
+					prefer(!(await t.hasOnlyKeyPackets())),
+					desc(await t.getBitrate()),
+				];
+			},
 		});
 
 		const sorted = await this.getVideoTracks(merged);
@@ -470,11 +474,15 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		const primaryVideoTrack = await this.getPrimaryVideoTrack();
 
 		const merged = mergeInputTrackQueries(query, {
-			sortBy: async t => [
-				prefer(!primaryVideoTrack || t.canBePairedWith(primaryVideoTrack)),
-				prefer((await t.getDisposition()).default),
-				desc(await t.getBitrate()),
-			],
+			sortBy: async (t) => {
+				const disposition = await t.getDisposition();
+				return [
+					prefer(!primaryVideoTrack || t.canBePairedWith(primaryVideoTrack)),
+					prefer(disposition.primary),
+					prefer(disposition.default),
+					desc(await t.getBitrate()),
+				];
+			},
 		});
 
 		const sorted = await this.getAudioTracks(merged);
