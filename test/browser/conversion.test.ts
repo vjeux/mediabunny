@@ -492,6 +492,30 @@ test('HLS track assignability can be overridden', async () => {
 	expect(newMasterPlaylist.match(/\.m3u8/g)?.length).toBe(1);
 });
 
+test('Transcoding keeps frames that have a duration of zero', async () => {
+	// The last frame of each cluster in this Matroska file has no duration (no BlockDuration or DefaultDuration), the
+	// first one at 4.81 s
+	using input = new Input({ source: new UrlSource('/annex-b-avc.mkv'), formats: ALL_FORMATS });
+	const inputTrack = (await input.getPrimaryVideoTrack())!;
+	const inputPackets = [];
+	const sink = new EncodedPacketSink(inputTrack);
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		if (packet.timestamp >= 6) {
+			break;
+		}
+		inputPackets.push(packet);
+	}
+	expect(inputPackets.some(x => x.duration === 0)).toBe(true);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, video: { width: 320 }, trim: { end: 6 } });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const outputTrack = (await result.getPrimaryVideoTrack())!;
+	expect((await outputTrack.computePacketStats()).packetCount).toBe(inputPackets.length);
+});
+
 test('Fractional audio sample boundary', async () => {
 	using input = new Input({
 		source: new UrlSource('/trim-buck-bunny-ffmpeg.ts'),
