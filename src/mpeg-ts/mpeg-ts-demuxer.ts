@@ -140,7 +140,7 @@ type ElementaryStream = {
 		reorderSize: number;
 		/**
 		 * How many frames can come before a frame in decode order but after it in presentation order
-		 * (num_reorder_frames, sps_max_num_reorder_pics), or -1 if the stream doesn't say
+		 * (num_reorder_frames, sps_max_num_reorder_pics)
 		 */
 		reorderFrameCount: number;
 	} | {
@@ -659,11 +659,8 @@ export class MpegTsDemuxer extends Demuxer {
 										fullRange: !!spsInfo.fullRangeFlag,
 									};
 									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
-									// Only when signaled: the inferred value (MaxDpbFrames) is loose, like the
-									// reorderSize inferred with it, which rewinds lookups further to begin with
-									elementaryStream.info.reorderFrameCount = spsInfo.bitstreamRestrictionFlag
-										? spsInfo.numReorderFrames
-										: -1;
+									// Without bitstream_restriction_flag, inferred as MaxDpbFrames
+									elementaryStream.info.reorderFrameCount = spsInfo.numReorderFrames;
 
 									break;
 								} else if (elementaryStream.info.codec === 'hevc') {
