@@ -1145,7 +1145,18 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 								// If packets contain an AUD and have NALUs before it, this trips up Chromium's key
 								// frame detector. Clear the NALUs if an AUD is encountered.
 								// https://github.com/Vanilagy/mediabunny/issues/396
+								// Parameter sets are kept and moved after the AUD though: without a description,
+								// they're the only ones the decoder gets.
+								const parameterSets = filteredNalUnits.filter((nalUnit) => {
+									const nalUnitType = extractNalUnitTypeForAvc(nalUnit[0]!);
+									return nalUnitType === AvcNalUnitType.SPS || nalUnitType === AvcNalUnitType.PPS;
+								});
 								filteredNalUnits.length = 0;
+								filteredNalUnits.push(
+									packet.data.subarray(loc.offset, loc.offset + loc.length),
+									...parameterSets,
+								);
+								continue;
 							}
 						}
 
