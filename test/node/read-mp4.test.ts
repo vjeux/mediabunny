@@ -382,3 +382,70 @@ test('Encrypted samples without encryption info throw instead of coming back as 
 		data: plaintext,
 	}))).toEqual(plaintext);
 });
+
+test('Samples of a sample description whose tenc marks them unprotected stay readable', async () => {
+	// A fragmented track with two encv sample descriptions: the first's tenc marks its samples as unprotected (clear
+	// data, no senc), the second's protects them (senc with 8-byte IVs). The first fragment uses the first.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
+	const plaintext = (i: number) => [
+		0, 0, 0, 28, 0x65, ...Array.from({ length: 27 }, (_, k) => (k * 13 + i * 7) & 0xff),
+	];
+	const iv = (i: number) => [...zeros(7), i + 1];
+	const encrypt = (i: number) => [
+		...createCipheriv('aes-128-ctr', key, Buffer.from([...iv(i), ...zeros(8)])).update(Buffer.from(plaintext(i))),
+	];
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const encv = (isProtected: number, keyIdByte: number) => box('encv', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64],
+		zeros(12), [0, 1], zeros(32), [0, 24, 0xff, 0xff], box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+		box('sinf', box('frma', ascii('avc1')), box('schm', u32(0), ascii('cenc'), u32(0x10000)),
+			box('schi', box('tenc', u32(0), [0, 0, isProtected, 8], zeros(16).fill(keyIdByte)))));
+	const bytes = [...box('ftyp', ascii('iso6'), u32(0)), ...box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(2), encv(0, 0xaa), encv(1, 0xbb)),
+					box('stts', zeros(8)),
+					box('stsc', zeros(8)),
+					box('stsz', zeros(12)),
+					box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	)];
+	for (const [fragment, description, samples] of [[0, 1, [0, 1]], [1, 2, [2, 3]]] as const) {
+		const data = samples.map(i => (description === 1 ? plaintext(i) : encrypt(i)));
+		const senc = description === 2 ? [box('senc', u32(0), u32(samples.length), samples.flatMap(iv))] : [];
+		const moof = (dataOffset: number) => box('moof', box('mfhd', u32(0), u32(fragment + 1)), box('traf',
+			box('tfhd', u32(0x020002), u32(1), u32(description)),
+			box('tfdt', u32(0), u32(samples[0])),
+			box('trun', u32(0x301), u32(samples.length), u32(dataOffset),
+				...samples.map(() => [...u32(1), ...u32(32)])),
+			...senc,
+		));
+		bytes.push(...moof(moof(0).length + 8), ...box('mdat', data.flat()));
+	}
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array(bytes)),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => key } },
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	for (let i = 0; i < 4; i++) {
+		expect([...(await sink.getPacket(i / 10 + 0.01))!.data]).toEqual(plaintext(i));
+	}
+});

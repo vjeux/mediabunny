@@ -140,6 +140,8 @@ type InternalTrack = {
 	languageCode: string;
 	sampleTableByteOffset: number | null; // null when the track's sample table is another file (ominous ik 👀)
 	sampleTable: SampleTable | null;
+	/** The encryption info of each sample description (stsd entry), which can each have their own key ID */
+	encryptionInfos: (TrackEncryptionInfo | null)[];
 	fragmentLookupTable: FragmentLookupTableEntry[];
 	currentFragmentState: FragmentTrackState | null;
 	/**
@@ -283,6 +285,7 @@ type FragmentTrackData = {
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	/** Whether the samples use an encrypted sample description */
 	isEncrypted: boolean;
+	sampleDescriptionIndex: number;
 };
 
 type FragmentTrackSample = {
@@ -562,6 +565,7 @@ export class IsobmffDemuxer extends Demuxer {
 				languageCode: foreignTrack.languageCode,
 				sampleTableByteOffset: null,
 				sampleTable: null,
+				encryptionInfos: foreignTrack.encryptionInfos,
 				fragmentLookupTable: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
@@ -1044,6 +1048,7 @@ export class IsobmffDemuxer extends Demuxer {
 					languageCode: UNDETERMINED_LANGUAGE,
 					sampleTableByteOffset: -1,
 					sampleTable: null,
+					encryptionInfos: [],
 					fragmentLookupTable: [],
 					currentFragmentState: null,
 					fragmentPositionCache: [],
@@ -1278,6 +1283,11 @@ export class IsobmffDemuxer extends Demuxer {
 						break;
 					}
 
+					// Each sample description can have its own encryption info (sinf), with its own key ID. The
+					// track's is the last one's, as before.
+					const previousEncryptionInfo = track.encryptionInfo;
+					track.encryptionInfo = null;
+
 					track.internalCodecId = sampleBoxInfo.name;
 					const lowercaseBoxName = sampleBoxInfo.name.toLowerCase();
 					track.encryptedSampleDescriptions.push(lowercaseBoxName === 'encv' || lowercaseBoxName === 'enca');
@@ -1511,6 +1521,9 @@ export class IsobmffDemuxer extends Demuxer {
 							Logging._warn(`Unsupported audio codec (sample entry type '${sampleBoxInfo.name}').`);
 						}
 					}
+
+					track.encryptionInfos.push(track.encryptionInfo);
+					track.encryptionInfo ??= previousEncryptionInfo;
 
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
 				}
@@ -2621,6 +2634,7 @@ export class IsobmffDemuxer extends Demuxer {
 							track,
 							track.currentFragmentState.sampleDescriptionIndex ?? 1,
 						),
+						sampleDescriptionIndex: track.currentFragmentState.sampleDescriptionIndex ?? 1,
 					};
 					this.currentFragment.trackData.set(track.id, trackData);
 				}
@@ -3493,7 +3507,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				} else {
 					assertUnprotectedSample(
 						this.internalTrack,
-						this.internalTrack.encryptionInfo,
+						getSampleDescriptionEncryptionInfo(this.internalTrack, sampleInfo.sampleDescriptionIndex)!,
 						sampleDescriptionIsEncrypted(this.internalTrack, sampleInfo.sampleDescriptionIndex),
 					);
 				}
@@ -3549,7 +3563,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				} else {
 					assertUnprotectedSample(
 						this.internalTrack,
-						this.internalTrack.encryptionInfo,
+						getSampleDescriptionEncryptionInfo(this.internalTrack, trackData.sampleDescriptionIndex)!,
 						trackData.isEncrypted,
 					);
 				}
@@ -4022,6 +4036,11 @@ const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInf
 			: true,
 		sampleDescriptionIndex: chunkEntry.sampleDescriptionIndex,
 	};
+};
+
+/** `index` is 1-based. The encryption info of that sample description, or else the track's. */
+const getSampleDescriptionEncryptionInfo = (track: InternalTrack, index: number) => {
+	return track.encryptionInfos[index - 1] ?? track.encryptionInfo;
 };
 
 const performPresentationTimeLookup = (
