@@ -1152,3 +1152,52 @@ test('MPEG-TS metadata reading gives up on declared streams that never show up, 
 	expect(unknownSize.warnings).toEqual([expect.stringContaining('within the first 120 seconds of media')]);
 	expect(unknownSize.warnings[0]).toContain('PID 257 (stream_type 0x0f)');
 });
+
+test('MPEG-TS track language and audio type come from the ISO 639 language descriptor', async () => {
+	// FFmpeg wrote these with an ISO_639_language_descriptor saying 'eng' for the audio stream, and none for video
+	using hevcInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/hevc.ts')),
+		formats: ALL_FORMATS,
+	});
+	expect(await (await hevcInput.getPrimaryAudioTrack())!.getLanguageCode()).toBe('eng');
+	expect(await (await hevcInput.getPrimaryVideoTrack())!.getLanguageCode()).toBe('und');
+
+	const buffer = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/mp3.ts')));
+	const descriptor = [0x0a, 0x04, 0x65, 0x6e, 0x67, 0x00]; // tag, length, 'eng', audio_type
+
+	const cases = [[0, false, false], [2, true, false], [3, false, true]] as const;
+	for (const [audioType, hearingImpaired, visuallyImpaired] of cases) {
+		const patched = buffer.slice();
+		for (let i = 0; i < patched.length - descriptor.length; i++) {
+			if (descriptor.every((byte, j) => patched[i + j] === byte)) {
+				patched[i + 5] = audioType;
+			}
+		}
+
+		using input = new Input({
+			source: new BufferSource(patched),
+			formats: ALL_FORMATS,
+		});
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(audioTrack);
+
+		expect(await audioTrack.getLanguageCode()).toBe('eng');
+		const disposition = await audioTrack.getDisposition();
+		expect(disposition.hearingImpaired).toBe(hearingImpaired);
+		expect(disposition.visuallyImpaired).toBe(visuallyImpaired);
+	}
+
+	// Some muxers write the language code in upper case
+	const upperCase = buffer.slice();
+	for (let i = 0; i < upperCase.length - descriptor.length; i++) {
+		if (descriptor.every((byte, j) => upperCase[i + j] === byte)) {
+			upperCase.set([0x45, 0x4e, 0x47], i + 2); // 'ENG'
+		}
+	}
+
+	using upperCaseInput = new Input({
+		source: new BufferSource(upperCase),
+		formats: ALL_FORMATS,
+	});
+	expect(await (await upperCaseInput.getPrimaryAudioTrack())!.getLanguageCode()).toBe('eng');
+});
