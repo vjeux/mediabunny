@@ -27,6 +27,7 @@ import {
 	HLS_MIME_TYPE,
 	TAG_DEFINE,
 	TAG_EXTINF,
+	TAG_CONTENT_STEERING,
 	TAG_I_FRAME_STREAM_INF,
 	TAG_I_FRAMES_ONLY,
 	TAG_MEDIA,
@@ -100,12 +101,13 @@ export class HlsDemuxer extends Demuxer {
 			const { rootPath } = this.input._rootSource;
 			const variables = new HlsPlaylistVariables(rootPath, null);
 
-			const variantStreams: {
+			let variantStreams: {
 				fullPath: string;
 				attributes: AttributeList;
 				lineNumber: number;
 				hasOnlyKeyPackets: boolean;
 			}[] = [];
+			let steeringPathwayId: string | null = null;
 			const mediaTags: {
 				fullPath: string | null;
 				attributes: AttributeList;
@@ -205,6 +207,9 @@ export class HlsDemuxer extends Demuxer {
 					}
 
 					mediaTags.push({ fullPath, attributes, lineNumber: i });
+				} else if (line.startsWith(TAG_CONTENT_STEERING)) {
+					const attributes = new AttributeList(line.slice(TAG_CONTENT_STEERING.length), variables);
+					steeringPathwayId = attributes.get('pathway-id');
 				} else if (line === TAG_I_FRAMES_ONLY) {
 					// iFramesOnlyTagFound = true;
 				} else if (line.startsWith(TAG_EXTINF)) {
@@ -227,6 +232,19 @@ export class HlsDemuxer extends Demuxer {
 			if (variantStreams.length > MAX_VARIANT_STREAMS || mediaTags.length > MAX_MEDIA_TAGS) {
 				throw new Error('Unsupported M3U8 file; too many variant streams or media tags.');
 			}
+
+			// Variant streams on different Content Steering Pathways are redundant copies of each other, e.g. on
+			// different CDNs (RFC 8216bis, Section 7). Content Steering isn't supported, so only one Pathway is used:
+			// the one EXT-X-CONTENT-STEERING starts with, else the default one, else the first one (like hls.js).
+			// Renditions only come from the variant streams referencing them, so they're filtered along.
+			const getPathwayId = (variantStream: typeof variantStreams[number]) => {
+				return variantStream.attributes.get('pathway-id') ?? '.';
+			};
+			let pathwayId = steeringPathwayId ?? '.';
+			if (variantStreams.length > 0 && !variantStreams.some(x => getPathwayId(x) === pathwayId)) {
+				pathwayId = getPathwayId(variantStreams[0]!);
+			}
+			variantStreams = variantStreams.filter(x => getPathwayId(x) === pathwayId);
 
 			this.masterPlaylistVariables = variables;
 			// Now, let's process & resolve all variant streams in parallel, mapping each of them to tracks.
