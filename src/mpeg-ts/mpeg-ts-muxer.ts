@@ -578,9 +578,7 @@ export class MpegTsMuxer extends Muxer {
 	/**
 	 * Returns the time for a PCR written along with the given packet: a bit before the earliest decode time still to
 	 * come (the packet's own or the next ones of the other tracks, since packets are interleaved by presentation
-	 * time), so that the data always arrives before it's decoded. Never goes backwards, nor below zero in the file:
-	 * with a timestamp offset smaller than that lead, the lead shrinks to the offset rather than the PCR wrapping
-	 * around.
+	 * time), so that the data always arrives before it's decoded. Never goes backwards.
 	 */
 	private getPcrTime(queuedPacket: QueuedPacket) {
 		let earliestDecodeTimestamp = queuedPacket.decodeTimestamp ?? queuedPacket.presentationTimestamp;
@@ -594,7 +592,7 @@ export class MpegTsMuxer extends Muxer {
 			}
 		}
 
-		return Math.max(earliestDecodeTimestamp - PCR_DELAY, -this.timestampOffset, this.lastPcrTime ?? -Infinity);
+		return Math.max(earliestDecodeTimestamp - PCR_DELAY, this.lastPcrTime ?? -Infinity);
 	}
 
 	/** Writes a TS packet on the PCR PID with nothing but a PCR in its adaptation field. */
