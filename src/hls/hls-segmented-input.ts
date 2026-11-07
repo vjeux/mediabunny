@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { AES_128_BLOCK_SIZE, createAes128CbcDecryptStream } from '../aes';
+import { AES_128_BLOCK_SIZE, createAes128CbcDecryptStream, Aes128CbcContext } from '../aes';
 import { DurationMetadataRequestOptions } from '../demuxer';
 import { ENCRYPTION_KEY_CACHE_GROUP, Input } from '../input';
 import { Segment, SegmentedInput, SegmentedInputTrackDeclaration, SegmentRetrievalOptions } from '../segmented-input';
@@ -25,7 +25,14 @@ import {
 	toArray,
 } from '../misc';
 import { readAllLines, readBytes, Reader } from '../reader';
-import { CustomPathedSource, PathedSource, ReadableStreamSource, SourceRef, SourceRequest } from '../source';
+import {
+	BufferSource,
+	CustomPathedSource,
+	PathedSource,
+	ReadableStreamSource,
+	SourceRef,
+	SourceRequest,
+} from '../source';
 import { HlsDemuxer } from './hls-demuxer';
 import {
 	AttributeList,
@@ -101,6 +108,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 	lastSegmentUpdateTime = -Infinity;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
 	hasTargetDuration = false;
+	/**
+	 * Whether this is an I-frame playlist. With AES-128, its resources are encrypted as a whole, not per byte range.
+	 */
+	iFramesOnly = false;
 	segmentTimestampOffsetPromise: Promise<number> | null = null;
 	/** Total duration of the gap segments after the last segment in the list, which they aren't part of. */
 	trailingGapDuration = 0;
@@ -309,7 +320,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 					};
 
 					let initSegment = currentInitSegment;
-					if (!initSegment && !currentFirstSegment && iFramesOnly && !key && location.offset > 0) {
+					if (!initSegment && !currentFirstSegment && iFramesOnly && location.offset > 0) {
 						// "The byte range of an I-frame segment with an EXT-X-BYTERANGE tag applied to it MUST NOT
 						// include its Media Initialization Section; clients can assume that the Media Initialization
 						// Section is defined by the EXT-X-MAP tag, or is located between the start of the resource and
@@ -324,7 +335,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 							sequenceNumber: null,
 							location: { path: fullPath, offset: 0, length: location.offset },
 							duration: 0,
-							encryption: null,
+							encryption: key,
 							initSegment: null,
 							lastProgramDateTimeSeconds,
 						};
@@ -597,6 +608,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				nextSegmentIsGap = true;
 			} else if (line === TAG_I_FRAMES_ONLY) {
 				iFramesOnly = true;
+				this.iFramesOnly = true;
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
 				// Counted even for known segments since the discontinuity number is absolute, derived from the
@@ -813,6 +825,56 @@ export class HlsSegmentedInput extends SegmentedInput {
 						const encryption = hlsSegment.encryption;
 						assert(encryption.iv);
 
+						const getKey = async () => {
+							using keyRef = await this.input._getSourceCached(
+								{ path: encryption.keyUri, isRoot: false },
+								ENCRYPTION_KEY_CACHE_GROUP,
+							);
+							const keyReader = new Reader(keyRef.source);
+							const keySlice = await keyReader.requestSlice(0, AES_128_BLOCK_SIZE);
+							if (!keySlice) {
+								throw new Error('Invalid AES-128 key; expected at least 16 bytes of data.');
+							}
+
+							return readBytes(keySlice, AES_128_BLOCK_SIZE);
+						};
+
+						if (this.iFramesOnly && hlsSegment.location.length !== null) {
+							// I-frame playlists point into resources that are encrypted as a whole. The I-frame is
+							// recovered by widening its byte range to block boundaries, plus one block in front whose
+							// ciphertext is the IV of the next (RFC 8216bis, 6.3.6).
+							const start = hlsSegment.location.offset;
+							const end = start + hlsSegment.location.length;
+							const blockStart = Math.floor(start / AES_128_BLOCK_SIZE) * AES_128_BLOCK_SIZE;
+							const blockEnd = Math.ceil(end / AES_128_BLOCK_SIZE) * AES_128_BLOCK_SIZE;
+							const readStart = Math.max(blockStart - AES_128_BLOCK_SIZE, 0);
+
+							using ciphertextRef = await this.input._getSourceCached(proxiedRequest);
+							const ciphertextSlice = await new Reader(ciphertextRef.source)
+								.requestSlice(readStart, blockEnd - readStart);
+							if (!ciphertextSlice) {
+								throw new Error('Invalid ciphertext; the byte range lies outside the resource.');
+							}
+							const ciphertext = readBytes(ciphertextSlice, blockEnd - readStart);
+
+							// At the start of the resource, there's no block in front, so the playlist's IV applies
+							const iv = blockStart === readStart
+								? encryption.iv
+								: ciphertext.subarray(0, AES_128_BLOCK_SIZE);
+							const blocks = ciphertext.subarray(blockStart - readStart);
+
+							const aesContext = new Aes128CbcContext();
+							aesContext.init({ key: await getKey(), iv });
+							const plaintext = new Uint8Array(blocks.length);
+							for (let i = 0; i < blocks.length; i += AES_128_BLOCK_SIZE) {
+								aesContext.in.set(blocks.subarray(i, i + AES_128_BLOCK_SIZE));
+								aesContext.decrypt();
+								plaintext.set(aesContext.out, i);
+							}
+
+							return new BufferSource(plaintext.subarray(start - blockStart, end - blockStart)).ref();
+						}
+
 						let ciphertextRef = await this.input._getSourceCached(proxiedRequest);
 						if (needsSlice) {
 							// Slice before decrypting
@@ -828,18 +890,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						const ciphertextReader = new Reader(ciphertextRef.source);
 
 						const stream = createAes128CbcDecryptStream(ciphertextReader, async () => {
-							using keyRef = await this.input._getSourceCached(
-								{ path: encryption.keyUri, isRoot: false },
-								ENCRYPTION_KEY_CACHE_GROUP,
-							);
-							const keyReader = new Reader(keyRef.source);
-							const keySlice = await keyReader.requestSlice(0, AES_128_BLOCK_SIZE);
-							if (!keySlice) {
-								throw new Error('Invalid AES-128 key; expected at least 16 bytes of data.');
-							}
-							const key = readBytes(keySlice, AES_128_BLOCK_SIZE);
-
-							return { key, iv: encryption.iv! };
+							return { key: await getKey(), iv: encryption.iv! };
 						}, () => {
 							ciphertextRef.free();
 						});
