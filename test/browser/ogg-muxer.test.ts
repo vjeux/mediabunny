@@ -146,6 +146,53 @@ test('Multi-frame Opus packets', async () => {
 	expect(packet?.duration).toBe(packetDuration);
 });
 
+test('The Vorbis comment header ends with the framing bit', async () => {
+	// Copies the packets of a Vorbis file, as remuxing does; the muxer writes its own comment header
+	const bytes = new Uint8Array(await (await fetch('/vorbis-eos.ogg')).arrayBuffer());
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+
+	for (const tags of [{}, { title: 'Title', artist: 'Artist' }]) {
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('vorbis');
+		output.addAudioTrack(source);
+		output.setMetadataTags(tags);
+		await output.start();
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			await source.add(packet, { decoderConfig });
+		}
+		await output.finalize();
+
+		// The headers are in the description, Xiph-laced: 2, the sizes of the first two, then the headers
+		using written = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const writtenTrack = await written.getPrimaryAudioTrack();
+		assert(writtenTrack);
+		const description = new Uint8Array((await writtenTrack.getDecoderConfig())!.description as ArrayBuffer);
+		let pos = 1;
+		const readSize = () => {
+			let size = 0;
+			while (description[pos] === 255) {
+				size += description[pos++]!;
+			}
+			return size + description[pos++]!;
+		};
+		const identificationHeaderSize = readSize();
+		const commentHeaderSize = readSize();
+		const commentHeader = description.subarray(
+			pos + identificationHeaderSize,
+			pos + identificationHeaderSize + commentHeaderSize,
+		);
+
+		// The comment header must end with a set framing bit (Vorbis I specification, section 5.2.1), or libvorbis
+		// rejects the stream (OV_EBADHEADER), and FFmpeg drops the last comment
+		expect(commentHeader[0]).toBe(3);
+		expect(commentHeader.at(-1)).toBe(1);
+	}
+});
+
 test('Opus start offset and end trimming survive a demux-mux roundtrip', async () => {
 	const SAMPLE_RATE = 48000;
 	const PRE_SKIP = 312;
