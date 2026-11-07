@@ -386,7 +386,20 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	expect(sample.hasAlpha).toBe(true);
 });
 
-test('Decoded frames with alpha keep the color space of the color stream', async () => {
+test('Decoded frames with alpha keep the color space of the color stream', async ({ skip }) => {
+	// WebKitGTK's VideoFrame.copyTo() returns YUV planes unconverted when asked for RGBA, so the colors can't be read
+	// back there. This probes the browser itself, not Mediabunny.
+	const probe = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
+		format: 'I420',
+		codedWidth: 2,
+		codedHeight: 2,
+		timestamp: 0,
+	});
+	const probeRgba = new Uint8Array(16);
+	await probe.copyTo(probeRgba, { format: 'RGBA' }).catch(() => {});
+	probe.close();
+	skip(probeRgba[3] !== 255, 'VideoFrame.copyTo() does not convert YUV to RGBA here');
+
 	// Opaque gray bars encoded with alpha: 'keep', like a canvas recording from Chrome's MediaRecorder: the color
 	// stream comes out full range, and every packet carries alpha side data. Grays, so that only the range matters.
 	const colors = [[16, 16, 16], [64, 64, 64], [192, 192, 192], [240, 240, 240]];
