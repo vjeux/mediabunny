@@ -1755,6 +1755,10 @@ export class IsobmffMuxer extends Muxer {
 					this.writer.write(sample.data);
 					sample.data = null;
 				}
+
+				// Hand each chunk to the target right away. Otherwise, targets that queue writes until a flush (like
+				// StreamTarget) would hold a second copy of the whole mdat and then write it out all at once.
+				await this.writer.flush();
 			}
 
 			if (this.formatOptions.onMdat) {
