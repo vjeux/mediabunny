@@ -2716,6 +2716,19 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 	const listLength = commentView.getUint32(commentPos, true);
 	commentPos += 4;
 
+	// The tags may already hold the comments of another logical stream of the file, which usually carries the same
+	// ones (each Ogg stream has its own comment header). Comments already there, pictures included, are only added
+	// again where this header holds them more often.
+	const previousValues = new Map<string, string[]>();
+	for (const key in metadataTags.raw) {
+		const value = metadataTags.raw[key];
+		if (typeof value === 'string') {
+			previousValues.set(key, [value]);
+		} else if (Array.isArray(value) && value.every(x => typeof x === 'string')) {
+			previousValues.set(key, [...value]);
+		}
+	}
+
 	// Loop over all metadata tags
 	for (let i = 0; i < listLength; i++) {
 		if (commentPos + 4 > bytes.length) {
@@ -2737,6 +2750,12 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 
 		const key = string.slice(0, separatorIndex).toUpperCase();
 		const value = string.slice(separatorIndex + 1);
+		const previousValuesOfKey = previousValues.get(key);
+		const previousIndex = previousValuesOfKey?.indexOf(value) ?? -1;
+		if (previousIndex !== -1) {
+			previousValuesOfKey!.splice(previousIndex, 1); // Already read from another logical stream
+			continue;
+		}
 
 		metadataTags.raw ??= {};
 		if (Array.isArray(metadataTags.raw[key])) {
