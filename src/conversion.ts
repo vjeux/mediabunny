@@ -697,6 +697,8 @@ type TrackPump = {
 	resolvers: ReturnType<typeof promiseWithResolvers<void>>;
 	wake: (() => void) | null;
 	start: () => void;
+	/** The media iterators the pump reads from, ended on cancel. */
+	iterators: Set<AsyncGenerator<unknown, void, unknown>>;
 };
 
 /**
@@ -1465,6 +1467,12 @@ export class Conversion {
 		// Wake all suspended track pumps so they can wind down
 		for (const pump of this._trackPumps) {
 			pump.wake?.();
+
+			// A pump may also be waiting for its next packet or sample, which can take arbitrarily long (at the live
+			// edge of a live input, say)
+			for (const iterator of pump.iterators) {
+				void iterator.return(undefined).catch(() => {});
+			}
 		}
 
 		this._synchronizer.resolveAll();
@@ -1681,11 +1689,11 @@ export class Conversion {
 				let warnedAboutDroppedPackets = false;
 
 				// eslint-disable-next-line curly
-				if (copyStartPacket) for await (const packet of sink.packets(
+				if (copyStartPacket) for await (const packet of this._trackIterator(pump, sink.packets(
 					copyStartPacket,
 					undefined,
 					{ verifyKeyPackets: true },
-				)) {
+				))) {
 					if (this._state === 'canceled') {
 						break;
 					}
@@ -1920,7 +1928,10 @@ export class Conversion {
 			this._registerTrackPump(async (pump) => {
 				const sink = new VideoSampleSink(track, { hardwareAcceleration: trackOptions.hardwareAcceleration });
 
-				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
+				for await (using sample of this._trackIterator(
+					pump,
+					sink.samples(this._startTimestamp, this._endTimestamp),
+				)) {
 					if (this._state === 'canceled') {
 						break;
 					}
@@ -2174,7 +2185,10 @@ export class Conversion {
 				let warnedAboutDroppedPackets = false;
 
 				// eslint-disable-next-line curly
-				if (copyStartPacket) for await (const packet of sink.packets(copyStartPacket)) {
+				if (copyStartPacket) for await (const packet of this._trackIterator(
+					pump,
+					sink.packets(copyStartPacket),
+				)) {
 					if (this._state === 'canceled') {
 						break;
 					}
@@ -2326,7 +2340,10 @@ export class Conversion {
 				let paddingLengthInSamples: number | null = null;
 
 				const sink = new AudioSampleSink(track);
-				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
+				for await (using sample of this._trackIterator(
+					pump,
+					sink.samples(this._startTimestamp, this._endTimestamp),
+				)) {
 					if (this._state === 'canceled') {
 						break;
 					}
@@ -2508,11 +2525,18 @@ export class Conversion {
 	}
 
 	/** @internal */
+	_trackIterator<T>(pump: TrackPump, iterator: AsyncGenerator<T, void, unknown>) {
+		pump.iterators.add(iterator as AsyncGenerator<unknown, void, unknown>);
+		return iterator;
+	}
+
+	/** @internal */
 	_registerTrackPump(fn: (pump: TrackPump) => Promise<void>) {
 		const pump: TrackPump = {
 			done: false,
 			resolvers: promiseWithResolvers(),
 			wake: null,
+			iterators: new Set(),
 			start: () => {
 				void fn(pump).then(() => {
 					pump.done = true;
