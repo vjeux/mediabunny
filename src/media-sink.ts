@@ -1951,7 +1951,9 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 	/**
 	 * Retrieves the video sample (frame) corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last video sample (in presentation order) with a start timestamp less than or equal to the given timestamp.
-	 * Returns null if the timestamp is before the track's first timestamp.
+	 * Returns null if no decodable frame starts at or before the timestamp: before the track's first timestamp, and
+	 * before the first key frame of a track that starts with delta frames (such as an MPEG-TS stream cut mid-GOP).
+	 * The first sample yielded by {@link VideoSampleSink.samples} is the first decodable one.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
@@ -2259,7 +2261,9 @@ export class CanvasSink {
 	/**
 	 * Retrieves a canvas with the video frame corresponding to the given timestamp, in seconds. More specifically,
 	 * returns the last video frame (in presentation order) with a start timestamp less than or equal to the given
-	 * timestamp. Returns null if the timestamp is before the track's first timestamp.
+	 * timestamp. Returns null if no decodable frame starts at or before the timestamp: before the track's first
+	 * timestamp, and before the first key frame of a track that starts with delta frames (such as an MPEG-TS stream
+	 * cut mid-GOP). The first canvas yielded by {@link CanvasSink.canvases} is the first decodable one.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.

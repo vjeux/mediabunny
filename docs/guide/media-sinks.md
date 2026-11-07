@@ -246,6 +246,8 @@ await sink.getSample(Infinity);
 ```
 This method returns the last sample with a timestamp less than or equal to the search timestamp, or `null` if there is no such sample.
 
+This can include the track's first timestamp: when a track starts with frames that can't be decoded on their own, such as an MPEG-TS stream cut mid-GOP, its samples only begin at the first key frame, and `getSample(await videoTrack.getFirstTimestamp())` returns `null`. To get the first sample, take the first one that `samples()` yields.
+
 #### Range iteration
 
 You can use the `samples` iterator method to iterate over a contiguous range of samples:
@@ -500,7 +502,7 @@ The methods for retrieving samples are analogous to those on `VideoSampleSink`.
 
 These methods yield [`AudioSample`](./packets-and-samples#audiosample) instances.
 
-Unlike video, `getSample(await audioTrack.getFirstTimestamp())` can return `null` for some audio tracks: for Opus, decoding drops the pre-skip, so the first sample starts after the first timestamp, and for Vorbis, the first decoded sample may not be found at the first timestamp either. To get the first sample, take the first one that `samples()` yields.
+For some audio tracks, `getSample(await audioTrack.getFirstTimestamp())` can also return `null`: for Opus, decoding drops the pre-skip, so the first sample starts after the first timestamp, and for Vorbis, the first decoded sample may not be found at the first timestamp either. To get the first sample, take the first one that `samples()` yields.
 
 For example, let's use this sink to calculate the average loudness of an audio track using [root mean square](https://en.wikipedia.org/wiki/Root_mean_square):
 ```ts
