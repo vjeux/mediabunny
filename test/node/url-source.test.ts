@@ -824,6 +824,35 @@ const startRangelessServer = async (
 	};
 };
 
+test('UrlSource takes the size from a range response stating Content-Encoding: identity', async () => {
+	const bytes = new Uint8Array(1000).map((_, i) => i & 0xff);
+
+	for (const contentEncoding of [null, 'identity', 'Identity']) {
+		const server = http.createServer((req, res) => {
+			const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+			res.writeHead(206, {
+				'Content-Range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+				'Content-Length': bytes.length - start,
+				// "identity" means no content coding, so the lengths still count the resource's own bytes
+				...(contentEncoding !== null && { 'Content-Encoding': contentEncoding }),
+			});
+			res.end(bytes.subarray(start));
+		});
+
+		await new Promise<void>(resolve => server.listen(0, resolve));
+
+		try {
+			const address = server.address();
+			assert(address && typeof address !== 'string');
+			using ref = new UrlSource(`http://localhost:${address.port}/data.bin`).ref();
+			expect(await ref.source.getSizeOrNull(), String(contentEncoding)).toBe(bytes.length);
+		} finally {
+			server.closeAllConnections();
+			server.close();
+		}
+	}
+});
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
