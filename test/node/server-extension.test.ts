@@ -32,7 +32,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, canEncodeVideo, Quality } from '../../src/encode.js';
+import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
@@ -560,38 +560,30 @@ describe('Video', async () => {
 		await encoder.close();
 	});
 
-	test('ProRes is only encoded at widths whose chroma prores_ks encodes in full', async () => {
-		// Encodes one frame of a uniform color as ProRes, decodes the packet with FFmpeg's ProRes decoder, and returns
-		// whether the last chroma column of the middle row came through
-		const encodeAndCheckLastChromaColumn = async (width: number, alpha: 'keep' | 'discard') => {
+	test('ProRes keeps the last chroma column of odd-width frames', async () => {
+		// Encodes a green frame with a red last column as ProRes, decodes the packet with FFmpeg's ProRes decoder, and
+		// returns the decoded width and the Cr of the middle row's last chroma sample, on an 8-bit scale
+		const encodeAndReadLastCr = async (width: number, alpha: 'keep' | 'discard') => {
 			const height = 16;
 			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
 			const source = new VideoSampleSource({ codec: 'prores', quality: new Quality('medium'), alpha });
 			output.addVideoTrack(source);
+			await output.start();
 
-			try {
-				await output.start();
-				const data = new Uint8Array(width * height * 4);
-				for (let i = 0; i < width * height; i++) {
-					data.set([20, 120, 60, 200], 4 * i);
-				}
-				const sample = new VideoSample(data, {
-					format: 'RGBA',
-					codedWidth: width,
-					codedHeight: height,
-					timestamp: 0,
-					duration: 1 / 30,
-				});
-				try {
-					await source.add(sample);
-				} finally {
-					sample.close();
-				}
-				await output.finalize();
-			} catch {
-				await output.cancel();
-				return 'declined';
+			const data = new Uint8Array(width * height * 4);
+			for (let i = 0; i < width * height; i++) {
+				data.set(i % width === width - 1 ? [255, 0, 0, 200] : [20, 120, 60, 200], 4 * i);
 			}
+			const sample = new VideoSample(data, {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+			sample.close();
+			await output.finalize();
 
 			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
 			const track = await input.getPrimaryVideoTrack();
@@ -612,33 +604,69 @@ describe('Video', async () => {
 			frame.alloc();
 			NodeAv.FFmpegError.throwIfError(await decoder.receiveFrame(frame), 'receiveFrame');
 
-			// The chroma planes hold 16-bit samples, a column per pixel for 4:4:4, one per two pixels for 4:2:2
-			const isYuv422 = NodeAv.avGetPixFmtName(frame.format as NodeAv.AVPixelFormat)?.includes('422');
-			const chromaWidth = isYuv422 ? Math.ceil(width / 2) : width;
-			const row = frame.data![1]!.subarray((height / 2) * frame.linesize[1]!);
-			const lastTwo = [row.readUInt16LE(2 * (chromaWidth - 2)), row.readUInt16LE(2 * (chromaWidth - 1))];
+			// 16-bit samples holding 10 or 12 bits, a chroma column per pixel for 4:4:4, one per two pixels for 4:2:2
+			const formatName = NodeAv.avGetPixFmtName(frame.format as NodeAv.AVPixelFormat) ?? '';
+			const chromaWidth = formatName.includes('422') ? Math.ceil(width / 2) : width;
+			const row = frame.data![2]!.subarray((height / 2) * frame.linesize[2]!);
+			const lastCr = row.readUInt16LE(2 * (chromaWidth - 1)) >> (formatName.includes('12') ? 4 : 2);
+			const decodedWidth = frame.width;
 
 			frame.free();
 			packet.free();
 			decoder.freeContext();
-			return lastTwo[0] === lastTwo[1] ? 'intact' : 'last chroma column lost';
+			return { decodedWidth, lastCr };
 		};
 
-		const cases: [width: number, alpha: 'keep' | 'discard', outcome: string][] = [
-			// 4:2:2, where prores_ks would zero the last chroma column of an odd width
-			[33, 'discard', 'declined'],
-			[34, 'discard', 'intact'],
-			// With alpha, it's 4:4:4
-			[33, 'keep', 'intact'],
-		];
-		for (const [width, alpha, outcome] of cases) {
-			expect({ width, alpha, outcome: await encodeAndCheckLastChromaColumn(width, alpha) })
-				.toEqual({ width, alpha, outcome });
+		// prores_ks only encodes floor(width / 2) chroma columns of 4:2:2 frames, so the last one of an odd width came
+		// out zeroed (widths of 16n + 1, a green line along the right edge) or copied from the one before
+		for (const [width, alpha] of [[33, 'discard'], [35, 'discard'], [33, 'keep']] as const) {
+			const { decodedWidth, lastCr } = await encodeAndReadLastCr(width, alpha);
+			expect({ width, alpha, decodedWidth, redEdgeKept: lastCr > 220 })
+				.toEqual({ width, alpha, decodedWidth: width, redEdgeKept: true });
 		}
+	});
 
-		// canEncodeVideo, which doesn't take alpha into account, agrees for frames without it
-		expect(await canEncodeVideo('prores', { width: 33, height: 16 })).toBe(false);
-		expect(await canEncodeVideo('prores', { width: 34, height: 16 })).toBe(true);
+	test('Odd-width conversions to ProRes keeping alpha keep working', async () => {
+		// A semi-transparent 641x16 ProRes 4444 source, written through the server itself
+		const width = 641;
+		const height = 16;
+		const sourceOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const videoSource = new VideoSampleSource({
+			codec: 'prores',
+			fullCodecString: 'ap4h',
+			quality: new Quality('medium'),
+			alpha: 'keep',
+		});
+		sourceOutput.addVideoTrack(videoSource);
+		await sourceOutput.start();
+		for (let i = 0; i < 3; i++) {
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(128), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await videoSource.add(sample);
+			sample.close();
+		}
+		await sourceOutput.finalize();
+
+		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec: 'prores', alpha: 'keep', forceTranscode: true },
+		});
+		expect(conversion.discardedTracks).toEqual([]);
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getCodedWidth()).toBe(width);
+		expect(await track.canBeTransparent()).toBe(true);
 	});
 
 	test('ProRes Proxy encode', async () => {
