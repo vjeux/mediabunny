@@ -830,7 +830,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 			const firstSegment = await this.getFirstSegment();
 			assert(firstSegment);
 
-			const referenceSegmentedInput = this.demuxer.getReferenceSegmentedInput();
+			const referenceSegmentedInput = await this.demuxer.getTimelineSegmentedInput();
 			if (this === referenceSegmentedInput) {
 				return 0;
 			}

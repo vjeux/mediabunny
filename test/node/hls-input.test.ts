@@ -789,6 +789,37 @@ test.concurrent('Single-value PDT with unix offsets disabled', { timeout: 15_000
 	expect(unixTimeDt).toBeCloseTo(timestampDt);
 });
 
+test.concurrent('Renditions can be read when the variant\'s own playlist has no segments', async () => {
+	// The only video variant's playlist is empty (an empty video track), but its audio rendition has segments, here in
+	// MPEG-TS. The timeline can't be taken from the video playlist then, so it's taken from the audio one.
+	const files: Record<string, string> = {
+		'master.m3u8': `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,URI="audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio"
+video.m3u8
+`,
+		'video.m3u8': '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-ENDLIST\n',
+		'audio.m3u8': '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n',
+	};
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => path === '0.ts'
+			? new FilePathSource('./test/public/0.ts')
+			: new BufferSource(new TextEncoder().encode(files[path]))),
+		formats: HLS_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.map(x => x.type)).toEqual(['audio', 'video']);
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	const sink = new EncodedPacketSink(audioTrack);
+	const firstPacket = await sink.getFirstPacket();
+	assert(firstPacket);
+	expect(Math.abs(firstPacket.timestamp)).toBeLessThan(0.1);
+	expect((await sink.getPacket(2.5))?.timestamp).toBeCloseTo(2.5, 1);
+});
+
 test.concurrent('Alternative audio only', { timeout: 15_000 }, async () => {
 	using input = new Input({
 		source: new UrlSource('https://playertest.longtailvideo.com/adaptive/alt-audio-no-video/sintel/playlist.m3u8'),
