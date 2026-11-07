@@ -1,19 +1,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
-import {
-	EncodedAudioPacketSource,
-	EncodedPacket,
-	StreamTarget,
-	StreamTargetChunk,
-	Target,
-	WavOutputFormat,
-} from '../../src/index.js';
+import { EncodedAudioPacketSource, EncodedPacket, WavOutputFormat } from '../../src/index.js';
 import { Input } from '../../src/input.js';
 import { FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { BufferTarget } from '../../src/target.js';
+import { BufferTarget, StreamTarget, StreamTargetChunk, Target } from '../../src/target.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 
