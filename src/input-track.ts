@@ -217,7 +217,9 @@ export abstract class InputTrack {
 	 * Returns the identifier of the codec used internally by the container. It is not homogenized by Mediabunny
 	 * and depends entirely on the container format.
 	 *
-	 * This method can be used to determine the codec of a track in case Mediabunny doesn't know that codec.
+	 * This method can be used to determine the codec of a track in case Mediabunny doesn't know that codec. Only
+	 * ISOBMFF and Matroska files surface such tracks: MPEG-TS and Ogg files leave them out, and reading a WAVE file
+	 * with an unsupported codec throws an error.
 	 *
 	 * - For ISOBMFF files, this resolves to the name of the Sample Description Box (e.g. `'avc1'`).
 	 * - For Matroska files, this resolves to the value of the `CodecID` element.

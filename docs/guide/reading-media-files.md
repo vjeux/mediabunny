@@ -189,7 +189,7 @@ You can query metadata related to the track's codec:
 ```ts
 await track.getCodec(); // => MediaCodec | null
 ```
-This field is `null` when the track's codec couldn't be recognized or is not supported by Mediabunny. See [Codecs](./supported-formats-and-codecs#codecs) for the full list of supported codecs. When Mediabunny doesn't recognize the format, you can still use `getInternalCodecId()` to figure out the codec of the track, although its format depends on the container format used and is not homogenized by Mediabunny.
+This field is `null` when the track's codec couldn't be recognized or is not supported by Mediabunny. See [Codecs](./supported-formats-and-codecs#codecs) for the full list of supported codecs. MP4/MOV and Matroska/WebM files still list tracks whose codec Mediabunny doesn't recognize, and you can use `getInternalCodecId()` to figure out their codec, although its format depends on the container format used and is not homogenized by Mediabunny. MPEG-TS and Ogg files leave such tracks out, and reading a WAVE file with an unsupported codec throws an error.
 
 You can also extract the full codec parameter string from the track, as specified in the [Mediabunny Codec Registry](/codec-registry/overview):
 ```ts
