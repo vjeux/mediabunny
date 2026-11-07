@@ -105,6 +105,16 @@ export class MpegTsMuxer extends Muxer {
 
 		this.writer = await this.output._getRootWriter(true);
 
+		// Tracks that declared their decoder config are set up right away, like in the other muxers, so that the MIME
+		// type is known before any packets come in, and the PMT lists them even if none ever do
+		for (const track of this.output.tracks) {
+			if (track.isVideoTrack() && track.metadata.decoderConfig) {
+				this.getVideoTrackData(track, { decoderConfig: track.metadata.decoderConfig });
+			} else if (track.isAudioTrack() && track.metadata.decoderConfig) {
+				this.getAudioTrackData(track, { decoderConfig: track.metadata.decoderConfig });
+			}
+		}
+
 		release();
 	}
 
@@ -237,13 +247,6 @@ export class MpegTsMuxer extends Muxer {
 		const release = await this.mutex.acquire();
 
 		try {
-			// The packets of a track that declared its decoder config up front may come without metadata, so the first
-			// one (which sets the track up) takes the declared config then
-			const isFirstPacket = !this.trackDatas.some(x => x.track === track);
-			if (isFirstPacket && !meta?.decoderConfig && track.metadata.decoderConfig) {
-				meta = { ...meta, decoderConfig: track.metadata.decoderConfig };
-			}
-
 			const trackData = this.getVideoTrackData(track, meta);
 
 			this.validateTimestamp(
@@ -277,13 +280,6 @@ export class MpegTsMuxer extends Muxer {
 		const release = await this.mutex.acquire();
 
 		try {
-			// The packets of a track that declared its decoder config up front may come without metadata, so the first
-			// one (which sets the track up) takes the declared config then
-			const isFirstPacket = !this.trackDatas.some(x => x.track === track);
-			if (isFirstPacket && !meta?.decoderConfig && track.metadata.decoderConfig) {
-				meta = { ...meta, decoderConfig: track.metadata.decoderConfig };
-			}
-
 			const trackData = this.getAudioTrackData(track, meta);
 
 			this.validateTimestamp(
@@ -321,8 +317,9 @@ export class MpegTsMuxer extends Muxer {
 		const codec = (trackData.track as OutputVideoTrack).source._codec;
 
 		if (trackData.inputIsAnnexB === null) {
-			// This is the first packet
-			const description = meta?.decoderConfig?.description;
+			// This is the first packet. It may come without metadata if the track declared its decoder config.
+			const decoderConfig = meta?.decoderConfig ?? (trackData.track as OutputVideoTrack).metadata.decoderConfig;
+			const description = decoderConfig?.description;
 			trackData.inputIsAnnexB = !description;
 
 			if (!trackData.inputIsAnnexB) {
@@ -446,8 +443,9 @@ export class MpegTsMuxer extends Muxer {
 		}
 
 		if (trackData.inputIsAdts === null) {
-			// It's the first packet
-			const description = meta?.decoderConfig?.description;
+			// It's the first packet. It may come without metadata if the track declared its decoder config.
+			const decoderConfig = meta?.decoderConfig ?? (trackData.track as OutputAudioTrack).metadata.decoderConfig;
+			const description = decoderConfig?.description;
 			trackData.inputIsAdts = !description;
 
 			if (!trackData.inputIsAdts) {
