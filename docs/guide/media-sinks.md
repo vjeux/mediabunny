@@ -246,6 +246,8 @@ await sink.getSample(Infinity);
 ```
 This method returns the last sample with a timestamp less than or equal to the search timestamp, or `null` if there is no such sample.
 
+This can include the track's first timestamp: when a track starts with frames that can't be decoded on their own, such as an MPEG-TS stream cut mid-GOP, its samples only begin at the first key frame, and `getSample(await videoTrack.getFirstTimestamp())` returns `null`. To get the first sample, take the first one that `samples()` yields.
+
 #### Range iteration
 
 You can use the `samples` iterator method to iterate over a contiguous range of samples:
@@ -264,7 +266,7 @@ for await (const sample of sink.samples(5, 10)) {
 	sample.close();
 }
 ```
-The `samples` iterator yields the samples in [presentation order](#decode-vs-presentation-order) (sorted by timestamp).
+The `samples` iterator yields the samples in [presentation order](#decode-vs-presentation-order) (sorted by timestamp). Like `getSample`, it starts with the sample presented at the start timestamp, which is the last one starting at or before it, so the first sample may begin before the start timestamp.
 
 #### Sparse iteration
 
@@ -272,7 +274,7 @@ Sometimes, you may want to retrieve the samples for multiple timestamps at once 
 ```ts
 for await (const sample of sink.samplesAtTimestamps([0, 1, 2, 3, 4, 5])) {
 	// `sample` is either VideoSample or null
-	sample.close();
+	sample?.close();
 }
 
 // Any timestamp sequence is allowed:
@@ -500,6 +502,8 @@ The methods for retrieving samples are analogous to those on `VideoSampleSink`.
 
 These methods yield [`AudioSample`](./packets-and-samples#audiosample) instances.
 
+For some audio tracks, `getSample(await audioTrack.getFirstTimestamp())` can also return `null`: for Opus, decoding drops the pre-skip, so the first sample starts after the first timestamp, and for Vorbis, the first decoded sample may not be found at the first timestamp either. To get the first sample, take the first one that `samples()` yields.
+
 For example, let's use this sink to calculate the average loudness of an audio track using [root mean square](https://en.wikipedia.org/wiki/Root_mean_square):
 ```ts
 const sink = new AudioSampleSink(audioTrack);
@@ -513,7 +517,7 @@ for await (const sample of sink.samples()) {
 	sample.copyTo(floats, { format: 'f32', planeIndex: 0 });
 
 	for (let i = 0; i < floats.length; i++) {
-		sumOfSquares += floats[i] ** 2;
+		sumOfSquares += floats[i]! ** 2;
 	}
 
 	totalSampleCount += floats.length;
@@ -541,6 +545,8 @@ The methods for retrieving audio buffers are analogous to those on `VideoSampleS
 - `buffersAtTimestamps`\
 	Iterates over buffers at specific timestamps; see [Sparse iteration](#sparse-iteration).
 
+As with `AudioSampleSink`, `getBuffer(await audioTrack.getFirstTimestamp())` can return `null` for Opus and Vorbis tracks; the first buffer that `buffers()` yields is the track's first one.
+
 These methods yield `WrappedAudioBuffer` instances:
 ```ts
 type WrappedAudioBuffer = {
@@ -558,12 +564,16 @@ For example, let's use this sink to play the last 10 seconds of an audio track:
 const sink = new AudioBufferSink(audioTrack);
 const audioContext = new AudioContext();
 const lastTimestamp = await audioTrack.computeDuration();
+const startTimestamp = Math.max(lastTimestamp - 10, 0);
 const baseTime = audioContext.currentTime;
 
-for await (const { buffer, timestamp } of sink.buffers(lastTimestamp - 10)) {
+for await (const { buffer, timestamp } of sink.buffers(startTimestamp)) {
 	const source = audioContext.createBufferSource();
 	source.buffer = buffer;
 	source.connect(audioContext.destination);
-	source.start(baseTime + timestamp);
+
+	// The first buffer can begin before startTimestamp; skip that part of it
+	const offset = Math.max(startTimestamp - timestamp, 0);
+	source.start(baseTime + Math.max(timestamp - startTimestamp, 0), offset);
 }
 ```
