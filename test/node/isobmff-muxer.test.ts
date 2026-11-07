@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget, NullTarget } from '../../src/target.js';
-import { CmafOutputFormat, Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { CmafOutputFormat, Mp4OutputFormat, WebMOutputFormat, MovOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -1016,4 +1016,24 @@ test('getMimeType names the hvc1 sample entry when remuxing an hev1 HEVC track',
 
 	// The codec string's first element is the sample entry's four-character code (RFC 6381)
 	expect(await output.getMimeType()).toBe('video/mp4; codecs="hvc1.1.6.L120.90"');
+});
+
+test('Media handler boxes have pre_defined = 0 in MP4 and the mhlr component type in MOV', async () => {
+	for (const [format, expected] of [[new Mp4OutputFormat(), '\0\0\0\0'], [new MovOutputFormat(), 'mhlr']] as const) {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 1), {
+			decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+		});
+		await output.finalize();
+
+		// The handler box of the track's media box, the one with the 'vide' handler type
+		const bytes = new Uint8Array(output.target.buffer!);
+		const text = (start: number) => String.fromCharCode(...bytes.subarray(start, start + 4));
+		const hdlr = bytes.findIndex((_, i) => text(i) === 'hdlr' && text(i + 12) === 'vide');
+		expect(hdlr).toBeGreaterThan(0);
+		expect(text(hdlr + 8)).toBe(expected); // pre_defined, or the component type in QuickTime
+	}
 });
