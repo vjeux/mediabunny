@@ -1,6 +1,7 @@
 /* eslint-disable @stylistic/max-len */
 import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
-import { expect, test, vi } from 'vitest';
+import { expect, test } from 'vitest';
+import { Logging } from '../../src/logging.js';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
 import { CustomPathedSource, FilePathSource } from '../../src/source.js';
@@ -907,8 +908,20 @@ test.concurrent('Advanced Apple HLS', { timeout: 30_000 }, async () => {
 	}
 });
 
-test.concurrent('Live HLS', { timeout: 30_000 }, async () => {
-	const consoleSpy = vi.spyOn(console, 'warn');
+test.concurrent('Live HLS', { timeout: 30_000 }, async ({ onTestFinished }) => {
+	// Collects this stream's range request warnings. A console spy can't tell whose warning it saw, since other tests
+	// run concurrently, and restoreMocks removes it whenever another test starts.
+	const rangeRequestWarnings: string[] = [];
+	onTestFinished(Logging.on('warn', (args) => {
+		const message = args.map(String).join(' ');
+		if (message.includes('did not respond to a range request') && message.includes('mux.com')) {
+			rangeRequestWarnings.push(message);
+		}
+	}));
+
+	// With skipLiveWait, durations don't wait for the stream to advance, which would never end. They may still download
+	// the newest segment though, which can take a few seconds on a slow network.
+	const skipLiveWaitTimeout = 10_000;
 
 	using input = new Input({
 		source: new UrlSource('https://stream.mux.com/v69RSHhFelSm4701snP22dYz2jICy4E4FUyk02rW4gxRM.m3u8'),
@@ -937,7 +950,7 @@ test.concurrent('Live HLS', { timeout: 30_000 }, async () => {
 
 	const duration = await Promise.race([
 		videoTrack.computeDuration({ skipLiveWait: true }),
-		rejectAfter(2000, 'Baby you make me smile'),
+		rejectAfter(skipLiveWaitTimeout, 'Baby you make me smile'),
 	]);
 	expect(duration).toBeGreaterThan((Date.now() / 1000) - 3600);
 
@@ -969,12 +982,12 @@ test.concurrent('Live HLS', { timeout: 30_000 }, async () => {
 
 	const metadataDuration = await Promise.race([
 		videoTrack.getDurationFromMetadata({ skipLiveWait: true }),
-		rejectAfter(2000, 'Baby you make me smile'),
+		rejectAfter(skipLiveWaitTimeout, 'Baby you make me smile'),
 	]);
 	expect(metadataDuration).toBeGreaterThan((Date.now() / 1000) - 3600);
 
 	// The server doesn't answer with range requests but since it's HLS we suppress that warning
-	expect(consoleSpy).not.toHaveBeenCalled();
+	expect(rangeRequestWarnings).toEqual([]);
 });
 
 test.concurrent('Mp4InputFormat recognises a CMAF segment that starts with sidx', async () => {
