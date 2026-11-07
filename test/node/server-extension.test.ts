@@ -474,6 +474,19 @@ describe('Video', async () => {
 		});
 	});
 
+	test.each(['avc', 'av1'] as VideoCodec[])('%s encode with alpha kept but no alpha format', async (codec) => {
+		// libx264 and libsvtav1 can't encode alpha, so the stream stays plain 8-bit 4:2:0 instead of switching to
+		// whichever format comes closest to a YUVA source
+		await encodeDecodeTest(codec, { alpha: 'keep' }, async (packet, meta, i) => {
+			if (i === 0 && codec === 'avc') {
+				// Not High 4:4:4 Predictive, which most hardware decoders can't play
+				expect(meta.decoderConfig!.codec.startsWith('avc1.f4')).toBe(false);
+			}
+		}, async (sample) => {
+			expect(sample.format).toBe('I420');
+		}, true);
+	});
+
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },

@@ -51,6 +51,11 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
 };
 
+/** Whether a pixel format has an alpha plane, going by FFmpeg's names for them (yuva420p, gbrap10le, rgba...). */
+const pixelFormatHasAlpha = (format: NodeAv.AVPixelFormat) => {
+	return /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|ayuv|vuya)/.test(NodeAv.avGetPixFmtName(format) ?? '');
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -141,13 +146,17 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 
 			if (this.config.alpha === 'keep') {
-				if (this.avCodec.pixelFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
+				// Encoders without an alpha format (libx264, libsvtav1) can't keep the alpha, so they stay on the
+				// default format, instead of whichever comes closest to a YUVA source (4:4:4 or 10-bit)
+				const alphaFormats = this.avCodec.pixelFormats.filter(pixelFormatHasAlpha);
+
+				if (alphaFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
 					pixelFormat = NodeAv.AV_PIX_FMT_YUVA420P;
-				} else {
+				} else if (alphaFormats.length > 0) {
 					// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a
 					// high-quality YUVA source
 					pixelFormat = NodeAv.avcodecFindBestPixFmtOfList(
-						this.avCodec.pixelFormats,
+						alphaFormats,
 						NodeAv.AV_PIX_FMT_YUVA444P12LE,
 					);
 				}
