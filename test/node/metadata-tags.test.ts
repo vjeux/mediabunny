@@ -434,6 +434,68 @@ test('Read and write metadata, MP3', async () => {
 	});
 });
 
+test('Keep the raw COMM and USLT frames with a content descriptor when writing a comment and lyrics, MP3', async () => {
+	const latin1 = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const utf16 = (text: string) => [0xff, 0xfe, ...latin1(text).flatMap(code => [code, 0])]; // With a BOM
+	// An ID3v2.3 frame holding an encoding, a language, a content descriptor and a text, in ISO 8859-1 or UTF-16
+	const describedFrame = (id: string, description: string, text: string, inUtf16 = false) => {
+		const body = inUtf16
+			? [1, ...latin1('eng'), ...utf16(description), 0, 0, ...utf16(text)]
+			: [0, ...latin1('eng'), ...latin1(description), 0, ...latin1(text)];
+		return [...latin1(id), 0, 0, 0, body.length, 0, 0, ...body];
+	};
+	const mp3Frame = new Uint8Array(417); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
+	mp3Frame.set([0xff, 0xfb, 0x90, 0x64]);
+
+	const readTags = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+	const writeMp3 = async (tags: MetadataTags) => {
+		const output = new Output({ format: new Mp3OutputFormat(), target: new BufferTarget() });
+		output.setMetadataTags(tags);
+		const source = new EncodedAudioPacketSource('mp3');
+		output.addAudioTrack(source);
+		await output.start();
+		for (let i = 0; i < 3; i++) {
+			await source.add(new EncodedPacket(mp3Frame, 'key', i * 1152 / 44100, 1152 / 44100), {
+				decoderConfig: { codec: 'mp3', numberOfChannels: 2, sampleRate: 44100 },
+			});
+		}
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+	const framesOf = (value: unknown) => value instanceof Uint8Array ? [value] : value as Uint8Array[];
+
+	// Like iTunes, which keeps its gapless info in a COMM frame described "iTunSMPB", all in UTF-16
+	const tagBody = [
+		...describedFrame('COMM', '', 'A comment', true),
+		...describedFrame('COMM', 'iTunSMPB', ' 00000000 00000210 0000096C', true),
+		...describedFrame('USLT', '', 'Lyrics'),
+		...describedFrame('USLT', 'Chorus', 'La la'),
+	];
+	const tags = await readTags(new Uint8Array([
+		...latin1('ID3'), 3, 0, 0, ...[21, 14, 7, 0].map(shift => (tagBody.length >> shift) & 0x7f), ...tagBody,
+		...mp3Frame, ...mp3Frame, ...mp3Frame,
+	]));
+	expect(tags.comment).toBe('A comment');
+	expect(tags.lyrics).toBe('Lyrics');
+	const iTunSmpb = framesOf(tags.raw!['COMM'])[1]!;
+	const chorus = framesOf(tags.raw!['USLT'])[1]!;
+
+	// Written back as read, and with a new comment and lyrics: the frames without a descriptor are replaced, the
+	// others kept
+	for (const [comment, lyrics] of [['A comment', 'Lyrics'], ['New comment', 'New lyrics']]) {
+		const written = await readTags(await writeMp3({ ...tags, comment, lyrics }));
+		expect(written.comment).toBe(comment);
+		expect(written.lyrics).toBe(lyrics);
+		expect(framesOf(written.raw!['COMM'])).toHaveLength(2);
+		expect(framesOf(written.raw!['COMM'])[1]).toEqual(iTunSmpb);
+		expect(framesOf(written.raw!['USLT'])).toHaveLength(2);
+		expect(framesOf(written.raw!['USLT'])[1]).toEqual(chorus);
+	}
+});
+
 test('Read and write metadata, Ogg', async () => {
 	const output = new Output({
 		format: new OggOutputFormat(),
