@@ -344,7 +344,9 @@ export class EncodedPacketSink {
 			throw new InputDisposedError();
 		}
 
-		const packetQueue: EncodedPacket[] = [];
+		// Dequeued packets are dropped from the front in bulk (see timestamps below)
+		const packetQueue: (EncodedPacket | undefined)[] = [];
+		let packetQueueStart = 0;
 
 		let { promise: queueNotEmpty, resolve: onQueueNotEmpty } = promiseWithResolvers();
 		let { promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers();
@@ -357,9 +359,12 @@ export class EncodedPacketSink {
 		let outOfBandError = null as unknown;
 		let hasOutOfBandError = false;
 
+		// When packets were dequeued during the last second, starting at index timestampsStart. Old entries are dropped
+		// in bulk since shift() is O(n) for large arrays, and fast consumers dequeue over 100k packets per second.
 		const timestamps: number[] = [];
+		let timestampsStart = 0;
 		// The queue should always be big enough to hold 1 second worth of packets
-		const maxQueueSize = () => Math.max(2, timestamps.length);
+		const maxQueueSize = () => Math.max(2, timestamps.length - timestampsStart);
 
 		// The following is the "pump" process that keeps pumping packets into the queue
 		(async () => {
@@ -370,7 +375,7 @@ export class EncodedPacketSink {
 					break;
 				}
 
-				if (packetQueue.length > maxQueueSize()) {
+				if (packetQueue.length - packetQueueStart > maxQueueSize()) {
 					({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 					await queueDequeue;
 					continue;
@@ -405,13 +410,24 @@ export class EncodedPacketSink {
 						return { value: undefined, done: true };
 					} else if (hasOutOfBandError) {
 						throw outOfBandError;
-					} else if (packetQueue.length > 0) {
-						const value = packetQueue.shift()!;
+					} else if (packetQueueStart < packetQueue.length) {
+						const value = packetQueue[packetQueueStart]!;
+						packetQueue[packetQueueStart] = undefined; // So it can be garbage-collected
+						packetQueueStart++;
+						if (packetQueueStart >= packetQueue.length / 2) {
+							packetQueue.splice(0, packetQueueStart);
+							packetQueueStart = 0;
+						}
+
 						const now = performance.now();
 						timestamps.push(now);
 
-						while (timestamps.length > 0 && now - timestamps[0]! >= 1000) {
-							timestamps.shift();
+						while (timestampsStart < timestamps.length && now - timestamps[timestampsStart]! >= 1000) {
+							timestampsStart++;
+						}
+						if (timestampsStart >= timestamps.length / 2) {
+							timestamps.splice(0, timestampsStart);
+							timestampsStart = 0;
 						}
 
 						onQueueDequeue();
