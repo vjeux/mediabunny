@@ -1833,16 +1833,16 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					startPesHeader = previousHeader;
 				}
 			};
-			await rewind();
 
-			// Inside a stretch of dropped video packets, the packet we're looking for comes before it
-			while (true) {
+			// Inside a stretch of dropped video packets, the packet we're looking for comes before it, and so does the
+			// window to rewind by, since the packets in the stretch don't count
+			const rewindOutOfDroppedRange = async () => {
 				const startPos = startPesHeader.sectionStartPos;
 				const droppedRange = this.elementaryStream.droppedRanges.find(
 					x => x.start <= startPos && startPos < x.end,
 				);
 				if (!droppedRange) {
-					break;
+					return false;
 				}
 
 				while (startPesHeader.sectionStartPos > droppedRange.start) {
@@ -1854,6 +1854,12 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					startPesHeader = previousHeader;
 				}
 
+				return true;
+			};
+
+			await rewindOutOfDroppedRange();
+			await rewind();
+			while (await rewindOutOfDroppedRange()) {
 				const rewoundFrom = startPesHeader.sectionStartPos;
 				await rewind();
 				if (startPesHeader.sectionStartPos === rewoundFrom) {

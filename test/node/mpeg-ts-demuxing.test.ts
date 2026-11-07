@@ -1175,4 +1175,9 @@ test('MPEG-TS drops the rest of the GOP after a video frame that lost a TS packe
 	expect(packet.data).toEqual(clean[8]!.data);
 	expect((await sink.getKeyPacket(12 / 25))?.timestamp).toBe(8 / 25);
 	expect((await sink.getNextPacket(packet))?.data).toEqual(clean[16]!.data);
+
+	// Lookups at every dropped frame, one after the other (each leaves reference points for the next ones)
+	for (let frame = 9; frame < 16; frame++) {
+		expect((await sink.getPacket(frame / 25))?.timestamp).toBe(8 / 25);
+	}
 });
