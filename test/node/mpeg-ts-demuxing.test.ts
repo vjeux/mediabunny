@@ -790,11 +790,12 @@ test('MPEG-TS with E-AC-3 audio in a Blu-ray (BDAV) stream', async () => {
 test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3 extension', async () => {
 	// Blu-ray's Dolby Digital Plus (stream_type 0x84) carries an AC-3 frame as the core of each frame, optionally
 	// followed by an E-AC-3 dependent substream frame extending it (to 7.1, say)
-	const ac3Core = new Uint8Array(128); // 48 kHz, 32 kbit/s, stereo
+	const ac3Core = new Uint8Array(128); // 48 kHz, 32 kbit/s, 5.1
 	// The crc1 bytes 0x40 0x00 look like the strmtyp of an E-AC-3 dependent substream, if read as one
-	ac3Core.set([0x0b, 0x77, 0x40, 0x00, 0x00, 0x40, 0x40]);
-	const eac3Dependent = new Uint8Array(64); // strmtyp 1, frmsiz 31, 6 blocks, bsid 16
-	eac3Dependent.set([0x0b, 0x77, 0x40, 0x1f, 0x34, 0x80]);
+	ac3Core.set([0x0b, 0x77, 0x40, 0x00, 0x00, 0x40, 0xe1]);
+	// strmtyp 1, frmsiz 31, 6 blocks, bsid 16, chanmap with the Lrs/Rrs pair (making it 7.1)
+	const eac3Dependent = new Uint8Array(64);
+	eac3Dependent.set([0x0b, 0x77, 0x40, 0x1f, 0x34, 0x80, 0x10, 0x20]);
 
 	const buildFile = (withExtension: boolean) => {
 		const packets: Uint8Array[] = [];
@@ -848,7 +849,8 @@ test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3
 		const audioTrack = await input.getPrimaryAudioTrack();
 		assert(audioTrack);
 		expect(await audioTrack.getCodec()).toBe('eac3');
-		expect(await audioTrack.getDecoderConfig()).toEqual({ codec: 'ec-3', numberOfChannels: 2, sampleRate: 48000 });
+		const numberOfChannels = withExtension ? 8 : 6;
+		expect(await audioTrack.getDecoderConfig()).toEqual({ codec: 'ec-3', numberOfChannels, sampleRate: 48000 });
 
 		const packets: EncodedPacket[] = [];
 		for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
@@ -861,7 +863,7 @@ test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3
 			[0, 1, 2, 3, 4, 5, 6, 7].map(i => [0.032 * i, 0.032, frameSize]),
 		);
 
-		// The packets can be copied to MP4, whose dec3 box describes the AC-3 core
+		// The packets can be copied to MP4, whose dec3 box describes the AC-3 core and its extension
 		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
 		const conversion = await Conversion.init({ input, output });
 		await conversion.execute();
@@ -873,7 +875,7 @@ test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3
 		const mp4AudioTrack = await mp4Input.getPrimaryAudioTrack();
 		assert(mp4AudioTrack);
 		expect(await mp4AudioTrack.getCodec()).toBe('eac3');
-		expect(await mp4AudioTrack.getNumberOfChannels()).toBe(2);
+		expect(await mp4AudioTrack.getNumberOfChannels()).toBe(numberOfChannels);
 		expect(await mp4AudioTrack.getSampleRate()).toBe(48000);
 
 		const mp4Packets: EncodedPacket[] = [];

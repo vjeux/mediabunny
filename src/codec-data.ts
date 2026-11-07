@@ -3332,6 +3332,11 @@ export const parseEac3OrAc3CoreSyncFrame = (data: Uint8Array): Eac3FrameInfo | n
 		return null;
 	}
 
+	const frameSize = AC3_FRAME_SIZES[3 * (data[4]! & 0x3f) + frameInfo.fscod];
+	const { numDepSub, chanLoc } = frameSize !== undefined
+		? readEac3DependentSubstreams(data, frameSize)
+		: { numDepSub: 0, chanLoc: 0 };
+
 	return {
 		dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]!,
 		substreams: [{
@@ -3341,10 +3346,64 @@ export const parseEac3OrAc3CoreSyncFrame = (data: Uint8Array): Eac3FrameInfo | n
 			bsmod: frameInfo.bsmod,
 			acmod: frameInfo.acmod,
 			lfeon: frameInfo.lfeon,
-			numDepSub: 0,
-			chanLoc: 0,
+			numDepSub,
+			chanLoc,
 		}],
 	};
+};
+
+/**
+ * Counts the dependent substream frames that directly follow an independent substream's frame (ending at `offset`)
+ * within the same access unit, and collects the channel locations they add, in dec3's `chan_loc` bits. Taken from
+ * upstream's bug-fix-mania branch, where parseEac3SyncFrame does the same for E-AC-3 frames.
+ */
+const readEac3DependentSubstreams = (data: Uint8Array, offset: number) => {
+	const bitstream = new Bitstream(data);
+	let numDepSub = 0;
+	let chanLoc = 0;
+
+	while (offset + 2 <= data.length) {
+		bitstream.seekToByte(offset);
+		if (bitstream.readBits(16) !== 0x0b77 || bitstream.readBits(2) !== 1) { // syncword, strmtyp
+			break;
+		}
+
+		bitstream.skipBits(3); // substreamid
+		const dependentFrmsiz = bitstream.readBits(11);
+		bitstream.skipBits(2 + 2); // fscod, fscod2 or numblkscod
+		const dependentAcmod = bitstream.readBits(3);
+		bitstream.skipBits(1 + 5 + 5); // lfeon, bsid, dialnorm
+
+		if (bitstream.readBits(1)) { // compre
+			bitstream.skipBits(8); // compr
+		}
+		if (dependentAcmod === 0) {
+			bitstream.skipBits(5); // dialnorm2
+			if (bitstream.readBits(1)) { // compr2e
+				bitstream.skipBits(8); // compr2
+			}
+		}
+
+		if (bitstream.readBits(1)) { // chanmape
+			const chanmap = bitstream.readBits(16);
+
+			// chanmap numbers its locations from the most significant bit, chan_loc from the least significant one.
+			// chan_loc covers the Lc/Rc pair through Cvh, then skips the Lts/Rts pair to end with LFE2.
+			for (let i = 0; i < 8; i++) {
+				if (chanmap & (1 << (10 - i))) {
+					chanLoc |= 1 << i;
+				}
+			}
+			if (chanmap & 0b10) {
+				chanLoc |= 1 << 8;
+			}
+		}
+
+		numDepSub++;
+		offset += 2 * (dependentFrmsiz + 1);
+	}
+
+	return { numDepSub, chanLoc };
 };
 
 /**
@@ -3437,8 +3496,9 @@ export const getEac3ChannelCount = (config: Eac3FrameInfo): number => {
 	if (sub.numDepSub > 0) {
 		const CHAN_LOC_COUNTS = [2, 2, 1, 1, 2, 2, 2, 1, 1];
 
+		// chan_loc numbers its locations from the least significant bit (as upstream's bug-fix-mania branch fixed)
 		for (let bit = 0; bit < 9; bit++) {
-			if (sub.chanLoc & (1 << (8 - bit))) {
+			if (sub.chanLoc & (1 << bit)) {
 				channels += CHAN_LOC_COUNTS[bit]!;
 			}
 		}
