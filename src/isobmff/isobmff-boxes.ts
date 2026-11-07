@@ -57,7 +57,7 @@ import {
 	determineAudioPacketType,
 	parseAc3SyncFrame,
 	parseDtsFrame,
-	parseEac3SyncFrame,
+	parseEac3OrAc3CoreSyncFrame,
 	parseOpusIdentificationHeader,
 } from '../codec-data';
 import { MetadataTags, RichImageData } from '../metadata';
@@ -1158,7 +1158,7 @@ const dac3 = (trackData: IsobmffAudioTrackData) => {
 const dec3 = (trackData: IsobmffAudioTrackData) => {
 	assert(trackData.info.primingPacket);
 
-	const frameInfo = parseEac3SyncFrame(trackData.info.primingPacket.data);
+	const frameInfo = parseEac3OrAc3CoreSyncFrame(trackData.info.primingPacket.data);
 	if (!frameInfo) {
 		throw new Error(
 			'Couldn\'t extract E-AC-3 frame info from the audio packet. '
