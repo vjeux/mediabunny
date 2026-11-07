@@ -69,6 +69,7 @@ import {
 	CODEC_STRING_MAP,
 	EBMLId,
 	LEVEL_0_AND_1_EBML_IDS,
+	LEVEL_0_EBML_IDS,
 	LEVEL_1_EBML_IDS,
 	MAX_HEADER_SIZE,
 	MIN_HEADER_SIZE,
@@ -367,6 +368,27 @@ export class MatroskaDemuxer extends Demuxer {
 				if (!slice) break;
 
 				const header = readElementHeader(slice);
+				const isJunkBeforeSegment = this.segments.length === 0 && (
+					!header
+					|| ![EBMLId.EBML, EBMLId.Segment, EBMLId.Void].includes(header.id)
+				);
+				if (isJunkBeforeSegment) {
+					// Like zero bytes or garbage between the EBML header and the Segment. Resync to the next EBML
+					// header or Segment, as FFmpeg does.
+					const nextPos = await resync(
+						this.reader,
+						currentPos + 1,
+						LEVEL_0_EBML_IDS,
+						Math.min(this.reader.fileSize ?? Infinity, currentPos + MAX_RESYNC_LENGTH),
+					);
+					if (nextPos === null) {
+						break;
+					}
+
+					currentPos = nextPos;
+					continue;
+				}
+
 				if (!header) {
 					break; // Zero padding at the end of the file triggers this, for example
 				}
@@ -384,6 +406,12 @@ export class MatroskaDemuxer extends Demuxer {
 
 					this.readContiguousElements(slice);
 				} else if (id === EBMLId.Segment) { // Segment found!
+					if (size === 0) {
+						// A Segment can't be empty (it needs Info and Tracks), so its size was never filled in. Read
+						// the elements that follow as its own, as FFmpeg does.
+						size = undefined;
+					}
+
 					await this.readSegment(dataStartPos, size);
 
 					if (size === undefined) {
