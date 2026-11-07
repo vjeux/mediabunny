@@ -340,6 +340,46 @@ test('E-AC-3 encoding', async () => {
 	expect(await track.computeDuration()).toBeCloseTo(2, 1);
 });
 
+test.each(['ac3', 'eac3'] as const)('%s encoding ends where the input ends', async (codec) => {
+	registerAc3Encoder();
+
+	const sampleRate = 48000;
+	const channels = 2;
+	const data = createSineWave(sampleRate, channels, 1); // Not a whole number of 1536-sample frames
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const audioSource = new AudioSampleSource({ codec, quality: new Quality({ bitrate: 192000 }) });
+	output.addAudioTrack(audioSource);
+
+	await output.start();
+	const sample = new AudioSample({
+		data,
+		format: 'f32',
+		numberOfChannels: channels,
+		sampleRate,
+		timestamp: 0,
+	});
+	await audioSource.add(sample);
+	sample.close();
+	audioSource.close();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	const lastPacket = (await new EncodedPacketSink(track).getPacket(Infinity))!;
+
+	// The silence that fills the last frame isn't part of the audio
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(1, 6);
+});
+
 test('AC-3 with huge timestamps', async () => {
 	registerAc3Decoder();
 	registerAc3Encoder();
