@@ -979,7 +979,11 @@ export class CallSerializer {
 	currentPromise = Promise.resolve();
 
 	call(fn: () => Promise<void> | void) {
-		return this.currentPromise = this.currentPromise.then(fn);
+		const result = this.currentPromise.then(fn);
+		// A failed call must not keep later ones (like close()) from running; its caller sees the error via result
+		this.currentPromise = result.catch(() => {});
+
+		return result;
 	}
 }
 

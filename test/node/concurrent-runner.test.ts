@@ -1,5 +1,20 @@
 import { expect, test } from 'vitest';
-import { ConcurrentRunner, promiseWithResolvers } from '../../src/misc.js';
+import { CallSerializer, ConcurrentRunner, promiseWithResolvers } from '../../src/misc.js';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+	ALL_FORMATS,
+	AudioCodec,
+	AudioSample,
+	AudioSampleSink,
+	CustomAudioDecoder,
+	EncodedPacket,
+	FilePathSource,
+	Input,
+	registerDecoder,
+} from '../../src/index.js';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 test('parallelism of 1 runs tasks strictly sequentially', async () => {
 	const runner = new ConcurrentRunner(1);
@@ -131,6 +146,81 @@ test('simultaneous run calls respect parallelism', async () => {
 	deferreds[2]!.resolve();
 	deferreds[3]!.resolve();
 	await runner.flush();
+});
+
+test('CallSerializer keeps running calls after one of them failed', async () => {
+	const serializer = new CallSerializer();
+	const failed = serializer.call(() => {
+		throw new Error('Boom');
+	});
+	await expect(failed).rejects.toThrow('Boom');
+
+	let ran = false;
+	await serializer.call(() => {
+		ran = true;
+	});
+	expect(ran).toBe(true);
+});
+
+test('A custom decoder that fails gets closed, without an unhandled rejection', async () => {
+	// Registered decoders are global, and this is the only test in this file that decodes MP3
+	let closeCalls = 0;
+	let decodeCalls = 0;
+	class FailingMp3Decoder extends CustomAudioDecoder {
+		static override supports(codec: AudioCodec) {
+			return codec === 'mp3';
+		}
+
+		async init() {}
+
+		async decode(packet: EncodedPacket) {
+			decodeCalls++;
+			if (decodeCalls === 3) {
+				// Like a WebAssembly decoder hitting a damaged frame
+				throw new Error('Damaged packet');
+			}
+
+			this.onSample(new AudioSample({
+				data: new Float32Array(1152 * 2),
+				format: 'f32',
+				numberOfChannels: 2,
+				sampleRate: 44100,
+				timestamp: packet.timestamp,
+			}));
+		}
+
+		async flush() {}
+
+		close() {
+			closeCalls++;
+		}
+	}
+	registerDecoder(FailingMp3Decoder);
+
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => unhandled.push(reason);
+	process.on('unhandledRejection', onUnhandled);
+
+	try {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public', 'Toothsome-Meme.VBRv2.mp3')),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		const iterate = async () => {
+			for await (const sample of new AudioSampleSink(track).samples()) {
+				sample.close();
+			}
+		};
+		await expect(iterate()).rejects.toThrow('Damaged packet');
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(closeCalls).toBe(1);
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off('unhandledRejection', onUnhandled);
+	}
 });
 
 test('errored task surfaces on the next run call', async () => {
