@@ -27,6 +27,63 @@ test('VideoSampleSource, normal usage', async () => {
 	}
 });
 
+test('AudioSampleSource, the encoder priming measurement skips empty decoder outputs', async () => {
+	// Firefox's Vorbis decoder starts with an AudioData of 0 frames, which can't be copied from. Emulated by handing
+	// such an output to the first AudioDecoder (the one measuring the encoder's priming) ahead of its real ones
+	const errors: unknown[] = [];
+	const onError = (event: ErrorEvent) => errors.push(event.error);
+	window.addEventListener('error', onError);
+	const RealAudioDecoder = AudioDecoder;
+	let emptyOutputGiven = false;
+	globalThis.AudioDecoder = class extends RealAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			super({
+				...init,
+				output: (audioData) => {
+					if (!emptyOutputGiven) {
+						emptyOutputGiven = true;
+						init.output({
+							numberOfFrames: 0,
+							copyTo: () => {
+								throw new RangeError('Frame offset of 0 greater or equal than frame count 0');
+							},
+							close: () => {},
+						} as unknown as AudioData);
+					}
+
+					init.output(audioData);
+				},
+			});
+		}
+	};
+
+	try {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+
+		// Stereo at 24 kHz, which no other test encodes, as the measurement only runs for the first encoder of a
+		// configuration on the page
+		using sample = new AudioSample({
+			data: new Float32Array(2 * 480),
+			format: 'f32',
+			numberOfChannels: 2,
+			sampleRate: 24000,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		globalThis.AudioDecoder = RealAudioDecoder;
+		await output.finalize();
+	} finally {
+		globalThis.AudioDecoder = RealAudioDecoder;
+		window.removeEventListener('error', onError);
+	}
+
+	expect(emptyOutputGiven).toBe(true);
+	expect(errors).toEqual([]);
+});
+
 test('VideoSampleSource, .close() should be idempotent after finalize()', async () => {
 	const output = new Output({
 		format: new WebMOutputFormat(),
