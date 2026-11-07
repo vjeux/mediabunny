@@ -167,14 +167,6 @@ export const readId3V2Header = (slice: FileSlice): Id3V2Header | null => {
 // replaces (callers parse consecutive tags into the same object)
 const datesFromReleaseTime = new WeakSet<MetadataTags>();
 
-/** Sets the date, unless one was already found. Only a date taken from a release time gets replaced. */
-const setId3V2Date = (tags: MetadataTags, date: Date) => {
-	if (tags.date === undefined || datesFromReleaseTime.has(tags)) {
-		tags.date = date;
-		datesFromReleaseTime.delete(tags);
-	}
-};
-
 export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
 	// https://id3.org/id3v2.3.0
 
@@ -207,6 +199,8 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			reader.pos += extendedHeaderSize - 4; // The extended header size includes itself
 		}
 	}
+
+	let recordingTime: Date | null = null;
 
 	while (reader.pos <= reader.bytes.length - reader.frameHeaderSize()) {
 		const frame = reader.readId3V2Frame();
@@ -369,7 +363,8 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				const date = new Date(dateText);
 
 				if (!Number.isNaN(date.getTime())) {
-					setId3V2Date(tags, date);
+					tags.date ??= date;
+					recordingTime ??= date;
 				}
 			}; break;
 
@@ -379,7 +374,9 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				const year = Number.parseInt(yearText, 10);
 
 				if (Number.isInteger(year)) {
-					setId3V2Date(tags, new Date(String(year))); // String so that it parses as UTC
+					const date = new Date(String(year)); // String so that it parses as UTC
+					tags.date ??= date;
+					recordingTime ??= date;
 				}
 			}; break;
 
@@ -457,6 +454,13 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 		}
 
 		reader.pos = nextFramePos;
+	}
+
+	// A recording time replaces a date that an earlier tag's release time gave. Done once the tag's frames have been
+	// read, as reading each frame only sets fields that aren't set yet.
+	if (recordingTime && datesFromReleaseTime.has(tags)) {
+		tags.date = recordingTime;
+		datesFromReleaseTime.delete(tags);
 	}
 
 	// Without a recording time, fall back to the release time (ID3v2.4), like FFmpeg does
