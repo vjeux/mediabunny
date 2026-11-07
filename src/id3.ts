@@ -808,9 +808,10 @@ export class Id3V2Writer {
 			}
 		}
 
-		// ID3v2.4 replaced ID3v2.3's date frames by TDRC, so raw ones from an ID3v2.3 tag mustn't stay next to the date
-		// written above, which they'd contradict
-		if (writtenTags.has('TDRC')) {
+		// ID3v2.4 replaced ID3v2.3's date frames by TDRC, and readers like FFmpeg prefer them to it. Raw ones from an
+		// ID3v2.3 tag are still copied when they hold the date (for its day and month, which a copy needs them for),
+		// but not when they'd contradict a changed one.
+		if (metadata.date !== undefined && !rawId3V2DateFramesHoldDate(metadata.raw, metadata.date)) {
 			for (const frameId of ['TYER', 'TDAT', 'TIME', 'TRDA']) {
 				writtenTags.add(frameId);
 			}
@@ -1034,3 +1035,40 @@ export class Id3V2Writer {
 		this.writer.write(imageData);
 	}
 }
+
+/**
+ * Whether the raw ID3v2.3 date frames hold the given date (to the day) the way it's read from them: TYER's year, with
+ * or without TDAT's day and month ("DDMM"), or TDAT taken on its own like TDRC, which happens when it comes first. Also
+ * true when there's no TYER or TDAT.
+ */
+const rawId3V2DateFramesHoldDate = (raw: MetadataTags['raw'], date: Date) => {
+	const yearText = raw?.['TYER'];
+	const dayAndMonthText = raw?.['TDAT'];
+	const year = typeof yearText === 'string' ? Number.parseInt(yearText, 10) : NaN;
+	const dayAndMonth = typeof dayAndMonthText === 'string' ? dayAndMonthText.trim() : null;
+
+	if (!Number.isInteger(year) && dayAndMonth === null) {
+		return true;
+	}
+
+	const candidates: Date[] = [];
+	if (Number.isInteger(year)) {
+		const yearDate = new Date(String(year)); // String so that it parses as UTC
+		candidates.push(yearDate);
+
+		const match = dayAndMonth !== null ? /^(\d\d)(\d\d)$/.exec(dayAndMonth) : null;
+		if (match) {
+			const withDay = new Date(yearDate);
+			withDay.setUTCMonth(Number(match[2]) - 1, Number(match[1]));
+			candidates.push(withDay);
+		}
+	}
+	if (dayAndMonth !== null) {
+		candidates.push(new Date(dayAndMonth));
+	}
+
+	const day = date.toISOString().slice(0, 10);
+	return candidates.some(
+		candidate => !Number.isNaN(candidate.getTime()) && candidate.toISOString().slice(0, 10) === day,
+	);
+};

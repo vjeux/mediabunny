@@ -1087,10 +1087,15 @@ test('Creation time override in conversion', async () => {
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
 
-test('Leave out raw ID3v2.3 date frames next to the written date, MP3', async () => {
+test('Leave out raw ID3v2.3 date frames that contradict the written date, MP3', async () => {
+	const latin1 = (text: string) => [...text].map(char => char.charCodeAt(0));
 	const mp3Frame = new Uint8Array(417); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
 	mp3Frame.set([0xff, 0xfb, 0x90, 0x64]);
 
+	const readTags = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
 	const writeAndRead = async (tags: MetadataTags) => {
 		const output = new Output({ format: new Mp3OutputFormat(), target: new BufferTarget() });
 		output.setMetadataTags(tags);
@@ -1103,21 +1108,46 @@ test('Leave out raw ID3v2.3 date frames next to the written date, MP3', async ()
 			});
 		}
 		await output.finalize();
-
-		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-		return await input.getMetadataTags();
+		return await readTags(new Uint8Array(output.target.buffer!));
 	};
 
 	// Raw frames as read from an ID3v2.3 tag, which stores the date as the year, "DDMM", "HHMM" and free text
-	const raw = { TIT2: 'Title', TYER: '2021', TDAT: '2304', TIME: '1200', TRDA: '23rd April 2021' };
+	const raw = { TIT2: 'Title', TYER: '2021', TDAT: '2304', TIME: '1530', TRDA: '23rd April 2021' };
+	const v23DateFrames = ['TYER', 'TDAT', 'TIME', 'TRDA'];
+	const copiedV23DateFrames = (tags: MetadataTags) =>
+		Object.keys(tags.raw!).filter(key => v23DateFrames.includes(key));
 
-	// ID3v2.4, which the writer writes, replaced those by TDRC, so they'd contradict a new date
-	const withDate = await writeAndRead({ date: new Date('1999-01-01T00:00:00Z'), raw });
-	expect(withDate.date).toEqual(new Date('1999-01-01T00:00:00Z'));
-	expect(withDate.raw).toMatchObject({ TIT2: 'Title', TDRC: '1999-01-01' });
-	expect(Object.keys(withDate.raw!).filter(key => ['TYER', 'TDAT', 'TIME', 'TRDA'].includes(key))).toEqual([]);
+	// A changed date: ID3v2.4, which the writer writes, replaced those frames by TDRC, and FFmpeg would show the old
+	// date from them instead of it
+	for (const date of ['1999-01-01', '2021-06-01']) {
+		const written = await writeAndRead({ date: new Date(`${date}T00:00:00Z`), raw });
+		expect(written.raw!['TDRC']).toBe(date);
+		expect(copiedV23DateFrames(written), date).toEqual([]);
+	}
 
-	// Without a date, they're copied as before
-	const withoutDate = await writeAndRead({ raw });
-	expect(withoutDate.raw).toMatchObject(raw);
+	// The date they hold, as read from them (the year, with TDAT's day and month, or TDAT on its own when it comes
+	// first): still copied, as FFmpeg reads the day and month of an unchanged date from them
+	for (const date of ['2021-01-01', '2021-04-23', '2304-01-01']) {
+		const written = await writeAndRead({ date: new Date(`${date}T00:00:00Z`), raw });
+		expect(copiedV23DateFrames(written), date).toEqual(v23DateFrames);
+	}
+
+	// Without a date, they're copied too
+	expect((await writeAndRead({ raw })).raw).toMatchObject(raw);
+
+	// End to end, like a Conversion: ID3v2.3 tags copied unchanged keep their date frames, whatever the date is read as
+	const textFrame = (id: string, text: string) => [...latin1(id), 0, 0, 0, text.length + 1, 0, 0, 0, ...latin1(text)];
+	for (const frames of [
+		[textFrame('TYER', '2021'), textFrame('TDAT', '2304')], // As `ffmpeg -id3v2_version 3` writes a whole date
+		[textFrame('TYER', '2021')], // A year alone
+		[textFrame('TDAT', '2304'), textFrame('TYER', '2021')],
+	]) {
+		const body = frames.flat();
+		const source = new Uint8Array([
+			...latin1('ID3'), 3, 0, 0, 0, 0, 0, body.length, ...body,
+			...mp3Frame, ...mp3Frame, ...mp3Frame,
+		]);
+		const written = await writeAndRead(await readTags(source));
+		expect(copiedV23DateFrames(written)).toEqual(frames.map(frame => String.fromCharCode(...frame.slice(0, 4))));
+	}
 });
