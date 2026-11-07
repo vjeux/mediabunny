@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createCipheriv } from 'node:crypto';
 import {
 	ALL_FORMATS,
 	BufferSource,
@@ -271,4 +272,85 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('Sample encryption entries without subsamples decrypt the whole sample', async () => {
+	// senc flags 0x2 (subsamples present) with a subsample count of 0; FFmpeg decrypts the whole sample then
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const build = (scheme: string, tenc: number[], senc: number[], sample: number[]) => {
+		const encv = box('encv', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(12), [0, 1], zeros(32),
+			[0, 24, 0xff, 0xff], box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+			box('sinf', box('frma', ascii('avc1')), box('schm', u32(0), ascii(scheme), u32(0x10000)),
+				box('schi', tenc)));
+		const moof = (dataOffset: number) => box('moof', box('mfhd', u32(0), u32(1)), box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(sample.length)),
+			senc,
+		));
+		return new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...box('moov',
+				box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+				box('trak',
+					box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+					box('mdia',
+						box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+						box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+						box('minf', box('stbl',
+							box('stsd', u32(0), u32(1), encv),
+							box('stts', zeros(8)),
+							box('stsc', zeros(8)),
+							box('stsz', zeros(12)),
+							box('stco', zeros(8)),
+						)),
+					),
+				),
+				box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+			),
+			...moof(moof(0).length + 8),
+			...box('mdat', sample),
+		]);
+	};
+	const readFirstPacket = async (bytes: Uint8Array) => {
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+			formatOptions: { isobmff: { resolveKeyId: () => key } },
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		return [...packet!.data];
+	};
+
+	// cenc, with an 8-byte IV per sample
+	const plaintext = [0, 0, 0, 12, 0x65, ...zeros(12).map((_, i) => i)];
+	const iv = [...zeros(7), 1];
+	const cencTenc = box('tenc', u32(0), [0, 0, 1, 8], zeros(16));
+	const cencSample = [
+		...createCipheriv('aes-128-ctr', key, Buffer.from([...iv, ...zeros(8)])).update(Buffer.from(plaintext)),
+	];
+	expect(await readFirstPacket(build('cenc', cencTenc, box('senc', u32(0), u32(1), iv), cencSample)))
+		.toEqual(plaintext);
+	expect(await readFirstPacket(build('cenc', cencTenc, box('senc', u32(2), u32(1), iv, [0, 0]), cencSample)))
+		.toEqual(plaintext);
+
+	// cbcs, with a constant IV: CBC over the whole blocks, and the rest stays clear
+	const constantIv = zeros(16).map((_, i) => i);
+	const cbcsTenc = box('tenc', u32(1 << 24), [0, 0x19, 1, 0], zeros(16), [16], constantIv);
+	const longPlaintext = [...plaintext, ...plaintext, 0xaa, 0xbb];
+	const cipher = createCipheriv('aes-128-cbc', key, Buffer.from(constantIv)).setAutoPadding(false);
+	const cbcsSample = [...cipher.update(Buffer.from(longPlaintext.slice(0, 32))), ...longPlaintext.slice(32)];
+	expect(await readFirstPacket(build('cbcs', cbcsTenc, box('senc', u32(0), u32(1)), cbcsSample)))
+		.toEqual(longPlaintext);
+	expect(await readFirstPacket(build('cbcs', cbcsTenc, box('senc', u32(2), u32(1), [0, 0]), cbcsSample)))
+		.toEqual(longPlaintext);
 });
