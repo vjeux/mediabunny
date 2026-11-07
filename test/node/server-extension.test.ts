@@ -32,7 +32,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
+import { buildQuantizerEncodeOptions, canEncodeVideo, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
@@ -372,31 +372,39 @@ describe('Video', async () => {
 		});
 	});
 
-	test('Encoding honors the profile and bit depth asked for in fullCodecString', async () => {
+	test('Encoding honors the profile and bit depth asked for in fullCodecString, or declines it', async () => {
 		// Encodes five mid-gray 64x64 frames and returns the codec string of the written track
 		const writtenCodecString = async (codec: VideoCodec, fullCodecString: string | undefined, bitDepth: number) => {
 			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
 			const quality = new Quality({ bitrate: 500_000 });
 			const source = new VideoSampleSource({ codec, quality, fullCodecString });
 			output.addVideoTrack(source);
-			await output.start();
 
-			for (let i = 0; i < 5; i++) {
-				const sampleCount = 64 * 64 * 3 / 2;
-				const data = bitDepth === 8
-					? new Uint8Array(sampleCount).fill(128)
-					: new Uint8Array(new Uint16Array(sampleCount).fill(128 << (bitDepth - 8)).buffer);
-				const sample = new VideoSample(data, {
-					format: bitDepth === 8 ? 'I420' : bitDepth === 10 ? 'I420P10' : 'I420P12',
-					codedWidth: 64,
-					codedHeight: 64,
-					timestamp: i / 30,
-					duration: 1 / 30,
-				});
-				await source.add(sample);
-				sample.close();
+			try {
+				await output.start();
+				for (let i = 0; i < 5; i++) {
+					const sampleCount = 64 * 64 * 3 / 2;
+					const data = bitDepth === 8
+						? new Uint8Array(sampleCount).fill(128)
+						: new Uint8Array(new Uint16Array(sampleCount).fill(128 << (bitDepth - 8)).buffer);
+					const sample = new VideoSample(data, {
+						format: bitDepth === 8 ? 'I420' : bitDepth === 10 ? 'I420P10' : 'I420P12',
+						codedWidth: 64,
+						codedHeight: 64,
+						timestamp: i / 30,
+						duration: 1 / 30,
+					});
+					try {
+						await source.add(sample);
+					} finally {
+						sample.close();
+					}
+				}
+				await output.finalize();
+			} catch (error) {
+				await output.cancel();
+				throw error;
 			}
-			await output.finalize();
 
 			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
 			const track = await input.getPrimaryVideoTrack();
@@ -404,15 +412,39 @@ describe('Video', async () => {
 			return await track.getCodecParameterString();
 		};
 
-		// AVC Baseline, Main and High 10 (libx264 picks High by itself)
-		expect(await writtenCodecString('avc', 'avc1.42001f', 8)).toMatch(/^avc1\.42/);
-		expect(await writtenCodecString('avc', 'avc1.4d001f', 8)).toMatch(/^avc1\.4d/);
-		expect(await writtenCodecString('avc', 'avc1.6e001f', 10)).toMatch(/^avc1\.6e/);
-		// HEVC Main 10, and the bit depth fields of VP9 and AV1
-		expect(await writtenCodecString('hevc', 'hvc1.2.4.L93.B0', 10)).toMatch(/^(hev1|hvc1)\.2\./);
-		expect(await writtenCodecString('vp9', 'vp09.02.10.10', 10)).toMatch(/^vp09\.02\.\d\d\.10/);
-		expect(await writtenCodecString('vp9', 'vp09.02.10.12', 12)).toMatch(/^vp09\.02\.\d\d\.12/);
-		expect(await writtenCodecString('av1', 'av01.0.04M.10', 10)).toMatch(/^av01\.0\.\d\d[MH]\.10/);
+		const honored: [codec: VideoCodec, fullCodecString: string, bitDepth: number, written: RegExp][] = [
+			// AVC Baseline, Main and High 10 (libx264 picks High by itself)
+			['avc', 'avc1.42001f', 8, /^avc1\.42/],
+			['avc', 'avc1.4d001f', 8, /^avc1\.4d/],
+			['avc', 'avc1.6e001f', 10, /^avc1\.6e/],
+			// HEVC Main 10, and the bit depth fields of VP9 and AV1
+			['hevc', 'hvc1.2.4.L93.B0', 10, /^(hev1|hvc1)\.2\./],
+			['vp9', 'vp09.02.10.10', 10, /^vp09\.02\.\d\d\.10/],
+			['vp9', 'vp09.02.10.12', 12, /^vp09\.02\.\d\d\.12/],
+			['av1', 'av01.0.04M.10', 10, /^av01\.0\.\d\d[MH]\.10/],
+		];
+		for (const [codec, fullCodecString, bitDepth, written] of honored) {
+			const canEncode = await canEncodeVideo(codec, { width: 64, height: 64, fullCodecString });
+			expect({ fullCodecString, canEncode }).toEqual({ fullCodecString, canEncode: true });
+			expect(await writtenCodecString(codec, fullCodecString, bitDepth)).toMatch(written);
+		}
+
+		// What these encoders can't produce is declined, as browsers do, rather than encoded as something else
+		const declined: [codec: VideoCodec, fullCodecString: string][] = [
+			['avc', 'avc1.7a0028'], // High 4:2:2
+			['avc', 'avc1.f40028'], // High 4:4:4 Predictive
+			['avc', 'avc1.58001f'], // Extended
+			['hevc', 'hvc1.4.10.L93.B0'], // Range extensions
+			['vp9', 'vp09.01.10.08'], // Profile 1 (4:2:2, 4:4:0 or 4:4:4)
+			['vp9', 'vp09.00.10.10'], // Profile 0 is 8-bit only
+			['av1', 'av01.1.04M.08'], // High (4:4:4)
+			['av1', 'av01.0.04M.12'], // 12 bits needs the Professional profile
+		];
+		for (const [codec, fullCodecString] of declined) {
+			const canEncode = await canEncodeVideo(codec, { width: 64, height: 64, fullCodecString });
+			expect({ fullCodecString, canEncode }).toEqual({ fullCodecString, canEncode: false });
+			await expect(writtenCodecString(codec, fullCodecString, 8)).rejects.toThrow();
+		}
 
 		// Without a codec string, the encoders' defaults stay: High, Main, and 8 bits even from 10-bit frames
 		expect(await writtenCodecString('avc', undefined, 8)).toMatch(/^avc1\.64/);

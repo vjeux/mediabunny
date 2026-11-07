@@ -82,6 +82,36 @@ const parseCodecStringRequirements = (codec: VideoCodec, codecString: string) =>
 	return { avcProfile, bitDepth };
 };
 
+/**
+ * Whether the encoders here can produce what a codec string asks for. They encode 4:2:0 only: AVC in the Baseline,
+ * Main, High and High 10 profiles, HEVC in Main and Main 10, VP9 in profiles 0 (8-bit) and 2 (10 and 12-bit), and AV1
+ * in the Main profile at 8 or 10 bits. Anything else would come out as something other than what was asked for, so
+ * it's declined, as browsers do.
+ */
+const canProduceCodecString = (codec: VideoCodec, codecString: string) => {
+	const parts = codecString.split('.');
+
+	if (codec === 'avc') {
+		return [66, 77, 100, 110].includes(parseInt(parts[1]?.slice(0, 2) ?? '', 16));
+	} else if (codec === 'hevc') {
+		// Profile space 0 (no letter), Main or Main 10
+		return parts[1] === '1' || parts[1] === '2';
+	} else if (codec === 'vp9') {
+		const profile = Number(parts[1]);
+		const bitDepth = Number(parts[3]);
+		// The optional chroma subsampling field: 0 and 1 are 4:2:0
+		const isYuv420 = parts[4] === undefined || Number(parts[4]) <= 1;
+		return isYuv420 && (profile === 0 ? bitDepth === 8 : profile === 2 && (bitDepth === 10 || bitDepth === 12));
+	} else if (codec === 'av1') {
+		const bitDepth = Number(parts[3]);
+		// The optional monochrome and chroma subsampling fields: 4:2:0 is 0 and 11x
+		const isYuv420 = (parts[4] === undefined || Number(parts[4]) === 0) && (parts[5] ?? '11').startsWith('11');
+		return parts[1] === '0' && (bitDepth === 8 || bitDepth === 10) && isYuv420;
+	}
+
+	return true;
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -104,13 +134,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
 		if (config.bitrateMode === 'quantizer') {
-			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
+			return (codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1')
+				&& canProduceCodecString(codec, config.codec);
 		}
 
 		return (
 			codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
 			|| codec === 'prores'
-		);
+		) && canProduceCodecString(codec, config.codec);
 	}
 
 	async init(): Promise<void> {
