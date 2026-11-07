@@ -1233,6 +1233,64 @@ test.concurrent('Widevine HLS passes #EXT-X-KEY PSSH boxes to key resolver', asy
 	expect(lastPacket.timestamp + lastPacket.duration).toBe(60);
 });
 
+test.concurrent('Paths stay relative to the requested playlist when a resolver serves it from elsewhere', async () => {
+	// A resolver may serve each requested path from another location, e.g. `new FilePathSource(dir + '/' + path)`.
+	// The paths it receives must stay in one namespace instead of turning into that location's paths for segments.
+	const files: Record<string, string> = {
+		'master.m3u8': '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64000d,mp4a.40.2"\nvideo/playlist.m3u8\n',
+		'video/playlist.m3u8': '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n',
+	};
+	const readFile = (path: string) => path.endsWith('.ts')
+		? new FilePathSource('./test/public/0.ts')
+		: new BufferSource(new TextEncoder().encode(files[path]));
+
+	const check = async (serve: (path: string) => FilePathSource | BufferSource | CustomPathedSource) => {
+		const requestedPaths: string[] = [];
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => {
+				requestedPaths.push(path);
+				return serve(path);
+			}),
+			formats: HLS_FORMATS,
+		});
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await new EncodedPacketSink(videoTrack).getFirstPacket()).not.toBeNull();
+		expect(requestedPaths).toEqual(['master.m3u8', 'video/playlist.m3u8', 'video/0.ts']);
+	};
+
+	// Plain sources, and sources with their own path
+	await check(readFile);
+	await check(path => new CustomPathedSource(
+		`storage/${path}`,
+		({ path: storagePath }) => readFile(storagePath.replace(/^(storage\/)+/, '')),
+	));
+
+	// A redirected media playlist's segments are still requested relative to where it was redirected to
+	const fetchFn = async (request: string | URL | Request) => {
+		const url = request instanceof Request ? request.url : request.toString();
+		if (url === 'https://a.example/master.m3u8') {
+			return new Response(files['master.m3u8']);
+		} else if (url === 'https://a.example/video/playlist.m3u8') {
+			const response = new Response(files['video/playlist.m3u8']);
+			Object.defineProperty(response, 'redirected', { value: true });
+			Object.defineProperty(response, 'url', { value: 'https://cdn.example/x/playlist.m3u8' });
+			return response;
+		}
+
+		return new Response(null, { status: 404 });
+	};
+	using redirectedInput = new Input({
+		source: new UrlSource('https://a.example/master.m3u8', { fetchFn }),
+		formats: HLS_FORMATS,
+	});
+	const videoTrack = await redirectedInput.getPrimaryVideoTrack();
+	assert(videoTrack);
+	// The segment itself isn't served; the failed request names the URL it was looked up at
+	await expect(new EncodedPacketSink(videoTrack).getFirstPacket()).rejects.toThrow('https://cdn.example/x/0.ts');
+});
+
 test.concurrent('SourceRequest.isRoot', async () => {
 	using input = new Input({
 		source: new CustomPathedSource(
