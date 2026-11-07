@@ -6,14 +6,27 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { assert } from './misc';
+import { assert, simplifyRational } from './misc';
 import { AudioSample } from './sample';
+
+/** Zero crossings of the resampling kernel on each side of its center. */
+const KERNEL_ZERO_CROSSINGS = 16;
+/** Cutoff frequency of the kernel, relative to the lower of the two Nyquist frequencies. */
+const KERNEL_CUTOFF = 0.9;
+/** Entries of the kernel table per source frame. Values in between are interpolated linearly. */
+const KERNEL_TABLE_RESOLUTION = 512;
+/** The maximum number of weights computed upfront for all phases. */
+const MAX_PHASE_TABLE_SIZE = 2 ** 18;
 
 /**
  * Utility class to handle audio resampling, handling both sample rate resampling as well as channel up/downmixing.
  * The advantage over doing this manually rather than using OfflineAudioContext to do it for us is the artifact-free
  * handling of putting multiple resampled audio samples back to back, which produces flaky results using
  * OfflineAudioContext.
+ *
+ * Resampling uses a windowed-sinc low-pass kernel (like Chromium's SincResampler), so that downsampling doesn't alias
+ * and upsampling doesn't image. Each input sample adds its contribution to the output frames within the kernel's
+ * reach, which makes the result independent of how the input is split into samples.
  */
 export class AudioResampler {
 	sourceSampleRate: number | null = null;
@@ -26,13 +39,51 @@ export class AudioResampler {
 	bufferSizeInFrames: number;
 	bufferSizeInSamples: number;
 	bufferCapacityInFrames!: number;
-	outputBuffer!: Float32Array;
+	/** Accumulates in double precision, so that the contributions of several samples add up exactly */
+	outputBuffer!: Float64Array;
 	/** Start frame of current buffer */
 	bufferStartFrame = 0;
 	/** The highest index written to in the current buffer */
 	maxWrittenFrame: number | null = null;
 	channelMixer!: (sourceData: Float32Array, sourceFrameIndex: number, targetChannelIndex: number) => number;
 	tempSourceBuffer!: Float32Array;
+	/** The source data mixed to the target channel count, interleaved */
+	mixedBuffer!: Float32Array;
+
+	/** Whether the sample rates match, so the samples only need their channels mixed */
+	passThrough = false;
+	/** The kernel, sampled from its center outwards (it's symmetric) */
+	kernelTable!: Float32Array;
+	/** Half the width of the kernel, in source frames */
+	kernelRadius = 0;
+	/**
+	 * When the ratio of the sample rates has a small enough denominator, output frames only fall on that many different
+	 * positions (phases) between two source frames, so the weights are computed once per phase upfront. 0 otherwise.
+	 */
+	phaseCount = 0;
+	/** Source frames per output frame, times the phase count */
+	phaseStep = 0;
+	/** The space reserved for the weights of one output frame */
+	weightsStride = 0;
+	/**
+	 * The normalized weights of the source frames within the kernel's reach of an output frame, for every phase (or for
+	 * the current output frame only, if there are too many phases)
+	 */
+	weights!: Float64Array;
+	/** For every phase, the first source frame within reach, relative to the source frame at or before the output */
+	phaseFirstSourceFrames!: Int32Array;
+	/** For every phase, the number of source frames within reach */
+	phaseWeightCounts!: Int32Array;
+	/** Where the weights of the current output frame start */
+	weightsOffset = 0;
+	/** The number of weights of the current output frame */
+	weightCount = 0;
+	/** The mixed first frame of the audio, which counts as repeated before the start (so the edges keep their level) */
+	firstFrame: Float32Array | null = null;
+	/** The mixed last frame of the audio so far, which counts as repeated after the end */
+	lastFrame!: Float32Array;
+	/** Source frame index (relative to the start) at the end of the audio so far */
+	sourceEndFrame = 0;
 
 	constructor(options: {
 		targetSampleRate: number;
@@ -159,17 +210,84 @@ export class AudioResampler {
 		}
 	}
 
-	ensureTempBufferSize(requiredSamples: number): void {
-		let length = this.tempSourceBuffer.length;
+	/** Sets up the windowed-sinc kernel, unless the sample rates match. */
+	doKernelSetup(): void {
+		assert(this.sourceSampleRate !== null);
 
-		while (length < requiredSamples) {
+		if (this.sourceSampleRate === this.targetSampleRate) {
+			this.passThrough = true;
+			return;
+		}
+
+		// Relative to the source's Nyquist frequency. When downsampling, the cutoff must also stay below the target's
+		// Nyquist frequency, as everything above it would alias.
+		const cutoff = KERNEL_CUTOFF * Math.min(1, this.targetSampleRate / this.sourceSampleRate);
+		this.kernelRadius = KERNEL_ZERO_CROSSINGS / cutoff;
+
+		const tableLength = Math.ceil(this.kernelRadius * KERNEL_TABLE_RESOLUTION) + 2;
+		this.kernelTable = new Float32Array(tableLength);
+
+		for (let i = 0; i < tableLength; i++) {
+			const t = i / KERNEL_TABLE_RESOLUTION;
+			if (t >= this.kernelRadius) {
+				break; // Rest stays 0
+			}
+
+			const x = Math.PI * cutoff * t;
+			const sinc = x === 0 ? 1 : Math.sin(x) / x;
+			const u = Math.PI * t / this.kernelRadius;
+			const blackmanWindow = 0.42 + 0.5 * Math.cos(u) + 0.08 * Math.cos(2 * u);
+
+			this.kernelTable[i] = cutoff * sinc * blackmanWindow;
+		}
+
+		this.weightsStride = Math.ceil(2 * this.kernelRadius) + 1;
+
+		if (Number.isInteger(this.sourceSampleRate) && Number.isInteger(this.targetSampleRate)) {
+			const ratio = simplifyRational({ num: this.sourceSampleRate, den: this.targetSampleRate });
+
+			if (ratio.den * this.weightsStride <= MAX_PHASE_TABLE_SIZE) {
+				this.phaseCount = ratio.den;
+				this.phaseStep = ratio.num;
+				this.weights = new Float64Array(this.phaseCount * this.weightsStride);
+				this.phaseFirstSourceFrames = new Int32Array(this.phaseCount);
+				this.phaseWeightCounts = new Int32Array(this.phaseCount);
+
+				for (let phase = 0; phase < this.phaseCount; phase++) {
+					this.phaseFirstSourceFrames[phase] = this.computeWeights(
+						phase / this.phaseCount,
+						phase * this.weightsStride,
+					);
+					this.phaseWeightCounts[phase] = this.weightCount;
+				}
+
+				return;
+			}
+		}
+
+		this.weights = new Float64Array(this.weightsStride);
+	}
+
+	/** Evaluates the kernel at the given distance from its center, in source frames. */
+	kernelAt(distance: number) {
+		const index = Math.abs(distance) * KERNEL_TABLE_RESOLUTION;
+		const lower = Math.floor(index);
+		const lowerValue = this.kernelTable[lower]!;
+
+		return lowerValue + (index - lower) * (this.kernelTable[lower + 1]! - lowerValue);
+	}
+
+	ensureTempBufferSizes(frames: number): void {
+		assert(this.sourceNumberOfChannels !== null);
+
+		let length = this.tempSourceBuffer.length / this.sourceNumberOfChannels;
+		while (length < frames) {
 			length *= 2;
 		}
 
-		if (length !== this.tempSourceBuffer.length) {
-			const newBuffer = new Float32Array(length);
-			newBuffer.set(this.tempSourceBuffer);
-			this.tempSourceBuffer = newBuffer;
+		if (length * this.sourceNumberOfChannels !== this.tempSourceBuffer.length) {
+			this.tempSourceBuffer = new Float32Array(length * this.sourceNumberOfChannels);
+			this.mixedBuffer = new Float32Array(length * this.targetNumberOfChannels);
 		}
 	}
 
@@ -182,39 +300,84 @@ export class AudioResampler {
 			this.sourceNumberOfChannels = audioSample.numberOfChannels;
 			this.startTime = audioSample.timestamp;
 
-			// An input sample may map to more than one output sample, which is why we need padding in the buffer to not
-			// lose any data
-			const overflowFrames = Math.ceil(this.targetSampleRate / this.sourceSampleRate);
+			this.doKernelSetup();
+
+			// An input sample affects the output frames within the kernel's reach, which is why we need padding in the
+			// buffer to not lose any data. The padding also makes sure that a buffer is only finalized once no later
+			// sample can contribute to it anymore.
+			const overflowFrames = Math.ceil(
+				(2 * this.kernelRadius + 2) * this.targetSampleRate / this.sourceSampleRate,
+			) + 2;
 			this.bufferCapacityInFrames = this.bufferSizeInFrames + overflowFrames;
-			this.outputBuffer = new Float32Array(
+			this.outputBuffer = new Float64Array(
 				this.bufferCapacityInFrames * this.targetNumberOfChannels,
 			);
 
-			// Pre-allocate temporary buffer for source data
+			// Pre-allocate temporary buffers for source data
 			this.tempSourceBuffer = new Float32Array(this.sourceSampleRate * this.sourceNumberOfChannels);
+			this.mixedBuffer = new Float32Array(this.sourceSampleRate * this.targetNumberOfChannels);
+			this.lastFrame = new Float32Array(this.targetNumberOfChannels);
 
 			this.doChannelMixerSetup();
 		}
 
 		assert(this.startTime !== null);
+		assert(this.sourceNumberOfChannels !== null);
 
-		const requiredSamples = audioSample.numberOfFrames * audioSample.numberOfChannels;
-		this.ensureTempBufferSize(requiredSamples);
+		const numberOfFrames = audioSample.numberOfFrames;
+		if (numberOfFrames === 0) {
+			return;
+		}
+
+		this.ensureTempBufferSizes(numberOfFrames);
 
 		// Copy the audio data to the temp buffer
 		const sourceDataSize = audioSample.allocationSize({ planeIndex: 0, format: 'f32' });
 		const sourceView = new Float32Array(this.tempSourceBuffer.buffer, 0, sourceDataSize / 4);
 		audioSample.copyTo(sourceView, { planeIndex: 0, format: 'f32' });
 
+		// Mix the channels first. Mixing is linear and works frame by frame, so it doesn't matter that it happens
+		// before the resampling. The mixed data is planar, which makes the resampling loops faster.
+		const channels = this.targetNumberOfChannels;
+		const mixed = this.mixedBuffer;
+		const planeLength = mixed.length / channels;
+		for (let channel = 0; channel < channels; channel++) {
+			const planeStart = channel * planeLength;
+			for (let frame = 0; frame < numberOfFrames; frame++) {
+				mixed[planeStart + frame] = this.channelMixer(sourceView, frame, channel);
+			}
+		}
+
 		// Audio sample is snapped to the input sample rate grid
 		const sourceStartFrame = Math.round((audioSample.timestamp - this.startTime) * this.sourceSampleRate);
-		const sourceEndFrame = sourceStartFrame + audioSample.numberOfFrames;
+		const sourceEndFrame = sourceStartFrame + numberOfFrames;
 
-		// Compute which output frames are affected by this sample
-		const outputStartFrame = Math.floor(
-			(sourceStartFrame - 1) * this.targetSampleRate / this.sourceSampleRate,
-		) + 1;
-		const outputEndFrame = Math.ceil(sourceEndFrame * this.targetSampleRate / this.sourceSampleRate);
+		const isFirstSample = this.firstFrame === null;
+		if (isFirstSample) {
+			this.firstFrame = new Float32Array(channels);
+			for (let channel = 0; channel < channels; channel++) {
+				this.firstFrame[channel] = mixed[channel * planeLength]!;
+			}
+		}
+		if (sourceEndFrame >= this.sourceEndFrame) {
+			for (let channel = 0; channel < channels; channel++) {
+				this.lastFrame[channel] = mixed[channel * planeLength + numberOfFrames - 1]!;
+			}
+			this.sourceEndFrame = sourceEndFrame;
+		}
+
+		const radius = this.kernelRadius;
+
+		// Compute which output frames are affected by this sample. Output frame i sits at source position
+		// i * sourceSampleRate / targetSampleRate.
+		const outputStartFrame = this.passThrough
+			? sourceStartFrame
+			: Math.floor((sourceStartFrame - radius) * this.targetSampleRate / this.sourceSampleRate) + 1;
+		const outputEndFrame = this.passThrough
+			? sourceEndFrame
+			: Math.ceil((sourceEndFrame - 1 + radius) * this.targetSampleRate / this.sourceSampleRate);
+		// The kernel reaches past the end of the sample, but only the frames before this belong to the audio so far
+		const coveredEndFrame = Math.ceil(sourceEndFrame * this.targetSampleRate / this.sourceSampleRate);
 
 		for (let outputFrame = outputStartFrame; outputFrame < outputEndFrame; outputFrame++) {
 			if (outputFrame < this.bufferStartFrame) {
@@ -229,41 +392,127 @@ export class AudioResampler {
 
 			const bufferFrameIndex = outputFrame - this.bufferStartFrame;
 			assert(bufferFrameIndex < this.bufferCapacityInFrames);
+			const outputIndex = bufferFrameIndex * channels;
 
-			const sourcePosition = outputFrame * this.sourceSampleRate / this.targetSampleRate - sourceStartFrame;
-
-			const sourceLowerFrame = Math.floor(sourcePosition);
-			const sourceUpperFrame = Math.ceil(sourcePosition);
-			const fraction = sourcePosition - sourceLowerFrame;
-
-			// Process each output channel
-			for (let targetChannel = 0; targetChannel < this.targetNumberOfChannels; targetChannel++) {
-				let lowerSample = 0;
-				let upperSample = 0;
-
-				if (sourceLowerFrame >= 0 && sourceLowerFrame < audioSample.numberOfFrames) {
-					lowerSample = this.channelMixer(sourceView, sourceLowerFrame, targetChannel);
+			if (this.passThrough) {
+				const sourceFrame = outputFrame - sourceStartFrame;
+				for (let channel = 0; channel < channels; channel++) {
+					this.outputBuffer[outputIndex + channel]! += mixed[channel * planeLength + sourceFrame]!;
 				}
-
-				if (sourceUpperFrame >= 0 && sourceUpperFrame < audioSample.numberOfFrames) {
-					upperSample = this.channelMixer(sourceView, sourceUpperFrame, targetChannel);
-				}
-
-				// For resampling, we do naive linear interpolation to find the in-between sample. This produces
-				// suboptimal results especially for downsampling (for which a low-pass filter would first need to be
-				// applied), but AudioContext doesn't do this either, so, whatever, for now.
-				const outputSample = lowerSample + fraction * (upperSample - lowerSample);
-
-				// Write to output buffer (interleaved)
-				const outputIndex = bufferFrameIndex * this.targetNumberOfChannels + targetChannel;
-				this.outputBuffer[outputIndex]! += outputSample; // Add in case of overlapping samples
-			}
-
-			if (this.maxWrittenFrame === null) {
-				this.maxWrittenFrame = bufferFrameIndex;
 			} else {
-				this.maxWrittenFrame = Math.max(this.maxWrittenFrame, bufferFrameIndex);
+				const firstSourceFrame = this.prepareWeights(outputFrame) - sourceStartFrame;
+				const lastSourceFrame = firstSourceFrame + this.weightCount - 1;
+
+				// Add in case of overlapping samples; the frames of other samples within the kernel's reach add their
+				// contributions when those samples are added
+				this.addContributions(
+					outputIndex,
+					mixed,
+					firstSourceFrame,
+					Math.max(firstSourceFrame, 0),
+					Math.min(lastSourceFrame, numberOfFrames - 1),
+				);
+
+				if (isFirstSample && firstSourceFrame < -sourceStartFrame) {
+					// The kernel reaches before the start of the audio, where the first frame counts as repeated
+					this.addRepeatedFrameContributions(
+						outputIndex,
+						this.firstFrame!,
+						firstSourceFrame,
+						firstSourceFrame,
+						-sourceStartFrame - 1,
+					);
+				}
 			}
+
+			if (outputFrame < coveredEndFrame) {
+				if (this.maxWrittenFrame === null) {
+					this.maxWrittenFrame = bufferFrameIndex;
+				} else {
+					this.maxWrittenFrame = Math.max(this.maxWrittenFrame, bufferFrameIndex);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Computes the weights of the source frames within the kernel's reach of the given source position, normalized to
+	 * sum up to 1 so that the level is kept exactly, and stores them at the given offset. Returns the index of the
+	 * first of these source frames.
+	 */
+	computeWeights(position: number, offset: number) {
+		const first = Math.floor(position - this.kernelRadius) + 1;
+		const count = Math.ceil(position + this.kernelRadius) - first;
+
+		let sum = 0;
+		for (let i = 0; i < count; i++) {
+			const weight = this.kernelAt(position - (first + i));
+			this.weights[offset + i] = weight;
+			sum += weight;
+		}
+		for (let i = 0; i < count; i++) {
+			this.weights[offset + i]! /= sum;
+		}
+
+		this.weightCount = count;
+		return first;
+	}
+
+	/**
+	 * Makes the weights of the source frames within the kernel's reach of the given output frame the current ones.
+	 * Returns the index of the first of these source frames.
+	 */
+	prepareWeights(outputFrame: number) {
+		if (this.phaseCount > 0) {
+			// Exact integer math
+			const numerator = outputFrame * this.phaseStep;
+			const sourceFrame = Math.floor(numerator / this.phaseCount);
+			const phase = numerator - sourceFrame * this.phaseCount;
+
+			this.weightsOffset = phase * this.weightsStride;
+			this.weightCount = this.phaseWeightCounts[phase]!;
+			return sourceFrame + this.phaseFirstSourceFrames[phase]!;
+		}
+
+		assert(this.sourceSampleRate !== null);
+
+		this.weightsOffset = 0;
+		return this.computeWeights(outputFrame * this.sourceSampleRate / this.targetSampleRate, 0);
+	}
+
+	/**
+	 * Adds the source frames from `from` to `to` (inclusive) of the planar source data to the output frame, using the
+	 * current weights, which start at source frame `first`.
+	 */
+	addContributions(outputIndex: number, source: Float32Array, first: number, from: number, to: number) {
+		const channels = this.targetNumberOfChannels;
+		const planeLength = source.length / channels;
+		const weights = this.weights;
+		const offset = this.weightsOffset - first;
+
+		for (let channel = 0; channel < channels; channel++) {
+			const sourceOffset = channel * planeLength;
+
+			let sum = 0;
+			for (let i = from; i <= to; i++) {
+				sum += weights[offset + i]! * source[sourceOffset + i]!;
+			}
+
+			this.outputBuffer[outputIndex + channel]! += sum;
+		}
+	}
+
+	/** Like `addContributions`, but for one frame repeated at the source positions from `from` to `to`. */
+	addRepeatedFrameContributions(outputIndex: number, frame: Float32Array, first: number, from: number, to: number) {
+		const offset = this.weightsOffset - first;
+
+		let weightSum = 0;
+		for (let i = from; i <= to; i++) {
+			weightSum += this.weights[offset + i]!;
+		}
+
+		for (let channel = 0; channel < this.targetNumberOfChannels; channel++) {
+			this.outputBuffer[outputIndex + channel]! += weightSum * frame[channel]!;
 		}
 	}
 
@@ -298,6 +547,30 @@ export class AudioResampler {
 	}
 
 	async finalize() {
+		if (this.maxWrittenFrame !== null && !this.passThrough) {
+			assert(this.sourceSampleRate !== null);
+
+			// The kernel reaches past the end of the audio, where the last frame counts as repeated
+			const end = this.sourceEndFrame;
+			const firstAffectedFrame = Math.max(
+				Math.floor((end - this.kernelRadius) * this.targetSampleRate / this.sourceSampleRate) + 1,
+				this.bufferStartFrame,
+			);
+			const coveredEndFrame = Math.ceil(end * this.targetSampleRate / this.sourceSampleRate);
+
+			for (let outputFrame = firstAffectedFrame; outputFrame < coveredEndFrame; outputFrame++) {
+				const firstSourceFrame = this.prepareWeights(outputFrame);
+
+				this.addRepeatedFrameContributions(
+					(outputFrame - this.bufferStartFrame) * this.targetNumberOfChannels,
+					this.lastFrame,
+					firstSourceFrame,
+					end,
+					firstSourceFrame + this.weightCount - 1,
+				);
+			}
+		}
+
 		while (this.maxWrittenFrame !== null) {
 			await this.finalizeCurrentBuffer();
 			this.bufferStartFrame += this.bufferSizeInFrames;
