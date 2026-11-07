@@ -258,7 +258,8 @@ export type ConversionVideoOptions = {
 	keyFrameInterval?: number;
 	/**
 	 * A hint that configures the hardware acceleration method used when transcoding, which applies to both decoding and
-	 * encoding. This is best left on `'no-preference'`, the default.
+	 * encoding. This is best left on `'no-preference'`, the default. Decoders and encoders may refuse it (Chromium
+	 * refuses `'prefer-hardware'` without hardware support), in which case the track is discarded.
 	 */
 	hardwareAcceleration?: 'no-preference' | 'prefer-hardware' | 'prefer-software';
 	/** When `true`, video will always be re-encoded instead of directly copying over the encoded packets. */
@@ -1786,7 +1787,9 @@ export class Conversion {
 		} else {
 			// We need to decode & reencode the video
 
-			const canDecode = await track.canDecode();
+			const canDecode = await new VideoSampleSink(track, {
+				hardwareAcceleration: trackOptions.hardwareAcceleration,
+			})._canDecode();
 			if (!canDecode) {
 				this.discardedTracks.push({
 					track,
@@ -1812,6 +1815,7 @@ export class Conversion {
 					? trackOptions.processedHeight
 					: height,
 				quality,
+				hardwareAcceleration: trackOptions.hardwareAcceleration,
 			});
 			if (!encodableCodec) {
 				this.discardedTracks.push({
