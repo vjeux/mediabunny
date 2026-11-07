@@ -4,6 +4,7 @@ import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { assert } from '../../src/misc.js';
 
 /** Reads the PMT's PCR_PID and streams, the PCRs, and the PES timestamps of a transport stream, in file order. */
 const readTransportStream = (data: Uint8Array) => {
@@ -154,4 +155,49 @@ test('MPEG-TS output carries PCRs on the PMT\'s PCR_PID before and between media
 			}
 		}
 	}
+});
+
+test('MPEG-TS output starts its PCRs at zero when the timestamp offset leaves no room for their lead', async () => {
+	// From L46's review. The PCR comes 0.1 s before the decode time, which the timestamp offset (0 by default) may not
+	// leave room for: the lead then shrinks to the offset, rather than the PCR wrapping around to just below 2^33
+	const avc = new Uint8Array([0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x10]);
+	const adts = new Uint8Array([0xff, 0xf1, 0x4c, 0x80, 0x01, 0x3f, 0xfc, 0x21, 0x00]);
+
+	const firstPcrAndDts = async (timestampOffset: number | undefined) => {
+		const output = new Output({
+			format: new MpegTsOutputFormat({ timestampOffset }),
+			target: new BufferTarget(),
+		});
+		const videoSource = new EncodedVideoPacketSource('avc');
+		const audioSource = new EncodedAudioPacketSource('aac');
+		output.addVideoTrack(videoSource);
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		for (let i = 0; i < 10; i++) {
+			await videoSource.add(
+				new EncodedPacket(avc, i === 0 ? 'key' : 'delta', i / 25, 1 / 25),
+				i === 0 ? { decoderConfig: { codec: 'avc1.42001f', codedWidth: 64, codedHeight: 64 } } : undefined,
+			);
+			for (let j = 0; j < 2; j++) {
+				await audioSource.add(
+					new EncodedPacket(adts, 'key', (2 * i + j) / 50, 0.02),
+					i === 0 && j === 0
+						? { decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000 } }
+						: undefined,
+				);
+			}
+		}
+		await output.finalize();
+
+		const { events } = readTransportStream(new Uint8Array(output.target.buffer!));
+		const firstPcr = events.find(x => x.type === 'pcr');
+		const firstPes = events.find(x => x.type === 'pes');
+		assert(firstPcr?.type === 'pcr' && firstPes?.type === 'pes');
+		return [firstPcr.value, firstPes.dts];
+	};
+
+	expect(await firstPcrAndDts(undefined)).toEqual([0, 0]);
+	expect(await firstPcrAndDts(0.05)).toEqual([0, 0.05 * 90000]);
+	expect(await firstPcrAndDts(1)).toEqual([0.9 * 90000, 90000]); // The full lead, as before
 });
