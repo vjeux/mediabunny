@@ -66,6 +66,7 @@ import {
 import { MetadataTags, validateMetadataTags } from './metadata';
 import { NullTarget } from './target';
 import { PacketOrderValidator } from './muxer';
+import { AudioResampler } from './resample';
 
 /**
  * The options for media file conversion.
@@ -2325,6 +2326,67 @@ export class Conversion {
 			this._registerTrackPump(async (pump) => {
 				let paddingLengthInSamples: number | null = null;
 
+				// The encoder needs constant audio parameters, but decoders can change theirs mid-stream, like at an
+				// HLS discontinuity into segments with another sample rate. Samples whose parameters differ from the
+				// first sample's are resampled and remixed to them.
+				let firstNumberOfChannels: number | null = null;
+				let firstSampleRate: number | null = null;
+				let resampler: AudioResampler | null = null;
+				let resamplerInputEnd: number | null = null;
+
+				const flushResampler = async () => {
+					if (resampler) {
+						await resampler.finalize();
+						resampler = null;
+						resamplerInputEnd = null;
+					}
+				};
+
+				const addSample = async (sample: AudioSample) => {
+					firstNumberOfChannels ??= sample.numberOfChannels;
+					firstSampleRate ??= sample.sampleRate;
+					const matchesFirst = sample.numberOfChannels === firstNumberOfChannels
+						&& sample.sampleRate === firstSampleRate;
+
+					if (
+						resampler
+						&& (matchesFirst
+							|| sample.numberOfChannels !== resampler.sourceNumberOfChannels
+							|| sample.sampleRate !== resampler.sourceSampleRate)
+					) {
+						// Its output must come before samples with other parameters
+						await flushResampler();
+					}
+
+					if (matchesFirst) {
+						await this._registerAudioSample(
+							pump, sample, source, outputTrackId, () => lastSampleTimestamp,
+						);
+						return;
+					}
+
+					resampler ??= new AudioResampler({
+						targetNumberOfChannels: firstNumberOfChannels,
+						targetSampleRate: firstSampleRate,
+						onSample: resampledSample => this._registerAudioSample(
+							pump, resampledSample, source, outputTrackId, () => lastSampleTimestamp,
+						),
+					});
+
+					// The resampler places samples by timestamp and adds up overlapping frames, so timestamps a few
+					// frames off (like rounded ones) would double or drop frames: a click. Keep these samples back to
+					// back, like the encoder does with the samples it gets directly.
+					if (
+						resamplerInputEnd !== null
+						&& Math.abs(sample.timestamp - resamplerInputEnd) * sample.sampleRate < 64
+					) {
+						sample.setTimestamp(resamplerInputEnd);
+					}
+					resamplerInputEnd = sample.timestamp + sample.duration;
+
+					await resampler.add(sample);
+				};
+
 				const sink = new AudioSampleSink(track);
 				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
 					if (this._state === 'canceled') {
@@ -2371,13 +2433,15 @@ export class Conversion {
 					if (paddingLengthInSamples === null) {
 						paddingLengthInSamples = this.output.format.supportsTimestampedMediaData
 							? 0
-							: Math.round(finalSample.timestamp * originalSampleRate);
+							: Math.round(finalSample.timestamp * finalSample.sampleRate);
 					}
 
 					if (paddingLengthInSamples > 0) {
-						// Add one padding sample at the beginning
+						// Add one padding sample at the beginning, with the decoded audio's parameters
 						const bytesPerSample = getBytesPerSample(sample.format);
-						const data = new Uint8Array(bytesPerSample * paddingLengthInSamples * originalNumberOfChannels);
+						const data = new Uint8Array(
+							bytesPerSample * paddingLengthInSamples * finalSample.numberOfChannels,
+						);
 						if (sample.format === 'u8' || sample.format === 'u8-planar') {
 							data.fill(2 ** 7); // Fill it with the silent value
 						}
@@ -2387,20 +2451,20 @@ export class Conversion {
 							// Use the same format the decoder is spitting out. This avoids feeding changing sample
 							// formats to the audio encoder.
 							format: sample.format,
-							numberOfChannels: originalNumberOfChannels,
-							sampleRate: originalSampleRate,
+							numberOfChannels: finalSample.numberOfChannels,
+							sampleRate: finalSample.sampleRate,
 							timestamp: 0,
 						});
-						await this._registerAudioSample(
-							pump, silentSample, source, outputTrackId, () => lastSampleTimestamp,
-						);
+						await addSample(silentSample);
 
 						paddingLengthInSamples = 0;
 					}
 
-					await this._registerAudioSample(
-						pump, finalSample, source, outputTrackId, () => lastSampleTimestamp,
-					);
+					await addSample(finalSample);
+				}
+
+				if (this._state !== 'canceled') {
+					await flushResampler();
 				}
 
 				source.close();
