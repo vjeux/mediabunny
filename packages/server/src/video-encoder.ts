@@ -40,7 +40,7 @@ import {
 	serializeHevcDecoderConfigurationRecord,
 } from '../../../src/codec-data';
 import { extractVideoCodecString, ProresFourCc } from '../../../src/codec';
-import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
+import { assert, binarySearchLessOrEqual, simplifyRational, toDataView, toUint8Array } from '../../../src/misc';
 
 const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	apco: NodeAv.AV_PROFILE_PRORES_PROXY,
@@ -57,6 +57,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	codecContext: NodeAv.CodecContext | null = null;
 	scaler: NodeAv.SoftwareScaleContext | null = null;
 	dstFrame: NodeAv.Frame | null = null;
+	/** Whether frames are encoded one column wider than the output, see `createCodecContext` */
+	encodesExtraColumn = false;
+	paddedFrame: NodeAv.Frame | null = null;
 	avCodec!: NodeAv.Codec;
 	lastBuffer: Buffer | null = null;
 	packetEmitted = false;
@@ -159,7 +162,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			den: (this.config.displayHeight ?? this.config.height) * this.config.width,
 		});
 
-		codecContext.width = this.config.width;
+		// prores_ks only encodes floor(width / 2) chroma columns of 4:2:2 frames, so the last one of an odd-width frame
+		// would be lost (zeroed or smeared). Such frames are encoded a column wider, with the last column repeated, and
+		// the frame headers then get the actual width back: both widths give the same macroblocks.
+		this.encodesExtraColumn = this.codec === 'prores'
+			&& this.config.width % 2 === 1
+			&& !!NodeAv.avGetPixFmtName(pixelFormat)?.startsWith('yuv422');
+
+		codecContext.width = this.config.width + (this.encodesExtraColumn ? 1 : 0);
 		codecContext.height = this.config.height;
 		codecContext.pixelFormat = pixelFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, 1e6);
@@ -377,7 +387,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 		const requiresScaler
 			= this.codecContext.pixelFormat !== this.frame.format
-				|| this.codecContext.width !== this.frame.width
+				|| this.config.width !== this.frame.width
 				|| this.codecContext.height !== this.frame.height;
 
 		if (requiresScaler) {
@@ -391,7 +401,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			if (!this.dstFrame) {
 				this.dstFrame = new NodeAv.Frame();
 				this.dstFrame.alloc();
-				this.dstFrame.width = this.codecContext.width;
+				this.dstFrame.width = this.config.width;
 				this.dstFrame.height = this.codecContext.height;
 				this.dstFrame.format = this.codecContext.pixelFormat;
 				this.dstFrame.allocBuffer();
@@ -413,6 +423,10 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			NodeAv.FFmpegError.throwIfError(ret, 'Scale frame');
 
 			frameToEncode = this.dstFrame;
+		}
+
+		if (this.encodesExtraColumn) {
+			frameToEncode = this.padWithExtraColumn(frameToEncode);
 		}
 
 		frameToEncode.pts = BigInt(videoSample.microsecondTimestamp);
@@ -481,6 +495,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			return;
 		}
 		let packetData = toUint8Array(this.packet.data);
+
+		if (this.encodesExtraColumn) {
+			// The frame header's width follows the frame size, the 'icpf' tag, the header size, version and creator
+			const view = toDataView(packetData);
+			assert(view.getUint32(4) === 0x69637066 && view.getUint16(16) === this.config.width + 1);
+			view.setUint16(16, this.config.width);
+		}
 
 		let timestamp = Number(this.packet.pts) / 1e6;
 		let duration = Number(this.packet.duration) / 1e6;
@@ -704,9 +725,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			// Create the decoder config
 			metadata.decoderConfig = {
 				codec: decoderConfigCodecString,
-				codedWidth: this.codecContext.width,
+				codedWidth: this.config.width,
 				codedHeight: this.codecContext.height,
-				displayAspectWidth: this.config.displayWidth ?? this.codecContext.width,
+				displayAspectWidth: this.config.displayWidth ?? this.config.width,
 				displayAspectHeight: this.config.displayHeight ?? this.codecContext.height,
 				description: decoderConfigDescription ?? undefined,
 				colorSpace: {
@@ -752,11 +773,55 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		this.packetEmitted = false;
 	}
 
+	/** Copies a 4:2:2 frame of odd width into one a column wider, whose chroma columns it already fills. */
+	padWithExtraColumn(frame: NodeAv.Frame) {
+		assert(this.codecContext);
+
+		if (!this.paddedFrame) {
+			this.paddedFrame = new NodeAv.Frame();
+			this.paddedFrame.alloc();
+			this.paddedFrame.width = this.codecContext.width;
+			this.paddedFrame.height = this.codecContext.height;
+			this.paddedFrame.format = this.codecContext.pixelFormat;
+			this.paddedFrame.allocBuffer();
+		}
+
+		NodeAv.FFmpegError.throwIfError(this.paddedFrame.makeWritable(), 'Make frame writable');
+		NodeAv.FFmpegError.throwIfError(this.paddedFrame.copyProps(frame), 'Copy frame properties');
+
+		const src = frame.data;
+		const dst = this.paddedFrame.data;
+		assert(src && dst);
+
+		// The 4:2:2 formats prores_ks takes have 16-bit samples
+		const lumaRowBytes = 2 * frame.width;
+		const chromaRowBytes = 2 * Math.ceil(frame.width / 2);
+
+		for (let plane = 0; plane < 3; plane++) {
+			const rowBytes = plane === 0 ? lumaRowBytes : chromaRowBytes;
+			const srcStride = frame.linesize[plane]!;
+			const dstStride = this.paddedFrame.linesize[plane]!;
+
+			for (let y = 0; y < frame.height; y++) {
+				const dstStart = y * dstStride;
+				src[plane]!.copy(dst[plane]!, dstStart, y * srcStride, y * srcStride + rowBytes);
+
+				if (plane === 0) {
+					// Repeat the last luma sample
+					dst[0]!.copy(dst[0]!, dstStart + rowBytes, dstStart + rowBytes - 2, dstStart + rowBytes);
+				}
+			}
+		}
+
+		return this.paddedFrame;
+	}
+
 	close(): MaybePromise<void> {
 		this.codecContext?.freeContext();
 		this.frame.free();
 		this.packet.free();
 		this.scaler?.freeContext();
 		this.dstFrame?.free();
+		this.paddedFrame?.free();
 	}
 }
