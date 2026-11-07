@@ -24,7 +24,7 @@ type PackageJson = {
 	exports?: unknown;
 	files: string[];
 	browser?: Record<string, string | false>;
-	sideEffects?: boolean;
+	sideEffects?: boolean | string[];
 	dependencies?: Record<string, string>;
 	peerDependencies?: Record<string, string>;
 };
@@ -150,7 +150,12 @@ describe('Package manifests', () => {
 		for (const dir of packageDirs) {
 			const pkg = readPackageJson(dir);
 			expect(pkg.version, pkg.name).toBe(core.version);
-			expect(pkg.sideEffects, `${pkg.name} must be tree-shakable`).toBe(false);
+			// Tree-shakable: nothing has side effects, except (once #532 is in) Mediabunny's entry module, whose only
+			// top-level code is the check for being loaded twice
+			const entryModules = JSON.stringify(['./dist/modules/src/index.js', './src/index.ts']);
+			const sideEffects = JSON.stringify(pkg.sideEffects);
+			const allowed = sideEffects === 'false' || (dir === '.' && sideEffects === entryModules);
+			expect(allowed, `${pkg.name}: ${sideEffects}`).toBe(true);
 			for (const [name, range] of Object.entries({ ...pkg.dependencies, ...pkg.peerDependencies })) {
 				if (name === 'mediabunny' || name.startsWith('@mediabunny/')) {
 					expect(satisfiesCaret(range), `${pkg.name}: ${name}@${range}`).toBe(true);
