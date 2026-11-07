@@ -328,6 +328,7 @@ type SampleEncryptionAuxInfo = {
 	sampleSizes: Uint8Array | null;
 	sampleCount: number;
 	offset: number | null; // Absolute file offset of the first sample's aux info
+	offsets: number[]; // Every absolute offset of the saio box: one per track run or chunk if there are several
 	resolved: SampleEncryptionInfo[] | null;
 };
 
@@ -910,6 +911,7 @@ export class IsobmffDemuxer extends Demuxer {
 					this.reader,
 					track.encryptionInfo,
 					trackData.encryptionAuxInfo,
+					trackData.trunSampleCounts,
 				);
 
 				for (let i = 0; i < Math.min(trackData.samples.length, entries.length); i++) {
@@ -2717,19 +2719,28 @@ export class IsobmffDemuxer extends Demuxer {
 				if (entryCount === 0) {
 					break;
 				}
-				if (entryCount > 1) {
-					Logging._warn('Multiple saio entries are not supported; using the first offset only.');
+
+				// One offset, or one per track run (in a traf) or chunk (ISO/IEC 14496-12 8.7.9)
+				const offsets: number[] = [];
+				const offsetSize = version === 0 ? 4 : 8;
+				for (let i = 0; i < entryCount && boxEndPos - slice.filePos >= offsetSize; i++) {
+					let offset = version === 0 ? readU32Be(slice) : Number(readU64Be(slice));
+
+					// Per ISO/IEC 23001-7: when saio is inside a moof, offsets are relative to the start of the moof.
+					if (this.currentFragment) {
+						offset += this.currentFragment.moofOffset;
+					}
+
+					offsets.push(offset);
 				}
 
-				let offset = version === 0 ? readU32Be(slice) : Number(readU64Be(slice));
-
-				// Per ISO/IEC 23001-7: when saio is inside a moof, offsets are relative to the start of the moof box.
-				if (this.currentFragment) {
-					offset += this.currentFragment.moofOffset;
+				if (offsets.length === 0) {
+					break;
 				}
 
 				const aux = getOrCreateEncryptionAuxInfo(track);
-				aux.offset = offset;
+				aux.offset = offsets[0]!;
+				aux.offsets = offsets;
 			}; break;
 
 			case 'senc': {
@@ -3444,11 +3455,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			if (this.internalTrack.encryptionInfo) {
 				let sampleEncryption: SampleEncryptionInfo | null = null;
 
-				if (this.internalTrack.encryptionAuxInfo) {
+				const auxInfo = this.internalTrack.encryptionAuxInfo;
+				if (auxInfo) {
 					const entries = await resolveEncryptionAuxInfo(
 						this.internalTrack.demuxer.reader,
 						this.internalTrack.encryptionInfo,
-						this.internalTrack.encryptionAuxInfo,
+						auxInfo,
+						auxInfo.offsets.length > 1 && !auxInfo.resolved ? getChunkSampleCounts(sampleTable) : null,
 					);
 
 					if (sampleIndex < entries.length) {
@@ -4077,6 +4090,21 @@ const findFirstSampleInEntry = (
 	return low;
 };
 
+/** The number of samples in each chunk */
+const getChunkSampleCounts = (sampleTable: SampleTable) => {
+	const counts: number[] = [];
+	for (let i = 0; i < sampleTable.sampleToChunk.length; i++) {
+		const entry = sampleTable.sampleToChunk[i]!;
+		const nextEntry = sampleTable.sampleToChunk[i + 1];
+		const endChunkIndex = Math.min(nextEntry?.startChunkIndex ?? Infinity, sampleTable.chunkOffsets.length);
+		for (let j = entry.startChunkIndex; j < endChunkIndex; j++) {
+			counts.push(entry.samplesPerChunk);
+		}
+	}
+
+	return counts;
+};
+
 const getDecodeTimestamp = (sampleTable: SampleTable, sampleIndex: number) => {
 	const timingEntryIndex = binarySearchLessOrEqual(sampleTable.sampleTimingEntries, sampleIndex, x => x.startIndex);
 	const timingEntry = sampleTable.sampleTimingEntries[timingEntryIndex]!;
@@ -4161,6 +4189,7 @@ const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
 			sampleSizes: null,
 			sampleCount: 0,
 			offset: null,
+			offsets: [],
 			resolved: null,
 		};
 	} else {
@@ -4169,6 +4198,7 @@ const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
 			sampleSizes: null,
 			sampleCount: 0,
 			offset: null,
+			offsets: [],
 			resolved: null,
 		};
 	}
@@ -4178,9 +4208,46 @@ const resolveEncryptionAuxInfo = async (
 	reader: Reader,
 	encryptionInfo: TrackEncryptionInfo,
 	aux: SampleEncryptionAuxInfo,
-) => {
+	runSampleCounts: number[] | null, // Of the track runs or chunks, which saio can give one offset each
+): Promise<SampleEncryptionInfo[]> => {
 	if (aux.resolved) {
 		return aux.resolved;
+	}
+
+	if (aux.offsets.length > 1) {
+		if (runSampleCounts?.length === aux.offsets.length) {
+			// Each run's entries are at its own offset (like Chromium's TrackRunIterator does it)
+			const entries: SampleEncryptionInfo[] = [];
+			let sampleStart = 0;
+			for (let i = 0; i < runSampleCounts.length && sampleStart < aux.sampleCount; i++) {
+				const sampleCount = Math.min(runSampleCounts[i]!, aux.sampleCount - sampleStart);
+				if (sampleCount === 0) {
+					continue;
+				}
+
+				const runEntries = await resolveEncryptionAuxInfo(reader, encryptionInfo, {
+					defaultSampleInfoSize: aux.defaultSampleInfoSize,
+					sampleSizes: aux.sampleSizes && aux.sampleSizes.subarray(sampleStart, sampleStart + sampleCount),
+					sampleCount,
+					offset: aux.offsets[i]!,
+					offsets: [aux.offsets[i]!],
+					resolved: null,
+				}, null);
+				for (const entry of runEntries) {
+					entries.push(entry);
+				}
+
+				sampleStart += sampleCount;
+			}
+
+			aux.resolved = entries;
+			return entries;
+		}
+
+		Logging._warn(
+			'Multiple saio entries that don\'t match the track runs or chunks are not supported; using the first'
+			+ ' offset only.',
+		);
 	}
 
 	if (aux.offset === null || aux.sampleCount === 0) {
