@@ -131,6 +131,18 @@ export class FlacDemuxer extends Demuxer {
 
 			currentPos += 4; // Skip 'fLaC'
 
+			// The Vorbis comment block is FLAC's own tag container (RFC 9639, section 8.6), so its fields take
+			// precedence over those of ID3v2 tags in front of the stream, as in FFmpeg. So, let's set the fields read
+			// from those aside while reading the metadata blocks, and keep them only where the Vorbis comments don't
+			// set them. The raw tags and images of both are kept.
+			const tagKeyOrder = Object.keys(this.metadataTags);
+			const id3Fields: MetadataTags = { ...this.metadataTags };
+			delete id3Fields.raw;
+			delete id3Fields.images;
+			for (const key of Object.keys(id3Fields) as (keyof MetadataTags)[]) {
+				delete this.metadataTags[key];
+			}
+
 			while (
 				this.reader.fileSize === null
 				|| currentPos < this.reader.fileSize
@@ -234,24 +246,10 @@ export class FlacDemuxer extends Demuxer {
 							);
 						}
 
-						// The Vorbis comment block is FLAC's own tag container (RFC 9639, section 8.6), so its tags
-						// take precedence over those of an ID3v2 tag that some tools put in front of the stream, as
-						// in FFmpeg
-						const vorbisCommentTags: MetadataTags = {};
 						readVorbisComments(
 							readBytes(vorbisCommentBlock, size),
-							vorbisCommentTags,
+							this.metadataTags,
 						);
-
-						for (const key of Object.keys(vorbisCommentTags) as (keyof MetadataTags)[]) {
-							if (key === 'raw') {
-								this.metadataTags.raw = { ...this.metadataTags.raw, ...vorbisCommentTags.raw };
-							} else if (key === 'images') {
-								(this.metadataTags.images ??= []).push(...vorbisCommentTags.images!);
-							} else {
-								(this.metadataTags as Record<string, unknown>)[key] = vorbisCommentTags[key];
-							}
-						}
 
 						break;
 					}
@@ -310,6 +308,15 @@ export class FlacDemuxer extends Demuxer {
 
 				if (isLastMetadata) {
 					break;
+				}
+			}
+
+			// Put the fields back where they were
+			const tags: Record<string, unknown> = { ...id3Fields, ...this.metadataTags };
+			for (const key of new Set([...tagKeyOrder, ...Object.keys(tags)])) {
+				delete (this.metadataTags as Record<string, unknown>)[key];
+				if (key in tags) {
+					(this.metadataTags as Record<string, unknown>)[key] = tags[key];
 				}
 			}
 
