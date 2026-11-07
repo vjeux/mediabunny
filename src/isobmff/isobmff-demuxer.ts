@@ -126,7 +126,14 @@ import {
 	readAscii,
 	SliceRangeError,
 } from '../reader';
-import { DEFAULT_TRACK_DISPOSITION, MetadataTags, RichImageData, TrackDisposition } from '../metadata';
+import {
+	DEFAULT_TRACK_DISPOSITION,
+	MetadataTags,
+	recordRawMetadataTagFields,
+	RichImageData,
+	setAsideMetadataTagFields,
+	TrackDisposition,
+} from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
@@ -3804,7 +3811,9 @@ export class IsobmffDemuxer extends Demuxer {
 						continue; // Too small for the length and language code of a text atom
 					}
 
-					if (boxInfo.name !== 'meta' && !this.currentTrack) {
+					const isMovieTag = boxInfo.name !== 'meta' && !this.currentTrack;
+					const setAside = isMovieTag ? setAsideMetadataTagFields(this.metadataTags) : null;
+					if (isMovieTag) {
 						const startPos = slice.filePos;
 						this.metadataTags.raw ??= {};
 
@@ -3884,6 +3893,10 @@ export class IsobmffDemuxer extends Demuxer {
 								this.metadataTags.lyrics ??= readMetadataStringShort(slice);
 							}
 						}; break;
+					}
+
+					if (setAside) {
+						recordRawMetadataTagFields(this.metadataTags, boxInfo.name, setAside);
 					}
 				}
 			}; break;
@@ -3973,6 +3986,7 @@ export class IsobmffDemuxer extends Demuxer {
 						data = readDataBox(slice);
 					}
 
+					const setAside = setAsideMetadataTagFields(this.metadataTags);
 					this.metadataTags.raw ??= {};
 					this.metadataTags.raw[metadataKey] ??= data;
 
@@ -4165,6 +4179,8 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 					}
+
+					recordRawMetadataTagFields(this.metadataTags, metadataKey, setAside);
 				}
 			}; break;
 		}

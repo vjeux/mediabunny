@@ -355,6 +355,79 @@ export const metadataTagsAreEmpty = (tags: MetadataTags) => {
 		&& (tags.raw === undefined || Object.keys(tags.raw).length === 0);
 };
 
+/** For the raw tags a demuxer read, which normalized fields each raw tag was read into (used by conversions). */
+const rawMetadataTagFields = new WeakMap<NonNullable<MetadataTags['raw']>, Map<string, Set<keyof MetadataTags>>>();
+
+const RAW_BACKED_FIELDS = [
+	'title', 'description', 'artist', 'album', 'albumArtist', 'trackNumber', 'tracksTotal', 'discNumber', 'discsTotal',
+	'beatsPerMinute', 'genre', 'date', 'lyrics', 'comment', 'images',
+] as const satisfies (keyof MetadataTags)[];
+type RawBackedFields = Pick<MetadataTags, typeof RAW_BACKED_FIELDS[number]>;
+
+/**
+ * Empties the normalized fields of the tags before a raw tag is read into them, so that afterwards every field the
+ * raw tag sets shows, even one that an earlier raw tag already set (readers keep the first value with `??=`). The
+ * fields stay in place (as undefined), so that the order of the tags' keys doesn't change.
+ */
+export const setAsideMetadataTagFields = (tags: MetadataTags) => {
+	const fields: RawBackedFields = {};
+	for (const field of RAW_BACKED_FIELDS) {
+		if (tags[field] !== undefined) {
+			(fields as Record<string, unknown>)[field] = tags[field];
+			tags[field] = undefined;
+		}
+	}
+
+	return fields;
+};
+
+/**
+ * Records the fields the given raw tag was read into (if any), then puts the set-aside fields back, which keep their
+ * value; images are added to the earlier ones.
+ */
+export const recordRawMetadataTagFields = (tags: MetadataTags, rawKey: string | null, setAside: RawBackedFields) => {
+	if (rawKey !== null && tags.raw) {
+		let fieldsByRawKey = rawMetadataTagFields.get(tags.raw);
+		if (!fieldsByRawKey) {
+			fieldsByRawKey = new Map();
+			rawMetadataTagFields.set(tags.raw, fieldsByRawKey);
+		}
+
+		for (const field of RAW_BACKED_FIELDS) {
+			const value = tags[field];
+			if (value === undefined || (Array.isArray(value) && value.length === 0)) {
+				continue;
+			}
+
+			let fields = fieldsByRawKey.get(rawKey);
+			if (!fields) {
+				fields = new Set();
+				fieldsByRawKey.set(rawKey, fields);
+			}
+
+			fields.add(field);
+		}
+	}
+
+	for (const field of RAW_BACKED_FIELDS) {
+		const earlier = setAside[field];
+		if (earlier === undefined) {
+			continue;
+		}
+
+		if (field === 'images') {
+			const images = earlier as AttachedImage[];
+			images.push(...(tags.images ?? []));
+			tags.images = images;
+		} else {
+			(tags as Record<string, unknown>)[field] = earlier;
+		}
+	}
+};
+
+/** Returns which normalized fields each of the given raw tags was read into, if a demuxer recorded it. */
+export const getRawMetadataTagFields = (raw: NonNullable<MetadataTags['raw']>) => rawMetadataTagFields.get(raw);
+
 /**
  * Specifies a track's disposition, i.e. information about its intended usage.
  * @public

@@ -11,7 +11,12 @@ import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { PacketRetrievalOptions } from '../media-sink';
-import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
+import {
+	DEFAULT_TRACK_DISPOSITION,
+	MetadataTags,
+	recordRawMetadataTagFields,
+	setAsideMetadataTagFields,
+} from '../metadata';
 import { assert, isThenable, roundIfAlmostInteger, UNDETERMINED_LANGUAGE } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
@@ -326,6 +331,7 @@ export class WaveDemuxer extends Demuxer {
 				value += String.fromCharCode(bytes[i]!);
 			}
 
+			const setAside = setAsideMetadataTagFields(this.metadataTags);
 			this.metadataTags.raw ??= {};
 			this.metadataTags.raw[chunkName] = value;
 			this.infoRawMetadataTagKeys.add(chunkName);
@@ -389,6 +395,8 @@ export class WaveDemuxer extends Demuxer {
 					this.metadataTags.comment ??= value;
 				}; break;
 			}
+
+			recordRawMetadataTagFields(this.metadataTags, chunkName, setAside);
 
 			currentPos += 8 + chunkSize + (chunkSize & 1); // Handle padding
 		}
