@@ -285,6 +285,27 @@ export type StreamTargetOptions = {
 
 const DEFAULT_CHUNK_SIZE = 2 ** 24;
 const MAX_CHUNKS_AT_ONCE = 2;
+/**
+ * When canceling, how long a {@link StreamTarget} keeps waiting for its stream to close while writes are pending and
+ * none of them completes; past that, it takes the sink as stalled and leaves the stream to close in the background.
+ */
+const STALLED_SINK_TIMEOUT_MS = 5000;
+
+/** Resolves with whether the promise fulfills within the given time, and rejects if it rejects within it. */
+const fulfillsWithin = async (promise: Promise<unknown>, ms: number) => {
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+	try {
+		return await Promise.race([
+			promise.then(() => true),
+			new Promise<false>((resolve) => {
+				timeoutId = setTimeout(() => resolve(false), ms);
+			}),
+		]);
+	} finally {
+		clearTimeout(timeoutId);
+	}
+};
 
 type Chunk = {
 	start: number;
@@ -327,6 +348,10 @@ export class StreamTarget extends Target {
 	_streamWriter: WritableStreamDefaultWriter<StreamTargetChunk> | null = null;
 	/** @internal */
 	_writeError: unknown = null;
+	/** @internal */
+	_pendingWrites = 0;
+	/** @internal */
+	_completedWrites = 0;
 
 	// These variables regard chunked mode:
 	/** @internal */
@@ -453,19 +478,29 @@ export class StreamTarget extends Target {
 					throw new Error('Internal error: Monotonicity violation.');
 				}
 
-				void this._streamWriter.write({
-					type: 'write',
-					data: chunk.data,
-					position: chunk.start,
-				}).catch((error) => {
-					this._writeError ??= error;
-				});
+				this._writeToStream(chunk.data, chunk.start);
 
 				this._lastFlushEnd = chunk.start + chunk.data.byteLength;
 			}
 		}
 
 		this._sections.length = 0;
+	}
+
+	/** @internal */
+	_writeToStream(data: Uint8Array<ArrayBuffer>, position: number) {
+		assert(this._streamWriter);
+
+		this._pendingWrites++;
+		void this._streamWriter.write({ type: 'write', data, position })
+			.then(() => {
+				this._completedWrites++;
+			}, (error) => {
+				this._writeError ??= error;
+			})
+			.finally(() => {
+				this._pendingWrites--;
+			});
 	}
 
 	/** @internal */
@@ -585,13 +620,7 @@ export class StreamTarget extends Target {
 					data = chunk.data.subarray(section.start, section.end);
 				}
 
-				void this._streamWriter.write({
-					type: 'write',
-					data,
-					position,
-				}).catch((error) => {
-					this._writeError ??= error;
-				});
+				this._writeToStream(data, position);
 
 				this._lastFlushEnd = chunk.start + section.end;
 			}
@@ -620,7 +649,26 @@ export class StreamTarget extends Target {
 
 	/** @internal */
 	async _close() {
-		return this._streamWriter?.close();
+		if (!this._streamWriter) {
+			return;
+		}
+
+		const closed = this._streamWriter.close();
+
+		// Closing only completes once every queued write has. Wait for that while the sink keeps completing writes,
+		// but not once it has stalled on one (an upload over a hung connection, say), or canceling would hang forever;
+		// the stream then gets closed in the background, should the sink ever catch up. Failed writes don't count as
+		// progress (any write made after closing began fails).
+		let completedWrites = -1;
+		while (this._completedWrites !== completedWrites || this._pendingWrites === 0) {
+			completedWrites = this._completedWrites;
+
+			if (await fulfillsWithin(closed, STALLED_SINK_TIMEOUT_MS)) {
+				return;
+			}
+		}
+
+		void closed.catch(() => {});
 	}
 }
 
