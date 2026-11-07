@@ -9,7 +9,7 @@ import {
 	MediaStreamAudioTrackSource,
 } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { canEncodeAudio, Quality } from '../../src/encode.js';
+import { canEncodeAudio, Quality, VideoTransformOptions } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
@@ -640,6 +640,52 @@ const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {
 
 	return canvas;
 };
+
+test('VideoSampleSource, transform.frameRate is the frame rate the encoder is configured with', async () => {
+	const configuredFramerate = async (transform: VideoTransformOptions) => {
+		let framerate: number | undefined;
+		await encodeFrames(
+			{
+				codec: 'vp8',
+				quality: new Quality('medium'),
+				transform,
+				onEncoderConfig: (config) => {
+					framerate = config.framerate;
+				},
+			},
+			[{ width: 64, height: 64, timestamp: 0, duration: 1 / 60 }],
+		);
+		return framerate;
+	};
+
+	expect(await configuredFramerate({ frameRate: 60 })).toBe(60);
+	// A process function may change the rate frames come out at
+	expect(await configuredFramerate({ frameRate: 60, process: sample => sample })).toBe(undefined);
+});
+
+test('VideoSampleSource, quality-level bitrates grow above 30 fps while explicit bitrates stay', async () => {
+	const configuredBitrate = async (quality: Quality, frameRate: number) => {
+		let bitrate: number | undefined;
+		await encodeFrames(
+			{
+				codec: 'vp8',
+				quality,
+				transform: { frameRate },
+				onEncoderConfig: (config) => {
+					bitrate = config.bitrate;
+				},
+			},
+			[{ width: 64, height: 64, timestamp: 0, duration: 1 / frameRate }],
+		);
+		return bitrate!;
+	};
+
+	const bitrate30 = await configuredBitrate(new Quality('medium'), 30);
+	expect(await configuredBitrate(new Quality('medium'), 24)).toBe(bitrate30);
+	// Bitrates are rounded up to whole kbps
+	expect(Math.abs(await configuredBitrate(new Quality('medium'), 60) - 2 * bitrate30)).toBeLessThanOrEqual(1000);
+	expect(await configuredBitrate(new Quality({ bitrate: 300_000 }), 60)).toBe(300_000);
+});
 
 const encodeFrames = async (
 	encodingConfig: ConstructorParameters<typeof VideoSampleSource>[0],
