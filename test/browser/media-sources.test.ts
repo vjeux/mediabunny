@@ -191,6 +191,69 @@ test('VideoSampleSource, changing dimensions with passThrough, width and height 
 	expect(samples[1]).toMatchObject({ codedWidth: 50, codedHeight: 80 });
 });
 
+test.each([
+	['avc', 'discard'],
+	['vp9', 'keep'],
+] as const)('VideoSampleSource, %s encoding of frames with negative timestamps (alpha: %s)', async (codec, alpha) => {
+	// Emulates Windows' Media Foundation hardware encoders, which wrap negative timestamps around and stall: a negative
+	// timestamp breaks the encoder, and its flush() then never settles
+	const encoderTimestamps: number[] = [];
+	const RealVideoEncoder = VideoEncoder;
+	globalThis.VideoEncoder = class extends RealVideoEncoder {
+		private broken = false;
+
+		override encode(frame: VideoFrame, options?: VideoEncoderEncodeOptions) {
+			encoderTimestamps.push(frame.timestamp);
+			this.broken ||= frame.timestamp < 0;
+			if (!this.broken) {
+				super.encode(frame, options);
+			}
+		}
+
+		override flush() {
+			return this.broken ? new Promise<void>(() => {}) : super.flush();
+		}
+	};
+
+	try {
+		const output = new Output({
+			format: codec === 'avc' ? new Mp4OutputFormat() : new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const packetTimestamps: number[] = [];
+		const source = new VideoSampleSource({
+			codec,
+			quality: new Quality('medium'),
+			alpha,
+			onEncodedPacket: packet => packetTimestamps.push(packet.timestamp),
+		});
+		output.addVideoTrack(source);
+		await output.start();
+
+		const canvas = new OffscreenCanvas(64, 64);
+		canvas.getContext('2d')!.fillRect(0, 0, 32, 64); // Half transparent, for the alpha encoder
+		const timestamps = Array.from({ length: 30 }, (_, i) => -1.5 + i / 30);
+		const encoding = (async () => {
+			for (const timestamp of timestamps) {
+				using sample = new VideoSample(canvas, { timestamp, duration: 1 / 30 });
+				await source.add(sample);
+			}
+			await output.finalize();
+			return 'finalized';
+		})();
+
+		expect(await Promise.race([
+			encoding,
+			new Promise(resolve => setTimeout(() => resolve('hung'), 5000)),
+		])).toBe('finalized');
+		expect(Math.min(...encoderTimestamps)).toBeGreaterThanOrEqual(0);
+		// The packets keep the frames' timestamps exactly
+		expect(packetTimestamps.sort((a, b) => a - b)).toEqual(timestamps);
+	} finally {
+		globalThis.VideoEncoder = RealVideoEncoder;
+	}
+});
+
 test('VideoSampleSource, encoding rotated video frames', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium') },
