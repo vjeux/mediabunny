@@ -4,7 +4,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
-import { assert, colorSpaceIsComplete } from '../../src/misc.js';
+import { assert } from '../../src/misc.js';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -47,11 +47,21 @@ test('Color space extraction, VP9 in MP4', async () => {
 	});
 });
 
+// The sequence header carries the color space, which the container then doesn't:
+// ffmpeg -f lavfi -i "color=c=0x808080:s=64x64:r=10:d=0.2" -c:v libaom-av1 -cpu-used 8 -crf 50 -color_primaries bt709 \
+//   -color_trc bt709 -colorspace bt709 -color_range tv -pix_fmt yuv420p -movflags +faststart av1-bt709.mp4
+const AV1_FIXTURE_COLOR_SPACE: VideoColorSpaceInit = {
+	primaries: 'bt709',
+	transfer: 'bt709',
+	matrix: 'bt709',
+	fullRange: false,
+};
+
 test('Color space extraction, AV1 in MP4', async () => {
-	const source = await encodePackets('av1', 'av01.0.04M.08');
+	const source = await readPackets('/av1-bt709.mp4');
 	const buffer = await remuxWithoutColorSpace(new Mp4OutputFormat(), source);
 
-	await expectCompleteColorSpace(new BufferSource(buffer));
+	await expectColorSpace(new BufferSource(buffer), AV1_FIXTURE_COLOR_SPACE);
 });
 
 test('Color space extraction, AVC in Matroska', async () => {
@@ -92,10 +102,10 @@ test('Color space extraction, VP9 in Matroska', async () => {
 });
 
 test('Color space extraction, AV1 in Matroska', async () => {
-	const source = await encodePackets('av1', 'av01.0.04M.08');
+	const source = await readPackets('/av1-bt709.mp4');
 	const buffer = await remuxWithoutColorSpace(new MkvOutputFormat(), source);
 
-	await expectCompleteColorSpace(new BufferSource(buffer));
+	await expectColorSpace(new BufferSource(buffer), AV1_FIXTURE_COLOR_SPACE);
 });
 
 const readPackets = async (path: string) => {
@@ -123,47 +133,6 @@ const readPackets = async (path: string) => {
 			break;
 		}
 	}
-
-	return { codec, decoderConfig, packets };
-};
-
-const encodePackets = async (codec: VideoCodec, codecString: string) => {
-	const width = 320;
-	const height = 240;
-
-	const canvas = new OffscreenCanvas(width, height);
-	const context = canvas.getContext('2d')!;
-
-	let decoderConfig: VideoDecoderConfig | null = null;
-	const packets: EncodedPacket[] = [];
-
-	// We manually go through WebCodecs here so we can intercept the decoder config
-	const encoder = new VideoEncoder({
-		output: (chunk, metadata) => {
-			decoderConfig ??= metadata?.decoderConfig ?? null;
-			packets.push(EncodedPacket.fromEncodedChunk(chunk));
-		},
-		error: (error) => {
-			throw error;
-		},
-	});
-	encoder.configure({ codec: codecString, width, height });
-
-	for (let i = 0; i < 10; i++) {
-		context.fillStyle = `hsl(${36 * i}, 100%, 50%)`;
-		context.fillRect(0, 0, width, height);
-		context.fillStyle = 'black';
-		context.fillRect(20 * i, 10 * i, 80, 80);
-
-		const frame = new VideoFrame(canvas, { timestamp: i * 1e6 / 30, duration: 1e6 / 30 });
-		encoder.encode(frame, { keyFrame: i === 0 });
-		frame.close();
-	}
-
-	await encoder.flush();
-	encoder.close();
-
-	assert(decoderConfig);
 
 	return { codec, decoderConfig, packets };
 };
@@ -213,20 +182,4 @@ const expectColorSpace = async (source: Source, expected: VideoColorSpaceInit) =
 
 	expect(await track.getColorSpace()).toEqual(expected);
 	expect({ ...decoderConfig.colorSpace }).toEqual(expected);
-};
-
-const expectCompleteColorSpace = async (source: Source) => {
-	using input = new Input({
-		source,
-		formats: ALL_FORMATS,
-	});
-
-	const track = await input.getPrimaryVideoTrack();
-	assert(track);
-
-	const decoderConfig = await track.getDecoderConfig();
-	assert(decoderConfig);
-
-	expect(colorSpaceIsComplete(await track.getColorSpace())).toBe(true);
-	expect(colorSpaceIsComplete(decoderConfig.colorSpace)).toBe(true);
 };
