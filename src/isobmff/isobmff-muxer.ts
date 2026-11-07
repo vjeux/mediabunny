@@ -625,7 +625,9 @@ export class IsobmffMuxer extends Muxer {
 					audioSampleDurationHistory: [],
 				},
 			},
-			timescale: decoderConfig.sampleRate,
+			// Opus always decodes at 48 kHz, whatever the input rate: Opus-in-ISOBMFF uses 48000 for sample-accurate
+			// edits, and readers like FFmpeg take an edit's media_time as that many decoded samples
+			timescale: track.source._codec === 'opus' ? OPUS_SAMPLE_RATE : decoderConfig.sampleRate,
 			samples: [],
 			sampleQueue: [],
 			timestampProcessingQueue: [],
