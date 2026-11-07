@@ -28,7 +28,7 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
@@ -1548,6 +1548,106 @@ describe('Video', async () => {
 		}
 
 		expect(count).toBe(48);
+	});
+
+	describe('VP9 alpha that starts after the first packet', () => {
+		// Encodes 64x64 VP9 frames whose right half is transparent, with a key frame every 10 frames, and returns the
+		// packets and decoder config
+		const encodeVp9 = async (frameCount: number, alpha: 'keep' | 'discard') => {
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'vp9', bitrate: 1e6, alpha, keyFrameInterval: 1 / 3 });
+			output.addVideoTrack(source);
+			await output.start();
+			for (let i = 0; i < frameCount; i++) {
+				const data = new Uint8Array(64 * 64 * 4);
+				for (let j = 0; j < 64 * 64; j++) {
+					data.set([200, 50, 50, j % 64 >= 32 ? 0 : 255], j * 4);
+				}
+				using sample = new VideoSample(data, {
+					format: 'RGBA',
+					codedWidth: 64,
+					codedHeight: 64,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await source.add(sample);
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = (await input.getPrimaryVideoTrack())!;
+			const packets: EncodedPacket[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push(packet);
+			}
+			return { packets, decoderConfig: (await track.getDecoderConfig())! };
+		};
+
+		// Decodes the packets with the server's decoder and returns the formats of the frames that come out
+		const decodeVp9 = async (packets: EncodedPacket[], decoderConfig: VideoDecoderConfig) => {
+			const decoder = new NodeAvVideoDecoder();
+			// @ts-expect-error Readonly
+			decoder.codec = 'vp9';
+			// @ts-expect-error Readonly
+			decoder.config = decoderConfig;
+			const formats: (string | null)[] = [];
+			// @ts-expect-error Readonly
+			decoder.onSample = (sample: VideoSample) => {
+				formats.push(sample.format);
+				sample.close();
+			};
+			await decoder.init();
+			for (const packet of packets) {
+				await decoder.decode(packet);
+			}
+			await decoder.flush();
+			await decoder.close();
+			return formats;
+		};
+
+		// Gives the packets the alpha of another encode from the given packet on, the way Mediabunny writes alpha:
+		// 'keep' when the first frames are opaque
+		const addAlpha = (packets: EncodedPacket[], alphaPackets: EncodedPacket[], start: number) => {
+			return packets.map((packet, i) => i < start || i >= start + alphaPackets.length
+				? packet
+				: packet.clone({ sideData: { alpha: alphaPackets[i - start]!.sideData.alpha } }),
+			);
+		};
+
+		test('VP9 alpha that starts on a delta frame is decoded from there', async () => {
+			const color = await encodeVp9(10, 'discard');
+			const alpha = await encodeVp9(5, 'keep');
+			const packets = addAlpha(color.packets, alpha.packets, 5);
+			expect(packets[5]!.type).toBe('delta');
+
+			expect(await decodeVp9(packets, color.decoderConfig)).toEqual([
+				...Array<string>(5).fill('I420'),
+				...Array<string>(5).fill('I420A'),
+			]);
+		});
+
+		test('VP9 alpha is decoded from the next key frame when the packets to catch up on are too big', async () => {
+			const color = await encodeVp9(15, 'discard');
+			const alpha = await encodeVp9(5, 'keep');
+			const packets = addAlpha(addAlpha(color.packets, alpha.packets, 5), alpha.packets, 10);
+			expect(packets[10]!.type).toBe('key');
+
+			const maxCatchUpBytes = NodeAvVideoDecoder.maxCatchUpBytes;
+			NodeAvVideoDecoder.maxCatchUpBytes = 0;
+			try {
+				expect(await decodeVp9(packets, color.decoderConfig)).toEqual([
+					...Array<string>(10).fill('I420'),
+					...Array<string>(5).fill('I420A'),
+				]);
+			} finally {
+				NodeAvVideoDecoder.maxCatchUpBytes = maxCatchUpBytes;
+			}
+		});
+
+		test('VP9 alpha from the first packet on is decoded (control)', async () => {
+			const { packets, decoderConfig } = await encodeVp9(10, 'keep');
+			expect(await decodeVp9(packets, decoderConfig)).toEqual(Array<string>(10).fill('I420A'));
+		});
 	});
 
 	describe('VideoSample transformation', () => {

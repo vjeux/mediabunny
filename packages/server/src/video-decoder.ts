@@ -27,6 +27,23 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		durationIsValid: boolean;
 	}[] = [];
 
+	/**
+	 * Whether VP9 is decoded by a decoder that ignores alpha (FFmpeg's own, or a hardware one) while libvpx, which
+	 * decodes it, is available, so that libvpx can take over if alpha only shows up after the first packet.
+	 */
+	canSwitchToAlphaDecoder = false;
+	/**
+	 * The packets since the last key packet, for libvpx to catch up from when it takes over mid-stream. Null when they
+	 * took more memory than allowed, in which case libvpx can only take over at the next key packet.
+	 */
+	packetsSinceKey: EncodedPacket[] | null = [];
+	bytesSinceKey = 0;
+	/** Set while a decoder that took over catches up on frames that were already output. */
+	discardFrames = false;
+
+	/** @internal How many bytes of packets to keep for libvpx to catch up from. */
+	static maxCatchUpBytes = 32 * 1024 * 1024;
+
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	static override supports(codec: VideoCodec, config: VideoDecoderConfig): boolean {
 		return codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1';
@@ -65,6 +82,10 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			throw new Error(`Unable to obtain libav codec for '${this.codec}'.`);
 		}
 
+		this.canSwitchToAlphaDecoder = this.codec === 'vp9'
+			&& codec.name !== NodeAv.FF_DECODER_LIBVPX_VP9
+			&& NodeAv.Codec.findDecoderByName(NodeAv.FF_DECODER_LIBVPX_VP9) !== null;
+
 		const codecContext = new NodeAv.CodecContext();
 		codecContext.allocContext3(codec);
 
@@ -95,6 +116,28 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 	async decode(packet: EncodedPacket) {
 		if (this.codecContext === null) {
 			await this.initCodecContext(packet);
+		} else if (
+			this.canSwitchToAlphaDecoder
+			&& packet.sideData.alpha
+			&& (packet.type === 'key' || this.packetsSinceKey)
+		) {
+			await this.switchToAlphaDecoder(packet);
+		}
+
+		if (this.canSwitchToAlphaDecoder) {
+			if (packet.type === 'key') {
+				this.packetsSinceKey = [];
+				this.bytesSinceKey = 0;
+			}
+
+			if (this.packetsSinceKey) {
+				this.packetsSinceKey.push(packet);
+				this.bytesSinceKey += packet.byteLength;
+
+				if (this.bytesSinceKey > NodeAvVideoDecoder.maxCatchUpBytes) {
+					this.packetsSinceKey = null;
+				}
+			}
 		}
 
 		assert(this.codecContext);
@@ -161,8 +204,37 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		}
 	}
 
+	/**
+	 * Hands VP9 decoding over to libvpx once a packet with alpha comes in, since the decoder in use ignores alpha.
+	 * libvpx first decodes the packets since the last key packet, without outputting their frames again.
+	 */
+	async switchToAlphaDecoder(packet: EncodedPacket) {
+		assert(this.codecContext);
+
+		const packetsToCatchUpOn = packet.type === 'key' ? [] : this.packetsSinceKey;
+		assert(packetsToCatchUpOn);
+
+		await this.flush();
+		this.codecContext.freeContext();
+		this.codecContext = null;
+		await this.initCodecContext(packet);
+
+		this.discardFrames = true;
+		try {
+			for (const previousPacket of packetsToCatchUpOn) {
+				await this.decode(previousPacket);
+			}
+		} finally {
+			this.discardFrames = false;
+		}
+	}
+
 	receiveFrame(ret: number) {
 		NodeAv.FFmpegError.throwIfError(ret, 'Receive frame');
+
+		if (this.discardFrames) {
+			return;
+		}
 
 		this.frame.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
 
