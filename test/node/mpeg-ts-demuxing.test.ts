@@ -1032,10 +1032,12 @@ test('MPEG-TS finds audio frames in PES packets that start inside a frame', asyn
 	expect(aacLateStart.packets.map(x => x[1])).toEqual(Array<number>(frameCount - 1).fill(frameSize));
 });
 
-test('MPEG-TS drops an audio frame cut off by the end of the file', async () => {
+test('MPEG-TS drops an audio frame cut off by the end of the file or a lost TS packet', async () => {
 	// Found by L80. A recording that stopped mid-write ends inside an audio frame, which doesn't decode (WebCodecs
-	// then fails the whole run); the ADTS and MP3 demuxers drop such a frame too. 30 AAC frames of 400 bytes, then the
-	// same without the last TS packet. Each packet must hold the whole frame its header announces.
+	// then fails the whole run); the ADTS and MP3 demuxers drop such a frame too. And a capture that lost a TS packet
+	// (a UDP datagram) inside an audio frame made that frame swallow the start of the next one. 30 AAC frames of 400
+	// bytes, then the same without the last TS packet, or without one in the middle of the 10th frame. Each packet
+	// must hold the whole frame its header announces.
 	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
 	const source = new EncodedAudioPacketSource('aac');
 	output.addAudioTrack(source);
@@ -1060,11 +1062,11 @@ test('MPEG-TS drops an audio frame cut off by the end of the file', async () => 
 
 	const readFrames = async (data: Uint8Array) => {
 		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
-		const result: { byteLength: number; frameLength: number }[] = [];
+		const result: { byteLength: number; frameLength: number; intact: boolean }[] = [];
 		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
 			const d = packet.data;
 			const frameLength = ((d[3]! & 0x03) << 11) | (d[4]! << 3) | (d[5]! >> 5); // aac_frame_length
-			result.push({ byteLength: d.byteLength, frameLength });
+			result.push({ byteLength: d.byteLength, frameLength, intact: d.subarray(7).every(x => x === 0x11) });
 		}
 		return result;
 	};
@@ -1075,7 +1077,11 @@ test('MPEG-TS drops an audio frame cut off by the end of the file', async () => 
 
 	const truncated = await readFrames(bytes.subarray(0, bytes.length - 188));
 	expect(truncated).toHaveLength(29);
-	expect(truncated.every(x => x.byteLength === x.frameLength)).toBe(true);
+	expect(truncated.every(x => x.byteLength === x.frameLength && x.intact)).toBe(true);
+
+	const damaged = await readFrames(new Uint8Array([...bytes.subarray(0, 30 * 188), ...bytes.subarray(31 * 188)]));
+	expect(damaged).toHaveLength(29);
+	expect(damaged.every(x => x.byteLength === x.frameLength && x.intact)).toBe(true);
 });
 
 test('MPEG-TS keeps the frames around an audio sample rate change', async () => {
