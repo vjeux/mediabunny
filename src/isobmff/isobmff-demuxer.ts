@@ -430,7 +430,8 @@ export class IsobmffDemuxer extends Demuxer {
 						throw new Error('Invalid moov box: missing mvhd box.');
 					}
 
-					for (const track of this.tracks) {
+					// Without a movie timescale, the previous segment durations (which are in it) can't be used
+					for (const track of this.movieTimescale > 0 ? this.tracks : []) {
 						// Modify the edit list offset based on the previous segment durations. They are in different
 						// timescales, so we first convert to seconds and then into the track timescale.
 						const previousSegmentDurationsInSeconds
@@ -1004,7 +1005,10 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (this.movieTimescale === 0) {
-					throw new Error('Invalid mvhd box: timescale must not be 0.');
+					// The tracks have timescales of their own, so read the file anyway, like FFmpeg and browsers do
+					Logging._warn(
+						'Invalid mvhd box: timescale is 0, so edit list entries before the main one are ignored.',
+					);
 				}
 
 				slice.skip(4 + 2 + 2 + 2 * 4); // Rate, volume, reserved

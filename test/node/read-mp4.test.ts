@@ -272,3 +272,47 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('An MP4 whose mvhd timescale is 0 still reads, as its tracks have timescales of their own', async () => {
+	// Five 1-second VP8 frames, starting at 0 or (with an empty edit list entry before the main one) at 2 seconds
+	const makeFile = async (firstTimestamp: number) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source);
+		await output.start();
+		for (let i = 0; i < 5; i++) {
+			await source.add(
+				new EncodedPacket(new Uint8Array(100).fill(i + 1), i === 0 ? 'key' : 'delta', firstTimestamp + i, 1),
+				{ decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 } },
+			);
+		}
+		await output.finalize();
+
+		return new Uint8Array(output.target.buffer!);
+	};
+	const zeroMovieTimescale = (bytes: Uint8Array) => {
+		const mvhd = bytes.findIndex((_, i) => new TextDecoder().decode(bytes.subarray(i + 4, i + 8)) === 'mvhd');
+		expect(bytes[mvhd + 8]).toBe(0); // Version 0: the timescale comes after two 32-bit dates
+		const damaged = bytes.slice();
+		new DataView(damaged.buffer).setUint32(mvhd + 8 + 4 + 8, 0);
+
+		return damaged;
+	};
+	const readTimestamps = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryVideoTrack())!).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+
+		return timestamps;
+	};
+
+	// FFmpeg and Chrome play such files
+	expect(await readTimestamps(zeroMovieTimescale(await makeFile(0)))).toEqual([0, 1, 2, 3, 4]);
+
+	// The empty entry's duration is in the movie timescale, so it can't be used
+	const delayed = await makeFile(2);
+	expect(await readTimestamps(delayed)).toEqual([2, 3, 4, 5, 6]);
+	expect(await readTimestamps(zeroMovieTimescale(delayed))).toEqual([0, 1, 2, 3, 4]);
+});

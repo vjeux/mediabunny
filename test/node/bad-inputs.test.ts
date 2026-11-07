@@ -512,11 +512,17 @@ test('MP4: Zero timescales', async () => {
 });
 
 test('MP4: Zero movie timescale', async () => {
-	// Used to turn every timestamp into NaN
-	await expectGracefulRead(concat(
+	// Used to turn every timestamp into NaN. The track has a timescale of its own, so like FFmpeg, read it with that.
+	const file = concat(
 		box('ftyp', ascii('isom'), u32(0), ascii('isom')),
 		box('moov', mvhd(0), trak({ handler: 'vide', stbl: singleChunkStbl(1, 0) })),
-	), /Invalid mvhd box: timescale must not be 0/);
+	);
+	await expectGracefulRead(file);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await input.getTracks())[0]!;
+	expect((await new EncodedPacketSink(track).getFirstPacket({ metadataOnly: true }))?.timestamp).toBe(0);
+	expect(Number.isFinite(await track.computeDuration())).toBe(true);
 });
 
 test('MP4: Without mvhd', async () => {
