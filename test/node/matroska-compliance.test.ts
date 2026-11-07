@@ -1364,9 +1364,10 @@ describe('Reader: RFC 8794 (EBML)', () => {
 	});
 
 	test('§7.4/§13: trailing NUL octets of a String element are not part of the value', async () => {
-		const entry = [...pcmTrack(), el('Language', new Uint8Array([0x67, 0x65, 0x72, 0, 0]))];
+		// 'jpn' has no bibliographic variant, and isn't the 'eng' default an ignored element would read as
+		const entry = [...pcmTrack(), el('Language', new Uint8Array([0x6a, 0x70, 0x6e, 0, 0]))];
 		using input = open(buildMatroska({ tracks: [entry], clusters: [pcmCluster()] }));
-		expect(await (await input.getTracks())[0]!.getLanguageCode()).toBe('ger');
+		expect(await (await input.getTracks())[0]!.getLanguageCode()).toBe('jpn');
 	});
 
 	test('§7.5/§13: trailing NUL octets of a UTF-8 element are not part of the value', async () => {
