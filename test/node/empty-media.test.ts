@@ -1,4 +1,6 @@
 import { expect, test } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -17,9 +19,10 @@ import {
 } from '../../src/output-format.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { Bitstream } from '../../shared/bitstream.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { BufferTarget, PathedTarget } from '../../src/target.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
+import { Conversion } from '../../src/conversion.js';
 
 type EmptyMediaVariant =
 	| { type: 'mp4'; fastStart: false | 'in-memory' | 'reserve' | 'fragmented' }
@@ -698,6 +701,29 @@ test('Empty HLS', async () => {
 	// HLS only ever writes segments for packets it has actually seen, so all we get is the master playlist (which is
 	// the root target) and one empty media playlist
 	expect([...files.keys()].sort()).toEqual(['', 'playlist-1.m3u8']);
+});
+
+test.each([
+	['glitch-hop-is-dead.wav', () => new WavOutputFormat()],
+	['sample.flac', () => new FlacOutputFormat()],
+	['Toothsome-Meme.VBRv2.mp3', () => new Mp3OutputFormat()],
+] as const)('A copy of %s whose trim range misses its media gives an empty file', async (fileName, createFormat) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(fileURLToPath(new URL('.', import.meta.url)), '../public', fileName)),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: createFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		trim: { start: await input.computeDuration() + 1 },
+		showWarnings: false,
+	});
+	expect(conversion.isValid).toBe(true);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect(await result.computeDuration()).toBe(0);
 });
 
 const createFormat = (variant: EmptyMediaVariant) => {
