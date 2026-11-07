@@ -54,19 +54,21 @@ export class FlacMuxer extends Muxer {
 	async start() {
 		const release = await this.mutex.acquire();
 
-		this.writer = await this.output._getRootWriter(!!this.format._options.appendOnly);
-		this.writer.write(FLAC_HEADER);
+		try {
+			this.writer = await this.output._getRootWriter(!!this.format._options.appendOnly);
+			this.writer.write(FLAC_HEADER);
 
-		// If the track already tells us what the stream looks like, we can pin the stream info down right now
-		const track = this.output.tracks[0];
-		assert(track?.isAudioTrack());
+			// If the track already tells us what the stream looks like, we can pin the stream info down right now
+			const track = this.output.tracks[0];
+			assert(track?.isAudioTrack());
 
-		if (track.metadata.decoderConfig) {
-			validateAudioChunkMetadata({ decoderConfig: track.metadata.decoderConfig }, track.source._codec);
-			this.applyDecoderConfig(track.metadata.decoderConfig);
+			if (track.metadata.decoderConfig) {
+				validateAudioChunkMetadata({ decoderConfig: track.metadata.decoderConfig }, track.source._codec);
+				this.applyDecoderConfig(track.metadata.decoderConfig);
+			}
+		} finally {
+			release();
 		}
-
-		release();
 	}
 
 	applyDecoderConfig(decoderConfig: AudioDecoderConfig) {

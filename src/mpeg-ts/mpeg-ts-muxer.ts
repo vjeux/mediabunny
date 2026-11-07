@@ -103,9 +103,11 @@ export class MpegTsMuxer extends Muxer {
 	async start() {
 		const release = await this.mutex.acquire();
 
-		this.writer = await this.output._getRootWriter(true);
-
-		release();
+		try {
+			this.writer = await this.output._getRootWriter(true);
+		} finally {
+			release();
+		}
 	}
 
 	async getMimeType() {

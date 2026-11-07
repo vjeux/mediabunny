@@ -182,33 +182,35 @@ export class MatroskaMuxer extends Muxer {
 	async start() {
 		const release = await this.mutex.acquire();
 
-		this.writer = await this.output._getRootWriter(!!this.format._options.appendOnly);
-		this.ebmlWriter = new EBMLWriter(this.writer);
+		try {
+			this.writer = await this.output._getRootWriter(!!this.format._options.appendOnly);
+			this.ebmlWriter = new EBMLWriter(this.writer);
 
-		this.writeEBMLHeader();
+			this.writeEBMLHeader();
 
-		this.createSegmentInfo();
-		this.createCues();
+			this.createSegmentInfo();
+			this.createCues();
 
-		await this.writer.flush();
+			await this.writer.flush();
 
-		for (const track of this.output.tracks) {
-			if (track.isVideoTrack() && track.metadata.decoderConfig) {
-				this.getVideoTrackData(
-					track,
-					track.metadata.primingPacket ?? null,
-					{ decoderConfig: track.metadata.decoderConfig },
-				);
-			} else if (track.isAudioTrack() && track.metadata.decoderConfig) {
-				this.getAudioTrackData(
-					track,
-					track.metadata.primingPacket ?? null,
-					{ decoderConfig: track.metadata.decoderConfig },
-				);
+			for (const track of this.output.tracks) {
+				if (track.isVideoTrack() && track.metadata.decoderConfig) {
+					this.getVideoTrackData(
+						track,
+						track.metadata.primingPacket ?? null,
+						{ decoderConfig: track.metadata.decoderConfig },
+					);
+				} else if (track.isAudioTrack() && track.metadata.decoderConfig) {
+					this.getAudioTrackData(
+						track,
+						track.metadata.primingPacket ?? null,
+						{ decoderConfig: track.metadata.decoderConfig },
+					);
+				}
 			}
+		} finally {
+			release();
 		}
-
-		release();
 	}
 
 	private writeEBMLHeader() {
@@ -1466,45 +1468,47 @@ export class MatroskaMuxer extends Muxer {
 	async finalize() {
 		const release = await this.mutex.acquire();
 
-		this.allTracksKnown.resolve();
+		try {
+			this.allTracksKnown.resolve();
 
-		for (const trackData of this.trackDatas) {
-			trackData.closed = true;
+			for (const trackData of this.trackDatas) {
+				trackData.closed = true;
+			}
+
+			if (!this.segment) {
+				this.createSegment();
+			}
+
+			// Flush any remaining queued chunks to the file
+			await this.interleaveChunks(true);
+
+			if (this.currentClusterStartMsTimestamp !== null) {
+				this.writeCurrentCluster();
+			}
+
+			assert(this.cues);
+			this.ebmlWriter.writeEBML(this.cues);
+
+			if (!this.format._options.appendOnly) {
+				// Write the Segment size
+				const segmentSize = this.writer.getPos() - this.segmentDataOffset;
+				this.writer.seek(this.ebmlWriter.offsets.get(this.segment!)! + 4);
+				this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
+
+				// Write the duration of the media to the Segment
+				const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp;
+				this.segmentDuration!.data = new EBMLFloat64(duration);
+				this.writer.seek(this.ebmlWriter.offsets.get(this.segmentDuration!)!);
+				this.ebmlWriter.writeEBML(this.segmentDuration);
+
+				// Fill in SeekHead position data and write it again
+				assert(this.seekHead);
+				this.writer.seek(this.ebmlWriter.offsets.get(this.seekHead)!);
+				this.maybeCreateSeekHead(true);
+				this.ebmlWriter.writeEBML(this.seekHead);
+			}
+		} finally {
+			release();
 		}
-
-		if (!this.segment) {
-			this.createSegment();
-		}
-
-		// Flush any remaining queued chunks to the file
-		await this.interleaveChunks(true);
-
-		if (this.currentClusterStartMsTimestamp !== null) {
-			this.writeCurrentCluster();
-		}
-
-		assert(this.cues);
-		this.ebmlWriter.writeEBML(this.cues);
-
-		if (!this.format._options.appendOnly) {
-			// Write the Segment size
-			const segmentSize = this.writer.getPos() - this.segmentDataOffset;
-			this.writer.seek(this.ebmlWriter.offsets.get(this.segment!)! + 4);
-			this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
-
-			// Write the duration of the media to the Segment
-			const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp;
-			this.segmentDuration!.data = new EBMLFloat64(duration);
-			this.writer.seek(this.ebmlWriter.offsets.get(this.segmentDuration!)!);
-			this.ebmlWriter.writeEBML(this.segmentDuration);
-
-			// Fill in SeekHead position data and write it again
-			assert(this.seekHead);
-			this.writer.seek(this.ebmlWriter.offsets.get(this.seekHead)!);
-			this.maybeCreateSeekHead(true);
-			this.ebmlWriter.writeEBML(this.seekHead);
-		}
-
-		release();
 	}
 }

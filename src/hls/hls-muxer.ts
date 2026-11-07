@@ -179,387 +179,390 @@ export class HlsMuxer extends Muxer {
 	async start(): Promise<void> {
 		const release = await this.mutex.acquire();
 
-		const someRelative = this.output.tracks.some(t => t.metadata.isRelativeToUnixEpoch);
-		const someNotRelative = this.output.tracks.some(t => !t.metadata.isRelativeToUnixEpoch);
-		if (someRelative && someNotRelative) {
-			throw new Error(
-				'All tracks must agree on `relativeToUnixEpoch`: some tracks are relative to the Unix epoch and some'
-				+ ' are not.',
-			);
-		}
-		this.isRelativeToUnixEpoch = someRelative;
-
-		// Upon starting, we now need to assign the tracks to separate playlists. This assignment will make use of the
-		// track pairability information provided by the user as well as other metadata specified on the tracks. The
-		// resulting master playlist should preserve track pairability; meaning that all tracks that are pairable
-		// remain pairable, and no two tracks become pairable that are meant to be mutually exclusive.
-		// The algorithm determines "groups" by enumerating all pairable tracks for each track, and then materializes
-		// each group either as #EXT-X-MEDIA tags or top-level #EXT-X-STREAM-INF tags. The algorithm is biased towards
-		// video being the top-level grouping, since that's the standard practice.
-
-		const groupAssignment = new Map<OutputTrack, string[]>();
-		const groups: {
-			name: string;
-			key: string;
-			tracks: OutputTrack[];
-			needsEmit: boolean;
-			firstNoUri: boolean;
-		}[] = [];
-
-		let hasVideo = false;
-		let illegalPairingDetected = false;
-		let keyPacketsOnlyPairingWarned = false;
-
-		// First, let's build the "sibling" groups induced by track pairability
-		for (const track of this.output.tracks) {
-			if (track.type === 'video') {
-				hasVideo = true;
+		try {
+			const someRelative = this.output.tracks.some(t => t.metadata.isRelativeToUnixEpoch);
+			const someNotRelative = this.output.tracks.some(t => !t.metadata.isRelativeToUnixEpoch);
+			if (someRelative && someNotRelative) {
+				throw new Error(
+					'All tracks must agree on `relativeToUnixEpoch`: some tracks are relative to the Unix epoch and'
+					+ ' some are not.',
+				);
 			}
+			this.isRelativeToUnixEpoch = someRelative;
 
-			const pairableGroups = new Map<MediaCodec, OutputTrack[]>();
+			// Upon starting, we now need to assign the tracks to separate playlists. This assignment will make use of
+			// the track pairability information provided by the user as well as other metadata specified on the tracks.
+			// The resulting master playlist should preserve track pairability; meaning that all tracks that are
+			// pairable remain pairable, and no two tracks become pairable that are meant to be mutually exclusive.
+			// The algorithm determines "groups" by enumerating all pairable tracks for each track, and then
+			// materializes each group either as #EXT-X-MEDIA tags or top-level #EXT-X-STREAM-INF tags. The algorithm is
+			// biased towards video being the top-level grouping, since that's the standard practice.
 
-			for (const otherTrack of this.output.tracks) {
-				if (track === otherTrack) {
-					continue;
+			const groupAssignment = new Map<OutputTrack, string[]>();
+			const groups: {
+				name: string;
+				key: string;
+				tracks: OutputTrack[];
+				needsEmit: boolean;
+				firstNoUri: boolean;
+			}[] = [];
+
+			let hasVideo = false;
+			let illegalPairingDetected = false;
+			let keyPacketsOnlyPairingWarned = false;
+
+			// First, let's build the "sibling" groups induced by track pairability
+			for (const track of this.output.tracks) {
+				if (track.type === 'video') {
+					hasVideo = true;
 				}
 
-				if (!track.canBePairedWith(otherTrack)) {
-					continue;
-				}
+				const pairableGroups = new Map<MediaCodec, OutputTrack[]>();
 
-				if (track.type === otherTrack.type) {
-					if (!illegalPairingDetected) {
-						Logging._warn(
-							`Illegal pairing of two ${track.type} tracks detected, which is not possible in HLS;`
-							+ ` treating them as unpaired.`,
-						);
-						illegalPairingDetected = true;
+				for (const otherTrack of this.output.tracks) {
+					if (track === otherTrack) {
+						continue;
 					}
 
-					continue;
-				}
-
-				// Key-packets-only tracks can neither pair with nor be paired with other tracks
-				if (
-					(track.isVideoTrack() && track.metadata.hasOnlyKeyPackets)
-					|| (otherTrack.isVideoTrack() && otherTrack.metadata.hasOnlyKeyPackets)
-				) {
-					if (!keyPacketsOnlyPairingWarned) {
-						Logging._warn(
-							`A key-packets-only video track is pairable with another track, which is not`
-							+ ` possible in HLS; treating them as unpaired.`,
-						);
-						keyPacketsOnlyPairingWarned = true;
+					if (!track.canBePairedWith(otherTrack)) {
+						continue;
 					}
 
-					continue;
+					if (track.type === otherTrack.type) {
+						if (!illegalPairingDetected) {
+							Logging._warn(
+								`Illegal pairing of two ${track.type} tracks detected, which is not possible in HLS;`
+								+ ` treating them as unpaired.`,
+							);
+							illegalPairingDetected = true;
+						}
+
+						continue;
+					}
+
+					// Key-packets-only tracks can neither pair with nor be paired with other tracks
+					if (
+						(track.isVideoTrack() && track.metadata.hasOnlyKeyPackets)
+						|| (otherTrack.isVideoTrack() && otherTrack.metadata.hasOnlyKeyPackets)
+					) {
+						if (!keyPacketsOnlyPairingWarned) {
+							Logging._warn(
+								`A key-packets-only video track is pairable with another track, which is not`
+								+ ` possible in HLS; treating them as unpaired.`,
+							);
+							keyPacketsOnlyPairingWarned = true;
+						}
+
+						continue;
+					}
+
+					let groupTracks = pairableGroups.get(otherTrack.source._codec);
+					if (!groupTracks) {
+						pairableGroups.set(otherTrack.source._codec, groupTracks = []);
+					}
+
+					groupTracks.push(otherTrack);
 				}
 
-				let groupTracks = pairableGroups.get(otherTrack.source._codec);
-				if (!groupTracks) {
-					pairableGroups.set(otherTrack.source._codec, groupTracks = []);
-				}
-
-				groupTracks.push(otherTrack);
-			}
-
-			for (const [, pairableTracks] of pairableGroups) {
-				const key = pairableTracks.map(x => x.id).join('-');
-				const group = groups.find(x => x.key === key);
-				if (!group) {
-					groups.push({
-						name: pairableTracks[0]!.type + '-' + (groups.length + 1),
-						key,
-						tracks: pairableTracks,
-						needsEmit: false,
-						firstNoUri: false,
-					});
-				}
-
-				let assignedGroups = groupAssignment.get(track);
-				if (!assignedGroups) {
-					groupAssignment.set(track, assignedGroups = []);
-				}
-				assignedGroups.push(key);
-			}
-		}
-
-		const mainType: TrackType = hasVideo ? 'video' : 'audio';
-
-		const variantStreams: {
-			tracks: OutputTrack[];
-			linkedGroup: typeof groups[number] | null;
-		}[] = [];
-
-		const unpairedVideoTracks: OutputTrack[] = [];
-		const unpairedAudioTracks: OutputTrack[] = [];
-
-		// Now, create the top-level variant streams
-		for (const track of this.output.tracks) {
-			const assignedGroupKeys = groupAssignment.get(track);
-			if (assignedGroupKeys) {
-				assert(assignedGroupKeys.length > 0);
-
-				if (track.type !== mainType) {
-					continue;
-				}
-
-				for (const key of assignedGroupKeys) {
+				for (const [, pairableTracks] of pairableGroups) {
+					const key = pairableTracks.map(x => x.id).join('-');
 					const group = groups.find(x => x.key === key);
-					assert(group);
+					if (!group) {
+						groups.push({
+							name: pairableTracks[0]!.type + '-' + (groups.length + 1),
+							key,
+							tracks: pairableTracks,
+							needsEmit: false,
+							firstNoUri: false,
+						});
+					}
 
-					if (assignedGroupKeys.length === 1 && group.tracks.length === 1) {
-						const otherGroupKeys = groupAssignment.get(group.tracks[0]!);
-						assert(otherGroupKeys !== undefined);
+					let assignedGroups = groupAssignment.get(track);
+					if (!assignedGroups) {
+						groupAssignment.set(track, assignedGroups = []);
+					}
+					assignedGroups.push(key);
+				}
+			}
 
-						if (otherGroupKeys.length === 1) {
-							const otherGroup = groups.find(x => x.key === otherGroupKeys[0]!)!;
+			const mainType: TrackType = hasVideo ? 'video' : 'audio';
 
-							if (otherGroup.tracks.length === 1) {
-								assert(otherGroup.tracks[0] === track);
+			const variantStreams: {
+				tracks: OutputTrack[];
+				linkedGroup: typeof groups[number] | null;
+			}[] = [];
 
-								variantStreams.push({
-									tracks: [track, group.tracks[0]!],
-									linkedGroup: null,
-								});
-								continue;
+			const unpairedVideoTracks: OutputTrack[] = [];
+			const unpairedAudioTracks: OutputTrack[] = [];
+
+			// Now, create the top-level variant streams
+			for (const track of this.output.tracks) {
+				const assignedGroupKeys = groupAssignment.get(track);
+				if (assignedGroupKeys) {
+					assert(assignedGroupKeys.length > 0);
+
+					if (track.type !== mainType) {
+						continue;
+					}
+
+					for (const key of assignedGroupKeys) {
+						const group = groups.find(x => x.key === key);
+						assert(group);
+
+						if (assignedGroupKeys.length === 1 && group.tracks.length === 1) {
+							const otherGroupKeys = groupAssignment.get(group.tracks[0]!);
+							assert(otherGroupKeys !== undefined);
+
+							if (otherGroupKeys.length === 1) {
+								const otherGroup = groups.find(x => x.key === otherGroupKeys[0]!)!;
+
+								if (otherGroup.tracks.length === 1) {
+									assert(otherGroup.tracks[0] === track);
+
+									variantStreams.push({
+										tracks: [track, group.tracks[0]!],
+										linkedGroup: null,
+									});
+									continue;
+								}
 							}
 						}
+
+						variantStreams.push({
+							tracks: [track],
+							linkedGroup: group,
+						});
+						group.needsEmit = true;
 					}
+				} else {
+					if (track.type === 'video') {
+						unpairedVideoTracks.push(track);
+					} else if (track.type === 'audio') {
+						unpairedAudioTracks.push(track);
+					}
+				}
+			}
+
+			const getMetadataKeyForTrack = ({ metadata }: OutputTrack) => {
+				let key = '';
+				key += `${metadata.languageCode ?? UNDETERMINED_LANGUAGE}-`;
+				key += `${metadata.name ?? ''}-`;
+				key += `${metadata.disposition?.default ?? true}-`;
+				key += `${metadata.disposition?.primary ?? false}-`;
+				key += `${metadata.disposition?.forced ?? false}-`;
+
+				return key;
+			};
+
+			// Video tracks that can't be paired with any other track always live on the top-level, the question is just
+			// if they need to be separated into #EXT-X-MEDIA tags or not
+			if (unpairedVideoTracks.length > 0) {
+				const uniqueMetadata = new Set(unpairedVideoTracks.map(getMetadataKeyForTrack));
+
+				if (uniqueMetadata.size > 1) {
+					// They differ in metadata, emit as group
+					const group: typeof groups[number] = {
+						key: unpairedVideoTracks.map(x => x.id).join('-'),
+						name: 'video-' + (groups.length + 1),
+						tracks: unpairedVideoTracks,
+						needsEmit: true,
+						firstNoUri: true,
+					};
+					groups.push(group);
 
 					variantStreams.push({
-						tracks: [track],
+						tracks: [unpairedVideoTracks[0]!],
 						linkedGroup: group,
 					});
-					group.needsEmit = true;
-				}
-			} else {
-				if (track.type === 'video') {
-					unpairedVideoTracks.push(track);
-				} else if (track.type === 'audio') {
-					unpairedAudioTracks.push(track);
+				} else {
+					for (const track of unpairedVideoTracks) {
+						variantStreams.push({
+							tracks: [track],
+							linkedGroup: null,
+						});
+					}
 				}
 			}
-		}
 
-		const getMetadataKeyForTrack = ({ metadata }: OutputTrack) => {
-			let key = '';
-			key += `${metadata.languageCode ?? UNDETERMINED_LANGUAGE}-`;
-			key += `${metadata.name ?? ''}-`;
-			key += `${metadata.disposition?.default ?? true}-`;
-			key += `${metadata.disposition?.primary ?? false}-`;
-			key += `${metadata.disposition?.forced ?? false}-`;
+			// Audio tracks that can't be paired with any other track always live on the top-level, the question is just
+			// if they need to be separated into #EXT-X-MEDIA tags or not
+			if (unpairedAudioTracks.length > 0) {
+				const uniqueMetadata = new Set(unpairedAudioTracks.map(getMetadataKeyForTrack));
 
-			return key;
-		};
+				if (uniqueMetadata.size > 1) {
+					// They differ in metadata, emit as group
+					const group: typeof groups[number] = {
+						key: unpairedAudioTracks.map(x => x.id).join('-'),
+						name: 'audio-' + (groups.length + 1),
+						tracks: unpairedAudioTracks,
+						needsEmit: true,
+						firstNoUri: true,
+					};
+					groups.push(group);
 
-		// Video tracks that can't be paired with any other track always live on the top-level, the question is just if
-		// they need to be separated into #EXT-X-MEDIA tags or not
-		if (unpairedVideoTracks.length > 0) {
-			const uniqueMetadata = new Set(unpairedVideoTracks.map(getMetadataKeyForTrack));
-
-			if (uniqueMetadata.size > 1) {
-				// They differ in metadata, emit as group
-				const group: typeof groups[number] = {
-					key: unpairedVideoTracks.map(x => x.id).join('-'),
-					name: 'video-' + (groups.length + 1),
-					tracks: unpairedVideoTracks,
-					needsEmit: true,
-					firstNoUri: true,
-				};
-				groups.push(group);
-
-				variantStreams.push({
-					tracks: [unpairedVideoTracks[0]!],
-					linkedGroup: group,
-				});
-			} else {
-				for (const track of unpairedVideoTracks) {
 					variantStreams.push({
-						tracks: [track],
-						linkedGroup: null,
+						tracks: [unpairedAudioTracks[0]!],
+						linkedGroup: group,
 					});
-				}
-			}
-		}
-
-		// Audio tracks that can't be paired with any other track always live on the top-level, the question is just if
-		// they need to be separated into #EXT-X-MEDIA tags or not
-		if (unpairedAudioTracks.length > 0) {
-			const uniqueMetadata = new Set(unpairedAudioTracks.map(getMetadataKeyForTrack));
-
-			if (uniqueMetadata.size > 1) {
-				// They differ in metadata, emit as group
-				const group: typeof groups[number] = {
-					key: unpairedAudioTracks.map(x => x.id).join('-'),
-					name: 'audio-' + (groups.length + 1),
-					tracks: unpairedAudioTracks,
-					needsEmit: true,
-					firstNoUri: true,
-				};
-				groups.push(group);
-
-				variantStreams.push({
-					tracks: [unpairedAudioTracks[0]!],
-					linkedGroup: group,
-				});
-			} else {
-				for (const track of unpairedAudioTracks) {
-					variantStreams.push({
-						tracks: [track],
-						linkedGroup: null,
-					});
-				}
-			}
-		}
-
-		const deduceSegmentFormat = (tracks: OutputTrack[]) => {
-			const codecs: MediaCodec[] = [];
-			let videoCount = 0;
-			let audioCount = 0;
-			let requiresTransformationMetadata = false;
-
-			let candidate: OutputFormat | null = null;
-			let candidateScore = -Infinity;
-
-			for (const track of tracks) {
-				if (track.isVideoTrack()) {
-					videoCount++;
-					requiresTransformationMetadata ||= (track.metadata.rotation ?? 0) !== 0
-						|| !!track.metadata.flip
-						|| !!track.metadata.transformationMatrix;
-				} else if (track.isAudioTrack()) {
-					audioCount++;
-				}
-
-				codecs.push(track.source._codec);
-			}
-
-			for (const format of toArray(this.format._options.segmentFormat)) {
-				const supportedCodecs = format.getSupportedCodecs();
-				const trackCounts = format.getSupportedTrackCounts();
-
-				if (codecs.some(codec => !supportedCodecs.includes(codec))) {
-					continue;
-				}
-
-				if (videoCount < trackCounts.video.min || videoCount > trackCounts.video.max) {
-					continue;
-				}
-
-				if (audioCount < trackCounts.audio.min || audioCount > trackCounts.audio.max) {
-					continue;
-				}
-
-				let score = 0;
-				if (requiresTransformationMetadata && format.supportsVideoTransformationMetadata) {
-					score++;
-				}
-
-				if (score > candidateScore) {
-					candidate = format;
-					candidateScore = score;
+				} else {
+					for (const track of unpairedAudioTracks) {
+						variantStreams.push({
+							tracks: [track],
+							linkedGroup: null,
+						});
+					}
 				}
 			}
 
-			// We must find a format. If no format is found, that means we incorrectly gated track creation and
-			// assignment at an earlier step.
-			assert(candidate);
+			const deduceSegmentFormat = (tracks: OutputTrack[]) => {
+				const codecs: MediaCodec[] = [];
+				let videoCount = 0;
+				let audioCount = 0;
+				let requiresTransformationMetadata = false;
 
-			return candidate;
-		};
+				let candidate: OutputFormat | null = null;
+				let candidateScore = -Infinity;
 
-		const registerPlaylist = async (tracks: OutputTrack[]) => {
-			if (tracks.some(track => this.playlists.some(playlist => playlist.tracks.includes(track)))) {
-				throw new Error('Internal error: track is already registered in a playlist.'); // Should be unreachable
-			}
+				for (const track of tracks) {
+					if (track.isVideoTrack()) {
+						videoCount++;
+						requiresTransformationMetadata ||= (track.metadata.rotation ?? 0) !== 0
+							|| !!track.metadata.flip
+							|| !!track.metadata.transformationMatrix;
+					} else if (track.isAudioTrack()) {
+						audioCount++;
+					}
 
-			const format = deduceSegmentFormat(tracks);
+					codecs.push(track.source._codec);
+				}
 
-			const id = this.playlists.length + 1;
-			const path = await this.getPlaylistPath({
-				n: id,
-				tracks,
-				segmentFormat: format,
-			});
-			validatePlaylistPath(path);
+				for (const format of toArray(this.format._options.segmentFormat)) {
+					const supportedCodecs = format.getSupportedCodecs();
+					const trackCounts = format.getSupportedTrackCounts();
 
-			const playlist: Playlist = {
-				id: this.playlists.length + 1,
-				path,
-				tracks,
-				segmentFormat: format,
-				currentSegmentStartTimestamp: null,
-				currentSegmentStartTimestampIsFixed: false,
-				nextSegmentId: 1,
-				initSegment: null,
-				writtenSegments: [],
-				peakBitrate: null,
-				averageBitrate: null,
-				mediaSequence: 0,
-				done: false,
-				singleFile: null,
-				mutex: new AsyncMutex(),
+					if (codecs.some(codec => !supportedCodecs.includes(codec))) {
+						continue;
+					}
+
+					if (videoCount < trackCounts.video.min || videoCount > trackCounts.video.max) {
+						continue;
+					}
+
+					if (audioCount < trackCounts.audio.min || audioCount > trackCounts.audio.max) {
+						continue;
+					}
+
+					let score = 0;
+					if (requiresTransformationMetadata && format.supportsVideoTransformationMetadata) {
+						score++;
+					}
+
+					if (score > candidateScore) {
+						candidate = format;
+						candidateScore = score;
+					}
+				}
+
+				// We must find a format. If no format is found, that means we incorrectly gated track creation and
+				// assignment at an earlier step.
+				assert(candidate);
+
+				return candidate;
 			};
-			this.playlists.push(playlist);
 
-			return playlist;
-		};
+			const registerPlaylist = async (tracks: OutputTrack[]) => {
+				if (tracks.some(track => this.playlists.some(playlist => playlist.tracks.includes(track)))) {
+					// Should be unreachable
+					throw new Error('Internal error: track is already registered in a playlist.');
+				}
 
-		// Now, finally let's create all declarations. Each declaration maps to one #EXT-X-MEDIA or #EXT-X-STREAM-INF
-		// tag in the final master playlist.
-		for (const group of groups) {
-			if (!group.needsEmit) {
-				continue;
+				const format = deduceSegmentFormat(tracks);
+
+				const id = this.playlists.length + 1;
+				const path = await this.getPlaylistPath({
+					n: id,
+					tracks,
+					segmentFormat: format,
+				});
+				validatePlaylistPath(path);
+
+				const playlist: Playlist = {
+					id: this.playlists.length + 1,
+					path,
+					tracks,
+					segmentFormat: format,
+					currentSegmentStartTimestamp: null,
+					currentSegmentStartTimestampIsFixed: false,
+					nextSegmentId: 1,
+					initSegment: null,
+					writtenSegments: [],
+					peakBitrate: null,
+					averageBitrate: null,
+					mediaSequence: 0,
+					done: false,
+					singleFile: null,
+					mutex: new AsyncMutex(),
+				};
+				this.playlists.push(playlist);
+
+				return playlist;
+			};
+
+			// Now, finally let's create all declarations. Each declaration maps to one #EXT-X-MEDIA or
+			// #EXT-X-STREAM-INF tag in the final master playlist.
+			for (const group of groups) {
+				if (!group.needsEmit) {
+					continue;
+				}
+
+				for (let i = 0; i < group.tracks.length; i++) {
+					const track = group.tracks[i]!;
+
+					let playlist = this.playlists.find(x => x.tracks[0]!.id === track.id);
+					playlist ??= await registerPlaylist([track]);
+
+					this.playlistDeclarations.push({
+						playlist,
+						groupId: group.name,
+						noUri: group.firstNoUri && i === 0,
+						references: [],
+					});
+				}
 			}
 
-			for (let i = 0; i < group.tracks.length; i++) {
-				const track = group.tracks[i]!;
-
-				let playlist = this.playlists.find(x => x.tracks[0]!.id === track.id);
-				playlist ??= await registerPlaylist([track]);
+			for (const variant of variantStreams) {
+				// Since tracks can only be assigned to one playlist, the first track's ID acts as a "playlist key"
+				let playlist = this.playlists.find(x => x.tracks[0]!.id === variant.tracks[0]!.id);
+				playlist ??= await registerPlaylist(variant.tracks);
 
 				this.playlistDeclarations.push({
 					playlist,
-					groupId: group.name,
-					noUri: group.firstNoUri && i === 0,
-					references: [],
+					groupId: null,
+					noUri: false,
+					references: variant.linkedGroup
+						? this.playlistDeclarations.filter(x => x.groupId === variant.linkedGroup!.name)
+						: [],
 				});
 			}
-		}
 
-		for (const variant of variantStreams) {
-			// Since tracks can only be assigned to one playlist, the first track's ID acts as a "playlist key"
-			let playlist = this.playlists.find(x => x.tracks[0]!.id === variant.tracks[0]!.id);
-			playlist ??= await registerPlaylist(variant.tracks);
-
-			this.playlistDeclarations.push({
-				playlist,
-				groupId: null,
-				noUri: false,
-				references: variant.linkedGroup
-					? this.playlistDeclarations.filter(x => x.groupId === variant.linkedGroup!.name)
-					: [],
-			});
-		}
-
-		for (const track of this.output.tracks) {
-			if (track.isVideoTrack() && track.metadata.decoderConfig) {
-				this.getVideoTrackData(
-					track,
-					track.metadata.primingPacket ?? null,
-					{ decoderConfig: track.metadata.decoderConfig },
-				);
-			} else if (track.isAudioTrack() && track.metadata.decoderConfig) {
-				this.getAudioTrackData(
-					track,
-					track.metadata.primingPacket ?? null,
-					{ decoderConfig: track.metadata.decoderConfig },
-				);
+			for (const track of this.output.tracks) {
+				if (track.isVideoTrack() && track.metadata.decoderConfig) {
+					this.getVideoTrackData(
+						track,
+						track.metadata.primingPacket ?? null,
+						{ decoderConfig: track.metadata.decoderConfig },
+					);
+				} else if (track.isAudioTrack() && track.metadata.decoderConfig) {
+					this.getAudioTrackData(
+						track,
+						track.metadata.primingPacket ?? null,
+						{ decoderConfig: track.metadata.decoderConfig },
+					);
+				}
 			}
+		} finally {
+			release();
 		}
-
-		release();
 	}
 
 	async getMimeType(): Promise<string> {

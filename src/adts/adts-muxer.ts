@@ -34,14 +34,16 @@ export class AdtsMuxer extends Muxer {
 	async start() {
 		const release = await this.mutex.acquire();
 
-		this.writer = await this.output._getRootWriter(true);
+		try {
+			this.writer = await this.output._getRootWriter(true);
 
-		if (!metadataTagsAreEmpty(this.output._metadataTags)) {
-			const id3Writer = new Id3V2Writer(this.writer);
-			id3Writer.writeId3V2Tag(this.output._metadataTags);
+			if (!metadataTagsAreEmpty(this.output._metadataTags)) {
+				const id3Writer = new Id3V2Writer(this.writer);
+				id3Writer.writeId3V2Tag(this.output._metadataTags);
+			}
+		} finally {
+			release();
 		}
-
-		release();
 	}
 
 	async getMimeType() {
