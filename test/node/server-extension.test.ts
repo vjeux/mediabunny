@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, test } from 'vitest';
+import fs from 'node:fs';
 import { registerMediabunnyServer } from '@mediabunny/server';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
@@ -2900,5 +2901,17 @@ describe('Audio', async () => {
 		const u8 = toUint8Array(frame.data[0]!);
 		const plane = new Float32Array(u8.buffer, u8.byteOffset, largeData.length);
 		expect(plane[plane.length - 1]).toBe(0.25);
+	});
+});
+
+describe('Packaging', () => {
+	// The bundles are built by `npm run pre-test`
+	test('Bundles load @mediabunny/prores instead of inlining a copy of it', () => {
+		for (const file of ['mediabunny-server.cjs', 'mediabunny-server.mjs']) {
+			const code = fs.readFileSync(`./packages/server/dist/bundles/${file}`, 'utf8');
+			expect(code).toMatch(/(require\(|from )"@mediabunny\/prores"/);
+			// turbores only has an "import" export, so a require() of it throws ERR_PACKAGE_PATH_NOT_EXPORTED
+			expect(code).not.toContain('turbores');
+		}
 	});
 });
