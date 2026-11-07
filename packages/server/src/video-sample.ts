@@ -58,6 +58,8 @@ const JPEG_RANGE_PIX_FORMATS = new Set([
 export class AvFrameVideoSampleResource extends VideoSampleResource {
 	/** @internal */
 	_frame: NodeAv.Frame | null;
+	/** @internal A top-down copy of a frame stored bottom-up, made when its planes are first needed. */
+	_topDownFrame: NodeAv.Frame | null = null;
 
 	/**
 	 * The NodeAV [`Frame`](https://seydx.github.io/node-av/api/lib/classes/Frame.html) instance backing this resource.
@@ -129,14 +131,35 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 	close(): void {
 		this.frame.free();
 		this._frame = null;
+		this._topDownFrame?.free();
+		this._topDownFrame = null;
 	}
 
 	getDataPlanes(): MaybePromise<VideoDataPlane[]> {
-		assert(this.frame.data);
+		let frame = this.frame;
 
-		return this.frame.data.map((data, i) => ({
+		if (frame.linesize.some(lineSize => lineSize < 0)) {
+			// NodeAV doesn't expose planes stored bottom-up (negative line sizes, like after FFmpeg's vflip filter), so
+			// copy the frame into a top-down one first
+			if (!this._topDownFrame) {
+				const copy = new NodeAv.Frame();
+				copy.alloc();
+				copy.format = frame.format;
+				copy.width = frame.width;
+				copy.height = frame.height;
+				NodeAv.FFmpegError.throwIfError(copy.allocBuffer(), 'allocBuffer');
+				NodeAv.FFmpegError.throwIfError(copy.copy(frame), 'copy');
+				this._topDownFrame = copy;
+			}
+
+			frame = this._topDownFrame;
+		}
+
+		assert(frame.data);
+
+		return frame.data.map((data, i) => ({
 			data: toUint8Array(data),
-			stride: this.frame.linesize[i]!,
+			stride: frame.linesize[i]!,
 		}));
 	}
 
