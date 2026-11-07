@@ -965,6 +965,10 @@ export class Output<
 	 * Cancels the creation of the output file, releasing internal resources like encoders and preventing further
 	 * samples from being added.
 	 *
+	 * When writing to a {@link StreamTarget}, this waits for its `WritableStream` to close, unless the stream's sink
+	 * has stalled on a write: once 5 seconds pass without any of the pending writes completing, this resolves, and the
+	 * stream closes in the background if the sink ever catches up.
+	 *
 	 * @returns A promise that resolves once all internal resources have been released.
 	 */
 	async cancel() {

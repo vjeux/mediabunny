@@ -7,18 +7,24 @@ import { EncodedPacket } from '../../src/packet.js';
 
 import { StreamTarget } from '../../src/index.js';
 
-test('Output.cancel() resolves even when the sink of its StreamTarget has stalled', async () => {
-	for (const stalled of [false, true]) {
+test('Output.cancel() waits for the stream of its StreamTarget to close, unless the sink has stalled', async () => {
+	for (const sink of ['instant', 'slow', 'stalled'] as const) {
 		let writes = 0;
-		let closed = false;
+		const events: string[] = [];
 		const target = new StreamTarget(new WritableStream({
 			write: () => {
 				writes++;
-				// A stalled sink never completes a write, like an upload over a hung connection
-				return stalled ? new Promise<void>(() => {}) : undefined;
+				if (sink === 'slow') {
+					return new Promise<void>(resolve => setTimeout(resolve, 5));
+				}
+				if (sink === 'stalled') {
+					// Never completes, like an upload over a hung connection
+					return new Promise<void>(() => {});
+				}
 			},
 			close: () => {
-				closed = true;
+				// E.g. a FileSystemWritableFileStream, whose close() commits the file
+				events.push('stream closed');
 			},
 		}));
 		const output = new Output({ format: new MkvOutputFormat(), target });
@@ -27,28 +33,31 @@ test('Output.cancel() resolves even when the sink of its StreamTarget has stalle
 		await output.start();
 
 		const decoderConfig = { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 };
-		for (let i = 0; writes === 0 && i < 500; i++) {
-			void source.add(new EncodedPacket(new Uint8Array(1000), 'key', i * 0.02, 0.02), { decoderConfig });
-			await new Promise(resolve => setTimeout(resolve, 1));
+		if (sink === 'stalled') {
+			// Adding waits for the sink once it applies backpressure, so don't wait for that here
+			for (let i = 0; writes === 0 && i < 500; i++) {
+				void source.add(new EncodedPacket(new Uint8Array(1000), 'key', i * 0.02, 0.02), { decoderConfig });
+				await new Promise(resolve => setTimeout(resolve, 1));
+			}
+		} else {
+			for (let i = 0; i < 20; i++) {
+				await source.add(new EncodedPacket(new Uint8Array(1000), 'key', i * 0.02, 0.02), { decoderConfig });
+			}
 		}
 		expect(writes).toBeGreaterThan(0);
 
 		const result = await Promise.race([
-			output.cancel().then(() => 'canceled'),
-			new Promise(resolve => setTimeout(() => resolve('still pending'), 500)),
+			output.cancel().then(() => {
+				events.push('cancel resolved');
+				return 'canceled';
+			}),
+			new Promise(resolve => setTimeout(() => resolve('still pending'), 10_000)),
 		]);
-		expect(result, stalled ? 'stalled sink' : 'working sink').toBe('canceled');
+		expect(result, sink).toBe('canceled');
 		expect(output.state).toBe('canceled');
-
-		if (!stalled) {
-			// The stream still gets closed once its queued writes are done, as documented
-			for (let i = 0; !closed && i < 100; i++) {
-				await new Promise(resolve => setTimeout(resolve, 5));
-			}
-			expect(closed).toBe(true);
-		}
+		expect(events, sink).toEqual(sink === 'stalled' ? ['cancel resolved'] : ['stream closed', 'cancel resolved']);
 	}
-});
+}, 30_000);
 
 test('Output, onFinalize', async () => {
 	let callCount = 0;
