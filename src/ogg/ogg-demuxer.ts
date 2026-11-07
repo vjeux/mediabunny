@@ -361,6 +361,13 @@ export class OggDemuxer extends Demuxer {
 		};
 	}
 
+	/**
+	 * For the end positions of pages after which the next page of the same bitstream comes only much later (or never),
+	 * that next page. A bitstream that ends before the others (or pauses) would otherwise make every lookup past its
+	 * end scan all the pages of the other bitstreams in between again.
+	 */
+	nextPagesAfterGaps = new Map<number, Page | null>();
+
 	async findNextPacketStart(lastPacket: Packet) {
 		// If there's another segment in the same page, return it
 		if (lastPacket.endSegmentIndex < lastPacket.endPage.lacingValues.length - 1) {
@@ -374,25 +381,38 @@ export class OggDemuxer extends Demuxer {
 		}
 
 		// Otherwise, search for the next page belonging to the same bitstream
-		let currentPos = lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize;
-		while (true) {
-			let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
-			if (!slice) {
-				return null;
+		const startPos = lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize;
+		let nextPage = this.nextPagesAfterGaps.get(startPos);
+		if (nextPage === undefined) {
+			nextPage = null;
+
+			let currentPos = startPos;
+			while (true) {
+				let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+
+				const page = slice && readPageHeader(slice);
+				if (!page) {
+					break;
+				}
+
+				if (page.serialNumber === lastPacket.endPage.serialNumber) {
+					nextPage = page;
+					break;
+				}
+
+				currentPos = page.headerStartPos + page.totalSize;
 			}
 
-			const nextPage = readPageHeader(slice);
-			if (!nextPage) {
-				return null;
+			// Only the long scans are remembered, which keeps this small
+			if (currentPos - startPos > MAX_PAGE_SIZE) {
+				this.nextPagesAfterGaps.set(startPos, nextPage);
 			}
-
-			if (nextPage.serialNumber === lastPacket.endPage.serialNumber) {
-				return { startPage: nextPage, startSegmentIndex: 0 };
-			}
-
-			currentPos = nextPage.headerStartPos + nextPage.totalSize;
 		}
+
+		return nextPage && { startPage: nextPage, startSegmentIndex: 0 };
 	}
 
 	async getMimeType() {
