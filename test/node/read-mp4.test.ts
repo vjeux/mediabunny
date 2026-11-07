@@ -272,3 +272,32 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Duration from metadata of a track whose samples all last 0', async () => {
+	// Like a still frame next to other media (from the L17 roundtrip fuzz sweep): its mdhd duration is 0, but the
+	// sample table says where it is
+	const avcC = new Uint8Array(
+		('0164000cffe100196764000cacd941011b011000000300100000030320f142996001000668ebe3cb22c0fdf8f800')
+			.match(/../g)!.map(x => parseInt(x, 16)),
+	);
+	const decoderConfig = { codec: 'avc1.64000c', codedWidth: 128, codedHeight: 128, description: avcC };
+
+	for (const format of [new Mp4OutputFormat(), new MovOutputFormat()]) {
+		const output = new Output({ format, target: new BufferTarget() });
+		const moving = new EncodedVideoPacketSource('avc');
+		const still = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(moving);
+		output.addVideoTrack(still);
+		await output.start();
+		await moving.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 0.5), { decoderConfig });
+		await moving.add(new EncodedPacket(new Uint8Array(16), 'key', 0.5, 0.5));
+		await still.add(new EncodedPacket(new Uint8Array(16), 'key', 10, 0), { decoderConfig });
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const tracks = await input.getVideoTracks();
+		expect(await Promise.all(tracks.map(track => track.getDurationFromMetadata()))).toEqual([1, 10]);
+		expect(await input.getDurationFromMetadata()).toBe(10);
+		expect(await input.computeDuration()).toBe(10);
+	}
+});
