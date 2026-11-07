@@ -1971,6 +1971,9 @@ export class Conversion {
 						}
 
 						await this._checkpoint(pump, lastSampleTimestamp);
+					} else {
+						// Nothing reached the output yet (process may drop samples), but pausing must work anyway
+						await this._checkpoint(pump, -Infinity);
 					}
 				}
 
@@ -2602,6 +2605,9 @@ export class Conversion {
 			}
 
 			await this._checkpoint(pump, lastSampleTimestamp);
+		} else {
+			// Nothing reached the output yet (process may drop samples), but pausing must work anyway
+			await this._checkpoint(pump, -Infinity);
 		}
 	}
 
