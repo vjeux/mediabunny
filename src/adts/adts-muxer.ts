@@ -62,11 +62,14 @@ export class AdtsMuxer extends Muxer {
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
 
-			// First packet - determine input format from metadata
+			// First packet - determine input format from metadata, or from the decoder config the track was added with
 			if (this.inputIsAdts === null) {
-				validateAudioChunkMetadata(meta, track.source._codec);
+				const chunkMeta = meta?.decoderConfig || !track.metadata.decoderConfig
+					? meta
+					: { decoderConfig: track.metadata.decoderConfig };
+				validateAudioChunkMetadata(chunkMeta, track.source._codec);
 
-				const description = meta?.decoderConfig?.description;
+				const description = chunkMeta?.decoderConfig?.description;
 
 				// Follows from the Mediabunny Codec Registry:
 				this.inputIsAdts = !description;
