@@ -798,7 +798,7 @@ test.concurrent('Renditions can be read when the variant\'s own playlist has no 
 #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio"
 video.m3u8
 `,
-		'video.m3u8': '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-ENDLIST\n',
+		'video.m3u8': '#EXTM3U\n#EXT-X-TARGETDURATION:600\n#EXT-X-ENDLIST\n',
 		'audio.m3u8': '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n',
 	};
 	using input = new Input({
@@ -818,6 +818,18 @@ video.m3u8
 	assert(firstPacket);
 	expect(Math.abs(firstPacket.timestamp)).toBeLessThan(0.1);
 	expect((await sink.getPacket(2.5))?.timestamp).toBeCloseTo(2.5, 1);
+
+	// Reads of the empty video track settle at once: its playlist has ended, so it isn't reloaded, which would wait a
+	// target duration (10 minutes here) on every read
+	const settles = (promise: Promise<unknown>) => Promise.race([
+		promise.then(() => true, () => true),
+		new Promise(resolve => setTimeout(() => resolve(false), 2000)),
+	]);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await settles(videoTrack.getFirstTimestamp())).toBe(true);
+	expect(await settles(videoTrack.getFirstTimestamp())).toBe(true);
+	expect(await settles(input.computeDuration())).toBe(true);
 });
 
 test.concurrent('Alternative audio only', { timeout: 15_000 }, async () => {
