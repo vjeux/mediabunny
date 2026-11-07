@@ -47,6 +47,7 @@ import {
 	concatNalUnitsInLengthPrefixed,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
+	iterateAv1PacketObus,
 	iterateNalUnitsInAnnexB,
 	parseOpusTocByte,
 	serializeAvcDecoderConfigurationRecord,
@@ -120,6 +121,8 @@ export type IsobmffTrackData = {
 		 */
 		requiresAnnexBTransformation: boolean;
 		hasAlphaChannel: boolean;
+		/** For AV1, the sequence header OBU of the first key packet, carried in av1C's configOBUs. */
+		av1SequenceHeaderObu: Uint8Array | null;
 	};
 } | {
 	track: OutputAudioTrack;
@@ -502,6 +505,26 @@ export class IsobmffMuxer extends Muxer {
 					den: displayAspectHeight * decoderConfig.codedWidth,
 				});
 
+		// Like FFmpeg, carry AV1's sequence header in av1C: without one there, AV1-ISOBMFF requires a colr box, which
+		// isn't written when the decoder config has no color space
+		let av1SequenceHeaderObu: Uint8Array | null = null;
+		if (track.source._codec === 'av1' && packet) {
+			for (const obu of iterateAv1PacketObus(packet.data)) {
+				if (obu.type === 1) { // OBU_SEQUENCE_HEADER
+					const sizeBytes: number[] = []; // LEB128
+					let remaining = obu.data.byteLength;
+					do {
+						sizeBytes.push((remaining & 0x7f) | (remaining > 0x7f ? 0x80 : 0));
+						remaining = Math.floor(remaining / 128);
+					} while (remaining > 0);
+
+					// configOBUs requires the OBU header to have obu_has_size_field set
+					av1SequenceHeaderObu = new Uint8Array([0x0a, ...sizeBytes, ...obu.data]);
+					break;
+				}
+			}
+		}
+
 		// Kicks for ProRes 4444.
 		const hasAlphaChannel = decoderConfig.codec === 'ap4h' || decoderConfig.codec === 'ap4x';
 
@@ -516,6 +539,7 @@ export class IsobmffMuxer extends Muxer {
 				decoderConfig: decoderConfig,
 				requiresAnnexBTransformation,
 				hasAlphaChannel,
+				av1SequenceHeaderObu,
 			},
 			timescale,
 			samples: [],
