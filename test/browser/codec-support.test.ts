@@ -35,6 +35,79 @@ const isDecodable = async (codec: string, width = 176, height = 144) => {
 	return support.supported;
 };
 
+/** Whether the browser really encodes a 100 ms tone with the config, and decodes it back audibly */
+const encodesAudibleTone = async (config: AudioEncoderConfig) => {
+	const { numberOfChannels, sampleRate } = config;
+	const numberOfFrames = sampleRate / 10;
+	const data = new Float32Array(numberOfFrames * numberOfChannels);
+	for (let i = 0; i < numberOfFrames; i++) {
+		data.fill(0.5 * Math.sin(2 * Math.PI * 440 * i / sampleRate), i * numberOfChannels, (i + 1) * numberOfChannels);
+	}
+
+	const chunks: EncodedAudioChunk[] = [];
+	let decoderConfig: AudioDecoderConfig | undefined;
+	let failed = false;
+	let peak = 0;
+
+	const encoder = new AudioEncoder({
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			decoderConfig ??= meta?.decoderConfig;
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+	const decoder = new AudioDecoder({
+		output: (audioData) => {
+			const values = new Float32Array(audioData.numberOfFrames);
+			audioData.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+			audioData.close();
+			for (const value of values) {
+				peak = Math.max(peak, Math.abs(value));
+			}
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+
+	try {
+		encoder.configure(config);
+		const audioData = new AudioData({
+			format: 'f32',
+			numberOfChannels,
+			sampleRate,
+			numberOfFrames,
+			timestamp: 0,
+			data,
+		});
+		encoder.encode(audioData);
+		audioData.close();
+		await encoder.flush();
+		if (failed || !decoderConfig) {
+			return false;
+		}
+
+		decoder.configure(decoderConfig);
+		for (const chunk of chunks) {
+			decoder.decode(chunk);
+		}
+		await decoder.flush();
+	} catch {
+		return false;
+	} finally {
+		if (encoder.state !== 'closed') {
+			encoder.close();
+		}
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+	}
+
+	return !failed && peak > 0.1;
+};
+
 describe('Codec strings in the browser', () => {
 	test('Strings derived from real streams are accepted', async () => {
 		// How strictly browsers parse codec strings varies (WebKitGTK, for one, accepts a wrong AV1 tier letter or a
@@ -132,14 +205,21 @@ describe('Codec strings in the browser', () => {
 			expect(await canEncodeVideo('avc', { width: 1281, height: 720 })).toBe(false);
 		}
 
-		// Opus encoders take up to two channels; the query has to say so rather than fail later
-		const opusSupport = await AudioEncoder.isConfigSupported({
-			codec: 'opus',
-			numberOfChannels: 6,
-			sampleRate: 48000,
-		});
-		expect(await canEncodeAudio('opus', { numberOfChannels: 6, quality: new Quality('medium') }))
-			.toBe(!!opusSupport.supported);
+		// Many Opus encoders only take up to two channels, and the query has to say so rather than fail later. It
+		// mustn't claim more than the browser does, but it may claim less: some browsers report configs as supported
+		// that their encoder then fails on (WebKitGTK and Firefox with multichannel Opus), which the query may find out
+		// by trying. Then, a real round trip has to fail too.
+		for (const numberOfChannels of [2, 6]) {
+			const config = { codec: 'opus', numberOfChannels, sampleRate: 48000 };
+			const nativelySupported = !!(await AudioEncoder.isConfigSupported(config)).supported;
+			const queried = await canEncodeAudio('opus', { numberOfChannels, quality: new Quality('medium') });
+
+			if (queried) {
+				expect(nativelySupported, `${numberOfChannels} channels`).toBe(true);
+			} else if (nativelySupported) {
+				expect(await encodesAudibleTone(config), `${numberOfChannels} channels`).toBe(false);
+			}
+		}
 	});
 });
 
