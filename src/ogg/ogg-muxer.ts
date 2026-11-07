@@ -7,7 +7,12 @@
  */
 
 import { OPUS_SAMPLE_RATE, validateAudioChunkMetadata } from '../codec';
-import { createVorbisComments, parseModesFromVorbisSetupPacket, parseOpusIdentificationHeader } from '../codec-data';
+import {
+	createVorbisComments,
+	OPUS_FRAME_DURATION_TABLE,
+	parseModesFromVorbisSetupPacket,
+	parseOpusIdentificationHeader,
+} from '../codec-data';
 import {
 	assert,
 	clamp,
@@ -33,6 +38,170 @@ import {
 import { MAX_PAGE_SIZE } from './ogg-reader';
 
 const PAGE_SIZE_TARGET = 8192;
+const OPUS_MIN_FRAME_DURATION = 120; // 2.5 ms in 48 kHz samples
+
+/** Reads an Opus frame length (RFC 6716, section 3.2.1), returning it and the number of bytes it takes. */
+const readOpusFrameLength = (data: Uint8Array, offset: number) => {
+	const first = data[offset];
+	if (first === undefined) {
+		return null;
+	}
+	if (first < 252) {
+		return { length: first, bytes: 1 };
+	}
+
+	const second = data[offset + 1];
+	if (second === undefined) {
+		return null;
+	}
+	return { length: first + 4 * second, bytes: 2 };
+};
+
+/** Returns the size of the self-delimited Opus packet (RFC 6716, appendix B) at the given offset, or null. */
+const getSelfDelimitedOpusPacketSize = (data: Uint8Array, offset: number) => {
+	const tocByte = data[offset];
+	if (tocByte === undefined) {
+		return null;
+	}
+
+	let pos = offset + 1;
+	let frameCount = 1;
+	let isVbr = false;
+	let paddingSize = 0;
+
+	const code = tocByte & 0b11;
+	if (code === 1) {
+		frameCount = 2;
+	} else if (code === 2) {
+		frameCount = 2;
+		isVbr = true;
+	} else if (code === 3) {
+		const frameCountByte = data[pos++];
+		if (frameCountByte === undefined) {
+			return null;
+		}
+
+		frameCount = frameCountByte & 0b111111;
+		isVbr = (frameCountByte & 0x80) !== 0;
+
+		if (frameCountByte & 0x40) {
+			// Padding: each byte of 255 adds 254 bytes and is followed by another padding length byte
+			while (true) {
+				const paddingByte = data[pos++];
+				if (paddingByte === undefined) {
+					return null;
+				}
+
+				paddingSize += paddingByte === 255 ? 254 : paddingByte;
+				if (paddingByte !== 255) {
+					break;
+				}
+			}
+		}
+	}
+
+	// Self-delimiting framing codes every frame length of a VBR packet, and the one frame length of a CBR packet
+	let framesSize = 0;
+	for (let i = 0; i < (isVbr ? frameCount : 1); i++) {
+		const frameLength = readOpusFrameLength(data, pos);
+		if (!frameLength) {
+			return null;
+		}
+
+		pos += frameLength.bytes;
+		framesSize += isVbr ? frameLength.length : frameLength.length * frameCount;
+	}
+
+	return pos - offset + framesSize + paddingSize;
+};
+
+/**
+ * Returns the TOC bytes of the streams in an Ogg Opus packet, which holds one Opus packet per stream, all but the last
+ * one in self-delimiting framing (RFC 7845, section 3). Returns null if the packet can't be parsed.
+ */
+const getOpusStreamTocBytes = (packet: Uint8Array, streamCount: number) => {
+	const tocBytes: number[] = [];
+	let offset = 0;
+
+	for (let i = 0; i < streamCount; i++) {
+		const tocByte = packet[offset];
+		if (tocByte === undefined) {
+			return null;
+		}
+		tocBytes.push(tocByte);
+
+		if (i < streamCount - 1) {
+			const size = getSelfDelimitedOpusPacketSize(packet, offset);
+			if (size === null) {
+				return null;
+			}
+			offset += size;
+		}
+	}
+
+	return tocBytes;
+};
+
+/**
+ * Creates packets of empty (zero-byte) frames spanning the given duration, which must be a multiple of 2.5 ms, for a
+ * stream whose last packet had the given TOC bytes (one per Opus stream). Following RFC 7845, section 4.1, they keep
+ * each stream's configuration for as long as possible and switch to shorter CELT frames only at the end, if needed.
+ */
+const createOpusGapPackets = (durationInSamples: number, previousTocBytes: number[]) => {
+	const packets: Uint8Array[] = [];
+	const stereoFlags = previousTocBytes.map(tocByte => tocByte & 0b100);
+
+	// Adds packets of `frameCount` empty frames per stream, using the given configuration for each stream (all of the
+	// same frame duration)
+	const addFrames = (configs: number[], frameCount: number) => {
+		const frameDuration = OPUS_FRAME_DURATION_TABLE[configs[0]!]!;
+		// A packet holds at most 48 frames and at most 120 ms
+		const maxFramesPerPacket = Math.min(48, Math.floor(5760 / frameDuration));
+
+		while (frameCount > 0) {
+			const count = Math.min(frameCount, maxFramesPerPacket);
+			const bytes: number[] = [];
+
+			configs.forEach((config, i) => {
+				const tocByte = (config << 3) | stereoFlags[i]!;
+				const isSelfDelimited = i < configs.length - 1;
+
+				if (count === 1) {
+					bytes.push(tocByte); // Code 0: one frame, which is empty
+				} else {
+					bytes.push(tocByte | 0b11, count); // Code 3, constant bitrate: `count` empty frames
+				}
+
+				if (isSelfDelimited) {
+					bytes.push(0); // The frame length, which is zero
+				}
+			});
+
+			packets.push(new Uint8Array(bytes));
+			frameCount -= count;
+		}
+	};
+
+	let remaining = durationInSamples;
+	const previousConfigs = previousTocBytes.map(tocByte => tocByte >> 3);
+	const previousFrameDurations = previousConfigs.map(config => OPUS_FRAME_DURATION_TABLE[config]!);
+	if (previousFrameDurations.every(duration => duration === previousFrameDurations[0])) {
+		addFrames(previousConfigs, Math.floor(remaining / previousFrameDurations[0]!));
+		remaining %= previousFrameDurations[0]!;
+	}
+
+	// The rest goes into CELT frames (configurations 16-31, 2.5 to 20 ms), keeping a CELT stream's bandwidth and using
+	// wideband after SILK or Hybrid frames
+	const celtBaseConfigs = previousConfigs.map(config => config >= 16 ? config & ~0b11 : 20);
+	for (let i = 3; i >= 0; i--) {
+		const frameDuration = OPUS_FRAME_DURATION_TABLE[16 + i]!;
+		addFrames(celtBaseConfigs.map(config => config + i), Math.floor(remaining / frameDuration));
+		remaining %= frameDuration;
+	}
+
+	assert(remaining === 0);
+	return packets;
+};
 
 type OggTrackData = {
 	track: OutputAudioTrack;
@@ -43,6 +212,12 @@ type OggTrackData = {
 	packetQueue: Packet[];
 	startOffsetInSamples: number | null;
 	currentTimestampInSamples: number;
+	/** Maps packet timestamps (in samples) onto `currentTimestampInSamples`. */
+	timestampOffsetInSamples: number;
+	/** The number of Opus streams in each packet (more than one for multichannel audio). */
+	opusStreamCount: number;
+	/** The TOC bytes of the streams in the last Opus packet, or null if unknown. */
+	lastOpusTocBytes: number[] | null;
 	audioPacketCount: number;
 	pagesWritten: number;
 
@@ -61,6 +236,8 @@ type Packet = {
 	durationInSamples: number;
 	trimmedDurationInSamples: number;
 	forcePageFlush: boolean;
+	/** Whether the packet must start a new page, as after a gap. */
+	startsNewPage?: boolean;
 };
 
 export class OggMuxer extends Muxer {
@@ -141,6 +318,9 @@ export class OggMuxer extends Muxer {
 			packetQueue: [],
 			startOffsetInSamples: null,
 			currentTimestampInSamples: 0,
+			timestampOffsetInSamples: 0,
+			opusStreamCount: 1,
+			lastOpusTocBytes: null,
 			audioPacketCount: 0,
 			pagesWritten: 0,
 
@@ -273,9 +453,14 @@ export class OggMuxer extends Muxer {
 				forcePageFlush: true, // The last header packet must flush the page
 			});
 
+			const header = parseOpusIdentificationHeader(identificationHeader);
 			trackData.codecInfo.opusInfo = {
-				preSkip: parseOpusIdentificationHeader(identificationHeader).preSkip,
+				preSkip: header.preSkip,
 			};
+			// With a channel mapping family other than 0, the mapping table starts with the stream count
+			trackData.opusStreamCount = header.channelMappingFamily !== 0 && header.channelMappingTable
+				? header.channelMappingTable[0]!
+				: 1;
 		}
 	}
 
@@ -307,10 +492,50 @@ export class OggMuxer extends Muxer {
 
 				trackData.startOffsetInSamples = startTimestampInSamples - minTimestampInSamples;
 				trackData.currentTimestampInSamples = startTimestampInSamples + preSkip;
+				trackData.timestampOffsetInSamples = trackData.currentTimestampInSamples - timestampInSamples;
 			}
 
-			const currentTimestampInSamples = trackData.currentTimestampInSamples;
-			trackData.currentTimestampInSamples += durationInSamples;
+			let startsNewPage = false;
+
+			if (trackData.codecInfo.codec === 'opus') {
+				// Granule positions must advance by exactly the samples in the packets (RFC 7845, section 4.1), so a
+				// gap in the packet timestamps would silently pull all later audio forward. Instead, fill a gap of at
+				// least one frame (as left by lost or paused packets) with synthesized packets of empty frames, which
+				// decoders play out as packet loss concealment. Only multiples of 2.5 ms, the shortest Opus frame, can
+				// be filled.
+				const timestampInSamples = Math.round(packet.timestamp * trackData.internalSampleRate)
+					+ trackData.timestampOffsetInSamples;
+				const gapInSamples = timestampInSamples - trackData.currentTimestampInSamples;
+
+				if (
+					trackData.lastOpusTocBytes !== null
+					&& gapInSamples >= OPUS_FRAME_DURATION_TABLE[trackData.lastOpusTocBytes[0]! >> 3]!
+				) {
+					const fillInSamples = gapInSamples - gapInSamples % OPUS_MIN_FRAME_DURATION;
+					for (const data of createOpusGapPackets(fillInSamples, trackData.lastOpusTocBytes)) {
+						const { durationInSamples } = extractSampleMetadata(data, trackData.codecInfo, null);
+						this.queueAudioPacket(trackData, data, durationInSamples, durationInSamples);
+					}
+				}
+
+				// If the packet can't be parsed, the next gap (if any) isn't filled
+				trackData.lastOpusTocBytes = getOpusStreamTocBytes(packet.data, trackData.opusStreamCount);
+			} else if (trackData.codecInfo.codec === 'vorbis' && trackData.audioPacketCount > 0) {
+				// Vorbis can express a gap through its granule positions, which may jump ahead from one page to the
+				// next. So, a packet after a gap starts a new page and keeps its timestamp. Readers may take smaller
+				// deviations for imprecise granule positions (some muxers write them a packet off), so only gaps longer
+				// than the longest packet duration doubled (a long block) are kept.
+				assert(trackData.codecInfo.vorbisInfo);
+				const timestampInSamples = Math.round(packet.timestamp * trackData.internalSampleRate)
+					+ trackData.timestampOffsetInSamples;
+				const gapInSamples = timestampInSamples - trackData.currentTimestampInSamples;
+
+				if (gapInSamples > trackData.codecInfo.vorbisInfo.blocksizes[1]!) {
+					trackData.currentTimestampInSamples += gapInSamples;
+					startsNewPage = true;
+				}
+			}
+
 			trackData.vorbisLastBlocksize = vorbisBlockSize;
 
 			// A shorter packet duration signals trailing samples to discard, which only the final packet can express
@@ -318,24 +543,41 @@ export class OggMuxer extends Muxer {
 				? clamp(Math.round(packet.duration * trackData.internalSampleRate), 0, durationInSamples)
 				: durationInSamples;
 
-			// With a start offset, the second audio packet flushes the page. This keeps the offset from sharing a page
-			// with end trimming, as both are signaled through the granule position and would be indistinguishable.
-			// This mirrors a requirement of the Vorbis spec.
-			const forcePageFlush = trackData.startOffsetInSamples > 0 && trackData.audioPacketCount === 1;
-			trackData.audioPacketCount++;
-
-			trackData.packetQueue.push({
-				data: packet.data,
-				timestampInSamples: currentTimestampInSamples,
-				durationInSamples,
-				trimmedDurationInSamples,
-				forcePageFlush,
-			});
+			this.queueAudioPacket(trackData, packet.data, durationInSamples, trimmedDurationInSamples, startsNewPage);
 
 			await this.interleavePages();
 		} finally {
 			release();
 		}
+	}
+
+	private queueAudioPacket(
+		trackData: OggTrackData,
+		data: Uint8Array,
+		durationInSamples: number,
+		trimmedDurationInSamples: number,
+		startsNewPage = false,
+	) {
+		assert(trackData.startOffsetInSamples !== null);
+
+		// With a start offset, the second audio packet flushes the page. This keeps the offset from sharing a page
+		// with end trimming, as both are signaled through the granule position and would be indistinguishable.
+		// This mirrors a requirement of the Vorbis spec. Likewise, a packet after a gap gets a page of its own, so that
+		// the gap isn't signaled on the final page, where readers couldn't tell it apart from end trimming (unless the
+		// stream ends with that packet).
+		const forcePageFlush = startsNewPage
+			|| (trackData.startOffsetInSamples > 0 && trackData.audioPacketCount === 1);
+		trackData.audioPacketCount++;
+
+		trackData.packetQueue.push({
+			data,
+			timestampInSamples: trackData.currentTimestampInSamples,
+			durationInSamples,
+			trimmedDurationInSamples,
+			forcePageFlush,
+			startsNewPage,
+		});
+		trackData.currentTimestampInSamples += durationInSamples;
 	}
 
 	addSubtitleCue(): never {
@@ -419,6 +661,10 @@ export class OggMuxer extends Muxer {
 				? packet.trimmedDurationInSamples
 				: packet.durationInSamples
 		);
+
+		if (packet.startsNewPage && trackData.currentLacingValues.length > 0) {
+			this.writePage(trackData, false);
+		}
 
 		if (trackData.currentLacingValues.length === 0) {
 			trackData.currentPageStartTimestampInSamples = packet.timestampInSamples;
