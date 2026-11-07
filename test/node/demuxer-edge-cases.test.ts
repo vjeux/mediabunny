@@ -729,6 +729,12 @@ describe('MPEG-TS demuxing', () => {
 		);
 	};
 
+	// Types and subtypes are case-insensitive (RFC 2045), so only those are lowercased; the codecs parameter must match
+	const normalizeMimeType = (mimeType: string) => {
+		const [type, ...parameters] = mimeType.split(';');
+		return [type!.toLowerCase(), ...parameters].join(';');
+	};
+
 	const describeTrack = async (bytes: Uint8Array) => {
 		using input = openBytes(bytes);
 		const tracks = await input.getTracks();
@@ -738,7 +744,7 @@ describe('MPEG-TS demuxing', () => {
 			packets.push(`${Math.round(packet.timestamp * 1e5) / 1e5}:${packet.byteLength}`);
 		}
 		return {
-			mimeType: await input.getMimeType(),
+			mimeType: normalizeMimeType(await input.getMimeType()),
 			trackCount: tracks.length,
 			codec: await track.getCodec(),
 			sampleRate: await track.getSampleRate(),
@@ -748,7 +754,7 @@ describe('MPEG-TS demuxing', () => {
 	};
 
 	const expected = {
-		mimeType: 'video/MP2T; codecs="mp4a.40.2"',
+		mimeType: 'video/mp2t; codecs="mp4a.40.2"',
 		trackCount: 1,
 		codec: 'aac',
 		sampleRate: 48000,
