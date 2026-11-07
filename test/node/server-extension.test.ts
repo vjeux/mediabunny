@@ -330,12 +330,15 @@ describe('Video', async () => {
 		};
 
 		const cases: [codec: VideoCodec, width: number, height: number, encodable: boolean][] = [
-			// libx265 needs at least 16 pixels in each dimension
+			// libx265 needs at least 16 pixels in each dimension, and at most 4216 in the other one under 32
 			['hevc', 16, 8, false], ['hevc', 8, 16, false], ['hevc', 16, 16, true],
+			['hevc', 4218, 16, false], ['hevc', 16, 4218, false], ['hevc', 4216, 16, true], ['hevc', 4218, 32, true],
 			// VP8 frame headers have 14 bits for each dimension (RFC 6386, section 9.1)
 			['vp8', 16384, 64, false], ['vp8', 64, 16384, false], ['vp8', 16382, 64, true],
 			// libx264 takes up to 16384 pixels in each dimension
 			['avc', 64, 16386, false], ['avc', 16386, 64, false], ['avc', 64, 16384, true],
+			// SVT-AV1 takes frames up to 16384x8704
+			['av1', 16386, 64, false], ['av1', 64, 8706, false], ['av1', 16384, 64, true], ['av1', 64, 8704, true],
 		];
 		for (const [codec, width, height, encodable] of cases) {
 			const canEncode = await canEncodeVideo(codec, { width, height });
