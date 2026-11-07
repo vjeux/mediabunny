@@ -726,6 +726,9 @@ export type UrlSourceOptions = {
 	 *
 	 * By default, it uses an exponential backoff algorithm that never gives up unless
 	 * a CORS error is suspected (`fetch()` did reject, `navigator.onLine` is true and origin is different).
+	 * The default can't tell a CORS failure from a network error when a URL of the same origin redirects to another
+	 * origin whose server doesn't allow it, so it keeps retrying such a request; if your URLs may redirect like that,
+	 * pass a function that gives up at some point.
 	 */
 	getRetryDelay?: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
 
