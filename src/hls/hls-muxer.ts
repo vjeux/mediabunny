@@ -1504,8 +1504,16 @@ export class HlsMuxer extends Muxer {
 				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
 					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
+				// A variant kept only for its renditions (its own playlist has no segments) is written as a variant of
+				// those renditions alone, so that no #EXT-X-STREAM-INF points to an empty playlist (which the reader
+				// could then take as its reference, and which wouldn't present the same content as the other variants)
+				const renditionWithSegments = decl.playlist.writtenSegments.length === 0
+					? decl.references.find(ref => ref.playlist.writtenSegments.length > 0) ?? null
+					: null;
+				const ownTracks = renditionWithSegments ? [] : decl.playlist.tracks;
+
 				const codecs: string[] = [];
-				for (const track of decl.playlist.tracks) {
+				for (const track of ownTracks) {
 					const trackData = this.trackDatas.find(x => x.track === track);
 					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
 					codecs.push(toHlsCodecString(codecString));
@@ -1515,7 +1523,7 @@ export class HlsMuxer extends Muxer {
 				let maxRefAverageBitrate = 0;
 
 				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
+					const firstRef = renditionWithSegments ?? decl.references[0]!;
 					const firstTrack = firstRef.playlist.tracks[0]!;
 					const trackData = this.trackDatas.find(x => x.track === firstTrack);
 					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
@@ -1529,8 +1537,10 @@ export class HlsMuxer extends Muxer {
 				}
 
 				assert(decl.playlist.peakBitrate !== null);
-				const totalPeakBitrate = decl.playlist.peakBitrate + peakDeclBitrate;
-				const totalAverageBitrate = (decl.playlist.averageBitrate ?? 0) + maxRefAverageBitrate;
+				const ownPeakBitrate = renditionWithSegments ? 0 : decl.playlist.peakBitrate;
+				const ownAverageBitrate = renditionWithSegments ? 0 : decl.playlist.averageBitrate ?? 0;
+				const totalPeakBitrate = ownPeakBitrate + peakDeclBitrate;
+				const totalAverageBitrate = ownAverageBitrate + maxRefAverageBitrate;
 
 				if (!firstVariantWritten) {
 					masterPlaylistText += '\n';
@@ -1551,7 +1561,7 @@ export class HlsMuxer extends Muxer {
 
 				masterPlaylistText += `,CODECS="${codecs.join(',')}"`;
 
-				const videoTrack = decl.playlist.tracks.find(x => x.isVideoTrack());
+				const videoTrack = ownTracks.find(x => x.isVideoTrack());
 				if (videoTrack?.isVideoTrack()) {
 					const trackData = this.trackDatas.find(x => x.track === videoTrack) as
 						HlsVideoTrackData | undefined;
@@ -1598,7 +1608,7 @@ export class HlsMuxer extends Muxer {
 					masterPlaylistText += '\n';
 				} else {
 					masterPlaylistText += '\n';
-					masterPlaylistText += `${decl.playlist.path}\n`;
+					masterPlaylistText += `${(renditionWithSegments ?? decl).playlist.path}\n`;
 				}
 			} else {
 				assert(decl.playlist.tracks.length === 1);
