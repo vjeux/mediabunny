@@ -632,13 +632,25 @@ test('Treat non-standard VideoFrame color space values as unknown', () => {
 test('init visibleRect and display size refine a wrapped VideoFrame', () => {
 	using source = makeCoordinateSample({});
 
+	// Pixels are only checked where the browser's own VideoFrame draws a visible rect correctly (WebKitGTK draws it
+	// from the frame's origin)
+	const uncropped = source.toVideoFrame();
+	const nativeCrop = new VideoFrame(uncropped, { visibleRect: { x: 2, y: 0, width: 2, height: 4 } });
+	const probe = new OffscreenCanvas(2, 4).getContext('2d', { willReadFrequently: true })!;
+	probe.drawImage(nativeCrop, 0, 0);
+	const browserDrawsCrops = pixelAt(probe.getImageData(0, 0, 2, 4).data, 2, 0, 0)[0] === 2;
+	nativeCrop.close();
+	uncropped.close();
+
 	const frame = source.toVideoFrame();
 	const cropped = new VideoSample(frame, { visibleRect: { left: 2, top: 0, width: 2, height: 4 } });
 	expect(cropped.visibleRect).toEqual({ left: 2, top: 0, width: 2, height: 4 });
 	expect([cropped.displayWidth, cropped.displayHeight]).toEqual([2, 4]);
-	const pixels = drawToPixels(cropped, 2, 4);
-	expect(pixelAt(pixels, 2, 0, 0)).toEqual([2, 0]);
-	expect(pixelAt(pixels, 2, 1, 3)).toEqual([3, 3]);
+	if (browserDrawsCrops) {
+		const pixels = drawToPixels(cropped, 2, 4);
+		expect(pixelAt(pixels, 2, 0, 0)).toEqual([2, 0]);
+		expect(pixelAt(pixels, 2, 1, 3)).toEqual([3, 3]);
+	}
 
 	// The passed frame stays usable until the sample is closed
 	expect(frame.format).toBe('RGBA');
@@ -664,5 +676,7 @@ test('init visibleRect and display size refine a wrapped VideoFrame', () => {
 	});
 	expect([fromCanvas.codedWidth, fromCanvas.codedHeight]).toEqual([2, 2]);
 	expect([fromCanvas.displayWidth, fromCanvas.displayHeight]).toEqual([4, 2]);
-	expect(pixelAt(drawToPixels(fromCanvas, 4, 2), 4, 0, 0)).toEqual([2, 2]);
+	if (browserDrawsCrops) {
+		expect(pixelAt(drawToPixels(fromCanvas, 4, 2), 4, 0, 0)).toEqual([2, 2]);
+	}
 });
