@@ -31,6 +31,7 @@ import {
 	TAG_I_FRAMES_ONLY,
 	TAG_MEDIA,
 	TAG_STREAM_INF,
+	TAG_TARGETDURATION,
 } from './hls-misc';
 import { HlsSegmentedInput } from './hls-segmented-input';
 import { SegmentedInputTrackDeclaration } from '../segmented-input';
@@ -105,6 +106,16 @@ export class HlsDemuxer extends Demuxer {
 				attributes: AttributeList;
 				lineNumber: number;
 			}[] = [];
+
+			const loadAsMediaPlaylist = async () => {
+				const segmentedInput = new HlsSegmentedInput(this, rootPath, null, lines);
+
+				this.segmentedInputs = [segmentedInput];
+				this.hasMasterPlaylist = false;
+				this.trackBackings = await segmentedInput.getTrackBackings();
+			};
+
+			let hasTargetDuration = false;
 
 			// Let's first iterate through the entire file, collecting all variant streams and media tags
 
@@ -192,14 +203,19 @@ export class HlsDemuxer extends Demuxer {
 					// iFramesOnlyTagFound = true;
 				} else if (line.startsWith(TAG_EXTINF)) {
 					// This is a media playlist, not a master playlist
-					const segmentedInput = new HlsSegmentedInput(this, rootPath, null, lines);
-
-					this.segmentedInputs = [segmentedInput];
-					this.hasMasterPlaylist = false;
-					this.trackBackings = await segmentedInput.getTrackBackings();
-
+					await loadAsMediaPlaylist();
 					return;
+				} else if (line.startsWith(TAG_TARGETDURATION)) {
+					hasTargetDuration = true;
 				}
+			}
+
+			if (hasTargetDuration && variantStreams.length === 0 && mediaTags.length === 0) {
+				// #EXT-X-TARGETDURATION is required in every media playlist, even in a live one that doesn't list any
+				// segments yet. Some multivariant playlists carry it too (though it doesn't belong there), so it only
+				// decides when there are no variant streams.
+				await loadAsMediaPlaylist();
+				return;
 			}
 
 			if (variantStreams.length > MAX_VARIANT_STREAMS || mediaTags.length > MAX_MEDIA_TAGS) {
