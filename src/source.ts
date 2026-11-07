@@ -19,6 +19,7 @@ import {
 	MaybePromise,
 	mergeRequestInit,
 	normalizeHeaders,
+	isSharedArrayBuffer,
 	polyfillSymbolDispose,
 	promiseWithResolvers,
 	retriedFetch,
@@ -445,7 +446,7 @@ export class BufferSource extends Source {
 	constructor(buffer: AllowSharedBufferSource) {
 		if (
 			!(buffer instanceof ArrayBuffer)
-			&& !(typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer)
+			&& !isSharedArrayBuffer(buffer)
 			&& !ArrayBuffer.isView(buffer)
 		) {
 			throw new TypeError('buffer must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView.');
