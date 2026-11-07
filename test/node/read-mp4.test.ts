@@ -272,3 +272,27 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('AV1 track with an empty av1C box', async () => {
+	// ffmpeg -f lavfi -i testsrc2=size=64x64:rate=10 -t 1 -c:v libaom-av1 -cpu-used 8 -row-mt 1 -g 10 -crf 50
+	//   -movflags frag_keyframe+empty_moov av1-empty-av1c.mp4
+	// libaom has no extradata when the empty moov is written, so FFmpeg writes an av1C box without content
+	const filePath = path.join(__dirname, '..', 'public/av1-empty-av1c.mp4');
+	using input = new Input({
+		source: new FilePathSource(filePath),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	expect(await track.getCodec()).toBe('av1');
+	expect((await track.getDecoderConfig())?.codec).toBe('av01.0.00M.08'); // From the sequence header
+
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		void packet;
+		packetCount++;
+	}
+	expect(packetCount).toBe(10);
+});
