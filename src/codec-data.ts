@@ -1154,7 +1154,6 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 	}
 };
 
-/** Builds a HevcDecoderConfigurationRecord from an HEVC packet in Annex B format. */
 /**
  * Finds the SPS that the first slice segment of a picture refers to (through the slice_pic_parameter_set_id of its
  * header and the pps_seq_parameter_set_id of that PPS), among the parameter sets preceding it. Returns its index in
@@ -1199,6 +1198,7 @@ const findActiveHevcSpsIndex = (spsUnits: Uint8Array[], ppsUnits: Uint8Array[], 
 	}
 };
 
+/** Builds a HevcDecoderConfigurationRecord from an HEVC packet in Annex B format. */
 export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) => {
 	try {
 		const vpsUnits: Uint8Array[] = [];
