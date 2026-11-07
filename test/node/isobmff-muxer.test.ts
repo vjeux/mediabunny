@@ -559,6 +559,29 @@ test('No btrt boxes, fragmented MP4 without bitrate metadata', async () => {
 	expect(findBtrtBoxes(new Uint8Array(output.target.buffer!))).toEqual([]);
 });
 
+test('btrt max bitrate counts the samples of one second, not one more', async () => {
+	for (const frameRate of [24, 25, 30, 60]) {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+
+		// Constant frame rate and size, so every one-second window holds exactly `frameRate` frames
+		for (let i = 0; i < 3 * frameRate; i++) {
+			const type = i === 0 ? 'key' : 'delta';
+			const packet = new EncodedPacket(new Uint8Array(1000), type, i / frameRate, 1 / frameRate);
+			await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+		}
+		await output.finalize();
+
+		expect(findBtrtBoxes(new Uint8Array(output.target.buffer!))).toEqual([{
+			bufferSizeDB: 0,
+			maxBitrate: 8 * 1000 * frameRate,
+			avgBitrate: 8 * 1000 * frameRate,
+		}]);
+	}
+});
+
 const copyVideoMp4 = async (format: Mp4OutputFormat) => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
