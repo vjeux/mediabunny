@@ -1761,6 +1761,136 @@ describe('Video', async () => {
 			expectColor(getColorAt(rgba, 400, 350, 150), [255, 0, 0]); // bottom-right (red)
 		});
 
+		// 32x24 I420 or NV12, whose luma ramps by 3 per column and 4 per row, so a crop that's off by one pixel is off
+		// by at least 3. The chroma is neutral unless given.
+		const rampLumaAt = (x: number, y: number) => 40 + 3 * x + 4 * y;
+		const makeRampSample = (format: 'I420' | 'NV12' = 'I420', u = 128, v = 128) => {
+			const data = new Uint8Array(32 * 24 * 3 / 2);
+			for (let y = 0; y < 24; y++) {
+				for (let x = 0; x < 32; x++) {
+					data[y * 32 + x] = rampLumaAt(x, y);
+				}
+			}
+
+			// NV12 interleaves U and V, I420 has a U plane and then a V plane
+			const chroma = data.subarray(32 * 24);
+			for (let i = 0; i < chroma.length / 2; i++) {
+				chroma[format === 'NV12' ? 2 * i : i] = u;
+				chroma[format === 'NV12' ? 2 * i + 1 : chroma.length / 2 + i] = v;
+			}
+
+			return new VideoSample(data, { format, codedWidth: 32, codedHeight: 24, timestamp: 0 });
+		};
+
+		// The largest difference between the result's luma and the ramp's, starting at the given offset
+		const getMaxRampLumaError = async (result: VideoSample, left: number, top: number) => {
+			const data = new Uint8Array(result.allocationSize());
+			await result.copyTo(data);
+
+			let maxError = 0;
+			for (let y = 0; y < result.codedHeight; y++) {
+				for (let x = 0; x < result.codedWidth; x++) {
+					const error = Math.abs(data[y * result.codedWidth + x]! - rampLumaAt(x + left, y + top));
+					maxError = Math.max(maxError, error);
+				}
+			}
+
+			return maxError;
+		};
+
+		test.each([
+			{ format: 'I420', left: 1, top: 3, width: 21, height: 15 },
+			{ format: 'I420', left: 2, top: 4, width: 20, height: 14 },
+			// Up to the right edge
+			{ format: 'I420', left: 3, top: 5, width: 29, height: 19 },
+			{ format: 'NV12', left: 3, top: 5, width: 29, height: 19 },
+			{ format: 'NV12', left: 5, top: 0, width: 27, height: 15 },
+			{ format: 'NV12', left: 1, top: 1, width: 31, height: 23 },
+		] as const)('Crop of $format to $width x $height at $left, $top keeps the exact region', async (crop) => {
+			// FFmpeg's crop filter rounds the offsets and size down to the chroma subsampling unless asked not to
+			for (let run = 0; run < 3; run++) {
+				using sample = makeRampSample(crop.format);
+				using result = await sample.transform({ crop });
+
+				expect(result.codedWidth).toBe(crop.width);
+				expect(result.codedHeight).toBe(crop.height);
+				expect(await getMaxRampLumaError(result, crop.left, crop.top)).toBeLessThanOrEqual(2);
+			}
+		});
+
+		test('Crop of NV12 at an odd offset up to the right edge, then resized, stays smooth', async () => {
+			for (let run = 0; run < 3; run++) {
+				using sample = makeRampSample('NV12');
+				using result = await sample.transform({
+					crop: { left: 3, top: 5, width: 29, height: 19 },
+					width: 58,
+					height: 38,
+					fit: 'fill',
+				});
+
+				const data = new Uint8Array(result.allocationSize());
+				await result.copyTo(data);
+				for (let y = 1; y < 37; y++) {
+					for (let x = 1; x < 58; x++) {
+						expect(Math.abs(data[y * 58 + x]! - data[y * 58 + x - 1]!)).toBeLessThanOrEqual(4);
+					}
+				}
+			}
+		});
+
+		test('Cover of I420 at an odd offset keeps the centered region', async () => {
+			// 32x24 covering 32x18 crops 3 rows off the top and bottom
+			using sample = makeRampSample();
+			using result = await sample.transform({ width: 32, height: 18, fit: 'cover' });
+
+			expect(result.codedHeight).toBe(18);
+			expect(await getMaxRampLumaError(result, 0, 3)).toBeLessThanOrEqual(1);
+		});
+
+		test('Crop at an odd offset keeps the chroma of NV12 and 10-bit I420', async () => {
+			// FFmpeg's exact crop moves the chroma by the wrong number of bytes when a chroma sample takes two, which
+			// swaps U and V in NV12 and misaligns 10-bit samples
+			const crop = { left: 3, top: 5, width: 29, height: 19 };
+
+			using nv12 = makeRampSample('NV12', 112, 144);
+			using nv12Result = await nv12.transform({ crop });
+			const nv12Data = new Uint8Array(nv12Result.allocationSize());
+			await nv12Result.copyTo(nv12Data);
+			const nv12Chroma = nv12Data.subarray(29 * 19);
+			for (let i = 0; i < nv12Chroma.length; i += 2) {
+				expect(Math.abs(nv12Chroma[i]! - 112)).toBeLessThanOrEqual(8);
+				expect(Math.abs(nv12Chroma[i + 1]! - 144)).toBeLessThanOrEqual(8);
+			}
+
+			const words = new Uint16Array(32 * 24 * 3 / 2);
+			for (let y = 0; y < 24; y++) {
+				for (let x = 0; x < 32; x++) {
+					words[y * 32 + x] = 4 * rampLumaAt(x, y);
+				}
+			}
+			words.subarray(32 * 24, 32 * 24 + 16 * 12).fill(448);
+			words.subarray(32 * 24 + 16 * 12).fill(576);
+			using i420P10 = new VideoSample(new Uint8Array(words.buffer), {
+				format: 'I420P10',
+				codedWidth: 32,
+				codedHeight: 24,
+				timestamp: 0,
+			});
+			using i420P10Result = await i420P10.transform({ crop });
+			const i420P10Data = new Uint16Array(i420P10Result.allocationSize() / 2);
+			await i420P10Result.copyTo(i420P10Data);
+
+			const lumaErrors = [...i420P10Data.subarray(0, 29 * 19)]
+				.map((value, i) => Math.abs(value - 4 * rampLumaAt(i % 29 + crop.left, Math.floor(i / 29) + crop.top)));
+			expect(Math.max(...lumaErrors)).toBeLessThanOrEqual(16);
+
+			const chroma = i420P10Data.subarray(29 * 19);
+			const u = chroma.subarray(0, chroma.length / 2);
+			const v = chroma.subarray(chroma.length / 2);
+			expect(Math.max(...u.map(value => Math.abs(value - 448)))).toBeLessThanOrEqual(32);
+			expect(Math.max(...v.map(value => Math.abs(value - 576)))).toBeLessThanOrEqual(32);
+		});
+
 		test('VideoSample transformation via Conversion API', async () => {
 			using input = new Input({
 				source: new FilePathSource('./test/public/video.mp4'),
