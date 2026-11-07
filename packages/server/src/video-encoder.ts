@@ -235,7 +235,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				|| this.avCodec.name === 'libvpx-vp9'
 			) {
 				// Mediabunny uses the quantizer index (0-255), while these encoders expect the 0-63 quantizer scale
-				mapped = Math.round(this.quantizer / 4);
+				// (254 and 255 would round up to 64)
+				mapped = Math.min(Math.round(this.quantizer / 4), 63);
 			} else {
 				// Everything else lines up with Mediabunny directly
 				mapped = this.quantizer;
