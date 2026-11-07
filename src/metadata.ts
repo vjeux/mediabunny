@@ -310,7 +310,12 @@ export type TrackDisposition = {
 	 * Indicates that this track is eligible for automatic selection by a player. Multiple tracks can be default tracks.
 	 */
 	default: boolean;
-	/** Indicates that the track is the primary track among other tracks of its type. */
+	/**
+	 * Indicates that the track is the primary track among other tracks of its type. Only HLS signals this: it maps to
+	 * the `DEFAULT` attribute, both when reading and when writing. Formats that hold a single track (MP3, ADTS, FLAC,
+	 * WAVE) report `true`, and tracks read from all other formats report `false`. To find a file's main tracks, use
+	 * {@link Input.getPrimaryVideoTrack} and {@link Input.getPrimaryAudioTrack}.
+	 */
 	primary: boolean;
 	/**
 	 * Indicates that players should always display this track by default, even if it goes against the user's default
