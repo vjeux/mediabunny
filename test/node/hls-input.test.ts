@@ -1411,75 +1411,85 @@ b.ts
 
 test.concurrent('A new EXT-X-MAP after a discontinuity sends its parameter sets in band', async () => {
 	// test/public/hls-disc: 64x48, then a discontinuity to 96x96 with its own init section, from x264 (baseline, then
-	// high) and from x265
-	const cases = [
-		{ playlist: 'disc.m3u8', first: 'a', second: 'b', codec: 'avc' },
-		{ playlist: 'hevc-disc.m3u8', first: 'ha', second: 'hb', codec: 'hevc' },
-	] as const;
-
-	for (const { playlist, first, second, codec } of cases) {
+	// high) and from x265; disc-return.m3u8 then goes back to the first init section, like content after an ad break
+	const readFile = async (name: string) => {
+		const bytes = Buffer.concat([
+			readFileSync(`./test/public/hls-disc/${name}_init.mp4`),
+			readFileSync(`./test/public/hls-disc/${name}_0.m4s`),
+		]);
+		using file = new Input({ source: new BufferSource(new Uint8Array(bytes)), formats: ALL_FORMATS });
+		const track = (await file.getPrimaryVideoTrack())!;
+		const filePackets = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			filePackets.push(packet);
+		}
+		return { packets: filePackets, description: new Uint8Array((await track.getDecoderConfig())!.description as ArrayBuffer) };
+	};
+	const readPlaylist = async (playlist: string) => {
 		using input = new Input({
-			source: new CustomPathedSource(`./test/public/hls-disc/${playlist}`, ({ path }) => new FilePathSource(path)),
+			source: new CustomPathedSource('playlist.m3u8', ({ path }) => (path === 'playlist.m3u8'
+				? new BufferSource(new TextEncoder().encode(playlist))
+				: new FilePathSource(`./test/public/hls-disc/${path}`))),
 			formats: ALL_FORMATS,
 		});
-		const videoTrack = await input.getPrimaryVideoTrack();
-		assert(videoTrack);
-		expect(await videoTrack.getCodec()).toBe(codec);
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
 		const packets = [];
 		for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
 			packets.push(packet);
 		}
-
-		// Each segment read on its own, as one fragmented MP4 file
-		const readFile = async (name: string) => {
-			const bytes = Buffer.concat([
-				readFileSync(`./test/public/hls-disc/${name}_init.mp4`),
-				readFileSync(`./test/public/hls-disc/${name}_0.m4s`),
-			]);
-			using file = new Input({ source: new BufferSource(new Uint8Array(bytes)), formats: ALL_FORMATS });
-			const track = (await file.getPrimaryVideoTrack())!;
-			const filePackets = [];
-			for await (const packet of new EncodedPacketSink(track).packets()) {
-				filePackets.push(packet);
-			}
-			return { packets: filePackets, description: new Uint8Array((await track.getDecoderConfig())!.description as ArrayBuffer) };
-		};
-		const a = await readFile(first);
-		const b = await readFile(second);
-		expect(packets).toHaveLength(a.packets.length + b.packets.length);
-
-		// The decoder config stays the first init section's, and its segment's packets are untouched
-		expect(new Uint8Array((await videoTrack.getDecoderConfig())!.description as ArrayBuffer)).toEqual(a.description);
-		expect(packets.slice(0, a.packets.length).map(x => x.data)).toEqual(a.packets.map(x => x.data));
-
-		// The second segment's key frame carries its parameter sets (length-prefixed, from its avcC/hvcC) in front
-		const getParameterSets = (description: Uint8Array) => {
-			if (codec === 'avc') {
-				const record = deserializeAvcDecoderConfigurationRecord(description)!;
-				return [...record.sequenceParameterSets, ...record.pictureParameterSets];
-			}
-
-			return deserializeHevcDecoderConfigurationRecord(description)!.arrays
-				.filter(x => [32, 33, 34].includes(x.nalUnitType)) // VPS, SPS, PPS
-				.flatMap(x => x.nalUnits);
-		};
-		const parameterSets = getParameterSets(b.description);
-		expect(parameterSets).not.toEqual(getParameterSets(a.description));
-		const bPackets = packets.slice(a.packets.length);
-		expect(bPackets[0]!.type).toBe('key');
-		expect(bPackets[0]!.data).toEqual(new Uint8Array([
-			...concatNalUnitsInLengthPrefixed(parameterSets, 4),
-			...b.packets[0]!.data,
-		]));
-		expect(bPackets.slice(1).map(x => x.data)).toEqual(b.packets.slice(1).map(x => x.data));
-
-		// Metadata-only packets report the same sizes
 		const metadataSizes: number[] = [];
 		for await (const packet of new EncodedPacketSink(videoTrack).packets(undefined, undefined, { metadataOnly: true })) {
 			metadataSizes.push(packet.byteLength);
 		}
-		expect(metadataSizes).toEqual(packets.map(x => x.byteLength));
-		expect(packets.every(x => x.byteLength === x.data.byteLength)).toBe(true);
+		const description = new Uint8Array((await videoTrack.getDecoderConfig())!.description as ArrayBuffer);
+		return { packets, metadataSizes, description, codec: await videoTrack.getCodec() };
+	};
+	const playlistOf = (...names: string[]) => [
+		'#EXTM3U',
+		'#EXT-X-VERSION:7',
+		'#EXT-X-TARGETDURATION:1',
+		...names.flatMap((name, i) => [
+			...(i > 0 ? ['#EXT-X-DISCONTINUITY'] : []),
+			...(i === 0 || name !== names[i - 1] ? [`#EXT-X-MAP:URI="${name}_init.mp4"`] : []),
+			'#EXTINF:1.0,',
+			`${name}_0.m4s`,
+		]),
+		'#EXT-X-ENDLIST',
+	].join('\n');
+
+	for (const { first, second, codec } of [{ first: 'a', second: 'b', codec: 'avc' }, { first: 'ha', second: 'hb', codec: 'hevc' }] as const) {
+		const a = await readFile(first);
+		const b = await readFile(second);
+		const getParameterSets = (description: Uint8Array) => {
+			if (codec === 'avc') {
+				const record = deserializeAvcDecoderConfigurationRecord(description)!;
+				return concatNalUnitsInLengthPrefixed([...record.sequenceParameterSets, ...record.pictureParameterSets], 4);
+			}
+
+			return concatNalUnitsInLengthPrefixed(deserializeHevcDecoderConfigurationRecord(description)!.arrays
+				.filter(x => [32, 33, 34].includes(x.nalUnitType)) // VPS, SPS, PPS
+				.flatMap(x => x.nalUnits), 4);
+		};
+		expect(getParameterSets(b.description)).not.toEqual(getParameterSets(a.description));
+		// Each segment's key packet starts with its own parameter sets (length-prefixed, from its avcC/hvcC)
+		const withOwnParameterSets = (file: typeof a) => [
+			new Uint8Array([...getParameterSets(file.description), ...file.packets[0]!.data]),
+			...file.packets.slice(1).map(x => x.data),
+		];
+
+		// Content, ad break, content again with the first init section
+		const result = await readPlaylist(playlistOf(first, second, first));
+		expect(result.codec).toBe(codec);
+		expect(result.description).toEqual(a.description); // The decoder config stays the first init section's
+		expect(result.packets.map(x => x.data)).toEqual([...withOwnParameterSets(a), ...withOwnParameterSets(b), ...withOwnParameterSets(a)]);
+		expect(result.packets[0]!.type).toBe('key');
+		expect(result.metadataSizes).toEqual(result.packets.map(x => x.byteLength));
+		expect(result.packets.every(x => x.byteLength === x.data.byteLength)).toBe(true);
+
+		// With a single init section, packets are left alone, discontinuities or not
+		const single = await readPlaylist(playlistOf(first, first));
+		expect(single.packets.map(x => x.data)).toEqual([...a.packets, ...a.packets].map(x => x.data));
+		expect(single.metadataSizes).toEqual(single.packets.map(x => x.byteLength));
 	}
 });
 

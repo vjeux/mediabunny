@@ -103,6 +103,14 @@ export abstract class SegmentedInput {
 	abstract getRawTimestampOffset(input: Input): Promise<number | null>; // Needed to make things like MP3/ADTS work
 	abstract getTimestampWrapPeriod(): number;
 
+	/**
+	 * Whether the segments come with more than one init section, whose codec parameters may then differ from segment to
+	 * segment.
+	 */
+	hasMultipleInitSections() {
+		return false;
+	}
+
 	async getDurationFromMetadata(options: DurationMetadataRequestOptions) {
 		const lastSegment = await this.getSegmentAt(Infinity, {
 			skipLiveWait: options.skipLiveWait,
@@ -242,6 +250,8 @@ type InBandParameterSets = {
 	lengthSize: 1 | 2 | 3 | 4;
 	/** The NAL unit length size the decoder config (the first segment's) declares */
 	targetLengthSize: 1 | 2 | 3 | 4;
+	/** Whether the segment's parameter sets differ from the first segment's */
+	differ: boolean;
 };
 
 const parseParameterSets = (codec: 'avc' | 'hevc', description: Uint8Array) => {
@@ -405,7 +415,13 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 		let data = packet.data;
 		let byteLength = packet.byteLength;
-		const inBand = await this.getInBandParameterSets(track);
+		const ownParameterSets = await this.getInBandParameterSets(track);
+		// When the segments come with more than one init section, every segment sends its own parameter sets, also
+		// those equal to the decoder config's: the decoder may have just received another segment's sets under the same
+		// IDs, which replace them
+		const inBand = ownParameterSets && (ownParameterSets.differ || this.segmentedInput.hasMultipleInitSections())
+			? ownParameterSets
+			: null;
 		if (inBand) {
 			let source = packet;
 			if (packet.isMetadataOnly && inBand.lengthSize !== inBand.targetLengthSize) {
@@ -453,14 +469,15 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	/**
 	 * The decoder config is the first segment's, but a later segment can come with its own init section whose parameter
 	 * sets differ (a new EXT-X-MAP after a discontinuity, such as an ad break from another encoder). Like Chromium does
-	 * for a new init segment, that segment's parameter sets are then sent in band, in front of each of its key packets.
+	 * for a new init segment, segments then send their own parameter sets in band, in front of each of their key
+	 * packets.
 	 */
 	getInBandParameterSets(track: InputTrack) {
 		let promise = this.inBandParameterSets.get(track);
 		if (!promise) {
 			promise = (async (): Promise<InBandParameterSets | null> => {
 				assert(this.firstInputTrack);
-				if (track === this.firstInputTrack || !track.isVideoTrack()) {
+				if (!track.isVideoTrack()) {
 					return null;
 				}
 
@@ -477,20 +494,26 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 				const firstDescription = toUint8Array(firstConfig.description);
 				const description = toUint8Array(config.description);
-				if (uint8ArraysAreEqual(firstDescription, description)) {
-					return null;
-				}
-
 				const first = parseParameterSets(codec, firstDescription);
 				const own = parseParameterSets(codec, description);
 				if (!first || !own) {
 					return null;
 				}
 
+				if (own.nalUnits.some(nalUnit => nalUnit.byteLength >= 2 ** (8 * first.lengthSize))) {
+					throw new Error(
+						'A parameter set is too large for the NAL unit length size of the first segment\'s decoder'
+						+ ' config.',
+					);
+				}
+
+				const differ = !uint8ArraysAreEqual(firstDescription, description);
+
 				return {
 					parameterSets: concatNalUnitsInLengthPrefixed(own.nalUnits, first.lengthSize),
 					lengthSize: own.lengthSize,
 					targetLengthSize: first.lengthSize,
+					differ,
 				};
 			})();
 			this.inBandParameterSets.set(track, promise);
