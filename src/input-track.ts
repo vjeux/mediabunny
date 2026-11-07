@@ -1120,6 +1120,8 @@ export interface InputAudioTrackBacking extends InputTrackBacking {
 	getNumberOfChannels(): MaybePromise<number>;
 	getSampleRate(): MaybePromise<number>;
 	getDecoderConfig(): Promise<AudioDecoderConfig | null>;
+	/** The pre-roll duration the container declares for the track, in seconds, if it declares one. */
+	getContainerPreRollDuration?(): MaybePromise<number | null>;
 }
 
 /**
@@ -1229,7 +1231,11 @@ export class InputAudioTrack extends InputTrack {
 
 		const decoderConfig = await this._backing.getDecoderConfig();
 		assert(decoderConfig);
-		return getAudioPreRollDuration(codec, decoderConfig);
+		const codecPreRollDuration = getAudioPreRollDuration(codec, decoderConfig);
+
+		// The container may declare that more is needed
+		const containerPreRollDuration = await this._backing.getContainerPreRollDuration?.() ?? 0;
+		return Math.max(codecPreRollDuration, containerPreRollDuration);
 	}
 
 	async canDecode() {
