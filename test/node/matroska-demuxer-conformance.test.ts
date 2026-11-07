@@ -490,11 +490,12 @@ describe('Track entries', () => {
 	test('prefers LanguageBCP47 over Language, in either order', async () => {
 		for (const order of ['bcp47-first', 'bcp47-last']) {
 			const language = str(EBMLId.Language, 'ger');
-			const bcp47 = str(EBMLId.LanguageBCP47, 'fr-CA');
+			// Swiss German, whose BCP 47 language subtag (gsw) is already an ISO 639-2 code
+			const bcp47 = str(EBMLId.LanguageBCP47, 'gsw-CH');
 			const extra = order === 'bcp47-first' ? [bcp47, language] : [language, bcp47];
 
 			using input = open(mkv(info(), tracks(videoTrack(1, 'V_VP8', { extra }))));
-			expect(await (await input.getVideoTracks())[0]!.getLanguageCode(), order).toBe('fr');
+			expect(await (await input.getVideoTracks())[0]!.getLanguageCode(), order).toBe('gsw');
 		}
 	});
 
