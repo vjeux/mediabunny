@@ -1488,3 +1488,23 @@ test('Transcoding odd-sized video to AVC rounds its dimensions up to even ones',
 	expect(await videoTrack.getCodedWidth()).toBe(322);
 	expect(await videoTrack.getCodedHeight()).toBe(242);
 });
+
+test('Transcoding to AVC with an odd-sized crop rounds the crop size up to even dimensions', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		video: { codec: 'avc', crop: { left: 10, top: 10, width: 45, height: 81 } },
+		trim: { end: 0.5 },
+		showWarnings: false,
+	});
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = await result.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await videoTrack.getCodec()).toBe('avc');
+	expect([await videoTrack.getCodedWidth(), await videoTrack.getCodedHeight()]).toEqual([46, 82]);
+});
