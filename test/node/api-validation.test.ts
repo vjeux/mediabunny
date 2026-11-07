@@ -1405,6 +1405,62 @@ describe('Lifecycle', () => {
 		expect(new InputDisposedError().name).toBe('InputDisposedError');
 	});
 
+	test('Input: reads after dispose return cached data or reject with InputDisposedError', async () => {
+		/** Resolves with 'cached', 'disposed', 'hang' or the unexpected error's message. */
+		const outcomeOf = async (call: () => Promise<unknown>) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const hang = new Promise<string>((resolve) => {
+				timer = setTimeout(() => resolve('hang'), 2000);
+			});
+			const settled = call().then(
+				() => 'cached',
+				(error: unknown) => (error instanceof InputDisposedError ? 'disposed' : String(error)),
+			);
+			const outcome = await Promise.race([settled, hang]);
+			clearTimeout(timer);
+			return outcome;
+		};
+
+		// Disposing before the first read fails with "ref has already been freed" on main (fixed in upstream's
+		// bug-fix-mania branch), and HLS has its own fix in flight, so this covers inputs that were read from first
+		const files = [
+			'video.mp4', 'trunc-buck-bunny.mov', 'ac3.mkv', 'demo.webm', 'glitch-hop-is-dead.wav', 'vorbis-eos.ogg',
+			'sample.flac', 'Toothsome-Meme.VBRv2.mp3', 'sample3.aac', '0.ts',
+		];
+		for (const file of files) {
+			const input = new Input({ source: new BufferSource(readPublic(file)), formats: ALL_FORMATS });
+			const tracks = await input.getTracks();
+			expect(tracks.length, file).toBeGreaterThan(0);
+			input.dispose();
+
+			const calls: [string, () => Promise<unknown>][] = [
+				['getFormat', () => input.getFormat()],
+				['getMimeType', () => input.getMimeType()],
+				['getMetadataTags', () => input.getMetadataTags()],
+				['getTracks', () => input.getTracks()],
+				['computeDuration', () => input.computeDuration()],
+				['getFirstTimestamp', () => input.getFirstTimestamp()],
+				['getDurationFromMetadata', () => input.getDurationFromMetadata()],
+			];
+			for (const track of tracks) {
+				calls.push(
+					[`${track.type}.getCodecParameterString`, () => track.getCodecParameterString()],
+					[`${track.type}.computeDuration`, () => track.computeDuration()],
+					[`${track.type}.getFirstTimestamp`, () => track.getFirstTimestamp()],
+					[`${track.type}.getDurationFromMetadata`, () => track.getDurationFromMetadata()],
+				);
+			}
+			for (const [label, call] of calls) {
+				expect(['cached', 'disposed'], `${file}: ${label}`).toContain(await outcomeOf(call));
+			}
+			// Reading packets always needs the source
+			for (const track of tracks) {
+				expect(await outcomeOf(() => new EncodedPacketSink(track).getFirstPacket()), file).toBe('disposed');
+				expect(await outcomeOf(() => track.computePacketStats(10)), file).toBe('disposed');
+			}
+		}
+	});
+
 	test('Source references: freeing disposes the source exactly once', async () => {
 		const source = new BufferSource(new Uint8Array(8));
 		const first = source.ref();
