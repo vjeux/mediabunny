@@ -167,11 +167,15 @@ const readFrameIndices = async (track: InputTrack) => {
 	return indices;
 };
 
+// Quality levels give small frames small bitrates, at which WebKitGTK's AVC encoder (OpenH264) flattens colors and
+// drops frames, so conversions that re-encode frames to read back their colors ask for an ample bitrate
+const AMPLE_VIDEO_QUALITY = new Quality({ bitrate: 2e6 });
+
 describe('Video transforms', () => {
 	test('a width alone keeps the aspect ratio, rounded to even dimensions', async () => {
 		const source = await createQuadrantVideo(320, 180);
 		const result = await inspectFirstFrame(await convert(source, new Mp4OutputFormat(), {
-			video: { width: 100 },
+			video: { width: 100, quality: AMPLE_VIDEO_QUALITY },
 		}), QUADRANT_CENTERS);
 
 		expect(result.codedSize).toBe('100x56'); // 100 / (16 / 9) = 56.25
@@ -181,7 +185,7 @@ describe('Video transforms', () => {
 	test('a height alone keeps the aspect ratio, rounded up to even dimensions', async () => {
 		const source = await createQuadrantVideo(320, 180);
 		const result = await inspectFirstFrame(await convert(source, new Mp4OutputFormat(), {
-			video: { height: 101 },
+			video: { height: 101, quality: AMPLE_VIDEO_QUALITY },
 		}), QUADRANT_CENTERS);
 
 		expect(result.codedSize).toBe('182x102');
@@ -194,18 +198,18 @@ describe('Video transforms', () => {
 		const points: [number, number][] = [...QUADRANT_CENTERS, [0.5, 0.02], [0.5, 0.98]];
 
 		const contain = await inspectFirstFrame(await convert(source, new Mp4OutputFormat(), {
-			video: { width: 200, height: 200, fit: 'contain' },
+			video: { width: 200, height: 200, fit: 'contain', quality: AMPLE_VIDEO_QUALITY },
 		}), points);
 		expect(contain.codedSize).toBe('200x200');
 		expect(contain.colors).toBe('RGBWKK');
 
 		const cover = await inspectFirstFrame(await convert(source, new Mp4OutputFormat(), {
-			video: { width: 200, height: 200, fit: 'cover' },
+			video: { width: 200, height: 200, fit: 'cover', quality: AMPLE_VIDEO_QUALITY },
 		}), [[0.02, 0.02], [0.98, 0.02], [0.02, 0.98], [0.98, 0.98]]);
 		expect(cover.colors).toBe('RGBW');
 
 		const fill = await inspectFirstFrame(await convert(source, new Mp4OutputFormat(), {
-			video: { width: 200, height: 200, fit: 'fill' },
+			video: { width: 200, height: 200, fit: 'fill', quality: AMPLE_VIDEO_QUALITY },
 		}), [[0.02, 0.02], [0.98, 0.02], [0.02, 0.98], [0.98, 0.98]]);
 		expect(fill.colors).toBe('RGBW');
 	});
@@ -227,11 +231,13 @@ describe('Video transforms', () => {
 	test('rotation is baked in when the format has no rotation metadata or it is disallowed', async () => {
 		const rotatedSource = await createQuadrantVideo(320, 180, 90);
 
-		const mkv = await inspectFirstFrame(await convert(rotatedSource, new MkvOutputFormat()), QUADRANT_CENTERS);
+		const mkv = await inspectFirstFrame(await convert(rotatedSource, new MkvOutputFormat(), {
+			video: { quality: AMPLE_VIDEO_QUALITY },
+		}), QUADRANT_CENTERS);
 		expect(mkv).toEqual({ codedSize: '180x320', displaySize: '180x320', rotation: 0, colors: 'BRWG' });
 
 		const disallowed = await inspectFirstFrame(await convert(rotatedSource, new Mp4OutputFormat(), {
-			video: { rotate: 90, allowTransformationMetadata: false },
+			video: { rotate: 90, allowTransformationMetadata: false, quality: AMPLE_VIDEO_QUALITY },
 		}), QUADRANT_CENTERS);
 		expect(disallowed).toEqual({ codedSize: '320x180', displaySize: '320x180', rotation: 0, colors: 'WBGR' });
 	});
@@ -239,13 +245,13 @@ describe('Video transforms', () => {
 	test('flip mirrors the frame horizontally, after the source rotation', async () => {
 		const source = await createQuadrantVideo(320, 180);
 		const flipped = await inspectFirstFrame(await convert(source, new Mp4OutputFormat(), {
-			video: { flip: true, allowTransformationMetadata: false },
+			video: { flip: true, allowTransformationMetadata: false, quality: AMPLE_VIDEO_QUALITY },
 		}), QUADRANT_CENTERS);
 		expect(flipped.colors).toBe('GRWB');
 
 		const rotatedSource = await createQuadrantVideo(320, 180, 90);
 		const rotatedFlipped = await inspectFirstFrame(await convert(rotatedSource, new Mp4OutputFormat(), {
-			video: { flip: true, allowTransformationMetadata: false },
+			video: { flip: true, allowTransformationMetadata: false, quality: AMPLE_VIDEO_QUALITY },
 		}), QUADRANT_CENTERS);
 		expect(rotatedFlipped).toMatchObject({ codedSize: '180x320', colors: 'RBGW' });
 	});
@@ -254,12 +260,12 @@ describe('Video transforms', () => {
 		const rotatedSource = await createQuadrantVideo(320, 180, 90); // Presented as 180x320
 
 		const topHalf = await inspectFirstFrame(await convert(rotatedSource, new Mp4OutputFormat(), {
-			video: { crop: { left: 0, top: 0, width: 180, height: 160 } },
+			video: { crop: { left: 0, top: 0, width: 180, height: 160 }, quality: AMPLE_VIDEO_QUALITY },
 		}), QUADRANT_CENTERS);
 		expect(topHalf).toMatchObject({ codedSize: '180x160', rotation: 0, colors: 'BRBR' });
 
 		const clamped = await inspectFirstFrame(await convert(rotatedSource, new Mp4OutputFormat(), {
-			video: { crop: { left: 90, top: 160, width: 1000, height: 1000 } },
+			video: { crop: { left: 90, top: 160, width: 1000, height: 1000 }, quality: AMPLE_VIDEO_QUALITY },
 		}), QUADRANT_CENTERS);
 		expect(clamped).toMatchObject({ codedSize: '90x160', colors: 'GGGG' });
 	});
@@ -383,7 +389,8 @@ describe('Key frames', () => {
 		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
 		const canvas = new OffscreenCanvas(64, 64);
 		canvas.getContext('2d')!.fillRect(0, 0, 64, 64);
-		const source = new CanvasSource(canvas, { codec: 'avc', quality: new Quality('medium'), keyFrameInterval: 5 });
+		// VP9, as WebKitGTK's AVC encoder adds a key frame every 15 frames on its own
+		const source = new CanvasSource(canvas, { codec: 'vp9', quality: new Quality('medium'), keyFrameInterval: 5 });
 		output.addVideoTrack(source, { frameRate: 10 });
 		await output.start();
 		for (let i = 0; i < 50; i++) {
@@ -393,13 +400,13 @@ describe('Key frames', () => {
 		const video = output.target.buffer!;
 
 		expect(await keyFrameTimestamps(await convert(video, new Mp4OutputFormat(), {
-			video: { forceTranscode: true },
+			video: { codec: 'vp9', forceTranscode: true },
 		}))).toEqual([0, 2, 4]); // The default interval is 2 s
 		expect(await keyFrameTimestamps(await convert(video, new Mp4OutputFormat(), {
-			video: { keyFrameInterval: 1 },
+			video: { codec: 'vp9', keyFrameInterval: 1 },
 		}))).toEqual([0, 1, 2, 3, 4]);
 		expect(await keyFrameTimestamps(await convert(video, new Mp4OutputFormat(), {
-			video: { keyFrameInterval: 0 },
+			video: { codec: 'vp9', keyFrameInterval: 0 },
 		}))).toHaveLength(50);
 	});
 });
