@@ -37,7 +37,7 @@ import {
 	InputTrackBacking,
 	InputVideoTrackBacking,
 } from '../input-track';
-import { AttachedFile, DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
+import { AttachedFile, AttachedImage, DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { PacketRetrievalOptions } from '../media-sink';
 import {
 	assert,
@@ -277,6 +277,20 @@ const getCoverArtRank = (fileName: string | null | undefined) => {
 	return match ? (match[1] ? 2 : 0) + (match[2] ? 1 : 0) : null;
 };
 
+/**
+ * The spec's cover art names are versions of the same cover, so the best one there is the front cover (cover.*
+ * always). Done once all attachments are read, whatever their order.
+ */
+const pickFrontCover = (images: AttachedImage[]) => {
+	const ranks = images.map(image => getCoverArtRank(image.name));
+	const bestRank = Math.min(...ranks.map(rank => rank ?? Infinity));
+	images.forEach((image, i) => {
+		if (ranks[i] !== null) {
+			image.kind = ranks[i] === bestRank ? 'coverFront' : 'unknown';
+		}
+	});
+};
+
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
 const MAX_ELEMENT_NESTING_DEPTH = 64;
 
@@ -360,6 +374,10 @@ export class MatroskaDemuxer extends Demuxer {
 		let metadataTags: MetadataTags = {};
 		for (const segment of this.segments) {
 			metadataTags = { ...metadataTags, ...segment.metadataTags };
+		}
+
+		if (metadataTags.images) {
+			pickFrontCover(metadataTags.images);
 		}
 
 		return metadataTags;
@@ -1897,28 +1915,15 @@ export class MatroskaDemuxer extends Demuxer {
 					const fileName = this.currentAttachedFile.fileName;
 					let kind: 'coverFront' | 'coverBack' | 'unknown' = 'unknown';
 
-					tags.images ??= [];
-
 					// The Matroska spec names cover art cover.(jpg|png), with versions of the same cover prefixed with
-					// small_ (smaller) or suffixed with _land (landscape). The best one there is the front cover, which
-					// cover.* always is.
-					const coverRank = getCoverArtRank(fileName);
-					if (coverRank !== null) {
-						const isWorse = (image: { name?: string }) => {
-							return (getCoverArtRank(image.name) ?? Infinity) > coverRank;
-						};
-						const frontCovers = tags.images.filter(x => x.kind === 'coverFront');
-						if (coverRank === 0 || frontCovers.every(isWorse)) {
-							for (const image of frontCovers.filter(isWorse)) {
-								image.kind = 'unknown';
-							}
-
-							kind = 'coverFront';
-						}
+					// small_ (smaller) or suffixed with _land (landscape); getMetadataTags() picks the front cover
+					if (getCoverArtRank(fileName) !== null) {
+						kind = 'coverFront';
 					} else if (fileName?.toLowerCase().startsWith('back.')) {
 						kind = 'coverBack';
 					}
 
+					tags.images ??= [];
 					tags.images.push({
 						data: this.currentAttachedFile.fileData,
 						mimeType: this.currentAttachedFile.fileMediaType,
