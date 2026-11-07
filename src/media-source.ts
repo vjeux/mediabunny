@@ -1082,12 +1082,17 @@ class VideoEncoderWrapper {
 		this.createWebCodecsEncoders();
 	}
 
-	async flushAndClose(forceClose: boolean) {
+	async flushAndClose(forceClose: boolean, initializationSettled = false) {
 		// When force closing, don't wait for an initialization that may never finish (one hanging in a platform codec,
-		// say), but close the encoder once it does
-		const closeEncoderLater = forceClose && !!this.ensureEncoderPromise && !this.encoderInitialized;
+		// say), but close the encoder once the initialization has settled, either way (a failed one can still leave an
+		// encoder behind)
+		const closeEncoderLater = forceClose
+			&& !initializationSettled
+			&& !!this.ensureEncoderPromise
+			&& !this.encoderInitialized;
 		if (closeEncoderLater) {
-			void this.ensureEncoderPromise!.then(() => this.flushAndClose(true), () => {}).catch(() => {});
+			const closeEncoder = () => this.flushAndClose(true, true);
+			void this.ensureEncoderPromise!.then(closeEncoder, closeEncoder).catch(() => {});
 		} else {
 			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
 			await this.ensureEncoderPromise?.catch(() => {});
@@ -2652,12 +2657,17 @@ class AudioEncoderWrapper {
 		}
 	}
 
-	async flushAndClose(forceClose: boolean) {
+	async flushAndClose(forceClose: boolean, initializationSettled = false) {
 		// When force closing, don't wait for an initialization that may never finish (one hanging in a platform codec,
-		// say), but close the encoder once it does
-		const closeEncoderLater = forceClose && !!this.ensureEncoderPromise && !this.encoderInitialized;
+		// say), but close the encoder once the initialization has settled, either way (a failed one can still leave an
+		// encoder behind)
+		const closeEncoderLater = forceClose
+			&& !initializationSettled
+			&& !!this.ensureEncoderPromise
+			&& !this.encoderInitialized;
 		if (closeEncoderLater) {
-			void this.ensureEncoderPromise!.then(() => this.flushAndClose(true), () => {}).catch(() => {});
+			const closeEncoder = () => this.flushAndClose(true, true);
+			void this.ensureEncoderPromise!.then(closeEncoder, closeEncoder).catch(() => {});
 		} else {
 			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
 			await this.ensureEncoderPromise?.catch(() => {});
