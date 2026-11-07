@@ -537,6 +537,48 @@ test('VideoSampleSource, transform.frameRate works with process', async () => {
 	input.dispose();
 });
 
+test('VideoSampleSource, keyFrameInterval puts a key frame on every multiple of a fractional interval', async () => {
+	const keyFrameIndices = async (keyFrameInterval: number, frameRate: number, frameCount: number) => {
+		const keyTimestamps: number[] = [];
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({
+			codec: 'vp8',
+			quality: new Quality('low'),
+			keyFrameInterval,
+			// In quality mode, encoders may add key frames of their own, which WebCodecs allows (Firefox's VP8 encoder
+			// places some at scene cuts)
+			latencyMode: 'realtime',
+			onEncodedPacket: (packet) => {
+				if (packet.type === 'key') {
+					keyTimestamps.push(packet.timestamp);
+				}
+			},
+		});
+		output.addVideoTrack(source, { frameRate });
+		await output.start();
+
+		const canvas = new OffscreenCanvas(64, 64);
+		const context = canvas.getContext('2d')!;
+		for (let i = 0; i < frameCount; i++) {
+			context.fillStyle = `rgb(${(i * 10) % 256}, 0, 0)`;
+			context.fillRect(0, 0, 64, 64);
+			const sample = new VideoSample(canvas, { timestamp: i / frameRate, duration: 1 / frameRate });
+			await source.add(sample);
+			sample.close();
+		}
+
+		await output.finalize();
+		return keyTimestamps.map(x => Math.round(x * frameRate));
+	};
+
+	// 0.6 / 0.2 is 2.9999999999999996 in floating point, but 0.6 s is still a multiple of 0.2 s
+	expect(await keyFrameIndices(0.2, 30, 25)).toEqual([0, 6, 12, 18, 24]);
+	expect(await keyFrameIndices(0.1, 30, 31)).toEqual(Array.from({ length: 11 }, (_, i) => 3 * i));
+	expect(await keyFrameIndices(0.4, 25, 51)).toEqual([0, 10, 20, 30, 40, 50]);
+	// Binary-exact intervals were fine already
+	expect(await keyFrameIndices(0.5, 30, 46)).toEqual([0, 15, 30, 45]);
+});
+
 const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {
 	const canvas = new OffscreenCanvas(width, height);
 	const ctx = canvas.getContext('2d')!;
