@@ -906,10 +906,6 @@ export const soundSampleDescription = (
 		const codec = trackData.track.source._codec as PcmAudioCodec;
 		const { sampleSize } = parsePcmCodec(codec);
 		sampleSizeInBits = 8 * sampleSize;
-
-		if (sampleSizeInBits > 16) {
-			version = 1;
-		}
 	}
 
 	// TrueHD's sample entry is defined on top of version 0, with its own sample rate layout

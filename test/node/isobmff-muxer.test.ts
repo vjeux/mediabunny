@@ -15,6 +15,61 @@ import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
+const STSD_PATH = ['moov', 'trak', 'mdia', 'minf', 'stbl', 'stsd'];
+
+type FoundBox = {
+	contentStart: number;
+	end: number;
+};
+
+const findBox = (bytes: Uint8Array, boxPath: string[]) => {
+	const view = toDataView(bytes);
+
+	const search = (start: number, end: number, depth: number, parentType: string | null): FoundBox | null => {
+		let pos = start;
+		while (pos < end) {
+			const size = view.getUint32(pos);
+			assert(size >= 8);
+
+			const type = String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+			const box = {
+				contentStart: pos + 8,
+				end: pos + size,
+			};
+
+			if (type === boxPath[depth]) {
+				if (depth === boxPath.length - 1) {
+					return box;
+				}
+
+				let childrenOffset = 0;
+				if (type === 'stsd') {
+					childrenOffset = 8;
+				} else if (type === 'meta') {
+					// QuickTime's meta box isn't a full box
+					const nextType = String.fromCharCode(...bytes.subarray(box.contentStart + 4, box.contentStart + 8));
+					childrenOffset = nextType === 'hdlr' ? 0 : 4;
+				} else if (parentType === 'stsd') {
+					// Audio sample entries grow with their version
+					const version = view.getUint16(box.contentStart + 8);
+					childrenOffset = 28 + [0, 16, 36][version]!;
+				}
+
+				const result = search(box.contentStart + childrenOffset, box.end, depth + 1, type);
+				if (result) {
+					return result;
+				}
+			}
+
+			pos += size;
+		}
+
+		return null;
+	};
+
+	return search(0, bytes.byteLength, 0, null);
+};
+
 test('ISOBMFF muxer internally converts ADTS to AAC', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/sample3.aac')),
@@ -131,6 +186,44 @@ test('Zero start timestamp, regular MP4', async () => {
 	// Hacky but works
 	const str = String.fromCharCode(...new Uint8Array(output.target.buffer!));
 	expect(str.includes('edts') || str.includes('elst')).toBe(false);
+});
+
+test('24-bit PCM sample entry, MP4', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('pcm-s24');
+	output.addAudioTrack(source);
+	await output.start();
+
+	const decoderConfig = {
+		codec: 'pcm-s24',
+		numberOfChannels: 2,
+		sampleRate: 48000,
+	};
+	await source.add(new EncodedPacket(new Uint8Array(6 * 1024), 'key', 0, 1024 / 48000), { decoderConfig });
+	await output.finalize();
+
+	// QuickTime's extended version 1 layout has no place in an ISO sample entry, Apple drops the track if it's there
+	const bytes = new Uint8Array(output.target.buffer!);
+	const sampleEntry = findBox(bytes, [...STSD_PATH, 'ipcm']);
+	assert(sampleEntry);
+
+	const version = toDataView(bytes).getUint16(sampleEntry.contentStart + 8);
+	expect(version).toBe(0);
+	expect(findBox(bytes, [...STSD_PATH, 'ipcm', 'pcmC'])).not.toBeNull();
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('pcm-s24');
+	expect(await track.getSampleRate()).toBe(48000);
 });
 
 test('Non-zero start timestamp, regular MP4', async () => {
