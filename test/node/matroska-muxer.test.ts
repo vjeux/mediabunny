@@ -65,6 +65,36 @@ test('Matroska muxer internally converts ADTS to AAC', async () => {
 	expect(count).toBe(4557);
 });
 
+test('Opus identification headers missing required bytes are rejected', async () => {
+	// RFC 7845, 5.1: 'OpusHead', version, channel count, pre-skip, input sample rate, output gain and mapping family,
+	// then, for any family but 0, the stream count, the coupled stream count and one mapping byte per channel
+	const opusHead = (channels: number, family: number, withMappingTable: boolean) => new Uint8Array([
+		...new TextEncoder().encode('OpusHead'),
+		1, channels, 0x38, 0x01, 0x80, 0xbb, 0x00, 0x00, 0x00, 0x00, family,
+		...(withMappingTable ? [4, 2, ...Array.from({ length: channels }, (_, i) => i)] : []),
+	]);
+
+	const addFirstPacket = async (description: Uint8Array, numberOfChannels: number) => {
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source);
+		await output.start();
+		// A one-frame 20 ms CELT packet
+		await source.add(new EncodedPacket(new Uint8Array([0xf8, 0xff, 0xfe]), 'key', 0, 0.02), {
+			decoderConfig: { codec: 'opus', sampleRate: 48000, numberOfChannels, description },
+		});
+	};
+
+	await addFirstPacket(opusHead(2, 0, false), 2);
+	await addFirstPacket(opusHead(6, 1, true), 6);
+
+	// These were written as CodecPrivate, which FFmpeg's decoder rejects ("Invalid extradata size"): one byte short
+	// of the mapping family, a family 1 header without its channel mapping table, and one with only part of it
+	await expect(addFirstPacket(opusHead(2, 0, false).subarray(0, 18), 2)).rejects.toThrow(TypeError);
+	await expect(addFirstPacket(opusHead(6, 1, false), 6)).rejects.toThrow(TypeError);
+	await expect(addFirstPacket(opusHead(6, 1, true).subarray(0, 26), 6)).rejects.toThrow(TypeError);
+});
+
 test('Negative start timestamps', async () => {
 	await testNegativeTimestampRoundTrip(
 		Array.from({ length: 50 }, (_, index) => (index - 10) / 10),
