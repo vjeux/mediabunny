@@ -672,3 +672,51 @@ test('Conversion of Ogg Opus to WebM with a sub-millisecond start trim applies t
 	// Matroska stores milliseconds
 	expect(Math.abs(outputPacket.timestamp - (inputPacket.timestamp - trimStart))).toBeLessThanOrEqual(0.0005 + 1e-9);
 });
+
+test('VP9 key frames keep the color space in their bitstream', async () => {
+	// The color space of an HDR (BT.2020) VP9 stream, as YouTube serves, was overwritten with 0 ("unknown") in a copy,
+	// so decoders that go by the bitstream (FFmpeg, WebCodecs without a colorSpace) showed different colors
+	const keyFrame = (colorSpace: number) => [
+		0b1001_0010, // Frame marker, profile 2, a shown key frame
+		0x49, 0x83, 0x42, // Sync code
+		colorSpace << 4, // 10-bit, color_space, studio range
+		1, 2, 3, 4, 5, 6, 7, 8,
+	];
+
+	// (The DOM types don't know the BT.2020 values yet)
+	const bt2020: VideoColorSpaceInit = {
+		primaries: 'bt2020' as VideoColorPrimaries,
+		transfer: 'pq' as VideoTransferCharacteristics,
+		matrix: 'bt2020-ncl' as VideoMatrixCoefficients,
+		fullRange: false,
+	};
+	const bt709: VideoColorSpaceInit = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false };
+
+	const muxAndRead = async (data: number[], colorSpace: VideoColorSpaceInit) => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(data), 'key', 0, 1 / 30), {
+			decoderConfig: {
+				codec: 'vp09.02.10.10',
+				codedWidth: 64,
+				codedHeight: 64,
+				colorSpace,
+			},
+		});
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array(output.target.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		return [...packet!.data];
+	};
+
+	expect(await muxAndRead(keyFrame(5), bt2020)).toEqual(keyFrame(5)); // color_space 5 is BT.2020
+	expect(await muxAndRead(keyFrame(2), bt709)).toEqual(keyFrame(2)); // 2 is BT.709
+});
