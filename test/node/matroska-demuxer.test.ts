@@ -163,3 +163,73 @@ test('getPacket finds B-frames that straddle a cluster boundary', async () => {
 		await checkLookups(file, [...timestamps].reverse());
 	}
 });
+
+test('getPacket finds B-frames in a cluster that starts before the cluster preceding it', async () => {
+	// x264's B-pyramid (decode order I0 P4 B2 b1 b3 ...), cut into clusters of a few blocks, each cluster's Timestamp
+	// being its first block's, as FFmpeg writes when it hits its cluster size limit (-f matroska to a pipe, or high
+	// bitrates). A cluster can then hold frames presented before the start of the cluster in front of it.
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const cluster = (timestamp: number, ...presentationTimestamps: number[]) => element(
+		EBMLId.Cluster,
+		element(EBMLId.Timestamp, [timestamp >> 8, timestamp & 0xff]),
+		...presentationTimestamps.map((pts) => {
+			const relative = pts - timestamp;
+			const flags = pts === 0 ? 0x80 : 0; // Only the first frame is a key frame
+			return element(EBMLId.SimpleBlock, [0x81, (relative >> 8) & 0xff, relative & 0xff, flags, 1]);
+		}),
+	);
+	const makeFile = (...clusters: number[][]) => new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [1]),
+				element(EBMLId.CodecID, ascii('V_MPEG4/ISO/AVC')),
+				element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00]), // 40 ms
+				element(EBMLId.Video, element(EBMLId.PixelWidth, [16]), element(EBMLId.PixelHeight, [16])),
+			)),
+			...clusters,
+		),
+	]);
+
+	const lookUp = async (file: Uint8Array, timestamps: number[]) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const sink = new EncodedPacketSink(track);
+
+		const found: number[] = [];
+		for (const timestamp of timestamps) {
+			found.push((await sink.getPacket(timestamp))!.timestamp);
+		}
+		return found;
+	};
+
+	// The 40 ms frame sits two clusters after the key frame, behind a cluster starting at 80 ms
+	const forward = makeFile(cluster(0, 0), cluster(160, 160, 80), cluster(40, 40, 120));
+	for (const timestamp of [0, 0.04, 0.08, 0.12, 0.16]) {
+		expect(await lookUp(forward, [timestamp])).toEqual([timestamp]);
+	}
+
+	// Once a lookup has cached the cluster at 280 ms, the 320 ms frame two clusters before it must still be found
+	const backward = makeFile(cluster(0, 0), cluster(40, 40, 120, 320), cluster(240, 240, 200), cluster(280, 280, 480));
+	expect(await lookUp(backward, [0.28, 0.32])).toEqual([0.28, 0.32]);
+
+	// Control: the same frames, cut only in front of the P frames
+	const control = makeFile(cluster(0, 0), cluster(160, 160, 80, 40, 120));
+	expect(await lookUp(control, [0, 0.04, 0.08, 0.12, 0.16])).toEqual([0, 0.04, 0.08, 0.12, 0.16]);
+});
