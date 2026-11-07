@@ -641,10 +641,11 @@ const PACKET_STATS_PACKET_COUNT = 256;
 const outputTrackAdditionMutexes = new WeakMap<Output, AsyncMutex>();
 
 /**
- * Outputs that conversions were initialized on. They aren't fresh anymore, even while those conversions haven't added
- * their tracks yet.
+ * How many conversions were initialized on each output, not counting those that failed without adding anything. An
+ * output that a conversion was initialized on isn't fresh anymore, even while that conversion hasn't added its tracks
+ * yet.
  */
-const claimedOutputs = new WeakSet<Output>();
+const outputConversionCounts = new WeakMap<Output, number>();
 
 /**
  * An input track that was discarded (excluded) from a {@link Conversion} alongside the discard reason.
@@ -827,7 +828,19 @@ export class Conversion {
 	/** Initializes a new conversion process without starting the conversion. */
 	static async init(options: ConversionOptions) {
 		const conversion = new Conversion(options);
-		await conversion._init();
+
+		try {
+			await conversion._init();
+		} catch (error) {
+			if (conversion._outputTrackIds.length === 0) {
+				// The conversion added nothing to the output, so it doesn't count as using it
+				const count = outputConversionCounts.get(conversion.output);
+				assert(count !== undefined);
+				outputConversionCounts.set(conversion.output, count - 1);
+			}
+
+			throw error;
+		}
 
 		return conversion;
 	}
@@ -891,7 +904,7 @@ export class Conversion {
 				|| Object.keys(options.output._metadataTags).length > 0
 				|| options.output.state !== 'pending'
 				// Another conversion that is still initializing has no tracks on it yet
-				|| claimedOutputs.has(options.output)
+				|| (outputConversionCounts.get(options.output) ?? 0) > 0
 			) {
 				throw new TypeError('options.output must be fresh: no tracks or metadata tags added and not started.');
 			}
@@ -970,7 +983,7 @@ export class Conversion {
 		this.input = options.input;
 		this.output = options.output;
 
-		claimedOutputs.add(options.output);
+		outputConversionCounts.set(options.output, (outputConversionCounts.get(options.output) ?? 0) + 1);
 	}
 
 	/** @internal */

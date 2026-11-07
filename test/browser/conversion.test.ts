@@ -839,6 +839,21 @@ test('Two non-composable conversions initialized concurrently can\'t both claim 
 	expect(output.tracks).toHaveLength(2);
 });
 
+test('An output stays fresh after a non-composable conversion fails to initialize on it', async () => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+
+	// The first conversion fails during init, as its input can't be read
+	using badInput = new Input({ source: new BufferSource(new Uint8Array(1000)), formats: ALL_FORMATS });
+	await expect(Conversion.init({ input: badInput, output, showWarnings: false })).rejects.toThrow(/unsupported/i);
+	expect(output.tracks).toHaveLength(0);
+
+	// Nothing was added to the output, so another conversion can still take it over
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const conversion = await Conversion.init({ input, output, trim: { end: 0.5 }, showWarnings: false });
+	await conversion.execute();
+	expect(output.state).toBe('finalized');
+});
+
 test('Blank execute', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
