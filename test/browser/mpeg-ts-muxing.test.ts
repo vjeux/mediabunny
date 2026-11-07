@@ -827,13 +827,61 @@ test('MPEG-TS muxing with B-frames keeps DTS at or before PTS', async () => {
 
 	await output.finalize();
 
-	// The PTS and DTS of the video PES packets (negative ones are written modulo 2^33)
-	const bytes = new Uint8Array(output.target.buffer!);
+	const timestamps = readVideoPesTimestamps(new Uint8Array(output.target.buffer!));
+	expect(timestamps.map(x => x.pts)).toEqual(frames.map(x => 3000 * x));
+	expect(timestamps.map(x => x.dts)).toEqual([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(x => 3000 * x));
+});
+
+test('MPEG-TS muxing keeps DTS increasing when a later GOP reorders deeper', async () => {
+	// A GOP without B-frames, then one with a B-pyramid (x264 can pick no B-frames at first). Without an SPS saying
+	// how deeply the stream reorders, the second GOP's DTS are kept after the first one's. With one (x264's, from
+	// video.mp4: 2 frames), DTS are that far behind PTS from the start, like in FFmpeg.
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const x264DecoderConfig = await videoTrack.getDecoderConfig();
+	assert(x264DecoderConfig);
+
+	const frames = [0, 1, 2, 3, 4, 8, 6, 5, 7, 9];
+	const cases = [
+		{ decoderConfig: { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 }, startCode: [0, 0, 0, 1] },
+		{ decoderConfig: x264DecoderConfig, startCode: [0, 0, 0, 2] }, // Length-prefixed NAL units
+	];
+	const expectedDts = [
+		[0, 3000, 6000, 9000, 9001, 9002, 12000, 15000, 18000, 21000],
+		[-2, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(x => 3000 * x),
+	];
+
+	for (const [index, { decoderConfig, startCode }] of cases.entries()) {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+
+		for (let i = 0; i < frames.length; i++) {
+			const isKey = i === 0 || i === 4 || i === 9;
+			const data = new Uint8Array([...startCode, isKey ? 0x65 : 0x41, 0x88]);
+			await source.add(new EncodedPacket(data, isKey ? 'key' : 'delta', frames[i]! / 30, 1 / 30), {
+				decoderConfig,
+			});
+		}
+
+		await output.finalize();
+
+		const timestamps = readVideoPesTimestamps(new Uint8Array(output.target.buffer!));
+		expect(timestamps.map(x => x.pts)).toEqual(frames.map(x => 3000 * x));
+		expect(timestamps.map(x => x.dts)).toEqual(expectedDts[index]);
+	}
+});
+
+/** Returns the PTS and DTS of the video PES packets (on PID 0x100), with negative ones as such. */
+const readVideoPesTimestamps = (bytes: Uint8Array) => {
 	const readTimestamp = (pos: number) => {
 		const value = ((bytes[pos]! >> 1) & 0x07) * 2 ** 30 + (bytes[pos + 1]! << 22) + ((bytes[pos + 2]! >> 1) << 15)
 			+ (bytes[pos + 3]! << 7) + (bytes[pos + 4]! >> 1);
-		return value >= 2 ** 32 ? value - 2 ** 33 : value;
+		return value >= 2 ** 32 ? value - 2 ** 33 : value; // Negative ones are written modulo 2^33
 	};
+
 	const timestamps: { pts: number; dts: number }[] = [];
 	for (let pos = 0; pos < bytes.length; pos += 188) {
 		if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && bytes[pos + 1]! & 0x40) {
@@ -842,6 +890,5 @@ test('MPEG-TS muxing with B-frames keeps DTS at or before PTS', async () => {
 		}
 	}
 
-	expect(timestamps.map(x => x.pts)).toEqual(frames.map(x => 3000 * x));
-	expect(timestamps.map(x => x.dts)).toEqual([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(x => 3000 * x));
-});
+	return timestamps;
+};

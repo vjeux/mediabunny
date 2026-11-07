@@ -22,6 +22,8 @@ import {
 	HevcNalUnitType,
 	iterateNalUnitsInAnnexB,
 	iterateNalUnitsInLengthPrefixed,
+	parseAvcSps,
+	parseHevcSps,
 } from '../codec-data';
 import { Bitstream } from '../../shared/bitstream';
 import { assert, promiseWithResolvers, setUint24, toDataView, toUint8Array } from '../misc';
@@ -32,6 +34,7 @@ import { EncodedPacket } from '../packet';
 import { Writer } from '../writer';
 import {
 	buildMpegTsMimeType,
+	MPEG_TS_TIMESCALE,
 	MpegTsStreamType,
 	secondsToMpegTsTimestamp,
 	TS_PACKET_SIZE,
@@ -57,7 +60,10 @@ type MpegTsTrackData = {
 	streamId: number;
 	codecString: string;
 	timestampProcessingQueue: QueuedPacket[];
+	/** How many frames the stream reorders at most, as its SPS says (if it does) */
+	reorderFrameCount: number | null;
 	reorderDelay: number;
+	lastDecodeTimestamp: number;
 	packetQueue: QueuedPacket[];
 	inputIsAnnexB: boolean | null;
 	inputIsAdts: boolean | null;
@@ -72,6 +78,7 @@ type MpegTsTrackData = {
 type QueuedPacket = {
 	data: Uint8Array;
 	presentationTimestamp: number;
+	duration: number;
 	decodeTimestamp: number | null;
 	isKeyframe: boolean;
 };
@@ -139,7 +146,9 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
+			reorderFrameCount: null,
 			reorderDelay: 0,
+			lastDecodeTimestamp: -Infinity,
 			packetQueue: [],
 			inputIsAnnexB: null,
 			inputIsAdts: null,
@@ -211,7 +220,9 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
+			reorderFrameCount: null,
 			reorderDelay: 0,
+			lastDecodeTimestamp: -Infinity,
 			packetQueue: [],
 			inputIsAnnexB: null,
 			inputIsAdts: null,
@@ -257,6 +268,7 @@ export class MpegTsMuxer extends Muxer {
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
 				presentationTimestamp: packet.timestamp,
+				duration: packet.duration,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -290,6 +302,7 @@ export class MpegTsMuxer extends Muxer {
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
 				presentationTimestamp: packet.timestamp,
+				duration: packet.duration,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -322,12 +335,49 @@ export class MpegTsMuxer extends Muxer {
 					trackData.hevcDecoderConfig = deserializeHevcDecoderConfigurationRecord(bytes);
 				}
 			}
+
+			trackData.reorderFrameCount = this.getReorderFrameCount(trackData, packet.data, codec as 'avc' | 'hevc');
 		}
 
 		if (trackData.inputIsAnnexB) {
 			return this.prepareAnnexBVideoPacket(packet.data, codec as 'avc' | 'hevc');
 		} else {
 			return this.prepareLengthPrefixedVideoPacket(trackData, packet, codec as 'avc' | 'hevc');
+		}
+	}
+
+	/**
+	 * Returns how many frames the stream reorders at most, as its SPS says: AVC's num_reorder_frames (only when it's
+	 * given, the inferred one can be much larger than what's used) or HEVC's sps_max_num_reorder_pics.
+	 */
+	private getReorderFrameCount(trackData: MpegTsTrackData, data: Uint8Array, codec: 'avc' | 'hevc') {
+		let sps = codec === 'avc'
+			? trackData.avcDecoderConfig?.sequenceParameterSets[0]
+			: trackData.hevcDecoderConfig?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
+
+		if (!sps && trackData.inputIsAnnexB) {
+			for (const loc of iterateNalUnitsInAnnexB(data)) {
+				const nalUnit = data.subarray(loc.offset, loc.offset + loc.length);
+				const isSps = codec === 'avc'
+					? extractNalUnitTypeForAvc(nalUnit[0]!) === AvcNalUnitType.SPS
+					: extractNalUnitTypeForHevc(nalUnit[0]!) === HevcNalUnitType.SPS_NUT;
+				if (isSps) {
+					sps = nalUnit;
+					break;
+				}
+			}
+		}
+
+		if (!sps) {
+			return null;
+		}
+
+		if (codec === 'avc') {
+			const info = parseAvcSps(sps);
+			return info?.bitstreamRestrictionFlag ? info.numReorderFrames : null;
+		} else {
+			const info = parseHevcSps(sps);
+			return info ? info.maxDecFrameBuffering - 1 : null; // That's sps_max_num_reorder_pics + 1
 		}
 	}
 
@@ -484,6 +534,23 @@ export class MpegTsMuxer extends Muxer {
 			.map(packet => packet.presentationTimestamp)
 			.sort((a, b) => a - b);
 
+		if (trackData.lastDecodeTimestamp === -Infinity && trackData.reorderFrameCount) {
+			// Like FFmpeg, start with the reordering the SPS announces, so that a GOP reordering deeper than the first
+			// one doesn't need a larger delay later on
+			let frameDuration = Infinity;
+			for (let i = 1; i < sortedTimestamps.length; i++) {
+				const gap = sortedTimestamps[i]! - sortedTimestamps[i - 1]!;
+				if (gap > 0) {
+					frameDuration = Math.min(frameDuration, gap);
+				}
+			}
+			if (frameDuration === Infinity) {
+				frameDuration = trackData.timestampProcessingQueue[0]!.duration;
+			}
+
+			trackData.reorderDelay = trackData.reorderFrameCount * frameDuration;
+		}
+
 		// In addition to monotonic decode timestamps, we also want to guarantee DTS <= PTS for all frames, because this
 		// is an expectation for many players.
 		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
@@ -496,7 +563,13 @@ export class MpegTsMuxer extends Muxer {
 
 		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
 			const queuedPacket = trackData.timestampProcessingQueue[i]!;
-			queuedPacket.decodeTimestamp = sortedTimestamps[i]! - trackData.reorderDelay;
+			// A GOP that reorders deeper than the ones before would go back below the DTS already written, so keep
+			// them increasing (letting a DTS exceed its PTS there, if need be)
+			queuedPacket.decodeTimestamp = Math.max(
+				sortedTimestamps[i]! - trackData.reorderDelay,
+				trackData.lastDecodeTimestamp + 1 / MPEG_TS_TIMESCALE,
+			);
+			trackData.lastDecodeTimestamp = queuedPacket.decodeTimestamp;
 			trackData.packetQueue.push(queuedPacket);
 		}
 
