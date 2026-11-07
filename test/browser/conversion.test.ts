@@ -8,6 +8,7 @@ import {
 	MpegTsOutputFormat,
 	OutputFormat,
 	WavOutputFormat,
+	WebMOutputFormat,
 } from '../../src/output-format.js';
 import { Output, OutputTrackGroup } from '../../src/output.js';
 import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
@@ -19,7 +20,7 @@ import { InputVideoTrack } from '../../src/input-track.js';
 import { CanvasSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
 
 test('Rotation is baked in when rerendering', async () => {
@@ -61,6 +62,58 @@ test('Rotation is baked in when rerendering', async () => {
 	expect(await track.getDisplayHeight()).toBe(570);
 	expect(await track.getRotation()).toBe(0);
 });
+
+// Whether this browser can decode a file's video at all, decided by VideoDecoder.isConfigSupported (WebKitGTK can't
+// decode VP9 profile 1 or AV1 4:4:4, say)
+const decodesVideoNatively = async (url: string) => {
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const decoderConfig = await (await input.getPrimaryVideoTrack())?.getDecoderConfig();
+	return !!decoderConfig && (await VideoDecoder.isConfigSupported(decoderConfig)).supported === true;
+};
+
+const testGbrTranscode = async (url: string, color: readonly number[]) => {
+	const firstPixel = async (input: Input) => {
+		using sample = (await new VideoSampleSink((await input.getPrimaryVideoTrack())!).getSample(0))!;
+		const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+		await sample.copyTo(rgba, { format: 'RGBA' });
+		return [...rgba.subarray(0, 3)];
+	};
+
+	for (const [createFormat, codec] of [
+		[() => new Mp4OutputFormat(), 'avc'],
+		[() => new WebMOutputFormat(), 'vp8'],
+		[() => new WebMOutputFormat(), 'vp9'],
+	] as const) {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		expect((await (await input.getPrimaryVideoTrack())!.getColorSpace()).matrix).toBe('rgb');
+
+		const output = new Output({ format: createFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video: { codec, forceTranscode: true } });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const pixel = await firstPixel(result);
+		for (let i = 0; i < 3; i++) {
+			expect(Math.abs(pixel[i]! - color[i]!)).toBeLessThan(15);
+		}
+	}
+};
+
+for (const [url, color] of [
+	// 32x32 solid (200, 200, 200), VP9 profile 1 GBR 4:4:4, as FFmpeg makes lossless VP9 from RGB sources:
+	// ffmpeg -f lavfi -i "color=0xc8c8c8:s=32x32:r=10:d=0.2,format=gbrp" -c:v libvpx-vp9 -lossless 1
+	['/vp9-gbr-lossless.webm', [200, 200, 200]],
+	// 32x32 solid (48, 128, 192), AV1 GBR 4:4:4:
+	// ffmpeg -f lavfi -i "color=0x3080c0:s=32x32:r=10:d=0.2,format=gbrp" -c:v libaom-av1 -cpu-used 8 -crf 0
+	['/av1-gbr-lossless.mkv', [48, 128, 192]],
+] as const) {
+	test.skipIf(!(await decodesVideoNatively(url)))(
+		`Transcoding GBR-coded video (identity matrix) keeps its colors: ${url}`,
+		async () => {
+			await testGbrTranscode(url, color);
+		},
+	);
+}
 
 test('Flip is forwarded as metadata when copying', async () => {
 	const buffer = await encodeFlippedVideo();
