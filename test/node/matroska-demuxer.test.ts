@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -81,4 +83,62 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('Tags whose target UID is 0 apply to the whole segment', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const utf8 = (text: string) => [...new TextEncoder().encode(text)];
+
+	const readArtist = async (uidElementId: number, uid: number[]) => {
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, utf8('matroska'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackUID, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, utf8('A_AC3')),
+				)),
+				element(EBMLId.Tags, element(
+					EBMLId.Tag,
+					element(EBMLId.Targets, element(uidElementId, uid)),
+					element(
+						EBMLId.SimpleTag,
+						element(EBMLId.TagName, utf8('ARTIST')),
+						element(EBMLId.TagString, utf8('Artist')),
+					),
+				)),
+			),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+		return (await input.getMetadataTags()).artist;
+	};
+
+	// "If the value is 0 at this level, the tags apply to all tracks in the Segment", like for the other UIDs
+	for (const uidElementId of [
+		EBMLId.TagTrackUID,
+		EBMLId.TagEditionUID,
+		EBMLId.TagChapterUID,
+		EBMLId.TagAttachmentUID,
+	]) {
+		expect(await readArtist(uidElementId, [0])).toBe('Artist');
+		expect(await readArtist(uidElementId, [])).toBe('Artist'); // An empty element is 0, the default
+		expect(await readArtist(uidElementId, [1])).toBe(undefined); // Tags of one track (or edition, ...)
+	}
 });

@@ -1829,7 +1829,11 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.TagEditionUID:
 			case EBMLId.TagChapterUID:
 			case EBMLId.TagAttachmentUID: {
-				this.currentTagTargetIsMovie = false;
+				// A UID of 0 (the default, for an empty element) stands for all tracks (or editions, chapters,
+				// attachments) of the segment
+				if (readBytes(slice, size).some(x => x !== 0)) {
+					this.currentTagTargetIsMovie = false;
+				}
 			}; break;
 
 			case EBMLId.SimpleTag: {
