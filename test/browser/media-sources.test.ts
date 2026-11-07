@@ -548,6 +548,77 @@ test('VideoSampleSource, canceling while transform.frameRate pads a gap ends the
 	expect(error === null || error.message === 'Output has been canceled.', String(error)).toBe(true);
 });
 
+test.each([false, true])(
+	'VideoSampleSource, canceling while a frame is transformed leaves no sample open (during the add: %s)',
+	async (cancelDuringAdd) => {
+		// Counts the samples made by clone() and transform() that are never closed, and lets transform() be held back
+		// like a slow one (large frames, a busy GPU)
+		const open = new Set<VideoSample>();
+		const prototype = VideoSample.prototype as unknown as {
+			clone: (this: VideoSample) => VideoSample;
+			close: (this: VideoSample) => void;
+			transform: (this: VideoSample, ...args: unknown[]) => Promise<VideoSample>;
+		};
+		const { clone, close, transform } = prototype;
+		let gate: Promise<void> | null = null;
+		prototype.clone = function () {
+			const sample = clone.call(this);
+			open.add(sample);
+			return sample;
+		};
+		prototype.close = function () {
+			open.delete(this);
+			close.call(this);
+		};
+		prototype.transform = async function (...args) {
+			if (gate) {
+				await gate;
+			}
+			const sample = await transform.apply(this, args);
+			open.add(sample);
+			return sample;
+		};
+
+		try {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({
+				codec: 'avc',
+				quality: new Quality('medium'),
+				transform: { width: 32, height: 32, fit: 'fill', frameRate: 30 },
+			});
+			output.addVideoTrack(source);
+			await output.start();
+
+			const makeSample = (timestamp: number) => new VideoSample(makeCanvas(64, 64), {
+				timestamp,
+				duration: 1 / 30,
+			});
+
+			using first = makeSample(0);
+			await source.add(first);
+
+			using second = makeSample(0.5);
+			let release = () => {};
+			if (cancelDuringAdd) {
+				gate = new Promise<void>(resolve => release = resolve);
+			}
+			const addPromise = source.add(second).catch(() => {});
+			if (cancelDuringAdd) {
+				await output.cancel(); // Completes while the add still awaits the transform
+				release();
+			}
+			await addPromise;
+			if (!cancelDuringAdd) {
+				await output.cancel();
+			}
+
+			expect(open.size).toBe(0);
+		} finally {
+			Object.assign(prototype, { clone, close, transform });
+		}
+	},
+);
+
 test('VideoSampleSource, transform.frameRate final padding fills remaining duration', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { frameRate: 10 } },

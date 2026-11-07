@@ -393,6 +393,11 @@ class VideoEncoderWrapper {
 
 				videoSample = transformed;
 				shouldClose = true;
+
+				if (this.closed) {
+					// The source got closed (or the output canceled) while the frame was being transformed
+					return;
+				}
 			} else {
 				// If no canvas is needed, we still need to record the output dimensions for the first frame
 				if (this.outputWidth === null || this.outputHeight === null) {
