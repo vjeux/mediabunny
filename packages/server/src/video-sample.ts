@@ -275,8 +275,10 @@ export const transformVideoSample = async (
 		chain.push('hflip');
 	}
 
+	// exact=1, as the crop filter otherwise rounds the offsets and the size down to the chroma subsampling (to even
+	// numbers for 4:2:0)
 	chain.push(`crop=${Math.round(description.crop.width)}:${Math.round(description.crop.height)}`
-		+ `:${Math.round(description.crop.left)}:${Math.round(description.crop.top)}`);
+		+ `:${Math.round(description.crop.left)}:${Math.round(description.crop.top)}:exact=1`);
 
 	if (description.fit === 'fill') {
 		chain.push(`scale=${description.width}:${description.height}`);
@@ -285,7 +287,7 @@ export const transformVideoSample = async (
 		chain.push(`pad=${description.width}:${description.height}:(ow-iw)/2:(oh-ih)/2:color=black@0`);
 	} else if (description.fit === 'cover') {
 		chain.push(`scale=${description.width}:${description.height}:force_original_aspect_ratio=increase`);
-		chain.push(`crop=${description.width}:${description.height}`);
+		chain.push(`crop=${description.width}:${description.height}:exact=1`);
 	}
 
 	chain.push('setsar=1');

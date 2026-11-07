@@ -1761,6 +1761,58 @@ describe('Video', async () => {
 			expectColor(getColorAt(rgba, 400, 350, 150), [255, 0, 0]); // bottom-right (red)
 		});
 
+		// 32x24 I420, whose luma ramps by 3 per column and 4 per row, so a crop that's off by one pixel is off by at
+		// least 3
+		const rampLumaAt = (x: number, y: number) => 40 + 3 * x + 4 * y;
+		const makeRampSample = () => {
+			const data = new Uint8Array(32 * 24 * 3 / 2).fill(128);
+			for (let y = 0; y < 24; y++) {
+				for (let x = 0; x < 32; x++) {
+					data[y * 32 + x] = rampLumaAt(x, y);
+				}
+			}
+
+			return new VideoSample(data, { format: 'I420', codedWidth: 32, codedHeight: 24, timestamp: 0 });
+		};
+
+		// The largest difference between the result's luma and the ramp's, starting at the given offset
+		const getMaxRampLumaError = async (result: VideoSample, left: number, top: number) => {
+			const data = new Uint8Array(result.allocationSize());
+			await result.copyTo(data);
+
+			let maxError = 0;
+			for (let y = 0; y < result.codedHeight; y++) {
+				for (let x = 0; x < result.codedWidth; x++) {
+					const error = Math.abs(data[y * result.codedWidth + x]! - rampLumaAt(x + left, y + top));
+					maxError = Math.max(maxError, error);
+				}
+			}
+
+			return maxError;
+		};
+
+		test.each([
+			{ left: 1, top: 3, width: 21, height: 15 },
+			{ left: 2, top: 4, width: 20, height: 14 },
+		])('Crop of I420 to $width x $height at $left, $top keeps the exact region', async (crop) => {
+			// FFmpeg's crop filter rounds the offsets and size down to the chroma subsampling unless asked not to
+			using sample = makeRampSample();
+			using result = await sample.transform({ crop });
+
+			expect(result.codedWidth).toBe(crop.width);
+			expect(result.codedHeight).toBe(crop.height);
+			expect(await getMaxRampLumaError(result, crop.left, crop.top)).toBeLessThanOrEqual(1);
+		});
+
+		test('Cover of I420 at an odd offset keeps the centered region', async () => {
+			// 32x24 covering 32x18 crops 3 rows off the top and bottom
+			using sample = makeRampSample();
+			using result = await sample.transform({ width: 32, height: 18, fit: 'cover' });
+
+			expect(result.codedHeight).toBe(18);
+			expect(await getMaxRampLumaError(result, 0, 3)).toBeLessThanOrEqual(1);
+		});
+
 		test('VideoSample transformation via Conversion API', async () => {
 			using input = new Input({
 				source: new FilePathSource('./test/public/video.mp4'),
