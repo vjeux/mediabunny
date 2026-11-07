@@ -417,14 +417,6 @@ export class Mp3InputFormat extends InputFormat {
 }
 
 /**
- * WAVE file format, based on RIFF.
- *
- * Do not instantiate this class; use the {@link WAVE} singleton instead.
- *
- * @group Input formats
- * @public
- */
-/**
  * Format tags of MPEG audio in WAVE ("RIFF MP3", as written by Windows' ACM codecs or FFmpeg): layers I and II, and
  * layer III. The data chunk of such a file holds a plain MPEG audio stream.
  */
@@ -461,6 +453,14 @@ const readWaveFormatTag = async (input: Input, littleEndian: boolean) => {
 	return null;
 };
 
+/**
+ * WAVE file format, based on RIFF.
+ *
+ * Do not instantiate this class; use the {@link WAVE} singleton instead.
+ *
+ * @group Input formats
+ * @public
+ */
 export class WaveInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
