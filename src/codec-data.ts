@@ -1256,7 +1256,8 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 			...(seiUnits.length
 				? [
 						{
-							arrayCompleteness: 1,
+							// Only parameter set arrays are complete; SEI messages stay in the samples too
+							arrayCompleteness: 0,
 							nalUnitType: extractNalUnitTypeForHevc(seiUnits[0]![0]!),
 							nalUnits: seiUnits,
 						},

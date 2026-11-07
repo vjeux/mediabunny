@@ -119,6 +119,11 @@ export type IsobmffTrackData = {
 		 * https://stackoverflow.com/questions/24884827
 		 */
 		requiresAnnexBTransformation: boolean;
+		/**
+		 * For Annex B HEVC, the parameter sets in the sample entry ('hvc1' declares it holds all of them), whose
+		 * in-band copies are dropped.
+		 */
+		sampleEntryParameterSets: Uint8Array[];
 		hasAlphaChannel: boolean;
 	};
 } | {
@@ -207,6 +212,18 @@ export const presentationSpan = (trackData: IsobmffTrackData) => {
 
 	return maxEndTimestamp - minTimestamp;
 };
+
+/** Strips the zero bytes an Annex B byte stream may leave after a NAL unit, which aren't part of it. */
+const withoutTrailingZeros = (nalUnit: Uint8Array) => {
+	let end = nalUnit.length;
+	while (end > 0 && nalUnit[end - 1] === 0) {
+		end--;
+	}
+
+	return nalUnit.subarray(0, end);
+};
+
+const isSameNalUnit = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((byte, i) => byte === b[i]);
 
 export class IsobmffMuxer extends Muxer {
 	format: IsobmffOutputFormat;
@@ -442,6 +459,7 @@ export class IsobmffMuxer extends Muxer {
 		assert(decoderConfig.codedHeight !== undefined);
 
 		let requiresAnnexBTransformation = false;
+		let sampleEntryParameterSets: Uint8Array[] = [];
 
 		if (track.source._codec === 'avc' && !decoderConfig.description) {
 			// ISOBMFF can only hold AVC in the AVCC format, not in Annex B, but the missing description indicates
@@ -483,6 +501,9 @@ export class IsobmffMuxer extends Muxer {
 
 			decoderConfig.description = serializeHevcDecoderConfigurationRecord(decoderConfigurationRecord);
 			requiresAnnexBTransformation = true;
+			sampleEntryParameterSets = decoderConfigurationRecord.arrays
+				.filter(array => array.arrayCompleteness)
+				.flatMap(array => array.nalUnits.map(withoutTrailingZeros));
 		}
 
 		// The frame rate set by the user may not be an integer. Since timescale is an integer, we'll approximate the
@@ -515,6 +536,7 @@ export class IsobmffMuxer extends Muxer {
 				pixelAspectRatio,
 				decoderConfig: decoderConfig,
 				requiresAnnexBTransformation,
+				sampleEntryParameterSets,
 				hasAlphaChannel,
 			},
 			timescale,
@@ -710,7 +732,7 @@ export class IsobmffMuxer extends Muxer {
 
 			let packetData = packet.data;
 			if (trackData.info.requiresAnnexBTransformation) {
-				const nalUnits = [...iterateNalUnitsInAnnexB(packetData)]
+				let nalUnits = [...iterateNalUnitsInAnnexB(packetData)]
 					.map(loc => packetData.subarray(loc.offset, loc.offset + loc.length));
 				if (nalUnits.length === 0) {
 					// It's not valid Annex B data
@@ -720,8 +742,20 @@ export class IsobmffMuxer extends Muxer {
 					);
 				}
 
-				// We don't strip things like SPS or PPS NALUs here, mainly because they can also appear in the middle
-				// of a stream and potentially modify the parameters of it. So, let's just leave them in to be sure.
+				// Parameter sets can appear in the middle of a stream and modify its parameters, so they're generally
+				// left in. But 'hvc1' declares that its sample entry holds every HEVC parameter set (with
+				// array_completeness), so in-band copies identical to those are dropped, as FFmpeg does. Ones that
+				// differ are kept.
+				const { sampleEntryParameterSets } = trackData.info;
+				if (sampleEntryParameterSets.length > 0) {
+					const remaining = nalUnits.filter(nalUnit => !sampleEntryParameterSets.some(
+						parameterSet => isSameNalUnit(parameterSet, withoutTrailingZeros(nalUnit)),
+					));
+					if (remaining.length > 0) {
+						nalUnits = remaining;
+					}
+				}
+
 				packetData = concatNalUnitsInLengthPrefixed(nalUnits, 4);
 			}
 

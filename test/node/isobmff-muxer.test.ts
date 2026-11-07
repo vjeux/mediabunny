@@ -12,6 +12,7 @@ import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { iterateNalUnitsInAnnexB } from '../../src/codec-data.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -219,6 +220,74 @@ test('Non-zero start timestamp, fragmented MP4', async () => {
 
 	expect(timestamps).toEqual([1, 1.1, 1.2, 1.3]);
 	expect(durations).toEqual([0.1, 0.1, 0.1, 0.1]);
+});
+
+test('Annex B HEVC muxed as hvc1 keeps only parameter sets that differ from its sample entry\'s', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/hevc.ts')),
+		formats: ALL_FORMATS,
+	});
+	const inputTrack = await input.getPrimaryVideoTrack();
+	assert(inputTrack);
+	const decoderConfig = await inputTrack.getDecoderConfig();
+	assert(decoderConfig);
+	expect(decoderConfig.description).toBeUndefined(); // Annex B
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('hevc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	let keyPacket: EncodedPacket | null = null; // The file's only key frame, which carries VPS, SPS and PPS
+	let end = 0;
+	for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
+		keyPacket ??= packet;
+		end = Math.max(end, packet.timestamp + packet.duration);
+		await source.add(packet, { decoderConfig });
+	}
+	assert(keyPacket);
+
+	// Another key frame that repeats the VPS and PPS but changes the SPS
+	const data = keyPacket.data.slice();
+	const sps = [...iterateNalUnitsInAnnexB(data)].find(nalUnit => ((data[nalUnit.offset]! >> 1) & 0x3f) === 33)!;
+	data[sps.offset + 6] = data[sps.offset + 6] === 0xaa ? 0x55 : 0xaa;
+	await source.add(new EncodedPacket(data, 'key', end, keyPacket.duration), { decoderConfig });
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const find = (type: string) => bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === type);
+	expect(find('hvc1')).toBeGreaterThan(0);
+
+	// The hvcC's VPS, SPS and PPS arrays are complete; its SEI array isn't, as SEI messages stay in the samples
+	const completeness = new Map<number, boolean>();
+	let pos = find('hvcC') + 4 + 22;
+	const arrayCount = bytes[pos++]!;
+	for (let i = 0; i < arrayCount; i++) {
+		completeness.set(bytes[pos]! & 0x3f, (bytes[pos]! & 0x80) !== 0);
+		const nalUnitCount = (bytes[pos + 1]! << 8) | bytes[pos + 2]!;
+		pos += 3;
+		for (let j = 0; j < nalUnitCount; j++) {
+			pos += 2 + ((bytes[pos]! << 8) | bytes[pos + 1]!);
+		}
+	}
+	expect([...completeness]).toEqual([[32, true], [33, true], [34, true], [39, false]]);
+
+	using back = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const backTrack = await back.getPrimaryVideoTrack();
+	assert(backTrack);
+	const nalUnitTypes: number[][] = [];
+	for await (const packet of new EncodedPacketSink(backTrack).packets()) {
+		const view = toDataView(packet.data);
+		const types: number[] = [];
+		for (let i = 0; i + 4 < packet.data.byteLength; i += 4 + view.getUint32(i)) {
+			types.push((packet.data[i + 4]! >> 1) & 0x3f);
+		}
+		nalUnitTypes.push(types);
+	}
+
+	// Copies identical to the sample entry's parameter sets are dropped (they used to stay), the changed SPS stays
+	expect(nalUnitTypes[0]).toEqual([35, 39, 20]);
+	expect(nalUnitTypes.at(-1)).toEqual([35, 33, 39, 20]);
 });
 
 test('Negative start timestamps, regular MP4', async () => {
