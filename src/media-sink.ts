@@ -2984,7 +2984,7 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 
 	async flush() {
-		// Do nothing
+		this.currentTimestamp = null;
 	}
 
 	close() {
