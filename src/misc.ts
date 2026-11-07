@@ -882,8 +882,11 @@ export const normalizeHeaders = (headers: HeadersInit): Record<string, string> =
 	if (Array.isArray(headers)) {
 		const result: Record<string, string> = {};
 		headers.forEach(([key, value]) => {
-			// Like Headers.append, a name given again (in any case) adds its value to the list
-			const existingKey = Object.keys(result).find(x => x.toLowerCase() === key.toLowerCase());
+			// Like Headers.append, a name given again (in any case) adds its value to the list. Not for Range though,
+			// which UrlSource maps onto a byte offset and which can't hold more than one range for that
+			const existingKey = key.toLowerCase() === 'range'
+				? undefined
+				: Object.keys(result).find(x => x.toLowerCase() === key.toLowerCase());
 			if (existingKey !== undefined) {
 				result[existingKey] += `, ${value}`;
 			} else {

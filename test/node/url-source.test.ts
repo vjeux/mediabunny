@@ -22,10 +22,13 @@ const videoFilePath = path.join(__dirname, '..', 'public/video.mp4');
 
 test('UrlSource sends every value of a header given more than once in a header list', async () => {
 	let received: string | string[] | undefined;
+	let receivedRange: string | undefined;
 	const server = http.createServer((req, res) => {
 		received = req.headers['x-tag'];
-		res.writeHead(206, { 'Content-Range': 'bytes 0-3/4', 'Content-Length': '4' });
-		res.end(Buffer.from([1, 2, 3, 4]));
+		receivedRange = req.headers.range;
+		const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+		res.writeHead(206, { 'Content-Range': `bytes ${start}-199/200`, 'Content-Length': 200 - start });
+		res.end(Buffer.alloc(200 - start));
 	});
 
 	await new Promise<void>(resolve => server.listen(0, resolve));
@@ -46,6 +49,13 @@ test('UrlSource sends every value of a header given more than once in a header l
 			await new Reader(ref.source).requestSlice(0, 4);
 			expect(received).toBe(expected);
 		}
+
+		// Range is the exception: UrlSource maps it onto a byte offset, and the last one given is used
+		const rangeHeaders: [string, string][] = [['Range', 'bytes=100-'], ['Range', 'bytes=7-']];
+		using ref = new UrlSource(url, { requestInit: { headers: rangeHeaders } }).ref();
+		await new Reader(ref.source).requestSlice(0, 4);
+		expect(receivedRange).toBe('bytes=7-');
+		expect(await ref.source.getSizeOrNull()).toBe(193);
 	} finally {
 		server.closeAllConnections();
 		server.close();
