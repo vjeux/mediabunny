@@ -5,7 +5,8 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
@@ -307,4 +308,142 @@ test('Vorbis audio keeps its timing, also after seeking', async () => {
 	expect(await findBurst(0.9)).toBeCloseTo(1, 3);
 	expect(await findBurst(1.45)).toBeCloseTo(1.5, 3);
 	expect(await findBurst(2.2)).toBeCloseTo(2.5, 3);
+});
+
+/** Remuxes the first two seconds of demo.mp4's AAC track (one decoded sample per packet) with new timestamps. */
+const remuxDemoAudio = async (getTimestamp: (timestamp: number, index: number) => number) => {
+	using input = new Input({
+		source: new UrlSource('/demo.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	let index = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		if (packet.timestamp >= 2) {
+			break;
+		}
+
+		await source.add(packet.clone({ timestamp: getTimestamp(packet.timestamp, index++) }), { decoderConfig });
+	}
+	await output.finalize();
+
+	return new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+};
+
+/** Runs the callback with WebCodecs audio decoders that drop one output, like a packet that decodes to nothing. */
+const withDroppedAudioOutput = async (outputIndex: number, callback: () => Promise<void>) => {
+	const OriginalAudioDecoder = globalThis.AudioDecoder;
+	globalThis.AudioDecoder = class extends OriginalAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			let outputCount = 0;
+			super({
+				output: (data) => {
+					if (outputCount++ === outputIndex) {
+						data.close();
+						return;
+					}
+
+					init.output(data);
+				},
+				error: init.error,
+			});
+		}
+	};
+
+	try {
+		await callback();
+	} finally {
+		globalThis.AudioDecoder = OriginalAudioDecoder;
+	}
+};
+
+const getPacketTimestamps = async (track: InputAudioTrack) => {
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+		timestamps.push(packet.timestamp);
+	}
+
+	return timestamps;
+};
+
+const getSampleTimestamps = async (track: InputAudioTrack) => {
+	const timestamps: number[] = [];
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		timestamps.push(sample.timestamp);
+	}
+
+	return timestamps;
+};
+
+test('Decoded audio keeps the gaps between packets', async () => {
+	// A half-second gap at 1 s
+	using input = await remuxDemoAudio(timestamp => timestamp >= 1 ? timestamp + 0.5 : timestamp);
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	// Each AAC packet decodes to one sample, which starts where the packet starts
+	const packetTimestamps = await getPacketTimestamps(track);
+	const sampleTimestamps = await getSampleTimestamps(track);
+	expect(sampleTimestamps).toHaveLength(packetTimestamps.length);
+	for (let i = 0; i < sampleTimestamps.length; i++) {
+		expect(sampleTimestamps[i]).toBeCloseTo(packetTimestamps[i]!, 4);
+	}
+});
+
+test('Decoded audio stays contiguous across packets that share a timestamp', async () => {
+	// A run of eight packets stamped at the first one's timestamp, like the laced frames of a Matroska block with no
+	// known durations
+	let runTimestamp = 0;
+	using input = await remuxDemoAudio((timestamp, index) => {
+		if (index === 20) {
+			runTimestamp = timestamp;
+		}
+
+		return index >= 20 && index < 28 ? runTimestamp : timestamp;
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	let previousEnd: number | null = null;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		if (previousEnd !== null) {
+			expect(sample.timestamp).toBeCloseTo(previousEnd, 4);
+		}
+
+		previousEnd = sample.timestamp + sample.duration;
+	}
+});
+
+test('Decoded audio stays in order when a packet decodes to nothing', async () => {
+	await withDroppedAudioOutput(10, async () => {
+		using input = new Input({
+			source: new UrlSource('/vorbis-eos.ogg'), // Vorbis, so packet durations vary
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		let previousEnd = -Infinity;
+		for await (using sample of new AudioSampleSink(track).samples(0, 2)) {
+			expect(sample.timestamp).toBeGreaterThan(previousEnd - 1e-6); // No overlaps
+			previousEnd = sample.timestamp + sample.duration;
+		}
+	});
 });
