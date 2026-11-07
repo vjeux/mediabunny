@@ -534,8 +534,14 @@ describe('Matroska demuxing', () => {
 		const config = await track!.getDecoderConfig();
 		expect(config!.codedWidth).toBe(640);
 		expect(config!.codedHeight).toBe(480);
-		expect(config!.displayAspectWidth).toBe((aspect as { displayAspectWidth?: number }).displayAspectWidth);
-		expect(config!.displayAspectHeight).toBe((aspect as { displayAspectHeight?: number }).displayAspectHeight);
+		const expected = aspect as { displayAspectWidth?: number; displayAspectHeight?: number };
+		if (expected.displayAspectWidth === undefined) {
+			expect([config!.displayAspectWidth, config!.displayAspectHeight]).toEqual([undefined, undefined]);
+		} else {
+			// The display aspect is a ratio: a rounded square-pixel size and the exact reduced ratio are both fine
+			expect(config!.displayAspectWidth! / config!.displayAspectHeight!)
+				.toBeCloseTo(expected.displayAspectWidth / expected.displayAspectHeight!, 2);
+		}
 	});
 
 	test('colour values missing from the Colour element are filled in from the SPS', async () => {
