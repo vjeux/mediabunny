@@ -37,6 +37,7 @@ export class WaveDemuxer extends Demuxer {
 		sampleRate: number;
 		sampleSizeInBytes: number;
 		blockSizeInBytes: number;
+		littleEndian: boolean;
 	} | null = null;
 
 	trackBackings: WaveAudioTrackBacking[] = [];
@@ -213,6 +214,7 @@ export class WaveDemuxer extends Demuxer {
 			sampleRate,
 			sampleSizeInBytes: Math.ceil(bitsPerSample / 8),
 			blockSizeInBytes: blockAlign,
+			littleEndian,
 		};
 	}
 
@@ -343,23 +345,26 @@ export class WaveDemuxer extends Demuxer {
 		if (this.audioInfo.format === WaveFormat.ALAW) {
 			return 'alaw';
 		}
+
+		// RIFX stores the samples big-endian, just like the rest of the file
+		const littleEndian = this.audioInfo.littleEndian;
+
 		if (this.audioInfo.format === WaveFormat.PCM) {
-			// All formats are little-endian
 			if (this.audioInfo.sampleSizeInBytes === 1) {
 				return 'pcm-u8';
 			} else if (this.audioInfo.sampleSizeInBytes === 2) {
-				return 'pcm-s16';
+				return littleEndian ? 'pcm-s16' : 'pcm-s16be';
 			} else if (this.audioInfo.sampleSizeInBytes === 3) {
-				return 'pcm-s24';
+				return littleEndian ? 'pcm-s24' : 'pcm-s24be';
 			} else if (this.audioInfo.sampleSizeInBytes === 4) {
-				return 'pcm-s32';
+				return littleEndian ? 'pcm-s32' : 'pcm-s32be';
 			}
 		}
 		if (this.audioInfo.format === WaveFormat.IEEE_FLOAT) {
 			if (this.audioInfo.sampleSizeInBytes === 4) {
-				return 'pcm-f32';
+				return littleEndian ? 'pcm-f32' : 'pcm-f32be';
 			} else if (this.audioInfo.sampleSizeInBytes === 8) {
-				return 'pcm-f64';
+				return littleEndian ? 'pcm-f64' : 'pcm-f64be';
 			}
 		}
 
