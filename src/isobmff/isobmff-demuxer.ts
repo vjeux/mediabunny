@@ -876,7 +876,12 @@ export class IsobmffDemuxer extends Demuxer {
 					} else {
 						// We're the first fragment, so we continue where the samples in the moov box end (which is
 						// at 0 if there are none)
-						const lastTimingEntry = last(this.getSampleTableForTrack(track).sampleTimingEntries);
+						let lastTimingEntry: SampleTimingEntry | undefined;
+						try {
+							lastTimingEntry = last(this.getSampleTableForTrack(track).sampleTimingEntries);
+						} catch {
+							// A sample table that can't be read (a damaged file) leaves the fragment at 0, as before
+						}
 						if (lastTimingEntry) {
 							const { startDecodeTimestamp, count, delta } = lastTimingEntry;
 							offsetFragmentTrackDataByTimestamp(trackData, startDecodeTimestamp + count * delta);

@@ -343,6 +343,48 @@ const moovSamplesThenFragment = (withTfdt: boolean) => {
 	);
 };
 
+test('Fragments without tfdt next to a track whose sample table is damaged', async () => {
+	// Two tracks with all of their samples in fragments without tfdt, the second of which has an stts box claiming
+	// 1000 entries that aren't there. The first track reads as before.
+	const trak = (trackId: number, damaged: boolean) => box('trak',
+		fullBox('tkhd', 0, 1, zeros(8), u32(trackId), zeros(68)),
+		box('mdia',
+			fullBox('mdhd', 0, 0, zeros(8), u32(1000), u32(0), zeros(4)),
+			fullBox('hdlr', 0, 0, zeros(4), ascii('vide'), zeros(13)),
+			box('minf', box('stbl',
+				fullBox('stsd', 0, 0, u32(1), videoSampleEntry('avc1')),
+				fullBox('stts', 0, 0, u32(damaged ? 1000 : 0)),
+				fullBox('stsc', 0, 0, u32(0)),
+				fullBox('stsz', 0, 0, u32(0), u32(0)),
+				fullBox('stco', 0, 0, u32(0)),
+			)),
+		),
+	);
+	const trex = (trackId: number) => fullBox('trex', 0, 0, u32(trackId), u32(1), u32(40), u32(4), u32(0x10000));
+	const traf = (trackId: number, dataOffset: number) => box('traf',
+		fullBox('tfhd', 0, 0x020000, u32(trackId)), // Default base is moof
+		fullBox('trun', 0, 0x000005, u32(3), u32(dataOffset), u32(0)), // First sample is a key frame
+	);
+	const moof = (dataOffset: number) => box('moof', traf(1, dataOffset), traf(2, dataOffset + 12));
+
+	const file = concat(
+		box('ftyp', ascii('isom'), u32(0), ascii('isom')),
+		box('moov', mvhd(), trak(1, false), trak(2, true), box('mvex', trex(1), trex(2))),
+		moof(moof(0).length + 8),
+		box('mdat', sampleData(0), sampleData(1), sampleData(2), sampleData(3), sampleData(4), sampleData(5)),
+	);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await input.getVideoTracks())[0]!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	expect(packets.map(x => x.timestamp)).toEqual([0, 0.04, 0.08]);
+	expect(packets.map(x => x.data[0])).toEqual([0, 1, 2]);
+});
+
 const sampleData = (value: number) => [value, value, value, value];
 
 const videoSampleEntry = (name: string, ...children: Bytes[]) => box(
