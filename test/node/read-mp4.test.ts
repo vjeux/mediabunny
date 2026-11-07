@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createCipheriv } from 'node:crypto';
 import {
 	ALL_FORMATS,
 	BufferSource,
@@ -271,4 +272,67 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('The key resolver only gets the pssh boxes of its key ID in non-fragmented files too', async () => {
+	// The pssh boxes in the moov box list different key IDs (version 1), and only one applies to the track
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
+	const keyId = '0123456789abcdef0123456789abcdef';
+	const otherKeyId = 'ffeeddccbbaa99887766554433221100';
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const encv = box('encv', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(12), [0, 1], zeros(32),
+		[0, 24, 0xff, 0xff], box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+		box('sinf', box('frma', ascii('avc1')), box('schm', u32(0), ascii('cenc'), u32(0x10000)),
+			box('schi', box('tenc', u32(0), [0, 0, 1, 8], [...Buffer.from(keyId, 'hex')]))));
+	const pssh = (kid: string) => box('pssh', [1, 0, 0, 0], [...Buffer.from('1077efecc0b24d02ace33c1e52e2fb4b', 'hex')],
+		u32(1), [...Buffer.from(kid, 'hex')], u32(0)); // Common pssh (version 1) listing one key ID
+	const plaintext = [0, 0, 0, 12, 0x65, ...zeros(12)];
+	const iv = [...zeros(7), 1];
+	const ciphertext = [...createCipheriv('aes-128-ctr', key, Buffer.from([...iv, ...zeros(8)]))
+		.update(Buffer.from(plaintext))];
+	// mdat payload: the IV (sample auxiliary information), then the sample
+	const moov = (mdatStart: number) => box('moov',
+		box('mvhd', zeros(12), u32(10), u32(1), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(1), zeros(16), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(1), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl', box('stsd', u32(0), u32(1), encv),
+					box('stts', u32(0), u32(1), u32(1), u32(1)),
+					box('stsc', u32(0), u32(1), u32(1), u32(1), u32(1)),
+					box('stsz', u32(0), u32(ciphertext.length), u32(1)),
+					box('stco', u32(0), u32(1), u32(mdatStart + 8 + iv.length)),
+					box('saiz', u32(0), [iv.length], u32(1)),
+					box('saio', u32(0), u32(1), u32(mdatStart + 8)))),
+			),
+		),
+		pssh(keyId),
+		pssh(otherKeyId),
+	);
+	const head = [...box('ftyp', ascii('isom'), u32(0))];
+	const mdatStart = head.length + moov(0).length;
+	const file = new Uint8Array([...head, ...moov(mdatStart), ...box('mdat', iv, ciphertext)]);
+
+	const seenKeyIds: string[][] = [];
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: ({ psshBoxes }) => {
+			seenKeyIds.push(psshBoxes.flatMap(x => x.keyIds ?? []));
+			return key;
+		} } },
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	expect([...packet!.data]).toEqual(plaintext);
+	expect(seenKeyIds).toEqual([[keyId]]);
 });
