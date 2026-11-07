@@ -277,7 +277,8 @@ describe('EBML header and Segment', () => {
 describe('Tracks', () => {
 	test('writes track numbers, types, language, name and flags', async () => {
 		const bytes = await mux([
-			vp8Track(videoPackets(5), { languageCode: 'fre', name: 'Vidéo principale' }),
+			// Spanish, whose ISO 639-2 code is the same in the bibliographic form that the Language element uses
+			vp8Track(videoPackets(5), { languageCode: 'spa', name: 'Vídeo principal' }),
 			opusTrack(audioPackets(5), {
 				languageCode: 'jpn',
 				disposition: { default: false, forced: true, hearingImpaired: true, commentary: true },
@@ -286,8 +287,8 @@ describe('Tracks', () => {
 		const [video, audio] = trackEntries(bytes);
 		expect(uintAt(video!.children, EBMLId.TrackNumber)).toBe(1);
 		expect(uintAt(video!.children, EBMLId.TrackType)).toBe(1);
-		expect(readString(findFirst(video!.children, EBMLId.Language).data)).toBe('fre');
-		expect(readString(findFirst(video!.children, EBMLId.Name).data)).toBe('Vidéo principale');
+		expect(readString(findFirst(video!.children, EBMLId.Language).data)).toBe('spa');
+		expect(readString(findFirst(video!.children, EBMLId.Name).data)).toBe('Vídeo principal');
 		expect(findOptional(video!.children, EBMLId.FlagDefault)).toBe(null); // Defaults to 1
 
 		expect(uintAt(audio!.children, EBMLId.TrackNumber)).toBe(2);
@@ -299,8 +300,8 @@ describe('Tracks', () => {
 
 		using input = open(bytes);
 		const [inputVideo, inputAudio] = await input.getTracks();
-		expect(await inputVideo!.getName()).toBe('Vidéo principale');
-		expect(await inputVideo!.getLanguageCode()).toBe('fre');
+		expect(await inputVideo!.getName()).toBe('Vídeo principal');
+		expect(await inputVideo!.getLanguageCode()).toBe('spa');
 		expect(await inputAudio!.getLanguageCode()).toBe('jpn');
 		expect(await inputAudio!.getDisposition()).toMatchObject({ default: false, forced: true, commentary: true });
 	});
