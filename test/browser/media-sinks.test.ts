@@ -153,6 +153,23 @@ test('Audio decoder pre-roll (HE-AAC signaled implicitly, ADTS)', async () => {
 	await testAudioDecoderPreRoll(track, -30);
 });
 
+// Parametric stereo (HE-AACv2) only kicks in at a frame carrying a PS header, which libfdk sends every 10 frames:
+// ffmpeg -f lavfi -i "aevalsrc=0.4*sin(2*PI*(220*t+300*t*t))|0.3*sin(2*PI*330*t):s=48000:d=2"
+//   -c:a libfdk_aac -profile:a aac_he_v2 he-aac-v2-2s.m4a (and he-aac-v2-2s.aac, where PS is only signaled implicitly)
+for (const [label, url] of [['HE-AACv2', '/he-aac-v2-2s.m4a'], ['HE-AACv2, ADTS', '/he-aac-v2-2s.aac']]) {
+	test(`Audio decoder pre-roll (${label})`, async () => {
+		using input = new Input({
+			source: new UrlSource(url!),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		await testAudioDecoderPreRoll(track, -30);
+	});
+}
+
 test('Audio decoder pre-roll (Opus)', async () => {
 	using input = new Input({
 		source: new UrlSource('/preroll-test.opus'),

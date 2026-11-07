@@ -868,31 +868,45 @@ export const guessDescriptionForAudio = (decoderConfig: AudioDecoderConfig): Uin
 
 // SBR doubles the core coder's sample rate, up to 48 kHz
 const MAX_AAC_SBR_CORE_SAMPLE_RATE = 24000;
+// Parametric stereo (HE-AACv2) only kicks in at a frame carrying a PS header, which encoders resend just every few
+// frames (libfdk: every 10), and the output converges two frames later
+const AAC_PS_PRE_ROLL_FRAMES = 12;
 
 export const getAudioPreRollDuration = (codec: AudioCodec, decoderConfig: AudioDecoderConfig) => {
 	switch (codec) {
 		case 'aac': {
 			// Frames overlap, so decoding must start a frame early. SBR (HE-AAC) also keeps the state of the frame
 			// before and codes its envelopes relative to it, so it needs one more (as in FFmpeg's seek_preroll() in
-			// aacdec.c). SBR is often signaled only implicitly (ADTS, MPEG-TS), leaving a config that describes just
-			// the core coder at half the output rate, so assume SBR whenever the core rate allows for it.
-			if (!decoderConfig.description) {
-				// Best guess
-				const frameCount = decoderConfig.sampleRate <= MAX_AAC_SBR_CORE_SAMPLE_RATE ? 2 : 1;
-				return frameCount * 1024 / decoderConfig.sampleRate;
+			// aacdec.c), and parametric stereo needs to reach back to its last header. SBR and PS are often signaled
+			// only implicitly (ADTS, MPEG-TS), leaving a config that describes just the core coder, so assume them
+			// whenever the core allows for them: SBR at core rates of 24 kHz or less, and PS if that core is mono.
+			let frameLength = 1024;
+			let coreSampleRate = decoderConfig.sampleRate;
+			let coreIsMono = decoderConfig.numberOfChannels === 1;
+			let signalsSbr = false;
+			let signalsPs = false;
+
+			if (decoderConfig.description) {
+				const audioSpecificConfig = parseAacAudioSpecificConfig(toUint8Array(decoderConfig.description));
+				if (audioSpecificConfig.coreSampleRate === null) {
+					throw new Error('Invalid AAC sampling frequency index.');
+				}
+
+				frameLength = audioSpecificConfig.frameLength;
+				coreSampleRate = audioSpecificConfig.coreSampleRate;
+				coreIsMono = audioSpecificConfig.channelConfiguration === 1;
+				signalsPs = audioSpecificConfig.objectType === 29
+					|| (coreIsMono && audioSpecificConfig.outputNumberOfChannels === 2);
+				signalsSbr = signalsPs
+					|| audioSpecificConfig.objectType === 5
+					|| audioSpecificConfig.outputSampleRate !== audioSpecificConfig.coreSampleRate;
 			}
 
-			const audioSpecificConfig = parseAacAudioSpecificConfig(toUint8Array(decoderConfig.description));
-			if (audioSpecificConfig.coreSampleRate === null) {
-				throw new Error('Invalid AAC sampling frequency index.');
-			}
+			const mayHaveSbr = signalsSbr || coreSampleRate <= MAX_AAC_SBR_CORE_SAMPLE_RATE;
+			const mayHavePs = signalsPs || (mayHaveSbr && coreIsMono);
+			const frameCount = mayHavePs ? AAC_PS_PRE_ROLL_FRAMES : mayHaveSbr ? 2 : 1;
 
-			const mayHaveSbr = audioSpecificConfig.objectType === 5
-				|| audioSpecificConfig.objectType === 29
-				|| audioSpecificConfig.outputSampleRate !== audioSpecificConfig.coreSampleRate
-				|| audioSpecificConfig.coreSampleRate <= MAX_AAC_SBR_CORE_SAMPLE_RATE;
-
-			return (mayHaveSbr ? 2 : 1) * audioSpecificConfig.frameLength / audioSpecificConfig.coreSampleRate;
+			return frameCount * frameLength / coreSampleRate;
 		}
 
 		case 'opus': {
