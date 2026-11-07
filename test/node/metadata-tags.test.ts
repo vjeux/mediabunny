@@ -338,6 +338,57 @@ test('Read MOV metadata tags, ilst with keys', async () => {
 	expect(tags.raw!['com.apple.quicktime.player.movie.audio.gain']).toEqual(new Uint8Array([63, 128, 0, 0]));
 });
 
+test('Read iTunes freeform tags, MP4', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: false }),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({ title: 'Title' });
+
+	const dummyTrack = createDummyAudioTrack('aac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	// Append two freeform items (as written by iTunes, AtomicParsley or Picard) to the ilst. The moov comes last, so
+	// ilst, meta, udta and moov all end at the end of the file and only their sizes need to grow.
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const atom = (name: string, content: number[]) => [...u32(8 + content.length), ...ascii(name), ...content];
+	const freeformItem = (mean: string, name: string, value: string) => atom('----', [
+		...atom('mean', [0, 0, 0, 0, ...ascii(mean)]),
+		...atom('name', [0, 0, 0, 0, ...ascii(name)]),
+		...atom('data', [...u32(1), ...u32(0), ...ascii(value)]),
+	]);
+	const items = [
+		...freeformItem('com.apple.iTunes', 'iTunSMPB', ' 00000000 00000840 000001C0 0000000000000000'),
+		...freeformItem('com.apple.iTunes', 'MusicBrainz Track Id', 'b1a9c0e9-d987-4042-ae91-78d6a3267d69'),
+	];
+
+	const original = new Uint8Array(output.target.buffer!);
+	const bytes = new Uint8Array(original.length + items.length);
+	bytes.set(original, 0);
+	bytes.set(items, original.length);
+	const view = new DataView(bytes.buffer);
+	for (const name of ['moov', 'udta', 'meta', 'ilst']) {
+		const position = Buffer.from(original).lastIndexOf(Buffer.from(name)) - 4;
+		view.setUint32(position, view.getUint32(position) + items.length);
+	}
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const tags = await input.getMetadataTags();
+	expect(tags.title).toBe('Title');
+	expect(tags.raw!['----:com.apple.iTunes:iTunSMPB']).toBe(' 00000000 00000840 000001C0 0000000000000000');
+	expect(tags.raw!['----:com.apple.iTunes:MusicBrainz Track Id']).toBe('b1a9c0e9-d987-4042-ae91-78d6a3267d69');
+	expect('----' in tags.raw!).toBe(false);
+});
+
 test('FFmpeg-unsafe raw udta tags, MP4', async () => {
 	const hmmt = new Uint8Array([0, 0, 0, 1, 0, 0, 0, 250]);
 

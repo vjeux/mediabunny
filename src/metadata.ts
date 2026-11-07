@@ -76,6 +76,7 @@ export type MetadataTags = {
 	 * - MP4/QuickTime: By default, the keys refer to the names of the individual atoms in the `'ilst'` atom inside the
 	 * `'meta'` atom, and the values are derived from the content of the `'data'` atom inside them. When a `'keys'` atom
 	 * is also used, then the keys reflect the keys specified there (such as `'com.apple.quicktime.version'`).
+	 * iTunes freeform (`'----'`) items are keyed by their domain and name, like `'----:com.apple.iTunes:iTunSMPB'`.
 	 * Additionally, any atoms within the `'udta'` atom are dumped into here, however with unknown internal format
 	 * (`Uint8Array`).
 	 * - WebM/Matroska: `SimpleTag` elements whose target is 50 (MOVIE), either containing string or `Uint8Array`
