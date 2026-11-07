@@ -594,6 +594,69 @@ test('Conversion metadata tags, fields removed by the tags function stay removed
 	expect(tags.artist).toBeUndefined();
 	expect(tags.raw!['ARTIST']).toBeUndefined();
 	expect(tags.raw!['ALBUM']).toBe('Samples files');
+
+	// Fields that a file carries twice, in two tag blocks or under two keys
+	const removeTitleAndTotal = async (bytes: Uint8Array, format: Format) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			showWarnings: false,
+			tags: inputTags => ({ ...inputTags, title: undefined, tracksTotal: undefined }),
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await result.getMetadataTags();
+	};
+
+	// A WAVE file with both RIFF INFO chunks and an ID3 chunk, like DAWs and taggers write
+	const writeWave = async (metadataFormat: 'info' | 'id3') => {
+		const output = new Output({ format: new WavOutputFormat({ metadataFormat }), target: new BufferTarget() });
+		output.setMetadataTags({ title: 'Title', artist: 'Artist' });
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(4096), 'key', 0, 1024 / 44100), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+		});
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+	const infoWave = await writeWave('info');
+	const id3Wave = await writeWave('id3');
+	const id3ChunkStart = Buffer.from(id3Wave).indexOf('ID3 ');
+	const id3ChunkSize = 8 + new DataView(id3Wave.buffer).getUint32(id3ChunkStart + 4, true);
+	const bothWave = new Uint8Array([...infoWave, ...id3Wave.subarray(id3ChunkStart, id3ChunkStart + id3ChunkSize)]);
+	new DataView(bothWave.buffer).setUint32(4, bothWave.length - 8, true);
+
+	for (const metadataFormat of ['info', 'id3'] as const) {
+		const tags = await removeTitleAndTotal(bothWave, new WavOutputFormat({ metadataFormat }));
+		expect(tags.title).toBeUndefined();
+		expect(tags.artist).toBe('Artist');
+	}
+
+	// A FLAC file with an ID3v2.4 tag (TIT2 "Old title") in front of its Vorbis comments
+	const id3Tag = [0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 20, 0x54, 0x49, 0x54, 0x32, 0, 0, 0, 10, 0, 0, 3]
+		.concat([...'Old title'].map(x => x.charCodeAt(0)));
+	const id3Flac = await removeTitleAndTotal(new Uint8Array([...id3Tag, ...flac]), new FlacOutputFormat());
+	expect(id3Flac.title).toBeUndefined();
+	expect(id3Flac.album).toBe('Samples files');
+
+	// Vorbis comments with the track total both in TRACKNUMBER and in TRACKTOTAL
+	using flacInput = new Input({ source: new BufferSource(flac), formats: ALL_FORMATS });
+	const flacOutput = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+	const tagging = await Conversion.init({
+		input: flacInput,
+		output: flacOutput,
+		showWarnings: false,
+		tags: { raw: { TRACKNUMBER: '3/12', TRACKTOTAL: '12' } },
+	});
+	await tagging.execute();
+	const totals = await removeTitleAndTotal(new Uint8Array(flacOutput.target.buffer!), new FlacOutputFormat());
+	expect(totals.trackNumber).toBe(3);
+	expect(totals.tracksTotal).toBeUndefined();
 });
 
 test('Read and write metadata, ADTS', async () => {
