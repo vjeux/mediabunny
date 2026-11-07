@@ -59,6 +59,8 @@ export class WaveDemuxer extends Demuxer {
 		littleEndian: boolean;
 	} | null = null;
 
+	/** Keys of the raw metadata tags read from RIFF INFO chunks; the others come from an ID3v2 chunk */
+	infoRawMetadataTagKeys = new Set<string>();
 	trackBackings: WaveAudioTrackBacking[] = [];
 	lastKnownPacketIndex = 0;
 	metadataTags: MetadataTags = {};
@@ -326,6 +328,7 @@ export class WaveDemuxer extends Demuxer {
 
 			this.metadataTags.raw ??= {};
 			this.metadataTags.raw[chunkName] = value;
+			this.infoRawMetadataTagKeys.add(chunkName);
 
 			switch (chunkName) {
 				case 'INAM':
@@ -455,6 +458,12 @@ export class WaveDemuxer extends Demuxer {
 
 	async getMimeType() {
 		return 'audio/wav';
+	}
+
+	override async getId3RawMetadataTagKeys() {
+		await this.readMetadata();
+		const keys = Object.keys(this.metadataTags.raw ?? {});
+		return new Set(keys.filter(key => !this.infoRawMetadataTagKeys.has(key)));
 	}
 
 	async getTrackBackings() {
