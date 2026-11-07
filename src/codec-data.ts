@@ -530,6 +530,7 @@ export type AvcSpsInfo = {
 	transferCharacteristics: number;
 	matrixCoefficients: number;
 	fullRangeFlag: number;
+	picOrderCntType: number;
 	numReorderFrames: number;
 	maxDecFrameBuffering: number;
 	vuiParametersFlagBitOffset: number;
@@ -836,6 +837,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			matrixCoefficients,
 			transferCharacteristics,
 			fullRangeFlag,
+			picOrderCntType,
 			numReorderFrames,
 			maxDecFrameBuffering,
 			vuiParametersFlagBitOffset,
