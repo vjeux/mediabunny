@@ -325,8 +325,10 @@ test('Duration from metadata with a damaged sample table and an mdhd duration of
 	const mdhd = bytes.indexOf('mdhd', secondTrak);
 	assert(bytes[mdhd + 4] === 0); // Version 0
 	bytes.fill(0, mdhd + 4 + 16, mdhd + 4 + 20); // Duration 0
-	const stco = bytes.indexOf('stco', secondTrak);
-	bytes.writeUInt32BE(0x10000, stco + 8); // An entry count far past the box
+	// Turn the stsz box into an stz2 box with an invalid field size, which no reader can make sense of
+	const stsz = bytes.indexOf('stsz', secondTrak);
+	bytes.write('stz2', stsz, 'ascii');
+	bytes[stsz + 11] = 7; // Field size, in bits
 
 	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 	const tracks = await input.getVideoTracks();
