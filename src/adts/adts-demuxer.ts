@@ -83,67 +83,70 @@ export class AdtsDemuxer extends Demuxer {
 	}
 
 	async advanceReader() {
-		if (this.lastLoadedPos === 0) {
-			// Skip all ID3v2 tags at the start of the file
-			while (true) {
-				let slice = this.reader.requestSlice(this.lastLoadedPos, ID3_V2_HEADER_SIZE);
-				if (isThenable(slice)) slice = await slice;
+		while (true) {
+			let slice = this.reader.requestSliceRange(
+				this.lastLoadedPos,
+				MIN_ADTS_FRAME_HEADER_SIZE,
+				MAX_ADTS_FRAME_HEADER_SIZE,
+			);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				this.lastSampleLoaded = true;
+				return;
+			}
 
-				if (!slice) {
+			const header = readAdtsFrameHeader(slice);
+			if (!header) {
+				// ID3v2 tags sit not only at the start of the file but can also come in between frames (like timed
+				// metadata in HLS packed audio), so let's skip them
+				let id3Slice = this.reader.requestSlice(this.lastLoadedPos, ID3_V2_HEADER_SIZE);
+				if (isThenable(id3Slice)) {
+					id3Slice = await id3Slice;
+				}
+				if (!id3Slice) {
 					this.lastSampleLoaded = true;
 					return;
 				}
 
-				const id3V2Header = readId3V2Header(slice);
+				const id3V2Header = readId3V2Header(id3Slice);
 				if (!id3V2Header) {
-					break;
+					this.lastSampleLoaded = true;
+					return;
 				}
 
-				this.lastLoadedPos = slice.filePos + id3V2Header.size;
+				this.lastLoadedPos = id3Slice.filePos + id3V2Header.size;
+				continue;
 			}
-		}
 
-		let slice = this.reader.requestSliceRange(
-			this.lastLoadedPos,
-			MIN_ADTS_FRAME_HEADER_SIZE,
-			MAX_ADTS_FRAME_HEADER_SIZE,
-		);
-		if (isThenable(slice)) slice = await slice;
-		if (!slice) {
-			this.lastSampleLoaded = true;
+			if (this.reader.fileSize !== null && header.startPos + header.frameLength > this.reader.fileSize) {
+				// Frame doesn't fit in the rest of the file
+				this.lastSampleLoaded = true;
+				return;
+			}
+
+			if (!this.firstFrameHeader) {
+				this.firstFrameHeader = header;
+			}
+
+			const sampleRate = aacFrequencyTable[header.samplingFrequencyIndex];
+			assert(sampleRate !== undefined);
+			const sampleDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
+
+			const sample: Sample = {
+				timestamp: this.nextTimestampInSamples / sampleRate,
+				duration: sampleDuration,
+				dataStart: header.startPos,
+				dataSize: header.frameLength,
+			};
+
+			this.loadedSamples.push(sample);
+			this.nextTimestampInSamples += SAMPLES_PER_AAC_FRAME;
+			this.lastLoadedPos = header.startPos + header.frameLength;
+
 			return;
 		}
-
-		const header = readAdtsFrameHeader(slice);
-		if (!header) {
-			this.lastSampleLoaded = true;
-			return;
-		}
-
-		if (this.reader.fileSize !== null && header.startPos + header.frameLength > this.reader.fileSize) {
-			// Frame doesn't fit in the rest of the file
-			this.lastSampleLoaded = true;
-			return;
-		}
-
-		if (!this.firstFrameHeader) {
-			this.firstFrameHeader = header;
-		}
-
-		const sampleRate = aacFrequencyTable[header.samplingFrequencyIndex];
-		assert(sampleRate !== undefined);
-		const sampleDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
-
-		const sample: Sample = {
-			timestamp: this.nextTimestampInSamples / sampleRate,
-			duration: sampleDuration,
-			dataStart: header.startPos,
-			dataSize: header.frameLength,
-		};
-
-		this.loadedSamples.push(sample);
-		this.nextTimestampInSamples += SAMPLES_PER_AAC_FRAME;
-		this.lastLoadedPos = header.startPos + header.frameLength;
 	}
 
 	async getMimeType() {
