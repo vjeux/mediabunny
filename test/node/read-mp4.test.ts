@@ -272,3 +272,118 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('24 and 32-bit PCM in twos and sowt sample entries', async () => {
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	// A QuickTime sound sample description (version 0), stereo, 48 kHz, 4 PCM frames in one chunk
+	const read = async (fourCc: string, sampleSize: number, littleEndian = false) => {
+		const frameSize = 2 * sampleSize / 8;
+		const pcm = Array.from({ length: 4 * frameSize }, (_, i) => i);
+		const moov = (chunkOffset: number) => box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(48000), u32(4), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(1), box(fourCc, zeros(6), [0, 1], zeros(8), [0, 2, 0, sampleSize],
+							zeros(4), u32(48000 * 0x10000), littleEndian
+								? box('wave', box('frma', ascii(fourCc)), box('enda', [0, 1]), zeros(8))
+								: [])),
+						box('stts', u32(0), u32(1), u32(4), u32(1)),
+						box('stsc', u32(0), u32(1), u32(1), u32(4), u32(1)),
+						box('stsz', u32(0), u32(frameSize), u32(4)),
+						box('stco', u32(0), u32(1), u32(chunkOffset)),
+					)),
+				),
+			),
+		);
+		const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+		const moovSize = moov(0).length;
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([
+				...ftyp,
+				...moov(ftyp.length + moovSize + 8),
+				...box('mdat', pcm),
+			])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+
+		return { codec: await track.getCodec(), data: [...packet!.data], expected: pcm };
+	};
+
+	for (const [fourCc, sampleSize, littleEndian, codec] of [
+		['twos', 24, false, 'pcm-s24be'],
+		['twos', 32, false, 'pcm-s32be'],
+		['twos', 24, true, 'pcm-s24'], // enda = 1, like for 16-bit twos
+		['twos', 32, true, 'pcm-s32'],
+		['sowt', 24, false, 'pcm-s24'],
+		['sowt', 32, false, 'pcm-s32'],
+	] as const) {
+		const result = await read(fourCc, sampleSize, littleEndian);
+		expect(result.codec).toBe(codec);
+		expect(result.data).toEqual(result.expected);
+	}
+});
+
+test('16-bit samples in a QuickTime raw sample entry', async () => {
+	// QuickTime defines 'raw ' as 8-bit offset binary, but FFmpeg reads an entry that says 16 bits per sample as
+	// signed big-endian 16-bit PCM
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (sampleSize: number) => {
+		const raw = box('raw ', zeros(6), u16(1), zeros(8), u16(2), u16(sampleSize), zeros(4), u32(48000 * 0x10000));
+		const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(48000), u32(480), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(480), zeros(16), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(48000), u32(480), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), raw),
+						box('stts', zeros(4), u32(1), u32(480), u32(1)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(480), u32(1)),
+						box('stsz', zeros(4), u32(1), u32(480)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+		const mdat = box('mdat', zeros(480 * 2 * sampleSize / 8)); // 480 stereo frames
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...mdat, ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		return [await track.getCodec(), packet?.byteLength, packet?.duration];
+	};
+
+	expect(await read(8)).toEqual(['pcm-u8', 960, 0.01]);
+	expect(await read(16)).toEqual(['pcm-s16be', 1920, 0.01]);
+});
