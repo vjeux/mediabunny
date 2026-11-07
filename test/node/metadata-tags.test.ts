@@ -15,6 +15,7 @@ import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { Input } from '../../src/input.js';
+import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AttachedFile, MetadataTags, RichImageData } from '../../src/metadata.js';
@@ -1549,4 +1550,80 @@ test('Remuxing mdta tags whose cover was read under the iTunes key keeps a singl
 	const remuxed = await writeAndRead(read);
 	expect(remuxed.images).toHaveLength(1);
 	expect(Object.keys(remuxed.raw!)).toEqual(['com.apple.quicktime.artwork']);
+});
+
+const bytesOf = (source: AllowSharedBufferSource) => ArrayBuffer.isView(source)
+	? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+	: new Uint8Array(source);
+
+test('Getters return copies that callers can modify without affecting the input', async () => {
+	for (const file of ['video.mp4', 'demo.webm', 'Toothsome-Meme.VBRv2.mp3']) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public', file)),
+			formats: ALL_FORMATS,
+		});
+		const mimeType = await input.getMimeType();
+		const track = (await input.getTracks())[0] as InputVideoTrack | InputAudioTrack;
+		const codecString = await track.getCodecParameterString();
+
+		const tags = await input.getMetadataTags();
+		const title = tags.title;
+		tags.title = 'Changed';
+		tags.raw = {};
+		const config = (await track.getDecoderConfig())!;
+		config.codec = 'vp8';
+		const description = config.description && bytesOf(config.description).slice();
+		if (config.description) {
+			bytesOf(config.description).fill(0); // Changed in place
+		}
+		const disposition = await track.getDisposition();
+		disposition.default = !disposition.default;
+
+		expect((await input.getMetadataTags()).title, file).toBe(title);
+		expect((await track.getDecoderConfig())!.codec, file).toBe(codecString);
+		const freshDescription = (await track.getDecoderConfig())!.description;
+		expect(freshDescription && bytesOf(freshDescription), file).toEqual(description);
+		expect(await track.getCodecParameterString(), file).toBe(codecString);
+		expect(await input.getMimeType(), file).toBe(mimeType);
+		expect((await track.getDisposition()).default, file).toBe(!disposition.default);
+
+		if (track.isVideoTrack()) {
+			const ratio = await track.getPixelAspectRatio();
+			ratio.num = 99;
+			expect((await track.getPixelAspectRatio()).num, file).not.toBe(99);
+		}
+	}
+
+	// Tags holding Dates, image bytes, attachments and binary raw values, changed in place
+	for (const format of [new Mp4OutputFormat(), new MkvOutputFormat()]) {
+		const output = new Output({ format, target: new BufferTarget() });
+		const track = createDummyAudioTrack('pcm-s16', output);
+		output.setMetadataTags({
+			date: new Date(Date.UTC(2024, 0, 2)),
+			creationTime: new Date(Date.UTC(2025, 0, 1)),
+			images: [{ data: new Uint8Array([1, 2, 3, 4]), mimeType: 'image/png', kind: 'coverFront' }],
+			raw: format instanceof MkvOutputFormat ? { CUSTOM_BINARY: new Uint8Array([5, 6, 7]) } : undefined,
+		});
+		await output.start();
+		await track.addPacket();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const original = await input.getMetadataTags();
+		const tags = await input.getMetadataTags();
+		tags.date!.setTime(0);
+		tags.creationTime!.setTime(0);
+		tags.images![0]!.data.fill(0);
+		for (const value of Object.values(tags.raw!)) {
+			if (value instanceof Uint8Array) {
+				value.fill(0);
+			} else if (value instanceof RichImageData || value instanceof AttachedFile) {
+				value.data.fill(0);
+			}
+		}
+
+		expect(await input.getMetadataTags()).toEqual(original);
+		expect(original.creationTime!.getTime()).toBe(Date.UTC(2025, 0, 1));
+		expect([...original.images![0]!.data]).toEqual([1, 2, 3, 4]);
+	}
 });
