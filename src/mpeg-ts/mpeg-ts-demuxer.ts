@@ -39,7 +39,9 @@ import {
 	AC3_FRAME_SIZES,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
+	iterateNalUnitsInAnnexB,
 	parseDtsFrame,
+	removeEmulationPreventionBytes,
 	parseDtsCoreFrameHeader,
 	parseDtsExssHeader,
 	DTS_CORE_FRAME_HEADER_SIZE,
@@ -1647,7 +1649,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			let currentChunkStartPos = scanStartPos;
 			let nextChunkStartPos: number | null = null; // "next" as in later in the file, even tho we scan backwards
 
-			const readSectionsInFull = !this.elementaryStream.canBeTrustedWithKeyPackets;
+			// Captured once, since reading packets can revoke the trust while we're searching
+			const trustKeyPackets = this.elementaryStream.canBeTrustedWithKeyPackets;
+			const readSectionsInFull = !trustKeyPackets;
 
 			while (true) {
 				let bestKeyPesHeader: TimestampedPesPacketHeader | null = null;
@@ -1684,7 +1688,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 					if (pesHeader.pts <= searchPts) {
 						let isKeyPacket: boolean;
-						if (this.elementaryStream.canBeTrustedWithKeyPackets) {
+						if (trustKeyPackets) {
 							isKeyPacket = pesHeader.randomAccessIndicator === 1;
 						} else {
 							if (!context) {
@@ -1799,6 +1803,10 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					);
 					if (encodedPacket) {
 						return encodedPacket;
+					} else if (trustKeyPackets && !this.elementaryStream.canBeTrustedWithKeyPackets) {
+						// The candidate wasn't a key frame after all, so random_access_indicator can't be trusted.
+						// Start over using the bitstream.
+						return this.doPacketLookup(timestamp, keyframesOnly, options);
 					} else {
 						// The key packet didn't materialize (can happen with odd packetization where packets take their
 						// timestamp from a later PES packet), so let's keep looking further back
@@ -1965,6 +1973,50 @@ type SuppliedPacket = {
 	sequenceNumber: number;
 	sectionStartPos: number;
 	randomAccessIndicator: number;
+};
+
+const RECOVERY_POINT_SEI_PAYLOAD_TYPE = 6; // The same in AVC and HEVC
+
+/** Whether the access unit carries a recovery point SEI message, which marks a random access point. */
+const containsRecoveryPointSei = (codec: VideoCodec, data: Uint8Array) => {
+	for (const loc of iterateNalUnitsInAnnexB(data)) {
+		const isSei = codec === 'avc'
+			? extractNalUnitTypeForAvc(data[loc.offset]!) === AvcNalUnitType.SEI
+			: extractNalUnitTypeForHevc(data[loc.offset]!) === HevcNalUnitType.PREFIX_SEI_NUT;
+		if (!isSei) {
+			continue;
+		}
+
+		const nalHeaderSize = codec === 'avc' ? 1 : 2;
+		const nalUnitPayload = data.subarray(loc.offset + nalHeaderSize, loc.offset + loc.length);
+		const bytes = removeEmulationPreventionBytes(nalUnitPayload);
+
+		// sei_rbsp(): sei_message()s until the rbsp_trailing_bits
+		let pos = 0;
+		while (pos < bytes.length && !(pos === bytes.length - 1 && bytes[pos] === 0x80)) {
+			let payloadType = 0;
+			while (bytes[pos] === 0xff) {
+				payloadType += 0xff;
+				pos++;
+			}
+			payloadType += bytes[pos++] ?? 0;
+
+			let payloadSize = 0;
+			while (bytes[pos] === 0xff) {
+				payloadSize += 0xff;
+				pos++;
+			}
+			payloadSize += bytes[pos++] ?? 0;
+
+			if (payloadType === RECOVERY_POINT_SEI_PAYLOAD_TYPE) {
+				return true;
+			}
+
+			pos += payloadSize;
+		}
+	}
+
+	return false;
 };
 
 /** Stateful context used to extract exact encoded packets from the underlying data stream. */
@@ -2607,22 +2659,30 @@ class PacketReadingContext {
 
 		let randomAccessIndicator = currentPesPacket.randomAccessIndicator;
 
-		if (randomAccessIndicator === 0 && !this.elementaryStream.canBeTrustedWithKeyPackets) {
-			if (this.elementaryStream.info.type === 'audio') {
+		if (this.elementaryStream.info.type === 'audio') {
+			if (randomAccessIndicator === 0 && !this.elementaryStream.canBeTrustedWithKeyPackets) {
 				randomAccessIndicator = 1;
-			} else {
-				if (this.elementaryStream.info.decoderConfig) {
-					const isKey = determineVideoPacketType(
-						this.elementaryStream.info.codec,
-						this.elementaryStream.info.decoderConfig,
-						data,
-					) === 'key';
-
-					randomAccessIndicator = Number(isKey);
-				} else {
-					// We're reading packets before the decoder config is determined
-				}
 			}
+		} else if (this.elementaryStream.info.decoderConfig) {
+			const { codec, decoderConfig } = this.elementaryStream.info;
+
+			if (randomAccessIndicator === 1) {
+				// Some muxers set random_access_indicator on packets that aren't key frames (on every PES packet, or on
+				// the ones carrying a PCR). A picture that is neither IDR/IRAP nor comes with a recovery point SEI
+				// message (as open-GOP and intra-refresh streams use) can't be a random access point, so the flag
+				// lied and can't be trusted from here on.
+				if (
+					determineVideoPacketType(codec, decoderConfig, data) !== 'key'
+					&& !containsRecoveryPointSei(codec, data)
+				) {
+					randomAccessIndicator = 0;
+					this.elementaryStream.canBeTrustedWithKeyPackets = false;
+				}
+			} else if (!this.elementaryStream.canBeTrustedWithKeyPackets) {
+				randomAccessIndicator = Number(determineVideoPacketType(codec, decoderConfig, data) === 'key');
+			}
+		} else {
+			// We're reading packets before the decoder config is determined
 		}
 
 		this.suppliedPacket = {
