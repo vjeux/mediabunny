@@ -231,17 +231,34 @@ const buildCells = () => {
 
 const CELLS = buildCells();
 
-/** Issues known on main, with the fork PRs that fix them. */
+// Issues on main that open pull requests fix (one of them on upstream's bug-fix-mania branch). isKnownIssue tolerates
+// each one only while its flag is on: a branch that merges the fix turns the flag off, so the matrix checks it again.
+const KNOWN_ISSUES: Record<string, boolean> = {
+	'#303+#306': true, // Opus encoding of audio at other rates than 48 kHz comes out late in Chrome (fixed by both)
+	'#75': true, // The encoder fallback changes both the channel count and the sample rate
+	'#304': true, // Trimming the end of MPEG-TS input throws "Assertion failed."
+	'#312': true, // HLS lists tracks without packets in CODECS
+	'#629': true, // Windows' AAC encoder silences the first ~512 samples
+	'bug-fix-mania': true, // The FLAC muxer writes a minimum block size of 0 for a single frame
+};
+
+/** Issues known on main, with the PRs that fix them. */
 const isKnownIssue = (cell: Cell, inView: MediaView, run: RunResult, issue: Issue) => {
 	// Windows' AAC encoder (Media Foundation) silences the first ~512 samples, so a beep right at the start of
 	// transcoded AAC comes out late (#629)
-	if (run.outputCodecs.audio === 'aac' && run.copied.audio === false && issue.fromStartBeepsOnly) {
+	if (
+		KNOWN_ISSUES['#629']
+		&& run.outputCodecs.audio === 'aac'
+		&& run.copied.audio === false
+		&& issue.fromStartBeepsOnly
+	) {
 		return true;
 	}
 	// Opus encoding in Chrome leaves audio at other rates than 48 kHz late by up to 5.5 ms (#303, #306)
 	const encodedRate = cell.options.audio?.sampleRate ?? inView.audio?.decodedSampleRate;
 	if (
-		run.outputCodecs.audio === 'opus'
+		KNOWN_ISSUES['#303+#306']
+		&& run.outputCodecs.audio === 'opus'
 		&& encodedRate !== 48000
 		&& (issue.kind === 'audio-offset' || issue.kind === 'av-sync')
 	) {
@@ -250,7 +267,8 @@ const isKnownIssue = (cell: Cell, inView: MediaView, run: RunResult, issue: Issu
 	// When the encoder can't take the channel count or the sample rate, Conversion falls back to stereo at 48 kHz,
 	// changing both (#75)
 	if (
-		run.outputCodecs.audio === 'mp3'
+		KNOWN_ISSUES['#75']
+		&& run.outputCodecs.audio === 'mp3'
 		&& (issue.kind === 'audio-sample-rate' || issue.kind === 'audio-channels')
 		&& ((inView.audio?.decodedNumberOfChannels ?? 0) > 2 || (cell.options.audio?.sampleRate ?? 0) > 48000)
 	) {
@@ -258,7 +276,12 @@ const isKnownIssue = (cell: Cell, inView: MediaView, run: RunResult, issue: Issu
 	}
 	// The FLAC muxer writes a minimum block size of 0 when there's a single frame, which decoders reject (fixed on
 	// upstream's bug-fix-mania branch)
-	if (cell.output === 'flac' && issue.kind === 'audio-decode' && cell.id.includes('trim-one-frame')) {
+	if (
+		KNOWN_ISSUES['bug-fix-mania']
+		&& cell.output === 'flac'
+		&& issue.kind === 'audio-decode'
+		&& cell.id.includes('trim-one-frame')
+	) {
 		return true;
 	}
 	// When no track gets a single packet, WAVE, FLAC and MP3 throw "Cannot finalize an empty file" and Ogg writes 0
@@ -268,11 +291,21 @@ const isKnownIssue = (cell: Cell, inView: MediaView, run: RunResult, issue: Issu
 		return true;
 	}
 	// HLS lists a track that never got a packet in CODECS, so reading the output back fails (#312)
-	if (cell.output.startsWith('hls') && issue.kind === 'error' && issue.detail.includes('No matching track found')) {
+	if (
+		KNOWN_ISSUES['#312']
+		&& cell.output.startsWith('hls')
+		&& issue.kind === 'error'
+		&& issue.detail.includes('No matching track found')
+	) {
 		return true;
 	}
 	// Trimming the end of MPEG-TS input races two reads of the same packet and throws "Assertion failed." (#304)
-	if (cell.input.startsWith('ts-') && cell.options.trim?.end !== undefined && issue.kind === 'error') {
+	if (
+		KNOWN_ISSUES['#304']
+		&& cell.input.startsWith('ts-')
+		&& cell.options.trim?.end !== undefined
+		&& issue.kind === 'error'
+	) {
 		return issue.detail.includes('Assertion failed') || issue.detail.includes('randomAccessIndicator');
 	}
 
