@@ -778,6 +778,30 @@ test('The last presented frame keeps its duration when B-frames follow it in dec
 	}
 });
 
+test('A track ends where its metadata says when an earlier frame declares a later end', async () => {
+	// I P B in decode order, where the B-frame's declared end (0.04 + 0.2) is past the last presented frame's (0.13)
+	const packets = [[0, 0.04], [0.12, 0.01], [0.04, 0.2]] as const;
+
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (const [i, [timestamp, duration]] of packets.entries()) {
+		const packet = new EncodedPacket(new Uint8Array([i]), i === 0 ? 'key' : 'delta', timestamp, duration);
+		await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// The movie and track durations cover the latest declared end, and so do the samples now
+	expect(await track.getDurationFromMetadata()).toBeCloseTo(0.24, 6);
+	expect(await track.computeDuration()).toBeCloseTo(0.24, 6);
+});
+
 test('B-frame streams that hold nothing keep their layout, however long', { timeout: 120_000 }, async () => {
 	// P B B mini-GOPs in decode order, timestamps index * (1 / fps), every frame lasting 1 / fps
 	const write = async (frameCount: number, fps: number, keyInterval: number) => {

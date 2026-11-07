@@ -1067,7 +1067,16 @@ export class IsobmffMuxer extends Muxer {
 			}
 
 			if (lastPresentedIndex < queue.length - 1) {
-				const shift = sortedTimestamps[lastPresentedIndex]! + queue[lastPresentedIndex]!.duration
+				// The slot runs to the latest end any sample declares, which the movie and track durations use too.
+				// That's normally the last presented sample's own end, but an earlier one may declare a later end.
+				let end = -Infinity;
+				for (const samples of [trackData.samples, queue]) {
+					for (const sample of samples) {
+						end = Math.max(end, sample.timestamp + sample.duration);
+					}
+				}
+
+				const shift = sortedTimestamps[lastPresentedIndex]! + end - queue[lastPresentedIndex]!.timestamp
 					- sortedTimestamps[lastPresentedIndex + 1]!;
 
 				// Differences below half a tick are rounding noise, not a different duration
