@@ -343,6 +343,8 @@ export class IsobmffDemuxer extends Demuxer {
 	idToTrack = new Map<number, InternalTrack>();
 	metadataPromise: Promise<void> | null = null;
 	movieTimescale = -1;
+	/** Whether the file ends inside the moov box (or the moov box's size goes past the end of the file) */
+	moovIsCutOff = false;
 	movieDurationInTimescale = -1;
 	movieMatrix = IDENTITY_MATRIX;
 	isQuickTime = false;
@@ -423,6 +425,7 @@ export class IsobmffDemuxer extends Demuxer {
 					if (isThenable(moovSlice)) moovSlice = await moovSlice;
 					if (!moovSlice) break;
 
+					this.moovIsCutOff = moovSlice.length < boxInfo.contentSize;
 					this.moovSlice = moovSlice;
 					this.readContiguousBoxes(this.moovSlice);
 
@@ -933,14 +936,15 @@ export class IsobmffDemuxer extends Demuxer {
 		try {
 			while (slice.filePos - startIndex <= slice.length - MIN_BOX_HEADER_SIZE) {
 				const fileSize = this.reader.fileSizeNonStrict;
-				if (fileSize !== null) {
+				if (this.moovIsCutOff && fileSize !== null) {
 					const startPos = slice.filePos;
 					const boxInfo = readBoxHeader(slice);
 					slice.filePos = startPos;
 
 					if (boxInfo && startPos + boxInfo.totalSize > fileSize) {
 						// The file is cut off inside this box, so its content is incomplete. Like FFmpeg, keep the
-						// boxes before it.
+						// boxes before it. (Within a complete moov box, a box past the end of the file only claims
+						// too much.)
 						break;
 					}
 				}
