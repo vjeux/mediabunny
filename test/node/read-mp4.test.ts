@@ -272,3 +272,119 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Fragments following samples in the moov box', async () => {
+	// FFmpeg writes files like these when fragmenting without empty_moov: The samples of the first fragment go into the
+	// moov box, all others into movie fragments
+	await testMoovSamplesThenFragment(true);
+});
+
+test('Fragments following samples in the moov box, without tfdt', async () => {
+	// Without a tfdt, the first fragment starts where the samples in the moov box end
+	await testMoovSamplesThenFragment(false);
+});
+
+const testMoovSamplesThenFragment = async (withTfdt: boolean) => {
+	using input = new Input({
+		source: new BufferSource(moovSamplesThenFragment(withTfdt)),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getVideoTracks())[0]!;
+	const sink = new EncodedPacketSink(track);
+
+	const packets: EncodedPacket[] = [];
+	for await (const packet of sink.packets()) {
+		packets.push(packet);
+	}
+
+	expect(packets.map(x => x.timestamp)).toEqual([0, 0.04, 0.08, 0.12, 0.16, 0.2]);
+	expect(packets.map(x => x.data[0])).toEqual([0, 1, 2, 3, 4, 5]);
+	expect(packets.map(x => x.type)).toEqual(['key', 'delta', 'delta', 'key', 'delta', 'delta']);
+
+	expect((await sink.getPacket(0.05))!.timestamp).toBe(0.04);
+	expect((await sink.getPacket(0.13))!.timestamp).toBe(0.12);
+	expect((await sink.getKeyPacket(0.1))!.timestamp).toBe(0);
+	expect((await sink.getKeyPacket(0.2))!.timestamp).toBe(0.12);
+	expect((await sink.getNextKeyPacket(packets[0]!))!.timestamp).toBe(0.12);
+
+	expect(await track.computeDuration()).toBe(0.24);
+	// The metadata only knows about the samples in the moov box
+	expect(await track.getDurationFromMetadata()).toBe(null);
+};
+
+const moovSamplesThenFragment = (withTfdt: boolean) => {
+	const moov = (dataOffset: number) => box('moov',
+		mvhd(),
+		trak('vide', fullBox('mdhd', 0, 0, zeros(8), u32(1000), u32(120), zeros(4)),
+			fullBox('stsd', 0, 0, u32(1), videoSampleEntry('avc1')),
+			fullBox('stts', 0, 0, u32(1), u32(3), u32(40)),
+			fullBox('stss', 0, 0, u32(1), u32(1)),
+			fullBox('stsc', 0, 0, u32(1), u32(1), u32(3), u32(1)),
+			fullBox('stsz', 0, 0, u32(0), u32(3), u32(4), u32(4), u32(4)),
+			fullBox('stco', 0, 0, u32(1), u32(dataOffset)),
+		),
+		box('mvex', fullBox('trex', 0, 0, u32(1), u32(1), u32(40), u32(4), u32(0x10000))),
+	);
+	const moof = (dataOffset: number) => box('moof', box('traf',
+		fullBox('tfhd', 0, 0x020000, u32(1)), // Default base is moof
+		...(withTfdt ? [fullBox('tfdt', 0, 0, u32(120))] : []),
+		fullBox('trun', 0, 0x000005, u32(3), u32(dataOffset), u32(0)), // First sample is a key frame
+	));
+
+	const ftyp = box('ftyp', ascii('isom'), u32(0), ascii('isom'));
+	const moovDataOffset = ftyp.length + moov(0).length + 8;
+
+	return concat(
+		ftyp,
+		moov(moovDataOffset),
+		box('mdat', sampleData(0), sampleData(1), sampleData(2)),
+		moof(moof(0).length + 8),
+		box('mdat', sampleData(3), sampleData(4), sampleData(5)),
+	);
+};
+
+const sampleData = (value: number) => [value, value, value, value];
+
+const videoSampleEntry = (name: string, ...children: Bytes[]) => box(
+	name, zeros(6), u16(1), zeros(16), u16(64), u16(64), zeros(50), ...children,
+);
+
+const mvhd = () => fullBox('mvhd', 0, 0, zeros(8), u32(1000), zeros(84));
+
+const trak = (handler: string, mediaHeader: Bytes, ...stblChildren: Bytes[]) => box('trak',
+	fullBox('tkhd', 0, 1, zeros(8), u32(1), zeros(68)),
+	box('mdia',
+		mediaHeader,
+		fullBox('hdlr', 0, 0, zeros(4), ascii(handler), zeros(13)),
+		box('minf', box('stbl', ...stblChildren)),
+	),
+);
+
+type Bytes = Uint8Array | number[];
+
+const fullBox = (name: string, version: number, flags: number, ...parts: Bytes[]) => {
+	return box(name, u8(version), u24(flags), ...parts);
+};
+
+const box = (name: string, ...parts: Bytes[]) => {
+	const content = concat(...parts);
+	return concat(u32(8 + content.length), ascii(name), content);
+};
+
+const concat = (...parts: Bytes[]) => {
+	const result = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+	let offset = 0;
+	for (const part of parts) {
+		result.set(part, offset);
+		offset += part.length;
+	}
+
+	return result;
+};
+
+const u32 = (value: number) => [(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+const u24 = (value: number) => [(value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+const u16 = (value: number) => [(value >>> 8) & 0xff, value & 0xff];
+const u8 = (value: number) => [value & 0xff];
+const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+const zeros = (length: number) => new Uint8Array(length);
