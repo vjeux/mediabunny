@@ -2330,6 +2330,9 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	stampsOutputsItself = isChromium();
 	queuedOutputs: number[] = [];
 	expectedQueuedTimestamp: number | null = null;
+	// Whether packet timestamps are exact to the sample (the time resolution is at least the sample rate), which makes
+	// a shorter gap between them trustworthy
+	packetTimestampsAreExact = false;
 	// WebCodecs impls discard the Opus pre-skip (correct) but don't advance the timestamp (incorrect). These are the
 	// pre-skip and the part of it the decoder still has to discard from the packets to come, in Opus samples.
 	opusPreSkip: number;
@@ -2363,6 +2366,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				// Some packets decode to nothing (discard padding, for example), so pair this output with the queued
 				// packet start closest to where the audio continues instead of just the next one. Equal starts (laced
 				// frames sharing one timestamp, for example) each keep their own output.
+				let skippedQueuedOutputs = false;
 				if (this.currentTimestamp !== null) {
 					const current = this.currentTimestamp;
 					while (
@@ -2370,6 +2374,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 						&& Math.abs(this.queuedOutputs[1]! - current) < Math.abs(this.queuedOutputs[0]! - current)
 					) {
 						this.queuedOutputs.shift();
+						skippedQueuedOutputs = true;
 					}
 				}
 
@@ -2377,17 +2382,27 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				// audio can run a little longer or shorter than them, so the audio just continues. Only where a
 				// packet's audio starts at least 0.1 s after both the previous packet's audio ends and where the
 				// decoded audio has got to (a gap, as FFmpeg's aresample defines it with min_hard_comp) does it skip
-				// ahead. It never moves back, which would play audio twice.
+				// ahead. Where packet timestamps are exact, a gap of this output's length is enough, as long as no
+				// queued packet was passed over just now (outputs and packets would have come apart). It never moves
+				// back, which would play audio twice.
 				const queued = this.queuedOutputs.shift();
+				const startsGap = (length: number) => {
+					// Give or take half a sample
+					const minLength = length - 0.5 / sample.sampleRate;
+					return queued !== undefined
+						&& this.expectedQueuedTimestamp !== null
+						&& this.currentTimestamp !== null
+						&& queued - this.expectedQueuedTimestamp >= minLength
+						&& queued - this.currentTimestamp >= minLength;
+				};
+
 				if (this.currentTimestamp === null) {
 					this.currentTimestamp = queued ?? sample.timestamp;
 				} else if (
-					queued !== undefined
-					&& this.expectedQueuedTimestamp !== null
-					&& queued - this.expectedQueuedTimestamp >= 0.1
-					&& queued - this.currentTimestamp >= 0.1
+					startsGap(0.1)
+					|| (this.packetTimestampsAreExact && !skippedQueuedOutputs && startsGap(sample.duration))
 				) {
-					this.currentTimestamp = queued;
+					this.currentTimestamp = queued!;
 				}
 
 				this.expectedQueuedTimestamp = (queued ?? this.expectedQueuedTimestamp ?? this.currentTimestamp)
@@ -2770,7 +2785,9 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			const decoder = new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			decoder.packetTimestampsAreExact = (await this._track.getTimeResolution()) >= decoderConfig.sampleRate;
+			return decoder;
 		}
 	}
 

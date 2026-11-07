@@ -374,6 +374,25 @@ test('Decoded audio keeps the gaps between packets', async () => {
 	}
 });
 
+test('Decoded audio keeps a short gap between packets with exact timestamps', async () => {
+	// FFmpeg's fragmented MP4 with B-frame video stretches the first audio packet over the video's delay, so the next
+	// packet starts about 60 ms after the first one's audio ends (found by lane L64)
+	using input = await remuxDemoAudio((timestamp, index) => index > 0 ? timestamp + 0.06 : timestamp);
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packetTimestamps = await getPacketTimestamps(track);
+	const sampleTimestamps = await getSampleTimestamps(track);
+	expect(sampleTimestamps).toHaveLength(packetTimestamps.length);
+	for (let i = 0; i < sampleTimestamps.length; i++) {
+		expect(sampleTimestamps[i]).toBeCloseTo(packetTimestamps[i]!, 4);
+	}
+
+	// Where seeking puts it too
+	using sample = await new AudioSampleSink(track).getSample(packetTimestamps[40]! + 0.001);
+	expect(sample!.timestamp).toBeCloseTo(sampleTimestamps[40]!, 4);
+});
+
 test('Decoded audio stays contiguous across packets that share a timestamp', async () => {
 	// A run of eight packets stamped at the first one's timestamp, like the laced frames of a Matroska block with no
 	// known durations
