@@ -178,6 +178,34 @@ const avcEncodable = await (async () => {
 	}
 })();
 
+// Whether this browser decodes every track of a fixture, decided by VideoDecoder/AudioDecoder.isConfigSupported
+// (Firefox without a system FFmpeg decodes neither the AVC nor the AAC of video.mp4)
+const decodesNatively = async (url: string) => {
+	try {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		for (const track of await input.getTracks()) {
+			let supported = false;
+			if (track.isVideoTrack()) {
+				const config = await track.getDecoderConfig();
+				supported = !!config && (await VideoDecoder.isConfigSupported(config)).supported === true;
+			} else if (track.isAudioTrack()) {
+				const config = await track.getDecoderConfig();
+				supported = !!config && (await AudioDecoder.isConfigSupported(config)).supported === true;
+			}
+
+			if (!supported) {
+				return false;
+			}
+		}
+
+		return true;
+	} catch {
+		return false;
+	}
+};
+const videoMp4Decodable = await decodesNatively('/video.mp4');
+const vfrVideoDecodable = await decodesNatively('/cursed-vfr.mp4');
+
 // Quality levels give small frames small bitrates, at which WebKitGTK's AVC encoder (OpenH264) flattens colors and
 // drops frames, so conversions that re-encode frames to read back their colors ask for an ample bitrate
 const AMPLE_VIDEO_QUALITY = new Quality({ bitrate: 2e6 });
@@ -372,7 +400,7 @@ describe('Frame rate conversion', () => {
 		expect(await readFrameIndices(track)).toEqual(Array.from({ length: 60 }, (_, i) => Math.floor(i / 2) % 8));
 	});
 
-	test('variable frame rate input comes out on the fixed frame grid', async () => {
+	test.skipIf(!vfrVideoDecodable)('variable frame rate input comes out on the fixed frame grid', async () => {
 		using input = new Input({ source: new UrlSource('/cursed-vfr.mp4'), formats: ALL_FORMATS });
 		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
 		const conversion = await Conversion.init({ input, output, video: { frameRate: 10, width: 320 } });
@@ -510,7 +538,7 @@ describe('Audio transcoding', () => {
 	});
 });
 
-describe('Trimming while transcoding', () => {
+describe.skipIf(!videoMp4Decodable)('Trimming while transcoding', () => {
 	test('both tracks start at 0 and end at the trim length', async () => {
 		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
@@ -535,7 +563,7 @@ describe('Trimming while transcoding', () => {
 	});
 });
 
-describe('Cancellation, errors and pausing', () => {
+describe.skipIf(!videoMp4Decodable)('Cancellation, errors and pausing', () => {
 	const unhandledRejections: unknown[] = [];
 	window.addEventListener('unhandledrejection', (event) => {
 		unhandledRejections.push(event.reason);
