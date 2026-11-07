@@ -108,6 +108,22 @@ test('Fragmented fMP4 with video+audio preserves B-frame CTS', async () => {
 	expect(timestamps).toEqual(originalTimestamps);
 });
 
+test.each([
+	// Overlapping cues, as in roll-up captions: split at every start and end time into 5 samples
+	['overlapping', '00:00.000 --> 00:04.000\nA\n\n00:01.000 --> 00:02.000\nB\n\n00:03.000 --> 00:05.000\nC\n', 3],
+	// A gap before every cue: one sample per gap and per cue
+	['gapped', '00:01.000 --> 00:02.000\nA\n\n00:03.000 --> 00:04.000\nB\n', 2],
+])('Reserved Fast Start fits %s WebVTT cues with the documented two packets per cue', async (_, cues, cueCount) => {
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
+	const source = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(source, { maximumPacketCount: 2 * cueCount });
+	await output.start();
+	await source.add('WEBVTT\n\n' + cues);
+	await output.finalize(); // Throws if the packets exceed the reserved count
+
+	expect(output.state).toBe('finalized');
+});
+
 test('Zero start timestamp, regular MP4', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
@@ -749,20 +765,4 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
-});
-
-test.each([
-	// Overlapping cues, as in roll-up captions: split at every start and end time into 5 samples
-	['overlapping', '00:00.000 --> 00:04.000\nA\n\n00:01.000 --> 00:02.000\nB\n\n00:03.000 --> 00:05.000\nC\n', 3],
-	// A gap before every cue: one sample per gap and per cue
-	['gapped', '00:01.000 --> 00:02.000\nA\n\n00:03.000 --> 00:04.000\nB\n', 2],
-])('Reserved Fast Start fits %s WebVTT cues with the documented two packets per cue', async (_, cues, cueCount) => {
-	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
-	const source = new TextSubtitleSource('webvtt');
-	output.addSubtitleTrack(source, { maximumPacketCount: 2 * cueCount });
-	await output.start();
-	await source.add('WEBVTT\n\n' + cues);
-	await output.finalize(); // Throws if the packets exceed the reserved count
-
-	expect(output.state).toBe('finalized');
 });
