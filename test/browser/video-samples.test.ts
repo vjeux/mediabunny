@@ -630,16 +630,17 @@ test('Treat non-standard VideoFrame color space values as unknown', () => {
 });
 
 test('toVideoFrame() keeps the pixels of padded and odd-sized YUV data', async () => {
-	// Firefox's VideoFrame constructor ignores `layout` and refuses odd-sized I420 frames
-	const readRgba = async (frame: VideoFrame) => {
-		const rgba = new Uint8Array(frame.allocationSize({ format: 'RGBA' }));
-		await frame.copyTo(rgba, { format: 'RGBA' });
+	// Firefox's VideoFrame constructor ignores `layout` and refuses odd-sized I420 frames. Read back through a canvas,
+	// as not every browser's copyTo() converts to RGBA (WebKitGTK's doesn't).
+	const readRgba = (frame: VideoFrame) => {
+		const context = new OffscreenCanvas(frame.displayWidth, frame.displayHeight).getContext('2d')!;
+		context.drawImage(frame, 0, 0);
 		frame.close();
-		return rgba;
+		return context.getImageData(0, 0, context.canvas.width, context.canvas.height).data;
 	};
 
 	// Reference color from tightly packed data
-	const reference = await readRgba(new VideoFrame(new Uint8Array([100, 100, 100, 100, 90, 200]), {
+	const reference = readRgba(new VideoFrame(new Uint8Array([100, 100, 100, 100, 90, 200]), {
 		format: 'I420', codedWidth: 2, codedHeight: 2, timestamp: 0,
 	}));
 
@@ -673,7 +674,7 @@ test('toVideoFrame() keeps the pixels of padded and odd-sized YUV data', async (
 
 		const frame = sample.toVideoFrame();
 		expect([frame.displayWidth, frame.displayHeight]).toEqual([width, height]);
-		const rgba = await readRgba(frame);
+		const rgba = readRgba(frame);
 		expect(rgba.length).toBe(width * height * 4);
 		for (let i = 0; i < rgba.length; i += 4) {
 			const pixel = [...rgba.subarray(i, i + 4)];

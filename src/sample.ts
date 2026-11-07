@@ -20,6 +20,7 @@ import {
 	SetRequired,
 	TRANSFER_CHARACTERISTICS_MAP,
 	isFirefox,
+	isChromium,
 	polyfillSymbolDispose,
 	assertNever,
 	isWebKit,
@@ -1068,8 +1069,8 @@ export class VideoSample implements Disposable {
 				);
 			}
 
-			if (isFirefox()) {
-				const repacked = repackPlanesForFirefox(this.format, this.codedWidth, this.codedHeight, planes, null);
+			if (!isChromium()) {
+				const repacked = repackPlanes(this.format, this.codedWidth, this.codedHeight, planes, null);
 				assert(repacked);
 
 				return this._repackedToVideoFrame(repacked);
@@ -1112,9 +1113,9 @@ export class VideoSample implements Disposable {
 		} else if (this._data instanceof Uint8Array) {
 			assert(this._layout);
 
-			if (isFirefox()) {
+			if (!isChromium()) {
 				const data = this._data;
-				const repacked = repackPlanesForFirefox(
+				const repacked = repackPlanes(
 					this.format!,
 					this.codedWidth,
 					this.codedHeight,
@@ -2154,12 +2155,12 @@ const createDefaultPlaneLayout = (
 };
 
 /**
- * Firefox's VideoFrame constructor ignores `layout`, reading the buffer as tightly packed planes of the coded size, and
- * only accepts even coded sizes for chroma-subsampled formats (https://bugzilla.mozilla.org/show_bug.cgi?id=1899811).
- * Repacks the top-left width x height region of the planes into that shape, repeating the edge into any padding.
- * Returns null if the given layout already has that shape.
+ * Outside Chromium, the VideoFrame constructor can't be trusted with `layout`: Firefox and WebKitGTK read the buffer as
+ * tightly packed planes of the coded size. Firefox also only accepts even coded sizes for chroma-subsampled formats
+ * (https://bugzilla.mozilla.org/show_bug.cgi?id=1899811). Repacks the top-left width x height region of the planes into
+ * that shape, repeating the edge into any padding. Returns null if the given layout already has that shape.
  */
-const repackPlanesForFirefox = (
+const repackPlanes = (
 	format: VideoSamplePixelFormat,
 	width: number,
 	height: number,
