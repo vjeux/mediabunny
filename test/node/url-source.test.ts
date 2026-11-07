@@ -58,6 +58,27 @@ test('UrlSource works against a server without range request support', async () 
 	}
 });
 
+test('UrlSource fails at once on a request fetch() can\'t make', async () => {
+	const getFormatError = async (makeSource: () => UrlSource) => {
+		try {
+			using input = new Input({ source: makeSource(), formats: ALL_FORMATS });
+			return await Promise.race([
+				input.getFormat().then(() => 'resolved', (error: unknown) => error),
+				new Promise(resolve => setTimeout(() => resolve('still pending'), 3000)),
+			]);
+		} catch (error) {
+			return error;
+		}
+	};
+
+	// fetch() rejects these with the same TypeError every time, without sending anything: a relative URL has no base
+	// URL outside of a browser, and header values must be ByteStrings
+	expect(await getFormatError(() => new UrlSource('video.mp4'))).toBeInstanceOf(TypeError);
+	expect(await getFormatError(() => new UrlSource('http://127.0.0.1:9/video.mp4', {
+		requestInit: { headers: { Authorization: 'Bearer \u4e2d' } },
+	}))).toBeInstanceOf(TypeError);
+}, 15_000);
+
 test('UrlSource throws when reading from an evicted region in sequential mode', async () => {
 	const server = await startRangelessServer();
 	const logs = captureLogs();
