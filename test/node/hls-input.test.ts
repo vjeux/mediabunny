@@ -1407,6 +1407,60 @@ b.ts
 	expect(types.every(type => type === 'key')).toBe(true);
 });
 
+test.concurrent('Audio packets after a discontinuity with a new EXT-X-MAP carry their own decoder config', async () => {
+	// test/public/hls-disc-audio: AAC-LC 48 kHz stereo, a discontinuity to AAC-LC 22.05 kHz mono with its own init
+	// section, then the first init section again
+	using input = new Input({
+		source: new CustomPathedSource('./test/public/hls-disc-audio/adisc.m3u8', ({ path }) => new FilePathSource(path)),
+		formats: ALL_FORMATS,
+	});
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	const trackConfig = await audioTrack.getDecoderConfig();
+	expect([trackConfig?.sampleRate, trackConfig?.numberOfChannels]).toEqual([48000, 2]);
+
+	const formats: string[] = [];
+	for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+		const config = audioTrack._backing.getDecoderConfigForPacket!(packet) as AudioDecoderConfig | null;
+		const format = config ? `${config.sampleRate}/${config.numberOfChannels}` : 'track';
+		if (formats[formats.length - 1] !== format) {
+			formats.push(format);
+		}
+	}
+	// Only the ad break's packets need another decoder config than the track's
+	expect(formats).toEqual(['track', '22050/1', 'track']);
+
+	// Consecutive ad segments sharing an init section share the decoder config object
+	using adInput = new Input({
+		source: new CustomPathedSource('ad.m3u8', ({ path }) => (path === 'ad.m3u8'
+			? new BufferSource(new TextEncoder().encode([
+				'#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:2',
+				'#EXT-X-MAP:URI="c_init.mp4"', '#EXTINF:1.021333,', 'c_0.m4s',
+				'#EXT-X-DISCONTINUITY', '#EXT-X-MAP:URI="d_init.mp4"', '#EXTINF:1.04644,', 'd_0.m4s', '#EXTINF:1.04644,', 'd_0.m4s',
+				'#EXT-X-DISCONTINUITY', '#EXT-X-MAP:URI="c_init.mp4"', '#EXTINF:1.021333,', 'c_0.m4s',
+				'#EXT-X-ENDLIST',
+			].join('\n')))
+			: new FilePathSource(`./test/public/hls-disc-audio/${path}`))),
+		formats: ALL_FORMATS,
+	});
+	const adTrack = (await adInput.getPrimaryAudioTrack())!;
+	const adConfigs = new Set<unknown>();
+	for await (const packet of new EncodedPacketSink(adTrack).packets()) {
+		adConfigs.add(adTrack._backing.getDecoderConfigForPacket!(packet));
+	}
+	expect(adConfigs.size).toBe(2); // null for the content, one object for both ad segments
+
+	// Streams whose decoder config never changes are left alone
+	using plainInput = new Input({
+		source: new CustomPathedSource('./test/public/hls-disc-audio/adisc.m3u8', ({ path }) => new FilePathSource(path.replace('d_', 'c_'))),
+		formats: ALL_FORMATS,
+	});
+	const plainTrack = (await plainInput.getPrimaryAudioTrack())!;
+	for await (const packet of new EncodedPacketSink(plainTrack).packets()) {
+		expect(plainTrack._backing.getDecoderConfigForPacket!(packet)).toBe(null);
+	}
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
