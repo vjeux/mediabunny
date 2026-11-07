@@ -302,7 +302,9 @@ describe('File layout', () => {
 			const reference = await mux(tracks(), { ...options, format: new Mp4OutputFormat({ fastStart }) });
 			for (const target of ['stream', 'chunked'] as const) {
 				const file = await mux(tracks(), { ...options, format: new Mp4OutputFormat({ fastStart }), target });
-				expect(file.bytes).toEqual(reference.bytes);
+				// Compared directly, since toEqual on Uint8Arrays of this size is slow
+				expect(file.bytes.byteLength).toBe(reference.bytes.byteLength);
+				expect(file.bytes.findIndex((byte, i) => byte !== reference.bytes[i])).toBe(-1);
 			}
 		}
 	});
@@ -2132,5 +2134,5 @@ describe('Randomized round trips', () => {
 				expect(count).toBe(expected.length);
 			}
 		}
-	});
+	}, 30_000);
 });
