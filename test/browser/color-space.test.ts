@@ -231,7 +231,20 @@ const expectCompleteColorSpace = async (source: Source) => {
 	expect(colorSpaceIsComplete(decoderConfig.colorSpace)).toBe(true);
 };
 
-test('VP8 and untagged VP9 decode with the BT.601 matrix', async () => {
+test('VP8 and untagged VP9 decode with the BT.601 matrix', async ({ skip }) => {
+	// WebKitGTK's VideoFrame.copyTo() returns YUV planes unconverted when asked for RGBA, so the colors can't be read
+	// back there. This probes the browser itself, not Mediabunny.
+	const probe = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
+		format: 'I420',
+		codedWidth: 2,
+		codedHeight: 2,
+		timestamp: 0,
+	});
+	const probeRgba = new Uint8Array(16);
+	await probe.copyTo(probeRgba, { format: 'RGBA' }).catch(() => {});
+	probe.close();
+	skip(probeRgba[3] !== 255, 'VideoFrame.copyTo() does not convert YUV to RGBA here');
+
 	// Four bars holding the limited-range BT.601 code values of red, green, blue and gray, made with FFmpeg 7.0.2:
 	// ffmpeg -f lavfi -i "color=s=64x64:d=0.5:r=10,format=yuv420p,geq=lum='if(lt(X,16),81,if(lt(X,32),145,
 	//   if(lt(X,48),41,128)))':cb='if(lt(X,8),90,if(lt(X,16),54,if(lt(X,24),240,128)))':cr='if(lt(X,8),240,
