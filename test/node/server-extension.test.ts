@@ -450,6 +450,42 @@ describe('Video', async () => {
 		}, true);
 	});
 
+	test('VP9 encode, the level allows the frame width and height', async () => {
+		const vp9Level = async (width: number, height: number) => {
+			let codecString: string | null = null;
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({
+				codec: 'vp9',
+				quality: new Quality('medium'),
+				onEncodedPacket: (packet, meta) => {
+					codecString ??= meta?.decoderConfig?.codec ?? null;
+				},
+			});
+			output.addVideoTrack(source, { frameRate: 30 });
+			await output.start();
+
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(128), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+			sample.close();
+			await output.finalize();
+
+			assert(codecString);
+			return Number((codecString as string).split('.')[2]);
+		};
+
+		// https://www.webmproject.org/vp9/levels/: level 1.1 allows 73728 pixels but at most 768 px of width or height,
+		// level 3 allows 2048 px, and levels 4 and 4.1 allow 4160 px
+		expect(await vp9Level(4096, 16)).toBe(40);
+		expect(await vp9Level(16, 2048)).toBe(30);
+		expect(await vp9Level(1280, 720)).toBe(31);
+	});
+
 	test('AV1 encode and decode', async () => {
 		await encodeDecodeTest('av1', {}, async (packet, meta, i) => {
 			expect(packet.duration).toBe(1 / 30);
