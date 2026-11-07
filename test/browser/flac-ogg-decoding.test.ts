@@ -113,14 +113,8 @@ const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.char
 // Set once the page's audio decoders stall: then every later audio decode on the page would hang
 let decodingStalled = false;
 
-/** Decodes a probe with WebCodecs; tells whether it decoded. */
-const runProbe = async (probe: Probe) => {
-	const config: AudioDecoderConfig = {
-		codec: probe.codec,
-		sampleRate: probe.sampleRate,
-		numberOfChannels: probe.numberOfChannels ?? 1,
-		description: probe.description !== undefined ? fromBase64(probe.description) : undefined,
-	};
+/** Decodes the chunks with WebCodecs alone; tells whether they decoded. */
+const decodesNatively = async (config: AudioDecoderConfig, chunks: Uint8Array[]) => {
 	try {
 		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
 			return false;
@@ -143,10 +137,10 @@ const runProbe = async (probe: Probe) => {
 	let flushed = false;
 	try {
 		decoder.configure(config);
-		probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+		chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
 			type: 'key',
 			timestamp: i * 20_000,
-			data: fromBase64(chunk),
+			data: chunk,
 		})));
 		flushed = await Promise.race([
 			decoder.flush().then(() => true, () => false),
@@ -172,6 +166,14 @@ const runProbe = async (probe: Probe) => {
 
 	return decodes;
 };
+
+/** Decodes a probe with WebCodecs; tells whether it decoded. */
+const runProbe = (probe: Probe) => decodesNatively({
+	codec: probe.codec,
+	sampleRate: probe.sampleRate,
+	numberOfChannels: probe.numberOfChannels ?? 1,
+	description: probe.description !== undefined ? fromBase64(probe.description) : undefined,
+}, probe.chunks.map(fromBase64));
 
 const probeResults = new Map<ProbeName, Promise<boolean>>();
 /** Runs each probe once, when first needed, so that one that hangs runs as late as possible. */
@@ -220,9 +222,9 @@ describe('Ogg decoding through WebCodecs', () => {
 		return new Uint8Array(output.target.buffer!);
 	};
 
-	const expectIdenticalDecodeAfterRemux = async (url: string) => {
+	const expectIdenticalDecodeAfterRemux = async (url: string, remuxedBytes?: Uint8Array) => {
 		const original = await decodeAll(url);
-		const remuxed = await decodeAll(await remuxToOgg(url));
+		const remuxed = await decodeAll(remuxedBytes ?? await remuxToOgg(url));
 		expect(remuxed.frames).toBe(original.frames);
 		expect(remuxed.timestamps).toEqual(original.timestamps);
 		expect(remuxed.samples).toEqual(original.samples);
@@ -232,15 +234,26 @@ describe('Ogg decoding through WebCodecs', () => {
 		await expectIdenticalDecodeAfterRemux('/preroll-test.opus');
 	});
 
-	// Firefox decodes Vorbis with libvorbis, which rejects the comment header the Ogg muxer writes without its
-	// framing bit
-	test.skipIf(navigator.userAgent.includes('Firefox'))(
-		'decodes /vorbis-eos.ogg identically after an Ogg remux',
-		async ({ skip }) => {
-			await skipUnlessDecodable('vorbis', skip);
-			await expectIdenticalDecodeAfterRemux('/vorbis-eos.ogg');
-		},
-	);
+	test('decodes /vorbis-eos.ogg identically after an Ogg remux', async ({ skip }) => {
+		await skipUnlessDecodable('vorbis', skip);
+
+		// The platform's own decoder must also accept the remuxed file's headers. libvorbis, which Firefox decodes
+		// Vorbis with, rejects the comment header the Ogg muxer writes without its framing bit (until #518).
+		const remuxed = await remuxToOgg('/vorbis-eos.ogg');
+		using input = new Input({ source: new BufferSource(remuxed), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		const firstPackets: Uint8Array[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			firstPackets.push(packet.data);
+			if (firstPackets.length === 4) {
+				break;
+			}
+		}
+		const nativelyDecodable = await decodesNatively((await track.getDecoderConfig())!, firstPackets);
+		skip(!nativelyDecodable, 'the platform rejects the remuxed file\'s Vorbis headers (native probe)');
+
+		await expectIdenticalDecodeAfterRemux('/vorbis-eos.ogg', remuxed);
+	});
 
 	test('Chrome\'s own Ogg demuxer gives a remuxed Opus file the duration Mediabunny computes', async () => {
 		const remuxed = await remuxToOgg('/preroll-test.opus');
