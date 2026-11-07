@@ -52,12 +52,20 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 };
 
 /**
- * The smallest width and height libsvtav1 encodes. With a target bitrate, it refuses to open below 64 pixels ("Adaptive
- * quantization can not be turned OFF when RC ON"), and in constant-quantizer mode, its flush hangs forever for some
- * sizes below 32 pixels (any frame up to 24 pixels wide, or up to 24 high and over 64 wide). The latter limit is
- * conservative, as the failing region is irregular.
+ * Whether libsvtav1 can encode frames of this size. With a target bitrate, it refuses to open below 64 pixels in either
+ * dimension ("Adaptive quantization can not be turned OFF when RC ON"). In constant-quantizer mode, its flush hangs
+ * forever for frames up to 24 pixels wide, and for frames up to 24 pixels high that are wider than 64 pixels
+ * (measured; SVT-AV1 documents no such limit).
  */
-const getAv1MinimumDimension = (config: VideoEncoderConfig) => config.bitrateMode === 'quantizer' ? 32 : 64;
+const av1SizeIsSupported = (config: VideoEncoderConfig) => {
+	const { width, height } = config;
+
+	if (config.bitrateMode === 'quantizer') {
+		return width > 24 && (height > 24 || width <= 64);
+	}
+
+	return width >= 64 && height >= 64;
+};
 
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
@@ -80,7 +88,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
-		if (codec === 'av1' && Math.min(config.width, config.height) < getAv1MinimumDimension(config)) {
+		if (codec === 'av1' && !av1SizeIsSupported(config)) {
 			return false;
 		}
 
@@ -95,12 +103,11 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}
 
 	async init(): Promise<void> {
-		const av1MinimumDimension = getAv1MinimumDimension(this.config);
-		if (this.codec === 'av1' && Math.min(this.config.width, this.config.height) < av1MinimumDimension) {
+		if (this.codec === 'av1' && !av1SizeIsSupported(this.config)) {
 			// Fail right away instead of failing to open, or hanging, later
 			throw new Error(
-				`AV1 encoding of ${this.config.width}x${this.config.height} video isn't supported; it needs at least`
-				+ ` ${av1MinimumDimension} pixels in each dimension.`,
+				`AV1 encoding of ${this.config.width}x${this.config.height} video isn't supported`
+				+ (this.config.bitrateMode === 'quantizer' ? ' in constant-quantizer mode.' : ' with a bitrate.'),
 			);
 		}
 
