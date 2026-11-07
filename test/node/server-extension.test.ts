@@ -31,7 +31,7 @@ import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
 import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
@@ -1994,6 +1994,41 @@ describe('Audio', async () => {
 			expect(sample.numberOfChannels).toBe(2);
 			expect(sample.sampleRate).toBe(48000);
 		});
+	});
+
+	test.each([
+		[22050, 2],
+		[16000, 1],
+		[24000, 6],
+		[48000, 2],
+	])('AAC codec string at %i Hz, %i channel(s), matches the encoder\'s output', async (sampleRate, channels) => {
+		let decoderConfig: AudioDecoderConfig | undefined;
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({
+			codec: 'aac',
+			quality: new Quality('medium'),
+			onEncodedPacket: (_, meta) => {
+				decoderConfig ??= meta?.decoderConfig;
+			},
+		});
+		output.addAudioTrack(source);
+		await output.start();
+
+		using sample = new AudioSample({
+			data: new Float32Array(sampleRate * channels / 2),
+			format: 'f32',
+			numberOfChannels: channels,
+			sampleRate,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		await output.finalize();
+
+		// FFmpeg's encoder makes AAC-LC (object type 2) at every rate, so no HE-AAC codec string ('mp4a.40.5' or
+		// 'mp4a.40.29') at low ones. The object type is the first 5 bits of the AudioSpecificConfig.
+		const description = toUint8Array(decoderConfig!.description!);
+		expect(description[0]! >> 3).toBe(2);
+		expect(decoderConfig!.codec).toBe('mp4a.40.2');
 	});
 
 	test('Opus encode & decode', async () => {
