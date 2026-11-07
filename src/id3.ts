@@ -163,8 +163,8 @@ export const readId3V2Header = (slice: FileSlice): Id3V2Header | null => {
 	return { majorVersion, revision, flags, size };
 };
 
-// The metadata tags whose date was taken from a release time (TDRL), which a recording time found in a later tag still
-// replaces (callers parse consecutive tags into the same object)
+// The metadata tags whose date was taken from a release time (TDRL), which a recording time found later still replaces
+// (callers parse consecutive tags into the same object)
 const datesFromReleaseTime = new WeakSet<MetadataTags>();
 
 export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
@@ -380,6 +380,16 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				}
 			}; break;
 
+			case 'TDRL': {
+				// Without a recording time, fall back to the release time (ID3v2.4), like FFmpeg does
+				const date = new Date(reader.readId3V2EncodingAndText(frameEndPos));
+
+				if (!Number.isNaN(date.getTime()) && tags.date === undefined) {
+					tags.date = date;
+					datesFromReleaseTime.add(tags);
+				}
+			}; break;
+
 			case 'TBPM':
 			case 'TBP': {
 				const bpmText = reader.readId3V2EncodingAndText(frameEndPos);
@@ -456,21 +466,11 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 		reader.pos = nextFramePos;
 	}
 
-	// A recording time replaces a date that an earlier tag's release time gave. Done once the tag's frames have been
-	// read, as reading each frame only sets fields that aren't set yet.
+	// A recording time replaces a date that a release time gave, from an earlier frame or tag. Done once the tag's
+	// frames have been read, as reading each frame only sets fields that aren't set yet.
 	if (recordingTime && datesFromReleaseTime.has(tags)) {
 		tags.date = recordingTime;
 		datesFromReleaseTime.delete(tags);
-	}
-
-	// Without a recording time, fall back to the release time (ID3v2.4), like FFmpeg does
-	const releaseTime = tags.raw?.['TDRL'];
-	if (tags.date === undefined && typeof releaseTime === 'string') {
-		const date = new Date(releaseTime);
-		if (!Number.isNaN(date.getTime())) {
-			tags.date = date;
-			datesFromReleaseTime.add(tags);
-		}
 	}
 };
 
