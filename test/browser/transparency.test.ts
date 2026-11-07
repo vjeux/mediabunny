@@ -10,7 +10,6 @@ import { CanvasSource, VideoSampleSource } from '../../src/media-source.js';
 import { canEncodeVideo, Quality } from '../../src/encode.js';
 import { VideoSample } from '../../src/sample.js';
 import { Conversion } from '../../src/conversion.js';
-import { isFirefox } from '../../src/misc.js';
 
 const decodeTransparentVideoTest = async () => {
 	using input = new Input({
@@ -387,9 +386,40 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	expect(sample.hasAlpha).toBe(true);
 });
 
-// Firefox's encoder always reports BT.709 limited range, whatever it encodes:
-// https://bugzilla.mozilla.org/show_bug.cgi?id=2056028
-test.skipIf(isFirefox())('Encoding planar YUV frames with alpha keeps their color space', async () => {
+// Whether this browser's VP9 encoder reports the color space of the frames it encodes. Decided with WebCodecs alone:
+// a BT.601 full-range I420 frame must come back with that color space in the decoder config (Firefox's encoder always
+// reports BT.709 limited range, https://bugzilla.mozilla.org/show_bug.cgi?id=2056028, and WebKitGTK's doesn't match
+// either)
+const vp9EncoderKeepsColorSpace = await (async () => {
+	const encoderConfig = { codec: 'vp09.00.10.08', width: 64, height: 64, bitrate: 1e6 };
+	if (!(await VideoEncoder.isConfigSupported(encoderConfig)).supported) {
+		return false;
+	}
+
+	let colorSpace: VideoColorSpaceInit | undefined;
+	const encoder = new VideoEncoder({
+		output: (chunk, meta) => {
+			colorSpace ??= meta?.decoderConfig?.colorSpace;
+		},
+		error: () => {},
+	});
+	encoder.configure(encoderConfig);
+	const frame = new VideoFrame(new Uint8Array(64 * 64 * 1.5).fill(128), {
+		format: 'I420',
+		codedWidth: 64,
+		codedHeight: 64,
+		timestamp: 0,
+		colorSpace: { primaries: 'smpte170m', transfer: 'smpte170m', matrix: 'smpte170m', fullRange: true },
+	});
+	encoder.encode(frame, { keyFrame: true });
+	frame.close();
+	await encoder.flush();
+	encoder.close();
+
+	return colorSpace?.matrix === 'smpte170m' && colorSpace.fullRange === true;
+})();
+
+test.skipIf(!vp9EncoderKeepsColorSpace)('Encoding planar YUV frames with alpha keeps their color space', async () => {
 	// BT.601 full-range I420A frames, which take the CPU color/alpha splitting path
 	const width = 64;
 	const height = 64;
