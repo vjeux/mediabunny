@@ -1977,8 +1977,9 @@ export class Conversion {
 				// which only produce frames when something changes), so count the packets instead of extrapolating
 				// from the rate of the first ones.
 				const packetCount = await this._countPacketsInTrimRange(track, needsTranscode ? null : copyStartPacket);
-				// A little extra for B-frames presented before the end that come after it in decode order
-				maximumPacketCount = packetCount + 64;
+				// With the same generous margin as the rate-based estimate, so this is never tighter for constant-rate
+				// input (the 64 also covers B-frames presented before the end that come after it in decode order)
+				maximumPacketCount = Math.ceil(1.5 * packetCount) + 64;
 			} else {
 				const packetRate = trackOptions.frameRate
 					?? (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
@@ -2435,8 +2436,8 @@ export class Conversion {
 		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
 			if (!needsTranscode && !await track.isLive()) {
 				// Copied packets can come at a varying rate too (think Opus with DTX, which only sends a packet
-				// every 400 ms during silence), so count them
-				maximumPacketCount = await this._countPacketsInTrimRange(track, copyStartPacket) + 64;
+				// every 400 ms during silence), so count them, with the rate-based estimate's margin
+				maximumPacketCount = Math.ceil(1.5 * await this._countPacketsInTrimRange(track, copyStartPacket)) + 64;
 			} else {
 				let packetRate: number;
 				if (needsTranscode) {
