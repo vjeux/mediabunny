@@ -742,6 +742,12 @@ const nativeAudioDecode = async (
 	let failed = false;
 	const decoder = new AudioDecoder({
 		output: (data) => {
+			if (data.numberOfFrames === 0) {
+				// Firefox's Vorbis decoder first outputs an empty AudioData, which copyTo rejects
+				data.close();
+				return;
+			}
+
 			rates.push(data.sampleRate);
 			timestamps.push(data.timestamp);
 			try {
