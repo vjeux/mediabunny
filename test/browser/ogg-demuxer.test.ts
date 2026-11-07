@@ -93,11 +93,12 @@ const readPackets = async (source: BufferSource | ReadableStreamSource) => {
  * frames decoded, or null if the platform can't decode them.
  */
 const decodeNatively = async (config: AudioDecoderConfig, packets: EncodedPacket[]) => {
-	try {
-		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
-			return null;
-		}
-	} catch {
+	// After a decoder hung (WebKitGTK's Vorbis decoder, in an earlier test), even this may never settle
+	const supported = await Promise.race([
+		AudioDecoder.isConfigSupported(config).then(support => !!support.supported, () => false),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 2000)),
+	]);
+	if (!supported) {
 		return null;
 	}
 
@@ -137,7 +138,7 @@ const decodeNatively = async (config: AudioDecoderConfig, packets: EncodedPacket
 	return failed ? null : frames;
 };
 
-test('reads all links of a chained Opus stream', async ({ skip }) => {
+test('reads all links of a chained Opus stream', async ({ skip, annotate }) => {
 	const { links, packetCount } = await remuxToOggLinks('/preroll-test.opus', [100, 220]);
 	const file = concatBytes(links);
 
@@ -157,10 +158,21 @@ test('reads all links of a chained Opus stream', async ({ skip }) => {
 
 	// The browser's own Ogg demuxer agrees on the length of the chain. Chrome's makes exactly that of it, as it doesn't
 	// reset its decoder between links either. Firefox's decodes each link on its own and trims at the joins instead,
-	// by up to a pre-skip and a packet per join (1272 frames fewer in all for this file).
-	const audioBuffer = await new OfflineAudioContext(1, 1, 48000).decodeAudioData(file.slice().buffer);
-	const joins = links.length - 1;
-	expect(Math.abs(audioBuffer.length - Math.round(duration * 48000))).toBeLessThanOrEqual(joins * (312 + 960));
+	// by up to a pre-skip and a packet per join (1272 frames fewer in all for this file). WebKitGTK's can't decode
+	// chained Ogg at all, so there's nothing to compare there.
+	const browserLength = await Promise.race([
+		new OfflineAudioContext(1, 1, 48000).decodeAudioData(file.slice().buffer).then(
+			buffer => buffer.length,
+			() => null,
+		),
+		new Promise<null>(resolve => setTimeout(() => resolve(null), 5000)),
+	]);
+	if (browserLength !== null) {
+		const joins = links.length - 1;
+		expect(Math.abs(browserLength - Math.round(duration * 48000))).toBeLessThanOrEqual(joins * (312 + 960));
+	} else {
+		await annotate('the browser\'s decodeAudioData can\'t decode chained Ogg Opus, so its length isn\'t compared');
+	}
 
 	// Random access finds the same packets, also in later links
 	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
@@ -266,7 +278,7 @@ test('stops with a warning at a chained Opus link whose pre-skip crops its start
 	}
 });
 
-test('ends the track at a damaged page of a chained link', async () => {
+test('ends the track at a damaged page of a chained link', async ({ skip }) => {
 	const { links } = await remuxToOggLinks('/preroll-test.opus', [100, 220]);
 
 	// Flip a byte in the third link's second audio page, which comes after its two header pages and one audio page
@@ -294,6 +306,9 @@ test('ends the track at a damaged page of a chained link', async () => {
 		expect((await sink.getPacket(packet.timestamp))?.byteLength).toBe(packet.byteLength);
 	}
 
+	// Wherever the platform's own decoder can decode these packets
+	const nativelyDecodable = await decodeNatively((await track.getDecoderConfig())!, packets) !== null;
+	skip(!nativelyDecodable, 'the platform can\'t decode these packets (native probe)');
 	let decodedFrames = 0;
 	for await (using sample of new AudioSampleSink(track).samples()) {
 		decodedFrames += sample.numberOfFrames;
