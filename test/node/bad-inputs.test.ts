@@ -1563,6 +1563,48 @@ test('Ogg: Short Vorbis identification header', async () => {
 	));
 });
 
+test('Ogg: Lookups of packets that end on a later page than they start on', async () => {
+	// Pages cut once they hold 700 bytes, even within a packet, as libogg 1.1 did, so that most pages hold a single
+	// packet end, of a packet that began on the page before. Its timestamp comes from the page where it ends.
+	const packets = Array.from({ length: 30 }, (_, i) => concat([0xfc], Array<number>(499 + i).fill(i)));
+	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
+	let lacing: number[] = [];
+	let data: number[] = [];
+	let granule = -1;
+	let continued = false;
+	const addPage = (isLast: boolean) => {
+		const headerType = (continued ? 1 : 0) | (isLast ? 4 : 0);
+		pages.push(oggPage({ headerType, granule, sequence: pages.length, lacing, data }));
+		continued = lacing.at(-1) === 255;
+		[lacing, data, granule] = [[], [], -1];
+	};
+	packets.forEach((packet, i) => {
+		for (let offset = 0; offset <= packet.length; offset += 255) {
+			const segment = [...packet.subarray(offset, offset + 255)];
+			lacing.push(segment.length);
+			data.push(...segment);
+			if (segment.length < 255) {
+				granule = 960 * (i + 1);
+			}
+			if (data.length >= 700 && !(i === packets.length - 1 && segment.length < 255)) {
+				addPage(false);
+			}
+		}
+	});
+	addPage(true);
+	const file = concatList(pages);
+
+	const lookUp = async (timestamp: number) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const packet = await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp);
+		return [packet?.timestamp, packet?.byteLength];
+	};
+	for (let i = 0; i < packets.length; i++) {
+		const timestamp = (960 * i - 312) / 48000;
+		expect(await lookUp(timestamp)).toEqual([timestamp, packets[i]!.length]);
+	}
+});
+
 test('Ogg: Vorbis with zero sample rate', async () => {
 	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
 	file.set(u32le(0), 28 + 12); // Sample rate field of the identification header

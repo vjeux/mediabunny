@@ -967,9 +967,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					&& packet.endSegmentIndex === endSegmentIndex
 				) {
 					// We know this packet end timestamp can be derived from the page's granule position
-					currentTimestampInSamples = this.granulePositionToTimestampInSamples(
-						currentPage.granulePosition,
-					);
+					currentTimestampInSamples = this.granulePositionToTimestampInSamples(endPage.granulePosition);
 					currentTimestampIsCorrect = true;
 
 					// Let's backpatch the packet we just created with the correct timestamp
