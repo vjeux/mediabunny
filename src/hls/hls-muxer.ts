@@ -1545,6 +1545,23 @@ export class HlsMuxer extends Muxer {
 						let width = decoderConfig.displayAspectWidth ?? decoderConfig.codedWidth;
 						let height = decoderConfig.displayAspectHeight ?? decoderConfig.codedHeight;
 
+						// WebCodecs defines the display aspect as a ratio, in any units. A display size in pixels is
+						// used as is, but a ratio smaller than the frame (such as 16:9, which Mediabunny's demuxers
+						// give when the size in square pixels isn't whole) grows the coded size until it matches
+						const { codedWidth, codedHeight } = decoderConfig;
+						if (
+							width !== undefined
+							&& height !== undefined
+							&& codedWidth !== undefined
+							&& codedHeight !== undefined
+							&& width < codedWidth
+							&& height < codedHeight
+						) {
+							[width, height] = width * codedHeight > height * codedWidth
+								? [Math.round(codedHeight * width / height), codedHeight]
+								: [codedWidth, Math.round(codedWidth * height / width)];
+						}
+
 						if (width !== undefined && height !== undefined) {
 							if (
 								videoTrack.metadata.rotation !== undefined

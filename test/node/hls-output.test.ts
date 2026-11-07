@@ -3607,3 +3607,48 @@ const testTimestampWraparound = async (
 		expect(timestamps[i]).toBeCloseTo(start + 0.5 * i, 4);
 	}
 };
+
+test('RESOLUTION with a display aspect given as a ratio or as a size', async () => {
+	// WebCodecs defines displayAspectWidth/Height as a ratio, in any units
+	const masterResolution = async (codedWidth: number, codedHeight: number, displayAspect?: [number, number]) => {
+		let masterText = '';
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new MpegTsOutputFormat(),
+				onMaster: (text) => {
+					masterText = text;
+				},
+			}),
+			target: new PathedTarget('', () => new BufferTarget()),
+		});
+		const source = videoSource();
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(avcPacketData, 'key', 0, 1), {
+			decoderConfig: {
+				...avcMetadata.decoderConfig!,
+				codedWidth,
+				codedHeight,
+				...(displayAspect && { displayAspectWidth: displayAspect[0], displayAspectHeight: displayAspect[1] }),
+			},
+		});
+		await output.finalize();
+
+		return /RESOLUTION=(\d+x\d+)/.exec(masterText)?.[1];
+	};
+
+	// A display size in pixels, at least as large as the frame in one dimension, is the RESOLUTION, as before
+	expect(await masterResolution(1280, 720)).toBe('1280x720');
+	expect(await masterResolution(720, 480, [853, 480])).toBe('853x480'); // NTSC 16:9
+	expect(await masterResolution(1440, 1080, [1920, 1080])).toBe('1920x1080'); // HDV
+	expect(await masterResolution(1280, 720, [1920, 720])).toBe('1920x720'); // 2:1 pixels
+	expect(await masterResolution(1280, 720, [1280, 1440])).toBe('1280x1440'); // 1:2 pixels
+	expect(await masterResolution(1280, 720, [1920, 1080])).toBe('1920x1080'); // Another scale
+
+	// A ratio, smaller than the frame in both dimensions, scales the coded size instead
+	expect(await masterResolution(720, 480, [16, 9])).toBe('853x480');
+	expect(await masterResolution(1440, 1080, [16, 9])).toBe('1920x1080');
+	expect(await masterResolution(1280, 720, [8, 3])).toBe('1920x720');
+	expect(await masterResolution(1280, 720, [16, 9])).toBe('1280x720');
+	expect(await masterResolution(1280, 720, [9, 32])).toBe('1280x4551');
+});
