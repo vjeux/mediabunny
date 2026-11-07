@@ -7,9 +7,10 @@ import { EncodedPacket } from '../../src/packet.js';
 import { Quality } from '../../src/encode.js';
 import { assert } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS, OggInputFormat } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Conversion } from '../../src/conversion.js';
 
 test('maximumPageDuration option', async () => {
 	const sampleRate = 48000;
@@ -302,5 +303,69 @@ test('Granule positions of full pages', async () => {
 	for (const timestamp of timestamps) {
 		const packet = await sink.getPacket(timestamp);
 		expect(packet?.timestamp).toBe(timestamp);
+	}
+});
+
+test.each(['/preroll-test.opus', '/vorbis-eos.ogg'])(
+	'Conversion of %s to Ogg copies the packets, keeping the priming before zero',
+	async (url) => {
+		// The first Opus packet starts at minus the pre-skip, the first Vorbis packet at minus its own duration (it
+		// decodes to nothing); the Ogg muxer puts granule position zero right after either
+		const readPackets = async (input: Input) => {
+			const track = await input.getPrimaryAudioTrack();
+			assert(track);
+
+			const packets: [number, number][] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push([packet.timestamp, packet.byteLength]);
+			}
+
+			return { codec: await track.getCodec(), packets };
+		};
+
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const inputPackets = await readPackets(input);
+		expect(inputPackets.packets[0]![0]).toBeLessThan(0);
+		expect(await readPackets(result)).toEqual(inputPackets);
+	},
+);
+
+test.each([
+	// Less than the 1 ms the pre-skip match allows for rounded sources
+	['/preroll-test.opus', 0.0008],
+	// Beyond the first packet, which starts 45 samples before zero and lasts 128 at 44.1 kHz, but less than 1 ms beyond
+	['/vorbis-eos.ogg', 0.0025],
+])('Conversion of %s to Ogg with a start trim of %s s applies the trim', async (url, trimStart) => {
+	// The priming must not absorb an explicit trim
+	const readPackets = async (input: Input) => {
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		return packets;
+	};
+
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, trim: { start: trimStart } });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const inputPackets = await readPackets(input);
+	const outputPackets = await readPackets(result);
+
+	// Transcoding applies the trim; a copy has to move every packet earlier by it (Ogg stores whole samples)
+	if (outputPackets[10]!.byteLength === inputPackets[10]!.byteLength) {
+		expect(outputPackets[10]!.data).toEqual(inputPackets[10]!.data);
+		expect(Math.abs(outputPackets[10]!.timestamp - (inputPackets[10]!.timestamp - trimStart))).toBeLessThan(2.5e-5);
 	}
 });

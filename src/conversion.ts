@@ -2055,6 +2055,7 @@ export class Conversion {
 			|| trackOptions.sampleFormat !== undefined;
 
 		let copyStartPacket: EncodedPacket | null = null;
+		let keptPriming: number | null = null;
 
 		if (!needsTranscode) {
 			// Check if we can copy it
@@ -2093,6 +2094,11 @@ export class Conversion {
 			copyStartPacket = startPacket;
 
 			if (startPacket) {
+				// The source's own priming before the start (like the Opus pre-skip) can stay if the format signals it
+				keptPriming = startPacket.timestamp < this._startTimestamp
+					? await this._getKeptAudioPriming(track, sink, startPacket)
+					: null;
+
 				const boundaryDeviation = this._copyBoundaryPolicy === 'shrink'
 					? Math.max(startPacket.timestamp - this._startTimestamp, 0)
 					: Math.max(this._startTimestamp - startPacket.timestamp, 0);
@@ -2128,6 +2134,7 @@ export class Conversion {
 				} else if (
 					this.output.format.negativeTimestampSupport !== 'full'
 					&& startPacket.timestamp < this._startTimestamp
+					&& keptPriming === null
 				) {
 					const correction = Math.min(
 						this._startTimestamp - startPacket.timestamp,
@@ -2189,7 +2196,11 @@ export class Conversion {
 						break;
 					}
 
-					const packetTimestamp = packet.timestamp + this._timestampOffset;
+					let packetTimestamp = packet.timestamp + this._timestampOffset;
+					if (keptPriming !== null && packet.sequenceNumber === copyStartPacket.sequenceNumber) {
+						// Exactly the priming, in case the source rounded it (like Matroska, to the millisecond)
+						packetTimestamp = -keptPriming + this._timestampOffset;
+					}
 
 					if (packet.type === 'key') {
 						droppingGop = false;
@@ -2456,6 +2467,35 @@ export class Conversion {
 		this.utilizedTracks.push(track);
 		this._outputTrackIds.push(outputTrackId);
 		this._outputOwnTrackGroups.push(ownGroup);
+	}
+
+	/**
+	 * When a copied audio track starts at its first packet, before zero, because of the source's own priming (like
+	 * the Opus pre-skip) that the output format signals the same way: the exact priming duration, in seconds. Only for
+	 * conversions starting at zero, where the priming ends; an explicit start anywhere else must not be absorbed by it.
+	 * @internal
+	 */
+	async _getKeptAudioPriming(track: InputAudioTrack, sink: EncodedPacketSink, startPacket: EncodedPacket) {
+		if (this._startTimestamp !== 0) {
+			return null;
+		}
+
+		const firstPacket = await sink.getFirstPacket({ metadataOnly: true });
+		if (!firstPacket || firstPacket.sequenceNumber !== startPacket.sequenceNumber) {
+			return null;
+		}
+
+		const decoderConfig = await track.getDecoderConfig();
+		if (!decoderConfig) {
+			return null;
+		}
+
+		return this.output.format._getSignalableAudioPriming(
+			await track.getCodec() as AudioCodec,
+			-startPacket.timestamp,
+			firstPacket,
+			decoderConfig,
+		);
 	}
 
 	/** @internal */
