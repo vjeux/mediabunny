@@ -1014,6 +1014,62 @@ describe('Video', async () => {
 		expect(Math.abs(maxAlpha - 4095 / 2)).toBeLessThan(32);
 	});
 
+	test('Odd-sized AVC and HEVC are unencodable with a clear error, like in browsers', async () => {
+		const encode = async (codec: VideoCodec, width: number, height: number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec, quality: new Quality('medium') });
+			output.addVideoTrack(source);
+			await output.start();
+
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(128), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			try {
+				await source.add(sample);
+			} finally {
+				sample.close();
+			}
+			await output.finalize();
+		};
+
+		// libx264 and libx265 encode 4:2:0, which needs even dimensions
+		for (const codec of ['avc', 'hevc'] as const) {
+			expect({ codec, canEncode: await canEncodeVideo(codec, { width: 321, height: 241 }) })
+				.toEqual({ codec, canEncode: false });
+			await expect(encode(codec, 321, 241)).rejects.toThrow('both width and height must be even numbers');
+			expect(await canEncodeVideo(codec, { width: 322, height: 242 })).toBe(true);
+		}
+
+		expect(await canEncodeVideo('vp9', { width: 321, height: 241 })).toBe(true);
+		await encode('vp9', 321, 241);
+	});
+
+	test('Converting to AVC with an odd-sized crop still rounds to even dimensions', async () => {
+		using input = new Input({ source: new FilePathSource('test/public/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			trim: { end: 0.2 },
+			audio: { discard: true },
+			video: { codec: 'avc', crop: { left: 3, top: 3, width: 641, height: 361 } },
+		});
+
+		// The frames are resized to 642x362 for AVC, so the odd crop size mustn't rule AVC out
+		expect(conversion.discardedTracks.filter(x => x.track.type === 'video').map(x => x.reason)).toEqual([]);
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getCodec()).toBe('avc');
+		expect([await track.getCodedWidth(), await track.getCodedHeight()]).toEqual([642, 362]);
+	});
+
 	test('Non-square pixels encode and decode #1', async () => {
 		await encodeDecodeTest('avc', { displayWidth: 2 * 1280, displayHeight: 720 }, async (packet, meta, i) => {
 			if (i === 0) {
