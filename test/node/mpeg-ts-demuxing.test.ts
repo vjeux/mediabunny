@@ -1001,13 +1001,27 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 	});
 	await expectFrames(damaged, [5, 13]);
 
-	// Muxers that never increment the counters, or that also count packets without payload, lose nothing
+	// Muxers that never increment the counters, or that also count packets without payload, lose nothing, not even
+	// identical TS packets in a row, which are data there (like in frame 3, here made of the same byte throughout)
 	const setCounter = (packet: Uint8Array, counter: number) => {
 		const copy = packet.slice();
 		copy[3] = (copy[3]! & 0xf0) | (counter & 0xf);
 		return copy;
 	};
-	await expectFrames(tsPackets.map(packet => (isVideo(packet) ? setCounter(packet, 0) : packet)), []);
+	const neverIncrementing = tsPackets.map((packet, i) => {
+		if (!isVideo(packet)) {
+			return packet;
+		}
+
+		const copy = setCounter(packet, 0);
+		if (i > frameStarts[3]! && i < frameStarts[4]! - 1) {
+			copy.fill(0x55, 4); // Whole TS packets of payload, all the same
+		}
+		return copy;
+	});
+	const neverIncrementingFrames = await readFrames(neverIncrementing);
+	expect(neverIncrementingFrames.map(x => x.data.byteLength)).toEqual(clean.map(x => x.data.byteLength));
+	expect(neverIncrementingFrames.filter((_, i) => i !== 3)).toEqual(clean.filter((_, i) => i !== 3));
 
 	let counter = 0;
 	const countingPacketsWithoutPayload = tsPackets.flatMap((packet, i) => {

@@ -185,6 +185,9 @@ type Section = {
 	firstPacketHasErrors: boolean;
 };
 
+/** How far ahead to look for the next packet of a PID, to tell a duplicate packet */
+const MAX_DUPLICATE_CHECK_PACKET_COUNT = 1024;
+
 /** For sections and PES packets without holes, so that they don't need an array of their own */
 const NO_HOLES: readonly number[] = Object.freeze([]);
 
@@ -929,7 +932,12 @@ export class MpegTsDemuxer extends Demuxer {
 						(holes ??= []).push(chunksByteLength);
 					}
 				} else if (payload && lastContinuityCounter !== -1 && counter !== ((lastContinuityCounter + 1) & 0xf)) {
-					if (counter === lastContinuityCounter && lastPayload && uint8ArraysAreEqual(payload, lastPayload)) {
+					if (
+						counter === lastContinuityCounter
+						&& lastPayload
+						&& uint8ArraysAreEqual(payload, lastPayload)
+						&& await this.nextContinuityCounterFollows(packet.pid, currentPos, counter)
+					) {
 						// A copy of the previous packet (only a PCR may differ), allowed once, which must be discarded
 						isDuplicate = true;
 						keepsPayload = false;
@@ -1021,6 +1029,26 @@ export class MpegTsDemuxer extends Demuxer {
 			holes: holes ?? NO_HOLES,
 			firstPacketHasErrors: firstPacket.transportErrorIndicator === 1,
 		};
+	}
+
+	/**
+	 * Whether the next TS packet of the PID with payload, from pos on, has the continuity counter that follows the
+	 * given one. That tells a duplicate packet from a muxer that never increments the counter, for which two identical
+	 * packets in a row are just data.
+	 */
+	async nextContinuityCounterFollows(pid: number, pos: number, counter: number) {
+		for (let i = 0; i < MAX_DUPLICATE_CHECK_PACKET_COUNT; i++, pos += this.packetStride) {
+			const packet = await this.readPacket(pos);
+			if (!packet) {
+				return false;
+			}
+
+			if (packet.pid === pid && packet.adaptationFieldControl & 0b01) {
+				return packet.continuityCounter === ((counter + 1) & 0xf);
+			}
+		}
+
+		return false;
 	}
 
 	async readPacketHeader(pos: number): Promise<TsPacketHeader | null> {
