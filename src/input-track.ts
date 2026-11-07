@@ -1430,6 +1430,34 @@ export const queryInputTracks = async <T extends InputTrack>(
 };
 
 /**
+ * Timestamps copied from a container that stores whole milliseconds (Matroska/WebM, which all MediaRecorder recordings
+ * use, or FLV) into one with a finer time resolution (MP4, MPEG-TS) keep their rounding to milliseconds. If all
+ * timestamps lie on that grid, returns them in whole milliseconds, relative to the first one; otherwise null.
+ */
+const toMillisecondGrid = (ticks: Float64Array, resolution: number) => {
+	const ticksPerMillisecond = resolution / 1000;
+	if (ticksPerMillisecond < 10 || ticks.length < 10) {
+		// Timestamps could lie on a coarse grid by chance, and a few of them could even on a fine one
+		return null;
+	}
+
+	const milliseconds = new Float64Array(ticks.length);
+	for (let i = 0; i < ticks.length; i++) {
+		// Relative to the first timestamp, so that a constant offset doesn't matter. Both were rounded to a tick, so
+		// the offset can be up to a tick off the grid.
+		const offset = (ticks[i]! - ticks[0]!) / ticksPerMillisecond;
+		const rounded = Math.round(offset);
+		if (Math.abs(offset - rounded) * ticksPerMillisecond > 1 + 1e-9 || (i > 0 && rounded === milliseconds[i - 1])) {
+			return null;
+		}
+
+		milliseconds[i] = rounded;
+	}
+
+	return milliseconds;
+};
+
+/**
  * Estimates the underlying CFR-like frame rate from timestamp deltas.
  *
  * Each delta is modeled as an integer multiple of one frame period, allowing dropped frames and a small number of
@@ -1466,6 +1494,13 @@ export const findUnderlyingFrameRate = (
 
 	if (ticks.length < 2) {
 		return null;
+	}
+
+	// Millisecond-rounded timestamps look like jitter in a finer time resolution. Estimating from the milliseconds
+	// gives the same frames the same frame rate as in their original container.
+	const milliseconds = toMillisecondGrid(ticks, resolution);
+	if (milliseconds) {
+		return findUnderlyingFrameRate(milliseconds, 1000);
 	}
 
 	const gaps = new Float64Array(ticks.length - 1);
