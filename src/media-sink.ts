@@ -2721,9 +2721,10 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 	/**
 	 * Retrieves the audio sample corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last audio sample (in presentation order) with a start timestamp less than or equal to the given timestamp.
-	 * Returns null if no sample starts at or before the timestamp: besides timestamps before the track's first
-	 * timestamp, this includes the start of tracks whose decoder drops their first audio (the Opus pre-skip, the first
-	 * Vorbis packet). The first sample yielded by {@link AudioSampleSink.samples} is the track's first sample.
+	 * Returns null if the timestamp is before the track's first timestamp. It can also return null at the first
+	 * timestamp itself for Opus and Vorbis tracks: Opus decoding drops the pre-skip, and for Vorbis, the first decoded
+	 * sample may not be found there. The first sample yielded by {@link AudioSampleSink.samples} is the track's first
+	 * sample.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
@@ -2815,9 +2816,10 @@ export class AudioBufferSink {
 	/**
 	 * Retrieves the audio buffer corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last audio buffer (in presentation order) with a start timestamp less than or equal to the given timestamp.
-	 * Returns null if no buffer starts at or before the timestamp: besides timestamps before the track's first
-	 * timestamp, this includes the start of tracks whose decoder drops their first audio (the Opus pre-skip, the first
-	 * Vorbis packet). The first buffer yielded by {@link AudioBufferSink.buffers} is the track's first buffer.
+	 * Returns null if the timestamp is before the track's first timestamp. It can also return null at the first
+	 * timestamp itself for Opus and Vorbis tracks: Opus decoding drops the pre-skip, and for Vorbis, the first decoded
+	 * buffer may not be found there. The first buffer yielded by {@link AudioBufferSink.buffers} is the track's first
+	 * buffer.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.

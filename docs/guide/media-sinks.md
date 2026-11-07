@@ -500,7 +500,7 @@ The methods for retrieving samples are analogous to those on `VideoSampleSink`.
 
 These methods yield [`AudioSample`](./packets-and-samples#audiosample) instances.
 
-Unlike video, decoded audio doesn't always start at the track's first timestamp: Opus decoders drop the pre-skip, and Vorbis decoders produce no audio for the first packet. For such tracks, `getSample(await audioTrack.getFirstTimestamp())` returns `null`, since no sample starts at or before that timestamp. To get the first sample, take the first one that `samples()` yields.
+Unlike video, `getSample(await audioTrack.getFirstTimestamp())` can return `null` for some audio tracks: for Opus, decoding drops the pre-skip, so the first sample starts after the first timestamp, and for Vorbis, the first decoded sample may not be found at the first timestamp either. To get the first sample, take the first one that `samples()` yields.
 
 For example, let's use this sink to calculate the average loudness of an audio track using [root mean square](https://en.wikipedia.org/wiki/Root_mean_square):
 ```ts
