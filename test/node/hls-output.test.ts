@@ -3654,3 +3654,43 @@ const testTimestampWraparound = async (
 		expect(timestamps[i]).toBeCloseTo(start + 0.5 * i, 4);
 	}
 };
+
+test('CODECS names the hvc1 sample entry for HEVC from an hev1 source in CMAF segments', async () => {
+	// video-h265.mp4 stores its HEVC in an 'hev1' sample entry, so its codec string starts with "hev1."
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/video-h265.mp4'), formats: ALL_FORMATS });
+	const sourceTrack = await sourceInput.getPrimaryVideoTrack();
+	assert(sourceTrack);
+	const decoderConfig = (await sourceTrack.getDecoderConfig())!;
+	expect(decoderConfig.codec).toMatch(/^hev1\./);
+
+	const writeHls = async (segmentFormat: CmafOutputFormat | MpegTsOutputFormat) => {
+		const files = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+				return target;
+			}),
+		});
+		const videoSource = new EncodedVideoPacketSource('hevc');
+		output.addVideoTrack(videoSource);
+		await output.start();
+		for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+			await videoSource.add(packet, { decoderConfig });
+		}
+		await output.finalize();
+
+		return files;
+	};
+
+	// The ISOBMFF muxer writes HEVC into an 'hvc1' sample entry, which the codec string must name
+	const cmafFiles = await writeHls(new CmafOutputFormat());
+	expect(new TextDecoder().decode(cmafFiles.get('init-1.m4s'))).toContain('hvc1');
+	const cmafMaster = new TextDecoder().decode(cmafFiles.get('master.m3u8'));
+	expect(cmafMaster).toContain(`CODECS="hvc1.${decoderConfig.codec.slice(5)}"`);
+
+	// MPEG-TS has no sample entry; the codec string stays as is
+	const tsMaster = new TextDecoder().decode((await writeHls(new MpegTsOutputFormat())).get('master.m3u8'));
+	expect(tsMaster).toContain(`CODECS="${decoderConfig.codec}"`);
+});
