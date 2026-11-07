@@ -8,6 +8,7 @@ import {
 	Mp3OutputFormat,
 	Mp4OutputFormat,
 	OggOutputFormat,
+	OutputFormat,
 	WavOutputFormat,
 } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -749,6 +750,161 @@ test('Read and write metadata, WAVE', async () => {
 
 	expect(readTags.raw!['INAM']).toBe(songMetadata.title);
 	expect(readTags.raw!['IKEK']).toBe('RIFF INFO lowkey mid');
+});
+
+test('Metadata dates outside the years 0 to 9999 are left out instead of written malformed', async () => {
+	// toISOString().slice(0, 10) would give '+010000-01' and '-000001-01'
+	const writeAndRead = async (format: OutputFormat, codec: AudioCodec, date: Date) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		output.setMetadataTags({ title: 'Title', date });
+		const track = createDummyAudioTrack(codec, output);
+		await output.start();
+		await track.addPacket();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+
+	const formats: [() => OutputFormat, AudioCodec][] = [
+		[() => new Mp4OutputFormat(), 'opus'],
+		[() => new MkvOutputFormat(), 'opus'],
+		[() => new OggOutputFormat(), 'opus'],
+		[() => new Mp3OutputFormat(), 'mp3'],
+		[() => new FlacOutputFormat(), 'flac'],
+		[() => new WavOutputFormat(), 'pcm-s16'],
+	];
+	for (const [format, codec] of formats) {
+		for (const date of [new Date(Date.UTC(10000, 0, 15)), new Date(Date.UTC(-1, 0, 15))]) {
+			const tags = await writeAndRead(format(), codec, date);
+			expect(tags.title).toBe('Title');
+			expect(tags.date).toBeUndefined();
+		}
+	}
+});
+
+test('Conversion copies tags of an input whose date lies past the year 9999', async () => {
+	// A ©day such as Mediabunny itself wrote for such dates before
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	output.setMetadataTags({ title: 'Title', raw: { '©day': '+010000-01' } });
+	const dummyTrack = createDummyAudioTrack('opus', output);
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect((await input.getMetadataTags()).date!.getUTCFullYear()).toBe(10000);
+
+	const output2 = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output: output2 });
+	await conversion.execute();
+
+	using input2 = new Input({ source: new BufferSource(output2.target.buffer!), formats: ALL_FORMATS });
+	const tags = await input2.getMetadataTags();
+	expect(tags.title).toBe('Title');
+	expect(tags.date).toBeUndefined();
+});
+
+const writeWithDummyTrack = async (format: OutputFormat, codec: AudioCodec, tags: MetadataTags) => {
+	const output = new Output({ format, target: new BufferTarget() });
+	output.setMetadataTags(tags);
+	const dummyTrack = createDummyAudioTrack(codec, output);
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+	return output.target.buffer!;
+};
+/** Writes MPEG-1 Layer III frames of 417 bytes (128 kbit/s, 44.1 kHz) back to back, like a real stream. */
+const writeMp3Frames = async (format: OutputFormat, tags: MetadataTags) => {
+	const output = new Output({ format, target: new BufferTarget() });
+	output.setMetadataTags(tags);
+	const source = new EncodedAudioPacketSource('mp3');
+	output.addAudioTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 10; i++) {
+		const data = new Uint8Array(417);
+		data.set([0xff, 0xfb, 0x90, 0x00]);
+		const decoderConfig = { codec: 'mp3', numberOfChannels: 2, sampleRate: 44100 };
+		await source.add(
+			new EncodedPacket(data, 'key', i * 1152 / 44100, 1152 / 44100),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+
+	await output.finalize();
+	return output.target.buffer!;
+};
+
+/** Copies a real file of the format into a new one with the given tags. */
+const writeFromFixture = async (fixtureName: string, format: OutputFormat, tags: MetadataTags) => {
+	const fixturePath = path.join(__dirname, '../public', fixtureName);
+	using fixture = new Input({ source: new FilePathSource(fixturePath), formats: ALL_FORMATS });
+	const output = new Output({ format, target: new BufferTarget() });
+	const conversion = await Conversion.init({ input: fixture, output, tags });
+	await conversion.execute();
+	return output.target.buffer!;
+};
+
+test('A same-format conversion leaves out an unrepresentable date instead of copying its raw tag back', async () => {
+	// Converting to the same format keeps the raw tags, which hold the date in its original form
+	const convertToSameFormat = async (bytes: ArrayBuffer, format: OutputFormat) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const inputYear = (await input.getMetadataTags()).date?.getUTCFullYear();
+
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+
+		using converted = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return { inputYear, tags: await converted.getMetadataTags() };
+	};
+
+	// Where the demuxer checks the stream, the audio has to be a valid one rather than a dummy packet
+	type Writer = (format: OutputFormat, tags: MetadataTags) => Promise<ArrayBuffer>;
+	const dummy = (codec: AudioCodec): Writer => (format, tags) => writeWithDummyTrack(format, codec, tags);
+	const flacFixture: Writer = (format, tags) => writeFromFixture('sample.flac', format, tags);
+	const cases: [string, () => OutputFormat, Writer, string][] = [
+		['MP4', () => new Mp4OutputFormat(), dummy('opus'), '©day'],
+		['MOV', () => new MovOutputFormat(), dummy('pcm-s16'), '©day'],
+		['MKV', () => new MkvOutputFormat(), dummy('opus'), 'DATE'],
+		['MP3', () => new Mp3OutputFormat(), writeMp3Frames, 'TDRC'],
+		['FLAC', () => new FlacOutputFormat(), flacFixture, 'DATE'], // Same Vorbis comment writer as Ogg
+		['WAVE', () => new WavOutputFormat(), dummy('pcm-s16'), 'ICRD'],
+	];
+	for (const [name, format, write, dateKey] of cases) {
+		// A date tag such as Mediabunny itself wrote for years past 9999 before
+		const writtenTags: MetadataTags = { title: 'Title', raw: { [dateKey]: '+010000-01' } };
+		const bytes = await write(format(), writtenTags);
+		const { inputYear, tags } = await convertToSameFormat(bytes, format());
+		expect(inputYear, name).toBe(10000);
+		expect(tags.title, name).toBe('Title');
+		expect(tags.date, name).toBeUndefined();
+		expect(tags.raw?.[dateKey], name).toBeUndefined();
+	}
+});
+
+test('A left-out date can\'t come back through a raw date tag in another letter case', async () => {
+	// Vorbis comment field names are case-insensitive, and Mediabunny reads Matroska tag names that way too
+	const writers: [string, (tags: MetadataTags) => Promise<ArrayBuffer>][] = [
+		['MKV', tags => writeWithDummyTrack(new MkvOutputFormat(), 'opus', tags)],
+		['FLAC', tags => writeFromFixture('sample.flac', new FlacOutputFormat(), tags)],
+	];
+	for (const [name, write] of writers) {
+		const readBack = async (tags: MetadataTags) => {
+			using input = new Input({ source: new BufferSource(await write(tags)), formats: ALL_FORMATS });
+			return await input.getMetadataTags();
+		};
+
+		const date = new Date(Date.UTC(10000, 0, 15));
+		const omitted = await readBack({ title: 'Title', date, raw: { date: '+010000-01' } });
+		expect(omitted.title, name).toBe('Title');
+		expect(omitted.date, name).toBeUndefined();
+
+		// Without a date to leave out, the raw tag is still written as it is
+		const rawOnly = await readBack({ title: 'Title', raw: { date: '2021-04-23' } });
+		expect(rawOnly.date, name).toEqual(new Date('2021-04-23T00:00:00Z'));
+	}
 });
 
 test('Conversion metadata tags, default case', async () => {
