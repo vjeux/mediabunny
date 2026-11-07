@@ -32,7 +32,7 @@ describe('Codec strings in the browser', () => {
 	test('Strings derived from real streams are accepted', async () => {
 		// The acceptance checks below only mean something where the browser parses codec strings. Where it rejects a
 		// clearly malformed control, subtler mistakes must be rejected too: a wrong tier letter, a missing bit depth.
-		// (WebKitGTK accepts all of these, so the checks below still hold there, but can't fail.)
+		// (Where the control is accepted, the checks below still have to pass, but can't tell good strings from bad.)
 		if (!await isDecodable('av01.garbage')) {
 			expect(await isDecodable('av01.0.04X.08')).toBe(false);
 		}
