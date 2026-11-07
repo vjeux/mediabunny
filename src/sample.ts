@@ -855,37 +855,30 @@ export class VideoSample implements Disposable {
 		}
 
 		// Copying into an RGB format converts the pixels into options.colorSpace (sRGB by default). We can't convert
-		// between color spaces ourselves, so let VideoFrame do it when the sample's RGB data is in another one. Custom
-		// resources are left alone, since they convert colors in toRgbSample().
+		// between color spaces ourselves, so let VideoFrame do it when the sample's RGB data is in another one, if this
+		// platform's VideoFrame can; otherwise, the pixels are copied as they are below. Custom resources are left
+		// alone, since they convert colors in toRgbSample().
 		if (
 			convertColorSpace
+			&& this._data instanceof Uint8Array
 			&& options.format
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(this.format!)
-			&& !(this._data instanceof VideoSampleResource)
 			&& !isInPredefinedColorSpace(this.colorSpace, options.colorSpace ?? 'srgb')
+			&& await canConvertRgbColorSpaces()
 		) {
-			if (typeof VideoFrame === 'undefined') {
-				throw new Error(
-					`For this sample, converting to the '${options.colorSpace ?? 'srgb'}' color space requires`
-					+ ' VideoFrame to be defined.',
-				);
-			}
-
-			// For raw data, wrap exactly the visible rect: the smallest coded size containing it, with the strides of
-			// the layout (toVideoFrame() would reset a visible rect that doesn't start at the origin)
+			// Wrap exactly the visible rect: the smallest coded size containing it, with the strides of the layout
+			// (toVideoFrame() would reset a visible rect that doesn't start at the origin)
 			const visible = this.visibleRect;
-			const tempFrame = this._data instanceof Uint8Array
-				? new VideoFrame(this._data, {
-					format: this.format as VideoPixelFormat,
-					codedWidth: visible.left + visible.width,
-					codedHeight: visible.top + visible.height,
-					layout: this._layout!,
-					visibleRect: { x: visible.left, y: visible.top, width: visible.width, height: visible.height },
-					timestamp: this.microsecondTimestamp,
-					colorSpace: this.colorSpace,
-				})
-				: this.toVideoFrame();
+			const tempFrame = new VideoFrame(this._data, {
+				format: this.format as VideoPixelFormat,
+				codedWidth: visible.left + visible.width,
+				codedHeight: visible.top + visible.height,
+				layout: this._layout!,
+				visibleRect: { x: visible.left, y: visible.top, width: visible.width, height: visible.height },
+				timestamp: this.microsecondTimestamp,
+				colorSpace: this.colorSpace,
+			});
 			try {
 				return await tempFrame.copyTo(destination, options);
 			} finally {
@@ -2060,6 +2053,55 @@ const isInPredefinedColorSpace = (colorSpace: VideoSampleColorSpace, target: Pre
 
 	return (primaries === null || primaries === 'bt709')
 		&& (transfer === null || transfer === 'iec61966-2-1' || transfer === 'bt709');
+};
+
+let rgbColorSpaceConversionSupport: Promise<boolean> | null = null;
+
+/**
+ * Whether this platform's VideoFrame converts RGB pixels between color spaces and channel orders in copyTo(), as the
+ * spec requires. Not all do: Firefox ignores the color space of a Display P3 frame, WebKitGTK copies RGB planes
+ * verbatim.
+ */
+const canConvertRgbColorSpaces = () => {
+	return rgbColorSpaceConversionSupport ??= (async () => {
+		if (typeof VideoFrame === 'undefined') {
+			return false;
+		}
+
+		const copyOrange = async (primaries: string, options: VideoFrameCopyToOptions) => {
+			const frame = new VideoFrame(new Uint8Array([200, 100, 50, 255]), {
+				format: 'RGBA',
+				codedWidth: 1,
+				codedHeight: 1,
+				timestamp: 0,
+				colorSpace: {
+					primaries: primaries as VideoColorPrimaries,
+					transfer: 'iec61966-2-1',
+					matrix: 'rgb',
+					fullRange: true,
+				},
+			});
+			const bytes = new Uint8Array(4);
+			try {
+				await frame.copyTo(bytes, options);
+			} finally {
+				frame.close();
+			}
+			return bytes;
+		};
+
+		try {
+			// sRGB orange copied as Display P3 BGRA must change color and have red and blue swapped, and Display P3
+			// orange copied as sRGB must change color
+			const toDisplayP3 = await copyOrange('bt709', { format: 'BGRA', colorSpace: 'display-p3' });
+			const toSrgb = await copyOrange('smpte432', { format: 'RGBA', colorSpace: 'srgb' });
+			return toDisplayP3[2]! > toDisplayP3[0]!
+				&& (toDisplayP3[0] !== 50 || toDisplayP3[2] !== 200)
+				&& (toSrgb[0] !== 200 || toSrgb[2] !== 50);
+		} catch {
+			return false;
+		}
+	})();
 };
 
 /**
