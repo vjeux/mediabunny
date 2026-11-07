@@ -395,6 +395,54 @@ test('PCM audio, silence padding', async () => {
 	expect(frameCount).toBe(expectedFrameCount);
 });
 
+test('MP4 with B-frames lists the iso4 brand its version 1 ctts needs', async () => {
+	// Major brand, then the compatible ones (skipping the minor version)
+	const readBrands = (bytes: Uint8Array) => {
+		const text = new TextDecoder('latin1').decode(bytes.subarray(8, toDataView(bytes).getUint32(0)));
+		return text.match(/.{4}/g)!.filter((_, i) => i !== 1);
+	};
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const decoderConfig = await videoTrack.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		await source.add(packet, { decoderConfig });
+		if (++count === 30) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	// B-frames get a version 1 ctts (signed composition offsets) and a cslg box, which are 'iso4' features. The brands
+	// used to stop at 'isom'.
+	const bytes = new Uint8Array(output.target.buffer!);
+	const ctts = new TextDecoder('latin1').decode(bytes).indexOf('ctts');
+	expect(bytes[ctts + 4]).toBe(1);
+	expect(readBrands(bytes)).toEqual(['isom', 'isom', 'avc1', 'mp41', 'iso4']);
+
+	// Unchanged for codecs that don't reorder frames
+	const vp9Output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const vp9Source = new EncodedVideoPacketSource('vp9');
+	vp9Output.addVideoTrack(vp9Source);
+	await vp9Output.start();
+	await vp9Source.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 1 / 30), {
+		decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+	});
+	await vp9Output.finalize();
+	expect(readBrands(new Uint8Array(vp9Output.target.buffer!))).toEqual(['isom', 'isom', 'mp41']);
+});
+
 test('PCM audio, no silence padding with approximate timestamps', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
