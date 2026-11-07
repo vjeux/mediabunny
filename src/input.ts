@@ -300,7 +300,15 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			}
 
 			throw new UnsupportedInputFormatError();
-		})();
+		})().catch((error: unknown) => {
+			// Unlike an unsupported format or a disposed input, a failed read (a network hiccup, say) may work out when
+			// tried again
+			if (!(error instanceof UnsupportedInputFormatError) && !this._disposed) {
+				this._demuxerPromise = null;
+			}
+
+			throw error;
+		});
 	}
 
 	/**
