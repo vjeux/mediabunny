@@ -1048,6 +1048,21 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					}
 				}
 
+				const { codedWidth, codedHeight, hardwareAcceleration } = this.decoderConfig;
+				if (
+					(codec === 'vp9' || codec === 'av1')
+					&& ((codedWidth ?? 0) % 2 === 1 || (codedHeight ?? 0) % 2 === 1)
+					&& (hardwareAcceleration ?? 'no-preference') === 'no-preference'
+				) {
+					// Chromium's hardware decoders fail on VP9 and AV1 of odd dimensions with a decoding error (seen
+					// with Windows' D3D11 ones), though isConfigSupported() says they decode them. Software decoding
+					// works, so ask for it, unless the caller asked for something else.
+					this.decoderConfig = {
+						...this.decoderConfig,
+						hardwareAcceleration: 'prefer-software',
+					};
+				}
+
 				if (!colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
 					// Found via https://github.com/remotion-dev/remotion/issues/10841.
 					// If the color space is incomplete (which is often that it's just partially filled), Chromium has
