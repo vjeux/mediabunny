@@ -373,6 +373,30 @@ test('MP4: trun without default sample values', async () => {
 	]), /trun/);
 });
 
+test('MP4: Fragment with more samples than its moof has bytes', async () => {
+	// Sequence numbers counted up from the moof's offset, so the zero-size samples of the first fragment got higher
+	// sequence numbers than the samples of the next one, in breach of decode order
+	const zeroSizeSamples = moof(
+		fullBox('tfhd', 0, 0x020018, u32(1), u32(1), u32(0)), // Default duration 1, default size 0
+		fullBox('trun', 0, 0, u32(1000)),
+	);
+	const file = mp4(fragmentedMoov(), [
+		zeroSizeSamples,
+		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('tfdt', 0, 0, u32(1000)), fullBox('trun', 0, 0, u32(3))),
+		box('mdat', zeros(12)),
+	]);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getTracks())[0]!);
+	const sequenceNumbers: number[] = [];
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		sequenceNumbers.push(packet.sequenceNumber);
+	}
+
+	expect(sequenceNumbers).toHaveLength(1003);
+	expect(sequenceNumbers.every((x, i) => i === 0 || x > sequenceNumbers[i - 1]!)).toBe(true);
+});
+
 test('MP4: Fragments with decreasing timestamps', async () => {
 	// Caching their positions used to insert at the front over and over
 	const fragmentCount = 100_000;
