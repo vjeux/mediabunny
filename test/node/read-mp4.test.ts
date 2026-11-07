@@ -298,15 +298,20 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 			box('data', u32(1), u32(0), ascii(smpb))),
 	)));
 
-	type Layout = 'lc' | 'explicit-sbr-core-timescale' | 'implicit-sbr-output-timescale';
+	type Layout = 'lc' | 'explicit-sbr-core-timescale' | 'implicit-sbr-output-rate' | 'lc-22050-timescale-44100';
 	const build = (edts: number[], layout: Layout = 'lc') => {
 		// HE-AAC: the media timescale may follow the core coder at half the output rate (Nero, afconvert) or the output
-		// rate (FFmpeg). With implicit SBR signaling, the AudioSpecificConfig only describes the core coder.
+		// rate (FFmpeg). With implicit SBR signaling, the AudioSpecificConfig only describes the core coder, and the
+		// sample entry gives the output rate.
 		const timescale = layout === 'explicit-sbr-core-timescale' ? 22050 : 44100;
+		const sampleEntryRate = layout === 'explicit-sbr-core-timescale' || layout === 'lc-22050-timescale-44100'
+			? 22050
+			: 44100;
 		const audioSpecificConfig = {
 			'lc': [0x12, 0x10], // AAC-LC, 44100 Hz, stereo
 			'explicit-sbr-core-timescale': [0x2b, 0x92, 0x08, 0x00], // SBR, 22050 Hz core, 44100 Hz output, stereo
-			'implicit-sbr-output-timescale': [0x13, 0x90], // AAC-LC, 22050 Hz, stereo
+			'implicit-sbr-output-rate': [0x13, 0x90], // AAC-LC, 22050 Hz, stereo
+			'lc-22050-timescale-44100': [0x13, 0x90],
 		}[layout];
 		const moov = (chunkOffset: number) => box('moov',
 			box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
@@ -318,7 +323,7 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
 					box('minf', box('stbl',
 						box('stsd', u32(0), u32(1), box('mp4a', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4),
-							u32(timescale * 0x10000), esds(audioSpecificConfig))),
+							u32(sampleEntryRate * 0x10000), esds(audioSpecificConfig))),
 						box('stts', u32(0), u32(1), u32(4), u32(1024)),
 						box('stsc', u32(0), u32(1), u32(1), u32(4), u32(1)),
 						box('stsz', u32(0), u32(10), u32(4)),
@@ -341,7 +346,9 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 	expect(await firstTimestamp(build([]))).toBeCloseTo(-2112 / 44100, 12);
 	// iTunSMPB counts output samples
 	expect(await firstTimestamp(build([], 'explicit-sbr-core-timescale'))).toBeCloseTo(-2112 / 44100, 12);
-	expect(await firstTimestamp(build([], 'implicit-sbr-output-timescale'))).toBeCloseTo(-2112 / 44100, 12);
+	expect(await firstTimestamp(build([], 'implicit-sbr-output-rate'))).toBeCloseTo(-2112 / 44100, 12);
+	// Plain AAC-LC at 22050 Hz, which only its sample entry tells apart from implicit SBR
+	expect(await firstTimestamp(build([], 'lc-22050-timescale-44100'))).toBeCloseTo(-2112 / 22050, 12);
 
 	// An edit list takes precedence over iTunSMPB
 	const edts = box('edts', box('elst', zeros(4), u32(1), u32(4096 - 1024), u32(1024), u32(0x10000)));

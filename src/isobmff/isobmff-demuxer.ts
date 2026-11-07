@@ -1870,12 +1870,13 @@ export class IsobmffDemuxer extends Demuxer {
 
 							// With implicit SBR signaling, the AudioSpecificConfig only describes the AAC-LC core coder
 							// (at up to 24 kHz), and the decoder doubles the rate once it finds SBR data in the stream.
-							// Writers then give the output rate in the sample entry or the media timescale.
+							// Writers like FFmpeg then give the output rate in the sample entry. (Not the media
+							// timescale, which may be a multiple of the rate of plain AAC-LC too.)
 							if (
 								audioSpecificConfig.objectType === 2
 								&& audioSpecificConfig.outputSampleRate === coreRate
 								&& coreRate <= 24000
-								&& (sampleEntryRate === 2 * coreRate || track.timescale === 2 * coreRate)
+								&& sampleEntryRate === 2 * coreRate
 							) {
 								track.aacOutputSampleRate = 2 * coreRate;
 							}
