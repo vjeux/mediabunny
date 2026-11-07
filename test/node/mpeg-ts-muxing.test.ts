@@ -13,6 +13,9 @@ const readTransportStream = (data: Uint8Array) => {
 	let mediaBeforeFirstPcr = false;
 	let continuityErrors = 0;
 	const lastCounters = new Map<number, number>();
+	// Per PID, the indices (among the PID's packets) of the packets with discontinuity_indicator set
+	const discontinuities = new Map<number, number[]>();
+	const packetCounts = new Map<number, number>();
 
 	const readTimestamp = (pos: number) => ((data[pos]! >> 1) & 0x07) * 2 ** 30
 		+ (((data[pos + 1]! << 8) | data[pos + 2]!) >> 1) * 2 ** 15
@@ -25,6 +28,12 @@ const readTransportStream = (data: Uint8Array) => {
 		const payloadStart = pos + 4 + (hasAdaptationField ? 1 + data[pos + 4]! : 0);
 
 		// A packet without payload repeats the counter of the previous one, a packet with payload increments it
+		const packetIndex = packetCounts.get(pid) ?? 0;
+		packetCounts.set(pid, packetIndex + 1);
+		if (hasAdaptationField && data[pos + 4]! > 0 && data[pos + 5]! & 0x80) {
+			discontinuities.set(pid, [...discontinuities.get(pid) ?? [], packetIndex]);
+		}
+
 		const counter = data[pos + 3]! & 0x0f;
 		const lastCounter = lastCounters.get(pid);
 		if (lastCounter !== undefined && counter !== (hasPayload ? (lastCounter + 1) & 0x0f : lastCounter)) {
@@ -67,7 +76,7 @@ const readTransportStream = (data: Uint8Array) => {
 		}
 	}
 
-	return { pcrPid, esPids, events, mediaBeforeFirstPcr, continuityErrors };
+	return { pcrPid, esPids, events, mediaBeforeFirstPcr, continuityErrors, discontinuities };
 };
 
 test('MPEG-TS output carries PCRs on the PMT\'s PCR_PID before and between media data', async () => {
@@ -96,8 +105,10 @@ test('MPEG-TS output carries PCRs on the PMT\'s PCR_PID before and between media
 				const packet = new EncodedPacket(avc, isKey ? 'key' : 'delta', frame / 25, 1 / 25);
 				await videoSource.add(packet, i === 0 ? { decoderConfig: videoDecoderConfig } : undefined);
 			}
+			// Starting before the video (like AAC with priming), so that the video PID begins with a packet with just
+			// a PCR
 			for (let i = 0; i < 22; i++) {
-				const packet = new EncodedPacket(adts, 'key', i / 50, 0.02);
+				const packet = new EncodedPacket(adts, 'key', (i - 1) / 50, 0.02);
 				await audioSource.add(packet, i === 0 ? { decoderConfig: audioDecoderConfig } : undefined);
 			}
 		} else {
@@ -115,7 +126,7 @@ test('MPEG-TS output carries PCRs on the PMT\'s PCR_PID before and between media
 
 		await output.finalize();
 
-		const { pcrPid, esPids, events, mediaBeforeFirstPcr, continuityErrors } = readTransportStream(
+		const { pcrPid, esPids, events, mediaBeforeFirstPcr, continuityErrors, discontinuities } = readTransportStream(
 			new Uint8Array(output.target.buffer!),
 		);
 		expect(esPids.size).toBe(2);
@@ -123,6 +134,8 @@ test('MPEG-TS output carries PCRs on the PMT\'s PCR_PID before and between media
 		expect(esPids.has(pcrPid!)).toBe(true);
 		expect(mediaBeforeFirstPcr).toBe(false); // W3C MSE MPEG-2 TS byte stream format, section 5
 		expect(continuityErrors).toBe(0);
+		// Only each PID's first packet has discontinuity_indicator set, also when it's a packet with just a PCR
+		expect([...esPids].map(pid => discontinuities.get(pid))).toEqual([[0], [0]]);
 
 		const pcrs = events.filter(x => x.type === 'pcr').map(x => x.value);
 		expect(pcrs.length).toBeGreaterThan(0);

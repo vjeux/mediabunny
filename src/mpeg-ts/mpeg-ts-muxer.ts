@@ -597,15 +597,18 @@ export class MpegTsMuxer extends Muxer {
 
 	/** Writes a TS packet on the PCR PID with nothing but a PCR in its adaptation field. */
 	private writePcrPacket(pcrTime: number) {
-		assert(this.pcrPid !== null);
+		const pcrTrackData = this.trackDatas.find(x => x.pid === this.pcrPid);
+		assert(pcrTrackData);
 
 		const buf = this.adaptationFieldBuffer;
 		buf[0] = 183; // adaptation_field_length
-		buf[1] = 0x10; // PCR_flag
+		// The PID's first packet carries its discontinuity_indicator, like a first PES packet does
+		buf[1] = (Number(!pcrTrackData.firstPacketWritten) << 7) | 0x10; // discontinuity_indicator, PCR_flag
 		this.writePcr(buf, pcrTime);
 		buf.fill(0xFF, 8, 184); // stuffing_bytes
 
-		this.writeTsPacket(this.pcrPid, false, buf, new Uint8Array(0));
+		this.writeTsPacket(pcrTrackData.pid, false, buf, new Uint8Array(0));
+		pcrTrackData.firstPacketWritten = true;
 	}
 
 	/** Writes the PCR for the given time into bytes 2 to 7 of an adaptation field. */
