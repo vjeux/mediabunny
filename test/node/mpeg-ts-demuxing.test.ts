@@ -985,10 +985,10 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 	const frameStarts = tsPackets.flatMap((packet, i) => (isVideo(packet) && packet[1]! & 0x40 ? [i] : []));
 	expect(frameStarts).toHaveLength(20);
 
-	// Frame 5 loses its second TS packet, frame 7 its last one, frame 9 gets its second sent twice, frame 11 its
-	// first, and frame 13's second has transport_error_indicator set and garbage in it
+	// Frame 5 loses its second TS packet, frame 9 gets its second sent twice, frame 11 its first, and frame 13's
+	// second has transport_error_indicator set and garbage in it
 	const damaged = tsPackets.flatMap((packet, i) => {
-		if (i === frameStarts[5]! + 1 || i === frameStarts[8]! - 1) {
+		if (i === frameStarts[5]! + 1) {
 			return [];
 		} else if (i === frameStarts[9]! + 1 || i === frameStarts[11]) {
 			return [packet, packet];
@@ -999,7 +999,7 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 		}
 		return [packet];
 	});
-	await expectFrames(damaged, [5, 7, 13]);
+	await expectFrames(damaged, [5, 13]);
 
 	// Muxers that never increment the counters, or that also count packets without payload, lose nothing
 	const setCounter = (packet: Uint8Array, counter: number) => {
@@ -1025,6 +1025,26 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 		return result;
 	});
 	await expectFrames(countingPacketsWithoutPayload, []);
+
+	// Two files joined, like `cat` of segments that `ffmpeg -f segment` writes (from L46's review): the counters start
+	// over at the join without discontinuity_indicator, but no packet is missing
+	const withoutDiscontinuityIndicator = (packet: Uint8Array) => {
+		const copy = packet.slice();
+		if (copy[3]! & 0x20 && copy[4]! > 0) {
+			copy[5]! &= 0x7f;
+		}
+		return copy;
+	};
+	// The first file has frames 0 to 9, the second one (with its own PAT and PMT) frames 10 to 19
+	const firstFile = tsPackets.slice(0, frameStarts[10]).map(withoutDiscontinuityIndicator);
+	const secondFile = [...tsPackets.slice(0, 2), ...tsPackets.slice(frameStarts[10])].map((packet) => {
+		const copy = withoutDiscontinuityIndicator(packet);
+		if (isVideo(copy)) {
+			copy[3] = (copy[3]! & 0xf0) | ((copy[3]! + 7) & 0xf); // Make the counters jump at the join in any case
+		}
+		return copy;
+	});
+	expect(await readFrames([...firstFile, ...secondFile])).toEqual(clean);
 });
 
 test('MPEG-TS drops only the video frame that lost a TS packet when PES packets begin mid-frame', async () => {

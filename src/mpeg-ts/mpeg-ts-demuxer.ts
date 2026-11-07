@@ -193,11 +193,6 @@ const ignoredStreamTypes = new Set<number>();
 
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
-	/**
-	 * End positions of sections after which TS packets of their PID went missing. Reading a section again stops at its
-	 * known end without reaching the next packet that tells.
-	 */
-	sectionEndsBeforeMissingPackets = new Set<number>();
 
 	metadataPromise: Promise<void> | null = null;
 	elementaryStreams: ElementaryStream[] = [];
@@ -938,7 +933,9 @@ export class MpegTsDemuxer extends Demuxer {
 						// A copy of the previous packet (only a PCR may differ), allowed once, which must be discarded
 						isDuplicate = true;
 						keepsPayload = false;
-					} else {
+					} else if (packet.payloadUnitStartIndicator === 0) {
+						// Only inside the section: at the start of the next one, a jump can as well be the join of two
+						// files whose counters both start over, like concatenated HLS segments
 						const discontinuityIndicator = adaptationFieldLength > 1 && !!(packet.body[1]! & 0x80);
 						const packetsWentMissing = !discontinuityIndicator
 							// Some muxers count the packets without payload too
@@ -948,10 +945,6 @@ export class MpegTsDemuxer extends Demuxer {
 
 						if (packetsWentMissing) {
 							(holes ??= []).push(chunksByteLength);
-							if (packet.payloadUnitStartIndicator === 1) {
-								// The packets of the section's end
-								this.sectionEndsBeforeMissingPackets.add(endPos);
-							}
 						}
 					}
 				}
@@ -993,9 +986,6 @@ export class MpegTsDemuxer extends Demuxer {
 			const isKnownSectionEnd = binarySearchExact(this.sectionEndPositions, endPos, x => x) !== -1;
 			if (isKnownSectionEnd) {
 				mustAddSectionEnd = false;
-				if (this.sectionEndsBeforeMissingPackets.has(endPos)) {
-					(holes ??= []).push(chunksByteLength);
-				}
 				break;
 			}
 		}
