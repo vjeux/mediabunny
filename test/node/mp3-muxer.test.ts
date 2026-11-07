@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
-import { ALL_FORMATS } from '../../src/input-format.js';
+import { ALL_FORMATS, MP3 } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { Mp3OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -12,6 +12,57 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+test('MP3 file holding a single frame', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/Toothsome-Meme.VBRv2.mp3')),
+		formats: ALL_FORMATS,
+	});
+
+	const inputTrack = await input.getPrimaryAudioTrack();
+	assert(inputTrack);
+
+	const firstPacket = await new EncodedPacketSink(inputTrack).getFirstPacket();
+	assert(firstPacket);
+
+	// Without a Xing frame, the file is just this one frame
+	const output = new Output({
+		format: new Mp3OutputFormat({ xingHeader: false }),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('mp3');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(firstPacket, { decoderConfig: (await inputTrack.getDecoderConfig())! });
+	await output.finalize();
+
+	const frame = new Uint8Array(output.target.buffer!);
+	expect(frame).toEqual(firstPacket.data);
+
+	// There's no second frame to confirm the first one with, but the file must still be detected, also when an ID3v1
+	// tag follows the frame
+	const id3V1Tag = new Uint8Array(128);
+	id3V1Tag.set([0x54, 0x41, 0x47]); // 'TAG'
+
+	for (const bytes of [frame, new Uint8Array([...frame, ...id3V1Tag])]) {
+		using singleFrameInput = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+		expect(await singleFrameInput.getFormat()).toBe(MP3);
+
+		const track = await singleFrameInput.getPrimaryAudioTrack();
+		assert(track);
+
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.data).toEqual(firstPacket.data);
+			count++;
+		}
+		expect(count).toBe(1);
+	}
+});
 
 test('Muxing without Xing header', async () => {
 	using input = new Input({
