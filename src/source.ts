@@ -784,7 +784,8 @@ export class UrlSource extends PathedSource {
 	/** @internal */
 	_sequentialAbortController: AbortController | null = null;
 	/**
-	 * The length of the resource as stated by the first response that stated it, which later responses must match.
+	 * The length of the resource as stated by the first response that stated it, which later responses mustn't fall
+	 * below.
 	 * @internal
 	 */
 	_resourceLength: number | null = null;
@@ -1156,9 +1157,10 @@ export class UrlSource extends PathedSource {
 	}
 
 	/**
-	 * Throws if a response states a different length for the resource than an earlier response did: the resource got
-	 * replaced in the meantime, and its new bytes can't be combined with the ones read before (RFC 9110, Section
-	 * 13.1.5). Chromium's media loader fails such responses the same way.
+	 * Throws if a response states a smaller length for the resource than the first response did: the resource got
+	 * replaced in the meantime, bytes read before may be gone, and the new bytes can't be combined with them (RFC 9110,
+	 * Section 13.1.5). A larger length is taken as a file that is still being written, which keeps being read within
+	 * the length first stated.
 	 * @internal
 	 */
 	private _checkResourceLength(response: Response) {
@@ -1181,7 +1183,7 @@ export class UrlSource extends PathedSource {
 
 		if (this._resourceLength === null) {
 			this._resourceLength = length;
-		} else if (length !== this._resourceLength) {
+		} else if (length < this._resourceLength) {
 			void response.body?.cancel().catch(() => {});
 			throw new Error(
 				// eslint-disable-next-line @typescript-eslint/no-base-to-string

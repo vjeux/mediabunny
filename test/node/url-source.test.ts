@@ -181,9 +181,9 @@ test('UrlSource with maxCacheSize: Infinity allows random access against a range
 	}
 });
 
-test('UrlSource rejects responses for a resource that changed while it was being read', async () => {
-	const v1 = new Uint8Array(2 * 2 ** 20).map((_, i) => i & 0xff);
-	const v2 = new Uint8Array(3 * 2 ** 20).map((_, i) => (i * 7 + 3) & 0xff);
+test('UrlSource rejects responses for a resource that got shorter while it was being read', async () => {
+	const v1 = new Uint8Array(3 * 2 ** 20).map((_, i) => i & 0xff);
+	const v2 = new Uint8Array(2 * 2 ** 20).map((_, i) => (i * 7 + 3) & 0xff);
 
 	for (const honorRanges of [true, false]) {
 		for (const changes of [false, true]) {
@@ -230,8 +230,8 @@ test('UrlSource rejects responses for a resource that changed while it was being
 				const read = async () => reader.requestSlice(start, length);
 				if (changes) {
 					await expect(read).rejects.toThrow(
-						`Error fetching ${url}: the resource changed while it was being read; it was 2097152`
-						+ ' bytes long, now it is 3145728.',
+						`Error fetching ${url}: the resource changed while it was being read; it was 3145728`
+						+ ' bytes long, now it is 2097152.',
 					);
 				} else {
 					const slice = await read();
@@ -244,6 +244,52 @@ test('UrlSource rejects responses for a resource that changed while it was being
 			}
 		}
 	}
+});
+
+test('UrlSource keeps reading a file that grows while it is read, within the length first stated', async () => {
+	// Like a server serving a recording in progress: every response states the length written so far, and the bytes
+	// already written never change
+	const full = new Uint8Array(3_000_000).map((_, i) => (i * 7 + (i >> 9)) & 0xff);
+	const lengths = [1_000_000, 1_500_000, 2_000_000];
+	const requestStarts: number[] = [];
+	const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+		const length = lengths[Math.min(requestStarts.length, lengths.length - 1)]!;
+		const start = Number(/^bytes=(\d+)-$/.exec(new Headers(init?.headers).get('Range') ?? '')![1]);
+		requestStarts.push(start);
+
+		let pos = start;
+		const body = new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (pos >= length) {
+					controller.close();
+					return;
+				}
+
+				controller.enqueue(full.slice(pos, Math.min(pos + 16384, length)));
+				pos += 16384;
+			},
+		});
+
+		return new Response(body, {
+			status: 206,
+			headers: {
+				'Content-Range': `bytes ${start}-${length - 1}/${length}`,
+				'Content-Length': String(length - start),
+			},
+		});
+	}) as typeof fetch;
+
+	// A small cache, so that the later reads need new requests
+	using ref = new UrlSource('https://example.com/recording.mkv', { fetchFn, maxCacheSize: 2 ** 16 }).ref();
+	const reader = new Reader(ref.source);
+
+	for (const start of [0, 900_000, 100_000]) {
+		const slice = await reader.requestSlice(start, 1000);
+		expect(Buffer.compare(readBytes(slice!, 1000), full.subarray(start, start + 1000))).toBe(0);
+	}
+
+	expect(requestStarts.length).toBeGreaterThanOrEqual(3);
+	expect(await ref.source.getSize()).toBe(1_000_000);
 });
 
 test('UrlSource in sequential mode downloads lazily and aborts the response on dispose', async () => {
