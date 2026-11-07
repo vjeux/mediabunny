@@ -46,17 +46,15 @@ export class Mp3Muxer extends Muxer {
 	async start() {
 		const release = await this.mutex.acquire();
 
-		try {
-			this.writer = await this.output._getRootWriter(!this.writeXingHeader);
-			this.mp3Writer = new Mp3Writer(this.writer);
+		this.writer = await this.output._getRootWriter(!this.writeXingHeader);
+		this.mp3Writer = new Mp3Writer(this.writer);
 
-			if (!metadataTagsAreEmpty(this.output._metadataTags)) {
-				const id3Writer = new Id3V2Writer(this.writer);
-				id3Writer.writeId3V2Tag(this.output._metadataTags);
-			}
-		} finally {
-			release();
+		if (!metadataTagsAreEmpty(this.output._metadataTags)) {
+			const id3Writer = new Id3V2Writer(this.writer);
+			id3Writer.writeId3V2Tag(this.output._metadataTags);
 		}
+
+		release();
 	}
 
 	async getMimeType() {

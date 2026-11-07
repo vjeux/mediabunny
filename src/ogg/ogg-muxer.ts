@@ -83,18 +83,16 @@ export class OggMuxer extends Muxer {
 	async start() {
 		const release = await this.mutex.acquire();
 
-		try {
-			this.writer = await this.output._getRootWriter(true); // Ogg is always monotonically written!
+		this.writer = await this.output._getRootWriter(true); // Ogg is always monotonically written!
 
-			for (const track of this.output.tracks) {
-				assert(track.isAudioTrack());
-				if (track.metadata.decoderConfig) {
-					this.getTrackData(track, { decoderConfig: track.metadata.decoderConfig });
-				}
+		for (const track of this.output.tracks) {
+			assert(track.isAudioTrack());
+			if (track.metadata.decoderConfig) {
+				this.getTrackData(track, { decoderConfig: track.metadata.decoderConfig });
 			}
-		} finally {
-			release();
 		}
+
+		release();
 	}
 
 	async getMimeType() {
