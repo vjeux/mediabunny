@@ -982,4 +982,11 @@ test('MPEG-TS drops the video frame that the end of the file cuts off', async ()
 		const frames = await readFrames(bytes.subarray(0, cutPos));
 		expect(frames).toEqual(clean.slice(0, 19));
 	}
+
+	// When the file ends inside the first frame, the track still opens: its SPS and PPS are there
+	let firstPesStart = 0;
+	while (!isVideoStart(firstPesStart)) {
+		firstPesStart += 188;
+	}
+	expect(await readFrames(bytes.subarray(0, firstPesStart + 2 * 188))).toEqual([]);
 });

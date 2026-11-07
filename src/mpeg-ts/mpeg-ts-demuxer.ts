@@ -2376,8 +2376,12 @@ class PacketReadingContext {
 			}
 
 			// End of stream - emit whatever's left as the final packet, unless it holds no picture or the file
-			// ends inside it (a cut frame fails decoding, with WebCodecs at the final flush, which ends the whole run)
-			if (frameStartFound && !last(this.pesPackets)?.cutAtEnd) {
+			// ends inside it (a cut frame fails decoding, with WebCodecs at the final flush, which ends the whole run).
+			// While the stream is being set up, its parameter sets are what counts, which a cut frame still has.
+			if (
+				frameStartFound
+				&& (!last(this.pesPackets)?.cutAtEnd || !elementaryStream.info.decoderConfig)
+			) {
 				assert(packetStartPos !== null);
 
 				const packetLength = this.endPos - packetStartPos;
