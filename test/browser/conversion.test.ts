@@ -1023,6 +1023,81 @@ test('Packet copy, delta frame trim, boundary tolerance exceeded', async () => {
 	});
 });
 
+test.each([
+	// The audio of this MPEG-TS file starts at 1.4 s, which a trim start of 0 keeps
+	['/mp3.ts', { start: 0 }, ['audio']],
+	// The video of this one starts 21 ms after its audio, where the trim starts by default
+	['/0.ts', undefined, ['video', 'audio']],
+] as const)('Packet copy, shrink, of %s keeps tracks whose media only starts after the trim start', async (
+	url,
+	trim,
+	types,
+) => {
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		trim,
+		copy: { mode: 'forced', boundaryPolicy: 'shrink', boundaryTolerance: 0 },
+		showWarnings: false,
+	});
+	// Copying them cuts nothing away from the trim range
+	expect(conversion.utilizedTracks.map(x => x.type)).toEqual(types);
+	await conversion.execute();
+
+	// The media keeps its place relative to the trim start (by default, the start of the earliest track)
+	const inputStart = await input.getFirstTimestamp();
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect(await result.getFirstTimestamp()).toBeCloseTo(inputStart - (trim?.start ?? inputStart), 3);
+});
+
+test('Packet copy, shrink, counts media skipped inside the trim range as deviating', async () => {
+	// A key frame every second: from a start of 1.5 s, the copy would skip ahead to 2 s
+	using input = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		audio: { discard: true },
+		trim: { start: 1.5 },
+		copy: { mode: 'forced', boundaryPolicy: 'shrink', boundaryTolerance: 0.25 },
+		showWarnings: false,
+	});
+	expect(conversion.discardedTracks.map(x => `${x.track.type}:${x.reason}`))
+		.toEqual(['audio:discarded_by_user', 'video:cannot_copy']);
+});
+
+test.each(['forced', 'preferred'] as const)(
+	'Packet copy, shrink, with no key frame after the trim start counts the whole range as deviating (%s)',
+	async (mode) => {
+		// This MPEG-TS file's video has a single key frame, at 10.033 s, so a shrinking copy from 10.5 s has nothing
+		using input = new Input({ source: new UrlSource('/0.ts'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			audio: { discard: true },
+			trim: { start: 10.5 },
+			copy: { mode, boundaryPolicy: 'shrink', boundaryTolerance: 0 },
+			showWarnings: false,
+		});
+
+		if (mode === 'forced') {
+			expect(conversion.discardedTracks.map(x => `${x.track.type}:${x.reason}`))
+				.toEqual(['audio:discarded_by_user', 'video:cannot_copy']);
+			return;
+		}
+
+		// The video gets transcoded instead
+		await conversion.execute();
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect((await track.computePacketStats()).packetCount).toBeGreaterThan(100);
+	},
+);
+
 test('Packet copy, whole file, Matroska', async () => {
 	await testCopy({
 		outputFormat: new MkvOutputFormat(),
