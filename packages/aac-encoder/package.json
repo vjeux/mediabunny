@@ -3,13 +3,13 @@
   "author": "Vanilagy",
   "version": "1.65.2",
   "description": "AAC encoder extension for Mediabunny, based on libavcodec.",
-  "main": "./dist/bundles/mediabunny-aac-encoder.mjs",
+  "main": "./dist/bundles/mediabunny-aac-encoder.cjs",
   "module": "./dist/bundles/mediabunny-aac-encoder.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
     "types": "./dist/modules/src/index.d.ts",
     "import": "./dist/bundles/mediabunny-aac-encoder.mjs",
-    "require": "./dist/bundles/mediabunny-aac-encoder.mjs"
+    "require": "./dist/bundles/mediabunny-aac-encoder.cjs"
   },
   "files": [
     "README.md",
