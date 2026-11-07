@@ -1613,6 +1613,25 @@ describe('Video', async () => {
 			expectColor(getColorAt(rgba, 200, 150, 150), [255, 0, 0]); // bottom-right
 		});
 
+		test('Transform keeps the color space', async () => {
+			const colorSpace: VideoColorSpaceInit = {
+				primaries: 'bt2020' as VideoColorPrimaries,
+				transfer: 'pq' as VideoTransferCharacteristics,
+				matrix: 'bt2020-ncl' as VideoMatrixCoefficients,
+				fullRange: true,
+			};
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 3 / 2).fill(0x80), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: 0,
+				colorSpace,
+			});
+			using result = await sample.transform({ width: 32 });
+
+			expect(result.colorSpace.toJSON()).toEqual(colorSpace);
+		});
+
 		test('Rotate 90 deg clockwise', async () => {
 			using sample = makeSample();
 			using result = await sample.transform({ rotate: 90 });

@@ -294,10 +294,13 @@ export const transformVideoSample = async (
 	graph.alloc();
 
 	try {
+		// The matrix and range describe the filter links, so leaving them out would get them dropped from the output
 		const srcArgs = `video_size=${srcFrame.width}x${srcFrame.height}`
 			+ `:pix_fmt=${srcFrame.format}`
 			+ `:time_base=1/1000000`
-			+ `:pixel_aspect=${sample.pixelAspectRatio.num}/${sample.pixelAspectRatio.den}`;
+			+ `:pixel_aspect=${sample.pixelAspectRatio.num}/${sample.pixelAspectRatio.den}`
+			+ `:colorspace=${srcFrame.colorSpace}`
+			+ `:range=${srcFrame.colorRange}`;
 
 		const bufferSrc = graph.createFilter(NodeAv.Filter.getByName('buffer')!, 'src', srcArgs);
 		const bufferSink = graph.createFilter(NodeAv.Filter.getByName('buffersink')!, 'sink');
