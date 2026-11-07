@@ -500,6 +500,8 @@ The methods for retrieving samples are analogous to those on `VideoSampleSink`.
 
 These methods yield [`AudioSample`](./packets-and-samples#audiosample) instances.
 
+Unlike video, decoded audio doesn't always start at the track's first timestamp: Opus decoders drop the pre-skip, and Vorbis decoders produce no audio for the first packet. For such tracks, `getSample(await audioTrack.getFirstTimestamp())` returns `null`, since no sample starts at or before that timestamp. To get the first sample, take the first one that `samples()` yields.
+
 For example, let's use this sink to calculate the average loudness of an audio track using [root mean square](https://en.wikipedia.org/wiki/Root_mean_square):
 ```ts
 const sink = new AudioSampleSink(audioTrack);
@@ -540,6 +542,8 @@ The methods for retrieving audio buffers are analogous to those on `VideoSampleS
 	Iterates over a range of buffers; see [Range iteration](#range-iteration).
 - `buffersAtTimestamps`\
 	Iterates over buffers at specific timestamps; see [Sparse iteration](#sparse-iteration).
+
+As with `AudioSampleSink`, `getBuffer(await audioTrack.getFirstTimestamp())` can return `null` for Opus and Vorbis tracks; the first buffer that `buffers()` yields is the track's first one.
 
 These methods yield `WrappedAudioBuffer` instances:
 ```ts
