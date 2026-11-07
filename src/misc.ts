@@ -722,9 +722,20 @@ export const setInt64 = (view: DataView, byteOffset: number, value: number, litt
 export const mapAsyncGenerator = <T, U>(
 	generator: AsyncGenerator<T, void, unknown>,
 	map: (t: T) => U,
+	/** Awaited before each value is pulled. If it rejects, the iteration ends with its error. */
+	ready?: Promise<unknown>,
 ): AsyncGenerator<U, void, unknown> => {
 	return {
 		async next() {
+			if (ready) {
+				try {
+					await ready;
+				} catch (error) {
+					await generator.return();
+					throw error;
+				}
+			}
+
 			const result = await generator.next();
 			if (result.done) {
 				return { value: undefined, done: true };

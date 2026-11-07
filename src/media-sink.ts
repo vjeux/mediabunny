@@ -2280,9 +2280,8 @@ export class CanvasSink {
 	 * @param endTimestamp - The timestamp in seconds at which to stop yielding canvases (exclusive).
 	 * @param options - Options used for the underlying packet retrieval.
 	 */
-	async* canvases(startTimestamp?: number, endTimestamp?: number, options?: PacketRetrievalOptions) {
-		await this._ensureInit();
-		yield* mapAsyncGenerator(
+	canvases(startTimestamp?: number, endTimestamp?: number, options?: PacketRetrievalOptions) {
+		return this._mapSamplesToCanvases(
 			this._videoSampleSink.samples(startTimestamp, endTimestamp, options),
 			sample => this._videoSampleToWrappedCanvas(sample),
 		);
@@ -2300,12 +2299,36 @@ export class CanvasSink {
 	 * @param timestamps - An iterable or async iterable of timestamps in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
 	 */
-	async* canvasesAtTimestamps(timestamps: AnyIterable<number>, options?: PacketRetrievalOptions) {
-		await this._ensureInit();
-		yield* mapAsyncGenerator(
+	canvasesAtTimestamps(timestamps: AnyIterable<number>, options?: PacketRetrievalOptions) {
+		return this._mapSamplesToCanvases(
 			this._videoSampleSink.samplesAtTimestamps(timestamps, options),
 			sample => sample && this._videoSampleToWrappedCanvas(sample),
 		);
+	}
+
+	/**
+	 * Maps an iterator of video samples to canvases, once the sink is initialized. This isn't an async generator
+	 * function, since that would queue a return() call behind a pending next() (one waiting for the next timestamp,
+	 * for example), so that the samples' decoder would only be freed once that resolves, if ever.
+	 * @internal
+	 */
+	_mapSamplesToCanvases<T, U>(samples: AsyncGenerator<T, void, unknown>, map: (sample: T) => U) {
+		const ready = this._ensureInit();
+		void ready.catch(() => {}); // Surfaces through next()
+
+		const canvases = mapAsyncGenerator(samples, map, ready);
+		if (typeof Symbol.asyncDispose === 'symbol') {
+			// Like an async generator, the iterator can be declared with `await using`
+			Object.defineProperty(canvases, Symbol.asyncDispose, {
+				value: async () => {
+					await canvases.return();
+				},
+				writable: true,
+				configurable: true,
+			});
+		}
+
+		return canvases;
 	}
 }
 
