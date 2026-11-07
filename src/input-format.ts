@@ -437,7 +437,9 @@ const readWaveFormatTag = async (input: Input, littleEndian: boolean) => {
 	// Few chunks come before the data, so looking at a bounded number of them is enough
 	for (let i = 0; i < 64; i++) {
 		let slice = input._reader.requestSlice(pos, 10);
-		if (isThenable(slice)) slice = await slice;
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
 		if (!slice) {
 			return null;
 		}
