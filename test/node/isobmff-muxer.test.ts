@@ -351,6 +351,59 @@ test('Negative start timestamps, fragmented MP4', async () => {
 	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1, true);
 });
 
+test('Opus from inputs below 48 kHz gets a 48 kHz media timescale, so its edit counts decoded samples', async () => {
+	// What encoders like Chrome's WebCodecs one report for 8-24 kHz input: the input rate, and an OpusHead whose
+	// pre-skip of 312 samples is at 48 kHz, as Opus always decodes at 48 kHz. Packets start that much before zero.
+	const mux = async (sampleRate: number) => {
+		const opusHead = new Uint8Array(19);
+		opusHead.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 1]); // "OpusHead", version, channel count
+		toDataView(opusHead).setUint16(10, 312, true); // Pre-skip
+		toDataView(opusHead).setUint32(12, sampleRate, true); // Input sample rate
+
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source);
+		await output.start();
+		for (let i = 0; i < 25; i++) {
+			const data = new Uint8Array([0xf8, 0xff, 0xfe]); // A 20 ms CELT packet (TOC config 31, one frame)
+			await source.add(new EncodedPacket(data, 'key', i * 0.02 - 312 / 48000, 0.02), {
+				decoderConfig: { codec: 'opus', numberOfChannels: 1, sampleRate, description: opusHead },
+			});
+		}
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = toDataView(bytes);
+		// Returns the offset of a FullBox's version byte
+		const findFullBox = (type: string) => bytes.findIndex(
+			(_, i) => String.fromCharCode(...bytes.subarray(i - 4, i)) === type,
+		);
+		const mdhd = findFullBox('mdhd');
+		const elst = findFullBox('elst');
+		expect([bytes[mdhd], bytes[elst]]).toEqual([0, 0]);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return {
+			timescale: view.getUint32(mdhd + 12),
+			editMediaTime: view.getInt32(elst + 12),
+			firstTimestampInSamples: Math.round(await track.getFirstTimestamp() * 48000),
+		};
+	};
+
+	// The edit's media_time is the pre-skip in decoded samples. With the input rate as the timescale, it used to be
+	// 52, 104 and 156: FFmpeg then skipped that many decoded samples, leaving the rest of the priming samples in.
+	for (const sampleRate of [8000, 16000, 24000, 48000]) {
+		expect({ sampleRate, ...await mux(sampleRate) }).toEqual({
+			sampleRate,
+			timescale: 48000,
+			editMediaTime: 312,
+			firstTimestampInSamples: -312, // The pre-skip, as before
+		});
+	}
+});
+
 test('Wholly negative timestamps, regular MP4', async () => {
 	await testNegativeTimestampRoundTrip([-1, -0.9, -0.8, -0.7, -0.6], 0.1, false);
 });
