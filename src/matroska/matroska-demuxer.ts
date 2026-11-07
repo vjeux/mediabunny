@@ -1444,7 +1444,8 @@ export class MatroskaDemuxer extends Demuxer {
 					break;
 				}
 
-				this.currentTrack.languageCode = readAsciiString(slice, size);
+				// Matroska v1 to v3 allow a country code after the ISO 639-2 code, like "fre-ca" (RFC 9559, section 12)
+				this.currentTrack.languageCode = readAsciiString(slice, size).split('-')[0]!;
 
 				if (!isIso639Dash2LanguageCode(this.currentTrack.languageCode)) {
 					this.currentTrack.languageCode = UNDETERMINED_LANGUAGE;
