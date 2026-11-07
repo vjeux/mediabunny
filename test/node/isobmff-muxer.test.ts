@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
+import { MovOutputFormat } from '../../src/output-format.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
@@ -14,6 +15,61 @@ import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/me
 import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+const STSD_PATH = ['moov', 'trak', 'mdia', 'minf', 'stbl', 'stsd'];
+
+type FoundBox = {
+	contentStart: number;
+	end: number;
+};
+
+const findBox = (bytes: Uint8Array, boxPath: string[]) => {
+	const view = toDataView(bytes);
+
+	const search = (start: number, end: number, depth: number, parentType: string | null): FoundBox | null => {
+		let pos = start;
+		while (pos < end) {
+			const size = view.getUint32(pos);
+			assert(size >= 8);
+
+			const type = String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+			const box = {
+				contentStart: pos + 8,
+				end: pos + size,
+			};
+
+			if (type === boxPath[depth]) {
+				if (depth === boxPath.length - 1) {
+					return box;
+				}
+
+				let childrenOffset = 0;
+				if (type === 'stsd') {
+					childrenOffset = 8;
+				} else if (type === 'meta') {
+					// QuickTime's meta box isn't a full box
+					const nextType = String.fromCharCode(...bytes.subarray(box.contentStart + 4, box.contentStart + 8));
+					childrenOffset = nextType === 'hdlr' ? 0 : 4;
+				} else if (parentType === 'stsd') {
+					// Audio sample entries grow with their version
+					const version = view.getUint16(box.contentStart + 8);
+					childrenOffset = 28 + [0, 16, 36][version]!;
+				}
+
+				const result = search(box.contentStart + childrenOffset, box.end, depth + 1, type);
+				if (result) {
+					return result;
+				}
+			}
+
+			pos += size;
+		}
+
+		return null;
+	};
+
+	return search(0, bytes.byteLength, 0, null);
+};
 
 test('ISOBMFF muxer internally converts ADTS to AAC', async () => {
 	using input = new Input({
@@ -605,6 +661,49 @@ test('Chunks written in chronological order, no Fast Start', async () => {
 test('Chunks written in chronological order, in-memory Fast Start', async () => {
 	await testChunkOrder('in-memory');
 });
+
+test('AC-3 in MOV', async () => {
+	await testAc3InMov('ac3', 'ac-3', 'dac3');
+});
+
+test('E-AC-3 in MOV', async () => {
+	// Apple's players drop E-AC-3 tracks in MOV whose dec3 box isn't wrapped in a wave box
+	await testAc3InMov('eac3', 'ec-3', 'dec3');
+});
+
+const testAc3InMov = async (codec: 'ac3' | 'eac3', sampleEntryName: string, configBoxName: string) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, `../public/${codec}.mp4`)),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({
+		format: new MovOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({
+		input,
+		output,
+		showWarnings: false,
+	});
+	await conversion.execute();
+
+	// The config box goes into a wave box
+	const bytes = new Uint8Array(output.target.buffer!);
+	expect(findBox(bytes, [...STSD_PATH, sampleEntryName, 'wave', configBoxName])).not.toBeNull();
+
+	using outputAsInput = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await outputAsInput.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe(codec);
+	expect(await track.getNumberOfChannels()).toBe(6);
+	expect(await track.getSampleRate()).toBe(48000);
+};
 
 test('Chunks written in chronological order, reserved Fast Start', async () => {
 	await testChunkOrder('reserve');
