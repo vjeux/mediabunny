@@ -673,15 +673,14 @@ const DEFAULT_RETRY_DELAY
 				|| error.message.includes('Load failed') // Safari
 				|| error.message.includes('NetworkError when attempting to fetch resource') // Firefox
 			)
-			&& typeof window !== 'undefined'; // CORS only happens in browser environments
+			// CORS only happens in browser environments, which have a location in windows and workers alike
+			&& typeof location !== 'undefined';
 
 		if (couldBeCorsError) {
 			let originOfSrc: string | null = null;
 			// Checking if the origin is different, because only then a CORS error could originate
 			try {
-				if (typeof window !== 'undefined' && typeof window.location !== 'undefined') {
-					originOfSrc = new URL(src instanceof Request ? src.url : src, window.location.href).origin;
-				}
+				originOfSrc = new URL(src instanceof Request ? src.url : src, location.href).origin;
 			} catch {
 				// URL parse failed
 			}
@@ -690,7 +689,7 @@ const DEFAULT_RETRY_DELAY
 			const isOnline
 			= typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
 
-			if (isOnline && originOfSrc !== null && originOfSrc !== window.location.origin) {
+			if (isOnline && originOfSrc !== null && originOfSrc !== location.origin) {
 				Logging._warn(
 					`Request will not be retried because a CORS error was suspected due to different origins. You can`
 					+ ` modify this behavior by providing your own function for the 'getRetryDelay' option.`,
