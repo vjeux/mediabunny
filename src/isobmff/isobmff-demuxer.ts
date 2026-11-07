@@ -2160,12 +2160,19 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4); // Version + flags
 
+				// Sample numbers start at 1, but some writers count from 0. Like FFmpeg, take a table whose first entry
+				// is 0 as counting from 0.
+				let firstSampleNumber = 1;
 				track.sampleTable.keySampleIndices = [];
 
 				const entryCount = readU32Be(slice);
 				for (let i = 0; i < entryCount; i++) {
-					const sampleIndex = readU32Be(slice) - 1; // Convert to 0-indexed
-					track.sampleTable.keySampleIndices.push(sampleIndex);
+					const sampleNumber = readU32Be(slice);
+					if (i === 0 && sampleNumber === 0) {
+						firstSampleNumber = 0;
+					}
+
+					track.sampleTable.keySampleIndices.push(sampleNumber - firstSampleNumber); // Convert to 0-indexed
 				}
 
 				// We binary search this list, so it must be sorted

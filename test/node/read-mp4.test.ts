@@ -272,3 +272,61 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Sync sample tables numbered from 0', async () => {
+	// One video track of 8 samples whose sync samples are the first and the fifth. The stss box numbers samples from
+	// 1, but some writers count from 0; like FFmpeg, a table starting at 0 counts from 0.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (syncSampleNumbers: number[]) => {
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(50),
+			box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(320), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(320), zeros(16), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(1000), u32(320), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), avc1),
+						box('stts', zeros(4), u32(1), u32(8), u32(40)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(8), u32(1)),
+						box('stss', zeros(4), u32(syncSampleNumbers.length), ...syncSampleNumbers.map(u32)),
+						box('stsz', zeros(4), u32(10), u32(8)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+		const mdat = box('mdat', ...Array.from({ length: 8 }, (_, i) => new Array<number>(10).fill(i)));
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...mdat, ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const sink = new EncodedPacketSink(track);
+		const types: string[] = [];
+		for await (const packet of sink.packets()) {
+			types.push(packet.type);
+		}
+		return { types, keyPacketAt0_25: (await sink.getKeyPacket(0.25))?.data[0] };
+	};
+
+	const expected = {
+		types: ['key', 'delta', 'delta', 'delta', 'key', 'delta', 'delta', 'delta'],
+		keyPacketAt0_25: 4,
+	};
+	expect(await read([1, 5])).toEqual(expected);
+	expect(await read([0, 4])).toEqual(expected);
+});
