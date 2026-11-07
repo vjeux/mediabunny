@@ -655,24 +655,30 @@ test('Conversion metadata tags, fields removed by the tags function stay removed
 	});
 	await output.finalize();
 
-	using dateInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-	const dateOutput = new Output({
-		format: new WavOutputFormat({ metadataFormat: 'id3' }),
-		target: new BufferTarget(),
-	});
-	const dateConversion = await Conversion.init({
-		input: dateInput,
-		output: dateOutput,
-		showWarnings: false,
-		tags: inputTags => ({ ...inputTags, date: undefined }),
-	});
-	await dateConversion.execute();
-	using dateResult = new Input({ source: new BufferSource(dateOutput.target.buffer!), formats: ALL_FORMATS });
-	const withoutDate = await dateResult.getMetadataTags();
-	expect(withoutDate.title).toBe('Title');
-	expect(withoutDate.date).toBeUndefined();
-	expect(withoutDate.raw!['TYER']).toBeUndefined();
-	expect(withoutDate.raw!['TDAT']).toBeUndefined();
+	// Removing or changing the date drops both frames, whose date would otherwise come back or stay in the file
+	const convertWithDate = async (date: Date | undefined) => {
+		using dateInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const dateOutput = new Output({
+			format: new WavOutputFormat({ metadataFormat: 'id3' }),
+			target: new BufferTarget(),
+		});
+		const dateConversion = await Conversion.init({
+			input: dateInput,
+			output: dateOutput,
+			showWarnings: false,
+			tags: inputTags => ({ ...inputTags, date }),
+		});
+		await dateConversion.execute();
+		using dateResult = new Input({ source: new BufferSource(dateOutput.target.buffer!), formats: ALL_FORMATS });
+		return await dateResult.getMetadataTags();
+	};
+	for (const date of [undefined, new Date('1999-06-01T00:00:00Z')]) {
+		const dateTags = await convertWithDate(date);
+		expect(dateTags.title).toBe('Title');
+		expect(dateTags.date).toEqual(date);
+		expect(dateTags.raw!['TYER']).toBeUndefined();
+		expect(dateTags.raw!['TDAT']).toBeUndefined();
+	}
 
 	// Vorbis comments with the track total both in TRACKNUMBER and in TRACKTOTAL
 	using flacInput = new Input({ source: new BufferSource(flac), formats: ALL_FORMATS });
