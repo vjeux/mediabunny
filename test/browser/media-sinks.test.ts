@@ -243,41 +243,6 @@ test('Sample retrieval within Opus pre-skip', async () => {
 	expect(results[3]!.timestamp + results[3]!.duration).toBeGreaterThan(1);
 });
 
-test('Samples at timestamps come out while timestamps are still coming in', async () => {
-	using input = new Input({
-		source: new UrlSource('/glitch-hop-is-dead.wav'),
-		formats: ALL_FORMATS,
-	});
-
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	const packetSink = new EncodedPacketSink(track);
-	const firstPacket = await packetSink.getFirstPacket();
-	assert(firstPacket);
-	const secondPacket = await packetSink.getNextPacket(firstPacket);
-	assert(secondPacket);
-
-	// The timestamps only end once the first sample has come out, which hangs if the sink holds off decoding until
-	// the run of consecutive packets is over
-	const { promise: firstSampleReceived, resolve: onFirstSampleReceived } = promiseWithResolvers();
-	const timestamps = async function* () {
-		yield firstPacket.timestamp;
-		yield secondPacket.timestamp;
-		await firstSampleReceived;
-	};
-
-	const sink = new AudioSampleSink(track);
-	const sampleTimestamps: number[] = [];
-	for await (using sample of sink.samplesAtTimestamps(timestamps())) {
-		assert(sample);
-		sampleTimestamps.push(sample.timestamp);
-		onFirstSampleReceived();
-	}
-
-	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
-});
-
 /** Remuxes the first two seconds of demo.mp4's AAC track (one decoded sample per packet) with new timestamps. */
 const remuxDemoAudio = async (getTimestamp: (timestamp: number, index: number) => number) => {
 	using input = new Input({
@@ -374,25 +339,6 @@ test('Decoded audio keeps the gaps between packets', async () => {
 	}
 });
 
-test('Decoded audio keeps a short gap between packets with exact timestamps', async () => {
-	// FFmpeg's fragmented MP4 with B-frame video stretches the first audio packet over the video's delay, so the next
-	// packet starts about 60 ms after the first one's audio ends (found by lane L64)
-	using input = await remuxDemoAudio((timestamp, index) => index > 0 ? timestamp + 0.06 : timestamp);
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	const packetTimestamps = await getPacketTimestamps(track);
-	const sampleTimestamps = await getSampleTimestamps(track);
-	expect(sampleTimestamps).toHaveLength(packetTimestamps.length);
-	for (let i = 0; i < sampleTimestamps.length; i++) {
-		expect(sampleTimestamps[i]).toBeCloseTo(packetTimestamps[i]!, 4);
-	}
-
-	// Where seeking puts it too
-	using sample = await new AudioSampleSink(track).getSample(packetTimestamps[40]! + 0.001);
-	expect(sample!.timestamp).toBeCloseTo(sampleTimestamps[40]!, 4);
-});
-
 test('Decoded audio stays contiguous across packets that share a timestamp', async () => {
 	// A run of eight packets stamped at the first one's timestamp, like the laced frames of a Matroska block with no
 	// known durations
@@ -458,4 +404,71 @@ test('Decoded audio stays in order when a packet decodes to nothing', async () =
 			previousEnd = sample.timestamp + sample.duration;
 		}
 	});
+});
+
+test('Samples at timestamps come out while timestamps are still coming in', async () => {
+	using input = new Input({
+		source: new UrlSource('/glitch-hop-is-dead.wav'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packetSink = new EncodedPacketSink(track);
+	const firstPacket = await packetSink.getFirstPacket();
+	assert(firstPacket);
+	const secondPacket = await packetSink.getNextPacket(firstPacket);
+	assert(secondPacket);
+
+	// The timestamps only end once the first sample has come out, which hangs if the sink holds off decoding until
+	// the run of consecutive packets is over
+	const { promise: firstSampleReceived, resolve: onFirstSampleReceived } = promiseWithResolvers();
+	const timestamps = async function* () {
+		yield firstPacket.timestamp;
+		yield secondPacket.timestamp;
+		await firstSampleReceived;
+	};
+
+	const sink = new AudioSampleSink(track);
+	const sampleTimestamps: number[] = [];
+	for await (using sample of sink.samplesAtTimestamps(timestamps())) {
+		assert(sample);
+		sampleTimestamps.push(sample.timestamp);
+		onFirstSampleReceived();
+	}
+
+	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+// vorbis-clicks.ogg was made with:
+// ffmpeg -f lavfi -i "aevalsrc=exprs='if(lt(mod(t\,0.5)\,0.004)\,0.8*sin(2*PI*1000*t)\,0)':s=44100:d=3" \
+//   -c:a libvorbis -q:a 4 vorbis-clicks.ogg
+test('Vorbis audio keeps its timing, also after seeking', async () => {
+	using input = new Input({
+		source: new UrlSource('/vorbis-clicks.ogg'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+
+	// A 1 kHz tone burst starts every 0.5 seconds
+	const findBurst = async (startTimestamp?: number) => {
+		for await (using sample of sink.samples(startTimestamp)) {
+			const index = getSampleData(sample).findIndex(x => Math.abs(x) > 0.3);
+			if (index !== -1) {
+				return sample.timestamp + index / sample.sampleRate;
+			}
+		}
+
+		return null;
+	};
+
+	expect(await findBurst()).toBeCloseTo(0, 3);
+	expect(await findBurst(0.9)).toBeCloseTo(1, 3);
+	expect(await findBurst(1.45)).toBeCloseTo(1.5, 3);
+	expect(await findBurst(2.2)).toBeCloseTo(2.5, 3);
 });
