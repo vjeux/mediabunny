@@ -544,6 +544,38 @@ await decoder.flush();
 
 As you can see, media sinks are incredibly versatile and allow for efficient, sparse reading of media data within the input file.
 
+## Encrypted files
+
+MP4 files (including fragmented MP4 and MOV) encrypted with Common Encryption, using the `cenc`, `cens` or `cbcs` scheme, can be read if you provide the decryption keys. For each key ID it encounters, Mediabunny calls `formatOptions.isobmff.resolveKeyId` with the key ID as a 32-character lowercase hex string, together with the file's Protection System Specific Header (PSSH) boxes for that key ID. Return the key as a 32-character hex string or a 16-byte `Uint8Array`:
+```ts
+import { Input, ALL_FORMATS, BlobSource } from 'mediabunny';
+
+// Maps each key ID to its decryption key
+const keyMap = new Map([
+	['00112233445566778899aabbccddeeff', 'aabbccddeeff00112233445566778899'],
+]);
+
+const input = new Input({
+	source: new BlobSource(file),
+	formats: ALL_FORMATS,
+	formatOptions: {
+		isobmff: {
+			resolveKeyId: ({ keyId, psshBoxes }) => {
+				// psshBoxes can be used to obtain the key from a DRM license server
+				const key = keyMap.get(keyId);
+				if (!key) {
+					throw new Error('Unknown key ID.');
+				}
+
+				return key;
+			},
+		},
+	},
+});
+```
+
+Without `resolveKeyId`, reading an encrypted sample throws an error. The same option decrypts `SAMPLE-AES` HLS content; see [Reading HLS](./reading-hls#encrypted-content).
+
 ## Disposing inputs
 
 When you're not using them anymore, `Input` instances will automatically get cleaned up by garbage collection. However, sometimes you may want to prematurely dispose of an `Input` and all its connected resources, or cancel any ongoing operation. You can do it like so:
