@@ -1904,7 +1904,8 @@ export type MediaStreamVideoTrackSourceOptions = {
 	 * to pair this mode with {@link BaseTrackMetadata.isRelativeToUnixEpoch}.
 	 *
 	 * With `'synced-zero'` and `'unix'`, all sources of the same `MediaStreamTrack` in an {@link Output} (e.g. one per
-	 * rendition) give the same frame the same timestamp.
+	 * rendition) give the same frame the same timestamp. So with `'synced-zero'`, frames that a later source of the
+	 * track receives from before the first frame of the first one get negative timestamps.
 	 *
 	 * Defaults to `'synced-zero'`.
 	 */
@@ -3542,8 +3543,9 @@ const MEDIA_STREAM_AUDIO_BUFFER_SIZE = 500;
  * Returns the offset that maps the capture timestamps of a MediaStreamTrack to output timestamps, computing it with
  * `computeOffset` for the first source of the track that asks. With `'synced-zero'` and `'unix'`, every source of the
  * same track (e.g. one per rendition) then uses the same offset, so that it gives the same media the same timestamp;
- * otherwise, each source would base it on when its own first chunk arrived. With `'zero'`, each source starts at its
- * own first chunk.
+ * otherwise, each source would base it on when its own first chunk arrived. A later source whose first chunk is older
+ * than the first source's thus gives it a timestamp before the first source's first one (negative with
+ * `'synced-zero'`). With `'zero'`, each source starts at its own first chunk.
  */
 const getMediaStreamTimestampOffset = (
 	output: OutputTrack['output'],
@@ -3584,7 +3586,8 @@ export type MediaStreamAudioTrackSourceOptions = {
 	 * to pair this mode with {@link BaseTrackMetadata.isRelativeToUnixEpoch}.
 	 *
 	 * With `'synced-zero'` and `'unix'`, all sources of the same `MediaStreamTrack` in an {@link Output} (e.g. one per
-	 * rendition) give the same audio the same timestamp.
+	 * rendition) give the same audio the same timestamp. So with `'synced-zero'`, audio that a later source of the
+	 * track receives from before the first audio of the first one gets negative timestamps.
 	 *
 	 * Defaults to `'synced-zero'`.
 	 */
