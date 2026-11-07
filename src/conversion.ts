@@ -641,9 +641,9 @@ const PACKET_STATS_PACKET_COUNT = 256;
 const outputTrackAdditionMutexes = new WeakMap<Output, AsyncMutex>();
 
 /**
- * How many conversions were initialized on each output, not counting those that failed without adding anything. An
- * output that a conversion was initialized on isn't fresh anymore, even while that conversion hasn't added its tracks
- * yet.
+ * How many conversions were initialized on each output, not counting those that ended up adding nothing to it. An
+ * output that a conversion is being initialized on isn't fresh anymore, even while that conversion hasn't added its
+ * tracks yet.
  */
 const outputConversionCounts = new WeakMap<Output, number>();
 
@@ -831,15 +831,13 @@ export class Conversion {
 
 		try {
 			await conversion._init();
-		} catch (error) {
+		} finally {
 			if (conversion._outputTrackIds.length === 0) {
 				// The conversion added nothing to the output, so it doesn't count as using it
 				const count = outputConversionCounts.get(conversion.output);
 				assert(count !== undefined);
 				outputConversionCounts.set(conversion.output, count - 1);
 			}
-
-			throw error;
 		}
 
 		return conversion;

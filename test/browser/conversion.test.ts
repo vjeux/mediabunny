@@ -854,6 +854,25 @@ test('An output stays fresh after a non-composable conversion fails to initializ
 	expect(output.state).toBe('finalized');
 });
 
+test('An output stays fresh after a composable conversion that added no track to it', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+
+	await Conversion.init({
+		input,
+		output,
+		composable: true,
+		video: { discard: true },
+		audio: { discard: true },
+		showWarnings: false,
+	});
+	expect(output.tracks).toHaveLength(0);
+
+	const conversion = await Conversion.init({ input, output, trim: { end: 0.3 }, showWarnings: false });
+	await conversion.execute();
+	expect(output.state).toBe('finalized');
+});
+
 test('Blank execute', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
