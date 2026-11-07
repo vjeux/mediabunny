@@ -22,7 +22,7 @@ import {
 	VideoCodec,
 } from './codec';
 import { customAudioEncoders, customVideoEncoders } from './custom-coder';
-import { assert, clamp, getChromiumVersion, isFirefox, lerp, MaybePromise, Rotation } from './misc';
+import { assert, clamp, getChromiumVersion, isChromium, isFirefox, lerp, MaybePromise, Rotation } from './misc';
 import { EncodedPacket } from './packet';
 import { AudioSample, CropRectangle, validateCropRectangle, VideoSample, VideoSampleResource } from './sample';
 
@@ -1297,21 +1297,21 @@ export const canEncodeAudio = async (
 			return false;
 		}
 
-		if (!isFirefox()) {
+		if (isChromium()) {
 			return true;
 		}
 
-		// Like for video, isConfigSupported on Firefox claims support for audio configs it can't actually encode: Opus
-		// with 3 or 4 channels fails once encoding starts, and Vorbis encodes everything as silence. Therefore, we
-		// encode a tone and check that it decodes back audibly.
-		return encodesAudibly(encoderConfig);
+		// Elsewhere, isConfigSupported claims support for audio configs that the encoder then fails on, like Opus with
+		// 3 or 4 channels in Firefox and WebKitGTK. Therefore, we try encoding a tone. Firefox's Vorbis encoder also
+		// encodes everything as silence, so there, the tone must also decode back audibly.
+		return encodesTone(encoderConfig, isFirefox());
 	})();
 	canEncodeAudioMemo.set(key, promise);
 
 	return promise;
 };
 
-const encodesAudibly = async (config: AudioEncoderConfig) => {
+const encodesTone = async (config: AudioEncoderConfig, checkAudible: boolean) => {
 	const { numberOfChannels, sampleRate } = config;
 	const numberOfFrames = Math.round(sampleRate / 10);
 	const data = new Float32Array(numberOfFrames * numberOfChannels);
@@ -1360,6 +1360,9 @@ const encodesAudibly = async (config: AudioEncoderConfig) => {
 		audioData.close();
 		await encoder.flush();
 
+		if (!checkAudible) {
+			return !failed;
+		}
 		if (!decoderConfig) {
 			return false;
 		}

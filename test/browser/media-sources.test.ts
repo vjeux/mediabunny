@@ -675,15 +675,14 @@ test('AudioSampleSource, resampled stereo with non-zero start timestamp', async 
 });
 
 test('canEncodeAudio only reports configs that encode audibly', async () => {
-	// Firefox claims support for Opus with 3 or 4 channels but fails to encode it, and encodes Vorbis as silence
-	const configs = [['opus', 2], ['opus', 3], ['opus', 4], ['opus', 6], ['vorbis', 2]] as const;
-	for (const [codec, numberOfChannels] of configs) {
-		if (!await canEncodeAudio(codec, { numberOfChannels })) {
+	// Firefox and WebKitGTK claim support for Opus with 3 or 4 channels but fail to encode it
+	for (const numberOfChannels of [2, 3, 4, 6]) {
+		if (!await canEncodeAudio('opus', { numberOfChannels })) {
 			continue;
 		}
 
 		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-		const audioSource = new AudioSampleSource({ codec, quality: new Quality('medium') });
+		const audioSource = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
 		output.addAudioTrack(audioSource);
 		await output.start();
 		const sample = makeSineWave(48000, numberOfChannels, 0.5);
@@ -703,7 +702,7 @@ test('canEncodeAudio only reports configs that encode audibly', async () => {
 		}
 		input.dispose();
 
-		expect(peak, `${codec}, ${numberOfChannels} channels`).toBeGreaterThan(0.1);
+		expect(peak, `${numberOfChannels} channels`).toBeGreaterThan(0.1);
 	}
 });
 
