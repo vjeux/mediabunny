@@ -324,14 +324,17 @@ const output = new Output({
 	format: new Mp4OutputFormat({ fastStart: 'fragmented' }),
 });
 
-const uploadComplete = fetch('https://example.com/upload', {
+// Streaming request bodies require `duplex: 'half'`, which
+// TypeScript's DOM types don't declare yet
+const init: RequestInit & { duplex: 'half' } = {
 	method: 'POST',
 	body: readable,
 	duplex: 'half',
 	headers: {
 		'Content-Type': output.format.mimeType,
 	},
-});
+};
+const uploadComplete = fetch('https://example.com/upload', init);
 
 await output.start();
 
