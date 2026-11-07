@@ -878,6 +878,12 @@ export class UrlSource extends PathedSource {
 			}
 		}
 
+		if (typeof Request !== 'undefined' && options.fetchFn === undefined && !(this._url instanceof Request)) {
+			// fetch() rejects a request it can't make (an unparsable URL, an invalid header value) with the same
+			// TypeError every time, which no retry fixes; constructing the request here throws that error right away
+			void new Request(this._url, this._requestInit);
+		}
+
 		// Most files in the real-world have a single sequential access pattern, but having two in parallel can
 		// also happen
 		const DEFAULT_PARALLELISM = 2;
