@@ -307,38 +307,6 @@ test('Decoded audio samples can be looked up by their own timestamps (Matroska)'
 	}
 });
 
-test('Audio lookups stay sample-exact where packets sit on the sample grid', async () => {
-	// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet
-	// before it
-	for (const file of ['/Toothsome-Meme.VBRv2.mp3', '/sample.flac']) {
-		using input = new Input({
-			source: new UrlSource(file),
-			formats: ALL_FORMATS,
-		});
-
-		const track = await input.getPrimaryAudioTrack();
-		assert(track);
-		const sampleRate = await track.getSampleRate();
-
-		const packetSink = new EncodedPacketSink(track);
-		const packet = await packetSink.getPacket(1);
-		assert(packet);
-		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
-		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
-
-		const sink = new AudioSampleSink(track);
-		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
-		using sampleAt = await sink.getSample(packet.timestamp);
-		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
-		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
-
-		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
-			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
-			break;
-		}
-	}
-});
-
 test('Sample ranges keep their exclusive end with timestamp tolerance', async () => {
 	// Video has no tolerance, PCM WAVE packets sit on the sample grid, Matroska audio is compared within a millisecond
 	const sinks = [
@@ -383,3 +351,71 @@ test('Sample ranges keep their exclusive end with timestamp tolerance', async ()
 		expect(range, file).toEqual(timestamps.slice(0, 2));
 	}
 });
+
+// WebKitGTK's GStreamer FLAC decoder fails, and then stalls every later audio decode on the page, so this comes last.
+// Whether the platform decodes FLAC is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
+// failure fails instead of skipping. The probe is the start of a tiny stream (as in the conformance suite), from
+// ffmpeg -f lavfi -i anullsrc=r=16000:cl=mono -t 0.1 -c:a flac ("fLaC" + the STREAMINFO block, then two frames).
+const flacDecodesNatively = async () => {
+	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+	const decoder = new AudioDecoder({ output: data => data.close(), error: () => {} });
+	decoder.configure({
+		codec: 'flac',
+		sampleRate: 16000,
+		numberOfChannels: 1,
+		description: fromBase64('ZkxhQ4AAACIEgASAAAALAAANA+gA8AAABkCfCt/b50DLnNgYijV2HiR2'),
+	});
+	['//g1CAADAAAAakQ=', '//h1CAEBv70AAAAGlg=='].forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+		type: 'key',
+		timestamp: i * 64000,
+		data: fromBase64(chunk),
+	})));
+
+	const decodes = await Promise.race([
+		decoder.flush().then(() => true, () => false),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+	]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return decodes;
+};
+
+// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet before it
+test.for(['/Toothsome-Meme.VBRv2.mp3', '/sample.flac'])(
+	'Audio lookups stay sample-exact where packets sit on the sample grid (%s)',
+	async (file, { skip }) => {
+		if (file.endsWith('.flac')) {
+			skip(!(await flacDecodesNatively()), 'FLAC can\'t be decoded here (native probe)');
+		}
+
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sampleRate = await track.getSampleRate();
+
+		// Far enough in that decoding doesn't start at the first packets, which start below 0 (MP3's encoder delay), as
+		// WebKitGTK's decoder scrambles the timestamps following a negative one. The MP3 pre-roll is over 2 s here.
+		const packetSink = new EncodedPacketSink(track);
+		const packet = await packetSink.getPacket(3);
+		assert(packet);
+		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
+		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
+
+		const sink = new AudioSampleSink(track);
+		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
+		using sampleAt = await sink.getSample(packet.timestamp);
+		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
+
+		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
+			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+			break;
+		}
+	},
+);
