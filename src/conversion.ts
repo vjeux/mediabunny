@@ -1601,7 +1601,7 @@ export class Conversion {
 					: startPacket.timestamp;
 
 				const boundaryDeviation = this._copyBoundaryPolicy === 'shrink'
-					? effectiveStartTimestamp - this._startTimestamp
+					? effectiveStartTimestamp - await this._getShrinkBoundaryReference(sink)
 					: Math.max(this._startTimestamp - effectiveStartTimestamp, 0);
 
 				if (boundaryDeviation > this._copyBoundaryTolerance) {
@@ -1654,6 +1654,8 @@ export class Conversion {
 						needsTranscode = true;
 					}
 				}
+			} else if (await this._shrinkingLeavesTooLittle(track)) {
+				needsTranscode = true;
 			}
 		}
 
@@ -2094,7 +2096,7 @@ export class Conversion {
 
 			if (startPacket) {
 				const boundaryDeviation = this._copyBoundaryPolicy === 'shrink'
-					? Math.max(startPacket.timestamp - this._startTimestamp, 0)
+					? Math.max(startPacket.timestamp - await this._getShrinkBoundaryReference(sink), 0)
 					: Math.max(this._startTimestamp - startPacket.timestamp, 0);
 
 				if (boundaryDeviation > this._copyBoundaryTolerance) {
@@ -2147,6 +2149,8 @@ export class Conversion {
 						needsTranscode = true;
 					}
 				}
+			} else if (await this._shrinkingLeavesTooLittle(track)) {
+				needsTranscode = true;
 			}
 		}
 
@@ -2465,6 +2469,30 @@ export class Conversion {
 
 		// Let's give this a generous margin
 		return Math.ceil(1.5 * packetRate * duration) + 64;
+	}
+
+	/**
+	 * Where a shrinking copy of a track should start without deviating from the trim range: at the trim start, or at
+	 * the track's first key packet if its media only begins after that, since there was nothing before it to cut away.
+	 * @internal
+	 */
+	async _getShrinkBoundaryReference(sink: EncodedPacketSink) {
+		const firstKeyPacket = await sink.getFirstKeyPacket({ verifyKeyPackets: true });
+		return Math.max(this._startTimestamp, firstKeyPacket?.timestamp ?? -Infinity);
+	}
+
+	/**
+	 * Whether a shrinking copy of a track that has no key packet left after the trim start, and would thus copy none
+	 * of the track's media in the trim range, deviates from the range by more than the boundary tolerance allows.
+	 * @internal
+	 */
+	async _shrinkingLeavesTooLittle(track: InputTrack) {
+		if (this._copyBoundaryPolicy !== 'shrink' || this._copyBoundaryTolerance === Infinity) {
+			return false;
+		}
+
+		const mediaEndTimestamp = Math.min(await this._getTrackDuration(track), this._endTimestamp);
+		return mediaEndTimestamp - this._startTimestamp > this._copyBoundaryTolerance;
 	}
 
 	/** @internal */
