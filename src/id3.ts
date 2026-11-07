@@ -168,9 +168,6 @@ export const readId3V2Header = (slice: FileSlice): Id3V2Header | null => {
 	return { majorVersion, revision, flags, size };
 };
 
-/** The frames that the date may be read from */
-const ID3_V2_DATE_FRAME_IDS = ['TDRC', 'TDRL', 'TYER', 'TYE', 'TDAT', 'TDA'];
-
 export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
 	try {
 		parseId3V2Frames(slice, header, tags);
@@ -180,9 +177,9 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 	}
 
 	// The date may also be put together after reading all frames (ID3v2.3 splits it into the year, TYER, and the day
-	// and month, TDAT), out of reach of the watch, so its frames are recorded as its sources here
+	// and month, TDAT), out of reach of the watch, so the frames it may come from are recorded as its sources here
 	if (tags.date !== undefined) {
-		for (const frameId of ID3_V2_DATE_FRAME_IDS) {
+		for (const frameId of ['TDRC', 'TDRL', 'TYER', 'TYE', 'TDAT', 'TDA']) {
 			if (tags.raw?.[frameId] !== undefined) {
 				recordRawMetadataTagFields(tags, frameId, ['date']);
 			}
