@@ -229,6 +229,20 @@ test('getPacket finds B-frames in a cluster that starts before the cluster prece
 	const backward = makeFile(cluster(0, 0), cluster(40, 40, 120, 320), cluster(240, 240, 200), cluster(280, 280, 480));
 	expect(await lookUp(backward, [0.28, 0.32])).toEqual([0.28, 0.32]);
 
+	// FFmpeg's cluster size limit cut the last GOP after its last P frame (240 ms), so the last cluster only holds the
+	// B-frame presented before it (200 ms). Once a lookup has cached that cluster, the packet presented last (as
+	// computeDuration looks it up) must still be the P frame.
+	const lastGop = makeFile(cluster(0, 0, 120, 40, 80), cluster(160, 240, 160), cluster(200, 200));
+	expect(await lookUp(lastGop, [0.2, Infinity])).toEqual([0.2, 0.24]);
+	expect(await lookUp(lastGop, [Infinity])).toEqual([0.24]);
+	{
+		using input = new Input({ source: new BufferSource(lastGop), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		await new EncodedPacketSink(track).getPacket(0.2);
+		expect(await track.computeDuration()).toBe(0.28);
+	}
+
 	// Control: the same frames, cut only in front of the P frames
 	const control = makeFile(cluster(0, 0), cluster(160, 160, 80, 40, 120));
 	expect(await lookUp(control, [0, 0.04, 0.08, 0.12, 0.16])).toEqual([0, 0.04, 0.08, 0.12, 0.16]);

@@ -278,6 +278,11 @@ const MAX_ELEMENT_NESTING_DEPTH = 64;
 // two field blocks
 const MAX_REORDER_BLOCKS = 32;
 
+/** Whether a cluster in the position cache holds a key frame presented at or before the given timestamp. */
+const holdsKeyFrameAtOrBefore = (entry: InternalTrack['clusterPositionCache'][number], timestamp: number) => {
+	return entry.firstKeyFrameTimestamp !== null && entry.firstKeyFrameTimestamp <= timestamp;
+};
+
 /** Whether the track's codec may have B-frames, so that its blocks are stored out of presentation order. */
 const trackMayReorder = (track: InternalTrack) => {
 	return track.info?.type === 'video'
@@ -2596,10 +2601,10 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					// With B-frames, a block presented after a cluster's start can sit in a cluster before it, but not
 					// one presented after a key frame (pictures can't be presented after a key frame and decoded before
 					// it), so the scan has to start at such a key frame
-					|| (mayReorder && !(
-						(clusterPositionCache[positionCacheIndex]!.firstKeyFrameTimestamp ?? Infinity)
-						<= searchTimestamp
-					))
+					|| (
+						mayReorder
+						&& !holdsKeyFrameAtOrBefore(clusterPositionCache[positionCacheIndex]!, searchTimestamp)
+					)
 				)
 			) {
 				positionCacheIndex--;
