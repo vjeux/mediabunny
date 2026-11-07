@@ -33,6 +33,11 @@ export default async function inlineWorker(scriptText) {
 		const blob = new Blob([scriptText], { type: "text/javascript" });
 		const url = URL.createObjectURL(blob);
 		const worker = new Worker(url, { type: typeof Deno !== 'undefined' ? 'module' : undefined }); // module for Deno
+		if (typeof Deno === 'undefined') {
+			// The Worker constructor has resolved the URL already, and a registered URL would keep the script in
+			// memory for as long as the page lives. Deno only loads the script later, so its URL must stay.
+			URL.revokeObjectURL(url);
+		}
 		return worker;
 	} else {
 		// Node, Bun (Bun's Worker is flaky, worker_threads works much better)
