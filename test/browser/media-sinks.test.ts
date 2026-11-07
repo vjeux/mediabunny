@@ -417,6 +417,31 @@ test('Decoded audio stays contiguous across packets that share a timestamp', asy
 	}
 });
 
+test('Decoded audio stays contiguous when a packet is stamped like the one after it', async () => {
+	// Like Chromium's front-discard.mp4, where a zero-duration packet shares the next one's timestamp: no audio is
+	// missing, so this must not open a gap (found by lane L15)
+	let packetTimestamps: number[];
+	{
+		using original = await remuxDemoAudio(timestamp => timestamp);
+		const originalTrack = await original.getPrimaryAudioTrack();
+		assert(originalTrack);
+		packetTimestamps = await getPacketTimestamps(originalTrack);
+	}
+
+	using input = await remuxDemoAudio((timestamp, index) => index === 20 ? packetTimestamps[21]! : timestamp);
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	let previousEnd: number | null = null;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		if (previousEnd !== null) {
+			expect(sample.timestamp).toBeCloseTo(previousEnd, 4);
+		}
+
+		previousEnd = sample.timestamp + sample.duration;
+	}
+});
+
 test('Decoded audio stays in order when a packet decodes to nothing', async () => {
 	await withDroppedAudioOutput(10, async () => {
 		using input = new Input({
