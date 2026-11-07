@@ -142,6 +142,48 @@ test('Read and write metadata, MP4', async () => {
 	expect(readTags.raw!['©hog']).toBe('pish');
 });
 
+test('MP4 cover art whose data type disagrees with the image', async () => {
+	// Taggers get the type wrong: mutagen's MP4Cover, for one, writes PNG images with the JPEG type unless told
+	// otherwise. Like in FFmpeg, the image's signature decides.
+	const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+	const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+	const readCoverMimeType = async (image: Uint8Array, mimeType: string, typeIndicator: number) => {
+		const output = new Output({
+			format: new Mp4OutputFormat(),
+			target: new BufferTarget(),
+		});
+		output.setMetadataTags({ images: [{ data: image, mimeType, kind: 'coverFront' }] });
+		const dummyTrack = createDummyAudioTrack('aac', output);
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+
+		// Rewrite the last byte of the type indicator, after the covr box's name and its data box's size and name
+		const bytes = new Uint8Array(output.target.buffer!);
+		const covr = bytes.findIndex((_, i) => [0x63, 0x6f, 0x76, 0x72].every((byte, j) => bytes[i + j] === byte));
+		expect(bytes[covr + 4 + 4 + 4 + 3]).toBe(mimeType === 'image/png' ? 14 : 13);
+		bytes[covr + 4 + 4 + 4 + 3] = typeIndicator;
+
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+		const images = (await input.getMetadataTags()).images!;
+		expect(images).toHaveLength(1);
+		expect(images[0]!.data).toEqual(image);
+
+		return images[0]!.mimeType;
+	};
+
+	expect(await readCoverMimeType(png, 'image/png', 13)).toBe('image/png');
+	expect(await readCoverMimeType(jpeg, 'image/jpeg', 14)).toBe('image/jpeg');
+	expect(await readCoverMimeType(png, 'image/png', 14)).toBe('image/png');
+	expect(await readCoverMimeType(jpeg, 'image/jpeg', 13)).toBe('image/jpeg');
+	// Neither signature, so the type decides
+	expect(await readCoverMimeType(coverArt, 'image/jpeg', 14)).toBe('image/png');
+	expect(await readCoverMimeType(coverArt, 'image/jpeg', 13)).toBe('image/jpeg');
+});
+
 test('Read and write metadata, QuickTime', async () => {
 	const output = new Output({
 		format: new MovOutputFormat(),
