@@ -72,6 +72,11 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
+		if ((codec === 'avc' || codec === 'hevc') && (config.width % 2 === 1 || config.height % 2 === 1)) {
+			// AVC and HEVC are encoded as 4:2:0, which libx264, libx265 and hardware encoders need even dimensions for
+			return false;
+		}
+
 		if (config.bitrateMode === 'quantizer') {
 			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 		}
