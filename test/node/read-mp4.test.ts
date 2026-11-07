@@ -309,3 +309,41 @@ test('Video tracks whose samples are all sync samples only have key packets', as
 	// The metadata of fragmented files doesn't say, so it's up to the codec, as before
 	expect((await read(['key', 'key', 'key', 'key'], 'fragmented')).hasOnlyKeyPackets).toBe(false);
 });
+
+test('An invalid stss entry of 0 does not make a video track only have key packets', async () => {
+	// Ten samples, all key frames but the last, with an extra stss entry 0 (entries are 1-based)
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+	for (let i = 0; i < 10; i++) {
+		await source.add(new EncodedPacket(new Uint8Array([i, 1, 2, 3]), i < 9 ? 'key' : 'delta', i / 10, 1 / 10), {
+			decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+		});
+	}
+	await output.finalize();
+
+	// Insert the entry, growing stss and its ancestors by 4 bytes. The moov box comes last, so no offsets change.
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = new DataView(bytes.buffer);
+	const findBox = (name: string) => bytes.findIndex(
+		(_, i) => new TextDecoder().decode(bytes.subarray(i + 4, i + 8)) === name,
+	);
+	const stss = findBox('stss');
+	const damaged = new Uint8Array([...bytes.subarray(0, stss + 16), 0, 0, 0, 0, ...bytes.subarray(stss + 16)]);
+	const damagedView = new DataView(damaged.buffer);
+	damagedView.setUint32(stss + 12, view.getUint32(stss + 12) + 1); // Entry count
+	for (const name of ['stss', 'stbl', 'minf', 'mdia', 'trak', 'moov']) {
+		const position = findBox(name);
+		damagedView.setUint32(position, view.getUint32(position) + 4);
+	}
+
+	using input = new Input({ source: new BufferSource(damaged), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+	let keyPacketCount = 0;
+	for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+		keyPacketCount += packet.type === 'key' ? 1 : 0;
+	}
+	expect(keyPacketCount).toBe(9);
+	expect(await track.hasOnlyKeyPackets()).toBe(false);
+});

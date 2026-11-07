@@ -3755,16 +3755,16 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 			return true; // Without an stss box, every sample is a sync sample (ISO/IEC 14496-12 8.6.2.1)
 		}
 
-		// Whether the stss box lists every sample (the list is sorted)
-		let listedCount = 0;
-		for (let i = 0; i < keySampleIndices.length; i++) {
-			const sampleIndex = keySampleIndices[i]!;
-			if (sampleIndex >= 0 && sampleIndex < sampleCount && sampleIndex !== keySampleIndices[i - 1]) {
-				listedCount++;
+		// Whether the stss box lists every sample. Invalid entries can leave the list unsorted (see the stss box), so
+		// count the distinct valid ones.
+		const listedSampleIndices = new Set<number>();
+		for (const sampleIndex of keySampleIndices) {
+			if (sampleIndex >= 0 && sampleIndex < sampleCount) {
+				listedSampleIndices.add(sampleIndex);
 			}
 		}
 
-		return listedCount === sampleCount;
+		return listedSampleIndices.size === sampleCount;
 	}
 
 	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
