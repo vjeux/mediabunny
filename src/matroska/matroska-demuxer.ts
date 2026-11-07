@@ -46,6 +46,7 @@ import {
 	colorSpaceIsComplete,
 	EMPTY_COLOR_SPACE,
 	findLastIndex,
+	bcp47ToIso639Dash2LanguageCode,
 	isIso639Dash2LanguageCode,
 	isThenable,
 	last,
@@ -1454,19 +1455,10 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.LanguageBCP47: {
 				if (!this.currentTrack) break;
 
-				const bcp47 = readAsciiString(slice, size);
-				const languageSubtag = bcp47.split('-')[0];
-
-				if (languageSubtag) {
-					// Technically invalid, for now: The language subtag might be a language code from ISO 639-1,
-					// ISO 639-2, ISO 639-3, ISO 639-5 or some other thing (source: Wikipedia). But, `languageCode` is
-					// documented as ISO 639-2. Changing the definition would be a breaking change. This will get
-					// cleaned up in the future by defining languageCode to be BCP 47 instead.
-					this.currentTrack.languageCode = languageSubtag;
-				} else {
-					this.currentTrack.languageCode = UNDETERMINED_LANGUAGE;
-				}
-
+				// `languageCode` is documented as ISO 639-2, while BCP 47 uses the two-letter ISO 639-1 codes where
+				// they exist: mkvmerge writes LanguageBCP47 "en" next to Language "eng", for example. (This will get
+				// cleaned up in the future by defining languageCode to be BCP 47 instead.)
+				this.currentTrack.languageCode = bcp47ToIso639Dash2LanguageCode(readAsciiString(slice, size));
 				this.currentTrack.hasLanguageBcp47 = true;
 			}; break;
 
