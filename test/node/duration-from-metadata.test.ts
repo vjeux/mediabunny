@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_FORMATS, Input, FilePathSource } from '../../src/index.js';
+import { ALL_FORMATS, BufferSource, Input, FilePathSource } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -126,4 +126,35 @@ test('MP3 duration metadata', async () => {
 	const audioTrack = await input.getPrimaryAudioTrack();
 	assert(audioTrack);
 	expect(await audioTrack.getDurationFromMetadata()).toBe(expectedDuration);
+});
+
+test('MP3 priming from an iTunes gapless comment', async () => {
+	// Apple's encoders write no LAME tag, but an iTunSMPB comment holding the priming (including the decoder delay),
+	// the end padding and the sample count, in hex
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const comment = [
+		0, // ISO-8859-1
+		...ascii('eng'),
+		...ascii('iTunSMPB'), 0,
+		...ascii(' 00000000 00000210 000003E0 0000000000002710'),
+	];
+	const frame = [...ascii('COMM'), 0, 0, 0, comment.length, 0, 0, ...comment];
+	const tag = [...ascii('ID3'), 3, 0, 0, 0, 0, 0, frame.length, ...frame];
+
+	// 10 silent MPEG-1 Layer III frames, 128 kbps at 44.1 kHz
+	const bytes = new Uint8Array(tag.length + 10 * 417);
+	bytes.set(tag);
+	for (let i = 0; i < 10; i++) {
+		bytes.set([0xff, 0xfb, 0x90, 0x00], tag.length + i * 417);
+	}
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	expect(await audioTrack.getFirstTimestamp()).toBe(-528 / 44100);
+	expect(await input.computeDuration()).toBe((10 * 1152 - 528) / 44100);
 });
