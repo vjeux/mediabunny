@@ -17,6 +17,14 @@ import { sendCommand, refWorker, unrefWorker } from './worker-client';
 import { assert } from './shared';
 import { AC3_SAMPLE_RATES, EAC3_REDUCED_SAMPLE_RATES } from '../../../shared/ac3-misc';
 
+/**
+ * The lowest bitrate for each channel count at which FFmpeg's bit allocation fits full-scale square and sawtooth waves,
+ * about the hardest signals for it: below that, it fails the encode for them. Each is the lowest AC-3 bitrate at least
+ * 16 kbps above the highest one that failed in measurements, so AC-3's rounding to the closest valid bitrate can't
+ * take a bitrate below it. Mono works at any bitrate, and FFmpeg can't encode more than 6 channels.
+ */
+const MIN_BITRATES: Record<number, number> = { 2: 56000, 3: 56000, 4: 80000, 5: 96000, 6: 96000 };
+
 class Ac3Encoder extends CustomAudioEncoder {
 	private ctx = 0;
 	private encoderFrameSize = 0;
@@ -38,7 +46,8 @@ class Ac3Encoder extends CustomAudioEncoder {
 			&& config.numberOfChannels >= 1
 			&& config.numberOfChannels <= 8
 			&& sampleRates.includes(config.sampleRate)
-			&& config.bitrate !== undefined;
+			&& config.bitrate !== undefined
+			&& config.bitrate >= (MIN_BITRATES[config.numberOfChannels] ?? 0);
 	}
 
 	async init() {

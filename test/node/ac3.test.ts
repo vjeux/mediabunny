@@ -16,6 +16,7 @@ import { Mp4OutputFormat } from '../../src/output-format.js';
 import { AudioSample } from '../../src/sample.js';
 import { registerAc3Decoder, registerAc3Encoder } from '@mediabunny/ac3';
 import { assert } from '../../src/misc.js';
+import { canEncodeAudio } from '../../src/encode.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -390,6 +391,78 @@ test('AC-3 with huge timestamps', async () => {
 	assert(firstSample);
 
 	expect(firstSample.timestamp).toBe(timestamp - primingDelay);
+});
+
+test('AC-3 and E-AC-3 only claim bitrates they can encode', { timeout: 60_000 }, async () => {
+	registerAc3Encoder();
+
+	// Full-scale square and sawtooth waves are about the hardest signals for FFmpeg's bit allocation, which fails the
+	// encode when even its coarsest allocation doesn't fit into the bitrate
+	const SIGNALS = {
+		square220: (t: number) => (220 * t) % 1 < 0.5 ? 1 : -1,
+		square550: (t: number) => (550 * t) % 1 < 0.5 ? 1 : -1,
+		saw330: (t: number) => 2 * ((330 * t) % 1) - 1,
+	};
+	const createSignal = (signal: (t: number) => number, sampleRate: number, channels: number) => {
+		const data = new Float32Array(sampleRate / 2 * channels);
+		for (let i = 0; i < sampleRate / 2; i++) {
+			for (let ch = 0; ch < channels; ch++) {
+				data[i * channels + ch] = signal(i * (1 + 0.01 * ch) / sampleRate); // Slightly detuned per channel
+			}
+		}
+		return data;
+	};
+
+	let encodable = 0;
+	const failures: string[] = [];
+	for (const codec of ['ac3', 'eac3'] as const) {
+		for (const sampleRate of [44100, 48000]) {
+			for (let channels = 1; channels <= 6; channels++) {
+				for (const bitrate of [32000, 40000, 48000, 64000, 80000, 96000]) {
+					const quality = new Quality({ bitrate });
+					if (!(await canEncodeAudio(codec, { numberOfChannels: channels, sampleRate, quality }))) {
+						continue;
+					}
+
+					for (const [name, signal] of Object.entries(SIGNALS)) {
+						encodable++;
+						const output = new Output({
+							format: new Mp4OutputFormat(),
+							target: new BufferTarget(),
+						});
+						const audioSource = new AudioSampleSource({ codec, quality });
+						output.addAudioTrack(audioSource);
+
+						const sample = new AudioSample({
+							data: createSignal(signal, sampleRate, channels),
+							format: 'f32',
+							numberOfChannels: channels,
+							sampleRate,
+							timestamp: 0,
+						});
+						try {
+							await output.start();
+							await audioSource.add(sample);
+							await output.finalize();
+						} catch (error) {
+							failures.push(`${codec} ${sampleRate} ${channels} ch ${bitrate} ${name}: ${String(error)}`);
+							await output.cancel();
+						}
+						sample.close();
+					}
+				}
+			}
+		}
+	}
+
+	expect(failures).toEqual([]);
+	expect(encodable).toBeGreaterThan(100);
+
+	const options = (numberOfChannels: number, bitrate: number) => {
+		return { numberOfChannels, sampleRate: 48000, quality: new Quality({ bitrate }) };
+	};
+	expect(await canEncodeAudio('eac3', options(6, 192000))).toBe(true);
+	expect(await canEncodeAudio('ac3', options(2, 32000))).toBe(false);
 });
 
 test('E-AC-3 with huge timestamps', async () => {
