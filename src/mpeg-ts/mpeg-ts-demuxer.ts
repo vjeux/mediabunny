@@ -153,6 +153,13 @@ type ElementaryStream = {
 	 * byte offset and PTS.
 	 */
 	referencePesPackets: TimestampedPesPacketHeader[];
+	/**
+	 * Stretches of video packets that are dropped (by sequence number, end exclusive): from a frame that lost data up
+	 * to the next key frame, as far as they've been read
+	 */
+	droppedRanges: { start: number; end: number }[];
+	/** Whether a frame that lost data takes the frames up to the next key frame with it (see supplyPacket) */
+	dropsRestOfGop: boolean | null;
 };
 
 type ElementaryVideoStream = ElementaryStream & { info: { type: 'video' } };
@@ -575,6 +582,8 @@ export class MpegTsDemuxer extends Demuxer {
 								canBeTrustedWithKeyPackets: false,
 								info,
 								referencePesPackets: [],
+								droppedRanges: [],
+								dropsRestOfGop: null,
 							});
 						}
 					}
@@ -1783,24 +1792,22 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				}
 			}
 
-			// Rewind by reorderSize + 1 PES packets (even for audio! To ensure proper durations)
-			outer:
-			for (let i = 0; i < reorderSize + 1; i++) {
-				let pos = currentPesHeader.sectionStartPos - demuxer.packetStride;
+			let startPesHeader: TimestampedPesPacketHeader = currentPesHeader;
 
-				while (pos >= demuxer.packetOffset) {
+			/** The PES packet with a PTS before the given one, if there is one. */
+			const getPreviousPesHeader = async (header: TimestampedPesPacketHeader) => {
+				for (let pos = header.sectionStartPos - demuxer.packetStride; pos >= demuxer.packetOffset;) {
 					const packetHeader = await demuxer.readPacketHeader(pos);
 					if (!packetHeader) {
-						break outer;
+						return null;
 					}
 
 					if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
 						const section = await demuxer.readSection(pos, false);
 						if (section) {
-							const header = readPesPacketHeader(demuxer, section, false);
-							if (header && header.pts !== null) {
-								currentPesHeader = header as TimestampedPesPacketHeader;
-								break;
+							const previousHeader = readPesPacketHeader(demuxer, section, false);
+							if (previousHeader && previousHeader.pts !== null) {
+								return previousHeader as TimestampedPesPacketHeader;
 							}
 						}
 					}
@@ -1808,12 +1815,49 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					pos -= demuxer.packetStride;
 				}
 
-				if (pos < demuxer.packetOffset) {
-					break; // We've hit the start of the file, there's nothing more to rewind
+				return null; // We've hit the start of the file, there's nothing more to rewind
+			};
+
+			// Rewind by reorderSize + 1 PES packets (even for audio! To ensure proper durations)
+			const rewind = async () => {
+				for (let i = 0; i < reorderSize + 1; i++) {
+					const previousHeader = await getPreviousPesHeader(startPesHeader);
+					if (!previousHeader) {
+						break;
+					}
+
+					startPesHeader = previousHeader;
+				}
+			};
+			await rewind();
+
+			// Inside a stretch of dropped video packets, the packet we're looking for comes before it
+			while (true) {
+				const startPos = startPesHeader.sectionStartPos;
+				const droppedRange = this.elementaryStream.droppedRanges.find(
+					x => x.start <= startPos && startPos < x.end,
+				);
+				if (!droppedRange) {
+					break;
+				}
+
+				while (startPesHeader.sectionStartPos > droppedRange.start) {
+					const previousHeader = await getPreviousPesHeader(startPesHeader);
+					if (!previousHeader) {
+						break;
+					}
+
+					startPesHeader = previousHeader;
+				}
+
+				const rewoundFrom = startPesHeader.sectionStartPos;
+				await rewind();
+				if (startPesHeader.sectionStartPos === rewoundFrom) {
+					break; // The start of the file
 				}
 			}
 
-			return retrieveEncodedPacket(currentPesHeader.sectionStartPos, p => p.pts <= searchPts);
+			return retrieveEncodedPacket(startPesHeader.sectionStartPos, p => p.pts <= searchPts);
 		} else {
 			// Key packet lookup case. Slightly harder since the starting chunk may not have a key packet at all, which
 			// means we might need to search the previous chunks until we find something.
@@ -2159,6 +2203,8 @@ class PacketReadingContext {
 	holes: number[] = [];
 	/** Whether the last packet found was skipped since data is missing in it */
 	skippedPacket = false;
+	/** The stretch of video packets being dropped, up to the next key frame */
+	droppedRange: { start: number; end: number } | null = null;
 
 	suppliedPacket: SuppliedPacket | null = null;
 
@@ -2167,6 +2213,10 @@ class PacketReadingContext {
 		this.pid = elementaryStream.pid;
 		this.demuxer = elementaryStream.demuxer;
 		this.startingPesPacket = startingPesPacket;
+
+		// Starting inside a stretch of dropped packets, like a lookup after a loss, keeps dropping them
+		const startPos = startingPesPacket.sectionStartPos;
+		this.droppedRange = elementaryStream.droppedRanges.find(x => x.start <= startPos && startPos < x.end) ?? null;
 	}
 
 	ensureBuffered(length: number) {
@@ -2796,12 +2846,9 @@ class PacketReadingContext {
 		const hole = this.holes.length > 0
 			? this.holes.find(x => x > this.currentPos && x <= packetEndPos)
 			: undefined;
-		if (hole !== undefined) {
-			this.readBytes((this.elementaryStream.info.type === 'video' ? packetEndPos : hole) - this.currentPos);
-			this.holes = this.holes.filter(x => x > this.currentPos);
-			this.pesPackets.splice(0, this.currentPesPacketIndex);
-			this.currentPesPacketIndex = 0;
-			this.skippedPacket = true;
+		if (hole !== undefined && this.elementaryStream.info.type === 'audio') {
+			this.readBytes(hole - this.currentPos);
+			this.skipPacket();
 			return;
 		}
 
@@ -2831,6 +2878,42 @@ class PacketReadingContext {
 			}
 		}
 
+		if (this.elementaryStream.info.type === 'video' && hole !== undefined && !this.dropsRestOfGop()) {
+			this.skipPacket(); // Just this frame
+			return;
+		}
+
+		if (
+			this.elementaryStream.info.type === 'video'
+			&& (hole !== undefined || (this.droppedRange && randomAccessIndicator !== 1))
+		) {
+			// The frames after one that lost data can refer to it, and with WebCodecs, a frame whose reference is
+			// missing can make the decoder fail just like a damaged one. So drop every frame up to the next key frame,
+			// and remember that for the contexts that start in between.
+			const endSequenceNumber = this.getCurrentPesPacket().sectionStartPos
+				+ (this.currentPos - this.currentPesPacketPos);
+			if (this.droppedRange) {
+				this.droppedRange.end = Math.max(this.droppedRange.end, endSequenceNumber);
+			} else {
+				const ranges = this.elementaryStream.droppedRanges;
+				this.droppedRange = ranges.find(x => x.start <= sequenceNumber && sequenceNumber <= x.end) ?? null;
+				if (this.droppedRange) {
+					this.droppedRange.end = Math.max(this.droppedRange.end, endSequenceNumber);
+				} else {
+					this.droppedRange = { start: sequenceNumber, end: endSequenceNumber };
+					ranges.splice(
+						binarySearchLessOrEqual(ranges, sequenceNumber, x => x.start) + 1,
+						0,
+						this.droppedRange,
+					);
+				}
+			}
+
+			this.skipPacket();
+			return;
+		}
+
+		this.droppedRange = null;
 		this.suppliedPacket = {
 			pts,
 			data,
@@ -2844,6 +2927,36 @@ class PacketReadingContext {
 		if (this.holes.length > 0) {
 			this.holes = this.holes.filter(x => x > this.currentPos);
 		}
+	}
+
+	/**
+	 * Whether the frames after one that lost data, up to the next key frame, are dropped too. That's needed where
+	 * frames can refer to frames that come later (B-frames): WebCodecs decoders in Chromium fail on such a frame when
+	 * its reference is missing. AVC streams without reordering (P-frames only) only lose the damaged frames, which
+	 * decoders handle like a gap in frame_num.
+	 */
+	dropsRestOfGop() {
+		const stream = this.elementaryStream;
+		if (stream.dropsRestOfGop === null) {
+			if (stream.info.type !== 'video' || stream.info.codec !== 'avc' || !stream.info.avcCodecInfo) {
+				return true; // Without knowing more, stay on the safe side
+			}
+
+			const spsUnit = stream.info.avcCodecInfo.sequenceParameterSets[0];
+			const spsInfo = spsUnit ? parseAvcSps(spsUnit) : null;
+			// Baseline has no B-slices
+			stream.dropsRestOfGop = !spsInfo || (spsInfo.numReorderFrames > 0 && spsInfo.profileIdc !== 66);
+		}
+
+		return stream.dropsRestOfGop;
+	}
+
+	/** Moves on from a packet that is left out. */
+	skipPacket() {
+		this.holes = this.holes.filter(x => x > this.currentPos);
+		this.pesPackets.splice(0, this.currentPesPacketIndex);
+		this.currentPesPacketIndex = 0;
+		this.skippedPacket = true;
 	}
 }
 
