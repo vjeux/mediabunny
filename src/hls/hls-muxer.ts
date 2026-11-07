@@ -47,6 +47,18 @@ import { HLS_MIME_TYPE, TIMESTAMP_PRIV_OWNER } from './hls-misc';
 import { secondsToMpegTsTimestamp } from '../mpeg-ts/mpeg-ts-misc';
 import type { IsobmffMuxer } from '../isobmff/isobmff-muxer';
 
+/** The VIDEO-RANGE of video with the given decoder config (draft-pantos-hls-rfc8216bis, Section 4.4.6.2). */
+const getVideoRange = (decoderConfig: VideoDecoderConfig) => {
+	const transfer = decoderConfig.colorSpace?.transfer as string | null | undefined;
+	if (transfer === 'pq') {
+		return 'PQ';
+	} else if (transfer === 'hlg') {
+		return 'HLG';
+	} else {
+		return 'SDR';
+	}
+};
+
 // Maps from WebCodecs to what HLS wants
 const toHlsCodecString = (codecString: string, segmentFormat: OutputFormat) => {
 	if (codecString === 'opus') {
@@ -1490,6 +1502,11 @@ export class HlsMuxer extends Muxer {
 		let groupIdTrackCount = 0;
 		let hasHadDefaultTrackInGroup = false;
 
+		// "Its absence implies a value of SDR", and Apple requires it unless all variants are SDR
+		const writeVideoRange = this.trackDatas.some(
+			x => x.info.type === 'video' && getVideoRange(x.info.decoderConfig) !== 'SDR',
+		);
+
 		for (const decl of this.playlistDeclarations) {
 			if (decl.groupId === null) {
 				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
@@ -1567,6 +1584,10 @@ export class HlsMuxer extends Muxer {
 					if (!isKeyPacketsOnly && videoTrack.metadata.frameRate !== undefined) {
 						// Spec requires that frame rate be rounded to 3 decimal places
 						masterPlaylistText += `,FRAME-RATE=${+videoTrack.metadata.frameRate.toFixed(3)}`;
+					}
+
+					if (writeVideoRange && decoderConfig) {
+						masterPlaylistText += `,VIDEO-RANGE=${getVideoRange(decoderConfig)}`;
 					}
 				}
 
