@@ -294,7 +294,9 @@ describe('MPEG-TS muxer: transport stream structure', () => {
 
 	test('resolves the MIME type with the tracks\' codec strings', async () => {
 		const { mimeType } = await mux([avcTrack(2), aacTrack(2)]);
-		expect(mimeType).toBe('video/MP2T; codecs="avc1.42c00a, mp4a.40.2"');
+		// MIME types are case-insensitive, their parameters aren't
+		const lowerCaseType = mimeType.replace(/^[^;]+/, type => type.toLowerCase());
+		expect(lowerCaseType).toBe('video/mp2t; codecs="avc1.42c00a, mp4a.40.2"');
 	});
 });
 
