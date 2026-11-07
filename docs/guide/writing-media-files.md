@@ -65,14 +65,14 @@ output.addAudioTrack(audioSourceEng, {
 	disposition: { commentary: true }, // Sets additional flags in the file
 });
 output.addAudioTrack(audioSourceGer, {
-	languageCode: 'ger',
+	languageCode: 'deu',
 });
 
 // This adds multiple subtitle tracks, all for different languages.
 output.addSubtitleTrack(subtitleSourceEng, { languageCode: 'eng' });
-output.addSubtitleTrack(subtitleSourceGer, { languageCode: 'ger' });
+output.addSubtitleTrack(subtitleSourceGer, { languageCode: 'deu' });
 output.addSubtitleTrack(subtitleSourceSpa, { languageCode: 'spa' });
-output.addSubtitleTrack(subtitleSourceFre, { languageCode: 'fre' });
+output.addSubtitleTrack(subtitleSourceFre, { languageCode: 'fra' });
 output.addSubtitleTrack(subtitleSourceIta, { languageCode: 'ita' });
 ```
 
@@ -217,7 +217,7 @@ audioStreamTrack.stop(); // Stops capturing the user's microphone
 
 await output.finalize();
 
-const file = output.target.buffer; // => Uint8Array
+const file = output.target.buffer; // => ArrayBuffer
 ```
 
 ---
