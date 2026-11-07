@@ -447,8 +447,12 @@ export class IsobmffDemuxer extends Demuxer {
 							&& track.info.codec === 'aac'
 						) {
 							// Without an edit list, iTunes-style files only declare the encoder delay in iTunSMPB,
-							// which FFmpeg applies just like an edit list's media time
-							track.editListOffset = this.iTunesPriming;
+							// which FFmpeg applies just like an edit list's media time. It counts output samples, which
+							// for HE-AAC are at twice the rate of the core coder that the media timescale may follow.
+							const outputSampleRate = track.info.sampleRate > 0
+								? track.info.sampleRate
+								: track.timescale;
+							track.editListOffset = Math.round(this.iTunesPriming * track.timescale / outputSampleRate);
 						}
 					}
 

@@ -283,13 +283,13 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
 	};
 	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
-	// ES_Descriptor > DecoderConfigDescriptor (AAC) > AudioSpecificConfig (AAC-LC, 44100 Hz, stereo), SLConfig
-	const esds = box(
+	// ES_Descriptor > DecoderConfigDescriptor (AAC) > AudioSpecificConfig, SLConfig
+	const esds = (audioSpecificConfig: number[]) => box(
 		'esds',
 		zeros(4),
-		[3, 25, 0, 1, 0],
-		[4, 17, 0x40, 0x15, ...zeros(11)],
-		[5, 2, 0x12, 0x10],
+		[3, 23 + audioSpecificConfig.length, 0, 1, 0],
+		[4, 15 + audioSpecificConfig.length, 0x40, 0x15, ...zeros(11)],
+		[5, audioSpecificConfig.length, ...audioSpecificConfig],
 		[6, 1, 2],
 	);
 	const smpb = ' 00000000 00000840 00000338 0000000000015888 00000000 00000000 00000000 00000000';
@@ -298,18 +298,23 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 			box('data', u32(1), u32(0), ascii(smpb))),
 	)));
 
-	const build = (edts: number[]) => {
+	// HE-AAC: the media timescale may follow the core coder, at half the output sample rate
+	const build = (edts: number[], heAac = false) => {
+		const timescale = heAac ? 22050 : 44100;
+		const audioSpecificConfig = heAac
+			? [0x2b, 0x92, 0x08, 0x00] // Explicit SBR, 22050 Hz core, 44100 Hz output, stereo
+			: [0x12, 0x10]; // AAC-LC, 44100 Hz, stereo
 		const moov = (chunkOffset: number) => box('moov',
 			box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
 			box('trak',
 				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
 				edts,
 				box('mdia',
-					box('mdhd', zeros(12), u32(44100), u32(4096), [0x55, 0xc4, 0, 0]),
+					box('mdhd', zeros(12), u32(timescale), u32(4096), [0x55, 0xc4, 0, 0]),
 					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
 					box('minf', box('stbl',
 						box('stsd', u32(0), u32(1), box('mp4a', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4),
-							u32(44100 * 0x10000), esds)),
+							u32(timescale * 0x10000), esds(audioSpecificConfig))),
 						box('stts', u32(0), u32(1), u32(4), u32(1024)),
 						box('stsc', u32(0), u32(1), u32(1), u32(4), u32(1)),
 						box('stsz', u32(0), u32(10), u32(4)),
@@ -330,6 +335,8 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 	};
 
 	expect(await firstTimestamp(build([]))).toBeCloseTo(-2112 / 44100, 12);
+	// iTunSMPB counts output samples
+	expect(await firstTimestamp(build([], true))).toBeCloseTo(-2112 / 44100, 12);
 
 	// An edit list takes precedence over iTunSMPB
 	const edts = box('edts', box('elst', zeros(4), u32(1), u32(4096 - 1024), u32(1024), u32(0x10000)));
