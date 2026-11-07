@@ -744,7 +744,8 @@ describe('Output', () => {
 			[() => new Mp4OutputFormat(), /^video\/mp4; codecs="avc1\.[0-9a-f]{6}, mp4a\.40\.2"$/],
 			[() => new MovOutputFormat(), /^video\/quicktime; codecs="avc1\.[0-9a-f]{6}, mp4a\.40\.2"$/],
 			[() => new MkvOutputFormat(), /^video\/x-matroska; codecs="avc1\.[0-9a-f]{6}, mp4a\.40\.2"$/],
-			[() => new MpegTsOutputFormat(), /^video\/MP2T; codecs="avc1\.[0-9a-f]{6}, mp4a\.40\.2"$/],
+			// MIME types are case-insensitive (RFC 2045), and both spellings of this one are in use
+			[() => new MpegTsOutputFormat(), /^video\/(?:MP2T|mp2t); codecs="avc1\.[0-9a-f]{6}, mp4a\.40\.2"$/],
 		];
 
 		for (const [createFormat, mimeType] of cases) {
