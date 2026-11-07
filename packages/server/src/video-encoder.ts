@@ -206,6 +206,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			if (isRealtime) {
 				codecContext.setOption('cpu-used', '8');
+				// libvpx otherwise holds back 25 frames to look for alternate reference frames
+				codecContext.setOption('lag-in-frames', '0');
 			} else {
 				codecContext.setOption('cpu-used', '5');
 			}
@@ -216,6 +218,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			if (isRealtime) {
 				codecContext.setOption('preset', '12');
+				// The default random access prediction structure holds back dozens of frames, the low-delay one none.
+				// It can't do variable bitrate, so bitrates are kept constant.
+				codecContext.setOption(
+					'svtav1-params',
+					this.config.bitrateMode === 'quantizer' ? 'pred-struct=1' : 'pred-struct=1:rc=2',
+				);
 			}
 		} else if (this.avCodec.name === 'h264_nvenc') {
 			// When we force a key frame, we want a true IDR frame, not just an I frame
