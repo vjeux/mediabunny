@@ -1484,13 +1484,44 @@ export class HlsMuxer extends Muxer {
 		let groupIdTrackCount = 0;
 		let hasHadDefaultTrackInGroup = false;
 
+		// A variant without segments can't be played (and players often start with the cheapest variant), so it's left
+		// out if another variant has segments, unless it's the only way to reach a rendition that has some (an I-frame
+		// stream, for one, can't carry audio renditions)
+		const variantsWithSegments = this.playlistDeclarations.filter(
+			x => x.groupId === null && x.playlist.writtenSegments.length > 0,
+		);
+		// A rendition without URI lives in its variant's own playlist. When that playlist is empty and the variant is
+		// written as a variant of another rendition (see below), the rendition would stand for that other rendition's
+		// media, so it's left out: it holds nothing
+		const isEmptyRenditionInVariantPlaylist = (decl: PlaylistDeclaration) => decl.noUri
+			&& decl.playlist.writtenSegments.length === 0
+			&& this.playlistDeclarations.some(
+				x => x.groupId === decl.groupId && x.playlist.writtenSegments.length > 0,
+			);
+		const isLeftOut = (decl: PlaylistDeclaration) => variantsWithSegments.length > 0
+			&& decl.playlist.writtenSegments.length === 0
+			&& !decl.references.some(ref => ref.playlist.writtenSegments.length > 0
+				&& !variantsWithSegments.some(x => x.references.includes(ref)));
+
 		for (const decl of this.playlistDeclarations) {
 			if (decl.groupId === null) {
+				if (isLeftOut(decl)) {
+					continue;
+				}
+
 				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
 					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
+				// A variant kept only for its renditions (its own playlist has no segments) is written as a variant of
+				// one of those renditions, so that no #EXT-X-STREAM-INF points to an empty playlist (which the reader
+				// could then take as its reference, and which wouldn't present the same content as the other variants)
+				const renditionWithSegments = decl.playlist.writtenSegments.length === 0
+					? decl.references.find(ref => ref.playlist.writtenSegments.length > 0) ?? null
+					: null;
+				const ownTracks = renditionWithSegments ? [] : decl.playlist.tracks;
+
 				const codecs: string[] = [];
-				for (const track of decl.playlist.tracks) {
+				for (const track of ownTracks) {
 					const trackData = this.trackDatas.find(x => x.track === track);
 					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
 					codecs.push(toHlsCodecString(codecString));
@@ -1500,13 +1531,17 @@ export class HlsMuxer extends Muxer {
 				let maxRefAverageBitrate = 0;
 
 				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
+					const firstRef = renditionWithSegments ?? decl.references[0]!;
 					const firstTrack = firstRef.playlist.tracks[0]!;
 					const trackData = this.trackDatas.find(x => x.track === firstTrack);
 					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
 					codecs.push(toHlsCodecString(codecString));
 
 					for (const ref of decl.references) {
+						if (renditionWithSegments && ref.playlist.writtenSegments.length === 0) {
+							continue;
+						}
+
 						assert(ref.playlist.peakBitrate !== null);
 						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
 						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
@@ -1514,8 +1549,10 @@ export class HlsMuxer extends Muxer {
 				}
 
 				assert(decl.playlist.peakBitrate !== null);
-				const totalPeakBitrate = decl.playlist.peakBitrate + peakDeclBitrate;
-				const totalAverageBitrate = (decl.playlist.averageBitrate ?? 0) + maxRefAverageBitrate;
+				const ownPeakBitrate = renditionWithSegments ? 0 : decl.playlist.peakBitrate;
+				const ownAverageBitrate = renditionWithSegments ? 0 : decl.playlist.averageBitrate ?? 0;
+				const totalPeakBitrate = ownPeakBitrate + peakDeclBitrate;
+				const totalAverageBitrate = ownAverageBitrate + maxRefAverageBitrate;
 
 				if (!firstVariantWritten) {
 					masterPlaylistText += '\n';
@@ -1536,7 +1573,7 @@ export class HlsMuxer extends Muxer {
 
 				masterPlaylistText += `,CODECS="${codecs.join(',')}"`;
 
-				const videoTrack = decl.playlist.tracks.find(x => x.isVideoTrack());
+				const videoTrack = (renditionWithSegments?.playlist.tracks ?? ownTracks).find(x => x.isVideoTrack());
 				if (videoTrack?.isVideoTrack()) {
 					const trackData = this.trackDatas.find(x => x.track === videoTrack) as
 						HlsVideoTrackData | undefined;
@@ -1583,10 +1620,14 @@ export class HlsMuxer extends Muxer {
 					masterPlaylistText += '\n';
 				} else {
 					masterPlaylistText += '\n';
-					masterPlaylistText += `${decl.playlist.path}\n`;
+					masterPlaylistText += `${(renditionWithSegments ?? decl).playlist.path}\n`;
 				}
 			} else {
 				assert(decl.playlist.tracks.length === 1);
+
+				if (isEmptyRenditionInVariantPlaylist(decl)) {
+					continue;
+				}
 
 				const track = decl.playlist.tracks[0]!;
 				const type = track.type;
