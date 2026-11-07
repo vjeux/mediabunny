@@ -757,6 +757,12 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 				const wantAmplitudes = expectedAmplitudes(inAmplitudes, targetChannels);
 				const lossless = LOSSLESS_CODECS.includes(out.codec ?? '');
 				for (let c = 0; c < targetChannels; c++) {
+					if (c === 3 && targetChannels >= 6 && !lossless) {
+						// The LFE channel of 5.1 and up, which lossy codecs low-pass (AAC's LFE element carries up to
+						// ~120 Hz), so the beeps don't come through there
+						continue;
+					}
+
 					const measured = median(outBeeps.slice(1).map(b => b.amplitudes[c] ?? 0));
 					const want = wantAmplitudes[c]!;
 					if (Math.abs(measured - want) > (lossless ? 0.03 * want + 0.01 : 0.25 * want + 0.02)) {

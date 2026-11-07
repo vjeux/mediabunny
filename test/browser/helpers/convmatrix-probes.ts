@@ -231,7 +231,8 @@ export const audioEncodingWorks = async (codec: 'opus' | 'mp4a.40.2') => {
 		return false;
 	}
 
-	const config: AudioEncoderConfig = { codec, sampleRate: 48000, numberOfChannels: 1, bitrate: 64000 };
+	// 96 kbps: Windows' AAC encoder (Media Foundation) only takes 96, 128, 160 and 192 kbps
+	const config: AudioEncoderConfig = { codec, sampleRate: 48000, numberOfChannels: 1, bitrate: 96000 };
 	const support = await withTimeout(
 		AudioEncoder.isConfigSupported(config).then(x => !!x.supported, () => false),
 		1000,
