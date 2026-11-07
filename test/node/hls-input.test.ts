@@ -1615,6 +1615,7 @@ const writeHlsFromPackets = async (
 	segmentFormat: MpegTsOutputFormat | CmafOutputFormat,
 	video: { timestamp: number; duration: number; type: 'key' | 'delta' }[],
 	audio: { timestamp: number; duration: number }[],
+	editPlaylist = (text: string) => text,
 ) => {
 	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
 	const sourceVideoTrack = await sourceInput.getPrimaryVideoTrack();
@@ -1664,7 +1665,10 @@ const writeHlsFromPackets = async (
 	await output.finalize();
 
 	return new Input({
-		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(path.endsWith('.m3u8')
+			? new TextEncoder().encode(editPlaylist(new TextDecoder().decode(files.get(path))))
+			: files.get(path)!,
+		)),
 		formats: HLS_FORMATS,
 	});
 };
@@ -1725,6 +1729,32 @@ test.concurrent('Packets before the first segment\'s playlist timestamp can be l
 		await check(new MpegTsOutputFormat(), audioFirst);
 		await check(new CmafOutputFormat(), audioFirst);
 	}
+});
+
+test.concurrent('Packets at the start can be looked up after a lookup in a later segment', async () => {
+	// FFmpeg rounds EXTINF to microseconds (1.001000 for its 29.97 fps segments), so the playlist drifts from the
+	// media. Learned from a later segment, the offset between the two put the first packet before the first segment's
+	// playlist timestamp. Here, every EXTINF is a microsecond short.
+	const frameDuration = 1001 / 30000;
+	using input = await writeHlsFromPackets(
+		new MpegTsOutputFormat(),
+		Array.from({ length: 120 }, (_, i) => ({
+			timestamp: i * frameDuration,
+			duration: frameDuration,
+			type: i % 30 === 0 ? 'key' as const : 'delta' as const,
+		})),
+		[],
+		text => text.replace(/#EXTINF:([\d.]+)/g, (_, duration: string) => {
+			return `#EXTINF:${(Number(duration) - 0.000001).toFixed(6)}`;
+		}),
+	);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sink = new EncodedPacketSink(videoTrack);
+	expect((await sink.getPacket(3.5))?.timestamp).toBeCloseTo(104 * frameDuration); // In the fourth segment
+	expect((await sink.getPacket(0))?.timestamp).toBe(0);
+	expect((await sink.getKeyPacket(0))?.timestamp).toBe(0);
 });
 
 test.concurrent('Leading frames of an open GOP can be looked up by their own timestamp', async () => {
