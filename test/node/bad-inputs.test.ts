@@ -674,6 +674,15 @@ test('MP4: Box fields running past the end of the parent box', async () => {
 	}
 });
 
+test('MP4: Many boxes running past the end of their parent', async () => {
+	// Each such box has the parse redone without it, so they're capped per parse
+	const damagedTrak = box('trak', box('mdia', mdhd(), hdlr('vide')), fullBox('tkhd', 0, 1, u32(0)));
+	await expectGracefulRead(
+		mp4([trak({ handler: 'vide', stbl: singleChunkStbl(3, 0) }), ...Array<Bytes>(20).fill(damagedTrak)]),
+		/too many damaged boxes/,
+	);
+});
+
 const firstPacketTimestamp = async (file: Uint8Array) => {
 	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
 	const packet = await new EncodedPacketSink((await input.getTracks())[0]!).getFirstPacket();
