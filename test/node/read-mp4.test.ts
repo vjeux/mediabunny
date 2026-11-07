@@ -5,6 +5,8 @@ import {
 	ALL_FORMATS,
 	BufferSource,
 	BufferTarget,
+	CustomSource,
+	EncodedAudioPacketSource,
 	EncodedPacket,
 	EncodedPacketSink,
 	EncodedVideoPacketSource,
@@ -272,3 +274,85 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Fragmented lookups outside of a track\'s data don\'t rescan the fragments without the track', async () => {
+	// Two Opus tracks over 3 minutes, the second of which has data only at the start (like a microphone that was
+	// unplugged), at the start and at the end (a gap), or only at the end
+	const makeFile = async (hasData: (timestamp: number) => boolean) => {
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+			target: new BufferTarget(),
+		});
+		const main = new EncodedAudioPacketSource('opus');
+		const partial = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(main);
+		output.addAudioTrack(partial);
+		await output.start();
+
+		const decoderConfig = {
+			codec: 'opus',
+			numberOfChannels: 2,
+			sampleRate: 48000,
+			// OpusHead: version 1, 2 channels, 312 pre-skip, 48 kHz, no gain, family 0
+			description: new Uint8Array([
+				0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0,
+			]),
+		};
+		const frameDuration = 0.02;
+		const data = new Uint8Array(300).fill(0xfc);
+		for (let i = 0; i < 180 / frameDuration; i++) {
+			const timestamp = i * frameDuration;
+			await main.add(new EncodedPacket(data, 'key', timestamp, frameDuration), { decoderConfig });
+			if (hasData(timestamp)) {
+				await partial.add(new EncodedPacket(data, 'key', timestamp, frameDuration), { decoderConfig });
+			}
+		}
+		await output.finalize();
+
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	const cases = [
+		// Data in the partial track; a lookup inside it; lookups outside of it, with the timestamp they return
+		{ hasData: (t: number) => t < 18, inside: 10, outside: [60, 90, 120, 150], result: 17.98 },
+		{ hasData: (t: number) => t < 18 || t >= 162, inside: 170, outside: [60, 90, 120, 150], result: 17.98 },
+		{ hasData: (t: number) => t >= 162, inside: 170, outside: [30, 60, 90, 120], result: null },
+	];
+	for (const { hasData, inside, outside, result } of cases) {
+		const bytes = await makeFile(hasData);
+		let bytesRead = 0;
+		using input = new Input({
+			formats: ALL_FORMATS,
+			source: new CustomSource({
+				// A cache much smaller than the file, as for any long recording
+				maxCacheSize: 2 ** 16,
+				getSize: () => bytes.byteLength,
+				read: (start, end) => {
+					bytesRead += end - start;
+					return bytes.subarray(start, end);
+				},
+			}),
+		});
+		const partialTrack = (await input.getAudioTracks())[1]!;
+		const sink = new EncodedPacketSink(partialTrack);
+
+		// Lookups inside the data only read around the packet
+		bytesRead = 0;
+		expect((await sink.getPacket(inside))!.timestamp).toBeCloseTo(inside, 5);
+		expect(bytesRead).toBeLessThan(bytes.byteLength / 4);
+
+		// The first lookup outside of it may have to walk the fragments without the track, but later ones don't
+		for (const [i, timestamp] of outside.entries()) {
+			bytesRead = 0;
+			const packet = await sink.getPacket(timestamp);
+			if (result === null) {
+				expect(packet).toBeNull();
+			} else {
+				expect(packet!.timestamp).toBeCloseTo(result, 5);
+			}
+			if (i > 0) {
+				expect(bytesRead).toBeLessThan(bytes.byteLength / 4);
+			}
+		}
+	}
+}, 60_000);
