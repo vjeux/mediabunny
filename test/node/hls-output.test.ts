@@ -3607,3 +3607,146 @@ const testTimestampWraparound = async (
 		expect(timestamps[i]).toBeCloseTo(start + 0.5 * i, 4);
 	}
 };
+
+test('Variant streams without segments are left out of the master playlist', async () => {
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+		}),
+		target: new PathedTarget('master.m3u8', ({ path }) => {
+			const target = new BufferTarget();
+			targets.set(path, target);
+			return target;
+		}),
+	});
+
+	const video = videoSource();
+	output.addVideoTrack(video);
+	// A second video track that never receives a packet
+	const emptyVideo = videoSource();
+	output.addVideoTrack(emptyVideo, { decoderConfig: avcMetadata.decoderConfig });
+	const audio = audioSource();
+	output.addAudioTrack(audio);
+
+	await output.start();
+
+	for (let i = 0; i < 4; i++) {
+		await video.add(new EncodedPacket(avcPacketData, i === 0 ? 'key' : 'delta', i * 0.5, 0.5), avcMetadata);
+		await audio.add(new EncodedPacket(aacPacketData, 'key', i * 0.5, 0.5), aacMetadata);
+	}
+
+	await output.finalize();
+
+	const masterText = new TextDecoder().decode(targets.get('master.m3u8')!.buffer!);
+	expect(masterText.match(/#EXT-X-STREAM-INF/g)).toHaveLength(1);
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			const target = targets.get(path);
+			assert(target);
+
+			return new BufferSource(target.buffer!);
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect((await new EncodedPacketSink(videoTrack).getFirstPacket())?.timestamp).toBe(0);
+});
+
+test('A variant without segments stays next to an I-frame stream when only it reaches the audio', async () => {
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+		}),
+		target: new PathedTarget('master.m3u8', ({ path }) => {
+			const target = new BufferTarget();
+			targets.set(path, target);
+			return target;
+		}),
+	});
+
+	// The I-frame stream has segments, but it can't carry the audio renditions
+	const iFrames = videoSource();
+	output.addVideoTrack(iFrames, { hasOnlyKeyPackets: true });
+	// The regular video track never receives a packet, but the audio paired with it does
+	output.addVideoTrack(videoSource(), { decoderConfig: avcMetadata.decoderConfig });
+	const audioA = audioSource();
+	output.addAudioTrack(audioA, { languageCode: 'eng' });
+	const audioB = audioSource();
+	output.addAudioTrack(audioB, { languageCode: 'ger' });
+
+	await output.start();
+
+	for (let i = 0; i < 4; i++) {
+		await iFrames.add(new EncodedPacket(avcPacketData, 'key', i * 0.5, 0.5), avcMetadata);
+		await audioA.add(new EncodedPacket(aacPacketData, 'key', i * 0.5, 0.5), aacMetadata);
+		await audioB.add(new EncodedPacket(aacPacketData, 'key', i * 0.5, 0.5), aacMetadata);
+	}
+
+	await output.finalize();
+
+	const masterText = new TextDecoder().decode(targets.get('master.m3u8')!.buffer!);
+	const groupId = /#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="([^"]+)"/.exec(masterText)?.[1];
+	assert(groupId);
+	expect(masterText.match(/#EXT-X-STREAM-INF:/g)).toHaveLength(1);
+	expect(masterText).toContain(`AUDIO="${groupId}"`);
+	expect(masterText.match(/#EXT-X-I-FRAME-STREAM-INF:/g)).toHaveLength(1);
+});
+
+test('A variant without segments stays when it is the only way to reach its paired audio renditions', async () => {
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+		}),
+		target: new PathedTarget('master.m3u8', ({ path }) => {
+			const target = new BufferTarget();
+			targets.set(path, target);
+			return target;
+		}),
+	});
+
+	const videoGroupA = new OutputTrackGroup();
+	const audioGroupA = new OutputTrackGroup();
+	const videoGroupB = new OutputTrackGroup();
+	const audioGroupB = new OutputTrackGroup();
+	videoGroupA.pairWith(audioGroupA);
+	videoGroupB.pairWith(audioGroupB);
+
+	const video = videoSource();
+	output.addVideoTrack(video, { group: videoGroupA });
+	// Never receives a packet, but it's the only variant its audio is paired with
+	output.addVideoTrack(videoSource(), { group: videoGroupB, decoderConfig: avcMetadata.decoderConfig });
+	// Two audio tracks per pairing, so each pairing's audio becomes a rendition group
+	const audioTracks = [
+		{ source: audioSource(), group: audioGroupA, languageCode: 'eng' },
+		{ source: audioSource(), group: audioGroupA, languageCode: 'fre' },
+		{ source: audioSource(), group: audioGroupB, languageCode: 'ger' },
+		{ source: audioSource(), group: audioGroupB, languageCode: 'spa' },
+	];
+	for (const { source, group, languageCode } of audioTracks) {
+		output.addAudioTrack(source, { group, languageCode });
+	}
+
+	await output.start();
+
+	for (let i = 0; i < 4; i++) {
+		await video.add(new EncodedPacket(avcPacketData, i === 0 ? 'key' : 'delta', i * 0.5, 0.5), avcMetadata);
+		for (const { source } of audioTracks) {
+			await source.add(new EncodedPacket(aacPacketData, 'key', i * 0.5, 0.5), aacMetadata);
+		}
+	}
+
+	await output.finalize();
+
+	const masterText = new TextDecoder().decode(targets.get('master.m3u8')!.buffer!);
+	const referencedGroups = [...masterText.matchAll(/#EXT-X-STREAM-INF:[^\n]*AUDIO="([^"]+)"/g)].map(x => x[1]);
+	const declaredGroups = [...masterText.matchAll(/#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="([^"]+)"/g)].map(x => x[1]);
+	// Both pairings' audio groups stay reachable
+	expect(new Set(declaredGroups).size).toBe(2);
+	expect(new Set(referencedGroups)).toEqual(new Set(declaredGroups));
+});
