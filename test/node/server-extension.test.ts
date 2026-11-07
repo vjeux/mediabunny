@@ -970,6 +970,30 @@ describe('Video', async () => {
 		expect(sample.colorSpace.toJSON()).toEqual(expected);
 	});
 
+	test('Decoded H.264 samples take the container\'s color space where the bitstream has none', async () => {
+		// 16x16 orange-red, one frame of H.264 whose VUI signals no color, with BT.601 color in the MP4 colr box:
+		// ffmpeg -f lavfi -i "color=c=0xC83020:s=16x16:r=10:d=0.1" -c:v libx264 -pix_fmt yuv420p untagged.mp4
+		// ffmpeg -i untagged.mp4 -c copy -color_primaries smpte170m -color_trc smpte170m -colorspace smpte170m
+		//   -color_range tv -movflags +write_colr h264-untagged-colr-bt601.mp4
+		using input = new Input({
+			source: new FilePathSource('./test/public/h264-untagged-colr-bt601.mp4'),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const expected = { primaries: 'smpte170m', transfer: 'smpte170m', matrix: 'smpte170m', fullRange: false };
+		expect((await track.getDecoderConfig())!.colorSpace).toEqual(expected);
+
+		using sample = (await new VideoSampleSink(track).getSample(0))!;
+		expect(sample.colorSpace.toJSON()).toEqual(expected);
+
+		// Converted to RGB with the BT.601 matrix, as Chromium does
+		const rgba = new Uint8Array(16 * 16 * 4);
+		await sample.copyTo(rgba, { format: 'RGBA' });
+		expect(Math.abs(rgba[0]! - 200)).toBeLessThanOrEqual(3);
+		expect(Math.abs(rgba[1]! - 48)).toBeLessThanOrEqual(3);
+		expect(Math.abs(rgba[2]! - 32)).toBeLessThanOrEqual(3);
+	});
+
 	test('Color space, RGB to BT.709 encode', async () => {
 		const width = 320;
 		const height = 180;

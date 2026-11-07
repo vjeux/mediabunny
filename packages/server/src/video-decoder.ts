@@ -172,27 +172,32 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 
 		this.frame.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
 
-		// The VP8 and VP9 bitstreams carry no primaries or transfer (VP9 only signals the matrix), so like Chromium,
-		// take the color space from the config (the container) for them. Other codecs keep their in-band values, as in
-		// Chromium.
+		// Like Chromium, take the color space from the config (the container): for VP8 and VP9, whose bitstreams carry
+		// no primaries or transfer (VP9 only signals the matrix), entirely, and for other codecs where the bitstream
+		// leaves a value unspecified
 		const colorSpace = this.config.colorSpace;
-		if (colorSpace && (this.codec === 'vp8' || this.codec === 'vp9')) {
+		if (colorSpace) {
+			const override = this.codec === 'vp8' || this.codec === 'vp9';
+
 			const primaries = colorSpace.primaries ? mapColorPrimaries(colorSpace.primaries) : null;
-			if (primaries !== null) {
+			if (primaries !== null && (override || this.frame.colorPrimaries === NodeAv.AVCOL_PRI_UNSPECIFIED)) {
 				this.frame.colorPrimaries = primaries;
 			}
 
 			const transfer = colorSpace.transfer ? mapTransferCharacteristics(colorSpace.transfer) : null;
-			if (transfer !== null) {
+			if (transfer !== null && (override || this.frame.colorTrc === NodeAv.AVCOL_TRC_UNSPECIFIED)) {
 				this.frame.colorTrc = transfer;
 			}
 
 			const matrix = colorSpace.matrix ? mapMatrixCoefficients(colorSpace.matrix) : null;
-			if (matrix !== null) {
+			if (matrix !== null && (override || this.frame.colorSpace === NodeAv.AVCOL_SPC_UNSPECIFIED)) {
 				this.frame.colorSpace = matrix;
 			}
 
-			if (typeof colorSpace.fullRange === 'boolean') {
+			if (
+				typeof colorSpace.fullRange === 'boolean'
+				&& (override || this.frame.colorRange === NodeAv.AVCOL_RANGE_UNSPECIFIED)
+			) {
 				this.frame.colorRange = colorSpace.fullRange ? NodeAv.AVCOL_RANGE_JPEG : NodeAv.AVCOL_RANGE_MPEG;
 			}
 		}
