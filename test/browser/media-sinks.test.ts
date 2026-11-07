@@ -308,8 +308,8 @@ test('Seeking into open-GOP H.264 returns the right frames, MP4', async (context
 	using input = new Input({ source: new UrlSource('/open-gop-h264.mp4'), formats: ALL_FORMATS });
 	const track = (await input.getPrimaryVideoTrack())!;
 
-	// Outside Chromium, decoding starts at recovery points, which not every decoder can do (WebKitGTK's can't). So probe
-	// the platform's decoder with the recovery point at 1 s and the packets following it.
+	// Outside Chromium, decoding starts at recovery points, which not every decoder can do (WebKitGTK's can't). So
+	// probe the platform's decoder with the recovery point at 1 s and the packets following it.
 	const packetSink = new EncodedPacketSink(track);
 	const recoveryPoint = (await packetSink.getKeyPacket(await track.getFirstTimestamp() + 1))!;
 	if (await track.determinePacketType(recoveryPoint) === 'key') {
