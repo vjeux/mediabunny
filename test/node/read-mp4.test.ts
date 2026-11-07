@@ -326,3 +326,67 @@ test('Fragmented video frames that depend on others are not key frames, even if 
 	expect(types).toEqual(['key', 'delta', 'delta', 'key', 'delta']);
 	expect((await sink.getKeyPacket(0.25))?.timestamp).toBe(0);
 });
+
+test('Video samples that the track fragment\'s sdtp box marks as dependent are delta frames', async () => {
+	// Four video samples in one fragment whose sample flags leave sample_depends_on unknown (0) and mark them all as
+	// sync samples. Like Chromium, the traf's sdtp box then tells: the first doesn't depend on others, the rest do.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (options: { handler: string; sampleFlags: number; sdtp: number[] | null }) => {
+		const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(50),
+			box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]));
+		const ipcm = box('ipcm', zeros(6), [0, 1], zeros(8), [0, 1, 0, 16], zeros(4), u32(48000 * 0x10000),
+			box('pcmC', zeros(4), [1, 16]));
+		const sampleEntry = options.handler === 'vide' ? avc1 : ipcm;
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(1000), u32(0), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii(options.handler), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), sampleEntry),
+						box('stts', zeros(8)),
+						box('stsc', zeros(8)),
+						box('stsz', zeros(12)),
+						box('stco', zeros(8)),
+					)),
+				),
+			),
+			box('mvex', box('trex', zeros(4), u32(1), u32(1), u32(40), u32(10), u32(options.sampleFlags))),
+		);
+		const moof = (dataOffset: number) => box('moof', box('mfhd', zeros(4), u32(1)), box('traf',
+			box('tfhd', [0, 2, 0, 0], u32(1)), // Default base is moof
+			box('tfdt', zeros(8)),
+			box('trun', [0, 0, 0, 1], u32(4), u32(dataOffset)), // The trex box's defaults
+			...(options.sdtp ? [box('sdtp', zeros(4), options.sdtp)] : []),
+		));
+		const ftyp = box('ftyp', ascii('iso6'), u32(0), ascii('iso6'));
+		const file = [...ftyp, ...moov, ...moof(moof(0).length + 8), ...box('mdat', zeros(40))];
+
+		using input = new Input({ source: new BufferSource(new Uint8Array(file)), formats: ALL_FORMATS });
+		const track = (await input.getTracks())[0];
+		assert(track);
+		const types: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			types.push(packet.type);
+		}
+		return types;
+	};
+
+	const sdtp = [0x20, 0x10, 0x10, 0x10]; // sample_depends_on 2 (no), then 1 (yes)
+	expect(await read({ handler: 'vide', sampleFlags: 0, sdtp: null })).toEqual(['key', 'key', 'key', 'key']);
+	expect(await read({ handler: 'vide', sampleFlags: 0, sdtp })).toEqual(['key', 'delta', 'delta', 'delta']);
+	// Sample flags that tell the dependency (2: none) win over the sdtp box
+	expect(await read({ handler: 'vide', sampleFlags: 0x02000000, sdtp })).toEqual(['key', 'key', 'key', 'key']);
+	// Audio samples may depend on others and still be random access points
+	expect(await read({ handler: 'soun', sampleFlags: 0, sdtp })).toEqual(['key', 'key', 'key', 'key']);
+});
