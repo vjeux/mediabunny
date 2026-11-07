@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +925,117 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS finds audio frames in PES packets that start inside a frame', async () => {
+	// Found by L80. Audio PES packets needn't be aligned to frames (data_alignment_indicator 0), so a PES packet can
+	// begin with the tail of a frame, and the frame sync search that a lookup starts there locks onto any bytes in it
+	// that look like a frame header. Here, MP3 frames of 104 bytes (MPEG-1 Layer III, 32 kbit/s, 44.1 kHz) in PES
+	// packets of 150 bytes, each stamped with the PTS of the first frame starting in it (H.222.0), with a fake header
+	// in each leftover. Expected: every frame's own timestamp finds it, as sequential reading does.
+	const frameSize = 104;
+	const frameCount = 24;
+	const frames = new Uint8Array(frameSize * frameCount);
+	for (let i = 0; i < frameCount; i++) {
+		frames.set([0xff, 0xfb, 0x10, 0x00], i * frameSize);
+	}
+	for (let start = 150; start < frames.length; start += 150) {
+		const frameEnd = Math.ceil(start / frameSize) * frameSize;
+		if (frameEnd - start >= 8) {
+			frames.set([0xff, 0xf6, 0xd4, 0xed], start + 2); // A fake header in the leftover
+		}
+	}
+
+	const packets: Uint8Array[] = [];
+	const pushPackets = (pid: number, payload: number[]) => {
+		for (let i = 0; i < payload.length; i += 184) {
+			const chunk = payload.slice(i, i + 184);
+			const packet = new Uint8Array(188);
+			const stuffing = 184 - chunk.length;
+			packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, stuffing ? 0x30 : 0x10], 0);
+			if (stuffing) {
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+				packet.fill(0xff, 6, 4 + stuffing);
+			}
+			packet.set(chunk, 4 + stuffing);
+			packets.push(packet);
+		}
+	};
+
+	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPackets(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x03, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+	for (let start = 0; start < frames.length; start += 150) {
+		const pts = Math.round(Math.ceil(start / frameSize) * 1152 * 90_000 / 44_100);
+		const data = [...frames.subarray(start, start + 150)];
+		pushPackets(0x100, [
+			0, 0, 1, 0xc0, (data.length + 8) >> 8, (data.length + 8) & 0xff, 0x84, 0x80, 5,
+			0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
+			((pts << 1) & 0xfe) | 1, ...data,
+		]);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
+	const sequential: [number, number][] = [];
+	for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+		sequential.push([packet.timestamp, packet.byteLength]);
+	}
+	expect(sequential).toHaveLength(frameCount);
+
+	for (const [timestamp, byteLength] of sequential) {
+		// A fresh input, so that the lookup can't use reading state from before
+		using lookupInput = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
+		const packet = await new EncodedPacketSink((await lookupInput.getPrimaryAudioTrack())!).getPacket(timestamp);
+		expect([packet?.timestamp, packet?.byteLength]).toEqual([timestamp, byteLength]);
+	}
+});
+
+test('MPEG-TS drops an audio frame cut off by the end of the file', async () => {
+	// Found by L80. A recording that stopped mid-write ends inside an audio frame, which doesn't decode (WebCodecs
+	// then fails the whole run); the ADTS and MP3 demuxers drop such a frame too. 30 AAC frames of 400 bytes, then the
+	// same without the last TS packet. Each packet must hold the whole frame its header announces.
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 30; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(400).fill(0x11), 'key', i * 1024 / 48000, 1024 / 48000),
+			i === 0
+				? {
+						decoderConfig: {
+							codec: 'mp4a.40.2',
+							numberOfChannels: 2,
+							sampleRate: 48000,
+							description: new Uint8Array([0x11, 0x90]),
+						},
+					}
+				: undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const readFrames = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const result: { byteLength: number; frameLength: number }[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			const d = packet.data;
+			const frameLength = ((d[3]! & 0x03) << 11) | (d[4]! << 3) | (d[5]! >> 5); // aac_frame_length
+			result.push({ byteLength: d.byteLength, frameLength });
+		}
+		return result;
+	};
+
+	const complete = await readFrames(bytes);
+	expect(complete).toHaveLength(30);
+	expect(complete.every(x => x.byteLength === x.frameLength)).toBe(true);
+
+	const truncated = await readFrames(bytes.subarray(0, bytes.length - 188));
+	expect(truncated).toHaveLength(29);
+	expect(truncated.every(x => x.byteLength === x.frameLength)).toBe(true);
 });
