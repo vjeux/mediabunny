@@ -7,6 +7,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS, FLAC } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { calculateCrc16, calculateCrc8 } from '../../src/flac/flac-misc.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { FlacOutputFormat } from '../../src/output-format.js';
@@ -14,7 +15,6 @@ import { Conversion } from '../../src/conversion.js';
 import { VERSIONED_NAME } from '../../src/version.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { calculateCrc16, calculateCrc8 } from '../../src/flac/flac-misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
