@@ -55,7 +55,10 @@ export const ENCRYPTION_KEY_CACHE_GROUP = 2;
 export type InputOptions<S extends Source = Source> = {
 	/** A list of supported formats. If the source file is not of one of these formats, then it cannot be read. */
 	formats: InputFormat[];
-	/** The source from which data will be read. */
+	/**
+	 * The source from which data will be read. When given a {@link SourceRef}, the input takes it over: it frees the
+	 * ref when disposed, so don't free it yourself.
+	 */
 	source: S | SourceRef<S>;
 	/**
 	 * An optional, second {@link Input} instance that contains the necessary metadata to initialize the tracks of
@@ -172,6 +175,9 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 		if (options.source instanceof Source && options.source._disposed) {
 			throw new TypeError('options.source must not be a disposed Source.');
+		}
+		if (options.source instanceof SourceRef && options.source.freed) {
+			throw new TypeError('options.source must not be a freed SourceRef.');
 		}
 		if (options.initInput !== undefined && !(options.initInput instanceof Input)) {
 			throw new TypeError('options.initInput, when provided, must be an Input.');
