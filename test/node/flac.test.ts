@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
 import { assert, toUint8Array } from '../../src/misc.js';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource } from '../../src/source.js';
+import { BufferSource, CustomSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS, FLAC } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
@@ -144,6 +144,51 @@ test('can get metadata', async () => {
 			vendor: 'Lavf58.76.100',
 		},
 	});
+});
+
+test('reads the track without loading the embedded pictures', async () => {
+	// A FLAC file with an 8 MiB front cover, as hi-res rips often have, and no audio frames
+	const imageSize = 8 * 2 ** 20;
+	const mimeType = new TextEncoder().encode('image/png');
+	const pictureSize = 32 + mimeType.length + imageSize;
+	const bytes = new Uint8Array(4 + 4 + 34 + 4 + pictureSize);
+	const view = new DataView(bytes.buffer);
+	bytes.set([0x66, 0x4c, 0x61, 0x43], 0); // 'fLaC'
+	// STREAMINFO: block size 4096, 44.1 kHz, 2 channels, 16 bits, no total sample count
+	view.setUint32(4, 34);
+	view.setUint16(8, 4096);
+	view.setUint16(10, 4096);
+	view.setUint32(18, (44100 << 12) | (1 << 9) | (15 << 4));
+	// PICTURE, the last metadata block: front cover, PNG
+	const picturePos = 46;
+	view.setUint32(picturePos - 4, 0x80000000 | (6 << 24) | pictureSize);
+	view.setUint32(picturePos, 3);
+	view.setUint32(picturePos + 4, mimeType.length);
+	bytes.set(mimeType, picturePos + 8);
+	view.setUint32(picturePos + 8 + mimeType.length + 20, imageSize);
+	bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], picturePos + 32 + mimeType.length);
+
+	let bytesRead = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => bytes.byteLength,
+			read: (start, end) => {
+				bytesRead += end - start;
+				return bytes.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	// The track doesn't need the picture, which only the metadata tags read
+	const track = await input.getPrimaryAudioTrack();
+	expect(await track!.getSampleRate()).toBe(44100);
+	expect(bytesRead).toBeLessThan(2 ** 20);
+
+	const tags = await input.getMetadataTags();
+	expect(tags.images).toHaveLength(1);
+	expect(tags.images![0]!.data.byteLength).toBe(imageSize);
+	expect(tags.images![0]!.kind).toBe('coverFront');
 });
 
 test('can re-mux a .flac', async () => {
