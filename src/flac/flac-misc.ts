@@ -101,6 +101,29 @@ export const readCodedNumber = (fileSlice: FileSlice): number => {
 	return encoded;
 };
 
+// https://www.rfc-editor.org/rfc/rfc9639.html#name-coded-number
+export const encodeCodedNumber = (value: number) => {
+	if (value < 0x80) {
+		return new Uint8Array([value]);
+	}
+
+	// Like UTF-8: the first byte starts with as many ones as there are bytes, each of the others holds 6 bits
+	let byteCount = 2;
+	while (byteCount < 7 && value >= 2 ** (5 * byteCount + 1)) {
+		byteCount++;
+	}
+
+	const bytes = new Uint8Array(byteCount);
+	let remaining = value;
+	for (let i = byteCount - 1; i > 0; i--) {
+		bytes[i] = 0x80 | (remaining % 64);
+		remaining = Math.floor(remaining / 64);
+	}
+	bytes[0] = ((0xff00 >> byteCount) & 0xff) | remaining;
+
+	return bytes;
+};
+
 export const readBlockSize = (
 	slice: FileSlice,
 	blockSizeBits: BlockSizeOrUncommon,
