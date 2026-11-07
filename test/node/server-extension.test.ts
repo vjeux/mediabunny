@@ -372,6 +372,55 @@ describe('Video', async () => {
 		});
 	});
 
+	test('Encoding honors the profile and bit depth asked for in fullCodecString', async () => {
+		// Encodes five mid-gray 64x64 frames and returns the codec string of the written track
+		const writtenCodecString = async (codec: VideoCodec, fullCodecString: string | undefined, bitDepth: number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const quality = new Quality({ bitrate: 500_000 });
+			const source = new VideoSampleSource({ codec, quality, fullCodecString });
+			output.addVideoTrack(source);
+			await output.start();
+
+			for (let i = 0; i < 5; i++) {
+				const sampleCount = 64 * 64 * 3 / 2;
+				const data = bitDepth === 8
+					? new Uint8Array(sampleCount).fill(128)
+					: new Uint8Array(new Uint16Array(sampleCount).fill(128 << (bitDepth - 8)).buffer);
+				const sample = new VideoSample(data, {
+					format: bitDepth === 8 ? 'I420' : bitDepth === 10 ? 'I420P10' : 'I420P12',
+					codedWidth: 64,
+					codedHeight: 64,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await source.add(sample);
+				sample.close();
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			return await track.getCodecParameterString();
+		};
+
+		// AVC Baseline, Main and High 10 (libx264 picks High by itself)
+		expect(await writtenCodecString('avc', 'avc1.42001f', 8)).toMatch(/^avc1\.42/);
+		expect(await writtenCodecString('avc', 'avc1.4d001f', 8)).toMatch(/^avc1\.4d/);
+		expect(await writtenCodecString('avc', 'avc1.6e001f', 10)).toMatch(/^avc1\.6e/);
+		// HEVC Main 10, and the bit depth fields of VP9 and AV1
+		expect(await writtenCodecString('hevc', 'hvc1.2.4.L93.B0', 10)).toMatch(/^(hev1|hvc1)\.2\./);
+		expect(await writtenCodecString('vp9', 'vp09.02.10.10', 10)).toMatch(/^vp09\.02\.\d\d\.10/);
+		expect(await writtenCodecString('vp9', 'vp09.02.10.12', 12)).toMatch(/^vp09\.02\.\d\d\.12/);
+		expect(await writtenCodecString('av1', 'av01.0.04M.10', 10)).toMatch(/^av01\.0\.\d\d[MH]\.10/);
+
+		// Without a codec string, the encoders' defaults stay: High, Main, and 8 bits even from 10-bit frames
+		expect(await writtenCodecString('avc', undefined, 8)).toMatch(/^avc1\.64/);
+		expect(await writtenCodecString('hevc', undefined, 10)).toMatch(/^(hev1|hvc1)\.1\./);
+		expect(await writtenCodecString('vp9', undefined, 10)).toMatch(/^vp09\.00\.\d\d\.08/);
+		expect(await writtenCodecString('av1', undefined, 10)).toMatch(/^av01\.0\.\d\d[MH]\.08/);
+	});
+
 	test('VP8 encode and decode', async () => {
 		await encodeDecodeTest('vp8', {}, async (packet, meta, i) => {
 			expect(packet.duration).toBe(1 / 30);

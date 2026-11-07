@@ -51,6 +51,37 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
 };
 
+/**
+ * What a codec string asks for beyond the codec itself: a profile below High for AVC, and the bit depth (AVC High 10,
+ * HEVC Main 10, and the bit depth fields of VP9 and AV1). The encoders would otherwise apply their own defaults (the
+ * High profile for libx264, 8 bits everywhere) whatever was requested.
+ */
+const parseCodecStringRequirements = (codec: VideoCodec, codecString: string) => {
+	const parts = codecString.split('.');
+	let avcProfile: NodeAv.AVProfile | null = null;
+	let bitDepth = 8;
+
+	if (codec === 'avc') {
+		const profileIdc = parseInt(parts[1]?.slice(0, 2) ?? '', 16);
+		// libx264 picks High (or above, like for lossless) by itself, so only the lower profiles need asking for
+		if (profileIdc === 66) {
+			avcProfile = NodeAv.AV_PROFILE_H264_BASELINE;
+		} else if (profileIdc === 77) {
+			avcProfile = NodeAv.AV_PROFILE_H264_MAIN;
+		} else if (profileIdc === 110) {
+			bitDepth = 10;
+		}
+	} else if (codec === 'hevc') {
+		// The general_profile_idc, after the optional profile space letter
+		bitDepth = Number(parts[1]?.replace(/^[ABC]/, '')) === 2 ? 10 : 8;
+	} else if (codec === 'vp9' || codec === 'av1') {
+		const fieldValue = Number(parts[3]);
+		bitDepth = fieldValue === 10 || fieldValue === 12 ? fieldValue : 8;
+	}
+
+	return { avcProfile, bitDepth };
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -154,6 +185,20 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 		}
 
+		const requirements = parseCodecStringRequirements(this.codec, this.config.codec);
+		const requestedPixelFormat = requirements.bitDepth === 10
+			? NodeAv.AV_PIX_FMT_YUV420P10LE
+			: requirements.bitDepth === 12
+				? NodeAv.AV_PIX_FMT_YUV420P12LE
+				: null;
+		if (
+			requestedPixelFormat !== null
+			&& pixelFormat === NodeAv.AV_PIX_FMT_YUV420P
+			&& this.avCodec.pixelFormats?.includes(requestedPixelFormat)
+		) {
+			pixelFormat = requestedPixelFormat;
+		}
+
 		const pixelAspectRatio = simplifyRational({
 			num: (this.config.displayWidth ?? this.config.width) * this.config.height,
 			den: (this.config.displayHeight ?? this.config.height) * this.config.width,
@@ -178,6 +223,10 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		if (this.config.bitrateMode === 'constant') {
 			codecContext.rcMinRate = codecContext.bitRate;
 			codecContext.rcMaxRate = codecContext.bitRate;
+		}
+
+		if (this.avCodec.name === 'libx264' && requirements.avcProfile !== null) {
+			codecContext.profile = requirements.avcProfile;
 		}
 
 		const isRealtime = this.config.latencyMode === 'realtime';
