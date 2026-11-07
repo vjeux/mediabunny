@@ -959,14 +959,20 @@ class FlacAudioTrackBacking implements InputAudioTrackBacking {
 	async getFirstPacket(
 		options: PacketRetrievalOptions,
 	): Promise<EncodedPacket | null> {
-		// Ensure the next sample exists
-		while (
-			this.demuxer.loadedSamples.length === 0
-			&& !this.demuxer.lastSampleLoaded
-		) {
-			await this.demuxer.advanceReader();
-		}
+		const release = await this.demuxer.readingMutex.acquire();
 
-		return this.getPacketAtIndex(0, options);
+		try {
+			// Ensure the next sample exists
+			while (
+				this.demuxer.loadedSamples.length === 0
+				&& !this.demuxer.lastSampleLoaded
+			) {
+				await this.demuxer.advanceReader();
+			}
+
+			return this.getPacketAtIndex(0, options);
+		} finally {
+			release();
+		}
 	}
 }
