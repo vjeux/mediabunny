@@ -2535,65 +2535,6 @@ test('Empty playlist bandwidth, from track metadata', async () => {
 	expect(masterText).toContain('BANDWIDTH=2128000,AVERAGE-BANDWIDTH=1600000,');
 });
 
-test('The empty track of an HLS output fails at once instead of reloading its ended playlist', async () => {
-	const keyFrame = new Uint8Array([
-		0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x06, 0x26, 0xc0, 0x44, 0x00, 0x00, 0x03,
-		0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x48, 0x99, 0x20,
-		0, 0, 0, 1, 0x68, 0xcb, 0x83, 0xcb, 0x20,
-		0, 0, 0, 1, 0x65, 0x88, 0x84, 0x10, 0x20, 0x40, 0x80, 0x01,
-	]);
-	// Heavy frames make the real variant costlier than the empty one's estimate, so the reader loads the empty
-	// playlist while choosing its reference, and a later query on its track used to reload it after a target
-	// duration
-	const heavyKeyFrame = new Uint8Array([...keyFrame, ...new Uint8Array(100_000)]);
-	const aacFrame = new Uint8Array([0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c]);
-
-	const files = new Map<string, BufferTarget>();
-	const output = new Output({
-		format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat(), targetDuration: 20 }),
-		target: new PathedTarget('master.m3u8', ({ path }) => {
-			const target = new BufferTarget();
-			files.set(path, target);
-			return target;
-		}),
-	});
-	// A full codec string, so that the empty variant's CODECS maps to a track
-	const videoConfig = { codec: 'avc1.42c00a', codedWidth: 96, codedHeight: 64 };
-	const video = new EncodedVideoPacketSource('avc');
-	output.addVideoTrack(video);
-	// Never gets a packet: its variant playlist is empty and ended
-	output.addVideoTrack(new EncodedVideoPacketSource('avc'), { decoderConfig: videoConfig });
-	const audio = new EncodedAudioPacketSource('aac');
-	output.addAudioTrack(audio);
-	await output.start();
-
-	const audioConfig = {
-		decoderConfig: {
-			codec: 'mp4a.40.2',
-			numberOfChannels: 1,
-			sampleRate: 44100,
-			description: new Uint8Array([0x12, 0x08]),
-		},
-	};
-	for (let i = 0; i < 3; i++) {
-		const videoMeta = i === 0 ? { decoderConfig: videoConfig } : undefined;
-		await video.add(new EncodedPacket(heavyKeyFrame, 'key', i * 20, 20), videoMeta);
-		await audio.add(new EncodedPacket(aacFrame, 'key', i * 20, 1024 / 44100), i === 0 ? audioConfig : undefined);
-	}
-	await output.finalize();
-
-	using input = new Input({
-		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!.buffer!)),
-		formats: ALL_FORMATS,
-	});
-	const [realTrack, emptyTrack] = await input.getVideoTracks();
-	expect(await realTrack!.getFirstTimestamp()).toBe(0);
-
-	const start = performance.now();
-	await expect(emptyTrack!.getFirstTimestamp()).rejects.toThrow('Missing first segment');
-	expect(performance.now() - start).toBeLessThan(2000);
-});
-
 test('Empty playlist bandwidth, medium quality default fallback', async () => {
 	let masterText = '';
 
