@@ -258,12 +258,16 @@ const PLATFORM_PROBES: Record<ProbedCodec | 'avcRecoveryPoint', Probe> = {
 
 const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
 
-const decodesNatively = async (probe: Probe) => {
+type NativeDecodeResult = { outputs: number; failed: boolean };
+
+/** Decodes the first chunks of a probe with WebCodecs alone, counting the outputs. */
+const decodeNatively = async (probe: Probe, chunkCount = probe.chunks.length): Promise<NativeDecodeResult> => {
 	const isVideo = probe.sampleRate === undefined;
 	const kind = isVideo ? 'video' : 'audio';
 	if (isVideo ? typeof VideoDecoder === 'undefined' : typeof AudioDecoder === 'undefined') {
-		return false;
+		return { outputs: 0, failed: true };
 	}
+	const chunks = probe.chunks.slice(0, chunkCount);
 
 	const description = probe.description !== undefined ? fromBase64(probe.description) : undefined;
 	const videoConfig: VideoDecoderConfig = { codec: probe.codec, codedWidth: 64, codedHeight: 64, description };
@@ -279,10 +283,10 @@ const decodesNatively = async (probe: Probe) => {
 	).then(x => x.supported === true, () => false));
 	if (support === null) {
 		hungDecoderKinds.add(kind);
-		return false;
+		return { outputs: 0, failed: true };
 	}
 	if (!support.value) {
-		return false;
+		return { outputs: 0, failed: true };
 	}
 
 	let outputs = 0;
@@ -301,14 +305,14 @@ const decodesNatively = async (probe: Probe) => {
 	try {
 		if (decoder instanceof VideoDecoder) {
 			decoder.configure(videoConfig);
-			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedVideoChunk({
+			chunks.forEach((chunk, i) => decoder.decode(new EncodedVideoChunk({
 				type: i === 0 ? 'key' : 'delta',
 				timestamp: i * 33_333,
 				data: fromBase64(chunk),
 			})));
 		} else {
 			decoder.configure(audioConfig);
-			probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+			chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
 				type: 'key',
 				timestamp: i * 20_000,
 				data: fromBase64(chunk),
@@ -327,25 +331,43 @@ const decodesNatively = async (probe: Probe) => {
 		decoder.close();
 	}
 
-	return !failed && outputs > 0;
+	return { outputs, failed };
 };
 
-type ProbeKey = keyof typeof PLATFORM_PROBES;
-const probeResults = new Map<ProbeKey, Promise<boolean>>();
-const platformDecodes = (key: ProbeKey) => {
-	let result = probeResults.get(key);
-	if (!result) {
-		result = decodesNatively(PLATFORM_PROBES[key]);
-		probeResults.set(key, result);
+const memoize = <T>(compute: () => Promise<T>) => {
+	let result: Promise<T> | null = null;
+	return () => result ??= compute();
+};
+
+const codecProbes = new Map<ProbedCodec, () => Promise<boolean>>();
+const platformDecodes = (codec: ProbedCodec) => {
+	let probe = codecProbes.get(codec);
+	if (!probe) {
+		probe = memoize(async () => {
+			const { outputs, failed } = await decodeNatively(PLATFORM_PROBES[codec]);
+			return !failed && outputs > 0;
+		});
+		codecProbes.set(codec, probe);
 	}
 
-	return result;
+	return probe();
 };
 
-// Mediabunny starts decoding at recovery points everywhere but in Chromium (which rejects them as first frames).
-// WebKitGTK can't either, so there, open-GOP files can't be checked.
-const isChromiumUserAgent = /Chrome/.test(navigator.userAgent);
-const isFirefoxUserAgent = navigator.userAgent.includes('Firefox');
+// Open GOPs: Mediabunny may start decoding at a recovery point (an I-frame that isn't an IDR), which needs a decoder
+// that can start there (WebKitGTK's can't). Main still feeds the decoder the leading pictures that follow the recovery
+// point but reference the previous GOP, and decoders that drop those without an output (Firefox's) shift every later
+// timestamp, which #191 fixes. Both are probed on the suite's own open-GOP file: the recovery point alone (Chrome and
+// Firefox decode it), and with the 7 packets after it (Firefox outputs 7 frames, dropping the one leading picture;
+// Chrome fails on these, but Mediabunny never starts at a recovery point there).
+const decoderStartsAtRecoveryPoint = memoize(async () => {
+	const { outputs, failed } = await decodeNatively(PLATFORM_PROBES.avcRecoveryPoint, 1);
+	return !failed && outputs === 1;
+});
+const decoderDropsLeadingPictures = memoize(async () => {
+	const { chunks } = PLATFORM_PROBES.avcRecoveryPoint;
+	const { outputs, failed } = await decodeNatively(PLATFORM_PROBES.avcRecoveryPoint);
+	return !failed && outputs > 0 && outputs < chunks.length;
+});
 
 const VIDEO_CODECS: ProbedCodec[] = ['avc', 'vp8', 'vp9', 'av1'];
 
@@ -365,15 +387,15 @@ const skipUnlessPlatformCapable = async (
 	if (negativeTimestamps && !negativeTimestampsDecodeCorrectly) {
 		skip('the decoder scrambles negative timestamps here (native probe)');
 	}
-	if (openGop && isFirefoxUserAgent) {
-		// Known: Firefox drops the leading pictures of open GOPs, which shifts the decoded timestamps (fork PR #191)
-		skip('Firefox drops open-GOP leading pictures (#191)');
-	}
 	if (!(await platformDecodes(codec))) {
 		skip(`${codec} can't be decoded here (native probe)`);
 	}
-	if (openGop && !isChromiumUserAgent && !(await platformDecodes('avcRecoveryPoint'))) {
+	if (openGop && !(await decoderStartsAtRecoveryPoint())) {
 		skip('the decoder can\'t start at a recovery point here (native probe)');
+	}
+	if (openGop && await decoderDropsLeadingPictures()) {
+		// Remove once #191 lands
+		skip('the decoder drops leading pictures after a recovery point, not yet handled (#191, native probe)');
 	}
 };
 
