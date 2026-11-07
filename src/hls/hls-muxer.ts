@@ -35,10 +35,10 @@ import {
 	HlsOutputFormatOptions,
 	HlsOutputPlaylistInfo,
 	HlsOutputSegmentInfo,
+	MpegTsOutputFormat,
 	OutputFormat,
 } from '../output-format';
 import { Writer } from '../writer';
-import { MpegTsOutputFormat } from '../output-format';
 import { EncodedPacket } from '../packet';
 import { SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
@@ -166,6 +166,18 @@ export class HlsMuxer extends Muxer {
 		this.maxLiveSegmentCount = format._options.maxLiveSegmentCount ?? Infinity;
 		this.mediaTimestampBase = format._options.mediaTimestampBase ?? 10;
 		this.globalTargetDuration = this.targetSegmentDuration;
+
+		if (
+			toArray(format._options.segmentFormat).some((segmentFormat) => {
+				return segmentFormat instanceof MpegTsOutputFormat && !!segmentFormat._options.timestampOffset;
+			})
+		) {
+			Logging._warn(
+				'The timestampOffset of an MpegTsOutputFormat is ignored for HLS segments, whose media starts at the'
+				+ ' HLS output\'s mediaTimestampBase like that of the other segment formats. Set mediaTimestampBase'
+				+ ' instead.',
+			);
+		}
 
 		this.getPlaylistPath = format._options.getPlaylistPath
 			?? (({ n }) => `playlist-${n}.m3u8`);

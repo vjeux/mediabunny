@@ -29,6 +29,7 @@ import { BufferSource, CustomPathedSource, FilePathSource } from '../../src/sour
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Logging } from '../../src/logging.js';
 const videoSource = (codec: VideoCodec = 'avc') => new EncodedVideoPacketSource(codec);
 const audioSource = (codec: AudioCodec = 'aac') => new EncodedAudioPacketSource(codec);
 
@@ -3355,9 +3356,13 @@ test('Cross-variant timestamps, CMAF', async () => {
 	});
 });
 
-test('Cross-variant timestamps, packed audio next to MPEG-TS with a timestampOffset', async () => {
+test('Cross-variant timestamps, packed audio next to MPEG-TS with a timestampOffset', async ({ onTestFinished }) => {
 	// The setup from the docs, packaging audio into .aac and video into .ts files. All segment media starts at
-	// mediaTimestampBase, so an offset given to the MPEG-TS format must not move the video away from the audio.
+	// mediaTimestampBase, so an offset given to the MPEG-TS format must not move the video away from the audio. It's
+	// ignored, with one warning saying so.
+	const warnings: string[] = [];
+	onTestFinished(Logging.on('warn', args => warnings.push(args.map(String).join(' '))));
+
 	const targets = new Map<string, BufferTarget>();
 	const output = new Output({
 		format: new HlsOutputFormat({
@@ -3402,6 +3407,7 @@ test('Cross-variant timestamps, packed audio next to MPEG-TS with a timestampOff
 	// The video is the reference, so its first packet lands at 0
 	expect((await new EncodedPacketSink(videoTrack).getFirstPacket())?.timestamp).toBe(0);
 	expect((await new EncodedPacketSink(audioTrack).getFirstPacket())?.timestamp).toBeCloseTo(-0.5, 3);
+	expect(warnings.filter(x => x.includes('timestampOffset'))).toHaveLength(1);
 });
 
 const testCrossVariantTimestamps = async (hlsOptions: HlsOutputFormatOptions) => {
