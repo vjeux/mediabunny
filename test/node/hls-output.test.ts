@@ -3656,7 +3656,7 @@ test('Variant streams without segments are left out of the master playlist', asy
 	expect((await new EncodedPacketSink(videoTrack).getFirstPacket())?.timestamp).toBe(0);
 });
 
-test('Variants without segments stay when an I-frame stream is the only variant with segments', async () => {
+test('A variant without segments stays next to an I-frame stream when only it reaches the audio', async () => {
 	const targets = new Map<string, BufferTarget>();
 	const output = new Output({
 		format: new HlsOutputFormat({
@@ -3669,7 +3669,7 @@ test('Variants without segments stay when an I-frame stream is the only variant 
 		}),
 	});
 
-	// An I-frame stream doesn't count as a variant with segments: players don't play it
+	// The I-frame stream has segments, but it can't carry the audio renditions
 	const iFrames = videoSource();
 	output.addVideoTrack(iFrames, { hasOnlyKeyPackets: true });
 	// The regular video track never receives a packet, but the audio paired with it does
