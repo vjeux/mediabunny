@@ -973,7 +973,9 @@ describe('MPEG-TS demuxer: track API', () => {
 		ts.pes(AUDIO_PID, buildPesPacket({ streamId: 0xc0, pts: 0, data: adtsFrame({ objectType: 2 }) }));
 
 		using input = openBytes(ts.toBytes());
-		expect(await input.getMimeType()).toBe('video/MP2T; codecs="avc1.42c00a, mp4a.40.2"');
+		// MIME types are case-insensitive, their parameters aren't
+		const mimeType = (await input.getMimeType()).replace(/^[^;]+/, type => type.toLowerCase());
+		expect(mimeType).toBe('video/mp2t; codecs="avc1.42c00a, mp4a.40.2"');
 
 		const video = (await input.getPrimaryVideoTrack())!;
 		expect(await video.getInternalCodecId()).toBe(0x1b);
