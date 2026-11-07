@@ -3144,6 +3144,8 @@ class PacketReadingContext {
 	endPos = 0;
 	/** The section start of the last PES packet whose PTS a packet took */
 	lastPtsSectionStartPos = -1;
+	/** The start of the last PES packet in which an access unit began */
+	lastAccessUnitSectionStartPos = -1;
 	nextPts: number | null = null;
 
 	suppliedPacket: SuppliedPacket | null = null;
@@ -4008,6 +4010,19 @@ class PacketReadingContext {
 			data = filtered;
 		}
 
+		// random_access_indicator says that a PES packet holds the start of a random access point: the first access
+		// unit beginning in it (the one taking its PTS, if it has one). A packet continuing an access unit begins none.
+		const beginsAccessUnit = !(continuesAccessUnit && accessUnitPos === null);
+		const isFirstAccessUnitOfPesPacket = beginsAccessUnit
+			&& currentPesPacket.sectionStartPos > this.lastAccessUnitSectionStartPos;
+		const isDescribedAccessUnit = isFirstAccessUnitOfPesPacket || (beginsAccessUnit && ptsPesPacket !== null);
+		if (beginsAccessUnit) {
+			this.lastAccessUnitSectionStartPos = Math.max(
+				currentPesPacket.sectionStartPos,
+				ptsPesPacket?.sectionStartPos ?? -1,
+			);
+		}
+
 		let randomAccessIndicator = Math.max(
 			currentPesPacket.randomAccessIndicator,
 			ptsPesPacket?.randomAccessIndicator ?? 0,
@@ -4020,7 +4035,23 @@ class PacketReadingContext {
 		} else if (this.elementaryStream.info.decoderConfig) {
 			const { codec, decoderConfig } = this.elementaryStream.info;
 
-			if (randomAccessIndicator === 1) {
+			if (isDescribedAccessUnit) {
+				// The access unit gets the flag of the PES packet(s) describing it (see above)
+				randomAccessIndicator = Math.max(
+					isFirstAccessUnitOfPesPacket ? currentPesPacket.randomAccessIndicator : 0,
+					beginsAccessUnit && ptsPesPacket ? ptsPesPacket.randomAccessIndicator : 0,
+				);
+			}
+
+			if (!isDescribedAccessUnit && this.elementaryStream.canBeTrustedWithKeyPackets) {
+				// random_access_indicator says that the PES packet holds the start of a random access point, the first
+				// access unit beginning in it. It doesn't tell about the access units after that one, so in a flagged
+				// PES packet, the bitstream decides for them (an all-intra stream may pack several key frames into one
+				// PES packet).
+				randomAccessIndicator = currentPesPacket.randomAccessIndicator === 1
+					? Number(determineVideoPacketType(codec, decoderConfig, data) === 'key')
+					: 0;
+			} else if (randomAccessIndicator === 1) {
 				// Some muxers set random_access_indicator on packets that aren't key frames (on every PES packet, or on
 				// the ones carrying a PCR). A picture that is neither IDR/IRAP nor comes with a recovery point SEI
 				// message (as open-GOP and intra-refresh streams use) can't be a random access point, so the flag
