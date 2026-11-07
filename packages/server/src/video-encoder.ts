@@ -163,7 +163,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.height = this.config.height;
 		codecContext.pixelFormat = pixelFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, 1e6);
-		codecContext.gopSize = 60;
+		// Mediabunny requests every key frame itself (keyFrameInterval), so the encoder must not insert its own on a
+		// schedule of its own
+		codecContext.gopSize = 100_000;
 		codecContext.framerate = new NodeAv.Rational(Math.round(this.config.framerate ?? 0) || 30, 1);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate
 		// control mode
