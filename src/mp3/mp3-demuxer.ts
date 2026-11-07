@@ -164,7 +164,9 @@ export class Mp3Demuxer extends Demuxer {
 						this.xingData = {
 							// LAME and FFmpeg write the same header with 'Info' in place of 'Xing' for CBR streams
 							isVbr: word === XING,
-							frameCount: (flags & XingFlags.FrameCount)
+							// A frame count of 0 can't describe the stream (like in a header that was never filled
+							// in), so it's ignored, like FFmpeg does
+							frameCount: (flags & XingFlags.FrameCount) && view.getUint32(4, false) !== 0
 								? view.getUint32(4, false)
 								: null,
 							fileSize: (flags & XingFlags.FileSize)
@@ -319,6 +321,13 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	async getDurationFromMetadata() {
+		const duration = await this.getDurationFromHeaders();
+		// Never below 0, even when the frames hold fewer samples than the encoder and decoder delays (like a single
+		// MPEG-2 frame of 576 samples does)
+		return duration === null ? null : Math.max(duration, 0);
+	}
+
+	private async getDurationFromHeaders() {
 		const demuxer = this.demuxer;
 
 		assert(demuxer.firstFrameHeader !== null);
