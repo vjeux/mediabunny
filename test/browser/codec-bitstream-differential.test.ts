@@ -48,15 +48,17 @@ const KNOWN_CODEC_STRING_DIVERGENCES: Record<string, string> = {
 	'vp9-bt2020-pq.webm': 'vp09.02.10.10.01.09.14.09.00',
 };
 
-/** Whether the browser decodes this VP9 or AV1 profile and bit depth at all (WebKitGTK only does profile 0). */
+/** Whether the browser decodes this profile and bit depth at all (WebKitGTK only does VP9 and AV1 profile 0, Firefox
+ * none of H.264's High 10, High 4:2:2 and High 4:4:4). */
 const decodesProfile = async (codecString: string) => {
 	const [family, profile, , bitDepth] = codecString.split('.');
-	const canonical = family === 'vp09'
-		? `vp09.${profile}.10.${bitDepth}`
-		: family === 'av01'
-			? `av01.${profile}.00M.${bitDepth}`
-			: null;
-	if (canonical === null) {
+	const canonicalCodecStrings: Record<string, string> = {
+		vp09: `vp09.${profile}.10.${bitDepth}`,
+		av01: `av01.${profile}.00M.${bitDepth}`,
+		avc1: codecString, // Just the profile and level
+	};
+	const canonical = canonicalCodecStrings[family!];
+	if (canonical === undefined) {
 		return true;
 	}
 
@@ -70,6 +72,7 @@ const decodesProfile = async (codecString: string) => {
 // packets of a tiny stream made by FFmpeg (0.4 s of black 64x64 video or 0.1 s of silence), read with
 // ffprobe -show_streams -show_packets -show_data:
 //   av1       -c:v libaom-av1 -cpu-used 8 -crf 50 (-f obu, with its sequence header)
+//   av1Mono   -pix_fmt gray -c:v libaom-av1 -cpu-used 8 -crf 50 (monochrome, which Firefox's dav1d wrapper rejects)
 //   avcSar2   -vf setsar=2/1 -c:v libx264 (64x64 with a 2:1 pixel aspect ratio in its SPS; the IDR without its SEI)
 //   flac      -c:a flac (16 kHz mono; "fLaC" + the STREAMINFO block)
 //   vorbis    -c:a libvorbis -q:a -1 (16 kHz mono; the Xiph-laced headers)
@@ -80,6 +83,10 @@ const PROBES = {
 	av1: {
 		codec: 'av01.0.00M.08',
 		chunks: ['EgAKCgAAAAKv/5tfIAgyDRAAuoAAAkAAAAPOF7o='],
+	},
+	av1Mono: {
+		codec: 'av01.0.00M.08',
+		chunks: ['EgAKCgAAAAKv/5tfJUAyDBAA5AAACwAADlK87A==', 'EgAyECAD4EAAAANyAAAFgBAAmRAyEDADwQAAQAbkAAALAHAAnMA='],
 	},
 	avcSar2: {
 		codec: 'avc1.64000a',
@@ -273,7 +280,7 @@ const NEEDS: Record<string, Needs> = {
 	'av1-high-444.webm': { probe: 'av1' },
 	'av1-professional-422-10bit.webm': { probe: 'av1' },
 	'av1-bt709-full.mp4': { probe: 'av1' },
-	'av1-monochrome.webm': { probe: 'av1' },
+	'av1-monochrome.webm': { probe: 'av1Mono' },
 	'flac-5.1-24bit.mkv': { probe: 'flac' },
 	'vorbis.webm': { probe: 'vorbis' },
 	'opus-5.1.webm': { probe: 'opus51' },
@@ -281,7 +288,7 @@ const NEEDS: Record<string, Needs> = {
 };
 
 /** Skips a fixture whose decoding the platform can't do (WebKitGTK fails on AV1, FLAC and multichannel Opus, hangs on
- * Vorbis, and scales anamorphic frames to square pixels). */
+ * Vorbis, and scales anamorphic frames to square pixels; Firefox fails on monochrome AV1). */
 const skipIfIncapable = async (fileName: string, skip: (condition: boolean, note?: string) => void) => {
 	const needs = NEEDS[fileName] ?? {};
 	if (needs.probe) {
