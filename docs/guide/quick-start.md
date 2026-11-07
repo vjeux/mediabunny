@@ -42,8 +42,8 @@ if (audioTrack) {
 const tags = await input.getMetadataTags();
 tags.title; // Title
 tags.date; // Release date
-tags.images[0]; // Cover art
-tags.raw['TBPM']; // Custom tags
+tags.images?.[0]; // Cover art
+tags.raw?.['TBPM']; // Custom tags
 // ...
 ```
 
@@ -472,6 +472,7 @@ import {
 	ALL_FORMATS,
 	BlobSource,
 	Mp4OutputFormat,
+	BufferTarget,
 } from 'mediabunny';
 
 // Check the above snippets for more examples of Input and Output
@@ -488,7 +489,7 @@ const conversion = await Conversion.init({ input, output });
 if (!conversion.isValid) {
 	// The conversion isn't possible and would error upon execution.
 	// Check `discardedTracks` for the reasons.
-	return;
+	throw new Error('Conversion is not possible.');
 }
 
 // List of tracks that won't make it into the output:
@@ -559,7 +560,7 @@ const conversion = await Conversion.init({
 	output,
 	tracks: 'primary', // Keep only the first track of each type
 	video: {
-		width: 480, // Resize to 480p
+		height: 480, // Resize to 480p
 		quality: new Quality('low'),
 	},
 	audio: {
@@ -599,7 +600,7 @@ await new Promise(resolve => watermark.onload = resolve);
 const input = new Input(...);
 const output = new Output(...);
 
-let ctx: CanvasRenderingContext2D | null = null;
+let ctx: OffscreenCanvasRenderingContext2D | null = null;
 const conversion = await Conversion.init({
 	input,
 	output,
