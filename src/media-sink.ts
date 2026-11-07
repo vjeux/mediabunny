@@ -2404,9 +2404,11 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 					+ sample.duration;
 			} else if (
 				this.currentTimestamp === null
-				|| Math.abs(sampleTimestamp - this.currentTimestamp) >= sample.duration
+				|| sampleTimestamp - this.currentTimestamp >= sample.duration
 			) {
-				// We need to sync with the sample timestamp again
+				// We need to sync with the sample timestamp again. Only forward (a gap), never back, which would play
+				// audio twice: decoders that stamp each output with its chunk's timestamp, as the spec says, stamp the
+				// outputs of packets that share a timestamp (laced frames without durations, for example) alike.
 				this.currentTimestamp = sampleTimestamp;
 			}
 

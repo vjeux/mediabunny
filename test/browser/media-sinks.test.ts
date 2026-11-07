@@ -263,13 +263,16 @@ const remuxDemoAudio = async (getTimestamp: (timestamp: number, index: number) =
 	output.addAudioTrack(source);
 	await output.start();
 
+	// From 0, without the priming packet's negative timestamp, which WebKitGTK's decoder mishandles
+	const firstTimestamp = await track.getFirstTimestamp();
 	let index = 0;
 	for await (const packet of new EncodedPacketSink(track).packets()) {
 		if (packet.timestamp >= 2) {
 			break;
 		}
 
-		await source.add(packet.clone({ timestamp: getTimestamp(packet.timestamp, index++) }), { decoderConfig });
+		const timestamp = getTimestamp(packet.timestamp - firstTimestamp, index++);
+		await source.add(packet.clone({ timestamp }), { decoderConfig });
 	}
 	await output.finalize();
 
@@ -374,7 +377,11 @@ test('Decoded audio stays contiguous when a packet is stamped like the one after
 		packetTimestamps = await getPacketTimestamps(originalTrack);
 	}
 
-	using input = await remuxDemoAudio((timestamp, index) => index === 20 ? packetTimestamps[21]! : timestamp);
+	// A sample before the next packet's timestamp, so that it's also less than a frame late where outputs are stamped
+	// with their own packet's timestamp (outside Chromium)
+	using input = await remuxDemoAudio((timestamp, index) => (
+		index === 20 ? packetTimestamps[21]! - 1 / 48000 : timestamp
+	));
 	const track = await input.getPrimaryAudioTrack();
 	assert(track);
 
@@ -388,7 +395,9 @@ test('Decoded audio stays contiguous when a packet is stamped like the one after
 	}
 });
 
-test('Decoded audio stays in order when a packet decodes to nothing', async () => {
+test('Decoded audio stays in order when a packet decodes to nothing', async ({ skip }) => {
+	skip(!(await vorbisDecoderFinishes()), 'the Vorbis decoder hangs here (native probe)');
+
 	await withDroppedAudioOutput(10, async () => {
 		using input = new Input({
 			source: new UrlSource('/vorbis-eos.ogg'), // Vorbis, so packet durations vary
@@ -441,10 +450,52 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
 
+// WebKitGTK's GStreamer Vorbis decoder hangs instead of decoding or failing, which can't be helped here. Whether the
+// platform's decoder finishes is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny failure
+// fails instead of skipping. vorbis-probe.json holds a tiny stream, from
+// ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -t 0.06 -c:a libvorbis -q:a 0 (decoder config and packets).
+let vorbisDecoderFinishesPromise: Promise<boolean> | null = null;
+const vorbisDecoderFinishes = () => vorbisDecoderFinishesPromise ??= (async () => {
+	const probe = await (await fetch('/vorbis-probe.json')).json() as {
+		codec: string;
+		sampleRate: number;
+		numberOfChannels: number;
+		description: string;
+		chunks: string[];
+	};
+	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+
+	const decoder = new AudioDecoder({ output: data => data.close(), error: () => {} });
+	decoder.configure({
+		codec: probe.codec,
+		sampleRate: probe.sampleRate,
+		numberOfChannels: probe.numberOfChannels,
+		description: fromBase64(probe.description),
+	});
+	probe.chunks.forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+		type: 'key',
+		timestamp: i * 32000,
+		data: fromBase64(chunk),
+	})));
+
+	// Decoding or failing both count as finishing; only a hang doesn't
+	const finished = await Promise.race([
+		decoder.flush().then(() => true, () => true),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+	]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return finished;
+})();
+
 // vorbis-clicks.ogg was made with:
 // ffmpeg -f lavfi -i "aevalsrc=exprs='if(lt(mod(t\,0.5)\,0.004)\,0.8*sin(2*PI*1000*t)\,0)':s=44100:d=3" \
 //   -c:a libvorbis -q:a 4 vorbis-clicks.ogg
-test('Vorbis audio keeps its timing, also after seeking', async () => {
+test('Vorbis audio keeps its timing, also after seeking', async ({ skip }) => {
+	skip(!(await vorbisDecoderFinishes()), 'the Vorbis decoder hangs here (native probe)');
+
 	using input = new Input({
 		source: new UrlSource('/vorbis-clicks.ogg'),
 		formats: ALL_FORMATS,
