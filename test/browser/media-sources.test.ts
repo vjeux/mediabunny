@@ -49,6 +49,35 @@ test('AudioSampleSource, encoding starts even when measuring the encoder\'s prim
 	} finally {
 		globalThis.AudioDecoder = RealAudioDecoder;
 	}
+
+	// The timed-out measurement isn't remembered: the next encoder measures again
+	let decoderCreated = false;
+	globalThis.AudioDecoder = class extends RealAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			super(init);
+			decoderCreated = true;
+		}
+	};
+
+	try {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({
+			data: new Float32Array(960),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		await output.finalize();
+	} finally {
+		globalThis.AudioDecoder = RealAudioDecoder;
+	}
+
+	expect(decoderCreated).toBe(true);
 }, 10_000);
 
 test('VideoSampleSource, normal usage', async () => {

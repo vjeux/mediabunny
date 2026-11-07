@@ -2824,8 +2824,13 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 				+ ` be shifted by the encoder's delay.`,
 			);
 
-			// Not remembered, as the platform may just have been slow
-			audioEncoderPrimingShiftPromises.delete(codecString);
+			// Not remembered, as the platform may just have been slow (found by identity rather than by key, so that
+			// this doesn't depend on how the cache is keyed)
+			for (const [key, value] of audioEncoderPrimingShiftPromises) {
+				if (value === promise) {
+					audioEncoderPrimingShiftPromises.delete(key);
+				}
+			}
 			return 0;
 		}
 
