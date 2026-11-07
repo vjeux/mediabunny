@@ -536,6 +536,57 @@ test('Read and write metadata, FLAC', async () => {
 	expect(readTags.raw!['COMPOSER']).toBe('Hans Zimmer');
 });
 
+test('Vorbis comments keep repeated fields and write pictures once when rewriting tags read from a file', async () => {
+	const writeAndRead = async (format: 'flac' | 'ogg', tags: MetadataTags) => {
+		const output = new Output({
+			format: format === 'flac' ? new FlacOutputFormat() : new OggOutputFormat(),
+			target: new BufferTarget(),
+		});
+		output.setMetadataTags(tags);
+		const dummyTrack = createDummyAudioTrack(format === 'flac' ? 'flac' : 'opus', output);
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+
+	for (const format of ['flac', 'ogg'] as const) {
+		// Fields repeat, as for several artists (RFC 9639, appendix D.2.3), when written by MusicBrainz Picard or
+		// mutagen, for example
+		const tags = await writeAndRead(format, {
+			raw: { ARTIST: ['Artist A', 'Artist B'], GENRE: ['Jazz', 'Bebop'], TITLE: 'Title' },
+		});
+		expect(tags.artist).toBe('Artist A');
+		expect(tags.raw!['ARTIST']).toEqual(['Artist A', 'Artist B']);
+
+		// Writing the tags read, as a conversion does, keeps every value
+		const rewrittenTags = await writeAndRead(format, tags);
+		expect(rewrittenTags.artist).toBe('Artist A');
+		expect(rewrittenTags.raw!['ARTIST']).toEqual(['Artist A', 'Artist B']);
+		expect(rewrittenTags.raw!['GENRE']).toEqual(['Jazz', 'Bebop']);
+		expect(rewrittenTags.raw!['TITLE']).toBe('Title');
+
+		// A changed normalized tag replaces the field's values
+		const changedTags = await writeAndRead(format, { ...tags, artist: 'Someone Else' });
+		expect(changedTags.raw!['ARTIST']).toBe('Someone Else');
+
+		// Field names are case-insensitive, so a raw tag doesn't repeat the field of a normalized one
+		const caseTags = await writeAndRead(format, { title: 'Title', raw: { title: 'Title' } });
+		expect(caseTags.raw!['TITLE']).toBe('Title');
+	}
+
+	// Pictures read from Ogg come with their METADATA_BLOCK_PICTURE raw tags. FLAC stores pictures in PICTURE blocks,
+	// so writing them there too would double them.
+	const oggTags = await writeAndRead('ogg', { images: songMetadata.images });
+	expect(Object.keys(oggTags.raw!)).toContain('METADATA_BLOCK_PICTURE');
+	const flacTags = await writeAndRead('flac', oggTags);
+	expect(flacTags.images).toHaveLength(1);
+	expect(flacTags.raw!['METADATA_BLOCK_PICTURE']).toBeUndefined();
+	expect((await writeAndRead('ogg', flacTags)).images).toHaveLength(1);
+});
+
 test('Read and write metadata, ADTS', async () => {
 	const originalInput = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/sample3.aac')),

@@ -2888,6 +2888,11 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 
 	const writtenTags: string[] = [];
 	const addCommentTag = (key: string, value: string) => {
+		if (isWritingNormalizedTags && key !== 'METADATA_BLOCK_PICTURE') {
+			addNormalizedCommentTag(key, value);
+			return;
+		}
+
 		const joined = `${key}=${value}`;
 		const encoded = textEncoder.encode(joined);
 
@@ -2899,6 +2904,44 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 
 		commentHeaderParts.push(currentBuffer);
 		writtenTags.push(key);
+		commentCount++;
+	};
+
+	let commentCount = 0;
+	let isWritingNormalizedTags = true;
+
+	// Marks the raw tags of a field as written (so that they're skipped), whatever the case of their key: field names
+	// are case-insensitive
+	const coverRawTags = (fieldName: string) => {
+		for (const key in tags.raw) {
+			if (key.toUpperCase() === fieldName) {
+				writtenTags.push(key);
+			}
+		}
+	};
+	// A field may repeat (as for several artists). Read from a file, the normalized tag holds its first value and the
+	// raw tags hold all of them, so if the normalized tag still holds that first value, let's write them all.
+	const addNormalizedCommentTag = (key: string, value: string) => {
+		const rawValues: string[] = [];
+		for (const rawKey in tags.raw) {
+			const rawValue = tags.raw[rawKey];
+			if (rawKey === 'vendor' || rawKey.toUpperCase() !== key) {
+				continue;
+			}
+
+			if (typeof rawValue === 'string') {
+				rawValues.push(rawValue);
+			} else if (Array.isArray(rawValue) && rawValue.every(x => typeof x === 'string')) {
+				rawValues.push(...rawValue);
+			}
+		}
+
+		coverRawTags(key);
+		isWritingNormalizedTags = false;
+		for (const valueToWrite of rawValues[0] === value ? rawValues : [value]) {
+			addCommentTag(key, valueToWrite);
+		}
+		isWritingNormalizedTags = true;
 	};
 
 	for (const { key, value } of keyValueIterator(tags)) {
@@ -2960,6 +3003,9 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 			}; break;
 
 			case 'images': {
+				// The images hold the pictures of the raw tags read from a file, wherever they're written
+				coverRawTags('METADATA_BLOCK_PICTURE');
+
 				// For example, in .flac, we put the pictures in a different section, not in the Vorbis comment header.
 				if (!writeImages) {
 					break;
@@ -3018,6 +3064,8 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 		}
 	}
 
+	isWritingNormalizedTags = false;
+
 	if (tags.raw) {
 		for (const key in tags.raw) {
 			const value = tags.raw[key] ?? tags.raw[key.toLowerCase()];
@@ -3040,7 +3088,7 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	}
 
 	const listLengthBuffer = new Uint8Array(4);
-	toDataView(listLengthBuffer).setUint32(0, writtenTags.length, true);
+	toDataView(listLengthBuffer).setUint32(0, commentCount, true);
 	commentHeaderParts.splice(2, 0, listLengthBuffer); // Insert after the header and vendor section
 
 	// Merge all comment header parts into a single buffer
