@@ -85,6 +85,10 @@ $29.97 \rightarrow 30000/1001$\
 $59.94 \rightarrow 60000/1001$
 :::
 
+::: info
+Which `disposition` flags end up in the file depends on the output format. Matroska and WebM store all of them except `primary`. MP4 and MOV only store `default`, as the track's enabled flag, and keep at least one track of each type enabled. HLS uses `default`, `primary` and `forced`. The other formats store none.
+:::
+
 As an example, let's add two tracks to our output:
 - A video track driven by the contents of a `<canvas>` element, encoded using AVC
 - An audio track driven by the user's microphone input, encoded using AAC
