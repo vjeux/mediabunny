@@ -155,6 +155,11 @@ describe('Support queries match real encodes', () => {
 				// The platform's encoder never settled, so no later audio call on this page can be trusted
 				break;
 			}
+			if (native === 'silent') {
+				// The platform's encoder outputs silence (Firefox's Vorbis encoder), so whether canEncodeAudio
+				// accepts it is up to how Mediabunny treats a broken encoder, and nothing here to compare with
+				continue;
+			}
 
 			const canEncode = await canEncodeAudio(codec, { sampleRate, numberOfChannels, quality: medium() });
 			const encoded = await withTimeout(encodeAudio({
@@ -457,9 +462,11 @@ describe('Rate control', () => {
 });
 
 describe('Key frames', () => {
+	// In realtime mode, since in quality mode encoders may add key frames of their own, which WebCodecs allows:
+	// Firefox's AV1 encoder adds one right after each requested one, and its VP8 encoder places some at scene cuts
 	const keyTimestamps = async (codec: VideoCodec, keyFrameInterval: number | undefined, timestamps: number[]) => {
 		const result = await encodeVideo({
-			config: { codec, quality: medium(), keyFrameInterval },
+			config: { codec, quality: medium(), keyFrameInterval, latencyMode: 'realtime' },
 			container: containerFor(codec),
 			width: 160,
 			height: 120,
@@ -610,14 +617,15 @@ describe('Encoder options', () => {
 				const frames = await decodeVideo(track);
 				expect(frames.length).toBe(3);
 				for (const frame of frames) {
+					// Decoders may output the merged frames as I420A or, like Firefox's, as BGRA
 					if (alpha === 'keep') {
-						expect(frame.format).toBe('I420A');
+						expect(frame.alpha).not.toBe(null);
 						if (alphaValuesSurvive) {
 							expect(frame.alpha![0]).toBeGreaterThan(245);
 							expect(Math.abs(frame.alpha![1] - 64)).toBeLessThan(10);
 						}
 					} else {
-						expect(frame.format).not.toBe('I420A');
+						expect(frame.alpha === null || Math.min(...frame.alpha) > 245).toBe(true);
 					}
 				}
 				input.dispose();
@@ -725,7 +733,14 @@ describe('Frame geometry and timing', () => {
 	test('with transform.frameRate, key frames fall on the normalized timeline', async () => {
 		for (const codec of await frameExactVideoCodecs()) {
 			const result = await encodeVideo({
-				config: { codec, quality: medium(), keyFrameInterval: 1, transform: { frameRate: 10 } },
+				// Realtime mode, so that the key frames are the requested ones only (see keyTimestamps)
+				config: {
+					codec,
+					quality: medium(),
+					keyFrameInterval: 1,
+					transform: { frameRate: 10 },
+					latencyMode: 'realtime',
+				},
 				container: containerFor(codec),
 				width: 160,
 				height: 120,
@@ -811,7 +826,8 @@ describe('Color metadata', () => {
 							.toEqual({ ...label, colorSpace });
 						expect({ ...label, colorSpace: await track.getColorSpace() }).toEqual({ ...label, colorSpace });
 					}
-					if (decoderReports) {
+					// The decoder gets the container's color space, so it needs the encoder to have reported it too
+					if (encoderReports && decoderReports) {
 						const frames = await decodeVideo(track);
 						expect({ ...label, colorSpace: frames[0]!.colorSpace }).toEqual({ ...label, colorSpace });
 					}

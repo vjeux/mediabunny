@@ -596,7 +596,7 @@ export const nativeAudioEncode = async (
 	numberOfChannels: number,
 	/** The sample rate to decode with, if not the encoder's (Mediabunny's demuxers give Opus 48 kHz). */
 	decodeSampleRate?: number,
-): Promise<'unsupported' | 'works' | 'fails' | 'hangs'> => {
+): Promise<'unsupported' | 'works' | 'silent' | 'fails' | 'hangs'> => {
 	if (typeof AudioEncoder === 'undefined') {
 		return 'unsupported';
 	}
@@ -631,14 +631,19 @@ export const nativeAudioEncode = async (
 	let hung = false;
 	try {
 		encoder.configure(config);
+		// A 440 Hz tone at half amplitude, so that an encoder outputting silence can be told apart
 		const frames = Math.round(sampleRate / 10);
+		const tone = new Float32Array(frames * numberOfChannels);
+		for (let i = 0; i < tone.length; i++) {
+			tone[i] = 0.5 * Math.sin(2 * Math.PI * 440 * (i % frames) / sampleRate);
+		}
 		const data = new AudioData({
 			format: 'f32-planar',
 			sampleRate,
 			numberOfChannels,
 			numberOfFrames: frames,
 			timestamp: 0,
-			data: new Float32Array(frames * numberOfChannels),
+			data: tone,
 		});
 		encoder.encode(data);
 		data.close();
@@ -671,7 +676,11 @@ export const nativeAudioEncode = async (
 	if (hungCoderKinds.has('audio')) {
 		return 'hangs';
 	}
-	return decoded && decoded.rates.length > 0 ? 'works' : 'fails';
+	if (!decoded || decoded.rates.length === 0) {
+		return 'fails';
+	}
+
+	return decoded.peak < 0.05 ? 'silent' : 'works';
 };
 
 /**
@@ -728,11 +737,24 @@ const nativeAudioDecode = async (
 
 	const rates: number[] = [];
 	const timestamps: number[] = [];
+	// The largest decoded sample magnitude, or Infinity if a decoder can't convert its output for reading
+	let peak = 0;
 	let failed = false;
 	const decoder = new AudioDecoder({
 		output: (data) => {
 			rates.push(data.sampleRate);
 			timestamps.push(data.timestamp);
+			try {
+				const plane = new Float32Array(data.numberOfFrames);
+				for (let channel = 0; channel < data.numberOfChannels; channel++) {
+					data.copyTo(plane, { planeIndex: channel, format: 'f32-planar' });
+					for (const value of plane) {
+						peak = Math.max(peak, Math.abs(value));
+					}
+				}
+			} catch {
+				peak = Infinity;
+			}
 			data.close();
 		},
 		error: () => {
@@ -755,5 +777,5 @@ const nativeAudioDecode = async (
 		decoder.close();
 	}
 
-	return failed ? null : { rates, timestamps };
+	return failed ? null : { rates, timestamps, peak };
 };

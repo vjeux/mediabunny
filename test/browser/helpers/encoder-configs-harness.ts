@@ -243,19 +243,22 @@ export const decodeVideo = async (track: InputVideoTrack) => {
 
 	for await (using sample of new VideoSampleSink(track).samples()) {
 		let alpha: [number, number] | null = null;
-		if (sample.format === 'I420A') {
+		const isPacked = sample.format === 'RGBA' || sample.format === 'BGRA';
+		if (sample.format === 'I420A' || isPacked) {
 			const size = sample.allocationSize();
 			const bytes = new Uint8Array(size);
 			await sample.copyTo(bytes);
 			const { codedWidth: w, codedHeight: h } = sample;
-			const alphaOffset = w * h + 2 * Math.ceil(w / 2) * Math.ceil(h / 2);
-			const row = alphaOffset + Math.floor(h / 2) * w;
+			// The alpha plane follows the Y, U and V planes in I420A, and is every fourth byte in RGBA and BGRA
+			const alphaOffset = isPacked ? 3 : w * h + 2 * Math.ceil(w / 2) * Math.ceil(h / 2);
+			const step = isPacked ? 4 : 1;
+			const row = alphaOffset + Math.floor(h / 2) * w * step;
 			let left = 0;
 			let right = 0;
 			const half = Math.floor(w / 2);
 			for (let x = 0; x < half; x++) {
-				left += bytes[row + x]!;
-				right += bytes[row + half + x]!;
+				left += bytes[row + x * step]!;
+				right += bytes[row + (half + x) * step]!;
 			}
 			alpha = [left / half, right / half];
 		}
