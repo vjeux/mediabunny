@@ -36,6 +36,20 @@ test('Implicit source disposal', async () => {
 	expect(source._disposed);
 });
 
+test('Input rejects a freed SourceRef, like a disposed Source', () => {
+	const source = new CustomSource({ getSize: () => 16, read: () => new Uint8Array(16) });
+	const ref = source.ref();
+	ref.free();
+
+	expect(() => new Input({ source, formats: ALL_FORMATS })).toThrow(
+		new TypeError('options.source must not be a disposed Source.'),
+	);
+	// Accepting it would make every read fail, and disposing the input free the ref a second time
+	expect(() => new Input({ source: ref, formats: ALL_FORMATS })).toThrow(
+		new TypeError('options.source must not be a freed SourceRef.'),
+	);
+});
+
 test('Implicit source disposal, double input', async () => {
 	const filePath = path.join(__dirname, '../public/video.mp4');
 	const source = new FilePathSource(filePath);
