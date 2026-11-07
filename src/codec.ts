@@ -420,6 +420,8 @@ export const extractVideoCodecString = (trackInfo: {
 	codecDescription: Uint8Array | null;
 	colorSpace: VideoColorSpaceInit | null;
 	avcType: 1 | 3 | null;
+	/** The sample entry type, when the container stores one. */
+	hevcType?: 'hvc1' | 'hev1' | null;
 	avcCodecInfo: AvcDecoderConfigurationRecord | null;
 	hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 	vp9CodecInfo: Vp9CodecInfo | null;
@@ -490,7 +492,8 @@ export const extractVideoCodecString = (trackInfo: {
 			}
 		}
 
-		let codecString = 'hev1.';
+		// The string starts with the sample entry type (ISO/IEC 14496-15, E.3)
+		let codecString = (trackInfo.hevcType ?? 'hev1') + '.';
 
 		codecString += ['', 'A', 'B', 'C'][generalProfileSpace]! + generalProfileIdc;
 		codecString += '.';
