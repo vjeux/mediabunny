@@ -1442,7 +1442,16 @@ test.concurrent('A new EXT-X-MAP after a discontinuity sends its parameter sets 
 			metadataSizes.push(packet.byteLength);
 		}
 		const description = new Uint8Array((await videoTrack.getDecoderConfig())!.description as ArrayBuffer);
-		return { packets, metadataSizes, description, codec: await videoTrack.getCodec() };
+		// The decoder config each packet needs when it's not the track's, as an ID per distinct config
+		const configs: (VideoDecoderConfig | null)[] = [];
+		const packetConfigs = packets.map((packet) => {
+			const config = videoTrack._backing.getDecoderConfigForPacket!(packet) as VideoDecoderConfig | null;
+			if (!configs.includes(config)) {
+				configs.push(config);
+			}
+			return configs.indexOf(config);
+		});
+		return { packets, metadataSizes, description, codec: await videoTrack.getCodec(), configs, packetConfigs };
 	};
 	const playlistOf = (...names: string[]) => [
 		'#EXTM3U',
@@ -1486,10 +1495,21 @@ test.concurrent('A new EXT-X-MAP after a discontinuity sends its parameter sets 
 		expect(result.metadataSizes).toEqual(result.packets.map(x => x.byteLength));
 		expect(result.packets.every(x => x.byteLength === x.data.byteLength)).toBe(true);
 
+		// The ad's packets also report their own decoder config, for decoders to be reconfigured with
+		expect(result.packetConfigs).toEqual([
+			...a.packets.map(() => 0),
+			...b.packets.map(() => 1),
+			...a.packets.map(() => 0),
+		]);
+		expect(result.configs[0]).toBe(null);
+		expect(new Uint8Array(result.configs[1]!.description as ArrayBuffer)).toEqual(b.description);
+		expect([result.configs[1]!.codedWidth, result.configs[1]!.codedHeight]).toEqual([96, 96]);
+
 		// With a single init section, packets are left alone, discontinuities or not
 		const single = await readPlaylist(playlistOf(first, first));
 		expect(single.packets.map(x => x.data)).toEqual([...a.packets, ...a.packets].map(x => x.data));
 		expect(single.metadataSizes).toEqual(single.packets.map(x => x.byteLength));
+		expect(single.configs).toEqual([null]);
 	}
 });
 

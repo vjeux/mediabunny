@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -301,11 +301,24 @@ test('HLS: video returning from an ad break to the first EXT-X-MAP decodes with 
 	assert(videoTrack);
 	const sink = new VideoSampleSink(videoTrack);
 
+	// The decoder is also reconfigured at each switch, for decoders that don't apply new parameter sets from the
+	// bitstream (WebKit's keeps the first resolution)
+	const configuredSizes: string[] = [];
+	const configureSpy = vi.spyOn(VideoDecoder.prototype, 'configure');
+
 	const sizes: string[] = [];
-	for await (const sample of sink.samples()) {
-		sizes.push(`${sample.codedWidth}x${sample.codedHeight}`);
-		sample.close();
+	try {
+		for await (const sample of sink.samples()) {
+			sizes.push(`${sample.codedWidth}x${sample.codedHeight}`);
+			sample.close();
+		}
+	} finally {
+		for (const [config] of configureSpy.mock.calls) {
+			configuredSizes.push(`${config.codedWidth}x${config.codedHeight}`);
+		}
+		configureSpy.mockRestore();
 	}
+	expect(configuredSizes).toEqual(['64x48', '96x96', '64x48']);
 	expect(sizes).toEqual([
 		...Array<string>(10).fill('64x48'),
 		...Array<string>(10).fill('96x96'),

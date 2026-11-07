@@ -252,6 +252,11 @@ type InBandParameterSets = {
 	targetLengthSize: 1 | 2 | 3 | 4;
 	/** Whether the segment's parameter sets differ from the first segment's */
 	differ: boolean;
+	/**
+	 * The decoder config of the segment's packets when its parameter sets differ from the first segment's, with the NAL
+	 * unit length size of the packets as delivered
+	 */
+	decoderConfig: VideoDecoderConfig | null;
 };
 
 const parseParameterSets = (codec: 'avc' | 'hevc', description: Uint8Array) => {
@@ -277,6 +282,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	number: number;
 	packetInfos = new WeakMap<EncodedPacket, PacketInfo>();
 	inBandParameterSets = new WeakMap<InputTrack, Promise<InBandParameterSets | null>>();
+	/** Decoder configs of packets that need another one than the track's */
+	packetDecoderConfigs = new WeakMap<EncodedPacket, VideoDecoderConfig | AudioDecoderConfig>();
+	/** One object per distinct video decoder config, so that segments sharing an init section share the object */
+	distinctVideoDecoderConfigs: VideoDecoderConfig[] = [];
 
 	hydrationPromise: Promise<void> | null = null;
 	firstInputTrack: InputTrack | null = null;
@@ -463,7 +472,16 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			sourcePacket: packet,
 		});
 
+		if (ownParameterSets?.decoderConfig) {
+			// Decoders that don't apply new parameter sets from the bitstream (WebKit's) need to be reconfigured
+			this.packetDecoderConfigs.set(modified, ownParameterSets.decoderConfig);
+		}
+
 		return modified;
+	}
+
+	getDecoderConfigForPacket(packet: EncodedPacket) {
+		return this.packetDecoderConfigs.get(packet) ?? null;
 	}
 
 	/**
@@ -509,11 +527,34 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 				const differ = !uint8ArraysAreEqual(firstDescription, description);
 
+				let decoderConfig: VideoDecoderConfig | null = null;
+				if (differ) {
+					let packetDescription = description;
+					if (own.lengthSize !== first.lengthSize) {
+						// The packets get the first segment's NAL unit length size; lengthSizeMinusOne is in the low
+						// two bits of byte 4 of avcC and of byte 21 of hvcC
+						packetDescription = description.slice();
+						const pos = codec === 'avc' ? 4 : 21;
+						packetDescription[pos] = (packetDescription[pos]! & 0xfc) | (first.lengthSize - 1);
+					}
+
+					decoderConfig = this.distinctVideoDecoderConfigs.find(x => x.codec === config.codec
+						&& x.codedWidth === config.codedWidth
+						&& x.codedHeight === config.codedHeight
+						&& uint8ArraysAreEqual(toUint8Array(x.description!), packetDescription),
+					) ?? null;
+					if (!decoderConfig) {
+						decoderConfig = { ...config, description: packetDescription };
+						this.distinctVideoDecoderConfigs.push(decoderConfig);
+					}
+				}
+
 				return {
 					parameterSets: concatNalUnitsInLengthPrefixed(own.nalUnits, first.lengthSize),
 					lengthSize: own.lengthSize,
 					targetLengthSize: first.lengthSize,
 					differ,
+					decoderConfig,
 				};
 			})();
 			this.inBandParameterSets.set(track, promise);
