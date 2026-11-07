@@ -324,9 +324,27 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		assert(demuxer.firstFrameHeader !== null);
 		assert(demuxer.firstFrameHeaderPos !== null);
 
-		if (demuxer.xingData && demuxer.xingData.frameCount !== null) {
+		let frameCount = demuxer.xingData?.frameCount ?? null;
+		const streamSize = demuxer.xingData?.fileSize ?? null;
+
+		const audioEndPos = frameCount !== null && streamSize
+			? await findAudioEndBeforeTrailingTags(demuxer.reader)
+			: null;
+		if (audioEndPos !== null && streamSize) {
+			// When the audio goes well beyond the stream that the Xing/Info header describes, the file holds more
+			// than that stream (like MP3s joined with `cat`), and the header's frame count only covers its start.
+			// Like FFmpeg, which then goes by the bitrate, don't use it. A file whose audio ends well before that was
+			// cut off, and keeps the frame count.
+			assert(demuxer.xingFrameHeaderPos !== null);
+			const audioSize = audioEndPos - demuxer.xingFrameHeaderPos;
+			if (audioSize - streamSize > streamSize / 16) {
+				frameCount = null;
+			}
+		}
+
+		if (frameCount !== null) {
 			return (
-				demuxer.xingData.frameCount * demuxer.firstFrameHeader.audioSamplesInFrame - demuxer.primingDelay
+				frameCount * demuxer.firstFrameHeader.audioSamplesInFrame - demuxer.primingDelay
 			) / demuxer.firstFrameHeader.sampleRate;
 		} else if (!demuxer.xingData?.isVbr) {
 			// Not tagged as VBR, assuming CBR
@@ -503,3 +521,46 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		return this.getNextPacket(packet, options);
 	}
 }
+
+const APE_TAG_FOOTER_SIZE = 32;
+
+/** Returns where the audio of an MP3 file ends, before any APEv2 and ID3v1 tags at its end. */
+const findAudioEndBeforeTrailingTags = async (reader: Reader) => {
+	if (reader.fileSize === null) {
+		return null;
+	}
+
+	let endPos = reader.fileSize;
+
+	if (endPos >= ID3_V1_TAG_SIZE) {
+		let slice = reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+
+		if (slice && readAscii(slice, 3) === 'TAG') {
+			endPos -= ID3_V1_TAG_SIZE;
+		}
+	}
+
+	// APEv2 tags end with a 32-byte footer and sit in front of any ID3v1 tag
+	if (endPos >= APE_TAG_FOOTER_SIZE) {
+		let slice = reader.requestSlice(endPos - APE_TAG_FOOTER_SIZE, APE_TAG_FOOTER_SIZE);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+
+		if (slice && readAscii(slice, 8) === 'APETAGEX') {
+			const view = toDataView(readBytes(slice, 24));
+			const tagSize = view.getUint32(4, true); // Includes the footer, but not the header
+			const hasHeader = (view.getUint32(12, true) & (1 << 31)) !== 0;
+
+			const tagStartPos = endPos - tagSize - (hasHeader ? APE_TAG_FOOTER_SIZE : 0);
+			if (tagStartPos >= 0) {
+				endPos = tagStartPos;
+			}
+		}
+	}
+
+	return endPos;
+};

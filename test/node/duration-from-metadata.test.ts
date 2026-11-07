@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_FORMATS, Input, FilePathSource } from '../../src/index.js';
+import { ALL_FORMATS, BufferSource, Input, FilePathSource } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -110,6 +110,41 @@ test('ADTS AAC duration metadata', async () => {
 	for (const track of tracks) {
 		expect(await track.getDurationFromMetadata()).toBe(null);
 	}
+});
+
+test('MP3 duration metadata of joined files, where the Xing/Info header only covers the first one', async () => {
+	// MPEG-1 Layer III, 128 kbps, 44.1 kHz, mono: 417 bytes and 1152 samples per frame
+	const frame = () => {
+		const bytes = new Uint8Array(417);
+		bytes.set([0xff, 0xfb, 0x90, 0xc0]);
+		return bytes;
+	};
+	// A LAME-style Info (CBR) frame in front of the given number of frames, declaring their count and size
+	const stream = (frameCount: number) => {
+		const info = frame();
+		info.set([...'Info'].map(char => char.charCodeAt(0)), 4 + 17); // Behind the side information
+		const view = new DataView(info.buffer);
+		view.setUint32(4 + 17 + 4, 0x3); // Frame count and byte count present
+		view.setUint32(4 + 17 + 8, frameCount);
+		view.setUint32(4 + 17 + 12, (frameCount + 1) * 417);
+		return [info, ...Array.from({ length: frameCount }, frame)];
+	};
+	const metadataDuration = async (frames: Uint8Array[]) => {
+		const bytes = new Uint8Array(frames.length * 417);
+		frames.forEach((frame, i) => bytes.set(frame, i * 417));
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return await input.getDurationFromMetadata();
+	};
+
+	// One stream: its header's frame count
+	expect(await metadataDuration(stream(383))).toBeCloseTo(383 * 1152 / 44100, 6);
+
+	// 1 s, then 10 s without a header (`cat ad.mp3 episode.mp3`, as with podcast ad insertion). FFmpeg detects an
+	// "invalid concatenated file" (the file is over 1/16 larger than the header's byte count) and goes by the bitrate.
+	expect(await metadataDuration([...stream(38), ...stream(383).slice(1)])).toBeCloseTo(421 * 1152 / 44100, 1);
+
+	// A file cut off within the stream still gets the header's frame count
+	expect(await metadataDuration(stream(383).slice(0, 200))).toBeCloseTo(383 * 1152 / 44100, 6);
 });
 
 test('MP3 duration metadata', async () => {
