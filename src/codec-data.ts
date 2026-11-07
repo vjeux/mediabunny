@@ -1155,12 +1155,59 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 };
 
 /** Builds a HevcDecoderConfigurationRecord from an HEVC packet in Annex B format. */
+/**
+ * Finds the SPS that the first slice segment of a picture refers to (through the slice_pic_parameter_set_id of its
+ * header and the pps_seq_parameter_set_id of that PPS), among the parameter sets preceding it. Returns its index in
+ * `spsUnits`, or null if it can't be told.
+ */
+const findActiveHevcSpsIndex = (spsUnits: Uint8Array[], ppsUnits: Uint8Array[], firstSlice: Uint8Array) => {
+	try {
+		const slice = new Bitstream(removeEmulationPreventionBytes(firstSlice));
+		const sliceType = extractNalUnitTypeForHevc(firstSlice[0]!);
+		slice.skipBits(16); // NAL unit header
+		slice.skipBits(1); // first_slice_segment_in_pic_flag
+		if (sliceType >= HevcNalUnitType.BLA_W_LP && sliceType <= HevcNalUnitType.RSV_IRAP_VCL23) {
+			slice.skipBits(1); // no_output_of_prior_pics_flag
+		}
+		const ppsId = readExpGolomb(slice); // slice_pic_parameter_set_id
+
+		// A later parameter set with the same ID replaces an earlier one
+		let spsId: number | null = null;
+		for (const pps of ppsUnits) {
+			const bitstream = new Bitstream(removeEmulationPreventionBytes(pps));
+			bitstream.skipBits(16); // NAL unit header
+			if (readExpGolomb(bitstream) === ppsId) { // pps_pic_parameter_set_id
+				spsId = readExpGolomb(bitstream); // pps_seq_parameter_set_id
+			}
+		}
+
+		let index: number | null = null;
+		for (let i = 0; i < spsUnits.length; i++) {
+			const bitstream = new Bitstream(removeEmulationPreventionBytes(spsUnits[i]!));
+			bitstream.skipBits(16 + 4); // NAL unit header, sps_video_parameter_set_id
+			const maxSubLayersMinus1 = bitstream.readBits(3);
+			bitstream.skipBits(1); // sps_temporal_id_nesting_flag
+			parseProfileTierLevel(bitstream, maxSubLayersMinus1);
+			if (readExpGolomb(bitstream) === spsId) { // sps_seq_parameter_set_id
+				index = i;
+			}
+		}
+
+		return index;
+	} catch {
+		return null;
+	}
+};
+
 export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) => {
 	try {
 		const vpsUnits: Uint8Array[] = [];
 		const spsUnits: Uint8Array[] = [];
 		const ppsUnits: Uint8Array[] = [];
 		const seiUnits: Uint8Array[] = [];
+		let firstSlice: Uint8Array | null = null;
+		let spsCountBeforeSlice = 0;
+		let ppsCountBeforeSlice = 0;
 
 		// The counts are capped at what the record can hold
 		const MAX_NAL_UNITS_PER_ARRAY = 0xffff;
@@ -1169,7 +1216,11 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 			const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
 			const type = extractNalUnitTypeForHevc(nalUnit[0]!);
 
-			if (type === HevcNalUnitType.VPS_NUT && vpsUnits.length < MAX_NAL_UNITS_PER_ARRAY) {
+			if (firstSlice === null && type < HevcNalUnitType.VPS_NUT) { // The first VCL NAL unit
+				firstSlice = nalUnit;
+				spsCountBeforeSlice = spsUnits.length;
+				ppsCountBeforeSlice = ppsUnits.length;
+			} else if (type === HevcNalUnitType.VPS_NUT && vpsUnits.length < MAX_NAL_UNITS_PER_ARRAY) {
 				vpsUnits.push(nalUnit);
 			} else if (type === HevcNalUnitType.SPS_NUT && spsUnits.length < MAX_NAL_UNITS_PER_ARRAY) {
 				spsUnits.push(nalUnit);
@@ -1184,6 +1235,17 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 		}
 
 		if (spsUnits.length === 0 || ppsUnits.length === 0) return null;
+
+		// The SPS the picture uses comes first, so that it describes the record, and so that users of the first SPS
+		// (like the MPEG-TS demuxer, for the dimensions) get it. Other SPS stay in the record.
+		const activeSpsIndex = firstSlice && findActiveHevcSpsIndex(
+			spsUnits.slice(0, spsCountBeforeSlice),
+			ppsUnits.slice(0, ppsCountBeforeSlice),
+			firstSlice,
+		);
+		if (activeSpsIndex) {
+			spsUnits.unshift(...spsUnits.splice(activeSpsIndex, 1));
+		}
 
 		const spsInfo = parseHevcSps(spsUnits[0]!);
 		if (!spsInfo) return null;
