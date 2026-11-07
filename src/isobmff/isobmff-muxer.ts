@@ -1524,11 +1524,20 @@ export class IsobmffMuxer extends Muxer {
 	private computeSampleTableSizeUpperBound() {
 		assert(this.fastStart === 'reserve');
 
-		let upperBound = 0;
+		// mvhd may grow to version 1 (64-bit times)
+		let upperBound = 12;
 
 		for (const trackData of this.trackDatas) {
 			const n = trackData.track.metadata.maximumPacketCount;
 			assert(n !== undefined); // We validated this earlier
+
+			// Boxes that only appear once samples have been added, which the moov box measured when reserving lacks:
+			upperBound += 20; // btrt
+			upperBound += 8 + 12 + 4 + 2 * 20; // edts with an elst of two 64-bit entries
+			upperBound += 2 * (8 + 4 + 4); // stss and ctts headers
+			upperBound += 8 + 4 + 5 * 8; // cslg with 64-bit fields
+			upperBound += (8 + 4 + 4 + 4 + 4) + (8 + 4 + 4 + 4); // sgpd and sbgp headers
+			upperBound += 2 * 12; // tkhd and mdhd growing to version 1
 
 			// Given the max allowed packet count, compute the space they'll take up in the Sample Table Box, assuming
 			// the worst case for each individual box:
