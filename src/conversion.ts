@@ -1840,7 +1840,11 @@ export class Conversion {
 				|| !!crop
 				// Don't expect encoders to reliably handle non-square pixels:
 				|| squarePixelWidth !== await track.getCodedWidth()
-				|| squarePixelHeight !== await track.getCodedHeight();
+				|| squarePixelHeight !== await track.getCodedHeight()
+				// Encoders read planar frames as YUV, so planes holding G, B and R (identity matrix, as in lossless
+				// VP9 or AV1 made from RGB sources) need to be converted first. The decoded frames don't reliably
+				// carry that matrix, so it's taken from the track:
+				|| (await track.getColorSpace()).matrix === 'rgb';
 
 			if (!needsRerender) {
 				// If we're directly passing decoded samples back to the encoder, sometimes the encoder may error due
