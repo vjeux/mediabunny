@@ -2471,6 +2471,23 @@ export class Conversion {
 		return Math.ceil(1.5 * packetRate * duration) + 64;
 	}
 
+	/** @internal */
+	_getTrackDuration(track: InputTrack) {
+		let promise = this._trackDurations.get(track);
+		if (!promise) {
+			promise = (async () => {
+				if (await track.isLive()) {
+					return Infinity; // Upper bound (assuming no universe heat death)
+				}
+
+				return (await track.getDurationFromMetadata()) ?? (await track.computeDuration());
+			})();
+			this._trackDurations.set(track, promise);
+		}
+
+		return promise;
+	}
+
 	/**
 	 * Where a shrinking copy of a track should start without deviating from the trim range: at the trim start, or at
 	 * the track's first key packet if its media only begins after that, since there was nothing before it to cut away.
@@ -2493,23 +2510,6 @@ export class Conversion {
 
 		const mediaEndTimestamp = Math.min(await this._getTrackDuration(track), this._endTimestamp);
 		return mediaEndTimestamp - this._startTimestamp > this._copyBoundaryTolerance;
-	}
-
-	/** @internal */
-	_getTrackDuration(track: InputTrack) {
-		let promise = this._trackDurations.get(track);
-		if (!promise) {
-			promise = (async () => {
-				if (await track.isLive()) {
-					return Infinity; // Upper bound (assuming no universe heat death)
-				}
-
-				return (await track.getDurationFromMetadata()) ?? (await track.computeDuration());
-			})();
-			this._trackDurations.set(track, promise);
-		}
-
-		return promise;
 	}
 
 	/** @internal */
