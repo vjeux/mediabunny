@@ -7,11 +7,14 @@ import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS, FLAC } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { calculateCrc16, calculateCrc8 } from '../../src/flac/flac-misc.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { FlacOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { VERSIONED_NAME } from '../../src/version.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -287,6 +290,85 @@ test('appendOnly writes correct STREAMINFO header', async () => {
 		// minimum_frame_size=0
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	]));
+});
+
+test('renumbers frames copied from later in a stream', async () => {
+	// A frame's coded number is the number of frames (or, with a variable block size, samples) before it in the stream
+	// (RFC 9639, section 9.1.5). Readers such as FFmpeg take timestamps from it, so frames copied from later in a
+	// stream, as when trimming its start, must be renumbered.
+	const mux = async (frames: Uint8Array[], decoderConfig: AudioDecoderConfig) => {
+		const target = new BufferTarget();
+		const output = new Output({ format: new FlacOutputFormat(), target });
+		const source = new EncodedAudioPacketSource('flac');
+		output.addAudioTrack(source);
+		await output.start();
+		for (const [i, frame] of frames.entries()) {
+			await source.add(new EncodedPacket(frame, 'key', i, 0), i === 0 ? { decoderConfig } : undefined);
+		}
+		await output.finalize();
+		assert(target.buffer);
+
+		using input = new Input({ source: new BufferSource(target.buffer), formats: ALL_FORMATS });
+		const written: Uint8Array[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			written.push(packet.data);
+		}
+		return written;
+	};
+	const expectValidChecksums = (frame: Uint8Array, headerLength: number) => {
+		expect(calculateCrc8(frame.subarray(0, headerLength))).toBe(frame[headerLength]);
+		expect(calculateCrc16(frame.subarray(0, -2))).toBe((frame.at(-2)! << 8) | frame.at(-1)!);
+	};
+
+	// Fixed block size: the frames of sample.flac from the second one on
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/sample.flac')),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryAudioTrack())!;
+	const frames: Uint8Array[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		frames.push(packet.data);
+		if (frames.length === 4) {
+			break;
+		}
+	}
+	expect(frames.map(x => x[4])).toEqual([0, 1, 2, 3]); // One-byte coded numbers
+
+	const trimmed = await mux(frames.slice(1), (await track.getDecoderConfig())!);
+	expect(trimmed.map(x => x[4])).toEqual([0, 1, 2]);
+	for (const [i, frame] of trimmed.entries()) {
+		expectValidChecksums(frame, 5);
+		expect(frame.subarray(6, -2)).toEqual(frames[i + 1]!.subarray(6, -2)); // The audio is untouched
+	}
+
+	// Variable block size: mono 16-bit 44.1 kHz frames of 576 samples numbered by their first sample, starting at
+	// sample 1152, whose two-byte coded number shrinks to one byte
+	const variableFrame = (sampleNumber: number) => {
+		const codedNumber = sampleNumber < 0x80
+			? [sampleNumber]
+			: [0xc0 | (sampleNumber >> 6), 0x80 | (sampleNumber & 0x3f)];
+		const header = [0xff, 0xf9, 0x79, 0x08, ...codedNumber, 0x02, 0x3f]; // Uncommon 16-bit block size of 576
+		const bytes = [...header, calculateCrc8(new Uint8Array(header)), 0x00, 0x12, 0x34]; // A constant subframe
+		const crc = calculateCrc16(new Uint8Array(bytes));
+		return new Uint8Array([...bytes, crc >> 8, crc & 0xff]);
+	};
+	const streamInfo = new Uint8Array(34);
+	const view = new DataView(streamInfo.buffer);
+	view.setUint16(0, 576);
+	view.setUint16(2, 576);
+	view.setUint32(10, (44100 << 12) | (0 << 9) | (15 << 4)); // 44.1 kHz, mono, 16 bits per sample
+	const description = new Uint8Array([0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34, ...streamInfo]);
+
+	const variable = await mux(
+		[variableFrame(1152), variableFrame(1728)],
+		{ codec: 'flac', numberOfChannels: 1, sampleRate: 44100, description },
+	);
+	expect(variable.map(x => x.length)).toEqual([13, 14]);
+	expect(variable[0]!.subarray(0, 5)).toEqual(new Uint8Array([0xff, 0xf9, 0x79, 0x08, 0]));
+	expect(variable[1]!.subarray(0, 6)).toEqual(new Uint8Array([0xff, 0xf9, 0x79, 0x08, 0xc9, 0x80])); // 576
+	expectValidChecksums(variable[0]!, 7);
+	expectValidChecksums(variable[1]!, 8);
 });
 
 test('can read a FLAC file with leading ID3v2 tags', async () => {
