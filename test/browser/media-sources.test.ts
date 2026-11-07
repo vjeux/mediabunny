@@ -12,6 +12,45 @@ import { VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
+// First in this file on purpose: the priming of an encoder is only measured for its first use on the page
+test('AudioSampleSource, encoding starts even when measuring the encoder\'s priming hangs', async () => {
+	// The measurement decodes the encoder's output, and some platform decoders never finish flushing (WebKitGTK's
+	// Vorbis decoder). Emulated by an AudioDecoder whose flush() never settles
+	const RealAudioDecoder = AudioDecoder;
+	globalThis.AudioDecoder = class extends RealAudioDecoder {
+		override flush() {
+			return new Promise<void>(() => {});
+		}
+	};
+
+	try {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+
+		using sample = new AudioSample({
+			data: new Float32Array(960),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		const encoding = (async () => {
+			await source.add(sample);
+			await output.finalize();
+			return 'finalized';
+		})();
+
+		expect(await Promise.race([
+			encoding,
+			new Promise(resolve => setTimeout(() => resolve('hung'), 8000)),
+		])).toBe('finalized');
+	} finally {
+		globalThis.AudioDecoder = RealAudioDecoder;
+	}
+}, 10_000);
+
 test('VideoSampleSource, normal usage', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium') },
