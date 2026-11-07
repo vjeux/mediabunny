@@ -343,7 +343,7 @@ export class StreamTarget extends Target {
 	/** @internal */
 	_pendingWrites = 0;
 	/** @internal */
-	_settledWrites = 0;
+	_completedWrites = 0;
 
 	// These variables regard chunked mode:
 	/** @internal */
@@ -485,12 +485,13 @@ export class StreamTarget extends Target {
 
 		this._pendingWrites++;
 		void this._streamWriter.write({ type: 'write', data, position })
-			.catch((error) => {
+			.then(() => {
+				this._completedWrites++;
+			}, (error) => {
 				this._writeError ??= error;
 			})
 			.finally(() => {
 				this._pendingWrites--;
-				this._settledWrites++;
 			});
 	}
 
@@ -638,10 +639,11 @@ export class StreamTarget extends Target {
 
 		// Closing only completes once every queued write has. Wait for that while the sink keeps completing writes,
 		// but not once it has stalled on one (an upload over a hung connection, say), or canceling would hang forever;
-		// the stream then gets closed in the background, should the sink ever catch up.
-		let settledWrites = -1;
-		while (this._settledWrites !== settledWrites || this._pendingWrites === 0) {
-			settledWrites = this._settledWrites;
+		// the stream then gets closed in the background, should the sink ever catch up. Failed writes don't count as
+		// progress (any write made after closing began fails).
+		let completedWrites = -1;
+		while (this._completedWrites !== completedWrites || this._pendingWrites === 0) {
+			completedWrites = this._completedWrites;
 
 			if (await fulfillsWithin(closed, STALLED_SINK_TIMEOUT_MS)) {
 				return;
