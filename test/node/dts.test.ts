@@ -257,6 +257,26 @@ test('Encode with huge timestamps', async () => {
 	expect(firstSample.timestamp).toBe(timestamp);
 });
 
+test('Encoding ends where the input ends', async () => {
+	registerDtsEncoder();
+
+	// The input isn't a whole number of 512-sample frames, and the silence that fills the last one isn't part of the
+	// audio
+	const output = await encodeSineWaveToMp4(0, new Mp4OutputFormat());
+
+	using input = new Input({
+		source: new BufferSource(output),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const lastPacket = await new EncodedPacketSink(track).getPacket(Infinity);
+	assert(lastPacket);
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(ENCODE_DURATION, 6);
+});
+
 const expectStreamShape = async (input: Input) => {
 	const packets = await readAllPackets(input);
 
