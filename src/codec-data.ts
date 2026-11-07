@@ -1944,11 +1944,11 @@ export const extractVp9CodecInfoFromPacket = (
 	const width = widthMinusOne + 1;
 	const height = heightMinusOne + 1;
 
-	// Calculate level based on dimensions
+	// Calculate level based on dimensions: each level limits both the picture size and the width and height
 	const pictureSize = width * height;
 	let level = last(VP9_LEVEL_TABLE)!.level; // Default to highest level
 	for (const entry of VP9_LEVEL_TABLE) {
-		if (pictureSize <= entry.maxPictureSize) {
+		if (pictureSize <= entry.maxPictureSize && Math.max(width, height) <= entry.maxDimension) {
 			level = entry.level;
 			break;
 		}
