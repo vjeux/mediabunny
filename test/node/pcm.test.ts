@@ -1,6 +1,8 @@
 import { expect, test } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
@@ -9,9 +11,12 @@ import { AudioSampleSource, EncodedAudioPacketSource, PCM_ENCODER_PACKET_SIZE } 
 import { EncodedPacket } from '../../src/packet.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
 import { AudioSample } from '../../src/sample.js';
-import { PcmAudioCodec } from '../../src/codec.js';
+import { AudioCodec, PcmAudioCodec } from '../../src/codec.js';
+import { CustomAudioDecoder, registerDecoder } from '../../src/custom-coder.js';
 import { toUint8Array, uint8ArraysAreEqual } from '../../src/misc.js';
 import { fromAlaw, fromUlaw, toAlaw, toUlaw } from '../../src/pcm.js';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 // All of these span the full value range of their format
 const u8Data = Uint8Array.from({ length: 256 }, (_, i) => i);
@@ -387,5 +392,52 @@ test('WAVE writes the format chunk of non-PCM formats as a WAVEFORMATEX with cbS
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
 		const track = (await input.getPrimaryAudioTrack())!;
 		expect(await track.getCodec(), codec).toBe(codec);
+	}
+});
+
+test('A registered custom decoder takes precedence over the built-in PCM decoder', async () => {
+	let active = false; // Keeps the decoder out of the other tests
+	let decodeCalls = 0;
+
+	class CustomPcmDecoder extends CustomAudioDecoder {
+		static override supports(codec: AudioCodec) {
+			return active && codec === 'pcm-s16';
+		}
+
+		override init() {}
+
+		override decode(packet: EncodedPacket) {
+			decodeCalls++;
+			const numberOfFrames = Math.round(packet.duration * this.config.sampleRate);
+			this.onSample(new AudioSample({
+				data: new Float32Array(numberOfFrames * this.config.numberOfChannels).fill(0.5),
+				format: 'f32',
+				numberOfChannels: this.config.numberOfChannels,
+				sampleRate: this.config.sampleRate,
+				timestamp: packet.timestamp,
+			}));
+		}
+
+		override flush() {}
+		override close() {}
+	}
+
+	registerDecoder(CustomPcmDecoder);
+	active = true;
+
+	try {
+		const filePath = path.join(__dirname, '..', 'public/glitch-hop-is-dead.wav'); // 16-bit PCM
+		using input = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getCodec()).toBe('pcm-s16');
+
+		using sample = (await new AudioSampleSink(track).getSample(1))!;
+		const data = new Float32Array(sample.allocationSize({ format: 'f32', planeIndex: 0 }) / 4);
+		sample.copyTo(data, { format: 'f32', planeIndex: 0 });
+
+		expect(decodeCalls).toBeGreaterThan(0);
+		expect(data[0]).toBe(0.5);
+	} finally {
+		active = false;
 	}
 });
