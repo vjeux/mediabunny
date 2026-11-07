@@ -2633,6 +2633,7 @@ class PacketReadingContext {
 	/** Supplies the context with a new encoded packet, beginning at the current position. */
 	supplyPacket(packetLength: number, intrinsicDuration: number) {
 		const currentPesPacket = this.getCurrentPesPacket();
+		const isFirstPacketOfPesPacket = this.lastSuppliedPesPacket !== currentPesPacket;
 
 		let pts: number;
 		if (this.lastSuppliedPesPacket === currentPesPacket) {
@@ -2665,6 +2666,12 @@ class PacketReadingContext {
 			}
 		} else if (this.elementaryStream.info.decoderConfig) {
 			const { codec, decoderConfig } = this.elementaryStream.info;
+
+			if (!isFirstPacketOfPesPacket) {
+				// random_access_indicator says that the PES packet holds the start of a random access point, the first
+				// access unit beginning in it, and nothing about the access units after that one
+				randomAccessIndicator = 0;
+			}
 
 			if (randomAccessIndicator === 1) {
 				// Some muxers set random_access_indicator on packets that aren't key frames (on every PES packet, or on
