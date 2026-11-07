@@ -44,6 +44,13 @@ const PAT_PID = 0x0000;
 const PMT_PID = 0x1000;
 const FIRST_TRACK_PID = 0x0100;
 
+// PCRs (the program clock reference, which the decoder's clock follows) are written at least this often, in seconds.
+// H.222.0 asks for one every 0.1 seconds, DVB for one every 0.04 seconds.
+const PCR_INTERVAL = 0.04;
+// How long before the earliest decode time still to come a PCR is, in seconds, so that the decoder has the data in
+// time (FFmpeg uses 0.7)
+const PCR_DELAY = 0.1;
+
 const VIDEO_STREAM_ID_BASE = 0xE0;
 const AUDIO_STREAM_ID_BASE = 0xC0;
 
@@ -83,6 +90,10 @@ export class MpegTsMuxer extends Muxer {
 	private trackDatas: MpegTsTrackData[] = [];
 	private tablesWritten = false;
 	private continuityCounters = new Map<number, number>();
+	/** The PID carrying the PCRs: the first video track's, else the first track's (like in FFmpeg) */
+	private pcrPid: number | null = null;
+	/** The time of the last PCR written, in seconds */
+	private lastPcrTime: number | null = null;
 	private packetBuffer = new Uint8Array(TS_PACKET_SIZE);
 	private packetView = toDataView(this.packetBuffer);
 	private allTracksKnown = promiseWithResolvers();
@@ -531,7 +542,20 @@ export class MpegTsMuxer extends Muxer {
 			}
 
 			const queuedPacket = trackWithMinTimestamp.packetQueue.shift()!;
-			this.writePesPacket(trackWithMinTimestamp, queuedPacket);
+
+			// The PCR PID's PES packets each carry a PCR. Before other PIDs' ones, a packet with just a PCR goes out on
+			// the PCR PID if it's been a while, so that PCRs come before any media data and often enough.
+			let pcrTime: number | null = null;
+			if (this.pcrPid !== null) {
+				const time = this.getPcrTime(queuedPacket);
+				if (trackWithMinTimestamp.pid === this.pcrPid) {
+					pcrTime = time;
+				} else if (this.lastPcrTime === null || time - this.lastPcrTime >= PCR_INTERVAL) {
+					this.writePcrPacket(time);
+				}
+			}
+
+			this.writePesPacket(trackWithMinTimestamp, queuedPacket, pcrTime);
 		}
 
 		if (!isFinalCall) {
@@ -542,10 +566,64 @@ export class MpegTsMuxer extends Muxer {
 	private writeTables() {
 		assert(!this.tablesWritten);
 
+		const pcrTrackData = this.trackDatas.find(x => x.track.type === 'video') ?? this.trackDatas[0];
+		this.pcrPid = pcrTrackData?.pid ?? null;
+
 		this.writePsiSection(PAT_PID, PAT_SECTION);
-		this.writePsiSection(PMT_PID, buildPmt(this.trackDatas));
+		this.writePsiSection(PMT_PID, buildPmt(this.trackDatas, this.pcrPid));
 
 		this.tablesWritten = true;
+	}
+
+	/**
+	 * Returns the time for a PCR written along with the given packet: a bit before the earliest decode time still to
+	 * come (the packet's own or the next ones of the other tracks, since packets are interleaved by presentation
+	 * time), so that the data always arrives before it's decoded. Never goes backwards.
+	 */
+	private getPcrTime(queuedPacket: QueuedPacket) {
+		let earliestDecodeTimestamp = queuedPacket.decodeTimestamp ?? queuedPacket.presentationTimestamp;
+		for (const trackData of this.trackDatas) {
+			const next = trackData.packetQueue[0];
+			if (next) {
+				earliestDecodeTimestamp = Math.min(
+					earliestDecodeTimestamp,
+					next.decodeTimestamp ?? next.presentationTimestamp,
+				);
+			}
+		}
+
+		return Math.max(earliestDecodeTimestamp - PCR_DELAY, this.lastPcrTime ?? -Infinity);
+	}
+
+	/** Writes a TS packet on the PCR PID with nothing but a PCR in its adaptation field. */
+	private writePcrPacket(pcrTime: number) {
+		const pcrTrackData = this.trackDatas.find(x => x.pid === this.pcrPid);
+		assert(pcrTrackData);
+
+		const buf = this.adaptationFieldBuffer;
+		buf[0] = 183; // adaptation_field_length
+		// The PID's first packet carries its discontinuity_indicator, like a first PES packet does
+		buf[1] = (Number(!pcrTrackData.firstPacketWritten) << 7) | 0x10; // discontinuity_indicator, PCR_flag
+		this.writePcr(buf, pcrTime);
+		buf.fill(0xFF, 8, 184); // stuffing_bytes
+
+		this.writeTsPacket(pcrTrackData.pid, false, buf, new Uint8Array(0));
+		pcrTrackData.firstPacketWritten = true;
+	}
+
+	/** Writes the PCR for the given time into bytes 2 to 7 of an adaptation field. */
+	private writePcr(adaptationField: Uint8Array, pcrTime: number) {
+		// program_clock_reference_base, in 90 kHz like PTS (negative times wrap around like theirs), then 6 reserved
+		// bits and program_clock_reference_extension (the remainder at 27 MHz, here 0)
+		const base = secondsToMpegTsTimestamp(pcrTime + this.timestampOffset);
+		adaptationField[2] = Math.floor(base / 2 ** 25);
+		adaptationField[3] = Math.floor(base / 2 ** 17) & 0xFF;
+		adaptationField[4] = Math.floor(base / 2 ** 9) & 0xFF;
+		adaptationField[5] = Math.floor(base / 2) & 0xFF;
+		adaptationField[6] = ((base % 2) << 7) | 0x7E;
+		adaptationField[7] = 0x00;
+
+		this.lastPcrTime = pcrTime;
 	}
 
 	private writePsiSection(pid: number, section: Uint8Array) {
@@ -575,7 +653,7 @@ export class MpegTsMuxer extends Muxer {
 		}
 	}
 
-	private writePesPacket(trackData: MpegTsTrackData, queuedPacket: QueuedPacket) {
+	private writePesPacket(trackData: MpegTsTrackData, queuedPacket: QueuedPacket, pcrTime: number | null) {
 		const includeDts = trackData.track.type === 'video';
 		const headerDataLength = includeDts ? 10 : 5;
 		const pesHeaderBuffer = new Uint8Array(9 + headerDataLength);
@@ -629,10 +707,14 @@ export class MpegTsMuxer extends Muxer {
 
 			const randomAccessIndicator = isFirstTsPacket && queuedPacket.isKeyframe;
 			const discontinuityIndicator = isFirstTsPacket && !trackData.firstPacketWritten;
+			const hasPcr = isFirstTsPacket && pcrTime !== null;
 			const basePaddingNeeded = Math.max(0, 184 - remainingData);
 
 			let adaptationFieldSize: number;
-			if (randomAccessIndicator || discontinuityIndicator) {
+			if (hasPcr) {
+				// The length, the flags and the 6 bytes of the PCR
+				adaptationFieldSize = Math.max(8, basePaddingNeeded);
+			} else if (randomAccessIndicator || discontinuityIndicator) {
 				// We need at least two bytes
 				adaptationFieldSize = Math.max(2, basePaddingNeeded);
 			} else {
@@ -649,8 +731,16 @@ export class MpegTsMuxer extends Muxer {
 					buf[0] = adaptationFieldSize - 1; // adaptation_field_length
 					buf[1]
 						= (Number(discontinuityIndicator) << 7) // discontinuity_indicator
-							| (Number(randomAccessIndicator) << 6); // random_access_indicator
-					buf.fill(0xFF, 2, adaptationFieldSize); // stuffing_bytes
+							| (Number(randomAccessIndicator) << 6) // random_access_indicator
+							| (Number(hasPcr) << 4); // PCR_flag
+
+					let stuffingStart = 2;
+					if (hasPcr) {
+						this.writePcr(buf, pcrTime);
+						stuffingStart = 8;
+					}
+
+					buf.fill(0xFF, stuffingStart, adaptationFieldSize); // stuffing_bytes
 				}
 
 				adaptationField = buf.subarray(0, adaptationFieldSize);
@@ -687,8 +777,10 @@ export class MpegTsMuxer extends Muxer {
 		adaptationField: Uint8Array | null,
 		payload: Uint8Array,
 	) {
-		const cc = this.continuityCounters.get(pid) ?? 0;
+		const nextCc = this.continuityCounters.get(pid) ?? 0;
 		const hasPayload = payload.length > 0;
+		// A packet without payload repeats the counter of the previous packet (H.222.0 2.4.3.3)
+		const cc = hasPayload ? nextCc : (nextCc + 15) & 0x0F;
 		const adaptCtrl = adaptationField
 			? (hasPayload ? 0b11 : 0b10)
 			: (hasPayload ? 0b01 : 0b00);
@@ -699,7 +791,7 @@ export class MpegTsMuxer extends Muxer {
 		this.packetBuffer[3] = (adaptCtrl << 4) | (cc & 0x0F);
 
 		if (hasPayload) {
-			this.continuityCounters.set(pid, (cc + 1) & 0x0F);
+			this.continuityCounters.set(pid, (nextCc + 1) & 0x0F);
 		}
 
 		let offset = 4;
@@ -797,7 +889,7 @@ const PAT_SECTION = new Uint8Array(16);
 	view.setUint32(12, computeMpegTsCrc32(PAT_SECTION.subarray(0, 12)), false); // CRC_32
 }
 
-const buildPmt = (trackDatas: MpegTsTrackData[]) => {
+const buildPmt = (trackDatas: MpegTsTrackData[], pcrPid: number | null) => {
 	let totalEsBytes = 0;
 	for (const trackData of trackDatas) {
 		totalEsBytes += 5;
@@ -820,7 +912,7 @@ const buildPmt = (trackDatas: MpegTsTrackData[]) => {
 	section[5] = 0xC1; // reserved=11, version_number=0, current_next_indicator=1
 	section[6] = 0x00; // section_number
 	section[7] = 0x00; // last_section_number
-	view.setUint16(8, 0xE000 | 0x1FFF, false); // reserved=111, PCR_PID=0x1FFF (none)
+	view.setUint16(8, 0xE000 | ((pcrPid ?? 0x1FFF) & 0x1FFF), false); // reserved=111, PCR_PID (0x1FFF: none)
 	view.setUint16(10, 0xF000, false); // reserved=1111, program_info_length=0
 
 	let offset = 12;
