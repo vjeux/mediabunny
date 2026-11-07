@@ -1679,7 +1679,9 @@ export class IsobmffMuxer extends Muxer {
 					trackData.avgBitrate = 0;
 				}
 
-				// Sliding one-second window over the samples in decode order
+				// Sliding one-second window over the samples in decode order, measured in the track's timescale since
+				// float seconds would keep samples exactly one second apart (k / 30 vs. (k - 30) / 30) in the window
+				const timescale = trackData.timescale;
 				let windowStart = 0;
 				let windowBytes = 0;
 				let maxWindowBytes = 0;
@@ -1687,7 +1689,11 @@ export class IsobmffMuxer extends Muxer {
 					const sample = trackData.samples[i]!;
 					windowBytes += sample.size;
 
-					while (sample.decodeTimestamp - trackData.samples[windowStart]!.decodeTimestamp >= 1) {
+					const decodeTime = intoTimescale(sample.decodeTimestamp, timescale);
+					while (
+						decodeTime - intoTimescale(trackData.samples[windowStart]!.decodeTimestamp, timescale)
+						>= timescale
+					) {
 						windowBytes -= trackData.samples[windowStart]!.size;
 						windowStart++;
 					}
