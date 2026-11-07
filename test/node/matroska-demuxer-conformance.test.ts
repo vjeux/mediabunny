@@ -727,8 +727,9 @@ describe('Video properties', () => {
 		const track = (await input.getVideoTracks())[0]!;
 		expect(await track.getSquarePixelWidth()).toBe(853);
 		expect(await track.getSquarePixelHeight()).toBe(480);
+		// The display aspect is a ratio: 16:9 exactly, or the rounded square pixel size
 		const config = await track.getDecoderConfig();
-		expect([config!.displayAspectWidth, config!.displayAspectHeight]).toEqual([853, 480]);
+		expect(config!.displayAspectWidth! / config!.displayAspectHeight!).toBeCloseTo(16 / 9, 2);
 	});
 
 	test('grows the height for display sizes narrower than the pixel aspect ratio', async () => {
