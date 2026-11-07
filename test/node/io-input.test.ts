@@ -467,6 +467,15 @@ describe('Input', () => {
 });
 
 describe('Input.getMimeType', () => {
+	// RFC 2045: the type and subtype are case-insensitive (MPEG-TS is written video/MP2T or video/mp2t), but parameters
+	// aren't
+	const splitMimeType = (mimeType: string) => {
+		const separator = mimeType.indexOf(';');
+		return separator === -1
+			? [mimeType.toLowerCase(), '']
+			: [mimeType.slice(0, separator).toLowerCase(), mimeType.slice(separator)];
+	};
+
 	test.each([
 		['video.mp4', 'video/mp4', true],
 		['trunc-buck-bunny.mov', 'video/quicktime', true],
@@ -484,14 +493,14 @@ describe('Input.getMimeType', () => {
 		const mimeType = await input.getMimeType();
 
 		if (!listsCodecs) {
-			expect(mimeType).toBe(baseType);
+			expect(splitMimeType(mimeType)).toEqual([baseType.toLowerCase(), '']);
 			return;
 		}
 
 		// RFC 6381: a quoted, comma-separated list of the codecs of every track, each listed once
 		const trackCodecs = await Promise.all((await input.getTracks()).map(t => t.getCodecParameterString()));
 		const uniqueCodecs = [...new Set(trackCodecs.filter(x => x !== null))];
-		expect(mimeType).toBe(`${baseType}; codecs="${uniqueCodecs.join(', ')}"`);
+		expect(splitMimeType(mimeType)).toEqual([baseType.toLowerCase(), `; codecs="${uniqueCodecs.join(', ')}"`]);
 	});
 
 	test('lists the codec of identical tracks only once', async () => {
