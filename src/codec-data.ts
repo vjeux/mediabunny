@@ -3137,6 +3137,9 @@ export const parseAc3SyncFrame = (data: Uint8Array): Ac3FrameInfo | null => {
 	return { fscod, bsid, bsmod, acmod, lfeon, bitRateCode };
 };
 
+/** AC-3 bit rates in kbit/s, indexed by frmsizecod / 2 (Table 4.13). */
+const AC3_BIT_RATES = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640];
+
 /**
  * AC-3 frame sizes in bytes, indexed by [3 * frmsizecod + fscod].
  * fscod: 0=48kHz, 1=44.1kHz, 2=32kHz
@@ -3315,6 +3318,100 @@ export const parseEac3SyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
 };
 
 /**
+ * Like parseEac3SyncFrame, but also accepts an AC-3 frame (bsid up to 10) as the first independent substream, as
+ * Blu-ray's Dolby Digital Plus streams carry it, the E-AC-3 data extending it following in dependent substreams. It's
+ * then described like an E-AC-3 one, as FFmpeg's MP4 muxer does in dec3.
+ */
+export const parseEac3OrAc3CoreSyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
+	if (data.length < 6 || data[0] !== 0x0B || data[1] !== 0x77 || data[5]! >> 3 > 10) {
+		return parseEac3SyncFrame(data);
+	}
+
+	const frameInfo = parseAc3SyncFrame(data);
+	if (!frameInfo) {
+		return null;
+	}
+
+	const frameSize = AC3_FRAME_SIZES[3 * (data[4]! & 0x3f) + frameInfo.fscod];
+	const { numDepSub, chanLoc, dependentSize } = frameSize !== undefined
+		? readEac3DependentSubstreams(data, frameSize)
+		: { numDepSub: 0, chanLoc: 0, dependentSize: 0 };
+
+	// data_rate is the rate of the whole bitstream, the dependent substreams' frames (spanning the core's 1536
+	// samples) included
+	const dependentDataRate = dependentSize * 8 * AC3_SAMPLE_RATES[frameInfo.fscod]! / AC3_SAMPLES_PER_FRAME / 1000;
+
+	return {
+		dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]! + Math.round(dependentDataRate),
+		substreams: [{
+			fscod: frameInfo.fscod,
+			fscod2: 0,
+			bsid: frameInfo.bsid,
+			bsmod: frameInfo.bsmod,
+			acmod: frameInfo.acmod,
+			lfeon: frameInfo.lfeon,
+			numDepSub,
+			chanLoc,
+		}],
+	};
+};
+
+/**
+ * Counts the dependent substream frames that directly follow an independent substream's frame (ending at `offset`)
+ * within the same access unit, and collects the channel locations they add, in dec3's `chan_loc` bits, and their
+ * size. Taken from upstream's bug-fix-mania branch, where parseEac3SyncFrame does the same for E-AC-3 frames.
+ */
+const readEac3DependentSubstreams = (data: Uint8Array, offset: number) => {
+	const bitstream = new Bitstream(data);
+	const startOffset = offset;
+	let numDepSub = 0;
+	let chanLoc = 0;
+
+	while (offset + 2 <= data.length) {
+		bitstream.seekToByte(offset);
+		if (bitstream.readBits(16) !== 0x0b77 || bitstream.readBits(2) !== 1) { // syncword, strmtyp
+			break;
+		}
+
+		bitstream.skipBits(3); // substreamid
+		const dependentFrmsiz = bitstream.readBits(11);
+		bitstream.skipBits(2 + 2); // fscod, fscod2 or numblkscod
+		const dependentAcmod = bitstream.readBits(3);
+		bitstream.skipBits(1 + 5 + 5); // lfeon, bsid, dialnorm
+
+		if (bitstream.readBits(1)) { // compre
+			bitstream.skipBits(8); // compr
+		}
+		if (dependentAcmod === 0) {
+			bitstream.skipBits(5); // dialnorm2
+			if (bitstream.readBits(1)) { // compr2e
+				bitstream.skipBits(8); // compr2
+			}
+		}
+
+		if (bitstream.readBits(1)) { // chanmape
+			const chanmap = bitstream.readBits(16);
+
+			// chanmap numbers its locations from the most significant bit, chan_loc from the least significant one.
+			// chan_loc covers the Lc/Rc pair through Cvh, then skips the Lts/Rts pair to end with LFE2.
+			for (let i = 0; i < 8; i++) {
+				if (chanmap & (1 << (10 - i))) {
+					chanLoc |= 1 << i;
+				}
+			}
+			if (chanmap & 0b10) {
+				chanLoc |= 1 << 8;
+			}
+		}
+
+		numDepSub++;
+		offset += 2 * (dependentFrmsiz + 1);
+	}
+
+	return { numDepSub, chanLoc, dependentSize: offset - startOffset };
+};
+
+/**
  * Parse a dec3 box to extract E-AC-3 parameters.
  * Section F.6
  */
@@ -3404,8 +3501,9 @@ export const getEac3ChannelCount = (config: Eac3FrameInfo): number => {
 	if (sub.numDepSub > 0) {
 		const CHAN_LOC_COUNTS = [2, 2, 1, 1, 2, 2, 2, 1, 1];
 
+		// chan_loc numbers its locations from the least significant bit (as upstream's bug-fix-mania branch fixed)
 		for (let bit = 0; bit < 9; bit++) {
-			if (sub.chanLoc & (1 << (8 - bit))) {
+			if (sub.chanLoc & (1 << bit)) {
 				channels += CHAN_LOC_COUNTS[bit]!;
 			}
 		}
