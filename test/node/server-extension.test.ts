@@ -28,11 +28,11 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
+import { buildQuantizerEncodeOptions, canEncodeVideo, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
@@ -299,6 +299,53 @@ describe('Video', async () => {
 
 			expect(buf[0]).toBeGreaterThan(250); // Quasi-white
 		});
+	});
+
+	test('canEncodeVideo agrees with what the encoders open, at the edges of their frame sizes', async () => {
+		// Encodes one mid-gray frame, returning whether that worked
+		const encodesFrame = async (codec: VideoCodec, width: number, height: number) => {
+			const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec, quality: new Quality('medium') });
+			output.addVideoTrack(source);
+			try {
+				await output.start();
+				const sample = new VideoSample(new Uint8Array(width * height * 3 / 2).fill(128), {
+					format: 'I420',
+					codedWidth: width,
+					codedHeight: height,
+					timestamp: 0,
+					duration: 1 / 30,
+				});
+				try {
+					await source.add(sample);
+				} finally {
+					sample.close();
+				}
+				await output.finalize();
+				return true;
+			} catch {
+				await output.cancel();
+				return false;
+			}
+		};
+
+		const cases: [codec: VideoCodec, width: number, height: number, encodable: boolean][] = [
+			// libx265 needs at least 16 pixels in each dimension, and at most 4216 in the other one under 32
+			['hevc', 16, 8, false], ['hevc', 8, 16, false], ['hevc', 16, 16, true],
+			['hevc', 4218, 16, false], ['hevc', 16, 4218, false], ['hevc', 4216, 16, true], ['hevc', 4218, 32, true],
+			// VP8 frame headers have 14 bits for each dimension (RFC 6386, section 9.1)
+			['vp8', 16384, 64, false], ['vp8', 64, 16384, false], ['vp8', 16382, 64, true],
+			// libx264 takes up to 16384 pixels in each dimension
+			['avc', 64, 16386, false], ['avc', 16386, 64, false], ['avc', 64, 16384, true],
+			// SVT-AV1 takes frames up to 16384x8704
+			['av1', 16386, 64, false], ['av1', 64, 8706, false], ['av1', 16384, 64, true], ['av1', 64, 8704, true],
+		];
+		for (const [codec, width, height, encodable] of cases) {
+			const canEncode = await canEncodeVideo(codec, { width, height });
+			const encoded = await encodesFrame(codec, width, height);
+			expect({ codec, width, height, canEncode, encoded })
+				.toEqual({ codec, width, height, canEncode: encodable, encoded: encodable });
+		}
 	});
 
 	test('HEVC encode and decode, length-prefixed', async () => {
