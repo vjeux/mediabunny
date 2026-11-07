@@ -1319,6 +1319,9 @@ export type HlsOutputFormatOptions = {
 	 * keeps timestamps positive that would otherwise be negative (caused by audio priming samples, B-frames, or tracks
 	 * starting slightly before the first packet). The timestamps in the playlists are not affected.
 	 *
+	 * With a base of at least 1 second, conversions copy such media as is, since its timestamps stay positive; with a
+	 * smaller one, they treat it like the segment formats do.
+	 *
 	 * Defaults to 10 seconds.
 	 */
 	mediaTimestampBase?: number;
@@ -1519,9 +1522,10 @@ export class HlsOutputFormat extends OutputFormat {
 	}
 
 	get negativeTimestampSupport() {
-		if ((this._options.mediaTimestampBase ?? 10) > 0) {
-			// The muxer moves all media onto the positive media timestamp base, measured from the first packet, so
-			// negative timestamps (encoder priming, B-frames, tracks starting a bit earlier) never reach the segments
+		if ((this._options.mediaTimestampBase ?? 10) >= 1) {
+			// The muxer moves all media onto the media timestamp base, measured from the first packet, so negative
+			// timestamps that lie less than the base before it (encoder priming, B-frames, tracks starting a bit
+			// earlier) never reach the segments. A copied track starts at most a fraction of a second before zero.
 			return 'full' as const;
 		}
 

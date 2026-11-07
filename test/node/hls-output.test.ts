@@ -2503,6 +2503,58 @@ test('Conversion copies AAC with encoder priming into HLS segments', async () =>
 	expect(zeroBaseFormat.negativeTimestampSupport).toBe('prefer-non-negative');
 });
 
+test('Conversion to HLS with a small mediaTimestampBase writes no negative (wrapped) PTS', async () => {
+	// The base only moves media that starts less than the base before the first packet up to positive timestamps
+	const readPtsValues = (bytes: Uint8Array) => {
+		const values: number[] = [];
+		for (let i = 0; i + 188 <= bytes.length; i += 188) {
+			const packet = bytes.subarray(i, i + 188);
+			const pid = ((packet[1]! & 0x1f) << 8) | packet[2]!;
+			if (!(packet[1]! & 0x40) || pid === 0 || pid >= 0x1000) {
+				continue;
+			}
+
+			const adaptationFieldControl = (packet[3]! >> 4) & 3;
+			const pes = packet.subarray(4 + (adaptationFieldControl === 3 ? 1 + packet[4]! : 0));
+			if (pes[0] !== 0 || pes[1] !== 0 || pes[2] !== 1 || !(pes[7]! & 0x80)) {
+				continue;
+			}
+
+			const q = pes.subarray(9, 14);
+			values.push(
+				((q[0]! >> 1) & 7) * 2 ** 30 + q[1]! * 2 ** 22 + (q[2]! >> 1) * 2 ** 15 + q[3]! * 2 ** 7 + (q[4]! >> 1),
+			);
+		}
+
+		return values;
+	};
+
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), mediaTimestampBase: 0.01 }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+			return target;
+		}),
+	});
+	const conversion = await Conversion.init({
+		input: new Input({ source: new FilePathSource('./test/public/demo.mp4'), formats: ALL_FORMATS }),
+		output,
+		trim: { end: 2 },
+		showWarnings: false,
+	});
+	await conversion.execute();
+
+	const segments = [...targets].filter(([path]) => path.endsWith('.ts'));
+	expect(segments.length).toBeGreaterThan(0);
+	for (const [path, target] of segments) {
+		const ptsValues = readPtsValues(new Uint8Array(target.buffer!));
+		expect(ptsValues.length, path).toBeGreaterThan(0);
+		expect(Math.max(...ptsValues), path).toBeLessThan(2 ** 32); // Larger means a negative timestamp wrapped around
+	}
+});
+
 test('Opus codec string in master playlist', async () => {
 	let masterText = '';
 	const targets = new Map<string, BufferTarget>();
