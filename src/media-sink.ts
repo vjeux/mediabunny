@@ -482,6 +482,14 @@ const MAX_QUEUED_PACKET_BYTES = 2 ** 25; // 32 MiB
 /** The bytes a packet holds in memory (metadata-only packets hold none). */
 const getPacketDataSize = (packet: EncodedPacket) => packet.data.byteLength + (packet.sideData.alpha?.byteLength ?? 0);
 
+/**
+ * VP8 alt-ref frames have show_frame = 0 (RFC 6386, section 9.1): they're decoded into a reference buffer but never
+ * output. libvpx stores them as packets of their own, so the decoder yields no frame for these packets.
+ */
+const isInvisibleVp8Frame = (codec: VideoCodec, data: Uint8Array) => {
+	return codec === 'vp8' && data.byteLength > 0 && (data[0]! & 0x10) === 0;
+};
+
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
 > {
@@ -1233,7 +1241,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		} else {
 			assert(this.decoder);
 
-			if (!isWebKit()) {
+			if (!isWebKit() && !isInvisibleVp8Frame(this.codec, packet.data)) {
 				insertSorted(this.inputTimestamps, packet.timestamp, x => x);
 			}
 
