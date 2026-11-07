@@ -337,3 +337,63 @@ test('Canvas iterators end on return() while a next() is still pending', async (
 		expect(await disposableCanvases.next()).toEqual({ value: undefined, done: true });
 	}
 });
+
+test('Canvas iterators open no decoder until they are iterated', async () => {
+	// Counts the WebCodecs decoders and decoded frames that are open
+	const countOpen = async (run: (sink: CanvasSink) => Promise<void>) => {
+		let openDecoders = 0;
+		const frames: VideoFrame[] = [];
+		const OriginalVideoDecoder = globalThis.VideoDecoder;
+		globalThis.VideoDecoder = class extends OriginalVideoDecoder {
+			constructor(init: VideoDecoderInit) {
+				super({
+					...init,
+					output: (frame) => {
+						frames.push(frame);
+						init.output(frame);
+					},
+				});
+				openDecoders++;
+			}
+
+			override close() {
+				if (this.state !== 'closed') {
+					openDecoders--;
+				}
+				super.close();
+			}
+		};
+
+		try {
+			using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			await run(new CanvasSink(track));
+			await new Promise(resolve => setTimeout(resolve, 500));
+
+			// A closed frame has no format anymore
+			return { openDecoders, openFrames: frames.filter(frame => frame.format !== null).length };
+		} finally {
+			globalThis.VideoDecoder = OriginalVideoDecoder;
+		}
+	};
+
+	// An iterator created up front and pulled from on demand, for example (found by lane L46)
+	expect(await countOpen(async (sink) => {
+		void sink.canvases();
+		void sink.canvasesAtTimestamps([0.5, 1]);
+	})).toEqual({ openDecoders: 0, openFrames: 0 });
+
+	expect(await countOpen(async (sink) => {
+		const canvases = sink.canvases();
+		await canvases.next();
+		await canvases.return();
+		expect(await canvases.next()).toEqual({ value: undefined, done: true });
+	})).toEqual({ openDecoders: 0, openFrames: 0 });
+
+	expect(await countOpen(async (sink) => {
+		const canvases = sink.canvases();
+		await canvases.next();
+		await expect(canvases.throw(new Error('Stop'))).rejects.toThrow('Stop');
+	})).toEqual({ openDecoders: 0, openFrames: 0 });
+});
