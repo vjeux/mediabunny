@@ -6,7 +6,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { Bitstream } from '../../shared/bitstream';
 import {
 	COLOR_PRIMARIES_MAP,
 	MATRIX_COEFFICIENTS_MAP,
@@ -29,7 +28,6 @@ import {
 	textEncoder,
 	toUint8Array,
 	uint8ArraysAreEqual,
-	writeBits,
 	roundToDivisor,
 } from '../misc';
 import {
@@ -1038,7 +1036,6 @@ export class MatroskaMuxer extends Muxer {
 				: null;
 
 			const videoChunk = this.createInternalChunk(packetData, timestamp, duration, packet.type, additions);
-			if (track.source._codec === 'vp9') this.fixVP9ColorSpace(trackData, videoChunk);
 
 			trackData.chunkQueue.push(videoChunk);
 			await this.interleaveChunks();
@@ -1155,54 +1152,6 @@ export class MatroskaMuxer extends Muxer {
 		if (!isFinalCall) {
 			await this.writer.flush();
 		}
-	}
-
-	/**
-	 * Due to [a bug in Chromium](https://bugs.chromium.org/p/chromium/issues/detail?id=1377842), VP9 streams often
- 	 * lack color space information. This method patches in that information.
-	 */
-	private fixVP9ColorSpace(
-		trackData: MatroskaVideoTrackData,
-		chunk: InternalMediaChunk,
-	) {
-		// http://downloads.webmproject.org/docs/vp9/vp9-bitstream_superframe-and-uncompressed-header_v1.0.pdf
-
-		if (chunk.type !== 'key') return;
-		if (!trackData.info.decoderConfig.colorSpace || !trackData.info.decoderConfig.colorSpace.matrix) return;
-
-		const bitstream = new Bitstream(chunk.data);
-
-		bitstream.skipBits(2);
-
-		const profileLowBit = bitstream.readBits(1);
-		const profileHighBit = bitstream.readBits(1);
-		const profile = (profileHighBit << 1) + profileLowBit;
-
-		if (profile === 3) bitstream.skipBits(1);
-
-		const showExistingFrame = bitstream.readBits(1);
-		if (showExistingFrame) return;
-
-		const frameType = bitstream.readBits(1);
-		if (frameType !== 0) return; // Just to be sure
-
-		bitstream.skipBits(2);
-
-		const syncCode = bitstream.readBits(24);
-		if (syncCode !== 0x498342) return;
-
-		if (profile >= 2) bitstream.skipBits(1);
-
-		const colorSpaceID = {
-			rgb: 7,
-			bt709: 2,
-			bt470bg: 1,
-			smpte170m: 3,
-		}[trackData.info.decoderConfig.colorSpace.matrix];
-
-		// The bitstream position is now at the start of the color space bits.
-		// We can use the global writeBits function here as requested.
-		writeBits(chunk.data, bitstream.pos, bitstream.pos + 3, colorSpaceID);
 	}
 
 	/** Converts a read-only external chunk into an internal one for easier use. */
