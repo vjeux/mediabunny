@@ -186,14 +186,30 @@ const peekAdtsFrameHeader = (bytes: Uint8Array) => {
 
 	const samplingFrequencyIndex = (bytes[2]! >> 2) & 0x0f;
 	const frameLength = ((bytes[3]! & 0x03) << 11) | (bytes[4]! << 3) | (bytes[5]! >> 5);
-	if (samplingFrequencyIndex >= aacFrequencyTable.length || frameLength < MIN_ADTS_FRAME_HEADER_SIZE) {
-		return null;
+	const headerSize = (bytes[1]! & 0x01) ? MIN_ADTS_FRAME_HEADER_SIZE : MIN_ADTS_FRAME_HEADER_SIZE + 2; // CRC
+	if (samplingFrequencyIndex >= aacFrequencyTable.length || frameLength < headerSize) {
+		return null; // The frame must at least contain its own header
 	}
 
 	return { samplingFrequencyIndex, frameLength };
 };
 
-const isAc3SyncWord = (bytes: Uint8Array) => bytes[0] === 0x0b && bytes[1] === 0x77;
+/** For the frame sync check: the size and sample rate (index) of the ADTS frame whose header starts the bytes. */
+const readAdtsSyncHeader = (bytes: Uint8Array) => {
+	const header = peekAdtsFrameHeader(bytes);
+	return header && { frameSize: header.frameLength, rate: header.samplingFrequencyIndex };
+};
+
+/** For the frame sync check: the size and sample rate of the MP3 frame whose header starts the bytes. */
+const readMp3SyncHeader = (bytes: Uint8Array) => {
+	const header = readMp3FrameHeader(toDataView(bytes).getUint32(0), null).header;
+	return header && { frameSize: header.totalSize, rate: header.sampleRate };
+};
+
+/** For the frame sync check: an AC-3 sync word, which E-AC-3 dependent substreams after a core start with too. */
+const readAc3SyncHeader = (bytes: Uint8Array) => {
+	return bytes[0] === 0x0b && bytes[1] === 0x77 ? { frameSize: 0, rate: 0 } : null;
+};
 
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
@@ -2372,22 +2388,17 @@ class PacketReadingContext {
 						const headerBytes = this.readBytes(MAX_ADTS_FRAME_HEADER_SIZE);
 						const candidate = peekAdtsFrameHeader(headerBytes);
 
-						if (
-							candidate
-							&& await this.isFrameStart(
-								possibleHeaderStartPos,
-								candidate.frameLength,
-								MIN_ADTS_FRAME_HEADER_SIZE,
-								bytes => peekAdtsFrameHeader(bytes)?.samplingFrequencyIndex
-									=== candidate.samplingFrequencyIndex,
-								[-1, aacFrequencyTable[candidate.samplingFrequencyIndex]]
-									.includes(elementaryStream.info.sampleRate),
-							)
-						) {
-							// Throws for frames we don't support
-							const header = readAdtsFrameHeader(FileSlice.tempFromBytes(headerBytes));
-							assert(header);
+						const isFrameStart = candidate && await this.isFrameStart(
+							possibleHeaderStartPos,
+							candidate.frameLength,
+							candidate.samplingFrequencyIndex,
+							MIN_ADTS_FRAME_HEADER_SIZE,
+							readAdtsSyncHeader,
+						);
+						// Throws for frames we don't support
+						const header = isFrameStart ? readAdtsFrameHeader(FileSlice.tempFromBytes(headerBytes)) : null;
 
+						if (header) {
 							return this.supplyPacket(
 								header.frameLength,
 								Math.round(
@@ -2422,10 +2433,9 @@ class PacketReadingContext {
 							&& await this.isFrameStart(
 								possibleHeaderStartPos,
 								header.totalSize,
+								header.sampleRate,
 								MP3_FRAME_HEADER_SIZE,
-								bytes => readMp3FrameHeader(toDataView(bytes).getUint32(0), null).header?.sampleRate
-									=== header.sampleRate,
-								[-1, header.sampleRate].includes(elementaryStream.info.sampleRate),
+								readMp3SyncHeader,
 							)
 						) {
 							const duration = header.audioSamplesInFrame * MPEG_TS_TIMESCALE
@@ -2470,14 +2480,7 @@ class PacketReadingContext {
 						const frameSize = AC3_FRAME_SIZES[3 * frmsizecod + fscod];
 						assert(frameSize !== undefined);
 
-						const isFrameStart = await this.isFrameStart(
-							possibleSyncPos,
-							frameSize,
-							2,
-							isAc3SyncWord, // E-AC-3 dependent substreams after the core start with it too
-							[-1, AC3_SAMPLE_RATES[fscod]].includes(elementaryStream.info.sampleRate),
-						);
-						if (!isFrameStart) {
+						if (!await this.isFrameStart(possibleSyncPos, frameSize, 0, 2, readAc3SyncHeader)) {
 							this.seekTo(possibleSyncPos + 1);
 							continue;
 						}
@@ -2515,7 +2518,7 @@ class PacketReadingContext {
 						const numblkscod = fscod === 3 ? 3 : (headerBytes[4]! >> 4) & 0x03;
 						const numblks = EAC3_NUMBLKS_TABLE[numblkscod]!;
 
-						if (!await this.isFrameStart(possibleSyncPos, frameSize, 2, isAc3SyncWord, true)) {
+						if (!await this.isFrameStart(possibleSyncPos, frameSize, 0, 2, readAc3SyncHeader)) {
 							this.seekTo(possibleSyncPos + 1);
 							continue;
 						}
@@ -2626,33 +2629,49 @@ class PacketReadingContext {
 	}
 
 	/**
-	 * Whether the frame header found at pos starts a frame of the given size. Sync words also show up inside frames,
-	 * notably at the start of a PES packet that begins with the tail of a frame (data_alignment_indicator 0), so like
-	 * Chromium's MPEG-2 TS parsers, it only does if another header of the stream follows the frame (isNextHeader, on
-	 * the nextHeaderSize bytes after it). If the data ends right after the frame, isLastFrame decides instead, and a
-	 * frame cut short by the end of the data doesn't count, since it wouldn't decode (the ADTS and MP3 demuxers
-	 * drop it too). Leaves the position at pos.
+	 * Whether the frame header found at pos starts a frame of the given size and sample rate. Sync words also show up
+	 * inside frames, notably at the start of a PES packet that begins with the tail of a frame
+	 * (data_alignment_indicator 0), so like Chromium's MPEG-2 TS parsers, it only does if another header of the
+	 * stream follows the frame (readHeader parses the headerSize bytes there). That one must have the same sample
+	 * rate, or else be followed by a header of its own rate: a sample rate change. If the data ends right after the
+	 * frame, it's the last frame, but a frame cut short by the end of the data doesn't count, since it wouldn't
+	 * decode (the ADTS and MP3 demuxers drop it too). Leaves the position at pos.
 	 */
 	async isFrameStart(
 		pos: number,
 		frameSize: number,
-		nextHeaderSize: number,
-		isNextHeader: (bytes: Uint8Array) => boolean,
-		isLastFrame: boolean,
+		rate: number,
+		headerSize: number,
+		readHeader: (bytes: Uint8Array) => { frameSize: number; rate: number } | null,
 	) {
-		this.seekTo(pos);
+		// The header at the given distance from pos: 'end' if the data ends there (or less than a header after it),
+		// null if the data ends before it or there's no header
+		const readHeaderAt = async (distance: number) => {
+			this.seekTo(pos);
+			let remaining = this.ensureBuffered(distance + headerSize);
+			if (isThenable(remaining)) {
+				remaining = await remaining;
+			}
 
-		let remaining = this.ensureBuffered(frameSize + nextHeaderSize);
-		if (isThenable(remaining)) {
-			remaining = await remaining;
-		}
+			if (remaining < distance + headerSize) {
+				return remaining >= distance ? 'end' as const : null;
+			}
 
-		let result: boolean;
-		if (remaining >= frameSize + nextHeaderSize) {
-			this.seekTo(pos + frameSize);
-			result = isNextHeader(this.readBytes(nextHeaderSize));
-		} else {
-			result = remaining >= frameSize && isLastFrame;
+			this.seekTo(pos + distance);
+			return readHeader(this.readBytes(headerSize));
+		};
+
+		let result = false;
+		const next = await readHeaderAt(frameSize);
+		if (next === 'end') {
+			result = true;
+		} else if (next) {
+			if (next.rate === rate) {
+				result = true;
+			} else {
+				const afterNext = await readHeaderAt(frameSize + next.frameSize);
+				result = afterNext === 'end' || afterNext?.rate === next.rate;
+			}
 		}
 
 		this.seekTo(pos);

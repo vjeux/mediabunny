@@ -947,7 +947,7 @@ test('MPEG-TS finds audio frames in PES packets that start inside a frame', asyn
 	}
 
 	// The stream, from `skip` bytes into the frames on
-	const buildFile = (skip: number) => {
+	const buildFile = (skip: number, data = frames, streamType = 0x03, ticksPerFrame = 1152 * 90_000 / 44_100) => {
 		const packets: Uint8Array[] = [];
 		const pushPackets = (pid: number, payload: number[]) => {
 			for (let i = 0; i < payload.length; i += 184) {
@@ -966,15 +966,16 @@ test('MPEG-TS finds audio frames in PES packets that start inside a frame', asyn
 
 		pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
 		pushPackets(0x1000, [
-			0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x03, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+			0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00,
+			streamType, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
 		]);
-		for (let start = skip; start < frames.length; start += 150) {
-			const pts = Math.round(Math.ceil(start / frameSize) * 1152 * 90_000 / 44_100);
-			const data = [...frames.subarray(start, start + 150)];
+		for (let start = skip; start < data.length; start += 150) {
+			const pts = Math.round(Math.ceil(start / frameSize) * ticksPerFrame);
+			const payload = [...data.subarray(start, start + 150)];
 			pushPackets(0x100, [
-				0, 0, 1, 0xc0, (data.length + 8) >> 8, (data.length + 8) & 0xff, 0x84, 0x80, 5,
+				0, 0, 1, 0xc0, (payload.length + 8) >> 8, (payload.length + 8) & 0xff, 0x84, 0x80, 5,
 				0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
-				((pts << 1) & 0xfe) | 1, ...data,
+				((pts << 1) & 0xfe) | 1, ...payload,
 			]);
 		}
 
@@ -1016,6 +1017,19 @@ test('MPEG-TS finds audio frames in PES packets that start inside a frame', asyn
 	expect(lateStart.sampleRate).toBe(44100);
 	expect(lateStart.numberOfChannels).toBe(2);
 	expect(lateStart.packets.map(x => x[1])).toEqual(Array<number>(frameCount - 1).fill(frameSize));
+
+	// The same with AAC (ADTS frames of 104 bytes, 48 kHz stereo), with header-like runs in the tail: one with a CRC
+	// whose aac_frame_length (8) is less than its own header (9 bytes), followed by one 8 bytes later
+	const aacFrames = new Uint8Array(frameSize * frameCount);
+	for (let i = 0; i < frameCount; i++) {
+		const header = [0xff, 0xf1, 0x4c, 0x80, (frameSize >> 3) & 0xff, ((frameSize & 7) << 5) | 0x1f, 0xfc];
+		aacFrames.set(header, i * frameSize);
+	}
+	aacFrames.set([0xff, 0xf0, 0x4c, 0x80, 0x01, 0x00, 0x00], 60);
+	aacFrames.set([0xff, 0xf1, 0x4c, 0x80, 0x01, 0x00, 0x00], 68);
+	const aacLateStart = await readAll(buildFile(52, aacFrames, 0x0f, 1024 * 90_000 / 48_000));
+	expect(aacLateStart.sampleRate).toBe(48000);
+	expect(aacLateStart.packets.map(x => x[1])).toEqual(Array<number>(frameCount - 1).fill(frameSize));
 });
 
 test('MPEG-TS drops an audio frame cut off by the end of the file', async () => {
@@ -1062,4 +1076,44 @@ test('MPEG-TS drops an audio frame cut off by the end of the file', async () => 
 	const truncated = await readFrames(bytes.subarray(0, bytes.length - 188));
 	expect(truncated).toHaveLength(29);
 	expect(truncated.every(x => x.byteLength === x.frameLength)).toBe(true);
+});
+
+test('MPEG-TS keeps the frames around an audio sample rate change', async () => {
+	// From L46's review: the frame sync takes a frame header only if another header follows the frame, which at a
+	// sample rate change has the other rate. MPEG-1 Layer III frames at 128 kbit/s with empty payloads, 384 bytes at
+	// 48 kHz and 417 bytes at 44.1 kHz: 10 at 48 kHz, 10 at 44.1 kHz and 10 at 48 kHz, like a broadcast switching
+	// programs, then the same ending at 44.1 kHz.
+	const mp3Frame = (sampleRate: number) => {
+		const frame = new Uint8Array(sampleRate === 48000 ? 384 : 417);
+		frame.set([0xff, 0xfb, sampleRate === 48000 ? 0x94 : 0x90, 0x00]);
+		return frame;
+	};
+
+	for (const rates of [
+		[...Array<number>(10).fill(48000), ...Array<number>(10).fill(44100), ...Array<number>(10).fill(48000)],
+		[...Array<number>(10).fill(48000), ...Array<number>(10).fill(44100)],
+	]) {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('mp3');
+		output.addAudioTrack(source);
+		await output.start();
+		let timestamp = 0;
+		for (const [i, rate] of rates.entries()) {
+			await source.add(
+				new EncodedPacket(mp3Frame(rate), 'key', timestamp, 1152 / rate),
+				i === 0 ? { decoderConfig: { codec: 'mp3', sampleRate: 48000, numberOfChannels: 2 } } : undefined,
+			);
+			timestamp += 1152 / rate;
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sizes: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			sizes.push(packet.byteLength);
+		}
+		expect(sizes).toEqual(rates.map(rate => (rate === 48000 ? 384 : 417)));
+	}
 });
