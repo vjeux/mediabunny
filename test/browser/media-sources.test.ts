@@ -1,8 +1,14 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import {
+	AudioSampleSource,
+	MediaStreamAudioTrackSource,
+	MediaStreamVideoTrackSource,
+	MediaStreamVideoTrackSourceOptions,
+	VideoSampleSource,
+} from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
@@ -731,3 +737,127 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+/**
+ * Hands the same media to two MediaStream sources of one track (like two renditions of one camera or microphone)
+ * through a stand-in MediaStreamTrackProcessor, the first chunk reaching the second source 5 ms after the first one
+ * (each source reads the track on its own), and returns the timestamps each source gave the media.
+ */
+const recordTwoRenditions = async (
+	kind: 'video' | 'audio',
+	options: MediaStreamVideoTrackSourceOptions,
+) => {
+	const controllers: ReadableStreamDefaultController<VideoFrame | AudioData>[] = [];
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const originalProcessor = globals.MediaStreamTrackProcessor;
+	globals.MediaStreamTrackProcessor = class {
+		readable = new ReadableStream<VideoFrame | AudioData>({
+			start: (controller) => {
+				controllers.push(controller);
+			},
+		});
+	};
+
+	// The track itself only provides its identity and settings here
+	let audioContext: AudioContext | null = null;
+	let track: MediaStreamTrack;
+	if (kind === 'video') {
+		track = document.createElement('canvas').captureStream(0).getVideoTracks()[0]!;
+	} else {
+		audioContext = new AudioContext();
+		track = audioContext.createMediaStreamDestination().stream.getAudioTracks()[0]!;
+	}
+
+	const output = new Output({
+		format: kind === 'video' ? new WebMOutputFormat() : new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const timestamps: number[][] = [[], []];
+	const errors: unknown[] = [];
+	try {
+		for (const list of timestamps) {
+			const onEncodedSample = (sample: VideoSample | AudioSample) => {
+				list.push(sample.timestamp);
+			};
+			if (kind === 'video') {
+				const source = new MediaStreamVideoTrackSource(
+					track as MediaStreamVideoTrack,
+					{ codec: 'vp8', quality: new Quality('low'), onEncodedSample },
+					options,
+				);
+				source.errorPromise.catch(error => errors.push(error));
+				output.addVideoTrack(source);
+			} else {
+				const source = new MediaStreamAudioTrackSource(
+					track as MediaStreamAudioTrack,
+					{ codec: 'pcm-s16', onEncodedSample },
+					{ timestampBase: options.timestampBase },
+				);
+				source.errorPromise.catch(error => errors.push(error));
+				output.addAudioTrack(source);
+			}
+		}
+		await output.start();
+	} finally {
+		globals.MediaStreamTrackProcessor = originalProcessor;
+	}
+
+	// 20 video frames at 30 FPS or 20 audio chunks of 10 ms, with the same capture timestamps for both sources
+	const canvas = new OffscreenCanvas(64, 48);
+	const context = canvas.getContext('2d')!;
+	const createChunk = (i: number) => {
+		if (kind === 'video') {
+			context.fillStyle = `rgb(${10 * i}, 0, 0)`;
+			context.fillRect(0, 0, canvas.width, canvas.height);
+			return new VideoFrame(canvas, { timestamp: 1e9 + 33333 * i, duration: 33333 });
+		} else {
+			return new AudioData({
+				format: 'f32-planar',
+				sampleRate: 48000,
+				numberOfChannels: 1,
+				numberOfFrames: 480,
+				timestamp: 1e9 + 10000 * i,
+				data: new Float32Array(480),
+			});
+		}
+	};
+	for (let i = 0; i < 20; i++) {
+		controllers[0]!.enqueue(createChunk(i));
+		if (i === 0) {
+			await new Promise(resolve => setTimeout(resolve, 5));
+		}
+		controllers[1]!.enqueue(createChunk(i));
+		await new Promise(resolve => setTimeout(resolve, kind === 'video' ? 15 : 10));
+	}
+	await new Promise(resolve => setTimeout(resolve, 50));
+	await output.finalize();
+	track.stop();
+	await audioContext?.close();
+
+	expect(errors).toEqual([]);
+	return timestamps;
+};
+
+test.for([
+	{ name: 'video', kind: 'video', options: { frameRate: null } },
+	{ name: 'video, unix timestamps', kind: 'video', options: { frameRate: null, timestampBase: 'unix' } },
+	{ name: 'video sampled at 30 FPS', kind: 'video', options: { frameRate: 30 } },
+	{ name: 'video, timestamps from zero', kind: 'video', options: { frameRate: null, timestampBase: 'zero' } },
+	{ name: 'audio', kind: 'audio', options: {} },
+	{ name: 'audio, unix timestamps', kind: 'audio', options: { timestampBase: 'unix' } },
+	{ name: 'audio, timestamps from zero', kind: 'audio', options: { timestampBase: 'zero' } },
+] as const)(
+	'MediaStream sources of the same track give the same media the same timestamps ($name)',
+	async ({ kind, options }, { skip }) => {
+		if (kind === 'video' && typeof VideoEncoder === 'undefined') {
+			skip('Needs VideoEncoder');
+		}
+
+		const [first, second] = await recordTwoRenditions(kind, options);
+		const count = Math.min(first!.length, second!.length);
+		expect(count).toBeGreaterThanOrEqual(kind === 'video' && options.frameRate === 30 ? 5 : 15);
+		for (let i = 0; i < count; i++) {
+			expect(Math.abs(second![i]! - first![i]!)).toBeLessThan(1e-6);
+		}
+	},
+);
