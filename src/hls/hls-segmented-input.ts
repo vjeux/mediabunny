@@ -122,6 +122,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 	 * Whether this is an I-frame playlist. With AES-128, its resources are encrypted as a whole, not per byte range.
 	 */
 	iFramesOnly = false;
+	/** Whether the segments come with more than one init section, as far as checked */
+	multipleInitSections = false;
+	initSectionsCheckedCount = 0;
 	segmentTimestampOffsetPromise: Promise<number> | null = null;
 	/** Total duration of the gap segments after the last segment in the list, which they aren't part of. */
 	trailingGapDuration = 0;
@@ -1124,5 +1127,27 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 	getTimestampWrapPeriod() {
 		return TIMESTAMP_MODULUS / MPEG_TS_TIMESCALE;
+	}
+
+	override hasMultipleInitSections() {
+		// Segments only ever get appended, so only the new ones need a look
+		const firstInitSegment = this.segments[0]?.initSegment ?? null;
+		while (!this.multipleInitSections && this.initSectionsCheckedCount < this.segments.length) {
+			const initSegment = this.segments[this.initSectionsCheckedCount]!.initSegment;
+			this.initSectionsCheckedCount++;
+
+			const sameInitSection = initSegment === firstInitSegment || (
+				initSegment !== null
+				&& firstInitSegment !== null
+				&& initSegment.location.path === firstInitSegment.location.path
+				&& initSegment.location.offset === firstInitSegment.location.offset
+				&& initSegment.location.length === firstInitSegment.location.length
+			);
+			if (!sameInitSection) {
+				this.multipleInitSections = true;
+			}
+		}
+
+		return this.multipleInitSections;
 	}
 }
