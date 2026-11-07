@@ -397,6 +397,163 @@ const startRangelessServer = async (
 	};
 };
 
+test('UrlSource retries requests that failed with a transient HTTP status', async () => {
+	const data = new Uint8Array(1000).map((_, i) => i & 0xff);
+	let failures: number[] = [];
+	let requestCount = 0;
+	const server = http.createServer((req, res) => {
+		requestCount++;
+		const status = failures.shift();
+		if (status !== undefined) {
+			res.writeHead(status);
+			res.end();
+			return;
+		}
+
+		const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+		const read = async (statuses: number[], retry = true) => {
+			failures = [...statuses];
+			const attempts: [number, unknown][] = [];
+			using ref = new UrlSource(url, {
+				getRetryDelay: (previousAttempts, error) => {
+					// The error carries the status, so that policies can tell this apart from a network error
+					attempts.push([previousAttempts, (error as { status?: unknown }).status]);
+					return retry ? 0 : null;
+				},
+			}).ref();
+
+			try {
+				const slice = await new Reader(ref.source).requestSlice(0, 4);
+				return { attempts, result: [...readBytes(slice!, 4)] };
+			} catch (error) {
+				return { attempts, result: String(error) };
+			}
+		};
+
+		// Server errors, timeouts and rate limiting can go away, so they're retried like network errors...
+		expect(await read([503, 429, 502])).toEqual({ attempts: [[1, 503], [2, 429], [3, 502]], result: [0, 1, 2, 3] });
+		// ...as long as the retry policy wants to
+		expect(await read([503], false)).toEqual({
+			attempts: [[1, 503]],
+			result: `Error: Error fetching ${url}: 503 Service Unavailable`,
+		});
+		// Other failures are final
+		expect(await read([404])).toEqual({ attempts: [], result: `Error: Error fetching ${url}: 404 Not Found` });
+
+		// The default policy gives up on a server that keeps answering such a status, after 5 retries (15.5 seconds of
+		// waiting, which this test skips), while it retries network errors indefinitely
+		const defaultPolicy = new UrlSource(url)._getRetryDelay;
+		const delays: (number | null)[] = [];
+		failures = new Array<number>(100).fill(503);
+		requestCount = 0;
+		using ref = new UrlSource(url, {
+			getRetryDelay: (previousAttempts, error, source) => {
+				const delay = defaultPolicy(previousAttempts, error, source);
+				delays.push(delay);
+				return delay === null ? null : 0;
+			},
+		}).ref();
+		await expect(new Reader(ref.source).requestSlice(0, 4)).rejects.toThrow(
+			`Error fetching ${url}: 503 Service Unavailable`,
+		);
+		expect(delays).toEqual([0.5, 1, 2, 4, 8, null]);
+		expect(requestCount).toBe(6);
+		expect(defaultPolicy(100, new TypeError('fetch failed'), url)).toBe(16);
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource frees the response of a transient HTTP status when its retry policy fails', async () => {
+	// Far too big for the client to take in by itself, so a response whose body is neither read nor cancelled keeps
+	// its connection busy for good
+	const body = Buffer.alloc(32 * 2 ** 20, 0x20);
+	const openSockets = new Set<http.IncomingMessage['socket']>();
+	const controlSockets = new Set<http.IncomingMessage['socket']>();
+	const server = http.createServer((req, res) => {
+		const sockets = req.url === '/control' ? controlSockets : openSockets;
+		if (!sockets.has(req.socket)) {
+			sockets.add(req.socket);
+			req.socket.on('close', () => sockets.delete(req.socket));
+		}
+
+		res.writeHead(503, { 'Content-Length': body.length });
+		res.end(body);
+	});
+	// Keeps every response referenced, so that garbage collection can't free a forgotten one behind the test's back
+	const responses: Response[] = [];
+	const fetchFn = (async (...args: Parameters<typeof fetch>) => {
+		const response = await fetch(...args);
+		responses.push(response);
+		return response;
+	}) as typeof fetch;
+	// Waits until all connections of the failed responses are closed, however long the system takes for that
+	const allClosed = async () => {
+		for (const deadline = Date.now() + 10_000; openSockets.size > 0 && Date.now() < deadline;) {
+			await new Promise(resolve => setTimeout(resolve, 20));
+		}
+		return openSockets.size === 0;
+	};
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+
+		// Control: a response whose body is left alone keeps its connection open
+		const control = await fetch(`http://localhost:${address.port}/control`);
+
+		const policies: [() => number, string][] = [
+			[() => {
+				throw new Error('Policy failed');
+			}, 'Policy failed'],
+			[() => -1, 'Retry delay must be a non-negative finite number.'],
+		];
+		for (const [getRetryDelay, message] of policies) {
+			const inputs: Input[] = [];
+			for (let i = 0; i < 10; i++) {
+				const input = new Input({
+					source: new UrlSource(`http://localhost:${address.port}/data.bin`, { fetchFn, getRetryDelay }),
+					formats: ALL_FORMATS,
+				});
+				inputs.push(input);
+				await expect(input.getFormat()).rejects.toThrow(message);
+			}
+
+			// The failed responses get cancelled, which closes their connections, even while the inputs are still
+			// around (disposing them would abort the requests anyway)
+			expect(await allClosed(), message).toBe(true);
+			inputs.forEach(input => input.dispose());
+		}
+
+		expect(responses).toHaveLength(20);
+		expect(controlSockets.size).toBe(1);
+		await control.body?.cancel();
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+}, 60_000);
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
