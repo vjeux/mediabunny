@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_FORMATS, Input, FilePathSource } from '../../src/index.js';
+import { ALL_FORMATS, BufferSource, Input, FilePathSource } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -96,6 +96,45 @@ test('OGG Vorbis duration metadata', async () => {
 	for (const track of tracks) {
 		expect(await track.getDurationFromMetadata()).toBe(null);
 	}
+});
+
+test('MP3 duration metadata with a Xing/Info frame count of 0', async () => {
+	// MPEG-1 Layer III, 128 kbps, 44.1 kHz, mono: 417 bytes and 1152 samples per frame
+	const frame = () => {
+		const bytes = new Uint8Array(417);
+		bytes.set([0xff, 0xfb, 0x90, 0xc0]);
+		return bytes;
+	};
+	// A Xing or Info frame declaring the given frame count, with a LAME tag giving an encoder delay of 576 samples,
+	// followed by 10 frames
+	const metadataDuration = async (tag: 'Xing' | 'Info', frameCount: number) => {
+		const header = frame();
+		const view = new DataView(header.buffer);
+		header.set([...tag].map(char => char.charCodeAt(0)), 4 + 17); // Behind the side information
+		view.setUint32(4 + 17 + 4, 0x3); // Frame count and byte count present
+		view.setUint32(4 + 17 + 8, frameCount);
+		view.setUint32(4 + 17 + 12, frameCount === 0 ? 0 : (frameCount + 1) * 417);
+		header.set([...'LAME3.100'].map(char => char.charCodeAt(0)), 4 + 17 + 16);
+		header.set([576 >> 4, (576 & 0xf) << 4], 4 + 17 + 16 + 21);
+
+		const bytes = new Uint8Array(11 * 417);
+		bytes.set(header);
+		for (let i = 1; i < 11; i++) {
+			bytes.set(frame(), i * 417);
+		}
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return await input.getDurationFromMetadata();
+	};
+
+	// The 10 frames, less the LAME encoder delay and the decoder delay
+	const duration = (10 * 1152 - 576 - 529) / 44100;
+	expect(await metadataDuration('Info', 10)).toBe(duration);
+
+	// FFmpeg only takes the duration from a frame count that isn't 0, and estimates it from the bitrate otherwise
+	expect(await metadataDuration('Info', 0)).toBeCloseTo(duration, 6);
+	// Which for a VBR stream it can't
+	expect(await metadataDuration('Xing', 0)).toBe(null);
 });
 
 test('ADTS AAC duration metadata', async () => {
