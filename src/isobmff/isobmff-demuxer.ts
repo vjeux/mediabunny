@@ -254,6 +254,10 @@ type FragmentTrackState = {
 	defaultSampleDuration: number | null;
 	defaultSampleSize: number | null;
 	defaultSampleFlags: number | null;
+	/** For video, the sample_depends_on of each sample's flags, which the sdtp box can tell where it's 0 (unknown) */
+	sampleDependsOn: number[];
+	/** The traf's sdtp box entries, one per sample */
+	sampleDependencies: Uint8Array | null;
 	startTimestamp: number | null;
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 };
@@ -2399,6 +2403,8 @@ export class IsobmffDemuxer extends Demuxer {
 							break cond;
 						}
 
+						applySampleDependencies(this.currentTrack, trackData);
+
 						trackData.presentationTimestamps = trackData.samples
 							.map((x, i) => ({ presentationTimestamp: x.presentationTimestamp, sampleIndex: i }))
 							.sort((a, b) => a.presentationTimestamp - b.presentationTimestamp);
@@ -2498,6 +2504,8 @@ export class IsobmffDemuxer extends Demuxer {
 					defaultSampleDuration: defaults?.defaultSampleDuration ?? null,
 					defaultSampleSize: defaults?.defaultSampleSize ?? null,
 					defaultSampleFlags: defaults?.defaultSampleFlags ?? null,
+					sampleDependsOn: [],
+					sampleDependencies: null,
 					startTimestamp: null,
 					encryptionAuxInfo: null,
 				};
@@ -2522,6 +2530,20 @@ export class IsobmffDemuxer extends Demuxer {
 				if (durationIsEmpty) {
 					track.currentFragmentState.defaultSampleDuration = 0;
 				}
+			}; break;
+
+			case 'sdtp': {
+				// Only the track fragment's one is read, for the dependencies of samples whose flags don't tell them
+				const fragmentState = this.currentTrack?.currentFragmentState;
+				if (!fragmentState || !this.currentFragment || boxInfo.contentSize < 4) {
+					break;
+				}
+
+				slice.skip(4); // Version + flags
+				fragmentState.sampleDependencies = readBytes(
+					slice,
+					Math.min(boxInfo.contentSize - 4, slice.remainingLength),
+				);
 			}; break;
 
 			case 'tfdt': {
@@ -2644,7 +2666,14 @@ export class IsobmffDemuxer extends Demuxer {
 						sampleCompositionTimeOffset = readI32Be(slice);
 					}
 
-					const isKeyFrame = !(sampleFlags & 0x00010000);
+					// Some muxers mark every video frame as a sync sample and only signal the dependency on other
+					// samples, which FFmpeg (mov_read_trun) and Chromium (PopulateSampleInfo) then don't treat as key
+					// frames. Audio samples may depend on others and still be random access points.
+					const isKeyFrame = !(sampleFlags & 0x00010000)
+						&& !(track.info?.type === 'video' && ((sampleFlags >>> 24) & 0b11) === 1);
+					if (track.info?.type === 'video') {
+						track.currentFragmentState.sampleDependsOn.push((sampleFlags >>> 24) & 0b11);
+					}
 
 					trackData.samples.push({
 						presentationTimestamp: trackData.currentTimestamp + sampleCompositionTimeOffset,
@@ -4102,6 +4131,25 @@ const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timest
 	}
 	for (const entry of trackData.presentationTimestamps) {
 		entry.presentationTimestamp += timestamp;
+	}
+};
+
+/**
+ * Takes the dependencies of video samples whose sample flags leave them unknown from the traf's sdtp box, like
+ * Chromium (TrackRunIterator), as some files mark every video frame as a sync sample.
+ */
+const applySampleDependencies = (track: InternalTrack, trackData: FragmentTrackData) => {
+	const state = track.currentFragmentState;
+	if (!state?.sampleDependencies || track.info?.type !== 'video') {
+		return;
+	}
+
+	const { sampleDependsOn, sampleDependencies } = state;
+	for (let i = 0; i < trackData.samples.length && i < sampleDependencies.length; i++) {
+		// sample_depends_on 1: the sample depends on others
+		if (sampleDependsOn[i] === 0 && ((sampleDependencies[i]! >> 4) & 0b11) === 1) {
+			trackData.samples[i]!.isKeyFrame = false;
+		}
 	}
 };
 
