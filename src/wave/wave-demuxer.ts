@@ -89,7 +89,11 @@ export class WaveDemuxer extends Demuxer {
 				}
 
 				if (chunkId === 'fmt ') {
-					await this.parseFmtChunk(startPos, chunkSize, littleEndian);
+					// Only the first format chunk counts, like in FFmpeg and when reading a stream, which stops at the
+					// data chunk
+					if (!this.audioInfo) {
+						await this.parseFmtChunk(startPos, chunkSize, littleEndian);
+					}
 				} else if (chunkId === 'data') {
 					dataChunkSize ??= chunkSize;
 
