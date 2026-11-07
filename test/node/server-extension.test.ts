@@ -28,10 +28,10 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { FlacOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
 import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
@@ -1883,10 +1883,16 @@ describe('Audio', async () => {
 		} satisfies AudioEncoderConfig;
 
 		let packetCount = 0;
+		let lastPacket: EncodedPacket | null = null;
 
 		// @ts-expect-error Readonly
 		encoder.onPacket = (packet: EncodedPacket, meta: EncodedAudioChunkMetadata) => {
-			expect(packet.duration).toBe(1024 / 48000);
+			if (lastPacket) {
+				// Every packet but the last holds a full frame
+				expect(lastPacket.duration).toBe(1024 / 48000);
+			}
+			lastPacket = packet;
+
 			expect(packet.type).toBe('key');
 
 			if (packetCount === 0) {
@@ -1918,8 +1924,10 @@ describe('Audio', async () => {
 
 		const minPacketCount = 2 * 48000 / 1024;
 		expect(packetCount).toBeGreaterThan(minPacketCount);
+		expect(lastPacket!.timestamp + lastPacket!.duration).toBeCloseTo(2, 10);
 
 		packetCount = 0;
+		lastPacket = null;
 
 		using sample2 = new AudioSample({
 			data,
@@ -1933,6 +1941,7 @@ describe('Audio', async () => {
 		await encoder.flush();
 
 		expect(packetCount).toBeGreaterThan(minPacketCount);
+		expect(lastPacket!.timestamp + lastPacket!.duration).toBeCloseTo(2, 10);
 
 		await encoder.close();
 	});
@@ -1955,9 +1964,12 @@ describe('Audio', async () => {
 		await encodeDecodeTest('aac', {
 			// @ts-expect-error Fucky type
 			aac: { format: 'aac' },
-		}, async (packet, meta, i) => {
+		}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(1024 / 48000);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(1024 / 48000);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -1977,9 +1989,12 @@ describe('Audio', async () => {
 		await encodeDecodeTest('aac', {
 			// @ts-expect-error Fucky type
 			aac: { format: 'adts' },
-		}, async (packet, meta, i) => {
+		}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(1024 / 48000);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(1024 / 48000);
+			}
 			expect(packet.data[0]).toBe(0xff);
 
 			if (i === 0) {
@@ -2066,9 +2081,12 @@ describe('Audio', async () => {
 	});
 
 	test('FLAC encode & decode', async () => {
-		await encodeDecodeTest('flac', {}, async (packet, meta, i) => {
+		await encodeDecodeTest('flac', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(0.096);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(0.096);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2081,17 +2099,23 @@ describe('Audio', async () => {
 					0x66, 0x4c, 0x61, 0x43,
 				]);
 			}
-		}, async (sample) => {
+		}, async (sample, i, n) => {
 			expect(sample.numberOfChannels).toBe(2);
 			expect(sample.sampleRate).toBe(48000);
-			expect(sample.duration).toBe(0.096);
+
+			if (i < n - 1) {
+				expect(sample.duration).toBe(0.096);
+			}
 		});
 	});
 
 	test('AC-3 encode & decode', async () => {
-		await encodeDecodeTest('ac3', {}, async (packet, meta, i) => {
+		await encodeDecodeTest('ac3', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(0.032);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(0.032);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2108,9 +2132,12 @@ describe('Audio', async () => {
 	});
 
 	test('E-AC-3 encode & decode', async () => {
-		await encodeDecodeTest('eac3', {}, async (packet, meta, i) => {
+		await encodeDecodeTest('eac3', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(0.032);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(0.032);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2127,9 +2154,12 @@ describe('Audio', async () => {
 	});
 
 	test('DTS encode & decode', async () => {
-		await encodeDecodeTest('dts', { bitrate: DTS_BITRATE }, async (packet, meta, i) => {
+		await encodeDecodeTest('dts', { bitrate: DTS_BITRATE }, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBeCloseTo(512 / 48000);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBeCloseTo(512 / 48000);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2163,6 +2193,90 @@ describe('Audio', async () => {
 			expect(sample.sampleRate).toBe(48000);
 			expect(sample.duration).toBeCloseTo(40 / 48000);
 		});
+	});
+
+	test.each([
+		'aac', 'opus', 'mp3', 'vorbis', 'flac', 'ac3', 'eac3', 'dts', 'truehd',
+	] as AudioCodec[])('%s encoding ends where the input ends', async (codec) => {
+		const sampleRate = 48000;
+		const frameCount = 48485; // Not a whole number of frames for any of these codecs
+
+		const encoder = new NodeAvAudioEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = codec;
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: buildAudioCodecString(codec, 2, sampleRate),
+			numberOfChannels: 2,
+			sampleRate,
+			bitrate: codec === 'dts' ? DTS_BITRATE : 128000,
+		} satisfies AudioEncoderConfig;
+
+		const packets: EncodedPacket[] = [];
+		// @ts-expect-error Readonly
+		encoder.onPacket = (packet: EncodedPacket) => {
+			packets.push(packet);
+		};
+
+		await encoder.init();
+
+		using sample = new AudioSample({
+			data: createF32SineWave(sampleRate, 2, 2).subarray(0, 2 * frameCount),
+			format: 'f32',
+			timestamp: 0,
+			numberOfChannels: 2,
+			sampleRate,
+		});
+		await encoder.encode(sample);
+		await encoder.flush();
+		await encoder.close();
+
+		// The silence that fills up the last frame isn't part of the audio
+		const lastPacket = last(packets)!;
+		expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(frameCount / sampleRate, 10);
+	});
+
+	test('FLAC encoding is lossless', async () => {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(source);
+		await output.start();
+
+		// 10000 frames isn't a multiple of the encoder's 4608-frame block size
+		const data = Int16Array.from({ length: 10000 }, (_, i) => Math.round(8000 * Math.sin(i / 7)));
+		using sample = new AudioSample({ data, format: 's16', numberOfChannels: 1, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		const decoded: number[] = [];
+		for await (using decodedSample of new AudioSampleSink(track).samples()) {
+			const values = new Int16Array(decodedSample.numberOfFrames);
+			decodedSample.copyTo(values, { planeIndex: 0, format: 's16' });
+			decoded.push(...values);
+		}
+
+		expect(await input.computeDuration()).toBe(10000 / 48000);
+		expect(decoded).toEqual([...data]);
+	});
+
+	test.each([1, 15, 16])('FLAC encoding of %i samples has a valid maximum block size', async (frameCount) => {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(source);
+		await output.start();
+
+		const data = new Float32Array(2 * frameCount).fill(0.5);
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		// STREAMINFO follows 'fLaC' and its block header. Blocks of fewer than 16 samples aren't allowed (RFC 9639,
+		// section 8.2), and FFmpeg rejects a stream whose maximum block size is below that.
+		const bytes = new Uint8Array(output.target.buffer!);
+		const maximumBlockSize = (bytes[10]! << 8) | bytes[11]!;
+		expect(maximumBlockSize).toBeGreaterThanOrEqual(16);
 	});
 
 	for (const codec of NON_PCM_AUDIO_CODECS) {
@@ -2255,6 +2369,9 @@ describe('Audio', async () => {
 		await encoder.encode(inputSample);
 
 		await encoder.flush();
+
+		// Any silence filling up the last frame isn't part of the audio
+		expect(last(packets)!.timestamp + last(packets)!.duration).toBeCloseTo(startTimestamp + 2, 6);
 
 		for (let i = 0; i < packets.length; i++) {
 			await onPacket(packets[i]!, metas[i]!, i, packets.length);
