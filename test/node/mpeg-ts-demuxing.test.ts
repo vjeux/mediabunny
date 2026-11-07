@@ -1066,10 +1066,21 @@ test('MPEG-TS keeps the last video frame when its PES packet fills its last TS p
 		return new Uint8Array(output.target.buffer!);
 	};
 
-	// Whether the video's last TS packet carries payload only (no adaptation field, so no stuffing)
+	// Whether the video's last TS packet carries payload only (no adaptation field, so no stuffing). The video PID is
+	// the one whose PES packets have stream_id 0xe0.
 	const lastVideoPacketIsFull = (bytes: Uint8Array) => {
+		const pidAt = (pos: number) => ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+		let videoPid = -1;
+		for (let pos = 0; pos < bytes.length && videoPid === -1; pos += 188) {
+			const payloadPos = pos + 4 + (bytes[pos + 3]! & 0x20 ? 1 + bytes[pos + 4]! : 0);
+			if (bytes[pos + 1]! & 0x40 && bytes[payloadPos] === 0 && bytes[payloadPos + 1] === 0
+				&& bytes[payloadPos + 2] === 1 && bytes[payloadPos + 3] === 0xe0) {
+				videoPid = pidAt(pos);
+			}
+		}
+
 		for (let pos = bytes.length - 188; pos >= 0; pos -= 188) {
-			if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100) {
+			if (pidAt(pos) === videoPid) {
 				return ((bytes[pos + 3]! >> 4) & 0b11) === 0b01;
 			}
 		}
