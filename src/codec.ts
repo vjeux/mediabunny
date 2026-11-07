@@ -110,6 +110,24 @@ export const SUBTITLE_CODECS = [
 	'webvtt',
 ] as const; // TODO add the rest
 
+export const validateCheckedCodecs = (checkedCodecs: unknown) => {
+	if (!Array.isArray(checkedCodecs)) {
+		throw new TypeError('checkedCodecs must be an array.');
+	}
+};
+
+/** Like {@link validateCheckedCodecs}, for the functions that only iterate over the codecs. */
+export const validateCheckedCodecIterable = (checkedCodecs: unknown) => {
+	if (
+		!checkedCodecs
+		// A string is iterable, but only yields characters
+		|| (typeof checkedCodecs !== 'object' && typeof checkedCodecs !== 'function')
+		|| !(Symbol.iterator in checkedCodecs)
+	) {
+		throw new TypeError('checkedCodecs must be an iterable of codecs.');
+	}
+};
+
 /**
  * Union type of known video codecs.
  * @group Codecs
@@ -186,22 +204,36 @@ const HEVC_LEVEL_TABLE = [
 	{ maxPictureSize: 35651584, maxBitrate: 800000000, tier: 'H', level: 186 }, // Level 6.2 (High Tier)
 ];
 
-// https://en.wikipedia.org/wiki/VP9
+// https://www.webmproject.org/vp9/levels/
 export const VP9_LEVEL_TABLE = [
-	{ maxPictureSize: 36864, maxBitrate: 200000, level: 10 }, // Level 1
-	{ maxPictureSize: 73728, maxBitrate: 800000, level: 11 }, // Level 1.1
-	{ maxPictureSize: 122880, maxBitrate: 1800000, level: 20 }, // Level 2
-	{ maxPictureSize: 245760, maxBitrate: 3600000, level: 21 }, // Level 2.1
-	{ maxPictureSize: 552960, maxBitrate: 7200000, level: 30 }, // Level 3
-	{ maxPictureSize: 983040, maxBitrate: 12000000, level: 31 }, // Level 3.1
-	{ maxPictureSize: 2228224, maxBitrate: 18000000, level: 40 }, // Level 4
-	{ maxPictureSize: 2228224, maxBitrate: 30000000, level: 41 }, // Level 4.1
-	{ maxPictureSize: 8912896, maxBitrate: 60000000, level: 50 }, // Level 5
-	{ maxPictureSize: 8912896, maxBitrate: 120000000, level: 51 }, // Level 5.1
-	{ maxPictureSize: 8912896, maxBitrate: 180000000, level: 52 }, // Level 5.2
-	{ maxPictureSize: 35651584, maxBitrate: 180000000, level: 60 }, // Level 6
-	{ maxPictureSize: 35651584, maxBitrate: 240000000, level: 61 }, // Level 6.1
-	{ maxPictureSize: 35651584, maxBitrate: 480000000, level: 62 }, // Level 6.2
+	// Level 1
+	{ maxPictureSize: 36864, maxSampleRate: 829440, maxDimension: 512, maxBitrate: 200000, level: 10 },
+	// Level 1.1
+	{ maxPictureSize: 73728, maxSampleRate: 2764800, maxDimension: 768, maxBitrate: 800000, level: 11 },
+	// Level 2
+	{ maxPictureSize: 122880, maxSampleRate: 4608000, maxDimension: 960, maxBitrate: 1800000, level: 20 },
+	// Level 2.1
+	{ maxPictureSize: 245760, maxSampleRate: 9216000, maxDimension: 1344, maxBitrate: 3600000, level: 21 },
+	// Level 3
+	{ maxPictureSize: 552960, maxSampleRate: 20736000, maxDimension: 2048, maxBitrate: 7200000, level: 30 },
+	// Level 3.1
+	{ maxPictureSize: 983040, maxSampleRate: 36864000, maxDimension: 2752, maxBitrate: 12000000, level: 31 },
+	// Level 4
+	{ maxPictureSize: 2228224, maxSampleRate: 83558400, maxDimension: 4160, maxBitrate: 18000000, level: 40 },
+	// Level 4.1
+	{ maxPictureSize: 2228224, maxSampleRate: 160432128, maxDimension: 4160, maxBitrate: 30000000, level: 41 },
+	// Level 5
+	{ maxPictureSize: 8912896, maxSampleRate: 311951360, maxDimension: 8384, maxBitrate: 60000000, level: 50 },
+	// Level 5.1
+	{ maxPictureSize: 8912896, maxSampleRate: 588251136, maxDimension: 8384, maxBitrate: 120000000, level: 51 },
+	// Level 5.2
+	{ maxPictureSize: 8912896, maxSampleRate: 1176502272, maxDimension: 8384, maxBitrate: 180000000, level: 52 },
+	// Level 6
+	{ maxPictureSize: 35651584, maxSampleRate: 1176502272, maxDimension: 16832, maxBitrate: 180000000, level: 60 },
+	// Level 6.1
+	{ maxPictureSize: 35651584, maxSampleRate: 2353004544, maxDimension: 16832, maxBitrate: 240000000, level: 61 },
+	// Level 6.2
+	{ maxPictureSize: 35651584, maxSampleRate: 4706009088, maxDimension: 16832, maxBitrate: 480000000, level: 62 },
 ];
 
 // https://en.wikipedia.org/wiki/AV1
@@ -239,7 +271,7 @@ export const PRORES_FOURCCS = [
 	'ap4x', // ProRes 4444 XQ
 	'ap4h', // ProRes 4444
 	'apch', // ProRes 422 High Quality
-	'apcn', // ProRes 422 Standard Definition
+	'apcn', // ProRes 422
 	'apcs', // ProRes 422 LT
 	'apco', // ProRes 422 Proxy
 ] as const;
@@ -269,6 +301,7 @@ export const buildVideoCodecString = (
 	height: number,
 	bitrate: number,
 	alpha: boolean,
+	framerate?: number,
 ) => {
 	if (codec === 'avc') {
 		// Needed as a workaround for https://github.com/WebKit/WebKit/pull/74602, otherwise the encoder stalls.
@@ -317,7 +350,10 @@ export const buildVideoCodecString = (
 
 		const pictureSize = width * height;
 		const levelInfo = VP9_LEVEL_TABLE.find(
-			level => pictureSize <= level.maxPictureSize && bitrate <= level.maxBitrate,
+			level => pictureSize <= level.maxPictureSize
+				&& Math.max(width, height) <= level.maxDimension
+				&& bitrate <= level.maxBitrate
+				&& (framerate === undefined || pictureSize * framerate <= level.maxSampleRate),
 		) ?? last(VP9_LEVEL_TABLE)!;
 
 		const bitDepth = '08'; // 8-bit
@@ -420,6 +456,8 @@ export const extractVideoCodecString = (trackInfo: {
 	codecDescription: Uint8Array | null;
 	colorSpace: VideoColorSpaceInit | null;
 	avcType: 1 | 3 | null;
+	/** The sample entry type, when the container stores one. */
+	hevcType?: 'hvc1' | 'hev1' | null;
 	avcCodecInfo: AvcDecoderConfigurationRecord | null;
 	hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 	vp9CodecInfo: Vp9CodecInfo | null;
@@ -490,7 +528,8 @@ export const extractVideoCodecString = (trackInfo: {
 			}
 		}
 
-		let codecString = 'hev1.';
+		// The string starts with the sample entry type (ISO/IEC 14496-15, E.3)
+		let codecString = (trackInfo.hevcType ?? 'hev1') + '.';
 
 		codecString += ['', 'A', 'B', 'C'][generalProfileSpace]! + generalProfileIdc;
 		codecString += '.';
@@ -531,10 +570,25 @@ export const extractVideoCodecString = (trackInfo: {
 		const level = vp9CodecInfo.level.toString().padStart(2, '0');
 		const bitDepth = vp9CodecInfo.bitDepth.toString().padStart(2, '0');
 		const chromaSubsampling = vp9CodecInfo.chromaSubsampling.toString().padStart(2, '0');
-		const colourPrimaries = vp9CodecInfo.colourPrimaries.toString().padStart(2, '0');
-		const transferCharacteristics = vp9CodecInfo.transferCharacteristics.toString().padStart(2, '0');
-		const matrixCoefficients = vp9CodecInfo.matrixCoefficients.toString().padStart(2, '0');
-		const videoFullRangeFlag = vp9CodecInfo.videoFullRangeFlag.toString().padStart(2, '0');
+
+		// The VP9 bitstream only signals a color space, from which the primaries and especially the transfer
+		// characteristics can merely be guessed (BT.2020 content may well be PQ or HLG). So, explicitly signaled
+		// color information, such as WebM's Colour element, takes precedence, keeping the string in line with the
+		// color space.
+		const colourPrimaries = (
+			colorSpace?.primaries ? COLOR_PRIMARIES_MAP[colorSpace.primaries] : vp9CodecInfo.colourPrimaries
+		).toString().padStart(2, '0');
+		const transferCharacteristics = (
+			colorSpace?.transfer
+				? TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer]
+				: vp9CodecInfo.transferCharacteristics
+		).toString().padStart(2, '0');
+		const matrixCoefficients = (
+			colorSpace?.matrix ? MATRIX_COEFFICIENTS_MAP[colorSpace.matrix] : vp9CodecInfo.matrixCoefficients
+		).toString().padStart(2, '0');
+		const videoFullRangeFlag = (
+			typeof colorSpace?.fullRange === 'boolean' ? Number(colorSpace.fullRange) : vp9CodecInfo.videoFullRangeFlag
+		).toString().padStart(2, '0');
 
 		let string = `vp09.${profile}.${level}.${bitDepth}.${chromaSubsampling}`;
 		string += `.${colourPrimaries}.${transferCharacteristics}.${matrixCoefficients}.${videoFullRangeFlag}`;
@@ -574,22 +628,26 @@ export const extractVideoCodecString = (trackInfo: {
 					: 0
 			);
 
-		let colorPrimaries: number;
-		let transferCharacteristics: number;
-		let matrixCoefficients: number;
-		let videoFullRangeFlag: number;
+		// Without a color description in the sequence header, the color fields default to ITU-R BT.709. The color space
+		// given by the container (an nclx colr box in MP4) takes precedence where it specifies a field, as AV1-ISOBMFF
+		// section 5 requires. Where it was filled in from the sequence header, it has the same values.
+		const hasColorInfo = av1CodecInfoHasColorInfo(av1CodecInfo);
+		let colorPrimaries = hasColorInfo ? av1CodecInfo.colourPrimaries : 1;
+		let transferCharacteristics = hasColorInfo ? av1CodecInfo.transferCharacteristics : 1;
+		let matrixCoefficients = hasColorInfo ? av1CodecInfo.matrixCoefficients : 1;
+		let videoFullRangeFlag = av1CodecInfo.videoFullRangeFlag;
 
-		if (av1CodecInfoHasColorInfo(av1CodecInfo)) {
-			colorPrimaries = av1CodecInfo.colourPrimaries;
-			transferCharacteristics = av1CodecInfo.transferCharacteristics;
-			matrixCoefficients = av1CodecInfo.matrixCoefficients;
-			videoFullRangeFlag = av1CodecInfo.videoFullRangeFlag;
-		} else {
-			// The defaults are 1 (ITU-R BT.709)
-			colorPrimaries = colorSpace?.primaries ? COLOR_PRIMARIES_MAP[colorSpace.primaries] : 1;
-			transferCharacteristics = colorSpace?.transfer ? TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer] : 1;
-			matrixCoefficients = colorSpace?.matrix ? MATRIX_COEFFICIENTS_MAP[colorSpace.matrix] : 1;
-			videoFullRangeFlag = colorSpace?.fullRange ? 1 : 0;
+		if (colorSpace?.primaries) {
+			colorPrimaries = COLOR_PRIMARIES_MAP[colorSpace.primaries];
+		}
+		if (colorSpace?.transfer) {
+			transferCharacteristics = TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer];
+		}
+		if (colorSpace?.matrix) {
+			matrixCoefficients = MATRIX_COEFFICIENTS_MAP[colorSpace.matrix];
+		}
+		if (colorSpace?.fullRange != null) {
+			videoFullRangeFlag = colorSpace.fullRange ? 1 : 0;
 		}
 
 		let string = `av01.${profile}.${level}${tier}.${bitDepth}`;
@@ -611,6 +669,20 @@ export const extractVideoCodecString = (trackInfo: {
 	}
 
 	throw new TypeError(`Unhandled codec '${codec}'.`);
+};
+
+/**
+ * Chromium only accepts AVC codec strings whose level is a level number from Table A-1 of ITU-T H.264 (see
+ * IsValidH264Level in media/base/mime_util_internal.cc), so it rejects level_idc 9, which is how the High profiles
+ * signal level 1b. Level 1b's limits are within those of level 1.1, so naming level 1.1 instead keeps such streams
+ * decodable.
+ */
+export const toChromiumCompatibleAvcCodecString = (codecString: string) => {
+	if (/^avc[13]\.[0-9a-fA-F]{4}09$/.test(codecString)) {
+		return codecString.slice(0, -2) + '0b';
+	}
+
+	return codecString;
 };
 
 export const extractColorSpace = (info: {
@@ -866,20 +938,47 @@ export const guessDescriptionForAudio = (decoderConfig: AudioDecoderConfig): Uin
 	}
 };
 
+// SBR doubles the core coder's sample rate, up to 48 kHz
+const MAX_AAC_SBR_CORE_SAMPLE_RATE = 24000;
+// Parametric stereo (HE-AACv2) only kicks in at a frame carrying a PS header, which encoders resend just every few
+// frames (libfdk: every 10), and the output converges two frames later
+const AAC_PS_PRE_ROLL_FRAMES = 12;
+
 export const getAudioPreRollDuration = (codec: AudioCodec, decoderConfig: AudioDecoderConfig) => {
 	switch (codec) {
 		case 'aac': {
-			if (!decoderConfig.description) {
-				// Best guess
-				return 1024 / decoderConfig.sampleRate;
+			// Frames overlap, so decoding must start a frame early. SBR (HE-AAC) also keeps the state of the frame
+			// before and codes its envelopes relative to it, so it needs one more (as in FFmpeg's seek_preroll() in
+			// aacdec.c), and parametric stereo needs to reach back to its last header. SBR and PS are often signaled
+			// only implicitly (ADTS, MPEG-TS), leaving a config that describes just the core coder, so assume them
+			// whenever the core allows for them: SBR at core rates of 24 kHz or less, and PS if that core is mono.
+			let frameLength = 1024;
+			let coreSampleRate = decoderConfig.sampleRate;
+			let coreIsMono = decoderConfig.numberOfChannels === 1;
+			let signalsSbr = false;
+			let signalsPs = false;
+
+			if (decoderConfig.description) {
+				const audioSpecificConfig = parseAacAudioSpecificConfig(toUint8Array(decoderConfig.description));
+				if (audioSpecificConfig.coreSampleRate === null) {
+					throw new Error('Invalid AAC sampling frequency index.');
+				}
+
+				frameLength = audioSpecificConfig.frameLength;
+				coreSampleRate = audioSpecificConfig.coreSampleRate;
+				coreIsMono = audioSpecificConfig.channelConfiguration === 1;
+				signalsPs = audioSpecificConfig.objectType === 29
+					|| (coreIsMono && audioSpecificConfig.outputNumberOfChannels === 2);
+				signalsSbr = signalsPs
+					|| audioSpecificConfig.objectType === 5
+					|| audioSpecificConfig.outputSampleRate !== audioSpecificConfig.coreSampleRate;
 			}
 
-			const audioSpecificConfig = parseAacAudioSpecificConfig(toUint8Array(decoderConfig.description));
-			if (audioSpecificConfig.coreSampleRate === null) {
-				throw new Error('Invalid AAC sampling frequency index.');
-			}
+			const mayHaveSbr = signalsSbr || coreSampleRate <= MAX_AAC_SBR_CORE_SAMPLE_RATE;
+			const mayHavePs = signalsPs || (mayHaveSbr && coreIsMono);
+			const frameCount = mayHavePs ? AAC_PS_PRE_ROLL_FRAMES : mayHaveSbr ? 2 : 1;
 
-			return audioSpecificConfig.frameLength / audioSpecificConfig.coreSampleRate;
+			return frameCount * frameLength / coreSampleRate;
 		}
 
 		case 'opus': {
@@ -908,20 +1007,25 @@ export const getAudioPreRollDuration = (codec: AudioCodec, decoderConfig: AudioD
 		}
 
 		case 'vorbis': {
-			assert(decoderConfig.description);
+			// Without a readable identification header, assume the largest long window Vorbis allows
+			let longBlockSize = 8192;
 
-			// Skip the Xiph lacing to get to the identification header
-			const bytes = toUint8Array(decoderConfig.description);
-			let pos = 1;
-			let lacedLengthsLeft = 2;
-			while (lacedLengthsLeft > 0) {
-				if (bytes[pos++]! < 255) {
-					lacedLengthsLeft--;
+			if (decoderConfig.description) {
+				// Skip the Xiph lacing to get to the identification header
+				const bytes = toUint8Array(decoderConfig.description);
+				let pos = 1;
+				let lacedLengthsLeft = 2;
+				while (lacedLengthsLeft > 0 && pos < bytes.length) {
+					if (bytes[pos++]! < 255) {
+						lacedLengthsLeft--;
+					}
+				}
+
+				const blockSizeByte = bytes[pos + 28];
+				if (lacedLengthsLeft === 0 && blockSizeByte !== undefined) {
+					longBlockSize = 1 << (blockSizeByte >> 4); // blocksize_1
 				}
 			}
-
-			const blockSizeByte = bytes[pos + 28]!;
-			const longBlockSize = 1 << (blockSizeByte >> 4); // blocksize_1
 
 			// The previous packet's long window overlaps by up to half its size
 			return (longBlockSize / 2) / decoderConfig.sampleRate;
@@ -1134,6 +1238,48 @@ const HEVC_CODEC_STRING_REGEX = /^(hev1|hvc1)\.(?:[ABC]?\d+)\.[0-9a-fA-F]{1,8}\.
 const VP9_CODEC_STRING_REGEX = /^vp09(?:\.\d{2}){3}(?:(?:\.\d{2}){5})?$/;
 const AV1_CODEC_STRING_REGEX = /^av01\.\d\.\d{2}[MH]\.\d{2}(?:\.\d\.\d{3}\.\d{2}\.\d{2}\.\d{2}\.\d)?$/;
 
+// The vpcC box and the WebM CodecPrivate are built from the codec string, so its fields have to be within the ranges
+// the VP codec ISOBMFF binding allows, which are also what fits their bit fields
+const vp9CodecStringFieldsAreValid = (codecString: string) => {
+	const [profile, level, bitDepth, chromaSubsampling, , , , videoFullRangeFlag] = codecString
+		.split('.')
+		.slice(1)
+		.map(Number);
+
+	return profile! <= 3
+		&& (level === 0 || VP9_LEVEL_TABLE.some(entry => entry.level === level)) // 0 means undefined
+		&& [8, 10, 12].includes(bitDepth!)
+		&& (chromaSubsampling === undefined || chromaSubsampling <= 3)
+		&& (videoFullRangeFlag === undefined || videoFullRangeFlag <= 1);
+};
+
+// Same for the av1C box: the fields have to be within the ranges of the corresponding sequence header fields
+const av1CodecStringFieldsAreValid = (codecString: string) => {
+	const parts = codecString.split('.');
+	const profile = Number(parts[1]);
+	const level = Number(parts[2]!.slice(0, 2));
+	const bitDepth = Number(parts[3]);
+
+	if (profile > 2 || level > 31 || ![8, 10, 12].includes(bitDepth)) {
+		return false;
+	}
+	if (parts.length === 4) {
+		return true;
+	}
+
+	const monochrome = Number(parts[4]);
+	const [subsamplingX, subsamplingY, chromaSamplePosition] = [...parts[5]!].map(Number);
+	const videoFullRangeFlag = Number(parts[9]);
+
+	return monochrome <= 1
+		&& subsamplingX! <= 1
+		&& subsamplingY! <= 1
+		&& chromaSamplePosition! <= 3
+		// The chroma sample position is only coded for 4:2:0
+		&& (chromaSamplePosition === 0 || (subsamplingX === 1 && subsamplingY === 1))
+		&& videoFullRangeFlag <= 1;
+};
+
 export const validateVideoChunkMetadata = (
 	metadata: EncodedVideoChunkMetadata | undefined,
 	trackCodec: VideoCodec | null,
@@ -1283,7 +1429,10 @@ export const validateVideoChunkMetadata = (
 	} else if (metadata.decoderConfig.codec.startsWith('vp09')) {
 		// VP9-specific validation
 
-		if (!VP9_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)) {
+		if (
+			!VP9_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)
+			|| !vp9CodecStringFieldsAreValid(metadata.decoderConfig.codec)
+		) {
 			throw new TypeError(
 				'Video chunk metadata decoder configuration codec string for VP9 must be a valid VP9 codec string as'
 				+ ' specified in Section "Codecs Parameter String" of https://www.webmproject.org/vp9/mp4/.',
@@ -1292,7 +1441,10 @@ export const validateVideoChunkMetadata = (
 	} else if (metadata.decoderConfig.codec.startsWith('av01')) {
 		// AV1-specific validation
 
-		if (!AV1_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)) {
+		if (
+			!AV1_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)
+			|| !av1CodecStringFieldsAreValid(metadata.decoderConfig.codec)
+		) {
 			throw new TypeError(
 				'Video chunk metadata decoder configuration codec string for AV1 must be a valid AV1 codec string as'
 				+ ' specified in Section "Codecs Parameter String" of https://aomediacodec.github.io/av1-isobmff/.',
@@ -1315,6 +1467,19 @@ export const validateVideoChunkMetadata = (
 			+ ` the track codec '${trackCodec}'.`,
 		);
 	}
+};
+
+/** Checks that an Opus identification header has all the fields of Section 5.1 of RFC 7845. */
+const isCompleteOpusIdentificationHeader = (bytes: Uint8Array) => {
+	// 'OpusHead', version, channel count, pre-skip, input sample rate, output gain and channel mapping family
+	if (bytes.byteLength < 19) {
+		return false;
+	}
+
+	// Any mapping family but 0 is followed by the stream count, the coupled stream count and one byte per channel
+	const outputChannelCount = bytes[9]!;
+	const channelMappingFamily = bytes[18]!;
+	return channelMappingFamily === 0 || bytes.byteLength >= 21 + outputChannelCount;
 };
 
 const VALID_AUDIO_CODEC_STRING_PREFIXES = [
@@ -1406,11 +1571,24 @@ export const validateAudioChunkMetadata = (
 			throw new TypeError('Audio chunk metadata decoder configuration codec string for Opus must be "opus".');
 		}
 
-		if (metadata.decoderConfig.description && metadata.decoderConfig.description.byteLength < 18) {
+		if (
+			metadata.decoderConfig.description
+			&& !isCompleteOpusIdentificationHeader(toUint8Array(metadata.decoderConfig.description))
+		) {
 			// Description is optional for Opus per-spec, so we shouldn't enforce it
 			throw new TypeError(
 				'Audio chunk metadata decoder configuration description, when specified, is expected to be an'
 				+ ' Identification Header as specified in Section 5.1 of RFC 7845.',
+			);
+		}
+
+		if (!metadata.decoderConfig.description && metadata.decoderConfig.numberOfChannels > 2) {
+			// Without a description, channel mapping family 0 is implied, which only covers mono and stereo. Beyond
+			// that, the stream and coupled stream counts and the channel mapping can't be inferred.
+			throw new TypeError(
+				'Audio chunk metadata decoder configuration for Opus with more than two channels must include a'
+				+ ' description, which is expected to be an Identification Header as specified in Section 5.1 of'
+				+ ' RFC 7845.',
 			);
 		}
 	} else if (metadata.decoderConfig.codec.startsWith('vorbis')) {

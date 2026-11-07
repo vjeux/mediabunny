@@ -10,7 +10,9 @@ import { aacChannelMap, aacFrequencyTable } from '../../shared/aac-misc';
 import { AudioCodec } from '../codec';
 import { Demuxer } from '../demuxer';
 import {
+	ID3_V1_TAG_SIZE,
 	ID3_V2_HEADER_SIZE,
+	parseId3V1Tag,
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
@@ -27,7 +29,7 @@ import {
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
-import { readBytes, Reader } from '../reader';
+import { readAscii, readBytes, Reader } from '../reader';
 import {
 	AdtsFrameHeader,
 	MIN_ADTS_FRAME_HEADER_SIZE,
@@ -51,6 +53,8 @@ export class AdtsDemuxer extends Demuxer {
 	firstFrameHeader: AdtsFrameHeader | null = null;
 	loadedSamples: Sample[] = [];
 	metadataTags: MetadataTags | null = null;
+	/** Whether metadataTags holds all tags, rather than the ones read before a parse error */
+	metadataTagsComplete = false;
 
 	trackBackings: AdtsAudioTrackBacking[] = [];
 
@@ -81,67 +85,70 @@ export class AdtsDemuxer extends Demuxer {
 	}
 
 	async advanceReader() {
-		if (this.lastLoadedPos === 0) {
-			// Skip all ID3v2 tags at the start of the file
-			while (true) {
-				let slice = this.reader.requestSlice(this.lastLoadedPos, ID3_V2_HEADER_SIZE);
-				if (isThenable(slice)) slice = await slice;
+		while (true) {
+			let slice = this.reader.requestSliceRange(
+				this.lastLoadedPos,
+				MIN_ADTS_FRAME_HEADER_SIZE,
+				MAX_ADTS_FRAME_HEADER_SIZE,
+			);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				this.lastSampleLoaded = true;
+				return;
+			}
 
-				if (!slice) {
+			const header = readAdtsFrameHeader(slice);
+			if (!header) {
+				// ID3v2 tags sit not only at the start of the file but can also come in between frames (like timed
+				// metadata in HLS packed audio), so let's skip them
+				let id3Slice = this.reader.requestSlice(this.lastLoadedPos, ID3_V2_HEADER_SIZE);
+				if (isThenable(id3Slice)) {
+					id3Slice = await id3Slice;
+				}
+				if (!id3Slice) {
 					this.lastSampleLoaded = true;
 					return;
 				}
 
-				const id3V2Header = readId3V2Header(slice);
+				const id3V2Header = readId3V2Header(id3Slice);
 				if (!id3V2Header) {
-					break;
+					this.lastSampleLoaded = true;
+					return;
 				}
 
-				this.lastLoadedPos = slice.filePos + id3V2Header.size;
+				this.lastLoadedPos = id3Slice.filePos + id3V2Header.size;
+				continue;
 			}
-		}
 
-		let slice = this.reader.requestSliceRange(
-			this.lastLoadedPos,
-			MIN_ADTS_FRAME_HEADER_SIZE,
-			MAX_ADTS_FRAME_HEADER_SIZE,
-		);
-		if (isThenable(slice)) slice = await slice;
-		if (!slice) {
-			this.lastSampleLoaded = true;
+			if (this.reader.fileSize !== null && header.startPos + header.frameLength > this.reader.fileSize) {
+				// Frame doesn't fit in the rest of the file
+				this.lastSampleLoaded = true;
+				return;
+			}
+
+			if (!this.firstFrameHeader) {
+				this.firstFrameHeader = header;
+			}
+
+			const sampleRate = aacFrequencyTable[header.samplingFrequencyIndex];
+			assert(sampleRate !== undefined);
+			const sampleDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
+
+			const sample: Sample = {
+				timestamp: this.nextTimestampInSamples / sampleRate,
+				duration: sampleDuration,
+				dataStart: header.startPos,
+				dataSize: header.frameLength,
+			};
+
+			this.loadedSamples.push(sample);
+			this.nextTimestampInSamples += SAMPLES_PER_AAC_FRAME;
+			this.lastLoadedPos = header.startPos + header.frameLength;
+
 			return;
 		}
-
-		const header = readAdtsFrameHeader(slice);
-		if (!header) {
-			this.lastSampleLoaded = true;
-			return;
-		}
-
-		if (this.reader.fileSize !== null && header.startPos + header.frameLength > this.reader.fileSize) {
-			// Frame doesn't fit in the rest of the file
-			this.lastSampleLoaded = true;
-			return;
-		}
-
-		if (!this.firstFrameHeader) {
-			this.firstFrameHeader = header;
-		}
-
-		const sampleRate = aacFrequencyTable[header.samplingFrequencyIndex];
-		assert(sampleRate !== undefined);
-		const sampleDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
-
-		const sample: Sample = {
-			timestamp: this.nextTimestampInSamples / sampleRate,
-			duration: sampleDuration,
-			dataStart: header.startPos,
-			dataSize: header.frameLength,
-		};
-
-		this.loadedSamples.push(sample);
-		this.nextTimestampInSamples += SAMPLES_PER_AAC_FRAME;
-		this.lastLoadedPos = header.startPos + header.frameLength;
 	}
 
 	async getMimeType() {
@@ -159,7 +166,8 @@ export class AdtsDemuxer extends Demuxer {
 		try {
 			await this.readMetadata();
 
-			if (this.metadataTags) {
+			// Tags that failed to parse are read again, so that every call fails, not just the first one
+			if (this.metadataTags && this.metadataTagsComplete) {
 				return this.metadataTags;
 			}
 
@@ -185,6 +193,20 @@ export class AdtsDemuxer extends Demuxer {
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
+			// Like for MP3, fall back to an ID3v1 tag at the end of the file when the ID3v2 tags gave us no text fields
+			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
+			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
+				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+
+				if (slice && readAscii(slice, 3) === 'TAG') {
+					parseId3V1Tag(slice, this.metadataTags);
+				}
+			}
+
+			this.metadataTagsComplete = true;
 			return this.metadataTags;
 		} finally {
 			release();

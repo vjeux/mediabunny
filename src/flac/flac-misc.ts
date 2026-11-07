@@ -101,6 +101,29 @@ export const readCodedNumber = (fileSlice: FileSlice): number => {
 	return encoded;
 };
 
+// https://www.rfc-editor.org/rfc/rfc9639.html#name-coded-number
+export const encodeCodedNumber = (value: number) => {
+	if (value < 0x80) {
+		return new Uint8Array([value]);
+	}
+
+	// Like UTF-8: the first byte starts with as many ones as there are bytes, each of the others holds 6 bits
+	let byteCount = 2;
+	while (byteCount < 7 && value >= 2 ** (5 * byteCount + 1)) {
+		byteCount++;
+	}
+
+	const bytes = new Uint8Array(byteCount);
+	let remaining = value;
+	for (let i = byteCount - 1; i > 0; i--) {
+		bytes[i] = 0x80 | (remaining % 64);
+		remaining = Math.floor(remaining / 64);
+	}
+	bytes[0] = ((0xff00 >> byteCount) & 0xff) | remaining;
+
+	return bytes;
+};
+
 export const readBlockSize = (
 	slice: FileSlice,
 	blockSizeBits: BlockSizeOrUncommon,
@@ -159,6 +182,29 @@ export const calculateCrc8 = (data: Uint8Array) => {
 
 			crc &= 0xff; // Ensure CRC remains 8-bit
 		}
+	}
+
+	return crc;
+};
+
+let crc16Table: Uint16Array | null = null;
+
+// https://www.rfc-editor.org/rfc/rfc9639.html#section-9.3
+export const calculateCrc16 = (data: Uint8Array) => {
+	if (!crc16Table) {
+		crc16Table = new Uint16Array(256);
+		for (let n = 0; n < 256; n++) {
+			let crc = n << 8;
+			for (let i = 0; i < 8; i++) {
+				crc = (crc & 0x8000) !== 0 ? (crc << 1) ^ 0x8005 : crc << 1; // x^16 + x^15 + x^2 + x^0
+			}
+			crc16Table[n] = crc & 0xffff;
+		}
+	}
+
+	let crc = 0;
+	for (const byte of data) {
+		crc = ((crc << 8) ^ crc16Table[(crc >> 8) ^ byte]!) & 0xffff;
 	}
 
 	return crc;

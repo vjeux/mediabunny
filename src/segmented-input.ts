@@ -19,8 +19,23 @@ import {
 	InputVideoTrackBacking,
 } from './input-track';
 import { PacketRetrievalOptions } from './media-sink';
-import { arrayCount, assert, MaybePromise, roundToDivisor } from './misc';
-import { EncodedPacket } from './packet';
+import {
+	arrayCount,
+	assert,
+	audioDecoderConfigsAreEqual,
+	MaybePromise,
+	roundToDivisor,
+	toUint8Array,
+	uint8ArraysAreEqual,
+} from './misc';
+import { EncodedPacket, PLACEHOLDER_DATA } from './packet';
+import {
+	concatNalUnitsInLengthPrefixed,
+	deserializeAvcDecoderConfigurationRecord,
+	deserializeHevcDecoderConfigurationRecord,
+	HevcNalUnitType,
+	iterateNalUnitsInLengthPrefixed,
+} from './codec-data';
 
 export type SegmentedInputMetadata = {
 	name: string | null;
@@ -71,6 +86,8 @@ export abstract class SegmentedInput {
 		age: number;
 	}[] = [];
 
+	evictedInputs: WeakRef<Input>[] = [];
+
 	trackBackingsPromise: Promise<InputTrackBacking[]> | null = null;
 	firstSegment: Segment | null = null;
 
@@ -95,6 +112,14 @@ export abstract class SegmentedInput {
 	abstract getFirstSegmentTimestampOffset(): Promise<number>;
 	abstract getRawTimestampOffset(input: Input): Promise<number | null>; // Needed to make things like MP3/ADTS work
 	abstract getTimestampWrapPeriod(): number;
+
+	/**
+	 * Whether the segments come with more than one init section, whose codec parameters may then differ from segment to
+	 * segment.
+	 */
+	hasMultipleInitSections() {
+		return false;
+	}
 
 	async getDurationFromMetadata(options: DurationMetadataRequestOptions) {
 		const lastSegment = await this.getSegmentAt(Infinity, {
@@ -214,13 +239,45 @@ export abstract class SegmentedInput {
 		return promise;
 	}
 
+	/**
+	 * Keeps track of an input that dropped out of the cache. It may still be in use (by packets read from it), so it's
+	 * only disposed together with this input, unless garbage collection gets to it first.
+	 */
+	trackEvictedInput(input: Input) {
+		if (typeof WeakRef === 'undefined') {
+			return;
+		}
+
+		if (this.evictedInputs.length >= 64) {
+			this.evictedInputs = this.evictedInputs.filter(x => x.deref());
+		}
+
+		this.evictedInputs.push(new WeakRef(input));
+	}
+
 	dispose() {
 		for (const entry of this.inputCache) {
 			entry.input.dispose();
 		}
 		this.inputCache.length = 0;
+
+		for (const ref of this.evictedInputs) {
+			ref.deref()?.dispose();
+		}
+		this.evictedInputs.length = 0;
 	}
 }
+
+/**
+ * The tick of the given time resolution at or before a timestamp. A timestamp within floating-point noise of a tick
+ * (a few ulps, as when it was computed along another path) counts as that tick. A looser tolerance, like
+ * roundIfAlmostInteger's, would also swallow real offsets of microseconds on Unix-epoch timelines.
+ */
+const getTickAtOrBefore = (timestamp: number, timeResolution: number) => {
+	const ticks = timestamp * timeResolution;
+	const rounded = Math.round(ticks);
+	return Math.abs(ticks - rounded) <= 4 * Number.EPSILON * Math.abs(ticks) ? rounded : Math.floor(ticks);
+};
 
 type PacketInfo = {
 	segment: Segment;
@@ -228,11 +285,45 @@ type PacketInfo = {
 	sourcePacket: EncodedPacket;
 };
 
+type InBandParameterSets = {
+	/** The segment's parameter sets, length-prefixed like the packets the decoder config describes */
+	parameterSets: Uint8Array;
+	/** The NAL unit length size of the segment's own packets */
+	lengthSize: 1 | 2 | 3 | 4;
+	/** The NAL unit length size the decoder config (the first segment's) declares */
+	targetLengthSize: 1 | 2 | 3 | 4;
+	/** Whether the segment's parameter sets differ from the first segment's */
+	differ: boolean;
+};
+
+const parseParameterSets = (codec: 'avc' | 'hevc', description: Uint8Array) => {
+	if (codec === 'avc') {
+		const record = deserializeAvcDecoderConfigurationRecord(description);
+		return record && {
+			nalUnits: [...record.sequenceParameterSets, ...record.pictureParameterSets],
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+		};
+	} else {
+		const record = deserializeHevcDecoderConfigurationRecord(description);
+		const parameterSetTypes: number[] = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+		return record && {
+			nalUnits: record.arrays.filter(x => parameterSetTypes.includes(x.nalUnitType)).flatMap(x => x.nalUnits),
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+		};
+	}
+};
+
 class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	segmentedInput: SegmentedInput;
 	decl: SegmentedInputTrackDeclaration;
 	number: number;
 	packetInfos = new WeakMap<EncodedPacket, PacketInfo>();
+	inBandParameterSets = new WeakMap<InputTrack, Promise<InBandParameterSets | null>>();
+	/** Decoder configs of packets that need another one than the track's */
+	packetDecoderConfigs = new WeakMap<EncodedPacket, AudioDecoderConfig>();
+	segmentAudioDecoderConfigs = new WeakMap<InputTrack, Promise<AudioDecoderConfig | null>>();
+	/** One object per distinct decoder config, so that segments sharing a config share the object */
+	distinctAudioDecoderConfigs: AudioDecoderConfig[] = [];
 
 	hydrationPromise: Promise<void> | null = null;
 	firstInputTrack: InputTrack | null = null;
@@ -369,15 +460,49 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		// If we didn't do this then sequence numbers would exceed Number.MAX_SAFE_INTEGER for Unix-timestamped segments
 		const segmentTimestampRelativeToFirst = segment.timestamp - this.segmentedInput.firstSegment.timestamp;
 
-		const modified = packet.clone({
-			timestamp: roundToDivisor(
+		let data = packet.data;
+		let byteLength = packet.byteLength;
+		const ownParameterSets = await this.getInBandParameterSets(track);
+		// When the segments come with more than one init section, every segment sends its own parameter sets, also
+		// those equal to the decoder config's: the decoder may have just received another segment's sets under the same
+		// IDs, which replace them
+		const inBand = ownParameterSets && (ownParameterSets.differ || this.segmentedInput.hasMultipleInitSections())
+			? ownParameterSets
+			: null;
+		if (inBand) {
+			let source = packet;
+			if (packet.isMetadataOnly && inBand.lengthSize !== inBand.targetLengthSize) {
+				// Converted length prefixes make the size depend on the NAL units, so a metadata-only packet needs them
+				// too
+				const fullPacket = await track._backing.getPacket(packet.timestamp, {});
+				if (fullPacket && fullPacket.sequenceNumber === packet.sequenceNumber) {
+					source = fullPacket;
+				}
+			}
+
+			if (!source.isMetadataOnly) {
+				const bytes = this.applyInBandParameterSets(source.data, packet.type === 'key', inBand);
+				byteLength = bytes.byteLength;
+				data = packet.isMetadataOnly ? PLACEHOLDER_DATA : bytes;
+			} else if (packet.type === 'key') {
+				byteLength += inBand.parameterSets.byteLength;
+			}
+		}
+
+		const modified = new EncodedPacket(
+			data,
+			packet.type,
+			roundToDivisor(
 				packet.timestamp + mediaOffset,
 				await track.getTimeResolution(),
 			),
+			packet.duration,
 			// The 1e8 assumes a max of 100 MB per second, highly unlikely to be hit, so this should guarantee
 			// monotonically increasing sequence numbers across segments.
-			sequenceNumber: Math.floor(1e8 * segmentTimestampRelativeToFirst) + packet.sequenceNumber,
-		});
+			Math.floor(1e8 * segmentTimestampRelativeToFirst) + packet.sequenceNumber,
+			byteLength,
+			packet.sideData,
+		);
 
 		this.packetInfos.set(modified, {
 			segment,
@@ -385,7 +510,131 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			sourcePacket: packet,
 		});
 
+		if (this.decl.type === 'audio') {
+			const decoderConfig = await this.getSegmentAudioDecoderConfig(track);
+			if (decoderConfig) {
+				this.packetDecoderConfigs.set(modified, decoderConfig);
+			}
+		}
+
 		return modified;
+	}
+
+	/**
+	 * The decoder config is the first segment's, but a later segment can come with its own init section whose parameter
+	 * sets differ (a new EXT-X-MAP after a discontinuity, such as an ad break from another encoder). Like Chromium does
+	 * for a new init segment, segments then send their own parameter sets in band, in front of each of their key
+	 * packets.
+	 */
+	getInBandParameterSets(track: InputTrack) {
+		let promise = this.inBandParameterSets.get(track);
+		if (!promise) {
+			promise = (async (): Promise<InBandParameterSets | null> => {
+				assert(this.firstInputTrack);
+				if (!track.isVideoTrack()) {
+					return null;
+				}
+
+				const codec = await track.getCodec();
+				if (codec !== 'avc' && codec !== 'hevc') {
+					return null;
+				}
+
+				const firstConfig = await this.firstInputTrack._backing.getDecoderConfig() as VideoDecoderConfig | null;
+				const config = await track._backing.getDecoderConfig();
+				if (!firstConfig?.description || !config?.description) {
+					return null; // Annex B packets carry their parameter sets in band already
+				}
+
+				const firstDescription = toUint8Array(firstConfig.description);
+				const description = toUint8Array(config.description);
+				const first = parseParameterSets(codec, firstDescription);
+				const own = parseParameterSets(codec, description);
+				if (!first || !own) {
+					return null;
+				}
+
+				if (own.nalUnits.some(nalUnit => nalUnit.byteLength >= 2 ** (8 * first.lengthSize))) {
+					throw new Error(
+						'A parameter set is too large for the NAL unit length size of the first segment\'s decoder'
+						+ ' config.',
+					);
+				}
+
+				const differ = !uint8ArraysAreEqual(firstDescription, description);
+
+				return {
+					parameterSets: concatNalUnitsInLengthPrefixed(own.nalUnits, first.lengthSize),
+					lengthSize: own.lengthSize,
+					targetLengthSize: first.lengthSize,
+					differ,
+				};
+			})();
+			this.inBandParameterSets.set(track, promise);
+		}
+
+		return promise;
+	}
+
+	applyInBandParameterSets(data: Uint8Array, isKey: boolean, inBand: InBandParameterSets) {
+		let bytes = data;
+		if (inBand.lengthSize !== inBand.targetLengthSize) {
+			const nalUnits = [...iterateNalUnitsInLengthPrefixed(data, inBand.lengthSize)]
+				.map(location => data.subarray(location.offset, location.offset + location.length));
+			if (nalUnits.some(nalUnit => nalUnit.byteLength >= 2 ** (8 * inBand.targetLengthSize))) {
+				throw new Error(
+					'A NAL unit is too large for the NAL unit length size of the first segment\'s decoder config.',
+				);
+			}
+			bytes = concatNalUnitsInLengthPrefixed(nalUnits, inBand.targetLengthSize);
+		}
+
+		if (!isKey) {
+			return bytes;
+		}
+
+		const result = new Uint8Array(inBand.parameterSets.byteLength + bytes.byteLength);
+		result.set(inBand.parameterSets, 0);
+		result.set(bytes, inBand.parameterSets.byteLength);
+		return result;
+	}
+
+	/**
+	 * The audio decoder config of a segment's track when it differs from the first segment's, which is the track's
+	 * decoder config: a new init section after a discontinuity (such as an ad break) can bring another sample rate,
+	 * channel count or AudioSpecificConfig.
+	 */
+	getSegmentAudioDecoderConfig(track: InputTrack) {
+		let promise = this.segmentAudioDecoderConfigs.get(track);
+		if (!promise) {
+			promise = (async () => {
+				assert(this.firstInputTrack);
+				if (track === this.firstInputTrack) {
+					return null;
+				}
+
+				const firstConfig = await this.firstInputTrack._backing.getDecoderConfig() as AudioDecoderConfig | null;
+				const config = await track._backing.getDecoderConfig() as AudioDecoderConfig | null;
+				if (!firstConfig || !config || audioDecoderConfigsAreEqual(firstConfig, config)) {
+					return null;
+				}
+
+				const existing = this.distinctAudioDecoderConfigs.find(x => audioDecoderConfigsAreEqual(x, config));
+				if (existing) {
+					return existing;
+				}
+
+				this.distinctAudioDecoderConfigs.push(config);
+				return config;
+			})();
+			this.segmentAudioDecoderConfigs.set(track, promise);
+		}
+
+		return promise;
+	}
+
+	getDecoderConfigForPacket(packet: EncodedPacket) {
+		return this.packetDecoderConfigs.get(packet) ?? null;
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
@@ -497,11 +746,72 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		let currentSegment = await this.segmentedInput.getSegmentAt(timestamp, {
 			skipLiveWait: options.skipLiveWait,
 		});
+
+		// The media may start before the first segment's timestamp
+		currentSegment ??= await this.segmentedInput.getFirstSegment({});
+
 		if (!currentSegment) {
 			return null;
 		}
 
 		await this.hydrate();
+
+		// Finds the packet at or before the timestamp in the segment after `segment`, if there is one. Media can start
+		// before the playlist timestamp of its segment: timestamps rounded to the media's clock, or leading frames of
+		// an open GOP, which are presented before the key frame that starts their segment.
+		const getPacketInNextSegment = async (segment: Segment, skipLiveWait: boolean | undefined) => {
+			const nextSegment = await this.segmentedInput.getNextSegment(segment, { skipLiveWait });
+			if (!nextSegment) {
+				return null;
+			}
+
+			const nextInput = this.segmentedInput.getInputForSegment(nextSegment);
+			const nextTracks = await nextInput.getTracks();
+			const nextTrack = nextTracks.find(t => (
+				t.type === this.firstInputTrack!.type && t.number === this.firstInputTrack!.number
+			));
+			if (!nextTrack) {
+				return null;
+			}
+
+			const nextMediaOffset = await this.segmentedInput.getMediaOffset(nextSegment, nextInput);
+			const nextPacket = await this._getPacketAtOrBefore(
+				nextTrack,
+				nextMediaOffset,
+				timestamp,
+				{ ...options, metadataOnly: true },
+				keyframesOnly,
+			);
+			if (!nextPacket) {
+				return null;
+			}
+
+			return {
+				segment: nextSegment,
+				timestamp: roundToDivisor(nextPacket.timestamp + nextMediaOffset, await nextTrack.getTimeResolution()),
+			};
+		};
+
+		// Once a segment turns out to have no packet at or before the timestamp, we search the previous segments, and
+		// don't look forward anymore: the segment after the current one is the one we came from.
+		let searchingBackward = false;
+
+		// Called when the current segment has no packet at or before the timestamp
+		const moveToNeighbor = async (segment: Segment) => {
+			if (!searchingBackward) {
+				// Don't wait for a live stream's next segment just for this
+				const next = await getPacketInNextSegment(segment, true);
+				if (next) {
+					return next.segment;
+				}
+			}
+
+			// Search the previous segment
+			searchingBackward = true;
+			return this.segmentedInput.getPreviousSegment(segment, {
+				skipLiveWait: options.skipLiveWait,
+			});
+		};
 
 		while (currentSegment) {
 			const input = this.segmentedInput.getInputForSegment(currentSegment);
@@ -511,10 +821,7 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			));
 
 			if (!track) {
-				// Search the previous segment
-				currentSegment = await this.segmentedInput.getPreviousSegment(currentSegment, {
-					skipLiveWait: options.skipLiveWait,
-				});
+				currentSegment = await moveToNeighbor(currentSegment);
 				continue;
 			}
 
@@ -544,55 +851,70 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 				}
 			}
 
-			const offsetTimestamp = timestamp - mediaOffset;
-			const packet = keyframesOnly
-				? await track._backing.getKeyPacket(offsetTimestamp, options)
-				: await track._backing.getPacket(offsetTimestamp, options);
+			const packet = await this._getPacketAtOrBefore(track, mediaOffset, timestamp, options, keyframesOnly);
 
 			if (!packet) {
-				// Search the previous segment
-				currentSegment = await this.segmentedInput.getPreviousSegment(currentSegment, {
-					skipLiveWait: options.skipLiveWait,
-				});
+				currentSegment = await moveToNeighbor(currentSegment);
 				continue;
+			}
+
+			if (searchingBackward) {
+				// The later segments have no packet at or before the timestamp
+				return this.createAdjustedPacket(packet, currentSegment, track);
 			}
 
 			// The playlist may claim the segment to be longer than its media actually is, in which case the timestamp
 			// can lie in the next segment instead. That's only possible if it lies past this segment's media.
 			const lastPacket = keyframesOnly
-				? await track._backing.getPacket(offsetTimestamp, { ...options, metadataOnly: true })
+				? await this._getPacketAtOrBefore(
+					track,
+					mediaOffset,
+					timestamp,
+					{ ...options, metadataOnly: true },
+					false,
+				)
 				: packet;
 			assert(lastPacket);
 
-			if (offsetTimestamp >= lastPacket.timestamp + lastPacket.duration) {
-				const nextSegment = await this.segmentedInput.getNextSegment(currentSegment, {
-					skipLiveWait: options.skipLiveWait,
-				});
+			const timeResolution = await track.getTimeResolution();
+			const lastPacketEnd = roundToDivisor(
+				lastPacket.timestamp + lastPacket.duration + mediaOffset,
+				timeResolution,
+			);
 
+			// Segments are muxed separately, so the end of one segment's media and the start of the next one's can
+			// overlap by a tick: the last packet's end and the next packet's start get rounded independently
+			const timestampTick = getTickAtOrBefore(timestamp, timeResolution);
+			let mayLieInNextSegment = timestampTick >= Math.round(lastPacketEnd * timeResolution) - 1;
+
+			if (!mayLieInNextSegment) {
+				// The last packet's duration can also be off (e.g. a nominal duration in variable frame rate media), in
+				// which case its end says nothing about where the next segment's media starts. The next segment's
+				// playlist timestamp says more, so also look there when the timestamp is within a tick of it.
+				const nextSegment = await this.segmentedInput.getNextSegment(currentSegment, { skipLiveWait: true });
 				if (nextSegment) {
-					const nextInput = this.segmentedInput.getInputForSegment(nextSegment);
-					const nextTracks = await nextInput.getTracks();
-					const nextTrack = nextTracks.find(t => (
-						t.type === this.firstInputTrack!.type && t.number === this.firstInputTrack!.number
-					));
+					const nextSegmentStart = nextSegment.timestamp
+						+ (this.segmentedInput.learnedSegmentTimestampOffset ?? 0);
+					mayLieInNextSegment = timestampTick >= Math.round(nextSegmentStart * timeResolution) - 1;
 
-					let nextPacket = nextTrack
-						? await nextTrack._backing.getFirstPacket({ ...options, metadataOnly: true })
-						: null;
-					if (nextPacket && keyframesOnly && nextPacket.type !== 'key') {
-						nextPacket = await nextTrack!._backing.getNextKeyPacket(nextPacket, {
-							...options,
-							metadataOnly: true,
-						});
+					if (!mayLieInNextSegment && !keyframesOnly && track.isVideoTrack()) {
+						// Leading frames of an open GOP in the next segment are shown right after this segment's last
+						// frame, possibly well before the next segment starts, and the last frame's duration can cover
+						// them. So if the packet is the segment's last frame, the next segment may hold a packet closer
+						// to the timestamp.
+						const lastTimestamp = await this.getLastPacketTimestamp(track);
+						mayLieInNextSegment = lastTimestamp !== null && packet.timestamp >= lastTimestamp;
 					}
+				}
+			}
 
-					if (nextPacket) {
-						const nextMediaOffset = await this.segmentedInput.getMediaOffset(nextSegment, nextInput);
-						if (nextPacket.timestamp + nextMediaOffset <= timestamp) {
-							currentSegment = nextSegment;
-							continue;
-						}
-					}
+			if (mayLieInNextSegment) {
+				// Not just the next segment's first packet matters: in decode order, an open GOP's leading frames come
+				// after the key frame that starts the segment
+				const next = await getPacketInNextSegment(currentSegment, options.skipLiveWait);
+				if (next && next.timestamp >= roundToDivisor(packet.timestamp + mediaOffset, timeResolution)) {
+					currentSegment = next.segment;
+					continue;
 				}
 			}
 
@@ -600,6 +922,52 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		}
 
 		return null;
+	}
+
+	/** The timestamp of the last packet in presentation order of each segment track, computed once per track. */
+	lastPacketTimestamps = new WeakMap<InputTrack, Promise<number | null>>();
+
+	getLastPacketTimestamp(track: InputTrack) {
+		let promise = this.lastPacketTimestamps.get(track);
+		if (!promise) {
+			promise = track._backing.getPacket(Infinity, { metadataOnly: true })
+				.then(packet => packet?.timestamp ?? null);
+			this.lastPacketTimestamps.set(track, promise);
+		}
+
+		return promise;
+	}
+
+	/**
+	 * Returns the last packet (or key packet) of a segment's track whose reported timestamp (see
+	 * `createAdjustedPacket`) is less than or equal to `timestamp`.
+	 */
+	async _getPacketAtOrBefore(
+		track: InputTrack,
+		mediaOffset: number,
+		timestamp: number,
+		options: PacketRetrievalOptions,
+		keyframesOnly: boolean,
+	) {
+		const getPacket = (offsetTimestamp: number) => keyframesOnly
+			? track._backing.getKeyPacket(offsetTimestamp, options)
+			: track._backing.getPacket(offsetTimestamp, options);
+
+		// Reported timestamps are rounded to the time resolution. If the media offset isn't a whole number of ticks, a
+		// packet can be reported at `timestamp` while lying up to half a tick after `timestamp - mediaOffset`, so we
+		// look up the point halfway between the last tick at or before `timestamp` and the next one instead.
+		const timeResolution = await track.getTimeResolution();
+		const tick = getTickAtOrBefore(timestamp, timeResolution);
+		let packet = await getPacket((tick + 0.5) / timeResolution - mediaOffset);
+
+		// Compared in ticks, since the timestamp may be a reported timestamp computed along another path, off in its
+		// last bit
+		if (packet && Math.round((packet.timestamp + mediaOffset) * timeResolution) > tick) {
+			// The packet lies exactly on the rounding boundary and is reported a tick later, so take the one before it
+			packet = await getPacket(packet.timestamp - 1 / (2 * timeResolution));
+		}
+
+		return packet;
 	}
 }
 
@@ -630,6 +998,10 @@ class SegmentedInputInputVideoTrackBacking
 
 	getSquarePixelHeight() {
 		return this.delegate(() => this.firstInputTrack!._backing.getSquarePixelHeight());
+	}
+
+	getPixelAspectRatio() {
+		return this.delegate(() => this.firstInputTrack!._backing.getPixelAspectRatio?.() ?? null);
 	}
 
 	getTransformationMatrix() {

@@ -6,7 +6,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { Bitstream } from '../../shared/bitstream';
 import {
 	COLOR_PRIMARIES_MAP,
 	MATRIX_COEFFICIENTS_MAP,
@@ -21,6 +20,7 @@ import {
 	multiplyMatrices,
 	normalizeRotation,
 	promiseWithResolvers,
+	Queue,
 	RAD_TO_DEG,
 	Rational,
 	Rotation,
@@ -29,7 +29,6 @@ import {
 	textEncoder,
 	toUint8Array,
 	uint8ArraysAreEqual,
-	writeBits,
 	roundToDivisor,
 } from '../misc';
 import {
@@ -67,17 +66,35 @@ import {
 	validateAudioChunkMetadata,
 	validateSubtitleMetadata,
 	validateVideoChunkMetadata,
+	OPUS_SAMPLE_RATE,
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
+import {
+	InBandParameterSetWriter,
+	concatNalUnitsInLengthPrefixed,
+	extractAvcDecoderConfigurationRecord,
+	extractHevcDecoderConfigurationRecord,
+	iterateNalUnitsInAnnexB,
+	serializeAvcDecoderConfigurationRecord,
+	serializeHevcDecoderConfigurationRecord,
+} from '../codec-data';
 import { FileSlice } from '../reader';
+import { filterAv1SampleObus } from '../codec-data';
 import { Muxer } from '../muxer';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
-import { AttachedFile } from '../metadata';
+import { AttachedFile, formatMetadataDate } from '../metadata';
 import { Logging } from '../logging';
 import { VERSIONED_NAME } from '../version';
 
 const MIN_CLUSTER_TIMESTAMP_MS = -(2 ** 15);
+
+/**
+ * Converts seconds to milliseconds, the muxer's timestamp ticks. Timestamps computed in floating point land a hair
+ * above or below an exact half millisecond, so plain rounding would round them up or down at random and turn equally
+ * spaced packets into ones 1 ms closer or further apart. Rounding to whole microseconds first removes that noise.
+ */
+const secondsToMs = (seconds: number) => Math.round(Math.round(seconds * 1e6) / 1000);
 const MAX_CLUSTER_TIMESTAMP_MS = 2 ** 15 - 1;
 const SEGMENT_SIZE_BYTES = 6;
 const CLUSTER_SIZE_BYTES = 5;
@@ -98,8 +115,19 @@ type ClusterBlock = {
 };
 
 type MatroskaTrackData = {
-	chunkQueue: InternalMediaChunk[];
+	chunkQueue: Queue<InternalMediaChunk>;
 	lastWrittenMsTimestamp: number | null;
+	/** For video tracks, see addEncodedVideoPacket. */
+	blockTimestampState: {
+		/** The latest timestamp among the track's packets so far, in seconds. */
+		maxPacketTimestamp: number;
+		/** The latest block timestamp so far, in milliseconds. */
+		maxBlockMsTimestamp: number;
+		/** Whether a packet came with a timestamp below the latest one (B-frames). */
+		reordered: boolean;
+		/** Recent packets moved to a later millisecond than their own. */
+		movedPackets: { timestamp: number; msTimestamp: number }[];
+	} | null;
 	codecPrivate: AllowSharedBufferSource | null;
 	closed: boolean;
 } & ({
@@ -115,7 +143,14 @@ type MatroskaTrackData = {
 		 * track metadata already hints at transparency.
 		 */
 		alphaMode: boolean | null;
+		/**
+		 * Matroska stores AVC and HEVC length-prefixed, so Annex B packets need to be converted. Null while it's not
+		 * known yet, which is until the first packet of a track whose decoder config came without a description.
+		 */
+		requiresAnnexBTransformation: boolean | null;
 	};
+	/** Keeps parameter sets of later AVC/HEVC decoder configs, since CodecPrivate only holds the first one. */
+	parameterSetWriter: InBandParameterSetWriter | null;
 } | {
 	track: OutputAudioTrack;
 	type: 'audio';
@@ -129,6 +164,8 @@ type MatroskaTrackData = {
 		 */
 		requiresAdtsStripping: boolean;
 		codecDelay: number | null; // in seconds
+		/** The pre-skip of the Opus identification header, in seconds, if there is one. */
+		opusPreSkip: number | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -155,6 +192,11 @@ export class MatroskaMuxer extends Muxer {
 
 	private trackDatas: MatroskaTrackData[] = [];
 	private allTracksKnown = promiseWithResolvers();
+	/**
+	 * Tracks whose closing we have processed. Unlike `source._closed`, which is set as soon as `close()` is called,
+	 * this is only set under the mutex, i.e. after the packets queued before the close have been added.
+	 */
+	private closedTracks = new Set<OutputTrack>();
 
 	private segment: EBMLElement | null = null;
 	private segmentInfo: EBMLElement | null = null;
@@ -363,6 +405,9 @@ export class MatroskaMuxer extends Muxer {
 				seekPreRollNs = Math.round(1e9 * preRollDuration);
 			}
 
+			// These Matroska v4 flags aren't part of WebM, and Chrome's WebM parser rejects files that contain them
+			const writeV4Flags = !(this.format instanceof WebMOutputFormat);
+
 			tracksElement.data.push({ id: EBMLId.TrackEntry, data: [
 				{ id: EBMLId.TrackNumber, data: trackData.track.id },
 				{ id: EBMLId.TrackUID, data: trackData.track.id },
@@ -373,16 +418,16 @@ export class MatroskaMuxer extends Muxer {
 				trackData.track.metadata.disposition?.forced
 					? { id: EBMLId.FlagForced, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.hearingImpaired
+				writeV4Flags && trackData.track.metadata.disposition?.hearingImpaired
 					? { id: EBMLId.FlagHearingImpaired, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.visuallyImpaired
+				writeV4Flags && trackData.track.metadata.disposition?.visuallyImpaired
 					? { id: EBMLId.FlagVisualImpaired, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.original
+				writeV4Flags && trackData.track.metadata.disposition?.original
 					? { id: EBMLId.FlagOriginal, data: 1 }
 					: null,
-				trackData.track.metadata.disposition?.commentary
+				writeV4Flags && trackData.track.metadata.disposition?.commentary
 					? { id: EBMLId.FlagCommentary, data: 1 }
 					: null,
 				{ id: EBMLId.FlagLacing, data: 0 },
@@ -455,13 +500,35 @@ export class MatroskaMuxer extends Muxer {
 				!== trackData.info.aspectRatio.den * trackData.info.width
 			);
 
+		let displayElements: EBMLElement[] = [];
+		if (hasNonSquarePixelAspectRatio) {
+			const aspectRatio = trackData.info.aspectRatio!;
+
+			if (this.format instanceof WebMOutputFormat) {
+				// WebM only allows pixels as the DisplayUnit, and WebKit and Gecko take the display dimensions as the
+				// video's pixel size. So, like FFmpeg, we scale the width and keep the height. (A width of 0 isn't
+				// allowed, which extreme aspect ratios would otherwise round to.)
+				displayElements = [
+					{
+						id: EBMLId.DisplayWidth,
+						data: Math.max(Math.round(trackData.info.height * aspectRatio.num / aspectRatio.den), 1),
+					},
+					{ id: EBMLId.DisplayHeight, data: trackData.info.height },
+				];
+			} else {
+				displayElements = [
+					{ id: EBMLId.DisplayWidth, data: aspectRatio.num },
+					{ id: EBMLId.DisplayHeight, data: aspectRatio.den },
+					{ id: EBMLId.DisplayUnit, data: 3 }, // 3 = display aspect ratio
+				];
+			}
+		}
+
 		const colorSpace = trackData.info.decoderConfig.colorSpace;
 		const videoElement: EBMLElement = { id: EBMLId.Video, data: [
 			{ id: EBMLId.PixelWidth, data: trackData.info.width },
 			{ id: EBMLId.PixelHeight, data: trackData.info.height },
-			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayWidth, data: trackData.info.aspectRatio!.num } : null),
-			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayHeight, data: trackData.info.aspectRatio!.den } : null),
-			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayUnit, data: 3 } : null), // 3 = display aspect ratio
+			...displayElements,
 			trackData.info.alphaMode ? { id: EBMLId.AlphaMode, data: 1 } : null,
 			(colorSpaceIsEmpty(colorSpace)
 				? null
@@ -557,6 +624,8 @@ export class MatroskaMuxer extends Muxer {
 
 		const metadataTags = this.output._metadataTags;
 		const writtenTags = new Set<string>();
+		// Keys left out on purpose, which a raw tag may not fill in
+		const omittedTags = new Set<string>();
 
 		for (const { key, value } of keyValueIterator(metadataTags)) {
 			switch (key) {
@@ -606,8 +675,13 @@ export class MatroskaMuxer extends Muxer {
 				}; break;
 
 				case 'date': {
-					addSimpleTag('DATE', value.toISOString().slice(0, 10));
-					writtenTags.add('DATE');
+					const dateString = formatMetadataDate(value);
+					if (dateString !== null) {
+						addSimpleTag('DATE', dateString);
+						writtenTags.add('DATE');
+					} else {
+						omittedTags.add('DATE');
+					}
 				}; break;
 
 				case 'trackNumber': {
@@ -646,7 +720,8 @@ export class MatroskaMuxer extends Muxer {
 		if (metadataTags.raw) {
 			for (const key in metadataTags.raw) {
 				const value = metadataTags.raw[key]!;
-				if (value == null || writtenTags.has(key)) {
+				// Tag names are read case-insensitively, so compare them that way for the keys left out
+				if (value == null || writtenTags.has(key) || omittedTags.has(key.toUpperCase())) {
 					continue;
 				}
 
@@ -664,8 +739,8 @@ export class MatroskaMuxer extends Muxer {
 			id: EBMLId.Tags,
 			data: [{ id: EBMLId.Tag, data: [
 				{ id: EBMLId.Targets, data: [
+					// No TargetType string: FFmpeg prefixes every tag name with it (MOVIE/TITLE instead of title)
 					{ id: EBMLId.TargetTypeValue, data: 50 },
-					{ id: EBMLId.TargetType, data: 'MOVIE' },
 				] },
 				...simpleTags,
 			] }],
@@ -751,6 +826,13 @@ export class MatroskaMuxer extends Muxer {
 			return;
 		}
 
+		if (this.format instanceof WebMOutputFormat) {
+			// WebM doesn't support the Attachments element (https://www.webmproject.org/docs/container/), and FFmpeg
+			// drops attachments when writing WebM as well
+			Logging._warn('Images and attached files were not written because WebM doesn\'t support attachments.');
+			return;
+		}
+
 		this.attachmentsElement = { id: EBMLId.Attachments, data: elements };
 	}
 
@@ -798,7 +880,7 @@ export class MatroskaMuxer extends Muxer {
 
 	private allTracksAreKnown() {
 		for (const track of this.output.tracks) {
-			if (!track.source._closed && !this.trackDatas.some(x => x.track === track)) {
+			if (!this.closedTracks.has(track) && !this.trackDatas.some(x => x.track === track)) {
 				return false; // We haven't seen a sample from this open track yet
 			}
 		}
@@ -843,8 +925,10 @@ export class MatroskaMuxer extends Muxer {
 		assert(meta.decoderConfig.codedWidth !== undefined);
 		assert(meta.decoderConfig.codedHeight !== undefined);
 
-		const displayAspectWidth = meta.decoderConfig.displayAspectWidth;
-		const displayAspectHeight = meta.decoderConfig.displayAspectHeight;
+		const decoderConfig = { ...meta.decoderConfig };
+
+		const displayAspectWidth = decoderConfig.displayAspectWidth;
+		const displayAspectHeight = decoderConfig.displayAspectHeight;
 
 		const aspectRatio = displayAspectWidth === undefined || displayAspectHeight === undefined
 			? null
@@ -860,13 +944,22 @@ export class MatroskaMuxer extends Muxer {
 				width: meta.decoderConfig.codedWidth,
 				height: meta.decoderConfig.codedHeight,
 				aspectRatio,
-				decoderConfig: meta.decoderConfig,
-				alphaMode: track.metadata.canBeTransparent || (packet ? !!packet.sideData.alpha : null),
+				decoderConfig,
+				// AlphaMode is set in the track header, before later packets (which may have alpha) are known
+				alphaMode: track.metadata.canBeTransparent
+					|| track.source._keepsAlpha
+					|| (packet ? !!packet.sideData.alpha : null),
+				requiresAnnexBTransformation: false,
 			},
-			chunkQueue: [],
+			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
-			codecPrivate: meta.decoderConfig.description ?? null,
+			blockTimestampState: null,
+			codecPrivate: decoderConfig.description ?? null,
 			closed: false,
+			parameterSetWriter: (track.source._codec === 'avc' || track.source._codec === 'hevc')
+				&& meta.decoderConfig.description
+				? new InBandParameterSetWriter(track.source._codec, toUint8Array(meta.decoderConfig.description))
+				: null,
 		};
 
 		if (track.source._codec === 'vp9') {
@@ -884,7 +977,15 @@ export class MatroskaMuxer extends Muxer {
 			);
 		} else if (track.source._codec === 'prores') {
 			// "The Private Data contains the FourCC as found in MP4 movies"
-			newTrackData.codecPrivate = textEncoder.encode(meta.decoderConfig.codec);
+			newTrackData.codecPrivate = textEncoder.encode(decoderConfig.codec);
+		} else if ((track.source._codec === 'avc' || track.source._codec === 'hevc') && !decoderConfig.description) {
+			// The Matroska codec mappings store AVC and HEVC length-prefixed, with the decoder configuration record in
+			// CodecPrivate, but the missing description indicates Annex B. The record is built from the parameter sets
+			// of the first packet, which comes later if the decoder config was provided ahead of time.
+			newTrackData.info.requiresAnnexBTransformation = null;
+			if (packet) {
+				this.resolveAnnexBTransformation(newTrackData, packet);
+			}
 		}
 
 		this.trackDatas.push(newTrackData);
@@ -895,6 +996,32 @@ export class MatroskaMuxer extends Muxer {
 		}
 
 		return newTrackData;
+	}
+
+	/**
+	 * Builds the decoder configuration record of an Annex B AVC/HEVC track from the parameter sets in its first packet.
+	 * If there are none, the packets are written untouched.
+	 */
+	private resolveAnnexBTransformation(trackData: MatroskaVideoTrackData, packet: EncodedPacket) {
+		if (trackData.info.requiresAnnexBTransformation !== null) {
+			return;
+		}
+
+		let description: Uint8Array | null;
+		if (trackData.track.source._codec === 'avc') {
+			const record = extractAvcDecoderConfigurationRecord(packet.data);
+			description = record && serializeAvcDecoderConfigurationRecord(record);
+		} else {
+			const record = extractHevcDecoderConfigurationRecord(packet.data);
+			description = record && serializeHevcDecoderConfigurationRecord(record);
+		}
+
+		trackData.info.requiresAnnexBTransformation = description !== null;
+		if (description) {
+			// The Tracks element isn't written yet: that only happens once every track has a block queued
+			trackData.info.decoderConfig = { ...trackData.info.decoderConfig, description };
+			trackData.codecPrivate = description;
+		}
 	}
 
 	private getAudioTrackData(track: OutputAudioTrack, packet: EncodedPacket | null, meta?: EncodedAudioChunkMetadata) {
@@ -944,6 +1071,33 @@ export class MatroskaMuxer extends Muxer {
 			requiresAdtsStripping = true;
 		}
 
+		// Matroska requires the Opus identification header as CodecPrivate, and a CodecDelay equal to its pre-skip (the
+		// samples a decoder drops at the start). A start before that is left to the (then negative) block timestamps,
+		// as growing the pre-skip to cover it would drop real audio.
+		let opusPreSkip: number | null = null;
+		if (track.source._codec === 'opus') {
+			if (!decoderConfig.description && decoderConfig.numberOfChannels <= 2) {
+				// With up to two channels (channel mapping family 0), the header can be built from the config. Nothing
+				// says to drop any samples, so its pre-skip is 0.
+				const header = new Uint8Array(19);
+				const view = new DataView(header.buffer);
+				view.setUint32(0, 0x4f707573, false); // 'Opus'
+				view.setUint32(4, 0x48656164, false); // 'Head'
+				view.setUint8(8, 1); // Version
+				view.setUint8(9, decoderConfig.numberOfChannels);
+				view.setUint16(10, 0, true); // Pre-skip
+				view.setUint32(12, decoderConfig.sampleRate, true); // Input sample rate
+				view.setInt16(16, 0, true); // Output gain
+				view.setUint8(18, 0); // Channel mapping family
+				decoderConfig.description = header;
+			}
+
+			const header = decoderConfig.description && toUint8Array(decoderConfig.description);
+			if (header && header.length >= 19 && String.fromCharCode(...header.subarray(0, 8)) === 'OpusHead') {
+				opusPreSkip = (header[10]! | (header[11]! << 8)) / OPUS_SAMPLE_RATE;
+			}
+		}
+
 		const newTrackData: MatroskaAudioTrackData = {
 			track,
 			type: 'audio',
@@ -953,9 +1107,11 @@ export class MatroskaMuxer extends Muxer {
 				decoderConfig,
 				requiresAdtsStripping,
 				codecDelay: null,
+				opusPreSkip,
 			},
-			chunkQueue: [],
+			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
+			blockTimestampState: null,
 			codecPrivate: decoderConfig.description ?? null,
 			closed: false,
 		};
@@ -987,8 +1143,9 @@ export class MatroskaMuxer extends Muxer {
 			info: {
 				config: meta.config,
 			},
-			chunkQueue: [],
+			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
+			blockTimestampState: null,
 			codecPrivate: textEncoder.encode(meta.config.description),
 			closed: false,
 		};
@@ -1009,6 +1166,7 @@ export class MatroskaMuxer extends Muxer {
 		try {
 			const trackData = this.getVideoTrackData(track, packet, meta);
 			trackData.info.alphaMode ??= !!packet.sideData.alpha;
+			this.resolveAnnexBTransformation(trackData, packet);
 
 			let packetData = packet.data;
 			if (track.source._codec === 'prores') {
@@ -1019,6 +1177,27 @@ export class MatroskaMuxer extends Muxer {
 				// Trim off the frame container atom header. FFmpeg does this too and cites the "Matroska spec" as the
 				// reason, despite the spec not saying anything about this.
 				packetData = packetData.subarray(8);
+			} else if (trackData.parameterSetWriter) {
+				packetData = trackData.parameterSetWriter.process(
+					packetData,
+					packet.type,
+					meta?.decoderConfig?.description,
+				);
+			} else if (track.source._codec === 'av1') {
+				packetData = filterAv1SampleObus(packetData);
+			} else if (trackData.info.requiresAnnexBTransformation) {
+				const nalUnits = [...iterateNalUnitsInAnnexB(packetData)]
+					.map(loc => packetData.subarray(loc.offset, loc.offset + loc.length));
+				if (nalUnits.length === 0) {
+					// It's not valid Annex B data
+					throw new Error(
+						'Failed to transform packet data. Make sure all packets are provided in Annex B format, as'
+						+ ' specified in ITU-T-REC-H.264 and ITU-T-REC-H.265.',
+					);
+				}
+
+				// In-band parameter sets are kept, like in the MP4 muxer, since they can change mid-stream
+				packetData = concatNalUnitsInLengthPrefixed(nalUnits, 4);
 			}
 
 			const isKeyFrame = packet.type === 'key';
@@ -1033,18 +1212,74 @@ export class MatroskaMuxer extends Muxer {
 				duration = roundToDivisor(duration, track.metadata.frameRate);
 			}
 
+			({ timestamp, duration } = this.assignVideoBlockTimestamp(trackData, timestamp, duration));
+
 			const additions = trackData.info.alphaMode
 				? packet.sideData.alpha ?? null
 				: null;
 
 			const videoChunk = this.createInternalChunk(packetData, timestamp, duration, packet.type, additions);
-			if (track.source._codec === 'vp9') this.fixVP9ColorSpace(trackData, videoChunk);
 
 			trackData.chunkQueue.push(videoChunk);
 			await this.interleaveChunks();
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * Blocks are timestamped in whole milliseconds, so a frame following the latest one by less than that (like after a
+	 * trim that starts just before a frame) would land on the same timestamp. While the track's timestamps keep
+	 * increasing, such a frame goes to the millisecond after the latest block instead, as long as that's within the
+	 * frame and at most a millisecond past its own; otherwise it shares the latest block's timestamp. Frames are never
+	 * moved before a frame presented earlier, also after the track turns out to have B-frames, when no more frames are
+	 * moved ahead.
+	 */
+	private assignVideoBlockTimestamp(trackData: MatroskaVideoTrackData, timestamp: number, duration: number) {
+		const ownMsTimestamp = secondsToMs(timestamp);
+		let msTimestamp = ownMsTimestamp;
+		const state = trackData.blockTimestampState;
+
+		if (!state) {
+			trackData.blockTimestampState = {
+				maxPacketTimestamp: timestamp,
+				maxBlockMsTimestamp: msTimestamp,
+				reordered: false,
+				movedPackets: [],
+			};
+			return { timestamp, duration };
+		}
+
+		state.reordered ||= timestamp < state.maxPacketTimestamp;
+		if (!state.reordered) {
+			if (msTimestamp <= state.maxBlockMsTimestamp) {
+				const nextMsTimestamp = state.maxBlockMsTimestamp + 1;
+				const canMove = timestamp > state.maxPacketTimestamp
+					&& nextMsTimestamp <= ownMsTimestamp + 1
+					&& nextMsTimestamp / 1000 < timestamp + duration;
+				msTimestamp = canMove ? nextMsTimestamp : state.maxBlockMsTimestamp;
+			}
+		} else {
+			for (const moved of state.movedPackets) {
+				if (moved.timestamp < timestamp) {
+					msTimestamp = Math.max(msTimestamp, moved.msTimestamp);
+				}
+			}
+		}
+
+		state.maxPacketTimestamp = Math.max(state.maxPacketTimestamp, timestamp);
+		state.maxBlockMsTimestamp = Math.max(state.maxBlockMsTimestamp, msTimestamp);
+
+		if (msTimestamp === ownMsTimestamp) {
+			return { timestamp, duration };
+		}
+
+		// Moved packets only matter to the frames presented within a millisecond or so after them, which arrive soon
+		state.movedPackets = state.movedPackets.filter(x => x.timestamp > state.maxPacketTimestamp - 10);
+		state.movedPackets.push({ timestamp, msTimestamp });
+
+		const end = timestamp + duration;
+		return { timestamp: msTimestamp / 1000, duration: Math.max(end - msTimestamp / 1000, 0) };
 	}
 
 	async addEncodedAudioPacket(track: OutputAudioTrack, packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) {
@@ -1069,12 +1304,35 @@ export class MatroskaMuxer extends Muxer {
 			const isKeyFrame = packet.type === 'key';
 			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
 
-			// A negative start (like from encoder priming) is expressed this way.
+			if (trackData.info.codecDelay === null && trackData.info.opusPreSkip !== null) {
+				// The CodecDelay is the Opus pre-skip, so an earlier start makes negative block timestamps. These can't
+				// go below MIN_CLUSTER_TIMESTAMP_MS, though, and rather than losing packets beyond that, the CodecDelay
+				// then covers the whole start.
+				const preSkip = trackData.info.opusPreSkip;
+				if (Math.round(1000 * (packet.timestamp + preSkip)) >= MIN_CLUSTER_TIMESTAMP_MS) {
+					trackData.info.codecDelay = preSkip;
+				} else {
+					trackData.info.codecDelay = -packet.timestamp;
+					Logging._warn(
+						'Opus audio starts too far before zero for the CodecDelay to equal its pre-skip, as Matroska'
+						+ ' requires; the CodecDelay covers the whole start instead.',
+					);
+				}
+			}
+
+			// A negative start (like from encoder priming) is expressed this way. Readers (like FFmpeg) convert
+			// CodecDelay to whole timestamp ticks before subtracting it, so the blocks are shifted by that same rounded
+			// amount; shifting them by the exact delay would add up to another tick of error to every timestamp.
 			trackData.info.codecDelay ??= Math.max(-packet.timestamp, 0);
+			const codecDelayMs = Math.round(Math.round(1e9 * trackData.info.codecDelay) / 1e6);
+			// The shifted timestamp goes onto the millisecond grid here. Rounding via whole microseconds keeps
+			// timestamps that sit right at half a millisecond (like a -6.5 ms Opus start in 20 ms steps) from rounding
+			// up or down at random on floating-point noise.
+			const msTimestamp = Math.round(Math.round(1e6 * packet.timestamp) / 1000) + codecDelayMs;
 
 			const audioChunk = this.createInternalChunk(
 				packetData,
-				packet.timestamp + trackData.info.codecDelay,
+				msTimestamp / 1000,
 				packet.duration,
 				packet.type,
 			);
@@ -1094,7 +1352,7 @@ export class MatroskaMuxer extends Muxer {
 			this.validateTimestamp(trackData.track, cue.timestamp, true);
 
 			let bodyText = cue.text;
-			const timestampMs = Math.round(cue.timestamp * 1000);
+			const timestampMs = secondsToMs(cue.timestamp);
 
 			// Replace in-body timestamps so that they're relative to the cue start time
 			inlineTimestampRegex.lastIndex = 0;
@@ -1138,9 +1396,9 @@ export class MatroskaMuxer extends Muxer {
 					break outer;
 				}
 
-				if (trackData.chunkQueue.length > 0 && trackData.chunkQueue[0]!.timestamp < minTimestamp) {
+				if (trackData.chunkQueue.length > 0 && trackData.chunkQueue.peek()!.timestamp < minTimestamp) {
 					trackWithMinTimestamp = trackData;
-					minTimestamp = trackData.chunkQueue[0]!.timestamp;
+					minTimestamp = trackData.chunkQueue.peek()!.timestamp;
 				}
 			}
 
@@ -1157,52 +1415,8 @@ export class MatroskaMuxer extends Muxer {
 		}
 	}
 
-	/**
-	 * Due to [a bug in Chromium](https://bugs.chromium.org/p/chromium/issues/detail?id=1377842), VP9 streams often
- 	 * lack color space information. This method patches in that information.
-	 */
-	private fixVP9ColorSpace(
-		trackData: MatroskaVideoTrackData,
-		chunk: InternalMediaChunk,
-	) {
-		// http://downloads.webmproject.org/docs/vp9/vp9-bitstream_superframe-and-uncompressed-header_v1.0.pdf
-
-		if (chunk.type !== 'key') return;
-		if (!trackData.info.decoderConfig.colorSpace || !trackData.info.decoderConfig.colorSpace.matrix) return;
-
-		const bitstream = new Bitstream(chunk.data);
-
-		bitstream.skipBits(2);
-
-		const profileLowBit = bitstream.readBits(1);
-		const profileHighBit = bitstream.readBits(1);
-		const profile = (profileHighBit << 1) + profileLowBit;
-
-		if (profile === 3) bitstream.skipBits(1);
-
-		const showExistingFrame = bitstream.readBits(1);
-		if (showExistingFrame) return;
-
-		const frameType = bitstream.readBits(1);
-		if (frameType !== 0) return; // Just to be sure
-
-		bitstream.skipBits(2);
-
-		const syncCode = bitstream.readBits(24);
-		if (syncCode !== 0x498342) return;
-
-		if (profile >= 2) bitstream.skipBits(1);
-
-		const colorSpaceID = {
-			rgb: 7,
-			bt709: 2,
-			bt470bg: 1,
-			smpte170m: 3,
-		}[trackData.info.decoderConfig.colorSpace.matrix];
-
-		// The bitstream position is now at the start of the color space bits.
-		// We can use the global writeBits function here as requested.
-		writeBits(chunk.data, bitstream.pos, bitstream.pos + 3, colorSpaceID);
+	private getCodecDelayMs(trackData: MatroskaTrackData) {
+		return trackData.type === 'audio' ? Math.round(1000 * (trackData.info.codecDelay ?? 0)) : 0;
 	}
 
 	/** Converts a read-only external chunk into an internal one for easier use. */
@@ -1231,7 +1445,7 @@ export class MatroskaMuxer extends Muxer {
 			this.createSegment();
 		}
 
-		const msTimestamp = Math.round(1000 * chunk.timestamp);
+		const msTimestamp = secondsToMs(chunk.timestamp);
 
 		// We wanna only finalize this cluster (and begin a new one) if we know that each track will be able to
 		// start the new one with a key frame.
@@ -1240,7 +1454,7 @@ export class MatroskaMuxer extends Muxer {
 				return chunk.type === 'key';
 			}
 
-			const firstQueuedSample = otherTrackData.chunkQueue[0];
+			const firstQueuedSample = otherTrackData.chunkQueue.peek();
 			if (firstQueuedSample) {
 				return firstQueuedSample.type === 'key';
 			}
@@ -1297,7 +1511,11 @@ export class MatroskaMuxer extends Muxer {
 		});
 
 		this.startTimestamp = Math.min(this.startTimestamp, msTimestamp);
-		this.endTimestamp = Math.max(this.endTimestamp, msTimestamp + Math.round(1000 * chunk.duration));
+		// Audio blocks are shifted by their track's codec delay, so the media ends that much earlier
+		this.endTimestamp = Math.max(
+			this.endTimestamp,
+			msTimestamp - this.getCodecDelayMs(trackData) + secondsToMs(chunk.duration),
+		);
 		trackData.lastWrittenMsTimestamp = msTimestamp;
 
 		this.currentClusterMaxMsTimestamp = Math.max(this.currentClusterMaxMsTimestamp!, msTimestamp);
@@ -1362,9 +1580,16 @@ export class MatroskaMuxer extends Muxer {
 		const clusterOffsetFromSegment = this.ebmlWriter.offsets.get(cluster)! - this.segmentDataOffset;
 		const clusterDataOffset = this.ebmlWriter.dataOffsets.get(cluster)!;
 
-		// Group tracks by their first key packet's timestamp and create a CuePoint for each unique timestamp
+		// Cue points go to each track's first key packet in the cluster, except for subtitle tracks: each of their
+		// blocks SHOULD get one, with its duration, so that a subtitle still shown at a seek target can be found
+		const cueBlocks = [
+			...[...firstKeyBlockPerTrack.values()].filter(block => block.trackData.type !== 'subtitle'),
+			...[...blockElements.keys()].filter(block => block.trackData.type === 'subtitle'),
+		];
+
+		// Group them by timestamp and create a CuePoint for each unique timestamp
 		const groupedByTimestamp = new Map<number, ClusterBlock[]>();
-		for (const block of firstKeyBlockPerTrack.values()) {
+		for (const block of cueBlocks) {
 			if (!groupedByTimestamp.has(block.msTimestamp)) {
 				groupedByTimestamp.set(block.msTimestamp, []);
 			}
@@ -1378,14 +1603,18 @@ export class MatroskaMuxer extends Muxer {
 			assert(this.cues);
 			(this.cues.data as EBML[]).push({ id: EBMLId.CuePoint, data: [
 				{ id: EBMLId.CueTime, data: Math.max(0, msTimestamp) }, // CueTime is unsigned
-				// Create CueTrackPositions for each track whose first key packet is at this timestamp
+				// Create CueTrackPositions for each block at this timestamp
 				...blocks.map((block) => {
 					const blockOffset = this.ebmlWriter.offsets.get(blockElements.get(block)!)!;
+					const msDuration = secondsToMs(block.chunk.duration);
 
 					return { id: EBMLId.CueTrackPositions, data: [
 						{ id: EBMLId.CueTrack, data: block.trackData.track.id },
 						{ id: EBMLId.CueClusterPosition, data: clusterOffsetFromSegment },
 						{ id: EBMLId.CueRelativePosition, data: blockOffset - clusterDataOffset },
+						block.trackData.type === 'subtitle' && msDuration > 0
+							? { id: EBMLId.CueDuration, data: msDuration }
+							: null,
 					] };
 				}),
 			] });
@@ -1401,7 +1630,7 @@ export class MatroskaMuxer extends Muxer {
 		view.setUint8(0, 0x80 | trackData.track.id);
 		view.setInt16(1, msTimestamp - clusterMsTimestamp, false);
 
-		const msDuration = Math.round(1000 * chunk.duration);
+		const msDuration = secondsToMs(chunk.duration);
 
 		// A SimpleBlock has no duration; readers infer it from the track's next block. So subtitle cues need an
 		// explicit BlockDuration, and so does the last block of each track in the cluster, which has no next block
@@ -1445,6 +1674,8 @@ export class MatroskaMuxer extends Muxer {
 	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const release = await this.mutex.acquire();
+
+		this.closedTracks.add(track);
 
 		const trackData = this.trackDatas.find(x => x.track === track);
 		if (trackData) {
@@ -1492,7 +1723,9 @@ export class MatroskaMuxer extends Muxer {
 			this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
 
 			// Write the duration of the media to the Segment
-			const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp;
+			// Readers take the Duration minus the smallest codec delay of all tracks as the end of the media
+			const minCodecDelayMs = Math.min(...this.trackDatas.map(trackData => this.getCodecDelayMs(trackData)));
+			const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp + minCodecDelayMs;
 			this.segmentDuration!.data = new EBMLFloat64(duration);
 			this.writer.seek(this.ebmlWriter.offsets.get(this.segmentDuration!)!);
 			this.ebmlWriter.writeEBML(this.segmentDuration);

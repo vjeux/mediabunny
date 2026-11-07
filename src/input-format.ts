@@ -22,21 +22,20 @@ import {
 } from './matroska/ebml';
 import { MatroskaDemuxer } from './matroska/matroska-demuxer';
 import { Mp3Demuxer } from './mp3/mp3-demuxer';
-import { MP3_FRAME_HEADER_SIZE, getXingOffset, INFO, XING } from '../shared/mp3-misc';
 import { ID3_V2_HEADER_SIZE, readId3V2Header } from './id3';
-import { readNextMp3FrameHeader } from './mp3/mp3-reader';
+import { readFirstMp3FrameHeader } from './mp3/mp3-reader';
 import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from './adts/adts-reader';
 import { AdtsDemuxer } from './adts/adts-demuxer';
-import { readAscii, readBytes, readU32Be, readU64Be } from './reader';
+import { readAscii, readBytes, Reader, readU32Be, readU64Be } from './reader';
 import { FlacDemuxer } from './flac/flac-demuxer';
 import { MpegTsDemuxer } from './mpeg-ts/mpeg-ts-demuxer';
-import { TS_PACKET_SIZE } from './mpeg-ts/mpeg-ts-misc';
+import { findTsPacketLayout, TS_PACKET_LAYOUT_PROBE_SIZE, TS_PACKET_SIZE } from './mpeg-ts/mpeg-ts-misc';
 import { HlsDemuxer } from './hls/hls-demuxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
 import { PathedSource } from './source';
-import { isThenable, MaybePromise } from './misc';
+import { isThenable, MaybePromise, toDataView } from './misc';
 
 /**
  * Base class representing an input media file format.
@@ -245,17 +244,16 @@ export class MatroskaInputFormat extends InputFormat {
 			const dataStartPos = dataSlice.filePos;
 			if (size === undefined) return false;
 
-			if (dataStartPos + size > startPos + dataSize || (size > 8 && id !== EBMLId.DocType)) {
+			const isInteger = id === EBMLId.EBMLVersion
+				|| id === EBMLId.EBMLReadVersion
+				|| id === EBMLId.DocTypeVersion;
+			if (dataStartPos + size > startPos + dataSize || (isInteger && size > 8)) {
 				return false; // The element overruns the header or is an integer of impossible size
 			}
 
+			// Whether we can read the file is decided by the read versions alone: EBMLVersion and DocTypeVersion may
+			// be higher, since newer elements are skipped (RFC 8794, Section 11.2.3; RFC 9559, Section 7)
 			switch (id) {
-				case EBMLId.EBMLVersion: {
-					const ebmlVersion = readUnsignedInt(dataSlice, size);
-					if (ebmlVersion !== 1) {
-						return false;
-					}
-				}; break;
 				case EBMLId.EBMLReadVersion: {
 					const ebmlReadVersion = readUnsignedInt(dataSlice, size);
 					if (ebmlReadVersion !== 1) {
@@ -268,9 +266,9 @@ export class MatroskaInputFormat extends InputFormat {
 						return false;
 					}
 				}; break;
-				case EBMLId.DocTypeVersion: {
-					const docTypeVersion = readUnsignedInt(dataSlice, size);
-					if (docTypeVersion > 4) { // Support up to Matroska v4
+				case EBMLId.DocTypeReadVersion: {
+					const docTypeReadVersion = readUnsignedInt(dataSlice, size);
+					if (docTypeReadVersion > 4) { // Support up to Matroska v4
 						return false;
 					}
 				}; break;
@@ -328,6 +326,85 @@ export class WebMInputFormat extends MatroskaInputFormat {
 	}
 }
 
+/** Whether the bytes are the start of an MPEG-1 or MPEG-2 program stream pack header. */
+const isMpegPackHeader = (bytes: Uint8Array) => bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x01
+	&& bytes[3] === 0xba
+	&& ((bytes[4]! & 0xf0) === 0x20 || (bytes[4]! & 0xc0) === 0x40); // MPEG-1 or MPEG-2 marker bits
+
+/**
+ * Returns the position of the first non-zero byte at or after `pos`, looking at most `maxLength` bytes ahead (and
+ * returning the position where it stopped if there's none).
+ */
+const skipZeroBytes = async (reader: Reader, pos: number, maxLength: number) => {
+	const end = pos + maxLength;
+
+	while (pos < end) {
+		let slice = reader.requestSliceRange(pos, 1, Math.min(2 ** 16, end - pos));
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice || slice.length === 0) {
+			break;
+		}
+
+		const bytes = readBytes(slice, slice.length);
+		const index = bytes.findIndex(x => x !== 0);
+		if (index !== -1) {
+			return pos + index;
+		}
+
+		pos += bytes.length;
+	}
+
+	return pos;
+};
+
+const ISOBMFF_LEADING_BOX_TYPES = ['ftyp', 'styp', 'moov', 'mdat', 'moof', 'sidx', 'free', 'skip', 'wide', 'pnot'];
+
+// How many MPEG-TS packets must start with a sync byte (fewer if the file is shorter), so that MP3 data that just
+// happens to hold 0x47 at a couple of packet starts isn't taken for MPEG-TS
+const MPEG_TS_SIGNATURE_PACKET_COUNT = 5;
+const MPEG_TS_SIGNATURE_LENGTH = 4 + MPEG_TS_SIGNATURE_PACKET_COUNT * (TS_PACKET_SIZE + 16);
+
+const startsWithMpegTsPackets = (bytes: Uint8Array, offset: number, packetSize: number) => {
+	let packetCount = 0;
+	for (
+		let pos = offset;
+		pos < bytes.length && packetCount < MPEG_TS_SIGNATURE_PACKET_COUNT;
+		pos += packetSize, packetCount++
+	) {
+		if (bytes[pos] !== 0x47) {
+			return false;
+		}
+	}
+
+	return packetCount >= 2;
+};
+
+/**
+ * Whether the bytes start like an ISOBMFF/QuickTime, Matroska, Ogg, FLAC or MPEG-TS file. RIFF files aren't included:
+ * some hold a plain MP3 stream (RIFF MP3, MP3 in WAVE), which reads fine as MP3.
+ */
+const startsWithOtherContainerSignature = (bytes: Uint8Array) => {
+	const view = toDataView(bytes);
+	const ascii = (start: number, length: number) => String.fromCharCode(...bytes.subarray(start, start + length));
+
+	if (bytes.length >= 8 && view.getUint32(0) >= 8 && ISOBMFF_LEADING_BOX_TYPES.includes(ascii(4, 4))) {
+		return true;
+	}
+	if (bytes.length >= 4 && view.getUint32(0) === EBMLId.EBML) {
+		return true;
+	}
+	if (['OggS', 'fLaC'].includes(ascii(0, 4))) {
+		return true;
+	}
+
+	// The packet layouts MPEG-TS detection checks: plain, with FEC, and with 4-byte timestamps (M2TS)
+	return startsWithMpegTsPackets(bytes, 0, TS_PACKET_SIZE)
+		|| startsWithMpegTsPackets(bytes, 0, TS_PACKET_SIZE + 16)
+		|| startsWithMpegTsPackets(bytes, 4, TS_PACKET_SIZE + 4);
+};
+
 /**
  * MP3 file format.
  *
@@ -354,48 +431,33 @@ export class Mp3InputFormat extends InputFormat {
 			currentPos = slice.filePos + id3V2Header.size;
 		}
 
-		const firstResult = await readNextMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
-		if (!firstResult) {
+		// Frame syncs are easily found in the data of other containers (in their sample tables, say), so a file that
+		// starts like one of them isn't taken for MP3, even when that format isn't among the input's formats
+		let signatureSlice = input._reader.requestSliceRange(currentPos, 0, MPEG_TS_SIGNATURE_LENGTH);
+		if (isThenable(signatureSlice)) {
+			signatureSlice = await signatureSlice;
+		}
+		if (signatureSlice && startsWithOtherContainerSignature(readBytes(signatureSlice, signatureSlice.length))) {
 			return false;
 		}
 
-		const firstHeader = firstResult.header;
-		const xingOffset = getXingOffset(firstHeader.mpegVersionId, firstHeader.channel);
-
-		let slice = input._reader.requestSlice(firstResult.startPos + xingOffset, 4);
-		if (isThenable(slice)) slice = await slice;
-		if (!slice) return false;
-
-		const word = readU32Be(slice);
-		const isXing = word === XING || word === INFO;
-
-		if (isXing) {
-			// Gotta be MP3
-			return true;
+		// MPEG program streams (like VOB files) hold runs of MPEG audio frames in their packets, which the search below
+		// would find. They start with a pack header, which an MP3 file doesn't.
+		let packHeaderSlice = input._reader.requestSlice(currentPos, 5);
+		if (isThenable(packHeaderSlice)) {
+			packHeaderSlice = await packHeaderSlice;
 		}
-
-		currentPos = firstResult.startPos + firstResult.header.totalSize;
-
-		// Fine, we found one frame header, but we're still not entirely sure this is MP3. Let's check if we can find
-		// another header right after it:
-		const secondResult = await readNextMp3FrameHeader(
-			input._reader,
-			currentPos,
-			currentPos + MP3_FRAME_HEADER_SIZE,
-		);
-		if (!secondResult) {
+		if (packHeaderSlice && isMpegPackHeader(readBytes(packHeaderSlice, 5))) {
 			return false;
 		}
 
-		const secondHeader = secondResult.header;
+		// Skip a run of zero bytes before the first frame, as found in files whose ID3v2 tag was stripped by zeroing it
+		// out in place. Zeros can't form a frame header; FFmpeg's mp3_read_probe skips them the same way.
+		currentPos = await skipZeroBytes(input._reader, currentPos, 2 ** 20);
 
-		// In a well-formed MP3 file, we'd expect these two frames to share some similarities:
-		if (firstHeader.channel !== secondHeader.channel || firstHeader.sampleRate !== secondHeader.sampleRate) {
-			return false;
-		}
-
-		// We have found two matching consecutive MP3 frames, a strong indicator that this is an MP3 file
-		return true;
+		// A Xing tag or two matching consecutive frames are a strong indicator that this is an MP3 file
+		const firstResult = await readFirstMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
+		return firstResult !== null;
 	}
 
 	/** @internal */
@@ -415,6 +477,43 @@ export class Mp3InputFormat extends InputFormat {
 		return false;
 	}
 }
+
+/**
+ * Format tags of MPEG audio in WAVE ("RIFF MP3", as written by Windows' ACM codecs or FFmpeg): layers I and II, and
+ * layer III. The data chunk of such a file holds a plain MPEG audio stream.
+ */
+const WAVE_MPEG_AUDIO_FORMAT_TAGS = [0x0050, 0x0055];
+
+/** Reads the format tag in the "fmt " chunk of a WAVE file, or returns null if no such chunk precedes the data. */
+const readWaveFormatTag = async (input: Input, littleEndian: boolean) => {
+	let pos = 12;
+
+	// Few chunks come before the data, so looking at a bounded number of them is enough
+	for (let i = 0; i < 64; i++) {
+		let slice = input._reader.requestSlice(pos, 10);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return null;
+		}
+
+		const chunkId = readAscii(slice, 4);
+		const bytes = readBytes(slice, 6);
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const chunkSize = view.getUint32(0, littleEndian);
+
+		if (chunkId === 'fmt ') {
+			return view.getUint16(4, littleEndian);
+		} else if (chunkId === 'data') {
+			return null;
+		}
+
+		pos += 8 + chunkSize + (chunkSize & 1);
+	}
+
+	return null;
+};
 
 /**
  * WAVE file format, based on RIFF.
@@ -439,7 +538,14 @@ export class WaveInputFormat extends InputFormat {
 		slice.skip(4);
 
 		const format = readAscii(slice, 4);
-		return format === 'WAVE';
+		if (format !== 'WAVE') {
+			return false;
+		}
+
+		// MPEG audio in WAVE is left to the MP3 format, which reads the plain MPEG audio stream in the data chunk; the
+		// WAVE demuxer doesn't support it
+		const formatTag = await readWaveFormatTag(input, riffType !== 'RIFX');
+		return formatTag === null || !WAVE_MPEG_AUDIO_FORMAT_TAGS.includes(formatTag);
 	}
 
 	/** @internal */
@@ -558,20 +664,29 @@ export class FlacInputFormat extends InputFormat {
 export class AdtsInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
-		let currentPos = 0;
+		/** Returns the position after the ID3v2 tags starting at the given position, if any. */
+		const skipId3V2Tags = async (pos: number) => {
+			while (true) {
+				let slice = input._reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					break;
+				}
 
-		while (true) {
-			let slice = input._reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
-			if (!slice) break;
+				const id3V2Header = readId3V2Header(slice);
+				if (!id3V2Header) {
+					break;
+				}
 
-			const id3V2Header = readId3V2Header(slice);
-			if (!id3V2Header) {
-				break;
+				pos = slice.filePos + id3V2Header.size;
 			}
 
-			currentPos = slice.filePos + id3V2Header.size;
-		}
+			return pos;
+		};
+
+		let currentPos = await skipId3V2Tags(0);
 
 		let slice = input._reader.requestSliceRange(
 			currentPos,
@@ -586,7 +701,8 @@ export class AdtsInputFormat extends InputFormat {
 			return false;
 		}
 
-		currentPos += firstHeader.frameLength;
+		// Packed audio, like HLS segments, may carry timed ID3v2 tags between frames
+		currentPos = await skipId3V2Tags(currentPos + firstHeader.frameLength);
 
 		slice = input._reader.requestSliceRange(
 			currentPos,
@@ -639,25 +755,11 @@ export class AdtsInputFormat extends InputFormat {
 export class MpegTsInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
-		const lengthToCheck = TS_PACKET_SIZE + 16 + 1;
-		let slice = input._reader.requestSlice(0, lengthToCheck);
+		let slice = input._reader.requestSliceRange(0, TS_PACKET_SIZE + 16 + 1, TS_PACKET_LAYOUT_PROBE_SIZE);
 		if (isThenable(slice)) slice = await slice;
 		if (!slice) return false;
 
-		const bytes = readBytes(slice, lengthToCheck);
-
-		if (bytes[0] === 0x47 && bytes[TS_PACKET_SIZE] === 0x47) {
-			// Regular MPEG-TS
-			return true;
-		} else if (bytes[0] === 0x47 && bytes[TS_PACKET_SIZE + 16] === 0x47) {
-			// MPEG-TS with Forward Error Correction
-			return true;
-		} else if (bytes[4] === 0x47 && bytes[4 + TS_PACKET_SIZE + 4] === 0x47) {
-			// MPEG-2-TS (DVHS)
-			return true;
-		}
-
-		return false;
+		return findTsPacketLayout(readBytes(slice, slice.length)) !== null;
 	}
 
 	/** @internal */
@@ -801,7 +903,9 @@ export const HLS = /* #__PURE__ */ new HlsInputFormat();
  * @group Input formats
  * @public
  */
-export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, OGG, FLAC, MP3, ADTS, MPEG_TS];
+// MPEG-TS comes before MP3 and ADTS: those are detected by searching for frame headers, which can find a couple of
+// small frames inside a transport stream, whereas MPEG-TS detection checks the packet structure.
+export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, OGG, FLAC, MPEG_TS, MP3, ADTS];
 
 /**
  * List of input formats required for playback of typical HLS manifests. Includes HLS itself as well as the typical
@@ -809,7 +913,7 @@ export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE,
  * @group Input formats
  * @public
  */
-export const HLS_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MP3, ADTS, MPEG_TS];
+export const HLS_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MPEG_TS, MP3, ADTS];
 
 /**
  * Additional per-format configuration.

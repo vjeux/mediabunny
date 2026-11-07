@@ -15,6 +15,7 @@ import { isRecordStringString } from './misc';
  *
  * - For MP4/QuickTime files, the metadata refers to the data in `'moov'`-level `'udta'` and `'meta'` atoms.
  * - For WebM/Matroska files, the metadata refers to the Tags and Attachments elements whose target is 50 (MOVIE).
+ * WebM output leaves out Attachments (images and attached files), which WebM doesn't support.
  * - For MP3 files, the metadata refers to the ID3v2 or ID3v1 tags.
  * - For Ogg files, there is no global metadata so instead, the metadata refers to the combined metadata of all tracks,
  * in Vorbis-style comment headers.
@@ -75,6 +76,7 @@ export type MetadataTags = {
 	 * - MP4/QuickTime: By default, the keys refer to the names of the individual atoms in the `'ilst'` atom inside the
 	 * `'meta'` atom, and the values are derived from the content of the `'data'` atom inside them. When a `'keys'` atom
 	 * is also used, then the keys reflect the keys specified there (such as `'com.apple.quicktime.version'`).
+	 * iTunes freeform (`'----'`) items are keyed by their domain and name, like `'----:com.apple.iTunes:iTunSMPB'`.
 	 * Additionally, any atoms within the `'udta'` atom are dumped into here, however with unknown internal format
 	 * (`Uint8Array`).
 	 * - WebM/Matroska: `SimpleTag` elements whose target is 50 (MOVIE), either containing string or `Uint8Array`
@@ -98,6 +100,46 @@ export type MetadataTags = {
 		string,
 		string | string[] | Uint8Array | Uint8Array[] | RichImageData | AttachedFile | Record<string, string> | null
 	>;
+};
+
+/** Deep-copies tags, so that changing the copy (Dates and image bytes included) leaves the original untouched. */
+export const cloneMetadataTags = (tags: MetadataTags): MetadataTags => {
+	const copy: MetadataTags = { ...tags };
+	if (tags.date) {
+		copy.date = new Date(tags.date.getTime());
+	}
+	if (tags.creationTime) {
+		copy.creationTime = new Date(tags.creationTime.getTime());
+	}
+	if (tags.images) {
+		copy.images = tags.images.map(image => ({ ...image, data: image.data.slice() }));
+	}
+	if (tags.raw) {
+		copy.raw = {};
+		for (const key in tags.raw) {
+			copy.raw[key] = cloneRawTagValue(tags.raw[key]!);
+		}
+	}
+
+	return copy;
+};
+
+type RawTagValue = NonNullable<MetadataTags['raw']>[string];
+
+const cloneRawTagValue = (value: RawTagValue): RawTagValue => {
+	if (value instanceof Uint8Array) {
+		return value.slice();
+	} else if (Array.isArray(value)) {
+		return value.map(item => (item instanceof Uint8Array ? item.slice() : item)) as string[] | Uint8Array[];
+	} else if (value instanceof RichImageData) {
+		return new RichImageData(value.data.slice(), value.mimeType);
+	} else if (value instanceof AttachedFile) {
+		return new AttachedFile(value.data.slice(), value.mimeType, value.name, value.description);
+	} else if (value && typeof value === 'object') {
+		return { ...value };
+	} else {
+		return value;
+	}
 };
 
 /**
@@ -281,6 +323,19 @@ export const validateMetadataTags = (tags: MetadataTags) => {
 	}
 };
 
+/**
+ * Formats a date as YYYY-MM-DD, the shape every format stores dates in. Returns null for years outside 0 to 9999,
+ * which those fields can't hold (toISOString uses the expanded ±YYYYYY form for them).
+ */
+export const formatMetadataDate = (date: Date) => {
+	const year = date.getUTCFullYear();
+	if (year < 0 || year > 9999) {
+		return null;
+	}
+
+	return date.toISOString().slice(0, 10);
+};
+
 export const metadataTagsAreEmpty = (tags: MetadataTags) => {
 	return tags.title === undefined
 		&& tags.description === undefined
@@ -300,6 +355,118 @@ export const metadataTagsAreEmpty = (tags: MetadataTags) => {
 		&& (tags.raw === undefined || Object.keys(tags.raw).length === 0);
 };
 
+/** For the raw tags a demuxer read, which normalized fields each raw tag was read into (used by conversions). */
+const rawMetadataTagFields = new WeakMap<NonNullable<MetadataTags['raw']>, Map<string, Set<keyof MetadataTags>>>();
+
+const RAW_BACKED_FIELDS = [
+	'title', 'description', 'artist', 'album', 'albumArtist', 'trackNumber', 'tracksTotal', 'discNumber', 'discsTotal',
+	'beatsPerMinute', 'genre', 'date', 'lyrics', 'comment', 'images',
+] as const satisfies (keyof MetadataTags)[];
+
+type MetadataTagFieldWatch = {
+	/** The raw tag being read, or null if there's none */
+	rawKey: string | null;
+	/** The values of the fields that were already set, which go through the getters and setters meanwhile */
+	values: Map<keyof MetadataTags, unknown>;
+	/** The getters installed, to tell whether a field still has one */
+	getters: Map<keyof MetadataTags, () => unknown>;
+	/** Which of the watched fields the reader read or wrote */
+	accessed: Set<keyof MetadataTags>;
+};
+
+/** The watch open on each tags object */
+const openMetadataTagFieldWatches = new WeakMap<MetadataTags, MetadataTagFieldWatch>();
+
+/**
+ * Starts watching which normalized fields a reader uses while it reads the raw tag with the given key. Readers keep a
+ * field's first value (`??=`), so a raw tag for a field that an earlier tag block or key already set doesn't change
+ * it, but the reader still reads it. So until unwatchMetadataTagFields, the fields already set temporarily become
+ * getters and setters that note every read and write; their values don't change.
+ */
+export const watchMetadataTagFields = (tags: MetadataTags, rawKey: string | null) => {
+	unwatchMetadataTagFields(tags); // In case a reader left one open
+
+	const watch: MetadataTagFieldWatch = { rawKey, values: new Map(), getters: new Map(), accessed: new Set() };
+	for (const field of RAW_BACKED_FIELDS) {
+		if (tags[field] === undefined) {
+			continue;
+		}
+
+		const get = () => {
+			watch.accessed.add(field);
+			return watch.values.get(field);
+		};
+		watch.values.set(field, tags[field]);
+		watch.getters.set(field, get);
+		Object.defineProperty(tags, field, {
+			get,
+			set: (value: unknown) => {
+				watch.accessed.add(field);
+				watch.values.set(field, value);
+			},
+			enumerable: true,
+			configurable: true,
+		});
+	}
+
+	openMetadataTagFieldWatches.set(tags, watch);
+};
+
+/**
+ * Ends the watch open on the given tags, if any: turns the watched fields back into plain data properties, in place so
+ * that the order of the keys stays the same, and records which fields the raw tag was read into (the watched fields
+ * the reader used, and those it set). Readers that can throw midway also call it in a `finally`.
+ */
+export const unwatchMetadataTagFields = (tags: MetadataTags) => {
+	const watch = openMetadataTagFieldWatches.get(tags);
+	if (!watch) {
+		return;
+	}
+
+	openMetadataTagFieldWatches.delete(tags);
+	for (const [field, value] of watch.values) {
+		// Unless something replaced or removed the property meanwhile
+		if (Object.getOwnPropertyDescriptor(tags, field)?.get === watch.getters.get(field)) {
+			Object.defineProperty(tags, field, { value, writable: true, enumerable: true, configurable: true });
+		}
+	}
+
+	if (watch.rawKey === null || !tags.raw) {
+		return;
+	}
+
+	const fields = RAW_BACKED_FIELDS.filter((field) => {
+		if (watch.values.has(field)) {
+			return watch.accessed.has(field);
+		}
+
+		const value = tags[field];
+		return value !== undefined && !(Array.isArray(value) && value.length === 0);
+	});
+	if (fields.length === 0) {
+		return;
+	}
+
+	let fieldsByRawKey = rawMetadataTagFields.get(tags.raw);
+	if (!fieldsByRawKey) {
+		fieldsByRawKey = new Map();
+		rawMetadataTagFields.set(tags.raw, fieldsByRawKey);
+	}
+
+	let recorded = fieldsByRawKey.get(watch.rawKey);
+	if (!recorded) {
+		recorded = new Set();
+		fieldsByRawKey.set(watch.rawKey, recorded);
+	}
+
+	for (const field of fields) {
+		recorded.add(field);
+	}
+};
+
+/** Returns which normalized fields each of the given raw tags was read into, if a demuxer recorded it. */
+export const getRawMetadataTagFields = (raw: NonNullable<MetadataTags['raw']>) => rawMetadataTagFields.get(raw);
+
 /**
  * Specifies a track's disposition, i.e. information about its intended usage.
  * @public
@@ -310,7 +477,13 @@ export type TrackDisposition = {
 	 * Indicates that this track is eligible for automatic selection by a player. Multiple tracks can be default tracks.
 	 */
 	default: boolean;
-	/** Indicates that the track is the primary track among other tracks of its type. */
+	/**
+	 * Indicates that the track is the primary track among other tracks of its type. Only HLS signals this: when
+	 * reading, `EXT-X-MEDIA` renditions follow their `DEFAULT` attribute and variant-stream tracks report `true`; when
+	 * writing, it sets `DEFAULT=YES`. Formats that hold a single track (MP3, ADTS, FLAC, WAVE) report `true`, and
+	 * tracks read from all other formats report `false`. To find a file's main tracks, use
+	 * {@link Input.getPrimaryVideoTrack} and {@link Input.getPrimaryAudioTrack}.
+	 */
 	primary: boolean;
 	/**
 	 * Indicates that players should always display this track by default, even if it goes against the user's default

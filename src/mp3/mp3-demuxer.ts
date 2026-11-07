@@ -31,16 +31,22 @@ import {
 	computeAverageMp3FrameSize,
 	getMp3ChannelCount,
 	MP3_DECODER_DELAY,
+	decodeSynchsafe,
 } from '../../shared/mp3-misc';
 import {
 	ID3_V1_TAG_SIZE,
 	ID3_V2_HEADER_SIZE,
+	Id3V2Header,
+	Id3V2HeaderFlags,
+	Id3V2Reader,
 	parseId3V1Tag,
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
-import { readNextMp3FrameHeader } from './mp3-reader';
-import { readAscii, readBytes, Reader, readU32Be } from '../reader';
+import { readNextMp3FrameHeader, readFirstMp3FrameHeader } from './mp3-reader';
+import { readAscii, readBytes, Reader, readU32Be, readU32Le, readU8 } from '../reader';
+
+const APE_TAG_FOOTER_SIZE = 32;
 
 type Sample = {
 	timestamp: number;
@@ -59,6 +65,8 @@ export class Mp3Demuxer extends Demuxer {
 	xingFrameHeaderPos: number | null = null;
 	loadedSamples: Sample[] = []; // All samples from the start of the file to lastLoadedPos
 	metadataTags: MetadataTags | null = null;
+	/** Whether metadataTags holds all tags, rather than the ones read before a parse error */
+	metadataTagsComplete = false;
 	xingData: {
 		isVbr: boolean;
 		frameCount: number | null;
@@ -72,6 +80,8 @@ export class Mp3Demuxer extends Demuxer {
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
 	primingDelay = 0;
+	itunesPriming: number | null = null;
+	audioEndPos: number | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -81,6 +91,8 @@ export class Mp3Demuxer extends Demuxer {
 
 	async readMetadata() {
 		return this.metadataPromise ??= (async () => {
+			this.audioEndPos = await this.computeAudioEndPos();
+
 			// Keep loading until we find the first frame header
 			while (!this.firstFrameHeader && !this.lastSampleLoaded) {
 				await this.advanceReader();
@@ -118,16 +130,38 @@ export class Mp3Demuxer extends Demuxer {
 					break;
 				}
 
+				await this.readItunesPriming(slice.filePos, id3V2Header);
+
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
 			}
 		}
 
-		const result = await readNextMp3FrameHeader(
-			this.reader,
-			this.lastLoadedPos,
-			this.reader.fileSize,
-			this.firstFrameHeader,
-		);
+		// Until a frame has been found, make sure we don't start off with a false sync. A Xing/Info frame confirms the
+		// stream already, so the frames after it are taken as they come.
+		let result = this.firstFrameHeader || this.xingFrameHeader
+			? await readNextMp3FrameHeader(
+				this.reader,
+				this.lastLoadedPos,
+				this.audioEndPos,
+				this.firstFrameHeader,
+			)
+			: await readFirstMp3FrameHeader(this.reader, this.lastLoadedPos, this.audioEndPos);
+
+		if (this.firstFrameHeader && (!result || result.startPos > this.lastLoadedPos + 1)) {
+			// No frame follows the previous one directly. If ID3v2 tags do (like in concatenated files), skip them
+			// instead of searching them for frames, since bytes inside them (like cover art) can look like frames.
+			const tagsEnd = await this.skipId3V2Tags(this.lastLoadedPos);
+			if (tagsEnd !== null) {
+				this.lastLoadedPos = tagsEnd;
+				result = await readNextMp3FrameHeader(
+					this.reader,
+					this.lastLoadedPos,
+					this.audioEndPos,
+					this.firstFrameHeader,
+				);
+			}
+		}
+
 		if (!result) {
 			this.lastSampleLoaded = true;
 			return;
@@ -164,7 +198,9 @@ export class Mp3Demuxer extends Demuxer {
 						this.xingData = {
 							// LAME and FFmpeg write the same header with 'Info' in place of 'Xing' for CBR streams
 							isVbr: word === XING,
-							frameCount: (flags & XingFlags.FrameCount)
+							// A frame count of 0 can't describe the stream (like in a header that was never filled
+							// in), so it's ignored, like FFmpeg does
+							frameCount: (flags & XingFlags.FrameCount) && view.getUint32(4, false) !== 0
 								? view.getUint32(4, false)
 								: null,
 							fileSize: (flags & XingFlags.FileSize)
@@ -199,6 +235,12 @@ export class Mp3Demuxer extends Demuxer {
 		if (!this.firstFrameHeader) {
 			this.firstFrameHeader = header;
 			this.firstFrameHeaderPos = result.startPos;
+
+			if (this.primingDelay === 0 && this.itunesPriming !== null) {
+				// No LAME tag told us about the delay, but iTunes did. Its priming includes the decoder delay already.
+				this.primingDelay = this.itunesPriming;
+				this.nextTimestampInSamples = -this.primingDelay;
+			}
 		}
 
 		const sampleDuration = header.audioSamplesInFrame / this.firstFrameHeader.sampleRate;
@@ -213,6 +255,175 @@ export class Mp3Demuxer extends Demuxer {
 		this.nextTimestampInSamples += header.audioSamplesInFrame;
 
 		return;
+	}
+
+	/**
+	 * Apple's encoders don't write a LAME tag but store the encoder delay in an iTunSMPB comment of the ID3v2 tag,
+	 * like " 00000000 00000210 0000086A 0000000000066486 ...": priming, end padding and sample count, in hex. To find
+	 * it, this only reads the frame headers and small comment frames, so large frames like cover art aren't loaded.
+	 */
+	async readItunesPriming(contentStart: number, header: Id3V2Header) {
+		if (
+			![2, 3, 4].includes(header.majorVersion)
+			|| (header.flags & (Id3V2HeaderFlags.Unsynchronisation | Id3V2HeaderFlags.ExtendedHeader))
+		) {
+			return; // iTunes writes neither
+		}
+
+		const frameHeaderSize = header.majorVersion === 2 ? 6 : 10;
+		const contentEnd = contentStart + header.size - ((header.flags & Id3V2HeaderFlags.Footer) ? 10 : 0);
+		let pos = contentStart;
+
+		while (pos + frameHeaderSize <= contentEnd) {
+			let slice = this.reader.requestSlice(pos, frameHeaderSize);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				return;
+			}
+
+			const id = readAscii(slice, header.majorVersion === 2 ? 3 : 4);
+			if (!/^[0-9A-Z]+$/.test(id)) {
+				return; // Padding
+			}
+
+			let size: number;
+			let flags = 0;
+			if (header.majorVersion === 2) {
+				size = (readU8(slice) << 16) | (readU8(slice) << 8) | readU8(slice);
+			} else {
+				const sizeRaw = readU32Be(slice);
+				size = header.majorVersion === 4 ? decodeSynchsafe(sizeRaw) : sizeRaw;
+				flags = readU8(slice) << 8 | readU8(slice);
+			}
+
+			const bodyPos = pos + frameHeaderSize;
+			pos = bodyPos + size;
+
+			// Frames with flags (compression, encryption, unsynchronisation...) aren't what iTunes writes
+			if (!['COMM', 'COM', 'TXXX', 'TXX'].includes(id) || flags !== 0 || size < 1 || size > 4096) {
+				continue;
+			}
+
+			let bodySlice = this.reader.requestSlice(bodyPos, Math.min(size, contentEnd - bodyPos));
+			if (isThenable(bodySlice)) {
+				bodySlice = await bodySlice;
+			}
+			if (!bodySlice) {
+				return;
+			}
+
+			const body = readBytes(bodySlice, bodySlice.length);
+			const reader = new Id3V2Reader(header, body);
+			const encoding = reader.readU8();
+			if (encoding > 3) {
+				continue;
+			}
+
+			if (id === 'COMM' || id === 'COM') {
+				reader.pos += 3; // Language
+			}
+
+			if (reader.pos > body.length || reader.readId3V2Text(encoding, body.length) !== 'iTunSMPB') {
+				continue;
+			}
+
+			const match = /^\s*[0-9a-f]{1,16}\s+([0-9a-f]{1,16})\s+([0-9a-f]{1,16})\s+([0-9a-f]{1,16})(?![0-9a-f])/i
+				.exec(reader.readId3V2Text(encoding, body.length));
+			if (!match) {
+				return;
+			}
+
+			const priming = Number.parseInt(match[1]!, 16);
+			const sampleCount = Number.parseInt(match[3]!, 16);
+
+			// Same sanity checks as FFmpeg
+			if (priming <= 16384 && sampleCount > 0) {
+				this.itunesPriming = priming;
+			}
+
+			return;
+		}
+	}
+
+	/** Skips the ID3v2 tags following the frame that ended at lastLoadedPos, returning where they end. */
+	async skipId3V2Tags(lastLoadedPos: number) {
+		let tagsEnd: number | null = null;
+		// The previous frame ended right after lastLoadedPos, or at it if it was a byte short
+		let positions = [lastLoadedPos + 1, lastLoadedPos];
+
+		while (true) {
+			let foundTag = false;
+
+			for (const pos of positions) {
+				let slice = this.reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					continue;
+				}
+
+				const id3V2Header = readId3V2Header(slice);
+				if (id3V2Header) {
+					tagsEnd = slice.filePos + id3V2Header.size;
+					positions = [tagsEnd];
+					foundTag = true;
+					break;
+				}
+			}
+
+			if (!foundTag) {
+				return tagsEnd;
+			}
+		}
+	}
+
+	/**
+	 * Returns where the audio ends, before any APEv2 and ID3v1 tags at the end of the file, so that the bytes inside
+	 * them (like cover art in an APEv2 tag) aren't mistaken for frames.
+	 */
+	async computeAudioEndPos() {
+		if (this.reader.fileSize === null) {
+			return null;
+		}
+
+		let endPos = this.reader.fileSize;
+
+		if (endPos >= ID3_V1_TAG_SIZE) {
+			let slice = this.reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+
+			if (slice && readAscii(slice, 3) === 'TAG') {
+				endPos -= ID3_V1_TAG_SIZE;
+			}
+		}
+
+		// APEv2 tags end with a 32-byte footer and sit in front of any ID3v1 tag
+		if (endPos >= APE_TAG_FOOTER_SIZE) {
+			let slice = this.reader.requestSlice(endPos - APE_TAG_FOOTER_SIZE, APE_TAG_FOOTER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+
+			if (slice && readAscii(slice, 8) === 'APETAGEX') {
+				slice.skip(4); // Version
+				const tagSize = readU32Le(slice); // Includes the footer, but not the header
+				slice.skip(4); // Item count
+				const flags = readU32Le(slice);
+				const hasHeader = (flags & (1 << 31)) !== 0;
+
+				const tagStartPos = endPos - tagSize - (hasHeader ? APE_TAG_FOOTER_SIZE : 0);
+				if (tagStartPos >= 0) {
+					endPos = tagStartPos;
+				}
+			}
+		}
+
+		return endPos;
 	}
 
 	async getMimeType() {
@@ -230,13 +441,13 @@ export class Mp3Demuxer extends Demuxer {
 		try {
 			await this.readMetadata();
 
-			if (this.metadataTags) {
+			// Tags that failed to parse are read again, so that every call fails, not just the first one
+			if (this.metadataTags && this.metadataTagsComplete) {
 				return this.metadataTags;
 			}
 
 			this.metadataTags = {};
 			let currentPos = 0;
-			let id3V2HeaderFound = false;
 
 			while (true) {
 				let headerSlice = this.reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
@@ -248,8 +459,6 @@ export class Mp3Demuxer extends Demuxer {
 					break;
 				}
 
-				id3V2HeaderFound = true;
-
 				let contentSlice = this.reader.requestSlice(headerSlice.filePos, id3V2Header.size);
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				if (!contentSlice) break;
@@ -259,8 +468,10 @@ export class Mp3Demuxer extends Demuxer {
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
-			if (!id3V2HeaderFound && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
-				// Try reading an ID3v1 tag at the end of the file
+			// Fall back to an ID3v1 tag at the end of the file when the ID3v2 tags gave us no text fields, like ones
+			// holding nothing but PRIV frames or cover art, like FFmpeg
+			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
+			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
 				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) slice = await slice;
 				assert(slice);
@@ -271,6 +482,7 @@ export class Mp3Demuxer extends Demuxer {
 				}
 			}
 
+			this.metadataTagsComplete = true;
 			return this.metadataTags;
 		} finally {
 			release();
@@ -319,14 +531,40 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	async getDurationFromMetadata() {
+		const duration = await this.getDurationFromHeaders();
+		// Never below 0, even when the frames hold fewer samples than the encoder and decoder delays (like a single
+		// MPEG-2 frame of 576 samples does)
+		return duration === null ? null : Math.max(duration, 0);
+	}
+
+	private async getDurationFromHeaders() {
 		const demuxer = this.demuxer;
 
 		assert(demuxer.firstFrameHeader !== null);
 		assert(demuxer.firstFrameHeaderPos !== null);
 
-		if (demuxer.xingData && demuxer.xingData.frameCount !== null) {
+		let frameCount = demuxer.xingData?.frameCount ?? null;
+		const streamSize = demuxer.xingData?.fileSize ?? null;
+
+		if (frameCount !== null && streamSize && demuxer.reader.fileSize !== null) {
+			// When the file goes well beyond the stream that the Xing/Info header describes (by more than 1/16, like
+			// FFmpeg checks) and more MP3 audio follows that stream, the file holds more than it (like MP3s joined
+			// with `cat`), and the header's frame count only covers its start. Like FFmpeg, which then goes by the
+			// bitrate, don't use it. Tags or other data behind the stream don't count, and a file that ends well
+			// before the stream's end was cut off and keeps the frame count.
+			assert(demuxer.xingFrameHeaderPos !== null);
+			const streamEndPos = demuxer.xingFrameHeaderPos + streamSize;
+			if (
+				demuxer.reader.fileSize - streamEndPos > streamSize / 16
+				&& await mp3AudioFollows(demuxer.reader, streamEndPos)
+			) {
+				frameCount = null;
+			}
+		}
+
+		if (frameCount !== null) {
 			return (
-				demuxer.xingData.frameCount * demuxer.firstFrameHeader.audioSamplesInFrame - demuxer.primingDelay
+				frameCount * demuxer.firstFrameHeader.audioSamplesInFrame - demuxer.primingDelay
 			) / demuxer.firstFrameHeader.sampleRate;
 		} else if (!demuxer.xingData?.isVbr) {
 			// Not tagged as VBR, assuming CBR
@@ -503,3 +741,52 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		return this.getNextPacket(packet, options);
 	}
 }
+
+/** How far behind the end of a stream the next one may start, like after some junk between joined files */
+const MAX_GAP_BETWEEN_JOINED_STREAMS = 4096;
+
+/**
+ * Whether more MP3 audio starts at the given position (or a little behind it), possibly behind the ID3 tags of the next
+ * file: a frame with another one right behind it.
+ */
+const mp3AudioFollows = async (reader: Reader, pos: number) => {
+	assert(reader.fileSize !== null);
+
+	// Skip the ID3v1 tag that ends a joined file, and the ID3v2 tags that start the next one
+	while (pos + ID3_V2_HEADER_SIZE <= reader.fileSize) {
+		let slice = reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return false;
+		}
+
+		if (readAscii(slice, 3) === 'TAG') {
+			pos += ID3_V1_TAG_SIZE;
+			continue;
+		}
+
+		slice.filePos = pos;
+		const id3V2Header = readId3V2Header(slice);
+		if (!id3V2Header) {
+			break;
+		}
+
+		pos += ID3_V2_HEADER_SIZE + id3V2Header.size;
+	}
+
+	const frame = await readNextMp3FrameHeader(
+		reader,
+		pos,
+		Math.min(pos + MAX_GAP_BETWEEN_JOINED_STREAMS, reader.fileSize),
+	);
+	if (!frame) {
+		return false;
+	}
+
+	// A frame header found in tags or other data is very unlikely to be followed by a second one
+	const nextFramePos = frame.startPos + frame.header.totalSize;
+	const nextFrame = await readNextMp3FrameHeader(reader, nextFramePos, nextFramePos + 1);
+	return nextFrame !== null;
+};

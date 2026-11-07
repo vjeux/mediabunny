@@ -18,6 +18,8 @@ import {
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
+	validateCheckedCodecIterable,
+	validateCheckedCodecs,
 	VIDEO_CODECS,
 	VideoCodec,
 } from './codec';
@@ -104,8 +106,8 @@ export type VideoTransformOptions = {
 	 * letterboxing.
 	 * - `'cover'` will scale the image until the entire box is filled, while preserving aspect ratio.
 	 *
-	 * To avoid ambiguity, this field must not be set when `sizeChangeBehavior` is `'fill'`, `'contain'` or
-	 * `'deny'`, since `sizeChangeBehavior` already determines the fitting algorithm.
+	 * Required when both width and height are set, unless `sizeChangeBehavior` is `'fill'`, `'contain'` or `'cover'`,
+	 * which already determines the fitting algorithm; then, this field can be omitted and, if set, must match it.
 	 */
 	fit?: 'fill' | 'contain' | 'cover';
 	/**
@@ -386,6 +388,7 @@ export const buildVideoEncoderConfigs = (options: {
 		options.width,
 		options.height,
 		fallbackBitrateMode,
+		options.framerate,
 	);
 
 	const buildConfig = (
@@ -399,6 +402,7 @@ export const buildVideoEncoderConfigs = (options: {
 			options.height,
 			bitrateEstimate,
 			options.alpha === 'keep',
+			options.framerate,
 		),
 		width: options.width,
 		height: options.height,
@@ -445,7 +449,8 @@ export type AudioEncodingConfig = {
 	/** The audio codec that should be used for encoding the audio samples. */
 	codec: AudioCodec;
 	/**
-	 * The desired quality of the encoded audio. Required for compressed audio codecs, unused for PCM codecs.
+	 * The desired quality of the encoded audio. Required for compressed audio codecs other than FLAC and
+	 * TrueHD; unused for those and for PCM codecs.
 	 */
 	quality?: Quality;
 	/**
@@ -774,6 +779,7 @@ export class Quality {
 		width: number,
 		height: number,
 		fallbackBitrateMode: 'constant' | 'variable' | undefined,
+		frameRate?: number,
 	): VideoRateControl {
 		const quantizerSupport = VIDEO_CODEC_QUANTIZER_SUPPORT[codec];
 
@@ -829,7 +835,7 @@ export class Quality {
 				);
 			}
 
-			bitrate = computeVideoBitrate(codec, width, height, qualityToBitrateFactor(quality));
+			bitrate = computeVideoBitrate(codec, width, height, qualityToBitrateFactor(quality), frameRate);
 		}
 
 		return { quantizer, bitrate, bitrateMode };
@@ -842,7 +848,7 @@ export class Quality {
 		}
 
 		assert(this._quality !== undefined);
-		return computeVideoBitrate(codec, width, height, qualityToBitrateFactor(this._quality));
+		return computeVideoBitrate(codec, width, height, qualityToBitrateFactor(this._quality), undefined);
 	}
 
 	/** @internal */
@@ -933,7 +939,13 @@ const VIDEO_CODEC_QUANTIZER_SUPPORT: Partial<Record<VideoCodec, {
  */
 const qualityToBitrateFactor = (quality: number) => 0.3 * Math.exp(2.5538 * quality);
 
-const computeVideoBitrate = (codec: VideoCodec, width: number, height: number, factor: number) => {
+const computeVideoBitrate = (
+	codec: VideoCodec,
+	width: number,
+	height: number,
+	factor: number,
+	frameRate: number | undefined,
+) => {
 	const pixels = width * height;
 	const referencePixels = 1920 * 1080;
 	const referenceBitrate = 3_000_000;
@@ -950,7 +962,13 @@ const computeVideoBitrate = (codec: VideoCodec, width: number, height: number, f
 	};
 
 	const codecAdjustedBitrate = baseBitrate * codecEfficiencyFactors[codec];
-	const finalBitrate = codecAdjustedBitrate * factor;
+
+	// The reference bitrates are meant for up to 30 fps. Higher frame rates get proportionally more bits, which is
+	// also what they used to get when encoders weren't told the frame rate and assumed 30 fps. ProRes is left out: its
+	// bitrate only picks a profile, whose data rates are given at 30 fps and grow with the frame rate by themselves.
+	const frameRateFactor = frameRate !== undefined && codec !== 'prores' ? Math.max(1, frameRate / 30) : 1;
+
+	const finalBitrate = codecAdjustedBitrate * factor * frameRateFactor;
 
 	return Math.ceil(finalBitrate / 1000) * 1000;
 };
@@ -1068,6 +1086,10 @@ export const canEncodeVideo = async (
 		frameRate?: number;
 	} & VideoEncodingAdditionalOptions = {},
 ) => {
+	if (!options || typeof options !== 'object') {
+		throw new TypeError('options must be an object.');
+	}
+
 	const {
 		width = 1280,
 		height = 720,
@@ -1230,6 +1252,10 @@ export const canEncodeAudio = async (
 		bitrate?: number | Quality;
 	} & AudioEncodingAdditionalOptions = {},
 ) => {
+	if (!options || typeof options !== 'object') {
+		throw new TypeError('options must be an object.');
+	}
+
 	const {
 		numberOfChannels = 2,
 		sampleRate = 48000,
@@ -1289,15 +1315,98 @@ export const canEncodeAudio = async (
 
 		try {
 			const support = await AudioEncoder.isConfigSupported(encoderConfig);
-			return support.supported === true;
+			if (!support.supported) {
+				return false;
+			}
 		} catch {
 			// Can type-error when unknown config features are used
 			return false;
 		}
+
+		if (!isFirefox()) {
+			return true;
+		}
+
+		// Like for video, isConfigSupported on Firefox claims support for audio configs it can't actually encode: Opus
+		// with 3 or 4 channels fails once encoding starts, and Vorbis encodes everything as silence. Therefore, we
+		// encode a tone and check that it decodes back audibly.
+		return encodesAudibly(encoderConfig);
 	})();
 	canEncodeAudioMemo.set(key, promise);
 
 	return promise;
+};
+
+const encodesAudibly = async (config: AudioEncoderConfig) => {
+	const { numberOfChannels, sampleRate } = config;
+	const numberOfFrames = Math.round(sampleRate / 10);
+	const data = new Float32Array(numberOfFrames * numberOfChannels);
+	for (let i = 0; i < numberOfFrames; i++) {
+		const value = 0.5 * Math.sin(2 * Math.PI * 440 * i / sampleRate);
+		data.fill(value, i * numberOfChannels, (i + 1) * numberOfChannels);
+	}
+
+	const chunks: EncodedAudioChunk[] = [];
+	let decoderConfig = null as AudioDecoderConfig | null;
+	let failed = false as boolean;
+	let peak = 0;
+
+	const encoder = new AudioEncoder({
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			decoderConfig ??= meta?.decoderConfig ?? null;
+		},
+		error: () => failed = true,
+	});
+	const decoder = new AudioDecoder({
+		output: (audioData) => {
+			if (audioData.numberOfFrames > 0) {
+				const values = new Float32Array(audioData.numberOfFrames);
+				audioData.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+				for (const value of values) {
+					peak = Math.max(peak, Math.abs(value));
+				}
+			}
+			audioData.close();
+		},
+		error: () => failed = true,
+	});
+
+	try {
+		encoder.configure(config);
+		const audioData = new AudioData({
+			format: 'f32',
+			numberOfChannels,
+			sampleRate,
+			numberOfFrames,
+			timestamp: 0,
+			data,
+		});
+		encoder.encode(audioData);
+		audioData.close();
+		await encoder.flush();
+
+		if (!decoderConfig) {
+			return false;
+		}
+
+		decoder.configure(decoderConfig);
+		for (const chunk of chunks) {
+			decoder.decode(chunk);
+		}
+		await decoder.flush();
+	} catch {
+		return false;
+	} finally {
+		if (encoder.state !== 'closed') {
+			encoder.close();
+		}
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+	}
+
+	return !failed && peak > 0.1;
 };
 
 /**
@@ -1367,6 +1476,8 @@ export const getEncodableVideoCodecs = async (
 		frameRate?: number;
 	},
 ): Promise<VideoCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(codec => canEncodeVideo(codec, options)));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
@@ -1393,6 +1504,8 @@ export const getEncodableAudioCodecs = async (
 		bitrate?: number | Quality;
 	},
 ): Promise<AudioCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(codec => canEncodeAudio(codec, options)));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
@@ -1405,6 +1518,8 @@ export const getEncodableAudioCodecs = async (
 export const getEncodableSubtitleCodecs = async (
 	checkedCodecs: SubtitleCodec[] = SUBTITLE_CODECS as unknown as SubtitleCodec[],
 ): Promise<SubtitleCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(canEncodeSubtitles));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
@@ -1431,8 +1546,10 @@ export const getFirstEncodableVideoCodec = async (
 		bitrate?: number | Quality;
 		/** The expected frame rate in frames per second, if known. */
 		frameRate?: number;
-	},
+	} & VideoEncodingAdditionalOptions,
 ): Promise<VideoCodec | null> => {
+	validateCheckedCodecIterable(checkedCodecs);
+
 	for (const codec of checkedCodecs) {
 		if (await canEncodeVideo(codec, options)) {
 			return codec;
@@ -1464,6 +1581,8 @@ export const getFirstEncodableAudioCodec = async (
 		bitrate?: number | Quality;
 	},
 ): Promise<AudioCodec | null> => {
+	validateCheckedCodecIterable(checkedCodecs);
+
 	for (const codec of checkedCodecs) {
 		if (await canEncodeAudio(codec, options)) {
 			return codec;
@@ -1481,6 +1600,8 @@ export const getFirstEncodableAudioCodec = async (
 export const getFirstEncodableSubtitleCodec = async (
 	checkedCodecs: SubtitleCodec[],
 ): Promise<SubtitleCodec | null> => {
+	validateCheckedCodecIterable(checkedCodecs);
+
 	for (const codec of checkedCodecs) {
 		if (await canEncodeSubtitles(codec)) {
 			return codec;

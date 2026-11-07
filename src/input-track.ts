@@ -12,16 +12,18 @@ import {
 	getAudioPreRollDuration,
 	MediaCodec,
 	PCM_AUDIO_CODECS,
+	toChromiumCompatibleAvcCodecString,
 	VideoCodec,
 } from './codec';
 import { determineAudioPacketType, determineVideoPacketType } from './codec-data';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
 import { Input } from './input';
 import { Logging } from './logging';
-import { EncodedPacketSink, PacketRetrievalOptions } from './media-sink';
+import { EncodedPacketSink, PacketRetrievalOptions, validatePacketRetrievalOptions } from './media-sink';
 import {
 	assert,
 	extractRotationFromMatrix,
+	isChromium,
 	isNumber,
 	isThenable,
 	matrixIsFlipped,
@@ -29,6 +31,7 @@ import {
 	Rational,
 	roundToDivisor,
 	simplifyRational,
+	toUint8Array,
 	TransformationMatrix,
 } from './misc';
 import { TrackType } from './output';
@@ -139,6 +142,11 @@ export interface InputTrackBacking {
 	getLiveRefreshInterval(): Promise<number | null>;
 	getHasOnlyKeyPackets?(): MaybePromise<boolean | null>;
 	getDecoderConfig(): Promise<VideoDecoderConfig | AudioDecoderConfig | null>;
+	/**
+	 * The decoder config a packet needs when it's not the track's, as for HLS segments after a discontinuity with a new
+	 * init section. Returns null for packets that use the track's decoder config.
+	 */
+	getDecoderConfigForPacket?(packet: EncodedPacket): VideoDecoderConfig | AudioDecoderConfig | null;
 	getMetadataCodecParameterString?(): MaybePromise<string | null>;
 
 	getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null>;
@@ -217,7 +225,9 @@ export abstract class InputTrack {
 	 * Returns the identifier of the codec used internally by the container. It is not homogenized by Mediabunny
 	 * and depends entirely on the container format.
 	 *
-	 * This method can be used to determine the codec of a track in case Mediabunny doesn't know that codec.
+	 * This method can be used to determine the codec of a track in case Mediabunny doesn't know that codec. Only
+	 * ISOBMFF and Matroska files surface such tracks: MPEG-TS and Ogg files leave them out, and reading a WAVE file
+	 * with an unsupported codec throws an error.
 	 *
 	 * - For ISOBMFF files, this resolves to the name of the Sample Description Box (e.g. `'avc1'`).
 	 * - For Matroska files, this resolves to the value of the `CodecID` element.
@@ -239,8 +249,9 @@ export abstract class InputTrack {
 	}
 
 	/**
-	 * Returns the ISO 639-2/T language code for this track. If the language is unknown, this resolves to `'und'`
-	 * (undetermined).
+	 * Returns the ISO 639-2 language code for this track, as stored in the file: Matroska uses the bibliographic form
+	 * (e.g. `'ger'`), MP4 usually the terminology form (e.g. `'deu'`). If the language is unknown, this resolves to
+	 * `'und'` (undetermined).
 	 */
 	async getLanguageCode() {
 		return this._backing.getLanguageCode();
@@ -315,16 +326,17 @@ export abstract class InputTrack {
 	}
 
 	/** Returns the track's disposition, i.e. information about its intended usage. */
-	async getDisposition() {
-		return this._backing.getDisposition();
+	async getDisposition(): Promise<TrackDisposition> {
+		// Copied so that callers can't modify the input's own state
+		return { ...await this._backing.getDisposition() };
 	}
 
 	/**
 	 * The track's disposition, i.e. information about its intended usage.
 	 * @deprecated Use {@link InputTrack.getDisposition} instead.
 	 */
-	get disposition() {
-		return requireSync(this._backing.getDisposition(), 'disposition', 'getDisposition');
+	get disposition(): TrackDisposition {
+		return { ...requireSync(this._backing.getDisposition(), 'disposition', 'getDisposition') };
 	}
 
 	/**
@@ -354,13 +366,18 @@ export abstract class InputTrack {
 	}
 
 	/**
-	 * Returns the end timestamp of the last packet of this track, in seconds.
+	 * Returns the end timestamp of the last packet of this track, in seconds, rounded to the track's time resolution
+	 * (see {@link InputTrack.getTimeResolution}).
 	 *
 	 * By default, when the underlying media is live, this method will only resolve once the live stream ends. If you
 	 * want to query the current end timestamp of the stream, set {@link PacketRetrievalOptions.skipLiveWait} to `true`
 	 * in the options.
 	 */
 	async computeDuration(options?: PacketRetrievalOptions) {
+		if (options !== undefined) {
+			validatePacketRetrievalOptions(options);
+		}
+
 		const lastPacket = await this._backing.getPacket(Infinity, { metadataOnly: true, ...options });
 		const result = (lastPacket?.timestamp ?? 0) + (lastPacket?.duration ?? 0);
 
@@ -378,6 +395,8 @@ export abstract class InputTrack {
 	 * {@link DurationMetadataRequestOptions.skipLiveWait} to `true` in the options.
 	 */
 	async getDurationFromMetadata(options: DurationMetadataRequestOptions = {}) {
+		validateDurationMetadataRequestOptions(options);
+
 		return this._backing.getDurationFromMetadata(options);
 	}
 
@@ -394,6 +413,10 @@ export abstract class InputTrack {
 	 * {@link PacketRetrievalOptions.skipLiveWait} to `true` in the options.
 	 */
 	async computePacketStats(targetPacketCount = Infinity, options?: PacketRetrievalOptions): Promise<PacketStats> {
+		if (!isNumber(targetPacketCount) || targetPacketCount < 0) {
+			throw new TypeError('targetPacketCount must be a non-negative number.');
+		}
+
 		const sink = new EncodedPacketSink(this);
 
 		let startTimestamp = Infinity;
@@ -451,14 +474,15 @@ export abstract class InputTrack {
 	 * Returns `true` if this track can be paired with the given track. Two tracks being pairable means they can be
 	 * presented (displayed) together.
 	 *
-	 * Returns `false` if `other` equals `this`.
+	 * Returns `false` if `other` equals `this` or is a track of the same type: tracks of the same type are alternatives
+	 * to each other (another language or camera angle, for example), not meant to be presented together.
 	 */
 	canBePairedWith(other: InputTrack) {
 		if (!(other instanceof InputTrack)) {
 			throw new TypeError('other must be an InputTrack.');
 		}
 
-		if (this.input !== other.input || this === other) {
+		if (this.input !== other.input || this === other || this.type === other.type) {
 			return false;
 		}
 
@@ -470,6 +494,8 @@ export abstract class InputTrack {
 	 * down the results.
 	 */
 	async getPairableTracks(query?: InputTrackQuery<InputTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getTracks(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -480,6 +506,8 @@ export abstract class InputTrack {
 	 * narrow down the results.
 	 */
 	async getPairableVideoTracks(query?: InputTrackQuery<InputVideoTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getVideoTracks(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -490,6 +518,8 @@ export abstract class InputTrack {
 	 * narrow down the results.
 	 */
 	async getPairableAudioTracks(query?: InputTrackQuery<InputAudioTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getAudioTracks(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -497,6 +527,8 @@ export abstract class InputTrack {
 
 	/** Returns the primary track that can be paired with this track, optionally steered by the provided query. */
 	async getPrimaryPairableVideoTrack(query?: InputTrackQuery<InputVideoTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getPrimaryVideoTrack(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -504,6 +536,8 @@ export abstract class InputTrack {
 
 	/** Returns the primary track that can be paired with this track, optionally steered by the provided query. */
 	async getPrimaryPairableAudioTrack(query?: InputTrackQuery<InputAudioTrack>) {
+		query &&= toValidatedInputTrackQuery(query);
+
 		return this.input.getPrimaryAudioTrack(mergeInputTrackQueries({
 			filter: t => t.canBePairedWith(this),
 		}, query));
@@ -544,6 +578,15 @@ export abstract class InputTrack {
 		);
 	}
 }
+
+export const validateDurationMetadataRequestOptions = (options: DurationMetadataRequestOptions) => {
+	if (!options || typeof options !== 'object') {
+		throw new TypeError('options must be an object.');
+	}
+	if (options.skipLiveWait !== undefined && typeof options.skipLiveWait !== 'boolean') {
+		throw new TypeError('options.skipLiveWait, when defined, must be a boolean.');
+	}
+};
 
 const requireSync = <T>(value: MaybePromise<T>, getterName: string, asyncName: string): T => {
 	if (isThenable(value)) {
@@ -587,6 +630,8 @@ export interface InputVideoTrackBacking extends InputTrackBacking {
 	getCodedHeight(): MaybePromise<number>;
 	getSquarePixelWidth(): MaybePromise<number>;
 	getSquarePixelHeight(): MaybePromise<number>;
+	/** The exact pixel aspect ratio, if known; otherwise, it's derived from the (rounded) square pixel size. */
+	getPixelAspectRatio?(): MaybePromise<Rational | null>;
 	getMetadataDisplayWidth?(): MaybePromise<number | null>;
 	getMetadataDisplayHeight?(): MaybePromise<number | null>;
 	getTransformationMatrix(): MaybePromise<TransformationMatrix>;
@@ -730,13 +775,20 @@ export class InputVideoTrack extends InputTrack {
 	 * Returns the pixel aspect ratio of the track's frames as a rational number in its reduced form. Most videos use
 	 * square pixels (1:1).
 	 */
-	async getPixelAspectRatio() {
+	async getPixelAspectRatio(): Promise<Rational> {
 		// Potential minor async race condition here if called twice, but doesn't matter since the computation is
 		// so cheap
-		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
+		const exact = await this._backing.getPixelAspectRatio?.();
+		if (exact) {
+			this._pixelAspectRatioCache ??= toPixelAspectRatio(exact.num, exact.den);
+		}
+
+		this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			(await this.getSquarePixelWidth()) * (await this.getCodedHeight()),
 			(await this.getSquarePixelHeight()) * (await this.getCodedWidth()),
 		);
+
+		return { ...this._pixelAspectRatioCache };
 	}
 
 	/**
@@ -744,13 +796,22 @@ export class InputVideoTrack extends InputTrack {
 	 * square pixels (1:1).
 	 * @deprecated Use {@link InputVideoTrack.getPixelAspectRatio} instead.
 	 */
-	get pixelAspectRatio() {
-		return this._pixelAspectRatioCache ??= toPixelAspectRatio(
+	get pixelAspectRatio(): Rational {
+		const exact = this._backing.getPixelAspectRatio
+			? requireSync(this._backing.getPixelAspectRatio(), 'pixelAspectRatio', 'getPixelAspectRatio')
+			: null;
+		if (exact) {
+			this._pixelAspectRatioCache ??= toPixelAspectRatio(exact.num, exact.den);
+		}
+
+		this._pixelAspectRatioCache ??= toPixelAspectRatio(
 			requireSync(this._backing.getSquarePixelWidth(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedHeight(), 'pixelAspectRatio', 'getPixelAspectRatio'),
 			requireSync(this._backing.getSquarePixelHeight(), 'pixelAspectRatio', 'getPixelAspectRatio')
 			* requireSync(this._backing.getCodedWidth(), 'pixelAspectRatio', 'getPixelAspectRatio'),
 		);
+
+		return { ...this._pixelAspectRatioCache };
 	}
 
 	/** Returns the display width of the track's frames in pixels, after aspect ratio adjustment and rotation. */
@@ -843,8 +904,23 @@ export class InputVideoTrack extends InputTrack {
 	 * track's packets using a [`VideoDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder). Returns
 	 * null if the track's codec is unknown.
 	 */
-	async getDecoderConfig() {
-		return this._backing.getDecoderConfig();
+	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
+		// Copied, description bytes included, so that changes made by the caller (e.g. before configuring their own
+		// decoder) don't leak into the input's own state
+		const config = await this._backing.getDecoderConfig();
+		if (!config) {
+			return null;
+		}
+
+		const copy = { ...config };
+		if (config.description) {
+			copy.description = toUint8Array(config.description).slice();
+		}
+		if (config.colorSpace) {
+			copy.colorSpace = { ...config.colorSpace };
+		}
+
+		return copy;
 	}
 
 	async getCodecParameterString() {
@@ -875,7 +951,11 @@ export class InputVideoTrack extends InputTrack {
 				return false;
 			}
 
-			const support = await VideoDecoder.isConfigSupported(decoderConfig);
+			const support = await VideoDecoder.isConfigSupported(
+				codec === 'avc' && isChromium()
+					? { ...decoderConfig, codec: toChromiumCompatibleAvcCodecString(decoderConfig.codec) }
+					: decoderConfig,
+			);
 			return support.supported === true;
 		} catch (error) {
 			Logging._error('Error during decodability check:', error);
@@ -1064,6 +1144,8 @@ export interface InputAudioTrackBacking extends InputTrackBacking {
 	getNumberOfChannels(): MaybePromise<number>;
 	getSampleRate(): MaybePromise<number>;
 	getDecoderConfig(): Promise<AudioDecoderConfig | null>;
+	/** The pre-roll duration the container declares for the track, in seconds, if it declares one. */
+	getContainerPreRollDuration?(): MaybePromise<number | null>;
 }
 
 /**
@@ -1135,8 +1217,19 @@ export class InputAudioTrack extends InputTrack {
 	 * track's packets using an [`AudioDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/AudioDecoder). Returns
 	 * null if the track's codec is unknown.
 	 */
-	async getDecoderConfig() {
-		return this._backing.getDecoderConfig();
+	async getDecoderConfig(): Promise<AudioDecoderConfig | null> {
+		// Copied, description bytes included, so that changes made by the caller don't leak into the input's own state
+		const config = await this._backing.getDecoderConfig();
+		if (!config) {
+			return null;
+		}
+
+		const copy = { ...config };
+		if (config.description) {
+			copy.description = toUint8Array(config.description).slice();
+		}
+
+		return copy;
 	}
 
 	async getCodecParameterString() {
@@ -1162,7 +1255,11 @@ export class InputAudioTrack extends InputTrack {
 
 		const decoderConfig = await this._backing.getDecoderConfig();
 		assert(decoderConfig);
-		return getAudioPreRollDuration(codec, decoderConfig);
+		const codecPreRollDuration = getAudioPreRollDuration(codec, decoderConfig);
+
+		// The container may declare that more is needed
+		const containerPreRollDuration = await this._backing.getContainerPreRollDuration?.() ?? 0;
+		return Math.max(codecPreRollDuration, containerPreRollDuration);
 	}
 
 	async canDecode() {
@@ -1430,6 +1527,34 @@ export const queryInputTracks = async <T extends InputTrack>(
 };
 
 /**
+ * Timestamps copied from a container that stores whole milliseconds (Matroska/WebM, which all MediaRecorder recordings
+ * use, or FLV) into one with a finer time resolution (MP4, MPEG-TS) keep their rounding to milliseconds. If all
+ * timestamps lie on that grid, returns them in whole milliseconds, relative to the first one; otherwise null.
+ */
+const toMillisecondGrid = (ticks: Float64Array, resolution: number) => {
+	const ticksPerMillisecond = resolution / 1000;
+	if (ticksPerMillisecond < 10 || ticks.length < 10) {
+		// Timestamps could lie on a coarse grid by chance, and a few of them could even on a fine one
+		return null;
+	}
+
+	const milliseconds = new Float64Array(ticks.length);
+	for (let i = 0; i < ticks.length; i++) {
+		// Relative to the first timestamp, so that a constant offset doesn't matter. Both were rounded to a tick, so
+		// the offset can be up to a tick off the grid.
+		const offset = (ticks[i]! - ticks[0]!) / ticksPerMillisecond;
+		const rounded = Math.round(offset);
+		if (Math.abs(offset - rounded) * ticksPerMillisecond > 1 + 1e-9 || (i > 0 && rounded === milliseconds[i - 1])) {
+			return null;
+		}
+
+		milliseconds[i] = rounded;
+	}
+
+	return milliseconds;
+};
+
+/**
  * Estimates the underlying CFR-like frame rate from timestamp deltas.
  *
  * Each delta is modeled as an integer multiple of one frame period, allowing dropped frames and a small number of
@@ -1466,6 +1591,13 @@ export const findUnderlyingFrameRate = (
 
 	if (ticks.length < 2) {
 		return null;
+	}
+
+	// Millisecond-rounded timestamps look like jitter in a finer time resolution. Estimating from the milliseconds
+	// gives the same frames the same frame rate as in their original container.
+	const milliseconds = toMillisecondGrid(ticks, resolution);
+	if (milliseconds) {
+		return findUnderlyingFrameRate(milliseconds, 1000);
 	}
 
 	const gaps = new Float64Array(ticks.length - 1);

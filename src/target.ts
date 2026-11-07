@@ -8,7 +8,7 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import * as nodeAlias from './node';
-import { assert, EventEmitter, FilePath, isWebKit, MaybePromise } from './misc';
+import { assert, EventEmitter, FilePath, isWebKit, MAX_FILE_IO_SIZE, MaybePromise } from './misc';
 
 const node = typeof nodeAlias !== 'undefined'
 	? nodeAlias // Aliasing it prevents some bundler warnings
@@ -42,6 +42,12 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 
 	/** @internal */
 	_monotonicity: boolean | null = null; // null = unknown
+	/**
+	 * How the slices of this target created with {@link Target.slice} use it: how many have started it and not yet
+	 * finished, and whether the last of them finalized or closed it.
+	 * @internal
+	 */
+	_sliceUsage = { users: 0, ended: false };
 
 	/** @internal */
 	abstract _start(): void;
@@ -83,14 +89,16 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 	/**
 	 * Returns a new {@link RangedTarget} that writes data to this target using the given offset.
 	 *
-	 * Useful for writing a file into a section of a larger file.
+	 * Useful for writing a file into a section of a larger file. The slice manages this target: it starts this target
+	 * when its output starts, and finalizes it (or closes it, on cancelation) once every slice of this target in use
+	 * is done. So don't use this target in an output directly.
 	 */
 	slice(offset: number) {
 		if (!Number.isInteger(offset) || offset < 0) {
 			throw new TypeError('offset must be a non-negative integer.');
 		}
 
-		return new RangedTarget(this, offset);
+		return new RangedTarget(this, offset, true);
 	}
 }
 
@@ -277,6 +285,27 @@ export type StreamTargetOptions = {
 
 const DEFAULT_CHUNK_SIZE = 2 ** 24;
 const MAX_CHUNKS_AT_ONCE = 2;
+/**
+ * When canceling, how long a {@link StreamTarget} keeps waiting for its stream to close while writes are pending and
+ * none of them completes; past that, it takes the sink as stalled and leaves the stream to close in the background.
+ */
+const STALLED_SINK_TIMEOUT_MS = 5000;
+
+/** Resolves with whether the promise fulfills within the given time, and rejects if it rejects within it. */
+const fulfillsWithin = async (promise: Promise<unknown>, ms: number) => {
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+	try {
+		return await Promise.race([
+			promise.then(() => true),
+			new Promise<false>((resolve) => {
+				timeoutId = setTimeout(() => resolve(false), ms);
+			}),
+		]);
+	} finally {
+		clearTimeout(timeoutId);
+	}
+};
 
 type Chunk = {
 	start: number;
@@ -319,6 +348,10 @@ export class StreamTarget extends Target {
 	_streamWriter: WritableStreamDefaultWriter<StreamTargetChunk> | null = null;
 	/** @internal */
 	_writeError: unknown = null;
+	/** @internal */
+	_pendingWrites = 0;
+	/** @internal */
+	_completedWrites = 0;
 
 	// These variables regard chunked mode:
 	/** @internal */
@@ -342,7 +375,7 @@ export class StreamTarget extends Target {
 		if (!(writable instanceof WritableStream)) {
 			throw new TypeError('StreamTarget requires a WritableStream instance.');
 		}
-		if (options != null && typeof options !== 'object') {
+		if (!options || typeof options !== 'object') {
 			throw new TypeError('StreamTarget options, when provided, must be an object.');
 		}
 		if (options.chunked !== undefined && typeof options.chunked !== 'boolean') {
@@ -445,13 +478,7 @@ export class StreamTarget extends Target {
 					throw new Error('Internal error: Monotonicity violation.');
 				}
 
-				void this._streamWriter.write({
-					type: 'write',
-					data: chunk.data,
-					position: chunk.start,
-				}).catch((error) => {
-					this._writeError ??= error;
-				});
+				this._writeToStream(chunk.data, chunk.start);
 
 				this._lastFlushEnd = chunk.start + chunk.data.byteLength;
 			}
@@ -461,7 +488,36 @@ export class StreamTarget extends Target {
 	}
 
 	/** @internal */
+	_writeToStream(data: Uint8Array<ArrayBuffer>, position: number) {
+		assert(this._streamWriter);
+
+		this._pendingWrites++;
+		void this._streamWriter.write({ type: 'write', data, position })
+			.then(() => {
+				this._completedWrites++;
+			}, (error) => {
+				this._writeError ??= error;
+			})
+			.finally(() => {
+				this._pendingWrites--;
+			});
+	}
+
+	/** @internal */
 	_writeDataIntoChunks(data: Uint8Array, position: number) {
+		// Chunk by chunk in a loop: recursing once per chunk would overflow the stack for data spanning many chunks (a
+		// big write with a small chunk size)
+		let offset = 0;
+		do {
+			offset += this._writeDataIntoChunk(data.subarray(offset), position + offset);
+		} while (offset < data.byteLength);
+	}
+
+	/**
+	 * Writes the start of the data into its chunk and returns how many bytes were written.
+	 * @internal
+	 */
+	_writeDataIntoChunk(data: Uint8Array, position: number) {
 		// First, find the chunk to write the data into, or create one if none exists
 		let chunkIndex = this._chunks.findIndex(x => x.start <= position && position < x.start + this._chunkSize);
 		if (chunkIndex === -1) chunkIndex = this._createChunk(position);
@@ -493,10 +549,7 @@ export class StreamTarget extends Target {
 			this._tryToFlushChunks();
 		}
 
-		// If the data didn't fit in one chunk, recurse with the remaining data
-		if (toWrite.byteLength < data.byteLength) {
-			this._writeDataIntoChunks(data.subarray(toWrite.byteLength), position + toWrite.byteLength);
-		}
+		return toWrite.byteLength;
 	}
 
 	/** @internal */
@@ -567,13 +620,7 @@ export class StreamTarget extends Target {
 					data = chunk.data.subarray(section.start, section.end);
 				}
 
-				void this._streamWriter.write({
-					type: 'write',
-					data,
-					position,
-				}).catch((error) => {
-					this._writeError ??= error;
-				});
+				this._writeToStream(data, position);
 
 				this._lastFlushEnd = chunk.start + section.end;
 			}
@@ -602,7 +649,26 @@ export class StreamTarget extends Target {
 
 	/** @internal */
 	async _close() {
-		return this._streamWriter?.close();
+		if (!this._streamWriter) {
+			return;
+		}
+
+		const closed = this._streamWriter.close();
+
+		// Closing only completes once every queued write has. Wait for that while the sink keeps completing writes,
+		// but not once it has stalled on one (an upload over a hung connection, say), or canceling would hang forever;
+		// the stream then gets closed in the background, should the sink ever catch up. Failed writes don't count as
+		// progress (any write made after closing began fails).
+		let completedWrites = -1;
+		while (this._completedWrites !== completedWrites || this._pendingWrites === 0) {
+			completedWrites = this._completedWrites;
+
+			if (await fulfillsWithin(closed, STALLED_SINK_TIMEOUT_MS)) {
+				return;
+			}
+		}
+
+		void closed.catch(() => {});
 	}
 }
 
@@ -628,6 +694,11 @@ export class AppendOnlyStreamTarget extends Target {
 	_nextWritePos = 0;
 
 	constructor(writable: WritableStream<Uint8Array>) {
+		// Duck-typed, since only getWriter() is used: a stream from another realm (an iframe) or a polyfill works too
+		if (!writable || typeof (writable as Partial<WritableStream>).getWriter !== 'function') {
+			throw new TypeError('AppendOnlyStreamTarget requires a WritableStream.');
+		}
+
 		super();
 
 		this._writable = writable;
@@ -728,12 +799,27 @@ export class FilePathTarget extends Target {
 
 		// Let's back this target with a StreamTarget, makes the implementation very simple
 		const writable = new WritableStream<StreamTargetChunk>({
-			start: async () => {
-				this._fileHandle = await node.fs.open(filePath, 'w');
-			},
 			write: async (chunk) => {
-				assert(this._fileHandle);
-				await this._fileHandle.write(chunk.data, 0, chunk.data.byteLength, chunk.position);
+				// Opened by the first write rather than in start(), which runs right away: constructing the target
+				// (even with options that are then rejected) must not truncate the file or leave a handle open
+				this._fileHandle ??= await node.fs.open(filePath, 'w');
+
+				// Node rejects writes of 2 GiB or more, and a write may write fewer bytes than asked for (Linux writes
+				// at most 0x7ffff000), so write in pieces until everything is written
+				let bytesWritten = 0;
+				while (bytesWritten < chunk.data.byteLength) {
+					const result = await this._fileHandle.write(
+						chunk.data,
+						bytesWritten,
+						Math.min(chunk.data.byteLength - bytesWritten, MAX_FILE_IO_SIZE),
+						chunk.position + bytesWritten,
+					);
+					if (result.bytesWritten === 0) {
+						throw new Error(`Couldn't write to ${filePath}.`);
+					}
+
+					bytesWritten += result.bytesWritten;
+				}
 			},
 			close: async () => {
 				if (this._fileHandle) {
@@ -822,17 +908,42 @@ export class RangedTarget extends Target {
 	_baseTarget: Target;
 	/** @internal */
 	_offset: number;
+	/**
+	 * Whether this slice starts and ends its base target. Slices made by {@link Target.slice} do; the HLS muxer
+	 * manages the targets it slices itself.
+	 * @internal
+	 */
+	_managesBase: boolean;
+	/** @internal */
+	_usingBase = false;
 
 	/** @internal */
-	constructor(baseTarget: Target, offset: number) {
+	constructor(baseTarget: Target, offset: number, managesBase: boolean) {
 		super();
 
 		this._baseTarget = baseTarget;
 		this._offset = offset;
+		this._managesBase = managesBase;
 	}
 
 	/** @internal */
-	_start() {}
+	_start() {
+		if (!this._managesBase) {
+			return;
+		}
+
+		const usage = this._baseTarget._sliceUsage;
+		if (usage.ended) {
+			throw new Error('Cannot use a slice of a target that has already been finalized or closed.');
+		}
+
+		if (usage.users === 0) {
+			this._baseTarget._start();
+		}
+
+		usage.users++;
+		this._usingBase = true;
+	}
 
 	/** @internal */
 	_write(data: Uint8Array, pos: number): void {
@@ -847,11 +958,47 @@ export class RangedTarget extends Target {
 
 	/** @internal */
 	async _finalize() {
+		if (this._stopUsingBase()) {
+			try {
+				await this._baseTarget._flush();
+				await this._baseTarget._finalize();
+			} catch (error) {
+				// Like Output does for a target that failed to finalize
+				await this._baseTarget._close().catch(() => {});
+				throw error;
+			}
+		}
+
 		this._emit('finalized');
 	}
 
 	/** @internal */
-	async _close() {}
+	async _close() {
+		if (this._stopUsingBase()) {
+			await this._baseTarget._close();
+		}
+	}
+
+	/**
+	 * Gives up this slice's use of the base target. Returns true if it was the last slice using it, which then has to
+	 * end the base target.
+	 * @internal
+	 */
+	_stopUsingBase() {
+		if (!this._usingBase) {
+			return false;
+		}
+
+		this._usingBase = false;
+		const usage = this._baseTarget._sliceUsage;
+		usage.users--;
+		if (usage.users > 0) {
+			return false;
+		}
+
+		usage.ended = true; // Set right away, so that no slice can start while the base target is being ended
+		return true;
+	}
 
 	/** @internal */
 	override _setMonotonicity(monotonicity: boolean): void {

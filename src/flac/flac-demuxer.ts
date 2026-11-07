@@ -15,6 +15,7 @@ import {
 	assert,
 	AsyncMutex,
 	binarySearchLessOrEqual,
+	bytesToBase64,
 	isThenable,
 	textDecoder,
 	UNDETERMINED_LANGUAGE,
@@ -31,6 +32,7 @@ import {
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
 import {
 	calculateCrc8,
+	calculateCrc16,
 	readBlockSize,
 	getBlockSizeOrUncommon,
 	readCodedNumber,
@@ -74,13 +76,20 @@ export class FlacDemuxer extends Demuxer {
 	metadataPromise: Promise<void> | null = null;
 	trackBacking: FlacAudioTrackBacking | null = null;
 	metadataTags: MetadataTags = {};
+	/** Rethrown by getMetadataTags(), so that a broken tag can't make the audio unreadable */
+	id3Error: Error | null = null;
 
 	audioInfo: FlacAudioInfo | null = null;
 	lastLoadedPos: number | null = null;
 	blockingBit: number | null = null;
+	/** Positions and sizes of the picture blocks, which are only read for the metadata tags */
+	pictureBlocks: { pos: number; size: number }[] = [];
+	picturesPromise: Promise<void> | null = null;
 
 	readingMutex = new AsyncMutex();
 	lastSampleLoaded = false;
+	/** Keys of the raw metadata tags read from the ID3v2 tags in front of the stream */
+	id3RawMetadataTagKeys = new Set<string>();
 
 	constructor(input: Input) {
 		super(input);
@@ -89,7 +98,13 @@ export class FlacDemuxer extends Demuxer {
 	}
 
 	override async getMetadataTags(): Promise<MetadataTags> {
+		await this.readPictures();
 		await this.readMetadata();
+
+		if (this.id3Error) {
+			throw this.id3Error;
+		}
+
 		return this.metadataTags;
 	}
 
@@ -101,6 +116,11 @@ export class FlacDemuxer extends Demuxer {
 
 	async getMimeType() {
 		return 'audio/flac';
+	}
+
+	override async getId3RawMetadataTagKeys() {
+		await this.readMetadata();
+		return this.id3RawMetadataTagKeys;
 	}
 
 	async readMetadata() {
@@ -124,12 +144,29 @@ export class FlacDemuxer extends Demuxer {
 				if (isThenable(contentSlice)) contentSlice = await contentSlice;
 				assert(contentSlice);
 
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				try {
+					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				} catch (error) {
+					this.id3Error ??= error as Error;
+				}
 
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
+			this.id3RawMetadataTagKeys = new Set(Object.keys(this.metadataTags.raw ?? {}));
 
 			currentPos += 4; // Skip 'fLaC'
+
+			// The Vorbis comment block is FLAC's own tag container (RFC 9639, section 8.6), so its fields take
+			// precedence over those of ID3v2 tags in front of the stream, as in FFmpeg. So, let's set the fields read
+			// from those aside while reading the metadata blocks, and keep them only where the Vorbis comments don't
+			// set them. The raw tags and images of both are kept.
+			const tagKeyOrder = Object.keys(this.metadataTags);
+			const id3Fields: MetadataTags = { ...this.metadataTags };
+			delete id3Fields.raw;
+			delete id3Fields.images;
+			for (const key of Object.keys(id3Fields) as (keyof MetadataTags)[]) {
+				delete this.metadataTags[key];
+			}
 
 			while (
 				this.reader.fileSize === null
@@ -242,51 +279,23 @@ export class FlacDemuxer extends Demuxer {
 						break;
 					}
 					case FlacBlockType.PICTURE: {
-						// Parse picture block
-						// https://www.rfc-editor.org/rfc/rfc9639.html#name-picture
-						let pictureBlock = this.reader.requestSlice(
-							currentPos,
-							size,
-						);
-						if (isThenable(pictureBlock)) pictureBlock = await pictureBlock;
+						if (this.reader.fileSize === null) {
+							// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep
+							// what's behind, so their pictures are read right away
+							await this.readPictureBlock(currentPos, size);
+							break;
+						}
 
-						if (!pictureBlock) {
+						// Pictures can be large and only the metadata tags need them, so they're read later (see
+						// readPictures), not to get the track
+						if (currentPos + size > this.reader.fileSize) {
 							throw new Error(
 								`Picture block at position ${currentPos} exceeds the file. Corrupted file.`,
 							);
 						}
 
-						try {
-							const pictureType = readU32Be(pictureBlock);
-							const mediaTypeLength = readU32Be(pictureBlock);
-							const mediaType = textDecoder.decode(
-								readBytes(pictureBlock, mediaTypeLength),
-							);
-							const descriptionLength = readU32Be(pictureBlock);
-							const description = textDecoder.decode(
-								readBytes(pictureBlock, descriptionLength),
-							);
-							// Skip width, height, color depth, number of indexed colors
-							pictureBlock.skip(4 + 4 + 4 + 4);
-							const dataLength = readU32Be(pictureBlock);
-							const data = readBytes(pictureBlock, dataLength);
-
-							this.metadataTags.images ??= [];
-							this.metadataTags.images.push({
-								data,
-								mimeType: mediaType,
-								// https://www.rfc-editor.org/rfc/rfc9639.html#table13
-								kind:
-									pictureType === 3
-										? 'coverFront'
-										: pictureType === 4
-											? 'coverBack'
-											: 'unknown',
-								description,
-							});
-						} catch {
-							// The lengths inside the block are off, so it's a malformed picture; let's just skip it
-						}
+						this.pictureBlocks.push({ pos: currentPos, size });
+						this.metadataTags.images ??= []; // Keeps the place of the images among the tags
 						break;
 					}
 					default:
@@ -299,6 +308,15 @@ export class FlacDemuxer extends Demuxer {
 				}
 			}
 
+			// Put the fields back where they were
+			const tags: Record<string, unknown> = { ...id3Fields, ...this.metadataTags };
+			for (const key of new Set([...tagKeyOrder, ...Object.keys(tags)])) {
+				delete (this.metadataTags as Record<string, unknown>)[key];
+				if (key in tags) {
+					(this.metadataTags as Record<string, unknown>)[key] = tags[key];
+				}
+			}
+
 			// Even if no block was flagged as the last one, the audio frames come after the metadata
 			this.lastLoadedPos = currentPos;
 
@@ -306,6 +324,85 @@ export class FlacDemuxer extends Demuxer {
 				throw new Error('Missing STREAMINFO metadata block! Corrupted FLAC file.');
 			}
 		})());
+	}
+
+	/** Reads the metadata and then the picture blocks found in it. */
+	async readPictures() {
+		await this.readMetadata();
+
+		return (this.picturesPromise ??= (async () => {
+			for (const { pos, size } of this.pictureBlocks) {
+				await this.readPictureBlock(pos, size);
+			}
+
+			if (this.metadataTags.images?.length === 0) {
+				delete this.metadataTags.images; // The pictures were all malformed
+			}
+		})());
+	}
+
+	async readPictureBlock(currentPos: number, size: number) {
+		// Parse picture block
+		// https://www.rfc-editor.org/rfc/rfc9639.html#name-picture
+		let pictureBlock = this.reader.requestSlice(
+			currentPos,
+			size,
+		);
+		if (isThenable(pictureBlock)) {
+			pictureBlock = await pictureBlock;
+		}
+
+		if (!pictureBlock) {
+			throw new Error(
+				`Picture block at position ${currentPos} exceeds the file. Corrupted file.`,
+			);
+		}
+
+		try {
+			const pictureType = readU32Be(pictureBlock);
+			const mediaTypeLength = readU32Be(pictureBlock);
+			const mediaType = textDecoder.decode(
+				readBytes(pictureBlock, mediaTypeLength),
+			);
+			const descriptionLength = readU32Be(pictureBlock);
+			const description = textDecoder.decode(
+				readBytes(pictureBlock, descriptionLength),
+			);
+			// Skip width, height, color depth, number of indexed colors
+			pictureBlock.skip(4 + 4 + 4 + 4);
+			const dataLength = readU32Be(pictureBlock);
+			const data = readBytes(pictureBlock, dataLength);
+
+			if (mediaType === '-->') {
+				// The data is a link to the picture (RFC 9639, section 8.8), not the picture. It's kept
+				// among the raw tags instead, as the METADATA_BLOCK_PICTURE comment of the same
+				// content that holds pictures in Ogg, which the muxers write back.
+				pictureBlock.filePos = currentPos;
+				const link = bytesToBase64(readBytes(pictureBlock, size));
+				const raw = this.metadataTags.raw ??= {};
+				const existing = raw['METADATA_BLOCK_PICTURE'];
+				raw['METADATA_BLOCK_PICTURE'] = typeof existing === 'string'
+					? [existing, link]
+					: Array.isArray(existing) ? [...existing as string[], link] : link;
+				return;
+			}
+
+			this.metadataTags.images ??= [];
+			this.metadataTags.images.push({
+				data,
+				mimeType: mediaType,
+				// https://www.rfc-editor.org/rfc/rfc9639.html#table13
+				kind:
+					pictureType === 3
+						? 'coverFront'
+						: pictureType === 4
+							? 'coverBack'
+							: 'unknown',
+				description,
+			});
+		} catch {
+			// The lengths inside the block are off, so it's a malformed picture; let's just skip it
+		}
 	}
 
 	async readNextFlacFrame(startPos: number): Promise<NextFlacFrameResult | null> {
@@ -353,7 +450,7 @@ export class FlacDemuxer extends Demuxer {
 		const maximumSliceLength
 			= effectiveMaxFrameSize + maximumHeaderLength;
 
-		const slice = await this.reader.requestSliceRange(
+		let slice = await this.reader.requestSliceRange(
 			startPos,
 			minimumHeaderLength,
 			maximumSliceLength,
@@ -377,14 +474,44 @@ export class FlacDemuxer extends Demuxer {
 		// we can skip over anything before that
 		slice.filePos = startPos + effectiveMinFrameSize;
 
+		// The frame sizes in STREAMINFO are only hints, though: frames of concatenated streams, or of files with a
+		// wrong STREAMINFO, can fall outside of them. If no frame follows within them, we search again, from the
+		// smallest frame up to the largest one the stream's block size and channel count allow.
+		let searchedAllSizes = effectiveMinFrameSize <= minimumFrameLength
+			&& effectiveMaxFrameSize >= maximumFrameLength;
+		// Where the packet ends if no frame follows it
+		let endIfNoFrameFollows: number | null = null;
+
 		while (true) {
-			// Reached end of the file, packet is over
 			if (slice.filePos > slice.end - minimumHeaderLength) {
+				if (!searchedAllSizes) {
+					searchedAllSizes = true;
+
+					const widerSliceLength = Math.max(effectiveMaxFrameSize, maximumFrameLength) + maximumHeaderLength;
+					const widerSlice = await this.reader.requestSliceRange(
+						startPos,
+						minimumHeaderLength,
+						widerSliceLength,
+					);
+					assert(widerSlice);
+
+					// If the wider slice reaches the end of the file, the frame may run up to there. Otherwise, it's
+					// followed by something that isn't a frame (such as a trailing tag), so let's not include more of
+					// that than the STREAMINFO maximum allows.
+					const reachesEndOfFile = widerSlice.end - startPos < widerSliceLength;
+					endIfNoFrameFollows = reachesEndOfFile ? widerSlice.end : slice.end;
+
+					slice = widerSlice;
+					slice.filePos = startPos + minimumFrameLength;
+					continue;
+				}
+
+				// No frame follows, so the packet is over
 				return {
 					num: frameHeader.num,
 					blockSize: frameHeader.blockSize,
 					sampleRate: frameHeader.sampleRate,
-					size: slice.end - startPos,
+					size: (endIfNoFrameFollows ?? slice.end) - startPos,
 					isLastFrame: true,
 				};
 			}
@@ -411,12 +538,37 @@ export class FlacDemuxer extends Demuxer {
 					continue;
 				}
 
+				// Where FLAC streams were joined (e.g. by FFmpeg's concat demuxer), the numbering starts over. Accept
+				// such a boundary if the frame before it ends with a valid CRC-16, which a sync code that's part of
+				// the frame data practically never produces.
+				if (nextFrameHeader.num <= frameHeader.num) {
+					slice.filePos = startPos;
+					const frameBytes = readBytes(slice, lengthIfNextFlacFrameHeaderIsLegit);
+
+					if (calculateCrc16(frameBytes) === 0) {
+						return {
+							num: frameHeader.num,
+							blockSize: frameHeader.blockSize,
+							sampleRate: frameHeader.sampleRate,
+							size: lengthIfNextFlacFrameHeaderIsLegit,
+							isLastFrame: false,
+						};
+					}
+
+					slice.filePos = positionBeforeReading;
+					continue;
+				}
+
 				// Ensure the frameOrSampleNum is consecutive.
 				// https://github.com/Vanilagy/mediabunny/issues/194
 
 				if (this.blockingBit === 0) {
-					// Case A: If the stream is fixed block size, this is the frame number, which increments by 1
-					if (nextFrameHeader.num - frameHeader.num !== 1) {
+					// Case A: If the stream is fixed block size, this is the frame number, which increments by 1.
+					// Encoders predating FLAC 1.2 (such as Flake) wrote variable block size streams without setting
+					// the blocking strategy bit, with sample numbers in place of frame numbers (RFC 9639, Appendix
+					// B.1), so let's accept those too, like FFmpeg does.
+					const difference = nextFrameHeader.num - frameHeader.num;
+					if (difference !== 1 && difference !== frameHeader.blockSize) {
 						slice.filePos = positionBeforeReading;
 						continue;
 					}
@@ -807,14 +959,20 @@ class FlacAudioTrackBacking implements InputAudioTrackBacking {
 	async getFirstPacket(
 		options: PacketRetrievalOptions,
 	): Promise<EncodedPacket | null> {
-		// Ensure the next sample exists
-		while (
-			this.demuxer.loadedSamples.length === 0
-			&& !this.demuxer.lastSampleLoaded
-		) {
-			await this.demuxer.advanceReader();
-		}
+		const release = await this.demuxer.readingMutex.acquire();
 
-		return this.getPacketAtIndex(0, options);
+		try {
+			// Ensure the next sample exists
+			while (
+				this.demuxer.loadedSamples.length === 0
+				&& !this.demuxer.lastSampleLoaded
+			) {
+				await this.demuxer.advanceReader();
+			}
+
+			return this.getPacketAtIndex(0, options);
+		} finally {
+			release();
+		}
 	}
 }

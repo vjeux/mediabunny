@@ -102,15 +102,21 @@ export enum EBMLId {
 	CodecDelay = 0x56aa,
 	SeekPreRoll = 0x56bb,
 	DefaultDuration = 0x23e383,
+	TrackTimestampScale = 0x23314f,
 	Video = 0xe0,
 	PixelWidth = 0xb0,
 	PixelHeight = 0xba,
+	PixelCropBottom = 0x54aa,
+	PixelCropTop = 0x54bb,
+	PixelCropLeft = 0x54cc,
+	PixelCropRight = 0x54dd,
 	DisplayWidth = 0x54b0,
 	DisplayHeight = 0x54ba,
 	DisplayUnit = 0x54b2,
 	AlphaMode = 0x53c0,
 	Audio = 0xe1,
 	SamplingFrequency = 0xb5,
+	OutputSamplingFrequency = 0x78b5,
 	Channels = 0x9f,
 	BitDepth = 0x6264,
 	SimpleBlock = 0xa3,
@@ -131,6 +137,7 @@ export enum EBMLId {
 	CueTrack = 0xf7,
 	CueClusterPosition = 0xf1,
 	CueRelativePosition = 0xf0,
+	CueDuration = 0xb2,
 	Colour = 0x55b0,
 	MatrixCoefficients = 0x55b1,
 	TransferCharacteristics = 0x55ba,
@@ -161,6 +168,8 @@ export enum EBMLId {
 	SimpleTag = 0x67c8,
 	TagName = 0x45a3,
 	TagLanguage = 0x447a,
+	TagLanguageBCP47 = 0x447b,
+	TagDefault = 0x4484,
 	TagString = 0x4487,
 	TagBinary = 0x4485,
 	ContentEncodings = 0x6d80,
@@ -432,6 +441,16 @@ export class EBMLWriter {
 
 				if (data.size !== -1) {
 					const size = this.writer.getPos() - startPos;
+
+					if (size >= 2 ** (7 * sizeSize) - 1) {
+						// The content outgrew the reserved size field (which would silently wrap around), so write the
+						// element again with a size field wide enough for it
+						this.writer.seek(this.offsets.get(data)!);
+						data.size = measureVarInt(size);
+						this.writeEBML(data);
+						return;
+					}
+
 					const endPos = this.writer.getPos();
 					this.writer.seek(sizePos);
 					this.writeVarInt(size, sizeSize);
@@ -715,7 +734,12 @@ export const searchForNextElementId = async (
 			return { pos: currentPos, found: true };
 		}
 
-		assertDefinedSize(elementHeader.size);
+		if (elementHeader.size === undefined) {
+			// Only master elements can have an unknown size (livestreamed files, such as WebM written by browsers, also
+			// use it for Cues and their children), and their children follow directly, so keep searching inside it
+			currentPos = slice.filePos;
+			continue;
+		}
 
 		currentPos = slice.filePos + elementHeader.size;
 	}

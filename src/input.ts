@@ -8,6 +8,7 @@
 
 import { Demuxer, DurationMetadataRequestOptions } from './demuxer';
 import { InputFormat, InputFormatOptions, validateInputFormatOptions } from './input-format';
+import { cloneMetadataTags } from './metadata';
 import {
 	InputAudioTrack,
 	InputAudioTrackBacking,
@@ -21,8 +22,9 @@ import {
 	toValidatedInputTrackQuery,
 	prefer,
 	desc,
+	validateDurationMetadataRequestOptions,
 } from './input-track';
-import { PacketRetrievalOptions } from './media-sink';
+import { PacketRetrievalOptions, validatePacketRetrievalOptions } from './media-sink';
 import {
 	arrayArgmin,
 	arrayCount,
@@ -53,7 +55,10 @@ export const ENCRYPTION_KEY_CACHE_GROUP = 2;
 export type InputOptions<S extends Source = Source> = {
 	/** A list of supported formats. If the source file is not of one of these formats, then it cannot be read. */
 	formats: InputFormat[];
-	/** The source from which data will be read. */
+	/**
+	 * The source from which data will be read. When given a {@link SourceRef}, the input takes it over: it frees the
+	 * ref when disposed, so don't free it yourself.
+	 */
 	source: S | SourceRef<S>;
 	/**
 	 * An optional, second {@link Input} instance that contains the necessary metadata to initialize the tracks of
@@ -123,6 +128,12 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	_backingToTrack = new Map<InputTrackBacking, InputTrack>();
 	/** @internal */
 	_disposed = false;
+	/**
+	 * Run when the input is disposed, to end operations that may be waiting on something other than a read (such as
+	 * sample iterators waiting for their consumer).
+	 * @internal
+	 */
+	_disposeCallbacks = new Set<() => void>();
 	/** @internal */
 	_nextSourceCacheAge = 0;
 	/** @internal */
@@ -164,6 +175,9 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 		if (options.source instanceof Source && options.source._disposed) {
 			throw new TypeError('options.source must not be a disposed Source.');
+		}
+		if (options.source instanceof SourceRef && options.source.freed) {
+			throw new TypeError('options.source must not be a freed SourceRef.');
 		}
 		if (options.initInput !== undefined && !(options.initInput instanceof Input)) {
 			throw new TypeError('options.initInput, when provided, must be an Input.');
@@ -292,7 +306,15 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			}
 
 			throw new UnsupportedInputFormatError();
-		})();
+		})().catch((error: unknown) => {
+			// Unlike an unsupported format or a disposed input, a failed read (a network hiccup, say) may work out when
+			// tried again
+			if (!(error instanceof UnsupportedInputFormatError) && !this._disposed) {
+				this._demuxerPromise = null;
+			}
+
+			throw error;
+		});
 	}
 
 	/**
@@ -338,6 +360,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 */
 	async getFirstTimestamp(tracks?: InputTrack[]) {
 		tracks ??= await this.getTracks();
+		validateTrackList(tracks);
 
 		const filtered = tracks.filter(x => x !== null);
 		if (filtered.length === 0) {
@@ -366,7 +389,12 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * to `true` in the options.
 	 */
 	async computeDuration(tracks?: InputTrack[], options?: PacketRetrievalOptions) {
+		if (options !== undefined) {
+			validatePacketRetrievalOptions(options);
+		}
+
 		tracks ??= await this.getTracks();
+		validateTrackList(tracks);
 
 		const filtered = tracks.filter(x => x !== null);
 		if (filtered.length === 0) {
@@ -390,7 +418,12 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * {@link DurationMetadataRequestOptions.skipLiveWait} to `true` in the options.
 	 */
 	async getDurationFromMetadata(tracks?: InputTrack[], options?: DurationMetadataRequestOptions) {
+		if (options !== undefined) {
+			validateDurationMetadataRequestOptions(options);
+		}
+
 		tracks ??= await this.getTracks();
+		validateTrackList(tracks);
 
 		const filtered = tracks.filter(x => x !== null);
 		const tracksDurations = await Promise.all(filtered.map(x => x.getDurationFromMetadata(options)));
@@ -444,12 +477,16 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		query &&= toValidatedInputTrackQuery(query);
 
 		const merged = mergeInputTrackQueries(query, {
-			sortBy: async t => [
-				prefer((await t.getDisposition()).default),
-				prefer(await t.hasPairableAudioTrack()),
-				prefer(!(await t.hasOnlyKeyPackets())),
-				desc(await t.getBitrate()),
-			],
+			sortBy: async (t) => {
+				const disposition = await t.getDisposition();
+				return [
+					prefer(disposition.primary),
+					prefer(disposition.default),
+					prefer(await t.hasPairableAudioTrack()),
+					prefer(!(await t.hasOnlyKeyPackets())),
+					desc(await t.getBitrate()),
+				];
+			},
 		});
 
 		const sorted = await this.getVideoTracks(merged);
@@ -470,11 +507,15 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		const primaryVideoTrack = await this.getPrimaryVideoTrack();
 
 		const merged = mergeInputTrackQueries(query, {
-			sortBy: async t => [
-				prefer(!primaryVideoTrack || t.canBePairedWith(primaryVideoTrack)),
-				prefer((await t.getDisposition()).default),
-				desc(await t.getBitrate()),
-			],
+			sortBy: async (t) => {
+				const disposition = await t.getDisposition();
+				return [
+					prefer(!primaryVideoTrack || t.canBePairedWith(primaryVideoTrack)),
+					prefer(disposition.primary),
+					prefer(disposition.default),
+					desc(await t.getBitrate()),
+				];
+			},
 		});
 
 		const sorted = await this.getAudioTracks(merged);
@@ -515,7 +556,9 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 */
 	async getMetadataTags() {
 		const demuxer = await this._getDemuxer();
-		return demuxer.getMetadataTags();
+
+		// Copied so that callers can't modify the input's own state
+		return cloneMetadataTags(await demuxer.getMetadataTags());
 	}
 
 	/**
@@ -532,6 +575,11 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		this._disposed = true;
+
+		for (const callback of [...this._disposeCallbacks]) {
+			callback();
+		}
+		this._disposeCallbacks.clear();
 
 		for (const ref of this._sourceRefs) {
 			ref.free();
@@ -554,6 +602,12 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		this.dispose();
 	}
 }
+
+const validateTrackList = (tracks: (InputTrack | null)[]) => {
+	if (!Array.isArray(tracks) || tracks.some(track => track !== null && !(track instanceof InputTrack))) {
+		throw new TypeError('tracks, when provided, must be an array of InputTrack.');
+	}
+};
 
 /**
  * Thrown when trying to operate on an input that has an unsupported or unrecognizable format.

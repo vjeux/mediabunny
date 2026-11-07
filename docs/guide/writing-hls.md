@@ -130,18 +130,21 @@ const output = new Output({
 		'master.m3u8',
 		async ({ path, mimeType }) => {
 			const { writable, readable } = new TransformStream<
-				Uint8Array, Uint8Array,
+				Uint8Array, Uint8Array
 			>();
 
 			const url = `/upload?file=${encodeURIComponent(path)}`;
-			const promise = fetch(url, {
+			// Streaming request bodies require `duplex: 'half'`, which
+			// TypeScript's DOM types don't declare yet
+			const init: RequestInit & { duplex: 'half' } = {
 				method: 'POST',
 				body: readable,
 				duplex: 'half',
 				headers: {
 					'Content-Type': mimeType,
 				},
-			});
+			};
+			const promise = fetch(url, init);
 			promises.push(promise);
 
 			// Requires that all segments use an append-only format
@@ -282,9 +285,9 @@ const conversion = await Conversion.init({
 Often you'll want to provide additional [track metadata](../api/BaseTrackMetadata) when dealing with multiple tracks. For example:
 ```ts
 output.addVideoTrack(videoSource);
-output.addAudioTrack(audioSourceEn, { languageCode: 'en', name: 'English' });
-output.addAudioTrack(audioSourceDe, { languageCode: 'de', name: 'German' });
-output.addAudioTrack(audioSourceEs, { languageCode: 'es', name: 'Spanish' });
+output.addAudioTrack(audioSourceEn, { languageCode: 'eng', name: 'English' });
+output.addAudioTrack(audioSourceDe, { languageCode: 'deu', name: 'German' });
+output.addAudioTrack(audioSourceEs, { languageCode: 'spa', name: 'Spanish' });
 ```
 
 ### Track disposition
@@ -297,12 +300,12 @@ You can control how a track is selected by players using the `disposition` optio
 For example:
 ```ts
 output.addAudioTrack(audioSourceEn, {
-	languageCode: 'en',
+	languageCode: 'eng',
 	name: 'English',
 	disposition: { primary: true },
 });
-output.addAudioTrack(audioSourceDe, {
-	languageCode: 'es',
+output.addAudioTrack(audioSourceEs, {
+	languageCode: 'spa',
 	name: 'Spanish',
 	disposition: { default: false },
 });
@@ -351,12 +354,10 @@ The above code will emit a media playlist like this:
 
 #EXTINF:2,
 #EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.000Z
-segments-1-1.ts
-
+segment-1-1.ts
 #EXTINF:2,
 #EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:02.000Z
-segments-1-2.ts
-
+segment-1-2.ts
 ...
 ```
 
@@ -422,7 +423,7 @@ video-2.m3u8
 To maintain the "every video track can be paired with every audio track" configuration, the audio tracks have been extracted into a media rendition group via `#EXT-X-MEDIA`.
 
 :::info
-Note that tracks in a media rendition group should differ in metadata. Thus, when creating tracks in this configuration, make sure to provide metadata options like `language` or `name` to differentiate the tracks.
+Note that tracks in a media rendition group should differ in metadata. Thus, when creating tracks in this configuration, make sure to provide metadata options like `languageCode` or `name` to differentiate the tracks.
 :::
 
 #### Codec alternatives
@@ -585,6 +586,8 @@ new HlsOutputFormat({
 
 Mediabunny will then use the first format that can contain all tracks of the segment.
 
+Which tracks share a segment depends on how they're split into playlists. With the default grouping, a single video track and a single audio track end up in the same playlist, so every segment holds both and is written as .ts. Audio only gets its own .aac segments when it has a separate rendition, for example when there are two or more audio tracks.
+
 ### File names
 
 By default, Mediabunny will create the following file names:
@@ -714,7 +717,13 @@ new HlsOutputFormat({
 });
 ```
 
-Whenever a segment is popped off the playlist in this fashion, the `onSegmentPopped` callback is called, which you can use to be notified of a segment being removed and to take action; for example, to delete the segment file. The callback is passed the path of the segment and [`HlsOutputSegmentInfo`](../api/HlsOutputSegmentInfo).
+Segments are only popped as long as the playlist still spans three times the target duration, the minimum length of a live playlist in HLS, so a playlist may hold more segments than `maxLiveSegmentCount`.
+
+Whenever a segment is popped off the playlist in this fashion, the `onSegmentPopped` callback is called, which you can use to be notified of a segment being removed and to take action; for example, to delete the segment file. The callback is passed the path of the segment and [`HlsOutputSegmentInfo`](../api/HlsOutputSegmentInfo). It is called once the updated playlist, which no longer lists the segment, has been written.
+
+::: warning
+Clients may still be playing from a playlist they loaded before the segment was popped. If you delete segment files, keep each one available for its own duration plus the duration of the playlist before deleting it, as [RFC 8216, Section 6.2.2](https://datatracker.ietf.org/doc/html/rfc8216#section-6.2.2) requires.
+:::
 
 ::: info
 `onSegmentPopped` is not called when `singleFilePerPlaylist` is enabled.

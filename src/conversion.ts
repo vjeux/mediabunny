@@ -17,8 +17,8 @@ import {
 } from './codec';
 import {
 	AudioEncodingConfig,
+	canEncodeVideo,
 	getEncodableAudioCodecs,
-	getFirstEncodableVideoCodec,
 	Quality,
 	resolveQuality,
 	VideoEncodingConfig,
@@ -52,7 +52,7 @@ import {
 	Rotation,
 } from './misc';
 import { Output, OutputTrackGroup } from './output';
-import { Mp4OutputFormat } from './output-format';
+import { Mp4OutputFormat, WavOutputFormat } from './output-format';
 import { EncodedPacket } from './packet';
 import {
 	AudioSample,
@@ -63,9 +63,10 @@ import {
 	VideoSample,
 	VideoSampleResource,
 } from './sample';
-import { MetadataTags, validateMetadataTags } from './metadata';
+import { getRawMetadataTagFields, MetadataTags, validateMetadataTags } from './metadata';
 import { NullTarget } from './target';
 import { PacketOrderValidator } from './muxer';
+import { AudioResampler } from './resample';
 
 /**
  * The options for media file conversion.
@@ -192,6 +193,8 @@ export type ConversionVideoOptions = {
 	height?: number;
 	/**
 	 * The fitting algorithm in case both width and height are set, or if the input video changes its size over time.
+	 * Setting it without both width and height makes the video be transcoded so that it applies to size changes; when
+	 * width and height equal the input's size, the video may still be copied, keeping its size changes.
 	 *
 	 * - `'fill'` will stretch the image to fill the entire box, potentially altering aspect ratio.
 	 * - `'contain'` will contain the entire image within the box while preserving aspect ratio. This may lead to
@@ -249,7 +252,7 @@ export type ConversionVideoOptions = {
 	 */
 	alpha?: 'discard' | 'keep';
 	/**
-	 * The interval, in seconds, of how often frames are encoded as a key frame. The default is 5 seconds. Frequent key
+	 * The interval, in seconds, of how often frames are encoded as a key frame. The default is 2 seconds. Frequent key
 	 * frames improve seeking behavior but increase file size. When using multiple video tracks, you should give them
 	 * all the same key frame interval.
 	 *
@@ -258,7 +261,8 @@ export type ConversionVideoOptions = {
 	keyFrameInterval?: number;
 	/**
 	 * A hint that configures the hardware acceleration method used when transcoding, which applies to both decoding and
-	 * encoding. This is best left on `'no-preference'`, the default.
+	 * encoding. This is best left on `'no-preference'`, the default. Decoders and encoders may refuse it (Chromium
+	 * refuses `'prefer-hardware'` without hardware support), in which case the track is discarded.
 	 */
 	hardwareAcceleration?: 'no-preference' | 'prefer-hardware' | 'prefer-software';
 	/** When `true`, video will always be re-encoded instead of directly copying over the encoded packets. */
@@ -370,8 +374,9 @@ export type ConversionAudioOptions = {
 	/**
 	 * Sets {@link BaseTrackMetadata.maximumPacketCount} for the output track. Only relevant when the output format
 	 * requires it (see {@link OutputFormat.requiresMaximumPacketCount}), in which case it is otherwise estimated
-	 * automatically. Set this field when the estimate doesn't work for you, for example when using a custom encoder
-	 * that produces unusually short packets. Required for live input tracks when no trim end is set.
+	 * automatically from the track's duration. Set this field when the estimate doesn't work for you, for example when
+	 * `process` makes the audio longer than the input, or when using a custom encoder that produces unusually short
+	 * packets. Required for live input tracks when no trim end is set.
 	 */
 	maximumPacketCount?: number;
 };
@@ -770,7 +775,9 @@ export class Conversion {
 	 * 0 and 1, indicating the completion of the conversion. Note that a progress of 1 doesn't necessarily mean the
 	 * conversion is complete; the conversion is complete once `execute()` resolves.
 	 *
-	 * As second argument, this callback receives the input time in seconds that has been processed.
+	 * As second argument, this callback receives how much media time, in seconds, has been processed so far, measured
+	 * from the start of the conversion (the trim start, if set). For example, it runs from 0 to 2 when converting with
+	 * `trim: { start: 2, end: 4 }`.
 	 *
 	 * In order for progress to be computed, this property must be set before `execute` is called.
 	 */
@@ -1183,6 +1190,32 @@ export class Conversion {
 				// If the input and output formats aren't the same, copying over raw metadata tags makes no sense and
 				// only results in junk tags, so let's cut them out.
 				delete outputTags.raw;
+			} else if (rawTagsAreUnchanged && outputTags.raw) {
+				// WAVE and FLAC files can also carry ID3v2 tags, whose frames end up among the raw tags too. Only keep
+				// the raw tags of the kind the output writes, since the others would turn into junk tags as well.
+				const id3Keys = await (await this.input._getDemuxer()).getId3RawMetadataTagKeys();
+				const outputWritesId3 = this.output.format instanceof WavOutputFormat
+					&& this.output.format._options.metadataFormat === 'id3';
+
+				if (id3Keys.size > 0 || outputWritesId3) {
+					outputTags.raw = Object.fromEntries(
+						Object.entries(outputTags.raw).filter(([key]) => id3Keys.has(key) === outputWritesId3),
+					);
+				}
+			}
+
+			if (rawTagsAreUnchanged && outputTags !== inputTags && outputTags.raw) {
+				// The tags option may have changed or removed fields. The raw tags they were read from would then bring
+				// the old values back (a writer leaves out raw tags only for the fields it writes), so drop those too.
+				const demuxerTags = await (await this.input._getDemuxer()).getMetadataTags();
+				const fieldsByRawKey = demuxerTags.raw && getRawMetadataTagFields(demuxerTags.raw);
+
+				if (fieldsByRawKey) {
+					const isChanged = (field: keyof MetadataTags) => outputTags[field] !== inputTags[field];
+					outputTags.raw = Object.fromEntries(Object.entries(outputTags.raw).filter(
+						([key]) => ![...(fieldsByRawKey.get(key) ?? [])].some(isChanged),
+					));
+				}
 			}
 
 			this.output.setMetadataTags(outputTags);
@@ -1512,13 +1545,14 @@ export class Conversion {
 		);
 		let outputTrackRotation = totalRotation;
 		let outputTrackFlip = totalFlip;
-		// When the transformation is left untouched, we forward the input's full matrix so nothing gets lost
-		let outputTrackMatrix = trackOptions.rotate || trackOptions.flip
-			? null
-			: await track.getTransformationMatrix();
 		const canUseRotationMetadata = this.output.format.supportsVideoTransformationMetadata
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			&& (trackOptions.allowTransformationMetadata ?? trackOptions.allowRotationMetadata ?? true);
+		// When the transformation is left untouched, we forward the input's full matrix so nothing gets lost, unless
+		// transformation metadata isn't to be used at all
+		let outputTrackMatrix = trackOptions.rotate || trackOptions.flip || !canUseRotationMetadata
+			? null
+			: await track.getTransformationMatrix();
 
 		const squarePixelWidth = await track.getSquarePixelWidth();
 		const squarePixelHeight = await track.getSquarePixelHeight();
@@ -1571,7 +1605,13 @@ export class Conversion {
 			// metadata after the output has already started. Should be possible with API changes in v2, though!
 			|| (totalRotation !== 0 && !canUseRotationMetadata)
 			|| (totalFlip && !canUseRotationMetadata)
-			|| !!crop;
+			|| !!crop
+			// Without both width and height, fit's only role is the handling of size changes over time, which only
+			// a transcode can apply
+			|| (
+				trackOptions.fit !== undefined
+				&& (trackOptions.width === undefined || trackOptions.height === undefined)
+			);
 
 		let copyStartPacket: EncodedPacket | null = null;
 
@@ -1786,7 +1826,9 @@ export class Conversion {
 		} else {
 			// We need to decode & reencode the video
 
-			const canDecode = await track.canDecode();
+			const canDecode = await new VideoSampleSink(track, {
+				hardwareAcceleration: trackOptions.hardwareAcceleration,
+			})._canDecode();
 			if (!canDecode) {
 				this.discardedTracks.push({
 					track,
@@ -1804,15 +1846,32 @@ export class Conversion {
 			const quality = resolveQuality(trackOptions.quality, trackOptions.bitrate)
 				?? new Quality('high');
 
-			const encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, {
-				width: trackOptions.process && trackOptions.processedWidth
-					? trackOptions.processedWidth
-					: width,
-				height: trackOptions.process && trackOptions.processedHeight
-					? trackOptions.processedHeight
-					: height,
-				quality,
-			});
+			let encodableCodec: VideoCodec | null = null;
+			for (const codec of videoCodecs) {
+				// These codecs require even dimensions, so odd ones get rounded up for them, like requested ones do
+				const needsEvenDimensions = codec === 'avc' || codec === 'hevc';
+				const canEncode = await canEncodeVideo(codec, {
+					width: trackOptions.process && trackOptions.processedWidth
+						? trackOptions.processedWidth
+						: needsEvenDimensions ? ceilToMultipleOfTwo(width) : width,
+					height: trackOptions.process && trackOptions.processedHeight
+						? trackOptions.processedHeight
+						: needsEvenDimensions ? ceilToMultipleOfTwo(height) : height,
+					quality,
+					hardwareAcceleration: trackOptions.hardwareAcceleration,
+				});
+
+				if (canEncode) {
+					encodableCodec = codec;
+					if (needsEvenDimensions) {
+						width = ceilToMultipleOfTwo(width);
+						height = ceilToMultipleOfTwo(height);
+					}
+
+					break;
+				}
+			}
+
 			if (!encodableCodec) {
 				this.discardedTracks.push({
 					track,
@@ -1840,7 +1899,12 @@ export class Conversion {
 				|| !!crop
 				// Don't expect encoders to reliably handle non-square pixels:
 				|| squarePixelWidth !== await track.getCodedWidth()
-				|| squarePixelHeight !== await track.getCodedHeight();
+				|| squarePixelHeight !== await track.getCodedHeight()
+				// Encoders read planar frames as YUV, so planes holding G, B and R (identity matrix, as in lossless
+				// VP9 or AV1 made from RGB sources) need to be converted first. The decoded frames don't reliably
+				// carry that matrix, so it's taken from the track. ProRes is left out: its matrix 0 means unknown
+				// (RDD 36), not identity.
+				|| (sourceCodec !== 'prores' && (await track.getColorSpace()).matrix === 'rgb');
 
 			if (!needsRerender) {
 				// If we're directly passing decoded samples back to the encoder, sometimes the encoder may error due
@@ -1917,6 +1981,15 @@ export class Conversion {
 			const source = new VideoSampleSource(encodingConfig);
 			videoSource = source;
 
+			if (!trackOptions.frameRate && !trackOptions.process && !await track.isLive()) {
+				// Tell the encoder the source's frame rate, since it budgets each frame's bits based on it. Not with a
+				// process function, which may change the rate frames come out at.
+				const { averagePacketRate } = await track.computePacketStats(PACKET_STATS_PACKET_COUNT);
+				if (Number.isFinite(averagePacketRate) && averagePacketRate > 0) {
+					source._frameRateHint = averagePacketRate;
+				}
+			}
+
 			this._registerTrackPump(async (pump) => {
 				const sink = new VideoSampleSink(track, { hardwareAcceleration: trackOptions.hardwareAcceleration });
 
@@ -1928,7 +2001,11 @@ export class Conversion {
 					const clampedStartTimestamp = Math.max(this._startTimestamp, sample.timestamp);
 					const clampedEndTimestamp = Math.min(this._endTimestamp, sample.timestamp + sample.duration);
 
-					if (clampedStartTimestamp >= clampedEndTimestamp) {
+					if (
+						clampedStartTimestamp > clampedEndTimestamp
+						// Zero-duration samples are still part of the trim region when they lie within it
+						|| (clampedStartTimestamp === clampedEndTimestamp && sample.duration > 0)
+					) {
 						// Wholly out of the trim region
 						continue;
 					}
@@ -1946,6 +2023,9 @@ export class Conversion {
 						}
 
 						await this._checkpoint(pump, lastSampleTimestamp);
+					} else {
+						// Nothing reached the output yet (process may drop samples), but pausing must work anyway
+						await this._checkpoint(pump, -Infinity);
 					}
 				}
 
@@ -1972,14 +2052,23 @@ export class Conversion {
 
 		let maximumPacketCount = trackOptions.maximumPacketCount;
 		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
-			// Frames map 1:1 to packets, so the input's packet rate is a good stand-in unless the frame rate is changed
-			const packetRate = trackOptions.frameRate
-				?? (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
-			const startTimestamp = needsTranscode
-				? this._startTimestamp
-				: copyStartPacket?.timestamp ?? this._startTimestamp;
+			if (!trackOptions.frameRate && !await track.isLive()) {
+				// Frames map 1:1 to packets. The frame rate can vary wildly within a file (think screen recordings,
+				// which only produce frames when something changes), so count the packets instead of extrapolating
+				// from the rate of the first ones.
+				const packetCount = await this._countPacketsInTrimRange(track, needsTranscode ? null : copyStartPacket);
+				// With the same generous margin as the rate-based estimate, so this is never tighter for constant-rate
+				// input (the 64 also covers B-frames presented before the end that come after it in decode order)
+				maximumPacketCount = Math.ceil(1.5 * packetCount) + 64;
+			} else {
+				const packetRate = trackOptions.frameRate
+					?? (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				const startTimestamp = needsTranscode
+					? this._startTimestamp
+					: copyStartPacket?.timestamp ?? this._startTimestamp;
 
-			maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
+				maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
+			}
 		}
 
 		this.output.addVideoTrack(videoSource, {
@@ -2055,6 +2144,7 @@ export class Conversion {
 			|| trackOptions.sampleFormat !== undefined;
 
 		let copyStartPacket: EncodedPacket | null = null;
+		let keptPriming: number | null = null;
 
 		if (!needsTranscode) {
 			// Check if we can copy it
@@ -2093,9 +2183,23 @@ export class Conversion {
 			copyStartPacket = startPacket;
 
 			if (startPacket) {
+				// The source's own priming before the start (like the Opus pre-skip) can stay if the format signals it
+				keptPriming = startPacket.timestamp < this._startTimestamp
+					? await this._getKeptAudioPriming(track, sink, startPacket)
+					: null;
+
 				const boundaryDeviation = this._copyBoundaryPolicy === 'shrink'
 					? Math.max(startPacket.timestamp - this._startTimestamp, 0)
 					: Math.max(this._startTimestamp - startPacket.timestamp, 0);
+
+				// Audio before the start can be kept as-is if the format marks it as encoder priming (think the LAME
+				// delay of MP3s, which makes their first packet start before zero)
+				const canSignalPriming = startPacket.timestamp < this._startTimestamp
+					&& this.output.format._canSignalAudioPriming(
+						sourceCodec,
+						this._startTimestamp - startPacket.timestamp,
+						originalSampleRate,
+					);
 
 				if (boundaryDeviation > this._copyBoundaryTolerance) {
 					needsTranscode = true;
@@ -2108,6 +2212,9 @@ export class Conversion {
 						if (!isValid) {
 							needsTranscode = true;
 						}
+					} else if (canSignalPriming) {
+						this._timestampOffset = -this._startTimestamp;
+						this._timestampOffsetAdjusted = true;
 					} else {
 						const correction = clamp(
 							this._startTimestamp - startPacket.timestamp,
@@ -2128,6 +2235,7 @@ export class Conversion {
 				} else if (
 					this.output.format.negativeTimestampSupport !== 'full'
 					&& startPacket.timestamp < this._startTimestamp
+					&& keptPriming === null
 				) {
 					const correction = Math.min(
 						this._startTimestamp - startPacket.timestamp,
@@ -2189,7 +2297,11 @@ export class Conversion {
 						break;
 					}
 
-					const packetTimestamp = packet.timestamp + this._timestampOffset;
+					let packetTimestamp = packet.timestamp + this._timestampOffset;
+					if (keptPriming !== null && packet.sequenceNumber === copyStartPacket.sequenceNumber) {
+						// Exactly the priming, in case the source rounded it (like Matroska, to the millisecond)
+						packetTimestamp = -keptPriming + this._timestampOffset;
+					}
 
 					if (packet.type === 'key') {
 						droppingGop = false;
@@ -2261,28 +2373,49 @@ export class Conversion {
 				quality,
 			});
 
+			// Fallback parameters, closest first (keep the channel count if possible), and those that change
+			// explicitly requested parameters last
+			const countOverriddenParams = (params: { numberOfChannels: number; sampleRate: number }) =>
+				Number(trackOptions.numberOfChannels !== undefined && params.numberOfChannels !== numberOfChannels)
+				+ Number(trackOptions.sampleRate !== undefined && params.sampleRate !== sampleRate);
+			const fallbackParams: { numberOfChannels: number; sampleRate: number }[] = [];
+			for (const params of [
+				{ numberOfChannels, sampleRate: FALLBACK_SAMPLE_RATE },
+				{ numberOfChannels: FALLBACK_NUMBER_OF_CHANNELS, sampleRate },
+				{ numberOfChannels: FALLBACK_NUMBER_OF_CHANNELS, sampleRate: FALLBACK_SAMPLE_RATE },
+			]) {
+				const isNew = [{ numberOfChannels, sampleRate }, ...fallbackParams]
+					.every(x => x.numberOfChannels !== params.numberOfChannels || x.sampleRate !== params.sampleRate);
+				if (isNew) {
+					fallbackParams.push(params);
+				}
+			}
+			fallbackParams.sort((a, b) => countOverriddenParams(a) - countOverriddenParams(b));
+
 			if (
 				!encodableCodecs.some(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec))
 				&& audioCodecs.some(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec))
-				&& (numberOfChannels !== FALLBACK_NUMBER_OF_CHANNELS || sampleRate !== FALLBACK_SAMPLE_RATE)
+				&& fallbackParams.length > 0
 			) {
 				// We could not find a compatible non-PCM codec despite the container supporting them. This can be
 				// caused by strange channel count or sample rate configurations. Therefore, let's try again but with
 				// fallback parameters.
 
-				const encodableCodecsWithDefaultParams = await getEncodableAudioCodecs(audioCodecs, {
-					numberOfChannels: FALLBACK_NUMBER_OF_CHANNELS,
-					sampleRate: FALLBACK_SAMPLE_RATE,
-					quality,
-				});
+				for (const params of fallbackParams) {
+					const encodableCodecsWithFallbackParams = await getEncodableAudioCodecs(audioCodecs, {
+						...params,
+						quality,
+					});
 
-				const nonPcmCodec = encodableCodecsWithDefaultParams
-					.find(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec));
-				if (nonPcmCodec) {
-					// We are able to encode using a non-PCM codec, but it'll require resampling
-					outputCodec = nonPcmCodec;
-					numberOfChannels = FALLBACK_NUMBER_OF_CHANNELS;
-					sampleRate = FALLBACK_SAMPLE_RATE;
+					const nonPcmCodec = encodableCodecsWithFallbackParams
+						.find(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec));
+					if (nonPcmCodec) {
+						// We are able to encode using a non-PCM codec, but it'll require resampling
+						outputCodec = nonPcmCodec;
+						numberOfChannels = params.numberOfChannels;
+						sampleRate = params.sampleRate;
+						break;
+					}
 				}
 			} else {
 				outputCodec = encodableCodecs[0] ?? null;
@@ -2307,10 +2440,12 @@ export class Conversion {
 			};
 			assert(encodingConfig.transform);
 
-			if (numberOfChannels !== originalNumberOfChannels) {
+			// Requested parameters apply even when the metadata already matches them, since the decoded audio can
+			// differ from it (implicitly signaled HE-AAC decodes at twice the sample rate, HE-AACv2 to stereo)
+			if (trackOptions.numberOfChannels !== undefined || numberOfChannels !== originalNumberOfChannels) {
 				encodingConfig.transform.numberOfChannels = numberOfChannels;
 			}
-			if (sampleRate !== originalSampleRate) {
+			if (trackOptions.sampleRate !== undefined || sampleRate !== originalSampleRate) {
 				encodingConfig.transform.sampleRate = sampleRate;
 			}
 
@@ -2324,6 +2459,67 @@ export class Conversion {
 
 			this._registerTrackPump(async (pump) => {
 				let paddingLengthInSamples: number | null = null;
+
+				// The encoder needs constant audio parameters, but decoders can change theirs mid-stream, like at an
+				// HLS discontinuity into segments with another sample rate. Samples whose parameters differ from the
+				// first sample's are resampled and remixed to them.
+				let firstNumberOfChannels: number | null = null;
+				let firstSampleRate: number | null = null;
+				let resampler: AudioResampler | null = null;
+				let resamplerInputEnd: number | null = null;
+
+				const flushResampler = async () => {
+					if (resampler) {
+						await resampler.finalize();
+						resampler = null;
+						resamplerInputEnd = null;
+					}
+				};
+
+				const addSample = async (sample: AudioSample) => {
+					firstNumberOfChannels ??= sample.numberOfChannels;
+					firstSampleRate ??= sample.sampleRate;
+					const matchesFirst = sample.numberOfChannels === firstNumberOfChannels
+						&& sample.sampleRate === firstSampleRate;
+
+					if (
+						resampler
+						&& (matchesFirst
+							|| sample.numberOfChannels !== resampler.sourceNumberOfChannels
+							|| sample.sampleRate !== resampler.sourceSampleRate)
+					) {
+						// Its output must come before samples with other parameters
+						await flushResampler();
+					}
+
+					if (matchesFirst) {
+						await this._registerAudioSample(
+							pump, sample, source, outputTrackId, () => lastSampleTimestamp,
+						);
+						return;
+					}
+
+					resampler ??= new AudioResampler({
+						targetNumberOfChannels: firstNumberOfChannels,
+						targetSampleRate: firstSampleRate,
+						onSample: resampledSample => this._registerAudioSample(
+							pump, resampledSample, source, outputTrackId, () => lastSampleTimestamp,
+						),
+					});
+
+					// The resampler places samples by timestamp and adds up overlapping frames, so timestamps a few
+					// frames off (like rounded ones) would double or drop frames: a click. Keep these samples back to
+					// back, like the encoder does with the samples it gets directly.
+					if (
+						resamplerInputEnd !== null
+						&& Math.abs(sample.timestamp - resamplerInputEnd) * sample.sampleRate < 64
+					) {
+						sample.setTimestamp(resamplerInputEnd);
+					}
+					resamplerInputEnd = sample.timestamp + sample.duration;
+
+					await resampler.add(sample);
+				};
 
 				const sink = new AudioSampleSink(track);
 				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
@@ -2371,13 +2567,15 @@ export class Conversion {
 					if (paddingLengthInSamples === null) {
 						paddingLengthInSamples = this.output.format.supportsTimestampedMediaData
 							? 0
-							: Math.round(finalSample.timestamp * originalSampleRate);
+							: Math.round(finalSample.timestamp * finalSample.sampleRate);
 					}
 
 					if (paddingLengthInSamples > 0) {
-						// Add one padding sample at the beginning
+						// Add one padding sample at the beginning, with the decoded audio's parameters
 						const bytesPerSample = getBytesPerSample(sample.format);
-						const data = new Uint8Array(bytesPerSample * paddingLengthInSamples * originalNumberOfChannels);
+						const data = new Uint8Array(
+							bytesPerSample * paddingLengthInSamples * finalSample.numberOfChannels,
+						);
 						if (sample.format === 'u8' || sample.format === 'u8-planar') {
 							data.fill(2 ** 7); // Fill it with the silent value
 						}
@@ -2387,20 +2585,20 @@ export class Conversion {
 							// Use the same format the decoder is spitting out. This avoids feeding changing sample
 							// formats to the audio encoder.
 							format: sample.format,
-							numberOfChannels: originalNumberOfChannels,
-							sampleRate: originalSampleRate,
+							numberOfChannels: finalSample.numberOfChannels,
+							sampleRate: finalSample.sampleRate,
 							timestamp: 0,
 						});
-						await this._registerAudioSample(
-							pump, silentSample, source, outputTrackId, () => lastSampleTimestamp,
-						);
+						await addSample(silentSample);
 
 						paddingLengthInSamples = 0;
 					}
 
-					await this._registerAudioSample(
-						pump, finalSample, source, outputTrackId, () => lastSampleTimestamp,
-					);
+					await addSample(finalSample);
+				}
+
+				if (this._state !== 'canceled') {
+					await flushResampler();
 				}
 
 				source.close();
@@ -2425,19 +2623,25 @@ export class Conversion {
 
 		let maximumPacketCount = trackOptions.maximumPacketCount;
 		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
-			let packetRate: number;
-			if (needsTranscode) {
-				assert(outputCodec);
-				packetRate = sampleRate / getMinimumAudioPacketSize(outputCodec, sampleRate);
+			if (!needsTranscode && !await track.isLive()) {
+				// Copied packets can come at a varying rate too (think Opus with DTX, which only sends a packet
+				// every 400 ms during silence), so count them, with the rate-based estimate's margin
+				maximumPacketCount = Math.ceil(1.5 * await this._countPacketsInTrimRange(track, copyStartPacket)) + 64;
 			} else {
-				packetRate = (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				let packetRate: number;
+				if (needsTranscode) {
+					assert(outputCodec);
+					packetRate = sampleRate / getMinimumAudioPacketSize(outputCodec, sampleRate);
+				} else {
+					packetRate = (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				}
+
+				const startTimestamp = needsTranscode
+					? this._startTimestamp
+					: copyStartPacket?.timestamp ?? this._startTimestamp;
+
+				maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
 			}
-
-			const startTimestamp = needsTranscode
-				? this._startTimestamp
-				: copyStartPacket?.timestamp ?? this._startTimestamp;
-
-			maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
 		}
 
 		this.output.addAudioTrack(audioSource, {
@@ -2458,6 +2662,35 @@ export class Conversion {
 		this._outputOwnTrackGroups.push(ownGroup);
 	}
 
+	/**
+	 * When a copied audio track starts at its first packet, before zero, because of the source's own priming (like
+	 * the Opus pre-skip) that the output format signals the same way: the exact priming duration, in seconds. Only for
+	 * conversions starting at zero, where the priming ends; an explicit start anywhere else must not be absorbed by it.
+	 * @internal
+	 */
+	async _getKeptAudioPriming(track: InputAudioTrack, sink: EncodedPacketSink, startPacket: EncodedPacket) {
+		if (this._startTimestamp !== 0) {
+			return null;
+		}
+
+		const firstPacket = await sink.getFirstPacket({ metadataOnly: true });
+		if (!firstPacket || firstPacket.sequenceNumber !== startPacket.sequenceNumber) {
+			return null;
+		}
+
+		const decoderConfig = await track.getDecoderConfig();
+		if (!decoderConfig) {
+			return null;
+		}
+
+		return this.output.format._getSignalableAudioPriming(
+			await track.getCodec() as AudioCodec,
+			-startPacket.timestamp,
+			firstPacket,
+			decoderConfig,
+		);
+	}
+
 	/** @internal */
 	async _estimateMaximumPacketCount(track: InputTrack, startTimestamp: number, packetRate: number) {
 		const endTimestamp = Math.min(await this._getTrackDuration(track), this._endTimestamp);
@@ -2465,6 +2698,30 @@ export class Conversion {
 
 		// Let's give this a generous margin
 		return Math.ceil(1.5 * packetRate * duration) + 64;
+	}
+
+	/**
+	 * Counts the packets from the given start packet (or the key packet at the trim start) up to the trim end.
+	 * @internal
+	 */
+	async _countPacketsInTrimRange(track: InputTrack, startPacket: EncodedPacket | null) {
+		const sink = new EncodedPacketSink(track);
+		startPacket ??= await sink.getKeyPacket(this._startTimestamp, { metadataOnly: true })
+			?? await sink.getFirstPacket({ metadataOnly: true });
+		if (!startPacket) {
+			return 0;
+		}
+
+		let count = 0;
+		for await (const packet of sink.packets(startPacket, undefined, { metadataOnly: true })) {
+			if (packet.timestamp >= this._endTimestamp) {
+				break;
+			}
+
+			count++;
+		}
+
+		return count;
 	}
 
 	/** @internal */
@@ -2504,6 +2761,9 @@ export class Conversion {
 			}
 
 			await this._checkpoint(pump, lastSampleTimestamp);
+		} else {
+			// Nothing reached the output yet (process may drop samples), but pausing must work anyway
+			await this._checkpoint(pump, -Infinity);
 		}
 	}
 

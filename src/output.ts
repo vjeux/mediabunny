@@ -230,7 +230,8 @@ export type BaseTrackMetadata = {
 	 * - For video codecs, you can assume one packet per frame.
 	 * - For audio codecs, there is one packet for each "audio chunk", the duration of which depends on the codec. For
 	 * simplicity, you can assume each packet is roughly 10 ms or 512 samples long, whichever is shorter.
-	 * - For subtitles, assume each cue and each gap in the subtitles adds a packet.
+	 * - For subtitles, a new packet can begin at every cue start and end time (overlapping cues get split, and gaps
+	 * fill their own packets), so assume up to two packets per cue.
 	 *
 	 * If you're not fully sure, make sure to add a buffer of around 33% to make sure you stay below the maximum.
 	 */
@@ -363,6 +364,9 @@ const validateBaseTrackMetadata = (metadata: BaseTrackMetadata) => {
 	) {
 		throw new TypeError('metadata.averageBitrate, when provided, must be a non-negative number.');
 	}
+	if (metadata.isRelativeToUnixEpoch !== undefined && typeof metadata.isRelativeToUnixEpoch !== 'boolean') {
+		throw new TypeError('metadata.isRelativeToUnixEpoch, when provided, must be a boolean.');
+	}
 	if (
 		metadata.group !== undefined
 		&& !(metadata.group instanceof OutputTrackGroup)
@@ -478,6 +482,13 @@ export class Output<
 	 * @internal
 	 */
 	_firstMediaStreamTimestamp: number | null = null;
+	/**
+	 * How the capture timestamps of a MediaStreamTrack map to output timestamps, by timestamp base and track. Every
+	 * source of the same track (e.g. one per rendition) uses the same mapping, so that it gives the same media the same
+	 * timestamp.
+	 * @internal
+	 */
+	_mediaStreamTimestampOffsets = new Map<string, number>();
 
 	/**
 	 * The target to which the root file will be written. Throws when using {@link PathedTarget} with an async callback;
@@ -527,7 +538,7 @@ export class Output<
 			&& !(options.initTarget instanceof Target)
 			&& typeof options.initTarget !== 'function'
 		) {
-			throw new Error(
+			throw new TypeError(
 				'options.initTarget, when provided, must be a Target or a function that returns or resolves to'
 				+ ' a Target.',
 			);
@@ -595,10 +606,12 @@ export class Output<
 		assert(this._initTarget !== null);
 
 		if (this._initTarget instanceof Target) {
+			this._emit('target', { target: this._initTarget, request: null, isRoot: false });
 			return this._initTarget;
 		}
 
 		const target = await this._initTarget();
+		this._emit('target', { target, request: null, isRoot: false });
 
 		if (this.state === 'canceled') {
 			await target._close();
@@ -964,6 +977,10 @@ export class Output<
 	/**
 	 * Cancels the creation of the output file, releasing internal resources like encoders and preventing further
 	 * samples from being added.
+	 *
+	 * When writing to a {@link StreamTarget}, this waits for its `WritableStream` to close, unless the stream's sink
+	 * has stalled on a write: once 5 seconds pass without any of the pending writes completing, this resolves, and the
+	 * stream closes in the background if the sink ever catches up.
 	 *
 	 * @returns A promise that resolves once all internal resources have been released.
 	 */

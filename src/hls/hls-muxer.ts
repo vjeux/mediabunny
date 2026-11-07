@@ -14,8 +14,11 @@ import {
 	arrayArgmax,
 	assert,
 	AsyncMutex,
+	computeRationalApproximation,
+	extractRotationFromMatrix,
 	findLastIndex,
 	joinPaths,
+	roundToDivisor,
 	textEncoder,
 	toArray,
 	toDataView,
@@ -35,20 +38,39 @@ import {
 	HlsOutputFormatOptions,
 	HlsOutputPlaylistInfo,
 	HlsOutputSegmentInfo,
+	Mp3OutputFormat,
+	IsobmffOutputFormat,
 	OutputFormat,
 } from '../output-format';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
 import { SubtitleCue, SubtitleMetadata } from '../subtitles';
-import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
+import { NullTarget, PathedTarget, RangedTarget, Target, TargetRequest } from '../target';
 import { HLS_MIME_TYPE, TIMESTAMP_PRIV_OWNER } from './hls-misc';
 import { secondsToMpegTsTimestamp } from '../mpeg-ts/mpeg-ts-misc';
-import type { IsobmffMuxer } from '../isobmff/isobmff-muxer';
+import { GLOBAL_TIMESCALE, type IsobmffMuxer } from '../isobmff/isobmff-muxer';
+import { MpegTsMuxer } from '../mpeg-ts/mpeg-ts-muxer';
+
+/** The VIDEO-RANGE of video with the given decoder config (draft-pantos-hls-rfc8216bis, Section 4.4.6.2). */
+const getVideoRange = (decoderConfig: VideoDecoderConfig) => {
+	const transfer = decoderConfig.colorSpace?.transfer as string | null | undefined;
+	if (transfer === 'pq') {
+		return 'PQ';
+	} else if (transfer === 'hlg') {
+		return 'HLG';
+	} else {
+		return 'SDR';
+	}
+};
 
 // Maps from WebCodecs to what HLS wants
-const toHlsCodecString = (codecString: string) => {
+const toHlsCodecString = (codecString: string, segmentFormat: OutputFormat) => {
 	if (codecString === 'opus') {
 		return 'Opus';
+	}
+	if (segmentFormat instanceof IsobmffOutputFormat && codecString.startsWith('hev1.')) {
+		// The codec string names the sample entry, and HEVC is always written into an 'hvc1' sample entry
+		return 'hvc1.' + codecString.slice('hev1.'.length);
 	}
 
 	return codecString;
@@ -57,6 +79,8 @@ const toHlsCodecString = (codecString: string) => {
 type HlsTrackData = {
 	track: OutputTrack;
 	packets: EncodedPacket[];
+	/** Whether a packet was ever added to the track, which then appears in the playlist's segments */
+	hasPackets: boolean;
 	playlist: Playlist;
 	// We must store it on the TrackData, reading it directly from the track leads to async race conditions!
 	closed: boolean;
@@ -108,6 +132,8 @@ type Playlist = {
 		 * segments file which is also a perfectly valid standalone fMP4 valid.
 		 */
 		fragmentedIsobmffOutput: FragmentedIsobmffOutput | null;
+		/** The MPEG-TS continuity counters, which go on from one segment to the next in the file */
+		continuityCounters: Map<number, number>;
 	} | null;
 
 	// For HLS, having a single mutex is too coarse. Every playlist is basically independent and therefore we can have
@@ -129,6 +155,24 @@ type FragmentedIsobmffOutput = {
 	audioSource: EncodedAudioPacketSource | null;
 	firstMoofPosition: number | null;
 	currentFileSize: number;
+};
+
+/**
+ * The frame rate to give the video track of a segment muxer. The HLS muxer snaps to the track's frame rate itself, in
+ * the input timeline, since the segment muxers see timestamps shifted by an amount that's usually not on the frame
+ * grid. Snapping again there, or using the frame rate as the timescale (CMAF does, so 30 fps gets ticks of 1/30 s),
+ * would move video against audio by up to half a frame. CMAF still needs a timescale that holds the frame duration
+ * exactly though, so it gets the smallest multiple of the frame rate's timescale that's at least as fine as the default
+ * one: its grid contains every frame, and snapping to it is just rounding to the timescale.
+ */
+const getSegmentFrameRate = (frameRate: number | undefined, segmentFormat: OutputFormat) => {
+	if (frameRate === undefined || !(segmentFormat instanceof IsobmffOutputFormat)) {
+		return undefined;
+	}
+
+	// The timescale the ISOBMFF muxer would derive from the frame rate itself
+	const timescale = computeRationalApproximation(1 / frameRate, 1e6).den;
+	return timescale * Math.ceil(GLOBAL_TIMESCALE / timescale);
 };
 
 export class HlsMuxer extends Muxer {
@@ -356,23 +400,33 @@ export class HlsMuxer extends Muxer {
 		// Video tracks that can't be paired with any other track always live on the top-level, the question is just if
 		// they need to be separated into #EXT-X-MEDIA tags or not
 		if (unpairedVideoTracks.length > 0) {
-			const uniqueMetadata = new Set(unpairedVideoTracks.map(getMetadataKeyForTrack));
+			// Key-packets-only tracks are standalone I-frame streams, so they can't be renditions within a group
+			const iFrameTracks = unpairedVideoTracks.filter(x => x.isVideoTrack() && x.metadata.hasOnlyKeyPackets);
+			const groupableTracks = unpairedVideoTracks.filter(x => !iFrameTracks.includes(x));
+			const uniqueMetadata = new Set(groupableTracks.map(getMetadataKeyForTrack));
 
 			if (uniqueMetadata.size > 1) {
 				// They differ in metadata, emit as group
 				const group: typeof groups[number] = {
-					key: unpairedVideoTracks.map(x => x.id).join('-'),
+					key: groupableTracks.map(x => x.id).join('-'),
 					name: 'video-' + (groups.length + 1),
-					tracks: unpairedVideoTracks,
+					tracks: groupableTracks,
 					needsEmit: true,
 					firstNoUri: true,
 				};
 				groups.push(group);
 
 				variantStreams.push({
-					tracks: [unpairedVideoTracks[0]!],
+					tracks: [groupableTracks[0]!],
 					linkedGroup: group,
 				});
+
+				for (const track of iFrameTracks) {
+					variantStreams.push({
+						tracks: [track],
+						linkedGroup: null,
+					});
+				}
 			} else {
 				for (const track of unpairedVideoTracks) {
 					variantStreams.push({
@@ -578,17 +632,19 @@ export class HlsMuxer extends Muxer {
 
 	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
-		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			trackData.closed = true;
-		}
-
 		const playlist = this.playlists.find(x => x.tracks.includes(track));
 		assert(playlist); // If there isn't one then the assignment algo failed innit
 
 		const release = await playlist.mutex.acquire();
 
 		try {
+			// Mark the track as closed only now, once the packets queued on the mutex before the close are in. Else,
+			// those would see it as closed and finish the playlist without the packets queued behind them.
+			const trackData = this.trackDatas.find(x => x.track === track);
+			if (trackData) {
+				trackData.closed = true;
+			}
+
 			await this.advancePlaylist(playlist);
 		} finally {
 			release();
@@ -612,6 +668,7 @@ export class HlsMuxer extends Muxer {
 		trackData = {
 			track,
 			packets: [],
+			hasPackets: false,
 			playlist: playlists[0]!,
 			closed: false,
 			info: {
@@ -642,6 +699,7 @@ export class HlsMuxer extends Muxer {
 		trackData = {
 			track,
 			packets: [],
+			hasPackets: false,
 			playlist: playlists[0]!,
 			closed: false,
 			info: {
@@ -667,7 +725,18 @@ export class HlsMuxer extends Muxer {
 
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
+
+			if (track.metadata.frameRate !== undefined) {
+				// Constrain the time values to the frame rate here, in the input timeline. The segment muxers don't get
+				// the frame rate, since snapping the shifted media timestamps would move video relative to audio.
+				packet = packet.clone({
+					timestamp: roundToDivisor(packet.timestamp, track.metadata.frameRate),
+					duration: roundToDivisor(packet.duration, track.metadata.frameRate),
+				});
+			}
+
 			trackData.packets.push(packet);
+			trackData.hasPackets = true;
 			this.firstPacketTimestamp ??= packet.timestamp;
 
 			if (playlist.currentSegmentStartTimestamp === null) {
@@ -698,6 +767,7 @@ export class HlsMuxer extends Muxer {
 		try {
 			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
 			trackData.packets.push(packet);
+			trackData.hasPackets = true;
 			this.firstPacketTimestamp ??= packet.timestamp;
 
 			if (playlist.currentSegmentStartTimestamp === null) {
@@ -785,6 +855,25 @@ export class HlsMuxer extends Muxer {
 						const packet = videoTrack.packets[i]!;
 
 						if (bestKeyPacket !== null && packet.timestamp > currentSegmentEndTimestamp) {
+							// In live mode, the segment may still end at this first packet past its end, if it's a
+							// key packet nearer to the end than the last one before it. With jittery frame timestamps
+							// (such as those of live capture), the key frame meant for this boundary often lands a bit
+							// late; ending at an earlier key frame instead, like one an encoder inserted at a scene
+							// cut, would put the boundaries of variants encoded from the same frames in different
+							// places. The overshoot is kept small enough for the duration to round to the target
+							// duration, which live playlists announce as is. (VOD playlists announce the ceiling of
+							// their longest segment, which any overshoot would raise.)
+							const overshoot = packet.timestamp - currentSegmentEndTimestamp;
+							if (
+								this.isLive
+								&& packet.type === 'key'
+								&& overshoot < currentSegmentEndTimestamp - bestKeyPacket.timestamp
+								&& overshoot < Math.ceil(this.targetSegmentDuration) + 0.5 - this.targetSegmentDuration
+							) {
+								bestKeyPacket = packet;
+								bestKeyPacketIndex = i;
+							}
+
 							break;
 						}
 
@@ -962,6 +1051,10 @@ export class HlsMuxer extends Muxer {
 								fragmentedIsobmffOutput.videoSource,
 								{
 									...videoTrack.track.metadata,
+									frameRate: getSegmentFrameRate(
+										(videoTrack.track as OutputVideoTrack).metadata.frameRate,
+										playlist.segmentFormat,
+									),
 									decoderConfig: videoTrack.info.decoderConfig,
 									primingPacket: videoTrack.info.primingPacket ?? undefined,
 								},
@@ -994,6 +1087,7 @@ export class HlsMuxer extends Muxer {
 						nextOffset: 0,
 						info: segmentInfo,
 						fragmentedIsobmffOutput,
+						continuityCounters: new Map(),
 					};
 				} else {
 					relativeSegmentPath = playlist.singleFile.path;
@@ -1033,7 +1127,7 @@ export class HlsMuxer extends Muxer {
 				} else {
 					// Create the output for this segment
 					output = new Output({
-						format: playlist.segmentFormat,
+						format: toSegmentOutputFormat(playlist.segmentFormat),
 						target: new PathedTarget(
 							fullSegmentPath,
 							async (request: TargetRequest) => {
@@ -1044,7 +1138,12 @@ export class HlsMuxer extends Muxer {
 
 								if (request.isRoot) {
 									if (playlist.singleFile) {
-										const slice = playlist.singleFile.target.slice(playlist.singleFile.nextOffset);
+										// The playlist starts and ends the single file itself (see onPlaylistDone)
+										const slice = new RangedTarget(
+											playlist.singleFile.target,
+											playlist.singleFile.nextOffset,
+											false,
+										);
 										slice.on('write', ({ end }) => segmentSize = Math.max(segmentSize, end));
 
 										return slice;
@@ -1076,7 +1175,11 @@ export class HlsMuxer extends Muxer {
 									info: null,
 								};
 
-								const slice = playlist.singleFile.target.slice(playlist.singleFile.nextOffset);
+								const slice = new RangedTarget(
+									playlist.singleFile.target,
+									playlist.singleFile.nextOffset,
+									false, // Started and ended by the playlist
+								);
 								slice.on('write', ({ end }) => {
 									playlist.initSegment!.byteSize = Math.max(playlist.initSegment!.byteSize, end);
 								});
@@ -1127,6 +1230,10 @@ export class HlsMuxer extends Muxer {
 						);
 						output.addVideoTrack(videoSource, {
 							...videoTrack.track.metadata,
+							frameRate: getSegmentFrameRate(
+								(videoTrack.track as OutputVideoTrack).metadata.frameRate,
+								playlist.segmentFormat,
+							),
 							decoderConfig: videoTrack.info.decoderConfig,
 							primingPacket: videoTrack.info.primingPacket ?? undefined,
 						});
@@ -1157,6 +1264,11 @@ export class HlsMuxer extends Muxer {
 
 							output.setMetadataTags({ raw: { PRIV: priv } });
 						}
+					}
+
+					if (playlist.singleFile && output._muxer instanceof MpegTsMuxer) {
+						// The segments make up one transport stream, so its continuity counters must not start over
+						output._muxer.continuityCounters = playlist.singleFile.continuityCounters;
 					}
 
 					await output.start();
@@ -1276,18 +1388,34 @@ export class HlsMuxer extends Muxer {
 			}
 
 			if (this.isLive) {
-				while (playlist.writtenSegments.length > this.maxLiveSegmentCount) {
-					const popped = playlist.writtenSegments.shift()!;
-					playlist.mediaSequence++;
+				// "The server MUST NOT remove a Media Segment from a Playlist file without an EXT-X-ENDLIST tag if that
+				// would produce a Playlist whose duration is less than three times the target duration." (RFC 8216,
+				// Section 6.2.2) So we may keep more segments than the maximum count.
+				const minPlaylistDuration = 3 * Math.ceil(this.targetSegmentDuration);
+				let playlistDuration = playlist.writtenSegments.reduce((sum, segment) => sum + segment.duration, 0);
 
-					if (!this.singleFilePerPlaylist) {
-						assert(popped.info);
-						this.format._options.onSegmentPopped?.(popped.path, popped.info);
-					}
+				const poppedSegments: PlaylistSegment[] = [];
+				while (
+					playlist.writtenSegments.length > this.maxLiveSegmentCount
+					&& playlistDuration - playlist.writtenSegments[0]!.duration >= minPlaylistDuration
+				) {
+					const popped = playlist.writtenSegments.shift()!;
+					playlistDuration -= popped.duration;
+					poppedSegments.push(popped);
+					playlist.mediaSequence++;
 				}
 
 				await this.writePlaylist(playlist);
 				await this.tryWriteMasterPlaylist();
+
+				// Popped segments are reported only once a playlist without them has been written, since their files
+				// may get deleted in response
+				if (!this.singleFilePerPlaylist) {
+					for (const popped of poppedSegments) {
+						assert(popped.info);
+						this.format._options.onSegmentPopped?.(popped.path, popped.info);
+					}
+				}
 			}
 		}
 	}
@@ -1484,29 +1612,78 @@ export class HlsMuxer extends Muxer {
 		let groupIdTrackCount = 0;
 		let hasHadDefaultTrackInGroup = false;
 
+		// Once complete, a rendition whose playlist never got a packet holds nothing, and readers would look for its
+		// media in vain. So it's left out, along with its codec and, when no rendition of its group remains, the
+		// variant's reference to the group. An output without any packets stays as it is.
+		const someTrackHasPackets = this.trackDatas.some(x => x.hasPackets);
+		const isEmptyRendition = (decl: PlaylistDeclaration) => someTrackHasPackets
+			&& !decl.noUri // Its media is in the variant's own playlist
+			&& (!this.isLive || decl.playlist.done)
+			&& !decl.playlist.tracks.some(track => this.trackDatas.some(x => x.track === track && x.hasPackets));
+		const getListedReferences = (decl: PlaylistDeclaration) => decl.references.filter(x => !isEmptyRendition(x));
+		const playlistsListedWithoutRenditions = new Set<Playlist>();
+
+		// "Its absence implies a value of SDR", and Apple requires it unless all variants are SDR
+		const writeVideoRange = this.trackDatas.some(
+			x => x.info.type === 'video' && getVideoRange(x.info.decoderConfig) !== 'SDR',
+		);
+
+		// A variant without segments can't be played (and players often start with the cheapest variant), so it's left
+		// out unless no variant has any
+		const someVariantHasSegments = this.playlistDeclarations.some(
+			x => x.groupId === null && x.playlist.writtenSegments.length > 0,
+		);
+
 		for (const decl of this.playlistDeclarations) {
 			if (decl.groupId === null) {
+				if (someVariantHasSegments && decl.playlist.writtenSegments.length === 0) {
+					continue;
+				}
+
+				const references = getListedReferences(decl);
+				if (decl.references.length > 0 && references.length === 0) {
+					// All renditions of the variant were left out. Variants that list the same playlist differ only
+					// by their group, so another one listing it with renditions (or without, already) covers it.
+					const listedWithRenditions = this.playlistDeclarations.some(
+						x => x.groupId === null && x.playlist === decl.playlist && getListedReferences(x).length > 0,
+					);
+					if (listedWithRenditions || playlistsListedWithoutRenditions.has(decl.playlist)) {
+						continue;
+					}
+					playlistsListedWithoutRenditions.add(decl.playlist);
+				}
+
 				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
 					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
+				// CODECS lists the formats present in the segments (RFC 8216, 4.3.4.2), so once the playlist is
+				// complete, tracks that never got a packet are left out (readers would look for them in vain), unless
+				// no track of the variant has any
+				const tracksWithPackets = decl.playlist.tracks.filter(
+					track => this.trackDatas.some(x => x.track === track && x.hasPackets),
+				);
+				const isComplete = !this.isLive || decl.playlist.done;
+				const codecTracks = isComplete && tracksWithPackets.length > 0
+					? tracksWithPackets
+					: decl.playlist.tracks;
 				const codecs: string[] = [];
-				for (const track of decl.playlist.tracks) {
+				for (const track of codecTracks) {
 					const trackData = this.trackDatas.find(x => x.track === track);
 					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
-					codecs.push(toHlsCodecString(codecString));
+					codecs.push(toHlsCodecString(codecString, decl.playlist.segmentFormat));
 				}
 
 				let peakDeclBitrate = 0;
 				let maxRefAverageBitrate = 0;
 
-				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
+				if (references.length > 0) {
+					const firstRef = references[0]!;
 					const firstTrack = firstRef.playlist.tracks[0]!;
 					const trackData = this.trackDatas.find(x => x.track === firstTrack);
 					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
-					codecs.push(toHlsCodecString(codecString));
+					codecs.push(toHlsCodecString(codecString, firstRef.playlist.segmentFormat));
 
-					for (const ref of decl.references) {
+					for (const ref of references) {
 						assert(ref.playlist.peakBitrate !== null);
 						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
 						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
@@ -1545,10 +1722,33 @@ export class HlsMuxer extends Muxer {
 						let width = decoderConfig.displayAspectWidth ?? decoderConfig.codedWidth;
 						let height = decoderConfig.displayAspectHeight ?? decoderConfig.codedHeight;
 
+						// WebCodecs defines the display aspect as a ratio, in any units. A display size in pixels is
+						// used as is, but a ratio smaller than the frame (such as 16:9, which Mediabunny's demuxers
+						// give when the size in square pixels isn't whole) grows the coded size until it matches
+						const { codedWidth, codedHeight } = decoderConfig;
+						if (
+							width !== undefined
+							&& height !== undefined
+							&& codedWidth !== undefined
+							&& codedHeight !== undefined
+							&& width < codedWidth
+							&& height < codedHeight
+						) {
+							[width, height] = width * codedHeight > height * codedWidth
+								? [Math.round(codedHeight * width / height), codedHeight]
+								: [codedWidth, Math.round(codedWidth * height / width)];
+						}
+
 						if (width !== undefined && height !== undefined) {
+							// The segments only display the frames rotated if their format stores the rotation. A
+							// transformation matrix takes precedence over `rotation`, like in the muxers.
+							const { rotation, transformationMatrix } = videoTrack.metadata;
+							const displayRotation = transformationMatrix
+								? extractRotationFromMatrix(transformationMatrix)
+								: rotation ?? 0;
 							if (
-								videoTrack.metadata.rotation !== undefined
-								&& videoTrack.metadata.rotation % 180 === 90
+								decl.playlist.segmentFormat.supportsVideoTransformationMetadata
+								&& displayRotation % 180 === 90
 							) {
 								[width, height] = [height, width];
 							}
@@ -1562,11 +1762,15 @@ export class HlsMuxer extends Muxer {
 						// Spec requires that frame rate be rounded to 3 decimal places
 						masterPlaylistText += `,FRAME-RATE=${+videoTrack.metadata.frameRate.toFixed(3)}`;
 					}
+
+					if (writeVideoRange && decoderConfig) {
+						masterPlaylistText += `,VIDEO-RANGE=${getVideoRange(decoderConfig)}`;
+					}
 				}
 
 				if (!isKeyPacketsOnly) {
 					const groupIdForType = new Map<string, string>();
-					for (const ref of decl.references) {
+					for (const ref of references) {
 						assert(ref.groupId !== null);
 						const type = ref.playlist.tracks[0]!.type;
 						groupIdForType.set(type, ref.groupId);
@@ -1586,6 +1790,10 @@ export class HlsMuxer extends Muxer {
 					masterPlaylistText += `${decl.playlist.path}\n`;
 				}
 			} else {
+				if (isEmptyRendition(decl)) {
+					continue;
+				}
+
 				assert(decl.playlist.tracks.length === 1);
 
 				const track = decl.playlist.tracks[0]!;
@@ -1752,6 +1960,16 @@ const validateInitPath = (path: string) => {
 			'Init paths cannot contain line feed, carriage return, or double quote characters.',
 		);
 	}
+};
+
+const toSegmentOutputFormat = (format: OutputFormat) => {
+	if (format instanceof Mp3OutputFormat) {
+		// The Xing frame describes an entire MP3 file. At the start of a packed audio segment, players read it as an
+		// extra frame of audio (FFmpeg does), so every segment would gain a frame of silence.
+		return new Mp3OutputFormat({ ...format._options, xingHeader: false });
+	}
+
+	return format;
 };
 
 const toPlaylistInfo = (playlist: Playlist): HlsOutputPlaylistInfo => {

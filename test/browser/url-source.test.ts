@@ -19,6 +19,38 @@ test('Should be able to load a very small video file via URL (<512 kB)', async (
 	expect(duration).toBeCloseTo(3.33333);
 });
 
+test('UrlSource does not retry a suspected CORS failure, in a window or in a worker', async () => {
+	// Nothing listens on port 9 (discard) of another origin, which Chrome reports as "Failed to fetch", like a CORS
+	// failure. Retrying couldn't help, so the read should fail instead of retrying forever.
+	const crossOriginUrl = 'http://127.0.0.1:9/video.mp4';
+	const settle = (promise: Promise<string>) => Promise.race([
+		promise,
+		new Promise<string>(resolve => setTimeout(() => resolve('still pending'), 3000)),
+	]);
+
+	const reader = new Reader(new UrlSource(crossOriginUrl));
+	const inWindow = await settle((async () => {
+		try {
+			await reader.requestSlice(0, 1);
+			return 'resolved';
+		} catch (error) {
+			return `rejected: ${String(error)}`;
+		}
+	})());
+	expect(inWindow, 'window').toMatch(/^rejected/);
+
+	const worker = new Worker(new URL('./helpers/io-url-source-worker.ts', import.meta.url), { type: 'module' });
+	try {
+		const inWorker = await settle(new Promise<string>((resolve) => {
+			worker.onmessage = (event: MessageEvent<string>) => resolve(event.data);
+			worker.postMessage(crossOriginUrl);
+		}));
+		expect(inWorker, 'worker').toMatch(/^rejected/);
+	} finally {
+		worker.terminate();
+	}
+});
+
 test('requestInit with Range', async () => {
 	const url = makeRampedUrl();
 
@@ -59,6 +91,21 @@ test('Request with Range', async () => {
 	expect(await reader.requestSlice(8, 4)).toBeNull();
 
 	URL.revokeObjectURL(url);
+});
+
+test('Random access keeps working when the browser has the resource cached', async () => {
+	// A plain fetch puts the whole file into the HTTP cache, from which Firefox answers bytes=0- with a 200
+	const expected = new Uint8Array(await (await fetch('/video.mp4')).arrayBuffer());
+
+	const source = new UrlSource('/video.mp4', { maxCacheSize: 2 ** 16 });
+	const reader = new Reader(source);
+
+	// The start of the file must still be readable after reading its end
+	for (const start of [0, expected.length - 1000, 0]) {
+		const slice = await reader.requestSlice(start, 1000);
+		expect(slice).not.toBeNull();
+		expect(readBytes(slice!, 1000)).toEqual(expected.subarray(start, start + 1000));
+	}
 });
 
 const makeRampedUrl = () => {

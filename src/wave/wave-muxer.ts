@@ -15,7 +15,7 @@ import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
 import { WavOutputFormat } from '../output-format';
 import { assert, assertNever, isIso88591Compatible, keyValueIterator } from '../misc';
-import { MetadataTags, metadataTagsAreEmpty } from '../metadata';
+import { formatMetadataDate, MetadataTags, metadataTagsAreEmpty } from '../metadata';
 import { Id3V2Writer } from '../id3';
 import { Logging } from '../logging';
 
@@ -26,8 +26,7 @@ export class WaveMuxer extends Muxer {
 	private riffWriter!: RiffWriter;
 	private headerWritten = false;
 	private dataSize = 0;
-	private sampleRate: number | null = null;
-	private sampleCount = 0;
+	private blockSize: number | null = null;
 
 	private riffSizePos: number | null = null;
 	private dataSizePos: number | null = null;
@@ -57,7 +56,6 @@ export class WaveMuxer extends Muxer {
 			validateAudioChunkMetadata({ decoderConfig: track.metadata.decoderConfig }, track.source._codec);
 
 			this.writeHeader(track, track.metadata.decoderConfig);
-			this.sampleRate = track.metadata.decoderConfig.sampleRate;
 			this.headerWritten = true;
 		}
 
@@ -87,7 +85,6 @@ export class WaveMuxer extends Muxer {
 				assert(meta.decoderConfig);
 
 				this.writeHeader(track, meta.decoderConfig);
-				this.sampleRate = meta.decoderConfig.sampleRate;
 				this.headerWritten = true;
 			}
 
@@ -102,7 +99,6 @@ export class WaveMuxer extends Muxer {
 
 			this.writer.write(packet.data);
 			this.dataSize += packet.data.byteLength;
-			this.sampleCount += Math.round(packet.duration * this.sampleRate!);
 
 			await this.writer.flush();
 		} finally {
@@ -137,6 +133,7 @@ export class WaveMuxer extends Muxer {
 		const channels = config.numberOfChannels;
 		const sampleRate = config.sampleRate;
 		const blockSize = pcmInfo.sampleSize * channels;
+		this.blockSize = blockSize;
 
 		// RIFF header
 		this.riffWriter.writeAscii(this.isRf64 ? 'RF64' : 'RIFF');
@@ -167,15 +164,20 @@ export class WaveMuxer extends Muxer {
 			// Empty table
 		}
 
-		// fmt chunk
+		// fmt chunk. Formats other than PCM use the WAVEFORMATEX structure, which ends with the size of the extra
+		// format information (cbSize), here none.
+		const isPcm = format === WaveFormat.PCM;
 		this.riffWriter.writeAscii('fmt ');
-		this.riffWriter.writeU32(16); // Chunk size
+		this.riffWriter.writeU32(isPcm ? 16 : 18); // Chunk size
 		this.riffWriter.writeU16(format);
 		this.riffWriter.writeU16(channels);
 		this.riffWriter.writeU32(sampleRate);
 		this.riffWriter.writeU32(sampleRate * blockSize); // Bytes per second
 		this.riffWriter.writeU16(blockSize);
 		this.riffWriter.writeU16(8 * pcmInfo.sampleSize);
+		if (!isPcm) {
+			this.riffWriter.writeU16(0); // cbSize
+		}
 
 		// Metadata tags
 		if (!metadataTagsAreEmpty(this.output._metadataTags)) {
@@ -273,7 +275,11 @@ export class WaveMuxer extends Muxer {
 				}; break;
 
 				case 'date': {
-					writeInfoTag('ICRD', value.toISOString().slice(0, 10));
+					const dateString = formatMetadataDate(value);
+					if (dateString !== null) {
+						writeInfoTag('ICRD', dateString);
+					}
+					// Marked as written even when left out, so that a raw tag can't bring the date back
 					writtenTags.add('ICRD');
 				}; break;
 
@@ -374,10 +380,11 @@ export class WaveMuxer extends Muxer {
 			this.writer.seek(this.ds64DataSizePos);
 			this.riffWriter.writeU64(this.dataSize);
 
-			// Write sample count
+			// Write sample count, going by the data since packet durations can be imprecise
 			assert(this.ds64SampleCountPos !== null);
+			assert(this.blockSize !== null);
 			this.writer.seek(this.ds64SampleCountPos);
-			this.riffWriter.writeU64(this.sampleCount);
+			this.riffWriter.writeU64(Math.floor(this.dataSize / this.blockSize));
 		} else {
 			// Write file size
 			assert(this.riffSizePos !== null);

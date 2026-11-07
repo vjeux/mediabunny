@@ -86,12 +86,12 @@ export class EncodedPacket {
 			);
 		}
 
-		if (byteLength === undefined) {
-			byteLength = data.byteLength;
-		}
-
 		if (!(data instanceof Uint8Array)) {
 			throw new TypeError('data must be a Uint8Array.');
+		}
+
+		if (byteLength === undefined) {
+			byteLength = data.byteLength;
 		}
 		if (type !== 'key' && type !== 'delta') {
 			throw new TypeError('type must be either "key" or "delta".');
@@ -219,7 +219,10 @@ export class EncodedPacket {
 		chunk: EncodedVideoChunk | EncodedAudioChunk,
 		sideData?: EncodedPacketSideData,
 	): EncodedPacket {
-		if (!(chunk instanceof EncodedVideoChunk || chunk instanceof EncodedAudioChunk)) {
+		if (
+			!(typeof EncodedVideoChunk !== 'undefined' && chunk instanceof EncodedVideoChunk)
+			&& !(typeof EncodedAudioChunk !== 'undefined' && chunk instanceof EncodedAudioChunk)
+		) {
 			throw new TypeError('chunk must be an EncodedVideoChunk or EncodedAudioChunk.');
 		}
 

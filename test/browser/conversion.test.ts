@@ -8,19 +8,32 @@ import {
 	MpegTsOutputFormat,
 	OutputFormat,
 	WavOutputFormat,
+	WebMOutputFormat,
 } from '../../src/output-format.js';
 import { Output, OutputTrackGroup } from '../../src/output.js';
-import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource, Source, UrlSource } from '../../src/source.js';
 import { expect, test } from 'vitest';
 import { BufferTarget, PathedTarget } from '../../src/target.js';
-import { Conversion, ConversionCanceledError, ConversionOptions } from '../../src/conversion.js';
+import {
+	Conversion,
+	ConversionCanceledError,
+	ConversionOptions,
+	ConversionVideoOptions,
+} from '../../src/conversion.js';
 import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
 import { InputVideoTrack } from '../../src/input-track.js';
-import { CanvasSource, EncodedAudioPacketSource } from '../../src/media-source.js';
+import {
+	CanvasSource,
+	EncodedAudioPacketSource,
+	VideoSampleSource,
+	EncodedVideoPacketSource,
+} from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
+import { VideoSample } from '../../src/sample.js';
+import { CustomVideoDecoder, registerDecoder } from '../../src/custom-coder.js';
 
 test('Rotation is baked in when rerendering', async () => {
 	using input = new Input({
@@ -60,6 +73,41 @@ test('Rotation is baked in when rerendering', async () => {
 	expect(await track.getDisplayWidth()).toBe(320);
 	expect(await track.getDisplayHeight()).toBe(570);
 	expect(await track.getRotation()).toBe(0);
+});
+
+test.each([
+	// 32x32 solid (200, 200, 200), VP9 profile 1 GBR 4:4:4, as FFmpeg makes lossless VP9 from RGB sources:
+	// ffmpeg -f lavfi -i "color=0xc8c8c8:s=32x32:r=10:d=0.2,format=gbrp" -c:v libvpx-vp9 -lossless 1
+	['/vp9-gbr-lossless.webm', [200, 200, 200]],
+	// 32x32 solid (48, 128, 192), AV1 GBR 4:4:4:
+	// ffmpeg -f lavfi -i "color=0x3080c0:s=32x32:r=10:d=0.2,format=gbrp" -c:v libaom-av1 -cpu-used 8 -crf 0
+	['/av1-gbr-lossless.mkv', [48, 128, 192]],
+])('Transcoding GBR-coded video (identity matrix) keeps its colors: %s', async (url, color) => {
+	const firstPixel = async (input: Input) => {
+		using sample = (await new VideoSampleSink((await input.getPrimaryVideoTrack())!).getSample(0))!;
+		const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+		await sample.copyTo(rgba, { format: 'RGBA' });
+		return [...rgba.subarray(0, 3)];
+	};
+
+	for (const [createFormat, codec] of [
+		[() => new Mp4OutputFormat(), 'avc'],
+		[() => new WebMOutputFormat(), 'vp8'],
+		[() => new WebMOutputFormat(), 'vp9'],
+	] as const) {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		expect((await (await input.getPrimaryVideoTrack())!.getColorSpace()).matrix).toBe('rgb');
+
+		const output = new Output({ format: createFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video: { codec, forceTranscode: true } });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const pixel = await firstPixel(result);
+		for (let i = 0; i < 3; i++) {
+			expect(Math.abs(pixel[i]! - color[i]!)).toBeLessThan(15);
+		}
+	}
 });
 
 test('Flip is forwarded as metadata when copying', async () => {
@@ -173,6 +221,66 @@ const encodeFlippedVideo = async () => {
 
 	return output.target.buffer!;
 };
+
+test('A fit without both width and height applies to video that changes size, even if it could be copied', async () => {
+	// A VP9 WebM switching from 64x48 to 32x32 mid-stream, as WebRTC and MediaRecorder recordings do
+	const encodeVp9 = async (width: number, height: number, first: number, count: number) => {
+		const chunks: { chunk: EncodedVideoChunk; meta?: EncodedVideoChunkMetadata }[] = [];
+		const encoder = new VideoEncoder({
+			output: (chunk, meta) => chunks.push({ chunk, meta }),
+			error: (error) => {
+				throw error;
+			},
+		});
+		encoder.configure({ codec: 'vp09.00.10.08', width, height, bitrate: 1e5 });
+
+		const canvas = new OffscreenCanvas(width, height);
+		const context = canvas.getContext('2d')!;
+		for (let i = first; i < first + count; i++) {
+			context.fillStyle = `rgb(${i * 40}, 128, 64)`;
+			context.fillRect(0, 0, width, height);
+			const frame = new VideoFrame(canvas, { timestamp: i * 100_000, duration: 100_000 });
+			encoder.encode(frame, { keyFrame: i === first });
+			frame.close();
+		}
+
+		await encoder.flush();
+		encoder.close();
+		return chunks;
+	};
+
+	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('vp9');
+	sourceOutput.addVideoTrack(videoSource);
+	await sourceOutput.start();
+	for (const { chunk, meta } of [...await encodeVp9(64, 48, 0, 3), ...await encodeVp9(32, 32, 3, 3)]) {
+		await videoSource.add(EncodedPacket.fromEncodedChunk(chunk), meta);
+	}
+	await sourceOutput.finalize();
+
+	const convertedFrameSizes = async (video: ConversionVideoOptions) => {
+		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const sizes: string[] = [];
+		for await (using sample of new VideoSampleSink((await result.getPrimaryVideoTrack())!).samples()) {
+			sizes.push(`${sample.displayWidth}x${sample.displayHeight}`);
+		}
+
+		return sizes;
+	};
+
+	const expected = Array(6).fill('64x48');
+	// Control: when a transcode happens anyway, fit handles the size change
+	expect(await convertedFrameSizes({ width: 64, height: 48, fit: 'contain', forceTranscode: true }))
+		.toEqual(expected);
+	// fit alone has no other role, so it must be applied too
+	expect(await convertedFrameSizes({ fit: 'contain' })).toEqual(expected);
+	expect(await convertedFrameSizes({ width: 64, fit: 'contain' })).toEqual(expected);
+});
 
 test('Exceeding max allowed track count', async () => {
 	using input = new Input({
@@ -490,6 +598,30 @@ test('HLS track assignability can be overridden', async () => {
 	const newMasterPlaylist = sanitizeMasterPlaylist(new TextDecoder().decode(files.get('new/master.m3u8')));
 	expect(newMasterPlaylist).not.toBe(masterPlaylist);
 	expect(newMasterPlaylist.match(/\.m3u8/g)?.length).toBe(1);
+});
+
+test('Transcoding keeps frames that have a duration of zero', async () => {
+	// The last frame of each cluster in this Matroska file has no duration (no BlockDuration or DefaultDuration), the
+	// first one at 4.81 s
+	using input = new Input({ source: new UrlSource('/annex-b-avc.mkv'), formats: ALL_FORMATS });
+	const inputTrack = (await input.getPrimaryVideoTrack())!;
+	const inputPackets = [];
+	const sink = new EncodedPacketSink(inputTrack);
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		if (packet.timestamp >= 6) {
+			break;
+		}
+		inputPackets.push(packet);
+	}
+	expect(inputPackets.some(x => x.duration === 0)).toBe(true);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, video: { width: 320 }, trim: { end: 6 } });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const outputTrack = (await result.getPrimaryVideoTrack())!;
+	expect((await outputTrack.computePacketStats()).packetCount).toBe(inputPackets.length);
 });
 
 test('Fractional audio sample boundary', async () => {
@@ -874,6 +1006,39 @@ test('Pause signal', async () => {
 	expect(conversion.state).toBe('done');
 });
 
+test.each(['video', 'audio'] as const)(
+	'A pause requested while %s processing drops every sample still pauses the conversion',
+	async (type) => {
+		// Like a voice activity filter that drops everything until speech starts
+		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const controller = new AbortController();
+		let calls = 0;
+		let dropAll = true;
+		const process = <T>(sample: T) => {
+			calls++;
+			controller.abort();
+			return dropAll ? null : sample;
+		};
+
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: type === 'video' ? { process } : { discard: true },
+			audio: type === 'audio' ? { process } : { discard: true },
+		});
+
+		await conversion.execute({ pauseSignal: controller.signal });
+		expect(conversion.state).toBe('idle');
+		expect(calls).toBe(1);
+
+		dropAll = false;
+		await conversion.execute();
+		expect(conversion.state).toBe('done');
+		expect(calls).toBeGreaterThan(1);
+	},
+);
+
 test('Pre-signaled pause signal', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
@@ -896,6 +1061,25 @@ test('Pre-signaled pause signal', async () => {
 
 	await conversion.execute();
 	expect(conversion.state).toBe('done');
+});
+
+test('onProgress reports the processed time from the start of the trim region', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, trim: { start: 2, end: 4 } });
+
+	const processedTimes: number[] = [];
+	conversion.onProgress = (progress, processedTime) => {
+		processedTimes.push(processedTime);
+	};
+	await conversion.execute();
+
+	expect(processedTimes[0]).toBe(0);
+	expect(processedTimes.at(-1)).toBeGreaterThanOrEqual(2);
+	expect(processedTimes.at(-1)).toBeLessThan(2.1);
+	for (let i = 1; i < processedTimes.length; i++) {
+		expect(processedTimes[i]).toBeGreaterThanOrEqual(processedTimes[i - 1]!);
+	}
 });
 
 test('Resizing at various scale factors', async () => {
@@ -997,7 +1181,7 @@ test('Packet copy, delta frame trim, shrink', async () => {
 		},
 		expectedTimeOffset: 1.5,
 		videoStartTimestamp: 0.5,
-		videoEndTimestamp: 1.02, // Due to MP4 not being able to express a different duration for the last packet
+		videoEndTimestamp: 1, // The last presented packet is shrunk to end at the trim end
 		audioStartTimestamp: -0.028 + 2 * 1024 / 48000,
 		audioEndTimestamp: 1.0173333333333334 - 1024 / 48000,
 	});
@@ -1208,6 +1392,134 @@ const testCopy = async (options: {
 		}
 	}
 };
+
+test('Requested audio parameters apply when the decoded audio differs from the metadata', async () => {
+	// ADTS signals HE-AACv2 implicitly, with the core's 22.05 kHz mono, while it decodes to 44.1 kHz stereo
+	using mp4Input = new Input({
+		source: new UrlSource('/he-aac-v2.mp4'),
+		formats: ALL_FORMATS,
+	});
+	const adtsOutput = new Output({ format: new AdtsOutputFormat(), target: new BufferTarget() });
+	const toAdts = await Conversion.init({
+		input: mp4Input,
+		output: adtsOutput,
+		video: { discard: true },
+		copy: { mode: 'forced', shiftTolerance: Infinity },
+		trim: { end: 1 },
+	});
+	await toAdts.execute();
+
+	using adtsInput = new Input({
+		source: new BufferSource(adtsOutput.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const adtsTrack = await adtsInput.getPrimaryAudioTrack();
+	assert(adtsTrack);
+	expect(await adtsTrack.getSampleRate()).toBe(22050);
+	expect(await adtsTrack.getNumberOfChannels()).toBe(1);
+
+	for (const audio of [{ numberOfChannels: 1 }, { sampleRate: 22050 }]) {
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input: adtsInput, output, audio });
+		await conversion.execute();
+
+		using wavInput = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+		const wavTrack = await wavInput.getPrimaryAudioTrack();
+		assert(wavTrack);
+		expect({
+			numberOfChannels: await wavTrack.getNumberOfChannels(),
+			sampleRate: await wavTrack.getSampleRate(),
+		}).toEqual({ numberOfChannels: 2, sampleRate: 44100, ...audio });
+	}
+});
+
+// video.mp4 is 1920x1080 H.264 High at level 4.0. Whether the platform has hardware video codecs is decided with
+// WebCodecs alone (Chromium refuses 'prefer-hardware' without them).
+const VIDEO_MP4_DECODER_CONFIG: VideoDecoderConfig = { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 };
+
+test('Video that the requested hardware acceleration can\'t decode is discarded', async (context) => {
+	const hardware = await VideoDecoder.isConfigSupported({
+		...VIDEO_MP4_DECODER_CONFIG,
+		hardwareAcceleration: 'prefer-hardware',
+	});
+	if (hardware.supported) {
+		context.skip('This platform decodes H.264 in hardware');
+	}
+
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		video: { forceTranscode: true, hardwareAcceleration: 'prefer-hardware' },
+		audio: { discard: true },
+		showWarnings: false,
+	});
+	expect(conversion.isValid).toBe(false);
+	expect(conversion.discardedTracks.map(x => x.reason)).toContain('undecodable_source_codec');
+
+	// Without the hint, it transcodes
+	using softwareInput = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const softwareOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const software = await Conversion.init({
+		input: softwareInput,
+		output: softwareOutput,
+		video: { forceTranscode: true, hardwareAcceleration: 'prefer-software' },
+		audio: { discard: true },
+		trim: { start: 0, end: 0.2 },
+		showWarnings: false,
+	});
+	expect(software.isValid).toBe(true);
+	await software.execute();
+});
+
+// Stands in for a hardware decoder where there is none, for the duration of a test
+let fakeHardwareDecoderEnabled = false;
+class FakeHardwareDecoder extends CustomVideoDecoder {
+	static override supports() {
+		return fakeHardwareDecoderEnabled;
+	}
+
+	init() {}
+	decode() {}
+	flush() {}
+	close() {}
+}
+
+test('Video that the requested hardware acceleration can\'t encode is discarded', async (context) => {
+	const hardware = await VideoEncoder.isConfigSupported({
+		codec: 'avc1.640028',
+		width: 1920,
+		height: 1080,
+		bitrate: 5_000_000,
+		hardwareAcceleration: 'prefer-hardware',
+	});
+	if (hardware.supported) {
+		context.skip('This platform encodes H.264 in hardware');
+	}
+
+	// Like a platform that decodes in hardware but has no hardware encoder for the codec (common for HEVC and AV1)
+	registerDecoder(FakeHardwareDecoder);
+	fakeHardwareDecoderEnabled = true;
+	try {
+		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec: 'avc', forceTranscode: true, hardwareAcceleration: 'prefer-hardware' },
+			audio: { discard: true },
+			showWarnings: false,
+		});
+		expect(conversion.isValid).toBe(false);
+		expect(conversion.discardedTracks.map(x => x.reason)).toContain('no_encodable_target_codec');
+	} finally {
+		fakeHardwareDecoderEnabled = false;
+	}
+});
 
 test('Trim wholly before media data, transcode', async () => {
 	using input = new Input({
@@ -1460,3 +1772,265 @@ const testReservedFastStart = async (
 		expect(maximumPacketCount).toBeLessThanOrEqual(2 * packetCount + 64);
 	}
 };
+
+test('Transcoding odd-sized video to AVC rounds its dimensions up to even ones', async () => {
+	// Like a screen recording of an odd-sized window
+	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const canvas = new OffscreenCanvas(321, 241);
+	canvas.getContext('2d')!.fillRect(0, 0, 321, 241);
+	const canvasSource = new CanvasSource(canvas, { codec: 'vp9', quality: new Quality('medium') });
+	sourceOutput.addVideoTrack(canvasSource);
+	await sourceOutput.start();
+	for (let i = 0; i < 5; i++) {
+		await canvasSource.add(i / 10, 1 / 10);
+	}
+	await sourceOutput.finalize();
+
+	using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, video: { codec: 'avc' }, showWarnings: false });
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = await result.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await videoTrack.getCodec()).toBe('avc');
+	expect(await videoTrack.getCodedWidth()).toBe(322);
+	expect(await videoTrack.getCodedHeight()).toBe(242);
+});
+
+test('Transcoding to AVC with an odd-sized crop rounds the crop size up to even dimensions', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		video: { codec: 'avc', crop: { left: 10, top: 10, width: 45, height: 81 } },
+		trim: { end: 0.5 },
+		showWarnings: false,
+	});
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = await result.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await videoTrack.getCodec()).toBe('avc');
+	expect([await videoTrack.getCodedWidth(), await videoTrack.getCodedHeight()]).toEqual([46, 82]);
+});
+
+/** Makes a 2 s WebM whose frames take some bits to encode, and transcodes it to VP8, returning the bitrate. */
+const transcodeToVp8 = async (
+	frameRate: number,
+	quality: Quality,
+	process?: (sample: VideoSample) => VideoSample | null,
+) => {
+	const width = 320;
+	const height = 180;
+	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const sourceVideo = new VideoSampleSource({ codec: 'vp9', quality: new Quality({ bitrate: 2_000_000 }) });
+	sourceOutput.addVideoTrack(sourceVideo, { frameRate });
+	await sourceOutput.start();
+
+	const addFrame = async (i: number) => {
+		const data = new Uint8Array(width * height * 3 / 2).fill(128);
+		for (let y = 0; y < height; y++) {
+			for (let x = 0; x < width; x++) {
+				data[y * width + x] = 128 + 60 * Math.sin(x * 0.05 + i * 0.3) * Math.cos(y * 0.07 - i * 0.2)
+					+ ((x * 7 + y * 13 + i * 31) % 9) - 4;
+			}
+		}
+
+		using sample = new VideoSample(data, {
+			format: 'I420',
+			codedWidth: width,
+			codedHeight: height,
+			timestamp: i / frameRate,
+			duration: 1 / frameRate,
+		});
+		await sourceVideo.add(sample);
+	};
+
+	for (let i = 0; i < 2 * frameRate; i++) {
+		await addFrame(i);
+	}
+	await sourceOutput.finalize();
+
+	using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		video: { codec: 'vp8', quality, process },
+	});
+	await conversion.execute();
+
+	using newInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await newInput.getPrimaryVideoTrack();
+	assert(track);
+
+	return (await track.computePacketStats()).averageBitrate;
+};
+
+test('Transcoding 60 fps video keeps the requested bitrate', { timeout: 30_000 }, async () => {
+	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }));
+	expect(averageBitrate).toBeGreaterThan(0.7 * 300_000);
+	expect(averageBitrate).toBeLessThan(1.3 * 300_000);
+});
+
+test('Transcoding 60 fps video whose process function drops every other frame keeps the requested bitrate', {
+	timeout: 30_000,
+}, async () => {
+	// The output runs at 30 fps, so the input's 60 fps must not be what the encoder budgets for
+	let index = 0;
+	const averageBitrate = await transcodeToVp8(60, new Quality({ bitrate: 300_000 }), (sample) => {
+		return index++ % 2 === 0 ? sample : null;
+	});
+	expect(averageBitrate).toBeGreaterThan(0.7 * 300_000);
+	expect(averageBitrate).toBeLessThan(1.3 * 300_000);
+});
+
+test('Transcoding 60 fps video with a quality level gets twice the bitrate of 30 fps', {
+	timeout: 30_000,
+}, async () => {
+	// Quality levels are meant for up to 30 fps, and 60 fps has always ended up with twice the bitrate (before
+	// encoders were told the frame rate, because they assumed 30 fps)
+	const bitrate30 = await transcodeToVp8(30, new Quality('medium'));
+	const bitrate60 = await transcodeToVp8(60, new Quality('medium'));
+	expect(bitrate60 / bitrate30).toBeGreaterThan(1.6);
+	expect(bitrate60 / bitrate30).toBeLessThan(2.4);
+});
+
+test('Audio whose sample rate and channel count change mid-stream converts with the first part\'s', async () => {
+	// An HLS stream with a segment between discontinuities that has other audio parameters, like an inserted ad: 1 s of
+	// 48 kHz mono, then after a short break 1 s of 44.1 kHz stereo, then 1 s of 48 kHz mono again. The playlist places
+	// the middle segment at `middleStart`.
+	const writeSegment = async (url: string) => {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig);
+
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('aac');
+		output.addAudioTrack(source);
+		await output.start();
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			if (packet.timestamp < 0) {
+				continue;
+			}
+			if (packet.timestamp >= 1) {
+				break;
+			}
+
+			await source.add(packet, { decoderConfig });
+		}
+		await output.finalize();
+
+		return output.target.buffer!;
+	};
+
+	const segments = new Map([
+		['a.ts', await writeSegment('/demo.mp4')],
+		['b.ts', await writeSegment('/sample3.aac')],
+		['c.ts', await writeSegment('/demo.mp4')],
+	]);
+	const getSource = (middleStart: string) => {
+		const playlist = new TextEncoder().encode([
+			'#EXTM3U',
+			'#EXT-X-VERSION:3',
+			'#EXT-X-TARGETDURATION:2',
+			`#EXTINF:${middleStart},`,
+			'a.ts',
+			'#EXT-X-DISCONTINUITY',
+			'#EXTINF:1.0,',
+			'b.ts',
+			'#EXT-X-DISCONTINUITY',
+			'#EXTINF:1.0,',
+			'c.ts',
+			'#EXT-X-ENDLIST',
+		].join('\n')).buffer;
+
+		return new CustomPathedSource('stream.m3u8', ({ path }) => {
+			return new BufferSource(path === 'stream.m3u8' ? playlist : segments.get(path)!);
+		});
+	};
+
+	const read = async (source: Source) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const chunks: Float32Array[] = [];
+		// Where the decoded audio switches to other parameters
+		let switchTimestamp: number | null = null;
+		for await (using sample of new AudioSampleSink(track).samples()) {
+			if (sample.sampleRate !== await track.getSampleRate() && switchTimestamp === null) {
+				switchTimestamp = sample.timestamp;
+			}
+
+			const chunk = new Float32Array(sample.numberOfFrames * sample.numberOfChannels);
+			sample.copyTo(chunk, { planeIndex: 0, format: 'f32' });
+			chunks.push(chunk);
+		}
+		const data = new Float32Array(chunks.reduce((total, x) => total + x.length, 0));
+		chunks.reduce((offset, chunk) => (data.set(chunk, offset), offset + chunk.length), 0);
+
+		return {
+			sampleRate: await track.getSampleRate(),
+			numberOfChannels: await track.getNumberOfChannels(),
+			duration: await track.computeDuration(),
+			switchTimestamp,
+			data,
+		};
+	};
+
+	const convert = async (source: Source, sampleRate: number) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, audio: { sampleRate }, showWarnings: false });
+		await conversion.execute();
+
+		return read(new BufferSource(output.target.buffer!));
+	};
+
+	// Halfway between two 48 kHz frames. The decoder rounds timestamps to the track's 48 kHz, which puts the middle
+	// segment's samples up to a 44.1 kHz frame off from where they meet, now early, now late.
+	const input = await read(getSource('1.0500104'));
+	assert(input.switchTimestamp !== null);
+
+	// At the first part's sample rate, and at another one, which the encoder resamples to
+	for (const sampleRate of [48000, 22050]) {
+		const result = await convert(getSource('1.0500104'), sampleRate);
+		expect(result.sampleRate).toBe(sampleRate);
+		expect(result.numberOfChannels).toBe(1);
+		expect(result.duration).toBeCloseTo(input.duration, 1);
+
+		// Each part comes out in its place, the middle one resampled and downmixed: it's louder than the others
+		const levels = [0.2, input.switchTimestamp + 0.2, input.switchTimestamp + 1.2].map((start) => {
+			const part = result.data.subarray(Math.round(start * sampleRate), Math.round((start + 0.6) * sampleRate));
+			return Math.sqrt(part.reduce((total, x) => total + x * x, 0) / part.length);
+		});
+		expect(levels[0]).toBeGreaterThan(0.01);
+		expect(levels[2]).toBeGreaterThan(0.01);
+		expect(levels[1]).toBeGreaterThan(2 * Math.max(levels[0]!, levels[2]!));
+
+		if (sampleRate === 48000) {
+			// The middle part comes out exactly as with the segment placed on a 48 kHz frame, where the timestamps are
+			// a fraction of a frame off at most: no frame doubled (a click) or dropped where the samples meet
+			const onGridInput = await read(getSource('1.05'));
+			const onGrid = await convert(getSource('1.05'), sampleRate);
+			const offset = Math.round(input.switchTimestamp * sampleRate);
+			const onGridOffset = Math.round(onGridInput.switchTimestamp! * sampleRate);
+			let maxDifference = 0;
+			for (let i = 0; i < Math.round(0.95 * sampleRate); i++) {
+				maxDifference = Math.max(
+					maxDifference,
+					Math.abs(result.data[offset + i]! - onGrid.data[onGridOffset + i]!),
+				);
+			}
+			expect(maxDifference).toBeLessThan(1e-4);
+		}
+	}
+});

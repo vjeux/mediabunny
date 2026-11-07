@@ -7,10 +7,10 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, TextSubtitleSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -63,6 +63,36 @@ test('Matroska muxer internally converts ADTS to AAC', async () => {
 	}
 
 	expect(count).toBe(4557);
+});
+
+test('Opus identification headers missing required bytes are rejected', async () => {
+	// RFC 7845, 5.1: 'OpusHead', version, channel count, pre-skip, input sample rate, output gain and mapping family,
+	// then, for any family but 0, the stream count, the coupled stream count and one mapping byte per channel
+	const opusHead = (channels: number, family: number, withMappingTable: boolean) => new Uint8Array([
+		...new TextEncoder().encode('OpusHead'),
+		1, channels, 0x38, 0x01, 0x80, 0xbb, 0x00, 0x00, 0x00, 0x00, family,
+		...(withMappingTable ? [4, 2, ...Array.from({ length: channels }, (_, i) => i)] : []),
+	]);
+
+	const addFirstPacket = async (description: Uint8Array, numberOfChannels: number) => {
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source);
+		await output.start();
+		// A one-frame 20 ms CELT packet
+		await source.add(new EncodedPacket(new Uint8Array([0xf8, 0xff, 0xfe]), 'key', 0, 0.02), {
+			decoderConfig: { codec: 'opus', sampleRate: 48000, numberOfChannels, description },
+		});
+	};
+
+	await addFirstPacket(opusHead(2, 0, false), 2);
+	await addFirstPacket(opusHead(6, 1, true), 6);
+
+	// These were written as CodecPrivate, which FFmpeg's decoder rejects ("Invalid extradata size"): one byte short
+	// of the mapping family, a family 1 header without its channel mapping table, and one with only part of it
+	await expect(addFirstPacket(opusHead(2, 0, false).subarray(0, 18), 2)).rejects.toThrow(TypeError);
+	await expect(addFirstPacket(opusHead(6, 1, false), 6)).rejects.toThrow(TypeError);
+	await expect(addFirstPacket(opusHead(6, 1, true).subarray(0, 26), 6)).rejects.toThrow(TypeError);
 });
 
 test('Negative start timestamps', async () => {
@@ -138,6 +168,62 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 	}
 };
 
+test('Segment Duration ends with the media when audio starts below zero next to video', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const videoSource = new EncodedVideoPacketSource('vp8');
+	output.addVideoTrack(videoSource);
+	const audioSource = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(audioSource);
+
+	await output.start();
+
+	// Video from 0 to 1 s, audio from -0.512 s (written via CodecDelay) to 1.28 s
+	const packets = [
+		...Array.from({ length: 30 }, (_, index) => ({
+			source: videoSource,
+			packet: new EncodedPacket(new Uint8Array(64).fill(index), 'key', index / 30, 1 / 30),
+		})),
+		...Array.from({ length: 56 }, (_, index) => ({
+			source: audioSource,
+			packet: new EncodedPacket(new Uint8Array(64).fill(index), 'key', (index - 16) * 32 / 1000, 32 / 1000),
+		})),
+	].sort((a, b) => a.packet.timestamp - b.packet.timestamp);
+
+	let videoStarted = false;
+	let audioStarted = false;
+	for (const { source, packet } of packets) {
+		if (source === videoSource) {
+			await videoSource.add(packet, videoStarted
+				? undefined
+				: { decoderConfig: { codec: 'vp8', codedWidth: 1280, codedHeight: 720 } });
+			videoStarted = true;
+		} else {
+			const decoderConfig = {
+				codec: 'mp4a.40.2',
+				numberOfChannels: 2,
+				sampleRate: 32000,
+				description: new Uint8Array([0x12, 0x90]),
+			};
+			await audioSource.add(packet, audioStarted ? undefined : { decoderConfig });
+			audioStarted = true;
+		}
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	expect(await input.computeDuration()).toBe(1.28);
+	expect(await input.getDurationFromMetadata()).toBe(1.28);
+});
+
 test('Negative audio start timestamps via CodecDelay', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
@@ -200,6 +286,157 @@ test('Negative audio start timestamps via CodecDelay', async () => {
 	}
 });
 
+test('WebM output stores the display size in pixels', async () => {
+	// WebM only allows pixels as the DisplayUnit. WebKit and Gecko read DisplayWidth/DisplayHeight as a pixel size.
+	const mux = async (displayAspectWidth: number, displayAspectHeight: number) => {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source);
+		await output.start();
+
+		await source.add(new EncodedPacket(new Uint8Array(64), 'key', 0, 0.04), {
+			decoderConfig: {
+				codec: 'vp8',
+				codedWidth: 640,
+				codedHeight: 480,
+				displayAspectWidth,
+				displayAspectHeight,
+			},
+		});
+		await output.finalize();
+
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	const bytes = await mux(16, 9);
+	expect(containsBytes(bytes, [0x54, 0xb0, 0x82, 0x03, 0x55])).toBe(true); // DisplayWidth 853
+	expect(containsBytes(bytes, [0x54, 0xba, 0x82, 0x01, 0xe0])).toBe(true); // DisplayHeight 480
+	expect(containsBytes(bytes, [0x54, 0xb2])).toBe(false); // No DisplayUnit
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getSquarePixelWidth()).toBe(853);
+	expect(await track.getSquarePixelHeight()).toBe(480);
+
+	// DisplayWidth must not be 0, which 480 * 1/2000 would round to
+	expect(containsBytes(await mux(1, 2000), [0x54, 0xb0, 0x81, 0x01])).toBe(true); // DisplayWidth 1
+});
+
+test('Negative audio start timestamps that aren\'t whole milliseconds stay within half a millisecond', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+
+	await output.start();
+
+	// AAC with the usual 1024 priming samples at 44.1 kHz: the first frame starts at -23.2199... ms
+	const frameDuration = 1024 / 44100;
+	const meta = {
+		decoderConfig: {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 2,
+			sampleRate: 44100,
+			description: new Uint8Array([0x12, 0x10]),
+		},
+	};
+	const inputPackets = Array.from({ length: 20 }, (_, index) => new EncodedPacket(
+		new Uint8Array(64).fill(index),
+		'key',
+		(index - 1) * frameDuration,
+		frameDuration,
+	));
+
+	for (let i = 0; i < inputPackets.length; i++) {
+		await source.add(inputPackets[i]!, i === 0 ? meta : undefined);
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const outputTimestamps: number[] = [];
+	for await (const packet of sink.packets()) {
+		outputTimestamps.push(packet.timestamp);
+	}
+
+	// Matroska stores millisecond ticks, so each timestamp should be the input rounded to the nearest millisecond
+	expect(outputTimestamps).toEqual(inputPackets.map(packet => Math.round(packet.timestamp * 1000) / 1000));
+});
+
+test('Negative audio start timestamps at half milliseconds keep their spacing', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(source);
+
+	await output.start();
+
+	// Like WebCodecs Opus: 312 samples of pre-skip (-6.5 ms) and 20 ms frames, on whole microseconds
+	const meta = {
+		decoderConfig: {
+			codec: 'opus',
+			numberOfChannels: 2,
+			sampleRate: 48000,
+		},
+	};
+	const inputPackets = Array.from({ length: 500 }, (_, index) => new EncodedPacket(
+		new Uint8Array([0xfc, index & 0xff]),
+		'key',
+		(index * 20000 - 6500) / 1e6,
+		0.02,
+	));
+
+	for (let i = 0; i < inputPackets.length; i++) {
+		await source.add(inputPackets[i]!, i === 0 ? meta : undefined);
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const outputTimestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		outputTimestamps.push(packet.timestamp);
+	}
+
+	expect(outputTimestamps).toHaveLength(inputPackets.length);
+	for (let i = 0; i < outputTimestamps.length; i++) {
+		expect(Math.abs(outputTimestamps[i]! - inputPackets[i]!.timestamp)).toBeLessThanOrEqual(0.0005 + 1e-9);
+		if (i > 0) {
+			expect(outputTimestamps[i]! - outputTimestamps[i - 1]!).toBeCloseTo(0.02, 9);
+		}
+	}
+});
+
 const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 	for (let i = 0; i <= haystack.length - needle.length; i++) {
 		if (needle.every((byte, j) => haystack[i + j] === byte)) {
@@ -209,3 +446,458 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('WebM output leaves out the Matroska v4 track flags', async () => {
+	// FlagHearingImpaired, FlagVisualImpaired, FlagOriginal and FlagCommentary aren't WebM elements, and Chrome's WebM
+	// parser (MSE) rejects files that contain them
+	const mux = async (format: MkvOutputFormat) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source, {
+			disposition: { hearingImpaired: true, visuallyImpaired: true, original: true, commentary: true },
+		});
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', 0, 0.02), {
+			decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 },
+		});
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	const flagIds = [0x55ab, 0x55ac, 0x55ae, 0x55af];
+	const hasFlag = (bytes: Uint8Array, id: number) => bytes.some((byte, i) => {
+		return byte === id >> 8 && bytes[i + 1] === (id & 0xff) && bytes[i + 2] === 0x81 && bytes[i + 3] === 1;
+	});
+
+	const webm = await mux(new WebMOutputFormat());
+	expect(flagIds.map(id => hasFlag(webm, id))).toEqual([false, false, false, false]);
+
+	const mkv = await mux(new MkvOutputFormat());
+	expect(flagIds.map(id => hasFlag(mkv, id))).toEqual([true, true, true, true]);
+});
+
+test('Opus gets an identification header as CodecPrivate, with the CodecDelay as its pre-skip', async () => {
+	// The Matroska Opus mapping requires the OpusHead in CodecPrivate (packets remuxed from MPEG-TS, say, come without
+	// one), and a CodecDelay equal to its pre-skip: the samples a decoder drops at the start. Any other start is left
+	// to the block timestamps.
+	type Options = { configBeforeStart?: boolean; description?: Uint8Array };
+	const muxAndRead = async (firstTimestamp: number, { configBeforeStart, description }: Options) => {
+		const decoderConfig = { codec: 'opus', numberOfChannels: 2, sampleRate: 44100, description };
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(source, configBeforeStart ? { decoderConfig } : {});
+		await output.start();
+		for (let i = 0; i < 3; i++) {
+			await source.add(
+				new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', firstTimestamp + 0.02 * i, 0.02),
+				i === 0 ? { decoderConfig } : undefined,
+			);
+		}
+		await output.finalize();
+		const bytes = new Uint8Array(output.target.buffer!);
+
+		// CodecDelay, in nanoseconds
+		const delayIndex = bytes.findIndex((byte, i) => byte === 0x56 && bytes[i + 1] === 0xaa);
+		let codecDelay = 0;
+		for (let i = 0; delayIndex !== -1 && i < (bytes[delayIndex + 2]! & 0x7f); i++) {
+			codecDelay = codecDelay * 256 + bytes[delayIndex + 3 + i]!;
+		}
+
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const config = await track.getDecoderConfig();
+		return {
+			description: config!.description && [...new Uint8Array(config!.description as ArrayBuffer)],
+			codecDelay,
+			firstTimestamp: await track.getFirstTimestamp(),
+		};
+	};
+
+	const opusHead = (preSkip: number) => [
+		...[...'OpusHead'].map(x => x.charCodeAt(0)),
+		1, 2, preSkip & 0xff, preSkip >> 8, 0x44, 0xac, 0, 0, 0, 0, 0,
+	];
+
+	const check = async (firstTimestamp: number, preSkip: number, options: Options = {}) => {
+		const result = await muxAndRead(firstTimestamp, options);
+		expect(result.description).toEqual(opusHead(preSkip));
+		expect(result.codecDelay).toBe(Math.round(preSkip * 1e9 / 48000));
+		// Read back within a tick (1 ms), as readers round CodecDelay to whole ticks
+		expect(Math.abs(result.firstTimestamp - firstTimestamp)).toBeLessThan(0.0015);
+	};
+
+	// Nothing says to drop samples, so a generated header has a pre-skip of 0, and a negative start stays negative
+	await check(0, 0);
+	await check(-0.0065, 0);
+	await check(-0.0065, 0, { configBeforeStart: true }); // The decoder config is known before the first packet
+	await check(-2, 0);
+
+	// A given header keeps its pre-skip, whatever the start
+	const description = new Uint8Array(opusHead(312));
+	await check(0.1, 312, { description });
+	await check(-0.0065, 312, { description });
+	await check(-0.1, 312, { description });
+	await check(-20, 312, { description });
+
+	// Block timestamps can't go below -32.768 s, so rather than losing the packets of an earlier start, the CodecDelay
+	// then covers it as a whole
+	const farStart = await muxAndRead(-40, { description });
+	expect(farStart.description).toEqual(opusHead(312));
+	expect(farStart.codecDelay).toBe(40_000_000_000);
+	expect(Math.abs(farStart.firstTimestamp - -40)).toBeLessThan(0.0015);
+});
+
+test('Movie-level tags are written without a TargetType string', async () => {
+	// FFmpeg prefixes every tag name with the TargetType (MOVIE/TITLE instead of title), so its own muxer leaves it
+	// out of global tags; TargetTypeValue 50 alone marks the tags as movie-level
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(source);
+	output.setMetadataTags({ title: 'Title', artist: 'Artist' });
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', 0, 0.02), {
+		decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 },
+	});
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const containsId = (id: number[]) => bytes.some((_, i) => id.every((byte, j) => bytes[i + j] === byte));
+	expect(containsId([0x63, 0xca])).toBe(false); // TargetType
+	expect(containsId([0x68, 0xca, 0x81, 50])).toBe(true); // TargetTypeValue 50
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tags = await input.getMetadataTags();
+	expect([tags.title, tags.artist]).toEqual(['Title', 'Artist']);
+});
+
+test('AV1 blocks are stored without temporal delimiter OBUs', async () => {
+	const target = new BufferTarget();
+	const output = new Output({ target, format: new MkvOutputFormat() });
+	const source = new EncodedVideoPacketSource('av1');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// Temporal unit as WebCodecs encoders emit it: OBU_TEMPORAL_DELIMITER followed by an OBU_FRAME
+	const frame = [0x32, 0x03, 0xaa, 0xbb, 0xcc];
+	await source.add(new EncodedPacket(new Uint8Array([0x12, 0x00, ...frame]), 'key', 0, 1), {
+		decoderConfig: { codec: 'av01.0.04M.08', codedWidth: 320, codedHeight: 240 },
+	});
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// The Matroska AV1 mapping says temporal delimiters SHOULD NOT be stored; FFmpeg's matroskaenc strips them too
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	expect(packet?.data).toEqual(new Uint8Array(frame));
+});
+
+test('Equally spaced packets at half milliseconds stay equally spaced', async () => {
+	// Timestamps computed in floating point land a hair off their exact half millisecond: (0.0135 + 0.02 * 29) * 1000
+	// is 593.4999999999999. All of them must round the same way, or the 20 ms spacing becomes 19 and 21 ms.
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array([0xfc, 0xff]), 'key', 0.0135 + 0.02 * i, 0.02),
+			i === 0 ? { decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 } } : undefined,
+		);
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array(output.target.buffer!)),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const timestampsInMs: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		timestampsInMs.push(Math.round(packet.timestamp * 1000));
+	}
+	expect(timestampsInMs).toEqual(Array.from({ length: 100 }, (_, i) => 14 + 20 * i));
+});
+
+test('Frames that outgrow a 4-byte element size keep their size', async () => {
+	// Blocks reserve 4 size bytes, which hold up to 2^28 - 2
+	const frameSizes = [2 ** 28, 100];
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const decoderConfig = { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 };
+	await source.add(new EncodedPacket(new Uint8Array(frameSizes[0]!), 'key', 0, 0.5), { decoderConfig });
+	await source.add(new EncodedPacket(new Uint8Array(frameSizes[1]!), 'delta', 0.5, 0.5));
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+	const sizes: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+		sizes.push(packet.byteLength);
+	}
+	expect(sizes).toEqual(frameSizes);
+});
+
+test('Conversion of Ogg Opus to WebM copies the packets, keeping the pre-skip as CodecDelay', async () => {
+	// The first packet starts at -312/48000 s, the pre-skip
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/preroll-test.opus')),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const inputSink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+	const outputSink = new EncodedPacketSink((await result.getPrimaryAudioTrack())!);
+	const inputPackets: EncodedPacket[] = [];
+	const outputPackets: EncodedPacket[] = [];
+	for await (const packet of inputSink.packets()) {
+		inputPackets.push(packet);
+	}
+	for await (const packet of outputSink.packets()) {
+		outputPackets.push(packet);
+	}
+
+	expect(outputPackets).toHaveLength(inputPackets.length);
+	for (let i = 0; i < inputPackets.length; i++) {
+		expect(outputPackets[i]!.data).toEqual(inputPackets[i]!.data);
+		// Matroska stores milliseconds
+		expect(Math.abs(outputPackets[i]!.timestamp - inputPackets[i]!.timestamp)).toBeLessThanOrEqual(0.0005 + 1e-9);
+	}
+	expect(containsBytes(new Uint8Array(output.target.buffer!), [0x56, 0xaa])).toBe(true); // CodecDelay element ID
+});
+
+test('Conversion of Ogg Opus to WebM with a sub-millisecond start trim applies the trim or doesn\'t copy', async () => {
+	// Matroska's CodecDelay has to be the pre-skip, so the priming can't absorb an explicit trim
+	const trimStart = 0.0008;
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/preroll-test.opus')),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false, trim: { start: trimStart } });
+	if (!conversion.isValid) {
+		return; // Needs a transcode, which isn't available in Node
+	}
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const inputPacket = (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(0.2))!;
+	const outputPacket = (await new EncodedPacketSink((await result.getPrimaryAudioTrack())!).getPacket(0.2))!;
+	expect(outputPacket.data).toEqual(inputPacket.data);
+	// Matroska stores milliseconds
+	expect(Math.abs(outputPacket.timestamp - (inputPacket.timestamp - trimStart))).toBeLessThanOrEqual(0.0005 + 1e-9);
+});
+
+test('VP9 key frames keep the color space in their bitstream', async () => {
+	// The color space of an HDR (BT.2020) VP9 stream, as YouTube serves, was overwritten with 0 ("unknown") in a copy,
+	// so decoders that go by the bitstream (FFmpeg, WebCodecs without a colorSpace) showed different colors
+	const keyFrame = (colorSpace: number) => [
+		0b1001_0010, // Frame marker, profile 2, a shown key frame
+		0x49, 0x83, 0x42, // Sync code
+		colorSpace << 4, // 10-bit, color_space, studio range
+		1, 2, 3, 4, 5, 6, 7, 8,
+	];
+
+	// (The DOM types don't know the BT.2020 values yet)
+	const bt2020: VideoColorSpaceInit = {
+		primaries: 'bt2020' as VideoColorPrimaries,
+		transfer: 'pq' as VideoTransferCharacteristics,
+		matrix: 'bt2020-ncl' as VideoMatrixCoefficients,
+		fullRange: false,
+	};
+	const bt709: VideoColorSpaceInit = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false };
+
+	const muxAndRead = async (data: number[], colorSpace: VideoColorSpaceInit) => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(data), 'key', 0, 1 / 30), {
+			decoderConfig: {
+				codec: 'vp09.02.10.10',
+				codedWidth: 64,
+				codedHeight: 64,
+				colorSpace,
+			},
+		});
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array(output.target.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		return [...packet!.data];
+	};
+
+	expect(await muxAndRead(keyFrame(5), bt2020)).toEqual(keyFrame(5)); // color_space 5 is BT.2020
+	expect(await muxAndRead(keyFrame(2), bt709)).toEqual(keyFrame(2)); // 2 is BT.709
+});
+
+test('Cues reference every subtitle block, with its duration', async () => {
+	// "For each subtitle track present, each subtitle frame SHOULD be referenced by a CuePoint element with a
+	// CueDuration element", so that a subtitle still shown at a seek target can be found
+
+	// Returns [CueTime, CueTrack, CueDuration] for each CueTrackPositions
+	const readCuePoints = (bytes: Uint8Array) => {
+		const readVint = (position: number, keepMarker: boolean) => {
+			let length = 1;
+			while (!(bytes[position]! & (0x80 >> (length - 1)))) {
+				length++;
+			}
+
+			let value = keepMarker ? bytes[position]! : bytes[position]! & (0xff >> length);
+			for (let i = 1; i < length; i++) {
+				value = value * 256 + bytes[position + i]!;
+			}
+			return { value, length };
+		};
+
+		const result: (number | null)[][] = [];
+		const walk = (start: number, end: number, cue: (number | null)[]) => {
+			for (let position = start; position < end;) {
+				const id = readVint(position, true);
+				const size = readVint(position + id.length, false);
+				const dataStart = position + id.length + size.length;
+				const dataEnd = Math.min(end, dataStart + size.value);
+				const uint = () => bytes.subarray(dataStart, dataEnd).reduce((value, byte) => value * 256 + byte, 0);
+
+				if (id.value === 0x18538067 || id.value === 0x1c53bb6b) {
+					walk(dataStart, dataEnd, cue); // Segment, Cues
+				} else if (id.value === 0xbb) {
+					walk(dataStart, dataEnd, [null, null, null]); // CuePoint
+				} else if (id.value === 0xb3) {
+					cue[0] = uint(); // CueTime
+				} else if (id.value === 0xb7) {
+					const positions = [cue[0]!, null, null];
+					walk(dataStart, dataEnd, positions); // CueTrackPositions
+					result.push(positions);
+				} else if (id.value === 0xf7) {
+					cue[1] = uint(); // CueTrack
+				} else if (id.value === 0xb2) {
+					cue[2] = uint(); // CueDuration
+				}
+
+				position = dataEnd;
+			}
+		};
+
+		walk(0, bytes.length, []);
+		return result;
+	};
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const video = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(video);
+	const subtitles = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(subtitles);
+	await output.start();
+
+	// B, from 2 to 8 s, is still shown in the cluster that begins at 5 s
+	await subtitles.add(
+		'WEBVTT\n\n00:00.500 --> 00:01.500\nA\n\n00:02.000 --> 00:08.000\nB\n\n00:03.000 --> 00:03.500\nC\n',
+	);
+	subtitles.close();
+	for (let i = 0; i < 100; i++) {
+		const packet = new EncodedPacket(new Uint8Array(100), i % 50 === 0 ? 'key' : 'delta', i / 10, 0.1);
+		await video.add(packet, { decoderConfig: { codec: 'avc1.42001f', codedWidth: 64, codedHeight: 64 } });
+	}
+	await output.finalize();
+
+	const cuePoints = readCuePoints(new Uint8Array(output.target.buffer!));
+	// The video key frames at 0 and 5 s, as before
+	expect(cuePoints.filter(([, track]) => track === 1)).toEqual([[0, 1, null], [5000, 1, null]]);
+	expect(cuePoints.filter(([, track]) => track === 2)).toEqual([[500, 2, 1000], [2000, 2, 6000], [3000, 2, 500]]);
+});
+
+test('Video frames less than a millisecond apart get distinct block timestamps, in presentation order', async () => {
+	// Block timestamps are whole milliseconds. A trimmed transcode starts with the frame straddling the trim start,
+	// which may then last a fraction of a millisecond.
+	const decoderConfig = { codec: 'avc1.42001f', codedWidth: 64, codedHeight: 64 };
+	const mux = async (packets: EncodedPacket[]) => {
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+		for (const [i, packet] of packets.entries()) {
+			await source.add(packet, i === 0 ? { decoderConfig } : undefined);
+		}
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	const read = async (bytes: Uint8Array) => {
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		return packets;
+	};
+
+	// [timestamp, key frame?] in decode order, each lasting 1/30 s unless given
+	const frames = (list: [number, boolean, number?][]) => list.map(([timestamp, key, duration], i) => {
+		return new EncodedPacket(new Uint8Array([i]), key ? 'key' : 'delta', timestamp, duration ?? 1 / 30);
+	});
+
+	// 60 fps from a trim start 0.27 ms before a frame: the second frame goes to the next millisecond
+	const trimmed: [number, boolean, number?][] = [[0, true, 0.00027]];
+	for (let i = 0; i < 5; i++) {
+		trimmed.push([0.00027 + i / 60, false, 1 / 60]);
+	}
+	const trimmedPackets = await read(await mux(frames(trimmed)));
+	expect(trimmedPackets.map(x => x.timestamp)).toEqual([0, 0.001, 0.017, 0.034, 0.05, 0.067]);
+
+	// Frames can't move more than a millisecond past their own: they share a timestamp instead of drifting, never one
+	// before an earlier frame's (which would make the file impossible to remux, as key frames can't go back)
+	const denseFrames = frames([[0, true], [0.0004, false], [0.00045, false], [0.00047, true], [0.04, false]]);
+	const dense = await read(await mux(denseFrames));
+	expect(dense.map(x => x.timestamp)).toEqual([0, 0.001, 0.001, 0.001, 0.04]);
+	await mux(dense);
+
+	// B-frames: the decode order isn't the presentation order, and no frame is moved ahead once that shows; but no
+	// frame goes before one presented earlier that was moved ahead
+	const base = 14.306;
+	const reordered: [number, boolean][] = [[base - 0.0001, true]];
+	for (const offset of [0.234, 0.232, 0.221, 0.233, 0.362, 0.344, 0.244, 0.361]) {
+		reordered.push([base + offset / 1000, false]);
+	}
+	const reorderedPackets = await read(await mux(frames(reordered)));
+	const inPresentationOrder = reorderedPackets
+		.map((packet, i) => ({ original: reordered[i]![0], timestamp: packet.timestamp }))
+		.sort((a, b) => a.original - b.original);
+	for (let i = 1; i < inPresentationOrder.length; i++) {
+		expect(inPresentationOrder[i]!.timestamp).toBeGreaterThanOrEqual(inPresentationOrder[i - 1]!.timestamp);
+	}
+	await mux(reorderedPackets);
+
+	// Frames shorter than a millisecond (here 1200 fps) can't all get their own timestamp, but they don't drift
+	const fast = await read(await mux(frames(Array.from({ length: 120 }, (_, i) => [i / 1200, i === 0, 1 / 1200]))));
+	for (const [i, packet] of fast.entries()) {
+		expect(Math.abs(packet.timestamp - i / 1200)).toBeLessThan(0.0015);
+		expect(packet.timestamp).toBeGreaterThanOrEqual(fast[i - 1]?.timestamp ?? 0);
+	}
+});

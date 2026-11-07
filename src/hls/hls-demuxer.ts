@@ -8,7 +8,7 @@
 
 import { AUDIO_CODECS, AudioCodec, inferCodecFromCodecString, MediaCodec, VIDEO_CODECS, VideoCodec } from '../codec';
 import { Demuxer, DurationMetadataRequestOptions } from '../demuxer';
-import { Input } from '../input';
+import { Input, InputDisposedError } from '../input';
 import {
 	InputAudioTrackBacking,
 	InputTrackBacking,
@@ -17,7 +17,15 @@ import {
 import { PacketRetrievalOptions } from '../media-sink';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { TrackType } from '../output';
-import { arrayArgmin, assert, joinPaths, MaybePromise, TransformationMatrix, UNDETERMINED_LANGUAGE } from '../misc';
+import {
+	arrayArgmin,
+	assert,
+	joinPaths,
+	MaybePromise,
+	Rational,
+	TransformationMatrix,
+	UNDETERMINED_LANGUAGE,
+} from '../misc';
 import { EncodedPacket } from '../packet';
 import { readAllLines } from '../reader';
 import {
@@ -27,13 +35,15 @@ import {
 	HLS_MIME_TYPE,
 	TAG_DEFINE,
 	TAG_EXTINF,
+	TAG_CONTENT_STEERING,
 	TAG_I_FRAME_STREAM_INF,
 	TAG_I_FRAMES_ONLY,
 	TAG_MEDIA,
 	TAG_STREAM_INF,
+	TAG_TARGETDURATION,
 } from './hls-misc';
 import { HlsSegmentedInput } from './hls-segmented-input';
-import { SegmentedInputTrackDeclaration } from '../segmented-input';
+import { Segment, SegmentedInputTrackDeclaration } from '../segmented-input';
 import { PathedSource } from '../source';
 
 type InternalTrack = {
@@ -52,6 +62,11 @@ type InternalTrack = {
 	averageBitrate: number | null;
 	name: string | null;
 	hasOnlyKeyPackets: boolean;
+	/**
+	 * Index of the track among the streams of its type in its playlist's media. Several renditions without a URI all
+	 * live in the variant's media, as its first, second, ... stream of their type.
+	 */
+	embeddedIndex: number;
 
 	info: {
 		type: 'video';
@@ -94,17 +109,28 @@ export class HlsDemuxer extends Demuxer {
 			const { rootPath } = this.input._rootSource;
 			const variables = new HlsPlaylistVariables(rootPath, null);
 
-			const variantStreams: {
+			let variantStreams: {
 				fullPath: string;
 				attributes: AttributeList;
 				lineNumber: number;
 				hasOnlyKeyPackets: boolean;
 			}[] = [];
+			let steeringPathwayId: string | null = null;
 			const mediaTags: {
 				fullPath: string | null;
 				attributes: AttributeList;
 				lineNumber: number;
 			}[] = [];
+
+			const loadAsMediaPlaylist = async () => {
+				const segmentedInput = new HlsSegmentedInput(this, rootPath, null, lines);
+
+				this.segmentedInputs = [segmentedInput];
+				this.hasMasterPlaylist = false;
+				this.trackBackings = await segmentedInput.getTrackBackings();
+			};
+
+			let hasTargetDuration = false;
 
 			// Let's first iterate through the entire file, collecting all variant streams and media tags
 
@@ -116,8 +142,9 @@ export class HlsDemuxer extends Demuxer {
 				} else if (line.startsWith(TAG_STREAM_INF)) {
 					const streamInfLineNumber = i;
 					let playlistPath = lines[++i];
-					if (playlistPath === undefined) {
-						throw new Error('Incorrect M3U8 file; a line must follow the #EXT-X-STREAM-INF tag.');
+					if (playlistPath === undefined || playlistPath.startsWith('#')) {
+						// "Every EXT-X-STREAM-INF tag MUST be followed by a URI line"
+						throw new Error('Incorrect M3U8 file; a URI must follow the #EXT-X-STREAM-INF tag.');
 					}
 
 					playlistPath = variables.substitute(playlistPath);
@@ -188,23 +215,44 @@ export class HlsDemuxer extends Demuxer {
 					}
 
 					mediaTags.push({ fullPath, attributes, lineNumber: i });
+				} else if (line.startsWith(TAG_CONTENT_STEERING)) {
+					const attributes = new AttributeList(line.slice(TAG_CONTENT_STEERING.length), variables);
+					steeringPathwayId = attributes.get('pathway-id');
 				} else if (line === TAG_I_FRAMES_ONLY) {
 					// iFramesOnlyTagFound = true;
 				} else if (line.startsWith(TAG_EXTINF)) {
 					// This is a media playlist, not a master playlist
-					const segmentedInput = new HlsSegmentedInput(this, rootPath, null, lines);
-
-					this.segmentedInputs = [segmentedInput];
-					this.hasMasterPlaylist = false;
-					this.trackBackings = await segmentedInput.getTrackBackings();
-
+					await loadAsMediaPlaylist();
 					return;
+				} else if (line.startsWith(TAG_TARGETDURATION)) {
+					hasTargetDuration = true;
 				}
+			}
+
+			if (hasTargetDuration && variantStreams.length === 0 && mediaTags.length === 0) {
+				// #EXT-X-TARGETDURATION is required in every media playlist, even in a live one that doesn't list any
+				// segments yet. Some multivariant playlists carry it too (though it doesn't belong there), so it only
+				// decides when there are no variant streams.
+				await loadAsMediaPlaylist();
+				return;
 			}
 
 			if (variantStreams.length > MAX_VARIANT_STREAMS || mediaTags.length > MAX_MEDIA_TAGS) {
 				throw new Error('Unsupported M3U8 file; too many variant streams or media tags.');
 			}
+
+			// Variant streams on different Content Steering Pathways are redundant copies of each other, e.g. on
+			// different CDNs (RFC 8216bis, Section 7). Content Steering isn't supported, so only one Pathway is used:
+			// the one EXT-X-CONTENT-STEERING starts with, else the default one, else the first one (like hls.js).
+			// Renditions only come from the variant streams referencing them, so they're filtered along.
+			const getPathwayId = (variantStream: typeof variantStreams[number]) => {
+				return variantStream.attributes.get('pathway-id') ?? '.';
+			};
+			let pathwayId = steeringPathwayId ?? '.';
+			if (variantStreams.length > 0 && !variantStreams.some(x => getPathwayId(x) === pathwayId)) {
+				pathwayId = getPathwayId(variantStreams[0]!);
+			}
+			variantStreams = variantStreams.filter(x => getPathwayId(x) === pathwayId);
 
 			this.masterPlaylistVariables = variables;
 			// Now, let's process & resolve all variant streams in parallel, mapping each of them to tracks.
@@ -315,6 +363,39 @@ export class HlsDemuxer extends Demuxer {
 				let videoCodecString: string | null = null;
 				let audioCodecString: string | null = null;
 
+				const videoCodecStrings = codecStrings.filter(x =>
+					VIDEO_CODECS.includes(inferCodecFromCodecString(x) as VideoCodec),
+				);
+				const audioCodecStrings = codecStrings.filter(x =>
+					AUDIO_CODECS.includes(inferCodecFromCodecString(x) as AudioCodec),
+				);
+
+				// CODECS lists "every media format present in any Media Segment in any of the Renditions specified by
+				// the Variant Stream" (RFC 8216bis, Section 4.4.6.2) without saying which rendition uses which. So when
+				// it lists several codecs of a type, each rendition's codec is read from its own media.
+				const getRenditionCodecString = async (
+					mediaTag: typeof mediaTags[number],
+					type: 'video' | 'audio',
+					listedCodecStrings: string[],
+					embeddedIndex: number,
+				) => {
+					if (listedCodecStrings.length > 1) {
+						const path = mediaTag.fullPath ?? variantStream.fullPath;
+						const segmentedInput = this.getSegmentedInputForPath(path);
+						const trackBacking = (await segmentedInput.getTrackBackings())
+							.filter(x => x.getType() === type)[embeddedIndex];
+
+						if (trackBacking && (await trackBacking.getCodec()) !== null) {
+							const decoderConfig = await trackBacking.getDecoderConfig();
+							if (decoderConfig) {
+								return decoderConfig.codec;
+							}
+						}
+					}
+
+					return listedCodecStrings[0]!;
+				};
+
 				const bandwidth = variantStream.attributes.getAsNumber('bandwidth');
 				assert(bandwidth !== null);
 
@@ -329,13 +410,9 @@ export class HlsDemuxer extends Demuxer {
 					}
 
 					if (VIDEO_CODECS.includes(inferredCodec as VideoCodec)) {
-						if (videoCodecString !== null) {
-							throw new Error(
-								'Unsupported M3U8 file; multiple video codecs found in the CODECS attribute of a'
-								+ ' variant stream.',
-							);
-						}
-
+						// The group's renditions are added once; without a group, each codec is a stream of the
+						// variant's own media
+						const isFirstVideoCodec = videoCodecString === null;
 						videoCodecString = codecString;
 
 						const videoGroupId = variantStream.attributes.get('video');
@@ -361,8 +438,9 @@ export class HlsDemuxer extends Demuxer {
 								autoselect: true,
 								languageCode: UNDETERMINED_LANGUAGE,
 								lineNumber: variantStream.lineNumber,
+								embeddedIndex: 0,
 								fullPath: variantStream.fullPath,
-								fullCodecString: videoCodecString,
+								fullCodecString: codecString,
 								pairingMask: 1n << BigInt(i),
 								peakBitrate: bandwidth,
 								averageBitrate: averageBandwidth,
@@ -374,7 +452,9 @@ export class HlsDemuxer extends Demuxer {
 									height,
 								},
 							});
-						} else {
+						} else if (isFirstVideoCodec) {
+							let uriLessCount = 0;
+
 							for (const mediaTag of mediaTags) {
 								const groupId = mediaTag.attributes.get('group-id')!;
 								const type = mediaTag.attributes.get('type')!;
@@ -382,6 +462,8 @@ export class HlsDemuxer extends Demuxer {
 								if (groupId !== videoGroupId || type.toLowerCase() !== 'video') {
 									continue;
 								}
+
+								const embeddedIndex = mediaTag.fullPath === null ? uriLessCount++ : 0;
 
 								const resolution = mediaTag.attributes.get('resolution')
 									?? variantStream.attributes.get('resolution');
@@ -406,8 +488,14 @@ export class HlsDemuxer extends Demuxer {
 										|| getMediaTagAutoselect(mediaTag.attributes),
 									languageCode: preprocessLanguageCode(mediaTag.attributes.get('language')),
 									lineNumber: mediaTag.lineNumber,
+									embeddedIndex,
 									fullPath: mediaTag.fullPath ?? variantStream.fullPath,
-									fullCodecString: videoCodecString,
+									fullCodecString: await getRenditionCodecString(
+										mediaTag,
+										'video',
+										videoCodecStrings,
+										embeddedIndex,
+									),
 									pairingMask: 1n << BigInt(i),
 									peakBitrate: mediaTag.fullPath === null ? bandwidth : null,
 									averageBitrate: mediaTag.fullPath === null ? averageBandwidth : null,
@@ -422,13 +510,9 @@ export class HlsDemuxer extends Demuxer {
 							}
 						}
 					} else if (AUDIO_CODECS.includes(inferredCodec as AudioCodec)) {
-						if (audioCodecString !== null) {
-							throw new Error(
-								'Unsupported M3U8 file; multiple audio codecs found in the CODECS attribute of a'
-								+ ' variant stream.',
-							);
-						}
-
+						// The group's renditions are added once; without a group, each codec is a stream of the
+						// variant's own media
+						const isFirstAudioCodec = audioCodecString === null;
 						audioCodecString = codecString;
 
 						const audioGroupId = variantStream.attributes.get('audio');
@@ -447,8 +531,9 @@ export class HlsDemuxer extends Demuxer {
 								autoselect: true,
 								languageCode: UNDETERMINED_LANGUAGE,
 								lineNumber: variantStream.lineNumber,
+								embeddedIndex: 0,
 								fullPath: variantStream.fullPath,
-								fullCodecString: audioCodecString,
+								fullCodecString: codecString,
 								pairingMask: 1n << BigInt(i),
 								peakBitrate: bandwidth,
 								averageBitrate: averageBandwidth,
@@ -464,7 +549,9 @@ export class HlsDemuxer extends Demuxer {
 												: null,
 								},
 							});
-						} else {
+						} else if (isFirstAudioCodec) {
+							let uriLessCount = 0;
+
 							for (const mediaTag of mediaTags) {
 								const groupId = mediaTag.attributes.get('group-id')!;
 								const type = mediaTag.attributes.get('type')!;
@@ -472,6 +559,8 @@ export class HlsDemuxer extends Demuxer {
 								if (groupId !== audioGroupId || type.toLowerCase() !== 'audio') {
 									continue;
 								}
+
+								const embeddedIndex = mediaTag.fullPath === null ? uriLessCount++ : 0;
 
 								const channels = mediaTag.attributes.get('channels')
 									?? variantStream.attributes.get('channels');
@@ -489,8 +578,14 @@ export class HlsDemuxer extends Demuxer {
 										|| getMediaTagAutoselect(mediaTag.attributes),
 									languageCode: preprocessLanguageCode(mediaTag.attributes.get('language')),
 									lineNumber: mediaTag.lineNumber,
+									embeddedIndex,
 									fullPath: mediaTag.fullPath ?? variantStream.fullPath,
-									fullCodecString: audioCodecString,
+									fullCodecString: await getRenditionCodecString(
+										mediaTag,
+										'audio',
+										audioCodecStrings,
+										embeddedIndex,
+									),
 									pairingMask: 1n << BigInt(i),
 									peakBitrate: mediaTag.fullPath === null ? bandwidth : null,
 									averageBitrate: mediaTag.fullPath === null ? averageBandwidth : null,
@@ -517,7 +612,12 @@ export class HlsDemuxer extends Demuxer {
 			const internalTracks: InternalTrack[] = [];
 			const addInternalTrack = (track: InternalTrack) => {
 				const existingTrack = internalTracks.find(x =>
-					x.fullPath === track.fullPath && x.info.type === track.info.type,
+					x.fullPath === track.fullPath
+					&& x.info.type === track.info.type
+					&& x.embeddedIndex === track.embeddedIndex
+					// A variant's own media can hold streams of one type with different codecs
+					&& inferCodecFromCodecString(x.fullCodecString)
+					=== inferCodecFromCodecString(track.fullCodecString),
 				);
 
 				if (existingTrack) {
@@ -581,7 +681,7 @@ export class HlsDemuxer extends Demuxer {
 		return this.trackBackings;
 	}
 
-	getMediaOffsetForDiscontinuity(discontinuityNumber: number) {
+	getMediaOffsetForDiscontinuity(discontinuityNumber: number, requester: HlsSegmentedInput | null = null) {
 		let promise = this.mediaOffsets.get(discontinuityNumber);
 		if (promise) {
 			return promise;
@@ -594,12 +694,28 @@ export class HlsDemuxer extends Demuxer {
 			// PDT is used) and that discontinuities don't mess with overall timestamp continuity.
 			const referenceSegmentedInput = this.getReferenceSegmentedInput();
 
-			let segment = await referenceSegmentedInput.getFirstSegment();
+			const referenceFirstSegment = await referenceSegmentedInput.getFirstSegment();
+			let segment = referenceFirstSegment;
 			while (segment && segment.discontinuityNumber < discontinuityNumber) {
 				segment = await referenceSegmentedInput.getNextSegment(segment, {});
 			}
 
 			if (!segment || segment.discontinuityNumber !== discontinuityNumber) {
+				if (
+					requester
+					&& requester !== referenceSegmentedInput
+					&& referenceFirstSegment
+					&& referenceFirstSegment.discontinuityNumber > discontinuityNumber
+				) {
+					// The reference's live window has already moved past this discontinuity, while the requesting
+					// playlist still lists it. Discontinuity boundaries line up across playlists (RFC 8216, 6.2.4), so
+					// the requesting playlist's next discontinuity, which can be synchronized, anchors this one.
+					const offset = await this.getMediaOffsetFromNextDiscontinuity(discontinuityNumber, requester);
+					if (offset !== null) {
+						return offset;
+					}
+				}
+
 				throw new Error(
 					`The reference playlist contains no segment in discontinuity ${discontinuityNumber}, so the`
 					+ ' discontinuity can\'t be synchronized across tracks. If you think this is a bug, please raise an'
@@ -619,11 +735,64 @@ export class HlsDemuxer extends Demuxer {
 			return segment.timestamp - (rawTimestampOffset + await track.getFirstTimestamp());
 		})();
 		this.mediaOffsets.set(discontinuityNumber, promise);
+		// Another playlist may still be able to anchor the discontinuity
+		promise.catch(() => {
+			if (this.mediaOffsets.get(discontinuityNumber) === promise) {
+				this.mediaOffsets.delete(discontinuityNumber);
+			}
+		});
 
 		return promise;
 	}
 
+	/**
+	 * Derives a discontinuity's media offset from a playlist that also lists the next discontinuity: the discontinuity
+	 * ends where that one begins, so its segments are placed before the next one's first segment by their durations.
+	 */
+	private async getMediaOffsetFromNextDiscontinuity(discontinuityNumber: number, playlist: HlsSegmentedInput) {
+		let first = await playlist.getFirstSegment();
+		while (first && first.discontinuityNumber < discontinuityNumber) {
+			first = await playlist.getNextSegment(first, { skipLiveWait: true });
+		}
+		if (!first || first.discontinuityNumber !== discontinuityNumber) {
+			return null;
+		}
+
+		let next: Segment | null = first;
+		while (next && next.discontinuityNumber === discontinuityNumber) {
+			next = await playlist.getNextSegment(next, { skipLiveWait: true });
+		}
+		if (!next) {
+			return null;
+		}
+
+		// Where the next discontinuity's first segment begins on the global timeline
+		const nextInput = playlist.getInputForSegment(next);
+		const nextTracks = await nextInput.getTracks();
+		const nextTrack = nextTracks.find(x => x.type === 'video') ?? nextTracks[0];
+		if (!nextTrack) {
+			return null;
+		}
+		const nextStart = await nextTrack.getFirstTimestamp() + await playlist.getMediaOffset(next, nextInput);
+
+		const firstInput = playlist.getInputForSegment(first);
+		const rawTimestampOffset = await playlist.getRawTimestampOffset(firstInput) ?? 0;
+		const firstTracks = await firstInput.getTracks();
+		const firstTrack = firstTracks.find(x => x.type === 'video') ?? firstTracks[0];
+		if (!firstTrack) {
+			return null;
+		}
+
+		const firstMediaStart = rawTimestampOffset + await firstTrack.getFirstTimestamp();
+		return nextStart - (next.timestamp - first.timestamp) - firstMediaStart;
+	}
+
 	getReferenceSegmentedInput() {
+		// dispose() drops the segmented inputs
+		if (this.input._disposed) {
+			throw new InputDisposedError();
+		}
+
 		if (!this.hasMasterPlaylist) {
 			return this.segmentedInputs[0]!;
 		}
@@ -631,8 +800,9 @@ export class HlsDemuxer extends Demuxer {
 		assert(this.internalTracks);
 
 		// Prefer the cheapest video track, since video timestamps are straightforward and its segments are
-		// cheap to load
-		const candidates = this.internalTracks.filter(x => !x.hasOnlyKeyPackets);
+		// cheap to load. I-frame variants are a last resort.
+		const regularTracks = this.internalTracks.filter(x => !x.hasOnlyKeyPackets);
+		const candidates = regularTracks.length > 0 ? regularTracks : this.internalTracks;
 		const videoCandidates = candidates.filter(x => x.info.type === 'video');
 		const pool = videoCandidates.length > 0 ? videoCandidates : candidates;
 		const index = arrayArgmin(pool, x => x.peakBitrate ?? Infinity);
@@ -642,6 +812,11 @@ export class HlsDemuxer extends Demuxer {
 	}
 
 	getSegmentedInputForPath(path: string) {
+		// dispose() drops the segmented inputs; don't create new ones
+		if (this.input._disposed) {
+			throw new InputDisposedError();
+		}
+
 		let segmentedInput = this.segmentedInputs.find(x => x.path === path);
 		if (segmentedInput) {
 			return segmentedInput;
@@ -701,22 +876,21 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 				// Avoids reading fields on the track
 				trackBacking = matchingType[0]!;
 			} else {
-				if (this instanceof HlsInputVideoTrackBacking) {
-					for (const backing of matchingType) {
-						if ((await backing.getCodec()) === this.getCodec()) {
-							trackBacking = backing;
-							break;
-						}
-					}
+				// The first, second, ... stream of the type for the first, second, ... rendition without a URI, as long
+				// as its codec matches
+				const indexed = matchingType[this.internalTrack.embeddedIndex];
+				if (indexed && (await indexed.getCodec()) === this.getCodec()) {
+					trackBacking = indexed;
 				} else {
-					assert(this instanceof HlsInputAudioTrackBacking);
-
+					const matchingCodec: InputTrackBacking[] = [];
 					for (const backing of matchingType) {
 						if ((await backing.getCodec()) === this.getCodec()) {
-							trackBacking = backing;
-							break;
+							matchingCodec.push(backing);
 						}
 					}
+
+					const index = Math.min(this.internalTrack.embeddedIndex, matchingCodec.length - 1);
+					trackBacking = matchingCodec[index] ?? null;
 				}
 			}
 
@@ -824,11 +998,22 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		await this.hydrate();
-		return this.internalTrack.backingTrack!.getFirstPacket(options);
+		const packet = await this.internalTrack.backingTrack!.getFirstPacket(options);
+		if (packet && this.internalTrack.hasOnlyKeyPackets && packet.type !== 'key') {
+			return this.internalTrack.backingTrack!.getNextKeyPacket(packet, options);
+		}
+
+		return packet;
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		await this.hydrate();
+		if (this.internalTrack.hasOnlyKeyPackets) {
+			// Each segment of an I-frame playlist is a single I-frame. Its byte range may hold other media too (with
+			// fMP4, the moof lists the samples of the entire fragment), but that's not part of the track.
+			return this.internalTrack.backingTrack!.getKeyPacket(timestamp, options);
+		}
+
 		return this.internalTrack.backingTrack!.getPacket(timestamp, options);
 	}
 
@@ -839,6 +1024,10 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 
 	async getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		await this.hydrate();
+		if (this.internalTrack.hasOnlyKeyPackets) {
+			return this.internalTrack.backingTrack!.getNextKeyPacket(packet, options);
+		}
+
 		return this.internalTrack.backingTrack!.getNextPacket(packet, options);
 	}
 
@@ -884,6 +1073,10 @@ class HlsInputVideoTrackBacking
 
 	getSquarePixelHeight(): MaybePromise<number> {
 		return this.delegate(() => this.backingVideoTrack!.getSquarePixelHeight());
+	}
+
+	getPixelAspectRatio(): MaybePromise<Rational | null> {
+		return this.delegate(() => this.backingVideoTrack!.getPixelAspectRatio?.() ?? null);
 	}
 
 	getMetadataDisplayWidth(): number | null {

@@ -20,6 +20,48 @@ import {
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const videoFilePath = path.join(__dirname, '..', 'public/video.mp4');
 
+test('UrlSource sends every value of a header given more than once in a header list', async () => {
+	let received: string | string[] | undefined;
+	let receivedRange: string | undefined;
+	const server = http.createServer((req, res) => {
+		received = req.headers['x-tag'];
+		receivedRange = req.headers.range;
+		const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+		res.writeHead(206, { 'Content-Range': `bytes ${start}-199/200`, 'Content-Length': 200 - start });
+		res.end(Buffer.alloc(200 - start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+
+		const headerLists: [string, string][][] = [[['X-Tag', 'a'], ['X-Tag', 'b']], [['x-tag', 'a'], ['X-Tag', 'b']]];
+		for (const headers of headerLists) {
+			// What fetch() itself sends for this header list: both values
+			await (await fetch(url, { headers })).arrayBuffer();
+			const expected = received;
+			expect(expected).toBe('a, b');
+
+			using ref = new UrlSource(url, { requestInit: { headers } }).ref();
+			await new Reader(ref.source).requestSlice(0, 4);
+			expect(received).toBe(expected);
+		}
+
+		// Range is the exception: UrlSource maps it onto a byte offset, and the last one given is used
+		const rangeHeaders: [string, string][] = [['Range', 'bytes=100-'], ['Range', 'bytes=7-']];
+		using ref = new UrlSource(url, { requestInit: { headers: rangeHeaders } }).ref();
+		await new Reader(ref.source).requestSlice(0, 4);
+		expect(receivedRange).toBe('bytes=7-');
+		expect(await ref.source.getSizeOrNull()).toBe(193);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 test('UrlSource works against a server without range request support', async () => {
 	const server = await startRangelessServer();
 	const logs = captureLogs();
@@ -58,6 +100,27 @@ test('UrlSource works against a server without range request support', async () 
 	}
 });
 
+test('UrlSource fails at once on a request fetch() can\'t make', async () => {
+	const getFormatError = async (makeSource: () => UrlSource) => {
+		try {
+			using input = new Input({ source: makeSource(), formats: ALL_FORMATS });
+			return await Promise.race([
+				input.getFormat().then(() => 'resolved', (error: unknown) => error),
+				new Promise(resolve => setTimeout(() => resolve('still pending'), 3000)),
+			]);
+		} catch (error) {
+			return error;
+		}
+	};
+
+	// fetch() rejects these with the same TypeError every time, without sending anything: a relative URL has no base
+	// URL outside of a browser, and header values must be ByteStrings
+	expect(await getFormatError(() => new UrlSource('video.mp4'))).toBeInstanceOf(TypeError);
+	expect(await getFormatError(() => new UrlSource('http://127.0.0.1:9/video.mp4', {
+		requestInit: { headers: { Authorization: 'Bearer \u4e2d' } },
+	}))).toBeInstanceOf(TypeError);
+}, 15_000);
+
 test('UrlSource throws when reading from an evicted region in sequential mode', async () => {
 	const server = await startRangelessServer();
 	const logs = captureLogs();
@@ -89,6 +152,27 @@ test('UrlSource throws when reading from an evicted region in sequential mode', 
 	} finally {
 		logs.stop();
 		server.close();
+	}
+});
+
+test('Disposing an Input clears the pending UrlSource retry timer', async () => {
+	const countTimers = () => process.getActiveResourcesInfo().filter(type => type === 'Timeout').length;
+	const logs = captureLogs();
+
+	try {
+		// Nothing listens on port 9, so the default policy keeps retrying, waiting longer and longer
+		const input = new Input({ source: new UrlSource('http://127.0.0.1:9/video.mp4'), formats: ALL_FORMATS });
+		const result = input.getFormat().catch((error: unknown) => error);
+		await new Promise(resolve => setTimeout(resolve, 1000)); // Now waiting before the third attempt
+		const timersWhileWaiting = countTimers();
+
+		input.dispose();
+		await result;
+
+		// A pending timer would keep Node from exiting, up to 16 seconds after disposal with the default policy
+		expect(countTimers()).toBe(timersWhileWaiting - 1);
+	} finally {
+		logs.stop();
 	}
 });
 
@@ -142,6 +226,52 @@ test('UrlSource resumes with correct data when the connection dies in sequential
 	}
 });
 
+test('UrlSource passes a growing attempt count to getRetryDelay while responses keep dying', async () => {
+	const data = new Uint8Array(2 ** 20).map((_, i) => i & 0xff);
+
+	for (const honorRanges of [true, false]) {
+		let requestCount = 0;
+		const server = http.createServer((req, res) => {
+			res.on('error', () => {});
+			const start = honorRanges ? Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0) : 0;
+			res.writeHead(honorRanges ? 206 : 200, {
+				...(honorRanges && { 'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}` }),
+				'Content-Length': data.length - start,
+			});
+
+			// The first response delivers some data; every response dies after a moment. Without range support,
+			// each response sends the same first bytes again, which are no new data.
+			if (requestCount++ === 0 || !honorRanges) {
+				res.write(data.subarray(start, start + 1000));
+			}
+			res.flushHeaders();
+			setTimeout(() => res.destroy(), 10);
+		});
+
+		await new Promise<void>(resolve => server.listen(0, resolve));
+		const logs = captureLogs();
+
+		try {
+			const address = server.address();
+			assert(address && typeof address !== 'string');
+			const attempts: number[] = [];
+			using ref = new UrlSource(`http://localhost:${address.port}/data.bin`, {
+				getRetryDelay: (previousAttempts) => {
+					attempts.push(previousAttempts);
+					return previousAttempts >= 3 || attempts.length >= 10 ? null : 0;
+				},
+			}).ref();
+
+			await expect(async () => new Reader(ref.source).requestSlice(0, 500_000)).rejects.toThrow();
+			expect(attempts, honorRanges ? 'range requests' : 'sequential mode').toEqual([1, 2, 3]);
+		} finally {
+			logs.stop();
+			server.closeAllConnections();
+			server.close();
+		}
+	}
+});
+
 test('UrlSource with maxCacheSize: Infinity allows random access against a rangeless server', async () => {
 	const server = await startRangelessServer();
 	const logs = captureLogs();
@@ -179,6 +309,117 @@ test('UrlSource with maxCacheSize: Infinity allows random access against a range
 		logs.stop();
 		server.close();
 	}
+});
+
+test('UrlSource rejects responses for a resource that got shorter while it was being read', async () => {
+	const v1 = new Uint8Array(3 * 2 ** 20).map((_, i) => i & 0xff);
+	const v2 = new Uint8Array(2 * 2 ** 20).map((_, i) => (i * 7 + 3) & 0xff);
+
+	for (const honorRanges of [true, false]) {
+		for (const changes of [false, true]) {
+			let requestCount = 0;
+			const server = http.createServer((req, res) => {
+				res.on('error', () => {});
+				const isFirst = requestCount++ === 0;
+				const data = isFirst || !changes ? v1 : v2;
+
+				if (honorRanges) {
+					const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+					res.writeHead(206, {
+						'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+						'Content-Length': data.length - start,
+					});
+					res.end(data.subarray(start));
+				} else {
+					res.writeHead(200, { 'Content-Length': data.length });
+					if (isFirst) {
+						// The connection dies, so that the download resumes with a second request
+						res.write(data.subarray(0, 100_000), () => res.destroy());
+					} else {
+						res.end(data);
+					}
+				}
+			});
+
+			await new Promise<void>(resolve => server.listen(0, resolve));
+			const logs = captureLogs();
+
+			try {
+				const address = server.address();
+				assert(address && typeof address !== 'string');
+				const url = `http://localhost:${address.port}/data.bin`;
+				using ref = new UrlSource(url, { getRetryDelay: () => 0 }).ref();
+				const reader = new Reader(ref.source);
+
+				// With range requests, a second request is made for a far-away read once the length is known
+				const [start, length] = honorRanges ? [1_900_000, 100] : [0, 500_000];
+				if (honorRanges) {
+					await reader.requestSlice(0, 100);
+				}
+
+				const read = async () => reader.requestSlice(start, length);
+				if (changes) {
+					await expect(read).rejects.toThrow(
+						`Error fetching ${url}: the resource changed while it was being read; it was 3145728`
+						+ ' bytes long, now it is 2097152.',
+					);
+				} else {
+					const slice = await read();
+					expect(Buffer.compare(readBytes(slice!, length), v1.subarray(start, start + length))).toBe(0);
+				}
+			} finally {
+				logs.stop();
+				server.closeAllConnections();
+				server.close();
+			}
+		}
+	}
+});
+
+test('UrlSource keeps reading a file that grows while it is read, within the length first stated', async () => {
+	// Like a server serving a recording in progress: every response states the length written so far, and the bytes
+	// already written never change
+	const full = new Uint8Array(3_000_000).map((_, i) => (i * 7 + (i >> 9)) & 0xff);
+	const lengths = [1_000_000, 1_500_000, 2_000_000];
+	const requestStarts: number[] = [];
+	const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+		const length = lengths[Math.min(requestStarts.length, lengths.length - 1)]!;
+		const start = Number(/^bytes=(\d+)-$/.exec(new Headers(init?.headers).get('Range') ?? '')![1]);
+		requestStarts.push(start);
+
+		let pos = start;
+		const body = new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (pos >= length) {
+					controller.close();
+					return;
+				}
+
+				controller.enqueue(full.slice(pos, Math.min(pos + 16384, length)));
+				pos += 16384;
+			},
+		});
+
+		return new Response(body, {
+			status: 206,
+			headers: {
+				'Content-Range': `bytes ${start}-${length - 1}/${length}`,
+				'Content-Length': String(length - start),
+			},
+		});
+	}) as typeof fetch;
+
+	// A small cache, so that the later reads need new requests
+	using ref = new UrlSource('https://example.com/recording.mkv', { fetchFn, maxCacheSize: 2 ** 16 }).ref();
+	const reader = new Reader(ref.source);
+
+	for (const start of [0, 900_000, 100_000]) {
+		const slice = await reader.requestSlice(start, 1000);
+		expect(Buffer.compare(readBytes(slice!, 1000), full.subarray(start, start + 1000))).toBe(0);
+	}
+
+	expect(requestStarts.length).toBeGreaterThanOrEqual(3);
+	expect(await ref.source.getSize()).toBe(1_000_000);
 });
 
 test('UrlSource in sequential mode downloads lazily and aborts the response on dispose', async () => {
@@ -229,6 +470,24 @@ test('UrlSource in sequential mode downloads lazily and aborts the response on d
 	}
 }, 10_000);
 
+test('UrlSource rejects Range headers it cannot map onto the resource', () => {
+	for (const range of ['bytes=-500', 'bytes=0-99,200-299', 'bytes=500-100', 'items=0-9']) {
+		expect(() => new UrlSource('https://example.com/a.mp4', { requestInit: { headers: { Range: range } } }))
+			.toThrow(new TypeError(
+				`Unsupported Range header '${range}': only 'bytes=<start>-' and 'bytes=<start>-<end>'`
+				+ ` (with end >= start) can be mapped onto the resource.`,
+			));
+		expect(() => new UrlSource(new Request('https://example.com/a.mp4', { headers: { Range: range } })))
+			.toThrow(TypeError);
+	}
+
+	// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+	for (const range of ['bytes=100-', 'Bytes=100-199', 'BYTES=0-0']) {
+		expect(() => new UrlSource('https://example.com/a.mp4', { requestInit: { headers: { Range: range } } }))
+			.not.toThrow();
+	}
+});
+
 test('UrlSource reads the full decoded body of a compressed response', async () => {
 	const text = 'Some playlist text\n'.repeat(256);
 	const content = Buffer.from(text);
@@ -256,6 +515,37 @@ test('UrlSource reads the full decoded body of a compressed response', async () 
 		expect(compressed.byteLength).toBeLessThan(content.byteLength);
 		expect(slice!.length).toBe(content.byteLength);
 		expect(Buffer.from(readBytes(slice!, slice!.length)).toString()).toBe(text);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource reports the real size when its Range window ends past the end of the resource', async () => {
+	const data = new Uint8Array(1000);
+	const server = http.createServer((req, res) => {
+		const [, start, end] = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')!;
+		const last = Math.min(end ? Number(end) : Infinity, data.length - 1);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${last}/${data.length}`,
+			'Content-Length': last - Number(start) + 1,
+		});
+		res.end(data.subarray(Number(start), last + 1));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+
+		// RFC 9110 reads a last-pos past the end as "up to the end"
+		const source = new UrlSource(url, { requestInit: { headers: { Range: 'bytes=100-99999' } } });
+		expect(await source.getSize()).toBe(900);
+
+		const withinBounds = new UrlSource(url, { requestInit: { headers: { Range: 'bytes=100-199' } } });
+		expect(await withinBounds.getSize()).toBe(100);
 	} finally {
 		server.closeAllConnections();
 		server.close();
@@ -293,6 +583,143 @@ test('UrlSource reads the full decoded body of a compressed 206 response', async
 		expect(compressed.byteLength).toBeLessThan(content.byteLength);
 		expect(slice!.length).toBe(content.byteLength);
 		expect(Buffer.from(readBytes(slice!, slice!.length)).toString()).toBe(text);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource places 206 bodies at the range their Content-Range states', async () => {
+	const data = new Uint8Array(3_000_000).map((_, i) => Math.imul(i, 2654435761) >>> 24); // Not periodic
+	let rangeUnit = 'bytes';
+	const server = http.createServer((req, res) => {
+		// Answer with a range that starts at the MiB boundary before the requested position
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		const start = requested - (requested % 2 ** 20);
+		res.writeHead(206, {
+			'Content-Range': `${rangeUnit} ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	const readAt = async (url: string, starts: number[]) => {
+		using ref = new UrlSource(url).ref();
+		const reader = new Reader(ref.source);
+
+		for (const start of starts) {
+			const slice = await reader.requestSlice(start, 16);
+			expect(slice).not.toBeNull();
+			expect([...readBytes(slice!, 16)]).toEqual([...data.subarray(start, start + 16)]);
+		}
+	};
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+
+		// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+		for (const unit of ['bytes', 'Bytes']) {
+			rangeUnit = unit;
+			await readAt(`http://localhost:${address.port}/data.bin`, [0, 2_500_123]);
+		}
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource rejects 206 bodies that start after the requested position', async () => {
+	const server = http.createServer((req, res) => {
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		res.writeHead(206, { 'Content-Range': `bytes ${requested + 10}-999/1000`, 'Content-Length': 990 - requested });
+		res.end(new Uint8Array(990 - requested));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+		using ref = new UrlSource(url).ref();
+
+		await expect(async () => new Reader(ref.source).requestSlice(0, 16)).rejects.toThrow(
+			`Error fetching ${url}: requested bytes from 0, but the server sent bytes 10-999.`,
+		);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource resumes sequential mode at the start its 206 response states', async () => {
+	const data = new Uint8Array(3_000_000).map((_, i) => Math.imul(i, 2654435761) >>> 24); // Not periodic
+	let requestCount = 0;
+	const server = http.createServer((req, res) => {
+		res.on('error', () => {});
+
+		if (requestCount++ === 0) {
+			// No range support at first, and the connection dies partway through
+			res.writeHead(200, { 'Content-Length': data.length });
+			res.write(data.subarray(0, 1_000_000), () => res.destroy());
+			return;
+		}
+
+		// The resume request gets a range that starts at the MiB boundary before the requested position
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		const start = requested - (requested % 2 ** 20);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using ref = new UrlSource(`http://localhost:${address.port}/data.bin`, { getRetryDelay: () => 0 }).ref();
+		const reader = new Reader(ref.source);
+
+		const slice = await reader.requestSlice(0, data.length);
+		expect(Buffer.compare(readBytes(slice!, data.length), data)).toBe(0);
+		expect(requestCount).toBe(2);
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource learns the size from where a 206 body without a total really starts', async () => {
+	const data = new Uint8Array(3_000_000);
+	const server = http.createServer((req, res) => {
+		// The range starts at the MiB boundary before the requested position, and the total size is unknown
+		const requested = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+		const start = requested - (requested % 2 ** 20);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/*`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const source = new UrlSource(`http://localhost:${address.port}/data.bin`);
+		using ref = source.ref();
+		await new Reader(ref.source).requestSlice(2_500_123, 16);
+
+		expect(await source.getSize()).toBe(data.length);
 	} finally {
 		server.closeAllConnections();
 		server.close();
@@ -397,6 +824,118 @@ const startRangelessServer = async (
 	};
 };
 
+test('UrlSource takes the size from a range response stating Content-Encoding: identity', async () => {
+	const bytes = new Uint8Array(1000).map((_, i) => i & 0xff);
+
+	for (const contentEncoding of [null, 'identity', 'Identity']) {
+		const server = http.createServer((req, res) => {
+			const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+			res.writeHead(206, {
+				'Content-Range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+				'Content-Length': bytes.length - start,
+				// "identity" means no content coding, so the lengths still count the resource's own bytes
+				...(contentEncoding !== null && { 'Content-Encoding': contentEncoding }),
+			});
+			res.end(bytes.subarray(start));
+		});
+
+		await new Promise<void>(resolve => server.listen(0, resolve));
+
+		try {
+			const address = server.address();
+			assert(address && typeof address !== 'string');
+			using ref = new UrlSource(`http://localhost:${address.port}/data.bin`).ref();
+			expect(await ref.source.getSizeOrNull(), String(contentEncoding)).toBe(bytes.length);
+		} finally {
+			server.closeAllConnections();
+			server.close();
+		}
+	}
+});
+
+test('UrlSource retries requests that failed with a transient HTTP status', async () => {
+	const data = new Uint8Array(1000).map((_, i) => i & 0xff);
+	let failures: number[] = [];
+	let requestCount = 0;
+	const server = http.createServer((req, res) => {
+		requestCount++;
+		const status = failures.shift();
+		if (status !== undefined) {
+			res.writeHead(status);
+			res.end();
+			return;
+		}
+
+		const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+		const read = async (statuses: number[], retry = true) => {
+			failures = [...statuses];
+			const attempts: [number, unknown][] = [];
+			using ref = new UrlSource(url, {
+				getRetryDelay: (previousAttempts, error) => {
+					// The error carries the status, so that policies can tell this apart from a network error
+					attempts.push([previousAttempts, (error as { status?: unknown }).status]);
+					return retry ? 0 : null;
+				},
+			}).ref();
+
+			try {
+				const slice = await new Reader(ref.source).requestSlice(0, 4);
+				return { attempts, result: [...readBytes(slice!, 4)] };
+			} catch (error) {
+				return { attempts, result: String(error) };
+			}
+		};
+
+		// Server errors, timeouts and rate limiting can go away, so they're retried like network errors...
+		expect(await read([503, 429, 502])).toEqual({ attempts: [[1, 503], [2, 429], [3, 502]], result: [0, 1, 2, 3] });
+		// ...as long as the retry policy wants to
+		expect(await read([503], false)).toEqual({
+			attempts: [[1, 503]],
+			result: `Error: Error fetching ${url}: 503 Service Unavailable`,
+		});
+		// Other failures are final
+		expect(await read([404])).toEqual({ attempts: [], result: `Error: Error fetching ${url}: 404 Not Found` });
+
+		// The default policy gives up on a server that keeps answering such a status, after 5 retries (15.5 seconds of
+		// waiting, which this test skips), while it retries network errors indefinitely
+		const defaultPolicy = new UrlSource(url)._getRetryDelay;
+		const delays: (number | null)[] = [];
+		failures = new Array<number>(100).fill(503);
+		requestCount = 0;
+		using ref = new UrlSource(url, {
+			getRetryDelay: (previousAttempts, error, source) => {
+				const delay = defaultPolicy(previousAttempts, error, source);
+				delays.push(delay);
+				return delay === null ? null : 0;
+			},
+		}).ref();
+		await expect(new Reader(ref.source).requestSlice(0, 4)).rejects.toThrow(
+			`Error fetching ${url}: 503 Service Unavailable`,
+		);
+		expect(delays).toEqual([0.5, 1, 2, 4, 8, null]);
+		expect(requestCount).toBe(6);
+		expect(defaultPolicy(100, new TypeError('fetch failed'), url)).toBe(16);
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
@@ -417,3 +956,53 @@ const captureLogs = () => {
 		},
 	};
 };
+
+test('UrlSource with a small cache only requests what fits into it', async () => {
+	// Prefetching more than the cache holds evicts the data before it's read, so it got requested again on nearly every
+	// read
+	const file = new Uint8Array(fs.readFileSync(path.join(__dirname, '..', 'public/0.ts')));
+	let requestCount = 0;
+	let transferredBytes = 0;
+	const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+		requestCount++;
+		const range = /bytes=(\d+)-/.exec(new Headers(init?.headers).get('Range') ?? '');
+		const start = Number(range?.[1] ?? 0);
+		let pos = start;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (pos >= file.length) {
+					controller.close();
+					return;
+				}
+
+				const chunk = file.slice(pos, pos + 16384);
+				transferredBytes += chunk.length;
+				pos += chunk.length;
+				controller.enqueue(chunk);
+			},
+		});
+
+		return new Response(body, {
+			status: 206,
+			headers: { 'Content-Range': `bytes ${start}-${file.length - 1}/${file.length}` },
+		});
+	}) as typeof fetch;
+
+	using input = new Input({
+		source: new UrlSource('https://example.com/0.ts', { fetchFn, maxCacheSize: 2 ** 16 }),
+		formats: ALL_FORMATS,
+	});
+
+	let packetCount = 0;
+	for (const track of await input.getTracks()) {
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			void packet;
+			packetCount++;
+		}
+	}
+
+	expect(packetCount).toBe(532);
+	// Main made 28k requests, transferring 13.8 GB of this 1.9 MB file
+	expect(requestCount).toBeLessThan(1000);
+	expect(transferredBytes).toBeLessThan(10 * file.length);
+});

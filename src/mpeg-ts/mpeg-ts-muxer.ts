@@ -22,9 +22,20 @@ import {
 	HevcNalUnitType,
 	iterateNalUnitsInAnnexB,
 	iterateNalUnitsInLengthPrefixed,
+	parseAvcSps,
+	parseHevcSps,
 } from '../codec-data';
 import { Bitstream } from '../../shared/bitstream';
-import { assert, promiseWithResolvers, setUint24, toDataView, toUint8Array } from '../misc';
+import {
+	assert,
+	promiseWithResolvers,
+	setUint24,
+	toDataView,
+	toUint8Array,
+	UNDETERMINED_LANGUAGE,
+	roundToDivisor,
+	Queue,
+} from '../misc';
 import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputTrack, OutputVideoTrack } from '../output';
 import { MpegTsOutputFormat } from '../output-format';
@@ -32,6 +43,8 @@ import { EncodedPacket } from '../packet';
 import { Writer } from '../writer';
 import {
 	buildMpegTsMimeType,
+	computeMpegTsCrc32,
+	MPEG_TS_TIMESCALE,
 	MpegTsStreamType,
 	secondsToMpegTsTimestamp,
 	TS_PACKET_SIZE,
@@ -44,10 +57,18 @@ const PAT_PID = 0x0000;
 const PMT_PID = 0x1000;
 const FIRST_TRACK_PID = 0x0100;
 
+// Audio that gets a stream_id of its own, rather than private_stream_1 (AC-3, E-AC-3 and DTS)
+const usesAudioStreamId = (track: OutputTrack) => {
+	return track.type === 'audio' && (track.source._codec === 'aac' || track.source._codec === 'mp3');
+};
+
 const VIDEO_STREAM_ID_BASE = 0xE0;
 const AUDIO_STREAM_ID_BASE = 0xC0;
 
 const AVC_AUD_NAL = new Uint8Array([0x09, 0xF0]);
+
+// More than the deepest reordering AVC and HEVC allow (16 frames), for streams reordering further than they say
+const MAX_REORDER_DEPTH = 64;
 const HEVC_AUD_NAL = new Uint8Array([0x46, 0x01]);
 
 type MpegTsTrackData = {
@@ -57,7 +78,15 @@ type MpegTsTrackData = {
 	streamId: number;
 	codecString: string;
 	timestampProcessingQueue: QueuedPacket[];
-	packetQueue: QueuedPacket[];
+	/** How many frames the stream reorders at most, as its SPS says (if it does) */
+	reorderFrameCount: number | null;
+	/** How many frames DTS are behind PTS, once known */
+	reorderDepth: number | null;
+	/** The last presentation timestamps (in 90 kHz ticks, in presentation order) of the packets given a DTS */
+	presentationTicksHistory: number[];
+	/** The last DTS given out, in 90 kHz ticks */
+	lastDecodeTicks: number;
+	packetQueue: Queue<QueuedPacket>;
 	inputIsAnnexB: boolean | null;
 	inputIsAdts: boolean | null;
 	avcDecoderConfig: AvcDecoderConfigurationRecord | null;
@@ -71,6 +100,7 @@ type MpegTsTrackData = {
 type QueuedPacket = {
 	data: Uint8Array;
 	presentationTimestamp: number;
+	duration: number;
 	decodeTimestamp: number | null;
 	isKeyframe: boolean;
 };
@@ -82,13 +112,11 @@ export class MpegTsMuxer extends Muxer {
 
 	private trackDatas: MpegTsTrackData[] = [];
 	private tablesWritten = false;
-	private continuityCounters = new Map<number, number>();
+	/** Per PID. The segments of single-file HLS output share them, since together they make one transport stream. */
+	continuityCounters = new Map<number, number>();
 	private packetBuffer = new Uint8Array(TS_PACKET_SIZE);
 	private packetView = toDataView(this.packetBuffer);
 	private allTracksKnown = promiseWithResolvers();
-
-	private videoTrackIndex = 0;
-	private audioTrackIndex = 0;
 
 	private adaptationFieldBuffer = new Uint8Array(184);
 	private payloadBuffer = new Uint8Array(184);
@@ -105,12 +133,40 @@ export class MpegTsMuxer extends Muxer {
 
 		this.writer = await this.output._getRootWriter(true);
 
+		// Tracks that declared their decoder config are set up right away, like in the other muxers, so that the MIME
+		// type is known before any packets come in, and the PMT lists them even if none ever do
+		for (const track of this.output.tracks) {
+			if (track.isVideoTrack() && track.metadata.decoderConfig) {
+				this.getVideoTrackData(track, { decoderConfig: track.metadata.decoderConfig });
+			} else if (track.isAudioTrack() && track.metadata.decoderConfig) {
+				this.getAudioTrackData(track, { decoderConfig: track.metadata.decoderConfig });
+			}
+		}
+
 		release();
 	}
 
 	async getMimeType() {
 		await this.allTracksKnown.promise;
 		return buildMpegTsMimeType(this.trackDatas.map(x => x.codecString));
+	}
+
+	/**
+	 * Tracks get their PIDs (and their place in the PMT) in the order they were added to the output, like in the other
+	 * formats, not in the order of their first packets, which depends on timing between the sources.
+	 */
+	private getTrackPid(track: OutputTrack) {
+		return FIRST_TRACK_PID + this.output.tracks.indexOf(track);
+	}
+
+	/** Returns the index of the given track among the output's tracks matching the predicate. */
+	private getTrackIndex(track: OutputTrack, predicate: (track: OutputTrack) => boolean) {
+		return this.output.tracks.filter(predicate).indexOf(track);
+	}
+
+	private addTrackData(trackData: MpegTsTrackData) {
+		this.trackDatas.push(trackData);
+		this.trackDatas.sort((a, b) => a.pid - b.pid);
 	}
 
 	private getVideoTrackData(track: OutputVideoTrack, meta?: EncodedVideoChunkMetadata) {
@@ -128,8 +184,8 @@ export class MpegTsMuxer extends Muxer {
 		const streamType = codec === 'avc'
 			? MpegTsStreamType.AVC
 			: MpegTsStreamType.HEVC;
-		const pid = FIRST_TRACK_PID + this.trackDatas.length;
-		const streamId = VIDEO_STREAM_ID_BASE + this.videoTrackIndex++;
+		const pid = this.getTrackPid(track);
+		const streamId = VIDEO_STREAM_ID_BASE + this.getTrackIndex(track, x => x.type === 'video');
 
 		const newTrackData: MpegTsTrackData = {
 			track,
@@ -138,7 +194,11 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
-			packetQueue: [],
+			reorderFrameCount: null,
+			reorderDepth: null,
+			presentationTicksHistory: [],
+			lastDecodeTicks: -Infinity,
+			packetQueue: new Queue(),
 			inputIsAnnexB: null,
 			inputIsAdts: null,
 			avcDecoderConfig: null,
@@ -149,7 +209,7 @@ export class MpegTsMuxer extends Muxer {
 			closed: false,
 		};
 
-		this.trackDatas.push(newTrackData);
+		this.addTrackData(newTrackData);
 
 		if (this.allTracksAreKnown()) {
 			this.allTracksKnown.resolve();
@@ -176,12 +236,16 @@ export class MpegTsMuxer extends Muxer {
 		switch (codec) {
 			case 'aac': {
 				streamType = MpegTsStreamType.AAC;
-				streamId = AUDIO_STREAM_ID_BASE + this.audioTrackIndex++;
+				streamId = AUDIO_STREAM_ID_BASE + this.getTrackIndex(track, usesAudioStreamId);
 			}; break;
 
 			case 'mp3': {
-				streamType = MpegTsStreamType.MP3_MPEG1;
-				streamId = AUDIO_STREAM_ID_BASE + this.audioTrackIndex++;
+				// H.222.0 Table 2-34: 0x03 is ISO/IEC 11172-3 (MPEG-1) audio, 0x04 is ISO/IEC 13818-3 audio, which
+				// covers the MPEG-2 low sampling frequencies (below 32 kHz). FFmpeg makes the same distinction.
+				streamType = meta.decoderConfig.sampleRate < 32000
+					? MpegTsStreamType.MP3_MPEG2
+					: MpegTsStreamType.MP3_MPEG1;
+				streamId = AUDIO_STREAM_ID_BASE + this.getTrackIndex(track, usesAudioStreamId);
 			}; break;
 
 			case 'ac3': {
@@ -200,7 +264,7 @@ export class MpegTsMuxer extends Muxer {
 			}; break;
 		}
 
-		const pid = FIRST_TRACK_PID + this.trackDatas.length;
+		const pid = this.getTrackPid(track);
 
 		const newTrackData: MpegTsTrackData = {
 			track,
@@ -209,7 +273,11 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
-			packetQueue: [],
+			reorderFrameCount: null,
+			reorderDepth: null,
+			presentationTicksHistory: [],
+			lastDecodeTicks: -Infinity,
+			packetQueue: new Queue(),
 			inputIsAnnexB: null,
 			inputIsAdts: null,
 			avcDecoderConfig: null,
@@ -220,7 +288,7 @@ export class MpegTsMuxer extends Muxer {
 			closed: false,
 		};
 
-		this.trackDatas.push(newTrackData);
+		this.addTrackData(newTrackData);
 
 		if (this.allTracksAreKnown()) {
 			this.allTracksKnown.resolve();
@@ -253,7 +321,11 @@ export class MpegTsMuxer extends Muxer {
 
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
-				presentationTimestamp: packet.timestamp,
+				// Constrain the timestamp to the frame rate
+				presentationTimestamp: track.metadata.frameRate !== undefined
+					? roundToDivisor(packet.timestamp, track.metadata.frameRate)
+					: packet.timestamp,
+				duration: packet.duration,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -287,6 +359,7 @@ export class MpegTsMuxer extends Muxer {
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
 				presentationTimestamp: packet.timestamp,
+				duration: packet.duration,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -305,26 +378,75 @@ export class MpegTsMuxer extends Muxer {
 		meta?: EncodedVideoChunkMetadata,
 	): Uint8Array {
 		const codec = (trackData.track as OutputVideoTrack).source._codec;
+		const isFirstPacket = trackData.inputIsAnnexB === null;
+		// The first packet may come without metadata if the track declared its decoder config. Later packets keep
+		// their own, so that the declared config can't undo a mid-stream change.
+		const description = (isFirstPacket
+			? meta?.decoderConfig ?? (trackData.track as OutputVideoTrack).metadata.decoderConfig
+			: meta?.decoderConfig)?.description;
 
 		if (trackData.inputIsAnnexB === null) {
 			// This is the first packet
-			const description = meta?.decoderConfig?.description;
 			trackData.inputIsAnnexB = !description;
+		}
 
-			if (!trackData.inputIsAnnexB) {
-				const bytes = toUint8Array(description!);
-				if (codec === 'avc') {
-					trackData.avcDecoderConfig = deserializeAvcDecoderConfigurationRecord(bytes);
-				} else {
-					trackData.hevcDecoderConfig = deserializeHevcDecoderConfigurationRecord(bytes);
-				}
+		if (!trackData.inputIsAnnexB && description) {
+			// Always take the parameter sets of the latest decoder config, since they're written in front of every key
+			// frame and a config can change mid-stream (e.g. when the browser replaces a failing hardware encoder)
+			const bytes = toUint8Array(description);
+			if (codec === 'avc') {
+				trackData.avcDecoderConfig = deserializeAvcDecoderConfigurationRecord(bytes)
+					?? trackData.avcDecoderConfig;
+			} else {
+				trackData.hevcDecoderConfig = deserializeHevcDecoderConfigurationRecord(bytes)
+					?? trackData.hevcDecoderConfig;
 			}
+		}
+
+		if (isFirstPacket) {
+			// The first packet's config (or, for Annex B input, the packet itself) has the SPS
+			trackData.reorderFrameCount = this.getReorderFrameCount(trackData, packet.data, codec as 'avc' | 'hevc');
 		}
 
 		if (trackData.inputIsAnnexB) {
 			return this.prepareAnnexBVideoPacket(packet.data, codec as 'avc' | 'hevc');
 		} else {
 			return this.prepareLengthPrefixedVideoPacket(trackData, packet, codec as 'avc' | 'hevc');
+		}
+	}
+
+	/**
+	 * Returns how many frames the stream reorders at most, as its SPS says: AVC's num_reorder_frames (only when it's
+	 * given, the inferred one can be much larger than what's used) or HEVC's sps_max_num_reorder_pics.
+	 */
+	private getReorderFrameCount(trackData: MpegTsTrackData, data: Uint8Array, codec: 'avc' | 'hevc') {
+		let sps = codec === 'avc'
+			? trackData.avcDecoderConfig?.sequenceParameterSets[0]
+			: trackData.hevcDecoderConfig?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
+
+		if (!sps && trackData.inputIsAnnexB) {
+			for (const loc of iterateNalUnitsInAnnexB(data)) {
+				const nalUnit = data.subarray(loc.offset, loc.offset + loc.length);
+				const isSps = codec === 'avc'
+					? extractNalUnitTypeForAvc(nalUnit[0]!) === AvcNalUnitType.SPS
+					: extractNalUnitTypeForHevc(nalUnit[0]!) === HevcNalUnitType.SPS_NUT;
+				if (isSps) {
+					sps = nalUnit;
+					break;
+				}
+			}
+		}
+
+		if (!sps) {
+			return null;
+		}
+
+		if (codec === 'avc') {
+			const info = parseAvcSps(sps);
+			return info?.bitstreamRestrictionFlag ? info.numReorderFrames : null;
+		} else {
+			const info = parseHevcSps(sps);
+			return info ? info.maxDecFrameBuffering - 1 : null; // That's sps_max_num_reorder_pics + 1
 		}
 	}
 
@@ -375,38 +497,42 @@ export class MpegTsMuxer extends Muxer {
 		}
 
 		if (packet.type === 'key') {
-			// Add whichever NALUs are missing
+			// Add whichever parameter sets are missing, so that decoding can start at this packet
+			const getNalUnitType = (nalUnit: Uint8Array) => codec === 'avc'
+				? extractNalUnitTypeForAvc(nalUnit[0]!)
+				: extractNalUnitTypeForHevc(nalUnit[0]!);
+
+			// In the order in which they depend on each other
+			let parameterSets: { type: number; nalUnits: Uint8Array[] }[];
 			if (codec === 'avc') {
 				const config = trackData.avcDecoderConfig!;
-				for (const pps of config.pictureParameterSets) {
-					nalUnits.unshift(pps);
-				}
-				for (const sps of config.sequenceParameterSets) {
-					nalUnits.unshift(sps);
-				}
+				parameterSets = [
+					{ type: AvcNalUnitType.SPS, nalUnits: config.sequenceParameterSets },
+					{ type: AvcNalUnitType.PPS, nalUnits: config.pictureParameterSets },
+				];
 			} else {
 				const config = trackData.hevcDecoderConfig!;
-				for (const arr of config.arrays) {
-					if (arr.nalUnitType === HevcNalUnitType.PPS_NUT) {
-						for (const nal of arr.nalUnits) {
-							nalUnits.unshift(nal);
-						}
-					}
+				const types = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+				parameterSets = types.map(type => ({
+					type,
+					nalUnits: config.arrays.filter(x => x.nalUnitType === type).flatMap(x => x.nalUnits),
+				}));
+			}
+
+			for (let i = 0; i < parameterSets.length; i++) {
+				const { type, nalUnits: configNalUnits } = parameterSets[i]!;
+				if (nalUnits.some(x => getNalUnitType(x) === type)) {
+					continue;
 				}
-				for (const arr of config.arrays) {
-					if (arr.nalUnitType === HevcNalUnitType.SPS_NUT) {
-						for (const nal of arr.nalUnits) {
-							nalUnits.unshift(nal);
-						}
-					}
+
+				// Insert them before the parameter sets that may depend on them, and before everything else
+				const earlierTypes = parameterSets.slice(0, i + 1).map(x => x.type);
+				let index = nalUnits.findIndex(x => !earlierTypes.includes(getNalUnitType(x)));
+				if (index === -1) {
+					index = nalUnits.length;
 				}
-				for (const arr of config.arrays) {
-					if (arr.nalUnitType === HevcNalUnitType.VPS_NUT) {
-						for (const nal of arr.nalUnits) {
-							nalUnits.unshift(nal);
-						}
-					}
-				}
+
+				nalUnits.splice(index, 0, ...configNalUnits);
 			}
 		}
 
@@ -432,8 +558,9 @@ export class MpegTsMuxer extends Muxer {
 		}
 
 		if (trackData.inputIsAdts === null) {
-			// It's the first packet
-			const description = meta?.decoderConfig?.description;
+			// It's the first packet. It may come without metadata if the track declared its decoder config.
+			const decoderConfig = meta?.decoderConfig ?? (trackData.track as OutputAudioTrack).metadata.decoderConfig;
+			const description = decoderConfig?.description;
 			trackData.inputIsAdts = !description;
 
 			if (!trackData.inputIsAdts) {
@@ -473,21 +600,66 @@ export class MpegTsMuxer extends Muxer {
 	}
 
 	private async flushTimestampQueue(trackData: MpegTsTrackData, alsoInterleave = true) {
-		if (trackData.timestampProcessingQueue.length === 0) {
+		const queue = trackData.timestampProcessingQueue;
+		if (queue.length === 0) {
 			return;
 		}
 
-		const sortedTimestamps = trackData.timestampProcessingQueue
-			.map(packet => packet.presentationTimestamp)
-			.sort((a, b) => a - b);
+		// Everything is worked out in whole ticks of the timestamps as written, so that remuxing gives the same DTS
+		const presentationTicks = queue.map(
+			packet => Math.round((packet.presentationTimestamp + this.timestampOffset) * MPEG_TS_TIMESCALE),
+		);
+		const presentationOrder = presentationTicks
+			.map((_, i) => i)
+			.sort((a, b) => presentationTicks[a]! - presentationTicks[b]! || a - b);
 
-		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
-			const queuedPacket = trackData.timestampProcessingQueue[i]!;
-			queuedPacket.decodeTimestamp = sortedTimestamps[i]!;
-			trackData.packetQueue.push(queuedPacket);
+		// How many frames shown earlier a frame is decoded after at most
+		let depth = 0;
+		presentationOrder.forEach((decodeIndex, presentationIndex) => {
+			depth = Math.max(depth, decodeIndex - presentationIndex);
+		});
+
+		// Like FFmpeg, start with the reordering the SPS announces, so that a GOP reordering deeper than the first ones
+		// doesn't need a larger delay later on. A track that ends with its first GOP has no later ones.
+		const isWholeTrack = trackData.closed && trackData.lastDecodeTicks === -Infinity;
+		const startDepth = isWholeTrack ? 0 : (trackData.reorderDepth ?? trackData.reorderFrameCount ?? 0);
+		const reorderDepth = Math.max(startDepth, depth);
+		trackData.reorderDepth = reorderDepth;
+
+		// Each DTS is the PTS of the frame shown that many frames earlier, which keeps DTS <= PTS (an expectation for
+		// many players) and increasing, also with irregular frame timing. Before the first frames, DTS go back at the
+		// frame rate.
+		const history = trackData.presentationTicksHistory;
+		const sortedTicks = [...history, ...presentationOrder.map(i => presentationTicks[i]!)];
+		let frameDuration = Infinity;
+		for (let i = 1; i < sortedTicks.length; i++) {
+			const gap = sortedTicks[i]! - sortedTicks[i - 1]!;
+			if (gap > 0) {
+				frameDuration = Math.min(frameDuration, gap);
+			}
+		}
+		if (frameDuration === Infinity) {
+			frameDuration = Math.round(queue[0]!.duration * MPEG_TS_TIMESCALE);
 		}
 
-		trackData.timestampProcessingQueue.length = 0;
+		for (let i = 0; i < queue.length; i++) {
+			const index = history.length + i - reorderDepth;
+			let decodeTicks = index >= 0 ? sortedTicks[index]! : sortedTicks[0]! + index * frameDuration;
+
+			if (decodeTicks <= trackData.lastDecodeTicks) {
+				// A GOP reordering deeper than the ones before, or timestamps less than a tick apart: keep DTS
+				// increasing, without passing the PTS while that's possible
+				const last = trackData.lastDecodeTicks;
+				decodeTicks = Math.max(last, Math.min(last + 1, presentationTicks[i]!));
+			}
+
+			trackData.lastDecodeTicks = decodeTicks;
+			queue[i]!.decodeTimestamp = decodeTicks / MPEG_TS_TIMESCALE - this.timestampOffset;
+			trackData.packetQueue.push(queue[i]!);
+		}
+
+		trackData.presentationTicksHistory = sortedTicks.slice(-MAX_REORDER_DEPTH);
+		queue.length = 0;
 
 		if (alsoInterleave) {
 			await this.interleavePackets();
@@ -519,10 +691,10 @@ export class MpegTsMuxer extends Muxer {
 
 				if (
 					trackData.packetQueue.length > 0
-					&& trackData.packetQueue[0]!.presentationTimestamp < minTimestamp
+					&& trackData.packetQueue.peek()!.presentationTimestamp < minTimestamp
 				) {
 					trackWithMinTimestamp = trackData;
-					minTimestamp = trackData.packetQueue[0]!.presentationTimestamp;
+					minTimestamp = trackData.packetQueue.peek()!.presentationTimestamp;
 				}
 			}
 
@@ -759,30 +931,6 @@ export class MpegTsMuxer extends Muxer {
 	}
 }
 
-// CRC-32 for MPEG-TS (polynomial 0x04C11DB7, initial value 0xFFFFFFFF)
-const MPEG_TS_CRC_POLYNOMIAL = 0x04c11db7;
-const MPEG_TS_CRC_TABLE = new Uint32Array(256);
-for (let n = 0; n < 256; n++) {
-	let crc = n << 24;
-
-	for (let k = 0; k < 8; k++) {
-		crc = (crc & 0x80000000)
-			? ((crc << 1) ^ MPEG_TS_CRC_POLYNOMIAL)
-			: (crc << 1);
-	}
-
-	MPEG_TS_CRC_TABLE[n] = (crc >>> 0) & 0xffffffff;
-}
-
-const computeMpegTsCrc32 = (data: Uint8Array) => {
-	let crc = 0xFFFFFFFF;
-	for (let i = 0; i < data.length; i++) {
-		const byte = data[i]!;
-		crc = ((crc << 8) ^ MPEG_TS_CRC_TABLE[(crc >>> 24) ^ byte]!) >>> 0;
-	}
-	return crc;
-};
-
 const PAT_SECTION = new Uint8Array(16);
 {
 	const view = toDataView(PAT_SECTION);
@@ -797,15 +945,47 @@ const PAT_SECTION = new Uint8Array(16);
 	view.setUint32(12, computeMpegTsCrc32(PAT_SECTION.subarray(0, 12)), false); // CRC_32
 }
 
+const getEsDescriptors = (trackData: MpegTsTrackData) => {
+	const descriptors: Uint8Array[] = [];
+
+	if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
+		descriptors.push(AC3_REGISTRATION_DESCRIPTOR);
+	} else if (trackData.streamType === MpegTsStreamType.EAC3_SYSTEM_A) {
+		descriptors.push(EAC3_REGISTRATION_DESCRIPTOR);
+	}
+
+	const { languageCode, disposition } = trackData.track.metadata;
+	// audio_type values per ISO/IEC 13818-1, mapped like FFmpeg does
+	const audioType = disposition?.hearingImpaired
+		? 0x02
+		: disposition?.visuallyImpaired
+			? 0x03
+			: 0x00;
+
+	if ((languageCode !== undefined && languageCode !== UNDETERMINED_LANGUAGE) || audioType !== 0x00) {
+		const language = languageCode ?? UNDETERMINED_LANGUAGE;
+		descriptors.push(new Uint8Array([
+			0x0a, // ISO_639_language_descriptor
+			4,
+			language.charCodeAt(0),
+			language.charCodeAt(1),
+			language.charCodeAt(2),
+			audioType,
+		]));
+	}
+
+	return descriptors;
+};
+
 const buildPmt = (trackDatas: MpegTsTrackData[]) => {
+	const esDescriptors = trackDatas.map(getEsDescriptors);
+
 	let totalEsBytes = 0;
-	for (const trackData of trackDatas) {
+	for (const descriptors of esDescriptors) {
 		totalEsBytes += 5;
 
-		if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
-			totalEsBytes += AC3_REGISTRATION_DESCRIPTOR.length;
-		} else if (trackData.streamType === MpegTsStreamType.EAC3_SYSTEM_A) {
-			totalEsBytes += EAC3_REGISTRATION_DESCRIPTOR.length;
+		for (const descriptor of descriptors) {
+			totalEsBytes += descriptor.length;
 		}
 	}
 
@@ -824,24 +1004,21 @@ const buildPmt = (trackDatas: MpegTsTrackData[]) => {
 	view.setUint16(10, 0xF000, false); // reserved=1111, program_info_length=0
 
 	let offset = 12;
-	for (const trackData of trackDatas) {
+	for (let i = 0; i < trackDatas.length; i++) {
+		const trackData = trackDatas[i]!;
+		const descriptors = esDescriptors[i]!;
+
 		section[offset++] = trackData.streamType; // stream_type
 		view.setUint16(offset, 0xE000 | (trackData.pid & 0x1FFF), false); // reserved=111, elementary_PID
 		offset += 2;
 
-		if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
-			view.setUint16(offset, 0xF000 | AC3_REGISTRATION_DESCRIPTOR.length, false);
-			offset += 2;
-			section.set(AC3_REGISTRATION_DESCRIPTOR, offset);
-			offset += AC3_REGISTRATION_DESCRIPTOR.length;
-		} else if (trackData.streamType === MpegTsStreamType.EAC3_SYSTEM_A) {
-			view.setUint16(offset, 0xF000 | EAC3_REGISTRATION_DESCRIPTOR.length, false);
-			offset += 2;
-			section.set(EAC3_REGISTRATION_DESCRIPTOR, offset);
-			offset += EAC3_REGISTRATION_DESCRIPTOR.length;
-		} else {
-			view.setUint16(offset, 0xF000, false); // reserved=1111, ES_info_length=0
-			offset += 2;
+		const esInfoLength = descriptors.reduce((sum, descriptor) => sum + descriptor.length, 0);
+		view.setUint16(offset, 0xF000 | esInfoLength, false); // reserved=1111, ES_info_length
+		offset += 2;
+
+		for (const descriptor of descriptors) {
+			section.set(descriptor, offset);
+			offset += descriptor.length;
 		}
 	}
 

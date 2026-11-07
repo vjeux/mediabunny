@@ -160,6 +160,49 @@ export const last = <T>(arr: T[]) => {
 	return arr && arr[arr.length - 1];
 };
 
+/**
+ * A first-in, first-out queue. Taking an item off the front is amortized O(1), unlike with
+ * `Array.prototype.shift()`, which copies the whole array once the array is large.
+ */
+export class Queue<T> {
+	private items: (T | undefined)[] = [];
+	private head = 0;
+
+	get length() {
+		return this.items.length - this.head;
+	}
+
+	push(...items: T[]) {
+		this.items.push(...items);
+	}
+
+	/** Returns the first item without removing it, or undefined if the queue is empty. */
+	peek() {
+		return this.items[this.head];
+	}
+
+	shift() {
+		if (this.head === this.items.length) {
+			return undefined;
+		}
+
+		const item = this.items[this.head];
+		this.items[this.head] = undefined; // So that it can be garbage-collected
+		this.head++;
+
+		if (2 * this.head >= this.items.length) {
+			// Drop the consumed items once they make up half the array, which keeps this amortized O(1)
+			this.items.splice(0, this.head);
+			this.head = 0;
+		}
+
+		return item;
+	}
+}
+
+/** The most bytes to read or write in one file system call (Node rejects 2 GiB or more). */
+export const MAX_FILE_IO_SIZE = 2 ** 30;
+
 export const isU32 = (value: number) => {
 	return value >= 0 && value < 2 ** 32;
 };
@@ -200,18 +243,6 @@ export const readSignedExpGolomb = (bitstream: Bitstream) => {
 	return codeNum % 2 === 0
 		? -(codeNum / 2)
 		: (codeNum + 1) / 2;
-};
-
-export const writeBits = (bytes: Uint8Array, start: number, end: number, value: number) => {
-	for (let i = start; i < end; i++) {
-		const byteIndex = Math.floor(i / 8);
-		let byte = bytes[byteIndex]!;
-		const bitIndex = 0b111 - (i & 0b111);
-
-		byte &= ~(1 << bitIndex);
-		byte |= ((value & (1 << (end - i - 1))) >> (end - i - 1)) << bitIndex;
-		bytes[byteIndex] = byte;
-	}
 };
 
 export const toUint8Array = (source: AllowSharedBufferSource): Uint8Array => {
@@ -278,7 +309,7 @@ export const TextEncoder = typeof globalThis.TextEncoder !== 'undefined'
 	};
 
 // Include a polyfill for environments that don't have TextEncoder (like AudioWorkletGlobalScope)
-export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
+const BaseTextDecoder: typeof globalThis.TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 	? globalThis.TextDecoder
 	: class TextDecoder {
 		readonly encoding: 'utf-8' | 'utf-16le' | 'utf-16be';
@@ -374,6 +405,11 @@ export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 							i += 2;
 						} else {
 							units.push(0xfffd);
+
+							if (next === -1) {
+								// Cut off by the end: like in the WHATWG decoder, a dangling odd byte shares this error
+								i = bytes.length;
+							}
 						}
 					} else if (unit >= 0xdc00 && unit <= 0xdfff) {
 						units.push(0xfffd);
@@ -394,7 +430,41 @@ export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 
 			return result;
 		}
-	};
+	} as unknown as typeof globalThis.TextDecoder;
+
+/**
+ * Whether the value is a SharedArrayBuffer. Also works where SharedArrayBuffer isn't a global: without cross-origin
+ * isolation, shared WebAssembly memory still is one.
+ */
+export const isSharedArrayBuffer = (value: unknown): value is SharedArrayBuffer => {
+	if (Object.prototype.toString.call(value) !== '[object SharedArrayBuffer]') {
+		return false;
+	}
+
+	try {
+		// The brand can be faked with Symbol.toStringTag, but only real buffers can back a DataView
+		new DataView(value as ArrayBufferLike, 0, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+/**
+ * Browsers' TextDecoder rejects views of shared memory ("must not be shared"), while sources accept shared memory, so
+ * shared bytes get copied before decoding.
+ */
+export const TextDecoder = class TextDecoder extends BaseTextDecoder {
+	override decode(input?: AllowSharedBufferSource, options?: TextDecodeOptions) {
+		if (input !== undefined && isSharedArrayBuffer(ArrayBuffer.isView(input) ? input.buffer : input)) {
+			input = ArrayBuffer.isView(input)
+				? new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice()
+				: new Uint8Array(input).slice();
+		}
+
+		return super.decode(input, options);
+	}
+};
 
 export const textDecoder = /* #__PURE__ */ new TextDecoder();
 export const textEncoder = /* #__PURE__ */ new TextEncoder();
@@ -482,7 +552,7 @@ export const EMPTY_COLOR_SPACE: VideoColorSpaceInit = {
 export const isAllowSharedBufferSource = (x: unknown) => {
 	return (
 		x instanceof ArrayBuffer
-		|| (typeof SharedArrayBuffer !== 'undefined' && x instanceof SharedArrayBuffer)
+		|| isSharedArrayBuffer(x)
 		|| ArrayBuffer.isView(x)
 	);
 };
@@ -649,7 +719,12 @@ export const toAsyncIterator = async function* <T>(source: AnyIterable<T>): Asyn
 };
 
 export const validateAnyIterable = (iterable: AnyIterable<unknown>) => {
-	if (!(Symbol.iterator in iterable) && !(Symbol.asyncIterator in iterable)) {
+	if (
+		!iterable
+		// Functions can be iterable too
+		|| (typeof iterable !== 'object' && typeof iterable !== 'function')
+		|| (!(Symbol.iterator in iterable) && !(Symbol.asyncIterator in iterable))
+	) {
 		throw new TypeError('Argument must be an iterable or async iterable.');
 	}
 };
@@ -719,11 +794,28 @@ export const setInt64 = (view: DataView, byteOffset: number, value: number, litt
  * Calls a function on each value spat out by an async generator. The reason for writing this manually instead of
  * using a generator function is that the generator function queues return() calls - here, we forward them immediately.
  */
+/**
+ * Makes the iterator serve one next() call at a time, like a generator does: concurrent calls then resolve in order,
+ * each with the value after the previous call's.
+ */
+export const serializeNextCalls = <T>(iterator: AsyncGenerator<T, void, unknown>) => {
+	const next = iterator.next.bind(iterator);
+	let lastCall: Promise<unknown> = Promise.resolve();
+
+	iterator.next = () => {
+		const result = lastCall.then(() => next());
+		lastCall = result.then(() => {}, () => {});
+		return result;
+	};
+
+	return iterator;
+};
+
 export const mapAsyncGenerator = <T, U>(
 	generator: AsyncGenerator<T, void, unknown>,
 	map: (t: T) => U,
 ): AsyncGenerator<U, void, unknown> => {
-	return {
+	return makeAsyncDisposable<U>({
 		async next() {
 			const result = await generator.next();
 			if (result.done) {
@@ -741,7 +833,22 @@ export const mapAsyncGenerator = <T, U>(
 		[Symbol.asyncIterator]() {
 			return this;
 		},
-	};
+	});
+};
+
+/**
+ * Gives a hand-written async generator the `Symbol.asyncDispose` method that native async generators have, which ends
+ * the iteration when the generator was declared with `await using`.
+ */
+export const makeAsyncDisposable = <T>(generator: AsyncGenerator<T, void, unknown>) => {
+	Object.defineProperty(generator, Symbol.asyncDispose, {
+		value: async () => {
+			await generator.return();
+		},
+		writable: true,
+		configurable: true,
+	});
+	return generator;
 };
 
 export const clamp = (value: number, min: number, max: number) => {
@@ -882,13 +989,28 @@ export const normalizeHeaders = (headers: HeadersInit): Record<string, string> =
 	if (Array.isArray(headers)) {
 		const result: Record<string, string> = {};
 		headers.forEach(([key, value]) => {
-			result[key] = value;
+			// Like Headers.append, a name given again (in any case) adds its value to the list. Not for Range though,
+			// which UrlSource maps onto a byte offset and which can't hold more than one range for that
+			const existingKey = key.toLowerCase() === 'range'
+				? undefined
+				: Object.keys(result).find(x => x.toLowerCase() === key.toLowerCase());
+			if (existingKey !== undefined) {
+				result[existingKey] += `, ${value}`;
+			} else {
+				result[key] = value;
+			}
 		});
 		return result;
 	}
 
 	return headers;
 };
+
+/**
+ * HTTP statuses of failures that can go away when the request is made again (server errors, timeouts, rate limiting),
+ * which are retried like network errors.
+ */
+const TRANSIENT_HTTP_STATUSES = [408, 429, 500, 502, 503, 504];
 
 export const retriedFetch = async (
 	fetchFn: typeof fetch,
@@ -900,10 +1022,25 @@ export const retriedFetch = async (
 	let attempts = 0;
 
 	while (true) {
+		let response: Response | null = null;
+
 		try {
-			return await fetchFn(url, requestInit);
+			response = await fetchFn(url, requestInit);
+			if (!TRANSIENT_HTTP_STATUSES.includes(response.status)) {
+				return response;
+			}
+
+			// The status lets retry policies tell this apart from a network error
+			throw Object.assign(
+				new Error(
+					`Error fetching ${url instanceof Request ? url.url : String(url)}: ${response.status}`
+					+ ` ${response.statusText}`,
+				),
+				{ status: response.status },
+			);
 		} catch (error) {
 			if (shouldStop()) {
+				void response?.body?.cancel().catch(() => {});
 				throw error;
 			}
 
@@ -911,8 +1048,14 @@ export const retriedFetch = async (
 			const retryDelayInSeconds = getRetryDelay(attempts, error, url);
 
 			if (retryDelayInSeconds === null) {
+				if (response) {
+					return response; // The caller reports the failed response
+				}
+
 				throw error;
 			}
+
+			void response?.body?.cancel().catch(() => {}); // Frees the connection
 
 			Logging._error('Retrying failed fetch. Error:', error);
 
@@ -921,7 +1064,7 @@ export const retriedFetch = async (
 			}
 
 			if (retryDelayInSeconds > 0) {
-				await wait(1000 * retryDelayInSeconds);
+				await wait(1000 * retryDelayInSeconds, requestInit.signal);
 			}
 
 			if (shouldStop()) {
@@ -1163,11 +1306,24 @@ export const base64ToBytes = (base64: string) => {
 export const bytesToBase64 = (bytes: Uint8Array) => {
 	let string = '';
 
-	for (let i = 0; i < bytes.length; i++) {
-		string += String.fromCharCode(bytes[i]!);
+	// In chunks: a string built one character at a time is a rope of one node per byte until it's flattened, which
+	// takes hundreds of MB for a cover of a few MB
+	for (let i = 0; i < bytes.length; i += 0x8000) {
+		string += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
 	}
 
 	return btoa(string);
+};
+
+export const concatUint8Arrays = (arrays: Uint8Array[]) => {
+	const result = new Uint8Array(arrays.reduce((sum, x) => sum + x.byteLength, 0));
+	let offset = 0;
+	for (const array of arrays) {
+		result.set(array, offset);
+		offset += array.byteLength;
+	}
+
+	return result;
 };
 
 export const uint8ArraysAreEqual = (a: Uint8Array, b: Uint8Array) => {
@@ -1184,10 +1340,32 @@ export const uint8ArraysAreEqual = (a: Uint8Array, b: Uint8Array) => {
 	return true;
 };
 
+// The explicit resource management types the public declarations use (as @types/node declares them), so that they
+// compile without TypeScript's esnext.disposable lib
+declare global {
+	interface SymbolConstructor {
+		readonly dispose: unique symbol;
+	}
+
+	interface Disposable {
+		[Symbol.dispose](): void;
+	}
+}
+
+/** Whether two audio decoder configs describe the same decoding: codec string, sample rate, channels, description. */
+export const audioDecoderConfigsAreEqual = (a: AudioDecoderConfig, b: AudioDecoderConfig) => a.codec === b.codec
+	&& a.sampleRate === b.sampleRate
+	&& a.numberOfChannels === b.numberOfChannels
+	&& (a.description && b.description
+		? uint8ArraysAreEqual(toUint8Array(a.description), toUint8Array(b.description))
+		: !a.description === !b.description);
+
 export const polyfillSymbolDispose = () => {
 	// https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-2.html
 	// @ts-expect-error Readonly
 	Symbol.dispose ??= Symbol('Symbol.dispose');
+	// @ts-expect-error Readonly
+	Symbol.asyncDispose ??= Symbol('Symbol.asyncDispose');
 };
 
 export const isNumber = (x: unknown) => {
@@ -1196,7 +1374,7 @@ export const isNumber = (x: unknown) => {
 
 /**
  * A path to a file. File paths can be relative or absolute, and be local paths or full URLs. Paths must be POSIX-like,
- * using `/` as the separator.
+ * using `/` as the separator. The exception are local paths on Windows, which may also use `\`.
  *
  * Examples of valid paths:
  * - `'video.mp4'`
@@ -1213,10 +1391,84 @@ export const isNumber = (x: unknown) => {
  */
 export type FilePath = string;
 
+const isWindowsPathSeparator = (char: string | undefined) => char === '\\' || char === '/';
+
+/** Splits a Windows path into its device (drive or UNC share), whether it's rooted, and the rest. */
+const splitWindowsPathRoot = (path: string) => {
+	if (isWindowsPathSeparator(path[0]) && isWindowsPathSeparator(path[1])) {
+		const uncRoot = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.exec(path);
+		if (uncRoot) {
+			return { device: uncRoot[0], isRooted: true, rest: path.slice(uncRoot[0].length) };
+		}
+	}
+
+	if (/^[a-zA-Z]:/.test(path)) {
+		return { device: path.slice(0, 2), isRooted: isWindowsPathSeparator(path[2]), rest: path.slice(2) };
+	}
+
+	return { device: '', isRooted: isWindowsPathSeparator(path[0]), rest: path };
+};
+
+/** Joins local paths like Windows resolves them, where both `\` and `/` are separators. */
+const joinWindowsPaths = (basePath: FilePath, relativePath: FilePath) => {
+	const base = splitWindowsPathRoot(basePath);
+	const relative = splitWindowsPathRoot(relativePath);
+
+	let device = base.device;
+	let isRooted = base.isRooted;
+	let path: string;
+
+	// A drive-relative path (C:file) continues from the base path if the base path is on that drive or names none
+	const continuesBasePath = relative.device.length === 2
+		&& !relative.isRooted
+		&& (base.device === '' || relative.device.toLowerCase() === base.device.toLowerCase());
+
+	if (relative.device && !continuesBasePath) {
+		// Drive letters and UNC shares begin a path of their own
+		({ device, isRooted } = relative);
+		path = relative.rest;
+	} else if (relative.isRooted) {
+		// A leading separator refers to the root of the base path's drive or share
+		isRooted = true;
+		path = relative.rest;
+	} else {
+		if (relative.device) {
+			device = relative.device;
+		}
+
+		const lastSeparator = Math.max(base.rest.lastIndexOf('/'), base.rest.lastIndexOf('\\'));
+		path = base.rest.slice(0, lastSeparator + 1) + relative.rest;
+	}
+
+	const segments: string[] = [];
+	for (const segment of path.split(/[\\/]/)) {
+		if (segment === '..') {
+			if (segments.length > 0 && last(segments) !== '..') {
+				segments.pop();
+			} else if (!isRooted) {
+				// A relative path keeps the parts reaching above its start; a rooted one can't go above its root
+				segments.push(segment);
+			}
+		} else if (segment !== '.' && segment !== '') {
+			segments.push(segment);
+		}
+	}
+
+	// Keep the native separator if the paths use it
+	const separator = (basePath + relativePath).includes('\\') ? '\\' : '/';
+	return device + (isRooted ? separator : '') + segments.join(separator);
+};
+
 export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 	// If relativePath is a full URL with protocol, return it as-is
 	if (relativePath.includes('://')) {
 		return relativePath;
+	}
+
+	// Local paths on Windows (like the ones Node's path module produces there) may use backslashes too
+	const platform = (globalThis as { process?: { platform?: string } }).process?.platform;
+	if (platform === 'win32' && !basePath.includes('://')) {
+		return joinWindowsPaths(basePath, relativePath);
 	}
 
 	// Strip query parameters from URL base paths so their contents don't mess up the join
@@ -1266,7 +1518,12 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 	const normalized: string[] = [];
 	for (const segment of segments) {
 		if (segment === '..') {
-			normalized.pop();
+			if (!result.startsWith('/') && (normalized.length === 0 || normalized[normalized.length - 1] === '..')) {
+				// A relative path that climbs above its starting point has to keep its leading '..' segments
+				normalized.push(segment);
+			} else {
+				normalized.pop();
+			}
 		} else if (segment !== '.') {
 			normalized.push(segment);
 		}
@@ -1376,6 +1633,37 @@ export const simplifyRational = (rational: Rational): Rational => {
 		num: rational.num / gcd,
 		den: rational.den / gcd,
 	};
+};
+
+/**
+ * The display aspect for a decoder config of frames with the given coded size and pixel aspect ratio. As Mediabunny's
+ * demuxers always gave it, it's the frame size in square pixels when that's a whole number of pixels. Otherwise, a
+ * rounded size would change the pixel aspect ratio of anything derived from it, such as the pasp box of a remux, so
+ * it's the exact display aspect ratio in its reduced form (WebCodecs defines the two fields as a ratio). That's only
+ * when the ratio is smaller than the frame in both dimensions, which tells it apart from a size in pixels (the HLS
+ * muxer relies on this); the rare ratios that aren't give the rounded size.
+ */
+export const getDisplayAspect = (width: number, height: number, pixelAspectRatio: Rational) => {
+	const { num, den } = pixelAspectRatio;
+	if (!(num > 0 && den > 0) || num === den || !(width > 0 && height > 0)) {
+		return null;
+	}
+
+	const isWhole = num > den ? (width * num) % den === 0 : (height * den) % num === 0;
+	if (!isWhole) {
+		const displayAspectRatio = simplifyRational({ num: width * num, den: height * den });
+		if (displayAspectRatio.num < width && displayAspectRatio.den < height) {
+			return { displayAspectWidth: displayAspectRatio.num, displayAspectHeight: displayAspectRatio.den };
+		}
+	}
+
+	const squarePixelWidth = num > den ? Math.round(width * num / den) : width;
+	const squarePixelHeight = num > den ? height : Math.round(height * den / num);
+	if (squarePixelWidth === width && squarePixelHeight === height) {
+		return null;
+	}
+
+	return { displayAspectWidth: squarePixelWidth, displayAspectHeight: squarePixelHeight };
 };
 
 /**
@@ -1586,8 +1874,27 @@ export const clearIntervalUnthrottled = (timer: UnthrottledTimerHandle) => {
 	} satisfies UnthrottledTimerMessage);
 };
 
-export const wait = (ms: number) => {
-	return new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * Resolves after the given time, or right away once the signal aborts, clearing the timer then so that it doesn't keep
+ * the process alive.
+ */
+export const wait = (ms: number, signal?: AbortSignal | null) => {
+	return new Promise<void>((resolve) => {
+		if (signal?.aborted) {
+			resolve();
+			return;
+		}
+
+		const onAbort = () => {
+			clearTimeout(timeoutId);
+			resolve();
+		};
+		const timeoutId = setTimeout(() => {
+			signal?.removeEventListener('abort', onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener('abort', onAbort, { once: true });
+	});
 };
 
 export const rejectAfter = (ms: number, message = 'Promise rejected') => {
@@ -1631,6 +1938,16 @@ export class EventEmitter<TEvents extends Record<string, unknown>> {
 		listener: (data: TEvents[K]) => unknown,
 		options?: EventListenerOptions,
 	): () => void {
+		if (typeof listener !== 'function') {
+			throw new TypeError('listener must be a function.');
+		}
+		if (options !== undefined && (!options || typeof options !== 'object')) {
+			throw new TypeError('options, when provided, must be an object.');
+		}
+		if (options?.once !== undefined && typeof options.once !== 'boolean') {
+			throw new TypeError('options.once, when provided, must be a boolean.');
+		}
+
 		if (!this._listeners.has(event)) {
 			this._listeners.set(event, new Set());
 		}
@@ -1690,6 +2007,11 @@ export class ConcurrentRunner {
 	parallelism: number;
 
 	constructor(parallelism: number) {
+		// Fractional values keep working as on main (1.5 lets two functions run at once); NaN fails this check too
+		if (typeof parallelism !== 'number' || !(parallelism > 0)) {
+			throw new TypeError('parallelism must be a positive number or Infinity.');
+		}
+
 		this.parallelism = parallelism;
 	}
 
@@ -1711,15 +2033,20 @@ export class ConcurrentRunner {
 	 * Throws if the runner is errored.
 	 */
 	async run(fn: () => Promise<unknown>) {
+		if (typeof fn !== 'function') {
+			throw new TypeError('fn must be a function.');
+		}
+
 		if (this._errored) {
 			await Promise.race(this._queue); // Will surface the error
 		}
 
-		while (this._queue.length >= this.parallelism) {
+		// Racing an empty queue would never settle, so a free runner always starts the function
+		while (this._queue.length > 0 && this._queue.length >= this.parallelism) {
 			await Promise.race(this._queue);
 		}
 
-		const promise = fn();
+		const promise = Promise.resolve(fn());
 		this._queue.push(promise);
 
 		void promise

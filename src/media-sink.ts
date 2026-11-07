@@ -6,12 +6,21 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { parsePcmCodec, PCM_AUDIO_CODECS, PcmAudioCodec, VideoCodec, AudioCodec, OPUS_SAMPLE_RATE } from './codec';
+import {
+	parsePcmCodec,
+	PCM_AUDIO_CODECS,
+	PcmAudioCodec,
+	VideoCodec,
+	AudioCodec,
+	OPUS_SAMPLE_RATE,
+	toChromiumCompatibleAvcCodecString,
+} from './codec';
 import {
 	addAvcBitstreamRestriction,
 	AvcNalUnitType,
 	concatAvcNalUnits,
 	deserializeAvcDecoderConfigurationRecord,
+	deserializeHevcDecoderConfigurationRecord,
 	determineVideoPacketType,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
@@ -19,6 +28,7 @@ import {
 	iterateAvcNalUnits,
 	iterateHevcNalUnits,
 	parseAvcSps,
+	parseHevcSps,
 	parseOpusIdentificationHeader,
 	sanitizeHevcPacketForChromium,
 	serializeAvcDecoderConfigurationRecord,
@@ -30,6 +40,7 @@ import {
 	AnyIterable,
 	assert,
 	assertNever,
+	audioDecoderConfigsAreEqual,
 	CallSerializer,
 	clamp,
 	colorSpaceIsComplete,
@@ -42,16 +53,19 @@ import {
 	isNumber,
 	isWebKit,
 	last,
+	makeAsyncDisposable,
 	mapAsyncGenerator,
 	missingWebCodecsClassMessage,
 	promiseWithResolvers,
 	removeItem,
 	Rotation,
+	serializeNextCalls,
 	toAsyncIterator,
 	toDataView,
 	toUint8Array,
 	validateAnyIterable,
 } from './misc';
+import { Logging } from './logging';
 import { EncodedPacket } from './packet';
 import { fromAlaw, fromUlaw } from './pcm';
 import {
@@ -97,7 +111,7 @@ export type PacketRetrievalOptions = {
 	skipLiveWait?: boolean;
 };
 
-const validatePacketRetrievalOptions = (options: PacketRetrievalOptions) => {
+export const validatePacketRetrievalOptions = (options: PacketRetrievalOptions) => {
 	if (!options || typeof options !== 'object') {
 		throw new TypeError('options must be an object.');
 	}
@@ -344,7 +358,9 @@ export class EncodedPacketSink {
 			throw new InputDisposedError();
 		}
 
-		const packetQueue: EncodedPacket[] = [];
+		// Dequeued packets are dropped from the front in bulk (see timestamps below)
+		const packetQueue: (EncodedPacket | undefined)[] = [];
+		let packetQueueStart = 0;
 
 		let { promise: queueNotEmpty, resolve: onQueueNotEmpty } = promiseWithResolvers();
 		let { promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers();
@@ -357,9 +373,18 @@ export class EncodedPacketSink {
 		let outOfBandError = null as unknown;
 		let hasOutOfBandError = false;
 
+		// When packets were dequeued during the last second, starting at index timestampsStart. Old entries are dropped
+		// in bulk since shift() is O(n) for large arrays, and fast consumers dequeue over 100k packets per second.
 		const timestamps: number[] = [];
+		let timestampsStart = 0;
 		// The queue should always be big enough to hold 1 second worth of packets
-		const maxQueueSize = () => Math.max(2, timestamps.length);
+		const maxQueueSize = () => Math.max(2, timestamps.length - timestampsStart);
+		// ...as long as their data (alpha included) stays within a limit: a second's worth of high-bitrate packets
+		// (copying lossless or ProRes video, say) can take up hundreds of megabytes
+		let queuedBytes = 0;
+
+		// Disposing the input ends the iteration like return() does, so that the pump stops waiting for the consumer
+		let onInputDisposed: (() => void) | null = null;
 
 		// The following is the "pump" process that keeps pumping packets into the queue
 		(async () => {
@@ -370,13 +395,17 @@ export class EncodedPacketSink {
 					break;
 				}
 
-				if (packetQueue.length > maxQueueSize()) {
+				if (
+					packetQueue.length - packetQueueStart > maxQueueSize()
+					|| (packetQueue.length - packetQueueStart >= 2 && queuedBytes >= MAX_QUEUED_PACKET_BYTES)
+				) {
 					({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 					await queueDequeue;
 					continue;
 				}
 
 				packetQueue.push(packet);
+				queuedBytes += getPacketDataSize(packet);
 
 				onQueueNotEmpty();
 				({ promise: queueNotEmpty, resolve: onQueueNotEmpty } = promiseWithResolvers());
@@ -392,11 +421,15 @@ export class EncodedPacketSink {
 				hasOutOfBandError = true;
 				onQueueNotEmpty();
 			}
+		}).finally(() => {
+			if (onInputDisposed) {
+				this._track.input._disposeCallbacks.delete(onInputDisposed);
+			}
 		});
 
 		const track = this._track;
 
-		return {
+		const iterator = makeAsyncDisposable<EncodedPacket>(serializeNextCalls<EncodedPacket>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -405,13 +438,25 @@ export class EncodedPacketSink {
 						return { value: undefined, done: true };
 					} else if (hasOutOfBandError) {
 						throw outOfBandError;
-					} else if (packetQueue.length > 0) {
-						const value = packetQueue.shift()!;
+					} else if (packetQueueStart < packetQueue.length) {
+						const value = packetQueue[packetQueueStart]!;
+						queuedBytes -= getPacketDataSize(value);
+						packetQueue[packetQueueStart] = undefined; // So it can be garbage-collected
+						packetQueueStart++;
+						if (packetQueueStart >= packetQueue.length / 2) {
+							packetQueue.splice(0, packetQueueStart);
+							packetQueueStart = 0;
+						}
+
 						const now = performance.now();
 						timestamps.push(now);
 
-						while (timestamps.length > 0 && now - timestamps[0]! >= 1000) {
-							timestamps.shift();
+						while (timestampsStart < timestamps.length && now - timestamps[timestampsStart]! >= 1000) {
+							timestampsStart++;
+						}
+						if (timestampsStart >= timestamps.length / 2) {
+							timestamps.splice(0, timestampsStart);
+							timestampsStart = 0;
 						}
 
 						onQueueDequeue();
@@ -426,22 +471,49 @@ export class EncodedPacketSink {
 			},
 			async return() {
 				terminated = true;
+				// No longer needed
+				packetQueue.length = 0;
 				onQueueDequeue();
 				onQueueNotEmpty();
 
 				return { value: undefined, done: true };
 			},
 			async throw(error) {
+				// Like a generator function, a throw() ends the iteration
+				await this.return();
 				throw error;
 			},
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		}));
+
+		onInputDisposed = () => void iterator.return();
+		track.input._disposeCallbacks.add(onInputDisposed);
+
+		return iterator;
 	}
 }
 
 const MAX_QUEUE_SIZE = 4;
+const MAX_QUEUED_PACKET_BYTES = 2 ** 25; // 32 MiB
+
+/** The bytes a packet holds in memory (metadata-only packets hold none). */
+const getPacketDataSize = (packet: EncodedPacket) => packet.data.byteLength + (packet.sideData.alpha?.byteLength ?? 0);
+
+/**
+ * VP8 alt-ref frames have show_frame = 0 (RFC 6386, section 9.1): they're decoded into a reference buffer but never
+ * output. libvpx stores them as packets of their own, so the decoder yields no frame for these packets.
+ */
+const isInvisibleVp8Frame = (codec: VideoCodec, data: Uint8Array) => {
+	return codec === 'vp8' && data.byteLength > 0 && (data[0]! & 0x10) === 0;
+};
+
+/**
+ * Timestamps this close count as equal when matching samples to query timestamps, so that rounding errors in the
+ * caller's timestamps (like a frame index times the frame duration) don't select the previous sample.
+ */
+const TIMESTAMP_EPSILON = 1e-10;
 
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
@@ -469,6 +541,13 @@ export abstract class BaseMediaSampleSink<
 > {
 	/** @internal */
 	abstract _track: InputTrack;
+	/**
+	 * How many packets can follow a frame in decode order but come before it in presentation order.
+	 * @internal
+	 */
+	async _getReorderDepth() {
+		return 0;
+	}
 
 	/** @internal */
 	abstract _createDecoder(
@@ -479,6 +558,12 @@ export abstract class BaseMediaSampleSink<
 	abstract _createPacketSink(): EncodedPacketSink;
 	/** @internal */
 	abstract _getPreRollDuration(): Promise<number>;
+	/**
+	 * How far apart, in seconds, a decoded sample's timestamp and its packet's timestamp can be. Timestamps within
+	 * this tolerance count as equal when looking up samples.
+	 * @internal
+	 */
+	abstract _getTimestampTolerance(): Promise<number>;
 
 	/** @internal */
 	protected mediaSamplesInRange(
@@ -489,6 +574,11 @@ export abstract class BaseMediaSampleSink<
 		validateTimestamp(startTimestamp);
 		validateTimestamp(endTimestamp);
 
+		if (endTimestamp <= startTimestamp) {
+			// The end is exclusive, so the range is empty (just like for packet iteration)
+			return (async function* () {})();
+		}
+
 		const sampleQueue: MediaSample[] = [];
 		let firstSampleQueued = false;
 		let lastSample: MediaSample | null = null;
@@ -498,6 +588,7 @@ export abstract class BaseMediaSampleSink<
 		let ended = false;
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
+		let tolerance = 0;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -511,11 +602,17 @@ export abstract class BaseMediaSampleSink<
 			metadataOnly: false,
 		};
 
+		// Disposing the input ends the iteration like return() does, so that the pump stops waiting for the consumer
+		// and closes the decoder and queued samples
+		let onInputDisposed: (() => void) | null = null;
+
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
+			tolerance = Math.max(await this._getTimestampTolerance(), TIMESTAMP_EPSILON);
+
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
-				if (sample.timestamp >= endTimestamp) {
+				if (sample.timestamp >= endTimestamp - TIMESTAMP_EPSILON) {
 					ended = true;
 				}
 
@@ -525,7 +622,7 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				if (lastSample) {
-					if (sample.timestamp > startTimestamp) {
+					if (sample.timestamp > startTimestamp + tolerance) {
 						// We don't know ahead of time what the first first is. This is because the first first is the
 						// last first whose timestamp is less than or equal to the start timestamp. Therefore we need to
 						// wait for the first first after the start timestamp, and then we'll know that the previous
@@ -537,7 +634,7 @@ export abstract class BaseMediaSampleSink<
 					}
 				}
 
-				if (sample.timestamp >= startTimestamp) {
+				if (sample.timestamp >= startTimestamp - tolerance) {
 					sampleQueue.push(sample);
 					firstSampleQueued = true;
 				}
@@ -560,7 +657,7 @@ export abstract class BaseMediaSampleSink<
 			const packetSink = this._createPacketSink();
 			const preRollDuration = await this._getPreRollDuration();
 
-			const startPacket = await packetSink.getPacket(startTimestamp, packetRetrievalOptions);
+			const startPacket = await packetSink.getPacket(startTimestamp + tolerance, packetRetrievalOptions);
 			const keyPacket = await packetSink.getKeyPacket(
 				(startPacket?.timestamp ?? startTimestamp) - preRollDuration,
 				packetRetrievalOptions,
@@ -617,6 +714,10 @@ export abstract class BaseMediaSampleSink<
 			}
 		}).finally(() => {
 			decoder?.close();
+
+			if (onInputDisposed) {
+				this._track.input._disposeCallbacks.delete(onInputDisposed);
+			}
 		});
 
 		const track = this._track;
@@ -627,7 +728,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		const iterator = makeAsyncDisposable<MediaSample>(serializeNextCalls<MediaSample>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -671,7 +772,12 @@ export abstract class BaseMediaSampleSink<
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		}));
+
+		onInputDisposed = () => void iterator.return();
+		track.input._disposeCallbacks.add(onInputDisposed);
+
+		return iterator;
 	}
 
 	/** @internal */
@@ -689,6 +795,7 @@ export abstract class BaseMediaSampleSink<
 		let decoderIsFlushed = false;
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
+		let tolerance = 0;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -725,8 +832,14 @@ export abstract class BaseMediaSampleSink<
 			metadataOnly: false,
 		};
 
+		// Disposing the input ends the iteration like return() does, so that the pump stops waiting for the consumer
+		// and closes the decoder and queued samples
+		let onInputDisposed: (() => void) | null = null;
+
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
+			tolerance = Math.max(await this._getTimestampTolerance(), TIMESTAMP_EPSILON);
+
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
 
@@ -735,11 +848,12 @@ export abstract class BaseMediaSampleSink<
 					return;
 				}
 
-				// Every query timestamp this sample starts after is answered by the sample before it
+				// Every query timestamp this sample starts after (by more than the tolerance, or at least a little
+				// epsilon) is answered by the sample before it
 				let heldSampleUses = 0;
 				while (
 					timestampsOfInterest.length > 0
-					&& sample.timestamp - timestampsOfInterest[0]! > 1e-10 // Give it a little epsilon
+					&& sample.timestamp - timestampsOfInterest[0]! > Math.max(tolerance, 1e-10)
 				) {
 					heldSampleUses++;
 					timestampsOfInterest.shift();
@@ -758,6 +872,7 @@ export abstract class BaseMediaSampleSink<
 
 			const packetSink = this._createPacketSink();
 			const preRollDuration = await this._getPreRollDuration();
+			const reorderDepth = await this._getReorderDepth();
 			let lastPacket: EncodedPacket | null = null;
 			let lastTimestamp = -Infinity;
 			let lastKeyPacket: EncodedPacket | null = null;
@@ -800,8 +915,39 @@ export abstract class BaseMediaSampleSink<
 				lastDecodedPacket = currentPacket;
 			};
 
+			// The sequence number of the last packet to decode before flushing, after the given one. With B-frames,
+			// frames presented before a packet's frame can come after it in decode order, up to the reorder depth.
+			// That usually doesn't matter, but where packet timestamps are in decode order (MP4 without composition
+			// offsets, as written by `ffmpeg -i raw.h264 -c copy`), frames get the decoded packets' timestamps in
+			// sorted order (see VideoDecoderWrapper). That's only right if every frame presented up to the last one
+			// asked for was decoded when the decoder flushes the frames it holds back. Until it flushes, it only
+			// outputs frames once all frames presented before them are out, so nothing needs to be decoded ahead.
+			const getLastPacketToDecode = async (targetPacket: EncodedPacket) => {
+				let packet = targetPacket;
+				for (let i = 0; i < reorderDepth; i++) {
+					const nextPacket = await packetSink.getNextPacket(packet, { ...options, metadataOnly: true });
+					if (!nextPacket) {
+						break;
+					}
+					if (nextPacket.timestamp < packet.timestamp) {
+						// Timestamps are in presentation order, so the frames keep their own
+						return targetPacket.sequenceNumber;
+					}
+
+					packet = nextPacket;
+				}
+
+				return packet.sequenceNumber;
+			};
+
 			const flushDecoder = async () => {
 				assert(decoder);
+
+				if (lastDecodedPacket && reorderDepth > 0) {
+					maxSequenceNumber = await getLastPacketToDecode(lastDecodedPacket);
+					await decodePackets();
+				}
+
 				await decoder.flush();
 
 				// No sample starts after the remaining query timestamps, so the last one answers all of them
@@ -816,7 +962,8 @@ export abstract class BaseMediaSampleSink<
 					break;
 				}
 
-				const targetPacket = await packetSink.getPacket(timestamp, retrievalOptions);
+				// Also decode a sample that starts within the tolerance after the timestamp, since it's the answer
+				const targetPacket = await packetSink.getPacket(timestamp + tolerance, retrievalOptions);
 				let keyPacket = targetPacket && await packetSink.getKeyPacket(
 					targetPacket.timestamp - preRollDuration,
 					retrievalOptions,
@@ -881,6 +1028,10 @@ export abstract class BaseMediaSampleSink<
 			}
 		}).finally(() => {
 			decoder?.close();
+
+			if (onInputDisposed) {
+				this._track.input._disposeCallbacks.delete(onInputDisposed);
+			}
 		});
 
 		const track = this._track;
@@ -892,7 +1043,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		const iterator = makeAsyncDisposable<MediaSample | null>(serializeNextCalls<MediaSample | null>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -934,9 +1085,102 @@ export abstract class BaseMediaSampleSink<
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		}));
+
+		onInputDisposed = () => void iterator.return();
+		track.input._disposeCallbacks.add(onInputDisposed);
+
+		return iterator;
 	}
 }
+
+/**
+ * Adds reorder info (bitstream_restriction) to every SPS among the given AVC NAL units that has B-frame reordering but
+ * lacks that info. Returns true if it replaced any SPS.
+ */
+const addReorderInfoToAvcSps = (nalUnits: Uint8Array[]) => {
+	let replaced = false;
+
+	for (let i = 0; i < nalUnits.length; i++) {
+		const nalUnit = nalUnits[i]!;
+		if (extractNalUnitTypeForAvc(nalUnit[0]!) !== AvcNalUnitType.SPS) {
+			continue;
+		}
+
+		const sps = parseAvcSps(nalUnit);
+		if (sps && sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+			nalUnits[i] = addAvcBitstreamRestriction(sps);
+			replaced = true;
+		}
+	}
+
+	return replaced;
+};
+
+/** Adjusts a decoder config to work around Chromium decoder bugs, before a WebCodecs decoder is configured with it. */
+const adjustVideoDecoderConfig = (codec: VideoCodec, decoderConfig: VideoDecoderConfig) => {
+	if (isChromium() || isFirefox()) {
+		if (codec === 'avc' && isChromium()) {
+			decoderConfig = {
+				...decoderConfig,
+				codec: toChromiumCompatibleAvcCodecString(decoderConfig.codec),
+			};
+		}
+
+		if (codec === 'avc' && decoderConfig.description) {
+			const record = deserializeAvcDecoderConfigurationRecord(
+				toUint8Array(decoderConfig.description),
+			);
+			if (record && record.sequenceParameterSets.length > 0) {
+				const sps = parseAvcSps(record.sequenceParameterSets[0]!);
+				if (sps) {
+					if (sps.frameMbsOnlyFlag === 0 && isChromium()) {
+						// Chromium has/had a bug with playing interlaced AVC
+						// (https://issues.chromium.org/issues/456919096) which can be worked around by
+						// requesting that software decoding be used. So, here we peek into the AVC description,
+						// if present, and switch to software decoding if we find interlaced content.
+						decoderConfig = {
+							...decoderConfig,
+							hardwareAcceleration: 'prefer-software',
+						};
+					}
+
+					if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+						// Modify the SPS to fix potential loss of B frames (Firefox loses the last frame)
+						record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
+						decoderConfig = {
+							...decoderConfig,
+							description: serializeAvcDecoderConfigurationRecord(record),
+						};
+					}
+				}
+			}
+		}
+
+		if (isChromium() && !colorSpaceIsComplete(decoderConfig.colorSpace)) {
+			// Found via https://github.com/remotion-dev/remotion/issues/10841.
+			// If the color space is incomplete (which is often that it's just partially filled), Chromium has
+			// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
+			// that information is genuinely lost, like the color matrix for example. Chromium has other code
+			// paths where it just fills the missing values with a hardcoded default, so we do the exact same
+			// thing here, with the same hardcoded defaults. The exception is the matrix of VP8, which is
+			// always BT.601 (RFC 6386, section 9.2), and of VP9 without a color space, which FFmpeg and
+			// Chromium's own media pipeline also treat as BT.601.
+			decoderConfig = {
+				...decoderConfig,
+				colorSpace: {
+					primaries: decoderConfig.colorSpace?.primaries ?? 'bt709',
+					matrix: decoderConfig.colorSpace?.matrix
+						?? (codec === 'vp8' || codec === 'vp9' ? 'smpte170m' : 'bt709'),
+					transfer: decoderConfig.colorSpace?.transfer ?? 'bt709',
+					fullRange: decoderConfig.colorSpace?.fullRange ?? false,
+				},
+			};
+		}
+	}
+
+	return decoderConfig;
+};
 
 class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	decoder: VideoDecoder | null = null;
@@ -949,6 +1193,8 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	sampleQueue: VideoSample[] = []; // Safari-specific thing, check usage.
 	currentPacketIndex = 0;
 	raslSkipped = false; // For HEVC stuff
+	firstPacketTimestamp = 0;
+	leadingPicturesSkipped = false; // For AVC stuff
 
 	// Alpha stuff
 	alphaDecoder: VideoDecoder | null = null;
@@ -1017,62 +1263,14 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				}
 			};
 
-			if (isChromium()) {
-				if (codec === 'avc' && this.decoderConfig.description) {
-					const record = deserializeAvcDecoderConfigurationRecord(
-						toUint8Array(this.decoderConfig.description),
-					);
-					if (record && record.sequenceParameterSets.length > 0) {
-						const sps = parseAvcSps(record.sequenceParameterSets[0]!);
-						if (sps) {
-							if (sps.frameMbsOnlyFlag === 0) {
-								// Chromium has/had a bug with playing interlaced AVC
-								// (https://issues.chromium.org/issues/456919096) which can be worked around by
-								// requesting that software decoding be used. So, here we peek into the AVC description,
-								// if present, and switch to software decoding if we find interlaced content.
-								this.decoderConfig = {
-									...this.decoderConfig,
-									hardwareAcceleration: 'prefer-software',
-								};
-							}
-
-							if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
-								// Modify the SPS to fix potential loss of B frames
-								record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
-								this.decoderConfig = {
-									...this.decoderConfig,
-									description: serializeAvcDecoderConfigurationRecord(record),
-								};
-							}
-						}
-					}
-				}
-
-				if (!colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
-					// Found via https://github.com/remotion-dev/remotion/issues/10841.
-					// If the color space is incomplete (which is often that it's just partially filled), Chromium has
-					// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
-					// that information is genuinely lost, like the color matrix for example. Chromium has other code
-					// paths where it just fills the missing values with a hardcoded default, so we do the exact same
-					// thing here, with the same hardcoded defaults:
-					this.decoderConfig = {
-						...this.decoderConfig,
-						colorSpace: {
-							primaries: this.decoderConfig.colorSpace?.primaries ?? 'bt709',
-							matrix: this.decoderConfig.colorSpace?.matrix ?? 'bt709',
-							transfer: this.decoderConfig.colorSpace?.transfer ?? 'bt709',
-							fullRange: this.decoderConfig.colorSpace?.fullRange ?? false,
-						},
-					};
-				}
-			}
+			this.decoderConfig = adjustVideoDecoderConfig(codec, this.decoderConfig);
 
 			const stack = new Error('Decoding error').stack;
 
 			this.decoder = new VideoDecoder({
 				output: (frame) => {
 					try {
-						colorHandler(this.copyFrameIfNeeded(frame));
+						colorHandler(this.applyConfiguredDisplayAspect(this.copyFrameIfNeeded(frame)));
 					} catch (error) {
 						this.onError(error);
 					}
@@ -1103,12 +1301,33 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	decode(packet: EncodedPacket) {
+		if (packet.byteLength === 0) {
+			// Empty packets hold no frame (MP4 allows zero-size samples), and decoders error out on them
+			return;
+		}
+
 		if (this.codec === 'hevc' && this.currentPacketIndex > 0 && !this.raslSkipped) {
 			if (this.hasHevcRaslPicture(packet.data)) {
 				return; // Drop
 			}
 
 			this.raslSkipped = true;
+		}
+
+		// The AVC counterpart: decoding that starts at an open-GOP I-frame (a recovery point) can't reconstruct the
+		// leading pictures that follow it but are presented before it. Some decoders (Firefox's) drop them, which would
+		// throw off the timestamp assignment below, so let's drop them ourselves. They're never needed when starting
+		// here since they lie before the start.
+		if (this.codec === 'avc') {
+			if (this.currentPacketIndex === 0) {
+				this.firstPacketTimestamp = packet.timestamp;
+			} else if (!this.leadingPicturesSkipped) {
+				if (packet.timestamp < this.firstPacketTimestamp) {
+					return; // Drop
+				}
+
+				this.leadingPicturesSkipped = true;
+			}
 		}
 
 		if (this.customDecoder) {
@@ -1123,7 +1342,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		} else {
 			assert(this.decoder);
 
-			if (!isWebKit()) {
+			if (!isWebKit() && !isInvisibleVp8Frame(this.codec, packet.data)) {
 				insertSorted(this.inputTimestamps, packet.timestamp, x => x);
 			}
 
@@ -1145,7 +1364,18 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 								// If packets contain an AUD and have NALUs before it, this trips up Chromium's key
 								// frame detector. Clear the NALUs if an AUD is encountered.
 								// https://github.com/Vanilagy/mediabunny/issues/396
+								// Parameter sets are kept and moved after the AUD though: without a description,
+								// they're the only ones the decoder gets.
+								const parameterSets = filteredNalUnits.filter((nalUnit) => {
+									const nalUnitType = extractNalUnitTypeForAvc(nalUnit[0]!);
+									return nalUnitType === AvcNalUnitType.SPS || nalUnitType === AvcNalUnitType.PPS;
+								});
 								filteredNalUnits.length = 0;
+								filteredNalUnits.push(
+									packet.data.subarray(loc.offset, loc.offset + loc.length),
+									...parameterSets,
+								);
+								continue;
 							}
 						}
 
@@ -1180,6 +1410,14 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					if (sanitizedData) {
 						packet = new EncodedPacket(sanitizedData, packet.type, packet.timestamp, packet.duration);
 					}
+				}
+			} else if (isFirefox() && this.codec === 'avc' && packet.type === 'key') {
+				// Same SPS fixup, but Firefox re-reads every in-band SPS, so all of them need it, not just the first
+				const nalUnits = [...iterateAvcNalUnits(packet.data, this.decoderConfig)]
+					.map(loc => packet.data.subarray(loc.offset, loc.offset + loc.length));
+				if (addReorderInfoToAvcSps(nalUnits)) {
+					const newData = concatAvcNalUnits(nalUnits, this.decoderConfig);
+					packet = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
 				}
 			}
 
@@ -1403,6 +1641,36 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	/**
+	 * WebKit's VideoDecoder never applies the displayAspectWidth and displayAspectHeight of its config: its frames
+	 * always have their visible size as their display size, so anamorphic video would come out squeezed. For frames
+	 * whose display size is still their visible size, this applies the configured aspect ratio like the spec does
+	 * (growing the display width or height until the ratio matches).
+	 */
+	applyConfiguredDisplayAspect(frame: VideoFrame) {
+		const { displayAspectWidth, displayAspectHeight } = this.decoderConfig;
+		const visibleRect = frame.visibleRect;
+		if (
+			displayAspectWidth === undefined
+			|| displayAspectHeight === undefined
+			|| !visibleRect
+			|| frame.displayWidth !== visibleRect.width
+			|| frame.displayHeight !== visibleRect.height
+			|| frame.displayWidth * displayAspectHeight === frame.displayHeight * displayAspectWidth
+		) {
+			return frame;
+		}
+
+		const aspectRatio = displayAspectWidth / displayAspectHeight;
+		const displaySize = frame.displayWidth / frame.displayHeight < aspectRatio
+			? { displayWidth: Math.round(frame.displayHeight * aspectRatio), displayHeight: frame.displayHeight }
+			: { displayWidth: frame.displayWidth, displayHeight: Math.round(frame.displayWidth / aspectRatio) };
+		const corrected = new VideoFrame(frame, displaySize);
+		frame.close();
+
+		return corrected;
+	}
+
+	/**
 	 * This is a workaround for https://issues.chromium.org/issues/579043455. It circumvents the problem by instantly
 	 * drawing a frame to a new region of GPU memory (a canvas), which we know for certain won't get fucked up by
 	 * other draws.
@@ -1493,6 +1761,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 
 		this.currentPacketIndex = 0;
 		this.raslSkipped = false;
+		this.leadingPicturesSkipped = false;
 	}
 
 	close() {
@@ -1692,6 +1961,9 @@ const colorAlphaMergerWorkerCode = () => {
 			format: outputFormat,
 			codedWidth: width,
 			codedHeight: height,
+			displayWidth: color.displayWidth,
+			displayHeight: color.displayHeight,
+			colorSpace: color.colorSpace.toJSON(),
 			timestamp: color.timestamp,
 			duration: color.duration ?? undefined,
 			transfer: [output.buffer],
@@ -1750,6 +2022,9 @@ const colorAlphaMergerWorkerCode = () => {
 			format: outputFormat,
 			codedWidth: width,
 			codedHeight: height,
+			displayWidth: color.displayWidth,
+			displayHeight: color.displayHeight,
+			colorSpace: color.colorSpace.toJSON(),
 			timestamp: color.timestamp,
 			duration: color.duration ?? undefined,
 			transfer: [output.buffer],
@@ -1797,6 +2072,9 @@ const colorAlphaMergerWorkerCode = () => {
 			format: 'I420A',
 			codedWidth: width,
 			codedHeight: height,
+			displayWidth: color.displayWidth,
+			displayHeight: color.displayHeight,
+			colorSpace: color.colorSpace.toJSON(),
 			timestamp: color.timestamp,
 			duration: color.duration ?? undefined,
 			transfer: [output.buffer],
@@ -1907,33 +2185,78 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 	}
 
 	/** @internal */
+	async _getDecoderConfig() {
+		const decoderConfig = await this._track.getDecoderConfig();
+		assert(decoderConfig);
+
+		return {
+			...decoderConfig,
+			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
+			optimizeForLatency: this._decoderOptions.optimizeForLatency,
+		};
+	}
+
+	/**
+	 * Whether the track can be decoded with this sink's decoder options. The decoder gets them on top of the track's
+	 * own config, and decoders may refuse them: Chromium refuses 'prefer-hardware' without hardware decoding.
+	 * @internal
+	 */
+	async _canDecode() {
+		if (!(await this._track.canDecode())) {
+			return false;
+		}
+
+		try {
+			const codec = await this._track.getCodec();
+			assert(codec);
+			const decoderConfig = await this._getDecoderConfig();
+			if (customVideoDecoders.some(x => x.supports(codec, decoderConfig))) {
+				return true;
+			}
+
+			// The track's own config was checked above, so only a config with hints needs another check
+			const finalConfig = adjustVideoDecoderConfig(codec, decoderConfig);
+			if (
+				(finalConfig.hardwareAcceleration ?? 'no-preference') === 'no-preference'
+				&& finalConfig.optimizeForLatency === undefined
+			) {
+				return true;
+			}
+
+			const support = await VideoDecoder.isConfigSupported(finalConfig);
+			return support.supported === true;
+		} catch (error) {
+			Logging._error('Error during decodability check:', error);
+			return false;
+		}
+	}
+
+	/** @internal */
 	async _createDecoder(
 		onSample: (sample: VideoSample) => unknown,
 		onError: (error: unknown) => unknown,
 	) {
-		if (!(await this._track.canDecode())) {
+		if (!(await this._canDecode())) {
 			if (typeof VideoDecoder === 'undefined') {
 				throw new Error(missingWebCodecsClassMessage('VideoDecoder'));
 			}
 
+			const { hardwareAcceleration } = this._decoderOptions;
 			throw new Error(
-				'This video track cannot be decoded in this environment. Make sure to check decodability before using'
-				+ ' a track.',
+				'This video track cannot be decoded in this environment'
+				+ (hardwareAcceleration && hardwareAcceleration !== 'no-preference'
+					? ` with hardwareAcceleration '${hardwareAcceleration}'`
+					: '')
+				+ '. Make sure to check decodability before using a track.',
 			);
 		}
 
 		const codec = await this._track.getCodec();
 		const rotation = await this._track.getRotation();
 		const flip = await this._track.getFlip();
-		let decoderConfig = await this._track.getDecoderConfig();
+		const decoderConfig = await this._getDecoderConfig();
 		const timeResolution = await this._track.getTimeResolution();
-		assert(codec && decoderConfig);
-
-		decoderConfig = {
-			...decoderConfig,
-			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
-			optimizeForLatency: this._decoderOptions.optimizeForLatency,
-		};
+		assert(codec);
 
 		return new VideoDecoderWrapper(onSample, onError, codec, decoderConfig, rotation, flip, timeResolution);
 	}
@@ -1944,14 +2267,71 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 	}
 
 	/** @internal */
+	override async _getReorderDepth() {
+		const codec = await this._track.getCodec();
+		if (codec !== 'avc' && codec !== 'hevc') {
+			return 0;
+		}
+
+		const decoderConfig = await this._track.getDecoderConfig();
+		assert(decoderConfig);
+
+		let sps: Uint8Array | null = null;
+		if (decoderConfig.description) {
+			const description = toUint8Array(decoderConfig.description);
+			sps = codec === 'avc'
+				? deserializeAvcDecoderConfigurationRecord(description)?.sequenceParameterSets[0] ?? null
+				: deserializeHevcDecoderConfigurationRecord(description)?.arrays
+					.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0] ?? null;
+		} else {
+			// Annex B, where the parameter sets are in the key packets
+			const keyPacket = await this._createPacketSink().getFirstKeyPacket();
+			if (keyPacket) {
+				const nalUnits = codec === 'avc'
+					? iterateAvcNalUnits(keyPacket.data, decoderConfig)
+					: iterateHevcNalUnits(keyPacket.data, decoderConfig);
+				for (const loc of nalUnits) {
+					const type = codec === 'avc'
+						? extractNalUnitTypeForAvc(keyPacket.data[loc.offset]!)
+						: extractNalUnitTypeForHevc(keyPacket.data[loc.offset]!);
+					if (type === (codec === 'avc' ? AvcNalUnitType.SPS : HevcNalUnitType.SPS_NUT)) {
+						sps = keyPacket.data.subarray(loc.offset, loc.offset + loc.length);
+						break;
+					}
+				}
+			}
+		}
+
+		if (codec === 'avc') {
+			const spsInfo = sps && parseAvcSps(sps);
+			if (spsInfo && (spsInfo.profileIdc === 66 || spsInfo.picOrderCntType === 2)) {
+				// Baseline profile has no B-frames, and with pic_order_cnt_type 2, frames are presented in decode order
+				return 0;
+			}
+
+			return spsInfo?.numReorderFrames ?? 16; // 16 is the most frames a decoder can hold back
+		} else {
+			const spsInfo = sps && parseHevcSps(sps);
+			return spsInfo ? spsInfo.maxDecFrameBuffering - 1 : 16; // That's sps_max_num_reorder_pics + 1
+		}
+	}
+
+	/** @internal */
 	async _getPreRollDuration() {
 		return 0;
+	}
+
+	/** @internal */
+	async _getTimestampTolerance() {
+		return 0; // Frames carry their packet's timestamp
 	}
 
 	/**
 	 * Retrieves the video sample (frame) corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last video sample (in presentation order) with a start timestamp less than or equal to the given timestamp.
-	 * Returns null if the timestamp is before the track's first timestamp.
+	 * Returns null if no decodable frame starts at or before the timestamp: before the track's first timestamp, and
+	 * before the first key frame of a track that starts with delta frames (such as an MPEG-TS stream cut mid-GOP).
+	 * The first sample yielded by {@link VideoSampleSink.samples} is the first decodable one.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
@@ -2108,7 +2488,7 @@ export class CanvasSink {
 		if (!(videoTrack instanceof InputVideoTrack)) {
 			throw new TypeError('videoTrack must be an InputVideoTrack.');
 		}
-		if (options && typeof options !== 'object') {
+		if (!options || typeof options !== 'object') {
 			throw new TypeError('options must be an object.');
 		}
 		if (options.alpha !== undefined && typeof options.alpha !== 'boolean') {
@@ -2243,7 +2623,9 @@ export class CanvasSink {
 			flip: this._flip,
 			crop: this._crop,
 			targetIsFresh: canvasIsNew,
-			fillBlack: !this._alpha && isFirefox(),
+			// WebKit doesn't support { alpha: false } on 2D contexts and keeps transparent pixels, so on Firefox and
+			// WebKit, emulate the opaque canvas by painting a black background
+			fillBlack: !this._alpha && (isFirefox() || isWebKit()),
 		});
 
 		const result = {
@@ -2259,7 +2641,9 @@ export class CanvasSink {
 	/**
 	 * Retrieves a canvas with the video frame corresponding to the given timestamp, in seconds. More specifically,
 	 * returns the last video frame (in presentation order) with a start timestamp less than or equal to the given
-	 * timestamp. Returns null if the timestamp is before the track's first timestamp.
+	 * timestamp. Returns null if no decodable frame starts at or before the timestamp: before the track's first
+	 * timestamp, and before the first key frame of a track that starts with delta frames (such as an MPEG-TS stream
+	 * cut mid-GOP). The first canvas yielded by {@link CanvasSink.canvases} is the first decodable one.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
@@ -2309,12 +2693,84 @@ export class CanvasSink {
 	}
 }
 
+/**
+ * Mixes an audio sample to the given number of channels, the way the Web Audio API mixes speakers for mono and
+ * stereo: up from mono by copying the channel, down to mono by averaging the channels. Keeps the sample format.
+ */
+const remixAudioSample = (sample: AudioSample, numberOfChannels: number) => {
+	const frameCount = sample.numberOfFrames;
+	const sourcePlanes = Array.from({ length: sample.numberOfChannels }, (_, planeIndex) => {
+		const plane = new Float32Array(frameCount);
+		sample.copyTo(plane, { planeIndex, format: 'f32-planar' });
+		return plane;
+	});
+
+	const data = new Float32Array(numberOfChannels * frameCount);
+	for (let channel = 0; channel < numberOfChannels; channel++) {
+		const target = data.subarray(channel * frameCount, (channel + 1) * frameCount);
+
+		if (numberOfChannels === 1) {
+			for (const plane of sourcePlanes) {
+				for (let i = 0; i < frameCount; i++) {
+					target[i]! += plane[i]! / sourcePlanes.length;
+				}
+			}
+		} else {
+			target.set(sourcePlanes[Math.min(channel, sourcePlanes.length - 1)]!);
+		}
+	}
+
+	const remixed = new AudioSample({
+		data,
+		format: 'f32-planar',
+		numberOfChannels,
+		sampleRate: sample.sampleRate,
+		timestamp: sample.timestamp,
+	});
+
+	const format = sample.format;
+	if (format === 'f32-planar') {
+		return remixed;
+	}
+
+	const planeCount = format.endsWith('-planar') ? numberOfChannels : 1;
+	const planeSizes = Array.from({ length: planeCount }, (_, planeIndex) => {
+		return remixed.allocationSize({ planeIndex, format });
+	});
+	const converted = new Uint8Array(planeSizes.reduce((sum, size) => sum + size, 0));
+
+	let offset = 0;
+	planeSizes.forEach((size, planeIndex) => {
+		remixed.copyTo(converted.subarray(offset, offset + size), { planeIndex, format });
+		offset += size;
+	});
+	remixed.close();
+
+	return new AudioSample({
+		data: converted,
+		format,
+		numberOfChannels,
+		sampleRate: sample.sampleRate,
+		timestamp: sample.timestamp,
+	});
+};
+
 class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	decoder: AudioDecoder | null = null;
 
 	customDecoder: CustomAudioDecoder | null = null;
 	customDecoderCallSerializer = new CallSerializer();
 	customDecoderQueueSize = 0;
+	// By spec, each output carries the timestamp of the chunk it was decoded from, but Chromium instead counts up from
+	// the first chunk's timestamp, which loses any gap between packets. So there, we keep where the audio of each
+	// packet passed to the decoder starts (in decode order), and where the next packet's audio would start if there
+	// were no gap.
+	stampsOutputsItself = isChromium();
+	queuedOutputs: number[] = [];
+	expectedQueuedTimestamp: number | null = null;
+	// The Opus pre-skip and the part of it the decoder still has to discard from the packets to come, in Opus samples
+	opusPreSkipSamples = 0;
+	remainingOpusPreSkip = 0;
 
 	// Internal state to accumulate a precise current timestamp based on audio durations, not the (potentially
 	// inaccurate) packet timestamps.
@@ -2322,21 +2778,54 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
+	// A Vorbis decoder outputs nothing for the first packet it gets, which only primes the window overlap. The first
+	// audio comes out of the second packet, so that's the one whose timestamp the output must start at.
+	primingPacketPending: boolean;
+
+	/** The decoder config the decoder currently takes packets with; packets can need another one than the track's. */
+	currentDecoderConfig: AudioDecoderConfig;
+	/** The sample rate of the samples the decoder currently emits, which timestamps are rounded to. */
+	outputSampleRate: number;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
 		onError: (error: unknown) => unknown,
-		codec: AudioCodec,
-		decoderConfig: AudioDecoderConfig,
+		public codec: AudioCodec,
+		public decoderConfig: AudioDecoderConfig,
+		public getPacketDecoderConfig: (packet: EncodedPacket) => AudioDecoderConfig | null = () => null,
 	) {
 		super(onSample, onError);
+
+		this.currentDecoderConfig = decoderConfig;
+		this.outputSampleRate = decoderConfig.sampleRate;
+
+		this.primingPacketPending = codec === 'vorbis';
 
 		// WebCodecs impls discards the preskip (correct) but doesn't advance the timestamp (incorrect)
 		const opusPreSkip = codec === 'opus' && decoderConfig.description
 			? parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip / OPUS_SAMPLE_RATE
 			: 0;
+		this.opusPreSkipSamples = Math.round(opusPreSkip * OPUS_SAMPLE_RATE);
+		this.remainingOpusPreSkip = this.opusPreSkipSamples;
 
 		const sampleHandler = (sample: AudioSample) => {
+			if (sample.numberOfFrames === 0) {
+				// We skip zero-data (empty) AudioSamples. These are sometimes emitted, for example, by Firefox when it
+				// decodes Vorbis (at the start). They carry no audio, so they mustn't anchor the timestamps either.
+				sample.close();
+				return;
+			}
+
+			if (codec === 'mp3' && sample.numberOfChannels !== decoderConfig.numberOfChannels) {
+				// The channel mode of MP3 frames may switch between mono and stereo mid-stream, and decoders output
+				// every frame with its own channel count. Keep the output at the track's channel count, as consumers
+				// (like encoders) need a constant one. Other codecs are left alone, since there, the decoder can
+				// rightfully output more channels than configured (HE-AAC v2 turns one channel into two).
+				const remixed = remixAudioSample(sample, decoderConfig.numberOfChannels);
+				sample.close();
+				sample = remixed;
+			}
+
 			let sampleTimestamp = sample.timestamp;
 
 			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
@@ -2345,7 +2834,40 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 			sampleTimestamp += this.timestampOffset;
 
-			if (
+			if (this.stampsOutputsItself && !this.customDecoder) {
+				// Some packets decode to nothing (discard padding, for example), so pair this output with the queued
+				// packet start closest to where the audio continues instead of just the next one. Equal starts (laced
+				// frames sharing one timestamp, for example) each keep their own output.
+				if (this.currentTimestamp !== null) {
+					const current = this.currentTimestamp;
+					while (
+						this.queuedOutputs.length > 1
+						&& Math.abs(this.queuedOutputs[1]! - current) < Math.abs(this.queuedOutputs[0]! - current)
+					) {
+						this.queuedOutputs.shift();
+					}
+				}
+
+				// Packet timestamps are often off by a frame or more (rounding, laced frames, jitter), and decoded
+				// audio can run a little longer or shorter than them, so the audio just continues. Only where a
+				// packet's audio starts at least 0.1 s after both the previous packet's audio ends and where the
+				// decoded audio has got to (a gap, as FFmpeg's aresample defines it with min_hard_comp) does it skip
+				// ahead. It never moves back, which would play audio twice.
+				const queued = this.queuedOutputs.shift();
+				if (this.currentTimestamp === null) {
+					this.currentTimestamp = queued ?? sampleTimestamp;
+				} else if (
+					queued !== undefined
+					&& this.expectedQueuedTimestamp !== null
+					&& queued - this.expectedQueuedTimestamp >= 0.1
+					&& queued - this.currentTimestamp >= 0.1
+				) {
+					this.currentTimestamp = queued;
+				}
+
+				this.expectedQueuedTimestamp = (queued ?? this.expectedQueuedTimestamp ?? this.currentTimestamp)
+					+ sample.duration;
+			} else if (
 				this.currentTimestamp === null
 				|| Math.abs(sampleTimestamp - this.currentTimestamp) >= sample.duration
 			) {
@@ -2356,43 +2878,21 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			const preciseTimestamp = this.currentTimestamp;
 			this.currentTimestamp += sample.duration;
 
-			if (sample.numberOfFrames === 0) {
-				// We skip zero-data (empty) AudioSamples. These are sometimes emitted, for example, by Firefox when it
-				// decodes Vorbis (at the start).
-				sample.close();
-				return;
-			}
-
 			// Round the timestamp to the sample rate
-			const sampleRate = decoderConfig.sampleRate;
+			const sampleRate = this.outputSampleRate;
 			sample.setTimestamp(Math.round(preciseTimestamp * sampleRate) / sampleRate);
 
 			onSample(sample);
 		};
+		this.sampleHandler = sampleHandler;
 
 		const MatchingCustomDecoder = customAudioDecoders.find(x => x.supports(codec, decoderConfig));
 		if (MatchingCustomDecoder) {
-			// @ts-expect-error "Can't create instance of abstract class 🤓"
-			this.customDecoder = new MatchingCustomDecoder() as CustomAudioDecoder;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.codec = codec;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.config = decoderConfig;
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.onSample = (sample) => {
-				if (!(sample instanceof AudioSample)) {
-					throw new TypeError('The argument passed to onSample must be an AudioSample.');
-				}
-
-				sampleHandler(sample);
-			};
-			// @ts-expect-error It's technically readonly
-			this.customDecoder.onError = (error) => {
-				onError(error);
-			};
+			const customDecoder = this.createCustomDecoder(MatchingCustomDecoder, decoderConfig);
+			this.customDecoder = customDecoder;
 
 			void this.customDecoderCallSerializer
-				.call(() => this.customDecoder!.init())
+				.call(() => customDecoder.init())
 				.catch(error => onError(error));
 		} else {
 			const stack = new Error('Decoding error').stack;
@@ -2426,11 +2926,106 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		}
 	}
 
+	sampleHandler: (sample: AudioSample) => void;
+
+	createCustomDecoder(MatchingCustomDecoder: typeof CustomAudioDecoder, decoderConfig: AudioDecoderConfig) {
+		// @ts-expect-error "Can't create instance of abstract class 🤓"
+		const customDecoder = new MatchingCustomDecoder() as CustomAudioDecoder;
+		// @ts-expect-error It's technically readonly
+		customDecoder.codec = this.codec;
+		// @ts-expect-error It's technically readonly
+		customDecoder.config = decoderConfig;
+		// @ts-expect-error It's technically readonly
+		customDecoder.onSample = (sample) => {
+			if (!(sample instanceof AudioSample)) {
+				throw new TypeError('The argument passed to onSample must be an AudioSample.');
+			}
+
+			this.sampleHandler(sample);
+		};
+		// @ts-expect-error It's technically readonly
+		customDecoder.onError = (error) => {
+			this.onError(error);
+		};
+
+		return customDecoder;
+	}
+
+	/**
+	 * Switches the decoder to another config after the packets decoded so far, whose samples it emits first. This
+	 * happens when packets need another decoder config than the track's, such as HLS segments after a discontinuity
+	 * with a new init section (an ad break with another sample rate or channel count).
+	 */
+	switchDecoderConfig(decoderConfig: AudioDecoderConfig, firstPacket: EncodedPacket) {
+		this.currentDecoderConfig = decoderConfig;
+
+		// The decoder starts over with the new config, so its audio starts at the first packet's timestamp, not where
+		// the previous config's audio ended (which, at a discontinuity, can be off by up to a frame or more)
+		const restartTimeline = () => {
+			this.outputSampleRate = decoderConfig.sampleRate;
+			this.currentTimestamp = null;
+			this.expectedFirstTimestamp = firstPacket.timestamp;
+			this.expectedQueuedTimestamp = null;
+		};
+		const MatchingCustomDecoder = customAudioDecoders.find(x => x.supports(this.codec, decoderConfig));
+
+		if (this.decoder && !MatchingCustomDecoder) {
+			// WebCodecs processes control messages in order, so the flush and the new config apply right after the
+			// packets decoded so far. The flush resolves once their samples are out, before any sample of the new
+			// config.
+			const decoder = this.decoder;
+			// Decoding errors reach onError through the decoder's error callback
+			void decoder.flush().then(restartTimeline, () => {});
+			decoder.configure(decoderConfig);
+			// The decoder starts over, so it discards the new config's pre-skip and Vorbis priming packet again
+			this.expectedFirstTimestamp = null;
+			this.primingPacketPending = this.codec === 'vorbis';
+			this.opusPreSkipSamples = this.codec === 'opus' && decoderConfig.description
+				? parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip
+				: 0;
+			this.remainingOpusPreSkip = this.opusPreSkipSamples;
+		} else if (this.customDecoder && MatchingCustomDecoder) {
+			const previousDecoder = this.customDecoder;
+			const nextDecoder = this.createCustomDecoder(MatchingCustomDecoder, decoderConfig);
+			this.customDecoder = nextDecoder;
+
+			void this.customDecoderCallSerializer
+				.call(async () => {
+					await previousDecoder.flush();
+					await previousDecoder.close();
+					restartTimeline();
+					await nextDecoder.init();
+				})
+				.catch(error => this.onError(error));
+		} else {
+			this.onError(new Error(
+				'The audio decoder config changes mid-track in a way that needs a switch between a custom decoder and'
+				+ ' the built-in one, which isn\'t supported.',
+			));
+		}
+	}
+
 	decode(packet: EncodedPacket) {
+		if (packet.byteLength === 0) {
+			// Empty packets hold no audio (MP4 allows zero-size samples), and decoders error out on them
+			return;
+		}
+
+		const decoderConfig = this.getPacketDecoderConfig(packet) ?? this.decoderConfig;
+		if (decoderConfig !== this.currentDecoderConfig) {
+			if (audioDecoderConfigsAreEqual(decoderConfig, this.currentDecoderConfig)) {
+				// The same config in another object, such as the next segment of an ad break: keep the decoder's state
+				this.currentDecoderConfig = decoderConfig;
+			} else {
+				this.switchDecoderConfig(decoderConfig, packet);
+			}
+		}
+
 		if (this.customDecoder) {
+			const customDecoder = this.customDecoder;
 			this.customDecoderQueueSize++;
 			void this.customDecoderCallSerializer
-				.call(() => this.customDecoder!.decode(packet))
+				.call(() => customDecoder.decode(packet))
 				.catch(error => this.onError(error))
 				.finally(() => {
 					this.customDecoderQueueSize--;
@@ -2439,8 +3034,25 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		} else {
 			assert(this.decoder);
 
-			this.expectedFirstTimestamp ??= packet.timestamp;
+			if (this.primingPacketPending) {
+				this.primingPacketPending = false;
+			} else {
+				this.expectedFirstTimestamp ??= packet.timestamp;
+			}
+
 			this.decoder.decode(packet.toEncodedAudioChunk());
+
+			// Where this packet's audio starts, for stampsOutputsItself. No output comes of the Vorbis priming packet
+			// (the first timestamp is still unset after it), nor of Opus packets that lie entirely within the pre-skip.
+			if (this.stampsOutputsItself && this.expectedFirstTimestamp !== null) {
+				const opusPacketSamples = Math.round(packet.duration * OPUS_SAMPLE_RATE);
+				if (opusPacketSamples > 0 && this.remainingOpusPreSkip >= opusPacketSamples) {
+					this.remainingOpusPreSkip -= opusPacketSamples;
+				} else {
+					this.queuedOutputs.push(packet.timestamp + this.remainingOpusPreSkip / OPUS_SAMPLE_RATE);
+					this.remainingOpusPreSkip = 0;
+				}
+			}
 		}
 	}
 
@@ -2452,9 +3064,14 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			await this.decoder.flush();
 		}
 
+		// The decoder starts over after a flush
+		this.queuedOutputs.length = 0;
+		this.expectedQueuedTimestamp = null;
+		this.remainingOpusPreSkip = this.opusPreSkipSamples;
 		this.currentTimestamp = null;
 		this.expectedFirstTimestamp = null;
 		this.timestampOffset = 0;
+		this.primingPacketPending = this.codec === 'vorbis';
 	}
 
 	close() {
@@ -2615,6 +3232,10 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		const numberOfFrames = Math.floor(
 			packet.byteLength / this.decoderConfig.numberOfChannels / this.inputSampleSize,
 		);
+		if (numberOfFrames === 0) {
+			// Empty packets (MP4 allows zero-size samples) hold no audio, and samples can't have zero frames
+			return;
+		}
 
 		const outputBufferSize = numberOfFrames * this.decoderConfig.numberOfChannels * this.outputSampleSize;
 		const outputBuffer = new ArrayBuffer(outputBufferSize);
@@ -2650,7 +3271,7 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 
 	async flush() {
-		// Do nothing
+		this.currentTimestamp = null;
 	}
 
 	close() {
@@ -2698,10 +3319,21 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		const decoderConfig = await this._track.getDecoderConfig();
 		assert(codec && decoderConfig);
 
-		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
+		if (
+			(PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)
+			// Custom decoders take precedence over the built-in PCM decoder, just like custom encoders do
+			&& !customAudioDecoders.some(x => x.supports(codec, decoderConfig))
+		) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			const backing = this._track._backing;
+			return new AudioDecoderWrapper(
+				onSample,
+				onError,
+				codec,
+				decoderConfig,
+				packet => (backing.getDecoderConfigForPacket?.(packet) ?? null) as AudioDecoderConfig | null,
+			);
 		}
 	}
 
@@ -2718,10 +3350,33 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		return preRollDuration;
 	}
 
+	/** @internal */
+	async _getTimestampTolerance() {
+		const timeResolution = await this._track.getTimeResolution();
+		const sampleRate = await this._track.getSampleRate();
+
+		if (Number.isInteger(timeResolution / sampleRate)) {
+			// The container can place a packet on any sample, so decoded audio, timed by its sample count, starts
+			// exactly at its packet's timestamp
+			return 0;
+		}
+
+		// The container rounds packet timestamps to its own resolution (a millisecond in Matroska, for example), so
+		// decoded audio, timed by its sample count, can start up to a tick away from its packet's timestamp. The
+		// epsilon keeps a difference of exactly one tick within the tolerance despite rounding errors.
+		return 1 / timeResolution + 1e-10;
+	}
+
 	/**
 	 * Retrieves the audio sample corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last audio sample (in presentation order) with a start timestamp less than or equal to the given timestamp.
-	 * Returns null if the timestamp is before the track's first timestamp.
+	 * Returns null if the timestamp is before the track's first timestamp. It can also return null at the first
+	 * timestamp itself for Opus and Vorbis tracks: Opus decoding drops the pre-skip, and for Vorbis, the first decoded
+	 * sample may not be found there. The first sample yielded by {@link AudioSampleSink.samples} is the track's first
+	 * sample.
+	 *
+	 * Decoded audio is timed by its sample count, so in containers that round packet timestamps to a coarser
+	 * resolution (a millisecond in Matroska, for example), timestamps are compared within one such tick.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
@@ -2813,7 +3468,10 @@ export class AudioBufferSink {
 	/**
 	 * Retrieves the audio buffer corresponding to the given timestamp, in seconds. More specifically, returns
 	 * the last audio buffer (in presentation order) with a start timestamp less than or equal to the given timestamp.
-	 * Returns null if the timestamp is before the track's first timestamp.
+	 * Returns null if the timestamp is before the track's first timestamp. It can also return null at the first
+	 * timestamp itself for Opus and Vorbis tracks: Opus decoding drops the pre-skip, and for Vorbis, the first decoded
+	 * buffer may not be found there. The first buffer yielded by {@link AudioBufferSink.buffers} is the track's first
+	 * buffer.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.

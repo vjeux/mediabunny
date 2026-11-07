@@ -28,14 +28,17 @@ type SubtitleParserOptions = {
 	output: (cue: SubtitleCue, metadata: SubtitleMetadata) => unknown;
 };
 
-const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
+// The hours of a timestamp may have any number of digits, even just one (W3C WebVTT, "collect a WebVTT timestamp")
+const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d+:)?\d{2}:\d{2}.\d{3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}.\d{3})/g;
 const preambleStartRegex = /^WEBVTT(.|\n)*?\n{2}/;
-export const inlineTimestampRegex = /<(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})>/g;
+export const inlineTimestampRegex = /<(?:(\d+):)?(\d{2}):(\d{2}).(\d{3})>/g;
 
 export class SubtitleParser {
 	private options: SubtitleParserOptions;
 	private preambleText: string | null = null;
 	private preambleEmitted = false;
+	/** Text after the last cue of the previous chunk, such as a NOTE block, which precedes this chunk's first cue. */
+	private pendingText = '';
 
 	constructor(options: SubtitleParserOptions) {
 		this.options = options;
@@ -48,10 +51,14 @@ export class SubtitleParser {
 		let match: RegExpMatchArray | null;
 
 		if (!this.preambleText) {
-			if (!preambleStartRegex.test(text)) {
+			// The text may also end right after the header, as a file without cues does
+			if (!preambleStartRegex.test(text + '\n\n')) {
 				throw new Error('WebVTT preamble incorrect.');
 			}
 
+			// The header holds at least the WEBVTT line, so that line can't be the identifier of a cue that directly
+			// follows it (W3C WebVTT parser: a line containing "-->" ends the header)
+			cueBlockHeaderRegex.lastIndex = text.indexOf('\n') + 1;
 			match = cueBlockHeaderRegex.exec(text);
 			const preamble = text.slice(0, match?.index ?? text.length).trimEnd();
 
@@ -64,23 +71,38 @@ export class SubtitleParser {
 			if (match) {
 				text = text.slice(match.index);
 				cueBlockHeaderRegex.lastIndex = 0;
+			} else {
+				text = ''; // All of it is the preamble
 			}
+		} else {
+			text = this.pendingText + text;
 		}
 
 		while ((match = cueBlockHeaderRegex.exec(text))) {
 			const notes = text.slice(0, match.index);
 			const cueIdentifier = match[1];
 			const matchEnd = match.index! + match[0].length;
-			const bodyStart = text.indexOf('\n', matchEnd) + 1;
+			const lineEnd = text.indexOf('\n', matchEnd);
+			// Without a line break after it, the timing line ends the text and the cue has no text
+			const bodyStart = lineEnd === -1 ? text.length : lineEnd + 1;
 			const cueSettings = text.slice(matchEnd, bodyStart).trim();
 			let bodyEnd = text.indexOf('\n\n', matchEnd);
 			if (bodyEnd === -1) bodyEnd = text.length;
+
+			// Like in the W3C parser, a line containing "-->" starts the next cue, even without a blank line before it.
+			// The search starts after this cue's timing line, so every iteration consumes at least that line.
+			const nextArrowIndex = text.indexOf('-->', bodyStart);
+			if (nextArrowIndex !== -1 && nextArrowIndex < bodyEnd) {
+				bodyEnd = Math.max(text.lastIndexOf('\n', nextArrowIndex), bodyStart);
+			}
 
 			const startTime = parseSubtitleTimestamp(match[2]!);
 			const endTime = parseSubtitleTimestamp(match[3]!);
 			const duration = endTime - startTime;
 
-			const body = text.slice(bodyStart, bodyEnd).trim();
+			// Lines holding only whitespace belong to the cue text too, as only an empty line ends a cue (W3C WebVTT
+			// parser); just drop the line break that ends the text
+			const body = text.slice(bodyStart, bodyEnd).replace(/\n+$/, '');
 
 			text = text.slice(bodyEnd).trimStart();
 			cueBlockHeaderRegex.lastIndex = 0;
@@ -104,10 +126,12 @@ export class SubtitleParser {
 
 			this.options.output(cue, meta);
 		}
+
+		this.pendingText = text;
 	}
 }
 
-const timestampRegex = /(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})/;
+const timestampRegex = /(?:(\d+):)?(\d{2}):(\d{2}).(\d{3})/;
 export const parseSubtitleTimestamp = (string: string) => {
 	const match = timestampRegex.exec(string);
 	if (!match) throw new Error('Expected match.');

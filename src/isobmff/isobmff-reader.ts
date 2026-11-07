@@ -20,6 +20,10 @@ export const readBoxHeader = (slice: FileSlice) => {
 
 	const hasLargeSize = totalSize === 1;
 	if (hasLargeSize) {
+		if (slice.remainingLength < 8) {
+			return null; // The 64-bit size is cut off
+		}
+
 		totalSize = readU64Be(slice);
 		headerSize = 16;
 	}
@@ -114,15 +118,101 @@ export const readEsDescriptor = (slice: FileSlice) => {
 	};
 };
 
-export const readMetadataStringShort = (slice: FileSlice) => {
-	let stringLength = readU16Be(slice);
-	slice.skip(2); // Language
+// The characters for bytes 0x80-0xFF in Mac Roman, the encoding of QuickTime text in Western Macintosh languages
+const MAC_ROMAN_HIGH_CHARACTERS = 'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»…'
+	+ '\u00a0ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔ\uf8ffÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ';
 
-	stringLength = Math.min(stringLength, slice.remainingLength);
-	return textDecoder.decode(readBytes(slice, stringLength));
+const isValidUtf8 = (bytes: Uint8Array) => {
+	if (typeof globalThis.TextDecoder === 'undefined') {
+		// The polyfill can't tell invalid UTF-8 from text that contains U+FFFD
+		return !textDecoder.decode(bytes).includes('\ufffd');
+	}
+
+	try {
+		new globalThis.TextDecoder('utf-8', { fatal: true }).decode(bytes);
+		return true;
+	} catch {
+		return false;
+	}
 };
 
+export const readMetadataStringShort = (slice: FileSlice) => {
+	let stringLength = readU16Be(slice);
+	const languageCode = readU16Be(slice);
+
+	stringLength = Math.min(stringLength, slice.remainingLength);
+	let bytes = readBytes(slice, stringLength);
+
+	// Many QuickTime-era writers count a terminating NUL into the length
+	let end = bytes.length;
+	while (end > 0 && bytes[end - 1] === 0) {
+		end--;
+	}
+	bytes = bytes.subarray(0, end);
+
+	// Language codes below 0x400 are Macintosh language codes (0x7fff: unspecified), whose text is in a Mac encoding
+	// (Mac Roman for the Western languages) rather than UTF-8. Text that is valid UTF-8 anyway is kept as is.
+	const isMacLanguage = languageCode < 0x400 || languageCode === 0x7fff;
+	if (isMacLanguage && !isValidUtf8(bytes)) {
+		let macRomanText = '';
+		for (const byte of bytes) {
+			macRomanText += byte < 0x80 ? String.fromCharCode(byte) : MAC_ROMAN_HIGH_CHARACTERS[byte - 0x80]!;
+		}
+
+		return macRomanText;
+	}
+
+	return textDecoder.decode(bytes);
+};
+
+/**
+ * Reads an iTunes freeform ('----') item, which holds 'mean' (a reverse-DNS domain) and 'name' boxes before its
+ * data box. Returns null if either name part is missing.
+ */
+export const readFreeformMetadataItem = (slice: FileSlice, contentSize: number) => {
+	const endPos = slice.filePos + Math.min(contentSize, slice.remainingLength);
+	let mean: string | null = null;
+	let name: string | null = null;
+	let data: ReturnType<typeof readDataBox> = null;
+
+	while (endPos - slice.filePos >= MIN_BOX_HEADER_SIZE) {
+		const startPos = slice.filePos;
+		const header = readBoxHeader(slice);
+		if (!header || startPos + header.totalSize > endPos) {
+			break;
+		}
+
+		if ((header.name === 'mean' || header.name === 'name') && header.contentSize >= 4) {
+			slice.skip(4); // Version and flags
+			const value = textDecoder.decode(readBytes(slice, header.contentSize - 4));
+
+			if (header.name === 'mean') {
+				mean = value;
+			} else {
+				name = value;
+			}
+		} else if (header.name === 'data' && data === null) {
+			slice.filePos = startPos;
+			data = readDataBox(slice);
+		}
+
+		slice.filePos = startPos + header.totalSize;
+	}
+
+	if (mean === null || name === null) {
+		return null;
+	}
+
+	return { mean, name, data };
+};
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
 export const readDataBox = (slice: FileSlice) => {
+	if (slice.remainingLength < MIN_BOX_HEADER_SIZE) {
+		return null;
+	}
+
 	const header = readBoxHeader(slice);
 	if (!header || header.name !== 'data') {
 		return null;
@@ -135,13 +225,24 @@ export const readDataBox = (slice: FileSlice) => {
 
 	const typeIndicator = readU32Be(slice);
 	slice.skip(4); // Locale indicator
-	const data = readBytes(slice, header.contentSize - 8);
+	const data = readBytes(slice, Math.min(header.contentSize - 8, slice.remainingLength)); // Cut off if it overruns
 
 	switch (typeIndicator) {
 		case 1: return textDecoder.decode(data); // UTF-8
 		case 2: return new TextDecoder('utf-16be').decode(data); // UTF-16-BE
-		case 13: return new RichImageData(data, 'image/jpeg');
-		case 14: return new RichImageData(data, 'image/png');
+		case 13: // JPEG
+		case 14: { // PNG
+			// Like in FFmpeg, the image's signature wins over the type, which taggers get wrong: mutagen, for one,
+			// writes PNG images with the JPEG type unless told otherwise
+			let mimeType = typeIndicator === 13 ? 'image/jpeg' : 'image/png';
+			if (PNG_SIGNATURE.every((byte, i) => data[i] === byte)) {
+				mimeType = 'image/png';
+			} else if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+				mimeType = 'image/jpeg';
+			}
+
+			return new RichImageData(data, mimeType);
+		}
 		case 27: return new RichImageData(data, 'image/bmp');
 
 		default: return data;

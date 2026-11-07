@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from 'vitest';
@@ -7,12 +8,15 @@ import {
 	BufferSource,
 	CustomPathedSource,
 	CustomSource,
+	EncodedPacket,
 	EncodedPacketSink,
 	Input,
 	ReadableStreamSource,
 	Source,
 } from '../../src/index.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
+import type { IsobmffDemuxer } from '../../src/isobmff/isobmff-demuxer.js';
+import type { MatroskaDemuxer } from '../../src/matroska/matroska-demuxer.js';
 
 // Each test tests a malicious or malformed ("bad") file that once made the code hang, exhaust memory, burn CPU for way
 // too long, or fail in an unintended way (a failed assertion or an implicit error). The tests make sure the files
@@ -163,6 +167,16 @@ test('MP4: PCM track with huge stsc first chunk', async () => {
 	})]));
 });
 
+test('MP4: PCM track with zero channels', async () => {
+	// Decoding it used to create audio samples with 0 channels
+	const channelCount = 0;
+	const sampleEntry = box('sowt', zeros(6), u16(1), zeros(8), u16(channelCount), u16(16), zeros(4), u32(48000 << 16));
+	await expectGracefulDecode(mp4([trak({
+		handler: 'soun',
+		stbl: [stsd(sampleEntry), stts([[4, 1]]), stsc([[1, 4, 1]]), fullBox('stsz', 0, 0, u32(2), u32(4)), stco([0])],
+	})]));
+});
+
 test('MP4: stsc with huge samples per chunk', async () => {
 	await expectGracefulRead(mp4([trak({
 		handler: 'vide',
@@ -188,6 +202,47 @@ test('MP4: stsc with alternating chunk indices', async () => {
 		],
 	})]));
 });
+
+test('MP4: stsc entry starting at chunk 0', async () => {
+	// The first chunk became chunk -1, whose offset doesn't exist, so the packets came out without their data
+	const stbl = (dataOffset: number) => [
+		stsd(videoSampleEntry()), stts([[2, 1]]), stsc([[0, 2, 1]]), stsz([4, 4]), stco([dataOffset]),
+	];
+	const header = mp4([trak({ handler: 'vide', stbl: stbl(0) })]);
+	const file = mp4(
+		[trak({ handler: 'vide', stbl: stbl(header.length + 8) })],
+		[box('mdat', [1, 2, 3, 4, 5, 6, 7, 8])],
+	);
+
+	expect(await packetData(file)).toEqual([[1, 2, 3, 4], [5, 6, 7, 8]]);
+
+	// A whole table numbered from 0: chunks of 1, 2 and 2 samples
+	const zeroBasedStbl = (dataOffset: number) => [
+		stsd(videoSampleEntry()),
+		stts([[5, 1]]),
+		stsc([[0, 1, 1], [1, 2, 1]]),
+		stsz([4, 4, 4, 4, 4]),
+		stco([dataOffset, dataOffset + 4, dataOffset + 12]),
+	];
+	const zeroBasedHeader = mp4([trak({ handler: 'vide', stbl: zeroBasedStbl(0) })]);
+	const zeroBasedFile = mp4(
+		[trak({ handler: 'vide', stbl: zeroBasedStbl(zeroBasedHeader.length + 8) })],
+		[box('mdat', Array.from({ length: 20 }, (_, i) => i + 1))],
+	);
+	expect(await packetData(zeroBasedFile)).toEqual([
+		[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20],
+	]);
+});
+
+const packetData = async (file: Uint8Array) => {
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getTracks())[0]!);
+	const data: number[][] = [];
+	for await (const packet of sink.packets()) {
+		data.push([...packet.data]);
+	}
+	return data;
+};
 
 test('MP4: Single chunk with many samples', async () => {
 	// Computing a sample's offset in its chunk used to be linear, making iteration quadratic
@@ -296,11 +351,50 @@ test('MP4: Streamed truns adding up to billions of samples', async () => {
 	await expectGracefulRead(streamedSource(file), /Too many \(> 2\^20\) samples in fragment/);
 });
 
+test('MP4: Streamed with a sample-to-chunk entry starting at chunk 0', async () => {
+	// The first chunk index became -1 and the sample offsets NaN; reading at NaN from a source without a size waited
+	// forever
+	await expectGracefulRead(streamedSource(mp4([trak({
+		handler: 'vide',
+		stbl: [stsd(videoSampleEntry()), stts([[2, 1]]), stsc([[0, 2, 1]]), stsz([4, 4]), stco([0])],
+	})])));
+});
+
+test('MP4: Streamed with a 64-bit box size beyond 2^53', async () => {
+	// The next box's position lost precision, so reading there became a zero-length read that slipped past the bounds
+	// checks and failed in a DataView
+	await expectGracefulRead(streamedSource(concat(u32(1), ascii('styp'), u64(2 ** 62), ascii('isom'), zeros(12))));
+});
+
 test('MP4: trun without default sample values', async () => {
 	await expectGracefulRead(mp4(fragmentedMoov({ trex: false }), [
 		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('trun', 0, 0, u32(1))),
 		box('mdat', zeros(16)),
 	]), /trun/);
+});
+
+test('MP4: Fragment with more samples than its moof has bytes', async () => {
+	// Sequence numbers counted up from the moof's offset, so the zero-size samples of the first fragment got higher
+	// sequence numbers than the samples of the next one, in breach of decode order
+	const zeroSizeSamples = moof(
+		fullBox('tfhd', 0, 0x020018, u32(1), u32(1), u32(0)), // Default duration 1, default size 0
+		fullBox('trun', 0, 0, u32(1000)),
+	);
+	const file = mp4(fragmentedMoov(), [
+		zeroSizeSamples,
+		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('tfdt', 0, 0, u32(1000)), fullBox('trun', 0, 0, u32(3))),
+		box('mdat', zeros(12)),
+	]);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getTracks())[0]!);
+	const sequenceNumbers: number[] = [];
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		sequenceNumbers.push(packet.sequenceNumber);
+	}
+
+	expect(sequenceNumbers).toHaveLength(1003);
+	expect(sequenceNumbers.every((x, i) => i === 0 || x > sequenceNumbers[i - 1]!)).toBe(true);
 });
 
 test('MP4: Fragments with decreasing timestamps', async () => {
@@ -428,6 +522,18 @@ test('MP4: tfdt in trak', async () => {
 	]));
 });
 
+test('MP4: Sample table boxes in a fragment', async () => {
+	// Misplaced sample table boxes changed the track's sample table once it was loaded, leaving it with samples
+	// without timing information
+	const stsz = fullBox('stsz', 0, 0, u32(4), u32(1000));
+	for (const misplaced of [stsz, box('stbl', stsz)]) {
+		await expectGracefulRead(mp4(fragmentedMoov(), [
+			moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('trun', 0, 0x000200, u32(2), u32(4), u32(4)), misplaced),
+			box('mdat', zeros(8)),
+		]));
+	}
+});
+
 test('MP4: Truncated moof', async () => {
 	const file = mp4(fragmentedMoov(), [
 		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('trun', 0, 0, u32(1)), zeros(100)),
@@ -441,6 +547,80 @@ test('MP4: Nested moof', async () => {
 		moof(fullBox('tfhd', 0, 0x020000, u32(1)), fullBox('trun', 0, 0, u32(1)), box('moof')),
 		box('mdat', zeros(16)),
 	]));
+});
+
+test('MP4: trak extending past the end of the moov', async () => {
+	// Seen in old QuickTime files (FFmpeg's samples mov/broken-movs/apple_cv.mov): the trak claims more bytes than the
+	// moov holds. This used to throw for the whole file; FFmpeg cuts a box down to its parent and reads the track.
+	const sampleCount = 3;
+	const header = mp4([trak({ handler: 'vide', stbl: singleChunkStbl(sampleCount, 0) })]);
+	const file = mp4(
+		[trak({ handler: 'vide', stbl: singleChunkStbl(sampleCount, header.length + 8) })],
+		[box('mdat', zeros(4 * sampleCount))],
+	);
+	const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+	const trakPos = indexOfAscii(file, 'trak', 0) - 4;
+	view.setUint32(trakPos, view.getUint32(trakPos) + 100);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	expect(await countPackets(input)).toBe(sampleCount);
+});
+
+test('MP4: Empty boxes', async () => {
+	// An empty box used to be read past its end, which threw an internal error for the whole file when it was the
+	// last box of its parent (FFmpeg skips boxes that are too small)
+	const files: Uint8Array[] = [];
+
+	for (const name of ['stts', 'ctts', 'stss', 'stsz', 'stz2', 'stsc', 'stco', 'co64']) {
+		files.push(mp4([trak({ handler: 'vide', stbl: [...singleChunkStbl(1, 0), box(name)] })]));
+	}
+	files.push(mp4([trak({ handler: 'vide', stbl: singleChunkStbl(1, 0), extra: [box('edts', box('elst'))] })]));
+
+	for (const name of ['colr', 'pasp', 'btrt', 'vpcC']) {
+		files.push(mp4([trak({
+			handler: 'vide',
+			stbl: [stsd(videoSampleEntry('avc1', [box(name)])), ...singleChunkStbl(1, 0).slice(1)],
+		})]));
+	}
+	for (const name of ['esds', 'dOps', 'dfLa', 'dac3', 'dmlp', 'pcmC', 'enda', 'frma', 'btrt']) {
+		files.push(mp4([trak({
+			handler: 'soun',
+			stbl: [stsd(audioSampleEntry('mp4a', box(name))), ...singleChunkStbl(1, 0).slice(1)],
+		})]));
+	}
+
+	files.push(mp4([trak({ handler: 'vide', stbl: singleChunkStbl(1, 0) }), box('udta', box('©nam'))]));
+	files.push(mp4([trak({ handler: 'vide', stbl: singleChunkStbl(1, 0) }), box('udta', box('meta'))]));
+	files.push(mp4([trak({ handler: 'vide', stbl: emptyStbl() }), box('mvex', trex(1), box('mehd'))]));
+	files.push(mp4([trak({ handler: 'vide', stbl: emptyStbl() }), box('mvex', box('trex'))]));
+	files.push(mp4(fragmentedMoov(), [moof(fullBox('tfhd', 0, 0x020000, u32(1)), box('tfdt')), box('mdat', zeros(4))]));
+	files.push(mp4(fragmentedMoov(), [moof(fullBox('tfhd', 0, 0x020000, u32(1)), box('trun')), box('mdat', zeros(4))]));
+
+	for (const file of files) {
+		await expectGracefulRead(file);
+	}
+});
+
+test('MP4: nclx colr box without its full range byte', async () => {
+	// Real files carry 18-byte nclx boxes (ExoPlayer's sample_18byte_nclx_colr.mp4). The missing byte used to be read
+	// past the box, failing the whole file; like FFmpeg, the color description is still read
+	const avcC = box('avcC', [1, 0x64, 0x00, 0x1f, 0xff, 0xe0, 0x00]);
+	const colr = box('colr', ascii('nclx'), u16(1), u16(1), u16(1));
+	const file = mp4([trak({
+		handler: 'vide',
+		stbl: [stsd(videoSampleEntry('avc1', [avcC, colr])), ...singleChunkStbl(1, 0).slice(1)],
+	})]);
+
+	await expectGracefulRead(file);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await input.getVideoTracks())[0]!;
+	expect((await track.getDecoderConfig())?.colorSpace).toEqual({
+		primaries: 'bt709',
+		transfer: 'bt709',
+		matrix: 'bt709',
+		fullRange: undefined,
+	});
 });
 
 test('MP4: Broken fragment followed by valid ones', async () => {
@@ -588,13 +768,36 @@ test('MP4: Encryption subsamples exceeding the sample', async () => {
 	await expect(new EncodedPacketSink(track).getFirstPacket()).rejects.toThrow(/subsamples exceed/);
 });
 
+test('MP4: Sample auxiliary information larger than its saiz size', async () => {
+	// A subsample count that doesn't fit into its entry used to read past the auxiliary information with an internal
+	// error. Chromium parses each entry within its saiz size.
+	const sinf = box('sinf',
+		box('frma', ascii('avc1')),
+		fullBox('schm', 0, 0, ascii('cenc'), u32(0x10000)),
+		box('schi', fullBox('tenc', 0, 0, u8(0), u8(0), u8(1), u8(8), zeros(16))),
+	);
+	const stbl = (dataOffset: number) => [
+		stsd(videoSampleEntry('encv', sinf)),
+		...singleChunkStbl(1, dataOffset).slice(1),
+		fullBox('saiz', 0, 0, u8(16), u32(1)),
+		fullBox('saio', 0, 0, u32(1), u32(dataOffset + 4)),
+	];
+	const header = mp4([trak({ handler: 'vide', stbl: stbl(0) })]);
+	const auxInfo = [...zeros(8), ...u16(0xffff), ...zeros(6)]; // IV, then far more subsamples than fit
+
+	await expectGracefulRead(
+		mp4([trak({ handler: 'vide', stbl: stbl(header.length + 8) })], [box('mdat', zeros(4), auxInfo)]),
+		/saiz/,
+	);
+});
+
 test('MP4: Sample table failing to parse', async () => {
 	// A failed parse used to leave a half-built sample table behind, which later calls then tripped over
-	const truncatedStco = fullBox('stco', 0, 0, u32(1000), u32(0));
+	const invalidStz2 = fullBox('stz2', 0, 0, zeros(3), u8(3), u32(3)); // 3-bit field size doesn't exist
 	using input = new Input({
 		source: new BufferSource(mp4([trak({
 			handler: 'vide',
-			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), stsz([4, 4, 4]), truncatedStco],
+			stbl: [stsd(videoSampleEntry()), stts([[3, 1]]), stsc([[1, 3, 1]]), invalidStz2, stco([0])],
 		})])),
 		formats: ALL_FORMATS,
 	});
@@ -603,7 +806,8 @@ test('MP4: Sample table failing to parse', async () => {
 	const firstError = await sink.getFirstPacket().catch((error: unknown) => error);
 	const secondError = await sink.getFirstPacket().catch((error: unknown) => error);
 
-	expect(firstError).toBeInstanceOf(RangeError);
+	expect(firstError).toBeInstanceOf(Error);
+	expect(String(firstError)).toMatch(/stz2/);
 	expect(secondError).toEqual(firstError);
 });
 
@@ -616,6 +820,79 @@ test('MP4: trun outside of traf', async () => {
 	]));
 });
 
+test('MP4: Box fields running past the end of the parent box', async () => {
+	// A broken size field (a single flipped byte in real files) made a box's fixed fields run past the end of its
+	// parent, which failed the whole file with an internal error. Such a box is now skipped instead.
+	const goodTrak = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), id: 1 });
+	const damagedFiles = [
+		// Sample entry shorter than its fixed fields
+		mp4([goodTrak, trak({ handler: 'vide', stbl: [stsd(box('avc1', zeros(8)))], id: 2 })]),
+		// tkhd cut short at the end of its trak
+		mp4([goodTrak, box('trak', box('mdia', mdhd(), hdlr('vide')), fullBox('tkhd', 0, 1, u32(0)))]),
+		// DecoderSpecificInfo claiming more bytes than its esds holds
+		mp4([goodTrak, trak({ handler: 'soun', stbl: [stsd(audioSampleEntry('mp4a', fullBox(
+			'esds', 0, 0, u8(0x03), u8(23), u16(1), u8(0), u8(0x04), u8(15), u8(0x40), u8(0x15), zeros(11),
+			u8(0x05), u8(100), u8(0x12), u8(0x10),
+		)))], id: 2 })]),
+	];
+
+	for (const file of damagedFiles) {
+		await expectGracefulRead(file);
+		expect(await countPackets(new Input({ source: new BufferSource(file), formats: ALL_FORMATS }))).toBe(3);
+	}
+
+	// A file cut off within the 64-bit size of a box header
+	await expectGracefulRead(concat(box('ftyp', ascii('isom'), u32(0), ascii('isom')), u32(1), ascii('mdat')));
+
+	// What the skipped box parsed before failing is undone: a truncated second mvhd mustn't change the movie timescale
+	// that the edit list delaying the intact track by 1 s is in
+	const delayedTrak = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), extra: [box('edts', fullBox(
+		'elst', 0, 0, u32(2), u32(1000), u32(0xffffffff), u16(1), u16(0), u32(120), u32(0), u16(1), u16(0),
+	))] });
+	const truncatedMvhd = fullBox('mvhd', 0, 0, u32(0), u32(0), u32(1), u32(0));
+	expect(await firstPacketTimestamp(mp4([delayedTrak]))).toBe(1);
+	expect(await firstPacketTimestamp(mp4([delayedTrak, truncatedMvhd]))).toBe(1);
+
+	// ...including what it changed in place: a truncated second tkhd (track disabled, ID 999) mustn't change the track
+	const truncatedTkhd = fullBox('tkhd', 0, 0, u32(0), u32(0), u32(999));
+	const trakWithTruncatedTkhd = trak({ handler: 'vide', stbl: singleChunkStbl(3, 0), extra: [truncatedTkhd] });
+	{
+		using input = new Input({ source: new BufferSource(mp4([trakWithTruncatedTkhd])), formats: ALL_FORMATS });
+		const track = (await input.getVideoTracks())[0]!;
+		expect(track.id).toBe(1);
+		expect((await track.getDisposition()).default).toBe(true);
+	}
+
+	// ...and a damaged udta mustn't break an earlier one, or leave raw tags that disagree with the parsed ones
+	const quickTimeText = (name: string, text: string) => box(name, u16(text.length), u16(0), ascii(text));
+	const damagedUdta = box('udta', quickTimeText('\u00a9cmt', 'Stale'), u32(200), ascii('XYZW'), zeros(4));
+	{
+		using input = new Input({
+			source: new BufferSource(mp4([goodTrak, box('udta', quickTimeText('\u00a9nam', 'Good')), damagedUdta])),
+			formats: ALL_FORMATS,
+		});
+		const tags = await input.getMetadataTags();
+		expect(tags.title).toBe('Good');
+		expect(tags.raw!['\u00a9nam']).toBe('Good');
+		expect(tags.raw!['\u00a9cmt']).toBe(tags.comment);
+	}
+});
+
+test('MP4: Many boxes running past the end of their parent', async () => {
+	// Each such box has the parse redone without it, so they're capped per parse
+	const damagedTrak = box('trak', box('mdia', mdhd(), hdlr('vide')), fullBox('tkhd', 0, 1, u32(0)));
+	await expectGracefulRead(
+		mp4([trak({ handler: 'vide', stbl: singleChunkStbl(3, 0) }), ...Array<Bytes>(20).fill(damagedTrak)]),
+		/too many damaged boxes/,
+	);
+});
+
+const firstPacketTimestamp = async (file: Uint8Array) => {
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const packet = await new EncodedPacketSink((await input.getTracks())[0]!).getFirstPacket();
+	return packet?.timestamp;
+};
+
 test('MP4: trak inside moof', async () => {
 	// The trak used to hijack the current track, leaving the traf inside of it without fragment state
 	await expectGracefulRead(mp4(fragmentedMoov(), [
@@ -625,6 +902,61 @@ test('MP4: trak inside moof', async () => {
 		),
 		box('mdat', zeros(16)),
 	]));
+});
+
+test('MP4: Boxes claiming more entries than they hold', async () => {
+	// Like the edit list in FFmpeg's FATE sample mov/invalid_elst_entry_count.mov. Reading the claimed entries ran past
+	// the box with an internal error, which made the whole file unreadable.
+	const withEntryCount = (box: Uint8Array, entryCount: number, offset = 12) => {
+		const copy = box.slice();
+		new DataView(copy.buffer).setUint32(offset, entryCount);
+		return copy;
+	};
+	const tables: Record<string, Uint8Array> = {
+		stts: stts([[1, 40]]),
+		ctts: ctts([[1, 0]]),
+		stss: fullBox('stss', 0, 0, u32(1), u32(1)),
+		stsc: stsc([[1, 1, 1]]),
+		stsz: stsz([4]),
+		stco: stco([0]),
+	};
+
+	for (const name of [...Object.keys(tables), 'elst']) {
+		const stbl = [stsd(videoSampleEntry()), ...Object.entries(tables).map(([tableName, table]) => {
+			return tableName === name ? withEntryCount(table, 1000, name === 'stsz' ? 16 : 12) : table;
+		})];
+		const elst = fullBox('elst', 0, 0, u32(1), u32(40), u32(0), u32(0x10000));
+		const extra = [box('edts', name === 'elst' ? withEntryCount(elst, 2) : elst)];
+		const file = mp4([trak({ handler: 'vide', stbl, extra })]);
+
+		await expectGracefulRead(file);
+
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const track = (await input.getVideoTracks())[0];
+		expect(track).toBeDefined();
+		expect(await new EncodedPacketSink(track!).getFirstPacket()).not.toBeNull();
+	}
+
+	// The same for a fragment's trun (Firefox's dom/media/test/crashtests/1414444.mp4): 2 of 10 claimed sample sizes
+	const fragmented = mp4(fragmentedMoov(), [
+		moof(
+			fullBox('tfhd', 0, 0x020000, u32(1)),
+			fullBox('tfdt', 0, 0, u32(0)),
+			fullBox('trun', 0, 0x000200, u32(10), u32(4), u32(4)),
+		),
+		box('mdat', zeros(8)),
+	]);
+
+	await expectGracefulRead(fragmented);
+
+	using fragmentedInput = new Input({ source: new BufferSource(fragmented), formats: ALL_FORMATS });
+	const fragmentedTrack = (await fragmentedInput.getVideoTracks())[0]!;
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(fragmentedTrack).packets()) {
+		expect(packet.byteLength).toBe(4);
+		packetCount++;
+	}
+	expect(packetCount).toBe(2);
 });
 
 const mp4 = (moovChildren: Bytes[], after: Bytes[] = []) => concat(
@@ -933,6 +1265,22 @@ test('Matroska: Xiph lacing running out of data', async () => {
 		matroska(info(), tracks(videoTrack(1)), cluster(0, simpleBlock(1, 0, 0x82, [2, 0xff, 0xff]))),
 		/lacing/,
 	);
+});
+
+test('Matroska: Vorbis CodecPrivate with unterminated Xiph lacing', async () => {
+	// Computing the pre-roll used to scan past the end of the CodecPrivate forever, and asserted without one
+	const vorbisFile = (codecPrivate: number[] | null) => matroska(info(), tracks(element(
+		EBMLId.TrackEntry,
+		uintElement(EBMLId.TrackNumber, 1),
+		uintElement(EBMLId.TrackType, 2),
+		element(EBMLId.CodecID, ascii('A_VORBIS')),
+		codecPrivate ? element(EBMLId.CodecPrivate, codecPrivate) : [],
+		element(EBMLId.Audio, element(EBMLId.SamplingFrequency, float64(48000)), uintElement(EBMLId.Channels, 2)),
+	)), cluster(0, simpleBlock(1, 0, 0x80)));
+	const getPreRollDuration = 'async input => (await input.getAudioTracks())[0].getPreRollDuration()';
+
+	expect(evaluateWithDeadline(vorbisFile([2, 0xff, 0xff, 0xff]), getPreRollDuration)).toBe(4096 / 48000);
+	expect(evaluateWithDeadline(vorbisFile(null), getPreRollDuration)).toBe(4096 / 48000);
 });
 
 test('Matroska: Laced block without data', async () => {
@@ -1443,6 +1791,39 @@ test('Ogg: Truncated page payload', async () => {
 	await expectGracefulRead(file.subarray(0, file.length - 5));
 });
 
+test('Ogg: Truncated last page still lets lookups find the last complete packet', async () => {
+	// Like a partial download: there's no EOS page, and the cut-off page ends in the middle of a packet, as is the
+	// norm for Vorbis. Each page holds the tail of a packet started on the previous page, a whole packet, and the head
+	// of a packet continuing on the next page.
+	const wholePacket = concat([0xf8], zeros(99)); // 20 ms of CELT
+	const splitPacket = concat([0xf8], zeros(299));
+	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
+	for (let i = 0; i < 20; i++) {
+		pages.push(oggPage({
+			headerType: i === 0 ? 0 : 1,
+			granule: 960 * (1 + 2 * i),
+			sequence: 2 + i,
+			lacing: i === 0 ? [100, 255] : [45, 100, 255],
+			data: concat(i === 0 ? [] : splitPacket.subarray(255), wholePacket, splitPacket.subarray(0, 255)),
+		}));
+	}
+	const file = concatList(pages);
+
+	using input = new Input({ source: new BufferSource(file.subarray(0, file.length - 5)), formats: ALL_FORMATS });
+	const track = (await input.getAudioTracks())[0]!;
+	const sink = new EncodedPacketSink(track);
+
+	let lastPacket: EncodedPacket | null = null;
+	for await (const packet of sink.packets()) {
+		lastPacket = packet;
+	}
+	expect(lastPacket).not.toBeNull();
+
+	expect((await sink.getPacket(Infinity))?.timestamp).toBe(lastPacket!.timestamp);
+	expect((await sink.getKeyPacket(Infinity))?.timestamp).toBe(lastPacket!.timestamp);
+	expect(await track.computeDuration()).toBe(lastPacket!.timestamp + lastPacket!.duration);
+});
+
 test('Ogg: Truncated page header', async () => {
 	const pages = opusPages();
 	const lastPageStart = concatList(pages).length - pages.at(-1)!.length;
@@ -1462,9 +1843,159 @@ test('Ogg: Page claiming to extend past the end of the file', async () => {
 	await expectGracefulRead(concat(...opusPages({ pageCount: 20 }), fakePage));
 });
 
+test('Ogg: Continuation pages after lost pages', async () => {
+	const describePacket = (packet: { timestamp: number; byteLength: number; sequenceNumber: number }) => ({
+		timestamp: packet.timestamp,
+		byteLength: packet.byteLength,
+		sequenceNumber: packet.sequenceNumber,
+	});
+	const readPackets = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+		const packets = [];
+		for await (const packet of sink.packets()) {
+			packets.push(describePacket(packet));
+		}
+
+		// Lookups of the packets' own timestamps, each on a fresh input
+		const lookups = [];
+		for (const packet of packets) {
+			using lookupInput = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+			const lookupSink = new EncodedPacketSink((await lookupInput.getPrimaryAudioTrack())!);
+			lookups.push(describePacket((await lookupSink.getPacket(packet.timestamp))!));
+		}
+
+		return { packets, lookups };
+	};
+	const headerPages = [
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+	];
+	const orphanedEnd = zeros(10); // The end of a packet whose start was on a lost page
+
+	// With page 3 lost, page 4 continues a packet whose start is missing. Like FFmpeg, the orphaned end is skipped,
+	// rather than read as a packet of its own.
+	const afterLostPage = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ granule: 312 + 960, sequence: 2 }, [OPUS_PACKET]),
+		oggPacketsPage({ headerType: 1 | 4, granule: 312 + 2880, sequence: 4 }, [orphanedEnd, OPUS_PACKET]),
+	]));
+	expect(afterLostPage.packets.map(x => x.byteLength)).toEqual([3, 3]);
+	expect(afterLostPage.lookups).toEqual(afterLostPage.packets);
+
+	// The same where the orphaned end spans a whole page, and at the start of the stream
+	const acrossPages = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ granule: 312 + 960, sequence: 2 }, [OPUS_PACKET]),
+		oggPage({ headerType: 1, granule: -1, sequence: 4, lacing: [255], data: zeros(255) }),
+		oggPacketsPage({ headerType: 1 | 4, granule: 312 + 2880, sequence: 5 }, [orphanedEnd, OPUS_PACKET]),
+	]));
+	expect(acrossPages.packets.map(x => x.byteLength)).toEqual([3, 3]);
+	expect(acrossPages.lookups).toEqual(acrossPages.packets);
+
+	const atStart = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ headerType: 1, granule: 312 + 960, sequence: 3 }, [orphanedEnd, OPUS_PACKET]),
+		oggPacketsPage({ headerType: 4, granule: 312 + 1920, sequence: 4 }, [OPUS_PACKET]),
+	]));
+	expect(atStart.packets.map(x => x.byteLength)).toEqual([3, 3]);
+	expect(atStart.lookups).toEqual(atStart.packets);
+
+	// Where nothing but the orphaned end is on the page, its granule position still places the packets after it, and
+	// lookups never return a packet after the timestamp
+	const orphanOnly = await readPackets(concatList([
+		...headerPages,
+		oggPacketsPage({ granule: 312 + 960, sequence: 2 }, [OPUS_PACKET]),
+		oggPacketsPage({ headerType: 1, granule: 312 + 1920, sequence: 4 }, [orphanedEnd]),
+		oggPacketsPage({ granule: 312 + 2880, sequence: 5 }, [OPUS_PACKET]),
+		oggPacketsPage({ headerType: 4, granule: 312 + 3840, sequence: 6 }, [OPUS_PACKET, OPUS_PACKET]),
+	]));
+	expect(orphanOnly.packets.map(x => x.byteLength)).toEqual([3, 3, 3, 3]);
+	for (const [i, lookup] of orphanOnly.lookups.entries()) {
+		expect(lookup.byteLength).toBe(3);
+		expect(lookup.timestamp).toBeLessThanOrEqual(orphanOnly.packets[i]!.timestamp);
+	}
+
+	// Without lost pages, a page continuing a packet is read as before, here the first audio page, which begins with
+	// the end of the comment header
+	const tags = opusTags([ascii(`A=${'x'.repeat(600)}`)]);
+	const intact = await readPackets(concatList([
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPage({ granule: -1, sequence: 1, lacing: [255, 255], data: tags.subarray(0, 510) }),
+		oggPage({
+			headerType: 1,
+			granule: 312 + 9600,
+			sequence: 2,
+			lacing: [tags.length - 510, ...Array<number>(10).fill(3)],
+			data: concatList([tags.subarray(510), ...Array<Bytes>(10).fill(OPUS_PACKET)]),
+		}),
+		oggPacketsPage({ headerType: 4, granule: 312 + 19200, sequence: 3 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+	]));
+	const intactTimestamps = intact.packets.map(x => Math.round(x.timestamp * 48000));
+	expect(intactTimestamps).toEqual(Array.from({ length: 20 }, (_, i) => 960 * i));
+	expect(intact.lookups).toEqual(intact.packets);
+});
+
 test('Ogg: Garbage between pages', async () => {
 	const pages = opusPages({ pageCount: 40 });
 	await expectGracefulRead(concatList(pages.flatMap((page, i) => i >= 2 ? [page, zeros(8)] : [page])));
+});
+
+test('Ogg: Reading goes on past garbage and empty pages between pages', async () => {
+	// Like libogg and FFmpeg, skip whatever sits between two pages instead of ending the stream there
+	const pages = opusPages({ pageCount: 10 });
+	const file = concatList([
+		...pages.slice(0, 2), // The header pages
+		new Uint8Array(100).fill(0x4f), // Garbage made of 'O's
+		...pages.slice(2, 6),
+		oggPage({ granule: -1, sequence: 99, lacing: [], data: [] }), // A page without segments
+		...pages.slice(6),
+	]);
+
+	for (const source of [new BufferSource(file), streamedSource(file)]) {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(Math.round(packet.timestamp * 48000));
+		}
+		expect(timestamps).toEqual(Array.from({ length: 100 }, (_, i) => 960 * i - 312));
+	}
+});
+
+test('Ogg: Reading doesn\'t go on past garbage after damaged pages, into lost pages or another bitstream', async () => {
+	const readTimestamps = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			timestamps.push(Math.round(packet.timestamp * 48000));
+		}
+		return timestamps;
+	};
+	const expectedTimestamps = (count: number) => Array.from({ length: count }, (_, i) => 960 * i - 312);
+
+	// A page replaced by garbage: the audio after it would get wrong timestamps, so the stream ends there
+	const pages = opusPages({ pageCount: 10 });
+	const lostPage = new Uint8Array(pages[6]!.length).fill(0x4f);
+	expect(await readTimestamps(concatList([...pages.slice(0, 6), lostPage, ...pages.slice(7)])))
+		.toEqual(expectedTimestamps(40));
+
+	// A chained file whose first link was cut off in the middle of a packet, and whose second link reuses the serial
+	// number (as in a broken-off Icecast capture): the second link must not be read as a continuation of the first
+	const firstLink = opusPages({ pageCount: 9, lastEos: false });
+	const cutOffPage = oggPage({ granule: -1, sequence: 11, lacing: [255, 255], data: new Uint8Array(510).fill(0xf8) });
+	const file = concat(...firstLink, cutOffPage.subarray(0, 100), ...opusPages({ pageCount: 10 }));
+	expect(await readTimestamps(file)).toEqual(expectedTimestamps(90));
+
+	// Bytes inserted into a page (as into sectors of game discs) damage it and make it end before where its header
+	// says, and the pages after it are likely damaged too, so the stream ends after it
+	const withInsertedBytes = concatList([
+		...pages.slice(0, 5),
+		concat(pages[5]!.subarray(0, 40), new Uint8Array(16).fill(0x99), pages[5]!.subarray(40)),
+		...pages.slice(6),
+	]);
+	expect((await readTimestamps(withInsertedBytes)).length).toBeLessThanOrEqual(40);
 });
 
 test('Ogg: Pages without granule positions at the start', async () => {
@@ -1478,6 +2009,47 @@ test('Ogg: Pages without granule positions at the start', async () => {
 	}
 
 	await expectGracefulRead(concatList(pages));
+});
+
+test('Ogg: Repeated header packets are not taken for audio', async () => {
+	// Some muxers write the header pages twice, as in ExoPlayer's bear_duplicate_header.opus test file
+	const readPackets = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+		const packets: [number, number][] = [];
+		for await (const packet of sink.packets()) {
+			packets.push([packet.timestamp, packet.byteLength]);
+		}
+		return packets;
+	};
+
+	const opusPageList = opusPages({ pageCount: 3 });
+	const opusFile = concatList(opusPageList);
+	const opusFileWithRepeatedHeaders = concatList([
+		...opusPageList.slice(0, 2),
+		...opusPageList.slice(0, 2),
+		...opusPageList.slice(2),
+	]);
+	const opusPackets = await readPackets(opusFile);
+	expect(opusPackets).toHaveLength(30);
+	expect(await readPackets(opusFileWithRepeatedHeaders)).toEqual(opusPackets);
+
+	// The Vorbis fixture's header packets fill its first two pages
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	let headerPagesLength = 0;
+	for (let i = 0; i < 2; i++) {
+		const segmentCount = vorbisFile[headerPagesLength + 26]!;
+		const lacing = vorbisFile.subarray(headerPagesLength + 27, headerPagesLength + 27 + segmentCount);
+		headerPagesLength += 27 + segmentCount + lacing.reduce((a, b) => a + b, 0);
+	}
+	const vorbisFileWithRepeatedHeaders = concat(
+		vorbisFile.subarray(0, headerPagesLength),
+		vorbisFile.subarray(0, headerPagesLength),
+		vorbisFile.subarray(headerPagesLength),
+	);
+	const vorbisPackets = await readPackets(vorbisFile);
+	expect(vorbisPackets).toHaveLength(365);
+	expect(await readPackets(vorbisFileWithRepeatedHeaders)).toEqual(vorbisPackets);
 });
 
 test('Ogg: Continuation page without a preceding packet', async () => {
@@ -1498,6 +2070,53 @@ test('Ogg: Continuation page without a preceding packet', async () => {
 	));
 });
 
+test('Ogg: Packets can be looked up by their own timestamps despite granule positions off by a sample', async () => {
+	// Some of the granule positions in VLC's vorbis-eos.ogg disagree with the packet durations by a sample, so the
+	// timestamps derived from them differ from those of the same packets when iterating from the start
+	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	const iterated: { timestamp: number; sequenceNumber: number }[] = [];
+	{
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			iterated.push({ timestamp: packet.timestamp, sequenceNumber: packet.sequenceNumber });
+		}
+	}
+	expect(iterated).toHaveLength(365);
+
+	// A fresh input for each lookup, so that it can't benefit from earlier ones
+	const lookUp = async (timestamp: number) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const packet = await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp);
+		return packet && { timestamp: packet.timestamp, sequenceNumber: packet.sequenceNumber };
+	};
+
+	// Lookups return the same packet with the same timestamp as iteration
+	const mismatches: number[] = [];
+	for (const packet of iterated) {
+		const found = await lookUp(packet.timestamp);
+		if (found?.sequenceNumber !== packet.sequenceNumber || found.timestamp !== packet.timestamp) {
+			mismatches.push(packet.timestamp);
+		}
+	}
+	expect(mismatches).toEqual([]);
+
+	// Also when looking up a timestamp within a packet
+	for (const packet of iterated.filter((_, i) => i % 10 === 5)) {
+		const found = await lookUp(packet.timestamp + 0.001);
+		expect(found).toEqual({ timestamp: packet.timestamp, sequenceNumber: packet.sequenceNumber });
+	}
+
+	// Where the granule positions add up, a lookup less than a sample before a packet still returns the one before it
+	const opusFile = concatList(opusPages({ pageCount: 3 }));
+	using opusInput = new Input({ source: new BufferSource(opusFile), formats: ALL_FORMATS });
+	const opusSink = new EncodedPacketSink((await opusInput.getPrimaryAudioTrack())!);
+	const packetStart = (960 * 15 - 312) / 48000;
+	for (const offset of [-1e-7, -1e-5, -2e-5]) {
+		expect((await opusSink.getPacket(packetStart + offset))?.timestamp).toBeCloseTo((960 * 14 - 312) / 48000, 9);
+	}
+	expect((await opusSink.getPacket(packetStart))?.timestamp).toBeCloseTo(packetStart, 9);
+});
+
 test('Ogg: Many logical bitstreams', async () => {
 	// Each bitstream used to scan all following pages for its second header packet
 	const pages = Array.from(
@@ -1505,6 +2124,24 @@ test('Ogg: Many logical bitstreams', async () => {
 		(_, i) => oggPacketsPage({ headerType: 2, serial: i + 1 }, [opusHead()]),
 	);
 	await expectGracefulRead(concatList(pages), /logical bitstreams/);
+});
+
+test('Ogg: Page header inside the last page', async () => {
+	// Seeking to the last packet found the page header embedded in the last page's data, which continues a packet from
+	// before the first page walked. Stepping back from it failed, and the lookup then read from past the page's end.
+	const embeddedPage = oggPage({ headerType: 5, sequence: 3, lacing: [0], data: [] });
+	await expectGracefulRead(concat(
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		oggPage({
+			headerType: 1,
+			granule: 9600,
+			sequence: 2,
+			lacing: [255],
+			data: concat(zeros(173), embeddedPage, zeros(255 - 173 - embeddedPage.length)),
+		}),
+		zeros(1),
+	));
 });
 
 test('Ogg: Seeking across a region full of fake page headers', async () => {
@@ -1534,11 +2171,85 @@ test('Ogg: Seeking across a region full of fake page headers', async () => {
 	expect(performance.now() - start).toBeLessThan(1000);
 });
 
+test('Ogg: Page chain jumping over the page found by bisection', async () => {
+	// A page header inside another page's payload made the walk from the bisection skip that page and record the
+	// pages out of order, after which stepping back to the last packet looped forever
+	const hiddenPage = oggPage({
+		headerType: 1,
+		granule: 960,
+		sequence: 9, // Out of sequence, so that it can't pass for a real page in the chain
+		lacing: [255, 255, 255, 15],
+		data: zeros(780),
+	});
+	const payload = new Uint8Array(2000).fill(0xf8);
+	payload.set(hiddenPage, 1180);
+	const file = concat(
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		oggPage({ granule: 1920, sequence: 2, lacing: Array<number>(8).fill(250), data: payload }),
+		oggPage({ headerType: 1, granule: -1, sequence: 4, lacing: [255], data: zeros(255) }),
+		zeros(100),
+	);
+
+	expect(evaluateWithDeadline(file, 'input => input.computeDuration()')).toBeCloseTo(0.0335);
+	await expectGracefulRead(file);
+});
+
 test('Ogg: Short Opus identification header', async () => {
 	await expectGracefulRead(concat(
 		oggPacketsPage({ headerType: 2 }, [ascii('OpusHead')]),
 		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
 	));
+});
+
+test('Ogg: Opus with zero channels', async () => {
+	const head = opusHead();
+	head[9] = 0; // Output channel count
+
+	// As the only stream, the file can't be read
+	const file = concat(oggPacketsPage({ headerType: 2 }, [head]), ...opusPages().slice(1));
+	await expectGracefulRead(file, /Invalid Opus identification header/);
+
+	// Next to a valid stream, it's skipped and the valid stream stays readable
+	const multiplexedFile = concatList([
+		oggPacketsPage({ headerType: 2, serial: 1 }, [opusHead()]),
+		oggPacketsPage({ headerType: 2, serial: 2 }, [head]),
+		oggPacketsPage({ serial: 1, sequence: 1 }, [opusTags([])]),
+		oggPacketsPage({ serial: 2, sequence: 1 }, [opusTags([])]),
+		oggPacketsPage({ headerType: 4, granule: 9600, serial: 1, sequence: 2 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+		oggPacketsPage({ headerType: 4, serial: 2, sequence: 2 }, []),
+	]);
+	using input = new Input({ source: new BufferSource(multiplexedFile), formats: ALL_FORMATS });
+	expect(await input.getTracks()).toHaveLength(1);
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getNumberOfChannels()).toBe(2);
+
+	const packets = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	expect(packets).toHaveLength(10);
+});
+
+test('Ogg: Vorbis with zero sample rate next to a valid stream', async () => {
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	vorbisFile.set(u32le(0), 28 + 12); // Sample rate field of the identification header
+
+	// The Vorbis stream is skipped, and the Opus stream stays readable. All beginning-of-stream pages come first.
+	const [opusBosPage, ...otherOpusPages] = opusPages();
+	const file = concatList([opusBosPage!, vorbisFile, ...otherOpusPages]);
+	await expectGracefulRead(file);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	expect(await input.getTracks()).toHaveLength(1);
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getCodec()).toBe('opus');
+
+	const packets = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	expect(packets).toHaveLength(100);
 });
 
 test('Ogg: Opus comments with many repeated keys', async () => {
@@ -1567,6 +2278,120 @@ test('Ogg: Vorbis with zero sample rate', async () => {
 	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
 	file.set(u32le(0), 28 + 12); // Sample rate field of the identification header
 	await expectGracefulRead(file, /Invalid Vorbis identification header/);
+});
+
+test('Ogg: Gaps in granule positions', async () => {
+	const readPackets = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const packets: { timestamp: number; duration: number; byteLength: number }[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			packets.push({ timestamp: packet.timestamp, duration: packet.duration, byteLength: packet.byteLength });
+		}
+		return packets;
+	};
+	const lookUp = async (file: Uint8Array, timestamp: number) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		return (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp))?.timestamp;
+	};
+
+	// Six pages of ten 20 ms Opus packets, with a second missing before the given page, as in a capture with a
+	// dropout, and optionally samples trimmed off the end
+	const opusFileWithGap = (gapBeforePage: number, trimmedSamples = 0) => {
+		const pages = [
+			oggPacketsPage({ headerType: 2 }, [opusHead()]),
+			oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		];
+		for (let i = 0; i < 6; i++) {
+			pages.push(oggPacketsPage({
+				headerType: i === 5 ? 4 : 0,
+				granule: 312 + 9600 * (i + 1) + (i >= gapBeforePage ? 48000 : 0) - (i === 5 ? trimmedSamples : 0),
+				sequence: 2 + i,
+			}, Array<Bytes>(10).fill(OPUS_PACKET)));
+		}
+		return concatList(pages);
+	};
+	const opusFile = opusFileWithGap(3);
+
+	const opusTimestamps = (await readPackets(opusFile)).map(x => x.timestamp);
+	expect(opusTimestamps).toHaveLength(60);
+	expect(opusTimestamps[29]).toBeCloseTo(0.58, 10);
+	expect(opusTimestamps[30]).toBeCloseTo(1.6, 10);
+	expect(opusTimestamps[59]).toBeCloseTo(2.18, 10);
+
+	// Lookups agree, and one within the gap returns the last packet before it
+	for (const timestamp of opusTimestamps) {
+		expect(await lookUp(opusFile, timestamp)).toBe(timestamp);
+	}
+	expect(await lookUp(opusFile, 1)).toBe(opusTimestamps[29]);
+
+	// End trimming on the final page still applies after an earlier gap
+	const trimmedPackets = await readPackets(opusFileWithGap(3, 100));
+	expect(trimmedPackets[59]!.timestamp).toBeCloseTo(2.18, 10);
+	expect(trimmedPackets[59]!.duration).toBeCloseTo(860 / 48000, 10);
+
+	// On the final page itself, a gap and end trimming can't be told apart, as its granule position only gives their
+	// difference. The stream still ends where that granule position says.
+	const lastPacket = (await readPackets(opusFileWithGap(5, 100)))[59]!;
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo((9600 * 6 + 48000 - 100) / 48000, 10);
+
+	// Where pages were lost, as their sequence numbers show, even a gap too short to count above counts, so that
+	// iteration agrees with lookups, which go by the granule positions. Here, the page holding the 11th packet is
+	// lost, either whole or holding the start of a packet that ends on the next page. That orphaned end isn't read as
+	// a packet with #371, and isn't counted below either way.
+	const lostPageFile = (withOrphanedEnd: boolean) => concatList([
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		oggPacketsPage({ granule: 312 + 9600, sequence: 2 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+		oggPacketsPage(
+			{ headerType: withOrphanedEnd ? 1 : 0, granule: 312 + 20160, sequence: 4 },
+			[...(withOrphanedEnd ? [zeros(10)] : []), ...Array<Bytes>(10).fill(OPUS_PACKET)],
+		),
+		oggPacketsPage({ headerType: 4, granule: 312 + 29760, sequence: 5 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+	]);
+	for (const withOrphanedEnd of [false, true]) {
+		const file = lostPageFile(withOrphanedEnd);
+		const timestamps = (await readPackets(file)).filter(x => x.byteLength === 3).map(x => x.timestamp);
+		expect(timestamps.map(x => Math.round(x * 48000))).toEqual([
+			...Array.from({ length: 10 }, (_, i) => 960 * i),
+			...Array.from({ length: 20 }, (_, i) => 10560 + 960 * i),
+		]);
+		for (const timestamp of timestamps) {
+			expect(await lookUp(file, timestamp)).toBe(timestamp);
+		}
+	}
+
+	// The same in Vorbis, with a second missing before the sixth page of a file whose granule positions are off by
+	// a sample here and there, which isn't a gap
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	const gappedVorbisFile = vorbisFile.slice();
+	const view = new DataView(gappedVorbisFile.buffer);
+	for (let pos = 0, pageIndex = 0; pos < gappedVorbisFile.length; pageIndex++) {
+		const segmentCount = gappedVorbisFile[pos + 26]!;
+		const lacing = gappedVorbisFile.subarray(pos + 27, pos + 27 + segmentCount);
+		const pageSize = 27 + segmentCount + lacing.reduce((a, b) => a + b, 0);
+
+		if (pageIndex >= 5 && view.getInt32(pos + 10, true) === 0) {
+			view.setUint32(pos + 6, view.getUint32(pos + 6, true) + 44100, true);
+			view.setUint32(pos + 22, 0, true);
+			view.setUint32(pos + 22, oggCrc(gappedVorbisFile.subarray(pos, pos + pageSize)), true);
+		}
+
+		pos += pageSize;
+	}
+
+	const vorbisPackets = await readPackets(vorbisFile);
+	for (let i = 1; i < vorbisPackets.length; i++) {
+		const previous = vorbisPackets[i - 1]!;
+		expect(vorbisPackets[i]!.timestamp).toBeCloseTo(previous.timestamp + previous.duration, 10);
+	}
+
+	const gappedVorbisPackets = await readPackets(gappedVorbisFile);
+	expect(gappedVorbisPackets).toHaveLength(vorbisPackets.length);
+	const firstShifted = gappedVorbisPackets.findIndex((x, i) => x.timestamp !== vorbisPackets[i]!.timestamp);
+	expect(firstShifted).toBeGreaterThan(0);
+	for (let i = firstShifted; i < vorbisPackets.length; i++) {
+		expect(gappedVorbisPackets[i]!.timestamp).toBeCloseTo(vorbisPackets[i]!.timestamp + 1, 10);
+	}
 });
 
 const opusPages = (options: { pageCount?: number; lastEos?: boolean } = {}) => {
@@ -1821,9 +2646,54 @@ test('WAV: Short id3 chunk', async () => {
 	await expectGracefulRead(wav([fmtChunk(), riffChunk('id3 ', ascii('ID3\x03')), dataChunk()]));
 });
 
+test('WAV: Second fmt chunk behind the data', async () => {
+	// The last format chunk used to win when the file size was known, but the first one when reading a stream, which
+	// stops at the data chunk. FFmpeg also takes the first one.
+	const file = wav([
+		fmtChunk({ channels: 1, sampleRate: 48000, blockAlign: 2 }),
+		dataChunk(96000), // 1 s
+		fmtChunk({ channels: 1, sampleRate: 8000, blockAlign: 2 }),
+	]);
+
+	for (const source of [new BufferSource(file), streamedSource(file)]) {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getSampleRate()).toBe(48000);
+		expect(await input.computeDuration()).toBe(1);
+	}
+});
+
 test('WAV: Block alignment not matching the channel count', async () => {
 	// The PCM decoder used to compute a fractional number of frames
 	await expectGracefulDecode(wav([fmtChunk({ channels: 3, blockAlign: 4 }), dataChunk()]));
+});
+
+test('WAV: Block alignment not matching the sample size', async () => {
+	// The duration and timestamps used to go by the block alignment, while the samples are decoded by their bit depth.
+	// A block alignment too small for the samples, or one the byte rate disagrees with, is now overruled.
+	const readTimeline = async (fmt: Bytes) => {
+		using input = new Input({ source: new BufferSource(wav([fmt, dataChunk()])), formats: ALL_FORMATS });
+		const duration = await input.computeDuration();
+
+		let frameCount = 0;
+		for await (const sample of new AudioSampleSink((await input.getAudioTracks())[0]!).samples()) {
+			expect(Math.round(sample.timestamp * 44100)).toBe(frameCount);
+			frameCount += sample.numberOfFrames;
+			sample.close();
+		}
+		return { duration, frameCount };
+	};
+
+	expect(await readTimeline(fmtChunk({ blockAlign: 2 }))).toEqual({ duration: 1, frameCount: 44100 });
+	expect(await readTimeline(fmtChunk({ blockAlign: 8, bytesPerSecond: 44100 * 4 })))
+		.toEqual({ duration: 1, frameCount: 44100 });
+
+	// A larger block alignment that the byte rate agrees with is kept, like for 24-bit samples in 4-byte containers
+	using input = new Input({
+		source: new BufferSource(wav([fmtChunk({ bitsPerSample: 24, blockAlign: 8 }), dataChunk()])),
+		formats: ALL_FORMATS,
+	});
+	expect(await input.computeDuration()).toBe(0.5);
 });
 
 const wav = (chunks: Bytes[], riffType = 'RIFF') => {
@@ -1831,7 +2701,13 @@ const wav = (chunks: Bytes[], riffType = 'RIFF') => {
 	return concat(ascii(riffType), u32le(4 + body.length), ascii('WAVE'), body);
 };
 
-const fmtChunk = (options: { channels?: number; sampleRate?: number; blockAlign?: number } = {}) => {
+const fmtChunk = (options: {
+	channels?: number;
+	sampleRate?: number;
+	blockAlign?: number;
+	bytesPerSecond?: number;
+	bitsPerSample?: number;
+} = {}) => {
 	const channels = options.channels ?? 2;
 	const sampleRate = options.sampleRate ?? 44100;
 	const blockAlign = options.blockAlign ?? 4;
@@ -1840,9 +2716,9 @@ const fmtChunk = (options: { channels?: number; sampleRate?: number; blockAlign?
 		u16le(1),
 		u16le(channels),
 		u32le(sampleRate),
-		u32le(sampleRate * blockAlign),
+		u32le(options.bytesPerSecond ?? sampleRate * blockAlign),
 		u16le(blockAlign),
-		u16le(16),
+		u16le(options.bitsPerSample ?? 16),
 	));
 };
 
@@ -2079,6 +2955,73 @@ test('Key packet verification with timestamps beyond float precision', async () 
 	expect(packet!.timestamp).toBe(0);
 });
 
+test('Key packet verification in a big fragment of fake key frames', async () => {
+	// Each step back to the previous key frame used to scan all of the fragment's (or cluster's) samples, making
+	// verification quadratic in their number. Count the key frame flags read rather than time it, to be independent
+	// of machine speed.
+	const sampleCount = 5000;
+	const realKeyFrame = [0x00, 0x00, 0x00];
+	const fakeKeyFrame = [0x01, 0x00, 0x00];
+	const fragment = (dataOffset: number) => moof(
+		fullBox('tfhd', 0, 0x020038, u32(1), u32(1), u32(3), u32(0)), // Default duration 1, size 3, key frames
+		fullBox('tfdt', 0, 0, u32(0)),
+		fullBox('trun', 0, 0x000001, u32(sampleCount), u32(dataOffset)),
+	);
+	const moov = [
+		trak({ handler: 'vide', stbl: [stsd(videoSampleEntry('vp08')), ...emptyStbl().slice(1)] }),
+		box('mvex', trex(1)),
+	];
+	const data = concat(realKeyFrame, ...Array<Bytes>(sampleCount - 1).fill(fakeKeyFrame));
+	using input = new Input({
+		source: new BufferSource(mp4(moov, [fragment(fragment(0).length + 8), box('mdat', data)])),
+		formats: ALL_FORMATS,
+	});
+	const sink = new EncodedPacketSink((await input.getVideoTracks())[0]!);
+	await sink.getFirstPacket(); // Loads the fragment
+	const isobmffDemuxer = (await input._demuxerPromise) as IsobmffDemuxer;
+	const flagReads = countKeyFrameFlagReads(isobmffDemuxer.lastReadFragment!.trackData.get(1)!.samples);
+
+	const packet = await sink.getKeyPacket(Infinity, { verifyKeyPackets: true });
+	expect(packet!.timestamp).toBe(0);
+	expect(flagReads.count).toBeGreaterThanOrEqual(sampleCount - 1); // Every sample was stepped through
+	expect(flagReads.count).toBeLessThan(10 * sampleCount);
+
+	// The same in a Matroska cluster
+	const blocks = [simpleBlock(1, 0, 0x80, [0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00])];
+	for (let i = 1; i < sampleCount; i++) {
+		blocks.push(simpleBlock(1, i, 0x80, fakeKeyFrame));
+	}
+	using matroskaInput = new Input({
+		source: new BufferSource(matroska(info(), tracks(videoTrack(1)), cluster(0, concatList(blocks)))),
+		formats: ALL_FORMATS,
+	});
+	const matroskaSink = new EncodedPacketSink((await matroskaInput.getVideoTracks())[0]!);
+	await matroskaSink.getFirstPacket(); // Loads the cluster
+	const matroskaDemuxer = (await matroskaInput._demuxerPromise) as MatroskaDemuxer;
+	const loadedCluster = matroskaDemuxer.segments[0]!.lastReadCluster!;
+	const matroskaFlagReads = countKeyFrameFlagReads([...loadedCluster.trackData.values()][0]!.blocks);
+
+	const matroskaPacket = await matroskaSink.getKeyPacket(Infinity, { verifyKeyPackets: true });
+	expect(matroskaPacket!.timestamp).toBe(0);
+	expect(matroskaFlagReads.count).toBeGreaterThanOrEqual(sampleCount - 1);
+	expect(matroskaFlagReads.count).toBeLessThan(10 * sampleCount);
+});
+
+const countKeyFrameFlagReads = (samples: { isKeyFrame: boolean }[]) => {
+	const reads = { count: 0 };
+	for (const sample of samples) {
+		const isKeyFrame = sample.isKeyFrame;
+		Object.defineProperty(sample, 'isKeyFrame', {
+			get: () => {
+				reads.count++;
+				return isKeyFrame;
+			},
+		});
+	}
+
+	return reads;
+};
+
 test('PCM blocks not containing whole frames', async () => {
 	for (const channels of [2, 0]) {
 		const audioTrack = element(
@@ -2130,6 +3073,33 @@ const expectGracefulRead = async (fileOrSource: Uint8Array | Source, expectedErr
 	if (expectedError) {
 		expect(errors.some(x => expectedError.test(x))).toBe(true);
 	}
+};
+
+// A synchronous infinite loop stalls the whole file, since the test timeout can't fire while the event loop is blocked.
+// Reads that once looped like that run in a child process with a deadline instead, so that a regression fails fast.
+const evaluateWithDeadline = (file: Uint8Array, readFunction: string) => {
+	const script = `import(${JSON.stringify(new URL('../../src/index.ts', import.meta.url).href)}).then(async (mb) => {
+		const source = new mb.BufferSource(require('node:fs').readFileSync(0));
+		const input = new mb.Input({ source, formats: mb.ALL_FORMATS });
+		console.log(JSON.stringify(await (${readFunction})(input)));
+	});`;
+
+	let output: string;
+	try {
+		output = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
+			input: file,
+			encoding: 'utf8',
+			timeout: 10_000,
+		});
+	} catch (error) {
+		if ((error as { code?: string }).code === 'ETIMEDOUT') {
+			throw new Error('The read hung (killed after 10 s).');
+		}
+
+		throw error;
+	}
+
+	return JSON.parse(output.trim().split('\n').pop()!) as unknown;
 };
 
 // The file size stays unknown

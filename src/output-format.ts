@@ -13,6 +13,7 @@ import {
 	AudioCodec,
 	MediaCodec,
 	NON_PCM_AUDIO_CODECS,
+	OPUS_SAMPLE_RATE,
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
@@ -20,6 +21,8 @@ import {
 	VideoCodec,
 } from './codec';
 import { FlacMuxer } from './flac/flac-muxer';
+import { parseOpusIdentificationHeader } from './codec-data';
+import { EncodedPacket } from './packet';
 import { IsobmffMuxer } from './isobmff/isobmff-muxer';
 import { MatroskaMuxer } from './matroska/matroska-muxer';
 import { MediaSource } from './media-source';
@@ -31,8 +34,27 @@ import { MpegTsMuxer } from './mpeg-ts/mpeg-ts-muxer';
 import { WaveMuxer } from './wave/wave-muxer';
 import { HlsMuxer } from './hls/hls-muxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
-import { MaybePromise, FilePath, isNumber, toArray } from './misc';
+import { MaybePromise, FilePath, isNumber, toArray, toUint8Array } from './misc';
 import { Target } from './target';
+import { MP3_DECODER_DELAY } from '../shared/mp3-misc';
+
+const getOpusPreSkipDuration = (decoderConfig: AudioDecoderConfig) => {
+	if (!decoderConfig.description) {
+		return null;
+	}
+
+	return parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip / OPUS_SAMPLE_RATE;
+};
+
+/**
+ * Returns the codec's priming if the given leading duration of a source is that priming. Allows for sources that round
+ * timestamps to the millisecond, like Matroska.
+ */
+const matchPriming = (primingDuration: number, codecPriming: number | null) => {
+	return codecPriming !== null && codecPriming > 0 && Math.abs(primingDuration - codecPriming) <= 0.001
+		? codecPriming
+		: null;
+};
 
 /**
  * Specifies an inclusive range of integers.
@@ -103,6 +125,19 @@ export abstract class OutputFormat {
 	abstract get negativeTimestampSupport(): 'full' | 'prefer-non-negative' | 'none' | null;
 
 	/**
+	 * For a copied audio track whose first packet starts the given number of seconds before zero (where its audible
+	 * part begins): the exact priming duration, in seconds, that this format signals for it (like the Opus pre-skip),
+	 * so that the track can keep that start instead of needing a non-negative one. `null` if it can't.
+	 * @internal
+	 */
+	_getSignalableAudioPriming(
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	): number | null {
+		return null;
+	}
+
+	/**
 	 * Whether this output format, as configured, requires {@link BaseTrackMetadata.maximumPacketCount} to be set in
 	 * the metadata of every track added to it.
 	 */
@@ -136,6 +171,16 @@ export abstract class OutputFormat {
 
 	/** @internal */
 	_isFragmentedIsobmff() {
+		return false;
+	}
+
+	/**
+	 * Whether this format can mark the given amount of leading audio, in seconds, as encoder priming for a track using
+	 * the given codec, so that players skip it. Lets copy conversions keep audio whose first packet starts early.
+	 * @internal
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
 		return false;
 	}
 }
@@ -467,6 +512,13 @@ export class MovOutputFormat extends IsobmffOutputFormat {
 		];
 	}
 
+	override getSupportedTrackCounts(): TrackCountLimits {
+		return {
+			...super.getSupportedTrackCounts(),
+			subtitle: { min: 0, max: 0 }, // No subtitle codecs are supported
+		};
+	}
+
 	/** @internal */
 	override _codecUnsupportedHint(codec: MediaCodec) {
 		if (new Mp4OutputFormat().getSupportedCodecs().includes(codec)) {
@@ -615,6 +667,14 @@ export class MkvOutputFormat extends OutputFormat {
 	get negativeTimestampSupport() {
 		return 'prefer-non-negative' as const;
 	}
+
+	/** @internal */
+	override _getSignalableAudioPriming(
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	) {
+		// The muxer writes a negative start as the CodecDelay, which for Opus has to be the pre-skip (RFC 9559)
+		return codec === 'opus' ? matchPriming(primingDuration, getOpusPreSkipDuration(decoderConfig)) : null;
+	}
 }
 
 /**
@@ -679,11 +739,15 @@ export type Mp3OutputFormatOptions = {
 	/**
 	 * Controls whether the Xing header, which contains additional metadata as well as an index, is written to the start
 	 * of the MP3 file. When disabled, the writing process becomes append-only. Defaults to `true`.
+	 *
+	 * MP3 segments written for HLS never get a Xing header, regardless of this option: it would describe a single
+	 * segment as if it were a whole file, and players decode it as an extra frame of silence at every segment start.
 	 */
 	xingHeader?: boolean;
 
 	/**
-	 * Will be called once the Xing metadata frame is finalized.
+	 * Will be called once the Xing metadata frame is finalized. Not called when no Xing header is written, which is
+	 * always the case for MP3 segments written for HLS.
 	 *
 	 * @param data - The raw bytes.
 	 * @param position - The byte offset of the data in the file.
@@ -758,6 +822,14 @@ export class Mp3OutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return null;
+	}
+
+	/** @internal */
+	override _canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
+		// The muxer writes the priming into the LAME header's 12-bit encoder delay field, which excludes the decoder
+		// delay
+		const encoderDelay = Math.round(primingDuration * sampleRate) - MP3_DECODER_DELAY;
+		return codec === 'mp3' && this._options.xingHeader !== false && encoderDelay >= 0 && encoderDelay <= 0xfff;
 	}
 }
 
@@ -963,6 +1035,24 @@ export class OggOutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return 'none' as const;
+	}
+
+	/** @internal */
+	override _getSignalableAudioPriming(
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	) {
+		// The muxer puts granule position zero at the end of the pre-skip (Opus), or anywhere within the first packet,
+		// which decodes to nothing (Vorbis)
+		if (codec === 'opus') {
+			return matchPriming(primingDuration, getOpusPreSkipDuration(decoderConfig));
+		} else if (codec === 'vorbis') {
+			// Any start within the first packet, allowing for rounded sources
+			return primingDuration > 0 && primingDuration <= firstPacket.duration + 0.001
+				? Math.min(primingDuration, firstPacket.duration)
+				: null;
+		} else {
+			return null;
+		}
 	}
 }
 
@@ -1284,6 +1374,8 @@ export type HlsOutputFormatOptions = {
 	 *
 	 * When an array of formats is specified, for each playlist, the first format that can contain all of the playlist's
 	 * tracks is chosen. This allows you to, for example, package audio into .aac files and video into .ts files.
+	 *
+	 * MP3 segments are written without a Xing header, whatever {@link Mp3OutputFormatOptions.xingHeader} says.
 	 */
 	segmentFormat: OutputFormat | OutputFormat[];
 	/**
@@ -1310,7 +1402,8 @@ export type HlsOutputFormatOptions = {
 	live?: boolean;
 	/**
 	 * When in live mode, this controls the maximum number of segments contained in each playlist. Defaults to
-	 * `Infinity`, meaning playlists continually grow in size.
+	 * `Infinity`, meaning playlists continually grow in size. Playlists keep more segments when fewer wouldn't add up
+	 * to three times the target duration, the minimum length of a live playlist in HLS.
 	 */
 	maxLiveSegmentCount?: number;
 	/**
@@ -1367,8 +1460,11 @@ export type HlsOutputFormatOptions = {
 	onInit?: (target: Target, info: HlsOutputPlaylistInfo) => unknown;
 	/**
 	 * Called when a media segment is removed from the start of a media playlist due to
-	 * {@link HlsOutputFormatOptions.maxLiveSegmentCount}. Will not be called when
-	 * {@link HlsOutputFormatOptions.singleFilePerPlaylist} is `true`.
+	 * {@link HlsOutputFormatOptions.maxLiveSegmentCount}, once the updated playlist has been written. Will not be
+	 * called when {@link HlsOutputFormatOptions.singleFilePerPlaylist} is `true`.
+	 *
+	 * Clients may still be playing from an earlier playlist, so if you delete the segment's file in response, keep it
+	 * available for the segment's duration plus the playlist's duration first (RFC 8216, Section 6.2.2).
 	 */
 	onSegmentPopped?: (path: string, info: HlsOutputSegmentInfo) => unknown;
 };

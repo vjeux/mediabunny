@@ -26,6 +26,13 @@ export const aacFrequencyTable = [
 
 export const aacChannelMap = [-1, 1, 2, 3, 4, 5, 6, 8];
 
+/**
+ * The channel count of each 4-bit channelConfiguration of an AudioSpecificConfig, null for 0 (described elsewhere) and
+ * the reserved values. ISO/IEC 14496-3 added 11 to 14 after the ones ADTS's 3-bit field can hold (FFmpeg's
+ * ff_mpeg4audio_channels has the same counts).
+ */
+const audioSpecificConfigChannelCounts = [null, 1, 2, 3, 4, 5, 6, 8, null, null, null, 7, 8, 24, 8, null];
+
 // The object types whose config is a GASpecificConfig, except for AAC-LD, for which frameLengthFlag means 480 vs. 512
 const generalAudioObjectTypes = [1, 2, 3, 4, 6, 7, 17, 19, 20, 21, 22];
 
@@ -40,10 +47,7 @@ export const parseAacAudioSpecificConfig = (bytes: Uint8Array | null): AacAudioS
 	const { frequencyIndex, sampleRate } = readAacSamplingFrequency(bitstream);
 
 	const channelConfiguration = bitstream.readBits(4);
-	let numberOfChannels: number | null = null;
-	if (channelConfiguration >= 1 && channelConfiguration <= 7) {
-		numberOfChannels = aacChannelMap[channelConfiguration]!;
-	}
+	const numberOfChannels = audioSpecificConfigChannelCounts[channelConfiguration] ?? null;
 
 	let coreObjectType = objectType;
 	let psPresent = false;
@@ -136,12 +140,14 @@ export const buildAacAudioSpecificConfig = (config: {
 	objectType: number;
 	outputSampleRate: number;
 	outputNumberOfChannels: number;
+	/** The rate of the core coder, when it's known separately from the output rate. */
+	coreSampleRate?: number;
 }) => {
 	const usesSbr = config.objectType === 5 || config.objectType === 29;
 	const usesPs = config.objectType === 29;
 
-	// SBR runs the core coder at half the output rate, and PS upmixes a mono core to stereo
-	const coreSampleRate = usesSbr ? config.outputSampleRate / 2 : config.outputSampleRate;
+	// SBR usually runs the core coder at half the output rate, and PS upmixes a mono core to stereo
+	const coreSampleRate = config.coreSampleRate ?? (usesSbr ? config.outputSampleRate / 2 : config.outputSampleRate);
 	const coreNumberOfChannels = usesPs ? 1 : config.outputNumberOfChannels;
 
 	const channelConfiguration = aacChannelMap.indexOf(coreNumberOfChannels);

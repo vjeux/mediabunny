@@ -3,13 +3,13 @@
   "author": "Vanilagy",
   "version": "1.65.2",
   "description": "FLAC encoder extension for Mediabunny, based on libFLAC.",
-  "main": "./dist/bundles/mediabunny-flac-encoder.mjs",
+  "main": "./dist/bundles/mediabunny-flac-encoder.cjs",
   "module": "./dist/bundles/mediabunny-flac-encoder.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
     "types": "./dist/modules/src/index.d.ts",
     "import": "./dist/bundles/mediabunny-flac-encoder.mjs",
-    "require": "./dist/bundles/mediabunny-flac-encoder.mjs"
+    "require": "./dist/bundles/mediabunny-flac-encoder.cjs"
   },
   "files": [
     "README.md",

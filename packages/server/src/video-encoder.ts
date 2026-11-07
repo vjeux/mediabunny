@@ -18,6 +18,7 @@ import {
 import * as NodeAv from 'node-av';
 import {
 	CODEC_TO_CODEC_ID,
+	getCodecThreadCount,
 	getHardwareEncoderCodec,
 	isRgbPixelFormat,
 	unmapColorPrimaries,
@@ -51,6 +52,51 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
 };
 
+// Codecs whose bitstream can carry alpha: VP8 and VP9 (as a second stream), HEVC (as an extra layer) and ProRes 4444
+const ALPHA_CAPABLE_CODECS: VideoCodec[] = ['vp8', 'vp9', 'hevc', 'prores'];
+
+/**
+ * The pixel format to encode with when keeping alpha, or null for the default one. Codecs that can't carry alpha
+ * (AVC, AV1) never get an alpha format: it would drop the alpha anyway, only changing the stream's format (to 4:4:4
+ * 10-bit for libx264) or the input format (to RGBA for NVENC).
+ */
+export const getAlphaPixelFormat = (codec: VideoCodec, pixelFormats: NodeAv.AVPixelFormat[]) => {
+	if (!ALPHA_CAPABLE_CODECS.includes(codec)) {
+		return null;
+	}
+
+	// Going by FFmpeg's names for them, planar (yuva420p, gbrap10le) and packed: prores_videotoolbox only takes alpha
+	// as ayuv64le or bgra
+	const alphaFormats = pixelFormats.filter(
+		format => /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|ayuv|vuya)/.test(NodeAv.avGetPixFmtName(format) ?? ''),
+	);
+
+	if (alphaFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
+		return NodeAv.AV_PIX_FMT_YUVA420P;
+	} else if (alphaFormats.length === 0) {
+		return null;
+	}
+
+	// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a high-quality YUVA source
+	return NodeAv.avcodecFindBestPixFmtOfList(alphaFormats, NodeAv.AV_PIX_FMT_YUVA444P12LE);
+};
+
+/**
+ * Whether libsvtav1 can encode frames of this size. With a target bitrate, it refuses to open below 64 pixels in either
+ * dimension ("Adaptive quantization can not be turned OFF when RC ON"). In constant-quantizer mode, its flush hangs
+ * forever for frames up to 24 pixels wide, and for frames up to 24 pixels high that are wider than 64 pixels
+ * (measured; SVT-AV1 documents no such limit).
+ */
+const av1SizeIsSupported = (config: VideoEncoderConfig) => {
+	const { width, height } = config;
+
+	if (config.bitrateMode === 'quantizer') {
+		return width > 24 && (height > 24 || width <= 64);
+	}
+
+	return width >= 64 && height >= 64;
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -61,6 +107,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	lastBuffer: Buffer | null = null;
 	packetEmitted = false;
 	quantizer: number | null = null;
+	/** The software encoder to switch to should the chosen hardware encoder fail to open. */
+	softwareFallbackCodec: NodeAv.Codec | null = null;
 
 	// Bookkeeping to restore the original timing information
 	preciseTimings: {
@@ -72,6 +120,15 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
+		if (codec === 'av1' && !av1SizeIsSupported(config)) {
+			return false;
+		}
+
+		if ((codec === 'avc' || codec === 'hevc') && (config.width % 2 === 1 || config.height % 2 === 1)) {
+			// AVC and HEVC are encoded as 4:2:0, which libx264, libx265 and hardware encoders need even dimensions for
+			return false;
+		}
+
 		if (config.bitrateMode === 'quantizer') {
 			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 		}
@@ -83,6 +140,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}
 
 	async init(): Promise<void> {
+		if (this.codec === 'av1' && !av1SizeIsSupported(this.config)) {
+			// Fail right away instead of failing to open, or hanging, later
+			throw new Error(
+				`AV1 encoding of ${this.config.width}x${this.config.height} video isn't supported`
+				+ (this.config.bitrateMode === 'quantizer' ? ' in constant-quantizer mode.' : ' with a bitrate.'),
+			);
+		}
+
 		this.frame = new NodeAv.Frame();
 		this.frame.alloc();
 		this.frame.timeBase = new NodeAv.Rational(1, 1e6);
@@ -118,6 +183,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 
 			codec = hardwareCodec ?? getSoftwareCodec();
+
+			if (hardwareCodec) {
+				// A listed hardware encoder can still fail to open, like av1_nvenc on NVIDIA GPUs without AV1 encoding
+				// or once all of the GPU's encoder sessions are taken, so keep a software encoder at hand
+				this.softwareFallbackCodec = getSoftwareCodec();
+			}
 		}
 
 		if (!codec) {
@@ -141,16 +212,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 
 			if (this.config.alpha === 'keep') {
-				if (this.avCodec.pixelFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
-					pixelFormat = NodeAv.AV_PIX_FMT_YUVA420P;
-				} else {
-					// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a
-					// high-quality YUVA source
-					pixelFormat = NodeAv.avcodecFindBestPixFmtOfList(
-						this.avCodec.pixelFormats,
-						NodeAv.AV_PIX_FMT_YUVA444P12LE,
-					);
-				}
+				pixelFormat = getAlphaPixelFormat(this.codec, this.avCodec.pixelFormats) ?? pixelFormat;
 			}
 		}
 
@@ -163,7 +225,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.height = this.config.height;
 		codecContext.pixelFormat = pixelFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, 1e6);
-		codecContext.gopSize = 60;
+		// Mediabunny requests every key frame itself (keyFrameInterval), so the encoder must not insert its own on a
+		// schedule of its own
+		codecContext.gopSize = 100_000;
 		codecContext.framerate = new NodeAv.Rational(Math.round(this.config.framerate ?? 0) || 30, 1);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate
 		// control mode
@@ -176,8 +240,16 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.sampleAspectRatio = new NodeAv.Rational(pixelAspectRatio.num, pixelAspectRatio.den);
 
 		if (this.config.bitrateMode === 'constant') {
-			codecContext.rcMinRate = codecContext.bitRate;
-			codecContext.rcMaxRate = codecContext.bitRate;
+			if (this.avCodec.name === 'libsvtav1') {
+				// SVT-AV1 only does CBR with its low-delay prediction structure, and refuses a maximum bitrate
+				// outside of CRF mode, which FFmpeg would pass on from rcMaxRate
+				codecContext.setOption('svtav1-params', 'rc=2:pred-struct=1');
+			} else {
+				codecContext.rcMinRate = codecContext.bitRate;
+				codecContext.rcMaxRate = codecContext.bitRate;
+				// libx264 and libx265 ignore the maximum rate without a buffer size: one second's worth
+				codecContext.rcBufferSize = Number(codecContext.bitRate);
+			}
 		}
 
 		const isRealtime = this.config.latencyMode === 'realtime';
@@ -202,6 +274,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				codecContext.setOption('cpu-used', '8');
 			}
 		} else if (this.avCodec.name === 'libvpx-vp9') {
+			// libvpx encodes VP9 tile columns in parallel, which gives the exact same bytes as a single thread. (Unlike
+			// VP8 and libx265, whose output changes with the thread count, so they're left as they are.)
+			codecContext.threadCount = getCodecThreadCount();
 			codecContext.setOption('deadline', 'realtime');
 
 			if (isRealtime) {
@@ -235,7 +310,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				|| this.avCodec.name === 'libvpx-vp9'
 			) {
 				// Mediabunny uses the quantizer index (0-255), while these encoders expect the 0-63 quantizer scale
-				mapped = Math.round(this.quantizer / 4);
+				// (254 and 255 would round up to 64)
+				mapped = Math.min(Math.round(this.quantizer / 4), 63);
 			} else {
 				// Everything else lines up with Mediabunny directly
 				mapped = this.quantizer;
@@ -269,6 +345,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			assert(profile !== undefined);
 
 			codecContext.setOption('profile', String(profile));
+		}
+
+		if (this.avCodec.name === 'prores_ks') {
+			// Unlike the FFmpeg CLI, libavcodec defaults to a single thread, which makes prores_ks the slowest encoder
+			// here by far. Slice threading (one thread per core, up to 16) produces the exact same bytes, without the
+			// delay and the extra frames in memory that frame threading would bring.
+			codecContext.threadCount = 0;
+			codecContext.threadType = NodeAv.FF_THREAD_SLICE;
 		}
 
 		let primaries = this.frame.colorPrimaries;
@@ -312,6 +396,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.colorRange = range;
 
 		const ret = await codecContext.open2();
+		if (ret < 0 && this.softwareFallbackCodec) {
+			codecContext.freeContext();
+			this.avCodec = this.softwareFallbackCodec;
+			this.softwareFallbackCodec = null;
+
+			await this.createCodecContext();
+			return;
+		}
 		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
 
 		this.codecContext = codecContext;

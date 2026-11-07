@@ -10,6 +10,7 @@ import { CanvasSource, VideoSampleSource } from '../../src/media-source.js';
 import { canEncodeVideo, Quality } from '../../src/encode.js';
 import { VideoSample } from '../../src/sample.js';
 import { Conversion } from '../../src/conversion.js';
+import { isFirefox } from '../../src/misc.js';
 
 const decodeTransparentVideoTest = async () => {
 	using input = new Input({
@@ -257,6 +258,56 @@ test('Can encode video with alternating transparency', async () => {
 	}
 });
 
+test('Can encode video that turns transparent after opaque frames', async () => {
+	// The track's alpha mode is written before the later frames are known, so the first, opaque frame mustn't decide it
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		alpha: 'keep',
+	});
+	output.addVideoTrack(source);
+
+	await output.start();
+
+	for (let i = 0; i < 8; i++) {
+		using sample = new VideoSample(new Uint8Array(64 * 48 * 4).fill(128), {
+			format: i === 0 ? 'RGBX' : 'RGBA',
+			codedWidth: 64,
+			codedHeight: 48,
+			timestamp: i,
+			duration: 1,
+		});
+		await source.add(sample);
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.canBeTransparent()).toBe(true);
+
+	const withAlpha: boolean[] = [];
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		withAlpha.push(packet.sideData.alpha !== undefined);
+	}
+	expect(withAlpha).toEqual([false, true, true, true, true, true, true, true]);
+
+	const formatsWithAlpha: boolean[] = [];
+	for await (using sample of new VideoSampleSink(videoTrack).samples()) {
+		formatsWithAlpha.push(sample.format!.includes('A'));
+	}
+	expect(formatsWithAlpha).toEqual(withAlpha);
+});
+
 test('Can encode transparent video with odd dimensions', async () => {
 	const output = new Output({
 		format: new WebMOutputFormat(),
@@ -278,6 +329,83 @@ test('Can encode transparent video with odd dimensions', async () => {
 	await output.start();
 	await source.add(0, 1);
 	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(641);
+	expect(await videoTrack.getDisplayHeight()).toBe(479);
+	expect(await videoTrack.canBeTransparent()).toBe(true);
+
+	using sample = (await new VideoSampleSink(videoTrack).getSample(0))!;
+	expect(sample.hasAlpha).toBe(true);
+
+	// The last row and column keep their alpha too
+	const readbackContext = new OffscreenCanvas(641, 479).getContext('2d')!;
+	sample.draw(readbackContext, 0, 0);
+	expect(readbackContext.getImageData(640, 478, 1, 1).data[3]).toBeGreaterThan(100);
+});
+
+test('Can encode transparent YUV frames with odd dimensions', async () => {
+	// Decoders (like the ProRes one) hand out I420A frames with a padded coded size and an odd visible rect
+	const width = 161;
+	const height = 91;
+	const codedWidth = 176;
+	const codedHeight = 96;
+	const lumaSize = codedWidth * codedHeight;
+	const chromaSize = (codedWidth / 2) * (codedHeight / 2);
+	const data = new Uint8Array(2 * lumaSize + 2 * chromaSize);
+	data.fill(81, 0, lumaSize); // Red
+	data.fill(90, lumaSize, lumaSize + chromaSize);
+	data.fill(240, lumaSize + chromaSize, lumaSize + 2 * chromaSize);
+	data.fill(160, lumaSize + 2 * chromaSize); // Alpha
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		alpha: 'keep',
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	const frame = new VideoFrame(data, {
+		format: 'I420A',
+		codedWidth,
+		codedHeight,
+		visibleRect: { x: 0, y: 0, width, height },
+		timestamp: 0,
+		duration: 1e6,
+	});
+	using inputSample = new VideoSample(frame);
+	await source.add(inputSample);
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(width);
+	expect(await videoTrack.getDisplayHeight()).toBe(height);
+
+	using sample = (await new VideoSampleSink(videoTrack).getSample(0))!;
+	expect(sample.hasAlpha).toBe(true);
+
+	// Including the last row and column. Read through copyTo, as Firefox draws non-opaque RGBA frames with wrong colors
+	// (https://bugzilla.mozilla.org/show_bug.cgi?id=2079836)
+	const pixels = new Uint8Array(width * height * 4);
+	await sample.copyTo(pixels, { format: 'RGBA' });
+	const [red, green, , alpha] = pixels.subarray(pixels.length - 4);
+	expect(alpha).toBeGreaterThan(130);
+	expect(alpha).toBeLessThan(190);
+	expect(red).toBeGreaterThan(150);
+	expect(green).toBeLessThan(80);
 });
 
 test('Positive encodability check with alpha', async () => {
@@ -384,4 +512,167 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	using sample = (await sink.getSample(await videoTrack.getFirstTimestamp()))!;
 	expect(sample.format).toContain('A');
 	expect(sample.hasAlpha).toBe(true);
+});
+
+// Firefox's encoder always reports BT.709 limited range, whatever it encodes:
+// https://bugzilla.mozilla.org/show_bug.cgi?id=2056028
+test.skipIf(isFirefox())('Encoding planar YUV frames with alpha keeps their color space', async () => {
+	// BT.601 full-range I420A frames, which take the CPU color/alpha splitting path
+	const width = 64;
+	const height = 64;
+	const data = new Uint8Array(width * height * 2.5).fill(128);
+
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	let colorSpace: VideoColorSpaceInit | undefined;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		alpha: 'keep',
+		onEncodedPacket: (packet, meta) => {
+			colorSpace ??= meta?.decoderConfig?.colorSpace;
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	for (let i = 0; i < 3; i++) {
+		using sample = new VideoSample(data, {
+			format: 'I420A',
+			codedWidth: width,
+			codedHeight: height,
+			timestamp: i / 10,
+			duration: 1 / 10,
+			colorSpace: { primaries: 'smpte170m', transfer: 'smpte170m', matrix: 'smpte170m', fullRange: true },
+		});
+		await videoSource.add(sample);
+	}
+
+	await output.finalize();
+
+	expect(colorSpace).toMatchObject({ matrix: 'smpte170m', fullRange: true });
+});
+
+test('Encoding semi-transparent canvas content keeps the colors unpremultiplied', async () => {
+	const canvas = new OffscreenCanvas(64, 32);
+	const context = canvas.getContext('2d')!;
+	context.fillStyle = 'rgba(255, 64, 0, 0.5)';
+	context.fillRect(0, 0, 32, 32);
+	context.fillStyle = 'rgba(0, 128, 255, 0.25)';
+	context.fillRect(32, 0, 32, 32);
+
+	// Decodes only the color stream, which must hold the straight colors (the alpha stream is applied on top)
+	const readColors = async (buffer: ArrayBuffer) => {
+		using input = new Input({ source: new BufferSource(buffer), formats: ALL_FORMATS });
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		const packet = (await new EncodedPacketSink(videoTrack).getFirstPacket())!;
+		expect(packet.sideData.alpha).toBeDefined();
+
+		const decoderConfig = (await videoTrack.getDecoderConfig())!;
+		const decoded = await new Promise<VideoFrame>((resolve, reject) => {
+			const decoder = new VideoDecoder({ output: resolve, error: reject });
+			decoder.configure(decoderConfig);
+			decoder.decode(packet.toEncodedVideoChunk());
+			void decoder.flush();
+		});
+		const data = new Uint8Array(decoded.allocationSize({ format: 'RGBA' }));
+		await decoded.copyTo(data, { format: 'RGBA' });
+		const width = decoded.visibleRect!.width;
+		const row = Math.floor(decoded.visibleRect!.height / 2);
+		decoded.close();
+
+		const pixelAt = (x: number) => Array.from(data.subarray((row * width + x) * 4, (row * width + x) * 4 + 3));
+		return [pixelAt(width / 4), pixelAt(3 * width / 4)];
+	};
+	// The saturated channel shows it best: premultiplied, it would read 128 and 64 instead of 255
+	const expectStraightColors = ([left, right]: number[][]) => {
+		expect(left![0], left!.join()).toBeGreaterThanOrEqual(240);
+		expect(right![2], right!.join()).toBeGreaterThanOrEqual(240);
+	};
+
+	// Recording the canvas
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new CanvasSource(canvas, { codec: 'vp9', bitrate: 8e6, alpha: 'keep' });
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(0, 1);
+	await output.finalize();
+
+	expectStraightColors(await readColors(output.target.buffer!));
+
+	// Resizing in a conversion, which draws the frames onto a canvas
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const resizedOutput = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const conversion = await Conversion.init({
+		input,
+		output: resizedOutput,
+		video: { width: 32, bitrate: 8e6, alpha: 'keep' },
+	});
+	await conversion.execute();
+
+	expectStraightColors(await readColors(resizedOutput.target.buffer!));
+});
+
+test('Decoded frames with alpha keep the color space of the color stream', async () => {
+	// Opaque gray bars encoded with alpha: 'keep', like a canvas recording from Chrome's MediaRecorder: the color
+	// stream comes out full range, and every packet carries alpha side data. Grays, so that only the range matters.
+	const colors = [[16, 16, 16], [64, 64, 64], [192, 192, 192], [240, 240, 240]];
+	const data = new Uint8Array(64 * 16 * 4);
+	for (let i = 0; i < 64 * 16; i++) {
+		data.set([...colors[Math.floor((i % 64) / 16)]!, 255], i * 4);
+	}
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new VideoSampleSource({ codec: 'vp9', bitrate: 8e6, alpha: 'keep' });
+	output.addVideoTrack(source);
+	await output.start();
+	using inputSample = new VideoSample(data, {
+		format: 'RGBA',
+		codedWidth: 64,
+		codedHeight: 16,
+		timestamp: 0,
+		duration: 1,
+	});
+	await source.add(inputSample);
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	const sink = new VideoSampleSink(videoTrack);
+	using sample = (await sink.getSample(0))!;
+	expect(sample.hasAlpha).toBe(true); // Went through the alpha merger
+
+	const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+	await sample.copyTo(rgba, { format: 'RGBA' });
+	for (let i = 0; i < colors.length; i++) {
+		const offset = (8 * 64 + i * 16 + 8) * 4;
+		const actual = Array.from(rgba.subarray(offset, offset + 3));
+		for (let j = 0; j < 3; j++) {
+			expect(Math.abs(actual[j]! - colors[i]![j]!), `${actual.join()} vs ${colors[i]!.join()}`)
+				.toBeLessThanOrEqual(6);
+		}
+	}
+});
+
+test('Decoded frames with alpha keep the display size of the color stream', async () => {
+	// 64x32 VP9 with alpha and a 2:1 pixel aspect ratio (display size 128x32), made with FFmpeg 7.0.2:
+	// ffmpeg -f lavfi -i "testsrc2=s=64x32:d=0.5:r=10,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':
+	//   cr='cr(X,Y)':a='X*4'" -vf setsar=2/1 -c:v libvpx-vp9 -pix_fmt yuva420p -b:v 1M vp9-alpha-anamorphic.webm
+	using input = new Input({ source: new UrlSource('/vp9-alpha-anamorphic.webm'), formats: ALL_FORMATS });
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(128);
+
+	const sink = new VideoSampleSink(videoTrack);
+	using sample = (await sink.getSample(0))!;
+	expect(sample.hasAlpha).toBe(true); // Went through the alpha merger
+	expect([sample.displayWidth, sample.displayHeight]).toEqual([128, 32]);
+	expect(sample.pixelAspectRatio).toEqual({ num: 2, den: 1 });
 });
