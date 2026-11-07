@@ -301,3 +301,36 @@ test('Duration from metadata of a track whose samples all last 0', async () => {
 		expect(await input.computeDuration()).toBe(10);
 	}
 });
+
+test('Duration from metadata with a damaged sample table and an mdhd duration of 0', async () => {
+	// The second track's sample table can't be read: its metadata duration stays unknown, and the file's comes from
+	// the first track (from the L46 deep review)
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const sources = [new EncodedVideoPacketSource('vp9'), new EncodedVideoPacketSource('vp9')];
+	for (const source of sources) {
+		output.addVideoTrack(source);
+	}
+	await output.start();
+	for (let i = 0; i < 10; i++) {
+		for (const source of sources) {
+			await source.add(new EncodedPacket(new Uint8Array([i]), i === 0 ? 'key' : 'delta', i / 10, 0.1), {
+				decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+			});
+		}
+	}
+	await output.finalize();
+
+	const bytes = Buffer.from(output.target.buffer!);
+	const secondTrak = bytes.indexOf('trak', bytes.indexOf('trak') + 4);
+	const mdhd = bytes.indexOf('mdhd', secondTrak);
+	assert(bytes[mdhd + 4] === 0); // Version 0
+	bytes.fill(0, mdhd + 4 + 16, mdhd + 4 + 20); // Duration 0
+	const stco = bytes.indexOf('stco', secondTrak);
+	bytes.writeUInt32BE(0x10000, stco + 8); // An entry count far past the box
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tracks = await input.getVideoTracks();
+	expect(await tracks[0]!.getDurationFromMetadata()).toBeCloseTo(1, 6);
+	expect(await tracks[1]!.getDurationFromMetadata()).toBe(null);
+	expect(await input.getDurationFromMetadata()).toBeCloseTo(1, 6);
+});
