@@ -1438,7 +1438,7 @@ export class VideoSample implements Disposable {
 
 		({ sx, sy, sWidth, sHeight } = this._unmapSourceRegion(sx, sy, sWidth, sHeight, this.rotation, this.flip));
 
-		const source = this.toCanvasImageSource();
+		const source = this._toCanvasImageSourceForRegion(sx, sy, sWidth, sHeight);
 
 		context.save();
 
@@ -1591,7 +1591,8 @@ export class VideoSample implements Disposable {
 
 		// Important that we don't use .draw() here since that would take rotation and flip into account, but we wanna
 		// handle them ourselves here
-		context.drawImage(this.toCanvasImageSource(), sx, sy, sWidth, sHeight, dx, dy, newWidth, newHeight);
+		const source = this._toCanvasImageSourceForRegion(sx, sy, sWidth, sHeight);
+		context.drawImage(source, sx, sy, sWidth, sHeight, dx, dy, newWidth, newHeight);
 
 		context.restore();
 	}
@@ -1743,6 +1744,31 @@ export class VideoSample implements Disposable {
 		} else {
 			return this._data;
 		}
+	}
+
+	/**
+	 * Like toCanvasImageSource(), but for drawing only the given region of the sample. WebKit ignores the source
+	 * rectangle when drawing a VideoFrame and always draws the whole frame, so there, the frame is first drawn onto a
+	 * canvas, which respects it.
+	 * @internal
+	 */
+	_toCanvasImageSourceForRegion(sx: number, sy: number, sWidth: number, sHeight: number) {
+		const source = this.toCanvasImageSource();
+		const width = this.squarePixelWidth;
+		const height = this.squarePixelHeight;
+		if (
+			!isWebKit()
+			|| !isVideoFrame(source)
+			|| (sx === 0 && sy === 0 && sWidth === width && sHeight === height)
+		) {
+			return source;
+		}
+
+		const { canvas, context } = getWebKitFrameCanvas(width, height);
+		context.clearRect(0, 0, width, height);
+		context.drawImage(source, 0, 0, width, height);
+
+		return canvas;
 	}
 
 	/**
@@ -2060,6 +2086,35 @@ export const registerVideoSampleTransformer = (
 	}
 
 	registeredVideoSampleTransformers.push(transformer);
+};
+
+let webKitFrameCanvas: {
+	canvas: HTMLCanvasElement | OffscreenCanvas;
+	context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+} | null = null;
+
+/** The canvas that VideoFrames are drawn onto on WebKit before drawing a region of them. */
+const getWebKitFrameCanvas = (width: number, height: number) => {
+	if (!webKitFrameCanvas) {
+		let canvas: HTMLCanvasElement | OffscreenCanvas;
+		if (typeof OffscreenCanvas !== 'undefined') {
+			canvas = new OffscreenCanvas(width, height);
+		} else {
+			canvas = document.createElement('canvas');
+		}
+
+		const context = canvas.getContext('2d') as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
+		assert(context);
+		webKitFrameCanvas = { canvas, context };
+	}
+
+	const { canvas } = webKitFrameCanvas;
+	if (canvas.width !== width || canvas.height !== height) {
+		canvas.width = width;
+		canvas.height = height;
+	}
+
+	return webKitFrameCanvas;
 };
 
 const TRANSFORMATION_CANVAS_CACHE_MAX_SIZE = 3;
