@@ -491,6 +491,14 @@ describe('Video', async () => {
 				.toBeGreaterThan(highQuantizerPackets.reduce((sum, packet) => sum + packet.data.byteLength, 0));
 		});
 
+		test(`${name} encode at the ends of the quantizer range`, { timeout: 20_000 }, async () => {
+			// The Mediabunny Codec Registry ranges: 0-51 for AVC and HEVC, 0-255 for VP9 and AV1
+			const max = codec === 'avc' || codec === 'hevc' ? 51 : 255;
+			for (const quantizer of [0, max - 1, max]) {
+				expect(await quantizerEncodeTest(codec, () => quantizer)).toHaveLength(10);
+			}
+		});
+
 		test(`${name} mid-stream quantizer change`, { timeout: 20_000 }, async () => {
 			const packets = await quantizerEncodeTest(codec, i => i < 5 ? low : high);
 
