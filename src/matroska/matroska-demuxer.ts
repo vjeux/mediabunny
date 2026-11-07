@@ -1890,7 +1890,9 @@ export class MatroskaDemuxer extends Demuxer {
 
 					if (fileName) {
 						const lowerName = fileName.toLowerCase();
-						if (lowerName.startsWith('cover.')) {
+						// The cover art names of the Matroska spec: cover.(jpg|png), with a small_ prefix for the small
+						// version and a _land suffix for the landscape one
+						if (/^(small_)?cover(_land)?\./.test(lowerName)) {
 							kind = 'coverFront';
 						} else if (lowerName.startsWith('back.')) {
 							kind = 'coverBack';
