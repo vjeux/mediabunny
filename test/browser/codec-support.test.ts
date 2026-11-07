@@ -3,7 +3,6 @@ import { buildVideoCodecString, extractVideoCodecString, VideoCodec } from '../.
 import { extractAv1CodecInfoFromPacket, extractVp9CodecInfoFromPacket, parseAvcSps } from '../../src/codec-data.js';
 import { canDecodeAudio, canDecodeVideo } from '../../src/decode.js';
 import { canEncodeAudio, canEncodeVideo, Quality } from '../../src/encode.js';
-import { isWebKit } from '../../src/misc.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { AV1_FIXTURES, AVC_SPS_FIXTURES, hexToBytes, VP9_FIXTURES } from '../node/helpers/codecs-fixtures.js';
 
@@ -31,10 +30,13 @@ const isDecodable = async (codec: string, width = 176, height = 144) => {
 
 describe('Codec strings in the browser', () => {
 	test('Strings derived from real streams are accepted', async () => {
-		// Malformed strings are rejected, except by WebKit, whose codec string parser accepts them (the checks below
-		// still hold there)
-		if (!isWebKit()) {
+		// The acceptance checks below only mean something where the browser parses codec strings. Where it rejects a
+		// clearly malformed control, subtler mistakes must be rejected too: a wrong tier letter, a missing bit depth.
+		// (WebKitGTK accepts all of these, so the checks below still hold there, but can't fail.)
+		if (!await isDecodable('av01.garbage')) {
 			expect(await isDecodable('av01.0.04X.08')).toBe(false);
+		}
+		if (!await isDecodable('vp09.garbage')) {
 			expect(await isDecodable('vp09.00.10')).toBe(false);
 		}
 
