@@ -123,6 +123,12 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	_backingToTrack = new Map<InputTrackBacking, InputTrack>();
 	/** @internal */
 	_disposed = false;
+	/**
+	 * Run when the input is disposed, to end operations that may be waiting on something other than a read (such as
+	 * sample iterators waiting for their consumer).
+	 * @internal
+	 */
+	_disposeCallbacks = new Set<() => void>();
 	/** @internal */
 	_nextSourceCacheAge = 0;
 	/** @internal */
@@ -532,6 +538,11 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		this._disposed = true;
+
+		for (const callback of [...this._disposeCallbacks]) {
+			callback();
+		}
+		this._disposeCallbacks.clear();
 
 		for (const ref of this._sourceRefs) {
 			ref.free();

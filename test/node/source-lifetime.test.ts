@@ -4,9 +4,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input, InputDisposedError } from '../../src/input.js';
 import { ALL_FORMATS, MP4 } from '../../src/input-format.js';
-import { promiseWithResolvers } from '../../src/misc.js';
+import { assert, promiseWithResolvers } from '../../src/misc.js';
+import { AudioSampleSink } from '../../src/media-sink.js';
+import { AudioSample } from '../../src/sample.js';
+import { CustomAudioDecoder, registerDecoder } from '../../src/custom-coder.js';
+import { AudioCodec } from '../../src/codec.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { readFile } from 'node:fs/promises';
-import { setImmediate } from 'node:timers/promises';
+import { setImmediate, setTimeout } from 'node:timers/promises';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -145,4 +150,72 @@ test('CustomSource releases stream readers after read errors', async () => {
 	});
 	await expect(input.getFormat()).rejects.toBe(error);
 	expect(stream.locked).toBe(false);
+});
+
+// A stand-in AAC decoder, active only while a test enables it, that keeps track of what it emits and whether it's
+// closed
+let countingDecoderActive = false;
+const countingDecoderSamples: AudioSample[] = [];
+let countingDecoderCloseCount = 0;
+
+class CountingAacDecoder extends CustomAudioDecoder {
+	static override supports(codec: AudioCodec) {
+		return codec === 'aac' && countingDecoderActive;
+	}
+
+	init() {}
+
+	decode(packet: EncodedPacket) {
+		const sample = new AudioSample({
+			data: new Float32Array(1024),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: packet.timestamp,
+		});
+		countingDecoderSamples.push(sample);
+		this.onSample(sample);
+	}
+
+	flush() {}
+
+	close() {
+		countingDecoderCloseCount++;
+	}
+}
+registerDecoder(CountingAacDecoder);
+
+test.each([
+	['samples()', (sink: AudioSampleSink) => sink.samples()],
+	['samplesAtTimestamps()', (sink: AudioSampleSink) => sink.samplesAtTimestamps([0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4])],
+] as const)('Disposing the input closes the decoder and samples of an open %s iterator', async (_, iterate) => {
+	countingDecoderActive = true;
+	countingDecoderSamples.length = 0;
+	countingDecoderCloseCount = 0;
+
+	try {
+		const input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const iterator = iterate(new AudioSampleSink(track));
+		const first = await iterator.next();
+		first.value?.close();
+
+		// The sink decodes ahead until its queue is full, then waits for the consumer, which stops here and just
+		// disposes the input (a player being torn down, for example), found by lane L57
+		await setTimeout(50);
+		expect(countingDecoderSamples.length).toBeGreaterThan(1);
+		input.dispose();
+		await setTimeout(50);
+
+		expect(countingDecoderCloseCount).toBe(1);
+		expect(countingDecoderSamples.filter(sample => !sample._closed)).toHaveLength(0);
+		await expect(iterator.next()).rejects.toThrow(InputDisposedError);
+	} finally {
+		countingDecoderActive = false;
+	}
 });

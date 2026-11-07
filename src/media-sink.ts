@@ -511,6 +511,10 @@ export abstract class BaseMediaSampleSink<
 			metadataOnly: false,
 		};
 
+		// Disposing the input ends the iteration like return() does, so that the pump stops waiting for the consumer
+		// and closes the decoder and queued samples
+		let onInputDisposed: (() => void) | null = null;
+
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
 			decoder = await this._createDecoder((sample) => {
@@ -617,6 +621,10 @@ export abstract class BaseMediaSampleSink<
 			}
 		}).finally(() => {
 			decoder?.close();
+
+			if (onInputDisposed) {
+				this._track.input._disposeCallbacks.delete(onInputDisposed);
+			}
 		});
 
 		const track = this._track;
@@ -627,7 +635,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		const iterator: AsyncGenerator<MediaSample, void, unknown> = {
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -672,6 +680,11 @@ export abstract class BaseMediaSampleSink<
 				return this;
 			},
 		};
+
+		onInputDisposed = () => void iterator.return();
+		track.input._disposeCallbacks.add(onInputDisposed);
+
+		return iterator;
 	}
 
 	/** @internal */
@@ -724,6 +737,10 @@ export abstract class BaseMediaSampleSink<
 			verifyKeyPackets: true,
 			metadataOnly: false,
 		};
+
+		// Disposing the input ends the iteration like return() does, so that the pump stops waiting for the consumer
+		// and closes the decoder and queued samples
+		let onInputDisposed: (() => void) | null = null;
 
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
@@ -881,6 +898,10 @@ export abstract class BaseMediaSampleSink<
 			}
 		}).finally(() => {
 			decoder?.close();
+
+			if (onInputDisposed) {
+				this._track.input._disposeCallbacks.delete(onInputDisposed);
+			}
 		});
 
 		const track = this._track;
@@ -892,7 +913,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		const iterator: AsyncGenerator<MediaSample | null, void, unknown> = {
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -935,6 +956,11 @@ export abstract class BaseMediaSampleSink<
 				return this;
 			},
 		};
+
+		onInputDisposed = () => void iterator.return();
+		track.input._disposeCallbacks.add(onInputDisposed);
+
+		return iterator;
 	}
 }
 
