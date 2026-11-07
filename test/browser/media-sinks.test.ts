@@ -276,3 +276,52 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
+
+test('HLS: audio after a discontinuity with a new EXT-X-MAP decodes with its own AudioSpecificConfig', async () => {
+	// AAC-LC 48 kHz stereo, then an ad break as AAC-LC 22.05 kHz mono with its own init section, then the first again
+	using input = new Input({ source: new UrlSource('/hls-disc-audio/adisc.m3u8'), formats: ALL_FORMATS });
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+
+	const sink = new AudioSampleSink(audioTrack);
+	const periods: { format: string; frames: number; start: number; end: number }[] = [];
+	let offGrid = 0;
+	for await (const sample of sink.samples()) {
+		// Timestamps are rounded to the sample rate of their own period
+		if (Math.abs(sample.timestamp * sample.sampleRate - Math.round(sample.timestamp * sample.sampleRate)) > 1e-6) {
+			offGrid++;
+		}
+		const format = `${sample.sampleRate} Hz, ${sample.numberOfChannels} ch`;
+		const last = periods[periods.length - 1];
+		if (last?.format === format) {
+			last.frames += sample.numberOfFrames;
+			last.end = sample.timestamp + sample.duration;
+		} else {
+			periods.push({
+				format,
+				frames: sample.numberOfFrames,
+				start: sample.timestamp,
+				end: sample.timestamp + sample.duration,
+			});
+		}
+		sample.close();
+	}
+
+	expect(periods.map(x => x.format)).toEqual(['48000 Hz, 2 ch', '22050 Hz, 1 ch', '48000 Hz, 2 ch']);
+	// Every period decodes completely (48 and 23 AAC frames of 1024 samples) and in its place on the timeline
+	expect(periods.map(x => x.frames)).toEqual([48 * 1024, 23 * 1024, 48 * 1024]);
+	expect(periods[1]!.start).toBeCloseTo(1.021333, 2);
+	expect(periods[2]!.start).toBeCloseTo(1.021333 + 1.04644, 2);
+	expect(offGrid).toBe(0);
+
+	// Decoding that starts in the ad break, and lookups across the switches
+	const samples = [];
+	for await (const sample of sink.samplesAtTimestamps([1.5, 0.5, 2.5])) {
+		samples.push(sample && `${sample.sampleRate} Hz, ${sample.numberOfChannels} ch`);
+		sample?.close();
+	}
+	expect(samples).toEqual(['22050 Hz, 1 ch', '48000 Hz, 2 ch', '48000 Hz, 2 ch']);
+	const adSample = await sink.getSample(1.5);
+	expect(adSample?.sampleRate).toBe(22050);
+	adSample?.close();
+});
