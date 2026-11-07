@@ -312,26 +312,39 @@ describe('AV1 sequence headers', () => {
 });
 
 describe('VP9 key frame headers', () => {
+	// The limits of every level: the maximum luma picture size from the VP9 bitstream spec's Annex A, and the maximum
+	// width and height of the luma picture from the WebM project's VP9 levels page, as libvpx's level definitions carry
+	// them (max_luma_picture_breadth in vp9_level_defs, vp9/encoder/vp9_encoder.c, checked by vp9_get_level)
+	const LEVEL_LIMITS: [level: number, maxLumaPictureSize: number, maxLumaPictureBreadth: number][] = [
+		[10, 36864, 512], [11, 73728, 768], [20, 122880, 960], [21, 245760, 1344], [30, 552960, 2048],
+		[31, 983040, 2752], [40, 2228224, 4160], [41, 2228224, 4160], [50, 8912896, 8384], [51, 8912896, 8384],
+		[52, 8912896, 8384], [60, 35651584, 16832], [61, 35651584, 16832], [62, 35651584, 16832],
+	];
+
+	// A key frame header has neither the frame rate nor the bitrate, so the level can only follow from the frame
+	// dimensions: the lowest level that holds them. No level holds a larger picture; Mediabunny reports the highest one
+	// then (libvpx's vp9_get_level returns LEVEL_UNKNOWN, FFmpeg's vpcc.c writes 0).
+	const expectedLevel = (width: number, height: number) => {
+		return LEVEL_LIMITS.find(([, maxSize, maxBreadth]) => {
+			return width * height <= maxSize && Math.max(width, height) <= maxBreadth;
+		})?.[0] ?? 62;
+	};
+
 	const KNOWN_DIVERGENCES: KnownDivergence<Vp9KeyFrameParams>[] = [
 		{
 			// bug-fix-mania: "VP9 RGB reserved bit" (profiles 1 and 3 have reserved_zero after CS_RGB too)
 			reason: 'RGB in profiles 1 and 3',
 			applies: params => params.colorSpace === 7,
 		},
+		{
+			// #487: on main, the level only follows from the picture size, without the maximum width and height
+			reason: 'frames wider or taller than the level of their picture size allows',
+			applies: ({ width, height }) => {
+				const levelFromSize = LEVEL_LIMITS.find(([, maxSize]) => width * height <= maxSize)?.[0] ?? 62;
+				return levelFromSize !== expectedLevel(width, height);
+			},
+		},
 	];
-
-	// VP9 bitstream spec, Annex A: the maximum luma picture size of every level
-	const LEVEL_PICTURE_SIZES: [level: number, maxLumaPictureSize: number][] = [
-		[10, 36864], [11, 73728], [20, 122880], [21, 245760], [30, 552960], [31, 983040], [40, 2228224],
-		[41, 2228224], [50, 8912896], [51, 8912896], [52, 8912896], [60, 35651584], [61, 35651584], [62, 35651584],
-	];
-
-	// A key frame header has neither the frame rate nor the bitrate, so the level can only follow from the picture
-	// size: the lowest level that holds it. No level holds a larger picture; Mediabunny reports the highest one then
-	// (FFmpeg's vpcc.c writes 0, an unknown level).
-	const expectedLevel = (width: number, height: number) => {
-		return LEVEL_PICTURE_SIZES.find(([, maxSize]) => width * height <= maxSize)?.[0] ?? 62;
-	};
 
 	// color_space (7.2.2) names a standard, and these are its ISO/IEC 23001-8 code points (primaries, transfer and
 	// matrix). Unspecified (2) is always allowed for the primaries and transfer: BT.601 doesn't pin one set of
@@ -347,11 +360,11 @@ describe('VP9 key frame headers', () => {
 		{ primaries: [2, 1], transfer: [2, 13], matrix: 0 }, // CS_RGB (sRGB)
 	];
 
-	test('Every derived field and the vp09 codec string of 500 random key frames', () => {
+	test('Every derived field and the vp09 codec string of 1000 random key frames', () => {
 		const rng = createRng(8);
 		const mismatches: string[] = [];
 		let checked = 0;
-		for (let i = 0; i < 500; i++) {
+		for (let i = 0; i < 1000; i++) {
 			const { data, params } = randomVp9KeyFrame(rng);
 			if (KNOWN_DIVERGENCES.some(x => x.applies(params))) {
 				continue;
@@ -405,7 +418,7 @@ describe('VP9 key frame headers', () => {
 			}
 		}
 
-		expect(checked).toBeGreaterThan(400);
+		expect(checked).toBeGreaterThan(450);
 		expect(mismatches).toEqual([]);
 	});
 
@@ -417,18 +430,27 @@ describe('VP9 key frame headers', () => {
 		];
 
 		const rng = createRng(13);
+		let checked = 0;
 		for (const [width, height] of SIZES_AT_LIMITS) {
 			for (const rows of [height, height + 1]) {
+				// Other random fields are drawn again until they're clear of the known divergences
 				let frame = randomVp9KeyFrame(rng, { width, height: rows });
-				while (KNOWN_DIVERGENCES.some(x => x.applies(frame.params))) {
+				for (let tries = 0; tries < 20 && KNOWN_DIVERGENCES.some(x => x.applies(frame.params)); tries++) {
 					frame = randomVp9KeyFrame(rng, { width, height: rows });
+				}
+
+				if (KNOWN_DIVERGENCES.some(x => x.applies(frame.params))) {
+					continue;
 				}
 
 				const level = extractVp9CodecInfoFromPacket(frame.data)?.level;
 				const expected = expectedLevel(width, rows);
 				expect({ width, height: rows, level }).toEqual({ width, height: rows, level: expected });
+				checked++;
 			}
 		}
+
+		expect(checked).toBe(2 * SIZES_AT_LIMITS.length);
 
 		// Spot checks of the table lookup itself
 		expect(expectedLevel(256, 144)).toBe(10);
@@ -436,6 +458,9 @@ describe('VP9 key frame headers', () => {
 		expect(expectedLevel(2048, 1089)).toBe(50);
 		expect(expectedLevel(8192, 4352)).toBe(60);
 		expect(expectedLevel(8192, 4353)).toBe(62);
+		expect(expectedLevel(513, 1)).toBe(11); // Wider than level 1's 512
+		expect(expectedLevel(4096, 16)).toBe(40);
+		expect(expectedLevel(16, 2048)).toBe(30);
 	});
 });
 
