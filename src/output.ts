@@ -230,7 +230,8 @@ export type BaseTrackMetadata = {
 	 * - For video codecs, you can assume one packet per frame.
 	 * - For audio codecs, there is one packet for each "audio chunk", the duration of which depends on the codec. For
 	 * simplicity, you can assume each packet is roughly 10 ms or 512 samples long, whichever is shorter.
-	 * - For subtitles, assume each cue and each gap in the subtitles adds a packet.
+	 * - For subtitles, a new packet can begin at every cue start and end time (overlapping cues get split, and gaps
+	 * fill their own packets), so assume up to two packets per cue.
 	 *
 	 * If you're not fully sure, make sure to add a buffer of around 33% to make sure you stay below the maximum.
 	 */
