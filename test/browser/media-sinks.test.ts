@@ -159,6 +159,34 @@ test('Audio decoder pre-roll (AAC)', async () => {
 	await testAudioDecoderPreRoll(track, -90);
 });
 
+// SBR keeps state across frames, so HE-AAC needs two frames of pre-roll. Its noise generator never quite
+// converges, hence the higher error bound than for AAC-LC. Both files were made with:
+// ffmpeg -f lavfi -i "anoisesrc=color=pink:amplitude=0.5:duration=2:seed=1,lowpass=f=4000"
+//   -c:a libfdk_aac -profile:a aac_he -b:a 32k he-aac-2s.m4a (and he-aac-2s.aac)
+test('Audio decoder pre-roll (HE-AAC)', async () => {
+	using input = new Input({
+		source: new UrlSource('/he-aac-2s.m4a'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	await testAudioDecoderPreRoll(track, -30);
+});
+
+test('Audio decoder pre-roll (HE-AAC signaled implicitly, ADTS)', async () => {
+	using input = new Input({
+		source: new UrlSource('/he-aac-2s.aac'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	await testAudioDecoderPreRoll(track, -30);
+});
+
 test('Audio decoder pre-roll (Opus)', async () => {
 	using input = new Input({
 		source: new UrlSource('/preroll-test.opus'),
