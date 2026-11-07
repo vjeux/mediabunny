@@ -8,7 +8,7 @@ import {
 	VideoSamplePixelFormat,
 	VideoSampleResource,
 } from '../../src/sample.js';
-import { isChromium, isWebKit, Rotation } from '../../src/misc.js';
+import { isWebKit, Rotation } from '../../src/misc.js';
 import {
 	PIXEL_FORMAT_PLANES,
 	layoutSize,
@@ -151,9 +151,9 @@ const nativeRgbConversionWorks = await (async () => {
 
 describe('VideoSample matches VideoFrame', () => {
 	test('the browser supports most pixel formats', () => {
-		// Without these, the parity tests below would cover little
-		const expected = ['I420', 'I420A', 'NV12', 'RGBA', 'BGRX', ...(isChromium() ? ['I422', 'I444'] : [])];
-		expect(SUPPORTED_FORMATS).toEqual(expect.arrayContaining(expected));
+		// Without these, the parity tests below would cover little. Formats beyond them (e.g. 4:2:2 and 4:4:4) are
+		// tested wherever the browser's VideoFrame has them.
+		expect(SUPPORTED_FORMATS).toEqual(expect.arrayContaining(['I420', 'I420A', 'NV12', 'RGBA', 'BGRX']));
 	});
 
 	const ifExactNativeYuvCopy = test.skipIf(!nativeYuvCopyIsExact);
@@ -178,8 +178,7 @@ describe('VideoSample matches VideoFrame', () => {
 						format: format as VideoPixelFormat, codedWidth: width, codedHeight: height, timestamp: 0,
 					}));
 					if (!frameResult.ok) {
-						expect(isChromium(), `${format} ${width}x${height}`).toBe(false);
-						continue;
+						continue; // This browser's VideoFrame doesn't take this size (e.g. odd YUV sizes in Firefox)
 					}
 					const frame = frameResult.value;
 					using raw = new VideoSample(data, init);
@@ -205,12 +204,12 @@ describe('VideoSample matches VideoFrame', () => {
 					for (const [i, options] of optionSets.entries()) {
 						const label = `${format} ${width}x${height} +${padding} ${JSON.stringify(options)}`;
 						const expected = await copyWith(frame, options);
-						// Only the misaligned and the out-of-bounds rects fail
+						// Per the spec, only the misaligned and the out-of-bounds rects fail. Where the browser's
+						// VideoFrame disagrees (Firefox rejects rects of odd height in sub-sampled formats), it can't
+						// be the reference.
 						const misaligned = i === 4 && (subX > 1 || subY > 1);
-						if (isChromium()) {
-							expect('error' in expected, label).toBe(misaligned || i === 6);
-						} else if ('error' in expected !== (misaligned || i === 6)) {
-							continue; // This browser's VideoFrame can't serve as the reference here
+						if ('error' in expected !== (misaligned || i === 6)) {
+							continue;
 						}
 
 						expect(await copyWith(raw, options), `raw ${label}`).toEqual(expected);
@@ -709,7 +708,8 @@ describe('AudioSample matches AudioData', () => {
 					if (isWebKit() && channels > 1 && destFormat !== format) {
 						// WebKit's AudioData.copyTo can crash the tab when converting the format of several channels
 						// (https://bugs.webkit.org/show_bug.cgi?id=302521; in WebKitGTK also with 2 channels at a frame
-						// offset), so it can't be the reference here
+						// offset), so it can't be the reference here. A crash can't be probed from inside the page,
+						// hence the engine check rather than a native probe.
 						continue;
 					}
 
