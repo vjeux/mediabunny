@@ -2505,6 +2505,8 @@ export const determineVideoPacketType = (
 ): PacketType | null => {
 	switch (codec) {
 		case 'avc': {
+			let hasSps = false;
+
 			for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
 				const nalTypeByte = packetData[loc.offset]!;
 				const type = extractNalUnitTypeForAvc(nalTypeByte);
@@ -2517,10 +2519,13 @@ export const determineVideoPacketType = (
 					return 'key';
 				}
 
+				hasSps ||= type === AvcNalUnitType.SPS;
+
 				// In addition to IDR, Recovery Point SEI also counts as a valid H.264 keyframe by current consensus.
 				// See https://github.com/w3c/webcodecs/issues/650 for the relevant discussion. WebKit and Firefox have
-				// always supported them, but Chromium hasn't.
-				if (type === AvcNalUnitType.SEI && !isChromium()) {
+				// always supported them, but Chromium hasn't. Decoding can only start there if the parameter sets are
+				// known though, which in Annex B means the packet must carry them (an IDR always gets them inserted).
+				if (type === AvcNalUnitType.SEI && !isChromium() && (decoderConfig.description || hasSps)) {
 					const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
 					const bytes = removeEmulationPreventionBytes(nalUnit);
 					let pos = 1; // Skip NALU header
