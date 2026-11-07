@@ -1367,8 +1367,11 @@ export type HlsOutputFormatOptions = {
 	onInit?: (target: Target, info: HlsOutputPlaylistInfo) => unknown;
 	/**
 	 * Called when a media segment is removed from the start of a media playlist due to
-	 * {@link HlsOutputFormatOptions.maxLiveSegmentCount}. Will not be called when
-	 * {@link HlsOutputFormatOptions.singleFilePerPlaylist} is `true`.
+	 * {@link HlsOutputFormatOptions.maxLiveSegmentCount}, once the updated playlist has been written. Will not be
+	 * called when {@link HlsOutputFormatOptions.singleFilePerPlaylist} is `true`.
+	 *
+	 * Clients may still be playing from an earlier playlist, so if you delete the segment's file in response, keep it
+	 * available for the segment's duration plus the playlist's duration first (RFC 8216, Section 6.2.2).
 	 */
 	onSegmentPopped?: (path: string, info: HlsOutputSegmentInfo) => unknown;
 };
