@@ -22,7 +22,6 @@ import {
 	WEBM,
 	WebMOutputFormat,
 } from '../../src/index.js';
-import { isFirefox, isWebKit } from '../../src/misc.js';
 
 // Matroska/WebM interoperability with Chrome: files Mediabunny writes must play through Media Source Extensions (which
 // uses Chromium's own WebM parser) and the <video> element, and files Chrome's MediaRecorder writes must demux and
@@ -279,12 +278,18 @@ describe('Mediabunny WebM in Chrome', () => {
 		const result = await loadInVideoElement(bytes, 'video/webm');
 		expect(result.duration).toBeCloseTo(1.5, 2);
 
-		// Firefox's WebM demuxer ignores the Matroska rotation, and so does WebKit's GStreamer-based one
-		const rotatedSize = isFirefox() || isWebKit() ? [160, 120] : [120, 160];
-		expect([result.width, result.height]).toEqual(rotatedSize);
+		// Whether the browser applies a Matroska rotation (Firefox's WebM demuxer doesn't, nor does WebKit's
+		// GStreamer-based one) shows with a 160x120 file that FFmpeg wrote with a 90 degree rotation (a Projection
+		// with a ProjectionPoseRoll, as Mediabunny writes it)
+		const reference = new Uint8Array(await (await fetch('/rotated-90.webm')).arrayBuffer());
+		const referenceResult = await loadInVideoElement(reference, 'video/webm');
+		expect([[160, 120], [120, 160]]).toContainEqual([referenceResult.width, referenceResult.height]);
+		expect([result.width, result.height]).toEqual([referenceResult.width, referenceResult.height]);
 
+		// Through MSE, the file shows the same way. (Chrome's MSE rejects FFmpeg's file, which leaves out the
+		// ProjectionType, as its default allows; Mediabunny writes it.)
 		const mse = await playThroughMse(bytes, 'video/webm; codecs="vp9"');
-		expect([mse.width, mse.height]).toEqual(rotatedSize);
+		expect([mse.width, mse.height]).toEqual([result.width, result.height]);
 	});
 
 	test('a packet copy of a WebM file keeps playing in Chrome', async () => {
