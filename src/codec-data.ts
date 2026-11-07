@@ -2854,6 +2854,10 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 						mediaTypeLength + descriptionLength + 32 + dataLength,
 					);
 
+					if (mediaType === '-->') {
+						break; // The data is a link to the picture, not the picture; it's only kept in the raw tags
+					}
+
 					metadataTags.images ??= [];
 					metadataTags.images.push({
 						data,

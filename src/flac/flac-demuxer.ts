@@ -271,6 +271,10 @@ export class FlacDemuxer extends Demuxer {
 							const dataLength = readU32Be(pictureBlock);
 							const data = readBytes(pictureBlock, dataLength);
 
+							if (mediaType === '-->') {
+								break; // The data is a link to the picture (RFC 9639, section 8.8), not the picture
+							}
+
 							this.metadataTags.images ??= [];
 							this.metadataTags.images.push({
 								data,
