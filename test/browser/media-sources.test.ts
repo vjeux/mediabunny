@@ -8,7 +8,7 @@ import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -535,6 +535,56 @@ test('VideoSampleSource, transform.frameRate works with process', async () => {
 	expect(await track.getCodedHeight()).toBe(40);
 
 	input.dispose();
+});
+
+test('VideoSampleSource, frame rate normalization doesn\'t repeat key frame requests on padded frames', async () => {
+	const keyFrameTimestamps = async (requestVia: 'add' | 'sample', frameRate?: number) => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('medium'),
+			keyFrameInterval: 100,
+			transform: frameRate ? { frameRate } : undefined,
+		});
+		output.addVideoTrack(source);
+		await output.start();
+
+		// 10 frames at 10 fps; only the one at 0.5 s asks for a key frame
+		const canvas = new OffscreenCanvas(48, 48);
+		const context = canvas.getContext('2d')!;
+		for (let i = 0; i < 10; i++) {
+			context.fillStyle = `rgb(${i * 20}, 0, 0)`;
+			context.fillRect(0, 0, 48, 48);
+			const sample = new VideoSample(canvas, {
+				timestamp: i / 10,
+				duration: 1 / 10,
+				encodeOptions: requestVia === 'sample' && i === 5 ? { keyFrame: true } : undefined,
+			});
+			await source.add(sample, requestVia === 'add' && i === 5 ? { keyFrame: true } : undefined);
+			sample.close();
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, {
+			verifyKeyPackets: true,
+		})) {
+			if (packet.type === 'key') {
+				timestamps.push(Math.round(packet.timestamp * 1000) / 1000);
+			}
+		}
+		return timestamps;
+	};
+
+	// Normalized to 30 fps, each input frame is followed by two repeats, which aren't the frame that asked
+	expect(await keyFrameTimestamps('add', 30)).toEqual([0, 0.5]);
+	expect(await keyFrameTimestamps('sample', 30)).toEqual([0, 0.5]);
+	expect(await keyFrameTimestamps('add')).toEqual([0, 0.5]);
+	expect(await keyFrameTimestamps('sample')).toEqual([0, 0.5]);
 });
 
 const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {
