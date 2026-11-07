@@ -397,6 +397,136 @@ const startRangelessServer = async (
 	};
 };
 
+test('UrlSource retries requests that failed with a transient HTTP status', async () => {
+	const data = new Uint8Array(1000).map((_, i) => i & 0xff);
+	let failures: number[] = [];
+	let requestCount = 0;
+	const server = http.createServer((req, res) => {
+		requestCount++;
+		const status = failures.shift();
+		if (status !== undefined) {
+			res.writeHead(status);
+			res.end();
+			return;
+		}
+
+		const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+		res.writeHead(206, {
+			'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+			'Content-Length': data.length - start,
+		});
+		res.end(data.subarray(start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+		const read = async (statuses: number[], retry = true) => {
+			failures = [...statuses];
+			const attempts: [number, unknown][] = [];
+			using ref = new UrlSource(url, {
+				getRetryDelay: (previousAttempts, error) => {
+					// The error carries the status, so that policies can tell this apart from a network error
+					attempts.push([previousAttempts, (error as { status?: unknown }).status]);
+					return retry ? 0 : null;
+				},
+			}).ref();
+
+			try {
+				const slice = await new Reader(ref.source).requestSlice(0, 4);
+				return { attempts, result: [...readBytes(slice!, 4)] };
+			} catch (error) {
+				return { attempts, result: String(error) };
+			}
+		};
+
+		// Server errors, timeouts and rate limiting can go away, so they're retried like network errors...
+		expect(await read([503, 429, 502])).toEqual({ attempts: [[1, 503], [2, 429], [3, 502]], result: [0, 1, 2, 3] });
+		// ...as long as the retry policy wants to
+		expect(await read([503], false)).toEqual({
+			attempts: [[1, 503]],
+			result: `Error: Error fetching ${url}: 503 Service Unavailable`,
+		});
+		// Other failures are final
+		expect(await read([404])).toEqual({ attempts: [], result: `Error: Error fetching ${url}: 404 Not Found` });
+
+		// The default policy gives up on a server that keeps answering such a status, after 5 retries (15.5 seconds of
+		// waiting, which this test skips), while it retries network errors indefinitely
+		const defaultPolicy = new UrlSource(url)._getRetryDelay;
+		const delays: (number | null)[] = [];
+		failures = new Array<number>(100).fill(503);
+		requestCount = 0;
+		using ref = new UrlSource(url, {
+			getRetryDelay: (previousAttempts, error, source) => {
+				const delay = defaultPolicy(previousAttempts, error, source);
+				delays.push(delay);
+				return delay === null ? null : 0;
+			},
+		}).ref();
+		await expect(new Reader(ref.source).requestSlice(0, 4)).rejects.toThrow(
+			`Error fetching ${url}: 503 Service Unavailable`,
+		);
+		expect(delays).toEqual([0.5, 1, 2, 4, 8, null]);
+		expect(requestCount).toBe(6);
+		expect(defaultPolicy(100, new TypeError('fetch failed'), url)).toBe(16);
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource frees the response of a transient HTTP status when its retry policy fails', async () => {
+	let openConnections = 0;
+	const server = http.createServer((req, res) => {
+		// Big enough that the client doesn't take in the whole body by itself
+		const body = Buffer.alloc(200_000, 0x20);
+		res.writeHead(503, { 'Content-Length': body.length });
+		res.end(body);
+	});
+	server.on('connection', (socket) => {
+		openConnections++;
+		socket.on('close', () => openConnections--);
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs();
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+
+		const policies: [() => number, string][] = [
+			[() => {
+				throw new Error('Policy failed');
+			}, 'Policy failed'],
+			[() => -1, 'Retry delay must be a non-negative finite number.'],
+		];
+		for (const [getRetryDelay, message] of policies) {
+			for (let i = 0; i < 10; i++) {
+				const input = new Input({
+					source: new UrlSource(`http://localhost:${address.port}/data.bin`, { getRetryDelay }),
+					formats: ALL_FORMATS,
+				});
+				await expect(input.getFormat()).rejects.toThrow(message);
+				input.dispose();
+			}
+
+			// The failed responses' connections get closed, instead of staying open with their unread bodies
+			await new Promise(resolve => setTimeout(resolve, 1000));
+			expect(openConnections, message).toBeLessThanOrEqual(2);
+		}
+	} finally {
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
