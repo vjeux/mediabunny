@@ -3,7 +3,7 @@ import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AudioSampleSource } from '../../src/media-source.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
-import { assert } from '../../src/misc.js';
+import { assert, toUint8Array } from '../../src/misc.js';
 import { Output } from '../../src/output.js';
 import { FlacOutputFormat } from '../../src/output-format.js';
 import { AudioSample } from '../../src/sample.js';
@@ -29,8 +29,8 @@ test('FLAC encoder, 24-bit', async () => {
 	using sample = result.sample;
 
 	expect(result.size).toBeGreaterThan(90_000);
-
-	expect(sample.format).toBe('s32');
+	expect(result.bitsPerSample).toBe(24);
+	expect(sample.numberOfChannels).toBe(channels);
 });
 
 test('FLAC encoder, 16-bit', async () => {
@@ -51,10 +51,8 @@ test('FLAC encoder, 16-bit', async () => {
 	using sample = result.sample;
 
 	expect(result.size).toBeLessThan(50_000); // Shit just uses less data
-
-	// Really, this should only have s16 but decoders can differ and be flaky here. Trust me, I have tested that the
-	// encoder does in fact encode s16.
-	expect(['s16', 's32'].includes(sample.format)).toBe(true);
+	expect(result.bitsPerSample).toBe(16);
+	expect(sample.numberOfChannels).toBe(channels);
 });
 
 const createF32SineWave = (sampleRate: number, channels: number, durationSeconds: number) => {
@@ -108,11 +106,18 @@ const encodeAndDecodeFirstSample = async (audioSample: AudioSample) => {
 	const track = await input.getPrimaryAudioTrack();
 	assert(track);
 
+	// Read the bit depth from STREAMINFO (after 'fLaC' and the metadata block header), since decoders differ in the
+	// sample format they decode to (Firefox always decodes to f32)
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig?.description);
+	const streamInfo = toUint8Array(decoderConfig.description).subarray(8);
+	const bitsPerSample = (((streamInfo[12]! & 0b1) << 4) | (streamInfo[13]! >> 4)) + 1;
+
 	const sink = new AudioSampleSink(track);
 	const sample = await sink.getSample(0);
 	assert(sample);
 
-	return { sample, size: output.target.buffer!.byteLength };
+	return { sample, size: output.target.buffer!.byteLength, bitsPerSample };
 };
 
 test('FLAC encoder instances leave no Blob URL of their worker registered', async () => {
