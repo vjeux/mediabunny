@@ -2821,7 +2821,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 							slice.skip(4); // Version + flags
 							const [scheme, value] = textDecoder
-								.decode(readBytes(slice, boxInfo.contentSize - 4))
+								.decode(readBytes(slice, Math.min(boxInfo.contentSize - 4, slice.remainingLength)))
 								.split('\0');
 							if (scheme !== 'urn:mpeg:dash:role:2011') { // ISO/IEC 23009-1 5.8.5.5
 								break;

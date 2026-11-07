@@ -158,3 +158,50 @@ test('MP4 track dispositions from kind boxes', async () => {
 	expect(await withKindBoxes([role('dub'), role('main'), ['urn:example:roles', 'commentary']]))
 		.toEqual([false, false, false, false]);
 });
+
+test('MP4 kind box whose size goes past its udta box', async () => {
+	// The kind box is complete, but its size field claims 0x7fffff00 bytes. Like FFmpeg, read what's there.
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source, { name: 'Commentary' });
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(100), 'key', 0, 1024 / 48000), {
+		// AudioSpecificConfig: AAC-LC, 48 kHz, mono
+		decoderConfig: {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			description: new Uint8Array([0x11, 0x88]),
+		},
+	});
+	await output.finalize();
+
+	// Add udta { kind } at the end of the trak box
+	const bytes = new Uint8Array(output.target.buffer!);
+	const findBox = (name: string) => bytes.findIndex(
+		(_, i) => new TextDecoder().decode(bytes.subarray(i + 4, i + 8)) === name,
+	);
+	const content = [0, 0, 0, 0, ...new TextEncoder().encode('urn:mpeg:dash:role:2011\0commentary\0')];
+	const kind = new Uint8Array(8 + content.length);
+	new DataView(kind.buffer).setUint32(0, 0x7fffff00);
+	kind.set(new TextEncoder().encode('kind'), 4);
+	kind.set(content, 8);
+	const udta = new Uint8Array(8 + kind.length);
+	new DataView(udta.buffer).setUint32(0, udta.length);
+	udta.set(new TextEncoder().encode('udta'), 4);
+	udta.set(kind, 8);
+
+	const view = new DataView(bytes.buffer);
+	const [moov, trak] = [findBox('moov'), findBox('trak')];
+	const trakEnd = trak + view.getUint32(trak);
+	const result = new Uint8Array([...bytes.subarray(0, trakEnd), ...udta, ...bytes.subarray(trakEnd)]);
+	const resultView = new DataView(result.buffer);
+	resultView.setUint32(trak, view.getUint32(trak) + udta.length);
+	resultView.setUint32(moov, view.getUint32(moov) + udta.length);
+
+	using input = new Input({ source: new BufferSource(result), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect((await track.getDisposition()).commentary).toBe(true);
+	expect(await track.getName()).toBe('Commentary');
+	expect((await track.computePacketStats()).packetCount).toBe(1);
+});
