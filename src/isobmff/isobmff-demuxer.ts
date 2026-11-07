@@ -1412,7 +1412,13 @@ export class IsobmffDemuxer extends Demuxer {
 								track.info.codec = null;
 							}
 						} else if (codecName === 'raw ') {
-							track.info.codec = 'pcm-u8';
+							// QuickTime defines 'raw ' as 8-bit, but like FFmpeg, read 16-bit samples as signed and
+							// big-endian, unless an enda box says otherwise
+							if (sampleSize === 16) {
+								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s16' : 'pcm-s16be';
+							} else {
+								track.info.codec = 'pcm-u8';
+							}
 						} else if (codecName === 'in24') {
 							track.info.codec = track.info.pcmLittleEndian ? 'pcm-s24' : 'pcm-s24be';
 						} else if (codecName === 'in32') {

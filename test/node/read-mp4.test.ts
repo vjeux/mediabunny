@@ -338,3 +338,52 @@ test('24 and 32-bit PCM in twos and sowt sample entries', async () => {
 		expect(result.data).toEqual(result.expected);
 	}
 });
+
+test('16-bit samples in a QuickTime raw sample entry', async () => {
+	// QuickTime defines 'raw ' as 8-bit offset binary, but FFmpeg reads an entry that says 16 bits per sample as
+	// signed big-endian 16-bit PCM
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (sampleSize: number) => {
+		const raw = box('raw ', zeros(6), u16(1), zeros(8), u16(2), u16(sampleSize), zeros(4), u32(48000 * 0x10000));
+		const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(48000), u32(480), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(480), zeros(16), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(48000), u32(480), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), raw),
+						box('stts', zeros(4), u32(1), u32(480), u32(1)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(480), u32(1)),
+						box('stsz', zeros(4), u32(1), u32(480)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+		const mdat = box('mdat', zeros(480 * 2 * sampleSize / 8)); // 480 stereo frames
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...mdat, ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		return [await track.getCodec(), packet?.byteLength, packet?.duration];
+	};
+
+	expect(await read(8)).toEqual(['pcm-u8', 960, 0.01]);
+	expect(await read(16)).toEqual(['pcm-s16be', 1920, 0.01]);
+});
