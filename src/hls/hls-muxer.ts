@@ -36,6 +36,7 @@ import {
 	HlsOutputPlaylistInfo,
 	HlsOutputSegmentInfo,
 	Mp3OutputFormat,
+	IsobmffOutputFormat,
 	OutputFormat,
 } from '../output-format';
 import { Writer } from '../writer';
@@ -47,9 +48,13 @@ import { secondsToMpegTsTimestamp } from '../mpeg-ts/mpeg-ts-misc';
 import type { IsobmffMuxer } from '../isobmff/isobmff-muxer';
 
 // Maps from WebCodecs to what HLS wants
-const toHlsCodecString = (codecString: string) => {
+const toHlsCodecString = (codecString: string, segmentFormat: OutputFormat) => {
 	if (codecString === 'opus') {
 		return 'Opus';
+	}
+	if (segmentFormat instanceof IsobmffOutputFormat && codecString.startsWith('hev1.')) {
+		// The codec string names the sample entry, and HEVC is always written into an 'hvc1' sample entry
+		return 'hvc1.' + codecString.slice('hev1.'.length);
 	}
 
 	return codecString;
@@ -1494,7 +1499,7 @@ export class HlsMuxer extends Muxer {
 				for (const track of decl.playlist.tracks) {
 					const trackData = this.trackDatas.find(x => x.track === track);
 					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
-					codecs.push(toHlsCodecString(codecString));
+					codecs.push(toHlsCodecString(codecString, decl.playlist.segmentFormat));
 				}
 
 				let peakDeclBitrate = 0;
@@ -1505,7 +1510,7 @@ export class HlsMuxer extends Muxer {
 					const firstTrack = firstRef.playlist.tracks[0]!;
 					const trackData = this.trackDatas.find(x => x.track === firstTrack);
 					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
-					codecs.push(toHlsCodecString(codecString));
+					codecs.push(toHlsCodecString(codecString, firstRef.playlist.segmentFormat));
 
 					for (const ref of decl.references) {
 						assert(ref.playlist.peakBitrate !== null);
