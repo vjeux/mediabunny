@@ -24,13 +24,18 @@ import {
 // pages. The playlists follow the real ones (URIs shortened); the media comes from test/public, segmented in memory, so
 // nothing touches the network.
 
+// A rendition's two-letter LANGUAGE (BCP 47, "en") can be reported as written or as ISO 639-2 ("eng"); both read
+// as ISO 639-2 here
+const ISO_639_1_TO_2: Record<string, string> = { en: 'eng', de: 'deu', it: 'ita', fr: 'fra', es: 'spa' };
+const normalizeLanguage = (code: string) => ISO_639_1_TO_2[code] ?? code;
+
 const describeTrack = async (track: InputTrack) => {
 	const disposition = await track.getDisposition();
 	return {
 		type: track.type,
 		codec: await track.getCodec(),
 		name: await track.getName(),
-		language: await track.getLanguageCode(),
+		language: normalizeLanguage(await track.getLanguageCode()),
 		bitrate: await track.getBitrate(),
 		primary: disposition.primary,
 		default: disposition.default,
@@ -216,12 +221,12 @@ playlist_v-0144p-0100k-libx264.mp4.m3u8
 		const audioTracks = await input.getAudioTracks();
 		const described = await Promise.all(audioTracks.map(describeTrack));
 		expect(described.map(x => [x.name, x.language, x.primary, x.default])).toEqual([
-			['stream_5', 'en', true, true],
-			['stream_4', 'de', false, true],
-			['stream_8', 'it', false, true],
-			['stream_7', 'fr', false, true],
-			['stream_9', 'es', false, true],
-			['stream_6', 'en', false, false],
+			['stream_5', 'eng', true, true],
+			['stream_4', 'deu', false, true],
+			['stream_8', 'ita', false, true],
+			['stream_7', 'fra', false, true],
+			['stream_9', 'spa', false, true],
+			['stream_6', 'eng', false, false],
 		]);
 		expect(await Promise.all(audioTracks.map(x => x.getNumberOfChannels()))).toEqual([2, 2, 2, 2, 2, 6]);
 		expect(await input.getPrimaryAudioTrack()).toBe(audioTracks[0]);
@@ -249,9 +254,9 @@ https://storage.googleapis.com/shaka-demo-assets/angel-one-hls/playlist_a-eng-01
 		// The "##" line is a comment, not a fourth rendition
 		const tracks = await input.getTracks();
 		expect(await Promise.all(tracks.map(describeTrack))).toEqual([
-			{ type: 'audio', codec: 'aac', name: 'English', language: 'en', bitrate: 482170, primary: true, default: true, keyOnly: true },
-			{ type: 'audio', codec: 'aac', name: 'German', language: 'de', bitrate: null, primary: false, default: true, keyOnly: true },
-			{ type: 'audio', codec: 'aac', name: 'Spanish, Castilian', language: 'es', bitrate: null, primary: false, default: true, keyOnly: true },
+			{ type: 'audio', codec: 'aac', name: 'English', language: 'eng', bitrate: 482170, primary: true, default: true, keyOnly: true },
+			{ type: 'audio', codec: 'aac', name: 'German', language: 'deu', bitrate: null, primary: false, default: true, keyOnly: true },
+			{ type: 'audio', codec: 'aac', name: 'Spanish, Castilian', language: 'spa', bitrate: null, primary: false, default: true, keyOnly: true },
 		]);
 		expect(await input.getPrimaryVideoTrack()).toBe(null);
 		expect(await input.getPrimaryAudioTrack()).toBe(tracks[0]);
@@ -335,9 +340,9 @@ sdr_720/prog_index.m3u8
 			.toEqual(['hvc1.2.20000000.H150.B0', 'avc1.64001f']);
 		const audioTracks = await input.getAudioTracks();
 		expect(await Promise.all(audioTracks.map(describeTrack))).toMatchObject([
-			{ codec: 'eac3', name: 'English', language: 'en', primary: true },
-			{ codec: 'eac3', name: 'English (DVS)', language: 'en', primary: false },
-			{ codec: 'aac', name: 'English', language: 'en', primary: true },
+			{ codec: 'eac3', name: 'English', language: 'eng', primary: true },
+			{ codec: 'eac3', name: 'English (DVS)', language: 'eng', primary: false },
+			{ codec: 'aac', name: 'English', language: 'eng', primary: true },
 		]);
 		expect(await videoTracks[0]!.getPairableAudioTracks()).toEqual(audioTracks.slice(0, 2));
 		expect(await videoTracks[1]!.getPairableAudioTracks()).toEqual(audioTracks.slice(2));
