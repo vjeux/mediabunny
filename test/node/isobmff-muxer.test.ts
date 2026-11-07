@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
+import { MovOutputFormat } from '../../src/output-format.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
@@ -354,6 +355,44 @@ test('PCM audio with non-zero timestamp', async () => {
 	assert(audioTrack);
 
 	expect(await audioTrack.getFirstTimestamp()).toBe(1);
+});
+
+test('MP4 tkhd carries the presentation size of anamorphic video', async () => {
+	const readTkhd = async (format: Mp4OutputFormat | MovOutputFormat, rotation: 0 | 180, anamorphic: boolean) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source, { rotation });
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(100), 'key', 0, 1), {
+			decoderConfig: {
+				codec: 'vp8',
+				codedWidth: 640,
+				codedHeight: 360,
+				// 2:1 pixels, displayed at 32:9
+				...(anamorphic ? { displayAspectWidth: 32, displayAspectHeight: 9 } : {}),
+			},
+		});
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = toDataView(bytes);
+		const tkhd = new TextDecoder('latin1').decode(bytes).indexOf('tkhd') + 4;
+		const matrix = tkhd + 4 + (bytes[tkhd] === 1 ? 32 : 20) + 8 + 8;
+		return {
+			size: [view.getUint32(matrix + 36) / 0x10000, view.getUint32(matrix + 40) / 0x10000],
+			translation: [view.getInt32(matrix + 24) / 0x10000, view.getInt32(matrix + 28) / 0x10000],
+		};
+	};
+
+	// ISO/IEC 14496-12: for visual tracks, tkhd's width and height are the presentation size, to which all images are
+	// scaled before the matrix applies. They used to be the pixel size (640) with only pasp saying 2:1.
+	expect(await readTkhd(new Mp4OutputFormat(), 0, true)).toEqual({ size: [1280, 360], translation: [0, 0] });
+	// So a half turn keeps the image in place by moving it by the presentation width
+	expect(await readTkhd(new Mp4OutputFormat(), 180, true)).toEqual({ size: [1280, 360], translation: [1280, 360] });
+
+	// Square pixels are unchanged, and QuickTime keeps the pixel size, as FFmpeg does
+	expect(await readTkhd(new Mp4OutputFormat(), 0, false)).toEqual({ size: [640, 360], translation: [0, 0] });
+	expect(await readTkhd(new MovOutputFormat(), 180, true)).toEqual({ size: [640, 360], translation: [640, 360] });
 });
 
 test('PCM audio, silence padding', async () => {
