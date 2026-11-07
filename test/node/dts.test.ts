@@ -153,6 +153,49 @@ test('Decode with the extension', async () => {
 	expect(sampleCount).toBe(packetCount);
 });
 
+// The DTS core's ADPCM predictors carry state across frames, so random access needs enough pre-roll. Made with
+// FFmpeg 8.0:
+// ffmpeg -f lavfi -i "anoisesrc=color=pink:amplitude=0.25:sample_rate=48000:duration=0.6:seed=5"
+//   -f lavfi -i "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*330*t):s=48000:d=0.6"
+//   -filter_complex "[0]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=0.7*c0[n];[n][1]amix=inputs=2:normalize=0"
+//   -c:a dca -strict -2 -dca_adpcm 1 -b:a 384k dts-adpcm.mp4
+test('Random access into DTS decodes the same audio as decoding from the start', async () => {
+	registerDtsDecoder();
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'dts-adpcm.mp4')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const getPlanes = (sample: AudioSample) => Array.from({ length: sample.numberOfChannels }, (_, i) => {
+		const plane = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(plane, { format: 'f32-planar', planeIndex: i });
+		return plane;
+	});
+
+	const sink = new AudioSampleSink(track);
+	const sequential: { timestamp: number; planes: Float32Array[] }[] = [];
+	for await (using sample of sink.samples()) {
+		sequential.push({ timestamp: sample.timestamp, planes: getPlanes(sample) });
+	}
+	expect(sequential.length).toBeGreaterThan(50);
+
+	for (const [i, { timestamp, planes }] of sequential.entries()) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBe(timestamp);
+
+		let maxDifference = 0;
+		getPlanes(sample).forEach((plane, channel) => plane.forEach((value, j) => {
+			maxDifference = Math.max(maxDifference, Math.abs(value - planes[channel]![j]!));
+		}));
+		expect(maxDifference, `frame ${i}`).toBeLessThan(1e-3); // -60 dBFS
+	}
+});
+
 test('Encode with the extension', async () => {
 	registerDtsEncoder();
 

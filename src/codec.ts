@@ -933,7 +933,11 @@ export const getAudioPreRollDuration = (codec: AudioCodec, decoderConfig: AudioD
 		}
 
 		case 'dts': {
-			return 512 / decoderConfig.sampleRate;
+			// The core's subband ADPCM predictors carry their history across frames, and the error from starting
+			// without it only fades out gradually: one 512-sample frame of pre-roll left errors of up to -14 dBFS in
+			// DTS-ES streams. 8192 samples (found by measuring) bring that below -110 dBFS for DTS-ES and DTS-HD MA,
+			// and below -65 dBFS even for pure tones from FFmpeg's ADPCM encoder.
+			return 8192 / decoderConfig.sampleRate;
 		}
 
 		case 'flac':
