@@ -73,6 +73,8 @@ export class FlacMuxer extends Muxer {
 	private metadataWritten = false;
 
 	private blockSizes: number[] = [];
+	/** In append-only mode, the fixed block size that STREAMINFO declares, if it declares one. */
+	private declaredFixedBlockSize: number | null = null;
 	private frameSizes: number[] = [];
 	private writtenFrameCount = 0;
 	private writtenSampleCount = 0;
@@ -116,24 +118,31 @@ export class FlacMuxer extends Muxer {
 		const descriptionBitstream = new Bitstream(
 			toUint8Array(decoderConfig.description),
 		);
-		// skip 'fLaC' + block size + frame size + sample rate + number of channels
+		// skip 'fLaC' + the metadata block header, then read the block sizes
 		// See demuxer for the exact structure
-		descriptionBitstream.skipBits(103 + 64);
+		descriptionBitstream.skipBits(64);
+		const minimumBlockSize = descriptionBitstream.readBits(16);
+		const maximumBlockSize = descriptionBitstream.readBits(16);
+		// skip frame size + sample rate + number of channels
+		descriptionBitstream.skipBits(24 + 24 + 20 + 3);
 		this.bitsPerSample = descriptionBitstream.readBits(5) + 1;
 
 		if (this.format._options.appendOnly) {
+			// https://www.rfc-editor.org/rfc/rfc9639.html#name-streaminfo
+			// A stream with a fixed block size states it as both the minimum and maximum block size: decoders such as
+			// libFLAC take a stream whose minimum and maximum differ as one with a variable block size, can't place
+			// frames numbered by frame (instead of sample) in it, and fail to seek. Only for a variable block size may
+			// the sizes be looser than the actual ones, so for those, we use the full valid range (16-65535): "This is
+			// because the encoder has to write these fields before receiving any input audio data and cannot know
+			// beforehand what block sizes it will use." Like the rest of the header, the block size comes from the
+			// decoder config.
+			const isFixedBlockSize = minimumBlockSize === maximumBlockSize && minimumBlockSize >= 16;
+			this.declaredFixedBlockSize = isFixedBlockSize ? minimumBlockSize : null;
+
 			// Write STREAMINFO immediately since we can't seek back later.
 			this.writeHeader({
-				// https://www.rfc-editor.org/rfc/rfc9639.html#name-streaminfo
-				// Per RFC 9639, min/max block sizes can be looser than
-				// actual values, so we use the full valid range (16–65535).
-				// "The actual max block size MAY be smaller than what's
-				// listed, and the actual min (excluding last block) MAY be
-				// larger. This is because the encoder has to write these
-				// fields before receiving any input audio data and cannot
-				// know beforehand what block sizes it will use."
-				minimumBlockSize: 16,
-				maximumBlockSize: 65535,
+				minimumBlockSize: isFixedBlockSize ? minimumBlockSize : 16,
+				maximumBlockSize: isFixedBlockSize ? maximumBlockSize : 65535,
 				// https://www.rfc-editor.org/rfc/rfc9639.html#name-streaminfo
 				// "A value of 0 signifies that the value is not known."
 				minimumFrameSize: 0,
@@ -350,6 +359,17 @@ export class FlacMuxer extends Muxer {
 			if (!this.format._options.appendOnly) {
 				this.blockSizes.push(blockSize);
 				this.frameSizes.push(data.length);
+			}
+
+			if (this.declaredFixedBlockSize !== null && blockSize > this.declaredFixedBlockSize) {
+				// Decoders such as FFmpeg's drop frames larger than STREAMINFO's maximum block size, which was already
+				// written, so let's fail instead of writing audio that would be lost. A shorter frame (as where streams
+				// are joined) is decoded fine.
+				throw new Error(
+					`Cannot write a FLAC frame of ${blockSize} samples in append-only mode, as the STREAMINFO already`
+					+ ` written declares a fixed block size of ${this.declaredFixedBlockSize} samples, taken from the`
+					+ ' decoder config. To join streams with different block sizes, disable appendOnly.',
+				);
 			}
 
 			const startPos = this.writer.getPos();
