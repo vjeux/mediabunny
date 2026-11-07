@@ -930,9 +930,9 @@ test('MPEG-TS with AUD-less video packets', async () => {
 test('MPEG-TS finds audio frames in PES packets that start inside a frame', async () => {
 	// Found by L80. Audio PES packets needn't be aligned to frames (data_alignment_indicator 0), so a PES packet can
 	// begin with the tail of a frame, and the frame sync search that a lookup starts there locks onto any bytes in it
-	// that look like a frame header. Here, MP3 frames of 104 bytes (MPEG-1 Layer III, 32 kbit/s, 44.1 kHz) in PES
-	// packets of 150 bytes, each stamped with the PTS of the first frame starting in it (H.222.0), with a fake header
-	// in each leftover. Expected: every frame's own timestamp finds it, as sequential reading does.
+	// that look like a frame header. Here, MP3 frames of 104 bytes (MPEG-1 Layer III, 32 kbit/s, 44.1 kHz, stereo) in
+	// PES packets of 150 bytes, each stamped with the PTS of the first frame starting in it (H.222.0), with a fake
+	// header in each leftover.
 	const frameSize = 104;
 	const frameCount = 24;
 	const frames = new Uint8Array(frameSize * frameCount);
@@ -942,56 +942,80 @@ test('MPEG-TS finds audio frames in PES packets that start inside a frame', asyn
 	for (let start = 150; start < frames.length; start += 150) {
 		const frameEnd = Math.ceil(start / frameSize) * frameSize;
 		if (frameEnd - start >= 8) {
-			frames.set([0xff, 0xf6, 0xd4, 0xed], start + 2); // A fake header in the leftover
+			frames.set([0xff, 0xf6, 0xd4, 0xed], start + 2); // A fake header (24 kHz, mono) in the leftover
 		}
 	}
 
-	const packets: Uint8Array[] = [];
-	const pushPackets = (pid: number, payload: number[]) => {
-		for (let i = 0; i < payload.length; i += 184) {
-			const chunk = payload.slice(i, i + 184);
-			const packet = new Uint8Array(188);
-			const stuffing = 184 - chunk.length;
-			packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, stuffing ? 0x30 : 0x10], 0);
-			if (stuffing) {
-				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
-				packet.fill(0xff, 6, 4 + stuffing);
+	// The stream, from `skip` bytes into the frames on
+	const buildFile = (skip: number) => {
+		const packets: Uint8Array[] = [];
+		const pushPackets = (pid: number, payload: number[]) => {
+			for (let i = 0; i < payload.length; i += 184) {
+				const chunk = payload.slice(i, i + 184);
+				const packet = new Uint8Array(188);
+				const stuffing = 184 - chunk.length;
+				packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, stuffing ? 0x30 : 0x10], 0);
+				if (stuffing) {
+					packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+					packet.fill(0xff, 6, 4 + stuffing);
+				}
+				packet.set(chunk, 4 + stuffing);
+				packets.push(packet);
 			}
-			packet.set(chunk, 4 + stuffing);
-			packets.push(packet);
+		};
+
+		pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+		pushPackets(0x1000, [
+			0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x03, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+		]);
+		for (let start = skip; start < frames.length; start += 150) {
+			const pts = Math.round(Math.ceil(start / frameSize) * 1152 * 90_000 / 44_100);
+			const data = [...frames.subarray(start, start + 150)];
+			pushPackets(0x100, [
+				0, 0, 1, 0xc0, (data.length + 8) >> 8, (data.length + 8) & 0xff, 0x84, 0x80, 5,
+				0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
+				((pts << 1) & 0xfe) | 1, ...data,
+			]);
 		}
+
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+		return bytes;
 	};
 
-	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
-	pushPackets(0x1000, [
-		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x03, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
-	]);
-	for (let start = 0; start < frames.length; start += 150) {
-		const pts = Math.round(Math.ceil(start / frameSize) * 1152 * 90_000 / 44_100);
-		const data = [...frames.subarray(start, start + 150)];
-		pushPackets(0x100, [
-			0, 0, 1, 0xc0, (data.length + 8) >> 8, (data.length + 8) & 0xff, 0x84, 0x80, 5,
-			0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff,
-			((pts << 1) & 0xfe) | 1, ...data,
-		]);
-	}
+	const readAll = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const packets: [number, number][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([packet.timestamp, packet.byteLength]);
+		}
+		return {
+			sampleRate: await track.getSampleRate(),
+			numberOfChannels: await track.getNumberOfChannels(),
+			packets,
+		};
+	};
 
-	const bytes = new Uint8Array(188 * packets.length);
-	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
-
-	using input = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
-	const sequential: [number, number][] = [];
-	for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
-		sequential.push([packet.timestamp, packet.byteLength]);
-	}
-	expect(sequential).toHaveLength(frameCount);
-
-	for (const [timestamp, byteLength] of sequential) {
+	// Every frame's own timestamp finds it, as sequential reading does
+	const bytes = buildFile(0);
+	const { packets } = await readAll(bytes);
+	expect(packets).toHaveLength(frameCount);
+	for (const [timestamp, byteLength] of packets) {
 		// A fresh input, so that the lookup can't use reading state from before
-		using lookupInput = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
-		const packet = await new EncodedPacketSink((await lookupInput.getPrimaryAudioTrack())!).getPacket(timestamp);
+		using input = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
+		const packet = await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp);
 		expect([packet?.timestamp, packet?.byteLength]).toEqual([timestamp, byteLength]);
 	}
+
+	// A stream whose first PES packet begins with the tail of a frame, with a fake header in it, must not take its
+	// sample rate and channel count from that header
+	frames.set([0xff, 0xf6, 0xd4, 0xed], 56);
+	const lateStart = await readAll(buildFile(52));
+	expect(lateStart.sampleRate).toBe(44100);
+	expect(lateStart.numberOfChannels).toBe(2);
+	expect(lateStart.packets.map(x => x[1])).toEqual(Array<number>(frameCount - 1).fill(frameSize));
 });
 
 test('MPEG-TS drops an audio frame cut off by the end of the file', async () => {
