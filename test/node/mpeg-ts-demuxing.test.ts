@@ -1118,6 +1118,71 @@ test('MPEG-TS keeps the frame before one that lost a TS packet when PES packets 
 	expect(await readFrames(damaged)).toEqual(clean.slice(0, 21));
 });
 
+test('MPEG-TS drops the GOP of a key frame that lost a TS packet, also in streams without reordering', async () => {
+	// A stream of P-frames only loses just the frames that lost data, which decoders handle like a gap in frame_num.
+	// But nothing decodes without its key frame, so a damaged key frame takes its GOP with it (coordinator ruling). 20
+	// frames of a 64x64 x264 Baseline stream with a key frame every 4 (SPS and PPS, then stub slices of 600 bytes, so
+	// each frame spans several TS packets).
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x04, 0x26, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03,
+		0x00, 0xc8, 0x3c, 0x48, 0x99, 0x20];
+	const pps = [0x68, 0xcb, 0x83, 0xcb, 0x20];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 20; i++) {
+		const isKey = i % 4 === 0;
+		const sliceData = Array.from({ length: 600 }, (_, j) => 0x20 + (7 * j + i) % 0x60);
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...sliceData]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.42c00a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+	const tsPackets = Array.from({ length: bytes.length / 188 }, (_, i) => bytes.slice(188 * i, 188 * (i + 1)));
+	const isVideo = (packet: Uint8Array) => (((packet[1]! & 0x1f) << 8) | packet[2]!) === 0x100;
+	const frameStarts = tsPackets.flatMap((packet, i) => (isVideo(packet) && packet[1]! & 0x40 ? [i] : []));
+
+	const readFrameNumbers = async (packets: Uint8Array[]) => {
+		const data = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => data.set(packet, 188 * i));
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const frameNumbers: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			frameNumbers.push(Math.round(packet.timestamp * 25));
+		}
+		return frameNumbers;
+	};
+	const allFrames = Array.from({ length: 20 }, (_, i) => i);
+	expect(await readFrameNumbers(tsPackets)).toEqual(allFrames);
+
+	// Frame 5, a P-frame, loses a TS packet: only it goes. Frame 8, a key frame, gets transport_error_indicator on its
+	// second TS packet: frames 8 to 11 go, and the next GOP is intact.
+	const damaged = tsPackets.flatMap((packet, i) => {
+		if (i === frameStarts[5]! + 1) {
+			return [];
+		} else if (i === frameStarts[8]! + 1) {
+			const flagged = packet.slice();
+			flagged[1]! |= 0x80;
+			return [flagged];
+		}
+
+		return [packet];
+	});
+	expect(await readFrameNumbers(damaged)).toEqual(allFrames.filter(x => x !== 5 && (x < 8 || x > 11)));
+});
+
 test('MPEG-TS drops the rest of the GOP after a video frame that lost a TS packet, also for lookups', async () => {
 	// With B-frames, the frames after a damaged one can refer to it, and Chromium's decoder fails on a frame whose
 	// reference is missing (from L46's review). So everything up to the next key frame goes, and lookups made after

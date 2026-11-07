@@ -2947,7 +2947,8 @@ class PacketReadingContext {
 				}
 
 				if (!isBeforeFirstKeyFrame) {
-					if (this.dropsRestOfGop()) {
+					// Nothing after a damaged key frame decodes without it, whatever the stream
+					if (randomAccessIndicator === 1 || this.dropsRestOfGop()) {
 						this.extendDroppedRange(sequenceNumber);
 					}
 
@@ -2977,7 +2978,7 @@ class PacketReadingContext {
 	 * Whether the frames after one that lost data, up to the next key frame, are dropped too. That's needed where
 	 * frames can refer to frames that come later (B-frames): WebCodecs decoders in Chromium fail on such a frame when
 	 * its reference is missing. AVC streams without reordering (P-frames only) only lose the damaged frames, which
-	 * decoders handle like a gap in frame_num.
+	 * decoders handle like a gap in frame_num, unless that's a key frame.
 	 */
 	dropsRestOfGop() {
 		const stream = this.elementaryStream;
