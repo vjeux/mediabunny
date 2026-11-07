@@ -73,6 +73,7 @@ import {
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
 import { InBandParameterSetWriter } from '../codec-data';
 import { FileSlice } from '../reader';
+import { filterAv1SampleObus } from '../codec-data';
 import { Muxer } from '../muxer';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
@@ -1109,6 +1110,8 @@ export class MatroskaMuxer extends Muxer {
 					packet.type,
 					meta?.decoderConfig?.description,
 				);
+			} else if (track.source._codec === 'av1') {
+				packetData = filterAv1SampleObus(packetData);
 			}
 
 			const isKeyFrame = packet.type === 'key';
