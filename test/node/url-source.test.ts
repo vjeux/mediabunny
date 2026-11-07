@@ -92,6 +92,27 @@ test('UrlSource throws when reading from an evicted region in sequential mode', 
 	}
 });
 
+test('Disposing an Input clears the pending UrlSource retry timer', async () => {
+	const countTimers = () => process.getActiveResourcesInfo().filter(type => type === 'Timeout').length;
+	const logs = captureLogs();
+
+	try {
+		// Nothing listens on port 9, so the default policy keeps retrying, waiting longer and longer
+		const input = new Input({ source: new UrlSource('http://127.0.0.1:9/video.mp4'), formats: ALL_FORMATS });
+		const result = input.getFormat().catch((error: unknown) => error);
+		await new Promise(resolve => setTimeout(resolve, 1000)); // Now waiting before the third attempt
+		const timersWhileWaiting = countTimers();
+
+		input.dispose();
+		await result;
+
+		// A pending timer would keep Node from exiting, up to 16 seconds after disposal with the default policy
+		expect(countTimers()).toBe(timersWhileWaiting - 1);
+	} finally {
+		logs.stop();
+	}
+});
+
 test('UrlSource resumes with correct data when the connection dies in sequential mode', async () => {
 	// The server kills the connection partway through the first two responses. Since it doesn't support range
 	// requests, each resume response starts back at byte 0 and the already-delivered prefix must be skipped over

@@ -921,7 +921,7 @@ export const retriedFetch = async (
 			}
 
 			if (retryDelayInSeconds > 0) {
-				await wait(1000 * retryDelayInSeconds);
+				await wait(1000 * retryDelayInSeconds, requestInit.signal);
 			}
 
 			if (shouldStop()) {
@@ -1586,8 +1586,27 @@ export const clearIntervalUnthrottled = (timer: UnthrottledTimerHandle) => {
 	} satisfies UnthrottledTimerMessage);
 };
 
-export const wait = (ms: number) => {
-	return new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * Resolves after the given time, or right away once the signal aborts, clearing the timer then so that it doesn't keep
+ * the process alive.
+ */
+export const wait = (ms: number, signal?: AbortSignal | null) => {
+	return new Promise<void>((resolve) => {
+		if (signal?.aborted) {
+			resolve();
+			return;
+		}
+
+		const onAbort = () => {
+			clearTimeout(timeoutId);
+			resolve();
+		};
+		const timeoutId = setTimeout(() => {
+			signal?.removeEventListener('abort', onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener('abort', onAbort, { once: true });
+	});
 };
 
 export const rejectAfter = (ms: number, message = 'Promise rejected') => {
