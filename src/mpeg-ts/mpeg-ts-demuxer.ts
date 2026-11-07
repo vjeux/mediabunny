@@ -173,6 +173,54 @@ type Section = {
 	pid: number;
 	payload: Uint8Array<ArrayBufferLike>;
 	randomAccessIndicator: number;
+	/** Whether the end of the file cut the section off */
+	cutAtEnd: boolean;
+};
+
+/**
+ * Whether the TS packet's adaptation field pads it, which is how muxers make a PES packet end on a TS packet boundary.
+ * Only a PES packet whose data fills its last TS packet exactly ends without.
+ */
+const hasStuffing = (packet: TsPacket) => {
+	if (!(packet.adaptationFieldControl & 0b10)) {
+		return false;
+	}
+
+	const length = packet.body[0]!;
+	if (length === 0) {
+		return true; // The length byte itself is the stuffing
+	}
+
+	const flags = packet.body[1]!;
+	if ((flags & 0x1f) === 0) {
+		return true; // Without optional fields, the adaptation field is there to pad (2 bytes or more)
+	}
+
+	let usedLength = 1 + (flags & 0x10 ? 6 : 0) + (flags & 0x08 ? 6 : 0) + (flags & 0x04 ? 1 : 0);
+	if (flags & 0x02) {
+		usedLength += 1 + (packet.body[1 + usedLength] ?? 0); // transport_private_data
+	}
+	if (flags & 0x01) {
+		usedLength += 1 + (packet.body[1 + usedLength] ?? 0); // adaptation_field_extension
+	}
+
+	return length > usedLength;
+};
+
+/**
+ * Whether a section has all its data, as far as can be told: a bounded PES packet has its length, an unbounded one
+ * ends with stuffing.
+ */
+const sectionLooksComplete = (chunks: Uint8Array[], byteLength: number, lastPacketWithPayload: TsPacket | null) => {
+	const start = chunks[0];
+	if (start && start.length >= 6 && start[0] === 0 && start[1] === 0 && start[2] === 1) {
+		const pesPacketLength = (start[4]! << 8) | start[5]!;
+		if (pesPacketLength > 0) {
+			return byteLength >= 6 + pesPacketLength;
+		}
+	}
+
+	return !!lastPacketWithPayload && hasStuffing(lastPacketWithPayload);
 };
 
 // Remember them so the warning doesn't get spammed
@@ -187,6 +235,8 @@ export class MpegTsDemuxer extends Demuxer {
 	packetOffset = 0;
 	packetStride = -1;
 	sectionEndPositions: number[] = [];
+	/** Start positions of the sections that the end of the file cut off */
+	cutSectionStarts = new Set<number>();
 	seekChunkSize = 5 * 1024 * 1024; // 5 MiB, picked because most HLS segments are below this size
 	minReferencePointByteDistance = -1;
 	timestampWrapInfo: TimestampWrapInfo | null = null;
@@ -870,12 +920,19 @@ export class MpegTsDemuxer extends Demuxer {
 		let firstPacket: TsPacket | null = null;
 		let mustAddSectionEnd = true;
 		let randomAccessIndicator = 0;
+		let lastPacketWithPayload: TsPacket | null = null;
 
 		while (true) {
 			const packet = await this.readPacket(currentPos);
 			currentPos += this.packetStride;
 
 			if (!packet) {
+				if (full && firstPacket && !sectionLooksComplete(chunks, chunksByteLength, lastPacketWithPayload)) {
+					// The file ends before the section does. Since reading the section again stops at its known end,
+					// remember that.
+					this.cutSectionStarts.add(startPos);
+				}
+
 				break;
 			}
 
@@ -913,6 +970,7 @@ export class MpegTsDemuxer extends Demuxer {
 			}
 
 			if (hasPayload) {
+				lastPacketWithPayload = packet;
 				if (adaptationFieldLength === 0) {
 					chunks.push(packet.body);
 					chunksByteLength += packet.body.byteLength;
@@ -966,6 +1024,7 @@ export class MpegTsDemuxer extends Demuxer {
 			pid: firstPacket.pid,
 			payload: merged,
 			randomAccessIndicator,
+			cutAtEnd: this.cutSectionStarts.has(startPos),
 		};
 	}
 
@@ -1064,6 +1123,8 @@ type TimestampedPesPacketHeader = PesPacketHeader & {
 
 type PesPacket = PesPacketHeader & {
 	data: Uint8Array<ArrayBufferLike>;
+	/** Whether the end of the file cut the PES packet off */
+	cutAtEnd: boolean;
 };
 
 type TimestampedPesPacket = PesPacket & {
@@ -1173,6 +1234,7 @@ const readPesPacket = <T extends boolean>(
 	return {
 		...header,
 		data,
+		cutAtEnd: section.cutAtEnd,
 	} as T extends true ? TimestampedPesPacket : PesPacket;
 };
 
@@ -2313,8 +2375,9 @@ class PacketReadingContext {
 				}
 			}
 
-			// End of stream - emit whatever's left as the final packet, unless it holds no picture
-			if (frameStartFound) {
+			// End of stream - emit whatever's left as the final packet, unless it holds no picture or the file
+			// ends inside it (a cut frame fails decoding, with WebCodecs at the final flush, which ends the whole run)
+			if (frameStartFound && !last(this.pesPackets)?.cutAtEnd) {
 				assert(packetStartPos !== null);
 
 				const packetLength = this.endPos - packetStartPos;

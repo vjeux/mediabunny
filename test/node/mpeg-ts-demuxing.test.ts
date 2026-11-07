@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +925,61 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS drops the video frame that the end of the file cuts off', async () => {
+	// From L80's review. A recording stopped mid-write or a partial download ends inside a frame, which fails decoding
+	// (with WebCodecs at the final flush: "EncodingError: Error during flush.", which ends the whole run). Unbounded
+	// PES packets don't say how long they are, but muxers end each one with stuffing in its last TS packet, which a cut
+	// one lacks. 20 frames of a 64x64 x264 stream (SPS and PPS, then stub slices of 600 bytes, so each frame spans
+	// several TS packets).
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 20; i++) {
+		const slice = nalUnit([i === 0 ? 0x65 : 0x41, 0x88, ...new Array<number>(600).fill(0x20 + i)]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(i === 0 ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				i === 0 ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const readFrames = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const frames: Uint8Array[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			frames.push(packet.data);
+		}
+		return frames;
+	};
+
+	const clean = await readFrames(bytes);
+	expect(clean).toHaveLength(20); // Complete PES packets end with stuffing
+
+	// Cut the file two TS packets into the last frame's PES packet, at a TS packet boundary or inside a TS packet
+	const isVideoStart = (pos: number) => !!(bytes[pos + 1]! & 0x40)
+		&& (((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100;
+	let lastPesStart = bytes.length - 188;
+	while (!isVideoStart(lastPesStart)) {
+		lastPesStart -= 188;
+	}
+	for (const cutPos of [lastPesStart + 2 * 188, lastPesStart + 2 * 188 + 100]) {
+		const frames = await readFrames(bytes.subarray(0, cutPos));
+		expect(frames).toEqual(clean.slice(0, 19));
+	}
 });
