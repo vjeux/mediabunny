@@ -5,10 +5,15 @@ import fs from 'node:fs';
 import {
 	ALL_FORMATS,
 	BufferSource,
+	BufferTarget,
 	CustomSource,
+	EncodedAudioPacketSource,
+	EncodedPacket,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
+	MkvOutputFormat,
+	Output,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
@@ -138,4 +143,28 @@ test('A SeekPreRoll longer than the codec\'s pre-roll is honored', async () => {
 	// The 80 ms that Opus files usually declare, or none, leaves the codec's own (more conservative) pre-roll
 	expect(await getPreRollDuration(80_000_000)).toBe(0.4);
 	expect(await getPreRollDuration(null)).toBe(0.4);
+
+	// SeekPreRoll is in whole nanoseconds, so the codec's own pre-roll comes back rounded (Mediabunny's muxer writes it
+	// for every audio track). That doesn't count as more: AAC at 44.1 kHz keeps 1024 / 44100 s after a round trip.
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array([0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c]), 'key', 0, 1024 / 44100), {
+		decoderConfig: {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 1,
+			sampleRate: 44100,
+			description: new Uint8Array([0x12, 0x08]), // AAC-LC, 44.1 kHz, mono
+		},
+	});
+	await output.finalize();
+
+	using roundTripped = new Input({
+		source: new BufferSource(new Uint8Array(output.target.buffer!)),
+		formats: ALL_FORMATS,
+	});
+	const aacTrack = await roundTripped.getPrimaryAudioTrack();
+	assert(aacTrack);
+	expect(await aacTrack.getPreRollDuration()).toBe(1024 / 44100);
 });
