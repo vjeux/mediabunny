@@ -138,6 +138,15 @@ export abstract class OutputFormat {
 	_isFragmentedIsobmff() {
 		return false;
 	}
+
+	/**
+	 * How far below zero timestamps can go and still come out non-negative in the file, in seconds: with a
+	 * negativeTimestampSupport other than 'full', conversions copy tracks starting that much before zero as they are.
+	 * @internal
+	 */
+	get _negativeTimestampHeadroom() {
+		return 0;
+	}
 }
 
 /**
@@ -1148,6 +1157,9 @@ export type MpegTsOutputFormatOptions = {
 	 * otherwise be negative (caused by audio priming samples or B-frames) positive in the final file, since negative
 	 * timestamps trip up some players. A recommended value is 10 seconds.
 	 *
+	 * Conversions copy tracks that start no more than this offset before zero, like AAC with encoder priming, instead
+	 * of re-encoding them.
+	 *
 	 * Defaults to 0. When writing HLS, prefer {@link HlsOutputFormatOptions.mediaTimestampBase} instead.
 	 */
 	timestampOffset?: number;
@@ -1238,6 +1250,12 @@ export class MpegTsOutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return 'prefer-non-negative' as const;
+	}
+
+	/** @internal */
+	override get _negativeTimestampHeadroom() {
+		// The muxer adds the offset to every timestamp
+		return this._options.timestampOffset ?? 0;
 	}
 }
 
