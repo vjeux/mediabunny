@@ -237,6 +237,13 @@ export class MpegTsMuxer extends Muxer {
 		const release = await this.mutex.acquire();
 
 		try {
+			// The packets of a track that declared its decoder config up front may come without metadata, so the first
+			// one (which sets the track up) takes the declared config then
+			const isFirstPacket = !this.trackDatas.some(x => x.track === track);
+			if (isFirstPacket && !meta?.decoderConfig && track.metadata.decoderConfig) {
+				meta = { ...meta, decoderConfig: track.metadata.decoderConfig };
+			}
+
 			const trackData = this.getVideoTrackData(track, meta);
 
 			this.validateTimestamp(
@@ -270,6 +277,13 @@ export class MpegTsMuxer extends Muxer {
 		const release = await this.mutex.acquire();
 
 		try {
+			// The packets of a track that declared its decoder config up front may come without metadata, so the first
+			// one (which sets the track up) takes the declared config then
+			const isFirstPacket = !this.trackDatas.some(x => x.track === track);
+			if (isFirstPacket && !meta?.decoderConfig && track.metadata.decoderConfig) {
+				meta = { ...meta, decoderConfig: track.metadata.decoderConfig };
+			}
+
 			const trackData = this.getAudioTrackData(track, meta);
 
 			this.validateTimestamp(
