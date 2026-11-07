@@ -20,6 +20,7 @@ import {
 	binarySearchLessOrEqual,
 	clamp,
 	findLast,
+	findLastIndex,
 	isThenable,
 	last,
 	roundIfAlmostInteger,
@@ -1397,6 +1398,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		let lastEncodedPacket: EncodedPacket | null = null;
 		let lastEncodedPacketMetadata: EncodedPacketMetadata | null = null;
 
+		// The granule position that the timestamps are derived from, if they are, and the timestamp it maps to
+		const timestampsComeFromGranulePosition = !currentTimestampIsCorrect;
+		let referenceGranulePosition: number | null = null;
+		let referenceTimestampInSamples = 0;
+
 		// Alright, now it's time for the final, granular seek: We keep iterating over packets until we've found the
 		// one with the correct timestamp - i.e., the last one with a timestamp <= the timestamp we're looking for.
 		while (currentPage !== null) {
@@ -1459,6 +1465,16 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					currentTimestampInSamples += encodedPacketMetadata.durationInSamples;
 				}
 
+				if (
+					timestampsComeFromGranulePosition
+					&& referenceGranulePosition === null
+					&& packet.endPage.headerStartPos === endPage.headerStartPos
+					&& packet.endSegmentIndex === endSegmentIndex
+				) {
+					referenceGranulePosition = endPage.granulePosition;
+					referenceTimestampInSamples = currentTimestampInSamples;
+				}
+
 				lastEncodedPacket = encodedPacket;
 				lastEncodedPacketMetadata = encodedPacketMetadata;
 
@@ -1484,7 +1500,84 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			currentSegmentIndex = nextPosition.startSegmentIndex;
 		}
 
+		// Some muxers (VLC, for one) write granule positions that disagree with the packet durations by a sample. The
+		// timestamps derived from such a granule position come out a sample later than when iterating from the start,
+		// where each timestamp is the sum of the preceding durations. Where the next page's granule position shows that
+		// (by being a sample behind the durations), let's report iteration's timestamps instead, so that both agree and
+		// a packet looked up by its own timestamp is that packet.
+		if (lastEncodedPacket && lastEncodedPacketMetadata && referenceGranulePosition !== null) {
+			const deviation = await this.getNextGranulePositionDeviation(
+				lastEncodedPacket,
+				endPage,
+				referenceTimestampInSamples,
+			);
+
+			if (deviation === -1) {
+				// The packet after the found one may start at or before the timestamp by iteration's timestamps
+				const nextPacket = currentTimestampInSamples - 1 <= timestampInSamples
+					? await this.getNextPacket(lastEncodedPacket, options)
+					: null;
+				return this.shiftEncodedPacket(nextPacket ?? lastEncodedPacket, -1, options);
+			}
+		}
+
 		return lastEncodedPacket;
+	}
+
+	/** Returns a copy of a packet created by this track, with its timestamp shifted by the given number of samples. */
+	shiftEncodedPacket(packet: EncodedPacket, shiftInSamples: number, options: PacketRetrievalOptions) {
+		const metadata = this.encodedPacketToMetadata.get(packet);
+		assert(metadata);
+
+		return this.createEncodedPacketFromOggPacket(
+			metadata.packet,
+			{
+				...metadata, // Whatever else the packet was created with
+				timestampInSamples: metadata.timestampInSamples + shiftInSamples,
+				vorbisLastBlocksize: metadata.vorbisLastBlockSize,
+			},
+			options,
+		);
+	}
+
+	/**
+	 * Starting with the given packet, finds the first page after the reference page on which a packet ends, and returns
+	 * by how many samples its granule position deviates from what the packet durations add up to, relative to the
+	 * reference page's granule position and timestamp. Returns null if there's no such page in the logical bitstream,
+	 * or if it's the final page, whose granule position may signal end trimming.
+	 */
+	async getNextGranulePositionDeviation(
+		packet: EncodedPacket,
+		referencePage: Page,
+		referenceTimestampInSamples: number,
+	) {
+		let currentPacket: EncodedPacket | null = packet;
+
+		while (currentPacket) {
+			const metadata = this.encodedPacketToMetadata.get(currentPacket);
+			assert(metadata);
+
+			const page = metadata.packet.endPage;
+			if (page.serialNumber !== referencePage.serialNumber) {
+				return null;
+			}
+
+			// A page's granule position is the end of the last packet that ends on it
+			const endsPage = metadata.packet.endSegmentIndex === findLastIndex([...page.lacingValues], x => x < 255);
+			if (endsPage && page.headerStartPos > referencePage.headerStartPos) {
+				if (page.headerType & 0x04) {
+					return null;
+				}
+
+				const endInSamples = metadata.timestampInSamples + metadata.durationInSamples;
+				const durationsSum = endInSamples - referenceTimestampInSamples;
+				return (page.granulePosition - referencePage.granulePosition) - durationsSum;
+			}
+
+			currentPacket = await this.getNextPacket(currentPacket, { metadataOnly: true });
+		}
+
+		return null;
 	}
 
 	// A slower but simpler and sequential algorithm for finding a packet in a file
