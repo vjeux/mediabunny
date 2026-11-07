@@ -15,7 +15,7 @@ import {
 } from 'mediabunny';
 import { sendCommand, refWorker, unrefWorker } from './worker-client';
 import { assert } from './shared';
-import { AC3_SAMPLE_RATES, EAC3_REDUCED_SAMPLE_RATES } from '../../../shared/ac3-misc';
+import { AC3_SAMPLE_RATES } from '../../../shared/ac3-misc';
 
 // The valid AC-3 bitrates
 const AC3_BITRATES = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640]
@@ -58,15 +58,12 @@ class Ac3Encoder extends CustomAudioEncoder {
 	private nextSampleTimestampInSamples: number | null = null;
 
 	static override supports(codec: AudioCodec, config: AudioEncoderConfig): boolean {
-		const sampleRates = codec === 'eac3'
-			? [...AC3_SAMPLE_RATES, ...EAC3_REDUCED_SAMPLE_RATES]
-			: AC3_SAMPLE_RATES;
-
+		// FFmpeg's encoders top out at 5.1 and can't do E-AC-3's reduced sample rates
 		if (
 			(codec !== 'ac3' && codec !== 'eac3')
 			|| config.numberOfChannels < 1
-			|| config.numberOfChannels > 6 // FFmpeg's encoders top out at 5.1
-			|| !sampleRates.includes(config.sampleRate)
+			|| config.numberOfChannels > 6
+			|| !AC3_SAMPLE_RATES.includes(config.sampleRate)
 			|| config.bitrate === undefined
 		) {
 			return false;

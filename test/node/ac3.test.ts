@@ -503,12 +503,15 @@ test('AC-3 and E-AC-3 encode real content at the lowest bitrate they claim', { t
 
 	expect(failures).toEqual([]);
 
-	// FFmpeg's encoders top out at 5.1
+	// FFmpeg's encoders top out at 5.1 and can't do E-AC-3's reduced sample rates
+	const quality = new Quality({ bitrate: 448000 });
 	for (const codec of ['ac3', 'eac3'] as const) {
 		for (const channels of [7, 8]) {
-			const quality = new Quality({ bitrate: 448000 });
 			expect(await canEncodeAudio(codec, { numberOfChannels: channels, sampleRate: 48000, quality })).toBe(false);
 		}
+	}
+	for (const sampleRate of [16000, 22050, 24000]) {
+		expect(await canEncodeAudio('eac3', { numberOfChannels: 2, sampleRate, quality })).toBe(false);
 	}
 });
 
