@@ -1317,6 +1317,19 @@ export const validateVideoChunkMetadata = (
 	}
 };
 
+/** Checks that an Opus identification header has all the fields of Section 5.1 of RFC 7845. */
+const isCompleteOpusIdentificationHeader = (bytes: Uint8Array) => {
+	// 'OpusHead', version, channel count, pre-skip, input sample rate, output gain and channel mapping family
+	if (bytes.byteLength < 19) {
+		return false;
+	}
+
+	// Any mapping family but 0 is followed by the stream count, the coupled stream count and one byte per channel
+	const outputChannelCount = bytes[9]!;
+	const channelMappingFamily = bytes[18]!;
+	return channelMappingFamily === 0 || bytes.byteLength >= 21 + outputChannelCount;
+};
+
 const VALID_AUDIO_CODEC_STRING_PREFIXES = [
 	'mp4a', 'mp3', 'opus', 'vorbis', 'flac', 'ulaw', 'alaw', 'pcm', 'ac-3', 'ec-3', 'dts', 'mlpa',
 ];
@@ -1406,7 +1419,10 @@ export const validateAudioChunkMetadata = (
 			throw new TypeError('Audio chunk metadata decoder configuration codec string for Opus must be "opus".');
 		}
 
-		if (metadata.decoderConfig.description && metadata.decoderConfig.description.byteLength < 18) {
+		if (
+			metadata.decoderConfig.description
+			&& !isCompleteOpusIdentificationHeader(toUint8Array(metadata.decoderConfig.description))
+		) {
 			// Description is optional for Opus per-spec, so we shouldn't enforce it
 			throw new TypeError(
 				'Audio chunk metadata decoder configuration description, when specified, is expected to be an'
