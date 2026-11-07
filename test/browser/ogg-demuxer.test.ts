@@ -87,7 +87,57 @@ const readPackets = async (source: BufferSource | ReadableStreamSource) => {
 	return { packets, duration: await track.computeDuration() };
 };
 
-test('reads all links of a chained Opus stream', async () => {
+/**
+ * Decodes the packets with WebCodecs alone, never with Mediabunny, to tell whether the platform's own decoder can
+ * decode them, so that a Mediabunny failure on a capable platform fails instead of skipping. Returns the number of
+ * frames decoded, or null if the platform can't decode them.
+ */
+const decodeNatively = async (config: AudioDecoderConfig, packets: EncodedPacket[]) => {
+	try {
+		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
+			return null;
+		}
+	} catch {
+		return null;
+	}
+
+	let frames = 0;
+	let failed = false;
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			frames += data.numberOfFrames;
+			data.close();
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+	try {
+		decoder.configure(config);
+		for (const packet of packets) {
+			decoder.decode(new EncodedAudioChunk({
+				type: 'key',
+				timestamp: Math.round(packet.timestamp * 1e6),
+				duration: Math.round(packet.duration * 1e6),
+				data: packet.data,
+			}));
+		}
+		// A decoder that fails may also never settle
+		failed ||= !await Promise.race([
+			decoder.flush().then(() => true, () => false),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+		]);
+	} catch {
+		failed = true;
+	}
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return failed ? null : frames;
+};
+
+test('reads all links of a chained Opus stream', async ({ skip }) => {
 	const { links, packetCount } = await remuxToOggLinks('/preroll-test.opus', [100, 220]);
 	const file = concatBytes(links);
 
@@ -105,9 +155,12 @@ test('reads all links of a chained Opus stream', async () => {
 	const preSkip = 312 / 48000;
 	expect(duration).toBeCloseTo(linkDurations[0]! + linkDurations[1]! + linkDurations[2]! + 2 * preSkip, 9);
 
-	// That's also what Chrome's own Ogg demuxer makes of it
+	// The browser's own Ogg demuxer agrees on the length of the chain. Chrome's makes exactly that of it, as it doesn't
+	// reset its decoder between links either. Firefox's decodes each link on its own and trims at the joins instead,
+	// by up to a pre-skip and a packet per join (1272 frames fewer in all for this file).
 	const audioBuffer = await new OfflineAudioContext(1, 1, 48000).decodeAudioData(file.slice().buffer);
-	expect(audioBuffer.length).toBe(Math.round(duration * 48000));
+	const joins = links.length - 1;
+	expect(Math.abs(audioBuffer.length - Math.round(duration * 48000))).toBeLessThanOrEqual(joins * (312 + 960));
 
 	// Random access finds the same packets, also in later links
 	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
@@ -127,7 +180,10 @@ test('reads all links of a chained Opus stream', async () => {
 	const streamed = await readPackets(new ReadableStreamSource(stream));
 	expect(streamed.packets.map(x => x.timestamp)).toEqual(packets.map(x => x.timestamp));
 
-	// And the whole stream decodes
+	// And the whole stream decodes, wherever the platform's own decoder can decode these packets
+	const decoderConfig = (await (await input.getPrimaryAudioTrack())!.getDecoderConfig())!;
+	const nativelyDecodable = await decodeNatively(decoderConfig, packets) !== null;
+	skip(!nativelyDecodable, 'the platform can\'t decode these packets (native probe)');
 	let decodedFrames = 0;
 	for await (using sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
 		decodedFrames += sample.numberOfFrames;
