@@ -1,14 +1,14 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
-import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { BufferTarget, StreamTarget, StreamTargetChunk } from '../../src/target.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -731,3 +731,194 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+/**
+ * Records a generated track (40 frames, 30 FPS timestamps) through a MediaStreamVideoTrackSource into a fragmented MP4
+ * StreamTarget. With `stall`, the target's sink stops taking data at its second write (like a stalled upload) until the
+ * recording is done. The frames handed to the source by the real MediaStreamTrackProcessor are observed on the way.
+ */
+const recordIntoSink = async (options: { stall: boolean; frameRate: number | null; frameIntervalMs: number }) => {
+	const deliveredFrames: VideoFrame[] = [];
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const RealProcessor = MediaStreamTrackProcessor;
+	globals.MediaStreamTrackProcessor = class {
+		readable: ReadableStream<VideoFrame>;
+
+		constructor(init: { track: MediaStreamVideoTrack }) {
+			this.readable = new RealProcessor(init).readable.pipeThrough(new TransformStream<VideoFrame, VideoFrame>({
+				transform: (frame, controller) => {
+					deliveredFrames.push(frame);
+					controller.enqueue(frame);
+				},
+			}));
+		}
+	};
+
+	try {
+		let writes = 0;
+		let encoded = 0;
+		let encodedBeforeStall: number | null = null;
+		let releaseSink!: () => void;
+		const sinkReleased = new Promise<void>((resolve) => {
+			releaseSink = resolve;
+		});
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration: 0.05 }),
+			target: new StreamTarget(new WritableStream<StreamTargetChunk>({
+				write: () => {
+					writes++;
+					if (!options.stall || writes === 1) {
+						return;
+					}
+
+					encodedBeforeStall ??= encoded;
+					return sinkReleased;
+				},
+			})),
+		});
+
+		const generator = new MediaStreamTrackGenerator({ kind: 'video' });
+		const writer = generator.writable.getWriter();
+		const videoSource = new MediaStreamVideoTrackSource(
+			generator as unknown as MediaStreamVideoTrack,
+			{
+				codec: 'vp8',
+				quality: new Quality('low'),
+				keyFrameInterval: 0.1,
+				onEncodedSample: () => encoded++,
+			},
+			{ frameRate: options.frameRate },
+		);
+		const errors: unknown[] = [];
+		videoSource.errorPromise.catch(error => errors.push(error));
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		const canvas = new OffscreenCanvas(320, 240);
+		const context = canvas.getContext('2d')!;
+		for (let i = 0; i < 40; i++) {
+			context.fillStyle = `hsl(${9 * i}, 80%, 50%)`;
+			context.fillRect(0, 0, canvas.width, canvas.height);
+			await writer.write(new VideoFrame(canvas, { timestamp: 33333 * i }));
+			await new Promise(resolve => setTimeout(resolve, options.frameIntervalMs));
+		}
+		await new Promise(resolve => setTimeout(resolve, 200));
+
+		const result = {
+			delivered: deliveredFrames.length,
+			open: deliveredFrames.filter(frame => frame.format !== null).length,
+			encoded,
+			encodedWhileStalled: encodedBeforeStall === null ? null : encoded - encodedBeforeStall,
+		};
+
+		releaseSink();
+		await writer.close();
+		await output.finalize();
+		expect(errors).toEqual([]);
+
+		return result;
+	} finally {
+		globals.MediaStreamTrackProcessor = RealProcessor;
+	}
+};
+
+test.for([
+	{ name: 'as they come', frameRate: null, frameIntervalMs: 10 },
+	{ name: 'at a constant frame rate', frameRate: 30, frameIntervalMs: 25 },
+])(
+	'MediaStreamVideoTrackSource, frames taken $name are dropped rather than held while the output can\'t take data',
+	async ({ frameRate, frameIntervalMs }, { skip }) => {
+		if (typeof MediaStreamTrackGenerator === 'undefined' || typeof MediaStreamTrackProcessor === 'undefined') {
+			skip('Needs MediaStreamTrackGenerator and MediaStreamTrackProcessor (Chromium)');
+		}
+
+		const result = await recordIntoSink({ stall: true, frameRate, frameIntervalMs });
+		expect(result.delivered).toBeGreaterThanOrEqual(30);
+		expect(result.encodedWhileStalled).not.toBe(null);
+
+		// Each frame handed to the encoder is held until the output has taken what came before it. So, while the output
+		// takes nothing, at most a few frames get through, the ones that were on their way when it stopped
+		expect(result.encodedWhileStalled).toBeLessThanOrEqual(16);
+		if (frameRate === null) {
+			// The frames themselves, which here are the ones the processor delivered
+			expect(result.open).toBeLessThanOrEqual(10);
+		}
+	},
+);
+
+test('MediaStreamVideoTrackSource, drops no frame and holds none when the output keeps up', async ({ skip }) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined' || typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator and MediaStreamTrackProcessor (Chromium)');
+	}
+
+	const result = await recordIntoSink({ stall: false, frameRate: null, frameIntervalMs: 10 });
+	expect(result.delivered).toBeGreaterThanOrEqual(30);
+	expect(result.encoded).toBe(result.delivered);
+	expect(result.open).toBeLessThanOrEqual(1);
+});
+
+test('MediaStreamVideoTrackSource, frames waiting for the encoder\'s setup aren\'t dropped', async ({ skip }) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined' || typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator and MediaStreamTrackProcessor (Chromium)');
+	}
+
+	// Holds the encoder's setup, like a slow hardware encoder would
+	let releaseSetup!: () => void;
+	const setupReleased = new Promise<void>((resolve) => {
+		releaseSetup = resolve;
+	});
+	const originalIsConfigSupported = VideoEncoder.isConfigSupported.bind(VideoEncoder);
+	VideoEncoder.isConfigSupported = async (config) => {
+		await setupReleased;
+		return originalIsConfigSupported(config);
+	};
+
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const generator = new MediaStreamTrackGenerator({ kind: 'video' });
+		const writer = generator.writable.getWriter();
+		let encoded = 0;
+		const videoSource = new MediaStreamVideoTrackSource(
+			generator as unknown as MediaStreamVideoTrack,
+			{ codec: 'vp8', quality: new Quality('low'), onEncodedSample: () => encoded++ },
+			{ frameRate: null },
+		);
+		const errors: unknown[] = [];
+		videoSource.errorPromise.catch(error => errors.push(error));
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		const canvas = new OffscreenCanvas(64, 48);
+		const context = canvas.getContext('2d')!;
+		for (let i = 0; i < 20; i++) {
+			context.fillStyle = `rgb(${10 * i}, 0, 0)`;
+			context.fillRect(0, 0, canvas.width, canvas.height);
+			await writer.write(new VideoFrame(canvas, { timestamp: 33333 * i }));
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		releaseSetup();
+
+		// Let the encoder take the frames before finalizing
+		const deadline = performance.now() + 2000;
+		while (encoded < 20 && performance.now() < deadline) {
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		await writer.close();
+		await output.finalize();
+		expect(errors).toEqual([]);
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		let packets = 0;
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryVideoTrack())!).packets()) {
+			expect(packet.timestamp).toBeCloseTo(packets / 30, 3);
+			packets++;
+		}
+		expect(packets).toBe(20);
+	} finally {
+		releaseSetup();
+		VideoEncoder.isConfigSupported = originalIsConfigSupported;
+	}
+});
