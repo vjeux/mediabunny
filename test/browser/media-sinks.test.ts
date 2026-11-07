@@ -125,41 +125,53 @@ test('Audio decoder pre-roll (AAC)', async () => {
 	await testAudioDecoderPreRoll(track, -90);
 });
 
-// SBR keeps state across frames, so HE-AAC needs two frames of pre-roll. Its noise generator never quite
-// converges, hence the higher error bound than for AAC-LC. Both files were made with:
+// SBR keeps state across frames, so HE-AAC needs two frames of pre-roll, and parametric stereo (HE-AACv2) only kicks in
+// at a frame carrying a PS header, which libfdk sends every 10 frames. SBR's noise generator never quite converges,
+// hence the higher error bound than for AAC-LC. The files were made with:
 // ffmpeg -f lavfi -i "anoisesrc=color=pink:amplitude=0.5:duration=2:seed=1,lowpass=f=4000"
 //   -c:a libfdk_aac -profile:a aac_he -b:a 32k he-aac-2s.m4a (and he-aac-2s.aac)
-test('Audio decoder pre-roll (HE-AAC)', async () => {
-	using input = new Input({
-		source: new UrlSource('/he-aac-2s.m4a'),
-		formats: ALL_FORMATS,
-	});
-
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	await testAudioDecoderPreRoll(track, -30);
-});
-
-test('Audio decoder pre-roll (HE-AAC signaled implicitly, ADTS)', async () => {
-	using input = new Input({
-		source: new UrlSource('/he-aac-2s.aac'),
-		formats: ALL_FORMATS,
-	});
-
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	await testAudioDecoderPreRoll(track, -30);
-});
-
-// Parametric stereo (HE-AACv2) only kicks in at a frame carrying a PS header, which libfdk sends every 10 frames:
 // ffmpeg -f lavfi -i "aevalsrc=0.4*sin(2*PI*(220*t+300*t*t))|0.3*sin(2*PI*330*t):s=48000:d=2"
-//   -c:a libfdk_aac -profile:a aac_he_v2 he-aac-v2-2s.m4a (and he-aac-v2-2s.aac, where PS is only signaled implicitly)
-for (const [label, url] of [['HE-AACv2', '/he-aac-v2-2s.m4a'], ['HE-AACv2, ADTS', '/he-aac-v2-2s.aac']]) {
-	test(`Audio decoder pre-roll (${label})`, async () => {
+//   -c:a libfdk_aac -profile:a aac_he_v2 he-aac-v2-2s.m4a (and he-aac-v2-2s.aac)
+// In ADTS, SBR and PS are only signaled implicitly. The MP4 files start below zero (an edit list cuts the encoder
+// delay).
+const heAacPreRollCases = [
+	{ label: 'HE-AAC', url: '/he-aac-2s.m4a', startsBelowZero: true },
+	{ label: 'HE-AAC signaled implicitly, ADTS', url: '/he-aac-2s.aac', startsBelowZero: false },
+	{ label: 'HE-AACv2', url: '/he-aac-v2-2s.m4a', startsBelowZero: true },
+	{ label: 'HE-AACv2, ADTS', url: '/he-aac-v2-2s.aac', startsBelowZero: false },
+];
+
+// WebKitGTK's GStreamer decoders scramble the timestamps that follow a negative one, so there, a file that starts below
+// zero can't be decoded straight through for the reference. This asks the platform's own decoder, not Mediabunny.
+const decodesNegativeTimestampsInOrder = async () => {
+	const timestamps: number[] = [];
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			timestamps.push(data.timestamp);
+			data.close();
+		},
+		error: () => {},
+	});
+	decoder.configure({ codec: 'pcm-s16', sampleRate: 48000, numberOfChannels: 1 });
+	for (const timestamp of [-20000, 0, 20000]) {
+		decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp, data: new Uint8Array(1920) }));
+	}
+	await Promise.race([decoder.flush().catch(() => {}), new Promise(resolve => setTimeout(resolve, 2000))]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return timestamps.join() === '-20000,0,20000';
+};
+
+for (const { label, url, startsBelowZero } of heAacPreRollCases) {
+	test(`Audio decoder pre-roll (${label})`, async (context) => {
+		if (startsBelowZero && !(await decodesNegativeTimestampsInOrder())) {
+			context.skip('the platform\'s decoder scrambles negative timestamps (native probe)');
+		}
+
 		using input = new Input({
-			source: new UrlSource(url!),
+			source: new UrlSource(url),
 			formats: ALL_FORMATS,
 		});
 
