@@ -545,6 +545,9 @@ test('VideoSampleSource, keyFrameInterval puts a key frame on every multiple of 
 			codec: 'vp8',
 			quality: new Quality('low'),
 			keyFrameInterval,
+			// In quality mode, encoders may add key frames of their own, which WebCodecs allows (Firefox's VP8 encoder
+			// places some at scene cuts)
+			latencyMode: 'realtime',
 			onEncodedPacket: (packet) => {
 				if (packet.type === 'key') {
 					keyTimestamps.push(packet.timestamp);
