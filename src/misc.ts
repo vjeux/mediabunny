@@ -1760,6 +1760,16 @@ export class EventEmitter<TEvents extends Record<string, unknown>> {
 		listener: (data: TEvents[K]) => unknown,
 		options?: EventListenerOptions,
 	): () => void {
+		if (typeof listener !== 'function') {
+			throw new TypeError('listener must be a function.');
+		}
+		if (options !== undefined && (!options || typeof options !== 'object')) {
+			throw new TypeError('options, when provided, must be an object.');
+		}
+		if (options?.once !== undefined && typeof options.once !== 'boolean') {
+			throw new TypeError('options.once, when provided, must be a boolean.');
+		}
+
 		if (!this._listeners.has(event)) {
 			this._listeners.set(event, new Set());
 		}
