@@ -9,12 +9,14 @@ import {
 	Conversion,
 	EncodedPacket,
 	EncodedVideoPacketSource,
+	HlsOutputFormat,
 	Input,
 	MkvOutputFormat,
 	Mp4OutputFormat,
 	MpegTsOutputFormat,
 	Output,
 	OutputFormat,
+	PathedTarget,
 	Rotation,
 	TransformationMatrix,
 	VideoTrackMetadata,
@@ -190,6 +192,22 @@ test('Exact pixel aspect ratios, and their remuxes', async () => {
 		await conversion.execute();
 		return output.target.buffer!;
 	};
+	const remuxToHlsResolution = async (buffer: ArrayBuffer) => {
+		using input = new Input({ source: new BufferSource(buffer), formats: ALL_FORMATS });
+		let masterText = '';
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new MpegTsOutputFormat(),
+				onMaster: (text) => {
+					masterText = text;
+				},
+			}),
+			target: new PathedTarget('', () => new BufferTarget()),
+		});
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+		return /RESOLUTION=(\d+x\d+)/.exec(masterText)?.[1];
+	};
 
 	const anamorphic = { codec: 'avc1.64000c', codedWidth: 1920, codedHeight: 1080, description };
 	for (const format of [new Mp4OutputFormat(), new MkvOutputFormat()]) {
@@ -211,6 +229,28 @@ test('Exact pixel aspect ratios, and their remuxes', async () => {
 		squarePixelWidth: 1920,
 		displayAspect: [1920, 1080],
 	});
+	expect(await remuxToHlsResolution(exact)).toBe('1920x1080');
+
+	// The HLS muxer tells a display aspect ratio from a size in pixels by it being smaller than the frame in both
+	// dimensions, so a reduced ratio that isn't gives the rounded size, as before
+	const cases = [
+		// Coded size, display aspect written, display aspect read back, HLS resolution
+		[720, 480, 16, 9, [16, 9], '853x480'],
+		[718, 480, 718, 405, [851, 480], '851x480'],
+		[1918, 1078, 4384, 2079, [2273, 1078], '2273x1078'],
+	] as const;
+	for (const [codedWidth, codedHeight, displayAspectWidth, displayAspectHeight, displayAspect, resolution] of cases) {
+		const written = await write(
+			new Mp4OutputFormat(),
+			{ ...anamorphic, codedWidth, codedHeight, displayAspectWidth, displayAspectHeight },
+		);
+		expect(await read(written)).toEqual({
+			pixelAspectRatio: { num: 32, den: 27 },
+			squarePixelWidth: Math.round(codedWidth * 32 / 27),
+			displayAspect,
+		});
+		expect(await remuxToHlsResolution(written)).toBe(resolution);
+	}
 });
 
 test('Exact pixel aspect ratios from the SPS, in MP4 and MPEG-TS', async () => {
