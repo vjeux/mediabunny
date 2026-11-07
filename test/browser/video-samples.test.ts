@@ -438,6 +438,32 @@ test('RGB conversion for ArrayBuffer-backed data converts into the target color 
 	}
 });
 
+test('Closing a sample right after calling copyTo() still copies it, also when converting color spaces', async () => {
+	const displayP3 = {
+		primaries: 'smpte432' as VideoColorPrimaries,
+		transfer: 'iec61966-2-1' as VideoTransferCharacteristics,
+		matrix: 'rgb' as VideoMatrixCoefficients,
+		fullRange: true,
+	};
+
+	for (const colorSpace of [displayP3, undefined]) {
+		const sample = new VideoSample(new Uint8Array([200, 100, 50, 255]), {
+			format: 'RGBA',
+			codedWidth: 1,
+			codedHeight: 1,
+			timestamp: 0,
+			colorSpace,
+		});
+
+		// As with VideoFrame, the copy reads the pixels as they are when copyTo() is called
+		const bytes = new Uint8Array(4);
+		const promise = sample.copyTo(bytes, { format: 'RGBA' });
+		sample.close();
+		await expect(promise).resolves.toBeDefined();
+		expect(bytes[3]).toBe(255);
+	}
+});
+
 test('crop (rect option) for ArrayBuffer-backed data', async () => {
 	// 4x4 RGBA image where each pixel's R/G channels encode (x, y)
 	const width = 4;

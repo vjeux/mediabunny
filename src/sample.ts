@@ -849,9 +849,13 @@ export class VideoSample implements Disposable {
 		}
 
 		assert(this._data !== null);
+		// Like VideoFrame.copyTo(), the copy reads the pixels as they are when it's called, even if the sample is
+		// closed before the copy (which may wait for the conversion probe) finishes
+		const data = this._data;
+		const layout = this._layout;
 
-		if (isVideoFrame(this._data)) {
-			return this._data.copyTo(destination, options);
+		if (isVideoFrame(data)) {
+			return data.copyTo(destination, options);
 		}
 
 		// Copying into an RGB format converts the pixels into options.colorSpace (sRGB by default). We can't convert
@@ -860,7 +864,7 @@ export class VideoSample implements Disposable {
 		// alone, since they convert colors in toRgbSample().
 		if (
 			convertColorSpace
-			&& this._data instanceof Uint8Array
+			&& data instanceof Uint8Array
 			&& options.format
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(this.format!)
@@ -870,11 +874,11 @@ export class VideoSample implements Disposable {
 			// Wrap exactly the visible rect: the smallest coded size containing it, with the strides of the layout
 			// (toVideoFrame() would reset a visible rect that doesn't start at the origin)
 			const visible = this.visibleRect;
-			const tempFrame = new VideoFrame(this._data, {
+			const tempFrame = new VideoFrame(data, {
 				format: this.format as VideoPixelFormat,
 				codedWidth: visible.left + visible.width,
 				codedHeight: visible.top + visible.height,
-				layout: this._layout!,
+				layout: layout!,
 				visibleRect: { x: visible.left, y: visible.top, width: visible.width, height: visible.height },
 				timestamp: this.microsecondTimestamp,
 				colorSpace: this.colorSpace,
@@ -893,8 +897,8 @@ export class VideoSample implements Disposable {
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
 		) {
 			// RGB conversion for custom VideoSampleResource
-			if (this._data instanceof VideoSampleResource) {
-				using rgbSample = await this._data.toRgbSample(
+			if (data instanceof VideoSampleResource) {
+				using rgbSample = await data.toRgbSample(
 					{
 						timestamp: this.timestamp,
 						duration: this.duration,
@@ -947,8 +951,8 @@ export class VideoSample implements Disposable {
 		const planeConfigs = getPlaneConfigs(this.format);
 		let dataPlanes: VideoDataPlane[];
 
-		if (this._data instanceof VideoSampleResource) {
-			let result = this._data.getDataPlanes();
+		if (data instanceof VideoSampleResource) {
+			let result = data.getDataPlanes();
 			if (isThenable(result)) result = await result;
 
 			if (
@@ -962,15 +966,15 @@ export class VideoSample implements Disposable {
 			}
 
 			dataPlanes = result;
-		} else if (this._data instanceof Uint8Array) {
-			assert(this._layout);
-			assert(this._layout.length === planeConfigs.length);
+		} else if (data instanceof Uint8Array) {
+			assert(layout);
+			assert(layout.length === planeConfigs.length);
 
-			dataPlanes = this._layout.map((planeLayout, i) => {
+			dataPlanes = layout.map((planeLayout, i) => {
 				const height = Math.ceil(this.codedHeight / planeConfigs[i]!.heightDivisor);
 
 				return {
-					data: (this._data as Uint8Array).subarray(
+					data: data.subarray(
 						planeLayout.offset,
 						planeLayout.offset + planeLayout.stride * height,
 					),
@@ -978,7 +982,7 @@ export class VideoSample implements Disposable {
 				};
 			});
 		} else {
-			const canvas = this._data;
+			const canvas = data;
 			const context = canvas.getContext('2d');
 			assert(context); // We already got it earlier so it's definitely available
 
