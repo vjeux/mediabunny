@@ -320,6 +320,10 @@ export class IsobmffMuxer extends Muxer {
 				holdsAvc: holdsAvc,
 				fragmented: this.isFragmented,
 				cmaf: this.isCmaf,
+				// The ftyp comes before any sample, so this goes by the codecs that reorder frames (B-frames)
+				mayUseCttsV1: this.output.tracks.some(
+					x => x.isVideoTrack() && (x.source._codec === 'avc' || x.source._codec === 'hevc'),
+				),
 			}));
 
 			if (this.formatOptions.onFtyp) {

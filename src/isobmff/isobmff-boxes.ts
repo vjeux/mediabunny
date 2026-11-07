@@ -289,6 +289,7 @@ export const ftyp = (details: {
 	holdsAvc: boolean;
 	fragmented: boolean;
 	cmaf: boolean;
+	mayUseCttsV1: boolean;
 }) => {
 	// You can find the full logic for this at
 	// https://github.com/FFmpeg/FFmpeg/blob/de2fb43e785773738c660cdafb9309b1ef1bc80d/libavformat/movenc.c#L5518
@@ -336,6 +337,8 @@ export const ftyp = (details: {
 		ascii('isom'),
 		details.holdsAvc ? ascii('avc1') : [],
 		ascii('mp41'),
+		// A version 1 ctts (signed composition offsets) and cslg, as written for B-frames, need 'iso4'
+		details.mayUseCttsV1 ? ascii('iso4') : [],
 	]);
 };
 
