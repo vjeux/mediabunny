@@ -801,7 +801,10 @@ export class MatroskaDemuxer extends Demuxer {
 			}
 
 			const lastBlock = blocks.reduce((a, b) => (b.timestamp >= a.timestamp ? b : a));
-			if (lastBlock.lacing !== BlockLacing.None && lastBlock.duration === 0) {
+			if (
+				lastBlock.duration === 0
+				&& (lastBlock.lacing !== BlockLacing.None || track.info.codec === 'vorbis')
+			) {
 				tracksNeedingNextBlock.add(trackNumber);
 			}
 		}
@@ -851,11 +854,12 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 			}
 
-			if (hasLacedBlocks) {
+			const finalBlock = trackData.blocks[last(trackData.presentationTimestamps)!.blockIndex]!;
+			if (hasLacedBlocks || (finalBlock.duration === 0 && getVorbisInfo(track))) {
 				// Perform lace resolution. Here, we expand each laced block into multiple blocks where each contains
 				// one frame of the lace. We do this after determining block timestamps so we can properly distribute
-				// the block's duration across the laced frames.
-				const finalBlock = trackData.blocks[last(trackData.presentationTimestamps)!.blockIndex]!;
+				// the block's duration across the laced frames. (This also gives the cluster's last Vorbis block its
+				// duration, which takes the block sizes of the frames before it.)
 				trackData.blocks = this.expandLacedBlocks(
 					trackData.blocks,
 					track,
@@ -1101,9 +1105,26 @@ export class MatroskaDemuxer extends Demuxer {
 				expandedBlocks.push(originalBlock);
 
 				if (vorbisInfo) {
-					lastVorbisBlocksize = originalBlock.decoded
-						? getVorbisDurations([originalBlock.data], lastVorbisBlocksize)?.lastBlocksize ?? null
+					const result: ReturnType<typeof getVorbisDurations> = originalBlock.decoded
+						? getVorbisDurations([originalBlock.data], lastVorbisBlocksize)
 						: null;
+
+					const isFinalWithoutDuration = originalBlock === finalBlock && originalBlock.duration === 0;
+					if (result && lastVorbisBlocksize !== null && isFinalWithoutDuration) {
+						// The cluster's last block, with no block after it to take the duration from: it lasts as long
+						// as its block sizes say, but not past the track's next block
+						assert(track.info?.type === 'audio');
+						const ticksPerSample = track.segment.timestampFactor / track.info.sampleRate;
+						const untilNextBlock = nextBlockTimestamp !== null
+							? nextBlockTimestamp - originalBlock.timestamp
+							: Infinity;
+						originalBlock.duration = Math.min(
+							Math.round(result.durations[0]! * ticksPerSample),
+							Math.max(untilNextBlock, 0),
+						);
+					}
+
+					lastVorbisBlocksize = result?.lastBlocksize ?? null;
 				}
 
 				continue;

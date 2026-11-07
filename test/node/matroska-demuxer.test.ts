@@ -128,7 +128,7 @@ test('Laced Vorbis frames get their own durations', async () => {
 		...frames.flatMap(x => [x, 0xaa]),
 	]);
 
-	const file = matroskaFile(
+	const header = [
 		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x01, 0xe8, 0x48])), // 125 us = 1 sample
 		element(EBMLId.Tracks, element(
 			EBMLId.TrackEntry,
@@ -141,10 +141,35 @@ test('Laced Vorbis frames get their own durations', async () => {
 			]),
 			element(EBMLId.Audio, element(EBMLId.SamplingFrequency, [0x45, 0xfa, 0, 0]), element(EBMLId.Channels, [1])),
 		)),
+	];
+
+	const readTimings = async (file: Uint8Array) => {
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		return {
+			timestamps: packets.map(x => x.timestamp * 8000),
+			durations: packets.map(x => x.duration * 8000),
+		};
+	};
+
+	const file = matroskaFile(
+		...header,
 		element(
 			EBMLId.Cluster,
 			element(EBMLId.Timestamp, [0]),
 			block(0, [SHORT, LONG_AFTER_SHORT, LONG_AFTER_LONG, SHORT]), // 128 + 576 + 1024 + 576 samples
+			// The cluster's last block, unlaced, has no block after it to take its duration from: its 576 samples
 			block(2304, [LONG_AFTER_SHORT]),
 		),
 		element(
@@ -165,26 +190,25 @@ test('Laced Vorbis frames get their own durations', async () => {
 		),
 	);
 
-	using input = new Input({
-		source: new BufferSource(file),
-		formats: ALL_FORMATS,
-	});
-
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	const packets: EncodedPacket[] = [];
-	for await (const packet of new EncodedPacketSink(track).packets()) {
-		packets.push(packet);
-	}
-
-	expect(packets.map(x => x.timestamp * 8000)).toEqual([
+	const { timestamps, durations } = await readTimings(file);
+	expect(timestamps).toEqual([
 		0, 128, 704, 1728, 2304, // First cluster
 		2880, 3370, 3480, 3536, 3592, // Second cluster
 		3648, 3776, // Last cluster
 	]);
-	expect(packets.slice(0, 4).map(x => x.duration * 8000)).toEqual([128, 576, 1024, 576]);
-	expect(packets.slice(5).map(x => x.duration * 8000)).toEqual([490, 110, 56, 56, 56, 128, 128]);
+	expect(durations).toEqual([128, 576, 1024, 576, 576, 490, 110, 56, 56, 56, 128, 128]);
+
+	// Without lacing, as FFmpeg writes Vorbis: each cluster's last block lasts as long as its block sizes say
+	expect(await readTimings(matroskaFile(
+		...header,
+		element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), block(0, [SHORT]), block(128, [LONG_AFTER_SHORT])),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [0x02, 0xc0]), // 704
+			block(0, [LONG_AFTER_LONG]),
+			block(1024, [SHORT]),
+		),
+	))).toEqual({ timestamps: [0, 128, 704, 1728], durations: [128, 576, 1024, 576] });
 });
 
 test('Laced Opus frames at the end of a cluster get their own durations', async () => {
