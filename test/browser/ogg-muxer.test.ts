@@ -336,7 +336,8 @@ test.each(['/preroll-test.opus', '/vorbis-eos.ogg'])(
 );
 
 // Whether this browser decodes a file's audio, within a few seconds. Decided by WebCodecs: the file's first packets
-// through an AudioDecoder (WebKitGTK's Vorbis decoder hangs, say)
+// through an AudioDecoder (WebKitGTK's Vorbis decoder hangs, say). Run inside the test that needs it, as late as
+// possible: a hung native decoder can stall the browser's later media work
 const decodesAudioNatively = async (url: string) => {
 	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
 	const track = await input.getPrimaryAudioTrack();
@@ -412,11 +413,9 @@ for (const [url, trimStart] of [
 	// Beyond the first packet, which starts 45 samples before zero and lasts 128 at 44.1 kHz, but less than 1 ms beyond
 	['/vorbis-eos.ogg', 0.0025],
 ] as const) {
-	// A trim this small makes the conversion transcode, which needs a decoder
-	test.skipIf(!(await decodesAudioNatively(url)))(
-		`Conversion of ${url} to Ogg with a start trim of ${trimStart} s applies the trim`,
-		async () => {
-			await testTrimmedConversion(url, trimStart);
-		},
-	);
+	test(`Conversion of ${url} to Ogg with a start trim of ${trimStart} s applies the trim`, async ({ skip }) => {
+		// A trim this small makes the conversion transcode, which needs a decoder
+		skip(!(await decodesAudioNatively(url)), 'This browser can\'t decode the file');
+		await testTrimmedConversion(url, trimStart);
+	});
 }
