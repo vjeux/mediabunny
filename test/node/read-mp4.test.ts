@@ -272,3 +272,40 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Video tracks whose samples are all sync samples only have key packets', async () => {
+	// Without an stss box, every sample is a sync sample (ISO/IEC 14496-12 8.6.2.1); FFmpeg and Mediabunny leave it out
+	// for all-intra video. Fragments flag their samples themselves.
+	const read = async (types: ('key' | 'delta')[], fastStart?: 'fragmented') => {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart }), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		for (const [i, type] of types.entries()) {
+			await source.add(new EncodedPacket(new Uint8Array([i, 1, 2, 3]), type, i / 10, 1 / 10), {
+				decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+			});
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const packetTypes: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packetTypes.push(packet.type);
+		}
+
+		return { packetTypes, hasOnlyKeyPackets: await track.hasOnlyKeyPackets() };
+	};
+
+	expect(await read(['key', 'key', 'key', 'key'])).toEqual({
+		packetTypes: ['key', 'key', 'key', 'key'],
+		hasOnlyKeyPackets: true,
+	});
+	expect(await read(['key', 'delta', 'delta', 'key'])).toEqual({
+		packetTypes: ['key', 'delta', 'delta', 'key'],
+		hasOnlyKeyPackets: false,
+	});
+	// The metadata of fragmented files doesn't say, so it's up to the codec, as before
+	expect((await read(['key', 'key', 'key', 'key'], 'fragmented')).hasOnlyKeyPackets).toBe(false);
+});
