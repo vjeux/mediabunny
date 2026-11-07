@@ -285,7 +285,12 @@ export const runCell = async (
 
 // ---- Expectations ----
 
-export type Issue = { kind: string; detail: string };
+export type Issue = {
+	kind: string;
+	detail: string;
+	/** For timing issues: whether they go away without the beeps in the first 12 ms of the audio */
+	fromStartBeepsOnly?: boolean;
+};
 
 const median = (values: number[]) => {
 	if (values.length === 0) {
@@ -374,7 +379,9 @@ const checkAudioFormat = (cell: Cell, inView: MediaView, run: RunResult, add: Ad
  */
 export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, markers = true): Issue[] => {
 	const issues: Issue[] = [];
-	const add = (kind: string, detail: string) => issues.push({ kind, detail });
+	const add = (kind: string, detail: string, fromStartBeepsOnly?: boolean) => {
+		issues.push({ kind, detail, fromStartBeepsOnly });
+	};
 	const options = cell.options;
 
 	if (options.cancelAt !== undefined) {
@@ -687,6 +694,9 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 				}
 			}
 			const deltas: number[] = [];
+			// Whether each delta's beep starts in the first 12 ms of the audio
+			const atAudioStart: boolean[] = [];
+			const audioStart = Math.max(0, (inView.audio.firstTimestamp ?? S) - S);
 			const matched = new Set<number>();
 			let missing = 0;
 			let wrongBeeps = 0;
@@ -705,6 +715,7 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 				}
 				matched.add(best);
 				deltas.push(outBeeps[best]!.time - (beep.time - S));
+				atAudioStart.push(beep.time - S - audioStart < 0.012);
 				if (outBeeps[best]!.k8 !== beep.k8 && outBeeps[best]!.k8 !== -1 && beep.k8 !== -1) {
 					wrongBeeps++;
 				}
@@ -730,19 +741,40 @@ export const verifyCell = (cell: Cell, inView: MediaView, run: RunResult, marker
 				add('audio-beeps', `${extra.length} beeps outside the trim range, first at ${first}`);
 			}
 
-			const audioOffset = median(deltas);
-			const spread = deltas.length > 0 ? Math.max(...deltas) - Math.min(...deltas) : 0;
-			if (spread > 0.002) {
-				add('audio-drift', `Beep offsets spread over ${(spread * 1000).toFixed(2)} ms`);
-			}
-			// ADTS can't signal encoder priming, so transcoded AAC starts one frame late there (FFmpeg alike)
-			const adtsPriming = cell.output === 'adts'
-				&& Math.abs(audioOffset - 1024 / out.decodedSampleRate!) < 0.0015;
-			if (Math.abs(audioOffset) > 0.0015 && !allowShift && !adtsPriming) {
-				add('audio-offset', `Audio timeline shifted by ${(audioOffset * 1000).toFixed(2)} ms`);
-			}
-			if (videoOffset !== null && Number.isFinite(audioOffset) && Math.abs(videoOffset - audioOffset) > 0.0025) {
-				add('av-sync', `Audio moved ${((audioOffset - videoOffset) * 1000).toFixed(2)} ms against the video`);
+			const getTimingIssues = (values: number[]) => {
+				const timingIssues: Issue[] = [];
+				const audioOffset = median(values);
+				const spread = values.length > 0 ? Math.max(...values) - Math.min(...values) : 0;
+				if (spread > 0.002) {
+					timingIssues.push({
+						kind: 'audio-drift',
+						detail: `Beep offsets spread over ${(spread * 1000).toFixed(2)} ms`,
+					});
+				}
+				// ADTS can't signal encoder priming, so transcoded AAC starts one frame late there (FFmpeg alike)
+				const adtsPriming = cell.output === 'adts'
+					&& Math.abs(audioOffset - 1024 / out.decodedSampleRate!) < 0.0015;
+				if (Math.abs(audioOffset) > 0.0015 && !allowShift && !adtsPriming) {
+					timingIssues.push({
+						kind: 'audio-offset',
+						detail: `Audio timeline shifted by ${(audioOffset * 1000).toFixed(2)} ms`,
+					});
+				}
+				if (
+					videoOffset !== null
+					&& Number.isFinite(audioOffset)
+					&& Math.abs(videoOffset - audioOffset) > 0.0025
+				) {
+					timingIssues.push({
+						kind: 'av-sync',
+						detail: `Audio moved ${((audioOffset - videoOffset) * 1000).toFixed(2)} ms against the video`,
+					});
+				}
+				return timingIssues;
+			};
+			const withoutStartBeeps = getTimingIssues(deltas.filter((_, i) => !atAudioStart[i]));
+			for (const issue of getTimingIssues(deltas)) {
+				add(issue.kind, issue.detail, !withoutStartBeeps.some(x => x.kind === issue.kind));
 			}
 
 			checkAudioFormat(cell, inView, run, add);

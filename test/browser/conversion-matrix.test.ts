@@ -233,6 +233,11 @@ const CELLS = buildCells();
 
 /** Issues known on main, with the fork PRs that fix them. */
 const isKnownIssue = (cell: Cell, inView: MediaView, run: RunResult, issue: Issue) => {
+	// Windows' AAC encoder (Media Foundation) silences the first ~512 samples, so a beep right at the start of
+	// transcoded AAC comes out late (#629)
+	if (run.outputCodecs.audio === 'aac' && run.copied.audio === false && issue.fromStartBeepsOnly) {
+		return true;
+	}
 	// Opus encoding in Chrome leaves audio at other rates than 48 kHz late by up to 5.5 ms (#303, #306)
 	const encodedRate = cell.options.audio?.sampleRate ?? inView.audio?.decodedSampleRate;
 	if (
