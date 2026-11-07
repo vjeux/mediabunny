@@ -946,14 +946,29 @@ test('MPEG-TS with several programs skips the ones it can\'t read anything from'
 		inFile: true,
 	};
 	const clear: Program = { pmtPid: 0x1003, descriptors: [], streams: [[0x0f, 0x104, []]], inFile: true };
+	const partlyScrambled: Program = {
+		pmtPid: 0x1004,
+		descriptors: [],
+		streams: [[0x0f, 0x105, caDescriptor], [0x0f, 0x106, []]],
+		inFile: true,
+	};
 
-	// The first program with a stream we can read, also when the first PMT comes before the PAT
+	// The first program that's entirely clear, also when the first PMT comes before the PAT
 	expect(await readTracks([scrambled, radio, scrambledStream, clear])).toEqual([[0x104, 3]]);
 	expect(await readTracks([scrambled, radio, scrambledStream, clear], true)).toEqual([[0x104, 3]]);
+	expect(await readTracks([partlyScrambled, clear])).toEqual([[0x104, 3]]);
 
-	// When no program has one, the first one whose PMT showed up, once all of them did, or at the end of the file
-	expect(await readTracks([scrambled, radio])).toEqual([[0x101, 3]]);
-	expect(await readTracks([{ ...clear, inFile: false }, scrambled])).toEqual([[0x101, 3]]);
+	// Else the clear streams of the first program that has some, once all programs showed up
+	expect(await readTracks([scrambled, partlyScrambled, radio])).toEqual([[0x106, 3]]);
+
+	// When no program has a stream we can read, a clear error, also when a program's PMT never shows up (rather than
+	// reading the whole file)
+	await expect(readTracks([scrambled, radio])).rejects.toThrow(/scrambled/);
+	await expect(readTracks([{ ...clear, inFile: false }, scrambled])).rejects.toThrow(/scrambled/);
+
+	// A single program is read as it is, as recordings that were descrambled may keep their CA descriptors
+	expect(await readTracks([scrambled])).toEqual([[0x101, 3]]);
+	expect(await readTracks([partlyScrambled])).toEqual([[0x105, 3], [0x106, 3]]);
 });
 
 test('MPEG-TS first packet key packet forcing', async () => {

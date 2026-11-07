@@ -240,25 +240,48 @@ export class MpegTsDemuxer extends Demuxer {
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
 
-			// The programs whose PMT has shown up, and the first one of them we couldn't read anything from, which we
-			// only fall back to if we find no better one
+			// The programs whose PMT has shown up. When the PAT lists several, the ones with scrambled streams
+			// (conditional access) or no supported ones are only fallen back to if no better one shows up: first one
+			// whose other streams are clear, else the first one.
 			const seenProgramMapPids = new Set<number>();
-			let fallbackProgram: { pmtPos: number; streams: ElementaryStream[] } | null = null;
+			type FallbackProgram = { pmtPos: number; streams: ElementaryStream[]; clearStreams: ElementaryStream[] };
+			let partlyScrambledProgram: FallbackProgram | null = null;
+			let unreadableProgram: FallbackProgram | null = null;
 
-			// Uses the fallback program, going back to its PMT to read its streams from there
+			// Uses the best fallback program, going back to its PMT to read its streams from there
 			const useFallbackProgram = () => {
-				if (hasProgramMap || !fallbackProgram) {
+				const program = partlyScrambledProgram ?? unreadableProgram;
+				if (hasProgramMap || !program) {
 					return false;
 				}
 
-				this.elementaryStreams.push(...fallbackProgram.streams);
+				if (programMapPids.size <= 1) {
+					// With a single program, its streams are what the file holds (descrambled recordings may keep the
+					// CA descriptors)
+					this.elementaryStreams.push(...program.streams);
+				} else if (program.streams.length > 0 && program.clearStreams.length === 0) {
+					throw new Error(
+						'All programs of this transport stream are scrambled (conditional access) or have no supported'
+						+ ' stream, so none of its streams can be read.',
+					);
+				} else {
+					this.elementaryStreams.push(...program.clearStreams);
+				}
+
 				hasProgramMap = true;
-				currentPos = fallbackProgram.pmtPos;
+				currentPos = program.pmtPos;
 				return true;
 			};
 
+			const hasSeenAllPrograms = () => hasProgramAssociationTable
+				&& [...programMapPids].every(pid => seenProgramMapPids.has(pid));
+
 			while (true) {
-				if (fallbackProgram && currentPos - fallbackProgram.pmtPos > MAX_PROGRAM_SEARCH_SIZE) {
+				const firstFallbackPmtPos = Math.min(
+					partlyScrambledProgram?.pmtPos ?? Infinity,
+					unreadableProgram?.pmtPos ?? Infinity,
+				);
+				if (currentPos - firstFallbackPmtPos > MAX_PROGRAM_SEARCH_SIZE) {
 					useFallbackProgram();
 				}
 
@@ -348,6 +371,11 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					hasProgramAssociationTable = true;
+
+					if (hasSeenAllPrograms()) {
+						// The PMTs came before the PAT, so there's no better program to find
+						useFallbackProgram();
+					}
 				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap) {
 					// Broadcast captures often carry several programs. We present just one, so let's use the first one
 					// whose PMT shows up (some programs listed in the PAT may not even be in the capture) and that has
@@ -564,18 +592,27 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					seenProgramMapPids.add(section.pid);
+					const clearStreams = isScrambledProgram
+						? []
+						: streams.filter(stream => !scrambledPids.has(stream.pid));
 
-					if (!isScrambledProgram && streams.some(stream => !scrambledPids.has(stream.pid))) {
+					if (
+						(hasProgramAssociationTable && programMapPids.size <= 1)
+						|| (streams.length > 0 && clearStreams.length === streams.length)
+					) {
+						// The only program, or one that's entirely clear
 						this.elementaryStreams.push(...streams);
 						hasProgramMap = true;
 					} else {
-						fallbackProgram ??= { pmtPos: currentPos, streams };
+						const program = { pmtPos: currentPos, streams, clearStreams };
+						if (clearStreams.length > 0) {
+							partlyScrambledProgram ??= program;
+						} else {
+							unreadableProgram ??= program;
+						}
 
-						if (
-							hasProgramAssociationTable
-							&& [...programMapPids].every(pid => seenProgramMapPids.has(pid))
-						) {
-							// We've seen all programs, so there's no better one to find
+						if (hasSeenAllPrograms()) {
+							// There's no better program to find
 							useFallbackProgram();
 						}
 					}
