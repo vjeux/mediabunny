@@ -344,3 +344,69 @@ test('can read a FLAC file with leading ID3v2 tags', async () => {
 	expect(metadataTags.raw!['TIT2']).toBe('First tag');
 	expect(metadataTags.raw!['TITLE']).toBe('The Happy Meeting');
 });
+
+test('can read an old-format variable block size stream without the blocking strategy bit', async () => {
+	// Encoders predating FLAC 1.2 (e.g. Flake 0.11) wrote variable block size streams with the blocking strategy bit
+	// unset, but with sample numbers instead of frame numbers in the frame headers (RFC 9639, Appendix B.1)
+	const crc8 = (bytes: number[]) => bytes.reduce((crc, byte) => {
+		crc ^= byte;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+		}
+		return crc;
+	}, 0);
+	const crc16 = (bytes: number[]) => bytes.reduce((crc, byte) => {
+		crc ^= byte << 8;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x8000 ? ((crc << 1) ^ 0x8005) & 0xffff : (crc << 1) & 0xffff;
+		}
+		return crc;
+	}, 0);
+	const codedNumber = (value: number) => value < 0x80
+		? [value]
+		: value < 0x800
+			? [0xc0 | (value >> 6), 0x80 | (value & 0x3f)]
+			: [0xe0 | (value >> 12), 0x80 | ((value >> 6) & 0x3f), 0x80 | (value & 0x3f)];
+
+	// Mono 16-bit 44.1 kHz frames with a constant subframe, the block size stored as an uncommon 16-bit value
+	const blockSizes = [4608, 2304, 1152, 576, 4608, 1000];
+	const frames: number[][] = [];
+	let sampleNumber = 0;
+	for (const blockSize of blockSizes) {
+		const header = [
+			0xff, 0xf8, 0x79, 0x08, ...codedNumber(sampleNumber), (blockSize - 1) >> 8, (blockSize - 1) & 0xff,
+		];
+		const frame = [...header, crc8(header), 0x00, 0x12, 0x34];
+		const crc = crc16(frame);
+		frames.push([...frame, crc >> 8, crc & 0xff]);
+		sampleNumber += blockSize;
+	}
+
+	const streamInfo = new Uint8Array(34);
+	const view = new DataView(streamInfo.buffer);
+	view.setUint16(0, 576); // Minimum and maximum block sizes differ
+	view.setUint16(2, 4608);
+	view.setUint32(10, (44100 << 12) | (0 << 9) | (15 << 4)); // 44.1 kHz, mono, 16 bits per sample
+	view.setUint32(14, sampleNumber);
+
+	const file = new Uint8Array([
+		0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34, ...streamInfo,
+		...frames.flat(),
+	]);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packets: [number, number, number][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([packet.timestamp * 44100, packet.duration * 44100, packet.byteLength]);
+	}
+
+	let start = 0;
+	expect(packets).toEqual(blockSizes.map((blockSize, i) => {
+		const entry = [start, blockSize, frames[i]!.length];
+		start += blockSize;
+		return entry;
+	}));
+});
