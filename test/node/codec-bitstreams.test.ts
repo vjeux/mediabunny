@@ -548,8 +548,15 @@ describe('Audio configuration', () => {
 		// FFmpeg's AAC-LC encoder output (48 kHz stereo) and a config built for the same parameters
 		const ffmpegLc = new Uint8Array([0x11, 0x90]);
 		expect(parseAacAudioSpecificConfig(ffmpegLc).outputSampleRate).toBe(48000);
-		expect([...buildAacAudioSpecificConfig({ objectType: 2, outputSampleRate: 48000, outputNumberOfChannels: 2 })])
-			.toEqual([...ffmpegLc]);
+		// Stereo needs no program config element. (A variable rather than a literal argument, so this also compiles
+		// against versions of the builder without that field.)
+		const lcConfig = {
+			objectType: 2,
+			outputSampleRate: 48000,
+			outputNumberOfChannels: 2,
+			programConfigElement: null,
+		};
+		expect([...buildAacAudioSpecificConfig(lcConfig)]).toEqual([...ffmpegLc]);
 	});
 
 	test('Opus identification header', () => {
