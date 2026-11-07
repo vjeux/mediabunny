@@ -20,6 +20,38 @@ import {
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const videoFilePath = path.join(__dirname, '..', 'public/video.mp4');
 
+test('UrlSource sends every value of a header given more than once in a header list', async () => {
+	let received: string | string[] | undefined;
+	const server = http.createServer((req, res) => {
+		received = req.headers['x-tag'];
+		res.writeHead(206, { 'Content-Range': 'bytes 0-3/4', 'Content-Length': '4' });
+		res.end(Buffer.from([1, 2, 3, 4]));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+
+		const headerLists: [string, string][][] = [[['X-Tag', 'a'], ['X-Tag', 'b']], [['x-tag', 'a'], ['X-Tag', 'b']]];
+		for (const headers of headerLists) {
+			// What fetch() itself sends for this header list: both values
+			await (await fetch(url, { headers })).arrayBuffer();
+			const expected = received;
+			expect(expected).toBe('a, b');
+
+			using ref = new UrlSource(url, { requestInit: { headers } }).ref();
+			await new Reader(ref.source).requestSlice(0, 4);
+			expect(received).toBe(expected);
+		}
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 test('UrlSource works against a server without range request support', async () => {
 	const server = await startRangelessServer();
 	const logs = captureLogs();

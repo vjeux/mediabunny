@@ -882,7 +882,13 @@ export const normalizeHeaders = (headers: HeadersInit): Record<string, string> =
 	if (Array.isArray(headers)) {
 		const result: Record<string, string> = {};
 		headers.forEach(([key, value]) => {
-			result[key] = value;
+			// Like Headers.append, a name given again (in any case) adds its value to the list
+			const existingKey = Object.keys(result).find(x => x.toLowerCase() === key.toLowerCase());
+			if (existingKey !== undefined) {
+				result[existingKey] += `, ${value}`;
+			} else {
+				result[key] = value;
+			}
 		});
 		return result;
 	}
