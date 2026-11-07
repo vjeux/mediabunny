@@ -999,7 +999,8 @@ export class MpegTsDemuxer extends Demuxer {
 			}
 		}
 
-		if (mustAddSectionEnd) {
+		// (Only if a section was read: a position that holds no section start says nothing about where one ends.)
+		if (mustAddSectionEnd && firstPacket) {
 			const index = binarySearchLessOrEqual(this.sectionEndPositions, endPos, x => x);
 			this.sectionEndPositions.splice(index + 1, 0, endPos);
 		}
