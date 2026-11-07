@@ -35,6 +35,9 @@ class Mp3Encoder extends CustomAudioEncoder {
 	private buffer = new Uint8Array(2 ** 16);
 	private currentBufferOffset = 0;
 	private currentTimestamp: number | null = null;
+	private inputStartTimestamp = 0;
+	private inputFrames = 0;
+	private firstPacketEndTimestamp: number | null = null;
 	private chunkMetadata: EncodedAudioChunkMetadata = {};
 
 	static override supports(codec: AudioCodec, config: AudioDecoderConfig): boolean {
@@ -102,6 +105,9 @@ class Mp3Encoder extends CustomAudioEncoder {
 	private resetInternalState() {
 		this.currentBufferOffset = 0;
 		this.currentTimestamp = null;
+		this.inputStartTimestamp = 0;
+		this.inputFrames = 0;
+		this.firstPacketEndTimestamp = null;
 		this.chunkMetadata = {
 			decoderConfig: {
 				codec: 'mp3',
@@ -115,7 +121,9 @@ class Mp3Encoder extends CustomAudioEncoder {
 		if (this.currentTimestamp === null) {
 			// LAME adds 576 samples of encoder delay on top of inherent delay
 			this.currentTimestamp = audioSample.timestamp - (576 + MP3_DECODER_DELAY) / this.config.sampleRate;
+			this.inputStartTimestamp = audioSample.timestamp;
 		}
+		this.inputFrames += audioSample.numberOfFrames;
 
 		const sizePerChannel = audioSample.allocationSize({
 			format: 's16-planar',
@@ -147,7 +155,10 @@ class Mp3Encoder extends CustomAudioEncoder {
 	async flush() {
 		const result = await this.sendCommand({ type: 'flush' });
 
-		this.digestOutput(new Uint8Array(result.flushedData));
+		// LAME fills its last frames with silence, which isn't part of the audio, so the packets must end where the
+		// input does
+		const inputEndTimestamp = this.inputStartTimestamp + this.inputFrames / this.config.sampleRate;
+		this.digestOutput(new Uint8Array(result.flushedData), inputEndTimestamp);
 
 		this.resetInternalState();
 	}
@@ -160,7 +171,7 @@ class Mp3Encoder extends CustomAudioEncoder {
 	 * LAME returns data in chunks, but a chunk doesn't need to contain a full MP3 frame. Therefore, we must accumulate
 	 * these chunks and extract the MP3 frames only when they're complete.
 	 */
-	private digestOutput(bytes: Uint8Array) {
+	private digestOutput(bytes: Uint8Array, inputEndTimestamp?: number) {
 		assert(this.currentTimestamp !== null);
 
 		const requiredBufferSize = this.currentBufferOffset + bytes.length;
@@ -191,9 +202,31 @@ class Mp3Encoder extends CustomAudioEncoder {
 
 			const data = this.buffer.slice(pos, pos + header.totalSize);
 			const duration = header.audioSamplesInFrame / header.sampleRate;
-			this.onPacket(new EncodedPacket(data, 'key', this.currentTimestamp, duration), this.chunkMetadata);
 
-			this.chunkMetadata = {}; // Mimic WebCodecs-like behavior
+			let samplesInInput = header.audioSamplesInFrame;
+			if (
+				inputEndTimestamp !== undefined
+				// When the input ends within the first packet, the frames are kept as they are, as FFmpeg misplaces
+				// the audio of an MP4 track that is one shortened packet
+				&& this.firstPacketEndTimestamp !== null
+				&& Math.round((inputEndTimestamp - this.firstPacketEndTimestamp) * header.sampleRate) > 0
+			) {
+				samplesInInput = Math.min(
+					samplesInInput,
+					Math.round((inputEndTimestamp - this.currentTimestamp) * header.sampleRate),
+				);
+			}
+
+			// A frame that only holds padding is dropped
+			if (samplesInInput > 0) {
+				this.onPacket(
+					new EncodedPacket(data, 'key', this.currentTimestamp, samplesInInput / header.sampleRate),
+					this.chunkMetadata,
+				);
+
+				this.chunkMetadata = {}; // Mimic WebCodecs-like behavior
+				this.firstPacketEndTimestamp ??= this.currentTimestamp + duration;
+			}
 
 			this.currentTimestamp += duration;
 			pos += header.totalSize;
