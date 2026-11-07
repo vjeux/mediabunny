@@ -2851,6 +2851,8 @@ class PacketReadingContext {
 	/** Supplies the context with a new encoded packet, beginning at the current position. */
 	supplyPacket(packetLength: number, intrinsicDuration: number) {
 		const currentPesPacket = this.getCurrentPesPacket();
+		// For reading the packet again (see firstKeyFrameSearchTarget)
+		const { lastSuppliedPesPacket, nextPts } = this;
 
 		let pts: number;
 		if (this.lastSuppliedPesPacket === currentPesPacket) {
@@ -2938,6 +2940,8 @@ class PacketReadingContext {
 				if (isBeforeFirstKeyFrame === null) {
 					// Not known yet: find out, then read the packet again
 					this.firstKeyFrameSearchTarget = sequenceNumber;
+					this.lastSuppliedPesPacket = lastSuppliedPesPacket;
+					this.nextPts = nextPts;
 					this.seekTo(packetStartPos);
 					return;
 				}
