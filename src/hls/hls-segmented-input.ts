@@ -96,6 +96,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 	currentUpdateSegmentsPromise: Promise<void> | null = null;
 	streamHasEnded = false;
 	neverRemovesSegments = false;
+	/** Whether a playlist load has completed; until then, the stream's end and refresh interval are unknown. */
+	playlistLoaded = false;
 	lastSegmentUpdateTime = -Infinity;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
 	hasTargetDuration = false;
@@ -642,6 +644,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (!headerRead) {
 			throw new Error('Invalid M3U8 file; no #EXTM3U header.');
 		}
+
+		this.playlistLoaded = true;
 	}
 
 	override async getDurationFromMetadata(options: DurationMetadataRequestOptions) {
@@ -897,7 +901,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 	}
 
 	async getLiveRefreshInterval() {
-		if (!this.streamHasEnded && this.getRemainingWaitTimeMs() === 0) {
+		if (!this.playlistLoaded || (!this.streamHasEnded && this.getRemainingWaitTimeMs() === 0)) {
+			// Before the first load has completed (it may still be in flight for another track of this playlist),
+			// we can't know yet whether the stream has ended, nor its refresh interval
 			await this.runUpdateSegments();
 		}
 
