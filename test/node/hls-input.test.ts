@@ -1109,6 +1109,50 @@ test.concurrent('#EXT-X-I-FRAME-STREAM-INF tags without BANDWIDTH attribute are 
 	await expect(input.getTracks()).rejects.toThrow('BANDWIDTH');
 });
 
+test.concurrent('#EXT-X-BYTERANGE without an offset must continue a byte range of the same resource', async () => {
+	// Two packet-aligned halves of 0.ts as segments, the second one with an implicit offset
+	const half = 188 * 5000;
+	const openPlaylist = (secondUri: string) => {
+		const playlist = `#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:5
+#EXTINF:2.5,
+#EXT-X-BYTERANGE:${half}@0
+0.ts
+#EXTINF:2.5,
+#EXT-X-BYTERANGE:${half}
+${secondUri}
+#EXT-X-ENDLIST
+`;
+
+		return new Input({
+			source: new CustomPathedSource('playlist.m3u8', ({ path }) => path === 'playlist.m3u8'
+				? new BufferSource(new TextEncoder().encode(playlist))
+				: new FilePathSource('./test/public/0.ts')),
+			formats: HLS_FORMATS,
+		});
+	};
+
+	// The same resource, however it's spelled (URIs are compared once resolved): the second segment starts where the
+	// first one ends
+	const checkSameResource = async (secondUri: string) => {
+		using input = openPlaylist(secondUri);
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.getDurationFromMetadata()).toBe(5);
+		expect(await new EncodedPacketSink(videoTrack).getFirstPacket()).not.toBeNull();
+	};
+	await checkSameResource('0.ts');
+	await checkSameResource('./0.ts');
+	await checkSameResource('x/../0.ts');
+
+	// "If o is not present, a previous Media Segment MUST appear in the Playlist file and MUST be a sub-range of the same
+	// media resource, or the Media Segment is undefined and the client MUST fail to parse the Playlist." (RFC 8216,
+	// Section 4.3.2.2)
+	using otherResourceInput = openPlaylist('other.ts');
+	await expect(otherResourceInput.getTracks()).rejects.toThrow('sub-range of the same resource');
+});
+
 test.concurrent('#EXT-X-STREAM-INF tags without BANDWIDTH attribute are rejected', async () => {
 	const text = `#EXTM3U
 #EXT-X-STREAM-INF:CODECS="avc1.4D401E",RESOLUTION=480x270
