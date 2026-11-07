@@ -890,7 +890,13 @@ test.for(['video', 'audio'] as const)(
 		});
 		const errors: unknown[] = [];
 		if (track.kind === 'video') {
-			const source = new MediaStreamVideoTrackSource(track, { codec: 'vp8', quality: new Quality('low') });
+			// Sampling from a <video> element needs a frame rate, which Firefox and Safari don't report for canvas
+			// capture tracks
+			const source = new MediaStreamVideoTrackSource(
+				track,
+				{ codec: 'vp8', quality: new Quality('low') },
+				{ frameRate: 30 },
+			);
 			source.errorPromise.catch(error => errors.push(error));
 			output.addVideoTrack(source);
 		} else {
