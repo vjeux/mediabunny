@@ -329,6 +329,66 @@ test('PCM audio', async () => {
 	expect(await audioTrack.getFirstTimestamp()).toBe(0);
 });
 
+test('Reserved Fast Start rejects the packet over the maximum packet count and keeps the file consistent', async () => {
+	const videoConfig = { codec: 'vp8', codedWidth: 64, codedHeight: 64 };
+	const audioConfig = { codec: 'opus', numberOfChannels: 1, sampleRate: 48000 };
+	const countSamples = async (bytes: Uint8Array) => {
+		const text = new TextDecoder('latin1').decode(bytes);
+		const stsz: number[] = [];
+		for (let pos = text.indexOf('stsz'); pos !== -1; pos = text.indexOf('stsz', pos + 4)) {
+			stsz.push(toDataView(bytes).getUint32(pos + 12)); // After version and flags, and sample_size
+		}
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const readable: number[] = [];
+		for (const track of await input.getTracks()) {
+			let count = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				void packet;
+				count++;
+			}
+			readable.push(count);
+		}
+		return { stsz, readable };
+	};
+
+	// The rejected packet used to stay counted in stsz (and stts, stss) without being in any chunk
+	const single = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
+	const singleSource = new EncodedVideoPacketSource('vp8');
+	single.addVideoTrack(singleSource, { maximumPacketCount: 2 });
+	await single.start();
+	await singleSource.add(new EncodedPacket(new Uint8Array(100), 'key', 0, 1), { decoderConfig: videoConfig });
+	await singleSource.add(new EncodedPacket(new Uint8Array(100), 'key', 1, 1));
+	await expect(singleSource.add(new EncodedPacket(new Uint8Array(100), 'key', 2, 1)))
+		.rejects.toThrow('maximum packet count');
+	await single.finalize();
+	expect(await countSamples(new Uint8Array(single.target.buffer!))).toEqual({ stsz: [2], readable: [2] });
+
+	// With several tracks, the error used to come from whichever add() interleaved the packet over the limit
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('vp8');
+	output.addVideoTrack(videoSource, { maximumPacketCount: 10 });
+	const audioSource = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(audioSource, { maximumPacketCount: 100 });
+	await output.start();
+
+	const rejected: string[] = [];
+	for (let i = 0; i < 50; i++) {
+		if (i % 3 === 0) {
+			await videoSource.add(new EncodedPacket(new Uint8Array(100), 'key', i * 0.02, 0.06), {
+				decoderConfig: videoConfig,
+			}).catch(() => rejected.push(`video ${i / 3}`));
+		}
+		await audioSource.add(new EncodedPacket(new Uint8Array(10), 'key', i * 0.02, 0.02), {
+			decoderConfig: audioConfig,
+		}).catch(() => rejected.push(`audio ${i}`));
+	}
+	await output.finalize();
+
+	expect(rejected).toEqual([10, 11, 12, 13, 14, 15, 16].map(i => `video ${i}`));
+	expect(await countSamples(new Uint8Array(output.target.buffer!))).toEqual({ stsz: [10, 50], readable: [10, 50] });
+});
+
 test('PCM audio with non-zero timestamp', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
