@@ -165,6 +165,16 @@ test('MP4: PCM track with huge stsc first chunk', async () => {
 	})]));
 });
 
+test('MP4: PCM track with zero channels', async () => {
+	// Decoding it used to create audio samples with 0 channels
+	const channelCount = 0;
+	const sampleEntry = box('sowt', zeros(6), u16(1), zeros(8), u16(channelCount), u16(16), zeros(4), u32(48000 << 16));
+	await expectGracefulDecode(mp4([trak({
+		handler: 'soun',
+		stbl: [stsd(sampleEntry), stts([[4, 1]]), stsc([[1, 4, 1]]), fullBox('stsz', 0, 0, u32(2), u32(4)), stco([0])],
+	})]));
+});
+
 test('MP4: stsc with huge samples per chunk', async () => {
 	await expectGracefulRead(mp4([trak({
 		handler: 'vide',
