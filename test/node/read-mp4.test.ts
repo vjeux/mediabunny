@@ -272,3 +272,59 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Display aspect ratio from a tkhd presentation size of another shape', async () => {
+	// A 320x240 video track whose tkhd box gives its visual presentation size. WebKit's test file test-par-16-9.mp4
+	// presents it at 426.67x240 with no pasp box and no ratio in the SPS; FFmpeg (mov_read_trak) takes a pixel aspect
+	// ratio of 213:160 from that, and Chromium (MP4StreamParser) a 16:9 display aspect ratio.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (presentationSize: number[], pasp?: [number, number]) => {
+		const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [1, 64, 0, 240], zeros(50),
+			box('avcC', [1, 0x4d, 0x40, 0x0d, 0xff, 0xe0, 0x00]), // No SPS, so no ratio from there
+			...(pasp ? [box('pasp', u32(pasp[0]), u32(pasp[1]))] : []));
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(1000), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(1000), zeros(16), matrix,
+					...presentationSize.map(x => u32(Math.round(x * 0x10000)))),
+				box('mdia',
+					box('mdhd', zeros(12), u32(1000), u32(1000), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), avc1),
+						box('stts', zeros(4), u32(1), u32(1), u32(1000)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(1), u32(1)),
+						box('stsz', zeros(4), u32(10), u32(1)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...box('mdat', zeros(10)), ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return [await track.getCodedWidth(), await track.getSquarePixelWidth(), await track.getSquarePixelHeight()];
+	};
+
+	expect(await read([426.6667, 240])).toEqual([320, 426, 240]);
+	expect(await read([320, 300])).toEqual([320, 320, 300]); // Never shrunk, only heightened
+	// Square pixels: the same shape, a shape within 1%, a pasp box (which wins, like in FFmpeg), and a size whose
+	// integer parts are 0 (tkhd fields shifted by one entry, as in Chromium's agtm-metadata-*.mp4 test files)
+	expect(await read([320, 240])).toEqual([320, 320, 240]);
+	expect(await read([321, 240])).toEqual([320, 320, 240]);
+	expect(await read([426.6667, 240], [1, 1])).toEqual([320, 320, 240]);
+	expect(await read([0.25, 1 / 1024])).toEqual([320, 320, 240]);
+});

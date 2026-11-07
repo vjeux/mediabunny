@@ -135,6 +135,11 @@ type InternalTrack = {
 	durationInMovieTimescale: number;
 	durationInMediaTimescale: number;
 	matrix: TransformationMatrix;
+	/** The integer parts of the tkhd box's width and height, the visual presentation size before the matrix */
+	presentationWidth: number;
+	presentationHeight: number;
+	/** Whether a pasp box gave the pixel aspect ratio */
+	hasPaspBox: boolean;
 	internalCodecId: string | null;
 	name: string | null;
 	languageCode: string;
@@ -548,6 +553,9 @@ export class IsobmffDemuxer extends Demuxer {
 				durationInMediaTimescale: foreignTrack.durationInMediaTimescale,
 				durationInMovieTimescale: foreignTrack.durationInMovieTimescale,
 				matrix: foreignTrack.matrix,
+				presentationWidth: foreignTrack.presentationWidth,
+				presentationHeight: foreignTrack.presentationHeight,
+				hasPaspBox: foreignTrack.hasPaspBox,
 				internalCodecId: foreignTrack.internalCodecId,
 				name: foreignTrack.name,
 				languageCode: foreignTrack.languageCode,
@@ -1029,6 +1037,9 @@ export class IsobmffDemuxer extends Demuxer {
 					durationInMovieTimescale: -1,
 					durationInMediaTimescale: -1,
 					matrix: IDENTITY_MATRIX,
+					presentationWidth: 0,
+					presentationHeight: 0,
+					hasPaspBox: false,
 					internalCodecId: null,
 					name: null,
 					languageCode: UNDETERMINED_LANGUAGE,
@@ -1056,6 +1067,7 @@ export class IsobmffDemuxer extends Demuxer {
 					&& track.sampleTableByteOffset !== -1
 				) {
 					if (track.info.type === 'video' && track.info.width !== -1) {
+						applyPresentationSizeAspectRatio(track);
 						const videoTrack = track as InternalVideoTrack;
 						track.trackBacking = new IsobmffVideoTrackBacking(videoTrack);
 						this.tracks.push(track);
@@ -1102,6 +1114,9 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(2 * 4 + 2 + 2 + 2 + 2);
 				const trackMatrix = readMatrix(slice);
+				// Like FFmpeg, only the integer parts of the size: they're 0 in tkhd boxes whose fields are shifted
+				track.presentationWidth = Math.floor(readU32Be(slice) / 0x10000);
+				track.presentationHeight = Math.floor(readU32Be(slice) / 0x10000);
 
 				// The track matrix maps into movie space, and the movie matrix then maps into the final output space
 				track.matrix = multiplyMatrices(trackMatrix, this.movieMatrix);
@@ -1734,6 +1749,9 @@ export class IsobmffDemuxer extends Demuxer {
 
 				const num = readU32Be(slice);
 				const den = readU32Be(slice);
+				if (num > 0 && den > 0) {
+					track.hasPaspBox = true;
+				}
 
 				// https://github.com/Vanilagy/mediabunny/issues/362
 				if (num > 0 && den > 0) {
@@ -3865,6 +3883,37 @@ class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudio
 		})();
 	}
 }
+
+/**
+ * Without a pasp box or a pixel aspect ratio in the bitstream, a tkhd presentation size of another shape than the coded
+ * frame gives the pixel aspect ratio, as FFmpeg (mov_read_trak) and Chromium (MP4StreamParser) take it.
+ */
+const applyPresentationSizeAspectRatio = (track: InternalTrack) => {
+	const info = track.info;
+	if (
+		info?.type !== 'video'
+		|| track.hasPaspBox
+		|| info.squarePixelWidth !== info.width
+		|| info.squarePixelHeight !== info.height
+		|| !(track.presentationWidth > 0 && track.presentationHeight > 0)
+		|| !(info.width > 0 && info.height > 0)
+	) {
+		return;
+	}
+
+	// FFmpeg's ratio. Shapes within 1% of the frame's are left alone, as rounding or a clean aperture can explain
+	// them.
+	const pixelAspectRatio = {
+		num: info.height * track.presentationWidth,
+		den: info.width * track.presentationHeight,
+	};
+	if (Math.abs(pixelAspectRatio.num / pixelAspectRatio.den - 1) < 0.01) {
+		return;
+	}
+
+	// Applied like a ratio from the bitstream, which only widens or heightens the frame
+	applySpsPixelAspectRatio(track, pixelAspectRatio);
+};
 
 const getSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: number) => {
 	if (sampleTable.sortedCompositionTimeOffsets) {
