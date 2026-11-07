@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
+import { StreamTarget, type StreamTargetChunk } from '../../src/target.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget, NullTarget } from '../../src/target.js';
@@ -972,6 +973,38 @@ const testChunkOrder = async (fastStart: false | 'in-memory' | 'reserve') => {
 	expect(chunkStartTimestamps.length).toBeGreaterThan(10);
 	expect(chunkStartTimestamps).toEqual([...chunkStartTimestamps].sort((a, b) => a - b));
 };
+
+test('In-memory Fast Start hands the media data to a StreamTarget chunk by chunk', async () => {
+	let totalSize = 0;
+	let largestWrite = 0;
+	const writable = new WritableStream<StreamTargetChunk>({
+		write: (chunk) => {
+			totalSize = Math.max(totalSize, chunk.position + chunk.data.byteLength);
+			largestWrite = Math.max(largestWrite, chunk.data.byteLength);
+		},
+	});
+
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'in-memory' }),
+		target: new StreamTarget(writable),
+	});
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source, { frameRate: 30 });
+	await output.start();
+
+	// 40 s of 256 KiB frames, as half-second chunks of 7.5 MiB, 300 MiB in total; every packet is a view of one buffer
+	const frame = new Uint8Array(2 ** 18);
+	for (let i = 0; i < 1200; i++) {
+		await source.add(new EncodedPacket(frame, i === 0 ? 'key' : 'delta', i / 30, 1 / 30), {
+			decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+		});
+	}
+	await output.finalize();
+
+	expect(totalSize).toBeGreaterThan(300 * 2 ** 20);
+	// The file is already held in memory once; one write of the whole media data used to copy all of it again
+	expect(largestWrite).toBeLessThan(16 * 2 ** 20);
+}, 60_000);
 
 test('Reserved Fast Start rejects a maximum packet count beyond u32', async () => {
 	const output = new Output({
