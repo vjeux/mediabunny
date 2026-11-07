@@ -37,6 +37,8 @@ export class FlacMuxer extends Muxer {
 	private metadataWritten = false;
 
 	private blockSizes: number[] = [];
+	/** In append-only mode, the fixed block size that STREAMINFO declares, if it declares one. */
+	private declaredFixedBlockSize: number | null = null;
 	private frameSizes: number[] = [];
 
 	private sampleRate: number | null = null;
@@ -97,6 +99,7 @@ export class FlacMuxer extends Muxer {
 			// beforehand what block sizes it will use." Like the rest of the header, the block size comes from the
 			// decoder config.
 			const isFixedBlockSize = minimumBlockSize === maximumBlockSize && minimumBlockSize >= 16;
+			this.declaredFixedBlockSize = isFixedBlockSize ? minimumBlockSize : null;
 
 			// Write STREAMINFO immediately since we can't seek back later.
 			this.writeHeader({
@@ -299,6 +302,17 @@ export class FlacMuxer extends Muxer {
 
 			readCodedNumber(slice); // num
 			const blockSize = readBlockSize(slice, blockSizeOrUncommon);
+
+			if (this.declaredFixedBlockSize !== null && blockSize > this.declaredFixedBlockSize) {
+				// Decoders such as FFmpeg's drop frames larger than STREAMINFO's maximum block size, which was already
+				// written, so let's fail instead of writing audio that would be lost. A shorter frame (as where streams
+				// are joined) is decoded fine.
+				throw new Error(
+					`Cannot write a FLAC frame of ${blockSize} samples in append-only mode, as the STREAMINFO already`
+					+ ` written declares a fixed block size of ${this.declaredFixedBlockSize} samples, taken from the`
+					+ ' decoder config. To join streams with different block sizes, disable appendOnly.',
+				);
+			}
 
 			if (!this.format._options.appendOnly) {
 				this.blockSizes.push(blockSize);
