@@ -86,6 +86,14 @@ if (typeof FinalizationRegistry !== 'undefined') {
 }
 
 /**
+ * Whether the value is a SharedArrayBuffer. Also works where SharedArrayBuffer isn't a global: without cross-origin
+ * isolation, shared WebAssembly memory still is one.
+ */
+const isSharedArrayBuffer = (value: unknown): value is SharedArrayBuffer => {
+	return Object.prototype.toString.call(value) === '[object SharedArrayBuffer]';
+};
+
+/**
  * Abstract base class for custom video sample resources. Implement this class to provide custom backing
  * for VideoSample instances.
  * @group Samples
@@ -370,7 +378,7 @@ export class VideoSample implements Disposable {
 	) {
 		if (
 			data instanceof ArrayBuffer
-			|| (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)
+			|| isSharedArrayBuffer(data)
 			|| ArrayBuffer.isView(data)
 		) {
 			if (!init || typeof init !== 'object') {

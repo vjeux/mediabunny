@@ -438,6 +438,19 @@ test('draw with rotation then flip', () => {
 	expect(pixelAt(pixels, 4, 0, 3)).toEqual([3, 0]);
 });
 
+test('ArrayBuffer-backed samples accept the SharedArrayBuffer of shared WebAssembly memory', async () => {
+	// Without cross-origin isolation (as in this test page), SharedArrayBuffer isn't a global, but shared WebAssembly
+	// memory, e.g. the heap of a threaded WebAssembly decoder, still is one
+	const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+	const pixels = Uint8Array.from({ length: 16 }, (_, i) => i + 1);
+	new Uint8Array(memory.buffer).set(pixels);
+
+	using sample = new VideoSample(memory.buffer, { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 });
+	const bytes = new Uint8Array(16);
+	await sample.copyTo(bytes);
+	expect(bytes).toEqual(pixels);
+});
+
 test('drawWithFit with rotation, flip and crop', () => {
 	using sample = makeCoordinateSample({ rotation: 90, flip: true });
 
