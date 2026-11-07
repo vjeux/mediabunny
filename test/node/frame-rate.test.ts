@@ -90,6 +90,16 @@ test('findUnderlyingFrameRate with millisecond-rounded timestamps at a finer tim
 	}
 });
 
+test('findUnderlyingFrameRate with millisecond-rounded VFR at a finer time resolution', () => {
+	// A drifting ~30 fps capture stored in whole milliseconds, as in a WebM. FFmpeg's -c copy into MP4 gives such a
+	// track a 16000 Hz timescale. It stays variable there, as it is at 1000 Hz (found by lane L46).
+	const milliseconds = [
+		0, 33, 66, 98, 131, 164, 197, 231, 264, 298, 330, 363, 396, 429, 462, 495, 528, 561, 594, 627,
+	];
+	expect(findUnderlyingFrameRate(Float64Array.from(milliseconds), 1000)).toBe(null);
+	expect(findUnderlyingFrameRate(Float64Array.from(milliseconds, x => x * 16), 16000)).toBe(null);
+});
+
 test('findUnderlyingFrameRate with irregular timestamps yields null', () => {
 	const ticks = new Float64Array([0, 0.2, 0.5].map(x => Math.round(x * 100)));
 	expect(findUnderlyingFrameRate(ticks, 100)).toBe(null);
