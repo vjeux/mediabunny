@@ -10,7 +10,7 @@ import { BufferTarget } from '../../src/target.js';
 import { MkvOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, TextSubtitleSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -209,3 +209,79 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('Cues reference every subtitle block, with its duration', async () => {
+	// "For each subtitle track present, each subtitle frame SHOULD be referenced by a CuePoint element with a
+	// CueDuration element", so that a subtitle still shown at a seek target can be found
+
+	// Returns [CueTime, CueTrack, CueDuration] for each CueTrackPositions
+	const readCuePoints = (bytes: Uint8Array) => {
+		const readVint = (position: number, keepMarker: boolean) => {
+			let length = 1;
+			while (!(bytes[position]! & (0x80 >> (length - 1)))) {
+				length++;
+			}
+
+			let value = keepMarker ? bytes[position]! : bytes[position]! & (0xff >> length);
+			for (let i = 1; i < length; i++) {
+				value = value * 256 + bytes[position + i]!;
+			}
+			return { value, length };
+		};
+
+		const result: (number | null)[][] = [];
+		const walk = (start: number, end: number, cue: (number | null)[]) => {
+			for (let position = start; position < end;) {
+				const id = readVint(position, true);
+				const size = readVint(position + id.length, false);
+				const dataStart = position + id.length + size.length;
+				const dataEnd = Math.min(end, dataStart + size.value);
+				const uint = () => bytes.subarray(dataStart, dataEnd).reduce((value, byte) => value * 256 + byte, 0);
+
+				if (id.value === 0x18538067 || id.value === 0x1c53bb6b) {
+					walk(dataStart, dataEnd, cue); // Segment, Cues
+				} else if (id.value === 0xbb) {
+					walk(dataStart, dataEnd, [null, null, null]); // CuePoint
+				} else if (id.value === 0xb3) {
+					cue[0] = uint(); // CueTime
+				} else if (id.value === 0xb7) {
+					const positions = [cue[0]!, null, null];
+					walk(dataStart, dataEnd, positions); // CueTrackPositions
+					result.push(positions);
+				} else if (id.value === 0xf7) {
+					cue[1] = uint(); // CueTrack
+				} else if (id.value === 0xb2) {
+					cue[2] = uint(); // CueDuration
+				}
+
+				position = dataEnd;
+			}
+		};
+
+		walk(0, bytes.length, []);
+		return result;
+	};
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const video = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(video);
+	const subtitles = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(subtitles);
+	await output.start();
+
+	// B, from 2 to 8 s, is still shown in the cluster that begins at 5 s
+	await subtitles.add(
+		'WEBVTT\n\n00:00.500 --> 00:01.500\nA\n\n00:02.000 --> 00:08.000\nB\n\n00:03.000 --> 00:03.500\nC\n',
+	);
+	subtitles.close();
+	for (let i = 0; i < 100; i++) {
+		const packet = new EncodedPacket(new Uint8Array(100), i % 50 === 0 ? 'key' : 'delta', i / 10, 0.1);
+		await video.add(packet, { decoderConfig: { codec: 'avc1.42001f', codedWidth: 64, codedHeight: 64 } });
+	}
+	await output.finalize();
+
+	const cuePoints = readCuePoints(new Uint8Array(output.target.buffer!));
+	// The video key frames at 0 and 5 s, as before
+	expect(cuePoints.filter(([, track]) => track === 1)).toEqual([[0, 1, null], [5000, 1, null]]);
+	expect(cuePoints.filter(([, track]) => track === 2)).toEqual([[500, 2, 1000], [2000, 2, 6000], [3000, 2, 500]]);
+});
