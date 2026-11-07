@@ -180,6 +180,66 @@ const encodeFlippedVideo = async () => {
 	return output.target.buffer!;
 };
 
+test('A fit without both width and height applies to video that changes size, even if it could be copied', async () => {
+	// A VP9 WebM switching from 64x48 to 32x32 mid-stream, as WebRTC and MediaRecorder recordings do
+	const encodeVp9 = async (width: number, height: number, first: number, count: number) => {
+		const chunks: { chunk: EncodedVideoChunk; meta?: EncodedVideoChunkMetadata }[] = [];
+		const encoder = new VideoEncoder({
+			output: (chunk, meta) => chunks.push({ chunk, meta }),
+			error: (error) => {
+				throw error;
+			},
+		});
+		encoder.configure({ codec: 'vp09.00.10.08', width, height, bitrate: 1e5 });
+
+		const canvas = new OffscreenCanvas(width, height);
+		const context = canvas.getContext('2d')!;
+		for (let i = first; i < first + count; i++) {
+			context.fillStyle = `rgb(${i * 40}, 128, 64)`;
+			context.fillRect(0, 0, width, height);
+			const frame = new VideoFrame(canvas, { timestamp: i * 100_000, duration: 100_000 });
+			encoder.encode(frame, { keyFrame: i === first });
+			frame.close();
+		}
+
+		await encoder.flush();
+		encoder.close();
+		return chunks;
+	};
+
+	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('vp9');
+	sourceOutput.addVideoTrack(videoSource);
+	await sourceOutput.start();
+	for (const { chunk, meta } of [...await encodeVp9(64, 48, 0, 3), ...await encodeVp9(32, 32, 3, 3)]) {
+		await videoSource.add(EncodedPacket.fromEncodedChunk(chunk), meta);
+	}
+	await sourceOutput.finalize();
+
+	const convertedFrameSizes = async (video: ConversionVideoOptions) => {
+		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const sizes: string[] = [];
+		for await (using sample of new VideoSampleSink((await result.getPrimaryVideoTrack())!).samples()) {
+			sizes.push(`${sample.displayWidth}x${sample.displayHeight}`);
+		}
+
+		return sizes;
+	};
+
+	const expected = Array(6).fill('64x48');
+	// Control: when a transcode happens anyway, fit handles the size change
+	expect(await convertedFrameSizes({ width: 64, height: 48, fit: 'contain', forceTranscode: true }))
+		.toEqual(expected);
+	// fit alone has no other role, so it must be applied too
+	expect(await convertedFrameSizes({ fit: 'contain' })).toEqual(expected);
+	expect(await convertedFrameSizes({ width: 64, fit: 'contain' })).toEqual(expected);
+});
+
 test('Exceeding max allowed track count', async () => {
 	using input = new Input({
 		source: new UrlSource('/multiple-aac-tracks.mp4'),
@@ -1466,63 +1526,3 @@ const testReservedFastStart = async (
 		expect(maximumPacketCount).toBeLessThanOrEqual(2 * packetCount + 64);
 	}
 };
-
-test('A fit without both width and height applies to video that changes size, even if it could be copied', async () => {
-	// A VP9 WebM switching from 64x48 to 32x32 mid-stream, as WebRTC and MediaRecorder recordings do
-	const encodeVp9 = async (width: number, height: number, first: number, count: number) => {
-		const chunks: { chunk: EncodedVideoChunk; meta?: EncodedVideoChunkMetadata }[] = [];
-		const encoder = new VideoEncoder({
-			output: (chunk, meta) => chunks.push({ chunk, meta }),
-			error: (error) => {
-				throw error;
-			},
-		});
-		encoder.configure({ codec: 'vp09.00.10.08', width, height, bitrate: 1e5 });
-
-		const canvas = new OffscreenCanvas(width, height);
-		const context = canvas.getContext('2d')!;
-		for (let i = first; i < first + count; i++) {
-			context.fillStyle = `rgb(${i * 40}, 128, 64)`;
-			context.fillRect(0, 0, width, height);
-			const frame = new VideoFrame(canvas, { timestamp: i * 100_000, duration: 100_000 });
-			encoder.encode(frame, { keyFrame: i === first });
-			frame.close();
-		}
-
-		await encoder.flush();
-		encoder.close();
-		return chunks;
-	};
-
-	const sourceOutput = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-	const videoSource = new EncodedVideoPacketSource('vp9');
-	sourceOutput.addVideoTrack(videoSource);
-	await sourceOutput.start();
-	for (const { chunk, meta } of [...await encodeVp9(64, 48, 0, 3), ...await encodeVp9(32, 32, 3, 3)]) {
-		await videoSource.add(EncodedPacket.fromEncodedChunk(chunk), meta);
-	}
-	await sourceOutput.finalize();
-
-	const convertedFrameSizes = async (video: ConversionVideoOptions) => {
-		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
-		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
-		const conversion = await Conversion.init({ input, output, video });
-		await conversion.execute();
-
-		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-		const sizes: string[] = [];
-		for await (using sample of new VideoSampleSink((await result.getPrimaryVideoTrack())!).samples()) {
-			sizes.push(`${sample.displayWidth}x${sample.displayHeight}`);
-		}
-
-		return sizes;
-	};
-
-	const expected = Array(6).fill('64x48');
-	// Control: when a transcode happens anyway, fit handles the size change
-	expect(await convertedFrameSizes({ width: 64, height: 48, fit: 'contain', forceTranscode: true }))
-		.toEqual(expected);
-	// fit alone has no other role, so it must be applied too
-	expect(await convertedFrameSizes({ fit: 'contain' })).toEqual(expected);
-	expect(await convertedFrameSizes({ width: 64, fit: 'contain' })).toEqual(expected);
-});
