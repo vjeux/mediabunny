@@ -63,8 +63,8 @@ To get going with Mediabunny, here are some starting points:
 Mediabunny's simple yet flexible API provides a modern alternative to traditional server-side media processing pipelines which may involve calling out to FFmpeg's CLI manually. Mediabunny was primarily built for client-side environments, but when combined with the [`@mediabunny/server`](./extensions/server) extension, the full Mediabunny feature set is available in server-side environments such as Node, Bun, and Deno.
 
 The extension enables:
-- Video decoders and encoders for AVC (H.264), HEVC (H.265), VP8, VP9, and AV1. Supports both length-prefixed and Annex B AVC/HEVC as well as transparent video via VP9.
-- Audio decoders and encoders for AAC, MP3, Vorbis, Opus, FLAC, AC-3, E-AC-3 and DTS. Supports AAC in both AAC and ADTS formats.
+- Video decoders and encoders for AVC (H.264), HEVC (H.265), VP8, VP9, AV1, and ProRes. Supports both length-prefixed and Annex B AVC/HEVC as well as transparent video via VP9 and ProRes.
+- Audio decoders and encoders for AAC, MP3, Vorbis, Opus, FLAC, AC-3, E-AC-3, DTS and TrueHD. Supports AAC in both AAC and ADTS formats.
 - Video frame transformation support (resize, rotate, crop)
 - Automatic hardware acceleration on all platforms (macOS, Linux, Windows)
 - Built-in multithreading
