@@ -181,6 +181,117 @@ test('UrlSource with maxCacheSize: Infinity allows random access against a range
 	}
 });
 
+test('UrlSource rejects responses for a resource that got shorter while it was being read', async () => {
+	const v1 = new Uint8Array(3 * 2 ** 20).map((_, i) => i & 0xff);
+	const v2 = new Uint8Array(2 * 2 ** 20).map((_, i) => (i * 7 + 3) & 0xff);
+
+	for (const honorRanges of [true, false]) {
+		for (const changes of [false, true]) {
+			let requestCount = 0;
+			const server = http.createServer((req, res) => {
+				res.on('error', () => {});
+				const isFirst = requestCount++ === 0;
+				const data = isFirst || !changes ? v1 : v2;
+
+				if (honorRanges) {
+					const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')![1]);
+					res.writeHead(206, {
+						'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}`,
+						'Content-Length': data.length - start,
+					});
+					res.end(data.subarray(start));
+				} else {
+					res.writeHead(200, { 'Content-Length': data.length });
+					if (isFirst) {
+						// The connection dies, so that the download resumes with a second request
+						res.write(data.subarray(0, 100_000), () => res.destroy());
+					} else {
+						res.end(data);
+					}
+				}
+			});
+
+			await new Promise<void>(resolve => server.listen(0, resolve));
+			const logs = captureLogs();
+
+			try {
+				const address = server.address();
+				assert(address && typeof address !== 'string');
+				const url = `http://localhost:${address.port}/data.bin`;
+				using ref = new UrlSource(url, { getRetryDelay: () => 0 }).ref();
+				const reader = new Reader(ref.source);
+
+				// With range requests, a second request is made for a far-away read once the length is known
+				const [start, length] = honorRanges ? [1_900_000, 100] : [0, 500_000];
+				if (honorRanges) {
+					await reader.requestSlice(0, 100);
+				}
+
+				const read = async () => reader.requestSlice(start, length);
+				if (changes) {
+					await expect(read).rejects.toThrow(
+						`Error fetching ${url}: the resource changed while it was being read; it was 3145728`
+						+ ' bytes long, now it is 2097152.',
+					);
+				} else {
+					const slice = await read();
+					expect(Buffer.compare(readBytes(slice!, length), v1.subarray(start, start + length))).toBe(0);
+				}
+			} finally {
+				logs.stop();
+				server.closeAllConnections();
+				server.close();
+			}
+		}
+	}
+});
+
+test('UrlSource keeps reading a file that grows while it is read, within the length first stated', async () => {
+	// Like a server serving a recording in progress: every response states the length written so far, and the bytes
+	// already written never change
+	const full = new Uint8Array(3_000_000).map((_, i) => (i * 7 + (i >> 9)) & 0xff);
+	const lengths = [1_000_000, 1_500_000, 2_000_000];
+	const requestStarts: number[] = [];
+	const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+		const length = lengths[Math.min(requestStarts.length, lengths.length - 1)]!;
+		const start = Number(/^bytes=(\d+)-$/.exec(new Headers(init?.headers).get('Range') ?? '')![1]);
+		requestStarts.push(start);
+
+		let pos = start;
+		const body = new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (pos >= length) {
+					controller.close();
+					return;
+				}
+
+				controller.enqueue(full.slice(pos, Math.min(pos + 16384, length)));
+				pos += 16384;
+			},
+		});
+
+		return new Response(body, {
+			status: 206,
+			headers: {
+				'Content-Range': `bytes ${start}-${length - 1}/${length}`,
+				'Content-Length': String(length - start),
+			},
+		});
+	}) as typeof fetch;
+
+	// A small cache, so that the later reads need new requests
+	using ref = new UrlSource('https://example.com/recording.mkv', { fetchFn, maxCacheSize: 2 ** 16 }).ref();
+	const reader = new Reader(ref.source);
+
+	for (const start of [0, 900_000, 100_000]) {
+		const slice = await reader.requestSlice(start, 1000);
+		expect(Buffer.compare(readBytes(slice!, 1000), full.subarray(start, start + 1000))).toBe(0);
+	}
+
+	expect(requestStarts.length).toBeGreaterThanOrEqual(3);
+	expect(await ref.source.getSize()).toBe(1_000_000);
+});
+
 test('UrlSource in sequential mode downloads lazily and aborts the response on dispose', async () => {
 	// The resource is padded to a size far beyond what kernel socket buffers can swallow. This matters: the server
 	// can only observe the client's laziness through backpressure, and on some systems (like Linux with its TCP

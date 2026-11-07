@@ -783,6 +783,12 @@ export class UrlSource extends PathedSource {
 	_abortControllers = new Map<ReadWorker, AbortController>();
 	/** @internal */
 	_sequentialAbortController: AbortController | null = null;
+	/**
+	 * The length of the resource as stated by the first response that stated it, which later responses mustn't fall
+	 * below.
+	 * @internal
+	 */
+	_resourceLength: number | null = null;
 
 	/**
 	 * Creates a new {@link UrlSource} backed by the resource at the specified URL.
@@ -979,6 +985,8 @@ export class UrlSource extends PathedSource {
 				throw new Error(`Error fetching ${String(this._url)}: ${response.status} ${response.statusText}`);
 			}
 
+			this._checkResourceLength(response);
+
 			if (response.redirected) {
 				// Modify our own root path so that future subrequests get made relative to the redirected URL
 				this.rootPath = response.url;
@@ -1148,6 +1156,43 @@ export class UrlSource extends PathedSource {
 		// logic for that has vanished for now. Leaving a comment here if this becomes relevant again.
 	}
 
+	/**
+	 * Throws if a response states a smaller length for the resource than the first response did: the resource got
+	 * replaced in the meantime, bytes read before may be gone, and the new bytes can't be combined with them (RFC 9110,
+	 * Section 13.1.5). A larger length is taken as a file that is still being written, which keeps being read within
+	 * the length first stated.
+	 * @internal
+	 */
+	private _checkResourceLength(response: Response) {
+		let length: number | null = null;
+
+		// Lengths count encoded bytes when Content-Encoding is present (and CORS responses may hide that header)
+		if (!response.headers.has('Content-Encoding')) {
+			if (response.status === 206) {
+				const match = /\/(\d+)\s*$/.exec(response.headers.get('Content-Range') ?? '');
+				length = match ? Number(match[1]) : null; // A complete length of '*' is unknown
+			} else if (response.status === 200 && response.type === 'basic') {
+				const contentLength = response.headers.get('Content-Length')?.trim() ?? '';
+				length = /^\d+$/.test(contentLength) ? Number(contentLength) : null;
+			}
+		}
+
+		if (length === null) {
+			return;
+		}
+
+		if (this._resourceLength === null) {
+			this._resourceLength = length;
+		} else if (length < this._resourceLength) {
+			void response.body?.cancel().catch(() => {});
+			throw new Error(
+				// eslint-disable-next-line @typescript-eslint/no-base-to-string
+				`Error fetching ${String(this._url)}: the resource changed while it was being read; it was`
+				+ ` ${this._resourceLength} bytes long, now it is ${length}.`,
+			);
+		}
+	}
+
 	/** @internal */
 	private _transitionToSequentialMode(body: ReadableStream<Uint8Array>, abortController: AbortController) {
 		// The server ignored our range request and is sending the entire resource from byte 0. Instead of downloading
@@ -1207,6 +1252,8 @@ export class UrlSource extends PathedSource {
 								+ ` ${newResponse.status} ${newResponse.statusText}`,
 							);
 						}
+
+						this._checkResourceLength(newResponse);
 
 						if (!newResponse.body) {
 							throw new Error(
