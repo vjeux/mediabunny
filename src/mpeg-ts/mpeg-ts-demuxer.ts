@@ -230,6 +230,7 @@ export class MpegTsDemuxer extends Demuxer {
 			// Some files contain these multiple times, but we only care about their first appearance
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
+			let programMapSectionPid: number | null = null;
 
 			while (true) {
 				const packetHeader = await this.readPacketHeader(currentPos);
@@ -245,7 +246,10 @@ export class MpegTsDemuxer extends Demuxer {
 
 				if (
 					hasProgramMap
-					&& !this.elementaryStreams.some(x => x.pid === packetHeader.pid && !x.initialized)
+					&& (
+						packetHeader.pid === programMapSectionPid
+						|| !this.elementaryStreams.some(x => x.pid === packetHeader.pid && !x.initialized)
+					)
 				) {
 					// Don't care about this PID (anymore)
 					currentPos += this.packetStride;
@@ -517,6 +521,14 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					hasProgramMap = true;
+					programMapSectionPid = section.pid;
+
+					if (this.elementaryStreams.some(x => !x.initialized)) {
+						// PES packets can come before the PMT, like in a capture of a broadcast that starts between two
+						// of its PSI repetitions, so look for each stream's first PES packet from the start of the file
+						currentPos = this.packetOffset;
+						continue;
+					}
 				} else {
 					const elementaryStream = this.elementaryStreams.find(x => x.pid === section.pid);
 					outer:
@@ -888,7 +900,9 @@ export class MpegTsDemuxer extends Demuxer {
 			} else {
 				if (packet.pid !== firstPacket.pid) {
 					if (contiguous) {
-						break; // End of section
+						// The section may well continue after the foreign packets, so this isn't necessarily its end
+						mustAddSectionEnd = false;
+						break;
 					} else {
 						continue; // Ignore this packet
 					}
