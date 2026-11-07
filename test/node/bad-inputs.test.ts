@@ -1850,6 +1850,26 @@ const dataChunk = (size = 44100 * 4) => riffChunk('data', zeros(size));
 
 const riffChunk = (id: string, body: Bytes) => concat(ascii(id), u32le(body.length), body, zeros(body.length % 2));
 
+test('ID3: Tag in front of an Ogg file', async () => {
+	// Some taggers put an ID3v2 tag in front of any file; FFmpeg and browsers skip it, as Mediabunny does for FLAC
+	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
+	pages.push(oggPacketsPage({ headerType: 4, granule: 9600, sequence: 2 }, Array<Bytes>(10).fill(OPUS_PACKET)));
+	const file = concat(id3Tag(3, 0, concat(id3Frame('TIT2', concat([0], ascii('Title'))), zeros(32))), ...pages);
+
+	for (const source of [new BufferSource(file), streamedSource(file)]) {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		expect((await input.getFormat()).name).toBe('Ogg');
+		const track = await input.getPrimaryAudioTrack();
+		expect(await track!.getCodec()).toBe('opus');
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track!).packets()) {
+			expect(packet.byteLength).toBe(OPUS_PACKET.length);
+			packetCount++;
+		}
+		expect(packetCount).toBe(10);
+	}
+});
+
 test('ID3: Unsynchronized tag with many frames', async () => {
 	// Each frame used to undo the unsynchronization on a fresh copy of the entire tag
 	const frames = Array.from({ length: 50_000 }, () => id3Frame('ABCD', [0]));
