@@ -496,13 +496,40 @@ export const trak = (trackData: IsobmffTrackData, creationTime: number) => {
 		tkhd(trackData, creationTime),
 		needsEditList ? edts(trackData) : null,
 		mdia(trackData, creationTime),
-		trackMetadata.name !== undefined
-			? box('udta', undefined, [
-					box('name', [ // VLC (and Mediabunny) also recognize ©nam
-						...textEncoder.encode(trackMetadata.name),
-					]),
+		trackUdta(trackData, trackMetadata.name),
+	]);
+};
+
+/** The DASH roles (ISO/IEC 23009-1) of a track's dispositions, in the order FFmpeg writes them. */
+const DASH_ROLES = [
+	['hearingImpaired', 'caption'],
+	['commentary', 'commentary'],
+	['visuallyImpaired', 'description'],
+	['forced', 'forced-subtitle'],
+] as const;
+
+/** User Data Box of a track: its name and, in MP4, a Track Kind Box for each disposition with a DASH role. */
+const trackUdta = (trackData: IsobmffTrackData, name: string | undefined) => {
+	const disposition = trackData.track.metadata.disposition;
+	// Like FFmpeg, only for MP4 (not QuickTime)
+	const roles = trackData.muxer.isQuickTime
+		? []
+		: DASH_ROLES.filter(([key]) => disposition?.[key]).map(([, role]) => role);
+
+	if (name === undefined && roles.length === 0) {
+		return null;
+	}
+
+	return box('udta', undefined, [
+		name !== undefined
+			? box('name', [ // VLC (and Mediabunny) also recognize ©nam
+					...textEncoder.encode(name),
 				])
 			: null,
+		...roles.map(role => fullBox('kind', 0, 0, [
+			ascii('urn:mpeg:dash:role:2011', true), // Scheme URI
+			ascii(role, true), // Value
+		])),
 	]);
 };
 
