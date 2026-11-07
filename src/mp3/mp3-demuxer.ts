@@ -31,16 +31,20 @@ import {
 	computeAverageMp3FrameSize,
 	getMp3ChannelCount,
 	MP3_DECODER_DELAY,
+	decodeSynchsafe,
 } from '../../shared/mp3-misc';
 import {
 	ID3_V1_TAG_SIZE,
 	ID3_V2_HEADER_SIZE,
+	Id3V2Header,
+	Id3V2HeaderFlags,
+	Id3V2Reader,
 	parseId3V1Tag,
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
 import { readNextMp3FrameHeader } from './mp3-reader';
-import { readAscii, readBytes, Reader, readU32Be } from '../reader';
+import { readAscii, readBytes, Reader, readU32Be, readU8 } from '../reader';
 
 type Sample = {
 	timestamp: number;
@@ -72,6 +76,7 @@ export class Mp3Demuxer extends Demuxer {
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
 	primingDelay = 0;
+	itunesPriming: number | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -117,6 +122,8 @@ export class Mp3Demuxer extends Demuxer {
 				if (!id3V2Header) {
 					break;
 				}
+
+				await this.readItunesPriming(slice.filePos, id3V2Header);
 
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
 			}
@@ -199,6 +206,12 @@ export class Mp3Demuxer extends Demuxer {
 		if (!this.firstFrameHeader) {
 			this.firstFrameHeader = header;
 			this.firstFrameHeaderPos = result.startPos;
+
+			if (this.primingDelay === 0 && this.itunesPriming !== null) {
+				// No LAME tag told us about the delay, but iTunes did. Its priming includes the decoder delay already.
+				this.primingDelay = this.itunesPriming;
+				this.nextTimestampInSamples = -this.primingDelay;
+			}
 		}
 
 		const sampleDuration = header.audioSamplesInFrame / this.firstFrameHeader.sampleRate;
@@ -213,6 +226,96 @@ export class Mp3Demuxer extends Demuxer {
 		this.nextTimestampInSamples += header.audioSamplesInFrame;
 
 		return;
+	}
+
+	/**
+	 * Apple's encoders don't write a LAME tag but store the encoder delay in an iTunSMPB comment of the ID3v2 tag,
+	 * like " 00000000 00000210 0000086A 0000000000066486 ...": priming, end padding and sample count, in hex. To find
+	 * it, this only reads the frame headers and small comment frames, so large frames like cover art aren't loaded.
+	 */
+	async readItunesPriming(contentStart: number, header: Id3V2Header) {
+		if (
+			![2, 3, 4].includes(header.majorVersion)
+			|| (header.flags & (Id3V2HeaderFlags.Unsynchronisation | Id3V2HeaderFlags.ExtendedHeader))
+		) {
+			return; // iTunes writes neither
+		}
+
+		const frameHeaderSize = header.majorVersion === 2 ? 6 : 10;
+		const contentEnd = contentStart + header.size - ((header.flags & Id3V2HeaderFlags.Footer) ? 10 : 0);
+		let pos = contentStart;
+
+		while (pos + frameHeaderSize <= contentEnd) {
+			let slice = this.reader.requestSlice(pos, frameHeaderSize);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				return;
+			}
+
+			const id = readAscii(slice, header.majorVersion === 2 ? 3 : 4);
+			if (!/^[0-9A-Z]+$/.test(id)) {
+				return; // Padding
+			}
+
+			let size: number;
+			let flags = 0;
+			if (header.majorVersion === 2) {
+				size = (readU8(slice) << 16) | (readU8(slice) << 8) | readU8(slice);
+			} else {
+				const sizeRaw = readU32Be(slice);
+				size = header.majorVersion === 4 ? decodeSynchsafe(sizeRaw) : sizeRaw;
+				flags = readU8(slice) << 8 | readU8(slice);
+			}
+
+			const bodyPos = pos + frameHeaderSize;
+			pos = bodyPos + size;
+
+			// Frames with flags (compression, encryption, unsynchronisation...) aren't what iTunes writes
+			if (!['COMM', 'COM', 'TXXX', 'TXX'].includes(id) || flags !== 0 || size < 1 || size > 4096) {
+				continue;
+			}
+
+			let bodySlice = this.reader.requestSlice(bodyPos, Math.min(size, contentEnd - bodyPos));
+			if (isThenable(bodySlice)) {
+				bodySlice = await bodySlice;
+			}
+			if (!bodySlice) {
+				return;
+			}
+
+			const body = readBytes(bodySlice, bodySlice.length);
+			const reader = new Id3V2Reader(header, body);
+			const encoding = reader.readU8();
+			if (encoding > 3) {
+				continue;
+			}
+
+			if (id === 'COMM' || id === 'COM') {
+				reader.pos += 3; // Language
+			}
+
+			if (reader.pos > body.length || reader.readId3V2Text(encoding, body.length) !== 'iTunSMPB') {
+				continue;
+			}
+
+			const match = /^\s*[0-9a-f]{1,16}\s+([0-9a-f]{1,16})\s+([0-9a-f]{1,16})\s+([0-9a-f]{1,16})(?![0-9a-f])/i
+				.exec(reader.readId3V2Text(encoding, body.length));
+			if (!match) {
+				return;
+			}
+
+			const priming = Number.parseInt(match[1]!, 16);
+			const sampleCount = Number.parseInt(match[3]!, 16);
+
+			// Same sanity checks as FFmpeg
+			if (priming <= 16384 && sampleCount > 0) {
+				this.itunesPriming = priming;
+			}
+
+			return;
+		}
 	}
 
 	async getMimeType() {
