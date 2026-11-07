@@ -268,6 +268,15 @@ const METADATA_ELEMENTS = [
 	{ id: EBMLId.Tracks, flag: 'tracksSeen' },
 	{ id: EBMLId.Cues, flag: 'cuesSeen' },
 ] as const;
+/**
+ * Ranks the Matroska spec's cover art file names, best first: cover.*, cover_land.*, small_cover.*, small_cover_land.*.
+ * Returns null for other names.
+ */
+const getCoverArtRank = (fileName: string | null | undefined) => {
+	const match = fileName && /^(small_)?cover(_land)?\./.exec(fileName.toLowerCase());
+	return match ? (match[1] ? 2 : 0) + (match[2] ? 1 : 0) : null;
+};
+
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
 const MAX_ELEMENT_NESTING_DEPTH = 64;
 
@@ -1888,18 +1897,28 @@ export class MatroskaDemuxer extends Demuxer {
 					const fileName = this.currentAttachedFile.fileName;
 					let kind: 'coverFront' | 'coverBack' | 'unknown' = 'unknown';
 
-					if (fileName) {
-						const lowerName = fileName.toLowerCase();
-						// The cover art names of the Matroska spec: cover.(jpg|png), with a small_ prefix for the small
-						// version and a _land suffix for the landscape one
-						if (/^(small_)?cover(_land)?\./.test(lowerName)) {
+					tags.images ??= [];
+
+					// The Matroska spec names cover art cover.(jpg|png), with versions of the same cover prefixed with
+					// small_ (smaller) or suffixed with _land (landscape). The best one there is the front cover, which
+					// cover.* always is.
+					const coverRank = getCoverArtRank(fileName);
+					if (coverRank !== null) {
+						const isWorse = (image: { name?: string }) => {
+							return (getCoverArtRank(image.name) ?? Infinity) > coverRank;
+						};
+						const frontCovers = tags.images.filter(x => x.kind === 'coverFront');
+						if (coverRank === 0 || frontCovers.every(isWorse)) {
+							for (const image of frontCovers.filter(isWorse)) {
+								image.kind = 'unknown';
+							}
+
 							kind = 'coverFront';
-						} else if (lowerName.startsWith('back.')) {
-							kind = 'coverBack';
 						}
+					} else if (fileName?.toLowerCase().startsWith('back.')) {
+						kind = 'coverBack';
 					}
 
-					tags.images ??= [];
 					tags.images.push({
 						data: this.currentAttachedFile.fileData,
 						mimeType: this.currentAttachedFile.fileMediaType,
