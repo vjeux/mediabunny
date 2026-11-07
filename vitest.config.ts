@@ -21,6 +21,12 @@ export default defineConfig({
 	},
 	test: {
 		restoreMocks: true,
+		browser: {
+			// How long the browser gets to start and load the test page (Vitest only reads this from the root config).
+			// The default of 60 s ran out on CI while the heavy node tests ran alongside, before a single browser
+			// test started; 5 minutes leaves room for the node project to keep growing
+			connectTimeout: 300_000,
+		},
 		projects: [
 			{
 				extends: true,
