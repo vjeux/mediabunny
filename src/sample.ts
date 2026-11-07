@@ -1665,7 +1665,15 @@ export class VideoSample implements Disposable {
 			let result = transformer(this, description);
 			if (isThenable(result)) result = await result;
 
-			if (result !== null) {
+			// Plain JavaScript transformers that don't handle the sample may return nothing, which defers too
+			if (result != null) {
+				if (!(result instanceof VideoSample)) {
+					throw new TypeError(
+						'Transformers registered with registerVideoSampleTransformer() must return a VideoSample,'
+						+ ' or null to defer.',
+					);
+				}
+
 				return result;
 			}
 		}
