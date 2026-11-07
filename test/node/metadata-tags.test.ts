@@ -19,6 +19,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { AttachedFile, MetadataTags } from '../../src/metadata.js';
 import { VERSIONED_NAME } from '../../src/version.js';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { AudioCodec, buildAudioCodecString } from '../../src/codec.js';
 import { Conversion } from '../../src/conversion.js';
@@ -831,6 +832,59 @@ test('Write WAV with ID3 tags', async () => {
 		expect(readTags.raw['TPOS']).toBe(`${songMetadata.discNumber}/${songMetadata.discsTotal}`);
 		expect(readTags.raw['TDRC']).toBeDefined();
 	}
+});
+
+test('Conversion metadata tags, raw ID3v2 frames of WAVE and FLAC files', async () => {
+	const writeWave = async (metadataFormat: 'info' | 'id3', tags: MetadataTags) => {
+		const output = new Output({ format: new WavOutputFormat({ metadataFormat }), target: new BufferTarget() });
+		output.setMetadataTags(tags);
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(4410 * 4), 'key', 0, 0.1), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+		});
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	const read = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+
+	const convert = async (bytes: Uint8Array, format: WavOutputFormat | FlacOutputFormat) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, showWarnings: false });
+		await conversion.execute();
+
+		return read(new Uint8Array(output.target.buffer!));
+	};
+
+	// A WAVE file with an ID3 chunk keeps its fields, but its ID3v2 frames don't become RIFF INFO chunks...
+	const id3Wave = await writeWave('id3', { artist: 'Artist', album: 'Album', raw: { TCOM: 'Composer' } });
+	expect((await read(id3Wave)).raw).toEqual({ TPE1: 'Artist', TALB: 'Album', TCOM: 'Composer' });
+	const fromId3 = await convert(id3Wave, new WavOutputFormat());
+	expect(fromId3.artist).toBe('Artist');
+	expect(fromId3.album).toBe('Album');
+	expect(fromId3.raw).toEqual({ IART: 'Artist', IPRD: 'Album' });
+
+	// ...and RIFF INFO chunks don't become ID3v2 frames, while they stay when the output writes them too
+	const infoWave = await writeWave('info', { artist: 'Artist', raw: { ICOP: 'Copyright' } });
+	expect((await convert(infoWave, new WavOutputFormat({ metadataFormat: 'id3' }))).raw).toEqual({ TPE1: 'Artist' });
+	expect((await convert(infoWave, new WavOutputFormat())).raw).toEqual({ IART: 'Artist', ICOP: 'Copyright' });
+
+	// A FLAC file with an ID3v2.4 tag (TCOM "Composer") in front keeps its Vorbis comments, but the ID3v2 frames don't
+	// become Vorbis comments
+	const tag = [0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 19, 0x54, 0x43, 0x4f, 0x4d, 0, 0, 0, 9, 0, 0, 3, ...'Composer']
+		.map(x => typeof x === 'string' ? x.charCodeAt(0) : x);
+	const flac = new Uint8Array([...tag, ...readFileSync(path.join(__dirname, '../public/sample.flac'))]);
+	expect((await read(flac)).raw!['TCOM']).toBe('Composer');
+	const fromFlac = await convert(flac, new FlacOutputFormat());
+	expect(fromFlac.title).toBe('The Happy Meeting');
+	expect(fromFlac.raw!['ARTIST']).toBe('Samples Files');
+	expect(fromFlac.raw!['TCOM']).toBeUndefined();
 });
 
 test('Default creation time, ISOBMFF', async () => {
