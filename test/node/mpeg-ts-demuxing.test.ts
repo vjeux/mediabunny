@@ -11,6 +11,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Logging } from '../../src/logging.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +922,96 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS skips metadata streams, like the ID3 timed metadata of HLS, without a note', async () => {
+	// Apple's timed metadata for HLS: ID3 tags in PES packets (stream_id 0xBD) of a stream_type 0x15 stream, described
+	// by a metadata_pointer_descriptor in the program info and a metadata_descriptor in the stream info. Made here by
+	// adding such a stream (PID 0x101), with one ID3 tag, to the AC-3 audio of ac3.ts (PID 0x100). An MPEG-2 video
+	// stream (stream_type 0x02, PID 0x102), whose codec isn't supported, still gets its note.
+	const crc32 = (bytes: number[]) => {
+		let crc = 0xffffffff;
+		for (const byte of bytes) {
+			crc ^= byte << 24;
+			for (let i = 0; i < 8; i++) {
+				crc = (crc << 1) ^ (crc & 0x80000000 ? 0x04c11db7 : 0);
+			}
+		}
+
+		crc >>>= 0;
+		return [crc >>> 24, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff];
+	};
+	const psiPacket = (pid: number, tableId: number, body: number[]) => {
+		const section = [tableId, 0xb0 | ((body.length + 4) >> 8), (body.length + 4) & 0xff, ...body];
+		const packet = new Uint8Array(188).fill(0xff);
+		packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, 0x10, 0x00, ...section, ...crc32(section)]);
+		return packet;
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+
+	// metadata_application_format 0xFFFF and metadata_format 0xFF, both identified as 'ID3 ', metadata_service_id 0
+	const id3Format = [0xff, 0xff, ...ascii('ID3 '), 0xff, ...ascii('ID3 '), 0x00];
+	const metadataPointerDescriptor = [0x25, 15, ...id3Format, 0x1f, 0x00, 0x01]; // For program 1
+	const metadataDescriptor = [0x26, 13, ...id3Format, 0x0f];
+
+	// An ID3v2.4 tag with the PRIV frame Apple uses to map the stream's timestamps
+	const privFrameData = [...ascii('com.apple.streaming.transportStreamTimestamp\0'), 0, 0, 0, 0, 0, 0x01, 0xb7, 0x74];
+	const id3Tag = [
+		...ascii('ID3'), 4, 0, 0, 0, 0, 0, 10 + privFrameData.length,
+		...ascii('PRIV'), 0, 0, 0, privFrameData.length, 0, 0, ...privFrameData,
+	];
+	const pesPacket = [
+		0x00, 0x00, 0x01, 0xbd, 0x00, 8 + id3Tag.length, 0x84, 0x80, 5, 0x21, 0x00, 0x01, 0x00, 0x01, // PTS 0
+		...id3Tag,
+	];
+	const id3Packet = new Uint8Array(188).fill(0xff);
+	id3Packet.set([0x47, 0x41, 0x01, 0x30, 183 - pesPacket.length, 0x00]);
+	id3Packet.set(pesPacket, 188 - pesPacket.length);
+
+	const original = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/ac3.ts')));
+	const packets = [
+		psiPacket(0x0000, 0x00, [0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00]),
+		psiPacket(0x1000, 0x02, [
+			0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, metadataPointerDescriptor.length, ...metadataPointerDescriptor,
+			0x81, 0xe1, 0x00, 0xf0, 6, 0x05, 4, ...ascii('AC-3'),
+			0x15, 0xe1, 0x01, 0xf0, metadataDescriptor.length, ...metadataDescriptor,
+			0x02, 0xe1, 0x02, 0xf0, 0,
+		]),
+		id3Packet,
+	];
+	for (let pos = 0; pos < original.length; pos += 188) {
+		if ((((original[pos + 1]! & 0x1f) << 8) | original[pos + 2]!) === 0x100) {
+			packets.push(original.subarray(pos, pos + 188));
+		}
+	}
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	const readTracks = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: [MPEG_TS] });
+		const tracks = await input.getTracks();
+		const audioPackets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
+			audioPackets.push(packet);
+		}
+		return { codecs: await Promise.all(tracks.map(x => x.getCodec())), audioPackets };
+	};
+
+	const notes: string[] = [];
+	const unsubscribe = Logging.on('warn', args => notes.push(args.map(String).join(' ')));
+	let actual: Awaited<ReturnType<typeof readTracks>>;
+	try {
+		actual = await readTracks(bytes);
+	} finally {
+		unsubscribe();
+	}
+
+	const expected = await readTracks(original);
+	expect(actual.codecs).toEqual(['ac3']);
+	expect(actual.audioPackets.length).toBeGreaterThan(0);
+	expect(actual.audioPackets.map(x => [x.timestamp, x.byteLength]))
+		.toEqual(expected.audioPackets.map(x => [x.timestamp, x.byteLength]));
+	expect(notes.filter(x => x.includes('stream_type'))).toEqual([
+		'Note: MPEG-TS streams with stream_type 0x2 are not currently supported.',
+	]);
 });

@@ -175,6 +175,10 @@ type Section = {
 	randomAccessIndicator: number;
 };
 
+// Stream types for metadata rather than media (H.222.0 Table 2-34), like the ID3 timed metadata (0x15) that many HLS
+// streams carry. They're skipped like unsupported codecs, but without a note, since they aren't tracks to begin with.
+const METADATA_STREAM_TYPES = new Set<number>([0x15, 0x16, 0x17, 0x18, 0x19]);
+
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
@@ -492,7 +496,7 @@ export class MpegTsDemuxer extends Demuxer {
 								// If we don't recognize the codec, we don't surface the track at all. This is because
 								// we can't determine its metadata and also have no idea how to packetize its data.
 
-								if (!ignoredStreamTypes.has(streamType)) {
+								if (!ignoredStreamTypes.has(streamType) && !METADATA_STREAM_TYPES.has(streamType)) {
 									Logging._warn(
 										`Note: MPEG-TS streams with stream_type 0x${streamType.toString(16)} are not`
 										+ ` currently supported.`,
