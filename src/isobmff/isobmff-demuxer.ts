@@ -874,7 +874,18 @@ export class IsobmffDemuxer extends Demuxer {
 						const lastCache = fragmentPositionCache[lastCacheIndex]!;
 						offsetFragmentTrackDataByTimestamp(trackData, lastCache.endTimestamp);
 					} else {
-						// We're the first fragment I guess, "offset by 0"
+						// We're the first fragment, so we continue where the samples in the moov box end (which is
+						// at 0 if there are none)
+						let lastTimingEntry: SampleTimingEntry | undefined;
+						try {
+							lastTimingEntry = last(this.getSampleTableForTrack(track).sampleTimingEntries);
+						} catch {
+							// A sample table that can't be read (a damaged file) leaves the fragment at 0, as before
+						}
+						if (lastTimingEntry) {
+							const { startDecodeTimestamp, count, delta } = lastTimingEntry;
+							offsetFragmentTrackDataByTimestamp(trackData, startDecodeTimestamp + count * delta);
+						}
 					}
 				}
 
@@ -3196,6 +3207,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			return null;
 		}
 
+		if (track.demuxer.isFragmented && track.demuxer.getSampleTableForTrack(track).sampleCount > 0) {
+			// The duration only covers the samples in the moov box and not the fragments that follow
+			return null;
+		}
+
 		assert(track.trackBacking);
 
 		const firstPacket = await track.trackBacking.getFirstPacket({ metadataOnly: true });
@@ -3213,26 +3229,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			return regularPacket;
 		}
 
-		return this.performFragmentedLookup(
-			null,
-			(fragment) => {
-				const trackData = fragment.trackData.get(this.internalTrack.id);
-				if (trackData) {
-					return {
-						sampleIndex: 0,
-						correctSampleFound: true,
-					};
-				}
-
-				return {
-					sampleIndex: -1,
-					correctSampleFound: false,
-				};
-			},
-			-Infinity, // Use -Infinity as a search timestamp to avoid using the lookup entries
-			Infinity,
-			options,
-		);
+		return this.fetchFirstFragmentedPacket(false, options);
 	}
 
 	private mapTimestampIntoTimescale(timestamp: number) {
@@ -3249,12 +3246,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		const sampleIndex = getSampleIndexForTimestamp(sampleTable, timestampInTimescale);
 		const regularPacket = await this.fetchPacketForSampleIndex(sampleIndex, options);
 
-		if (!sampleTableIsEmpty(sampleTable) || !this.internalTrack.demuxer.isFragmented) {
-			// Prefer the non-fragmented packet
+		if (!this.internalTrack.demuxer.isFragmented) {
 			return regularPacket;
 		}
 
-		return this.performFragmentedLookup(
+		const fragmentedPacket = await this.performFragmentedLookup(
 			null,
 			(fragment) => {
 				const trackData = fragment.trackData.get(this.internalTrack.id);
@@ -3277,6 +3273,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestampInTimescale,
 			options,
 		);
+
+		if (!regularPacket || !fragmentedPacket) {
+			return regularPacket ?? fragmentedPacket;
+		}
+
+		// The closer one wins
+		return regularPacket.timestamp > fragmentedPacket.timestamp ? regularPacket : fragmentedPacket;
 	}
 
 	async getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions) {
@@ -3284,7 +3287,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 		if (regularSampleIndex !== undefined) {
 			// Prefer the non-fragmented packet
-			return this.fetchPacketForSampleIndex(regularSampleIndex + 1, options);
+			const regularPacket = await this.fetchPacketForSampleIndex(regularSampleIndex + 1, options);
+			if (regularPacket || !this.internalTrack.demuxer.isFragmented) {
+				return regularPacket;
+			}
+
+			// The fragments come after the non-fragmented samples
+			return this.fetchFirstFragmentedPacket(false, options);
 		}
 
 		const locationInFragment = this.packetToFragmentLocation.get(packet);
@@ -3332,12 +3341,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		const sampleIndex = getKeyframeSampleIndexForTimestamp(sampleTable, timestampInTimescale);
 		const regularPacket = await this.fetchPacketForSampleIndex(sampleIndex, options);
 
-		if (!sampleTableIsEmpty(sampleTable) || !this.internalTrack.demuxer.isFragmented) {
-			// Prefer the non-fragmented packet
+		if (!this.internalTrack.demuxer.isFragmented) {
 			return regularPacket;
 		}
 
-		return this.performFragmentedLookup(
+		const fragmentedPacket = await this.performFragmentedLookup(
 			null,
 			(fragment) => {
 				const trackData = fragment.trackData.get(this.internalTrack.id);
@@ -3360,6 +3368,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			options,
 			true,
 		);
+
+		if (!regularPacket || !fragmentedPacket) {
+			return regularPacket ?? fragmentedPacket;
+		}
+
+		// The closer one wins
+		return regularPacket.timestamp > fragmentedPacket.timestamp ? regularPacket : fragmentedPacket;
 	}
 
 	async getNextKeyPacket(packet: EncodedPacket, options: PacketRetrievalOptions) {
@@ -3368,7 +3383,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			// Prefer the non-fragmented packet
 			const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
 			const nextKeyFrameSampleIndex = getNextKeyframeIndexForSample(sampleTable, regularSampleIndex);
-			return this.fetchPacketForSampleIndex(nextKeyFrameSampleIndex, options);
+			const regularPacket = await this.fetchPacketForSampleIndex(nextKeyFrameSampleIndex, options);
+			if (regularPacket || !this.internalTrack.demuxer.isFragmented) {
+				return regularPacket;
+			}
+
+			// The fragments come after the non-fragmented samples
+			return this.fetchFirstFragmentedPacket(true, options);
 		}
 
 		const locationInFragment = this.packetToFragmentLocation.get(packet);
@@ -3407,6 +3428,24 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				return {
 					sampleIndex: -1,
 					correctSampleFound: false,
+				};
+			},
+			-Infinity, // Use -Infinity as a search timestamp to avoid using the lookup entries
+			Infinity,
+			options,
+		);
+	}
+
+	private fetchFirstFragmentedPacket(keyPacketsOnly: boolean, options: PacketRetrievalOptions) {
+		return this.performFragmentedLookup(
+			null,
+			(fragment) => {
+				const trackData = fragment.trackData.get(this.internalTrack.id);
+				const sampleIndex = trackData?.samples.findIndex(x => !keyPacketsOnly || x.isKeyFrame) ?? -1;
+
+				return {
+					sampleIndex,
+					correctSampleFound: sampleIndex !== -1,
 				};
 			},
 			-Infinity, // Use -Infinity as a search timestamp to avoid using the lookup entries
@@ -4137,10 +4176,6 @@ const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Ration
 		info.squarePixelWidth = info.width;
 		info.squarePixelHeight = Math.round(info.height * den / num);
 	}
-};
-
-const sampleTableIsEmpty = (sampleTable: SampleTable) => {
-	return sampleTable.sampleSizes.length === 0;
 };
 
 const capEntryCounts = (entries: { startIndex: number; count: number }[], sampleCount: number) => {
