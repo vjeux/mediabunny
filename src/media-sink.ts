@@ -62,6 +62,7 @@ import {
 	toUint8Array,
 	validateAnyIterable,
 } from './misc';
+import { Logging } from './logging';
 import { EncodedPacket } from './packet';
 import { fromAlaw, fromUlaw } from './pcm';
 import {
@@ -1034,6 +1035,71 @@ const addReorderInfoToAvcSps = (nalUnits: Uint8Array[]) => {
 	return replaced;
 };
 
+/** Adjusts a decoder config to work around Chromium decoder bugs, before a WebCodecs decoder is configured with it. */
+const adjustVideoDecoderConfig = (codec: VideoCodec, decoderConfig: VideoDecoderConfig) => {
+	if (isChromium() || isFirefox()) {
+		if (codec === 'avc' && isChromium()) {
+			decoderConfig = {
+				...decoderConfig,
+				codec: toChromiumCompatibleAvcCodecString(decoderConfig.codec),
+			};
+		}
+
+		if (codec === 'avc' && decoderConfig.description) {
+			const record = deserializeAvcDecoderConfigurationRecord(
+				toUint8Array(decoderConfig.description),
+			);
+			if (record && record.sequenceParameterSets.length > 0) {
+				const sps = parseAvcSps(record.sequenceParameterSets[0]!);
+				if (sps) {
+					if (sps.frameMbsOnlyFlag === 0 && isChromium()) {
+						// Chromium has/had a bug with playing interlaced AVC
+						// (https://issues.chromium.org/issues/456919096) which can be worked around by
+						// requesting that software decoding be used. So, here we peek into the AVC description,
+						// if present, and switch to software decoding if we find interlaced content.
+						decoderConfig = {
+							...decoderConfig,
+							hardwareAcceleration: 'prefer-software',
+						};
+					}
+
+					if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+						// Modify the SPS to fix potential loss of B frames (Firefox loses the last frame)
+						record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
+						decoderConfig = {
+							...decoderConfig,
+							description: serializeAvcDecoderConfigurationRecord(record),
+						};
+					}
+				}
+			}
+		}
+
+		if (isChromium() && !colorSpaceIsComplete(decoderConfig.colorSpace)) {
+			// Found via https://github.com/remotion-dev/remotion/issues/10841.
+			// If the color space is incomplete (which is often that it's just partially filled), Chromium has
+			// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
+			// that information is genuinely lost, like the color matrix for example. Chromium has other code
+			// paths where it just fills the missing values with a hardcoded default, so we do the exact same
+			// thing here, with the same hardcoded defaults. The exception is the matrix of VP8, which is
+			// always BT.601 (RFC 6386, section 9.2), and of VP9 without a color space, which FFmpeg and
+			// Chromium's own media pipeline also treat as BT.601.
+			decoderConfig = {
+				...decoderConfig,
+				colorSpace: {
+					primaries: decoderConfig.colorSpace?.primaries ?? 'bt709',
+					matrix: decoderConfig.colorSpace?.matrix
+						?? (codec === 'vp8' || codec === 'vp9' ? 'smpte170m' : 'bt709'),
+					transfer: decoderConfig.colorSpace?.transfer ?? 'bt709',
+					fullRange: decoderConfig.colorSpace?.fullRange ?? false,
+				},
+			};
+		}
+	}
+
+	return decoderConfig;
+};
+
 class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	decoder: VideoDecoder | null = null;
 
@@ -1115,65 +1181,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				}
 			};
 
-			if (isChromium() || isFirefox()) {
-				if (codec === 'avc' && isChromium()) {
-					this.decoderConfig = {
-						...this.decoderConfig,
-						codec: toChromiumCompatibleAvcCodecString(this.decoderConfig.codec),
-					};
-				}
-
-				if (codec === 'avc' && this.decoderConfig.description) {
-					const record = deserializeAvcDecoderConfigurationRecord(
-						toUint8Array(this.decoderConfig.description),
-					);
-					if (record && record.sequenceParameterSets.length > 0) {
-						const sps = parseAvcSps(record.sequenceParameterSets[0]!);
-						if (sps) {
-							if (sps.frameMbsOnlyFlag === 0 && isChromium()) {
-								// Chromium has/had a bug with playing interlaced AVC
-								// (https://issues.chromium.org/issues/456919096) which can be worked around by
-								// requesting that software decoding be used. So, here we peek into the AVC description,
-								// if present, and switch to software decoding if we find interlaced content.
-								this.decoderConfig = {
-									...this.decoderConfig,
-									hardwareAcceleration: 'prefer-software',
-								};
-							}
-
-							if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
-								// Modify the SPS to fix potential loss of B frames (Firefox loses the last frame)
-								record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
-								this.decoderConfig = {
-									...this.decoderConfig,
-									description: serializeAvcDecoderConfigurationRecord(record),
-								};
-							}
-						}
-					}
-				}
-
-				if (isChromium() && !colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
-					// Found via https://github.com/remotion-dev/remotion/issues/10841.
-					// If the color space is incomplete (which is often that it's just partially filled), Chromium has
-					// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
-					// that information is genuinely lost, like the color matrix for example. Chromium has other code
-					// paths where it just fills the missing values with a hardcoded default, so we do the exact same
-					// thing here, with the same hardcoded defaults. The exception is the matrix of VP8, which is
-					// always BT.601 (RFC 6386, section 9.2), and of VP9 without a color space, which FFmpeg and
-					// Chromium's own media pipeline also treat as BT.601.
-					this.decoderConfig = {
-						...this.decoderConfig,
-						colorSpace: {
-							primaries: this.decoderConfig.colorSpace?.primaries ?? 'bt709',
-							matrix: this.decoderConfig.colorSpace?.matrix
-								?? (codec === 'vp8' || codec === 'vp9' ? 'smpte170m' : 'bt709'),
-							transfer: this.decoderConfig.colorSpace?.transfer ?? 'bt709',
-							fullRange: this.decoderConfig.colorSpace?.fullRange ?? false,
-						},
-					};
-				}
-			}
+			this.decoderConfig = adjustVideoDecoderConfig(codec, this.decoderConfig);
 
 			const stack = new Error('Decoding error').stack;
 
@@ -2084,33 +2092,78 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 	}
 
 	/** @internal */
+	async _getDecoderConfig() {
+		const decoderConfig = await this._track.getDecoderConfig();
+		assert(decoderConfig);
+
+		return {
+			...decoderConfig,
+			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
+			optimizeForLatency: this._decoderOptions.optimizeForLatency,
+		};
+	}
+
+	/**
+	 * Whether the track can be decoded with this sink's decoder options. The decoder gets them on top of the track's
+	 * own config, and decoders may refuse them: Chromium refuses 'prefer-hardware' without hardware decoding.
+	 * @internal
+	 */
+	async _canDecode() {
+		if (!(await this._track.canDecode())) {
+			return false;
+		}
+
+		try {
+			const codec = await this._track.getCodec();
+			assert(codec);
+			const decoderConfig = await this._getDecoderConfig();
+			if (customVideoDecoders.some(x => x.supports(codec, decoderConfig))) {
+				return true;
+			}
+
+			// The track's own config was checked above, so only a config with hints needs another check
+			const finalConfig = adjustVideoDecoderConfig(codec, decoderConfig);
+			if (
+				(finalConfig.hardwareAcceleration ?? 'no-preference') === 'no-preference'
+				&& finalConfig.optimizeForLatency === undefined
+			) {
+				return true;
+			}
+
+			const support = await VideoDecoder.isConfigSupported(finalConfig);
+			return support.supported === true;
+		} catch (error) {
+			Logging._error('Error during decodability check:', error);
+			return false;
+		}
+	}
+
+	/** @internal */
 	async _createDecoder(
 		onSample: (sample: VideoSample) => unknown,
 		onError: (error: unknown) => unknown,
 	) {
-		if (!(await this._track.canDecode())) {
+		if (!(await this._canDecode())) {
 			if (typeof VideoDecoder === 'undefined') {
 				throw new Error(missingWebCodecsClassMessage('VideoDecoder'));
 			}
 
+			const { hardwareAcceleration } = this._decoderOptions;
 			throw new Error(
-				'This video track cannot be decoded in this environment. Make sure to check decodability before using'
-				+ ' a track.',
+				'This video track cannot be decoded in this environment'
+				+ (hardwareAcceleration && hardwareAcceleration !== 'no-preference'
+					? ` with hardwareAcceleration '${hardwareAcceleration}'`
+					: '')
+				+ '. Make sure to check decodability before using a track.',
 			);
 		}
 
 		const codec = await this._track.getCodec();
 		const rotation = await this._track.getRotation();
 		const flip = await this._track.getFlip();
-		let decoderConfig = await this._track.getDecoderConfig();
+		const decoderConfig = await this._getDecoderConfig();
 		const timeResolution = await this._track.getTimeResolution();
-		assert(codec && decoderConfig);
-
-		decoderConfig = {
-			...decoderConfig,
-			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
-			optimizeForLatency: this._decoderOptions.optimizeForLatency,
-		};
+		assert(codec);
 
 		return new VideoDecoderWrapper(onSample, onError, codec, decoderConfig, rotation, flip, timeResolution);
 	}
