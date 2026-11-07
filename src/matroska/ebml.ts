@@ -161,6 +161,8 @@ export enum EBMLId {
 	SimpleTag = 0x67c8,
 	TagName = 0x45a3,
 	TagLanguage = 0x447a,
+	TagLanguageBCP47 = 0x447b,
+	TagDefault = 0x4484,
 	TagString = 0x4487,
 	TagBinary = 0x4485,
 	ContentEncodings = 0x6d80,
