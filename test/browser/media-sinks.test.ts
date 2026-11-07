@@ -323,4 +323,52 @@ test.each([
 		assert(sample);
 		expect(getSignature(sample)).toBe(signatures.get(timestamps[index++]!));
 	}
+
+	// Every frame and the points halfway to the next one, in one go
+	const allTimestamps = [...signatures.keys()];
+	const queries = allTimestamps.slice(0, -1).flatMap((timestamp, i) => [
+		timestamp,
+		(timestamp + allTimestamps[i + 1]!) / 2,
+	]);
+	index = 0;
+	for await (using sample of sink.samplesAtTimestamps(queries)) {
+		assert(sample);
+		const expected = allTimestamps.filter(timestamp => timestamp <= queries[index]!).at(-1)!;
+		expect(sample.timestamp, `query ${queries[index]}`).toBe(expected);
+		expect(getSignature(sample), `query ${queries[index]}`).toBe(signatures.get(expected));
+		index++;
+	}
+});
+
+test('Frame lookups in a stream without B-frames stay exact when the reorder depth is unknown', async () => {
+	// An SPS without bitstream restriction info (which many encoders leave out) gives no reorder depth, so
+	// Mediabunny assumes the worst, 16 frames. In a stream without B-frames, no frame after the one asked for may
+	// answer a lookup all the same (found by lane L46).
+	using input = new Input({ source: new UrlSource('/missing-tfdt.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new VideoSampleSink(track);
+	sink._getReorderDepth = async () => 16;
+
+	const timestamps: number[] = [];
+	for await (using sample of sink.samples()) {
+		timestamps.push(sample.timestamp);
+		if (timestamps.length === 40) {
+			break;
+		}
+	}
+
+	const queries = timestamps.slice(0, -1).flatMap((timestamp, i) => [
+		timestamp,
+		(timestamp + timestamps[i + 1]!) / 2,
+	]);
+	let index = 0;
+	for await (using sample of sink.samplesAtTimestamps(queries)) {
+		const expected = timestamps.filter(timestamp => timestamp <= queries[index]!).at(-1);
+		expect(sample?.timestamp, `query ${queries[index]}`).toBe(expected);
+		index++;
+	}
+
+	using sample = await sink.getSample(timestamps[20]!);
+	expect(sample?.timestamp).toBe(timestamps[20]);
 });

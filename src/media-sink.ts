@@ -810,11 +810,13 @@ export abstract class BaseMediaSampleSink<
 				lastDecodedPacket = currentPacket;
 			};
 
-			// The sequence number of the last packet to decode for a target packet. With B-frames, frames presented
-			// before the target can come after it in decode order, up to the reorder depth. That usually doesn't
-			// matter, but where packet timestamps are in decode order (MP4 without composition offsets, as written by
-			// `ffmpeg -i raw.h264 -c copy`), frames get the decoded packets' timestamps in sorted order (see
-			// VideoDecoderWrapper), which is only right if every frame presented up to the target was decoded.
+			// The sequence number of the last packet to decode before flushing, after the given one. With B-frames,
+			// frames presented before a packet's frame can come after it in decode order, up to the reorder depth.
+			// That usually doesn't matter, but where packet timestamps are in decode order (MP4 without composition
+			// offsets, as written by `ffmpeg -i raw.h264 -c copy`), frames get the decoded packets' timestamps in
+			// sorted order (see VideoDecoderWrapper). That's only right if every frame presented up to the last one
+			// asked for was decoded when the decoder flushes the frames it holds back. Until it flushes, it only
+			// outputs frames once all frames presented before them are out, so nothing needs to be decoded ahead.
 			const getLastPacketToDecode = async (targetPacket: EncodedPacket) => {
 				let packet = targetPacket;
 				for (let i = 0; i < reorderDepth; i++) {
@@ -835,6 +837,12 @@ export abstract class BaseMediaSampleSink<
 
 			const flushDecoder = async () => {
 				assert(decoder);
+
+				if (lastDecodedPacket && reorderDepth > 0) {
+					maxSequenceNumber = await getLastPacketToDecode(lastDecodedPacket);
+					await decodePackets();
+				}
+
 				await decoder.flush();
 
 				// No sample starts after the remaining query timestamps, so the last one answers all of them
@@ -891,7 +899,7 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				timestampsOfInterest.push(timestamp);
-				maxSequenceNumber = Math.max(await getLastPacketToDecode(targetPacket), maxSequenceNumber);
+				maxSequenceNumber = Math.max(targetPacket.sequenceNumber, maxSequenceNumber);
 
 				lastPacket = targetPacket;
 				lastTimestamp = timestamp;
@@ -2014,8 +2022,9 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 
 		if (codec === 'avc') {
 			const spsInfo = sps && parseAvcSps(sps);
-			if (spsInfo && spsInfo.profileIdc === 66) {
-				return 0; // Baseline profile has no B-frames
+			if (spsInfo && (spsInfo.profileIdc === 66 || spsInfo.picOrderCntType === 2)) {
+				// Baseline profile has no B-frames, and with pic_order_cnt_type 2, frames are presented in decode order
+				return 0;
 			}
 
 			return spsInfo?.numReorderFrames ?? 16; // 16 is the most frames a decoder can hold back
