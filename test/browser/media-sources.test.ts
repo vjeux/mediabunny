@@ -8,7 +8,7 @@ import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -535,6 +535,78 @@ test('VideoSampleSource, transform.frameRate works with process', async () => {
 	expect(await track.getCodedHeight()).toBe(40);
 
 	input.dispose();
+});
+
+test('VideoSampleSource, frame rate normalization puts a key frame request on the first frame showing it', async () => {
+	const keyFrameTimestamps = async (
+		requestVia: 'add' | 'sample',
+		frames: { timestamp: number; duration: number; keyFrame?: boolean }[],
+		frameRate?: number,
+	) => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('medium'),
+			keyFrameInterval: 100,
+			transform: frameRate ? { frameRate } : undefined,
+		});
+		output.addVideoTrack(source);
+		await output.start();
+
+		const canvas = new OffscreenCanvas(48, 48);
+		const context = canvas.getContext('2d')!;
+		for (const [i, frame] of frames.entries()) {
+			context.fillStyle = `rgb(${(i * 20) % 256}, 0, 0)`;
+			context.fillRect(0, 0, 48, 48);
+			const sample = new VideoSample(canvas, {
+				timestamp: frame.timestamp,
+				duration: frame.duration,
+				encodeOptions: requestVia === 'sample' && frame.keyFrame ? { keyFrame: true } : undefined,
+			});
+			await source.add(sample, requestVia === 'add' && frame.keyFrame ? { keyFrame: true } : undefined);
+			sample.close();
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, {
+			verifyKeyPackets: true,
+		})) {
+			if (packet.type === 'key') {
+				timestamps.push(Math.round(packet.timestamp * 1000) / 1000);
+			}
+		}
+		return timestamps;
+	};
+
+	// 10 fps, with a key frame requested for the frame at 0.5 s
+	const tenFps = Array.from({ length: 10 }, (_, i) => ({ timestamp: i / 10, duration: 1 / 10, keyFrame: i === 5 }));
+	// Like a screen capture that only emits frames on change: the frame at 0.05 s takes the first 10 fps slot from the
+	// one at 0 s, and nothing changes until 0.3 s, so its picture first shows at 0.1 s, as padding
+	const onChange = [
+		{ timestamp: 0, duration: 0.05 },
+		{ timestamp: 0.05, duration: 0.25, keyFrame: true },
+		{ timestamp: 0.3, duration: 0.1 },
+		{ timestamp: 0.4, duration: 0.1 },
+	];
+	// 32 fps down to 8 fps: the frame at 0.15625 s that asks for a key frame is dropped, so the next one shown takes it
+	const thirtyTwoFps = Array.from({ length: 32 }, (_, i) => ({
+		timestamp: i / 32,
+		duration: 1 / 32,
+		keyFrame: i === 5,
+	}));
+
+	for (const requestVia of ['add', 'sample'] as const) {
+		// Normalized to 30 fps, each input frame is followed by two repeats, which aren't the frame that asked
+		expect(await keyFrameTimestamps(requestVia, tenFps, 30)).toEqual([0, 0.5]);
+		expect(await keyFrameTimestamps(requestVia, tenFps)).toEqual([0, 0.5]);
+		expect(await keyFrameTimestamps(requestVia, onChange, 10)).toEqual([0, 0.1]);
+		expect(await keyFrameTimestamps(requestVia, thirtyTwoFps, 8)).toEqual([0, 0.25]);
+	}
 });
 
 const makeCanvas = (width: number, height: number, leftHalfBlue = false) => {

@@ -272,6 +272,13 @@ class VideoEncoderWrapper {
 	private frameRateLastSample: VideoSample | null = null;
 	private frameRateLastTimestamp: number | null = null;
 	private frameRateLastEndTimestamp: number | null = null;
+	/** The encode options that the last frame rate sample was added with. */
+	private frameRateLastEncodeOptions: VideoEncoderEncodeOptions | undefined = undefined;
+	/**
+	 * Whether a key frame was requested for a sample that took the last frame rate slot without being encoded, so the
+	 * next frame encoded (the first one showing its picture, or the one after it) must be a key frame.
+	 */
+	private frameRateKeyFramePending = false;
 
 	// VideoEncoder converts everything to microseconds, so we need to do some bookkeeping to restore the original
 	// timing information
@@ -409,14 +416,18 @@ class VideoEncoderWrapper {
 
 				if (this.frameRateLastSample !== null) {
 					if (alignedTimestamp <= this.frameRateLastTimestamp!) {
-						// Same frame rate slot, replace stored sample with the newer one
+						// Same frame rate slot, replace stored sample with the newer one. It isn't encoded itself, so a
+						// key frame request of it goes to the next frame that is.
 						this.frameRateLastSample.close();
 						this.frameRateLastSample = videoSample.clone();
 						this.frameRateLastEndTimestamp = originalEndTimestamp;
+						this.frameRateLastEncodeOptions = encodeOptions;
+						const keyFrame = encodeOptions?.keyFrame ?? videoSample.encodeOptions.keyFrame;
+						this.frameRateKeyFramePending ||= keyFrame === true;
 						return;
 					} else {
 						// Pad the gap by repeating the previous frame
-						await this.padFrameRate(alignedTimestamp, encodeOptions);
+						await this.padFrameRate(alignedTimestamp);
 					}
 				}
 
@@ -433,6 +444,14 @@ class VideoEncoderWrapper {
 				this.frameRateLastSample = videoSample.clone();
 				this.frameRateLastTimestamp = alignedTimestamp;
 				this.frameRateLastEndTimestamp = originalEndTimestamp;
+				this.frameRateLastEncodeOptions = encodeOptions;
+
+				if (this.frameRateKeyFramePending) {
+					// A key frame request of a sample that was replaced without being shown
+					this.frameRateKeyFramePending = false;
+					await this.processAndEncode(videoSample, { ...encodeOptions, keyFrame: true });
+					return;
+				}
 			}
 
 			await this.processAndEncode(videoSample, encodeOptions);
@@ -667,17 +686,33 @@ class VideoEncoderWrapper {
 	}
 
 	/** Repeats the last frame rate sample to fill the gap up to the given timestamp. */
-	private async padFrameRate(until: number, encodeOptions?: VideoEncoderEncodeOptions) {
+	private async padFrameRate(until: number) {
 		const frameRate = this.encodingConfig.transform!.frameRate!;
 		assert(this.frameRateLastSample);
 
 		const frameDifference = Math.round((until - this.frameRateLastTimestamp!) * frameRate);
 
+		// The repeats are encoded with the options of the sample they repeat, except for its key frame request, which
+		// is only for the first frame showing its picture: the sample itself if it was encoded, else the first repeat
+		const encodeOptions = { ...this.frameRateLastEncodeOptions };
+		delete encodeOptions.keyFrame;
+
 		for (let i = 1; i < frameDifference; i++) {
 			using sample = this.frameRateLastSample.clone();
 			sample.setTimestamp(this.frameRateLastTimestamp! + i / frameRate);
 			sample.setDuration(1 / frameRate);
-			await this.processAndEncode(sample, encodeOptions);
+			if (sample.encodeOptions.keyFrame !== undefined) {
+				const sampleEncodeOptions = { ...sample.encodeOptions } as VideoEncoderEncodeOptions;
+				delete sampleEncodeOptions.keyFrame;
+				sample.setEncodeOptions(sampleEncodeOptions);
+			}
+
+			if (this.frameRateKeyFramePending) {
+				this.frameRateKeyFramePending = false;
+				await this.processAndEncode(sample, { ...encodeOptions, keyFrame: true });
+			} else {
+				await this.processAndEncode(sample, encodeOptions);
+			}
 		}
 	}
 
@@ -1113,6 +1148,8 @@ class VideoEncoderWrapper {
 
 			this.frameRateLastSample?.close();
 			this.frameRateLastSample = null;
+			this.frameRateLastEncodeOptions = undefined;
+			this.frameRateKeyFramePending = false;
 
 			if (this.customEncoder) {
 				await this.customEncoderCallSerializer.call(() => this.customEncoder!.close())
