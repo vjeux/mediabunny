@@ -310,18 +310,13 @@ test.each([
 		signatures.set(sample.timestamp, getSignature(sample));
 	}
 
-	const timestamps = [...signatures.keys()].filter((_, i) => i % 5 === 2);
+	// Each lookup decodes from its key frame with a fresh decoder, which is slow, so only a few of them
+	const timestamps = [...signatures.keys()].filter((_, i) => i % 25 === 2);
 	for (const timestamp of timestamps) {
 		using sample = await sink.getSample(timestamp);
 		assert(sample);
 		expect(sample.timestamp).toBe(timestamp);
 		expect(getSignature(sample), `frame at ${timestamp}`).toBe(signatures.get(timestamp));
-	}
-
-	let index = 0;
-	for await (using sample of sink.samplesAtTimestamps(timestamps)) {
-		assert(sample);
-		expect(getSignature(sample)).toBe(signatures.get(timestamps[index++]!));
 	}
 
 	// Every frame and the points halfway to the next one, in one go
@@ -330,7 +325,7 @@ test.each([
 		timestamp,
 		(timestamp + allTimestamps[i + 1]!) / 2,
 	]);
-	index = 0;
+	let index = 0;
 	for await (using sample of sink.samplesAtTimestamps(queries)) {
 		assert(sample);
 		const expected = allTimestamps.filter(timestamp => timestamp <= queries[index]!).at(-1)!;
