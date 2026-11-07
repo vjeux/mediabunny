@@ -52,7 +52,7 @@ import {
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
 } from '../codec-data';
-import { buildIsobmffMimeType, TIMESTAMP_OFFSET } from './isobmff-misc';
+import { buildIsobmffMimeType, TIMESTAMP_OFFSET, validateIsobmffVideoSize } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
 
 export const GLOBAL_TIMESCALE = 57600; // LCM of a bunch of common frame rates (24, 25, 30, 60, 144, ...)
@@ -441,13 +441,8 @@ export class IsobmffMuxer extends Muxer {
 		assert(decoderConfig.codedWidth !== undefined);
 		assert(decoderConfig.codedHeight !== undefined);
 
-		// The sample entry stores the pixel size in 16-bit fields (FFmpeg rejects larger sizes the same way)
-		if (decoderConfig.codedWidth > 0xffff || decoderConfig.codedHeight > 0xffff) {
-			throw new Error(
-				`Video of ${decoderConfig.codedWidth}x${decoderConfig.codedHeight} pixels can't be stored in MP4/MOV,`
-				+ ' which holds at most 65535x65535.',
-			);
-		}
+		// Sizes declared with the track were already checked when it was added
+		validateIsobmffVideoSize(decoderConfig.codedWidth, decoderConfig.codedHeight);
 
 		let requiresAnnexBTransformation = false;
 
