@@ -134,6 +134,11 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		if (this.config.bitrateMode === 'constant') {
 			codecContext.rcMinRate = codecContext.bitRate;
 			codecContext.rcMaxRate = codecContext.bitRate;
+
+			if (this.avCodec.name === 'libopus') {
+				// libopus doesn't look at the rate limits, only at its own VBR switch
+				codecContext.setOption('vbr', 'off');
+			}
 		}
 
 		// libav's DTS and TrueHD encoders are marked experimental, so they refuse to open at the default compliance
