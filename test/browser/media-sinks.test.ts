@@ -310,8 +310,9 @@ test('HLS: audio after a discontinuity with a new EXT-X-MAP decodes with its own
 	expect(periods.map(x => x.format)).toEqual(['48000 Hz, 2 ch', '22050 Hz, 1 ch', '48000 Hz, 2 ch']);
 	// Every period decodes completely (48 and 23 AAC frames of 1024 samples) and in its place on the timeline
 	expect(periods.map(x => x.frames)).toEqual([48 * 1024, 23 * 1024, 48 * 1024]);
-	expect(periods[1]!.start).toBeCloseTo(1.021333, 2);
-	expect(periods[2]!.start).toBeCloseTo(1.021333 + 1.04644, 2);
+	// Each period starts at its first packet: the timeline restarts with the decoder
+	expect(periods[1]!.start).toBeCloseTo(1.021333, 4); // Rounded to the sample rate
+	expect(periods[2]!.start).toBeCloseTo(1.021333 + 1.04644, 4);
 	expect(offGrid).toBe(0);
 
 	// Decoding that starts in the ad break, and lookups across the switches
@@ -324,6 +325,30 @@ test('HLS: audio after a discontinuity with a new EXT-X-MAP decodes with its own
 	const adSample = await sink.getSample(1.5);
 	expect(adSample?.sampleRate).toBe(22050);
 	adSample?.close();
+});
+
+test('HLS: audio after a decoder config switch starts at its first packet, wherever the previous ended', async () => {
+	// The ad's EXTINF is a bit longer than its audio, so the content after it starts after a little gap
+	const playlist = new TextDecoder().decode(await (await fetch('/hls-disc-audio/adisc.m3u8')).arrayBuffer())
+		.replace('#EXTINF:1.04644,', '#EXTINF:1.06,');
+	using input = new Input({
+		source: new CustomPathedSource('p.m3u8', ({ path }) => (path === 'p.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new UrlSource('/hls-disc-audio/' + path))),
+		formats: ALL_FORMATS,
+	});
+	const starts: number[] = [];
+	let lastRate = 0;
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		if (sample.sampleRate !== lastRate) {
+			starts.push(sample.timestamp);
+			lastRate = sample.sampleRate;
+		}
+		sample.close();
+	}
+	expect(starts).toHaveLength(3);
+	expect(starts[1]).toBeCloseTo(1.021333, 4);
+	expect(starts[2]).toBeCloseTo(1.021333 + 1.06, 4);
 });
 
 test('HLS: an ad break of several segments sharing an init section decodes like the ad alone', async () => {

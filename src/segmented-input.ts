@@ -236,6 +236,8 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	/** Decoder configs of packets that need another one than the track's */
 	packetDecoderConfigs = new WeakMap<EncodedPacket, AudioDecoderConfig>();
 	segmentAudioDecoderConfigs = new WeakMap<InputTrack, Promise<AudioDecoderConfig | null>>();
+	/** One object per distinct decoder config, so that segments sharing a config share the object */
+	distinctAudioDecoderConfigs: AudioDecoderConfig[] = [];
 
 	hydrationPromise: Promise<void> | null = null;
 	firstInputTrack: InputTrack | null = null;
@@ -418,6 +420,12 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 					return null;
 				}
 
+				const existing = this.distinctAudioDecoderConfigs.find(x => audioDecoderConfigsAreEqual(x, config));
+				if (existing) {
+					return existing;
+				}
+
+				this.distinctAudioDecoderConfigs.push(config);
 				return config;
 			})();
 			this.segmentAudioDecoderConfigs.set(track, promise);

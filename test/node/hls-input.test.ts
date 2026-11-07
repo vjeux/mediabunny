@@ -1430,6 +1430,26 @@ test.concurrent('Audio packets after a discontinuity with a new EXT-X-MAP carry 
 	// Only the ad break's packets need another decoder config than the track's
 	expect(formats).toEqual(['track', '22050/1', 'track']);
 
+	// Consecutive ad segments sharing an init section share the decoder config object
+	using adInput = new Input({
+		source: new CustomPathedSource('ad.m3u8', ({ path }) => (path === 'ad.m3u8'
+			? new BufferSource(new TextEncoder().encode([
+				'#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:2',
+				'#EXT-X-MAP:URI="c_init.mp4"', '#EXTINF:1.021333,', 'c_0.m4s',
+				'#EXT-X-DISCONTINUITY', '#EXT-X-MAP:URI="d_init.mp4"', '#EXTINF:1.04644,', 'd_0.m4s', '#EXTINF:1.04644,', 'd_0.m4s',
+				'#EXT-X-DISCONTINUITY', '#EXT-X-MAP:URI="c_init.mp4"', '#EXTINF:1.021333,', 'c_0.m4s',
+				'#EXT-X-ENDLIST',
+			].join('\n')))
+			: new FilePathSource(`./test/public/hls-disc-audio/${path}`))),
+		formats: ALL_FORMATS,
+	});
+	const adTrack = (await adInput.getPrimaryAudioTrack())!;
+	const adConfigs = new Set<unknown>();
+	for await (const packet of new EncodedPacketSink(adTrack).packets()) {
+		adConfigs.add(adTrack._backing.getDecoderConfigForPacket!(packet));
+	}
+	expect(adConfigs.size).toBe(2); // null for the content, one object for both ad segments
+
 	// Streams whose decoder config never changes are left alone
 	using plainInput = new Input({
 		source: new CustomPathedSource('./test/public/hls-disc-audio/adisc.m3u8', ({ path }) => new FilePathSource(path.replace('d_', 'c_'))),

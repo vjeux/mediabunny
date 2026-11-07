@@ -2451,8 +2451,16 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	 * happens when packets need another decoder config than the track's, such as HLS segments after a discontinuity
 	 * with a new init section (an ad break with another sample rate or channel count).
 	 */
-	switchDecoderConfig(decoderConfig: AudioDecoderConfig) {
+	switchDecoderConfig(decoderConfig: AudioDecoderConfig, firstPacket: EncodedPacket) {
 		this.currentDecoderConfig = decoderConfig;
+
+		// The decoder starts over with the new config, so its audio starts at the first packet's timestamp, not where
+		// the previous config's audio ended (which, at a discontinuity, can be off by up to a frame or more)
+		const restartTimeline = () => {
+			this.outputSampleRate = decoderConfig.sampleRate;
+			this.currentTimestamp = null;
+			this.expectedFirstTimestamp = firstPacket.timestamp;
+		};
 		const MatchingCustomDecoder = customAudioDecoders.find(x => x.supports(this.codec, decoderConfig));
 
 		if (this.decoder && !MatchingCustomDecoder) {
@@ -2460,9 +2468,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			// packets decoded so far. The flush resolves once their samples are out, before any sample of the new
 			// config.
 			const decoder = this.decoder;
-			void decoder.flush().then(() => {
-				this.outputSampleRate = decoderConfig.sampleRate;
-			}, () => {}); // Decoding errors reach onError through the decoder's error callback
+			// Decoding errors reach onError through the decoder's error callback
+			void decoder.flush().then(restartTimeline, () => {});
 			decoder.configure(decoderConfig);
 		} else if (this.customDecoder && MatchingCustomDecoder) {
 			const previousDecoder = this.customDecoder;
@@ -2473,7 +2480,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				.call(async () => {
 					await previousDecoder.flush();
 					await previousDecoder.close();
-					this.outputSampleRate = decoderConfig.sampleRate;
+					restartTimeline();
 					await nextDecoder.init();
 				})
 				.catch(error => this.onError(error));
@@ -2492,7 +2499,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				// The same config in another object, such as the next segment of an ad break: keep the decoder's state
 				this.currentDecoderConfig = decoderConfig;
 			} else {
-				this.switchDecoderConfig(decoderConfig);
+				this.switchDecoderConfig(decoderConfig, packet);
 			}
 		}
 
