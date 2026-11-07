@@ -37,6 +37,7 @@ import { AvFrameVideoSampleResource } from '../../packages/server/src/video-samp
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { _serverOptions, toAvFrame } from '../../packages/server/src/index.js';
 import * as NodeAv from 'node-av';
+import os from 'node:os';
 
 beforeAll(() => {
 	registerMediabunnyServer();
@@ -636,6 +637,43 @@ describe('Video', async () => {
 		await encoder.close();
 	});
 
+	test('ProRes encoding runs on several threads', async () => {
+		// libavcodec defaults to a single thread, with which prores_ks took 19 s to encode 5 s of 1080p
+		const encoder = new NodeAvVideoEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'prores';
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: 'apch',
+			width: 1920,
+			height: 1080,
+			bitrate: 1e6,
+		} satisfies VideoEncoderConfig;
+		// @ts-expect-error Readonly
+		encoder.onPacket = () => {};
+
+		await encoder.init();
+
+		using sample = new VideoSample(new Uint8Array(1920 * 1080 * 4), {
+			format: 'RGBX',
+			codedWidth: 1920,
+			codedHeight: 1080,
+			timestamp: 0,
+			duration: 1 / 30,
+		});
+		await encoder.encode(sample, {});
+
+		assert(encoder.codecContext);
+		// Slice threads, unlike frame threads, give the exact same bytes as a single thread
+		expect(encoder.codecContext.threadType).toBe(NodeAv.FF_THREAD_SLICE);
+		if (os.availableParallelism() > 1) {
+			expect(encoder.codecContext.threadCount).toBeGreaterThan(1);
+		}
+
+		await encoder.flush();
+		await encoder.close();
+	});
+
 	test('Transparent ProRes encode and decode', async () => {
 		const output = new Output({
 			format: new Mp4OutputFormat(),
@@ -901,7 +939,8 @@ describe('Video', async () => {
 	});
 
 	test('ProRes conversion roundtrip', { timeout: 30_000 }, async () => {
-		await conversionRoundtrip('prores');
+		// Encoding the whole clip as ProRes takes 30 CPU-seconds, which can exceed the timeout under parallel load
+		await conversionRoundtrip('prores', 1);
 	});
 
 	const conversionRoundtrip = async (codec: VideoCodec, duration?: number) => {
