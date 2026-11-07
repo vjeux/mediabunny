@@ -11,6 +11,7 @@ import { Logging } from './logging';
 import { MetadataTags } from './metadata';
 import {
 	coalesceIndex,
+	createUtcDate,
 	TextDecoder,
 	textDecoder,
 	textEncoder,
@@ -196,6 +197,10 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 		}
 	}
 
+	// ID3v2.3 splits the date into the year (TYER) and the day and month (TDAT), which may come in any order
+	let year: number | null = null;
+	let dayAndMonth: string | null = null;
+
 	while (reader.pos <= reader.bytes.length - reader.frameHeaderSize()) {
 		const frame = reader.readId3V2Frame();
 		if (!frame) {
@@ -351,8 +356,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				tags.genre ??= genreText;
 			}; break;
 
-			case 'TDRC':
-			case 'TDAT': {
+			case 'TDRC': {
 				const dateText = reader.readId3V2EncodingAndText(frameEndPos);
 				const date = new Date(dateText);
 
@@ -365,12 +369,15 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			case 'TYE': {
 				const yearText = reader.readId3V2EncodingAndText(frameEndPos);
 				const parsedYear = Number.parseInt(yearText, 10);
-				// Only a year that makes a valid date counts, unlike a whole date ("20190103") where the year belongs
-				const year = Number.isNaN(new Date(String(parsedYear)).getTime()) ? NaN : parsedYear;
 
-				if (Number.isInteger(year)) {
-					tags.date ??= new Date(String(year)); // String so that it parses as UTC
+				if (Number.isInteger(parsedYear)) {
+					year ??= parsedYear;
 				}
+			}; break;
+
+			case 'TDAT':
+			case 'TDA': {
+				dayAndMonth ??= reader.readId3V2EncodingAndText(frameEndPos);
 			}; break;
 
 			case 'TBPM':
@@ -447,6 +454,25 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 		}
 
 		reader.pos = nextFramePos;
+	}
+
+	if (year !== null) {
+		let date = createUtcDate(year);
+
+		const dayAndMonthMatch = /^(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])$/.exec(dayAndMonth ?? '');
+		if (dayAndMonthMatch) {
+			const day = Number(dayAndMonthMatch[1]);
+			const fullDate = createUtcDate(year, Number(dayAndMonthMatch[2]) - 1, day);
+
+			// Out-of-range fields like a February 31 would otherwise roll over
+			if (fullDate.getUTCDate() === day) {
+				date = fullDate;
+			}
+		}
+
+		if (!Number.isNaN(date.getTime())) {
+			tags.date ??= date;
+		}
 	}
 };
 

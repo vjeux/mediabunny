@@ -709,6 +709,47 @@ test('Conversion metadata tags, ID3v2 year that isn\'t a year', async () => {
 	expect((await converted.getMetadataTags()).date).toBeUndefined();
 });
 
+test('Read ID3v2.3 dates from TYER and TDAT, MP3', async () => {
+	const latin1 = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const mp3Frame = new Uint8Array(417); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
+	mp3Frame.set([0xff, 0xfb, 0x90, 0x64]);
+
+	// Reads the date of an ID3v2 tag holding the given text frames, in front of three MP3 frames
+	const readDate = async (frames: [string, string][], majorVersion = 3) => {
+		const body = frames.flatMap(([id, text]) => {
+			const size = text.length + 1;
+			const sizeBytes = majorVersion === 4
+				? [21, 14, 7, 0].map(shift => (size >> shift) & 0x7f)
+				: [24, 16, 8, 0].map(shift => (size >>> shift) & 0xff);
+			return [...latin1(id), ...sizeBytes, 0, 0, 0, ...latin1(text)];
+		});
+		const tagSize = [21, 14, 7, 0].map(shift => (body.length >> shift) & 0x7f);
+		const bytes = new Uint8Array([
+			...latin1('ID3'), majorVersion, 0, 0, ...tagSize, ...body,
+			...mp3Frame, ...mp3Frame, ...mp3Frame,
+		]);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return (await input.getMetadataTags()).date;
+	};
+
+	// A year
+	expect(await readDate([['TYER', '2024']])).toEqual(new Date('2024-01-01T00:00:00Z'));
+	// With the day and month ("DDMM"), as FFmpeg writes a whole date, in either order
+	expect(await readDate([['TYER', '2021'], ['TDAT', '2304']])).toEqual(new Date('2021-04-23T00:00:00Z'));
+	expect(await readDate([['TDAT', '2304'], ['TYER', '2021']])).toEqual(new Date('2021-04-23T00:00:00Z'));
+	// A day and month that don't make a date are left out
+	expect(await readDate([['TYER', '2021'], ['TDAT', '3102']])).toEqual(new Date('2021-01-01T00:00:00Z'));
+
+	// A whole date where the year belongs gives no date, with or without a day, month and time
+	expect(await readDate([['TYER', '20190103']])).toBeUndefined();
+	expect(await readDate([['TYER', '20190103'], ['TDAT', '2304']])).toBeUndefined();
+	expect(await readDate([['TYER', '20190103'], ['TDAT', '2304'], ['TIME', '1200']])).toBeUndefined();
+
+	// The ID3v2.4 recording time is read as before
+	expect(await readDate([['TDRC', '2024-03-15']], 4)).toEqual(new Date('2024-03-15T00:00:00Z'));
+});
+
 test('Conversion metadata tags, modified', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
@@ -1001,6 +1042,42 @@ test('Creation time override, Matroska', async () => {
 	const nullReadTags = await nullInput.getMetadataTags();
 
 	expect(nullReadTags.creationTime).toBeUndefined();
+});
+
+test('Conversion metadata tags, RIFF INFO year that isn\'t a year', async () => {
+	// A WAVE file whose RIFF INFO chunk has the given YEAR
+	const writeWithYear = async (year: string) => {
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		output.setMetadataTags({ title: 'Title', raw: { YEAR: year } });
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(400), 'key', 0, 100 / 44100), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+		});
+		await output.finalize();
+		return output.target.buffer!;
+	};
+
+	// A year, at the start of it in UTC like the other dates read
+	using input2013 = new Input({ source: new BufferSource(await writeWithYear('2013')), formats: ALL_FORMATS });
+	expect((await input2013.getMetadataTags()).date).toEqual(new Date('2013-01-01T00:00:00Z'));
+
+	// A whole date where the year belongs: no date, rather than an Invalid Date
+	using input = new Input({ source: new BufferSource(await writeWithYear('20190103')), formats: ALL_FORMATS });
+	const tags = await input.getMetadataTags();
+	expect(tags.raw?.['YEAR']).toBe('20190103');
+	expect(tags.date).toBeUndefined();
+
+	// Copying the tags used to throw, as they held an Invalid Date
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	await conversion.execute();
+
+	using converted = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const convertedTags = await converted.getMetadataTags();
+	expect(convertedTags.title).toBe('Title');
+	expect(convertedTags.date).toBeUndefined();
 });
 
 test('Creation time not copied in conversion', async () => {
