@@ -272,3 +272,63 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('AC-3 and E-AC-3 declared by an esds box', async () => {
+	// An mp4a sample entry whose esds box declares the codec with an MP4RA object type indication: 0xa5 for AC-3 and
+	// 0xa6 for E-AC-3 (as FFmpeg and Chromium read them), like 0xa9 for DTS
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (objectTypeIndication: number) => {
+		const esds = box('esds', zeros(4),
+			[0x03, 21, 0, 1, 0], // ES descriptor
+			[0x04, 13, objectTypeIndication, 0x15, ...zeros(11)], // Decoder config descriptor (audio stream)
+			[0x06, 1, 2], // SL config descriptor
+		);
+		const mp4a = box('mp4a', zeros(6), u16(1), zeros(8), u16(6), u16(16), zeros(4), u32(48000 * 0x10000), esds);
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const frame = zeros(100).fill(objectTypeIndication);
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(48000), u32(1536), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(1536), zeros(16), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(48000), u32(1536), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), mp4a),
+						box('stts', zeros(4), u32(1), u32(1), u32(1536)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(1), u32(1)),
+						box('stsz', zeros(4), u32(frame.length), u32(1)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...box('mdat', frame), ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		return [
+			await track.getCodec(),
+			await track.getNumberOfChannels(),
+			await track.getSampleRate(),
+			packet?.byteLength,
+		];
+	};
+
+	expect(await read(0xa5)).toEqual(['ac3', 6, 48000, 100]);
+	expect(await read(0xa6)).toEqual(['eac3', 6, 48000, 100]);
+	expect(await read(0xa9)).toEqual(['dts', 6, 48000, 100]);
+});
