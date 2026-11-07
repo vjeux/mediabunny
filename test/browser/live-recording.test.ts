@@ -117,7 +117,6 @@ const feedInRealTime = async (
 	if (options.delayBeforeMs) {
 		await sleep(options.delayBeforeMs);
 	}
-	const startDate = Date.now() / 1000;
 	const timestampBase = performance.now(); // Media time 0
 	let scheduleBase = timestampBase; // When media time 0 is due
 	let audioChunks = 0;
@@ -131,7 +130,7 @@ const feedInRealTime = async (
 			const videoTime = (options.videoStartMs ?? 0) + frameIntervalMs * videoFrames;
 			const time = Math.min(audioTime, videoTime);
 			if (time >= options.durationMs) {
-				return { startDate };
+				return;
 			}
 
 			const lateness = performance.now() - (scheduleBase + time);
@@ -238,6 +237,40 @@ const blockMainThread = (ms: number) => {
 	}
 };
 
+/**
+ * While sources start, replaces MediaStreamTrackProcessor with one that notes when the first chunk of each track
+ * reaches its source, in seconds, in the performance.now() (`time`) and Date.now() (`date`) time bases. That moment
+ * decides where a track starts with the 'synced-zero' and 'unix' timestamp bases.
+ */
+const tapFirstArrivals = () => {
+	const arrivals = new Map<MediaStreamTrack, { time: number; date: number }>();
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const RealProcessor = MediaStreamTrackProcessor;
+	globals.MediaStreamTrackProcessor = class {
+		readable: ReadableStream<VideoFrame | AudioData>;
+
+		constructor(init: MediaStreamTrackProcessorInit & { track: MediaStreamVideoTrack }) {
+			// (Typed as a video track only to pick one of the constructor's overloads)
+			const realReadable: ReadableStream<VideoFrame | AudioData> = new RealProcessor(init).readable;
+			this.readable = realReadable.pipeThrough(new TransformStream({
+				transform: (chunk, controller) => {
+					if (!arrivals.has(init.track)) {
+						arrivals.set(init.track, { time: performance.now() / 1000, date: Date.now() / 1000 });
+					}
+					controller.enqueue(chunk);
+				},
+			}));
+		}
+	};
+
+	return {
+		arrivals,
+		restore: () => {
+			globals.MediaStreamTrackProcessor = RealProcessor;
+		},
+	};
+};
+
 const recordGenerated = async (options: {
 	format: OutputFormat;
 	durationMs: number;
@@ -265,8 +298,13 @@ const recordGenerated = async (options: {
 	output.addVideoTrack(videoSource);
 	output.addAudioTrack(audioSource);
 
-	await output.start();
-	const { startDate: startTime } = await feedInRealTime(tracks, options);
+	const tap = tapFirstArrivals();
+	try {
+		await output.start();
+	} finally {
+		tap.restore();
+	}
+	await feedInRealTime(tracks, options);
 	await sleep(100);
 	await output.finalize();
 	await tracks.videoWriter.close();
@@ -283,7 +321,8 @@ const recordGenerated = async (options: {
 
 	return {
 		errors,
-		startTime,
+		videoArrival: tap.arrivals.get(tracks.videoTrack)!,
+		audioArrival: tap.arrivals.get(tracks.audioTrack)!,
 		videoTimestamps: videoTimestamps.sort((a, b) => a - b),
 		videoStart: await videoTrack!.getFirstTimestamp(),
 		videoEnd: await videoTrack!.computeDuration(),
@@ -374,8 +413,11 @@ describe.skipIf(!hasTrackGenerator)('Timeline', () => {
 		// The audio's first packet starts before 0 by Opus's pre-skip (6.5 ms) at most
 		expect(result.audioStart).toBeGreaterThan(-0.01);
 		expect(result.audioStart).toBeLessThan(0.005);
-		expect(result.videoStart).toBeGreaterThan(0.38);
-		expect(result.videoStart).toBeLessThan(0.43);
+		// The video starts as long after the audio as its first frame reached its source after the audio's first chunk
+		// (400 ms, or more if the test got held up)
+		const videoDelay = result.videoArrival.time - result.audioArrival.time;
+		expect(videoDelay).toBeGreaterThan(0.35);
+		expect(Math.abs(result.videoStart - videoDelay)).toBeLessThan(0.005);
 		expect(result.audioEnd).toBeGreaterThan(0.95);
 	});
 
@@ -402,9 +444,12 @@ describe.skipIf(!hasTrackGenerator)('Timeline', () => {
 		});
 
 		expect(result.errors).toEqual([]);
-		expect(Math.abs(result.audioStart - result.startTime)).toBeLessThan(0.1);
-		expect(result.videoStart - result.audioStart).toBeGreaterThan(0.28);
-		expect(result.videoStart - result.audioStart).toBeLessThan(0.33);
+		// Each track starts at the wall-clock time its first chunk reached its source; the audio's first packet starts
+		// before it by Opus's pre-skip (6.5 ms) at most
+		expect(result.videoArrival.date - result.audioArrival.date).toBeGreaterThan(0.25);
+		expect(result.audioStart - result.audioArrival.date).toBeGreaterThan(-0.01);
+		expect(result.audioStart - result.audioArrival.date).toBeLessThan(0.005);
+		expect(Math.abs(result.videoStart - result.videoArrival.date)).toBeLessThan(0.005);
 	});
 
 	test('frameRate: null keeps the capture timestamps of the frames', async () => {
