@@ -482,6 +482,13 @@ export class Output<
 	 * @internal
 	 */
 	_firstMediaStreamTimestamp: number | null = null;
+	/**
+	 * How the capture timestamps of a MediaStreamTrack map to output timestamps, by timestamp base and track. Every
+	 * source of the same track (e.g. one per rendition) uses the same mapping, so that it gives the same media the same
+	 * timestamp.
+	 * @internal
+	 */
+	_mediaStreamTimestampOffsets = new Map<string, number>();
 
 	/**
 	 * The target to which the root file will be written. Throws when using {@link PathedTarget} with an async callback;
