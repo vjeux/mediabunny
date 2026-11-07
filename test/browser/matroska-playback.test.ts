@@ -221,11 +221,22 @@ const loadInVideoElement = async (bytes: Uint8Array, mimeType: string) => {
 };
 
 describe('Mediabunny WebM in Chrome', () => {
-	test.each([
+	test.for([
 		{ codec: 'vp8' as const, mimeType: 'video/webm; codecs="vp8, opus"' },
 		{ codec: 'vp9' as const, mimeType: 'video/webm; codecs="vp9, opus"' },
 		{ codec: 'av1' as const, mimeType: 'video/webm; codecs="av01.0.04M.08, opus"' },
-	])('$codec + Opus plays through Media Source Extensions', async ({ codec, mimeType }) => {
+	])('$codec + Opus plays through Media Source Extensions', async ({ codec, mimeType }, { skip }) => {
+		if (codec === 'av1') {
+			// Capability guard: not every browser can encode AV1 (Safari can't) or play it through MSE. This is the
+			// encoder configuration Mediabunny asks for at this size.
+			const encoderSupport = await VideoEncoder.isConfigSupported({
+				codec: 'av01.0.00M.08',
+				width: 160,
+				height: 120,
+			});
+			skip(!encoderSupport.supported || !MediaSource.isTypeSupported(mimeType), 'AV1 isn\'t supported here');
+		}
+
 		const bytes = await encodeWebM({ codec, audio: true });
 		const result = await playThroughMse(bytes, mimeType);
 		expect(result.buffered.length).toBe(1);
