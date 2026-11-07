@@ -96,7 +96,12 @@ const playWithMse = async (mimeType: string, chunks: Uint8Array<ArrayBuffer>[]) 
 	]);
 	mediaSource.endOfStream();
 
-	video.currentTime = buffered[0]?.[0] ?? 0;
+	// Start where the media starts if that's well past 0. A small gap at the start is played through, and WebKit
+	// never completes a seek to just after 0 (with FFmpeg's fragmented files too)
+	const start = buffered[0]?.[0] ?? 0;
+	if (start > 0.5) {
+		video.currentTime = start;
+	}
 	video.playbackRate = 8;
 	await video.play();
 	await new Promise<void>((resolve, reject) => {
