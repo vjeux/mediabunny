@@ -8,7 +8,13 @@
 
 import { CustomVideoDecoder, VideoCodec, EncodedPacket, VideoSample, type MaybePromise, Rational } from 'mediabunny';
 import * as NodeAv from 'node-av';
-import { CODEC_TO_CODEC_ID, getHardwareDecoderCodec } from './misc';
+import {
+	CODEC_TO_CODEC_ID,
+	getHardwareDecoderCodec,
+	mapColorPrimaries,
+	mapMatrixCoefficients,
+	mapTransferCharacteristics,
+} from './misc';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
 import { AvFrameVideoSampleResource } from './video-sample';
 
@@ -165,6 +171,30 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		NodeAv.FFmpegError.throwIfError(ret, 'Receive frame');
 
 		this.frame.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
+
+		// Like in WebCodecs, the config's color space overrides the bitstream's, which often carries only part of it
+		// or none (VP9 only signals the matrix, the container carries the rest)
+		const colorSpace = this.config.colorSpace;
+		if (colorSpace) {
+			const primaries = colorSpace.primaries ? mapColorPrimaries(colorSpace.primaries) : null;
+			if (primaries !== null) {
+				this.frame.colorPrimaries = primaries;
+			}
+
+			const transfer = colorSpace.transfer ? mapTransferCharacteristics(colorSpace.transfer) : null;
+			if (transfer !== null) {
+				this.frame.colorTrc = transfer;
+			}
+
+			const matrix = colorSpace.matrix ? mapMatrixCoefficients(colorSpace.matrix) : null;
+			if (matrix !== null) {
+				this.frame.colorSpace = matrix;
+			}
+
+			if (typeof colorSpace.fullRange === 'boolean') {
+				this.frame.colorRange = colorSpace.fullRange ? NodeAv.AVCOL_RANGE_JPEG : NodeAv.AVCOL_RANGE_MPEG;
+			}
+		}
 
 		let timestamp = Number(this.frame.pts) / 1e6;
 		let duration = Number(this.frame.duration) / 1e6;

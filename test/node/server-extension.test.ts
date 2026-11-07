@@ -952,6 +952,24 @@ describe('Video', async () => {
 		expect(sampleCount).toBe(packetTimestamps.length);
 	};
 
+	test('Decoded samples carry the color space of the decoder config', async () => {
+		// 16x16 gray, one frame, VP9 profile 2 tagged BT.2020/PQ. The VP9 bitstream itself can only signal the matrix,
+		// so the primaries and transfer are only in the WebM Colour element:
+		// ffmpeg -f lavfi -i "color=gray:s=16x16:r=10:d=0.1" -c:v libvpx-vp9 -pix_fmt yuv420p10le -profile:v 2
+		//   -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv vp9-pq-16x16.webm
+		using input = new Input({
+			source: new FilePathSource('./test/public/vp9-pq-16x16.webm'),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const expected = { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false };
+		expect((await track.getDecoderConfig())!.colorSpace).toEqual(expected);
+
+		// Like in WebCodecs, the config's color space applies to the decoded samples
+		using sample = (await new VideoSampleSink(track).getSample(0))!;
+		expect(sample.colorSpace.toJSON()).toEqual(expected);
+	});
+
 	test('Color space, RGB to BT.709 encode', async () => {
 		const width = 320;
 		const height = 180;
