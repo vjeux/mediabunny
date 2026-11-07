@@ -149,8 +149,9 @@ const roundTrip = async (format: OutputFormat, metadata: VideoTrackMetadata) => 
 test.each([true, false])(
 	'Conversion with allowTransformationMetadata %s and a matrix that only scales and translates',
 	async (allowTransformationMetadata) => {
-		// Like a QuickTime track offset and stretched in its tkhd
-		const matrix: TransformationMatrix = [2, 0, 0, 0, 1, 0, 16, 8, 1];
+		// Like a QuickTime track offset and scaled in its tkhd. The scale is uniform, as readers may take an uneven one as
+		// a pixel aspect ratio instead
+		const matrix: TransformationMatrix = [2, 0, 0, 0, 2, 0, 16, 8, 1];
 		const sourceOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
 		const source = new EncodedVideoPacketSource('vp8');
 		sourceOutput.addVideoTrack(source, { transformationMatrix: matrix });
