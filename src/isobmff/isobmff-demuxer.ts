@@ -152,6 +152,11 @@ type InternalTrack = {
 		endTimestamp: number;
 		hasKeyFrame: boolean;
 	}[];
+	/**
+	 * The moof offsets of the fragments read so far whose samples of this track aren't placed in time and remembered
+	 * in `fragmentPositionCache` yet (see placeFragmentTrackData)
+	 */
+	unplacedFragmentOffsets: number[];
 	/** The segment durations of all edit list entries leading up to the main one (from which the offset is taken.) */
 	editListPreviousSegmentDurations: number;
 	/** The media time offset of the main edit list entry (with media time !== -1) */
@@ -360,6 +365,8 @@ export class IsobmffDemuxer extends Demuxer {
 	 */
 	lastReadFragment: Fragment | null = null;
 	fragmentSummaries = new Map<number, FragmentSummary>(); // Keyed by moof offset
+	/** Lookups have gone past every top-level box before this file position, so its fragments have all been read */
+	fragmentsWalkedUpTo = 0;
 
 	decryptionKeyCache = new Map<string, Promise<Uint8Array>>();
 	boxNestingDepth = 0;
@@ -556,6 +563,7 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentLookupTable: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
+				unplacedFragmentOffsets: [],
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
 				encryptionInfo: foreignTrack.encryptionInfo,
@@ -799,8 +807,11 @@ export class IsobmffDemuxer extends Demuxer {
 		return sampleTable;
 	}
 
-	async readFragment(startPos: number): Promise<Fragment | null> {
+	/** Reads the fragment at the given position for a lookup of the given track, which reads its fragments in order */
+	async readFragment(startPos: number, track: InternalTrack): Promise<Fragment | null> {
 		if (this.lastReadFragment?.moofOffset === startPos) {
+			// It may have been read for another track, which can leave this track's samples unplaced (see below)
+			this.placeFragment(this.lastReadFragment, track);
 			return this.lastReadFragment;
 		}
 
@@ -826,89 +837,11 @@ export class IsobmffDemuxer extends Demuxer {
 		});
 
 		for (const [, trackData] of fragment.trackData) {
-			const track = trackData.track;
-			const { fragmentPositionCache } = track;
-
-			if (!trackData.startTimestampIsFinal) {
-				// It may be that some tracks don't define the base decode time, i.e. when the fragment begins. This
-				// we'll need to figure out the start timestamp another way. We'll compute the timestamp by accessing
-				// the lookup entries and fragment cache, which works out nicely with the lookup algorithm: If these
-				// exist, then the lookup will automatically start at the furthest possible point. If they don't, the
-				// lookup starts sequentially from the start, incrementally summing up all fragment durations. It's sort
-				// of implicit, but it ends up working nicely.
-
-				// The table is sorted by timestamp, which for any sane file means it's also sorted by offset
-				const lookupEntryIndex = binarySearchExact(
-					track.fragmentLookupTable,
-					fragment.moofOffset,
-					x => x.moofOffset,
-				);
-				const lookupEntry = track.fragmentLookupTable[lookupEntryIndex];
-				const lookupEntryIsValid = lookupEntry
-					&& trackData.trunSampleCounts.length >= lookupEntry.trunNumber
-					&& trackData.trunSampleCounts[lookupEntry.trunNumber - 1]! >= lookupEntry.sampleNumber;
-
-				if (lookupEntryIsValid) {
-					// We ignore traf number here, since we've already matched based on track ID
-
-					let sampleIndex = 0;
-					for (let i = 1; i < lookupEntry.trunNumber; i++) {
-						sampleIndex += trackData.trunSampleCounts[i - 1]!;
-					}
-
-					sampleIndex += lookupEntry.sampleNumber - 1;
-					const sample = trackData.samples[sampleIndex];
-					assert(sample); // Must hold due to the above range checks
-
-					// The timestamp in the lookup entry describes the timestamp of the referenced sample
-					const timestampOffset = lookupEntry.timestamp - sample.presentationTimestamp;
-					offsetFragmentTrackDataByTimestamp(trackData, timestampOffset);
-				} else {
-					const lastCacheIndex = binarySearchLessOrEqual(
-						fragmentPositionCache,
-						fragment.moofOffset - 1,
-						x => x.moofOffset,
-					);
-					if (lastCacheIndex !== -1) {
-						// Let's use the end timestamp of the previous fragment in the cache
-						const lastCache = fragmentPositionCache[lastCacheIndex]!;
-						offsetFragmentTrackDataByTimestamp(trackData, lastCache.endTimestamp);
-					} else {
-						// We're the first fragment I guess, "offset by 0"
-					}
-				}
-
-				trackData.startTimestampIsFinal = true;
-			}
-
-			// Let's remember that a fragment with a given timestamp is here, speeding up future lookups if no
-			// lookup table exists
-			const insertionIndex = binarySearchLessOrEqual(
-				fragmentPositionCache,
-				trackData.startTimestamp,
-				x => x.startTimestamp,
-			);
-			const previousEntry = fragmentPositionCache[insertionIndex];
-			const nextEntry = fragmentPositionCache[insertionIndex + 1];
-
-			// Only remember it if the timestamp order matches the moof offset order
-			if (
-				(!previousEntry || previousEntry.moofOffset < fragment.moofOffset)
-				&& (!nextEntry || nextEntry.moofOffset > fragment.moofOffset)
-			) {
-				fragmentPositionCache.splice(insertionIndex + 1, 0, {
-					moofOffset: fragment.moofOffset,
-					startTimestamp: trackData.startTimestamp,
-					endTimestamp: trackData.endTimestamp,
-					hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
-				});
-			}
-
 			// If senc wasn't parsed but saiz+saio were, fetch the aux info now and stamp each sample with it
-			if (trackData.encryptionAuxInfo && track.encryptionInfo) {
+			if (trackData.encryptionAuxInfo && trackData.track.encryptionInfo) {
 				const entries = await resolveEncryptionAuxInfo(
 					this.reader,
-					track.encryptionInfo,
+					trackData.track.encryptionInfo,
 					trackData.encryptionAuxInfo,
 				);
 
@@ -919,7 +852,139 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 		}
 
+		this.placeFragment(fragment, track);
 		return fragment;
+	}
+
+	/** Places the samples of a fragment read for a lookup of the given track and moves `fragmentsWalkedUpTo` past it */
+	private placeFragment(fragment: Fragment, track: InternalTrack) {
+		for (const [, trackData] of fragment.trackData) {
+			// A lookup for the track reads its fragments in order. For the other tracks, this fragment may come after
+			// fragments of theirs that weren't read yet.
+			this.placeFragmentTrackData(fragment, trackData, trackData.track === track);
+		}
+
+		this.passTopLevelBox(fragment.moofOffset, fragment.moofOffset + fragment.moofSize);
+	}
+
+	/** Moves `fragmentsWalkedUpTo` past a top-level box that a lookup went past */
+	passTopLevelBox(start: number, end: number) {
+		if (this.fragmentsWalkedUpTo >= start && this.fragmentsWalkedUpTo < end) {
+			this.fragmentsWalkedUpTo = end;
+		}
+	}
+
+	/**
+	 * Settles the start timestamp of a track's samples in a fragment if it isn't final yet, and remembers where the
+	 * fragment is. When a fragment doesn't say when its samples begin, that's where the track's previous fragment
+	 * ended. That's only known once all of the track's fragments before it have been placed: when a lookup for the
+	 * track reads them in order, or when lookups have gone past every top-level box before the fragment and none of
+	 * the track's samples there is unplaced. Otherwise, the samples stay unplaced (unless a lookup entry places them)
+	 * until then.
+	 */
+	placeFragmentTrackData(fragment: Fragment, trackData: FragmentTrackData, readInOrder: boolean) {
+		const track = trackData.track;
+		const { fragmentPositionCache } = track;
+		// If so, the track's last remembered fragment before this one is the one right before it
+		const previousFragmentsArePlaced = readInOrder || (
+			this.fragmentsWalkedUpTo >= fragment.moofOffset
+			&& (track.unplacedFragmentOffsets[0] ?? Infinity) > fragment.moofOffset
+		);
+
+		if (!trackData.startTimestampIsFinal) {
+			// It may be that some tracks don't define the base decode time, i.e. when the fragment begins. This
+			// we'll need to figure out the start timestamp another way. We'll compute the timestamp by accessing
+			// the lookup entries and fragment cache, which works out nicely with the lookup algorithm: If these
+			// exist, then the lookup will automatically start at the furthest possible point. If they don't, the
+			// lookup starts sequentially from the start, incrementally summing up all fragment durations. It's sort
+			// of implicit, but it ends up working nicely.
+
+			// The table is sorted by timestamp, which for any sane file means it's also sorted by offset
+			const lookupEntryIndex = binarySearchExact(
+				track.fragmentLookupTable,
+				fragment.moofOffset,
+				x => x.moofOffset,
+			);
+			const lookupEntry = track.fragmentLookupTable[lookupEntryIndex];
+			const lookupEntryIsValid = lookupEntry
+				&& trackData.trunSampleCounts.length >= lookupEntry.trunNumber
+				&& trackData.trunSampleCounts[lookupEntry.trunNumber - 1]! >= lookupEntry.sampleNumber;
+			const rememberedIndex = binarySearchExact(fragmentPositionCache, fragment.moofOffset, x => x.moofOffset);
+
+			if (lookupEntryIsValid) {
+				// We ignore traf number here, since we've already matched based on track ID
+
+				let sampleIndex = 0;
+				for (let i = 1; i < lookupEntry.trunNumber; i++) {
+					sampleIndex += trackData.trunSampleCounts[i - 1]!;
+				}
+
+				sampleIndex += lookupEntry.sampleNumber - 1;
+				const sample = trackData.samples[sampleIndex];
+				assert(sample); // Must hold due to the above range checks
+
+				// The timestamp in the lookup entry describes the timestamp of the referenced sample
+				const timestampOffset = lookupEntry.timestamp - sample.presentationTimestamp;
+				offsetFragmentTrackDataByTimestamp(trackData, timestampOffset);
+			} else if (rememberedIndex !== -1) {
+				// We've placed it before
+				offsetFragmentTrackDataByTimestamp(
+					trackData,
+					fragmentPositionCache[rememberedIndex]!.startTimestamp - trackData.startTimestamp,
+				);
+			} else if (previousFragmentsArePlaced) {
+				const lastCacheIndex = binarySearchLessOrEqual(
+					fragmentPositionCache,
+					fragment.moofOffset - 1,
+					x => x.moofOffset,
+				);
+				if (lastCacheIndex !== -1) {
+					// Let's use the end timestamp of the previous fragment in the cache
+					const lastCache = fragmentPositionCache[lastCacheIndex]!;
+					offsetFragmentTrackDataByTimestamp(trackData, lastCache.endTimestamp);
+				} else {
+					// We're the first fragment I guess, "offset by 0"
+				}
+			} else {
+				// The track's previous fragment may not have been read yet
+				insertSorted(track.unplacedFragmentOffsets, fragment.moofOffset);
+				return;
+			}
+
+			trackData.startTimestampIsFinal = true;
+		}
+
+		// Let's remember that a fragment with a given timestamp is here, speeding up future lookups if no
+		// lookup table exists
+		const insertionIndex = binarySearchLessOrEqual(
+			fragmentPositionCache,
+			trackData.startTimestamp,
+			x => x.startTimestamp,
+		);
+		const previousEntry = fragmentPositionCache[insertionIndex];
+		const nextEntry = fragmentPositionCache[insertionIndex + 1];
+
+		// Only remember it if the timestamp order matches the moof offset order
+		if (
+			(!previousEntry || previousEntry.moofOffset < fragment.moofOffset)
+			&& (!nextEntry || nextEntry.moofOffset > fragment.moofOffset)
+		) {
+			fragmentPositionCache.splice(insertionIndex + 1, 0, {
+				moofOffset: fragment.moofOffset,
+				startTimestamp: trackData.startTimestamp,
+				endTimestamp: trackData.endTimestamp,
+				hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
+			});
+		}
+
+		// Samples that aren't remembered can't be built upon, so they count as unplaced
+		const isRemembered = binarySearchExact(fragmentPositionCache, fragment.moofOffset, x => x.moofOffset) !== -1;
+		const unplacedIndex = binarySearchExact(track.unplacedFragmentOffsets, fragment.moofOffset, x => x);
+		if (isRemembered && unplacedIndex !== -1) {
+			track.unplacedFragmentOffsets.splice(unplacedIndex, 1);
+		} else if (!isRemembered) {
+			insertSorted(track.unplacedFragmentOffsets, fragment.moofOffset);
+		}
 	}
 
 	readContiguousBoxes(slice: FileSlice) {
@@ -1037,6 +1102,7 @@ export class IsobmffDemuxer extends Demuxer {
 					fragmentLookupTable: [],
 					currentFragmentState: null,
 					fragmentPositionCache: [],
+					unplacedFragmentOffsets: [],
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
 					encryptionInfo: null,
@@ -3623,6 +3689,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				if (summary && !summary.trackIds.has(this.internalTrack.id)) {
 					// We've read this fragment before and know it has nothing for this track, so let's not read it
 					// again
+					demuxer.passTopLevelBox(currentPos, currentPos + summary.moofSize);
 					currentPos += summary.moofSize;
 					continue;
 				}
@@ -3639,7 +3706,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				}
 
 				if (boxInfo.name === 'moof') {
-					currentFragment = await demuxer.readFragment(boxStartPos);
+					currentFragment = await demuxer.readFragment(boxStartPos, this.internalTrack);
 					if (!currentFragment) {
 						break;
 					}
@@ -3652,6 +3719,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 						bestFragment = currentFragment;
 						bestSampleIndex = sampleIndex;
 					}
+				} else {
+					demuxer.passTopLevelBox(boxStartPos, boxStartPos + boxInfo.totalSize);
 				}
 
 				currentPos = boxStartPos + boxInfo.totalSize;
@@ -4141,6 +4210,14 @@ const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Ration
 
 const sampleTableIsEmpty = (sampleTable: SampleTable) => {
 	return sampleTable.sampleSizes.length === 0;
+};
+
+/** Inserts a number into a sorted array, unless it's already there */
+const insertSorted = (array: number[], value: number) => {
+	const index = binarySearchLessOrEqual(array, value, x => x);
+	if (array[index] !== value) {
+		array.splice(index + 1, 0, value);
+	}
 };
 
 const capEntryCounts = (entries: { startIndex: number; count: number }[], sampleCount: number) => {
