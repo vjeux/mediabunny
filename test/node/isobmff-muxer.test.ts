@@ -358,7 +358,12 @@ test('PCM audio with non-zero timestamp', async () => {
 });
 
 test('MP4 tkhd carries the presentation size of anamorphic video', async () => {
-	const readTkhd = async (format: Mp4OutputFormat | MovOutputFormat, rotation: 0 | 180, anamorphic: boolean) => {
+	const readTkhd = async (
+		format: Mp4OutputFormat | MovOutputFormat,
+		rotation: 0 | 180 | 270,
+		[codedWidth, codedHeight]: [number, number],
+		displayAspect?: [number, number],
+	) => {
 		const output = new Output({ format, target: new BufferTarget() });
 		const source = new EncodedVideoPacketSource('vp8');
 		output.addVideoTrack(source, { rotation });
@@ -366,10 +371,10 @@ test('MP4 tkhd carries the presentation size of anamorphic video', async () => {
 		await source.add(new EncodedPacket(new Uint8Array(100), 'key', 0, 1), {
 			decoderConfig: {
 				codec: 'vp8',
-				codedWidth: 640,
-				codedHeight: 360,
-				// 2:1 pixels, displayed at 32:9
-				...(anamorphic ? { displayAspectWidth: 32, displayAspectHeight: 9 } : {}),
+				codedWidth,
+				codedHeight,
+				displayAspectWidth: displayAspect?.[0],
+				displayAspectHeight: displayAspect?.[1],
 			},
 		});
 		await output.finalize();
@@ -385,14 +390,25 @@ test('MP4 tkhd carries the presentation size of anamorphic video', async () => {
 	};
 
 	// ISO/IEC 14496-12: for visual tracks, tkhd's width and height are the presentation size, to which all images are
-	// scaled before the matrix applies. They used to be the pixel size (640) with only pasp saying 2:1.
-	expect(await readTkhd(new Mp4OutputFormat(), 0, true)).toEqual({ size: [1280, 360], translation: [0, 0] });
+	// scaled before the matrix applies. They used to be the pixel size (640) with only pasp saying 2:1 (here 32:9).
+	const mp4 = new Mp4OutputFormat();
+	expect(await readTkhd(mp4, 0, [640, 360], [32, 9])).toEqual({ size: [1280, 360], translation: [0, 0] });
 	// So a half turn keeps the image in place by moving it by the presentation width
-	expect(await readTkhd(new Mp4OutputFormat(), 180, true)).toEqual({ size: [1280, 360], translation: [1280, 360] });
+	expect(await readTkhd(mp4, 180, [640, 360], [32, 9])).toEqual({ size: [1280, 360], translation: [1280, 360] });
+
+	// The matrix's translation is signed 16.16 (up to 32767), unlike the size. At 10:1, 4096 pixels are presented at
+	// 40960, which still fits the size, but not a translation by it: there, the pixel size stays
+	expect(await readTkhd(mp4, 0, [4096, 64], [640, 1])).toEqual({ size: [40960, 64], translation: [0, 0] });
+	expect(await readTkhd(mp4, 180, [4096, 64], [640, 1])).toEqual({ size: [4096, 64], translation: [4096, 64] });
+	expect((await readTkhd(mp4, 270, [4096, 64], [640, 1])).translation.every(x => x >= 0)).toBe(true);
+	expect(await readTkhd(mp4, 180, [4096, 64], [256, 1])).toEqual({ size: [16384, 64], translation: [16384, 64] });
 
 	// Square pixels are unchanged, and QuickTime keeps the pixel size, as FFmpeg does
-	expect(await readTkhd(new Mp4OutputFormat(), 0, false)).toEqual({ size: [640, 360], translation: [0, 0] });
-	expect(await readTkhd(new MovOutputFormat(), 180, true)).toEqual({ size: [640, 360], translation: [640, 360] });
+	expect(await readTkhd(mp4, 0, [640, 360])).toEqual({ size: [640, 360], translation: [0, 0] });
+	expect(await readTkhd(new MovOutputFormat(), 180, [640, 360], [32, 9])).toEqual({
+		size: [640, 360],
+		translation: [640, 360],
+	});
 });
 
 test('PCM audio, silence padding', async () => {

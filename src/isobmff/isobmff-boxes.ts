@@ -493,6 +493,12 @@ export const tkhd = (
 
 		// The matrix applies to the image at its presentation size
 		matrix = centeredTransformationMatrix(linear, width, height);
+
+		// Its translation is signed 16.16, though: if it doesn't fit, keep the pixel size, as before
+		if (width !== trackData.info.width && Math.max(Math.abs(matrix[6]), Math.abs(matrix[7])) >= 2 ** 15) {
+			width = trackData.info.width;
+			matrix = centeredTransformationMatrix(linear, width, height);
+		}
 	} else {
 		matrix = IDENTITY_MATRIX;
 	}
