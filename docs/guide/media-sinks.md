@@ -266,7 +266,7 @@ for await (const sample of sink.samples(5, 10)) {
 	sample.close();
 }
 ```
-The `samples` iterator yields the samples in [presentation order](#decode-vs-presentation-order) (sorted by timestamp).
+The `samples` iterator yields the samples in [presentation order](#decode-vs-presentation-order) (sorted by timestamp). Like `getSample`, it starts with the sample presented at the start timestamp, which is the last one starting at or before it, so the first sample may begin before the start timestamp.
 
 #### Sparse iteration
 
@@ -517,7 +517,7 @@ for await (const sample of sink.samples()) {
 	sample.copyTo(floats, { format: 'f32', planeIndex: 0 });
 
 	for (let i = 0; i < floats.length; i++) {
-		sumOfSquares += floats[i] ** 2;
+		sumOfSquares += floats[i]! ** 2;
 	}
 
 	totalSampleCount += floats.length;
