@@ -1783,6 +1783,28 @@ describe('Video', async () => {
 			});
 			await conversion.execute();
 		});
+
+		test('Transform leaves AVFrame-backed source intact', async () => {
+			using input = new Input({
+				source: new FilePathSource('./test/public/video.mp4'),
+				formats: ALL_FORMATS,
+			});
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			using sample = await new VideoSampleSink(track).getSample(0);
+			assert(sample);
+			expect(sample._data).toBeInstanceOf(AvFrameVideoSampleResource);
+
+			using first = await sample.transform({ width: 320 });
+			using second = await sample.transform({ width: 160 });
+			expect(first.codedWidth).toBe(320);
+			expect(second.codedWidth).toBe(160);
+
+			const buffer = new Uint8Array(sample.allocationSize());
+			await sample.copyTo(buffer);
+			expect(sample.codedWidth).toBe(1920);
+		});
 	});
 });
 
