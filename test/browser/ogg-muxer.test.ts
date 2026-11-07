@@ -335,12 +335,48 @@ test.each(['/preroll-test.opus', '/vorbis-eos.ogg'])(
 	},
 );
 
-test.each([
-	// Less than the 1 ms the pre-skip match allows for rounded sources
-	['/preroll-test.opus', 0.0008],
-	// Beyond the first packet, which starts 45 samples before zero and lasts 128 at 44.1 kHz, but less than 1 ms beyond
-	['/vorbis-eos.ogg', 0.0025],
-])('Conversion of %s to Ogg with a start trim of %s s applies the trim', async (url, trimStart) => {
+// Whether this browser decodes a file's audio, within a few seconds. Decided by WebCodecs: the file's first packets
+// through an AudioDecoder (WebKitGTK's Vorbis decoder hangs, say)
+const decodesAudioNatively = async (url: string) => {
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	const decoderConfig = await track?.getDecoderConfig();
+	if (!track || !decoderConfig || !(await AudioDecoder.isConfigSupported(decoderConfig)).supported) {
+		return false;
+	}
+
+	let outputCount = 0;
+	const decoder = new AudioDecoder({
+		output: (audioData) => {
+			outputCount++;
+			audioData.close();
+		},
+		error: () => {},
+	});
+
+	try {
+		decoder.configure(decoderConfig);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			decoder.decode(packet.toEncodedAudioChunk());
+			if (++packetCount === 10) {
+				break;
+			}
+		}
+
+		const flushed = await Promise.race([
+			decoder.flush().then(() => true, () => false),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 3000)),
+		]);
+		return flushed && outputCount > 0;
+	} finally {
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+	}
+};
+
+const testTrimmedConversion = async (url: string, trimStart: number) => {
 	// The priming must not absorb an explicit trim
 	const readPackets = async (input: Input) => {
 		const track = await input.getPrimaryAudioTrack();
@@ -368,4 +404,19 @@ test.each([
 		expect(outputPackets[10]!.data).toEqual(inputPackets[10]!.data);
 		expect(Math.abs(outputPackets[10]!.timestamp - (inputPackets[10]!.timestamp - trimStart))).toBeLessThan(2.5e-5);
 	}
-});
+};
+
+for (const [url, trimStart] of [
+	// Less than the 1 ms the pre-skip match allows for rounded sources
+	['/preroll-test.opus', 0.0008],
+	// Beyond the first packet, which starts 45 samples before zero and lasts 128 at 44.1 kHz, but less than 1 ms beyond
+	['/vorbis-eos.ogg', 0.0025],
+] as const) {
+	// A trim this small makes the conversion transcode, which needs a decoder
+	test.skipIf(!(await decodesAudioNatively(url)))(
+		`Conversion of ${url} to Ogg with a start trim of ${trimStart} s applies the trim`,
+		async () => {
+			await testTrimmedConversion(url, trimStart);
+		},
+	);
+}
