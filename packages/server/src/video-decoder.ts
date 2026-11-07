@@ -172,10 +172,11 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 
 		this.frame.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
 
-		// Like in WebCodecs, the config's color space overrides the bitstream's, which often carries only part of it
-		// or none (VP9 only signals the matrix, the container carries the rest)
+		// The VP8 and VP9 bitstreams carry no primaries or transfer (VP9 only signals the matrix), so like Chromium,
+		// take the color space from the config (the container) for them. Other codecs keep their in-band values, as in
+		// Chromium.
 		const colorSpace = this.config.colorSpace;
-		if (colorSpace) {
+		if (colorSpace && (this.codec === 'vp8' || this.codec === 'vp9')) {
 			const primaries = colorSpace.primaries ? mapColorPrimaries(colorSpace.primaries) : null;
 			if (primaries !== null) {
 				this.frame.colorPrimaries = primaries;
