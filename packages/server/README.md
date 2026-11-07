@@ -13,7 +13,7 @@ By default, Mediabunny requires a browser environment for full access to decoder
 
 Features added by this package include:
 - Video decoders and encoders for AVC (H.264), HEVC (H.265), VP8, VP9, AV1, and ProRes. Supports both length-prefixed and Annex B AVC/HEVC as well as transparent video via VP9 and ProRes.
-- Audio decoders and encoders for AAC, MP3, Vorbis, Opus, FLAC, AC-3 and E-AC-3. Supports AAC in both AAC and ADTS formats.
+- Audio decoders and encoders for AAC, MP3, Vorbis, Opus, FLAC, AC-3, E-AC-3, DTS and TrueHD. Supports AAC in both AAC and ADTS formats.
 - Video frame transformation support (resize, rotate, flip, crop)
 - Automatic hardware acceleration on all platforms (macOS, Linux, Windows)
 - Built-in multithreading
@@ -29,6 +29,8 @@ This library peer-depends on Mediabunny. Install both using npm:
 ```bash
 npm install mediabunny @mediabunny/server
 ```
+
+In TypeScript projects, include the `DOM` and `ESNext` libraries in your tsconfig, even on the server: Mediabunny's types use them. See [Installation](https://mediabunny.dev/guide/installation) for the settings.
 
 ## Usage
 
@@ -105,6 +107,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(3000);
 ```
+
+> [!NOTE]
+> This streaming setup needs inputs that can be read front to back. MP4 and MOV files qualify only with Fast Start (the `moov` box before the media data), which FFmpeg's default output and many camera recordings lack. For a file without it, Mediabunny has to read the end of the file first, and once the file outgrows `ReadableStreamSource`'s cache (32 MiB by default), the conversion fails with "Attempted to read data from an already-evicted part of the cache". To accept such files, write the upload to disk and read it with `FilePathSource`, or raise the source's `maxCacheSize`.
 
 For all the other ways to use Mediabunny, refer to its [guide](https://mediabunny.dev/guide/introduction).
 
@@ -295,7 +300,7 @@ Logging.level = LogLevel.Warnings;
 Logging.level = LogLevel.Errors;
 
 // Don't log anything at all.
-Logging.level = LogLevel.None;
+Logging.level = LogLevel.Silent;
 ```
 
 You can also hook into log events:
