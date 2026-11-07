@@ -41,7 +41,34 @@ test('Lookups past the end of a logical stream that ends early don\'t scan the r
 	}
 	await output.finalize();
 
-	const bytes = new Uint8Array(output.target.buffer!);
+	// Wherever the muxer put the short stream's last (EOS) page, move it to the end of the file, so that the next page
+	// of that stream after the others comes only after all the pages of the other one
+	const muxed = new Uint8Array(output.target.buffer!);
+	const pages: Uint8Array[] = [];
+	for (let pos = 0; pos < muxed.length;) {
+		const segmentCount = muxed[pos + 26]!;
+		const dataSize = muxed.subarray(pos + 27, pos + 27 + segmentCount).reduce((sum, value) => sum + value, 0);
+		pages.push(muxed.subarray(pos, pos + 27 + segmentCount + dataSize));
+		pos += 27 + segmentCount + dataSize;
+	}
+	const serialNumberOf = (page: Uint8Array) => new DataView(page.buffer, page.byteOffset).getUint32(14, true);
+	const pageCounts = new Map<number, number>();
+	for (const page of pages) {
+		pageCounts.set(serialNumberOf(page), (pageCounts.get(serialNumberOf(page)) ?? 0) + 1);
+	}
+	const shortSerialNumber = [...pageCounts].sort((a, b) => a[1] - b[1])[0]![0];
+	let lastShortPageIndex = pages.length - 1;
+	while (serialNumberOf(pages[lastShortPageIndex]!) !== shortSerialNumber) {
+		lastShortPageIndex--;
+	}
+	pages.push(...pages.splice(lastShortPageIndex, 1));
+
+	const bytes = new Uint8Array(muxed.length);
+	let offset = 0;
+	for (const page of pages) {
+		bytes.set(page, offset);
+		offset += page.length;
+	}
 	let bytesRead = 0;
 	using input = new Input({
 		source: new CustomSource({
