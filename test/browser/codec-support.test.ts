@@ -30,15 +30,9 @@ const isDecodable = async (codec: string, width = 176, height = 144) => {
 
 describe('Codec strings in the browser', () => {
 	test('Strings derived from real streams are accepted', async () => {
-		// The acceptance checks below only mean something where the browser parses codec strings. Where it rejects a
-		// clearly malformed control, subtler mistakes must be rejected too: a wrong tier letter, a missing bit depth.
-		// (Where the control is accepted, the checks below still have to pass, but can't tell good strings from bad.)
-		if (!await isDecodable('av01.garbage')) {
-			expect(await isDecodable('av01.0.04X.08')).toBe(false);
-		}
-		if (!await isDecodable('vp09.garbage')) {
-			expect(await isDecodable('vp09.00.10')).toBe(false);
-		}
+		// How strictly browsers parse codec strings varies (WebKitGTK, for one, accepts a wrong AV1 tier letter or a
+		// missing VP9 bit depth), so these checks only assert acceptance. Mediabunny's own rejection of malformed
+		// strings is tested in Node (codec-strings.test.ts).
 
 		for (const fixture of AV1_FIXTURES) {
 			const av1CodecInfo = extractAv1CodecInfoFromPacket(hexToBytes(fixture.sequenceHeaderObu))!;
