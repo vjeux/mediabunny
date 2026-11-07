@@ -86,7 +86,9 @@ export class AdtsDemuxer extends Demuxer {
 				// The channel layout comes from the PCE at the start of the frame's raw data block
 				const headerSize = header.crcCheck === null ? MIN_ADTS_FRAME_HEADER_SIZE : MAX_ADTS_FRAME_HEADER_SIZE;
 				let slice = this.reader.requestSlice(header.startPos + headerSize, header.frameLength - headerSize);
-				if (isThenable(slice)) slice = await slice;
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
 				if (!slice) {
 					throw new Error('Invalid ADTS file: the first frame is cut off.');
 				}
