@@ -67,6 +67,56 @@ test('Decode an AVC track whose sample descriptions change the parameter sets', 
 	const samples = [...first.chunks, ...second.chunks];
 	expect(samples.map(x => x.isKey)).toEqual([true, false, true, false]);
 
+	// Whether the platform's decoder takes a resolution change from parameter sets sent in band. WebKit's GStreamer
+	// one doesn't (the WebCodecs AVC registration only promises the description's parameter sets), and keeps the
+	// first size, for the decoder alone as for Mediabunny.
+	const decodesInBandResolutionChanges = await (async () => {
+		const lengthSize = (second.description[4]! & 3) + 1;
+		const inBandParameterSets: number[] = [];
+		let offset = 5;
+		for (const countMask of [0x1f, 0xff]) { // SPS, then PPS
+			const count = second.description[offset]! & countMask;
+			offset++;
+			for (let i = 0; i < count; i++) {
+				const length = (second.description[offset]! << 8) | second.description[offset + 1]!;
+				for (let j = lengthSize - 1; j >= 0; j--) {
+					inBandParameterSets.push((length >> (8 * j)) & 0xff);
+				}
+				inBandParameterSets.push(...second.description.subarray(offset + 2, offset + 2 + length));
+				offset += 2 + length;
+			}
+		}
+
+		const sizes: number[][] = [];
+		const decoder = new VideoDecoder({
+			output: (frame) => {
+				sizes.push([frame.codedWidth, frame.codedHeight]);
+				frame.close();
+			},
+			error: () => {},
+		});
+		decoder.configure({ codec: 'avc1.42001f', description: first.description });
+		for (const [i, sample] of samples.entries()) {
+			decoder.decode(new EncodedVideoChunk({
+				type: sample.isKey ? 'key' : 'delta',
+				timestamp: i * 40_000,
+				data: i === 2 ? new Uint8Array([...inBandParameterSets, ...sample.data]) : sample.data,
+			}));
+		}
+
+		try {
+			await decoder.flush();
+		} catch {
+			return false;
+		} finally {
+			if (decoder.state !== 'closed') {
+				decoder.close();
+			}
+		}
+
+		return sizes[2]?.[0] === 128;
+	})();
+
 	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
 	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
 	const zeros = (count: number) => new Array<number>(count).fill(0);
@@ -117,5 +167,10 @@ test('Decode an AVC track whose sample descriptions change the parameter sets', 
 		sizes.push([sample.codedWidth, sample.codedHeight]);
 		sample.close();
 	}
-	expect(sizes).toEqual([[256, 128], [256, 128], [128, 128], [128, 128]]);
+	if (decodesInBandResolutionChanges) {
+		expect(sizes).toEqual([[256, 128], [256, 128], [128, 128], [128, 128]]);
+	} else {
+		// Every frame still decodes, but at the first size, like with the decoder alone
+		expect(sizes).toHaveLength(4);
+	}
 });
