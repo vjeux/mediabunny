@@ -290,6 +290,20 @@ export const transformVideoSample = async (
 
 	chain.push('setsar=1');
 
+	let graphDescription = `[in]${chain.join(',')}[out]`;
+
+	const pixelFormatName = NodeAv.avGetPixFmtName(srcFrame.format as NodeAv.AVPixelFormat) ?? '';
+	const hasAlpha = /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|ayuv|vuya)/.test(pixelFormatName);
+
+	if (description.alpha === 'discard' && hasAlpha) {
+		// Like the canvas transformer, paint the frame (including transparent padding) onto black, then drop the alpha
+		// channel, letting FFmpeg pick the closest format without one
+		graphDescription = `[in]${chain.join(',')},split[fg][copy];`
+			+ '[copy]drawbox=t=fill:c=black:replace=1[bg];'
+			+ '[bg][fg]overlay=format=auto,format=pix_fmts=rgb0|bgr0|yuv420p|yuv422p|yuv444p'
+			+ '|yuv420p10le|yuv422p10le|yuv444p10le|yuv420p12le|yuv422p12le|yuv444p12le[out]';
+	}
+
 	const graph = new NodeAv.FilterGraph();
 	graph.alloc();
 
@@ -309,7 +323,7 @@ export const transformVideoSample = async (
 		const outputs = NodeAv.FilterInOut.createList([{ name: 'in', filterCtx: bufferSrc, padIdx: 0 }]);
 		const inputs = NodeAv.FilterInOut.createList([{ name: 'out', filterCtx: bufferSink, padIdx: 0 }]);
 
-		const parseRet = graph.parsePtr(`[in]${chain.join(',')}[out]`, inputs, outputs);
+		const parseRet = graph.parsePtr(graphDescription, inputs, outputs);
 		NodeAv.FFmpegError.throwIfError(parseRet, 'FilterGraph.parsePtr');
 
 		const configRet = await graph.config();
