@@ -3333,12 +3333,16 @@ export const parseEac3OrAc3CoreSyncFrame = (data: Uint8Array): Eac3FrameInfo | n
 	}
 
 	const frameSize = AC3_FRAME_SIZES[3 * (data[4]! & 0x3f) + frameInfo.fscod];
-	const { numDepSub, chanLoc } = frameSize !== undefined
+	const { numDepSub, chanLoc, dependentSize } = frameSize !== undefined
 		? readEac3DependentSubstreams(data, frameSize)
-		: { numDepSub: 0, chanLoc: 0 };
+		: { numDepSub: 0, chanLoc: 0, dependentSize: 0 };
+
+	// data_rate is the rate of the whole bitstream, the dependent substreams' frames (spanning the core's 1536
+	// samples) included
+	const dependentDataRate = dependentSize * 8 * AC3_SAMPLE_RATES[frameInfo.fscod]! / AC3_SAMPLES_PER_FRAME / 1000;
 
 	return {
-		dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]!,
+		dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]! + Math.round(dependentDataRate),
 		substreams: [{
 			fscod: frameInfo.fscod,
 			fscod2: 0,
@@ -3354,11 +3358,12 @@ export const parseEac3OrAc3CoreSyncFrame = (data: Uint8Array): Eac3FrameInfo | n
 
 /**
  * Counts the dependent substream frames that directly follow an independent substream's frame (ending at `offset`)
- * within the same access unit, and collects the channel locations they add, in dec3's `chan_loc` bits. Taken from
- * upstream's bug-fix-mania branch, where parseEac3SyncFrame does the same for E-AC-3 frames.
+ * within the same access unit, and collects the channel locations they add, in dec3's `chan_loc` bits, and their
+ * size. Taken from upstream's bug-fix-mania branch, where parseEac3SyncFrame does the same for E-AC-3 frames.
  */
 const readEac3DependentSubstreams = (data: Uint8Array, offset: number) => {
 	const bitstream = new Bitstream(data);
+	const startOffset = offset;
 	let numDepSub = 0;
 	let chanLoc = 0;
 
@@ -3403,7 +3408,7 @@ const readEac3DependentSubstreams = (data: Uint8Array, offset: number) => {
 		offset += 2 * (dependentFrmsiz + 1);
 	}
 
-	return { numDepSub, chanLoc };
+	return { numDepSub, chanLoc, dependentSize: offset - startOffset };
 };
 
 /**

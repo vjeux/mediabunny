@@ -883,6 +883,11 @@ test('MPEG-TS with Blu-ray Dolby Digital Plus made of an AC-3 core and an E-AC-3
 			mp4Packets.push(packet);
 		}
 		expect(mp4Packets.map(packet => packet.byteLength)).toEqual(new Array<number>(8).fill(frameSize));
+
+		// dec3's data_rate (13 bits, in kbit/s) is the whole bitstream's: 32 for the core, plus 16 for the extension
+		const mp4Bytes = new Uint8Array(output.target.buffer!);
+		const dec3Pos = mp4Bytes.findIndex((_, i) => String.fromCharCode(...mp4Bytes.subarray(i, i + 4)) === 'dec3');
+		expect(((mp4Bytes[dec3Pos + 4]! << 8) | mp4Bytes[dec3Pos + 5]!) >> 3).toBe(withExtension ? 48 : 32);
 	}
 });
 
