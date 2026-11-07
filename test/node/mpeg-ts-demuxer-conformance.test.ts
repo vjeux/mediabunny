@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest';
+import { isDeepStrictEqual } from 'node:util';
 import { Input } from '../../src/input.js';
 import { BufferSource, ReadableStreamSource } from '../../src/source.js';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
@@ -206,17 +207,40 @@ describe('MPEG-TS demuxer: packet layer', () => {
 	test('keeps reading across continuity counter gaps and transport_error_indicator flags', async () => {
 		const ts = buildBasic();
 		const bytes = ts.toBytes();
+		// Frames as timestamp, type and size (the duration of a frame before a dropped one spans the gap)
+		const frameOf = (packet: EncodedPacket) => ({
+			timestamp: packet.timestamp,
+			type: packet.type,
+			size: packet.byteLength,
+		});
+		const clean = (await readPackets((await openBytes(ts.toBytes()).getPrimaryVideoTrack())!)).map(frameOf);
 
-		for (let i = 2; i < bytes.length / 188; i += 3) {
-			bytes[i * 188 + 3] = (bytes[i * 188 + 3]! & 0xf0) | ((bytes[i * 188 + 3]! + 5) & 0x0f); // Wrong counter
-			if (i % 2 === 0) {
-				bytes[i * 188 + 1]! |= 0x80; // transport_error_indicator
+		// Damage two delta frames of the first GOP (key frames at 0 and 10, one PES packet per frame): a wrong
+		// continuity counter in frame 2's TS packet, and transport_error_indicator in frame 5's
+		const firstPacketOfFrame = (frame: number) => {
+			let count = -1;
+			for (let i = 0; i < bytes.length / 188; i++) {
+				const pid = ((bytes[i * 188 + 1]! & 0x1f) << 8) | bytes[i * 188 + 2]!;
+				if (pid === VIDEO_PID && bytes[i * 188 + 1]! & 0x40 && ++count === frame) {
+					return i;
+				}
 			}
-		}
+			throw new Error('No such frame');
+		};
+		const counterPos = firstPacketOfFrame(2) * 188 + 3;
+		bytes[counterPos] = (bytes[counterPos]! & 0xf0) | ((bytes[counterPos]! + 5) & 0x0f);
+		bytes[firstPacketOfFrame(5) * 188 + 1]! |= 0x80;
 
+		// Reading goes on to the end: whether frames of the damaged GOP are kept or dropped (frames that can't be
+		// decoded properly), the frames before the damage and the next GOP are there, and every frame is intact
 		using input = openBytes(bytes);
-		const packets = await readPackets((await input.getPrimaryVideoTrack())!);
-		expect(packets).toHaveLength(12);
+		const packets = (await readPackets((await input.getPrimaryVideoTrack())!)).map(frameOf);
+		for (const frame of [0, 1, 10, 11]) {
+			expect(packets).toContainEqual(clean[frame]);
+		}
+		expect(packets.every(packet => clean.some(frame => isDeepStrictEqual(frame, packet)))).toBe(true);
+		const timestamps = packets.map(packet => packet.timestamp);
+		expect(timestamps).toEqual([...timestamps].sort((x, y) => x - y));
 	});
 
 	test('ignores an incomplete last packet, like FFmpeg', async () => {
