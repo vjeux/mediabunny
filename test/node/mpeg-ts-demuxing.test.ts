@@ -864,7 +864,8 @@ test('MPEG-TS random_access_indicator on every frame with per-frame SEI messages
 
 test('MPEG-TS random_access_indicator on PES packets holding several frames', async () => {
 	// random_access_indicator marks the PES packet holding the start of a random access point: the first access unit
-	// in it. The access units after it in the same PES packet aren't key frames, and the flag didn't lie about them.
+	// in it. It doesn't tell about the access units after that one in the same PES packet, which may or may not be key
+	// frames (several, in all-intra or short-GOP streams), and it didn't lie about them.
 	const packets: Uint8Array[] = [];
 	const pushPes = (pid: number, payload: number[], randomAccess: boolean) => {
 		for (let i = 0; i < payload.length; i += 182) {
@@ -893,11 +894,12 @@ test('MPEG-TS random_access_indicator on PES packets holding several frames', as
 		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
 	], false);
 
-	// Three frames per PES packet; the first and last PES packets begin with a key frame and are flagged
+	// Several frames per PES packet; the PES packets that begin with a key frame are flagged
 	const pesPackets = [
 		[keyFrame, deltaFrame, deltaFrame],
 		[deltaFrame, deltaFrame, deltaFrame],
-		[keyFrame, deltaFrame],
+		[keyFrame, deltaFrame, keyFrame],
+		[keyFrame, keyFrame, deltaFrame],
 	];
 	pesPackets.forEach((frames, i) => {
 		const pts = 9000 * i;
@@ -921,7 +923,7 @@ test('MPEG-TS random_access_indicator on PES packets holding several frames', as
 		types.push(packet.type);
 	}
 
-	expect(types).toEqual(['key', 'delta', 'delta', 'delta', 'delta', 'delta', 'key', 'delta']);
+	expect(types).toEqual(pesPackets.flat().map(frame => frame === keyFrame ? 'key' : 'delta'));
 
 	// The flags stay trusted, so key packet lookups keep relying on them instead of reading the bitstream
 	const demuxer = (await input._getDemuxer()) as MpegTsDemuxer;

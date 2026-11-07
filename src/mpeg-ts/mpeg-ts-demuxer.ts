@@ -2667,13 +2667,15 @@ class PacketReadingContext {
 		} else if (this.elementaryStream.info.decoderConfig) {
 			const { codec, decoderConfig } = this.elementaryStream.info;
 
-			if (!isFirstPacketOfPesPacket) {
+			if (!isFirstPacketOfPesPacket && this.elementaryStream.canBeTrustedWithKeyPackets) {
 				// random_access_indicator says that the PES packet holds the start of a random access point, the first
-				// access unit beginning in it, and nothing about the access units after that one
-				randomAccessIndicator = 0;
-			}
-
-			if (randomAccessIndicator === 1) {
+				// access unit beginning in it. It doesn't tell about the access units after that one, so in a flagged
+				// PES packet, the bitstream decides for them (an all-intra stream may pack several key frames into one
+				// PES packet).
+				randomAccessIndicator = randomAccessIndicator === 1
+					? Number(determineVideoPacketType(codec, decoderConfig, data) === 'key')
+					: 0;
+			} else if (randomAccessIndicator === 1) {
 				// Some muxers set random_access_indicator on packets that aren't key frames (on every PES packet, or on
 				// the ones carrying a PCR). A picture that is neither IDR/IRAP nor comes with a recovery point SEI
 				// message (as open-GOP and intra-refresh streams use) can't be a random access point, so the flag
