@@ -26,6 +26,8 @@ This library peer-depends on Mediabunny. Install both using npm:
 npm install mediabunny @mediabunny/server
 ```
 
+In TypeScript projects, include the `DOM` and `ESNext` libraries in your tsconfig, even on the server: Mediabunny's types use them. See [Installation](../installation) for the settings.
+
 ## Usage
 
 ```ts
