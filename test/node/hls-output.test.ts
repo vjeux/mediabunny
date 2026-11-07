@@ -2440,6 +2440,66 @@ test('Sparse tracks in segments, standard MP4', async () => {
 	});
 });
 
+test('CMAF segments stay on one timeline when a track starts below zero', async () => {
+	// With a mediaTimestampBase of 0, a track whose encoder priming comes before the first packet starts below zero.
+	// The first segment's muxer then moves that track up to zero and says so in the init segment's edit list, which
+	// applies to every segment, so every later segment must be moved the same way.
+	const check = async (singleFilePerPlaylist: boolean) => {
+		const targets = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new CmafOutputFormat(),
+				targetDuration: 1,
+				mediaTimestampBase: 0,
+				singleFilePerPlaylist,
+			}),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				targets.set(request.path, target);
+				return target;
+			}),
+		});
+		const english = audioSource();
+		const french = audioSource();
+		output.addAudioTrack(english, { languageCode: 'eng' });
+		output.addAudioTrack(french, { languageCode: 'fra' });
+		await output.start();
+
+		const frameDuration = 1024 / 48000;
+		for (let i = 0; i < 150; i++) {
+			// The French track starts with encoder priming, one frame before the first packet of the English one
+			const timestamp = i * frameDuration;
+			const primed = timestamp - frameDuration;
+			await english.add(new EncodedPacket(aacPacketData, 'key', timestamp, frameDuration), aacMetadata);
+			await french.add(new EncodedPacket(aacPacketData, 'key', primed, frameDuration), aacMetadata);
+		}
+		await output.finalize();
+
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(targets.get(path)!.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const tracks = await input.getAudioTracks();
+		expect(tracks).toHaveLength(2);
+		for (const track of tracks) {
+			const sink = new EncodedPacketSink(track);
+			const packets: EncodedPacket[] = [];
+			for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+				packets.push(packet);
+			}
+			expect(packets).toHaveLength(150);
+
+			// Every packet starts where the previous one ends, across segment boundaries too
+			for (let i = 1; i < packets.length; i++) {
+				expect(packets[i]!.timestamp).toBeCloseTo(packets[i - 1]!.timestamp + packets[i - 1]!.duration, 4);
+			}
+		}
+	};
+
+	await check(false);
+	await check(true);
+});
+
 test('Sparse tracks in segments, fragmented MP4', async () => {
 	await testSparseTracksInSegments({
 		segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }),
