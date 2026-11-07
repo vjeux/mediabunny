@@ -12,6 +12,61 @@ import { CODEC_TO_CODEC_ID, getHardwareDecoderCodec } from './misc';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
 import { AvFrameVideoSampleResource } from './video-sample';
 
+/** The formats VP9 decodes to, and the same format with an alpha plane. */
+const WITH_ALPHA_PLANE = new Map<NodeAv.AVPixelFormat, NodeAv.AVPixelFormat>([
+	[NodeAv.AV_PIX_FMT_YUV420P, NodeAv.AV_PIX_FMT_YUVA420P],
+	[NodeAv.AV_PIX_FMT_YUV422P, NodeAv.AV_PIX_FMT_YUVA422P],
+	[NodeAv.AV_PIX_FMT_YUV444P, NodeAv.AV_PIX_FMT_YUVA444P],
+	[NodeAv.AV_PIX_FMT_YUV420P10LE, NodeAv.AV_PIX_FMT_YUVA420P10LE],
+	[NodeAv.AV_PIX_FMT_YUV422P10LE, NodeAv.AV_PIX_FMT_YUVA422P10LE],
+	[NodeAv.AV_PIX_FMT_YUV444P10LE, NodeAv.AV_PIX_FMT_YUVA444P10LE],
+	[NodeAv.AV_PIX_FMT_YUV444P12LE, NodeAv.AV_PIX_FMT_YUVA444P12LE],
+	[NodeAv.AV_PIX_FMT_GBRP, NodeAv.AV_PIX_FMT_GBRAP],
+	[NodeAv.AV_PIX_FMT_GBRP10LE, NodeAv.AV_PIX_FMT_GBRAP10LE],
+	[NodeAv.AV_PIX_FMT_GBRP12LE, NodeAv.AV_PIX_FMT_GBRAP12LE],
+]);
+
+const getBitDepth = (pixelFormat: NodeAv.AVPixelFormat) => {
+	return Number(/p(\d+)le$/.exec(NodeAv.avGetPixFmtName(pixelFormat) ?? '')?.[1] ?? 8);
+};
+
+/**
+ * Combines a decoded VP9 frame with the frame decoded from its alpha data, whose luma is the alpha plane, the way
+ * FFmpeg's libvpx decoder does. Returns null if they don't fit together.
+ */
+const addAlphaPlane = (frame: NodeAv.Frame, alphaFrame: NodeAv.Frame) => {
+	const format = WITH_ALPHA_PLANE.get(frame.format as NodeAv.AVPixelFormat);
+	const bitDepth = getBitDepth(frame.format as NodeAv.AVPixelFormat);
+	if (
+		format === undefined
+		|| alphaFrame.width !== frame.width
+		|| alphaFrame.height !== frame.height
+		|| getBitDepth(alphaFrame.format as NodeAv.AVPixelFormat) !== bitDepth
+	) {
+		return null;
+	}
+
+	// The planes of a format with alpha, packed, are those of the format without it followed by the alpha plane
+	const alphaPlaneSize = frame.width * frame.height * (bitDepth > 8 ? 2 : 1);
+	const data = Buffer.concat([frame.toBuffer(), alphaFrame.toBuffer().subarray(0, alphaPlaneSize)]);
+
+	const result = new NodeAv.Frame();
+	result.alloc();
+	result.format = format;
+	result.width = frame.width;
+	result.height = frame.height;
+	NodeAv.FFmpegError.throwIfError(result.fromBuffer(data), 'fromBuffer');
+
+	result.pts = frame.pts;
+	result.duration = frame.duration;
+	result.colorPrimaries = frame.colorPrimaries;
+	result.colorTrc = frame.colorTrc;
+	result.colorSpace = frame.colorSpace;
+	result.colorRange = frame.colorRange;
+
+	return result;
+};
+
 export class NodeAvVideoDecoder extends CustomVideoDecoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -27,22 +82,14 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		durationIsValid: boolean;
 	}[] = [];
 
-	/**
-	 * Whether VP9 is decoded by a decoder that ignores alpha (FFmpeg's own, or a hardware one) while libvpx, which
-	 * decodes it, is available, so that libvpx can take over if alpha only shows up after the first packet.
-	 */
-	canSwitchToAlphaDecoder = false;
-	/**
-	 * The packets since the last key packet, for libvpx to catch up from when it takes over mid-stream. Null when they
-	 * took more memory than allowed, in which case libvpx can only take over at the next key packet.
-	 */
-	packetsSinceKey: EncodedPacket[] | null = [];
-	bytesSinceKey = 0;
-	/** Set while a decoder that took over catches up on frames that were already output. */
-	discardFrames = false;
-
-	/** @internal How many bytes of packets to keep for libvpx to catch up from. */
-	static maxCatchUpBytes = 32 * 1024 * 1024;
+	// VP9 alpha is decoded separately, like Chromium does: the alpha data of each packet is a VP9 frame of its own,
+	// whose luma is the alpha plane. Unlike with FFmpeg's libvpx decoder, which decodes both, alpha can then start and
+	// stop on any frame.
+	alphaCodecContext: NodeAv.CodecContext | null = null;
+	alphaPacket: NodeAv.Packet | null = null;
+	alphaFrame: NodeAv.Frame | null = null;
+	/** Decoded alpha frames by their microsecond timestamp, until the frame they belong to comes out. */
+	alphaFrames = new Map<number, NodeAv.Frame>();
 
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	static override supports(codec: VideoCodec, config: VideoDecoderConfig): boolean {
@@ -64,7 +111,8 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 
 		let codec: NodeAv.Codec | null;
 		if (this.codec === 'vp9' && packet.sideData.alpha) {
-			codec = NodeAv.Codec.findDecoderByName(NodeAv.FF_DECODER_LIBVPX_VP9) ?? NodeAv.Codec.findDecoder(codecId);
+			// Software decoding, whose frames the alpha planes can be added to
+			codec = NodeAv.Codec.findDecoder(codecId);
 		} else if (
 			// This check used to be "is not prefer-hardware", meaning it would default to using software decode. I
 			// didn't leave a comment for that back then so I actually don't know what it was for. I'm sure it was to
@@ -81,10 +129,6 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		if (!codec) {
 			throw new Error(`Unable to obtain libav codec for '${this.codec}'.`);
 		}
-
-		this.canSwitchToAlphaDecoder = this.codec === 'vp9'
-			&& codec.name !== NodeAv.FF_DECODER_LIBVPX_VP9
-			&& NodeAv.Codec.findDecoderByName(NodeAv.FF_DECODER_LIBVPX_VP9) !== null;
 
 		const codecContext = new NodeAv.CodecContext();
 		codecContext.allocContext3(codec);
@@ -116,28 +160,6 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 	async decode(packet: EncodedPacket) {
 		if (this.codecContext === null) {
 			await this.initCodecContext(packet);
-		} else if (
-			this.canSwitchToAlphaDecoder
-			&& packet.sideData.alpha
-			&& (packet.type === 'key' || this.packetsSinceKey)
-		) {
-			await this.switchToAlphaDecoder(packet);
-		}
-
-		if (this.canSwitchToAlphaDecoder) {
-			if (packet.type === 'key') {
-				this.packetsSinceKey = [];
-				this.bytesSinceKey = 0;
-			}
-
-			if (this.packetsSinceKey) {
-				this.packetsSinceKey.push(packet);
-				this.bytesSinceKey += packet.byteLength;
-
-				if (this.bytesSinceKey > NodeAvVideoDecoder.maxCatchUpBytes) {
-					this.packetsSinceKey = null;
-				}
-			}
 		}
 
 		assert(this.codecContext);
@@ -149,12 +171,8 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		this.packet.dts = NodeAv.AV_NOPTS_VALUE;
 		this.packet.duration = BigInt(packet.microsecondDuration);
 
-		if (packet.sideData.alpha) {
-			const matroskaBlockAdditional = Buffer.alloc(8 + packet.sideData.alpha.byteLength);
-			matroskaBlockAdditional[7] = 1; // BlockAddId
-			matroskaBlockAdditional.set(packet.sideData.alpha, 8);
-
-			this.packet.addSideData(NodeAv.AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, matroskaBlockAdditional);
+		if (this.codec === 'vp9' && packet.sideData.alpha) {
+			await this.decodeAlpha(packet.sideData.alpha, packet.microsecondTimestamp);
 		}
 
 		const preciseTimingIndex = binarySearchLessOrEqual(
@@ -204,37 +222,53 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		}
 	}
 
-	/**
-	 * Hands VP9 decoding over to libvpx once a packet with alpha comes in, since the decoder in use ignores alpha.
-	 * libvpx first decodes the packets since the last key packet, without outputting their frames again.
-	 */
-	async switchToAlphaDecoder(packet: EncodedPacket) {
-		assert(this.codecContext);
+	async decodeAlpha(data: Uint8Array, microsecondTimestamp: number) {
+		if (!this.alphaCodecContext) {
+			const codec = NodeAv.Codec.findDecoder(NodeAv.AV_CODEC_ID_VP9);
+			assert(codec);
 
-		const packetsToCatchUpOn = packet.type === 'key' ? [] : this.packetsSinceKey;
-		assert(packetsToCatchUpOn);
+			const codecContext = new NodeAv.CodecContext();
+			codecContext.allocContext3(codec);
+			NodeAv.FFmpegError.throwIfError(await codecContext.open2(codec), 'Open alpha codec context');
 
-		await this.flush();
-		this.codecContext.freeContext();
-		this.codecContext = null;
-		await this.initCodecContext(packet);
+			this.alphaCodecContext = codecContext;
+			this.alphaPacket = new NodeAv.Packet();
+			this.alphaPacket.alloc();
+			this.alphaFrame = new NodeAv.Frame();
+			this.alphaFrame.alloc();
+		}
+		assert(this.alphaPacket && this.alphaFrame);
 
-		this.discardFrames = true;
-		try {
-			for (const previousPacket of packetsToCatchUpOn) {
-				await this.decode(previousPacket);
+		this.alphaPacket.data = Buffer.from(data);
+		this.alphaPacket.timeBase = { num: 1, den: 1e6 };
+		this.alphaPacket.pts = BigInt(microsecondTimestamp);
+		this.alphaPacket.dts = NodeAv.AV_NOPTS_VALUE;
+
+		// Alpha data that can't be decoded, like a delta frame whose reference frames are missing because the alpha
+		// started on it, leaves its frame opaque until the alpha's next key frame, like in Chromium
+		const ret = await this.alphaCodecContext.sendPacket(this.alphaPacket);
+		this.alphaPacket.unref();
+		if (ret < 0) {
+			return;
+		}
+
+		while (true) {
+			const receiveRet = await this.alphaCodecContext.receiveFrame(this.alphaFrame);
+			if (receiveRet < 0) {
+				break;
 			}
-		} finally {
-			this.discardFrames = false;
+
+			const clone = this.alphaFrame.clone();
+			if (!clone) {
+				throw new Error('Frame clone allocation failed.');
+			}
+			this.alphaFrames.get(microsecondTimestamp)?.free();
+			this.alphaFrames.set(microsecondTimestamp, clone);
 		}
 	}
 
 	receiveFrame(ret: number) {
 		NodeAv.FFmpegError.throwIfError(ret, 'Receive frame');
-
-		if (this.discardFrames) {
-			return;
-		}
 
 		this.frame.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
 
@@ -261,7 +295,28 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			}
 		}
 
-		const clone = this.frame.clone();
+		let clone: NodeAv.Frame | null = null;
+
+		const alphaFrame = this.alphaFrames.get(Number(this.frame.pts));
+		if (alphaFrame) {
+			this.alphaFrames.delete(Number(this.frame.pts));
+			clone = addAlphaPlane(this.frame, alphaFrame);
+			alphaFrame.free();
+
+			if (clone) {
+				clone.sampleAspectRatio = this.frame.sampleAspectRatio;
+			}
+		}
+
+		// Alpha frames for frames that came out before them won't be needed anymore
+		for (const [microsecondTimestamp, frame] of this.alphaFrames) {
+			if (microsecondTimestamp < Number(this.frame.pts)) {
+				frame.free();
+				this.alphaFrames.delete(microsecondTimestamp);
+			}
+		}
+
+		clone ??= this.frame.clone();
 		if (!clone) {
 			throw new Error('Frame clone allocation failed.');
 		}
@@ -293,11 +348,25 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		}
 
 		this.codecContext.flushBuffers();
+
+		this.alphaCodecContext?.flushBuffers();
+		for (const frame of this.alphaFrames.values()) {
+			frame.free();
+		}
+		this.alphaFrames.clear();
 	}
 
 	close(): MaybePromise<void> {
 		this.codecContext?.freeContext();
 		this.frame.free();
 		this.packet.free();
+
+		this.alphaCodecContext?.freeContext();
+		this.alphaPacket?.free();
+		this.alphaFrame?.free();
+		for (const frame of this.alphaFrames.values()) {
+			frame.free();
+		}
+		this.alphaFrames.clear();
 	}
 }
