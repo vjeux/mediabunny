@@ -162,6 +162,8 @@ type InternalTrack = {
 	encryptionGroups: SampleGroupEncryption[];
 	/** The entry of the track's 'seig' sample group description that applies to samples without a mapping. */
 	defaultEncryptionGroup: SampleGroupEncryption | null;
+	/** The 'seig' sample-to-group runs of a non-fragmented track's sample table, with their first sample index */
+	encryptionGroupRuns: { startIndex: number; sampleCount: number; groupDescriptionIndex: number }[];
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
@@ -584,6 +586,7 @@ export class IsobmffDemuxer extends Demuxer {
 				encryptionInfo: foreignTrack.encryptionInfo,
 				encryptionGroups: foreignTrack.encryptionGroups,
 				defaultEncryptionGroup: foreignTrack.defaultEncryptionGroup,
+				encryptionGroupRuns: foreignTrack.encryptionGroupRuns,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
 				maxBitrate: foreignTrack.maxBitrate,
@@ -1068,6 +1071,7 @@ export class IsobmffDemuxer extends Demuxer {
 					encryptionInfo: null,
 					encryptionGroups: [],
 					defaultEncryptionGroup: null,
+					encryptionGroupRuns: [],
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
 					maxBitrate: null,
@@ -2861,9 +2865,10 @@ export class IsobmffDemuxer extends Demuxer {
 			}; break;
 
 			case 'sbgp': {
-				// Sample to group; only CENC sample groups ('seig') in fragments are of interest
-				const fragmentState = this.currentTrack?.currentFragmentState;
-				if (!fragmentState) {
+				// Sample to group; only CENC sample groups ('seig') are of interest
+				const track = this.currentTrack;
+				const fragmentState = track?.currentFragmentState;
+				if (!track || (!fragmentState && this.currentFragment)) {
 					break;
 				}
 
@@ -2882,7 +2887,17 @@ export class IsobmffDemuxer extends Demuxer {
 					runs.push({ sampleCount: readU32Be(slice), groupDescriptionIndex: readU32Be(slice) });
 				}
 
-				fragmentState.encryptionGroupRuns = runs;
+				if (fragmentState) {
+					fragmentState.encryptionGroupRuns = runs;
+				} else {
+					// In a sample table
+					let startIndex = 0;
+					track.encryptionGroupRuns = runs.map((run) => {
+						const result = { startIndex, ...run };
+						startIndex += run.sampleCount;
+						return result;
+					});
+				}
 			}; break;
 
 				// Metadata section
@@ -3543,6 +3558,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			data = readBytes(slice, sampleInfo.sampleSize);
 
 			if (this.internalTrack.encryptionInfo) {
+				// Like in fragments, a sample's 'seig' sample group entry overrides tenc's parameters
+				const group = getSampleTableEncryptionGroup(this.internalTrack, sampleIndex);
+				const encryptionInfo = group
+					? applySampleGroupEncryption(this.internalTrack.encryptionInfo, group)
+					: this.internalTrack.encryptionInfo;
 				let sampleEncryption: SampleEncryptionInfo | null = null;
 
 				if (this.internalTrack.encryptionAuxInfo) {
@@ -3550,6 +3570,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 						this.internalTrack.demuxer.reader,
 						this.internalTrack.encryptionInfo,
 						this.internalTrack.encryptionAuxInfo,
+						i => getSampleTableEncryptionGroup(this.internalTrack, i),
 					);
 
 					if (sampleIndex < entries.length) {
@@ -3557,9 +3578,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					}
 				}
 
-				sampleEncryption ??= getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
-				if (sampleEncryption) {
-					data = await decryptSample(this.internalTrack, sampleEncryption, data, null);
+				sampleEncryption ??= getDefaultSampleEncryption(encryptionInfo);
+				if (sampleEncryption && (!group || group.isProtected)) {
+					data = await decryptSample(this.internalTrack, sampleEncryption, data, null, encryptionInfo);
 				}
 			}
 		}
@@ -4366,6 +4387,19 @@ const applySampleGroupEncryption = (
 	defaultCryptByteBlock: group.cryptByteBlock,
 	defaultSkipByteBlock: group.skipByteBlock,
 });
+
+/** The 'seig' sample group entry of a sample of a non-fragmented track (ISO/IEC 23001-7, 6), if any */
+const getSampleTableEncryptionGroup = (track: InternalTrack, sampleIndex: number) => {
+	const runIndex = binarySearchLessOrEqual(track.encryptionGroupRuns, sampleIndex, x => x.startIndex);
+	const run = runIndex === -1 ? null : track.encryptionGroupRuns[runIndex]!;
+	if (!run || sampleIndex >= run.startIndex + run.sampleCount) {
+		// Samples that no run covers get the default entry of a version 2 sample group description
+		return track.defaultEncryptionGroup;
+	}
+
+	// Index 0 means no group
+	return run.groupDescriptionIndex > 0 ? track.encryptionGroups[run.groupDescriptionIndex - 1] ?? null : null;
+};
 
 /** Maps a traf's samples to their 'seig' sample group entries (ISO/IEC 23001-7, 6). */
 const assignEncryptionGroups = (track: InternalTrack, state: FragmentTrackState, trackData: FragmentTrackData) => {

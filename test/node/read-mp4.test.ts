@@ -495,3 +495,75 @@ test('CENC sample group descriptions of every version, and their default entries
 		expect(await decrypt(testCase)).toEqual(plaintexts);
 	}
 });
+
+test('Key rotation and clear samples through CENC sample groups in a non-fragmented file', async () => {
+	// The sample table's sbgp maps the second sample to a 'seig' entry with another key, and the third to one that
+	// marks it as unprotected (with no IV in the auxiliary information)
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const keys = new Map([['a1'.repeat(16), Buffer.alloc(16, 0x11)], ['b2'.repeat(16), Buffer.alloc(16, 0x22)]]);
+	const keyIds = [...keys.keys()];
+	const plaintexts = [0, 1, 2].map(sample => Array.from({ length: 20 }, (_, i) => 10 * sample + i));
+	const ivs = [zeros(8).fill(1), zeros(8).fill(2)];
+	const samples = [
+		...[0, 1].map(sample => [...createCipheriv('aes-128-ctr', keys.get(keyIds[sample]!)!,
+			Buffer.from([...ivs[sample]!, ...zeros(8)])).update(Buffer.from(plaintexts[sample]!))]),
+		plaintexts[2]!,
+	];
+
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), box('sinf', box('frma', ascii('avc1')),
+		box('schm', zeros(4), ascii('cenc'), u32(0x10000)),
+		box('schi', box('tenc', zeros(4), [0, 0, 1, 8], [...Buffer.from(keyIds[0]!, 'hex')]))));
+	const seigEntry = (isProtected: number, ivSize: number, keyId: string) => [
+		0, 0, isProtected, ivSize, ...Buffer.from(keyId, 'hex'),
+	];
+	const moov = (mdatStart: number) => box('moov',
+		box('mvhd', zeros(12), u32(10), u32(3), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(3), zeros(16), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(3), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', zeros(4), u32(1), encv),
+					box('stts', zeros(4), u32(1), u32(3), u32(1)),
+					box('stsc', zeros(4), u32(1), u32(1), u32(3), u32(1)),
+					box('stsz', zeros(4), u32(20), u32(3)),
+					box('stco', zeros(4), u32(1), u32(mdatStart + 8 + 16)),
+					box('sbgp', zeros(4), ascii('seig'), u32(3), u32(1), u32(0), u32(1), u32(1), u32(1), u32(2)),
+					box('sgpd', u32(1 << 24), ascii('seig'), u32(20), u32(2), seigEntry(1, 8, keyIds[1]!),
+						seigEntry(0, 0, '00'.repeat(16))),
+					box('saiz', zeros(4), [0], u32(3), [8, 8, 0]),
+					box('saio', zeros(4), u32(1), u32(mdatStart + 8)),
+				)),
+			),
+		),
+	);
+	const ftyp = box('ftyp', ascii('isom'), u32(0));
+	const mdatStart = ftyp.length + moov(0).length;
+	const file = new Uint8Array([...ftyp, ...moov(mdatStart), ...box('mdat', ...ivs, ...samples)]);
+
+	const requestedKeyIds: string[] = [];
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: ({ keyId }) => {
+			requestedKeyIds.push(keyId);
+			return keys.get(keyId)!;
+		} } },
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual(plaintexts);
+	expect(requestedKeyIds).toEqual(keyIds);
+});
