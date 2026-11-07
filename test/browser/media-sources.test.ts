@@ -7,6 +7,7 @@ import {
 	MediaStreamVideoTrackSource,
 	VideoSampleSource,
 	MediaStreamAudioTrackSource,
+	CanvasSource,
 } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { canEncodeAudio, Quality, VideoTransformOptions } from '../../src/encode.js';
@@ -602,6 +603,45 @@ test('VideoSampleSource, transform.frameRate works with transform', async () => 
 		expect(samples[i]!.codedWidth).toBe(50);
 		expect(samples[i]!.codedHeight).toBe(50);
 	}
+});
+
+test.each([undefined, 10])('CanvasSource closes every frame it captures (frame rate: %s)', async (frameRate) => {
+	// Count the VideoFrames still open at the end
+	const createdFrames: VideoFrame[] = [];
+	const RealVideoFrame = VideoFrame;
+	globalThis.VideoFrame = new Proxy(RealVideoFrame, {
+		construct: (target, args) => {
+			const frame = Reflect.construct(target, args) as VideoFrame;
+			createdFrames.push(frame);
+			return frame;
+		},
+	});
+
+	try {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const canvas = new OffscreenCanvas(320, 240);
+		const context = canvas.getContext('2d')!;
+		const canvasSource = new CanvasSource(canvas, {
+			codec: 'vp8',
+			quality: new Quality('medium'),
+			transform: frameRate !== undefined ? { frameRate } : undefined,
+		});
+		output.addVideoTrack(canvasSource);
+		await output.start();
+
+		for (let i = 0; i < 30; i++) {
+			context.fillStyle = `hsl(${i * 10}, 80%, 50%)`;
+			context.fillRect(0, 0, 320, 240);
+			await canvasSource.add(i / 30, 1 / 30);
+		}
+
+		await output.finalize();
+	} finally {
+		globalThis.VideoFrame = RealVideoFrame;
+	}
+
+	expect(createdFrames.length).toBeGreaterThan(0);
+	expect(createdFrames.filter(frame => frame.format !== null)).toHaveLength(0);
 });
 
 test('VideoSampleSource, transform.frameRate works with process', async () => {
