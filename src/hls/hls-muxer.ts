@@ -31,6 +31,7 @@ import {
 	TrackType,
 } from '../output';
 import {
+	CmafOutputFormat,
 	HlsOutputFormat,
 	HlsOutputFormatOptions,
 	HlsOutputPlaylistInfo,
@@ -97,6 +98,12 @@ type Playlist = {
 	averageBitrate: number | null;
 	mediaSequence: number;
 	done: boolean;
+	/**
+	 * For CMAF segments: how far the first segment's muxer moved each track's media to keep it from starting below
+	 * zero. It signals that with an edit list in the init segment, which applies to every segment, so the media of the
+	 * later segments (written by muxers of their own) must be moved by the same amount.
+	 */
+	cmafStartShifts: { video: number; audio: number } | null;
 
 	singleFile: {
 		target: Target;
@@ -498,6 +505,7 @@ export class HlsMuxer extends Muxer {
 				averageBitrate: null,
 				mediaSequence: 0,
 				done: false,
+				cmafStartShifts: null,
 				singleFile: null,
 				mutex: new AsyncMutex(),
 			};
@@ -1164,6 +1172,21 @@ export class HlsMuxer extends Muxer {
 
 				// Add all of the packets
 
+				let videoShift = 0;
+				let audioShift = 0;
+				if (playlist.segmentFormat instanceof CmafOutputFormat) {
+					if (!playlist.cmafStartShifts) {
+						// This is the first segment, whose muxer moves its media itself
+						playlist.cmafStartShifts = {
+							video: videoTrack ? this.getIsobmffStartShift(videoTrack.packets, videoEndIndex) : 0,
+							audio: audioTrack ? this.getIsobmffStartShift(audioTrack.packets, audioEndIndex) : 0,
+						};
+					} else {
+						videoShift = playlist.cmafStartShifts.video;
+						audioShift = playlist.cmafStartShifts.audio;
+					}
+				}
+
 				if (videoTrack) {
 					assert(videoSource);
 					const meta = { decoderConfig: videoTrack.info.decoderConfig };
@@ -1172,7 +1195,7 @@ export class HlsMuxer extends Muxer {
 						const packet = videoTrack.packets[i]!;
 
 						const offsetPacket = packet.clone({
-							timestamp: this.toMediaTimestamp(packet.timestamp),
+							timestamp: this.toMediaTimestamp(packet.timestamp) + videoShift,
 						});
 
 						await videoSource.add(offsetPacket, meta);
@@ -1188,7 +1211,7 @@ export class HlsMuxer extends Muxer {
 						const packet = audioTrack.packets[i]!;
 
 						const offsetPacket = packet.clone({
-							timestamp: this.toMediaTimestamp(packet.timestamp),
+							timestamp: this.toMediaTimestamp(packet.timestamp) + audioShift,
 						});
 
 						await audioSource.add(offsetPacket, meta);
@@ -1290,6 +1313,19 @@ export class HlsMuxer extends Muxer {
 				await this.tryWriteMasterPlaylist();
 			}
 		}
+	}
+
+	/**
+	 * Returns how far a fragmented ISOBMFF muxer moves a track's media when given these packets first: up to zero, if
+	 * it starts below zero.
+	 */
+	private getIsobmffStartShift(packets: EncodedPacket[], endIndex: number) {
+		let minTimestamp = Infinity;
+		for (let i = 0; i < endIndex; i++) {
+			minTimestamp = Math.min(minTimestamp, this.toMediaTimestamp(packets[i]!.timestamp));
+		}
+
+		return endIndex > 0 ? Math.max(0, -minTimestamp) : 0;
 	}
 
 	private toMediaTimestamp(timestamp: number) {
