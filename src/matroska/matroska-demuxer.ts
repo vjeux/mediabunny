@@ -148,6 +148,11 @@ type ClusterTrackData = {
 		timestamp: number;
 		blockIndex: number;
 	}[];
+	/**
+	 * The shortest BlockDuration the file declares for the track's blocks in this cluster, as the block durations
+	 * themselves get replaced by the gaps between the blocks.
+	 */
+	minDeclaredDuration: number | null;
 };
 
 enum BlockLacing {
@@ -745,6 +750,11 @@ export class MatroskaDemuxer extends Demuxer {
 				block.timestamp += cluster.timestamp;
 
 				hasLacedBlocks ||= block.lacing !== BlockLacing.None;
+
+				if (block.lacing === BlockLacing.None && block.duration > 0) {
+					// Only BlockDuration has set the duration so far
+					trackData.minDeclaredDuration = Math.min(trackData.minDeclaredDuration ?? Infinity, block.duration);
+				}
 			}
 
 			trackData.presentationTimestamps = trackData.blocks
@@ -838,6 +848,7 @@ export class MatroskaDemuxer extends Demuxer {
 				firstKeyFrameTimestamp: null,
 				blocks: [],
 				presentationTimestamps: [],
+				minDeclaredDuration: null,
 			};
 			cluster.trackData.set(trackNumber, trackData);
 		}
@@ -2301,10 +2312,47 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					x => x.timestamp,
 				);
 
-				const blockIndex = index !== -1 ? trackData.presentationTimestamps[index]!.blockIndex : -1;
-				const correctBlockFound = index !== -1 && isSafelyBeforeEnd(trackData, timestampInTimescale);
+				if (index === -1) {
+					return { blockIndex: -1, correctBlockFound: false };
+				}
 
-				return { blockIndex, correctBlockFound };
+				const { timestamp: matchTimestamp, blockIndex } = trackData.presentationTimestamps[index]!;
+				const isExactMatch = matchTimestamp === timestampInTimescale;
+
+				// When B-frames straddle a cluster boundary, neighboring clusters overlap in presentation time: frames
+				// presented between two frames of this cluster can sit in the next cluster, and a cluster that doesn't
+				// begin with a key frame can continue a GOP whose frames are presented after its first ones. A gap
+				// after the match (longer than the cluster's frames) hints at the former.
+				// DefaultDuration is only nominal: shorter durations declared for the blocks themselves take precedence
+				let frameDuration = Math.min(
+					this.internalTrack.defaultDuration ?? Infinity,
+					trackData.minDeclaredDuration ?? Infinity,
+				);
+				for (let i = 1; i < trackData.presentationTimestamps.length; i++) {
+					const delta = trackData.presentationTimestamps[i]!.timestamp
+						- trackData.presentationTimestamps[i - 1]!.timestamp;
+					if (delta > 0) {
+						frameDuration = Math.min(frameDuration, delta);
+					}
+				}
+
+				// Without a DefaultDuration, though, the frame period is only estimated from the cluster's own frames,
+				// and in a short cluster the smallest gap may itself be such a hole. For codecs with B-frames, the next
+				// cluster is then always checked (the lookup reads on until a cluster that starts after the timestamp).
+				const { info } = this.internalTrack;
+				const periodIsUncertain = this.internalTrack.defaultDuration == null
+					&& info?.type === 'video'
+					&& (info.codec === 'avc' || info.codec === 'hevc' || info.codec === null);
+
+				const nextTimestamp = trackData.presentationTimestamps[index + 1]?.timestamp;
+				const hasGapAfterMatch = !isExactMatch
+					&& nextTimestamp !== undefined
+					&& (periodIsUncertain || nextTimestamp - matchTimestamp > 1.5 * frameDuration);
+
+				const correctBlockFound = isSafelyBeforeEnd(trackData, timestampInTimescale) && !hasGapAfterMatch;
+				const checkPreviousCluster = !isExactMatch && !trackData.blocks[0]!.isKeyFrame;
+
+				return { blockIndex, correctBlockFound, checkPreviousCluster };
 			},
 			timestampInTimescale,
 			timestampInTimescale,
@@ -2500,7 +2548,12 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		// The cluster where we start looking
 		startCluster: Cluster | null,
 		// This function returns the best-matching block in a given cluster
-		getMatchInCluster: (cluster: Cluster) => { blockIndex: number; correctBlockFound: boolean },
+		getMatchInCluster: (cluster: Cluster) => {
+			blockIndex: number;
+			correctBlockFound: boolean;
+			// Whether the cluster before this one might hold a better match, even if this one is correct
+			checkPreviousCluster?: boolean;
+		},
 		// The timestamp with which we can search the lookup table
 		searchTimestamp: number,
 		// The timestamp for which we know the correct block will not come after it
@@ -2514,6 +2567,27 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		let bestCluster: Cluster | null = null;
 		let bestBlockIndex = -1;
 
+		const getBlockTimestamp = (cluster: Cluster, blockIndex: number) => {
+			return cluster.trackData.get(this.internalTrack.id)!.blocks[blockIndex]!.timestamp;
+		};
+		const considerMatch = (cluster: Cluster, blockIndex: number) => {
+			// Keep the match presented last. Normally, that's simply the one from the latest cluster, but B-frames
+			// can make neighboring clusters overlap in presentation time.
+			if (
+				bestCluster
+				&& getBlockTimestamp(cluster, blockIndex) < getBlockTimestamp(bestCluster, bestBlockIndex)
+			) {
+				return;
+			}
+
+			bestCluster = cluster;
+			bestBlockIndex = blockIndex;
+		};
+
+		// Set when the scan started at a cluster whose match the cluster before it might beat. Then, the clusters
+		// before it get scanned too, and the match presented last wins.
+		let checkClustersBeforeBest = false;
+
 		if (startCluster) {
 			const { blockIndex, correctBlockFound } = getMatchInCluster(startCluster);
 
@@ -2522,8 +2596,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			}
 
 			if (blockIndex !== -1) {
-				bestCluster = startCluster;
-				bestBlockIndex = blockIndex;
+				considerMatch(startCluster, blockIndex);
 			}
 		}
 
@@ -2572,6 +2645,9 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			}
 
 			const scanStartPos = currentCluster ? currentCluster.elementStartPos : currentPos;
+			const scanningBeforeBest = checkClustersBeforeBest;
+			checkClustersBeforeBest = false;
+			let isFirstClusterOfScan = !currentCluster;
 
 			while (
 				(segment.elementEndPos === null || currentPos <= segment.elementEndPos - MIN_HEADER_SIZE)
@@ -2633,15 +2709,30 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					// instead
 					size = currentCluster.elementEndPos - dataStartPos;
 
-					const { blockIndex, correctBlockFound } = getMatchInCluster(currentCluster);
-					if (correctBlockFound) {
-						return this.fetchPacketInCluster(currentCluster, blockIndex, options);
+					const { blockIndex, correctBlockFound, checkPreviousCluster } = getMatchInCluster(currentCluster);
+					if (blockIndex !== -1) {
+						considerMatch(currentCluster, blockIndex);
 					}
 
-					if (blockIndex !== -1) {
-						bestCluster = currentCluster;
-						bestBlockIndex = blockIndex;
+					if (
+						checkPreviousCluster
+						&& isFirstClusterOfScan
+						&& lookupEntryPosition !== null
+						&& !scanningBeforeBest
+					) {
+						// The cluster before this one hasn't been looked at yet; do so once this scan is done
+						checkClustersBeforeBest = true;
 					}
+
+					if (correctBlockFound && !scanningBeforeBest) {
+						if (checkClustersBeforeBest) {
+							break;
+						}
+
+						return this.fetchPacketInCluster(bestCluster!, bestBlockIndex, options);
+					}
+
+					isFirstClusterOfScan = false;
 				}
 
 				if (size === undefined) {
@@ -2681,7 +2772,14 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				currentPos = endPos;
 			}
 
-			if (lookupEntryPosition === null || (bestCluster && bestCluster.elementStartPos >= lookupEntryPosition)) {
+			if (scanningBeforeBest) {
+				break; // The best match is now known
+			}
+
+			if (
+				lookupEntryPosition === null
+				|| (bestCluster && bestCluster.elementStartPos >= lookupEntryPosition && !checkClustersBeforeBest)
+			) {
 				break;
 			}
 
