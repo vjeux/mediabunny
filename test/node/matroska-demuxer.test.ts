@@ -4,11 +4,13 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -81,4 +83,51 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('Matroska Language with a country code gives the ISO 639-2 code', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+
+	const readLanguage = async (language: string) => {
+		const bytes = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+					element(EBMLId.Language, ascii(language)),
+					element(EBMLId.Audio, element(EBMLId.BitDepth, [16])),
+				)),
+				element(
+					EBMLId.Cluster,
+					element(EBMLId.Timestamp, [0]),
+					element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 0, 0]),
+				),
+			),
+		]);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return (await input.getTracks())[0]!.getLanguageCode();
+	};
+
+	// RFC 9559, section 12: Matroska v1 to v3 use ISO 639-2 codes, optionally followed by a dash and a country code
+	// (FFmpeg writes what it's given, like -metadata:s:a:0 language=fre-ca)
+	expect(await readLanguage('fre-ca')).toBe('fre');
+	expect(await readLanguage('por-br')).toBe('por');
+	expect(await readLanguage('fre')).toBe('fre');
+	expect(await readLanguage('xx-yy')).toBe('und');
 });
