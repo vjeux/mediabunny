@@ -14,6 +14,7 @@ import {
 	extractHevcDecoderConfigurationRecord,
 	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
+	EAC3_NUMBLKS_TABLE,
 	parseOpusTocByte,
 } from '../codec-data';
 import {
@@ -90,6 +91,9 @@ import {
 	EBML_DATE_EPOCH,
 } from './ebml';
 import { buildMatroskaMimeType } from './matroska-misc';
+import { parseAacAudioSpecificConfig } from '../../shared/aac-misc';
+import { readMp3FrameHeader } from '../../shared/mp3-misc';
+import { getBlockSizeOrUncommon } from '../flac/flac-misc';
 import { FileSlice, readBytes, Reader, readI16Be, readU8 } from '../reader';
 
 type Segment = {
@@ -272,21 +276,97 @@ const METADATA_ELEMENTS = [
 	{ id: EBMLId.Tracks, flag: 'tracksSeen' },
 	{ id: EBMLId.Cues, flag: 'cuesSeen' },
 ] as const;
-/** Returns the number of samples in an audio packet, for codecs where the packet alone tells it. */
-const getPacketSampleCount = (track: InternalTrack, data: Uint8Array) => {
+/**
+ * Returns the number of samples in an audio packet, at the track's sample rate, for codecs where the packet (and the
+ * codec configuration) alone tell it.
+ */
+const getPacketSampleCount = (track: InternalTrack, data: Uint8Array): number | null => {
 	if (track.info?.type !== 'audio' || data.length === 0) {
 		return null;
 	}
 
-	const codec = track.info.codec;
-	if (codec === 'opus') {
-		return parseOpusTocByte(data).durationInSamples; // At 48 kHz, the sample rate of every Opus track
-	} else if (codec && (PCM_AUDIO_CODECS as readonly string[]).includes(codec)) {
-		const { sampleSize } = parsePcmCodec(codec as PcmAudioCodec);
-		return Math.floor(data.length / (sampleSize * track.info.numberOfChannels));
-	}
+	const { codec, sampleRate } = track.info;
+	switch (codec) {
+		case 'opus': {
+			return parseOpusTocByte(data).durationInSamples; // At 48 kHz, the sample rate of every Opus track
+		}
 
-	return null;
+		case 'aac': {
+			// A frame holds frameLength samples at the core sample rate (half the output rate with SBR)
+			try {
+				const config = parseAacAudioSpecificConfig(track.codecPrivate);
+				return config.coreSampleRate ? config.frameLength * sampleRate / config.coreSampleRate : null;
+			} catch {
+				return null;
+			}
+		}
+
+		case 'mp3': {
+			if (data.length < 4) {
+				return null;
+			}
+
+			const word = ((data[0]! << 24) | (data[1]! << 16) | (data[2]! << 8) | data[3]!) >>> 0;
+			const { header } = readMp3FrameHeader(word, null);
+			return header ? header.audioSamplesInFrame * sampleRate / header.sampleRate : null;
+		}
+
+		case 'ac3': {
+			return 6 * 256; // Six blocks of 256 samples
+		}
+
+		case 'eac3': {
+			if (data.length < 5 || data[0] !== 0x0b || data[1] !== 0x77) {
+				return null;
+			}
+
+			const fscod = data[4]! >> 6;
+			const numblkscod = fscod === 3 ? 3 : (data[4]! >> 4) & 0x03; // Six blocks when fscod is 3
+			return EAC3_NUMBLKS_TABLE[numblkscod]! * 256;
+		}
+
+		case 'flac': {
+			if (data.length < 5 || data[0] !== 0xff || (data[1]! & 0xfe) !== 0xf8) {
+				return null;
+			}
+
+			const blockSize = getBlockSizeOrUncommon(data[2]! >> 4);
+			if (blockSize === null || typeof blockSize === 'number') {
+				return blockSize;
+			}
+
+			// An uncommon block size follows the frame or sample number, coded in 1 to 7 bytes like UTF-8
+			const firstByte = data[4]!;
+			let numberLength = 1;
+			if (firstByte & 0x80) {
+				numberLength = 0;
+				while (numberLength < 8 && (firstByte & (0x80 >> numberLength))) {
+					numberLength++;
+				}
+				if (numberLength < 2 || numberLength > 7) {
+					return null;
+				}
+			}
+
+			const position = 4 + numberLength;
+			if (blockSize === 'uncommon-u8' && position < data.length) {
+				return data[position]! + 1;
+			} else if (blockSize === 'uncommon-u16' && position + 1 < data.length) {
+				return ((data[position]! << 8) | data[position + 1]!) + 1;
+			}
+
+			return null;
+		}
+
+		default: {
+			if (codec && (PCM_AUDIO_CODECS as readonly string[]).includes(codec)) {
+				const { sampleSize } = parsePcmCodec(codec as PcmAudioCodec);
+				return Math.floor(data.length / (sampleSize * track.info.numberOfChannels));
+			}
+
+			return null;
+		}
+	}
 };
 
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
@@ -772,6 +852,7 @@ export class MatroskaDemuxer extends Demuxer {
 				.map((block, i) => ({ timestamp: block.timestamp, blockIndex: i }))
 				.sort((a, b) => a.timestamp - b.timestamp);
 
+			let lastDurationIsFromCodec = false;
 			for (let i = 0; i < trackData.presentationTimestamps.length; i++) {
 				const currentEntry = trackData.presentationTimestamps[i]!;
 				const currentBlock = trackData.blocks[currentEntry.blockIndex]!;
@@ -802,6 +883,7 @@ export class MatroskaDemuxer extends Demuxer {
 							currentBlock.duration = Math.round(
 								sampleCount / track.info.sampleRate * segment.timestampFactor,
 							);
+							lastDurationIsFromCodec = true;
 						}
 					}
 				}
@@ -823,7 +905,9 @@ export class MatroskaDemuxer extends Demuxer {
 			const lastBlock = trackData.blocks[last(trackData.presentationTimestamps)!.blockIndex]!;
 
 			trackData.startTimestamp = firstBlock.timestamp;
-			trackData.endTimestamp = lastBlock.timestamp + lastBlock.duration;
+			// A duration from the codec only describes the packet: the next cluster may begin before it ends, as block
+			// timestamps are rounded, so lookups don't count on it
+			trackData.endTimestamp = lastBlock.timestamp + (lastDurationIsFromCodec ? 0 : lastBlock.duration);
 
 			// Let's remember that a cluster with a given timestamp is here, speeding up future lookups if no cues exist
 			const insertionIndex = binarySearchLessOrEqual(
