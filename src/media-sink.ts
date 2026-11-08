@@ -490,6 +490,12 @@ const isInvisibleVp8Frame = (codec: VideoCodec, data: Uint8Array) => {
 	return codec === 'vp8' && data.byteLength > 0 && (data[0]! & 0x10) === 0;
 };
 
+/**
+ * Timestamps this close count as equal when matching samples to query timestamps, so that rounding errors in the
+ * caller's timestamps (like a frame index times the frame duration) don't select the previous sample.
+ */
+const TIMESTAMP_EPSILON = 1e-10;
+
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
 > {
@@ -572,11 +578,11 @@ export abstract class BaseMediaSampleSink<
 
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
-			tolerance = await this._getTimestampTolerance();
+			tolerance = Math.max(await this._getTimestampTolerance(), TIMESTAMP_EPSILON);
 
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
-				if (sample.timestamp >= endTimestamp) {
+				if (sample.timestamp >= endTimestamp - TIMESTAMP_EPSILON) {
 					ended = true;
 				}
 
@@ -789,7 +795,7 @@ export abstract class BaseMediaSampleSink<
 
 		// The following is the "pump" process that keeps pumping packets into the decoder
 		(async () => {
-			tolerance = await this._getTimestampTolerance();
+			tolerance = Math.max(await this._getTimestampTolerance(), TIMESTAMP_EPSILON);
 
 			decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
@@ -881,6 +887,7 @@ export abstract class BaseMediaSampleSink<
 					break;
 				}
 
+				// Also decode a sample that starts within the tolerance after the timestamp, since it's the answer
 				const targetPacket = await packetSink.getPacket(timestamp + tolerance, retrievalOptions);
 				let keyPacket = targetPacket && await packetSink.getKeyPacket(
 					targetPacket.timestamp - preRollDuration,
