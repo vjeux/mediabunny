@@ -81,6 +81,7 @@ import {
 } from '../../shared/mp3-misc';
 import { EncodedPacket, PacketType, PLACEHOLDER_DATA } from '../packet';
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
+import { UrlSource } from '../source';
 import {
 	buildMpegTsMimeType,
 	createTimestampWrapInfo,
@@ -120,11 +121,6 @@ const BLU_RAY_DTS_STREAM_TYPES = new Set<number>([
  * that doesn't: its audio would have shown up by then, and it may well hold none at all.
  */
 const MAX_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 22; // 4 MiB
-/**
- * The same for sources of unknown size, which may not be able to go back that far to read the other streams from their
- * start (a ReadableStreamSource only keeps what its cache holds)
- */
-const MAX_STREAMED_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 20; // 1 MiB
 
 // Descriptors that make a private data stream something other than audio: VBI data, VBI teletext, teletext, DVB
 // subtitling, data broadcast ID, application signalling and ARIB data component
@@ -951,11 +947,12 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 
 				if (hasProgramMap && this.elementaryStreams.every(x => x.initialized || x.codecFromPayload)) {
-					privateDataProbeEndPos ??= currentPos + (
-						this.reader.fileSizeNonStrict === null
-							? MAX_STREAMED_PRIVATE_DATA_PROBE_DISTANCE
-							: MAX_PRIVATE_DATA_PROBE_DISTANCE
-					);
+					// Sources that only keep what their cache holds (a ReadableStreamSource, whose size is unknown,
+					// or a UrlSource whose server ignores range requests) can't go back to the other streams' start
+					// after looking further, so they don't
+					const canGoBack = this.reader.fileSizeNonStrict !== null
+						&& !(this.reader.source instanceof UrlSource && this.reader.source._sequentialBacking);
+					privateDataProbeEndPos ??= currentPos + (canGoBack ? MAX_PRIVATE_DATA_PROBE_DISTANCE : 0);
 				}
 
 				const isDone = hasProgramMap && this.elementaryStreams.every(x => x.initialized);

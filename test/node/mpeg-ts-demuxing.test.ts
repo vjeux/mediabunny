@@ -1,9 +1,10 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource, UrlSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -1115,9 +1116,10 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 	expect(withEmptyStream.counter.bytes).toBeLessThan(8 * 2 ** 20); // 4 MiB past the MP3 stream's setup
 	withEmptyStream.input.dispose();
 
-	// Nor does it make a sequential source that keeps only what its cache holds (a ReadableStreamSource) read so far
-	// ahead that the other streams' start is gone (found in L15's streamed check): such sources look 1 MiB ahead. 6 MB
-	// of H.264 frames of 60 kB, written by Mediabunny, with such a stream added, read through a 2 MiB cache.
+	// Nor does it make a source that keeps only what its cache holds read so far ahead that the other streams' start is
+	// gone (found in L15's streamed checks): such sources don't look further. 6 MB of H.264 frames of 60 kB, written by
+	// Mediabunny, with such a stream added, read through a 2 MiB cache, from a ReadableStreamSource, then from a server
+	// that ignores range requests through a UrlSource, which knows the size but reads in order too.
 	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
 	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
 		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
@@ -1166,6 +1168,34 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 			packetCount++;
 		}
 		expect(packetCount).toBe(100);
+	}
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': streamedFile.byteLength });
+		response.end(streamedFile);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using urlInput = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 21,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const urlTracks = await urlInput.getTracks();
+		expect(urlTracks.map(track => track.type)).toEqual(['video']);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(urlTracks[0]!).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(packetCount).toBe(100);
+	} finally {
+		server.closeAllConnections();
+		server.close();
 	}
 
 	// A stream whose first PES packet merely starts with an ADTS-like header, followed by random data, stays out
