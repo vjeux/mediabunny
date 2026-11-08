@@ -2157,6 +2157,15 @@ export class MatroskaDemuxer extends Demuxer {
 	}
 }
 
+/**
+ * Whether a timestamp lies before the end of a track's blocks in a cluster, so that no later cluster can hold a better
+ * match for it. That end comes from the last block's duration, often a rounded or fractional DefaultDuration or
+ * BlockDuration, so the next cluster may begin up to a tick before it.
+ */
+const isSafelyBeforeEnd = (trackData: ClusterTrackData, timestamp: number) => {
+	return timestamp < trackData.endTimestamp - 1;
+};
+
 abstract class MatroskaTrackBacking implements InputTrackBacking {
 	packetToClusterLocation = new WeakMap<EncodedPacket, {
 		cluster: Cluster;
@@ -2293,7 +2302,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				);
 
 				const blockIndex = index !== -1 ? trackData.presentationTimestamps[index]!.blockIndex : -1;
-				const correctBlockFound = index !== -1 && timestampInTimescale < trackData.endTimestamp;
+				const correctBlockFound = index !== -1 && isSafelyBeforeEnd(trackData, timestampInTimescale);
 
 				return { blockIndex, correctBlockFound };
 			},
@@ -2359,7 +2368,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				});
 
 				const blockIndex = index !== -1 ? trackData.presentationTimestamps[index]!.blockIndex : -1;
-				const correctBlockFound = index !== -1 && timestampInTimescale < trackData.endTimestamp;
+				const correctBlockFound = index !== -1 && isSafelyBeforeEnd(trackData, timestampInTimescale);
 
 				return { blockIndex, correctBlockFound };
 			},
