@@ -11,7 +11,7 @@ import {
 	WebMOutputFormat,
 } from '../../src/output-format.js';
 import { Output, OutputTrackGroup } from '../../src/output.js';
-import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource, Source, UrlSource } from '../../src/source.js';
 import { expect, test } from 'vitest';
 import { BufferTarget, PathedTarget } from '../../src/target.js';
 import { Conversion, ConversionCanceledError, ConversionOptions } from '../../src/conversion.js';
@@ -20,7 +20,7 @@ import { InputVideoTrack } from '../../src/input-track.js';
 import { CanvasSource, EncodedAudioPacketSource, VideoSampleSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
 import { VideoSample } from '../../src/sample.js';
 import { CustomVideoDecoder, registerDecoder } from '../../src/custom-coder.js';
@@ -1816,4 +1816,137 @@ test('Transcoding 60 fps video with a quality level gets twice the bitrate of 30
 	const bitrate60 = await transcodeToVp8(60, new Quality('medium'));
 	expect(bitrate60 / bitrate30).toBeGreaterThan(1.6);
 	expect(bitrate60 / bitrate30).toBeLessThan(2.4);
+});
+
+test('Audio whose sample rate and channel count change mid-stream converts with the first part\'s', async () => {
+	// An HLS stream with a segment between discontinuities that has other audio parameters, like an inserted ad: 1 s of
+	// 48 kHz mono, then after a short break 1 s of 44.1 kHz stereo, then 1 s of 48 kHz mono again. The playlist places
+	// the middle segment at `middleStart`.
+	const writeSegment = async (url: string) => {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig);
+
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('aac');
+		output.addAudioTrack(source);
+		await output.start();
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			if (packet.timestamp < 0) {
+				continue;
+			}
+			if (packet.timestamp >= 1) {
+				break;
+			}
+
+			await source.add(packet, { decoderConfig });
+		}
+		await output.finalize();
+
+		return output.target.buffer!;
+	};
+
+	const segments = new Map([
+		['a.ts', await writeSegment('/demo.mp4')],
+		['b.ts', await writeSegment('/sample3.aac')],
+		['c.ts', await writeSegment('/demo.mp4')],
+	]);
+	const getSource = (middleStart: string) => {
+		const playlist = new TextEncoder().encode([
+			'#EXTM3U',
+			'#EXT-X-VERSION:3',
+			'#EXT-X-TARGETDURATION:2',
+			`#EXTINF:${middleStart},`,
+			'a.ts',
+			'#EXT-X-DISCONTINUITY',
+			'#EXTINF:1.0,',
+			'b.ts',
+			'#EXT-X-DISCONTINUITY',
+			'#EXTINF:1.0,',
+			'c.ts',
+			'#EXT-X-ENDLIST',
+		].join('\n')).buffer;
+
+		return new CustomPathedSource('stream.m3u8', ({ path }) => {
+			return new BufferSource(path === 'stream.m3u8' ? playlist : segments.get(path)!);
+		});
+	};
+
+	const read = async (source: Source) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const chunks: Float32Array[] = [];
+		// Where the decoded audio switches to other parameters
+		let switchTimestamp: number | null = null;
+		for await (using sample of new AudioSampleSink(track).samples()) {
+			if (sample.sampleRate !== await track.getSampleRate() && switchTimestamp === null) {
+				switchTimestamp = sample.timestamp;
+			}
+
+			const chunk = new Float32Array(sample.numberOfFrames * sample.numberOfChannels);
+			sample.copyTo(chunk, { planeIndex: 0, format: 'f32' });
+			chunks.push(chunk);
+		}
+		const data = new Float32Array(chunks.reduce((total, x) => total + x.length, 0));
+		chunks.reduce((offset, chunk) => (data.set(chunk, offset), offset + chunk.length), 0);
+
+		return {
+			sampleRate: await track.getSampleRate(),
+			numberOfChannels: await track.getNumberOfChannels(),
+			duration: await track.computeDuration(),
+			switchTimestamp,
+			data,
+		};
+	};
+
+	const convert = async (source: Source, sampleRate: number) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, audio: { sampleRate }, showWarnings: false });
+		await conversion.execute();
+
+		return read(new BufferSource(output.target.buffer!));
+	};
+
+	// Halfway between two 48 kHz frames. The decoder rounds timestamps to the track's 48 kHz, which puts the middle
+	// segment's samples up to a 44.1 kHz frame off from where they meet, now early, now late.
+	const input = await read(getSource('1.0500104'));
+	assert(input.switchTimestamp !== null);
+
+	// At the first part's sample rate, and at another one, which the encoder resamples to
+	for (const sampleRate of [48000, 22050]) {
+		const result = await convert(getSource('1.0500104'), sampleRate);
+		expect(result.sampleRate).toBe(sampleRate);
+		expect(result.numberOfChannels).toBe(1);
+		expect(result.duration).toBeCloseTo(input.duration, 1);
+
+		// Each part comes out in its place, the middle one resampled and downmixed: it's louder than the others
+		const levels = [0.2, input.switchTimestamp + 0.2, input.switchTimestamp + 1.2].map((start) => {
+			const part = result.data.subarray(Math.round(start * sampleRate), Math.round((start + 0.6) * sampleRate));
+			return Math.sqrt(part.reduce((total, x) => total + x * x, 0) / part.length);
+		});
+		expect(levels[0]).toBeGreaterThan(0.01);
+		expect(levels[2]).toBeGreaterThan(0.01);
+		expect(levels[1]).toBeGreaterThan(2 * Math.max(levels[0]!, levels[2]!));
+
+		if (sampleRate === 48000) {
+			// The middle part comes out exactly as with the segment placed on a 48 kHz frame, where the timestamps are
+			// a fraction of a frame off at most: no frame doubled (a click) or dropped where the samples meet
+			const onGridInput = await read(getSource('1.05'));
+			const onGrid = await convert(getSource('1.05'), sampleRate);
+			const offset = Math.round(input.switchTimestamp * sampleRate);
+			const onGridOffset = Math.round(onGridInput.switchTimestamp! * sampleRate);
+			let maxDifference = 0;
+			for (let i = 0; i < Math.round(0.95 * sampleRate); i++) {
+				maxDifference = Math.max(
+					maxDifference,
+					Math.abs(result.data[offset + i]! - onGrid.data[onGridOffset + i]!),
+				);
+			}
+			expect(maxDifference).toBeLessThan(1e-4);
+		}
+	}
 });
