@@ -9,6 +9,7 @@ import {
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
+	ReadableStreamSource,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
@@ -338,3 +339,88 @@ test('getPacket in a long GOP with B-frames doesn\'t rescan the clusters since i
 	// 830 KiB per lookup on average)
 	expect(bytesRead / 100).toBeLessThan(64 * 1024);
 }, 120_000);
+
+test('B-frame lookups on a stream don\'t need clusters the stream no longer holds', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const cluster = (timestamp: number, frames: [number, number][]) => element(
+		EBMLId.Cluster,
+		element(EBMLId.Timestamp, [timestamp >> 8, timestamp & 0xff]),
+		...frames.map(([pts, size]) => element(EBMLId.SimpleBlock, [
+			0x81,
+			((pts - timestamp) >> 8) & 0xff,
+			(pts - timestamp) & 0xff,
+			pts === 0 ? 0x80 : 0,
+			...new Array<number>(size).fill(0),
+		])),
+	);
+	const makeFile = (...clusters: number[][]) => new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [1]),
+				element(EBMLId.CodecID, ascii('V_MPEG4/ISO/AVC')),
+				element(EBMLId.DefaultDuration, [0x02, 0x62, 0x5a, 0x00]), // 40 ms
+				element(EBMLId.Video, element(EBMLId.PixelWidth, [16]), element(EBMLId.PixelHeight, [16])),
+			)),
+			...clusters,
+		),
+	]);
+
+	// Decode order I0 P120 B40 B80 P240 ... P1200, in a 580 kB cluster, and then the B-frames 1120 and 1160 in what
+	// follows: the frame presented last (P1200) sits in a cluster more than the stream's cache size before the end
+	const frames: [number, number][] = [[0, 20_000]];
+	for (let p = 120; p <= 1200; p += 120) {
+		frames.push([p, 20_000], [p - 80, 20_000], [p - 40, 20_000]);
+	}
+	const head = frames.slice(0, -2);
+
+	const lookUpStreamed = async (file: Uint8Array) => {
+		let offset = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (offset >= file.length) {
+					controller.close();
+					return;
+				}
+
+				controller.enqueue(file.slice(offset, offset + 2 ** 16));
+				offset += 2 ** 16;
+			},
+		});
+
+		using input = new Input({
+			source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 18 }),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		// Like computeDuration, the second lookup looks for the frame presented last
+		const duration = await track.computeDuration();
+		const last = await new EncodedPacketSink(track).getPacket(Infinity, { metadataOnly: true });
+		return [duration, last!.timestamp];
+	};
+
+	// The two clusters read last are kept, so the second lookup finds P1200 again without reading
+	expect(await lookUpStreamed(makeFile(cluster(0, head), cluster(1120, [[1120, 100], [1160, 100]]))))
+		.toEqual([1.24, 1.2]);
+
+	// When the cluster holding it isn't among them, the stream can't give it again, and the lookup does without it
+	// instead of failing, as it did before B-frames were looked for: it finds the frame presented last in what follows
+	const split = makeFile(cluster(0, head), cluster(1120, [[1120, 100]]), cluster(1160, [[1160, 100]]));
+	expect(await lookUpStreamed(split)).toEqual([1.24, 1.16]);
+});

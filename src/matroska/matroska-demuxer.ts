@@ -112,7 +112,8 @@ type Segment = {
 	 * Caches the last cluster that was read. Based on the assumption that there will be multiple reads to the
 	 * same cluster in quick succession.
 	 */
-	lastReadCluster: Cluster | null;
+	/** The clusters read last, most recent last, kept so they don't need to be read again right away */
+	recentClusters: Cluster[];
 	clusterSummaries: Map<number, ClusterSummary>; // Keyed by cluster position
 
 	metadataTags: MetadataTags;
@@ -277,6 +278,8 @@ const MAX_ELEMENT_NESTING_DEPTH = 64;
 // H.264 reorders a frame past at most 16 others (its largest DPB), HEVC a picture past at most 15; a frame can come as
 // two field blocks
 const MAX_REORDER_BLOCKS = 32;
+// How many of the clusters read last are kept
+const RECENT_CLUSTER_COUNT = 2;
 
 /** Whether a cluster in the position cache holds a key frame presented at or before the given timestamp. */
 const holdsKeyFrameAtOrBefore = (entry: InternalTrack['clusterPositionCache'][number], timestamp: number) => {
@@ -470,7 +473,7 @@ export class MatroskaDemuxer extends Demuxer {
 				: segmentDataStart + dataSize,
 			clusterSeekStartPos: segmentDataStart,
 
-			lastReadCluster: null,
+			recentClusters: [],
 			clusterSummaries: new Map(),
 
 			metadataTags: {},
@@ -691,9 +694,15 @@ export class MatroskaDemuxer extends Demuxer {
 		this.currentSegment = null;
 	}
 
+	/** Returns the cluster at the given position if it was read just before. */
+	getRecentCluster(segment: Segment, startPos: number) {
+		return segment.recentClusters.find(x => x.elementStartPos === startPos) ?? null;
+	}
+
 	async readCluster(startPos: number, segment: Segment) {
-		if (segment.lastReadCluster?.elementStartPos === startPos) {
-			return segment.lastReadCluster;
+		const recentCluster = this.getRecentCluster(segment, startPos);
+		if (recentCluster) {
+			return recentCluster;
 		}
 
 		let headerSlice = this.reader.requestSliceRange(startPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
@@ -833,7 +842,12 @@ export class MatroskaDemuxer extends Demuxer {
 			}
 		}
 
-		segment.lastReadCluster = cluster;
+		// A lookup often needs the clusters it just read again (like the last ones for the next lookup at the end),
+		// which a source that can only be streamed may not hold anymore
+		segment.recentClusters.push(cluster);
+		if (segment.recentClusters.length > RECENT_CLUSTER_COUNT) {
+			segment.recentClusters.shift();
+		}
 		segment.clusterSummaries.set(startPos, {
 			elementEndPos: cluster.elementEndPos,
 			trackIds: new Set(cluster.trackData.keys()),
@@ -2593,18 +2607,28 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			while (cuePointIndex !== -1 && cuePoints[cuePointIndex]!.clusterPosition >= stopPos) {
 				cuePointIndex--;
 			}
+			const isUsableEntry = (entry: InternalTrack['clusterPositionCache'][number]) => {
+				return entry.elementStartPos < stopPos && (!requireKeyFrame || entry.hasKeyFrame);
+			};
+			while (positionCacheIndex !== -1 && !isUsableEntry(clusterPositionCache[positionCacheIndex]!)) {
+				positionCacheIndex--;
+			}
+
+			// Where the lookup would start if blocks were stored in presentation order
+			const plainLookupEntryPosition = Math.max(
+				cuePoints[cuePointIndex]?.clusterPosition ?? 0,
+				clusterPositionCache[positionCacheIndex]?.elementStartPos ?? 0,
+			) || null;
+
+			// With B-frames, a block presented after a cluster's start can sit in a cluster before it, but not one
+			// presented after a key frame (pictures can't be presented after a key frame and decoded before it), so the
+			// scan has to start at such a key frame
 			while (
-				positionCacheIndex !== -1
+				mayReorder
+				&& positionCacheIndex !== -1
 				&& (
-					clusterPositionCache[positionCacheIndex]!.elementStartPos >= stopPos
-					|| (requireKeyFrame && !clusterPositionCache[positionCacheIndex]!.hasKeyFrame)
-					// With B-frames, a block presented after a cluster's start can sit in a cluster before it, but not
-					// one presented after a key frame (pictures can't be presented after a key frame and decoded before
-					// it), so the scan has to start at such a key frame
-					|| (
-						mayReorder
-						&& !holdsKeyFrameAtOrBefore(clusterPositionCache[positionCacheIndex]!, searchTimestamp)
-					)
+					!isUsableEntry(clusterPositionCache[positionCacheIndex]!)
+					|| !holdsKeyFrameAtOrBefore(clusterPositionCache[positionCacheIndex]!, searchTimestamp)
 				)
 			) {
 				positionCacheIndex--;
@@ -2614,6 +2638,18 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				cuePoints[cuePointIndex]?.clusterPosition ?? 0,
 				clusterPositionCache[positionCacheIndex]?.elementStartPos ?? 0,
 			) || null;
+
+			// Clusters before the plain lookup entry are only read to find B-frames there. A source that can only be
+			// streamed may not hold them anymore; then the lookup does without them and starts where it would without
+			// B-frames.
+			const fallBackToPlainEntry = (error: unknown) => {
+				if (plainLookupEntryPosition === null || currentPos >= plainLookupEntryPosition) {
+					throw error;
+				}
+
+				currentPos = plainLookupEntryPosition;
+				blocksAfterLatest = 0;
+			};
 
 			let currentPos: number;
 			let currentCluster: Cluster | null = null;
@@ -2680,41 +2716,65 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					continue;
 				}
 
-				// Load the header
-				let slice = demuxer.reader.requestSliceRange(currentPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
-				if (isThenable(slice)) slice = await slice;
-				if (!slice) break;
-
 				const elementStartPos = currentPos;
-				const elementHeader = readElementHeader(slice);
+				let id: number;
+				let size: number | undefined;
+				let dataStartPos: number;
 
-				if (
-					!elementHeader
-					|| (!LEVEL_1_EBML_IDS.includes(elementHeader.id) && elementHeader.id !== EBMLId.Void)
-				) {
-					// There's an element here that shouldn't be here. Might be garbage. In this case, let's
-					// try and resync to the next valid element.
-					const nextPos = await resync(
-						demuxer.reader,
-						elementStartPos + 1,
-						LEVEL_1_EBML_IDS,
-						Math.min(segment.elementEndPos ?? Infinity, elementStartPos + MAX_RESYNC_LENGTH),
-					);
-
-					if (nextPos) {
-						currentPos = nextPos;
+				// A cluster read just before doesn't need its header read again
+				const recentCluster = demuxer.getRecentCluster(segment, currentPos);
+				if (recentCluster) {
+					id = EBMLId.Cluster;
+					dataStartPos = recentCluster.dataStartPos;
+					size = recentCluster.elementEndPos - dataStartPos;
+				} else {
+					// Load the header
+					let slice: FileSlice | null;
+					try {
+						const result = demuxer.reader.requestSliceRange(currentPos, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
+						slice = isThenable(result) ? await result : result;
+					} catch (error) {
+						fallBackToPlainEntry(error);
 						continue;
-					} else {
-						break; // Resync failed
 					}
+					if (!slice) break;
+
+					const elementHeader = readElementHeader(slice);
+
+					if (
+						!elementHeader
+						|| (!LEVEL_1_EBML_IDS.includes(elementHeader.id) && elementHeader.id !== EBMLId.Void)
+					) {
+						// There's an element here that shouldn't be here. Might be garbage. In this case, let's
+						// try and resync to the next valid element.
+						const nextPos = await resync(
+							demuxer.reader,
+							elementStartPos + 1,
+							LEVEL_1_EBML_IDS,
+							Math.min(segment.elementEndPos ?? Infinity, elementStartPos + MAX_RESYNC_LENGTH),
+						);
+
+						if (nextPos) {
+							currentPos = nextPos;
+							continue;
+						} else {
+							break; // Resync failed
+						}
+					}
+
+					id = elementHeader.id;
+					size = elementHeader.size;
+					dataStartPos = slice.filePos;
 				}
 
-				const id = elementHeader.id;
-				let size = elementHeader.size;
-				const dataStartPos = slice.filePos;
-
 				if (id === EBMLId.Cluster) {
-					currentCluster = await demuxer.readCluster(elementStartPos, segment);
+					try {
+						currentCluster = await demuxer.readCluster(elementStartPos, segment);
+					} catch (error) {
+						fallBackToPlainEntry(error);
+						continue;
+					}
+
 					// readCluster computes the proper size even if it's undefined in the header, so let's use that
 					// instead
 					size = currentCluster.elementEndPos - dataStartPos;
