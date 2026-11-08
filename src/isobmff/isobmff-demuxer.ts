@@ -419,10 +419,16 @@ export class IsobmffDemuxer extends Demuxer {
 					const majorBrand = readAscii(slice, 4);
 					this.isQuickTime = majorBrand === 'qt  ';
 				} else if (boxInfo.name === 'moov') {
-					// Found moov, load it. If the file is cut off inside it (an interrupted download, say) or its size
-					// goes past the end of the file, take what's there: the boxes before that point are complete.
-					let moovSlice = this.reader.requestSliceRange(slice.filePos, 0, boxInfo.contentSize);
+					// Found moov, load it
+					let moovSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
 					if (isThenable(moovSlice)) moovSlice = await moovSlice;
+					if (!moovSlice) {
+						// The file is cut off inside the box (an interrupted download, say) or its size goes past the
+						// end of the file. Take what's there: the boxes before that point are complete. (The box is
+						// asked for whole first, so that a read too large to make fails as such.)
+						moovSlice = this.reader.requestSliceRange(slice.filePos, 0, boxInfo.contentSize);
+						if (isThenable(moovSlice)) moovSlice = await moovSlice;
+					}
 					if (!moovSlice) break;
 
 					this.moovIsCutOff = moovSlice.length < boxInfo.contentSize;
