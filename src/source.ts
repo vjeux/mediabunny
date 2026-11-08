@@ -14,6 +14,7 @@ import {
 	closedIntervalsOverlap,
 	FilePath,
 	isNumber,
+	isFirefox,
 	isThenable,
 	isWebKit,
 	MaybePromise,
@@ -774,6 +775,12 @@ export class UrlSource extends PathedSource {
 	 */
 	_fileSizeDetermined = false;
 	/**
+	 * Whether the server has honored a range request for this resource, after which a 200 for one doesn't mean it
+	 * ignores range requests.
+	 * @internal
+	 */
+	_rangeRequestsHonored = false;
+	/**
 	 * When the server doesn't support range requests, we abandon the orchestrator and instead defer to an internal
 	 * ReadableStreamSource wrapping the response body, which pulls new data only when reads demand it.
 	 * @internal
@@ -960,7 +967,7 @@ export class UrlSource extends PathedSource {
 			const abortController = new AbortController();
 			this._abortControllers.set(worker, abortController);
 
-			const response = await retriedFetch(
+			const fetchFromCurrentPos = (cache?: RequestCache) => retriedFetch(
 				this._options.fetchFn ?? fetch,
 				this._url,
 				mergeRequestInit(this._requestInit, {
@@ -969,10 +976,29 @@ export class UrlSource extends PathedSource {
 						Range: `bytes=${worker.currentPos}-`,
 					},
 					signal: abortController.signal,
+					...(cache && { cache }),
 				}),
 				this._getRetryDelay,
 				() => abortController.signal.aborted,
 			);
+
+			let response = await fetchFromCurrentPos();
+
+			const firefoxCachedStart = worker.currentPos === 0 && isFirefox();
+			if (response.status === 200 && (firefoxCachedStart || this._rangeRequestsHonored) && !this._usedForHls) {
+				// Firefox answers bytes=0- with a 200 from its HTTP cache when it holds the entire resource, so this
+				// doesn't mean the server ignores range requests. Neither does a 200 once the server has honored a
+				// range request: when a browser completes a range request from its HTTP cache with If-Range and the
+				// validator no longer matches (an ETag that differs per backend, say), the server rightly answers
+				// with a 200 and the whole resource. Ask the server itself. HLS segments are read sequentially anyway,
+				// so they keep the cached response.
+				void response.body?.cancel().catch(() => {});
+				response = await fetchFromCurrentPos('no-store');
+			}
+
+			if (response.status === 206) {
+				this._rangeRequestsHonored = true;
+			}
 
 			if (!response.ok) {
 				// eslint-disable-next-line @typescript-eslint/no-base-to-string
