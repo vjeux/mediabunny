@@ -372,6 +372,13 @@ class VideoEncoderWrapper {
 				|| (fitsSizeChanges && config.alpha !== 'keep' && isEightBitSdrSample(videoSample));
 
 			if (needsTransform) {
+				// A frame that is only fitted (no transform of its own) stays in its coded orientation, like the frames
+				// that aren't drawn: its rotation and flip remain the track's metadata, rather than being drawn in too
+				const keepsOrientation = !hasTransformConfig;
+				const undoneRotation = videoSample.flip
+					? videoSample.rotation
+					: ([0, 270, 180, 90] as const)[videoSample.rotation / 90]!;
+
 				let targetWidth = config.transform?.width;
 				let targetHeight = config.transform?.height;
 				let appliedFit: 'fill' | 'contain' | 'cover' = config.transform?.fit ?? 'fill';
@@ -387,12 +394,6 @@ class VideoEncoderWrapper {
 					appliedFit = sizeChangeBehavior;
 				}
 
-				// A frame that is only fitted (no transform of its own) stays in its coded orientation, like the frames
-				// that aren't drawn: its rotation and flip remain the track's metadata, rather than being drawn in too
-				const keepsOrientation = !hasTransformConfig;
-				const undoneRotation = videoSample.flip
-					? videoSample.rotation
-					: ([0, 270, 180, 90] as const)[videoSample.rotation / 90]!;
 				const transformed = await videoSample.transform({
 					width: targetWidth,
 					height: targetHeight,
