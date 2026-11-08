@@ -2595,3 +2595,61 @@ test('Matroska Language with a country code gives the ISO 639-2 code', async () 
 	expect(await readLanguage('por')).toBe('por');
 	expect(await readLanguage('xx-yy')).toBe('und');
 });
+
+test('Matroska files with junk in front of the Segment, or a Segment size of 0, still get read', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+
+	const ebmlHeader = element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska')));
+	const segmentChildren = [
+		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+		element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [2]),
+			element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+			element(EBMLId.Audio, element(EBMLId.Channels, [1]), element(EBMLId.BitDepth, [16])),
+		)),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [0]),
+			element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 1, 2]),
+			element(EBMLId.SimpleBlock, [0x81, 0, 20, 0x80, 3, 4]),
+		),
+	].flat();
+	const segment = element(EBMLId.Segment, segmentChildren);
+
+	const countPackets = async (bytes: number[]) => {
+		using input = new Input({ source: new BufferSource(new Uint8Array(bytes)), formats: ALL_FORMATS });
+		const tracks = await input.getTracks();
+		if (tracks.length === 0) {
+			return 0;
+		}
+
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
+			expect(packet.byteLength).toBe(2);
+			count++;
+		}
+		return count;
+	};
+
+	// Control
+	expect(await countPackets([...ebmlHeader, ...segment])).toBe(2);
+	// Zero bytes and garbage between the EBML header and the Segment, which FFmpeg skips by resyncing
+	expect(await countPackets([...ebmlHeader, ...new Array<number>(16).fill(0), ...segment])).toBe(2);
+	expect(await countPackets([...ebmlHeader, ...ascii('this is junk!!!!'), ...segment])).toBe(2);
+	// A Segment size left at 0 (FFmpeg reads the elements that follow as the Segment's)
+	expect(await countPackets([...ebmlHeader, 0x18, 0x53, 0x80, 0x67, 0x80, ...segmentChildren])).toBe(2);
+	// Zero padding after the Segment still just ends the file
+	expect(await countPackets([...ebmlHeader, ...segment, ...new Array<number>(16).fill(0)])).toBe(2);
+});
