@@ -277,7 +277,9 @@ export type StreamTargetOptions = {
 	/**
 	 * When setting this to true, data created by the output will first be accumulated and only written out
 	 * once it has reached sufficient size, using a default chunk size of 16 MiB. This is useful for reducing the total
-	 * amount of writes, at the cost of latency.
+	 * amount of writes, at the cost of latency. The exception is when the output needs its data written out before it
+	 * goes on, like a live HLS playlist listing byte ranges of a single segment file: then partial chunks are written
+	 * out too.
 	 */
 	chunked?: boolean;
 	/** When using `chunked: true`, this specifies the maximum size of each chunk. Defaults to 16 MiB. */
