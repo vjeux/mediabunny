@@ -40,10 +40,11 @@ export const buildIsobmffMimeType = (info: {
  * @public
  */
 export type PsshBox = {
-	/** The system ID as a 32-bit lowercase hex string. */
+	/** The system ID (16 bytes) as a 32-character lowercase hex string. */
 	systemId: string;
 	/**
-	 * The list of key IDs (32-bit lowercase hex strings) this box applies to, or `null` if it applies to all key IDs.
+	 * The list of key IDs (16 bytes each, as 32-character lowercase hex strings) this box applies to, or `null` if it
+	 * applies to all key IDs.
 	 */
 	keyIds: string[] | null;
 	/** The content protection system-specific data. */
