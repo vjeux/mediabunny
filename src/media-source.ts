@@ -584,7 +584,11 @@ class VideoEncoderWrapper {
 				}
 
 				const keyFrameInterval = this.encodingConfig.keyFrameInterval ?? 2;
-				const multipleOfKeyFrameInterval = Math.floor(sampleToEncode.timestamp / keyFrameInterval);
+				// Counted in whole microseconds, the precision of WebCodecs timestamps, since in floating point a
+				// multiple of a fractional interval can come out just short of it (0.6 / 0.2 = 2.9999999999999996)
+				const multipleOfKeyFrameInterval = Math.floor(
+					Math.round(sampleToEncode.timestamp * 1e6) / Math.max(Math.round(keyFrameInterval * 1e6), 1),
+				);
 
 				const mergedEncodeOptions = {
 					...this.defaultEncodeOptions,
