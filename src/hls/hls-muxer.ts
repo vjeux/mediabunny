@@ -69,6 +69,12 @@ const toHlsCodecString = (codecString: string, segmentFormat: OutputFormat) => {
 	if (codecString === 'opus') {
 		return 'Opus';
 	}
+	if (codecString === 'flac') {
+		return 'fLaC';
+	}
+	if (codecString === 'mp3' || codecString === 'mp4a.69' || codecString === 'mp4a.6B' || codecString === 'mp4a.6b') {
+		return 'mp4a.40.34';
+	}
 	if (segmentFormat instanceof IsobmffOutputFormat && codecString.startsWith('hev1.')) {
 		// The codec string names the sample entry, and HEVC is always written into an 'hvc1' sample entry
 		return 'hvc1.' + codecString.slice('hev1.'.length);
