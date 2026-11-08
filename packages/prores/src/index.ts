@@ -240,13 +240,13 @@ class ProresDecoder extends CustomVideoDecoder {
 let workersCanRunWasm: Promise<boolean> | null = null;
 
 /**
- * Whether the page can start a worker from a blob: URL and compile WebAssembly in it, which is how TurboRes runs its
- * decoding threads. A Content Security Policy can forbid either, and then TurboRes waits for its workers forever.
- * Checked once per page; true where there are no DOM workers (Node, whose TurboRes uses worker_threads).
+ * Whether the page can start a module worker from a blob: URL and compile WebAssembly in it, which is how TurboRes runs
+ * its decoding threads. A Content Security Policy can forbid either, and then TurboRes waits for its workers forever.
+ * Checked once per page; true where TurboRes uses worker_threads instead (Node and Bun, like its own check).
  */
 const canRunWasmInWorkers = () => {
 	return workersCanRunWasm ??= new Promise<boolean>((resolve) => {
-		if (typeof Worker === 'undefined' || typeof URL.createObjectURL !== 'function') {
+		if (typeof Worker === 'undefined' || 'Bun' in globalThis || typeof URL.createObjectURL !== 'function') {
 			resolve(true);
 			return;
 		}
@@ -263,7 +263,7 @@ const canRunWasmInWorkers = () => {
 		};
 
 		try {
-			worker = new Worker(url);
+			worker = new Worker(url, { type: 'module' }); // Like TurboRes's workers (and Deno only has module workers)
 			worker.addEventListener('message', event => finish(event.data === true));
 			worker.addEventListener('error', () => finish(false));
 		} catch {
