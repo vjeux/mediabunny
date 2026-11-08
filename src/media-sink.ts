@@ -1546,9 +1546,9 @@ export class ColorAlphaMerger {
 
 	/** Merges the color and alpha frames into one, taking ownership of both. */
 	async merge(color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame> {
-		// Frames can only be handed to a worker that runs, as frames transferred to one that never loads are lost
-		this.workersRunning ??= this.startWorkers();
-		const workersRunning = await this.workersRunning;
+		// Frames can only be handed to a worker that runs, as frames transferred to one that never loads are lost. A
+		// closed merger starts no workers.
+		const workersRunning = this.closed ? false : await (this.workersRunning ??= this.startWorkers());
 		if (this.closed) {
 			color.close();
 			alpha.close();
