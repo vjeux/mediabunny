@@ -998,7 +998,12 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (creationTime !== 0) {
-					this.metadataTags.creationTime = new Date(1000 * (creationTime - TIMESTAMP_OFFSET));
+					const date = new Date(1000 * (creationTime - TIMESTAMP_OFFSET));
+					if (!Number.isNaN(date.getTime())) {
+						this.metadataTags.creationTime = date;
+					} else {
+						// Further from 1970 than a Date can hold (275,760 years), so it's garbage
+					}
 				} else {
 					// Assume this means the creation time isn't set (I doubt the file was created in 1904)
 				}
