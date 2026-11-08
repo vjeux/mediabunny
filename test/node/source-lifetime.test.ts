@@ -1,5 +1,5 @@
 import { expect, test, vi } from 'vitest';
-import { CustomSource, FilePathSource } from '../../src/source.js';
+import { CustomPathedSource, CustomSource, FilePathSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input, InputDisposedError } from '../../src/input.js';
@@ -9,6 +9,8 @@ import { FileHandle, open, readFile, rm, truncate, writeFile } from 'node:fs/pro
 import { tmpdir } from 'node:os';
 import { Reader } from '../../src/reader.js';
 import { setImmediate } from 'node:timers/promises';
+import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Logging } from '../../src/logging.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -208,5 +210,74 @@ test('CustomSource rejects falsy prefetchProfile values it cannot use', async ()
 		})).toThrow(new TypeError(
 			'options.prefetchProfile, when provided, must be one of \'none\', \'fileSystem\' or \'network\'.',
 		));
+	}
+});
+
+test('A throwing CustomSource dispose callback does not stop the rest of the input from disposing', async () => {
+	// Minimal ADTS frames (AAC-LC, 44.1 kHz, stereo) with zeroed payloads
+	const adtsFrames = (count: number) => {
+		const frameLength = 7 + 10;
+		const bytes = new Uint8Array(count * frameLength);
+		for (let i = 0; i < count; i++) {
+			const header = [0xff, 0xf1, 0x50, 0x80, frameLength >> 3, ((frameLength & 7) << 5) | 0x1f, 0xfc];
+			bytes.set(header, i * frameLength);
+		}
+		return bytes;
+	};
+
+	const files = new Map<string, Uint8Array>([
+		['index.m3u8', new TextEncoder().encode([
+			'#EXTM3U',
+			'#EXT-X-TARGETDURATION:1',
+			'#EXT-X-PLAYLIST-TYPE:VOD',
+			'#EXTINF:0.1,',
+			'a.aac',
+			'#EXTINF:0.1,',
+			'b.aac',
+			'#EXT-X-ENDLIST',
+		].join('\n'))],
+		['a.aac', adtsFrames(4)],
+		['b.aac', adtsFrames(4)],
+	]);
+
+	const disposed: string[] = [];
+	const loggedErrors: unknown[] = [];
+	vi.spyOn(console, 'error').mockImplementation(() => {});
+	const unsubscribe = Logging.on('error', args => loggedErrors.push(args[1]));
+
+	const input = new Input({
+		formats: ALL_FORMATS,
+		source: new CustomPathedSource('index.m3u8', ({ path }) => {
+			const name = path.split('/').pop()!;
+			const bytes = files.get(name)!;
+			return new CustomSource({
+				getSize: () => bytes.length,
+				read: (start, end) => bytes.subarray(start, end),
+				dispose: () => {
+					disposed.push(name);
+					if (name === 'index.m3u8') {
+						throw new Error('Dispose failed');
+					}
+				},
+			});
+		}),
+	});
+
+	try {
+		const track = await input.getPrimaryAudioTrack();
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track!).packets()) {
+			void packet;
+			packetCount++;
+		}
+		expect(packetCount).toBe(8); // Both segments were read
+
+		input.dispose();
+		await setImmediate(); // The demuxer, and with it the segment inputs, gets disposed asynchronously
+
+		expect(disposed.sort()).toEqual(['a.aac', 'b.aac', 'index.m3u8']);
+		expect(loggedErrors).toEqual([new Error('Dispose failed')]);
+	} finally {
+		unsubscribe();
 	}
 });
