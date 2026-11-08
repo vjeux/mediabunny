@@ -3640,3 +3640,88 @@ test('MP4 files cut off in their media data end with the last packet whose data 
 		expect(await fullTrack.computeDuration()).toBe(10);
 	}
 });
+
+test('MP4 files cut off inside their moov box keep the tracks before the cut', async () => {
+	// A non-fast-start MP4 (moov after mdat) with a video and an audio track, and its udta box last in the moov box
+	const makeFile = async () => {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+		const video = new EncodedVideoPacketSource('vp8');
+		const audio = new EncodedAudioPacketSource('opus');
+		output.addVideoTrack(video);
+		output.addAudioTrack(audio);
+		output.setMetadataTags({ title: 'A title long enough to fill the udta box at the end of the moov box' });
+		await output.start();
+		for (let i = 0; i < 10; i++) {
+			await video.add(
+				new EncodedPacket(new Uint8Array(1000).fill(i + 1), i % 5 === 0 ? 'key' : 'delta', i, 1),
+				{ decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 } },
+			);
+			await audio.add(new EncodedPacket(new Uint8Array(100), 'key', i, 1), {
+				decoderConfig: {
+					codec: 'opus',
+					numberOfChannels: 2,
+					sampleRate: 48000,
+					description: new Uint8Array([
+						0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0,
+					]),
+				},
+			});
+		}
+		await output.finalize();
+
+		return new Uint8Array(output.target.buffer!);
+	};
+	const read = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const result: { type: string; packetCount: number }[] = [];
+		for (const track of await input.getTracks()) {
+			let packetCount = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				void packet;
+				packetCount++;
+			}
+			result.push({ type: track.type, packetCount });
+		}
+
+		return { tracks: result, title: (await input.getMetadataTags()).title };
+	};
+
+	// The offsets of the boxes with the given name (or of anything that looks like one, good enough here)
+	const findBoxes = (bytes: Uint8Array, name: string) => {
+		const offsets: number[] = [];
+		for (let i = 0; i + 8 <= bytes.byteLength; i++) {
+			if (new TextDecoder().decode(bytes.subarray(i + 4, i + 8)) === name) {
+				offsets.push(i);
+			}
+		}
+
+		return offsets;
+	};
+
+	const full = await makeFile();
+	const complete = {
+		tracks: [{ type: 'video', packetCount: 10 }, { type: 'audio', packetCount: 10 }],
+		title: 'A title long enough to fill the udta box at the end of the moov box',
+	};
+	expect(await read(full)).toEqual(complete);
+
+	// Cut off inside the udta box: only the title is lost
+	const udtaEnd = full.byteLength;
+	expect(new TextDecoder().decode(full.subarray(udtaEnd - 40))).toContain('end of the moov box');
+	expect(await read(full.subarray(0, udtaEnd - 10))).toEqual({ ...complete, title: undefined });
+
+	// A moov size that goes past the end of the file
+	const view = new DataView(full.buffer, full.byteOffset, full.byteLength);
+	const moovStart = findBoxes(full, 'moov')[0]!;
+	const oversized = full.slice();
+	new DataView(oversized.buffer).setUint32(moovStart, 0x7fffffff);
+	expect(await read(oversized)).toEqual(complete);
+	expect(view.getUint32(moovStart)).toBe(full.byteLength - moovStart);
+
+	// Cut off inside the second track: the first one stays
+	const secondTrakStart = findBoxes(full, 'trak')[1]!;
+	expect(await read(full.subarray(0, secondTrakStart + 100))).toEqual({
+		tracks: [{ type: 'video', packetCount: 10 }],
+		title: undefined,
+	});
+});
