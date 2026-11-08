@@ -238,7 +238,7 @@ export type ConversionVideoOptions = {
 	/** The desired quality of the output video. */
 	quality?: Quality;
 	/**
-	 * The desired bitrate of the output video.
+	 * The desired bitrate of the output video, as a positive integer in bits per second.
 	 * @deprecated Use `quality` instead.
 	 */
 	bitrate?: number | Quality;
@@ -330,7 +330,7 @@ export type ConversionAudioOptions = {
 	/** The desired quality of the output audio. */
 	quality?: Quality;
 	/**
-	 * The desired bitrate of the output audio.
+	 * The desired bitrate of the output audio, as a positive integer in bits per second.
 	 * @deprecated Use `quality` instead.
 	 */
 	bitrate?: number | Quality;

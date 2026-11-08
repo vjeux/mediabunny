@@ -40,7 +40,8 @@ export type VideoEncodingConfig = {
 	/** The desired quality of the encoded video. */
 	quality?: Quality;
 	/**
-	 * The target bitrate for the encoded video, in bits per second. Alternatively, a {@link Quality} can be provided.
+	 * The target bitrate for the encoded video, as a positive integer in bits per second. Alternatively, a
+	 * {@link Quality} can be provided.
 	 * @deprecated Use `quality` instead.
 	 */
 	bitrate?: number | Quality;
@@ -449,7 +450,8 @@ export type AudioEncodingConfig = {
 	 */
 	quality?: Quality;
 	/**
-	 * The target bitrate for the encoded audio, in bits per second. Alternatively, a {@link Quality} can be provided.
+	 * The target bitrate for the encoded audio, as a positive integer in bits per second. Alternatively, a
+	 * {@link Quality} can be provided.
 	 * @deprecated Use `quality` instead.
 	 */
 	bitrate?: number | Quality;
@@ -663,8 +665,9 @@ export type QualitativeQualityOptions = {
  */
 export type QuantitativeQualityOptions = {
 	/**
-	 * An explicit bitrate in bits per second. When set, this bitrate is used for encoding. It also acts as the
-	 * fallback in case a specified quantizer cannot be used.
+	 * An explicit bitrate in bits per second. Must be a positive integer, so round computed values (such as a bitrate
+	 * derived from a target file size). When set, this bitrate is used for encoding. It also acts as the fallback in
+	 * case a specified quantizer cannot be used.
 	 */
 	bitrate?: number;
 	/** The bitrate mode to use when encoding resolves to bitrate-based encoding. */
@@ -1059,8 +1062,8 @@ export const canEncodeVideo = async (
 		/** The desired quality of the encoded video. */
 		quality?: Quality;
 		/**
-		 * The target bitrate for the encoded video, in bits per second. Alternatively, a {@link Quality} can
-		 * be provided.
+		 * The target bitrate for the encoded video, as a positive integer in bits per second. Alternatively,
+		 * a {@link Quality} can be provided.
 		 * @deprecated Use `quality` instead.
 		 */
 		bitrate?: number | Quality;
@@ -1223,8 +1226,8 @@ export const canEncodeAudio = async (
 		/** The desired quality of the encoded audio. */
 		quality?: Quality;
 		/**
-		 * The target bitrate for the encoded audio, in bits per second. Alternatively, a {@link Quality} can
-		 * be provided.
+		 * The target bitrate for the encoded audio, as a positive integer in bits per second. Alternatively,
+		 * a {@link Quality} can be provided.
 		 * @deprecated Use `quality` instead.
 		 */
 		bitrate?: number | Quality;
@@ -1358,8 +1361,8 @@ export const getEncodableVideoCodecs = async (
 		/** The desired quality of the encoded video. */
 		quality?: Quality;
 		/**
-		 * The target bitrate for the encoded video, in bits per second. Alternatively, a {@link Quality} can
-		 * be provided.
+		 * The target bitrate for the encoded video, as a positive integer in bits per second. Alternatively,
+		 * a {@link Quality} can be provided.
 		 * @deprecated Use `quality` instead.
 		 */
 		bitrate?: number | Quality;
@@ -1386,8 +1389,8 @@ export const getEncodableAudioCodecs = async (
 		/** The desired quality of the encoded audio. */
 		quality?: Quality;
 		/**
-		 * The target bitrate for the encoded audio, in bits per second. Alternatively, a {@link Quality} can
-		 * be provided.
+		 * The target bitrate for the encoded audio, as a positive integer in bits per second. Alternatively,
+		 * a {@link Quality} can be provided.
 		 * @deprecated Use `quality` instead.
 		 */
 		bitrate?: number | Quality;
@@ -1424,8 +1427,8 @@ export const getFirstEncodableVideoCodec = async (
 		/** The desired quality of the encoded video. */
 		quality?: Quality;
 		/**
-		 * The target bitrate for the encoded video, in bits per second. Alternatively, a {@link Quality} can
-		 * be provided.
+		 * The target bitrate for the encoded video, as a positive integer in bits per second. Alternatively,
+		 * a {@link Quality} can be provided.
 		 * @deprecated Use `quality` instead.
 		 */
 		bitrate?: number | Quality;
@@ -1457,8 +1460,8 @@ export const getFirstEncodableAudioCodec = async (
 		/** The desired quality of the encoded audio. */
 		quality?: Quality;
 		/**
-		 * The target bitrate for the encoded audio, in bits per second. Alternatively, a {@link Quality} can
-		 * be provided.
+		 * The target bitrate for the encoded audio, as a positive integer in bits per second. Alternatively,
+		 * a {@link Quality} can be provided.
 		 * @deprecated Use `quality` instead.
 		 */
 		bitrate?: number | Quality;
