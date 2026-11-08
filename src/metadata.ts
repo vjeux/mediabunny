@@ -100,6 +100,46 @@ export type MetadataTags = {
 	>;
 };
 
+/** Deep-copies tags, so that changing the copy (Dates and image bytes included) leaves the original untouched. */
+export const cloneMetadataTags = (tags: MetadataTags): MetadataTags => {
+	const copy: MetadataTags = { ...tags };
+	if (tags.date) {
+		copy.date = new Date(tags.date.getTime());
+	}
+	if (tags.creationTime) {
+		copy.creationTime = new Date(tags.creationTime.getTime());
+	}
+	if (tags.images) {
+		copy.images = tags.images.map(image => ({ ...image, data: image.data.slice() }));
+	}
+	if (tags.raw) {
+		copy.raw = {};
+		for (const key in tags.raw) {
+			copy.raw[key] = cloneRawTagValue(tags.raw[key]!);
+		}
+	}
+
+	return copy;
+};
+
+type RawTagValue = NonNullable<MetadataTags['raw']>[string];
+
+const cloneRawTagValue = (value: RawTagValue): RawTagValue => {
+	if (value instanceof Uint8Array) {
+		return value.slice();
+	} else if (Array.isArray(value)) {
+		return value.map(item => (item instanceof Uint8Array ? item.slice() : item)) as string[] | Uint8Array[];
+	} else if (value instanceof RichImageData) {
+		return new RichImageData(value.data.slice(), value.mimeType);
+	} else if (value instanceof AttachedFile) {
+		return new AttachedFile(value.data.slice(), value.mimeType, value.name, value.description);
+	} else if (value && typeof value === 'object') {
+		return { ...value };
+	} else {
+		return value;
+	}
+};
+
 /**
  * An embedded image such as cover art, booklet scan, artwork or preview frame.
  *
