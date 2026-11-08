@@ -2794,6 +2794,7 @@ export class IsobmffDemuxer extends Demuxer {
 							objectType: 2,
 							outputSampleRate: track.info.sampleRate,
 							outputNumberOfChannels: track.info.numberOfChannels,
+							programConfigElement: null,
 						});
 					} catch {
 						// Channel count not expressible in an AudioSpecificConfig
