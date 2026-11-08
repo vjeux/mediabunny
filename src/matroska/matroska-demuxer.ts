@@ -8,15 +8,23 @@
 
 import { TrackType } from '../output';
 import {
+	deserializeAvcDecoderConfigurationRecord,
+	deserializeHevcDecoderConfigurationRecord,
 	extractAv1CodecInfoFromPacket,
 	extractDtsFourCcFromPacket,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	extractProresCodecInfoFromPacket,
+	extractAv1FrameSizeFromPacket,
+	extractVp8FrameSizeFromPacket,
 	extractVp9CodecInfoFromPacket,
 	parseModesFromVorbisSetupPacket,
 	parseOpusTocByte,
 	EAC3_NUMBLKS_TABLE,
+	extractVp9FrameSizeFromPacket,
+	HevcNalUnitType,
+	parseAvcSps,
+	parseHevcSps,
 } from '../codec-data';
 import {
 	AacCodecInfo,
@@ -303,6 +311,47 @@ type InternalTrack = {
 type InternalVideoTrack = InternalTrack & { info: { type: 'video' } };
 type InternalAudioTrack = InternalTrack & { info: { type: 'audio' } };
 
+/** Derives the size of the frames in square pixels from the pixel size and the display size. */
+const computeSquarePixelSize = (info: InternalVideoTrack['info']) => {
+	info.squarePixelWidth = info.width;
+	info.squarePixelHeight = info.height;
+
+	// The display size applies to the frame after cropping
+	const [cropTop, cropBottom, cropLeft, cropRight] = info.pixelCrop;
+	let visibleWidth = info.width - cropLeft - cropRight;
+	let visibleHeight = info.height - cropTop - cropBottom;
+	if (visibleWidth <= 0 || visibleHeight <= 0) {
+		// Cropping everything away makes no sense
+		visibleWidth = info.width;
+		visibleHeight = info.height;
+	}
+
+	let displayWidth = info.displayWidth;
+	let displayHeight = info.displayHeight;
+	if (info.displayUnit === 0) {
+		displayWidth ??= visibleWidth;
+		displayHeight ??= visibleHeight;
+	}
+
+	if (
+		info.displayUnit !== 4 // "unknown"
+		&& displayWidth !== null
+		&& displayHeight !== null
+	) {
+		const num = displayWidth * visibleHeight;
+		const den = displayHeight * visibleWidth;
+
+		if (num > 0 && den > 0) {
+			info.pixelAspectRatio = simplifyRational({ num, den });
+			if (num > den) {
+				info.squarePixelWidth = Math.round(info.width * num / den);
+			} else {
+				info.squarePixelHeight = Math.round(info.height * den / num);
+			}
+		}
+	}
+};
+
 const METADATA_ELEMENTS = [
 	{ id: EBMLId.SeekHead, flag: 'seekHeadSeen' },
 	{ id: EBMLId.Info, flag: 'infoSeen' },
@@ -537,6 +586,8 @@ const buildLegacyAacAudioSpecificConfig = (
 		return null; // Channel count that can't be signaled without a PCE
 	}
 };
+// How far into a track the first key frame is looked for when the container doesn't give the frame size
+const MAX_FRAME_SIZE_PROBE_BYTES = 2 ** 20;
 
 export class MatroskaDemuxer extends Demuxer {
 	reader: Reader;
@@ -731,6 +782,16 @@ export class MatroskaDemuxer extends Demuxer {
 
 				assertDefinedSize(size);
 				currentPos = dataStartPos + size;
+			}
+
+			// Some writers leave PixelWidth and PixelHeight at 0 (or out), although they're mandatory and can't be 0.
+			// Like FFmpeg, take the frame size from the bitstream then.
+			for (const segment of this.segments) {
+				for (const track of segment.tracks) {
+					if (track.info?.type === 'video' && (track.info.width === 0 || track.info.height === 0)) {
+						await (track.trackBacking as MatroskaVideoTrackBacking).resolveFrameSizeFromBitstream();
+					}
+				}
 			}
 		})();
 	}
@@ -1851,52 +1912,11 @@ export class MatroskaDemuxer extends Demuxer {
 						? this.currentTrack.codecId
 						: this.currentTrack.codecId.slice(0, slashIndex);
 
-					if (
-						this.currentTrack.info.type === 'video'
-						&& this.currentTrack.info.width !== -1
-						&& this.currentTrack.info.height !== -1
-					) {
-						this.currentTrack.info.squarePixelWidth = this.currentTrack.info.width;
-						this.currentTrack.info.squarePixelHeight = this.currentTrack.info.height;
-
-						// The display size applies to the frame after cropping
-						const [cropTop, cropBottom, cropLeft, cropRight] = this.currentTrack.info.pixelCrop;
-						let visibleWidth = this.currentTrack.info.width - cropLeft - cropRight;
-						let visibleHeight = this.currentTrack.info.height - cropTop - cropBottom;
-						if (visibleWidth <= 0 || visibleHeight <= 0) {
-							// Cropping everything away makes no sense
-							visibleWidth = this.currentTrack.info.width;
-							visibleHeight = this.currentTrack.info.height;
-						}
-
-						let displayWidth = this.currentTrack.info.displayWidth;
-						let displayHeight = this.currentTrack.info.displayHeight;
-						if (this.currentTrack.info.displayUnit === 0) {
-							displayWidth ??= visibleWidth;
-							displayHeight ??= visibleHeight;
-						}
-
-						if (
-							this.currentTrack.info.displayUnit !== 4 // "unknown"
-							&& displayWidth !== null
-							&& displayHeight !== null
-						) {
-							const num = displayWidth * visibleHeight;
-							const den = displayHeight * visibleWidth;
-
-							if (num > 0 && den > 0) {
-								this.currentTrack.info.pixelAspectRatio = simplifyRational({ num, den });
-								if (num > den) {
-									this.currentTrack.info.squarePixelWidth = Math.round(
-										this.currentTrack.info.width * num / den,
-									);
-								} else {
-									this.currentTrack.info.squarePixelHeight = Math.round(
-										this.currentTrack.info.height * den / num,
-									);
-								}
-							}
-						}
+					if (this.currentTrack.info.type === 'video') {
+						// A missing PixelWidth or PixelHeight is taken from the bitstream later, like a zero one
+						this.currentTrack.info.width = Math.max(this.currentTrack.info.width, 0);
+						this.currentTrack.info.height = Math.max(this.currentTrack.info.height, 0);
+						computeSquarePixelSize(this.currentTrack.info);
 
 						if (this.currentTrack.codecId === CODEC_STRING_MAP.avc) {
 							this.currentTrack.info.codec = 'avc';
@@ -3733,6 +3753,50 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 		return 'video' as const;
 	}
 
+	/** Fills in the frame size from the codec configuration or the first packet when the container lacks it. */
+	async resolveFrameSizeFromBitstream() {
+		const info = this.internalTrack.info;
+		let size: { width: number; height: number } | null = null;
+
+		if ((info.codec === 'avc' || info.codec === 'hevc') && info.codecDescription) {
+			size = getFrameSizeFromParameterSets(info.codec, info.codecDescription, null);
+		} else if (info.codec) {
+			// The first key frame carries the size (a cut stream may start with delta frames). It's only looked for in
+			// the first megabyte, since a track without any key frame would otherwise be read in full; the size is only
+			// informational then, as decoders take it from the bitstream. Best effort: a cluster that can't be read
+			// leaves the size unknown instead of failing the metadata.
+			let packet = await this.getFirstPacket({}).catch(() => null);
+			const firstClusterPos = packet && this.packetToClusterLocation.get(packet)!.cluster.elementStartPos;
+			while (packet && packet.type !== 'key') {
+				const clusterPos = this.packetToClusterLocation.get(packet)!.cluster.elementStartPos;
+				if (clusterPos - firstClusterPos! > MAX_FRAME_SIZE_PROBE_BYTES) {
+					packet = null;
+					break;
+				}
+
+				packet = await this.getNextPacket(packet, {}).catch(() => null);
+			}
+
+			if (packet) {
+				if (info.codec === 'vp8') {
+					size = extractVp8FrameSizeFromPacket(packet.data);
+				} else if (info.codec === 'vp9') {
+					size = extractVp9FrameSizeFromPacket(packet.data);
+				} else if (info.codec === 'av1') {
+					size = extractAv1FrameSizeFromPacket(packet.data);
+				} else if (info.codec === 'avc' || info.codec === 'hevc') {
+					size = getFrameSizeFromParameterSets(info.codec, null, packet.data);
+				}
+			}
+		}
+
+		if (size && size.width > 0 && size.height > 0) {
+			info.width = size.width;
+			info.height = size.height;
+			computeSquarePixelSize(info);
+		}
+	}
+
 	override getCodec(): VideoCodec | null {
 		return this.internalTrack.info.codec;
 	}
@@ -3847,15 +3911,15 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				this.internalTrack.info.colorSpace.fullRange ??= colorSpace.fullRange;
 			}
 
+			const { width, height, pixelAspectRatio } = this.internalTrack.info;
 			const config: VideoDecoderConfig = {
 				codec: extractVideoCodecString(codecInfo),
-				codedWidth: this.internalTrack.info.width,
-				codedHeight: this.internalTrack.info.height,
+				// An unknown size is left out rather than given as 0, which decoders reject
+				...(width > 0 && height > 0 ? { codedWidth: width, codedHeight: height } : {}),
 				description: this.internalTrack.info.codecDescription ?? undefined,
 				colorSpace: this.internalTrack.info.colorSpace,
 			};
 
-			const { width, height, pixelAspectRatio } = this.internalTrack.info;
 			const displayAspect = getDisplayAspect(width, height, pixelAspectRatio);
 			if (displayAspect) {
 				config.displayAspectWidth = displayAspect.displayAspectWidth;
@@ -3922,3 +3986,26 @@ class MatroskaAudioTrackBacking extends MatroskaTrackBacking implements InputAud
 		})();
 	}
 }
+
+/** Reads the frame size from the SPS of an AVC/HEVC decoder configuration record or Annex B packet. */
+const getFrameSizeFromParameterSets = (
+	codec: 'avc' | 'hevc',
+	description: Uint8Array | null,
+	annexBPacket: Uint8Array | null,
+) => {
+	if (codec === 'avc') {
+		const record = description
+			? deserializeAvcDecoderConfigurationRecord(description)
+			: annexBPacket && extractAvcDecoderConfigurationRecord(annexBPacket);
+		const sps = record?.sequenceParameterSets[0];
+		const spsInfo = sps && parseAvcSps(sps);
+		return spsInfo ? { width: spsInfo.displayWidth, height: spsInfo.displayHeight } : null;
+	} else {
+		const record = description
+			? deserializeHevcDecoderConfigurationRecord(description)
+			: annexBPacket && extractHevcDecoderConfigurationRecord(annexBPacket);
+		const sps = record?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
+		const spsInfo = sps && parseHevcSps(sps);
+		return spsInfo ? { width: spsInfo.displayWidth, height: spsInfo.displayHeight } : null;
+	}
+};
