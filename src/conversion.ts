@@ -2582,13 +2582,23 @@ export class Conversion {
 
 	/**
 	 * Whether a track's duration can't be known ahead of converting it: a live track's, or that of a track whose
-	 * duration isn't in its metadata when the input can only be read sequentially. Computing it would read the whole
-	 * input, evicting its start from the source before the conversion gets to read it.
+	 * duration isn't in its metadata when the input is a stream larger than its source's cache. Computing it would read
+	 * the whole input, evicting its start from the source before the conversion gets to read it.
 	 * @internal
 	 */
 	async _isTrackDurationUnknown(track: InputTrack) {
-		return await track.isLive()
-			|| (this.input._rootSource._evictsReadData && (await track.getDurationFromMetadata()) === null);
+		if (await track.isLive()) {
+			return true;
+		}
+
+		const source = this.input._rootSource;
+		if (!source._evictsReadData || (await track.getDurationFromMetadata()) !== null) {
+			return false;
+		}
+
+		// A stream that turns out to fit into the cache can still be read to its end
+		await source._readAheadWithinCache();
+		return source._evictsReadData;
 	}
 }
 

@@ -1404,13 +1404,14 @@ test('Reserved fast start, manual maximum packet count', async () => {
 	await expect(conversion.execute()).rejects.toThrow('maximum packet count');
 });
 
-test('Conversion with onProgress of a streamed input larger than the source\'s cache', async () => {
+test('Conversion with onProgress of a streamed input without a stored duration', async () => {
 	// ADTS stores no duration, which on a source that only keeps part of a stream can't be computed ahead of the
-	// conversion: that would read the whole input and evict its start before the conversion reads it
+	// conversion when the stream is larger than the cache: that would read the whole input, evicting its start before
+	// the conversion reads it. A stream that fits into the cache can still be read ahead
 	const { ReadableStreamSource } = await import('../../src/source.js');
 	const { AdtsOutputFormat: Adts } = await import('../../src/output-format.js');
 	const bytes = new Uint8Array(await (await fetch('/sample3.aac')).arrayBuffer());
-	const createInput = (maxCacheSize: number) => new Input({
+	const createInput = (maxCacheSize: number | undefined) => new Input({
 		source: new ReadableStreamSource(new ReadableStream<Uint8Array>({
 			start(controller) {
 				for (let i = 0; i < 2; i++) { // About 3.5 MB of ADTS
@@ -1424,7 +1425,10 @@ test('Conversion with onProgress of a streamed input larger than the source\'s c
 		formats: ALL_FORMATS,
 	});
 
-	for (const maxCacheSize of [2 ** 20, Infinity]) {
+	// A 1 MiB cache, and the default one (32 MiB), into which this stream fits
+	for (const maxCacheSize of [2 ** 20, undefined]) {
+		const fitsIntoCache = maxCacheSize === undefined;
+
 		using input = createInput(maxCacheSize);
 		const output = new Output({ format: new Adts(), target: new BufferTarget() });
 		const conversion = await Conversion.init({ input, output, showWarnings: false });
@@ -1435,20 +1439,37 @@ test('Conversion with onProgress of a streamed input larger than the source\'s c
 		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
 		const track = await result.getPrimaryAudioTrack();
 		assert(track);
-		expect((await track.computePacketStats()).packetCount).toBeGreaterThan(2000);
+		const { packetCount } = await track.computePacketStats();
+		expect(packetCount).toBeGreaterThan(2000);
 		expect(progressValues.at(-1)).toBe(1);
-		// With a bounded cache, the total isn't known ahead of time; with an unbounded one, it still is
-		expect(progressValues.some(progress => progress > 0 && progress < 1)).toBe(maxCacheSize === Infinity);
-	}
+		// The total is only known ahead of time when the stream fits into the cache
+		expect(progressValues.some(progress => progress > 0 && progress < 1)).toBe(fitsIntoCache);
 
-	// A format that needs to know the packet count ahead of time can't estimate it then
-	using input = createInput(2 ** 20);
-	const conversion = await Conversion.init({
-		input,
-		output: new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() }),
-		showWarnings: false,
-	});
-	expect(conversion.discardedTracks.map(x => x.reason)).toEqual(['unknown_maximum_packet_count']);
+		// Same for a format that needs to estimate the packet count ahead of time
+		using reserveInput = createInput(maxCacheSize);
+		const reserveOutput = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'reserve' }),
+			target: new BufferTarget(),
+		});
+		const reserveConversion = await Conversion.init({
+			input: reserveInput,
+			output: reserveOutput,
+			showWarnings: false,
+		});
+		if (!fitsIntoCache) {
+			expect(reserveConversion.discardedTracks.map(x => x.reason)).toEqual(['unknown_maximum_packet_count']);
+			continue;
+		}
+
+		await reserveConversion.execute();
+		using reserveResult = new Input({
+			source: new BufferSource(reserveOutput.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+		const reserveTrack = await reserveResult.getPrimaryAudioTrack();
+		assert(reserveTrack);
+		expect((await reserveTrack.computePacketStats()).packetCount).toBe(packetCount);
+	}
 });
 
 test('Maximum packet count is not set when not required', async () => {
