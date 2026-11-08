@@ -787,6 +787,13 @@ const DEFAULT_RETRY_DELAY
 			}
 		}
 
+		// blob:, data: and file: URLs are read without touching the network, so retrying can't fix a failure. (The
+		// Fetch standard reports a range at or past the end of a blob, or a revoked blob URL, as a network error.)
+		const href = typeof src === 'string' ? src : src instanceof URL ? src.href : src.url;
+		if (/^\s*(?:blob|data|file):/i.test(href)) {
+			return null;
+		}
+
 		return Math.min(2 ** (previousAttempts - 2), 16);
 	}) satisfies UrlSourceOptions['getRetryDelay'];
 
@@ -823,6 +830,8 @@ export type UrlSourceOptions = {
 	 * A function that returns the delay (in seconds) before retrying a failed request. The function is called
 	 * with the number of previous, unsuccessful attempts, as well as with the error with which the previous request
 	 * failed. If the function returns `null`, no more retries will be made.
+	 * Requests for `blob:`, `data:` and `file:` URLs are never retried by default: they don't touch the network, so
+	 * retrying can't fix their failures.
 	 *
 	 * A request fails when `fetch()` rejects, or when it's answered with an HTTP status that may be transient (408,
 	 * 429, 500, 502, 503 or 504), in which case the error has a `status` property holding that status.
