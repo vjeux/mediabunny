@@ -68,6 +68,7 @@ import {
 	validateAudioChunkMetadata,
 	validateSubtitleMetadata,
 	validateVideoChunkMetadata,
+	OPUS_SAMPLE_RATE,
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
 import { FileSlice } from '../reader';
@@ -130,6 +131,8 @@ type MatroskaTrackData = {
 		 */
 		requiresAdtsStripping: boolean;
 		codecDelay: number | null; // in seconds
+		/** The pre-skip of the Opus identification header, in seconds, if there is one. */
+		opusPreSkip: number | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -978,6 +981,33 @@ export class MatroskaMuxer extends Muxer {
 			requiresAdtsStripping = true;
 		}
 
+		// Matroska requires the Opus identification header as CodecPrivate, and a CodecDelay equal to its pre-skip (the
+		// samples a decoder drops at the start). A start before that is left to the (then negative) block timestamps,
+		// as growing the pre-skip to cover it would drop real audio.
+		let opusPreSkip: number | null = null;
+		if (track.source._codec === 'opus') {
+			if (!decoderConfig.description && decoderConfig.numberOfChannels <= 2) {
+				// With up to two channels (channel mapping family 0), the header can be built from the config. Nothing
+				// says to drop any samples, so its pre-skip is 0.
+				const header = new Uint8Array(19);
+				const view = new DataView(header.buffer);
+				view.setUint32(0, 0x4f707573, false); // 'Opus'
+				view.setUint32(4, 0x48656164, false); // 'Head'
+				view.setUint8(8, 1); // Version
+				view.setUint8(9, decoderConfig.numberOfChannels);
+				view.setUint16(10, 0, true); // Pre-skip
+				view.setUint32(12, decoderConfig.sampleRate, true); // Input sample rate
+				view.setInt16(16, 0, true); // Output gain
+				view.setUint8(18, 0); // Channel mapping family
+				decoderConfig.description = header;
+			}
+
+			const header = decoderConfig.description && toUint8Array(decoderConfig.description);
+			if (header && header.length >= 19 && String.fromCharCode(...header.subarray(0, 8)) === 'OpusHead') {
+				opusPreSkip = (header[10]! | (header[11]! << 8)) / OPUS_SAMPLE_RATE;
+			}
+		}
+
 		const newTrackData: MatroskaAudioTrackData = {
 			track,
 			type: 'audio',
@@ -987,6 +1017,7 @@ export class MatroskaMuxer extends Muxer {
 				decoderConfig,
 				requiresAdtsStripping,
 				codecDelay: null,
+				opusPreSkip,
 			},
 			chunkQueue: new Queue(),
 			lastWrittenMsTimestamp: null,
@@ -1102,6 +1133,22 @@ export class MatroskaMuxer extends Muxer {
 
 			const isKeyFrame = packet.type === 'key';
 			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
+
+			if (trackData.info.codecDelay === null && trackData.info.opusPreSkip !== null) {
+				// The CodecDelay is the Opus pre-skip, so an earlier start makes negative block timestamps. These can't
+				// go below MIN_CLUSTER_TIMESTAMP_MS, though, and rather than losing packets beyond that, the CodecDelay
+				// then covers the whole start.
+				const preSkip = trackData.info.opusPreSkip;
+				if (Math.round(1000 * (packet.timestamp + preSkip)) >= MIN_CLUSTER_TIMESTAMP_MS) {
+					trackData.info.codecDelay = preSkip;
+				} else {
+					trackData.info.codecDelay = -packet.timestamp;
+					Logging._warn(
+						'Opus audio starts too far before zero for the CodecDelay to equal its pre-skip, as Matroska'
+						+ ' requires; the CodecDelay covers the whole start instead.',
+					);
+				}
+			}
 
 			// A negative start (like from encoder priming) is expressed this way. Readers (like FFmpeg) convert
 			// CodecDelay to whole timestamp ticks before subtracting it, so the blocks are shifted by that same rounded
