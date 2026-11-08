@@ -2255,6 +2255,38 @@ test.concurrent('Invalid #EXT-X-DEFINE tags are rejected', async () => {
 	}
 });
 
+test.concurrent('Disposing an input cancels a read waiting for a live playlist to advance', async () => {
+	// "When an Input is disposed, ongoing read operations will be canceled" (Input.dispose). A read past the live edge
+	// waits for the next playlist reload, a target duration (6 s here) after the last one.
+	const openPlaylist = (playlist: string) => new Input({
+		source: new CustomPathedSource('live.m3u8', ({ path }) => path === 'live.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new FilePathSource('./test/public/0.ts')),
+		formats: HLS_FORMATS,
+	});
+	const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:5,\n0.ts\n';
+
+	// Ended: never waits
+	using vodInput = openPlaylist(playlist + '#EXT-X-ENDLIST\n');
+	const vodTrack = await vodInput.getPrimaryVideoTrack();
+	assert(vodTrack);
+	expect(await new EncodedPacketSink(vodTrack).getPacket(100)).not.toBeNull();
+
+	// Live: waits until the input is disposed
+	const liveInput = openPlaylist(playlist);
+	const liveTrack = await liveInput.getPrimaryVideoTrack();
+	assert(liveTrack);
+	const pendingPacket = new EncodedPacketSink(liveTrack).getPacket(100);
+	let settled = false;
+	void pendingPacket.finally(() => settled = true).catch(() => {});
+	await new Promise(resolve => setTimeout(resolve, 200));
+	expect(settled).toBe(false);
+
+	liveInput.dispose();
+	await expect(Promise.race([pendingPacket, rejectAfter(1000, 'Not canceled')]))
+		.rejects.toMatchObject({ name: 'InputDisposedError' });
+});
+
 test.concurrent('Key packets of segments starting with a delta frame', async () => {
 	const text = `#EXTM3U
 #EXT-X-TARGETDURATION:100
