@@ -63,6 +63,27 @@ test('WebVTT cue text keeps its leading and trailing whitespace lines', async ()
 	expect(cueTexts.filter(cueText => !written.includes(cueText))).toEqual([]);
 });
 
+test('A WebVTT cue right after the WEBVTT line is read, not taken for the header', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(source);
+
+	await output.start();
+
+	// Without a blank line after it, the header still ends there
+	await source.add('WEBVTT\n00:00.000 --> 00:01.000\nFirst cue\n\n00:02.000 --> 00:03.000\nSecond cue\n');
+
+	await output.finalize();
+
+	const written = new TextDecoder().decode(output.target.buffer!);
+	expect(['First cue', 'Second cue'].filter(cueText => !written.includes(cueText))).toEqual([]);
+	expect(written.includes('WEBVTT\n00:00.000')).toBe(false); // The header is just the WEBVTT line
+});
+
 test('ISOBMFF muxing', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
