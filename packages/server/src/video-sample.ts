@@ -39,6 +39,20 @@ const JPEG_RANGE_PIX_FORMATS = new Set([
 	NodeAv.AV_PIX_FMT_YUVJ444P,
 ]);
 
+/** Monochrome formats (monochrome AV1, 4:0:0 HEVC), handed out as 4:2:0 with neutral chroma, like Chromium does. */
+const GRAY_PIX_FORMATS = new Map<NodeAv.AVPixelFormat, VideoSamplePixelFormat>([
+	[NodeAv.AV_PIX_FMT_GRAY8, 'I420'],
+	[NodeAv.AV_PIX_FMT_GRAY10LE, 'I420P10'],
+	[NodeAv.AV_PIX_FMT_GRAY12LE, 'I420P12'],
+]);
+
+/** Planar RGB formats, handed out as 4:4:4 (see toPixelFormat), whose planes are G, B and R. */
+const GBR_PIX_FORMATS = new Set([
+	NodeAv.AV_PIX_FMT_GBRP,
+	NodeAv.AV_PIX_FMT_GBRP10LE,
+	NodeAv.AV_PIX_FMT_GBRP12LE,
+]);
+
 /**
  * A custom `VideoSampleResource` backed by NodeAV's
  * [`Frame`](https://seydx.github.io/node-av/api/lib/classes/Frame.html), which in turn is backed by FFmpeg's
@@ -85,7 +99,8 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 	}
 
 	getFormat(): VideoSamplePixelFormat | null {
-		return toPixelFormat(this.frame.format as NodeAv.AVPixelFormat);
+		const format = this.frame.format as NodeAv.AVPixelFormat;
+		return GRAY_PIX_FORMATS.get(format) ?? toPixelFormat(format);
 	}
 
 	getCodedWidth(): number {
@@ -113,11 +128,15 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 	}
 
 	getColorSpace(): VideoSampleColorSpace {
+		// Planar RGB planes are G, B and R, at full range, whatever the frame is tagged with
+		const isGbr = GBR_PIX_FORMATS.has(this.frame.format as NodeAv.AVPixelFormat);
+
 		return new VideoSampleColorSpace({
 			primaries: unmapColorPrimaries(this.frame.colorPrimaries) as VideoColorPrimaries | null,
 			transfer: unmapTransferCharacteristics(this.frame.colorTrc) as VideoTransferCharacteristics | null,
-			matrix: unmapMatrixCoefficients(this.frame.colorSpace) as VideoMatrixCoefficients | null,
-			fullRange: this.frame.colorRange === NodeAv.AVCOL_RANGE_JPEG
+			matrix: isGbr ? 'rgb' : unmapMatrixCoefficients(this.frame.colorSpace) as VideoMatrixCoefficients | null,
+			fullRange: isGbr
+				|| this.frame.colorRange === NodeAv.AVCOL_RANGE_JPEG
 				|| JPEG_RANGE_PIX_FORMATS.has(this.frame.format as NodeAv.AVPixelFormat)
 				? true
 				: this.frame.colorRange === NodeAv.AVCOL_RANGE_MPEG
@@ -134,10 +153,27 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 	getDataPlanes(): MaybePromise<VideoDataPlane[]> {
 		assert(this.frame.data);
 
-		return this.frame.data.map((data, i) => ({
+		const planes = this.frame.data.map((data, i) => ({
 			data: toUint8Array(data),
 			stride: this.frame.linesize[i]!,
 		}));
+
+		const grayFormat = GRAY_PIX_FORMATS.get(this.frame.format as NodeAv.AVPixelFormat);
+		if (grayFormat) {
+			// Add the chroma planes that monochrome frames don't have, at the middle of the value range
+			const bytesPerSample = grayFormat === 'I420' ? 1 : 2;
+			const stride = Math.ceil(this.frame.width / 2) * bytesPerSample;
+			const chroma = new Uint8Array(stride * Math.ceil(this.frame.height / 2));
+			if (bytesPerSample === 1) {
+				chroma.fill(128);
+			} else {
+				new Uint16Array(chroma.buffer).fill(grayFormat === 'I420P10' ? 512 : 2048);
+			}
+
+			return [planes[0]!, { data: chroma, stride }, { data: chroma, stride }];
+		}
+
+		return planes;
 	}
 
 	async toRgbSample(
