@@ -706,9 +706,22 @@ export class MatroskaDemuxer extends Demuxer {
 			size = nextElementPos.pos - dataStartPos;
 		}
 
-		// Load the entire cluster, or whatever's left of it in case the file got cut off
-		let dataSlice = this.reader.requestSliceRange(dataStartPos, 0, size);
+		// Load the entire cluster
+		let dataSlice = this.reader.requestSlice(dataStartPos, size);
 		if (isThenable(dataSlice)) dataSlice = await dataSlice;
+
+		const fileSize = this.reader.fileSizeNonStrict;
+		if (!dataSlice && fileSize !== null && fileSize > dataStartPos) {
+			// The file got cut off in the middle of the cluster: load whatever's left of it. A source that can only be
+			// streamed may not hold it anymore after reading up to the end of the file to find that out; then the
+			// cluster is lost, as it was before.
+			try {
+				dataSlice = this.reader.requestSlice(dataStartPos, fileSize - dataStartPos);
+				if (isThenable(dataSlice)) dataSlice = await dataSlice;
+			} catch {
+				dataSlice = null;
+			}
+		}
 
 		const cluster: Cluster = {
 			segment,

@@ -9,6 +9,7 @@ import {
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
+	ReadableStreamSource,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
@@ -161,4 +162,87 @@ test('A cluster cut off by the end of the file keeps its complete blocks', async
 			lookup: 240,
 		});
 	}
+});
+
+test('A cut-off cluster whose start a stream no longer holds is dropped instead of failing', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+
+	// 48 kHz mono 16-bit PCM in 20 ms blocks; each cluster holds 300 of them (6 s, 577 kB)
+	const cluster = (startMs: number) => element(
+		EBMLId.Cluster,
+		element(EBMLId.Timestamp, [(startMs >> 8) & 0xff, startMs & 0xff]),
+		...Array.from({ length: 300 }, (_, i) => element(
+			EBMLId.SimpleBlock,
+			[0x81, ((i * 20) >> 8) & 0xff, (i * 20) & 0xff, 0x80, ...new Array<number>(1920).fill(0)],
+		)),
+	);
+	const lastCluster = cluster(12000);
+	const fullFile = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Segment of unknown size
+		...element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+		...element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [2]),
+			element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+			element(
+				EBMLId.Audio,
+				element(EBMLId.SamplingFrequency, [0x40, 0xe7, 0x70, 0, 0, 0, 0, 0]), // 48000
+				element(EBMLId.BitDepth, [16]),
+			),
+		)),
+		...cluster(0),
+		...cluster(6000),
+		...lastCluster,
+	]);
+	// Cut 400 kB into the last cluster
+	const file = fullFile.subarray(0, fullFile.length - lastCluster.length + 400_000);
+
+	const readStreamed = async (maxCacheSize: number) => {
+		const open = () => {
+			let offset = 0;
+			const stream = new ReadableStream<Uint8Array>({
+				pull: (controller) => {
+					if (offset >= file.length) {
+						controller.close();
+						return;
+					}
+
+					controller.enqueue(file.slice(offset, offset + 2 ** 16));
+					offset += 2 ** 16;
+				},
+			});
+
+			return new Input({ source: new ReadableStreamSource(stream, { maxCacheSize }), formats: ALL_FORMATS });
+		};
+
+		using durationInput = open();
+		const duration = await (await durationInput.getPrimaryAudioTrack())!.computeDuration();
+
+		using input = open();
+		let count = 0;
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			void packet;
+			count++;
+		}
+
+		return [duration, count];
+	};
+
+	// With a cache that holds what's left of the cluster, its 207 complete blocks are kept
+	expect(await readStreamed(2 ** 20)).toEqual([16.12, 807]);
+	// Once the stream has read past the cluster's start (to find out where the file ends), it can't give it again:
+	// the cluster is dropped then, as it was before
+	expect(await readStreamed(2 ** 18)).toEqual([11.98, 600]);
 });
