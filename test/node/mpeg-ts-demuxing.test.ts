@@ -972,6 +972,18 @@ test('MPEG-TS resyncs after bytes were added or lost', async () => {
 	const withJunk = new Uint8Array(bytes.length + 1000);
 	withJunk.set(bytes);
 	expect(await readPackets(withJunk)).toEqual(original);
+
+	// Junk of 191 to 360 bytes after every 4 packets, like ExoPlayer's ts/sample_with_junk test file (found by L92), so
+	// that only the first two packets of each 4 have two more after them in a row
+	const parts: Uint8Array[] = [bytes.subarray(0, 188 * 8)];
+	let seed = 1;
+	for (let pos = 188 * 8; pos < bytes.length; pos += 188 * 4) {
+		seed = (seed * 1103515245 + 12345) >>> 0;
+		parts.push(Uint8Array.from({ length: 191 + seed % 170 }, (_, i) => i), bytes.subarray(pos, pos + 188 * 4));
+	}
+	const withJunkEveryFourPackets = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+	parts.reduce((pos, part) => (withJunkEveryFourPackets.set(part, pos), pos + part.length), 0);
+	expect(await readPackets(withJunkEveryFourPackets)).toEqual(original);
 });
 
 test('MPEG-TS with stray bytes between packets', async () => {

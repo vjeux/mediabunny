@@ -1097,12 +1097,14 @@ export class MpegTsDemuxer extends Demuxer {
 		}
 
 		if (!isAtExpectedPos) {
-			const offset = await this.searchPacketStart(packetPos);
+			// Searched for around the packet position itself, so that the positions on either side of where two blocks
+			// with different offsets meet don't find the same packet, or leave one out
+			const offset = await this.searchPacketStart(pos);
 			if (offset === null) {
 				return null;
 			}
 
-			packetPos += offset;
+			packetPos = pos + offset;
 		}
 
 		let slice = this.reader.requestSlice(packetPos, length);
@@ -1172,16 +1174,17 @@ export class MpegTsDemuxer extends Demuxer {
 
 	/**
 	 * Looks for a packet start near the given position, where several packets in a row start (at least two), and
-	 * returns its offset to the position. The search covers one stride, so that no two packet positions find the same
-	 * packet.
+	 * returns its offset to the position. The packets in a row may come before it too, as for the last packets before
+	 * junk. The search covers one stride, so that no two packet positions find the same packet.
 	 */
 	async searchPacketStart(pos: number) {
 		const stride = this.packetStride;
 		const searchStartPos = Math.max(pos - Math.floor(stride / 2), this.packetOffset);
 		const searchEndPos = pos - Math.floor(stride / 2) + stride;
 
-		const searchLength = searchEndPos - searchStartPos + RESYNC_PACKET_COUNT * stride;
-		let slice = this.reader.requestSliceRange(searchStartPos, 0, searchLength);
+		const readStartPos = Math.max(searchStartPos - (RESYNC_PACKET_COUNT - 1) * stride, 0);
+		const readLength = searchEndPos - readStartPos + RESYNC_PACKET_COUNT * stride;
+		let slice = this.reader.requestSliceRange(readStartPos, 0, readLength);
 		if (isThenable(slice)) {
 			slice = await slice;
 		}
@@ -1194,22 +1197,23 @@ export class MpegTsDemuxer extends Demuxer {
 		// Try the closest positions first
 		for (let distance = 0; distance <= stride; distance++) {
 			const offset = (distance & 1) ? (distance + 1) / 2 : -distance / 2;
-			const index = pos + offset - searchStartPos;
+			const index = pos + offset - readStartPos;
 			if (pos + offset < searchStartPos || pos + offset >= searchEndPos || bytes[index] !== 0x47) {
 				continue;
 			}
 
-			let syncCount = 0;
-			while (syncCount < RESYNC_PACKET_COUNT && index + syncCount * stride < bytes.length) {
-				if (bytes[index + syncCount * stride] !== 0x47) {
-					break;
-				}
-
+			// The packets in a row from it on, then before it
+			let syncCount = 1;
+			while (syncCount < RESYNC_PACKET_COUNT && bytes[index + syncCount * stride] === 0x47) {
+				syncCount++;
+			}
+			const reachesEnd = index + syncCount * stride >= bytes.length;
+			for (let i = 1; syncCount < RESYNC_PACKET_COUNT && bytes[index - i * stride] === 0x47; i++) {
 				syncCount++;
 			}
 
-			const availableCount = Math.min(RESYNC_PACKET_COUNT, Math.ceil((bytes.length - index) / stride));
-			if (syncCount === availableCount && syncCount >= 2) {
+			// (Fewer will do at the end of the file.)
+			if (syncCount >= RESYNC_PACKET_COUNT || (reachesEnd && syncCount >= 2)) {
 				return offset;
 			}
 		}
