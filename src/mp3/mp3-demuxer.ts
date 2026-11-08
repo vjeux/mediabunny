@@ -31,6 +31,8 @@ import {
 	computeAverageMp3FrameSize,
 	getMp3ChannelCount,
 	MP3_DECODER_DELAY,
+	MP3_FRAME_HEADER_SIZE,
+	VBRI,
 } from '../../shared/mp3-misc';
 import {
 	ID3_V1_TAG_SIZE,
@@ -40,7 +42,7 @@ import {
 	readId3V2Header,
 } from '../id3';
 import { readNextMp3FrameHeader } from './mp3-reader';
-import { readAscii, readBytes, Reader, readU32Be } from '../reader';
+import { readAscii, readBytes, Reader, readU16Be, readU32Be } from '../reader';
 
 type Sample = {
 	timestamp: number;
@@ -190,6 +192,40 @@ export class Mp3Demuxer extends Demuxer {
 							}
 						}
 					}
+				}
+
+				return;
+			}
+		}
+
+		// Fraunhofer's Layer III encoder writes a VBRI header instead, which always sits 32 bytes past the frame header
+		let vbriSlice = header.layer === 1
+			? this.reader.requestSlice(result.startPos + MP3_FRAME_HEADER_SIZE + 32, 18)
+			: null;
+		if (isThenable(vbriSlice)) {
+			vbriSlice = await vbriSlice;
+		}
+		if (vbriSlice) {
+			const word = readU32Be(vbriSlice);
+			const version = readU16Be(vbriSlice);
+
+			if (word === VBRI && version === 1) {
+				// Just like with Xing, there's no actual audio data in this frame
+				if (!this.xingFrameHeader) {
+					this.xingFrameHeader = header;
+					this.xingFrameHeaderPos = result.startPos;
+				}
+
+				if (!this.xingData) {
+					vbriSlice.skip(4); // Delay and quality
+					const fileSize = readU32Be(vbriSlice);
+					const frameCount = readU32Be(vbriSlice);
+
+					this.xingData = {
+						isVbr: true,
+						frameCount,
+						fileSize,
+					};
 				}
 
 				return;
