@@ -40,11 +40,13 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	packet!: NodeAv.Packet;
 	codecContext: NodeAv.CodecContext | null = null;
 	resampler: NodeAv.SoftwareResampleContext | null = null;
+	/** What came out of the resampler, until it adds up to a frame for the encoder. */
+	resampledFifo: NodeAv.AudioFifo | null = null;
+	resampledFrame: NodeAv.Frame | null = null;
 	dstFrame: NodeAv.Frame | null = null;
 	avCodec!: NodeAv.Codec;
 
 	inputParametersKey: string | null = null;
-	resamplerInputSampleRate: number | null = null;
 	nextResamplerPts: bigint | null = null;
 	packetEmitted = false;
 	adtsHeaderTemplate: AdtsHeaderTemplate | null = null;
@@ -195,7 +197,6 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		if (requiresResampler) {
 			if (!this.resampler) {
 				this.resampler = new NodeAv.SoftwareResampleContext();
-				this.resamplerInputSampleRate = this.frame.sampleRate;
 
 				// Resample straight to whatever layout the encoder was opened with, since not every codec accepts
 				// the layout that getChannelLayout hands out for a given channel count
@@ -220,6 +221,13 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 				this.dstFrame.duration = BigInt(this.dstFrame.nbSamples);
 				this.dstFrame.allocBuffer();
 
+				this.resampledFifo = new NodeAv.AudioFifo();
+				this.resampledFifo.alloc(
+					this.codecContext.sampleFormat,
+					this.codecContext.channels,
+					this.dstFrame.nbSamples,
+				);
+
 				// In the encoder's sample rate, which can differ from the input's
 				this.nextResamplerPts = BigInt(Math.round(audioSample.timestamp * this.codecContext.sampleRate));
 			}
@@ -228,7 +236,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			if (!inputBuffers) {
 				throw new DOMException('Frame has no data', 'EncodingError');
 			}
-			await this.resampler.convert(null, 0, inputBuffers, this.frame.nbSamples);
+			await this.resample(inputBuffers, this.frame.nbSamples);
 
 			await this.pullResampledFrames();
 		} else {
@@ -236,21 +244,53 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		}
 	}
 
-	async pullResampledFrames() {
+	/**
+	 * Runs samples through the resampler and adds what comes out of it to the FIFO. When converting between sample
+	 * rates, the resampler holds samples back for its filter, so it can output fewer samples than it said it could,
+	 * which is why this goes by what it returns. Null input flushes out what it holds back, so it's only for the end.
+	 */
+	async resample(input: Buffer[] | null, sampleCount: number) {
 		assert(this.codecContext);
 		assert(this.resampler);
+		assert(this.resampledFifo);
+
+		const capacity = this.resampler.getOutSamples(sampleCount);
+		NodeAv.FFmpegError.throwIfError(capacity, 'getOutSamples');
+		if (capacity === 0) {
+			return;
+		}
+
+		if (!this.resampledFrame || this.resampledFrame.nbSamples < capacity) {
+			this.resampledFrame?.free();
+			this.resampledFrame = new NodeAv.Frame();
+			this.resampledFrame.alloc();
+			this.resampledFrame.channelLayout = this.codecContext.channelLayout;
+			this.resampledFrame.sampleRate = this.codecContext.sampleRate;
+			this.resampledFrame.format = this.codecContext.sampleFormat;
+			this.resampledFrame.nbSamples = capacity;
+			this.resampledFrame.allocBuffer();
+		}
+		assert(this.resampledFrame.data);
+
+		const convertedCount = await this.resampler.convert(this.resampledFrame.data, capacity, input, sampleCount);
+		NodeAv.FFmpegError.throwIfError(convertedCount, 'Resample');
+
+		if (convertedCount > 0) {
+			await this.resampledFifo.write(this.resampledFrame.data, convertedCount);
+		}
+	}
+
+	/** Sends the resampled samples to the encoder, a frame at a time, for as long as there are enough for one. */
+	async pullResampledFrames() {
+		assert(this.resampledFifo);
 		assert(this.dstFrame);
 		assert(this.nextResamplerPts !== null);
 
-		const frameSize = this.codecContext.frameSize || FRAME_SIZE_FALLBACK;
+		const frameSize = this.dstFrame.nbSamples;
 
-		while (true) {
-			const available = this.resampler.getOutSamples(0);
-			if (available < frameSize) {
-				break;
-			}
-
-			await this.resampler.convert(this.dstFrame.data, frameSize, null, 0);
+		while (this.resampledFifo.size >= frameSize) {
+			assert(this.dstFrame.data);
+			await this.resampledFifo.read(this.dstFrame.data, frameSize);
 
 			this.dstFrame.pts = this.nextResamplerPts;
 
@@ -374,24 +414,29 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			return;
 		}
 
-		outer:
 		if (this.resampler) {
-			assert(this.resamplerInputSampleRate !== null);
+			assert(this.resampledFifo);
+			assert(this.dstFrame);
 
-			const currentOutSamples = this.resampler.getOutSamples(0);
-			if (currentOutSamples === 0) {
-				break outer; // Clean cut-off point
-			}
-
-			const frameSize = this.codecContext.frameSize || FRAME_SIZE_FALLBACK;
-			assert(currentOutSamples < frameSize); // Because if it's more, it would've already been retrieved
-
-			const inputSamplesNeeded = Math.ceil(
-				((frameSize - currentOutSamples) / this.codecContext.sampleRate) * this.resamplerInputSampleRate,
-			);
-			this.resampler.injectSilence(inputSamplesNeeded);
-
+			// Get out what the resampler still holds back, which it only does when converting between sample rates
+			await this.resample(null, 0);
 			await this.pullResampledFrames();
+
+			const remainingCount = this.resampledFifo.size;
+			if (remainingCount > 0) {
+				// Fill up the last frame with silence: zero bytes, in every sample format these encoders take
+				const sampleFormat = this.codecContext.sampleFormat;
+				const isPlanar = NodeAv.avSampleFmtIsPlanar(sampleFormat);
+				const silenceCount = this.dstFrame.nbSamples - remainingCount;
+				const planeSize = silenceCount * NodeAv.avGetBytesPerSample(sampleFormat)
+					* (isPlanar ? 1 : this.codecContext.channels);
+				const silence = Array.from({ length: isPlanar ? this.codecContext.channels : 1 }, () => {
+					return Buffer.alloc(planeSize);
+				});
+				await this.resampledFifo.write(silence, silenceCount);
+
+				await this.pullResampledFrames();
+			}
 		}
 
 		await this.sendFrameAndReceivePackets(null);
@@ -403,8 +448,11 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 		this.resampler?.free();
 		this.resampler = null;
+		this.resampledFifo?.free();
+		this.resampledFifo = null;
+		this.resampledFrame?.free();
+		this.resampledFrame = null;
 		this.inputParametersKey = null;
-		this.resamplerInputSampleRate = null;
 		this.nextResamplerPts = null;
 		this.dstFrame?.free();
 		this.dstFrame = null;
@@ -416,6 +464,8 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		this.packet.free();
 		this.dstFrame?.free();
 		this.resampler?.free();
+		this.resampledFifo?.free();
+		this.resampledFrame?.free();
 	}
 }
 
