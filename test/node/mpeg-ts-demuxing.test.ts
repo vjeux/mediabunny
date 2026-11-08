@@ -3650,7 +3650,7 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 		const slice = nalUnit([i % 4 === 0 ? 0x65 : 0x41, 0x88, ...sliceData]);
 		await source.add(
 			new EncodedPacket(
-				new Uint8Array(i === 0 ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				new Uint8Array(i % 4 === 0 ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
 				i % 4 === 0 ? 'key' : 'delta',
 				i / 25,
 				1 / 25,
@@ -3702,9 +3702,19 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 	});
 	await expectFrames(damaged, [5, 6, 7, 13, 14, 15, 18, 19]);
 
-	// When the first frame, with the only SPS and PPS, loses a TS packet, the track still opens (setup reads the
-	// parameter sets, which come first), and that frame's GOP goes
+	// When the first frame loses a TS packet, the track still opens (setup reads its parameter sets, which come
+	// first), and that frame's GOP goes
 	await expectFrames(tsPackets.filter((_, i) => i !== frameStarts[0]! + 1), [0, 1, 2, 3]);
+
+	// A capture that begins in the middle of a GOP (here inside frame 1, after the PAT and PMT) keeps its frames
+	// before the first key frame as they are, even when its first whole PES packet (frame 2) lost a TS packet: they
+	// don't decode without their key frame either way
+	const lostInFrame2 = tsPackets[frameStarts[2]! + 1];
+	const midGop = [...tsPackets.slice(0, 2), ...tsPackets.slice(frameStarts[1]! + 1)].filter(x => x !== lostInFrame2);
+	const midGopFrames = await readFrames(midGop);
+	const frameNumbers = (frames: { timestamp: number }[]) => frames.map(x => Math.round(x.timestamp * 25));
+	expect(frameNumbers(midGopFrames)).toEqual(frameNumbers(clean.slice(2)));
+	expect(midGopFrames.slice(1)).toEqual(clean.slice(3));
 
 	// Muxers that never increment the counters, or that also count packets without payload, lose nothing, not even
 	// identical TS packets in a row, which are data there (like in frame 3, here made of the same byte throughout)
