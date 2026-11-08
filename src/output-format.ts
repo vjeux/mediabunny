@@ -33,6 +33,7 @@ import { HlsMuxer } from './hls/hls-muxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
 import { MaybePromise, FilePath, isNumber, toArray } from './misc';
 import { Target } from './target';
+import { MP3_DECODER_DELAY } from '../shared/mp3-misc';
 
 /**
  * Specifies an inclusive range of integers.
@@ -136,6 +137,16 @@ export abstract class OutputFormat {
 
 	/** @internal */
 	_isFragmentedIsobmff() {
+		return false;
+	}
+
+	/**
+	 * Whether this format can mark the given amount of leading audio, in seconds, as encoder priming for a track using
+	 * the given codec, so that players skip it. Lets copy conversions keep audio whose first packet starts early.
+	 * @internal
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
 		return false;
 	}
 }
@@ -758,6 +769,14 @@ export class Mp3OutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return null;
+	}
+
+	/** @internal */
+	override _canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
+		// The muxer writes the priming into the LAME header's 12-bit encoder delay field, which excludes the decoder
+		// delay
+		const encoderDelay = Math.round(primingDuration * sampleRate) - MP3_DECODER_DELAY;
+		return codec === 'mp3' && this._options.xingHeader !== false && encoderDelay >= 0 && encoderDelay <= 0xfff;
 	}
 }
 

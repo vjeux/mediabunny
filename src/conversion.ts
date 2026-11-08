@@ -2097,6 +2097,15 @@ export class Conversion {
 					? Math.max(startPacket.timestamp - this._startTimestamp, 0)
 					: Math.max(this._startTimestamp - startPacket.timestamp, 0);
 
+				// Audio before the start can be kept as-is if the format marks it as encoder priming (think the LAME
+				// delay of MP3s, which makes their first packet start before zero)
+				const canSignalPriming = startPacket.timestamp < this._startTimestamp
+					&& this.output.format._canSignalAudioPriming(
+						sourceCodec,
+						this._startTimestamp - startPacket.timestamp,
+						originalSampleRate,
+					);
+
 				if (boundaryDeviation > this._copyBoundaryTolerance) {
 					needsTranscode = true;
 				} else if (!this.output.format.supportsTimestampedMediaData) {
@@ -2108,6 +2117,9 @@ export class Conversion {
 						if (!isValid) {
 							needsTranscode = true;
 						}
+					} else if (canSignalPriming) {
+						this._timestampOffset = -this._startTimestamp;
+						this._timestampOffsetAdjusted = true;
 					} else {
 						const correction = clamp(
 							this._startTimestamp - startPacket.timestamp,
