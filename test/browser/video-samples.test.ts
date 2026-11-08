@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { VideoSample } from '../../src/sample.js';
+import { VideoSample, registerVideoSampleTransformer } from '../../src/sample.js';
 import { VideoSampleSource } from '../../src/media-source.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
@@ -452,6 +452,36 @@ test('drawWithFit with rotation, flip and crop', () => {
 	const pixels = context.getImageData(0, 0, 1, 4).data;
 	expect(pixelAt(pixels, 1, 0, 0)).toEqual([0, 3]);
 	expect(pixelAt(pixels, 1, 0, 3)).toEqual([3, 3]);
+});
+
+test('transform never produces empty or infinite sizes', async () => {
+	const descriptions: string[] = [];
+	registerVideoSampleTransformer((sample, description) => {
+		if (sample.timestamp === 4242) {
+			descriptions.push(`${description.width}x${description.height}`);
+		}
+		return null;
+	});
+
+	// Extreme aspect ratios round to at least one pixel, or one multiple of roundDimensionsTo
+	using strip = new VideoSample(new Uint8Array(1000 * 4), {
+		format: 'RGBA', codedWidth: 1000, codedHeight: 1, timestamp: 4242,
+	});
+	using thin = await strip.transform({ width: 2 });
+	expect([thin.displayWidth, thin.displayHeight]).toEqual([2, 1]);
+	using rounded = await strip.transform({ width: 16, roundDimensionsTo: 4 });
+	expect([rounded.displayWidth, rounded.displayHeight]).toEqual([16, 4]);
+	expect(descriptions).toEqual(['2x1', '16x4']);
+
+	// A crop that selects nothing is rejected
+	using sample = makeCoordinateSample({});
+	const outside = { left: 10, top: 0, width: 2, height: 2 };
+	await expect(sample.transform({ crop: outside })).rejects.toThrow('lies outside the 4x4 frame');
+	await expect(sample.transform({ crop: outside, width: 2 })).rejects.toThrow('lies outside the 4x4 frame');
+	const context = new OffscreenCanvas(2, 2).getContext('2d')!;
+	expect(() => sample.drawWithFit(context, { fit: 'fill', crop: outside })).toThrow('lies outside the 4x4 frame');
+	await expect(sample.transform({ crop: { left: 0, top: 0, width: 0, height: 2 }, height: 2 }))
+		.rejects.toThrow('options.crop.width must be a positive integer');
 });
 
 test('transform with flip metadata and additional rotation', async () => {
