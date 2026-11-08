@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { SECOND_TO_MICROSECOND_FACTOR } from './misc';
+import { isUint8Array, SECOND_TO_MICROSECOND_FACTOR, uint8ArrayFromOtherRealm } from './misc';
 
 export const PLACEHOLDER_DATA = /* #__PURE__ */ new Uint8Array(0);
 
@@ -80,6 +80,15 @@ export class EncodedPacket {
 		byteLength?: number,
 		sideData?: EncodedPacketSideData,
 	) {
+		// Uint8Arrays created in another realm (an iframe, a Node.js vm context, Jest's jsdom environment) become
+		// ones of this realm over the same memory: they're genuine, but instanceof checks reject them
+		data = uint8ArrayFromOtherRealm(data);
+		this.data = data;
+		const alpha = uint8ArrayFromOtherRealm(sideData?.alpha);
+		if (alpha !== sideData?.alpha) {
+			sideData = { ...sideData, alpha };
+		}
+
 		if (data === PLACEHOLDER_DATA && byteLength === undefined) {
 			throw new Error(
 				'Internal error: byteLength must be explicitly provided when constructing metadata-only packets.',
@@ -255,7 +264,7 @@ export class EncodedPacket {
 		if (options !== undefined && (typeof options !== 'object' || options === null)) {
 			throw new TypeError('options, when provided, must be an object.');
 		}
-		if (options?.data !== undefined && !(options.data instanceof Uint8Array)) {
+		if (options?.data !== undefined && !isUint8Array(options.data)) {
 			throw new TypeError('options.data, when provided, must be a Uint8Array.');
 		}
 		if (options?.type !== undefined && options.type !== 'key' && options.type !== 'delta') {

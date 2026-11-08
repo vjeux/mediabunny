@@ -234,6 +234,71 @@ export const toDataView = (source: AllowSharedBufferSource): DataView => {
 	}
 };
 
+/**
+ * Whether the value is a Uint8Array, including one created in another realm (an iframe, a Node.js vm context, Jest's
+ * jsdom environment), which `instanceof Uint8Array` doesn't recognize.
+ */
+export const isUint8Array = (value: unknown): value is Uint8Array => {
+	return value instanceof Uint8Array
+		|| (ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === '[object Uint8Array]');
+};
+
+/**
+ * Returns a Uint8Array created in another realm as a Uint8Array of this realm over the same memory, so that it passes
+ * `instanceof` checks, here and further down the pipeline. Any other value is returned unchanged.
+ */
+export const uint8ArrayFromOtherRealm = <T>(value: T): T => {
+	if (value instanceof Uint8Array || !isUint8Array(value)) {
+		return value;
+	}
+
+	return new Uint8Array(value.buffer, value.byteOffset, value.byteLength) as T;
+};
+
+/**
+ * Returns an ArrayBuffer created in another realm as a Uint8Array of this realm over the same memory, so that it passes
+ * `instanceof` checks. Any other value is returned unchanged.
+ */
+export const arrayBufferFromOtherRealm = <T>(value: T): T | Uint8Array => {
+	if (
+		typeof value !== 'object'
+		|| value === null
+		|| value instanceof ArrayBuffer
+		|| Object.prototype.toString.call(value) !== '[object ArrayBuffer]'
+	) {
+		return value;
+	}
+
+	try {
+		// The tag can be faked with Symbol.toStringTag, but only an actual ArrayBuffer can back a view
+		new DataView(value as unknown as ArrayBuffer, 0, 0);
+	} catch {
+		return value;
+	}
+
+	return new Uint8Array(value as unknown as ArrayBuffer);
+};
+
+/** Whether the value is a Blob (or File), including one created in another realm. */
+export const isBlob = (value: unknown): value is Blob => {
+	if (typeof Blob !== 'undefined' && value instanceof Blob) {
+		return true;
+	}
+
+	const tag = Object.prototype.toString.call(value);
+	return (tag === '[object Blob]' || tag === '[object File]')
+		&& typeof (value as Blob).slice === 'function';
+};
+
+/**
+ * Whether the value is a ReadableStream, including one created in another realm or by a polyfill. Streams are
+ * recognized by their getReader method, which is all that's used of them.
+ */
+export const isReadableStream = (value: unknown): value is ReadableStream => {
+	return (typeof ReadableStream !== 'undefined' && value instanceof ReadableStream)
+		|| (typeof value === 'object' && value !== null && typeof (value as ReadableStream).getReader === 'function');
+};
+
 // Include a polyfill for environments that don't have TextEncoder (like AudioWorkletGlobalScope)
 export const TextEncoder = typeof globalThis.TextEncoder !== 'undefined'
 	? globalThis.TextEncoder
