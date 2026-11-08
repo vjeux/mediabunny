@@ -362,13 +362,14 @@ class VideoEncoderWrapper {
 				|| config.transform?.force === true;
 			// With fill/contain/cover, frames of a new size are drawn through a canvas. Draw the others the same way,
 			// so that every frame reaches the encoder in the same color space (the encoder can't switch it mid-track).
-			// Not high-bit-depth or HDR frames, though, which the 8-bit sRGB canvas would degrade
+			// Not high-bit-depth or HDR frames, though, which the 8-bit sRGB canvas would degrade, nor the frames of a
+			// track that keeps alpha, whose semi-transparent colors the canvas would premultiply
 			const fitsSizeChanges = sizeChangeBehavior === 'fill'
 				|| sizeChangeBehavior === 'contain'
 				|| sizeChangeBehavior === 'cover';
 			const needsTransform = hasTransformConfig
 				|| (isSizeChange && sizeChangeBehavior !== 'passThrough')
-				|| (fitsSizeChanges && isEightBitSdrSample(videoSample));
+				|| (fitsSizeChanges && config.alpha !== 'keep' && isEightBitSdrSample(videoSample));
 
 			if (needsTransform) {
 				let targetWidth = config.transform?.width;
@@ -386,13 +387,19 @@ class VideoEncoderWrapper {
 					appliedFit = sizeChangeBehavior;
 				}
 
+				// A frame that is only fitted (no transform of its own) stays in its coded orientation, like the frames
+				// that aren't drawn: its rotation and flip remain the track's metadata, rather than being drawn in too
+				const keepsOrientation = !hasTransformConfig;
+				const undoneRotation = videoSample.flip
+					? videoSample.rotation
+					: ([0, 270, 180, 90] as const)[videoSample.rotation / 90]!;
 				const transformed = await videoSample.transform({
 					width: targetWidth,
 					height: targetHeight,
 					roundDimensionsTo: 2,
 					crop: config.transform?.crop,
-					rotate: config.transform?.rotate,
-					flip: config.transform?.flip,
+					rotate: keepsOrientation ? undoneRotation : config.transform?.rotate,
+					flip: keepsOrientation ? videoSample.flip : config.transform?.flip,
 					fit: appliedFit,
 					alpha: config.alpha,
 				});
