@@ -1014,6 +1014,11 @@ export class UrlSource extends PathedSource {
 				() => abortController.signal.aborted,
 			);
 
+			if (response.ok) {
+				// It got through CORS. Recorded as soon as it arrives, before anything may request the URL again.
+				this._responseReceived = true;
+			}
+
 			if (!response.ok) {
 				// eslint-disable-next-line @typescript-eslint/no-base-to-string
 				throw new Error(`Error fetching ${String(this._url)}: ${response.status} ${response.statusText}`);
@@ -1057,7 +1062,6 @@ export class UrlSource extends PathedSource {
 			}
 
 			this._fileSizeDetermined = true; // Yes, this is correct even if file size is still null
-			this._responseReceived = true;
 
 			if (!response.body) {
 				throw new Error(

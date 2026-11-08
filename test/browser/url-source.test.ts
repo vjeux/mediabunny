@@ -43,8 +43,10 @@ test('requestInit with Range', async () => {
 test('UrlSource resumes a cross-origin response body that fails with WebKit\'s "Load failed"', async () => {
 	// WebKit (Safari, iOS) reports any failure of a response body as `TypeError: Load failed`, the text it also uses
 	// for CORS failures. For a URL on another origin, the default retry policy took it for one and gave up instead of
-	// resuming. Here, the first response dies after 100 kB.
+	// resuming. Here, the response for bytes=0- dies after 100 kB.
 	const data = new Uint8Array(1_000_000).map((_, i) => i % 251);
+	// Firefox may ask for bytes=0- twice, refetching past its HTTP cache, so a repeated first request is left out
+	const withoutRefetch = (ranges: string[]) => (ranges[1] === 'bytes=0-' ? ranges.slice(1) : ranges);
 
 	const makeFetchFn = (honorsRanges: boolean, requestedRanges: string[]) => {
 		return async (url: string | URL | Request, init?: RequestInit) => {
@@ -52,7 +54,7 @@ test('UrlSource resumes a cross-origin response body that fails with WebKit\'s "
 			requestedRanges.push(range);
 			const start = honorsRanges ? Number(/^bytes=(\d+)-$/.exec(range)![1]) : 0;
 			const body = data.subarray(start);
-			const failAfter = requestedRanges.length === 1 ? 100_000 : Infinity;
+			const failAfter = range === 'bytes=0-' ? 100_000 : Infinity;
 
 			let sent = 0;
 			const stream = new ReadableStream<Uint8Array>({
@@ -91,7 +93,7 @@ test('UrlSource resumes a cross-origin response body that fails with WebKit\'s "
 
 			expect(slice).not.toBeNull();
 			expect(readBytes(slice!, 400_000)).toEqual(data.subarray(0, 400_000));
-			expect(requestedRanges).toEqual(['bytes=0-', 'bytes=100000-']);
+			expect(withoutRefetch(requestedRanges)).toEqual(['bytes=0-', 'bytes=100000-']);
 		}
 
 		// A blob: URL is read without touching the network, so retrying its failed body can't help: give up instead
@@ -154,17 +156,21 @@ test('UrlSource retries a failed fetch() once the URL got through CORS, but not 
 		const slice = await reader.requestSlice(3_000_000, 1000);
 		expect(slice && readBytes(slice, 1000)).toEqual(data.subarray(3_000_000, 3_001_000));
 
-		// The same in sequential mode: a server without range support, whose body dies after 100 kB (Chrome: "network
-		// error"), and whose resume request then fails before any response
+		// The same in sequential mode: a server without range support, whose body for bytes=0- dies after 100 kB
+		// (Chrome: "network error"), and whose first request to resume then fails before any response. So does a
+		// second request for bytes=0-, which Firefox makes to refetch past its HTTP cache: it comes after a response
+		// that got through CORS, so it's retried too.
 		const sequentialRanges: string[] = [];
 		const sequentialFetch = async (url: string | URL | Request, init?: RequestInit) => {
-			sequentialRanges.push(new Headers(init?.headers).get('Range') ?? '');
-			if (sequentialRanges.length === 2) {
+			const range = new Headers(init?.headers).get('Range') ?? '';
+			sequentialRanges.push(range);
+			const count = sequentialRanges.filter(x => x === range).length;
+			if ((range === 'bytes=100000-' && count === 1) || (range === 'bytes=0-' && count === 2)) {
 				throw new TypeError('Failed to fetch');
 			}
 
 			let sent = 0;
-			const failAfter = sequentialRanges.length === 1 ? 100_000 : Infinity;
+			const failAfter = range === 'bytes=0-' ? 100_000 : Infinity;
 			const body = new ReadableStream<Uint8Array>({
 				pull: (controller) => {
 					if (sent >= failAfter) {
@@ -183,7 +189,10 @@ test('UrlSource retries a failed fetch() once the URL got through CORS, but not 
 		using sequentialRef = new UrlSource('https://cdn.example.com/video.mp4', { fetchFn: sequentialFetch }).ref();
 		const sequentialSlice = await new Reader(sequentialRef.source).requestSlice(0, 400_000);
 		expect(sequentialSlice && readBytes(sequentialSlice, 400_000)).toEqual(data.subarray(0, 400_000));
-		expect(sequentialRanges).toEqual(['bytes=0-', 'bytes=100000-', 'bytes=100000-']);
+		// Firefox's refetches of bytes=0- are left out
+		const firstResume = sequentialRanges.findIndex(x => x !== 'bytes=0-');
+		expect([sequentialRanges[0], ...sequentialRanges.slice(firstResume)])
+			.toEqual(['bytes=0-', 'bytes=100000-', 'bytes=100000-']);
 
 		// Control: when the very first request fails, CORS stays the suspect and nothing is retried
 		using firstFailsRef = new UrlSource('https://cdn.example.com/video.mp4', {
