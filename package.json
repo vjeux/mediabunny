@@ -46,7 +46,10 @@
     "./src/node.ts": false,
     "node:fs/promises": false
   },
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/modules/src/index.js",
+    "./src/index.ts"
+  ],
   "scripts": {
     "build": "./scripts/build.sh",
     "watch": "tsx scripts/bundle.ts --watch",
