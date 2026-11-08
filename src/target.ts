@@ -53,6 +53,11 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 	abstract _finalize(): Promise<void>;
 	/** @internal */
 	abstract _close(): Promise<void>;
+	/**
+	 * Called when the output is canceled while finalizing, for a target that can hold finalization up forever.
+	 * @internal
+	 */
+	_cancelFinalization() {}
 
 	/**
 	 * Called each time data is written to the target. Will be called with the byte range into which data was written.
@@ -341,6 +346,17 @@ export class StreamTarget extends Target {
 	/** @internal */
 	_writeError: unknown = null;
 	/** @internal */
+	_abandon: (error: Error) => void = () => {};
+	/** Rejects once finalization is given up on, since the sink stalled after canceling. @internal */
+	_abandonment = new Promise<never>((resolve, reject) => {
+		this._abandon = reject;
+	});
+
+	/** @internal */
+	_abandoned = false;
+	/** @internal */
+	_watchingFinalization = false;
+	/** @internal */
 	_pendingWrites = 0;
 	/** @internal */
 	_completedWrites = 0;
@@ -458,7 +474,7 @@ export class StreamTarget extends Target {
 			}
 
 			if (this._streamWriter.desiredSize !== null && this._streamWriter.desiredSize <= 0) {
-				await this._streamWriter.ready; // Allow the writer to apply backpressure
+				await this._unlessAbandoned(this._streamWriter.ready); // Allow the writer to apply backpressure
 			}
 
 			if (this._chunked) {
@@ -623,10 +639,44 @@ export class StreamTarget extends Target {
 		}
 
 		assert(this._streamWriter);
-		await this._streamWriter.ready;
-		await this._streamWriter.close();
+		await this._unlessAbandoned(this._streamWriter.ready);
+		const closed = this._streamWriter.close();
+		void closed.catch(() => {}); // Once finalization is given up on, the stream closes in the background
+		await this._unlessAbandoned(closed);
 
 		this._emit('finalized');
+	}
+
+	/** @internal */
+	_unlessAbandoned<T>(promise: Promise<T>) {
+		return Promise.race([promise, this._abandonment]);
+	}
+
+	/** @internal */
+	override _cancelFinalization() {
+		if (!this._streamWriter || this._watchingFinalization) {
+			return;
+		}
+		this._watchingFinalization = true;
+
+		// Finalization gets stuck only on a sink that has stalled on a write. Give up on it once none of the pending
+		// writes has completed for a while, as canceling does: the waits on the stream in _flush and _finalize then
+		// reject, which makes finalization fail.
+		const streamDone = this._streamWriter.closed.then(() => true, () => true);
+		void (async () => {
+			let completedWrites = -1;
+			while (this._completedWrites !== completedWrites || this._pendingWrites === 0) {
+				completedWrites = this._completedWrites;
+
+				if (await fulfillsWithin(streamDone, STALLED_SINK_TIMEOUT_MS)) {
+					return;
+				}
+			}
+
+			this._abandoned = true;
+			void this._abandonment.catch(() => {});
+			this._abandon(new Error('Output has been canceled.'));
+		})();
 	}
 
 	/** @internal */
@@ -636,6 +686,11 @@ export class StreamTarget extends Target {
 		}
 
 		const closed = this._streamWriter.close();
+		if (this._abandoned) {
+			// Finalization was given up on since the sink stalled; the stream closes in the background
+			void closed.catch(() => {});
+			return;
+		}
 
 		// Closing only completes once every queued write has. Wait for that while the sink keeps completing writes,
 		// but not once it has stalled on one (an upload over a hung connection, say), or canceling would hang forever;
@@ -727,6 +782,11 @@ export class AppendOnlyStreamTarget extends Target {
 	/** @internal */
 	_close(): Promise<void> {
 		return this._streamTarget._close();
+	}
+
+	/** @internal */
+	override _cancelFinalization() {
+		this._streamTarget._cancelFinalization();
 	}
 
 	/** @internal */
@@ -825,6 +885,11 @@ export class FilePathTarget extends Target {
 	}
 
 	/** @internal */
+	override _cancelFinalization() {
+		this._streamTarget._cancelFinalization();
+	}
+
+	/** @internal */
 	override _setMonotonicity(monotonicity: boolean): void {
 		super._setMonotonicity(monotonicity);
 		this._streamTarget._setMonotonicity(monotonicity);
@@ -900,6 +965,11 @@ export class RangedTarget extends Target {
 
 	/** @internal */
 	async _close() {}
+
+	/** @internal */
+	override _cancelFinalization() {
+		this._baseTarget._cancelFinalization();
+	}
 
 	/** @internal */
 	override _setMonotonicity(monotonicity: boolean): void {

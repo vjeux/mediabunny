@@ -70,6 +70,56 @@ test('Output.cancel() waits for the stream of its StreamTarget to close, unless 
 	}
 }, 30_000);
 
+test('Output.cancel() while finalizing gives up on a StreamTarget whose sink has stalled', async () => {
+	for (const sink of ['slow', 'stalled'] as const) {
+		let finalizing = false;
+		const target = new StreamTarget(new WritableStream({
+			write: () => {
+				if (finalizing && sink === 'stalled') {
+					// Never completes, like an upload over a hung connection
+					return new Promise<void>(() => {});
+				}
+				return new Promise<void>(resolve => setTimeout(resolve, finalizing ? 300 : 1));
+			},
+		}));
+		const output = new Output({ format: new MkvOutputFormat(), target });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+
+		const decoderConfig = { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 };
+		for (let i = 0; i < 20; i++) {
+			await source.add(new EncodedPacket(new Uint8Array(1000), 'key', i * 0.02, 0.02), { decoderConfig });
+		}
+
+		finalizing = true;
+		const finalized = output.finalize().then(() => 'finalized', (error: unknown) => String(error));
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(output.state).toBe('finalizing');
+
+		// Canceling while finalizing returns right away
+		const startTime = performance.now();
+		await output.cancel();
+		expect(performance.now() - startTime).toBeLessThan(1000);
+
+		const result = await Promise.race([
+			finalized,
+			new Promise(resolve => setTimeout(() => resolve('still pending'), 8000)),
+		]);
+		if (sink === 'stalled') {
+			// Finalization is given up on once the pending writes haven't made progress for 5 seconds. On main, it
+			// stayed pending forever.
+			expect(result).toBe('Error: Output has been canceled.');
+			expect(performance.now() - startTime).toBeLessThan(6500);
+			expect(output.state).toBe('canceled');
+		} else {
+			// A sink that keeps completing writes lets finalization complete
+			expect(result).toBe('finalized');
+			expect(output.state).toBe('finalized');
+		}
+	}
+}, 30_000);
+
 test('Output, onFinalize', async () => {
 	let callCount = 0;
 	const output = new Output({
