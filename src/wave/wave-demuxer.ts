@@ -29,6 +29,9 @@ export class WaveDemuxer extends Demuxer {
 	reader: Reader;
 
 	metadataPromise: Promise<void> | null = null;
+	/** Where the chunk walk stopped at the data chunk, as the chunks after it couldn't be read yet */
+	chunksAfterData: { pos: number; end: number | null; littleEndian: boolean } | null = null;
+	chunksAfterDataPromise: Promise<void> | null = null;
 	dataStart = -1;
 	dataSize = -1;
 	audioInfo: {
@@ -96,8 +99,15 @@ export class WaveDemuxer extends Demuxer {
 					this.dataStart = slice.filePos;
 					this.dataSize = Math.max(Math.min(dataChunkSize, (totalFileSize ?? Infinity) - this.dataStart), 0);
 
-					if (this.reader.fileSize === null) {
-						break; // Stop once we hit the data chunk
+					if (this.reader.randomAccessFileSize === null) {
+						// Stop once we hit the data chunk; the chunks after it are looked at once they can be read
+						// (see getMetadataTags)
+						this.chunksAfterData = {
+							pos: startPos + chunkSize + (chunkSize & 1),
+							end: totalFileSize,
+							littleEndian,
+						};
+						break;
 					}
 				} else if (chunkId === 'ds64') {
 					// File and data chunk sizes are defined in here instead
@@ -376,8 +386,48 @@ export class WaveDemuxer extends Demuxer {
 	}
 
 	async getMetadataTags() {
+		await this.readChunksAfterData();
 		await this.readMetadata();
 		return this.metadataTags;
+	}
+
+	/** If the chunk walk stopped at the data chunk, reads the chunks after it for the tags once they can be read */
+	async readChunksAfterData() {
+		await this.readMetadata();
+
+		if (this.chunksAfterData && this.reader.randomAccessFileSize !== null) {
+			// The chunks after the data, skipped when the file was opened, can be read by now (as once reads have
+			// nearly reached the end of a file that can only be streamed)
+			const { pos, end, littleEndian } = this.chunksAfterData;
+			this.chunksAfterData = null;
+
+			this.chunksAfterDataPromise = (async () => {
+				let currentPos = pos;
+				while (end === null || currentPos < end) {
+					let slice = this.reader.requestSlice(currentPos, 8);
+					if (isThenable(slice)) {
+						slice = await slice;
+					}
+					if (!slice) {
+						break;
+					}
+
+					const chunkId = readAscii(slice, 4);
+					const chunkSize = readU32(slice, littleEndian);
+					const startPos = slice.filePos;
+
+					if (chunkId === 'LIST') {
+						await this.parseListChunk(startPos, chunkSize, littleEndian);
+					} else if (chunkId === 'ID3 ' || chunkId === 'id3 ') {
+						await this.parseId3Chunk(startPos, chunkSize);
+					}
+
+					currentPos = startPos + chunkSize + (chunkSize & 1); // Handle padding
+				}
+			})();
+		}
+
+		await this.chunksAfterDataPromise;
 	}
 }
 
