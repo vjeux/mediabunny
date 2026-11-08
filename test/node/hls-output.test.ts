@@ -32,6 +32,89 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 const videoSource = (codec: VideoCodec = 'avc') => new EncodedVideoPacketSource(codec);
 const audioSource = (codec: AudioCodec = 'aac') => new EncodedAudioPacketSource(codec);
 
+test('Several codecs in one rendition group', async () => {
+	// Video-only and audio-only outputs whose tracks differ in metadata and in codec make one rendition group each.
+	// CODECS must list every codec of the group, so that each rendition reads back with its own codec.
+	using mp4 = new Input({ source: new FilePathSource('./test/public/demo.mp4'), formats: ALL_FORMATS });
+	using webm = new Input({ source: new FilePathSource('./test/public/demo.webm'), formats: ALL_FORMATS });
+
+	const writeAndRead = async (
+		sourceTracks: (InputVideoTrack | InputAudioTrack)[],
+		expectedCodecStrings: string[],
+	) => {
+		const files = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat() }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+				return target;
+			}),
+		});
+
+		const adders: ((packet: EncodedPacket) => Promise<void>)[] = [];
+		for (const [i, track] of sourceTracks.entries()) {
+			const name = `Rendition ${i + 1}`;
+			if (track.isVideoTrack()) {
+				const source = new EncodedVideoPacketSource((await track.getCodec())!);
+				output.addVideoTrack(source, { name });
+				const decoderConfig = (await track.getDecoderConfig())!;
+				adders.push(packet => source.add(packet, { decoderConfig }));
+			} else {
+				const source = new EncodedAudioPacketSource((await track.getCodec())!);
+				output.addAudioTrack(source, { name });
+				const decoderConfig = (await track.getDecoderConfig())!;
+				adders.push(packet => source.add(packet, { decoderConfig }));
+			}
+		}
+
+		await output.start();
+		for (const [i, track] of sourceTracks.entries()) {
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				if (packet.timestamp >= 2) {
+					break;
+				}
+
+				await adders[i]!(packet);
+			}
+		}
+		await output.finalize();
+
+		const master = new TextDecoder().decode(files.get('master.m3u8'));
+		const codecs = /CODECS="([^"]+)"/.exec(master)![1]!.split(',');
+		expect(new Set(codecs)).toEqual(new Set(expectedCodecStrings));
+
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+			formats: ALL_FORMATS,
+		});
+		const tracks = await input.getTracks();
+		const codecsOf = (list: { getCodec: () => Promise<unknown> }[]) => Promise.all(list.map(x => x.getCodec()));
+		expect(await codecsOf(tracks)).toEqual(await codecsOf(sourceTracks));
+		for (const track of tracks) {
+			let count = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				void packet;
+				count++;
+			}
+			expect(count).toBeGreaterThan(0);
+		}
+	};
+
+	const avc = (await mp4.getPrimaryVideoTrack())!;
+	const aac = (await mp4.getPrimaryAudioTrack())!;
+	const vp9 = (await webm.getPrimaryVideoTrack())!;
+	const opus = (await webm.getPrimaryAudioTrack())!;
+	const avcCodecString = (await avc.getDecoderConfig())!.codec;
+	const vp9CodecString = (await vp9.getDecoderConfig())!.codec;
+	const aacCodecString = (await aac.getDecoderConfig())!.codec;
+
+	await writeAndRead([vp9, avc], [vp9CodecString, avcCodecString]);
+	await writeAndRead([aac, opus], [aacCodecString, 'Opus']);
+	// A group in one codec lists it once, as before
+	await writeAndRead([avc, avc], [avcCodecString]);
+});
+
 test('Playlist assignment, single video', async () => {
 	const output = new Output({
 		format: new HlsOutputFormat({
