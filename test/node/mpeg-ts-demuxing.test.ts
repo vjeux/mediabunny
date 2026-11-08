@@ -1,10 +1,11 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource, UrlSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, HLS_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -4878,6 +4879,56 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 		packetCount++;
 	}
 	expect(packetCount).toBe(298);
+
+	// A server that ignores range requests makes a UrlSource read in order too, though it knows the size. Looking up
+	// the end, for the duration, reads past the stream's start before the frame duration is measured there; the last
+	// packet then takes the duration before it (found in L15's "sized but not seekable" check). 4 seconds of frames
+	// of 60 kB, more than one seek chunk, read through a 1 MiB cache.
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		const isKey = i % 25 === 0;
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': bytes.byteLength });
+		response.end(bytes);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using urlInput = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 20,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const urlTrack = await urlInput.getPrimaryVideoTrack();
+		assert(urlTrack);
+		expect(await urlTrack.computeDuration()).toBeCloseTo(4);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
 });
 
 test('MPEG-TS searches for an intact PMT copy only where it can go back to', async () => {
