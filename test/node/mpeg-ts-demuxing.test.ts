@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -992,4 +996,89 @@ test('MPEG-TS uses an intact copy of a damaged PAT or PMT', async () => {
 	});
 	expect(await Promise.all((await input.getTracks()).map(track => track.getCodec()))).toEqual(['mp3']);
 	expect(maxEnd).toBeLessThan(singleBad.byteLength / 2);
+});
+
+test('MPEG-TS searches for an intact PMT copy only where it can go back to', async () => {
+	// From L04's review. 4 seconds of 64x64 H.264 frames of 60 kB each, written by Mediabunny, which writes the PAT
+	// and PMT once
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		const isKey = i % 25 === 0;
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	// Its only PMT gets a bad CRC, and it's read from a stream through a ReadableStreamSource with a 2 MiB cache. The
+	// search for an intact copy must stay within what the cache keeps, as reading goes back to the PMT afterwards.
+	const damaged = bytes.slice();
+	const pmtPos = 188; // After the PAT
+	expect(((damaged[pmtPos + 1]! & 0x1f) << 8) | damaged[pmtPos + 2]!).toBe(0x1000);
+	const sectionStart = pmtPos + 5 + damaged[pmtPos + 4]!;
+	const sectionEnd = sectionStart + 3 + (((damaged[sectionStart + 1]! & 0x0f) << 8) | damaged[sectionStart + 2]!);
+	damaged[sectionEnd - 1]! ^= 0xff; // CRC_32
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= damaged.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(damaged.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	{
+		using input = new Input({
+			source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 21 }),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(packetCount).toBe(100);
+	}
+
+	// Some data before the PAT that looks like a PMT (a table_id of 2) but has a bad CRC isn't searched for: without a
+	// PAT naming its PID, it may well not be a PMT at all
+	const junk = new Uint8Array(188).fill(0xff);
+	junk.set([0x47, 0x4b, 0x2b, 0x10, 0x00, 0x02, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0xe1, 0x00, 0xf0, 0x00]);
+	junk.set([0xde, 0xad, 0xbe, 0xef], 17); // CRC_32
+	const withJunk = new Uint8Array(junk.length + bytes.length);
+	withJunk.set(junk);
+	withJunk.set(bytes, junk.length);
+	let maxEnd = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => withJunk.byteLength,
+			read: (start, end) => {
+				maxEnd = Math.max(maxEnd, end);
+				return withJunk.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	await input.getTracks();
+	expect(maxEnd).toBeLessThan(2 ** 20);
 });
