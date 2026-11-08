@@ -28,9 +28,10 @@ type SubtitleParserOptions = {
 	output: (cue: SubtitleCue, metadata: SubtitleMetadata) => unknown;
 };
 
-const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s*-->\s*((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
+// The hours of a timestamp may have any number of digits, even just one (W3C WebVTT, "collect a WebVTT timestamp")
+const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d+:)?\d{2}:\d{2}.\d{3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}.\d{3})/g;
 const preambleStartRegex = /^WEBVTT(.|\n)*?\n{2}/;
-export const inlineTimestampRegex = /<(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})>/g;
+export const inlineTimestampRegex = /<(?:(\d+):)?(\d{2}):(\d{2}).(\d{3})>/g;
 
 export class SubtitleParser {
 	private options: SubtitleParserOptions;
@@ -125,7 +126,7 @@ export class SubtitleParser {
 	}
 }
 
-const timestampRegex = /(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})/;
+const timestampRegex = /(?:(\d+):)?(\d{2}):(\d{2}).(\d{3})/;
 export const parseSubtitleTimestamp = (string: string) => {
 	const match = timestampRegex.exec(string);
 	if (!match) throw new Error('Expected match.');
