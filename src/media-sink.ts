@@ -1956,6 +1956,10 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 			const support = await VideoDecoder.isConfigSupported(finalConfig);
 			return support.supported === true;
 		} catch (error) {
+			if (error instanceof InputDisposedError) {
+				throw error; // The check was canceled, which says nothing about decodability
+			}
+
 			Logging._error('Error during decodability check:', error);
 			return false;
 		}

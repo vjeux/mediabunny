@@ -1,5 +1,5 @@
-import { expect, test } from 'vitest';
-import { Input } from '../../src/input.js';
+import { expect, test, vi } from 'vitest';
+import { Input, InputDisposedError } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
@@ -300,4 +300,15 @@ test('Decoding with a hardware acceleration the decoder refuses fails with the d
 
 	using sample = await new VideoSampleSink(track, { hardwareAcceleration: 'prefer-software' }).getSample(0);
 	expect(sample?.timestamp).toBe(0);
+});
+
+test('Disposing the input during a video sink\'s decodability check rejects with InputDisposedError', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	// Like an input disposed while the sink reads the decoder config to check it
+	vi.spyOn(track, 'getDecoderConfig').mockRejectedValue(new InputDisposedError());
+
+	// Not "can't be decoded": the check was canceled, which says nothing about decodability
+	await expect(new VideoSampleSink(track).getSample(0)).rejects.toBeInstanceOf(InputDisposedError);
 });
