@@ -762,6 +762,41 @@ export const promiseWithResolvers = <T = void>() => {
 	return { promise, resolve: resolve!, reject: reject! };
 };
 
+/**
+ * For waiting on promises that may never settle, like those of user callbacks, until something is disposed: `wait`
+ * settles like the given promise, unless `dispose` comes first, which rejects every wait still pending (and every
+ * later one) with the given error. Waits are let go of once settled, so that a long-lived signal doesn't hold on to
+ * their results.
+ */
+export class DisposalSignal {
+	pendingRejecters = new Set<(error: Error) => void>();
+	/** Set once disposed. */
+	error: Error | null = null;
+
+	wait<T>(promise: PromiseLike<T>) {
+		return new Promise<T>((resolve, reject) => {
+			if (this.error) {
+				reject(this.error);
+				return;
+			}
+
+			this.pendingRejecters.add(reject);
+			void Promise.resolve(promise)
+				.then(resolve, reject)
+				.finally(() => this.pendingRejecters.delete(reject));
+		});
+	}
+
+	dispose(error: Error) {
+		this.error = error;
+
+		for (const reject of this.pendingRejecters) {
+			reject(error);
+		}
+		this.pendingRejecters.clear();
+	}
+}
+
 export const removeItem = <T>(arr: T[], item: T) => {
 	const index = arr.indexOf(item);
 	if (index !== -1) {
