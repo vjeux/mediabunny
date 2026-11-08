@@ -1033,10 +1033,17 @@ export class Output<
 	/**
 	 * Resolves with the full MIME type of the output file, including track codecs.
 	 *
-	 * The returned promise will resolve only once the precise codec strings of all tracks are known.
+	 * The returned promise will resolve only once the precise codec strings of all tracks are known. If the output is
+	 * canceled before that, the promise rejects.
 	 */
 	getMimeType() {
-		return this._muxer.getMimeType();
+		return Promise.race([
+			this._muxer.getMimeType(),
+			// Codec strings still unknown once the output is canceled will never be known
+			this._canceled.promise.then(() => {
+				throw new Error('Output has been canceled.');
+			}),
+		]);
 	}
 
 	/**
