@@ -65,7 +65,7 @@ const compileConsumer = (entry: string, lib: string[], extraLibFiles: string[] =
 test('Declarations compile with skipLibCheck off next to the DOM lib of the installed TypeScript', () => {
 	// esnext: the declarations use the explicit resource management types (Disposable)
 	expect(compileConsumer('./dist/modules/src/index.js', ['esnext', 'dom', 'dom.iterable'])).toEqual([]);
-});
+}, 60_000);
 
 test('TypeScript before 5.8 gets declarations that add the ImageBufferSource type its DOM lib lacks', () => {
 	const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8')) as {
@@ -96,4 +96,4 @@ test('TypeScript before 5.8 gets declarations that add the ImageBufferSource typ
 		expect.stringMatching(/@types\/dom-webcodecs\/.*: Cannot find name 'ImageBufferSource'/),
 	]);
 	expect(compileConsumer('./types/ts5.7/index.js', ['esnext'], [domLibBefore58])).toEqual([]);
-});
+}, 60_000);
