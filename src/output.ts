@@ -1062,10 +1062,10 @@ export class Output<
 	 * has stalled on a write: once 5 seconds pass without any of the pending writes completing, this resolves, and the
 	 * stream closes in the background if the sink ever catches up.
 	 *
-	 * While the output is finalizing, this instead stops waiting for a `process` function call still in flight and
-	 * drops the samples queued behind it, so that a call that never settles can't hold finalization up forever (without
-	 * such a call, nothing is dropped). Finalization then goes on by itself, and the returned promise resolves right
-	 * away.
+	 * While the output is finalizing, this instead stops waiting for a `process` function call or an encoder
+	 * initialization still in flight and drops the samples queued behind it, so that one that never settles can't hold
+	 * finalization up forever (without either, nothing is dropped). Finalization then goes on by itself, and the
+	 * returned promise resolves right away.
 	 *
 	 * While the output is finalizing, this returns right away, and finalization goes on. Should the sink of a
 	 * {@link StreamTarget} then complete none of its pending writes for 5 seconds, finalization is given up on:
@@ -1082,10 +1082,10 @@ export class Output<
 			Logging._warn('Output has already been finalized.');
 			return;
 		} else if (this.state === 'finalizing') {
-			// Finalization waits for the samples added before it to be processed, which a process function call that
-			// never settles would hold up forever. Stop waiting for such a call and drop the samples queued behind it,
-			// so that finalization can go on. Don't wait for it here, though: something else, like a target whose
-			// sink stopped completing writes, may hold it up as well.
+			// Finalization waits for the samples added before it to be processed, which a process function call or an
+			// encoder initialization that never settles would hold up forever. Stop waiting for such a call or
+			// initialization and drop the samples queued behind it, so that finalization can go on. Don't wait for it
+			// here, though: something else, like a target whose sink stopped completing writes, may hold it up as well.
 			for (const track of this.tracks) {
 				track.source._cancelPendingAdds();
 			}
