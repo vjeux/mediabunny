@@ -1,9 +1,10 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource, UrlSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -14,7 +15,7 @@ import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
 import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -1374,5 +1375,85 @@ test('MPEG-TS places a first frame without PTS by its picture order', async () =
 		const damaged = bytes.slice();
 		damaged[getPesHeaderPos(damaged, getVideoPesPacketPositions(damaged)[0]!) + 7]! &= 0x3f; // PTS_DTS_flags
 		expect(await readTimestamps(damaged)).toEqual(await readTimestamps(bytes));
+	}
+});
+
+test('MPEG-TS lookups don\'t read the start of the track again', async () => {
+	// Found in L15's "sized but not seekable" check. A UrlSource whose server ignores range requests reads in order,
+	// keeping only what its cache holds. The track's first PES packet, which tells where it starts, is in memory
+	// already, so lookups must not read it again. 7 seconds of frames of 60 kB with an AAC track, 11 MB, read through
+	// an 8 MiB cache: the audio's duration is looked up after the video's, once the start is gone.
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('avc');
+	const audioSource = new EncodedAudioPacketSource('aac');
+	output.addVideoTrack(videoSource, { frameRate: 25 });
+	output.addAudioTrack(audioSource);
+	await output.start();
+	const audioFrameDuration = 1024 / 48000;
+	let audioFrame = 0;
+	for (let i = 0; i < 180; i++) {
+		const isKey = i % 25 === 0;
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+		await videoSource.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+		for (; audioFrame * audioFrameDuration < (i + 1) / 25; audioFrame++) {
+			await audioSource.add(
+				new EncodedPacket(
+					new Uint8Array(20).fill(0x11),
+					'key',
+					audioFrame * audioFrameDuration,
+					audioFrameDuration,
+				),
+				audioFrame === 0
+					? {
+							decoderConfig: {
+								codec: 'mp4a.40.2',
+								numberOfChannels: 2,
+								sampleRate: 48000,
+								description: new Uint8Array([0x11, 0x90]),
+							},
+						}
+					: undefined,
+			);
+		}
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+	expect(bytes.byteLength).toBeGreaterThan(10.5 * 2 ** 20);
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': bytes.byteLength });
+		response.end(bytes);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using input = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 23,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const videoTrack = await input.getPrimaryVideoTrack();
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(videoTrack && audioTrack);
+		expect(await videoTrack.computeDuration()).toBeCloseTo(180 / 25);
+		expect(await audioTrack.computeDuration()).toBeCloseTo(audioFrame * audioFrameDuration);
+	} finally {
+		server.closeAllConnections();
+		server.close();
 	}
 });
