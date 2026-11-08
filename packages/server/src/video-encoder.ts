@@ -58,11 +58,13 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
  */
 const parseCodecStringRequirements = (codec: VideoCodec, codecString: string) => {
 	const parts = codecString.split('.');
+	let avcProfileIdc: number | null = null;
 	let avcProfile: NodeAv.AVProfile | null = null;
 	let bitDepth = 8;
 
 	if (codec === 'avc') {
 		const profileIdc = parseInt(parts[1]?.slice(0, 2) ?? '', 16);
+		avcProfileIdc = profileIdc;
 		// libx264 picks High (or above, like for lossless) by itself, so only the lower profiles need asking for
 		if (profileIdc === 66) {
 			avcProfile = NodeAv.AV_PROFILE_H264_BASELINE;
@@ -79,7 +81,7 @@ const parseCodecStringRequirements = (codec: VideoCodec, codecString: string) =>
 		bitDepth = fieldValue === 10 || fieldValue === 12 ? fieldValue : 8;
 	}
 
-	return { avcProfile, bitDepth };
+	return { avcProfileIdc, avcProfile, bitDepth };
 };
 
 /**
@@ -88,7 +90,7 @@ const parseCodecStringRequirements = (codec: VideoCodec, codecString: string) =>
  * in the Main profile at 8 or 10 bits. Anything else would come out as something other than what was asked for, so
  * it's declined, as browsers do.
  */
-const canProduceCodecString = (codec: VideoCodec, codecString: string) => {
+const isProducibleCodecString = (codec: VideoCodec, codecString: string) => {
 	const parts = codecString.split('.');
 
 	if (codec === 'avc') {
@@ -107,6 +109,26 @@ const canProduceCodecString = (codec: VideoCodec, codecString: string) => {
 		// The optional monochrome and chroma subsampling fields: 4:2:0 is 0 and 11x
 		const isYuv420 = (parts[4] === undefined || Number(parts[4]) === 0) && (parts[5] ?? '11').startsWith('11');
 		return parts[1] === '0' && (bitDepth === 8 || bitDepth === 10) && isYuv420;
+	}
+
+	return true;
+};
+
+/**
+ * Whether a codec string is producible (see isProducibleCodecString) and the software encoder has its bit depth.
+ */
+const canProduceCodecString = (codec: VideoCodec, codecString: string) => {
+	if (!isProducibleCodecString(codec, codecString)) {
+		return false;
+	}
+
+	// Hardware encoders fall back to the software encoder (for frames they can't take, say), so it has to have the bit
+	// depth. Some builds don't: node-av's libx265 for Windows is 8-bit only.
+	const { bitDepth } = parseCodecStringRequirements(codec, codecString);
+	if (bitDepth > 8) {
+		const softwareCodec = NodeAv.Codec.findEncoder(CODEC_TO_CODEC_ID[codec]!);
+		const format = bitDepth === 10 ? NodeAv.AV_PIX_FMT_YUV420P10LE : NodeAv.AV_PIX_FMT_YUV420P12LE;
+		return !!softwareCodec?.pixelFormats?.includes(format);
 	}
 
 	return true;
@@ -286,11 +308,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 		if (this.avCodec.name === 'libx264' && requirements.avcProfile !== null) {
 			codecContext.profile = requirements.avcProfile;
-		} else if (this.avCodec.name === 'h264_nvenc' && requirements.avcProfile !== null) {
-			codecContext.setOption(
-				'profile',
-				requirements.avcProfile === NodeAv.AV_PROFILE_H264_BASELINE ? 'baseline' : 'main',
-			);
+		} else if (this.avCodec.name === 'h264_nvenc' && requirements.avcProfileIdc !== null) {
+			// NVENC defaults to Main, even for High (the default codec string)
+			const profile = { 66: 'baseline', 77: 'main', 100: 'high' }[requirements.avcProfileIdc];
+			if (profile) {
+				codecContext.setOption('profile', profile);
+			}
 		} else if (this.avCodec.name === 'hevc_nvenc' && requirements.bitDepth === 10) {
 			codecContext.setOption('profile', 'main10');
 		}
