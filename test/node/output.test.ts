@@ -46,7 +46,8 @@ test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
 				new Promise(resolve => setTimeout(() => resolve('pending'), 2000)),
 			]);
 			expect(cancelResult).toBe('canceled');
-			expect(await startResult).toBe('Output has been canceled.');
+			expect(await startResult).toBe('started'); // As when the cancel comes after the start
+			expect(output.state).toBe('canceled');
 
 			if (settlesLate) {
 				// A target that still arrives gets closed, and nothing gets written into it
@@ -67,6 +68,40 @@ test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
 				expect(writes).toEqual([]);
 				expect(writable.locked).toBe(false); // The caller's stream stays theirs
 			}
+		}
+	},
+);
+
+test.each(['synchronous', 'never settling'] as const)(
+	'Canceling right after an unawaited start() rejects nothing (%s target)',
+	async (targetKind) => {
+		const { Mp4OutputFormat } = await import('../../src/output-format.js');
+		const { PathedTarget } = await import('../../src/target.js');
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => void unhandledRejections.push(reason);
+		process.on('unhandledRejection', onUnhandledRejection);
+
+		try {
+			const output = new Output({
+				format: new Mp4OutputFormat(),
+				target: targetKind === 'synchronous'
+					? new BufferTarget()
+					: new PathedTarget('file.mp4', () => new Promise<BufferTarget>(() => {})),
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+
+			void output.start();
+			await output.cancel();
+			await new Promise(resolve => setTimeout(resolve, 50));
+
+			expect(unhandledRejections).toEqual([]);
+			expect(output.state).toBe('canceled');
+			// As on main after a cancel
+			await expect((async () => source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1)))())
+				.rejects.toThrow('Output has been canceled.');
+		} finally {
+			process.off('unhandledRejection', onUnhandledRejection);
 		}
 	},
 );

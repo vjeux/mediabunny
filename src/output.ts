@@ -952,13 +952,14 @@ export class Output<
 
 			try {
 				// The muxer may have to wait for its target (an async PathedTarget or initTarget callback, which might
-				// never settle). A cancel must not wait behind that: it ends the start, and a target that still arrives
-				// afterwards gets closed (see _getRootTarget)
+				// never settle). A cancel must not wait behind that: it ends the start (which resolves, as when the
+				// cancel comes after the start), and a target that still arrives afterwards gets closed and isn't
+				// written to (see _getRootTarget and _getRootWriter)
 				const muxerStartPromise = this._muxer.start();
-				muxerStartPromise.catch(() => {}); // It may fail on a target closed in the meantime
+				muxerStartPromise.catch(() => {}); // It fails on a target arriving after the cancel
 				await Promise.race([muxerStartPromise, this._canceledSignal.promise]);
 				if ((this.state as Output['state']) === 'canceled') {
-					throw new Error('Output has been canceled.');
+					return;
 				}
 
 				const promises = this.tracks.map(track => track.source._start());
