@@ -4376,16 +4376,32 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 	async getDurationFromMetadata() {
 		const track = this.internalTrack;
-		if (track.durationInMediaTimescale <= 0) {
+		let durationInMediaTimescale = track.durationInMediaTimescale;
+		if (durationInMediaTimescale <= 0) {
 			// The duration is often zero for fragmented files for example; return `null` to signal that the duration
-			// must be computed instead.
-			return null;
+			// must be computed instead. A regular track has its samples' durations in its sample table though, which
+			// all lasting 0 is also what makes the duration 0 (like a still frame next to other media).
+			let lastTimingEntry: SampleTimingEntry | undefined;
+			try {
+				const sampleTable = track.demuxer.isFragmented ? null : track.demuxer.getSampleTableForTrack(track);
+				lastTimingEntry = sampleTable && !sampleTableIsEmpty(sampleTable)
+					? last(sampleTable.sampleTimingEntries)
+					: undefined;
+			} catch {
+				// A sample table that can't be read (a damaged file) leaves the duration unknown, as it was before
+			}
+			if (!lastTimingEntry) {
+				return null;
+			}
+
+			durationInMediaTimescale = lastTimingEntry.startDecodeTimestamp
+				+ lastTimingEntry.count * lastTimingEntry.delta;
 		}
 
 		assert(track.trackBacking);
 
 		const firstPacket = await track.trackBacking.getFirstPacket({ metadataOnly: true });
-		return (firstPacket?.timestamp ?? 0) + track.durationInMediaTimescale / track.timescale;
+		return (firstPacket?.timestamp ?? 0) + durationInMediaTimescale / track.timescale;
 	}
 
 	async getLiveRefreshInterval() {

@@ -3259,3 +3259,67 @@ test('A movie matrix in an mvhd box after the trak boxes', async () => {
 	expect(await readRotation(false)).toBe(90);
 	expect(await readRotation(true)).toBe(90);
 });
+
+test('Duration from metadata of a track whose samples all last 0', async () => {
+	// Like a still frame next to other media (from the L17 roundtrip fuzz sweep): its mdhd duration is 0, but the
+	// sample table says where it is
+	const avcC = new Uint8Array(
+		('0164000cffe100196764000cacd941011b011000000300100000030320f142996001000668ebe3cb22c0fdf8f800')
+			.match(/../g)!.map(x => parseInt(x, 16)),
+	);
+	const decoderConfig = { codec: 'avc1.64000c', codedWidth: 128, codedHeight: 128, description: avcC };
+
+	for (const format of [new Mp4OutputFormat(), new MovOutputFormat()]) {
+		const output = new Output({ format, target: new BufferTarget() });
+		const moving = new EncodedVideoPacketSource('avc');
+		const still = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(moving);
+		output.addVideoTrack(still);
+		await output.start();
+		await moving.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 0.5), { decoderConfig });
+		await moving.add(new EncodedPacket(new Uint8Array(16), 'key', 0.5, 0.5));
+		await still.add(new EncodedPacket(new Uint8Array(16), 'key', 10, 0), { decoderConfig });
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const tracks = await input.getVideoTracks();
+		expect(await Promise.all(tracks.map(track => track.getDurationFromMetadata()))).toEqual([1, 10]);
+		expect(await input.getDurationFromMetadata()).toBe(10);
+		expect(await input.computeDuration()).toBe(10);
+	}
+});
+
+test('Duration from metadata with a damaged sample table and an mdhd duration of 0', async () => {
+	// The second track's sample table can't be read: its metadata duration stays unknown, and the file's comes from
+	// the first track (from the L46 deep review)
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const sources = [new EncodedVideoPacketSource('vp9'), new EncodedVideoPacketSource('vp9')];
+	for (const source of sources) {
+		output.addVideoTrack(source);
+	}
+	await output.start();
+	for (let i = 0; i < 10; i++) {
+		for (const source of sources) {
+			await source.add(new EncodedPacket(new Uint8Array([i]), i === 0 ? 'key' : 'delta', i / 10, 0.1), {
+				decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+			});
+		}
+	}
+	await output.finalize();
+
+	const bytes = Buffer.from(output.target.buffer!);
+	const secondTrak = bytes.indexOf('trak', bytes.indexOf('trak') + 4);
+	const mdhd = bytes.indexOf('mdhd', secondTrak);
+	assert(bytes[mdhd + 4] === 0); // Version 0
+	bytes.fill(0, mdhd + 4 + 16, mdhd + 4 + 20); // Duration 0
+	// Turn the stsz box into an stz2 box with an invalid field size, which no reader can make sense of
+	const stsz = bytes.indexOf('stsz', secondTrak);
+	bytes.write('stz2', stsz, 'ascii');
+	bytes[stsz + 11] = 7; // Field size, in bits
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tracks = await input.getVideoTracks();
+	expect(await tracks[0]!.getDurationFromMetadata()).toBeCloseTo(1, 6);
+	expect(await tracks[1]!.getDurationFromMetadata()).toBe(null);
+	expect(await input.getDurationFromMetadata()).toBeCloseTo(1, 6);
+});
