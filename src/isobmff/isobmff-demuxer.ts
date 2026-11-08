@@ -3320,6 +3320,15 @@ export class IsobmffDemuxer extends Demuxer {
 					);
 				}
 
+				// Some writers end the table with entries of zero samples per chunk. Like FFmpeg, drop them, so that
+				// their chunks keep the samples per chunk of the entry before.
+				while (
+					track.sampleTable.sampleToChunk.length > 1
+					&& last(track.sampleTable.sampleToChunk)!.samplesPerChunk === 0
+				) {
+					track.sampleTable.sampleToChunk.pop();
+				}
+
 				let startSampleIndex = 0;
 				for (let i = 0; i < track.sampleTable.sampleToChunk.length; i++) {
 					track.sampleTable.sampleToChunk[i]!.startSampleIndex = startSampleIndex;
