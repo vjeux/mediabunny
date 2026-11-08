@@ -72,6 +72,12 @@ test('MP4, degenerate matrix', async () => {
 	await expectMatrixRoundTrip(new Mp4OutputFormat(), [0, 0, 0, 0, 1, 0, 0, 0, 1], 0, false);
 });
 
+test('MP4, singular matrix', async () => {
+	// Shifted by one entry, as in Chromium's agtm-metadata-*.mp4 test files (raw [0, 1, 0, 0, 0, 1, 0, 0, 0]): it
+	// maps the frame onto a line, so it holds no rotation
+	await expectMatrixRoundTrip(new Mp4OutputFormat(), [0, 2 ** -16, 0, 0, 0, 2 ** -30, 0, 0, 0], 0, false);
+});
+
 test('Matroska, explicit matrix', async () => {
 	await expectMatrixRoundTrip(new MkvOutputFormat(), [0, 1, 0, -1, 0, 0, HEIGHT, 0, 1], 90, false);
 });
