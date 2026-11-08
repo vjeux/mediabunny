@@ -28,6 +28,7 @@ class DtsEncoder extends CustomAudioEncoder {
 	private pendingBuffer = new Float32Array(2 ** 16);
 	private pendingFrames = 0;
 	private nextSampleTimestampInSamples: number | null = null;
+	private packetCount = 0;
 
 	static override supports(codec: AudioCodec, config: AudioEncoderConfig): boolean {
 		return codec === 'dts'
@@ -62,6 +63,7 @@ class DtsEncoder extends CustomAudioEncoder {
 	private resetInternalState() {
 		this.pendingFrames = 0;
 		this.nextSampleTimestampInSamples = null;
+		this.packetCount = 0;
 
 		this.chunkMetadata = {
 			decoderConfig: {
@@ -107,15 +109,23 @@ class DtsEncoder extends CustomAudioEncoder {
 	async flush() {
 		// Pad remaining samples with silence to fill a full frame
 		if (this.pendingFrames > 0) {
+			assert(this.nextSampleTimestampInSamples !== null);
+
 			const channels = this.numberOfChannels;
 			const frameSize = this.encoderFrameSize;
 			const usedSamples = this.pendingFrames * channels;
 			const frameSamples = frameSize * channels;
 
+			// The padding isn't part of the audio, so the last packet must end where the input does. Except when it's
+			// the only packet: FFmpeg misplaces the audio of an MP4 track that is one shortened packet.
+			const inputEndInSamples = this.packetCount > 0
+				? this.nextSampleTimestampInSamples + this.pendingFrames
+				: undefined;
+
 			this.pendingBuffer.fill(0, usedSamples, frameSamples);
 			this.pendingFrames = frameSize;
 
-			await this.encodeOneFrame();
+			await this.encodeOneFrame(inputEndInSamples);
 		}
 
 		await sendCommand({ type: 'flush-encoder', data: { ctx: this.ctx } });
@@ -129,7 +139,7 @@ class DtsEncoder extends CustomAudioEncoder {
 		void unrefWorker();
 	}
 
-	private async encodeOneFrame() {
+	private async encodeOneFrame(inputEndInSamples?: number) {
 		assert(this.nextSampleTimestampInSamples !== null);
 
 		const channels = this.numberOfChannels;
@@ -155,13 +165,19 @@ class DtsEncoder extends CustomAudioEncoder {
 		}, [audioData]);
 
 		this.nextSampleTimestampInSamples += frameSize;
+		this.packetCount++;
+
+		let duration = result.duration;
+		if (inputEndInSamples !== undefined) {
+			duration = Math.min(duration, inputEndInSamples - result.pts);
+		}
 
 		// We always get exactly one packet because we encode the correct frame size
 		const packet = new EncodedPacket(
 			new Uint8Array(result.encodedData),
 			'key',
 			result.pts / this.sampleRate,
-			result.duration / this.sampleRate,
+			duration / this.sampleRate,
 		);
 
 		this.onPacket(
