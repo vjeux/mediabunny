@@ -276,3 +276,98 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
+
+// Whether the platform decodes Vorbis is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
+// failure fails instead of skipping. Some platforms don't support Vorbis, and WebKitGTK's GStreamer decoder hangs
+// instead of decoding or failing. vorbis-probe.json holds a tiny stream, from
+// ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -t 0.06 -c:a libvorbis -q:a 0 (decoder config and packets).
+let vorbisDecodesNativelyPromise: Promise<boolean> | null = null;
+const vorbisDecodesNatively = () => vorbisDecodesNativelyPromise ??= (async () => {
+	const probe = await (await fetch('/vorbis-probe.json')).json() as {
+		codec: string;
+		sampleRate: number;
+		numberOfChannels: number;
+		description: string;
+		chunks: string[];
+	};
+	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+	const config: AudioDecoderConfig = {
+		codec: probe.codec,
+		sampleRate: probe.sampleRate,
+		numberOfChannels: probe.numberOfChannels,
+		description: fromBase64(probe.description),
+	};
+
+	const decoders: AudioDecoder[] = [];
+	const decode = async () => {
+		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
+			return false;
+		}
+
+		let failed = false;
+		const decoder = new AudioDecoder({
+			output: data => data.close(),
+			error: () => {
+				failed = true;
+			},
+		});
+		decoders.push(decoder);
+		decoder.configure(config);
+		for (const [i, chunk] of probe.chunks.entries()) {
+			decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: i * 32000, data: fromBase64(chunk) }));
+		}
+		await decoder.flush();
+
+		return !failed;
+	};
+
+	try {
+		// A hung decoder (or a page whose decoding an earlier hang stalled) neither decodes nor fails
+		return await Promise.race([
+			decode(),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+		]);
+	} catch {
+		return false;
+	} finally {
+		for (const decoder of decoders) {
+			if (decoder.state !== 'closed') {
+				decoder.close();
+			}
+		}
+	}
+})();
+
+// vorbis-clicks.ogg was made with:
+// ffmpeg -f lavfi -i "aevalsrc=exprs='if(lt(mod(t\,0.5)\,0.004)\,0.8*sin(2*PI*1000*t)\,0)':s=44100:d=3" \
+//   -c:a libvorbis -q:a 4 vorbis-clicks.ogg
+test('Vorbis audio keeps its timing, also after seeking', async ({ skip }) => {
+	skip(!(await vorbisDecodesNatively()), 'Vorbis can\'t be decoded here (native probe)');
+
+	using input = new Input({
+		source: new UrlSource('/vorbis-clicks.ogg'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+
+	// A 1 kHz tone burst starts every 0.5 seconds
+	const findBurst = async (startTimestamp?: number) => {
+		for await (using sample of sink.samples(startTimestamp)) {
+			const index = getSampleData(sample).findIndex(x => Math.abs(x) > 0.3);
+			if (index !== -1) {
+				return sample.timestamp + index / sample.sampleRate;
+			}
+		}
+
+		return null;
+	};
+
+	expect(await findBurst()).toBeCloseTo(0, 3);
+	expect(await findBurst(0.9)).toBeCloseTo(1, 3);
+	expect(await findBurst(1.45)).toBeCloseTo(1.5, 3);
+	expect(await findBurst(2.2)).toBeCloseTo(2.5, 3);
+});
