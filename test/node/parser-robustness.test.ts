@@ -38,8 +38,8 @@ const KNOWN_FAILURES: Record<string, string> = {
 	'mkv/vorbis-without-codec-private.bin': '#325',
 	'mkv/vorbis-unterminated-lacing.bin': '#325',
 	'aac/sample-rate-change.bin': 'bug-fix-mania',
-	'wav/unsized-overstated-data-size.bin': 'bug-fix-mania',
-	'wav/id3-frame-size-past-tag.bin': 'bug-fix-mania',
+	'wav/unsized-overstated-data-size.bin': '#682',
+	'wav/id3-frame-size-past-tag.bin': '#274',
 };
 
 // These hang (or used to), which would stall the whole file instead of failing a test, so they run in a child process
