@@ -752,7 +752,8 @@ class VideoEncoderWrapper {
 			}
 
 			if (!selected) {
-				if (typeof VideoEncoder === 'undefined') {
+				// With custom encoders registered (like @mediabunny/server's), it's this config they declined
+				if (typeof VideoEncoder === 'undefined' && customVideoEncoders.length === 0) {
 					throw new Error(missingWebCodecsClassMessage('VideoEncoder'));
 				}
 
@@ -2443,17 +2444,20 @@ class AudioEncoderWrapper {
 			} else if ((PCM_AUDIO_CODECS as readonly string[]).includes(this.encodingConfig.codec)) {
 				this.initPcmEncoder();
 			} else {
-				if (typeof AudioEncoder === 'undefined') {
+				// With custom encoders registered (like @mediabunny/server's), it's this config they declined
+				if (typeof AudioEncoder === 'undefined' && customAudioEncoders.length === 0) {
 					throw new Error(missingWebCodecsClassMessage('AudioEncoder'));
 				}
 
-				let supported: boolean;
+				let supported = false;
 
-				try {
-					const support = await AudioEncoder.isConfigSupported(encoderConfig);
-					supported = support.supported ?? false;
-				} catch {
-					supported = false;
+				if (typeof AudioEncoder !== 'undefined') {
+					try {
+						const support = await AudioEncoder.isConfigSupported(encoderConfig);
+						supported = support.supported ?? false;
+					} catch {
+						// Not supported
+					}
 				}
 
 				if (!supported) {
