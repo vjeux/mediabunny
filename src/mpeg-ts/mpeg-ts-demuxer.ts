@@ -236,14 +236,20 @@ export class MpegTsDemuxer extends Demuxer {
 			// that data be gone after all (a source that only keeps what its cache holds evicts as it reads on)
 			let goingBack: {
 				resumePos: number;
-				streams: Pick<
-					ElementaryStream,
-					'initialized' | 'firstSection' | 'canBeTrustedWithKeyPackets' | 'info'
-				>[];
+				streams: {
+					stream: ElementaryStream;
+					state: Pick<
+						ElementaryStream,
+						'initialized' | 'firstSection' | 'canBeTrustedWithKeyPackets' | 'info'
+					>;
+				}[];
 				timestampWrapInfo: TimestampWrapInfo | null;
 			} | null = null;
 			const readOnFromPmt = (going: NonNullable<typeof goingBack>) => {
-				this.elementaryStreams.forEach((stream, i) => Object.assign(stream, going.streams[i]));
+				this.elementaryStreams.length = 0;
+				for (const { stream, state } of going.streams) {
+					this.elementaryStreams.push(Object.assign(stream, state));
+				}
 				this.timestampWrapInfo = going.timestampWrapInfo;
 				currentPos = going.resumePos;
 				goingBack = null;
@@ -573,11 +579,14 @@ export class MpegTsDemuxer extends Demuxer {
 					) {
 						goingBack = {
 							resumePos: currentPos + this.packetStride,
-							streams: this.elementaryStreams.map(x => ({
-								initialized: x.initialized,
-								firstSection: x.firstSection,
-								canBeTrustedWithKeyPackets: x.canBeTrustedWithKeyPackets,
-								info: { ...x.info },
+							streams: this.elementaryStreams.map(stream => ({
+								stream,
+								state: {
+									initialized: stream.initialized,
+									firstSection: stream.firstSection,
+									canBeTrustedWithKeyPackets: stream.canBeTrustedWithKeyPackets,
+									info: { ...stream.info },
+								},
 							})),
 							timestampWrapInfo: this.timestampWrapInfo,
 						};
