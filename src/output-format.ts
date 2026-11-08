@@ -508,6 +508,10 @@ export type MkvOutputFormatOptions = {
 	 * Will be called once the header part of the Matroska Segment element has been written. The header data includes
 	 * the Segment element and everything inside it, up to (but excluding) the first Matroska Cluster.
 	 *
+	 * Unless `appendOnly` is set, some of the header's values (the Segment's size, the duration and the positions in
+	 * the SeekHead) are only known once the output is finalized. The callback is then called again with the final
+	 * header data, at the same position.
+	 *
 	 * @param data - The raw bytes.
 	 * @param position - The byte offset of the data in the file.
 	 */
