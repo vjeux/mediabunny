@@ -53,6 +53,12 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 	abstract _finalize(): Promise<void>;
 	/** @internal */
 	abstract _close(): Promise<void>;
+	/**
+	 * Called when the output is canceled (while finalizing too), for a target that can hold canceling or finalization
+	 * up forever.
+	 * @internal
+	 */
+	_cancelFinalization() {}
 
 	/**
 	 * Called each time data is written to the target. Will be called with the byte range into which data was written.
@@ -277,6 +283,27 @@ export type StreamTargetOptions = {
 
 const DEFAULT_CHUNK_SIZE = 2 ** 24;
 const MAX_CHUNKS_AT_ONCE = 2;
+/**
+ * When canceling, how long a {@link StreamTarget} keeps waiting for its stream to close while writes are pending and
+ * none of them completes; past that, it takes the sink as stalled and leaves the stream to close in the background.
+ */
+const STALLED_SINK_TIMEOUT_MS = 5000;
+
+/** Resolves with whether the promise fulfills within the given time, and rejects if it rejects within it. */
+const fulfillsWithin = async (promise: Promise<unknown>, ms: number) => {
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+	try {
+		return await Promise.race([
+			promise.then(() => true),
+			new Promise<false>((resolve) => {
+				timeoutId = setTimeout(() => resolve(false), ms);
+			}),
+		]);
+	} finally {
+		clearTimeout(timeoutId);
+	}
+};
 
 type Chunk = {
 	start: number;
@@ -319,6 +346,21 @@ export class StreamTarget extends Target {
 	_streamWriter: WritableStreamDefaultWriter<StreamTargetChunk> | null = null;
 	/** @internal */
 	_writeError: unknown = null;
+	/** @internal */
+	_abandon: (error: Error) => void = () => {};
+	/** Rejects once finalization is given up on, since the sink stalled after canceling. @internal */
+	_abandonment = new Promise<never>((resolve, reject) => {
+		this._abandon = reject;
+	});
+
+	/** @internal */
+	_abandoned = false;
+	/** @internal */
+	_watchingFinalization = false;
+	/** @internal */
+	_pendingWrites = 0;
+	/** @internal */
+	_completedWrites = 0;
 
 	// These variables regard chunked mode:
 	/** @internal */
@@ -433,7 +475,7 @@ export class StreamTarget extends Target {
 			}
 
 			if (this._streamWriter.desiredSize !== null && this._streamWriter.desiredSize <= 0) {
-				await this._streamWriter.ready; // Allow the writer to apply backpressure
+				await this._unlessAbandoned(this._streamWriter.ready); // Allow the writer to apply backpressure
 			}
 
 			if (this._chunked) {
@@ -445,19 +487,29 @@ export class StreamTarget extends Target {
 					throw new Error('Internal error: Monotonicity violation.');
 				}
 
-				void this._streamWriter.write({
-					type: 'write',
-					data: chunk.data,
-					position: chunk.start,
-				}).catch((error) => {
-					this._writeError ??= error;
-				});
+				this._writeToStream(chunk.data, chunk.start);
 
 				this._lastFlushEnd = chunk.start + chunk.data.byteLength;
 			}
 		}
 
 		this._sections.length = 0;
+	}
+
+	/** @internal */
+	_writeToStream(data: Uint8Array<ArrayBuffer>, position: number) {
+		assert(this._streamWriter);
+
+		this._pendingWrites++;
+		void this._streamWriter.write({ type: 'write', data, position })
+			.then(() => {
+				this._completedWrites++;
+			}, (error) => {
+				this._writeError ??= error;
+			})
+			.finally(() => {
+				this._pendingWrites--;
+			});
 	}
 
 	/** @internal */
@@ -567,13 +619,7 @@ export class StreamTarget extends Target {
 					data = chunk.data.subarray(section.start, section.end);
 				}
 
-				void this._streamWriter.write({
-					type: 'write',
-					data,
-					position,
-				}).catch((error) => {
-					this._writeError ??= error;
-				});
+				this._writeToStream(data, position);
 
 				this._lastFlushEnd = chunk.start + section.end;
 			}
@@ -594,15 +640,73 @@ export class StreamTarget extends Target {
 		}
 
 		assert(this._streamWriter);
-		await this._streamWriter.ready;
-		await this._streamWriter.close();
+		await this._unlessAbandoned(this._streamWriter.ready);
+		const closed = this._streamWriter.close();
+		void closed.catch(() => {}); // Once finalization is given up on, the stream closes in the background
+		await this._unlessAbandoned(closed);
 
 		this._emit('finalized');
 	}
 
 	/** @internal */
+	_unlessAbandoned<T>(promise: Promise<T>) {
+		return Promise.race([promise, this._abandonment]);
+	}
+
+	/** @internal */
+	override _cancelFinalization() {
+		if (!this._streamWriter || this._watchingFinalization) {
+			return;
+		}
+		this._watchingFinalization = true;
+
+		// Finalization gets stuck only on a sink that has stalled on a write. Give up on it once none of the pending
+		// writes has completed for a while, as canceling does: the waits on the stream in _flush and _finalize then
+		// reject, which makes finalization fail.
+		const streamDone = this._streamWriter.closed.then(() => true, () => true);
+		void (async () => {
+			let completedWrites = -1;
+			while (this._completedWrites !== completedWrites || this._pendingWrites === 0) {
+				completedWrites = this._completedWrites;
+
+				if (await fulfillsWithin(streamDone, STALLED_SINK_TIMEOUT_MS)) {
+					return;
+				}
+			}
+
+			this._abandoned = true;
+			void this._abandonment.catch(() => {});
+			this._abandon(new Error('Output has been canceled.'));
+		})();
+	}
+
+	/** @internal */
 	async _close() {
-		return this._streamWriter?.close();
+		if (!this._streamWriter) {
+			return;
+		}
+
+		const closed = this._streamWriter.close();
+		if (this._abandoned) {
+			// Finalization was given up on since the sink stalled; the stream closes in the background
+			void closed.catch(() => {});
+			return;
+		}
+
+		// Closing only completes once every queued write has. Wait for that while the sink keeps completing writes,
+		// but not once it has stalled on one (an upload over a hung connection, say), or canceling would hang forever;
+		// the stream then gets closed in the background, should the sink ever catch up. Failed writes don't count as
+		// progress (any write made after closing began fails).
+		let completedWrites = -1;
+		while (this._completedWrites !== completedWrites || this._pendingWrites === 0) {
+			completedWrites = this._completedWrites;
+
+			if (await fulfillsWithin(closed, STALLED_SINK_TIMEOUT_MS)) {
+				return;
+			}
+		}
+
+		void closed.catch(() => {});
 	}
 }
 
@@ -679,6 +783,11 @@ export class AppendOnlyStreamTarget extends Target {
 	/** @internal */
 	_close(): Promise<void> {
 		return this._streamTarget._close();
+	}
+
+	/** @internal */
+	override _cancelFinalization() {
+		this._streamTarget._cancelFinalization();
 	}
 
 	/** @internal */
@@ -777,6 +886,11 @@ export class FilePathTarget extends Target {
 	}
 
 	/** @internal */
+	override _cancelFinalization() {
+		this._streamTarget._cancelFinalization();
+	}
+
+	/** @internal */
 	override _setMonotonicity(monotonicity: boolean): void {
 		super._setMonotonicity(monotonicity);
 		this._streamTarget._setMonotonicity(monotonicity);
@@ -852,6 +966,11 @@ export class RangedTarget extends Target {
 
 	/** @internal */
 	async _close() {}
+
+	/** @internal */
+	override _cancelFinalization() {
+		this._baseTarget._cancelFinalization();
+	}
 
 	/** @internal */
 	override _setMonotonicity(monotonicity: boolean): void {
