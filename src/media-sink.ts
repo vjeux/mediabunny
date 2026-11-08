@@ -2818,17 +2818,21 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		onError: (error: unknown) => unknown,
 	) {
 		if (!(await this._canDecode())) {
-			if (typeof VideoDecoder === 'undefined') {
+			if (typeof VideoDecoder === 'undefined' && customVideoDecoders.length === 0) {
 				throw new Error(missingWebCodecsClassMessage('VideoDecoder'));
 			}
 
+			// Custom decoders were registered then, and none supports this track (say, an extension for other codecs)
+			const missingClass = typeof VideoDecoder === 'undefined'
+				? ' No registered custom decoder supports it, and ' + missingWebCodecsClassMessage('VideoDecoder')
+				: '';
 			const { hardwareAcceleration } = this._decoderOptions;
 			throw new Error(
 				'This video track cannot be decoded in this environment'
 				+ (hardwareAcceleration && hardwareAcceleration !== 'no-preference'
 					? ` with hardwareAcceleration '${hardwareAcceleration}'`
 					: '')
-				+ '. Make sure to check decodability before using a track.',
+				+ `.${missingClass} Make sure to check decodability before using a track.`,
 			);
 		}
 
@@ -4082,13 +4086,17 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		onError: (error: unknown) => unknown,
 	) {
 		if (!(await this._track.canDecode())) {
-			if (typeof AudioDecoder === 'undefined') {
+			if (typeof AudioDecoder === 'undefined' && customAudioDecoders.length === 0) {
 				throw new Error(missingWebCodecsClassMessage('AudioDecoder'));
 			}
 
+			// Custom decoders were registered then, and none supports this track (say, an extension for other codecs)
+			const missingClass = typeof AudioDecoder === 'undefined'
+				? ' No registered custom decoder supports it, and ' + missingWebCodecsClassMessage('AudioDecoder')
+				: '';
 			throw new Error(
-				'This audio track cannot be decoded in this environment. Make sure to check decodability before using'
-				+ ' a track.',
+				`This audio track cannot be decoded in this environment.${missingClass} Make sure to check decodability`
+				+ ' before using a track.',
 			);
 		}
 
