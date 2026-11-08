@@ -8,6 +8,7 @@
 
 import { Demuxer, DurationMetadataRequestOptions } from './demuxer';
 import { InputFormat, InputFormatOptions, validateInputFormatOptions } from './input-format';
+import { cloneMetadataTags } from './metadata';
 import {
 	InputAudioTrack,
 	InputAudioTrackBacking,
@@ -515,7 +516,9 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 */
 	async getMetadataTags() {
 		const demuxer = await this._getDemuxer();
-		return demuxer.getMetadataTags();
+
+		// Copied so that callers can't modify the input's own state
+		return cloneMetadataTags(await demuxer.getMetadataTags());
 	}
 
 	/**
