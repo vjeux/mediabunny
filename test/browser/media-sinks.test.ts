@@ -1364,3 +1364,130 @@ test('Annex B AVC decodes when the first packet has its parameter sets before th
 	expect(frameCount).toBeGreaterThan(0);
 	expect(await decodeAll(reordered)).toBe(frameCount);
 });
+
+test.each([
+	['with', false],
+	['without', true],
+])('Looking up H.264 frames gives the frames samples() gives, %s composition offsets', async (_, stripOffsets) => {
+	const bytes = new Uint8Array(await (await fetch('/video.mp4')).arrayBuffer()); // H.264 with B-frames
+	if (stripOffsets) {
+		// What `ffmpeg -i in.h264 -c copy out.mp4` writes for a raw H.264 stream with B-frames: no ctts, so the
+		// timestamps are in decode order, and Chromium's frames get them in sorted order. Found by lane L64.
+		let ctts = 0;
+		while (String.fromCharCode(...bytes.subarray(ctts, ctts + 4)) !== 'ctts') {
+			ctts++;
+		}
+		bytes.set([0x66, 0x72, 0x65, 0x65], ctts); // 'free'
+	}
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new VideoSampleSink(track);
+
+	// A small picture of the frame, to tell frames apart
+	const getSignature = (sample: VideoSample) => {
+		const canvas = new OffscreenCanvas(8, 8);
+		const context = canvas.getContext('2d')!;
+		sample.draw(context, 0, 0, 8, 8);
+		return context.getImageData(0, 0, 8, 8).data.filter((_, i) => i % 4 === 1).join(',');
+	};
+
+	const signatures = new Map<number, string>();
+	for await (using sample of sink.samples()) {
+		signatures.set(sample.timestamp, getSignature(sample));
+	}
+
+	// Each lookup decodes from its key frame with a fresh decoder, which is slow, so only a few of them
+	const timestamps = [...signatures.keys()].filter((_, i) => i % 25 === 2);
+	for (const timestamp of timestamps) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBe(timestamp);
+		expect(getSignature(sample), `frame at ${timestamp}`).toBe(signatures.get(timestamp));
+	}
+
+	// Every frame and the points halfway to the next one, in one go
+	const allTimestamps = [...signatures.keys()];
+	const queries = allTimestamps.slice(0, -1).flatMap((timestamp, i) => [
+		timestamp,
+		(timestamp + allTimestamps[i + 1]!) / 2,
+	]);
+	let index = 0;
+	for await (using sample of sink.samplesAtTimestamps(queries)) {
+		assert(sample);
+		const expected = allTimestamps.filter(timestamp => timestamp <= queries[index]!).at(-1)!;
+		expect(sample.timestamp, `query ${queries[index]}`).toBe(expected);
+		expect(getSignature(sample), `query ${queries[index]}`).toBe(signatures.get(expected));
+		index++;
+	}
+});
+
+test('Frame lookups in a stream without B-frames stay exact when the reorder depth is unknown', async () => {
+	// An SPS without bitstream restriction info (which many encoders leave out) gives no reorder depth, so
+	// Mediabunny assumes the worst, 16 frames. In a stream without B-frames, no frame after the one asked for may
+	// answer a lookup all the same (found by lane L46).
+	using input = new Input({ source: new UrlSource('/missing-tfdt.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new VideoSampleSink(track);
+	sink._getReorderDepth = async () => 16;
+
+	const timestamps: number[] = [];
+	for await (using sample of sink.samples()) {
+		timestamps.push(sample.timestamp);
+		if (timestamps.length === 40) {
+			break;
+		}
+	}
+
+	const queries = timestamps.slice(0, -1).flatMap((timestamp, i) => [
+		timestamp,
+		(timestamp + timestamps[i + 1]!) / 2,
+	]);
+	let index = 0;
+	for await (using sample of sink.samplesAtTimestamps(queries)) {
+		const expected = timestamps.filter(timestamp => timestamp <= queries[index]!).at(-1);
+		expect(sample?.timestamp, `query ${queries[index]}`).toBe(expected);
+		index++;
+	}
+
+	using sample = await sink.getSample(timestamps[20]!);
+	expect(sample?.timestamp).toBe(timestamps[20]);
+});
+
+test('Frame lookups at the live edge of a stream return without waiting for it to go on', async () => {
+	// A live HLS stream (no EXT-X-ENDLIST) whose next segment never comes, as when its encoder stopped. Segments made
+	// with ffmpeg -f lavfi -i testsrc2=size=160x120:rate=25:duration=2 -c:v libx264 -g 12 -bf 2 -f hls -hls_time 0.5
+	const playlist = [
+		'#EXTM3U',
+		'#EXT-X-VERSION:3',
+		'#EXT-X-TARGETDURATION:1',
+		'#EXT-X-MEDIA-SEQUENCE:0',
+		'#EXTINF:0.96,',
+		'segment0.ts',
+		'#EXTINF:0.48,',
+		'segment1.ts',
+		'#EXTINF:0.48,',
+		'segment2.ts',
+	].join('\n');
+	using input = new Input({
+		source: new CustomPathedSource('index.m3u8', ({ path }) => path === 'index.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new UrlSource('/hls-live/' + path)),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new VideoSampleSink(track);
+
+	// Decoding ahead of the frame (for its reorder depth) must not wait for packets past the live edge
+	for (const timestamp of [1.68, 1.84, 1.88]) {
+		const sample = await Promise.race([
+			sink.getSample(timestamp),
+			new Promise<null>(resolve => setTimeout(() => resolve(null), 3000)),
+		]);
+		expect(sample?.timestamp, `frame at ${timestamp}`).toBe(timestamp);
+		sample?.close();
+	}
+});
