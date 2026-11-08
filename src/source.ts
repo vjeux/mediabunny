@@ -1034,9 +1034,16 @@ export class UrlSource extends PathedSource {
 				}
 
 				if (!this._usedForHls) {
+					let base: string | undefined;
+					try {
+						base = typeof location !== 'undefined' ? location.href : undefined; // Defined in workers too
+					} catch {
+						// Reading it may even throw, like in Deno without --location
+					}
+
 					const url = new URL(
-						this._url instanceof Request ? this._url.url : this._url,
-						typeof window !== 'undefined' ? window.location.href : undefined,
+						response.url || (this._url instanceof Request ? this._url.url : this._url),
+						base,
 					);
 
 					if (
