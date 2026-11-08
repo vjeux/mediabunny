@@ -29,7 +29,13 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { FlacOutputFormat, Mp4OutputFormat, OggOutputFormat, MkvOutputFormat } from '../../src/output-format.js';
+import {
+	FlacOutputFormat,
+	Mp4OutputFormat,
+	OggOutputFormat,
+	MkvOutputFormat,
+	WebMOutputFormat,
+} from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
@@ -2547,6 +2553,125 @@ describe('Video', async () => {
 		await result.copyTo(copied);
 		expect([0, 1, 2, 3].map(y => copied[4 * y])).toEqual(expectedRows);
 		expect([...copied.subarray(16)]).toEqual(Array(8).fill(128));
+	});
+
+	describe('VP9 alpha that starts after the first packet', () => {
+		// Encodes 64x64 VP9 frames whose right half is transparent, with a key frame every 10 frames, and returns the
+		// packets and decoder config
+		const encodeVp9 = async (frameCount: number, alpha: 'keep' | 'discard') => {
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'vp9', bitrate: 1e6, alpha, keyFrameInterval: 1 / 3 });
+			output.addVideoTrack(source);
+			await output.start();
+			for (let i = 0; i < frameCount; i++) {
+				const data = new Uint8Array(64 * 64 * 4);
+				for (let j = 0; j < 64 * 64; j++) {
+					data.set([200, 50, 50, j % 64 >= 32 ? 0 : 255], j * 4);
+				}
+				using sample = new VideoSample(data, {
+					format: 'RGBA',
+					codedWidth: 64,
+					codedHeight: 64,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await source.add(sample);
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = (await input.getPrimaryVideoTrack())!;
+			const packets: EncodedPacket[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push(packet);
+			}
+			return { packets, decoderConfig: (await track.getDecoderConfig())! };
+		};
+
+		// Decodes the packets with the server's decoder, and returns the format of each frame that comes out, with the
+		// alpha in the middle of its opaque left half and its transparent right half
+		const decodeVp9 = async (packets: EncodedPacket[], decoderConfig: VideoDecoderConfig) => {
+			const decoder = new NodeAvVideoDecoder();
+			// @ts-expect-error Readonly
+			decoder.codec = 'vp9';
+			// @ts-expect-error Readonly
+			decoder.config = decoderConfig;
+			const samples: VideoSample[] = [];
+			// @ts-expect-error Readonly
+			decoder.onSample = (sample: VideoSample) => {
+				samples.push(sample);
+			};
+			await decoder.init();
+			for (const packet of packets) {
+				await decoder.decode(packet);
+			}
+			await decoder.flush();
+			await decoder.close();
+
+			const frames: { format: string | null; alpha: number[] | null }[] = [];
+			for (const sample of samples) {
+				const data = new Uint8Array(sample.allocationSize());
+				await sample.copyTo(data);
+				const alphaPlane = data.subarray(64 * 64 + 2 * 32 * 32);
+				frames.push({
+					format: sample.format,
+					alpha: sample.format === 'I420A' ? [alphaPlane[32 * 64 + 16]!, alphaPlane[32 * 64 + 48]!] : null,
+				});
+				sample.close();
+			}
+			return frames;
+		};
+
+		// Gives packets the alpha data of another encode's packets, from the given packet on, the way Mediabunny writes
+		// alpha: 'keep' when only some frames are transparent
+		const addAlpha = (packets: EncodedPacket[], alphaPackets: EncodedPacket[], start: number) => {
+			return packets.map((packet, i) => i < start || i >= start + alphaPackets.length
+				? packet
+				: packet.clone({ sideData: { alpha: alphaPackets[i - start]!.sideData.alpha } }),
+			);
+		};
+
+		const opaque = (count: number) => Array.from({ length: count }, () => ({ format: 'I420', alpha: null }));
+		const transparent = (count: number) => {
+			return Array.from({ length: count }, () => ({ format: 'I420A', alpha: [255, 0] }));
+		};
+
+		test('VP9 alpha that starts on a delta frame is decoded from there', async () => {
+			const color = await encodeVp9(10, 'discard');
+			const alpha = await encodeVp9(5, 'keep');
+			const packets = addAlpha(color.packets, alpha.packets, 5);
+			expect(packets[5]!.type).toBe('delta');
+
+			expect(await decodeVp9(packets, color.decoderConfig)).toEqual([...opaque(5), ...transparent(5)]);
+		});
+
+		test('VP9 alpha that starts and stops mid-stream is decoded, and so are the frames after it', async () => {
+			// A fade from opaque to transparent and back
+			const color = await encodeVp9(20, 'discard');
+			const alpha = await encodeVp9(8, 'keep');
+			const packets = addAlpha(color.packets, alpha.packets, 5);
+
+			expect(await decodeVp9(packets, color.decoderConfig)).toEqual([
+				...opaque(5),
+				...transparent(8),
+				...opaque(7),
+			]);
+		});
+
+		test('VP9 alpha that starts on a delta frame of its own is decoded from its next key frame', async () => {
+			// The alpha data of frames 3-19 of an encode, so the first alpha frame refers to frames that are missing.
+			// Its frames stay opaque until the alpha's next key frame, at frame 10, like in Chromium.
+			const color = await encodeVp9(20, 'discard');
+			const alpha = await encodeVp9(20, 'keep');
+			const packets = addAlpha(color.packets, alpha.packets.slice(3), 3);
+
+			expect(await decodeVp9(packets, color.decoderConfig)).toEqual([...opaque(10), ...transparent(10)]);
+		});
+
+		test('VP9 alpha from the first packet on is decoded (control)', async () => {
+			const { packets, decoderConfig } = await encodeVp9(10, 'keep');
+			expect(await decodeVp9(packets, decoderConfig)).toEqual(transparent(10));
+		});
 	});
 
 	describe('VideoSample transformation', () => {
