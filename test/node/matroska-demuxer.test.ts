@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -97,4 +99,62 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('getPacket finds the first block of a cluster that starts before the previous one ends', async () => {
+	// 60 fps as FFmpeg writes it: millisecond timestamps rounded from multiples of 16.667 ms, a 16.667 ms
+	// DefaultDuration, and (with long GOPs) clusters that begin mid-GOP. The last block of the first cluster, at 67 ms,
+	// lasts until 83.667 ms (or 84 ms with a rounded DefaultDuration), past the next cluster's first block at 83 ms.
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const matroskaFile = (...segmentChildren: number[][]) => new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, [...'matroska'].map(x => x.charCodeAt(0)))),
+		...element(EBMLId.Segment, segmentChildren.flat()),
+	]);
+
+	const block = (timestamp: number, key = false) => element(
+		EBMLId.SimpleBlock,
+		[0x81, 0, timestamp, key ? 0x80 : 0, 1],
+	);
+	const file = matroskaFile(
+		element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+		element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [1]),
+			element(EBMLId.CodecID, [...'V_VP8'].map(x => x.charCodeAt(0))),
+			element(EBMLId.DefaultDuration, [0x00, 0xfe, 0x50, 0x6b]), // 16,666,667 ns
+			element(EBMLId.Video, element(EBMLId.PixelWidth, [16]), element(EBMLId.PixelHeight, [16])),
+		)),
+		element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [0]),
+			block(0, true), block(17), block(33), block(50), block(67),
+		),
+		element(EBMLId.Cluster, element(EBMLId.Timestamp, [83]), block(0), block(17)),
+	);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sink = new EncodedPacketSink(track);
+	for (const timestamp of [0, 0.017, 0.033, 0.05, 0.067, 0.083, 0.1]) {
+		const packet = await sink.getPacket(timestamp);
+		expect(packet?.timestamp).toBe(timestamp);
+	}
 });
