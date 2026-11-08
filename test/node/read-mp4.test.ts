@@ -5198,3 +5198,57 @@ test('Fragmented PCM with one sample per frame', async () => {
 	expect((await read(48_000, { lookupSampleNumber: 2 })).timestamps).toEqual([0, 32768]);
 	expect((await read(48_000, { lookupSampleNumber: 1 })).timestamps).toEqual([1, 32769]);
 });
+
+test('Sample rate from an srat box', async () => {
+	// The 16.16 sample rate field of a sample entry can't hold 96000. GPAC (MP4Box) keeps its low 16 bits there (30464)
+	// and puts the real rate in an srat box (ISO/IEC 14496-12 12.2.4).
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (withSrat: boolean) => {
+		const frameCount = 960; // 10 ms of stereo 24-bit PCM
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const ipcm = box('ipcm', zeros(6), [0, 1], zeros(8), [0, 2, 0, 24], zeros(4), u32((96000 & 0xffff) * 0x10000),
+			withSrat ? box('srat', zeros(4), u32(96000)) : [],
+			box('pcmC', zeros(4), [1, 24]));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(10), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(10), zeros(8), zeros(4), [1, 0], zeros(2), matrix,
+					zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(96000), u32(frameCount), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('smhd', zeros(8)), box('stbl',
+						box('stsd', zeros(4), u32(1), ipcm),
+						box('stts', zeros(4), u32(1), u32(frameCount), u32(1)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(frameCount), u32(1)),
+						box('stsz', zeros(4), u32(6), u32(frameCount)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...box('mdat', zeros(6 * frameCount)), ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return [
+			await track.getSampleRate(),
+			(await track.getDecoderConfig())?.sampleRate,
+			(await new EncodedPacketSink(track).getFirstPacket())?.byteLength,
+		];
+	};
+
+	expect(await read(true)).toEqual([96000, 96000, 6 * 960]);
+	expect(await read(false)).toEqual([30464, 30464, 6 * 960]); // All the sample entry has to say
+});
