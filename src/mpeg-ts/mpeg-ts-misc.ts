@@ -93,7 +93,9 @@ export const enum MpegTsStreamType {
 }
 
 export const buildMpegTsMimeType = (codecStrings: (string | null)[]) => {
-	let string = 'video/MP2T';
+	// Lower case, as MediaSource.isTypeSupported in Chromium only accepts it that way (MIME types are case-insensitive,
+	// but not there), and as HLS and most servers write it
+	let string = 'video/mp2t';
 
 	const uniqueCodecStrings = [...new Set(codecStrings.filter(Boolean))];
 	if (uniqueCodecStrings.length > 0) {
