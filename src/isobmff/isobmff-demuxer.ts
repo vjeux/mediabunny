@@ -10,6 +10,7 @@ import { TrackType } from '../output';
 import { buildAacAudioSpecificConfig, parseAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
 	AacCodecInfo,
+	AUDIO_CODECS_WITH_DELTA_PACKETS,
 	AudioCodec,
 	DTS_FOURCCS,
 	DtsFourCc,
@@ -1060,6 +1061,10 @@ export class IsobmffDemuxer extends Demuxer {
 
 		capEntryCounts(sampleTable.sampleTimingEntries, sampleTable.sampleCount);
 		capEntryCounts(sampleTable.sampleCompositionTimeOffsets, sampleTable.sampleCount);
+
+		if (hasOnlyKeySamples(internalTrack)) {
+			sampleTable.keySampleIndices = null; // Whatever the stss box says
+		}
 
 		const isPcmCodec = internalTrack.info?.type === 'audio'
 			&& internalTrack.info.codec
@@ -3856,6 +3861,7 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				trackData.trunSampleCounts.push(sampleCount);
+				const allSamplesAreKeySamples = hasOnlyKeySamples(track);
 
 				for (let i = 0; i < sampleCount; i++) {
 					let sampleDuration: number;
@@ -3907,7 +3913,7 @@ export class IsobmffDemuxer extends Demuxer {
 						duration: sampleDuration,
 						byteOffset: trackData.currentOffset,
 						byteSize: sampleSize,
-						isKeyFrame,
+						isKeyFrame: isKeyFrame || allSamplesAreKeySamples,
 						encryption: null,
 						encryptionGroup: null,
 					});
@@ -6001,6 +6007,25 @@ const getSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: nu
 				entry.count - 1,
 			);
 	}
+};
+
+/**
+ * Whether every sample of the track is a key sample, whatever the container says: true for audio codecs without delta
+ * packets, like in the Matroska demuxer. Some files flag such samples as non-sync samples.
+ */
+const hasOnlyKeySamples = (track: InternalTrack) => {
+	const info = track.info;
+	if (info?.type !== 'audio' || !info.codec || AUDIO_CODECS_WITH_DELTA_PACKETS.includes(info.codec)) {
+		return false;
+	}
+
+	if (info.codec === 'aac' && info.codecDescription) {
+		// xHE-AAC (USAC) frames can depend on the ones before; only its independent frames are sync samples (Chromium
+		// makes the same exception)
+		return parseAacAudioSpecificConfig(info.codecDescription).objectType !== 42;
+	}
+
+	return true;
 };
 
 const getKeyframeSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: number) => {
