@@ -1001,7 +1001,8 @@ export class Output<
 	 * such a call, nothing is dropped). Finalization then goes on by itself, and the returned promise resolves right
 	 * away.
 	 *
-	 * @returns A promise that resolves once all internal resources have been released.
+	 * @returns A promise that resolves once all internal resources have been released, or right away while the output
+	 * is finalizing.
 	 */
 	async cancel() {
 		if (this.state === 'canceled') {
