@@ -204,6 +204,12 @@ export const toPixelFormat = (ffmpegPixelFormat: NodeAv.AVPixelFormat): VideoSam
 
 		case NodeAv.AV_PIX_FMT_NV12: return 'NV12';
 
+		// What 4:4:4 streams with an identity matrix (H.264 and VP9 RGB, AV1 identity) decode to. Their planes (G, B,
+		// R) are the stream's Y, U and V planes, so like Chromium, they're handed out as 4:4:4 with the 'rgb' matrix.
+		case NodeAv.AV_PIX_FMT_GBRP: return 'I444';
+		case NodeAv.AV_PIX_FMT_GBRP10LE: return 'I444P10';
+		case NodeAv.AV_PIX_FMT_GBRP12LE: return 'I444P12';
+
 		case NodeAv.AV_PIX_FMT_RGBA: return 'RGBA';
 		case NodeAv.AV_PIX_FMT_RGB0: return 'RGBX';
 		case NodeAv.AV_PIX_FMT_BGRA: return 'BGRA';
