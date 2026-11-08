@@ -198,7 +198,11 @@ export abstract class SegmentedInput {
 				return null;
 			}
 
-			return await track.getFirstTimestamp() + await this.getMediaOffset(segment, input);
+			// Rounded like the timestamps of its packets, so that its first packet starts exactly there
+			return roundToDivisor(
+				await track.getFirstTimestamp() + await this.getMediaOffset(segment, input),
+				await track.getTimeResolution(),
+			);
 		})();
 		this.segmentMediaStarts.set(segment, promise);
 
@@ -210,6 +214,47 @@ export abstract class SegmentedInput {
 		});
 
 		return promise;
+	}
+
+	/**
+	 * Returns the segment whose media holds the given timestamp (or that comes last before it), going by where the
+	 * segments' media actually starts: from the segment the playlist's timeline gives, which dates and durations can
+	 * have moved away from the media.
+	 */
+	async getSegmentWithMediaAt(timestamp: number) {
+		let segment = await this.getSegmentAt(timestamp, { skipLiveWait: true });
+		segment ??= await this.getFirstSegment({ skipLiveWait: true });
+		if (!segment) {
+			return null;
+		}
+
+		// Each walk goes one way only, so this ends
+		while (true) {
+			const mediaStart = await this.getSegmentMediaStart(segment);
+			if (mediaStart === null || mediaStart <= timestamp) {
+				break;
+			}
+
+			const previousSegment = await this.getPreviousSegment(segment, { skipLiveWait: true });
+			if (!previousSegment) {
+				break;
+			}
+			segment = previousSegment;
+		}
+		while (true) {
+			const nextSegment = await this.getNextSegment(segment, { skipLiveWait: true });
+			if (!nextSegment) {
+				break;
+			}
+
+			const nextMediaStart = await this.getSegmentMediaStart(nextSegment);
+			if (nextMediaStart === null || nextMediaStart > timestamp) {
+				break;
+			}
+			segment = nextSegment;
+		}
+
+		return segment;
 	}
 
 	getMediaOffset(segment: Segment, input: Input) {
@@ -388,9 +433,8 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		// where the media actually is: dates can drift away from the media. So measure from where the media of the
 		// segment the Unix time was given for actually starts.
 		try {
-			const packet = await this.getPacket(timestamp, { metadataOnly: true });
-			const info = packet && this.packetInfos.get(packet);
-			const anchor = info ? this.segmentedInput.getUnixTimeAnchor(info.segment) : null;
+			const segment = await this.segmentedInput.getSegmentWithMediaAt(timestamp);
+			const anchor = segment ? this.segmentedInput.getUnixTimeAnchor(segment) : null;
 			if (anchor && anchor.unixEpochTimestamp !== null) {
 				const anchorMediaStart = await this.segmentedInput.getSegmentMediaStart(anchor);
 				if (anchorMediaStart !== null) {

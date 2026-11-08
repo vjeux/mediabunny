@@ -2633,6 +2633,7 @@ const writeHlsWithDates = async (
 	addMedia: (output: Output) => Promise<void>,
 	// Returns the #EXT-X-PROGRAM-DATE-TIME (in Unix seconds) for each segment, or null to leave it undated
 	getDate: (segmentIndex: number, durationsBefore: number[]) => number | null,
+	discontinuityBefore = (segmentIndex: number) => segmentIndex < 0,
 ) => {
 	const targets = new Map<string, BufferTarget>();
 	const output = new Output({
@@ -2648,9 +2649,11 @@ const writeHlsWithDates = async (
 	const durations: number[] = [];
 	const playlist = new TextDecoder().decode(targets.get('playlist-1.m3u8')!.buffer!)
 		.replace(/#EXTINF:([\d.]+),/g, (match, duration: string) => {
+			const discontinuity = discontinuityBefore(durations.length) ? '#EXT-X-DISCONTINUITY\n' : '';
 			const date = getDate(durations.length, durations);
 			durations.push(Number(duration));
-			return date === null ? match : `#EXT-X-PROGRAM-DATE-TIME:${new Date(1000 * date).toISOString()}\n${match}`;
+			const dateTag = date === null ? '' : `#EXT-X-PROGRAM-DATE-TIME:${new Date(1000 * date).toISOString()}\n`;
+			return discontinuity + dateTag + match;
 		});
 
 	const openInput = (offsetTimestampsByDateTime: boolean, rootPath = 'playlist-1.m3u8', readableSegments = true) => {
@@ -2755,6 +2758,70 @@ test('Muxed tracks map a timestamp to the same Unix time', async () => {
 		const timestamp = firstTimestamp + offset;
 		expect(await audioTrack.getUnixTimeForTimestamp(timestamp))
 			.toBeCloseTo((await videoTrack.getUnixTimeForTimestamp(timestamp))!, 6);
+	}
+});
+
+test('Unix times after a discontinuity with a gap in its dates', async () => {
+	// Real media (H.264 and AAC from demo.mp4) in muxed MPEG-TS segments, the second half after a discontinuity dated
+	// two seconds after the first half's end. The first frame of each part is its date exactly.
+	const start = Date.parse('2026-01-01T00:00:00.000Z') / 1000;
+	const { durations, openInput } = await writeHlsWithDates(async (output) => {
+		using demo = new Input({ source: new FilePathSource('./test/public/demo.mp4'), formats: ALL_FORMATS });
+		const demoVideo = (await demo.getPrimaryVideoTrack())!;
+		const demoAudio = (await demo.getPrimaryAudioTrack())!;
+		const group = new OutputTrackGroup();
+		const video = new EncodedVideoPacketSource('avc');
+		const audio = new EncodedAudioPacketSource('aac');
+		output.addVideoTrack(video, { group });
+		output.addAudioTrack(audio, { group });
+		await output.start();
+
+		const videoConfig = { decoderConfig: (await demoVideo.getDecoderConfig())! };
+		const audioConfig = { decoderConfig: (await demoAudio.getDecoderConfig())! };
+		const videoPackets = new EncodedPacketSink(demoVideo).packets();
+		const audioPackets = new EncodedPacketSink(demoAudio).packets();
+		const nextBefore = async (packets: AsyncGenerator<EncodedPacket>) => {
+			const next = await packets.next();
+			return !next.done && next.value.timestamp < 6 ? next.value : null;
+		};
+		let nextVideo = await nextBefore(videoPackets);
+		let nextAudio = await nextBefore(audioPackets);
+		while (nextVideo || nextAudio) {
+			if (nextVideo && (!nextAudio || nextVideo.timestamp <= nextAudio.timestamp)) {
+				await video.add(nextVideo, videoConfig);
+				nextVideo = await nextBefore(videoPackets);
+			} else if (nextAudio) {
+				await audio.add(nextAudio, audioConfig);
+				nextAudio = await nextBefore(audioPackets);
+			}
+		}
+		await output.finalize();
+	}, (index, durationsBefore) => {
+		const sum = durationsBefore.reduce((a, b) => a + b, 0);
+		return index === 0 ? start : index === 2 ? start + sum + 2 : null;
+	}, index => index === 2);
+	expect(durations.length).toBeGreaterThan(2);
+
+	for (const offsetTimestampsByDateTime of [true, false]) {
+		using input = openInput(offsetTimestampsByDateTime);
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		const timestamps: number[] = [];
+		const sink = new EncodedPacketSink(videoTrack);
+		for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+			timestamps.push(packet.timestamp);
+		}
+
+		const secondPartStart = durations[0]! + durations[1]!;
+		const firstOfSecondPart = timestamps.findIndex(x => x - timestamps[0]! >= secondPartStart - 1e-3);
+		const second = timestamps[firstOfSecondPart]!;
+		// As written into the playlist, to the millisecond
+		const secondPartDate = Math.round(1000 * (start + secondPartStart + 2)) / 1000;
+		expect(await videoTrack.getUnixTimeForTimestamp(timestamps[0]!)).toBeCloseTo(start, 6);
+		expect(await videoTrack.getUnixTimeForTimestamp(second)).toBeCloseTo(secondPartDate, 6);
+		expect(await videoTrack.getUnixTimeForTimestamp(second + 0.1)).toBeCloseTo(secondPartDate + 0.1, 6);
+		// The last frame before the discontinuity still belongs to the first part
+		const last = timestamps[firstOfSecondPart - 1]!;
+		expect(await videoTrack.getUnixTimeForTimestamp(last)).toBeCloseTo(start + last - timestamps[0]!, 6);
 	}
 });
 
