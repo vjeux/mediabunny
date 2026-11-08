@@ -355,6 +355,39 @@ export class HlsDemuxer extends Demuxer {
 				let videoCodecString: string | null = null;
 				let audioCodecString: string | null = null;
 
+				const videoCodecStrings = codecStrings.filter(x =>
+					VIDEO_CODECS.includes(inferCodecFromCodecString(x) as VideoCodec),
+				);
+				const audioCodecStrings = codecStrings.filter(x =>
+					AUDIO_CODECS.includes(inferCodecFromCodecString(x) as AudioCodec),
+				);
+
+				// CODECS lists "every media format present in any Media Segment in any of the Renditions specified by
+				// the Variant Stream" (RFC 8216bis, Section 4.4.6.2) without saying which rendition uses which. So when
+				// it lists several codecs of a type, each rendition's codec is read from its own media.
+				const getRenditionCodecString = async (
+					mediaTag: typeof mediaTags[number],
+					type: 'video' | 'audio',
+					listedCodecStrings: string[],
+					embeddedIndex: number,
+				) => {
+					if (listedCodecStrings.length > 1) {
+						const path = mediaTag.fullPath ?? variantStream.fullPath;
+						const segmentedInput = this.getSegmentedInputForPath(path);
+						const trackBacking = (await segmentedInput.getTrackBackings())
+							.filter(x => x.getType() === type)[embeddedIndex];
+
+						if (trackBacking && (await trackBacking.getCodec()) !== null) {
+							const decoderConfig = await trackBacking.getDecoderConfig();
+							if (decoderConfig) {
+								return decoderConfig.codec;
+							}
+						}
+					}
+
+					return listedCodecStrings[0]!;
+				};
+
 				const bandwidth = variantStream.attributes.getAsNumber('bandwidth');
 				assert(bandwidth !== null);
 
@@ -369,13 +402,9 @@ export class HlsDemuxer extends Demuxer {
 					}
 
 					if (VIDEO_CODECS.includes(inferredCodec as VideoCodec)) {
-						if (videoCodecString !== null) {
-							throw new Error(
-								'Unsupported M3U8 file; multiple video codecs found in the CODECS attribute of a'
-								+ ' variant stream.',
-							);
-						}
-
+						// The group's renditions are added once; without a group, each codec is a stream of the
+						// variant's own media
+						const isFirstVideoCodec = videoCodecString === null;
 						videoCodecString = codecString;
 
 						const videoGroupId = variantStream.attributes.get('video');
@@ -403,7 +432,7 @@ export class HlsDemuxer extends Demuxer {
 								lineNumber: variantStream.lineNumber,
 								embeddedIndex: 0,
 								fullPath: variantStream.fullPath,
-								fullCodecString: videoCodecString,
+								fullCodecString: codecString,
 								pairingMask: 1n << BigInt(i),
 								peakBitrate: bandwidth,
 								averageBitrate: averageBandwidth,
@@ -415,7 +444,7 @@ export class HlsDemuxer extends Demuxer {
 									height,
 								},
 							});
-						} else {
+						} else if (isFirstVideoCodec) {
 							let uriLessCount = 0;
 
 							for (const mediaTag of mediaTags) {
@@ -453,7 +482,12 @@ export class HlsDemuxer extends Demuxer {
 									lineNumber: mediaTag.lineNumber,
 									embeddedIndex,
 									fullPath: mediaTag.fullPath ?? variantStream.fullPath,
-									fullCodecString: videoCodecString,
+									fullCodecString: await getRenditionCodecString(
+										mediaTag,
+										'video',
+										videoCodecStrings,
+										embeddedIndex,
+									),
 									pairingMask: 1n << BigInt(i),
 									peakBitrate: mediaTag.fullPath === null ? bandwidth : null,
 									averageBitrate: mediaTag.fullPath === null ? averageBandwidth : null,
@@ -468,13 +502,9 @@ export class HlsDemuxer extends Demuxer {
 							}
 						}
 					} else if (AUDIO_CODECS.includes(inferredCodec as AudioCodec)) {
-						if (audioCodecString !== null) {
-							throw new Error(
-								'Unsupported M3U8 file; multiple audio codecs found in the CODECS attribute of a'
-								+ ' variant stream.',
-							);
-						}
-
+						// The group's renditions are added once; without a group, each codec is a stream of the
+						// variant's own media
+						const isFirstAudioCodec = audioCodecString === null;
 						audioCodecString = codecString;
 
 						const audioGroupId = variantStream.attributes.get('audio');
@@ -495,7 +525,7 @@ export class HlsDemuxer extends Demuxer {
 								lineNumber: variantStream.lineNumber,
 								embeddedIndex: 0,
 								fullPath: variantStream.fullPath,
-								fullCodecString: audioCodecString,
+								fullCodecString: codecString,
 								pairingMask: 1n << BigInt(i),
 								peakBitrate: bandwidth,
 								averageBitrate: averageBandwidth,
@@ -511,7 +541,7 @@ export class HlsDemuxer extends Demuxer {
 												: null,
 								},
 							});
-						} else {
+						} else if (isFirstAudioCodec) {
 							let uriLessCount = 0;
 
 							for (const mediaTag of mediaTags) {
@@ -542,7 +572,12 @@ export class HlsDemuxer extends Demuxer {
 									lineNumber: mediaTag.lineNumber,
 									embeddedIndex,
 									fullPath: mediaTag.fullPath ?? variantStream.fullPath,
-									fullCodecString: audioCodecString,
+									fullCodecString: await getRenditionCodecString(
+										mediaTag,
+										'audio',
+										audioCodecStrings,
+										embeddedIndex,
+									),
 									pairingMask: 1n << BigInt(i),
 									peakBitrate: mediaTag.fullPath === null ? bandwidth : null,
 									averageBitrate: mediaTag.fullPath === null ? averageBandwidth : null,
@@ -571,7 +606,10 @@ export class HlsDemuxer extends Demuxer {
 				const existingTrack = internalTracks.find(x =>
 					x.fullPath === track.fullPath
 					&& x.info.type === track.info.type
-					&& x.embeddedIndex === track.embeddedIndex,
+					&& x.embeddedIndex === track.embeddedIndex
+					// A variant's own media can hold streams of one type with different codecs
+					&& inferCodecFromCodecString(x.fullCodecString)
+					=== inferCodecFromCodecString(track.fullCodecString),
 				);
 
 				if (existingTrack) {
