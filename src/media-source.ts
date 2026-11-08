@@ -339,7 +339,10 @@ const copyVideoSampleIntoMemory = async (videoSample: VideoSample) => {
 
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
-	/** Resolved once the wrapper is closed, so that nothing keeps waiting for an encoder that may never come. */
+	/**
+	 * Resolved once the wrapper is closed, so that nothing keeps waiting for an encoder that may never come, or behind
+	 * an add that never finishes.
+	 */
 	private closedSignal = promiseWithResolvers();
 	private encoderInitialized = false;
 	private encoder: VideoEncoder | null = null;
@@ -462,7 +465,7 @@ class VideoEncoderWrapper {
 		}
 
 		this.queuedAddCount++;
-		const added = this.addQueue.then(async () => {
+		const added = Promise.race([this.addQueue, this.closedSignal.promise]).then(async () => {
 			const sample = copy ? await copy : videoSample;
 			await this.addInOrder(sample, shouldClose, encodeOptions);
 		});

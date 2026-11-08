@@ -3881,3 +3881,42 @@ test.for([{ frameRate: 30 }, { frameRate: null }])(
 		expect(backwards).toEqual([]);
 	},
 );
+
+test('VideoSampleSource, adds queued behind a process() that never finishes settle on cancel', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 1) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const adds = [0, 1, 2, 3].map(i => videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: i / 30,
+		duration: 1 / 30,
+	})));
+	await new Promise(resolve => setTimeout(resolve, 300));
+	await output.cancel();
+
+	// The stuck add is up to the process() function, but the ones after it mustn't wait forever once canceled
+	const settled = adds.slice(2).map(add => Promise.race([
+		add.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), 1000)),
+	]));
+	expect(await Promise.all(settled)).not.toContain('pending');
+});
