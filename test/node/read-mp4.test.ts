@@ -210,6 +210,35 @@ test('HE-AAC v2 audio config is parsed correctly', async () => {
 	expect([...toUint8Array(decoderConfig.description!)]).toEqual([0xeb, 0x8a, 0x08, 0x00]);
 });
 
+test('AAC channel configurations 11 to 14 give the channel count', async () => {
+	// ISO/IEC 14496-3 added channelConfiguration 11 (6.1), 12 (7.1 rear), 13 (22.2) and 14 (7.1 top front), with 7, 8,
+	// 24 and 8 channels (FFmpeg's ff_mpeg4audio_channels). The AudioSpecificConfig is what counts, not the sample
+	// entry's channel count, which muxers often set to 2. Made with:
+	// ffmpeg -f lavfi -i anullsrc=r=48000:cl=7.1 -t 0.1 -c:a aac aac-7.1.mp4
+	// Its AudioSpecificConfig has configuration 7, which has the same channel elements as 12, so changing it to 12
+	// gives a file that FFmpeg decodes to 8 channels.
+	const original = readFileSync(path.join(__dirname, '..', 'public/aac-7.1.mp4'));
+	const audioSpecificConfigOffset = original.indexOf(Buffer.from([0x11, 0xb8, 0x56, 0xe5, 0x00]));
+	const sampleEntryOffset = original.indexOf('mp4a');
+	expect(audioSpecificConfigOffset).toBeGreaterThan(0);
+	expect(sampleEntryOffset).toBeGreaterThan(0);
+
+	for (const [channelConfiguration, numberOfChannels] of [[7, 8], [11, 7], [12, 8], [13, 24], [14, 8]] as const) {
+		const data = Buffer.from(original);
+		data[audioSpecificConfigOffset + 1] = 0x80 | (channelConfiguration << 3);
+		data.writeUInt16BE(2, sampleEntryOffset + 20); // The sample entry's channelcount
+
+		using input = new Input({
+			source: new BufferSource(data),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect({ channelConfiguration, numberOfChannels: await track.getNumberOfChannels() })
+			.toEqual({ channelConfiguration, numberOfChannels });
+		expect((await track.getDecoderConfig())!.numberOfChannels).toBe(numberOfChannels);
+	}
+});
+
 test('PCM track with stsc not starting at the first chunk', async () => {
 	// The stsc box's first entry starts at the second chunk, leaving three chunks of PCM audio
 	const filePath = path.join(__dirname, '..', 'public/pcm-stsc-not-first-chunk.mp4');
