@@ -2806,6 +2806,73 @@ segment-1-3.m4s
 `);
 });
 
+test('Reading a live playlist that is caught in the middle of being rewritten', { timeout: 15_000 }, async () => {
+	// Write HLS to memory, then serve it the way it would look while still being written live: each reload of the media
+	// playlist lists one more segment. A server rewriting the playlist in place (like FilePathTarget does) can be
+	// caught with the file truncated to nothing; such reloads come back empty
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			targetDuration: 1, // Live playlists get reloaded about once per target duration
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+			return target;
+		}),
+	});
+
+	const source = videoSource();
+	output.addVideoTrack(source);
+	await output.start();
+	for (let i = 0; i < 16; i++) {
+		await source.add(new EncodedPacket(avcPacketData, i % 4 === 0 ? 'key' : 'delta', i / 4, 0.25), avcMetadata);
+	}
+	await output.finalize();
+
+	const fullPlaylist = new TextDecoder().decode(targets.get('playlist-1.m3u8')!.buffer!);
+	const header = fullPlaylist.slice(0, fullPlaylist.indexOf('#EXTINF')).replace('#EXT-X-PLAYLIST-TYPE:VOD\n', '');
+	const entries = fullPlaylist.match(/#EXTINF:.*\nsegment-1-\d+\.ts\n/g)!;
+	expect(entries.length).toBe(4);
+
+	const readWithEmptyReloads = async (emptyReloads: number[]) => {
+		let reload = 0;
+		let listed = 0;
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => {
+				if (path === 'playlist-1.m3u8') {
+					reload++;
+					if (emptyReloads.includes(reload)) {
+						return new BufferSource(new Uint8Array(0));
+					}
+
+					listed = Math.min(listed + 1, entries.length);
+					const ended = listed === entries.length ? '#EXT-X-ENDLIST\n' : '';
+					const text = header + entries.slice(0, listed).join('') + ended;
+					return new BufferSource(new TextEncoder().encode(text));
+				}
+
+				return new BufferSource(targets.get(path)!.buffer!);
+			}),
+			formats: ALL_FORMATS,
+		});
+
+		const videoTrack = await input.getPrimaryVideoTrack() as InputVideoTrack;
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+
+		return timestamps;
+	};
+
+	// One reload caught mid-rewrite is skipped; the next one continues the stream
+	expect(await readWithEmptyReloads([2])).toEqual([...Array(16).keys()].map(i => i / 4));
+	// But a playlist that keeps coming back empty is an error
+	await expect(readWithEmptyReloads([2, 3, 4, 5])).rejects.toThrow('Invalid M3U8 file');
+});
+
 test('Live mode, fixed target duration', async () => {
 	const writtenTexts = new Map<string, string>();
 	const writeCounts = new Map<string, number>();

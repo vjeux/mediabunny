@@ -55,6 +55,8 @@ import {
 
 const IV_STRING_REGEX = /^0[xX][0-9a-fA-F]+$/;
 const BASE64_DATA_URI_REGEX = /^data:.*;base64,/i;
+/** How many reloads in a row of a live playlist may come back without a playlist in them before it is an error. */
+const MAX_INVALID_PLAYLIST_RELOADS = 3;
 
 export type HlsSegment = Segment & {
 	index: number; // In the segment list, -1 for init segments
@@ -94,6 +96,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 	streamHasEnded = false;
 	neverRemovesSegments = false;
 	lastSegmentUpdateTime = -Infinity;
+	playlistParsed = false;
+	invalidPlaylistReloads = 0;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
 	segmentTimestampOffsetPromise: Promise<number> | null = null;
 
@@ -159,7 +163,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 			if (headerSlice) {
 				const header = textDecoder.decode(readBytes(headerSlice, headerSlice.length));
 				if (!header.trimStart().startsWith('#EXTM3U')) {
-					throw new Error('Invalid M3U8 file; expected first line to be #EXTM3U.');
+					this.handleInvalidPlaylist('Invalid M3U8 file; expected first line to be #EXTM3U.');
+					return;
 				}
 			}
 
@@ -240,10 +245,13 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 			if (!headerRead) {
 				if (line !== '#EXTM3U') {
-					throw new Error('Invalid M3U8 file; expected first line to be #EXTM3U.');
+					this.handleInvalidPlaylist('Invalid M3U8 file; expected first line to be #EXTM3U.');
+					return;
 				}
 
 				headerRead = true;
+				this.playlistParsed = true;
+				this.invalidPlaylistReloads = 0;
 				continue;
 			}
 
@@ -576,7 +584,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 		}
 
 		if (!headerRead) {
-			throw new Error('Invalid M3U8 file; no #EXTM3U header.');
+			this.handleInvalidPlaylist('Invalid M3U8 file; no #EXTM3U header.');
+			return;
 		}
 	}
 
@@ -811,6 +820,28 @@ export class HlsSegmentedInput extends SegmentedInput {
 		}
 
 		return input;
+	}
+
+	/**
+	 * Handles content that isn't a playlist. That is an error, except when reloading a live playlist that has already
+	 * been read: a server rewriting it in place (like FilePathTarget does) can be caught in the middle of that, with
+	 * the file truncated to nothing. Such a reload is skipped, and the next one, half a refresh interval later, sees
+	 * the new version; only a few such reloads in a row are an error.
+	 */
+	handleInvalidPlaylist(message: string) {
+		if (
+			this.playlistParsed
+			&& !this.streamHasEnded
+			&& this.invalidPlaylistReloads < MAX_INVALID_PLAYLIST_RELOADS
+		) {
+			this.invalidPlaylistReloads++;
+			// Try again after half the usual time, like after an unchanged reload (RFC 8216, Section 6.3.4); this also
+			// keeps the retry out of step with a server that rewrites the playlist as often as it is reloaded
+			this.lastSegmentUpdateTime -= 500 * this.refreshInterval;
+			return;
+		}
+
+		throw new Error(message);
 	}
 
 	async getLiveRefreshInterval() {
