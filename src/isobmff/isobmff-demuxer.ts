@@ -3755,7 +3755,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 					|| !vp9CodecInfoHasColorInfo(this.internalTrack.info.vp9CodecInfo)
 				)
 			) {
-				const firstPacket = await this.getFirstPacket({});
+				const firstPacket = await this.getFirstPacketForCodecInfo(!!this.internalTrack.info.vp9CodecInfo);
 				const packetInfo = firstPacket && extractVp9CodecInfoFromPacket(firstPacket.data);
 
 				if (packetInfo) {
@@ -3777,7 +3777,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 					)
 				)
 			) {
-				const firstPacket = await this.getFirstPacket({});
+				const firstPacket = await this.getFirstPacketForCodecInfo(!!this.internalTrack.info.av1CodecInfo);
 				const packetInfo = firstPacket && extractAv1CodecInfoFromPacket(firstPacket.data);
 
 				if (packetInfo) {
@@ -3817,6 +3817,23 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 
 			return config;
 		})();
+	}
+
+	/**
+	 * The first packet, from which the codec info of the sample entry is completed or refined. An encrypted track's
+	 * packets can't be read without its key: then, if the sample entry has codec info (hasCodecInfo), null is
+	 * returned, and that info is used as it is, as metadata calls don't need the key.
+	 */
+	private async getFirstPacketForCodecInfo(hasCodecInfo: boolean) {
+		try {
+			return await this.getFirstPacket({});
+		} catch (error) {
+			if (hasCodecInfo && this.internalTrack.encryptionInfo) {
+				return null;
+			}
+
+			throw error;
+		}
 	}
 }
 
