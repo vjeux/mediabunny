@@ -3702,6 +3702,10 @@ test('MPEG-TS drops a video frame that lost a TS packet, and discards duplicate 
 	});
 	await expectFrames(damaged, [5, 6, 7, 13, 14, 15, 18, 19]);
 
+	// When the first frame, with the only SPS and PPS, loses a TS packet, the track still opens (setup reads the
+	// parameter sets, which come first), and that frame's GOP goes
+	await expectFrames(tsPackets.filter((_, i) => i !== frameStarts[0]! + 1), [0, 1, 2, 3]);
+
 	// Muxers that never increment the counters, or that also count packets without payload, lose nothing, not even
 	// identical TS packets in a row, which are data there (like in frame 3, here made of the same byte throughout)
 	const setCounter = (packet: Uint8Array, counter: number) => {
@@ -3875,6 +3879,11 @@ test('MPEG-TS drops the rest of the GOP after a video frame that lost a TS packe
 	expect(packet.data).toEqual(clean[8]!.data);
 	expect((await sink.getKeyPacket(12 / 25))?.timestamp).toBe(8 / 25);
 	expect((await sink.getNextPacket(packet))?.data).toEqual(clean[16]!.data);
+
+	// Lookups at every dropped frame, one after the other (each leaves reference points for the next ones)
+	for (let frame = 9; frame < 16; frame++) {
+		expect((await sink.getPacket(frame / 25))?.timestamp).toBe(8 / 25);
+	}
 });
 
 test('MPEG-TS reads AAC declared as private data without descriptors, as FFmpeg\'s m2ts mode writes it', async () => {
