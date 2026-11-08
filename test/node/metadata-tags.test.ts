@@ -1116,6 +1116,46 @@ test('Read metadata of Ogg files with several logical streams once', async () =>
 	expect(tags.images).toHaveLength(1);
 });
 
+test('Read metadata, MP3 with a tempo of 0 or less', async () => {
+	const check = async (bpm: string) => {
+		const output = new Output({
+			format: new Mp3OutputFormat(),
+			target: new BufferTarget(),
+		});
+
+		output.setMetadataTags({ title: 'Title', raw: { TBPM: bpm } });
+
+		const dummyTrack = createDummyAudioTrack('mp3', output);
+
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+
+		using input = new Input({
+			source: new BufferSource(output.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+
+		const readTags = await input.getMetadataTags();
+		expect(readTags.title).toBe('Title');
+		expect(readTags.beatsPerMinute).toBeUndefined(); // Not a tempo, like for the other formats
+		expect(readTags.raw!['TBPM']).toBe(bpm);
+
+		// The tags are valid tags, so that they can be written again, e.g. by a conversion
+		const mp4Output = new Output({
+			format: new Mp4OutputFormat(),
+			target: new BufferTarget(),
+		});
+		const conversion = await Conversion.init({ input, output: mp4Output, showWarnings: false });
+		expect(conversion.isValid).toBe(true);
+		await conversion.execute();
+	};
+
+	// Some taggers write a TBPM of 0 for an unknown tempo
+	await check('0');
+	await check('-5');
+});
+
 test('Read and write metadata, FLAC', async () => {
 	const output = new Output({
 		format: new FlacOutputFormat(),
