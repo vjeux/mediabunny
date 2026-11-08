@@ -258,6 +258,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				throw new Error(`Encoder '${this.avCodec.name}' cannot be used for quantizer-based encoding.`);
 			}
 
+			if (this.avCodec.name === 'libx264') {
+				// A quantizer change re-creates the encoder, whose stream must then still fit the decoder config's
+				// parameter sets, as its own get stripped from the packets. x264 otherwise writes the quantizer into
+				// the PPS (as pic_init_qp), so the frames after a change would decode with the old one.
+				codecContext.setOption('x264-params', 'stitchable=1');
+			}
+
 			// Also pin the quantizer range so crf-based encoders (libvpx, libaom) hold the quantizer truly constant
 			codecContext.qMin = mapped;
 			codecContext.qMax = mapped;

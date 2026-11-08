@@ -502,6 +502,86 @@ describe('Video', async () => {
 		});
 	}
 
+	test('Frames after a mid-stream quantizer change decode as well as with a constant quantizer', {
+		timeout: 60_000,
+	}, async () => {
+		const width = 128;
+		const height = 96;
+
+		// A moving, textured luma pattern
+		const lumaPlane = (frameIndex: number) => {
+			const plane = new Uint8Array(width * height);
+			for (let y = 0; y < height; y++) {
+				for (let x = 0; x < width; x++) {
+					const value = 128 + 50 * Math.sin(x * 0.21 + frameIndex * 0.4)
+						+ 40 * Math.cos(y * 0.17 - frameIndex * 0.3) + ((x * 13 + y * 7 + frameIndex * 5) % 11) - 5;
+					plane[y * width + x] = Math.max(0, Math.min(255, Math.round(value)));
+				}
+			}
+			return plane;
+		};
+
+		// Encodes 12 frames through VideoSampleSource into MP4, decodes them back and returns the mean absolute luma
+		// error of each frame
+		const lumaErrors = async (codec: VideoCodec, getQuantizer: (frameIndex: number) => number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({
+				codec,
+				quality: new Quality({ quantizer: getQuantizer(0) }),
+				hardwareAcceleration: 'prefer-software',
+			});
+			output.addVideoTrack(source, { frameRate: 30 });
+			await output.start();
+
+			for (let i = 0; i < 12; i++) {
+				const data = new Uint8Array(width * height * 3 / 2).fill(128);
+				data.set(lumaPlane(i));
+				const sample = new VideoSample(data, {
+					format: 'I420',
+					codedWidth: width,
+					codedHeight: height,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await source.add(sample, buildQuantizerEncodeOptions(codec, getQuantizer(i)));
+				sample.close();
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			const errors: number[] = [];
+			for await (using sample of new VideoSampleSink(track).samples()) {
+				const decoded = new Uint8Array(sample.allocationSize({ format: 'I420' }));
+				await sample.copyTo(decoded, { format: 'I420' });
+				const original = lumaPlane(errors.length);
+				let sum = 0;
+				for (let i = 0; i < width * height; i++) {
+					sum += Math.abs(decoded[i]! - original[i]!);
+				}
+				errors.push(sum / (width * height));
+			}
+			expect(errors).toHaveLength(12);
+
+			return errors;
+		};
+
+		const cases = [
+			{ codec: 'avc', high: 36, low: 16 },
+			{ codec: 'hevc', high: 36, low: 16 },
+			{ codec: 'vp9', high: 144, low: 64 },
+			{ codec: 'av1', high: 144, low: 64 },
+		] as const;
+		for (const { codec, high, low } of cases) {
+			// The change re-creates the encoder, and its frames must decode with the new quantizer, not the old one
+			const afterChange = (await lumaErrors(codec, i => i < 6 ? high : low)).slice(6);
+			const constant = (await lumaErrors(codec, () => low)).slice(6);
+			expect(Math.max(...afterChange), codec).toBeLessThanOrEqual(2 * Math.max(...constant) + 0.5);
+		}
+	});
+
 	test('ProRes encode', async () => {
 		// ProRes can't be decoded by node-av's wrapper here, so this is encode-only.
 		const encoder = new NodeAvVideoEncoder();
