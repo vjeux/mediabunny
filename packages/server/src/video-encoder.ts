@@ -232,6 +232,15 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			codecContext.setOption('forced-idr', '1');
 		}
 
+		if (isRealtime && this.avCodec.name?.endsWith('_nvenc')) {
+			// NVENC otherwise uses B-frames and holds frames back for its output queue and lookahead
+			codecContext.setOption('tune', 'ull');
+			codecContext.setOption('zerolatency', '1');
+			codecContext.setOption('delay', '0');
+			codecContext.setOption('rc-lookahead', '0');
+			codecContext.maxBFrames = 0;
+		}
+
 		if (this.config.bitrateMode === 'quantizer') {
 			assert(this.quantizer !== null);
 
