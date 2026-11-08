@@ -413,6 +413,10 @@ class VideoEncoderWrapper {
 	/** How many adds are waiting for the writer to take what's been encoded so far; they still hold their samples. */
 	private writerWaitCount = 0;
 	private closed = false;
+	/** Settles once the samples added so far have been processed and encoded, one at a time, in order. */
+	private addQueue: Promise<void> = Promise.resolve();
+	/** How many added samples are waiting for their turn or being processed. */
+	private queuedAddCount = 0;
 
 	/**
 	 * Whether samples received while the encoder is still being set up get copied into memory (and the originals
@@ -420,10 +424,6 @@ class VideoEncoderWrapper {
 	 * holding on to them until the encoder is ready stalls the capture, and the recording starts with a frozen picture.
 	 */
 	copyFramesDuringSetup = false;
-	/** Settles once the samples copied so far are ready, in the order they were received. */
-	private setupCopyChain: Promise<unknown> = Promise.resolve();
-	/** How many adds are in the copy chain; until it's drained, later adds wait their turn to stay in order. */
-	private setupCopiesInChain = 0;
 	/** Memory held by copies that haven't been encoded yet. */
 	private setupCopyBytes = 0;
 
@@ -432,16 +432,60 @@ class VideoEncoderWrapper {
 	}
 
 	async add(videoSample: VideoSample, shouldClose: boolean, encodeOptions?: VideoEncoderEncodeOptions) {
-		const originalSample = videoSample;
-		let setupCopyBytes = 0;
-
 		try {
 			this.checkForEncoderError();
 			this.source._ensureValidAdd();
+		} catch (error) {
+			if (shouldClose) {
+				videoSample.close();
+			}
+			throw error;
+		}
 
-			const copiesDuringSetup = this.copyFramesDuringSetup && shouldClose;
-			if (copiesDuringSetup && (!this.encoderInitialized || this.setupCopiesInChain > 0)) {
-				({ videoSample, bytes: setupCopyBytes } = await this.copyDuringSetup(videoSample));
+		// Samples are processed and encoded one at a time, in the order they were added: with an asynchronous
+		// transform or process function, a later sample would otherwise overtake an earlier one that takes longer
+		// (sources that don't wait for their adds, like MediaStreamVideoTrackSource, add while others are pending).
+		// They're validated before waiting their turn, so that one added before finalize() isn't rejected for it.
+		// One that will wait for the encoder to be set up gets copied right away (see `copyFramesDuringSetup`), so it
+		// doesn't hold on to its frame while waiting.
+		let copy: Promise<VideoSample> | null = null;
+		let setupCopyBytes = 0;
+		if (this.copyFramesDuringSetup && shouldClose && !this.encoderInitialized && videoSample.format !== null) {
+			setupCopyBytes = videoSample.allocationSize();
+			if (this.setupCopyBytes + setupCopyBytes <= MAX_SETUP_COPY_BYTES) {
+				this.setupCopyBytes += setupCopyBytes;
+				copy = copyVideoSampleIntoMemory(videoSample);
+			} else {
+				// Too much held already; this one stays as it is, as without copying
+				setupCopyBytes = 0;
+			}
+		}
+
+		this.queuedAddCount++;
+		const added = this.addQueue.then(async () => {
+			const sample = copy ? await copy : videoSample;
+			await this.addInOrder(sample, shouldClose, encodeOptions);
+		});
+		this.addQueue = added.catch(() => {});
+		try {
+			await added;
+		} finally {
+			this.queuedAddCount--;
+			this.setupCopyBytes -= setupCopyBytes;
+		}
+	}
+
+	private async addInOrder(
+		videoSample: VideoSample,
+		shouldClose: boolean,
+		encodeOptions?: VideoEncoderEncodeOptions,
+	) {
+		const originalSample = videoSample;
+
+		try {
+			this.checkForEncoderError();
+			if (this.closed) {
+				return; // Canceled while waiting
 			}
 
 			const config = this.encodingConfig;
@@ -585,38 +629,6 @@ class VideoEncoderWrapper {
 			if (shouldClose) {
 				videoSample.close();
 			}
-			this.setupCopyBytes -= setupCopyBytes;
-		}
-	}
-
-	/** Copies a sample received while the encoder is being set up into memory (see `copyFramesDuringSetup`). */
-	private async copyDuringSetup(videoSample: VideoSample) {
-		this.setupCopiesInChain++;
-
-		let bytes = 0;
-		let copy: Promise<VideoSample>;
-		if (this.encoderInitialized || videoSample.format === null) {
-			// Nothing to copy (anymore); just stay in order
-			copy = Promise.resolve(videoSample);
-		} else {
-			bytes = videoSample.allocationSize();
-			if (this.setupCopyBytes + bytes > MAX_SETUP_COPY_BYTES) {
-				// Too much held already; this one stays as it is, as without copying
-				bytes = 0;
-				copy = Promise.resolve(videoSample);
-			} else {
-				this.setupCopyBytes += bytes;
-				copy = copyVideoSampleIntoMemory(videoSample);
-			}
-		}
-
-		// Copying is asynchronous, so the samples are chained to come out in the order they came in
-		const ready = this.setupCopyChain.then(() => copy);
-		this.setupCopyChain = ready.catch(() => {});
-		try {
-			return { videoSample: await ready, bytes };
-		} finally {
-			this.setupCopiesInChain--;
 		}
 	}
 
@@ -1386,6 +1398,9 @@ class VideoEncoderWrapper {
 
 		try {
 			if (!forceClose) {
+				// The samples added so far go in first
+				await this.addQueue;
+
 				this.checkForEncoderError();
 
 				// Final frame rate padding: fill remaining frames up to the last sample's original end timestamp
@@ -1454,16 +1469,20 @@ class VideoEncoderWrapper {
 	}
 
 	/**
-	 * How many samples this encoder is still working on: the ones queued in the encoder, and the ones whose add is
-	 * waiting for the writer to apply backpressure (they're held until then).
+	 * How many samples this encoder is still working on: the ones queued in the encoder, the ones whose add is waiting
+	 * for the writer to apply backpressure (they're held until then), and the ones waiting for their turn behind them.
 	 */
 	getQueueSize() {
+		// Samples waiting for their turn behind the one being processed count too, except while the encoder is being
+		// set up, so that a slow setup doesn't get the first frames dropped
+		const waitingAdds = this.encoderInitialized ? Math.max(this.queuedAddCount - 1, 0) : 0;
+
 		if (this.customEncoder) {
-			return this.customEncoderQueueSize + this.writerWaitCount;
+			return this.customEncoderQueueSize + this.writerWaitCount + waitingAdds;
 		} else {
 			// Because the color and alpha encoders are wired in series, there's no need to also include the alpha
 			// encoder's queue size here
-			return (this.encoder?.encodeQueueSize ?? 0) + this.writerWaitCount;
+			return (this.encoder?.encodeQueueSize ?? 0) + this.writerWaitCount + waitingAdds;
 		}
 	}
 
