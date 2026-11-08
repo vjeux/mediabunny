@@ -472,6 +472,8 @@ export class Output<
 	_unfinalizedTargets = new Set<Target>();
 	/** @internal Set when a target that the muxer needed at start couldn't be had (see _waitForTarget). */
 	_targetFailure: { error: unknown } | null = null;
+	/** @internal Ends the wait for each target request in progress once the output is canceled. */
+	_targetWaits: Set<() => void> | null = null;
 	/** @internal */
 	_rootWriterPromise: Promise<Writer> | null = null;
 	/** @internal */
@@ -725,8 +727,34 @@ export class Output<
 
 	/** Resolves with the target, or with one discarding everything if the output is canceled before it comes. */
 	async _targetUnlessCanceled(target: MaybePromise<Target>): Promise<Target> {
-		const result = await Promise.race([target, this._canceled.promise.then(() => null)]);
-		return result && this.state !== 'canceled' ? result : new NullTarget();
+		if (this.state === 'canceled') {
+			// A target still to come gets closed as it arrives (see _requestTarget)
+			void Promise.resolve(target).catch(() => {});
+			return new NullTarget();
+		}
+
+		if (!this._targetWaits) {
+			// A single reaction to the cancel, rather than one per request: those would pile up for as long as the
+			// output lives (one per HLS segment)
+			const targetWaits = this._targetWaits = new Set();
+			void this._canceled.promise.then(() => {
+				for (const endWait of targetWaits) {
+					endWait();
+				}
+				targetWaits.clear();
+			});
+		}
+
+		const canceled = promiseWithResolvers<null>();
+		const endWait = () => canceled.resolve(null);
+		this._targetWaits.add(endWait);
+
+		try {
+			const result = await Promise.race([target, canceled.promise]);
+			return result && (this.state as Output['state']) !== 'canceled' ? result : new NullTarget();
+		} finally {
+			this._targetWaits.delete(endWait);
+		}
 	}
 
 	/** Adds a video track to the output with the given source. Can only be called before the output is started. */

@@ -267,6 +267,51 @@ test.each(['MPEG-TS', 'CMAF'] as const)(
 	},
 );
 
+test('HLS target requests leave nothing waiting on the output\'s cancel once their target has come', async () => {
+	// A live output can make thousands of requests (one per segment) without ever being canceled
+	const { HlsOutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
+	const { PathedTarget } = await import('../../src/target.js');
+	const { EncodedVideoPacketSource } = await import('../../src/media-source.js');
+	const { EncodedPacket } = await import('../../src/packet.js');
+
+	let requests = 0;
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1 }),
+		target: new PathedTarget('', () => {
+			requests++;
+			return new BufferTarget();
+		}),
+	});
+
+	// Counts the reactions registered on the output's cancel signal
+	let cancelReactions = 0;
+	const canceledPromise = output._canceled.promise;
+	const then = canceledPromise.then.bind(canceledPromise);
+	canceledPromise.then = ((...args: Parameters<typeof then>) => {
+		cancelReactions++;
+		return then(...args);
+	}) as typeof canceledPromise.then;
+
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	const decoderConfig = {
+		codec: 'avc1.42001f',
+		codedWidth: 64,
+		codedHeight: 64,
+		description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+	};
+	for (let i = 0; i < 60; i++) {
+		const packet = new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', i * 0.5, 0.5);
+		await source.add(packet, i === 0 ? { decoderConfig } : undefined);
+	}
+	await output.finalize();
+
+	expect(requests).toBeGreaterThan(25);
+	expect(cancelReactions).toBeLessThanOrEqual(2);
+	expect(output._targetWaits?.size ?? 0).toBe(0);
+});
+
 test('BufferTarget onFinalize callback', async () => {
 	let received: ArrayBuffer | null = null;
 	let asyncCallbackDone = false;
