@@ -7,10 +7,10 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, TextSubtitleSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -209,3 +209,37 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('The MIME type of Matroska output with subtitles lists no subtitle codec', async () => {
+	const write = async (format: MkvOutputFormat | WebMOutputFormat, withVideo: boolean) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const video = new EncodedVideoPacketSource('vp8');
+		if (withVideo) {
+			output.addVideoTrack(video);
+		}
+		const subtitles = new TextSubtitleSource('webvtt');
+		output.addSubtitleTrack(subtitles);
+		await output.start();
+
+		if (withVideo) {
+			const decoderConfig = { codec: 'vp8', codedWidth: 16, codedHeight: 16 };
+			await video.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 1), { decoderConfig });
+		}
+		await subtitles.add('WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n');
+		subtitles.close();
+
+		const mimeType = await output.getMimeType();
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return [mimeType, await input.getMimeType()];
+	};
+
+	// WebM and Matroska define no codecs value for WebVTT ("wvtt" is MP4's), and Media Source Extensions reject MIME
+	// types that list one: Chrome's addSourceBuffer throws for 'video/webm; codecs="vp8, wvtt"'. Reading the file
+	// back gives the same MIME type.
+	expect(await write(new WebMOutputFormat(), true)).toEqual(['video/webm; codecs="vp8"', 'video/webm; codecs="vp8"']);
+	expect(await write(new MkvOutputFormat(), true))
+		.toEqual(['video/x-matroska; codecs="vp8"', 'video/x-matroska; codecs="vp8"']);
+	expect((await write(new MkvOutputFormat(), false))[0]).toBe('application/x-matroska');
+});

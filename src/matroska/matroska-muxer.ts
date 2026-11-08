@@ -59,7 +59,6 @@ import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '.
 import {
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
-	SubtitleCodec,
 	generateAv1CodecConfigurationFromCodecString,
 	getAudioPreRollDuration,
 	generateVp9CodecConfigurationFromCodecString,
@@ -809,17 +808,14 @@ export class MatroskaMuxer extends Muxer {
 	async getMimeType() {
 		await this.allTracksKnown.promise;
 
-		const codecStrings = this.trackDatas.map((trackData) => {
-			if (trackData.type === 'video') {
-				return trackData.info.decoderConfig.codec;
-			} else if (trackData.type === 'audio') {
-				return trackData.info.decoderConfig.codec;
-			} else {
-				const map: Record<SubtitleCodec, string> = {
-					webvtt: 'wvtt',
-				};
-				return map[trackData.track.source._codec];
+		// WebM and Matroska define no codecs parameter value for subtitles (wvtt is MP4's), and Media Source Extensions
+		// reject MIME types that list one, so only the video and audio codecs are given
+		const codecStrings = this.trackDatas.flatMap((trackData) => {
+			if (trackData.type === 'video' || trackData.type === 'audio') {
+				return [trackData.info.decoderConfig.codec];
 			}
+
+			return [];
 		});
 
 		return buildMatroskaMimeType({
