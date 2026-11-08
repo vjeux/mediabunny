@@ -1072,7 +1072,8 @@ export class Output<
 	 * {@link Output.finalize} rejects, the output becomes canceled, and the stream closes in the background if the sink
 	 * ever catches up.
 	 *
-	 * @returns A promise that resolves once all internal resources have been released.
+	 * @returns A promise that resolves once all internal resources have been released, or right away while the output
+	 * is finalizing.
 	 */
 	async cancel() {
 		if (this.state === 'canceled') {
