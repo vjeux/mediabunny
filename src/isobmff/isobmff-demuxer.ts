@@ -1883,7 +1883,14 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				slice.skip(4); // Version + flags
+				const version = readU8(slice);
+				if (version !== 1) {
+					// Version 0 comes from an early draft of the spec with a different layout. Like FFmpeg, ignore it;
+					// the codec info then comes from the first key frame instead.
+					break;
+				}
+
+				slice.skip(3); // Flags
 
 				const profile = readU8(slice);
 				const level = readU8(slice);
