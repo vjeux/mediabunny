@@ -342,6 +342,9 @@ export class OggMuxer extends Muxer {
 		this.queueHeaderPackets(newTrackData, meta);
 
 		this.trackDatas.push(newTrackData);
+		// Keep the tracks in the order they were added in, not in that of their first packets, so that their logical
+		// streams (and the tracks read back from the file) come in that order, as in the other formats
+		this.trackDatas.sort((a, b) => this.output.tracks.indexOf(a.track) - this.output.tracks.indexOf(b.track));
 
 		if (this.allTracksAreKnown()) {
 			this.allTracksKnown.resolve();
