@@ -403,7 +403,12 @@ export class OggMuxer extends Muxer {
 			commentHeaderHeader[5] = 0x69; // 'i'
 			commentHeaderHeader[6] = 0x73; // 's'
 
-			const commentHeader = createVorbisComments(commentHeaderHeader, this.output._metadataTags, true);
+			const vorbisComments = createVorbisComments(commentHeaderHeader, this.output._metadataTags, true);
+
+			// Unlike Opus, Vorbis requires the comment header to end with a set framing bit
+			const commentHeader = new Uint8Array(vorbisComments.length + 1);
+			commentHeader.set(vorbisComments);
+			commentHeader[vorbisComments.length] = 1;
 
 			trackData.packetQueue.push({
 				data: identificationHeader,
