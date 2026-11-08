@@ -133,6 +133,21 @@ import { ID3_V1_GENRES } from '../id3';
 
 const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
 
+/**
+ * QuickTime's Macintosh language codes 0 to 94 as ISO 639-2/T codes, empty where a language has none of its own (the
+ * languages of FFmpeg's mov_mdhd_language_map, with terminology codes for the bibliographic ones it lists).
+ */
+const MACINTOSH_LANGUAGE_CODES = [
+	'eng', 'fra', 'deu', 'ita', 'nld', 'swe', 'spa', 'dan', 'por', 'nor', 'heb', 'jpn', 'ara', 'fin', 'ell', 'isl',
+	'mlt', 'tur', 'hrv', 'zho', 'urd', 'hin', 'tha', 'kor', 'lit', 'pol', 'hun', 'est', 'lav', 'smi', 'fao', 'fas',
+	'rus', 'zho', '', 'gle', 'sqi', 'ron', 'ces', 'slk', 'slv', 'yid', 'srp', 'mkd', 'bul', 'ukr', 'bel', 'uzb',
+	'kaz', 'aze', 'aze', 'hye', 'kat', 'ron', 'kir', 'tgk', 'tuk', 'mon', '', 'pus', 'kur', 'kas', 'snd', 'bod',
+	'nep', 'san', 'mar', 'ben', 'asm', 'guj', 'pan', 'ori', 'mal', 'kan', 'tam', 'tel', 'sin', 'mya', 'khm', 'lao',
+	'vie', 'ind', 'tgl', 'msa', 'msa', 'amh', 'tir', 'orm', 'som', 'swa', 'kin', 'run', 'nya', 'mlg', 'epo',
+];
+/** Macintosh language codes 128 to 138, likewise */
+const MACINTOSH_LANGUAGE_CODES_FROM_128 = ['cym', 'eus', 'cat', 'lat', 'que', 'grn', 'aym', 'tat', 'uig', 'dzo', 'jav'];
+
 type InternalTrack = {
 	id: number;
 	demuxer: IsobmffDemuxer;
@@ -1864,7 +1879,16 @@ export class IsobmffDemuxer extends Demuxer {
 
 				let language = readU16Be(slice);
 
-				if (language > 0) {
+				if (language < 0x400) {
+					// Not a packed ISO 639-2/T code (whose first letter makes it at least 0x400), but in QuickTime
+					// files, one of the Macintosh language codes, 0 being English
+					if (this.isQuickTime) {
+						const languageCode = language < 128
+							? MACINTOSH_LANGUAGE_CODES[language]
+							: MACINTOSH_LANGUAGE_CODES_FROM_128[language - 128];
+						track.languageCode = languageCode || UNDETERMINED_LANGUAGE;
+					}
+				} else {
 					track.languageCode = '';
 
 					for (let i = 0; i < 3; i++) {

@@ -2,6 +2,7 @@ import { createCipheriv } from 'node:crypto';
 import { expect, test } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
 	ALL_FORMATS,
@@ -3083,4 +3084,30 @@ test('Fragments without tfdt continue from the decode end of the fragment right 
 		timestamps.push(packet.timestamp);
 	}
 	expect(timestamps).toEqual([0, 0.08, 0.04, 0.12]);
+});
+
+test('Macintosh language codes in the mdhd box of QuickTime files', async () => {
+	// Below 0x400, QuickTime's mdhd holds a Macintosh language code (0 is English), as in FFmpeg's FATE samples
+	// apple_cv.mov and ctk_cpro.mov. In other MP4 files, such a value isn't a language code at all.
+	const readLanguage = async (majorBrand: string, language: number) => {
+		const bytes = readFileSync(path.join(__dirname, '../public/sps-only-sar-h264.mp4'));
+		bytes.write(majorBrand, 8, 'ascii');
+		const mdhd = bytes.indexOf('mdhd');
+		assert(mdhd > 0 && bytes[mdhd + 4] === 0); // Version 0
+		bytes.writeUInt16BE(language, mdhd + 24);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return track.getLanguageCode();
+	};
+
+	expect(await readLanguage('qt  ', 0x1a41)).toBe('fra'); // Packed ISO 639-2/T
+	expect(await readLanguage('qt  ', 0)).toBe('eng');
+	expect(await readLanguage('qt  ', 1)).toBe('fra');
+	expect(await readLanguage('qt  ', 2)).toBe('deu'); // As a terminology code
+	expect(await readLanguage('qt  ', 129)).toBe('eus');
+	expect(await readLanguage('qt  ', 100)).toBe('und'); // Unassigned
+	expect(await readLanguage('qt  ', 0x7fff)).toBe('und'); // Unspecified
+	expect(await readLanguage('isom', 0)).toBe('und');
 });
