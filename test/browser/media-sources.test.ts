@@ -9,7 +9,7 @@ import {
 	VideoSampleSource,
 } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { canEncodeAudio, Quality } from '../../src/encode.js';
+import { Quality } from '../../src/encode.js';
 import { CustomAudioEncoder, registerEncoder } from '../../src/custom-coder.js';
 import { AudioCodec } from '../../src/codec.js';
 import { Input } from '../../src/input.js';
