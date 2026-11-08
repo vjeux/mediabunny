@@ -5740,6 +5740,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					continue;
 				}
 
+				const mdatSize = demuxer.mdatSizes.get(currentPos);
+				if (mdatSize !== undefined) {
+					demuxer.passTopLevelBox(currentPos, currentPos + mdatSize);
+					currentPos += mdatSize; // Without reading its header, which may be gone from the source by now
+					continue;
+				}
+
 				// Load the header
 				let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 				if (isThenable(slice)) slice = await slice;
