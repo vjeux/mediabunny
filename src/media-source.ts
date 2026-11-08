@@ -42,6 +42,7 @@ import {
 	setInt24,
 	setIntervalUnthrottled,
 	setUint24,
+	toDataView,
 	toUint8Array,
 	UnthrottledTimerHandle,
 	wait,
@@ -3206,6 +3207,23 @@ const fixAudioDecoderConfig = (
 				aacCodecInfo: { isMpeg2: false, objectType: null },
 				dtsFormat: null,
 			});
+		}
+	} else if (codec === 'opus' && decoderConfig.description && decoderConfig.description.byteLength >= 19) {
+		// Chromium encodes 8, 12, 16 and 24 kHz input at that rate and writes the encoder's lookahead as the
+		// identification header's pre-skip without converting it to 48 kHz samples, which is the unit RFC 7845 (5.1)
+		// defines (FFmpeg's libopusenc scales it). Since libopus's lookahead is always 6.5 ms (2.5 ms for restricted
+		// low delay), a pre-skip that equals it in samples at the encoder's rate gives the mistake away.
+		const rate = decoderConfig.sampleRate;
+		const description = toUint8Array(decoderConfig.description).slice();
+		const view = toDataView(description);
+		const preSkip = view.getUint16(10, true);
+
+		if (
+			[8000, 12000, 16000, 24000].includes(rate)
+			&& (preSkip * 2000 === rate * 13 || preSkip * 400 === rate)
+		) {
+			view.setUint16(10, preSkip * OPUS_SAMPLE_RATE / rate, true);
+			decoderConfig.description = description;
 		}
 	}
 };
