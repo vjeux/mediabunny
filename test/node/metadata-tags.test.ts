@@ -68,6 +68,41 @@ const createDummyAudioTrack = (codec: AudioCodec, output: Output) => {
 
 const coverArt = new Uint8Array(1024);
 coverArt[0] = 69;
+
+test('ID3v2 COMM frames with a description, like iTunNORM, aren\'t the comment', async () => {
+	const latin1 = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const frame = (id: string, body: number[]) => [...latin1(id), 0, 0, 0, body.length, 0, 0, ...body];
+	const mp3WithId3V23Tag = (frames: number[]) => {
+		const tag = [...latin1('ID3'), 3, 0, 0, 0, 0, 0, frames.length, ...frames];
+		const bytes = new Uint8Array(tag.length + 10 * 417);
+		bytes.set(tag);
+		for (let i = 0; i < 10; i++) {
+			bytes.set([0xff, 0xfb, 0x90, 0x64], tag.length + i * 417); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
+		}
+		return bytes;
+	};
+	const readComment = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return (await input.getMetadataTags()).comment;
+	};
+
+	// iTunes writes COMM frames described iTunNORM and iTunSMPB into every MP3 it encodes
+	const iTunNorm = frame('COMM', [0, ...latin1('eng'), ...latin1('iTunNORM'), 0, ...latin1(' 00000A2B 000009F5')]);
+	const plainComment = frame('COMM', [0, ...latin1('eng'), 0, ...latin1('Comment')]);
+
+	expect(await readComment(mp3WithId3V23Tag([...iTunNorm, ...plainComment]))).toBe('Comment');
+
+	const bytes = mp3WithId3V23Tag([...iTunNorm, ...frame('TIT2', [0, ...latin1('Song')])]);
+	expect(await readComment(bytes)).toBeUndefined();
+
+	// Nor does a conversion turn it into one
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp3OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output });
+	await conversion.execute();
+	expect(await readComment(new Uint8Array(output.target.buffer!))).toBeUndefined();
+});
+
 const songMetadata: MetadataTags = {
 	title: 'Trying to Feel Alive',
 	description: 'A song',

@@ -395,8 +395,13 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				ensureFrameHasBytes(4);
 				const encoding = reader.readU8();
 				reader.pos += 3; // Skip language
-				reader.readId3V2Text(encoding, frameEndPos); // Short content description
-				tags.comment ??= reader.readId3V2Text(encoding, frameEndPos);
+				const description = reader.readId3V2Text(encoding, frameEndPos);
+
+				if (description === '') {
+					tags.comment ??= reader.readId3V2Text(encoding, frameEndPos);
+				} else {
+					// Described comments are named entries (like iTunes' iTunNORM) rather than the actual comment
+				}
 			}; break;
 
 			case 'APIC':
