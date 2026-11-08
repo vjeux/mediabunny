@@ -164,3 +164,44 @@ test('FLAC encoding at sample rates outside of the frame header table', async ()
 		expect(await track.computeDuration()).toBe(1);
 	}
 });
+
+// A gain effect producing float samples, like most audio processing does
+const halveVolume = (sample: AudioSample) => {
+	const data = new Float32Array(sample.numberOfFrames * sample.numberOfChannels);
+	sample.copyTo(data, { planeIndex: 0, format: 'f32' });
+
+	return new AudioSample({
+		data: data.map(x => 0.5 * x),
+		format: 'f32',
+		numberOfChannels: sample.numberOfChannels,
+		sampleRate: sample.sampleRate,
+		timestamp: sample.timestamp,
+	});
+};
+
+test.each([
+	['without', undefined],
+	['with', halveVolume],
+])('transform.sampleFormat sets the FLAC bit depth %s process', async (_, process) => {
+	registerFlacEncoder();
+
+	const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+	const source = new AudioSampleSource({ codec: 'flac', transform: { sampleFormat: 's16', process } });
+	output.addAudioTrack(source);
+	await output.start();
+
+	using sample = new AudioSample({
+		data: createSineWave(48000, 1, 0.1),
+		format: 'f32',
+		numberOfChannels: 1,
+		sampleRate: 48000,
+		timestamp: 0,
+	});
+	await source.add(sample);
+	await output.finalize();
+
+	// STREAMINFO (after "fLaC" and the block header) holds bits per sample - 1 in bit 0 of byte 12 and the top
+	// nibble of byte 13
+	const bytes = new Uint8Array(output.target.buffer!);
+	expect((((bytes[8 + 12]! & 1) << 4) | (bytes[8 + 13]! >> 4)) + 1).toBe(16);
+});
