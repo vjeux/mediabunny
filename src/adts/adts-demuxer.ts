@@ -53,6 +53,8 @@ export class AdtsDemuxer extends Demuxer {
 	firstFrameHeader: AdtsFrameHeader | null = null;
 	loadedSamples: Sample[] = [];
 	metadataTags: MetadataTags | null = null;
+	/** Whether metadataTags holds all tags, rather than the ones read before a parse error */
+	metadataTagsComplete = false;
 
 	trackBackings: AdtsAudioTrackBacking[] = [];
 
@@ -164,7 +166,8 @@ export class AdtsDemuxer extends Demuxer {
 		try {
 			await this.readMetadata();
 
-			if (this.metadataTags) {
+			// Tags that failed to parse are read again, so that every call fails, not just the first one
+			if (this.metadataTags && this.metadataTagsComplete) {
 				return this.metadataTags;
 			}
 
@@ -203,6 +206,7 @@ export class AdtsDemuxer extends Demuxer {
 				}
 			}
 
+			this.metadataTagsComplete = true;
 			return this.metadataTags;
 		} finally {
 			release();
