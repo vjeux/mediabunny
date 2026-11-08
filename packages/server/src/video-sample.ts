@@ -423,7 +423,8 @@ export const transformVideoSample = async (
 		const configRet = await graph.config();
 		NodeAv.FFmpegError.throwIfError(configRet, 'FilterGraph.config');
 
-		const addRet = await bufferSrc.buffersrcAddFrame(srcFrame);
+		// Without KEEP_REF, the graph would take the frame's buffers away from the sample
+		const addRet = await bufferSrc.buffersrcAddFrame(srcFrame, NodeAv.AV_BUFFERSRC_FLAG_KEEP_REF);
 		NodeAv.FFmpegError.throwIfError(addRet, 'buffersrcAddFrame');
 
 		// Flush - we only ever push a single frame through this graph.
