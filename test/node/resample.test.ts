@@ -1,6 +1,14 @@
 import { expect, test } from 'vitest';
 import { AudioResampler } from '../../src/resample.js';
 import { AudioSample } from '../../src/sample.js';
+import { AudioSampleSource } from '../../src/media-source.js';
+import { AudioEncodingConfig } from '../../src/encode.js';
+import { Output } from '../../src/output.js';
+import { MkvOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { Input } from '../../src/input.js';
+import { BufferSource } from '../../src/source.js';
+import { ALL_FORMATS } from '../../src/input-format.js';
 
 test('Output buffer boundary with fractional chunk endpoint', async () => {
 	const output: number[] = [];
@@ -126,4 +134,38 @@ test('Resampling keeps the passband and filters out what the target rate cannot 
 	// and Chrome's decodeAudioData both suppress it by more than 75 dB)
 	const alias = relativeAmplitude(await resample(12_000, 48_000, 16_000), 16_000, 4_000);
 	expect(alias).toBeLessThan(0.001);
+});
+
+test('Audio sources built from one reused config keep their own transform', async () => {
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const config: AudioEncodingConfig = { codec: 'pcm-s16', transform: { sampleRate: 48000, numberOfChannels: 1 } };
+	const sources: AudioSampleSource[] = [];
+	for (const [sampleRate, numberOfChannels] of [[48000, 1], [16000, 2]] as const) {
+		config.transform!.sampleRate = sampleRate;
+		config.transform!.numberOfChannels = numberOfChannels;
+		const source = new AudioSampleSource(config);
+		output.addAudioTrack(source);
+		sources.push(source);
+	}
+	config.codec = 'pcm-f32'; // Too late to matter, and must not desync the encoder from its track
+
+	await output.start();
+	for (const source of sources) {
+		const sample = new AudioSample({
+			data: new Float32Array(4800),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		sample.close();
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const tracks = await input.getAudioTracks();
+	expect(await Promise.all(tracks.map(track => track.getSampleRate()))).toEqual([48000, 16000]);
+	expect(await Promise.all(tracks.map(track => track.getNumberOfChannels()))).toEqual([1, 2]);
+	expect(await Promise.all(tracks.map(track => track.getCodec()))).toEqual(['pcm-s16', 'pcm-s16']);
 });
