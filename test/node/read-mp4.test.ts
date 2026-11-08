@@ -285,6 +285,32 @@ test('H.264 packet types come from the length-prefixed slices when there are any
 	expect((await sink.getKeyPacket(2.5 / 30, { verifyKeyPackets: true }))?.timestamp).toBeCloseTo(2 / 30);
 });
 
+test('H.264 packet types ignore start codes in the bytes a broken length runs into', async () => {
+	// As in broken files from the wild: after a few NAL units, a length that runs far past the end of the packet, over
+	// bytes that happen to hold a start code and an IDR slice header
+	const lengthPrefixed = (...nalUnits: number[][]) => nalUnits.flatMap(x => [...u32(x.length), ...x]);
+	const brokenUnit = [...u32(0x5dc72a9a), 0x5d, 0x11, 0x22, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xff];
+	const sei = [0x06, 0x05, 0x10, ...Array.from({ length: 16 }, (_, i) => 0x10 + i), 0x80];
+	const sps = [0x67, 0x64, 0x00, 0x28, 0xac, 0xd9];
+
+	using input = new Input({
+		source: new BufferSource(await writeAvcFrames([
+			[...lengthPrefixed(sei, [0x16, 0x01, 0x02]), ...brokenUnit],
+			[...lengthPrefixed(sps), ...brokenUnit],
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+	const sink = new EncodedPacketSink(track);
+
+	const types: (string | null)[] = [];
+	for await (const packet of sink.packets()) {
+		types.push(await track.determinePacketType(packet));
+	}
+	expect(types).toEqual(['delta', 'delta']);
+	expect(await sink.getFirstKeyPacket({ verifyKeyPackets: true })).toBe(null);
+});
+
 test('Missing tfdt and tfra entries referencing non-first samples', async () => {
 	// See https://github.com/Vanilagy/mediabunny/issues/578
 	const filePath = path.join(__dirname, '..', 'public/missing-tfdt.mp4');

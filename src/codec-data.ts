@@ -2549,22 +2549,30 @@ export const determineVideoPacketType = (
 ): PacketType | null => {
 	switch (codec) {
 		case 'avc': {
-			// Only a frame without any length-prefixed slice hides its slices behind start codes. Elsewhere, a start
-			// code that a writer failed to escape (say, in an SEI payload before the slice) mustn't decide the type.
-			let hasLengthPrefixedSlice = false;
+			// Only a frame whose length-prefixed NAL units cover it exactly, but without any slice among them, hides
+			// its slices behind start codes. Elsewhere, a start code that a writer failed to escape (say, in an SEI
+			// payload before the slice), or one in the bytes that a broken length runs into, mustn't decide the type.
+			let lookBehindStartCodes = false;
 			if (decoderConfig.description) {
+				let hasLengthPrefixedSlice = false;
+				let end = 0;
+
 				for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
 					const type = extractNalUnitTypeForAvc(packetData[loc.offset]!);
 					if (type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR) {
 						hasLengthPrefixedSlice = true;
 						break;
 					}
+
+					end = loc.offset + loc.length;
 				}
+
+				lookBehindStartCodes = !hasLengthPrefixedSlice && end === packetData.byteLength;
 			}
 
-			const nalUnits = hasLengthPrefixedSlice
-				? iterateAvcNalUnits(packetData, decoderConfig)
-				: iterateAvcNalUnitsIncludingEmbedded(packetData, decoderConfig);
+			const nalUnits = lookBehindStartCodes
+				? iterateAvcNalUnitsIncludingEmbedded(packetData, decoderConfig)
+				: iterateAvcNalUnits(packetData, decoderConfig);
 
 			for (const loc of nalUnits) {
 				const nalTypeByte = packetData[loc.offset]!;
