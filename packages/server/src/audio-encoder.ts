@@ -46,6 +46,11 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	/** What came out of the resampler, until it adds up to a frame for the encoder. */
 	resampledFifo: NodeAv.AudioFifo | null = null;
 	resampledFrame: NodeAv.Frame | null = null;
+	resamplerInputSampleRate: number | null = null;
+	/** The samples that went into the resampler, at the input's rate. */
+	resampledInputCount = 0;
+	/** The samples kept from the resampler, at the encoder's rate. */
+	resampledOutputCount = 0;
 	dstFrame: NodeAv.Frame | null = null;
 	avCodec!: NodeAv.Codec;
 
@@ -310,6 +315,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		if (requiresResampler) {
 			if (!this.resampler) {
 				this.resampler = new NodeAv.SoftwareResampleContext();
+				this.resamplerInputSampleRate = this.frame.sampleRate;
 
 				// Resample straight to whatever layout the encoder was opened with, since not every codec accepts
 				// the layout that getChannelLayout hands out for a given channel count
@@ -360,9 +366,10 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	/**
 	 * Runs samples through the resampler and adds what comes out of it to the FIFO. When converting between sample
 	 * rates, the resampler holds samples back for its filter, so it can output fewer samples than it said it could,
-	 * which is why this goes by what it returns. Null input flushes out what it holds back, so it's only for the end.
+	 * which is why this goes by what it returns. With no input, it outputs what it can without more input. At most
+	 * `maxKeepCount` of the output samples are kept.
 	 */
-	async resample(input: Buffer[] | null, sampleCount: number) {
+	async resample(input: Buffer[] | null, sampleCount: number, maxKeepCount = Infinity) {
 		assert(this.codecContext);
 		assert(this.resampler);
 		assert(this.resampledFifo);
@@ -388,8 +395,14 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		const convertedCount = await this.resampler.convert(this.resampledFrame.data, capacity, input, sampleCount);
 		NodeAv.FFmpegError.throwIfError(convertedCount, 'Resample');
 
-		if (convertedCount > 0) {
-			await this.resampledFifo.write(this.resampledFrame.data, convertedCount);
+		if (input) {
+			this.resampledInputCount += sampleCount;
+		}
+
+		const keptCount = Math.min(convertedCount, maxKeepCount);
+		if (keptCount > 0) {
+			await this.resampledFifo.write(this.resampledFrame.data, keptCount);
+			this.resampledOutputCount += keptCount;
 		}
 	}
 
@@ -548,8 +561,17 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			assert(this.dstFrame);
 			assert(this.nextResamplerPts !== null);
 
-			// Get out what the resampler still holds back, which it only does when converting between sample rates
-			await this.resample(null, 0);
+			// When converting between sample rates, the resampler holds back the input's last samples for its filter
+			// until more input comes. Push them out with silence, keeping exactly as many samples as the input amounts
+			// to at the encoder's rate.
+			assert(this.resamplerInputSampleRate !== null);
+			const expectedCount = Math.round(
+				this.resampledInputCount * this.codecContext.sampleRate / this.resamplerInputSampleRate,
+			);
+			for (let i = 0; i < 16 && this.resampledOutputCount < expectedCount; i++) {
+				NodeAv.FFmpegError.throwIfError(this.resampler.injectSilence(256), 'injectSilence');
+				await this.resample(null, 0, expectedCount - this.resampledOutputCount);
+			}
 			await this.pullResampledFrames();
 
 			const remainingCount = this.resampledFifo.size;
@@ -614,6 +636,9 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		this.resampledFifo = null;
 		this.resampledFrame?.free();
 		this.resampledFrame = null;
+		this.resamplerInputSampleRate = null;
+		this.resampledInputCount = 0;
+		this.resampledOutputCount = 0;
 		this.inputParametersKey = null;
 		this.inputSampleFormat = null;
 		this.nextResamplerPts = null;
