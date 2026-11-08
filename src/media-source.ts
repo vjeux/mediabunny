@@ -145,8 +145,9 @@ export abstract class MediaSource {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async _flushAndClose(forceClose: boolean) {}
 	/**
-	 * Called when the output is canceled while finalizing: stops waiting for the samples added before finalizing to
-	 * be processed (a process function that never settles would hold finalization up forever) and drops them.
+	 * Called when the output is canceled while finalizing, or while a graceful close is under way: stops waiting for
+	 * the samples added before to be processed (a process function that never settles would hold finalization or the
+	 * close up forever) and drops them.
 	 * @internal
 	 */
 	_cancelPendingAdds() {}
@@ -189,6 +190,12 @@ export abstract class MediaSource {
 
 	/** @internal */
 	async _flushOrWaitForOngoingClose(forceClose: boolean) {
+		if (forceClose && this._closingPromise) {
+			// A graceful close under way (from close()) may be waiting for a process function call that never settles;
+			// forcing the close stops waiting for it
+			this._cancelPendingAdds();
+		}
+
 		return this._closingPromise ??= (async () => {
 			await this._flushAndClose(forceClose);
 			this._closed = true;
