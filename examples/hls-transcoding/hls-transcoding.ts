@@ -10,11 +10,13 @@ import {
 	PathedTarget,
 	Quality,
 	UrlSource,
+	canEncodeAudio,
 } from 'mediabunny';
 import { registerAc3Decoder } from '@mediabunny/ac3';
 import { registerDtsDecoder } from '@mediabunny/dts';
 import { registerTrueHdDecoder } from '@mediabunny/truehd';
 import { registerProresDecoder } from '@mediabunny/prores';
+import { registerAacEncoder } from '@mediabunny/aac-encoder';
 
 import SampleFileUrl from '../../docs/assets/big-buck-bunny-trimmed.mp4';
 
@@ -23,6 +25,13 @@ registerAc3Decoder();
 registerDtsDecoder();
 registerTrueHdDecoder();
 registerProresDecoder();
+
+// The audio rendition is AAC; fall back to the AAC encoder extension where the browser can't encode AAC natively
+const aacEncoderReady = canEncodeAudio('aac').then((supported) => {
+	if (!supported) {
+		registerAacEncoder();
+	}
+});
 
 (document.querySelector('#sample-file-download') as HTMLAnchorElement).href = SampleFileUrl;
 
@@ -95,6 +104,8 @@ const convertToHls = async (resource: File | string) => {
 			),
 			onFinalize: () => Promise.all(filePromises),
 		});
+
+		await aacEncoderReady;
 
 		currentConversion = await Conversion.init({
 			input,
@@ -271,6 +282,11 @@ document.addEventListener('dragover', (event) => {
 
 document.addEventListener('drop', (event) => {
 	event.preventDefault();
+	if (!directoryHandle) {
+		// Like the disabled file buttons: the output files need a directory to go to
+		return;
+	}
+
 	const files = event.dataTransfer!.files;
 	const file = files[0];
 	if (file) {
