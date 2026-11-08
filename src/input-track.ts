@@ -826,8 +826,10 @@ export class InputVideoTrack extends InputTrack {
 	}
 
 	/** Returns the color space of the track's samples. */
-	async getColorSpace() {
-		return this._backing.getColorSpace();
+	async getColorSpace(): Promise<VideoColorSpaceInit> {
+		// Copied so that changes made by the caller don't leak into the input's own state (MPEG-TS shares the object
+		// with its decoder config)
+		return { ...await this._backing.getColorSpace() };
 	}
 
 	/** If this method returns true, the track's samples use a high dynamic range (HDR). */

@@ -1130,6 +1130,31 @@ test('Getters return copies that callers can modify without affecting the input'
 		}
 	}
 
+	// Color spaces: MPEG-TS shares the object with the decoder config it decodes with
+	for (const file of ['0.ts', 'video.mp4', 'demo.webm']) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public', file)),
+			formats: ALL_FORMATS,
+		});
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		const colorSpace = await videoTrack.getColorSpace();
+		const configColorSpace = (await videoTrack.getDecoderConfig())!.colorSpace;
+		const isHdr = await videoTrack.hasHighDynamicRange();
+		if (file === '0.ts') {
+			expect(isHdr).toBe(true); // HLG, BT.2020
+		}
+
+		const changed = await videoTrack.getColorSpace();
+		changed.primaries = 'bt709';
+		changed.transfer = 'bt709';
+		changed.matrix = 'bt709';
+		changed.fullRange = !changed.fullRange;
+
+		expect(await videoTrack.getColorSpace(), file).toEqual(colorSpace);
+		expect((await videoTrack.getDecoderConfig())!.colorSpace, file).toEqual(configColorSpace);
+		expect(await videoTrack.hasHighDynamicRange(), file).toBe(isHdr);
+	}
+
 	// Tags holding Dates, image bytes, attachments and binary raw values, changed in place
 	for (const format of [new Mp4OutputFormat(), new MkvOutputFormat()]) {
 		const output = new Output({ format, target: new BufferTarget() });
