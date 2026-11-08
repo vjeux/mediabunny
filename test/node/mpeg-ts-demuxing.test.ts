@@ -606,6 +606,26 @@ test('MPEG-TS with HEVC video', async () => {
 	}
 });
 
+test('MPEG-TS HEVC with an unreferenced SPS in front of the active one', async () => {
+	// The first access unit of a 320x240 x265 stream carries an extra SPS (sps_seq_parameter_set_id 1, 160x96, taken
+	// from another x265 stream) before the SPS its PPS and slices use (id 0). Like FFmpeg, the track's properties must
+	// come from the SPS the first slice refers to. Made with:
+	// ffmpeg -f lavfi -i testsrc2=s=320x240:r=25:d=0.2 -pix_fmt yuv420p -c:v libx265 -x265-params keyint=5:bframes=0 \
+	//   -f hevc real.hevc
+	// ffmpeg -f lavfi -i testsrc2=s=160x96:r=25:d=0.2 -pix_fmt yuv420p -c:v libx265 -f hevc donor.hevc
+	// then the donor's SPS, with its sps_seq_parameter_set_id rewritten to 1, inserted in front of real.hevc's SPS, and
+	// ffmpeg -fflags +genpts -r 25 -i hevc-unused-sps.hevc -c copy hevc-unused-sps.ts
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/hevc-unused-sps.ts')),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	expect(await track.getDisplayWidth()).toBe(320);
+	expect(await track.getDisplayHeight()).toBe(240);
+	expect(await track.getCodecParameterString()).toBe('hev1.1.6.L60.90'); // Main, level 2
+});
+
 test('MPEG-TS with MP3 audio', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/mp3.ts')),
