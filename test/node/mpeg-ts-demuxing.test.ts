@@ -1433,6 +1433,237 @@ test('MPEG-TS with a damaged H.264 slice header reads past it', async () => {
 	expect(sizes).toEqual(frames.map(frame => frame.length));
 });
 
+test('MPEG-TS key packet lookup returns the same packet as reading in order', async () => {
+	// The file starts with a PES packet holding only SPS and PPS, then the IDR frame's PES packet, both with PTS 0 and
+	// random_access_indicator set. The first access unit spans both.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/no-aud.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	const sink = new EncodedPacketSink(track!);
+
+	const firstPacket = await sink.getFirstPacket();
+	const keyPacket = await sink.getKeyPacket(0);
+	expect(firstPacket!.timestamp).toBe(0);
+	expect(keyPacket!.sequenceNumber).toBe(firstPacket!.sequenceNumber);
+	expect(keyPacket!.data).toEqual(firstPacket!.data);
+});
+
+test('MPEG-TS key packet lookup finds key frames whose PES packet starts with the previous frame', async () => {
+	// Like Apple's bipbop HLS sample: pictures have two slices, and each PES packet begins with the second slice of
+	// the previous picture before its own AUD, the first one too (the file was cut from a longer stream). There are no
+	// random_access_indicator flags.
+	const packets: Uint8Array[] = [];
+	const pushPackets = (pid: number, payload: number[]) => {
+		for (let i = 0; i < payload.length; i += 184) {
+			const chunk = payload.slice(i, i + 184);
+			const packet = new Uint8Array(188);
+			const stuffing = 184 - chunk.length;
+			packet.set([0x47, (i === 0 ? 0x40 : 0) | (pid >> 8), pid & 0xff, (stuffing ? 0x30 : 0x10)], 0);
+			if (stuffing) {
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+				packet.fill(0xff, 6, 4 + stuffing);
+			}
+			packet.set(chunk, 4 + stuffing);
+			packets.push(packet);
+		}
+	};
+
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64 (16 macroblocks)
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const aud = [0x09, 0xf0];
+	// first_mb_in_slice 0 is the bit 1, 8 is 0001001
+	const slice = (idr: boolean, secondHalf: boolean) => [
+		idr ? 0x65 : 0x41, ...(secondHalf ? [0x12, 0x22] : [0x88, 0x84]), ...new Array<number>(30).fill(0xaa),
+	];
+	const nal = (nalUnit: number[]) => [0, 0, 0, 1, ...nalUnit];
+
+	const frameCount = 12;
+	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPackets(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+	for (let i = 0; i < frameCount; i++) {
+		const isKey = i % 4 === 0;
+		const previousTail = nal(slice(i > 0 && (i - 1) % 4 === 0, true));
+		const head = [
+			...nal(aud),
+			...(isKey ? [...nal(sps), ...nal(pps)] : []),
+			...nal(slice(isKey, false)),
+			...(i === frameCount - 1 ? nal(slice(isKey, true)) : []),
+		];
+		const pts = 3000 * i;
+		pushPackets(0x100, [
+			0, 0, 1, 0xe0, 0, 0, 0x84, 0x80, 5, 0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff,
+			((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1, ...previousTail, ...head,
+		]);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	const sink = new EncodedPacketSink(track!);
+
+	const keyPackets: EncodedPacket[] = [];
+	for await (const packet of sink.packets()) {
+		if (packet.type === 'key') {
+			keyPackets.push(packet);
+		}
+	}
+	expect(keyPackets.map(packet => packet.timestamp)).toEqual([0, 4 / 30, 8 / 30]);
+
+	for (const keyPacket of keyPackets) {
+		const found = await sink.getKeyPacket(keyPacket.timestamp);
+		expect(found?.sequenceNumber).toBe(keyPacket.sequenceNumber);
+		const foundLater = await sink.getKeyPacket(keyPacket.timestamp + 1 / 30);
+		expect(foundLater?.sequenceNumber).toBe(keyPacket.sequenceNumber);
+	}
+});
+
+test('MPEG-TS key packet lookup finds key frames sharing their PTS with the frame before them', async () => {
+	// 30 fps, every 10th frame a key frame that has the previous frame's timestamp (seen with Mediabunny's own output
+	// for such input). Key frames are flagged with random_access_indicator.
+	const packets: Uint8Array[] = [];
+	const pushPackets = (pid: number, payload: number[], randomAccess = false) => {
+		for (let i = 0; i < payload.length; i += 184 - (i === 0 && randomAccess ? 2 : 0)) {
+			const isFirst = i === 0;
+			const adaptation = isFirst && randomAccess ? [0x01, 0x40] : []; // random_access_indicator
+			const chunk = payload.slice(i, i + 184 - adaptation.length);
+			const packet = new Uint8Array(188);
+			const stuffing = 184 - adaptation.length - chunk.length;
+			const header = [0x47, (isFirst ? 0x40 : 0) | (pid >> 8), pid & 0xff];
+			if (adaptation.length > 0 || stuffing > 0) {
+				const adaptationLength = adaptation.length + stuffing;
+				packet.set([...header, 0x30, adaptationLength - 1], 0);
+				packet.set(adaptationLength > 1 ? [adaptation[1] ?? 0x00] : [], 5);
+				packet.fill(0xff, 6, 4 + adaptationLength);
+				packet.set(chunk, 4 + adaptationLength);
+			} else {
+				packet.set([...header, 0x10], 0);
+				packet.set(chunk, 4);
+			}
+			packets.push(packet);
+		}
+	};
+
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const aud = [0x09, 0xf0];
+	const nal = (nalUnit: number[]) => [0, 0, 0, 1, ...nalUnit];
+
+	pushPackets(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0]);
+	pushPackets(0x1000, [
+		0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+	]);
+	for (let i = 0; i < 40; i++) {
+		const isKey = i % 10 === 0;
+		const au = isKey
+			? [...nal(aud), ...nal(sps), ...nal(pps), ...nal([0x65, 0x88, 0x84, 0x00, 0x33, 0xaa, 0xaa])]
+			: [...nal(aud), ...nal([0x41, 0x9a, 0x02, 0x04, 0xaa, 0xaa])];
+		const pts = 3000 * (isKey && i > 0 ? i - 1 : i);
+		pushPackets(0x100, [
+			0, 0, 1, 0xe0, 0, 0, 0x84, 0x80, 5, 0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff,
+			((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1, ...au,
+		], isKey);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+	const keyPackets: EncodedPacket[] = [];
+	for await (const packet of sink.packets()) {
+		if (packet.type === 'key') {
+			keyPackets.push(packet);
+		}
+	}
+	expect(keyPackets.map(packet => Math.round(packet.timestamp * 30))).toEqual([0, 9, 19, 29]);
+
+	for (const keyPacket of keyPackets) {
+		expect((await sink.getKeyPacket(keyPacket.timestamp))?.sequenceNumber).toBe(keyPacket.sequenceNumber);
+	}
+});
+
+test('MPEG-TS key packet lookup returns key frames split over several PES packets whole', async () => {
+	// The first access unit comes in PES packets with PTS 0: AUD + SPS, PPS, possibly many SEI ones, and SEI + IDR. The
+	// first and last are flagged with random_access_indicator, the middle ones aren't, or all of them are.
+	const sps = [0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x6a]; // x264, 64x64
+	const pps = [0x68, 0xce, 0x0f, 0xc8];
+	const aud = [0x09, 0xf0];
+	const sei = [0x06, 0x05, 0x01, 0x00, 0x80];
+	const idr = [0x65, 0x88, 0x84, 0x00, 0x33, ...new Array<number>(30).fill(0xaa)];
+	const slice = [0x41, 0x9a, 0x02, 0x04, ...new Array<number>(20).fill(0xaa)];
+	const nal = (nalUnit: number[]) => [0, 0, 0, 1, ...nalUnit];
+
+	const buildFile = (flagMiddle: boolean, seiPesCount: number) => {
+		const packets: Uint8Array[] = [];
+		const pushPes = (pid: number, payload: number[], randomAccess: boolean) => {
+			// One TS packet per PES packet: adaptation field (flags + stuffing), then the payload
+			const packet = new Uint8Array(188).fill(0xff);
+			const adaptationLength = 184 - payload.length;
+			const flags = randomAccess ? 0x40 : 0x00;
+			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, 0x30, adaptationLength - 1, flags], 0);
+			packet.set(payload, 4 + adaptationLength);
+			packets.push(packet);
+		};
+		const pes = (pts: number, nalUnits: number[][]) => [
+			0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+			...nalUnits.flatMap(nal),
+		];
+
+		pushPes(0x0000, [0x00, 0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 0, 0, 0], false);
+		pushPes(0x1000, [
+			0x00, 0x02, 0xb0, 0x12, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00, 0x1b, 0xe1, 0x00, 0xf0, 0x00, 0, 0, 0, 0,
+		], false);
+		pushPes(0x100, pes(0, [aud, sps]), true);
+		pushPes(0x100, pes(0, [pps]), flagMiddle);
+		for (let i = 0; i < seiPesCount; i++) {
+			pushPes(0x100, pes(0, [sei]), flagMiddle);
+		}
+		pushPes(0x100, pes(0, [sei, idr]), true);
+		for (let i = 1; i < 4; i++) {
+			pushPes(0x100, pes(3000 * i, [aud, slice]), false);
+		}
+
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+		return bytes;
+	};
+
+	for (const [flagMiddle, seiPesCount] of [[false, 0], [true, 0], [false, 70]] as const) {
+		using input = new Input({
+			source: new BufferSource(buildFile(flagMiddle, seiPesCount)),
+			formats: ALL_FORMATS,
+		});
+
+		const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+		const firstPacket = await sink.getFirstPacket();
+		const nalUnits = [aud, sps, pps, ...new Array<number[]>(seiPesCount).fill(sei), sei, idr];
+		expect(firstPacket!.byteLength).toBe(nalUnits.flatMap(nal).length);
+
+		const keyPacket = await sink.getKeyPacket(0);
+		expect(keyPacket?.type).toBe('key');
+		expect(keyPacket?.sequenceNumber).toBe(firstPacket!.sequenceNumber);
+		expect(keyPacket?.data).toEqual(firstPacket!.data);
+	}
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
