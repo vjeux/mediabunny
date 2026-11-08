@@ -2952,6 +2952,44 @@ test('ID3: Unsynchronized tag with many frames', async () => {
 	await expectGracefulRead(concat(id3Tag(4, 0x80, concatList(frames)), flacFile(3)));
 });
 
+test('ID3: Tags asked for after the packets of a file streamed through a small cache', async () => {
+	// A stream source keeps only its latest data (1 MiB here), so the tags at the start of the file can't be read again
+	// once the packets have been read
+	const mp3Frame = concat([0xff, 0xfb, 0x90, 0xc0], zeros(413)); // MPEG-1 Layer III, 128 kbps, 44.1 kHz, mono
+	const titleTag = id3Tag(3, 0, id3Frame('TIT2', [0, ...ascii('Title')]));
+	const id3V1Tag = concat(ascii('TAG'), ascii('Title'), zeros(120));
+	const files = [
+		concat(titleTag, concatList(Array.from({ length: 8000 }, () => mp3Frame))),
+		concat(titleTag, concatList(Array.from({ length: 16000 }, () => adtsFrame(193)))),
+		// Without ID3v2 tags, the ID3v1 tag at the end of the file still counts
+		concat(concatList(Array.from({ length: 8000 }, () => mp3Frame)), id3V1Tag),
+	];
+
+	for (const file of files) {
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (let offset = 0; offset < file.length; offset += 65536) {
+					controller.enqueue(file.slice(offset, offset + 65536));
+				}
+				controller.close();
+			},
+		});
+		using input = new Input({
+			source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 20 }),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			void packet;
+			packetCount++;
+		}
+		expect(packetCount).toBeGreaterThanOrEqual(8000);
+		expect((await input.getMetadataTags()).title).toBe('Title');
+	}
+});
+
 test('ID3: Short extended header', async () => {
 	await expectGracefulRead(concat(id3Tag(3, 0x40, [0, 0]), flacFile(3)));
 });
