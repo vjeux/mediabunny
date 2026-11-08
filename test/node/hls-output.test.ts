@@ -2856,6 +2856,63 @@ segment-1-1.ts
 `);
 });
 
+test('Reading a live single-file playlist while its segments file grows', { timeout: 15_000 }, async () => {
+	// Write single-file HLS to memory, then serve it the way it would look while still being written live: each reload
+	// of the media playlist lists one more byte range of the segments file, which has grown by exactly that range
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			singleFilePerPlaylist: true,
+			targetDuration: 1, // Live playlists get reloaded about once per target duration
+		}),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+			return target;
+		}),
+	});
+
+	const source = videoSource();
+	output.addVideoTrack(source);
+	await output.start();
+	for (let i = 0; i < 16; i++) {
+		await source.add(new EncodedPacket(avcPacketData, i % 4 === 0 ? 'key' : 'delta', i / 4, 0.25), avcMetadata);
+	}
+	await output.finalize();
+
+	const fullPlaylist = new TextDecoder().decode(targets.get('playlist-1.m3u8')!.buffer!);
+	const header = fullPlaylist.slice(0, fullPlaylist.indexOf('#EXTINF')).replace('#EXT-X-PLAYLIST-TYPE:VOD\n', '');
+	const entries = fullPlaylist.match(/#EXTINF:.*\n#EXT-X-BYTERANGE:\d+@\d+\nsegments-1\.ts\n/g)!;
+	expect(entries.length).toBe(4);
+	const segmentsFile = new Uint8Array(targets.get('segments-1.ts')!.buffer!);
+
+	let listed = 0;
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			if (path === 'playlist-1.m3u8') {
+				listed = Math.min(listed + 1, entries.length);
+				const ended = listed === entries.length ? '#EXT-X-ENDLIST\n' : '';
+				return new BufferSource(new TextEncoder().encode(header + entries.slice(0, listed).join('') + ended));
+			} else if (path === 'segments-1.ts') {
+				const [, length, offset] = /BYTERANGE:(\d+)@(\d+)/.exec(entries[listed - 1]!)!;
+				return new BufferSource(segmentsFile.subarray(0, Number(offset) + Number(length)));
+			}
+
+			return new BufferSource(targets.get(path)!.buffer!);
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack() as InputVideoTrack;
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		timestamps.push(packet.timestamp);
+	}
+
+	expect(timestamps).toEqual([...Array(16).keys()].map(i => i / 4));
+});
+
 test('Live mode, empty', async () => {
 	const writtenTexts = new Map<string, string>();
 
