@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { Conversion } from '../../src/conversion.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +925,31 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS leading pictures written just below zero read back as negative, not 26.5 hours later', async () => {
+	// Found by L83. A conversion of an open-GOP source (x264 with open-gop, x265 by default) trimmed to start on an
+	// open-GOP I-frame writes its leading B-frames just below zero, which wrap around to just below 2^33 in the file.
+	// test/public/avc-open-gop.mp4: `ffmpeg -f lavfi -i testsrc2=s=96x64:r=25:d=3 -c:v libx264 -x264-params
+	// keyint=25:min-keyint=25:open-gop=1:bframes=3:scenecut=0 -pix_fmt yuv420p` (FFmpeg 8.0.3)
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/avc-open-gop.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	// Starts on the open GOP's I-frame at 1 s; its leading B-frames (0.88-0.96 s) land just below zero
+	const conversion = await Conversion.init({ input, output, trim: { start: 1 }, showWarnings: false });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await result.getPrimaryVideoTrack();
+	assert(track);
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+		timestamps.push(packet.timestamp);
+	}
+	// On main: [0, 95443.638, 95443.598, 95443.678, ...]
+	expect(timestamps.slice(0, 4).map(x => Number(x.toFixed(3)))).toEqual([0, -0.08, -0.12, -0.04]);
+	expect(Math.max(...timestamps)).toBeLessThan(2);
+	expect(await result.computeDuration()).toBeCloseTo(2, 3);
 });
