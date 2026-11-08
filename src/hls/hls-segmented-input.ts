@@ -916,6 +916,28 @@ export class HlsSegmentedInput extends SegmentedInput {
 		}
 	}
 
+	/**
+	 * Gets the resource a segment is in. A cached source may predate a segment's byte range: in a live playlist, new
+	 * byte ranges can extend a resource that is still being written (like single-file live output), but a source keeps
+	 * the size its resource had when it was opened. Such a source is opened anew.
+	 */
+	async getSegmentResourceRef(request: SourceRequest, location: HlsSegmentLocation) {
+		let ref = await this.input._getSourceCached(request);
+
+		const knownSize = ref.source._getFileSize();
+		if (
+			location.length !== null
+			&& typeof knownSize === 'number'
+			&& location.offset + location.length > knownSize
+		) {
+			ref.free();
+			this.input._evictSourceCached(request);
+			ref = await this.input._getSourceCached(request);
+		}
+
+		return ref;
+	}
+
 	async getPreviousSegment(segment: Segment) {
 		const index = (segment as HlsSegment).index;
 		assert(index !== -1);
@@ -1030,7 +1052,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						|| hlsSegment.encryption.method === 'SAMPLE-AES'
 						|| hlsSegment.encryption.method === 'SAMPLE-AES-CTR'
 					) {
-						ref = await this.input._getSourceCached(proxiedRequest);
+						ref = await this.getSegmentResourceRef(proxiedRequest, hlsSegment.location);
 
 						if (needsSlice) {
 							const slice = ref.source.slice(
@@ -1095,7 +1117,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 							return new BufferSource(plaintext.subarray(start - blockStart, end - blockStart)).ref();
 						}
 
-						let ciphertextRef = await this.input._getSourceCached(proxiedRequest);
+						let ciphertextRef = await this.getSegmentResourceRef(proxiedRequest, hlsSegment.location);
 						if (needsSlice) {
 							// Slice before decrypting
 							const slice = ciphertextRef.source.slice(
