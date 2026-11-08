@@ -242,6 +242,8 @@ type InternalTrack = {
 	defaultDurationNs: number | null;
 	codecDelay: number;
 	codecDelayNs: number;
+	/** Converts the track's Track Ticks (block timestamps, BlockDuration) into Segment Ticks. */
+	trackTimestampScale: number;
 	name: string | null;
 	languageCode: string;
 	hasLanguageBcp47: boolean;
@@ -999,7 +1001,9 @@ export class MatroskaDemuxer extends Demuxer {
 
 			for (let i = 0; i < trackData.blocks.length; i++) {
 				const block = trackData.blocks[i]!;
-				block.timestamp += cluster.timestamp;
+				// Block timestamps and BlockDuration are in Track Ticks, the cluster's timestamp in Segment Ticks
+				block.timestamp = cluster.timestamp + block.timestamp * track.trackTimestampScale;
+				block.duration *= track.trackTimestampScale;
 
 				hasLacedBlocks ||= block.lacing !== BlockLacing.None;
 			}
@@ -1672,6 +1676,7 @@ export class MatroskaDemuxer extends Demuxer {
 					defaultDurationNs: null,
 					codecDelay: 0,
 					codecDelayNs: 0,
+					trackTimestampScale: 1,
 					name: null,
 					languageCode: 'eng', // The default in Matroska
 					hasLanguageBcp47: false,
@@ -1996,6 +2001,17 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.CodecDelay: {
 				if (!this.currentTrack) break;
 				this.currentTrack.codecDelayNs = readUnsignedInt(slice, size);
+			}; break;
+
+			case EBMLId.TrackTimestampScale: {
+				if (!this.currentTrack) {
+					break;
+				}
+
+				const value = readFloat(slice, size);
+				if (Number.isFinite(value) && value > 0) {
+					this.currentTrack.trackTimestampScale = value;
+				}
 			}; break;
 
 			case EBMLId.Name: {
