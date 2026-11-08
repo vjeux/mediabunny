@@ -2760,6 +2760,44 @@ test('WAV: LIST sub-chunk exceeding its parent', async () => {
 	await expectGracefulRead(wav([fmtChunk(), list, dataChunk()]));
 });
 
+test('WAV: Streamed with placeholder sizes, as FFmpeg writes when piping', async () => {
+	// FFmpeg can't seek back to fill in the sizes when piping, so it leaves them at 0xFFFFFFFF. The file size of a
+	// streamed source stays unknown until the stream ends.
+	const frameCount = 5000; // 16-bit mono at 8 kHz, so two full packets of 2048 frames and a last one of 904
+	const file = wav([fmtChunk({ channels: 1, sampleRate: 8000, blockAlign: 2 }), dataChunk(2 * frameCount)]);
+	file.set(u32le(0xffffffff), 4); // RIFF size
+	file.set(u32le(0xffffffff), file.length - 2 * frameCount - 4); // Data size
+
+	// All the audio comes out, including the last packet
+	using input = new Input({ source: streamedSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+	let readFrameCount = 0;
+	for await (const packet of sink.packets()) {
+		readFrameCount += packet.data.byteLength / 2;
+	}
+	expect(readFrameCount).toBe(frameCount);
+
+	// Once the end has been reached, the duration and lookups take the actual size
+	expect(await input.computeDuration()).toBe(frameCount / 8000);
+	expect((await sink.getPacket(1000))!.data.byteLength).toBe(2 * (frameCount - 2 * 2048));
+
+	// The duration also works without reading the packets first
+	using otherInput = new Input({ source: streamedSource(file), formats: ALL_FORMATS });
+	expect(await otherInput.computeDuration()).toBe(frameCount / 8000);
+
+	// The same goes for a file cut short, whose sizes promise more than it holds
+	const cutFile = wav([fmtChunk({ channels: 1, sampleRate: 8000, blockAlign: 2 }), dataChunk(2 * 8000)])
+		.subarray(0, file.length);
+	using cutInput = new Input({ source: streamedSource(cutFile), formats: ALL_FORMATS });
+	const cutSink = new EncodedPacketSink((await cutInput.getPrimaryAudioTrack())!);
+	let cutFrameCount = 0;
+	for await (const packet of cutSink.packets()) {
+		cutFrameCount += packet.data.byteLength / 2;
+	}
+	expect(cutFrameCount).toBe(frameCount);
+	expect(await cutInput.computeDuration()).toBe(frameCount / 8000);
+});
+
 test('WAV: LIST with very long string', async () => {
 	const longString = new Uint8Array(300_000).fill(0x41);
 	const list = riffChunk('LIST', concat(ascii('INFOINAM'), u32le(longString.length), longString));
