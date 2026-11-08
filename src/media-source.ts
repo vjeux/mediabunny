@@ -2928,6 +2928,8 @@ class AudioEncoderWrapper {
 	private closed = false;
 	/** Resolved when waiting for a process function's result should stop; see `cancelPendingAdds()`. */
 	private pendingAddsCanceledSignal = promiseWithResolvers();
+	/** How many process function calls are being waited for. */
+	processCallsInFlight = 0;
 
 	constructor(private source: AudioSource, private encodingConfig: AudioEncodingConfig) {}
 
@@ -3003,7 +3005,13 @@ class AudioEncoderWrapper {
 					const pending = processed;
 					const whenCanceled = this.pendingAddsCanceledSignal.promise
 						.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
-					const result = await Promise.race([pending, whenCanceled]);
+					this.processCallsInFlight++;
+					let result;
+					try {
+						result = await Promise.race([pending, whenCanceled]);
+					} finally {
+						this.processCallsInFlight--;
+					}
 					if (result === PROCESS_CANCELED) {
 						// Whatever it returns once it does settle is dropped
 						void Promise.resolve(pending).then((late) => {
@@ -4182,6 +4190,13 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	private _pendingAddsCanceled = false;
 	/** @internal */
 	private _pendingAddsCanceledSignal = promiseWithResolvers();
+	/**
+	 * Hands the samples still waiting to be fed to the encoder over to the add chain (`keep`), or closes them.
+	 * @internal
+	 */
+	private _handOverPendingSamples: ((keep: boolean) => void) | null = null;
+	/** @internal */
+	private _hasProcessFunction: boolean;
 	/** @internal */
 	private _trackEndedListener: (() => void) | null = null;
 	/** @internal */
@@ -4238,6 +4253,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		super(encodingConfig.codec);
 		this._options = options;
 		this._encoder = new AudioEncoderWrapper(this, encodingConfig);
+		this._hasProcessFunction = !!encodingConfig.transform?.process;
 		this._track = track;
 	}
 
@@ -4455,6 +4471,15 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 					pendingSamples.length = 0;
 				}
 			};
+			this._handOverPendingSamples = (keep) => {
+				for (const audioSample of pendingSamples.splice(0)) {
+					if (keep) {
+						addToEncoder(audioSample);
+					} else {
+						audioSample.close();
+					}
+				}
+			};
 			const encodeWhenReady = (audioSample: AudioSample) => {
 				pendingSamples.push(audioSample);
 				if (pendingSamples.length > MEDIA_STREAM_AUDIO_BUFFER_SIZE) {
@@ -4565,6 +4590,10 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 	/** @internal */
 	override _cancelPendingAdds() {
+		if (this._encoder.processCallsInFlight === 0) {
+			return; // Nothing holds the chain up, so all of it still goes in
+		}
+
 		this._pendingAddsCanceled = true;
 		this._pendingAddsCanceledSignal.resolve();
 		this._abandonChainedAdds();
@@ -4584,6 +4613,12 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 	/** @internal */
 	override async _flushAndClose(forceClose: boolean) {
+		// Audio captured before closing began still belongs in the file, even the audio still waiting to be fed to the
+		// encoder: the add chain takes it in order, and a graceful close waits for the chain below. With a process
+		// function, though, that audio is waiting because the process function can't keep up, and finalizing mustn't
+		// wait for it to catch up, so it's dropped (like audio captured while the encoder is overloaded).
+		this._handOverPendingSamples?.(!forceClose && !this._hasProcessFunction);
+
 		try {
 			if (this._abortController) {
 				this._abortController.abort();

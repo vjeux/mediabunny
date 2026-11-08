@@ -4486,3 +4486,48 @@ test('MediaStreamAudioTrackSource drops audio a process() slower than real time 
 	expect(errors).toEqual([]);
 	expect(callsWhileFinalizing).toBeLessThanOrEqual(9);
 });
+
+test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async ({
+	skip,
+}) => {
+	if (typeof AudioEncoder === 'undefined' || !(await canEncodeAudio('opus'))) {
+		skip('Opus encoding is not supported here');
+	}
+
+	// A slow encoder setup keeps the captured audio waiting in the add chain while finalizing
+	const isConfigSupported = AudioEncoder.isConfigSupported.bind(AudioEncoder);
+	AudioEncoder.isConfigSupported = async (config: AudioEncoderConfig) => {
+		await new Promise(resolve => setTimeout(resolve, 500));
+		return isConfigSupported(config);
+	};
+	const capture = installSineCapture();
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
+		codec: 'opus',
+		quality: new Quality('low'),
+	});
+	audioSource.errorPromise.catch(() => {});
+	output.addAudioTrack(audioSource);
+
+	try {
+		await output.start();
+		await capture.deliver(15);
+
+		// Nothing can hold finalization up for good here, so canceling while it runs doesn't drop any audio
+		const finalized = output.finalize();
+		await output.cancel();
+		await finalized;
+	} finally {
+		AudioEncoder.isConfigSupported = isConfigSupported;
+		await capture.uninstall();
+	}
+
+	expect(output.state).toBe('finalized');
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	expect(track).not.toBeNull();
+	expect(await track!.computeDuration()).toBeGreaterThan(0.9 * 15 * 1024 / 48000);
+});
