@@ -841,11 +841,22 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		await this.hydrate();
-		return this.internalTrack.backingTrack!.getFirstPacket(options);
+		const packet = await this.internalTrack.backingTrack!.getFirstPacket(options);
+		if (packet && this.internalTrack.hasOnlyKeyPackets && packet.type !== 'key') {
+			return this.internalTrack.backingTrack!.getNextKeyPacket(packet, options);
+		}
+
+		return packet;
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		await this.hydrate();
+		if (this.internalTrack.hasOnlyKeyPackets) {
+			// Each segment of an I-frame playlist is a single I-frame. Its byte range may hold other media too (with
+			// fMP4, the moof lists the samples of the entire fragment), but that's not part of the track.
+			return this.internalTrack.backingTrack!.getKeyPacket(timestamp, options);
+		}
+
 		return this.internalTrack.backingTrack!.getPacket(timestamp, options);
 	}
 
@@ -856,6 +867,10 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 
 	async getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		await this.hydrate();
+		if (this.internalTrack.hasOnlyKeyPackets) {
+			return this.internalTrack.backingTrack!.getNextKeyPacket(packet, options);
+		}
+
 		return this.internalTrack.backingTrack!.getNextPacket(packet, options);
 	}
 
