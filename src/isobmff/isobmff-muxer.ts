@@ -328,6 +328,7 @@ export class IsobmffMuxer extends Muxer {
 	private nextFragmentNumber = 1;
 	// Only relevant for fragmented files, to make sure new fragments start with the highest timestamp seen so far
 	private maxWrittenTimestamp = -Infinity;
+	private nextSegmentTimestamps: Map<OutputTrack, number> | null = null;
 	minWrittenTimestamp = Infinity;
 	maxWrittenEndTimestamp = -Infinity;
 	minimumFragmentDuration: number;
@@ -1755,6 +1756,8 @@ export class IsobmffMuxer extends Muxer {
 			return;
 		}
 
+		this.endBeforeNextSegment(tracksInFragment);
+
 		const fragmentNumber = this.nextFragmentNumber++;
 
 		// Create an initial moof box and measure it; we need this to know where the following mdat box will begin
@@ -2028,6 +2031,49 @@ export class IsobmffMuxer extends Muxer {
 			entry.sampleCompositionTimeOffset -= minOffset;
 		}
 		trackData.compositionTimeOffsetShift = -minOffset;
+	}
+
+	override setNextSegmentTimestamps(timestamps: Map<OutputTrack, number>) {
+		this.nextSegmentTimestamps = timestamps;
+	}
+
+	/**
+	 * When this muxer writes a segment of a larger stream, keeps each track's last sample from reaching past the start
+	 * of the next segment, which another muxer writes: a fragment's decode time is the sum of all earlier sample
+	 * durations, so the next segment would overlap this one. To be called for the tracks of a fragment about to be
+	 * written.
+	 */
+	private endBeforeNextSegment(tracks: IsobmffTrackData[]) {
+		for (const trackData of tracks) {
+			const nextSegmentTimestamp = this.nextSegmentTimestamps?.get(trackData.track);
+			const chunk = trackData.currentChunk;
+			if (
+				nextSegmentTimestamp === undefined
+				|| !trackData.closed
+				|| !chunk
+				|| chunk.samples.length === 0
+				|| last(chunk.samples) !== trackData.lastSample
+			) {
+				// Not the fragment with the track's last sample
+				continue;
+			}
+			assert(trackData.startTimestampOffset !== null);
+
+			// In the timescale units the fragments' decode times are written in (rounded, see tfdt)
+			const toWrittenTime = (timestamp: number) => {
+				return intoTimescale(timestamp - trackData.startTimestampOffset!, trackData.timescale);
+			};
+			let lastSampleStart = toWrittenTime(chunk.startTimestamp);
+			for (let i = 0; i < chunk.samples.length - 1; i++) {
+				lastSampleStart += chunk.samples[i]!.timescaleUnitsToNextSample;
+			}
+
+			const lastSample = last(chunk.samples)!;
+			const delta = toWrittenTime(nextSegmentTimestamp) - lastSampleStart;
+			if (delta >= 0 && delta < lastSample.timescaleUnitsToNextSample) {
+				lastSample.timescaleUnitsToNextSample = delta;
+			}
+		}
 	}
 
 	/** Finalizes the file, making it ready for use. Must be called after all video and audio chunks have been added. */
