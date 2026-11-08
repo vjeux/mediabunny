@@ -832,6 +832,17 @@ class VideoEncoderWrapper {
 			assert(this.source._connectedTrack);
 			this.muxer = this.source._connectedTrack.output._muxer;
 
+			if (this.closed) {
+				// Closed (or canceled) while this initialization was pending, when there was no encoder to close yet:
+				// nothing else will close the ones just created
+				if (this.encoder && this.encoder.state !== 'closed') {
+					this.encoder.close();
+				}
+				if (this.alphaEncoder && this.alphaEncoder.state !== 'closed') {
+					this.alphaEncoder.close();
+				}
+			}
+
 			this.encoderInitialized = true;
 		})();
 	}
@@ -2538,6 +2549,12 @@ class AudioEncoderWrapper {
 
 			assert(this.source._connectedTrack);
 			this.muxer = this.source._connectedTrack.output._muxer;
+
+			if (this.closed && this.encoder && this.encoder.state !== 'closed') {
+				// Closed (or canceled) while this initialization was pending, when there was no encoder to close yet:
+				// nothing else will close the one just created
+				this.encoder.close();
+			}
 
 			this.encoderInitialized = true;
 		})();

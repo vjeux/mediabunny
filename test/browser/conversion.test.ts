@@ -773,6 +773,56 @@ test('Canceling while an encoder is still initializing rejects execute()', async
 	}
 });
 
+test('Canceling from onProgress closes the encoders an initialization creates afterwards', async () => {
+	// The cancel can come while an encoder is still being set up (here, from the second progress report); the
+	// initialization then finishes afterwards, and the encoders it creates must still get closed
+	const { WebMOutputFormat } = await import('../../src/output-format.js');
+	const encoders: (VideoEncoder | AudioEncoder)[] = [];
+	const RealVideoEncoder = VideoEncoder;
+	const RealAudioEncoder = AudioEncoder;
+	globalThis.VideoEncoder = class extends RealVideoEncoder {
+		constructor(init: VideoEncoderInit) {
+			super(init);
+			encoders.push(this);
+		}
+	};
+	globalThis.AudioEncoder = class extends RealAudioEncoder {
+		constructor(init: AudioEncoderInit) {
+			super(init);
+			encoders.push(this);
+		}
+	};
+
+	try {
+		for (let i = 0; i < 3; i++) {
+			using input = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: { width: 160, codec: 'vp8' },
+				audio: { codec: 'opus' },
+				trim: { start: 0, end: 1.5 },
+				showWarnings: false,
+			});
+
+			let progressCount = 0;
+			conversion.onProgress = () => {
+				if (++progressCount === 2) {
+					queueMicrotask(() => void conversion.cancel());
+				}
+			};
+			await expect(conversion.execute()).rejects.toThrow(ConversionCanceledError);
+
+			await new Promise(resolve => setTimeout(resolve, 300)); // Lets pending initializations finish
+			expect(encoders.map(encoder => encoder.state)).toEqual(encoders.map(() => 'closed'));
+		}
+	} finally {
+		globalThis.VideoEncoder = RealVideoEncoder;
+		globalThis.AudioEncoder = RealAudioEncoder;
+	}
+});
+
 test('Canceling a composable conversion leaves the output usable', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
