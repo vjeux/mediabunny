@@ -690,11 +690,15 @@ export type Mp3OutputFormatOptions = {
 	/**
 	 * Controls whether the Xing header, which contains additional metadata as well as an index, is written to the start
 	 * of the MP3 file. When disabled, the writing process becomes append-only. Defaults to `true`.
+	 *
+	 * MP3 segments written for HLS never get a Xing header, regardless of this option: it would describe a single
+	 * segment as if it were a whole file, and players decode it as an extra frame of silence at every segment start.
 	 */
 	xingHeader?: boolean;
 
 	/**
-	 * Will be called once the Xing metadata frame is finalized.
+	 * Will be called once the Xing metadata frame is finalized. Not called when no Xing header is written, which is
+	 * always the case for MP3 segments written for HLS.
 	 *
 	 * @param data - The raw bytes.
 	 * @param position - The byte offset of the data in the file.
@@ -1303,6 +1307,8 @@ export type HlsOutputFormatOptions = {
 	 *
 	 * When an array of formats is specified, for each playlist, the first format that can contain all of the playlist's
 	 * tracks is chosen. This allows you to, for example, package audio into .aac files and video into .ts files.
+	 *
+	 * MP3 segments are written without a Xing header, whatever {@link Mp3OutputFormatOptions.xingHeader} says.
 	 */
 	segmentFormat: OutputFormat | OutputFormat[];
 	/**
