@@ -85,6 +85,7 @@ import {
 	toDataView,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
 	TransformationMatrix,
+	uint8ArraysAreEqual,
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
 import {
@@ -197,6 +198,13 @@ type ElementaryStream = {
 	 * byte offset and PTS.
 	 */
 	referencePesPackets: TimestampedPesPacketHeader[];
+	/**
+	 * Stretches of video packets that are dropped (by sequence number, end exclusive): from a frame that lost data up
+	 * to the next key frame, as far as they've been read
+	 */
+	droppedRanges: { start: number; end: number }[];
+	/** Whether a frame that lost data takes the frames up to the next key frame with it (see supplyPacket) */
+	dropsRestOfGop: boolean | null;
 };
 
 /** A stretch of the file without TS packets of some PID, from `start` to `end` (exclusive, Infinity: to the end) */
@@ -225,6 +233,8 @@ type TsPacketHeader = {
 };
 
 type TsPacket = TsPacketHeader & {
+	transportErrorIndicator: number;
+	continuityCounter: number;
 	body: Uint8Array<ArrayBufferLike>;
 };
 
@@ -234,6 +244,13 @@ type Section = {
 	pid: number;
 	payload: Uint8Array<ArrayBufferLike>;
 	randomAccessIndicator: number;
+	/**
+	 * Where in the payload data is missing: TS packets that went missing (the continuity counters say so) or arrived
+	 * with errors (transport_error_indicator), which are left out. Ascending.
+	 */
+	holes: readonly number[];
+	/** Whether the first TS packet arrived with errors, which makes the payload garbage from the start. */
+	firstPacketHasErrors: boolean;
 };
 
 // Stream types for metadata rather than media (H.222.0 Table 2-34), like the ID3 timed metadata (0x15) that many HLS
@@ -321,6 +338,58 @@ const readMp3SyncHeader = (bytes: Uint8Array) => {
 const readAc3SyncHeader = (bytes: Uint8Array) => {
 	return bytes[0] === 0x0b && bytes[1] === 0x77 ? { frameSize: 0, rate: 0 } : null;
 };
+
+/**
+ * Whether a section has all its data, as far as can be told: a bounded PES packet has its length, an unbounded one
+ * ends with stuffing.
+ */
+const sectionLooksComplete = (chunks: Uint8Array[], byteLength: number, lastPacketWithPayload: TsPacket | null) => {
+	const start = chunks[0];
+	if (start && start.length >= 6 && start[0] === 0 && start[1] === 0 && start[2] === 1) {
+		const pesPacketLength = (start[4]! << 8) | start[5]!;
+		if (pesPacketLength > 0) {
+			return byteLength >= 6 + pesPacketLength;
+		}
+	}
+
+	return !!lastPacketWithPayload && hasStuffing(lastPacketWithPayload);
+};
+
+/** How far ahead to look for the next packet of a PID, to tell a duplicate packet */
+const MAX_DUPLICATE_CHECK_PACKET_COUNT = 1024;
+
+/**
+ * Whether the TS packet's adaptation field pads it, which is how muxers make a PES packet end on a TS packet boundary.
+ * Only a PES packet whose data fills its last TS packet exactly ends without.
+ */
+const hasStuffing = (packet: TsPacket) => {
+	if (!(packet.adaptationFieldControl & 0b10)) {
+		return false;
+	}
+
+	const length = packet.body[0]!;
+	if (length === 0) {
+		return true; // The length byte itself is the stuffing
+	}
+
+	const flags = packet.body[1]!;
+	if ((flags & 0x1f) === 0) {
+		return true; // Without optional fields, the adaptation field is there to pad (2 bytes or more)
+	}
+
+	let usedLength = 1 + (flags & 0x10 ? 6 : 0) + (flags & 0x08 ? 6 : 0) + (flags & 0x04 ? 1 : 0);
+	if (flags & 0x02) {
+		usedLength += 1 + (packet.body[1 + usedLength] ?? 0); // transport_private_data
+	}
+	if (flags & 0x01) {
+		usedLength += 1 + (packet.body[1 + usedLength] ?? 0); // adaptation_field_extension
+	}
+
+	return length > usedLength;
+};
+
+/** For sections and PES packets without holes, so that they don't need an array of their own */
+const NO_HOLES: readonly number[] = Object.freeze([]);
 
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
@@ -647,14 +716,18 @@ const readPacketHeaderFields = (slice: FileSlice): TsPacketHeader => {
 /** Reads a whole TS packet. Code in here is duplicated from readPacketHeaderFields for performance reasons. */
 const readPacketFields = (bytes: Uint8Array): TsPacket => {
 	const nextTwoBytes = (bytes[1]! << 8) + bytes[2]!;
+	const transportErrorIndicator = nextTwoBytes >> 15;
 	const payloadUnitStartIndicator = (nextTwoBytes >> 14) & 0x1;
 	const pid = nextTwoBytes & 0x1FFF;
 	const adaptationFieldControl = (bytes[3]! >> 4) & 0x3;
+	const continuityCounter = bytes[3]! & 0xF;
 
 	return {
 		payloadUnitStartIndicator,
 		pid,
 		adaptationFieldControl,
+		transportErrorIndicator,
+		continuityCounter,
 		body: bytes.subarray(4),
 	};
 };
@@ -691,6 +764,11 @@ export class MpegTsDemuxer extends Demuxer {
 	packetOffset = 0;
 	packetStride = -1;
 	sectionEndPositions = new Set<number>();
+	/**
+	 * End positions of sections after which TS packets of their PID went missing. Reading a section again stops at its
+	 * known end without reaching the next packet that tells.
+	 */
+	sectionEndsBeforeMissingPackets = new Set<number>();
 	/**
 	 * Per PID, the stretches of the file known to have no TS packets of it (only long ones, or ones running to the end
 	 * of the file), sorted and disjoint, so that searches skip them instead of walking them again
@@ -769,6 +847,8 @@ export class MpegTsDemuxer extends Demuxer {
 						canBeTrustedWithKeyPackets: false,
 						info: { ...stream.info },
 						referencePesPackets: [],
+						droppedRanges: [],
+						dropsRestOfGop: null,
 					});
 				}
 
@@ -1174,6 +1254,8 @@ export class MpegTsDemuxer extends Demuxer {
 								audioType,
 								info,
 								referencePesPackets: [],
+								droppedRanges: [],
+								dropsRestOfGop: null,
 							};
 
 							// Some PMTs list a PID twice, with the later entry describing the stream better (like an
@@ -1614,6 +1696,15 @@ export class MpegTsDemuxer extends Demuxer {
 		let randomAccessIndicator = 0;
 		// Stretches without packets of the section's PID, which can be skipped
 		let gaps: Gap[] | undefined;
+		let holes: number[] | null = null;
+		// For checking the continuity counters (H.222.0 2.4.3.3): the counter and payload of the section's last TS
+		// packet with payload, and how many packets without payload came after it
+		let lastContinuityCounter = -1;
+		let lastPayload: Uint8Array | null = null;
+		let packetsWithoutPayloadCount = 0;
+		let lastPacketWithPayload: TsPacket | null = null;
+		// Whether a PAT came since the section's last packet, like at the start of a file joined to the previous one
+		let sawPatSinceLastPacket = false;
 
 		while (true) {
 			if (gaps) {
@@ -1636,21 +1727,74 @@ export class MpegTsDemuxer extends Demuxer {
 				if (packet.payloadUnitStartIndicator === 0) {
 					break;
 				}
+			} else if (packet.pid !== firstPacket.pid) {
+				if (contiguous) {
+					// The section may well continue after the foreign packets, so this isn't necessarily its end
+					mustAddSectionEnd = false;
+					break;
+				} else {
+					sawPatSinceLastPacket ||= packet.pid === 0;
+					continue; // Ignore this packet
+				}
+			}
 
+			const hasAdaptationField = !!(packet.adaptationFieldControl & 0b10);
+			const hasPayload = !!(packet.adaptationFieldControl & 0b01);
+			const adaptationFieldLength = hasAdaptationField ? 1 + packet.body[0]! : 0;
+			const payload = hasPayload ? packet.body.subarray(adaptationFieldLength) : null;
+			let keepsPayload = true;
+
+			if (!firstPacket) {
 				firstPacket = packet;
 				gaps = contiguous ? undefined : this.gaps.get(packet.pid);
 			} else {
-				if (packet.pid !== firstPacket.pid) {
-					if (contiguous) {
-						// The section may well continue after the foreign packets, so this isn't necessarily its end
-						mustAddSectionEnd = false;
-						break;
+				let isDuplicate = false;
+				const counter = packet.continuityCounter;
+
+				if (packet.transportErrorIndicator === 1) {
+					// The packet had errors that couldn't be corrected, so its bytes are garbage: leave them out
+					keepsPayload = false;
+					if (packet.payloadUnitStartIndicator === 0) {
+						(holes ??= []).push(chunksByteLength);
+					}
+				} else if (payload && lastContinuityCounter !== -1 && counter !== ((lastContinuityCounter + 1) & 0xf)) {
+					if (
+						counter === lastContinuityCounter
+						&& lastPayload
+						&& uint8ArraysAreEqual(payload, lastPayload)
+						&& await this.nextContinuityCounterFollows(packet.pid, currentPos, counter)
+					) {
+						// A copy of the previous packet (only a PCR may differ), allowed once, which must be discarded
+						isDuplicate = true;
+						keepsPayload = false;
 					} else {
-						continue; // Ignore this packet
+						const discontinuityIndicator = adaptationFieldLength > 1 && !!(packet.body[1]! & 0x80);
+						const packetsWentMissing = !discontinuityIndicator
+							// Some muxers count the packets without payload too
+							&& counter !== ((lastContinuityCounter + 1 + packetsWithoutPayloadCount) & 0xf)
+							// And some never increment the counter, which then says nothing
+							&& counter !== lastContinuityCounter;
+
+						if (packet.payloadUnitStartIndicator === 0) {
+							if (packetsWentMissing) {
+								(holes ??= []).push(chunksByteLength);
+							}
+						} else if (
+							packetsWentMissing
+							// At the start of the next section, a jump can as well be the join of two files whose
+							// counters both start over (like concatenated HLS segments), where the section is complete
+							// and the second file starts with a PAT
+							&& !sawPatSinceLastPacket
+							&& !sectionLooksComplete(chunks, chunksByteLength, lastPacketWithPayload)
+						) {
+							// The packets of the section's end went missing
+							(holes ??= []).push(chunksByteLength);
+							this.sectionEndsBeforeMissingPackets.add(endPos);
+						}
 					}
 				}
 
-				if (packet.payloadUnitStartIndicator === 1) {
+				if (packet.payloadUnitStartIndicator === 1 && !isDuplicate) {
 					if (full && !contiguous) {
 						this.addGap(packet.pid, endPos, currentPos - this.packetStride);
 					}
@@ -1659,28 +1803,27 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 			}
 
-			const hasAdaptationField = !!(packet.adaptationFieldControl & 0b10);
-			const hasPayload = !!(packet.adaptationFieldControl & 0b01);
-
-			let adaptationFieldLength = 0;
-			if (hasAdaptationField) {
-				adaptationFieldLength = 1 + packet.body[0]!;
-
-				// Extract random_access_indicator from first packet's adaptation field
-				if (packet === firstPacket && adaptationFieldLength > 1) {
-					randomAccessIndicator = (packet.body[1]! >> 6) & 1;
-				}
-			}
-
-			if (hasPayload) {
-				if (adaptationFieldLength === 0) {
-					chunks.push(packet.body);
-					chunksByteLength += packet.body.byteLength;
+			if (keepsPayload && packet.transportErrorIndicator === 0) {
+				if (payload) {
+					lastContinuityCounter = packet.continuityCounter;
+					lastPayload = payload;
+					lastPacketWithPayload = packet;
+					packetsWithoutPayloadCount = 0;
 				} else {
-					chunks.push(packet.body.subarray(adaptationFieldLength));
-					chunksByteLength += packet.body.byteLength - adaptationFieldLength;
+					packetsWithoutPayloadCount++;
 				}
 			}
+
+			// Extract random_access_indicator from first packet's adaptation field
+			if (packet === firstPacket && adaptationFieldLength > 1) {
+				randomAccessIndicator = (packet.body[1]! >> 6) & 1;
+			}
+
+			if (payload && keepsPayload) {
+				chunks.push(payload);
+				chunksByteLength += payload.byteLength;
+			}
+			sawPatSinceLastPacket = false;
 
 			endPos = currentPos;
 
@@ -1694,6 +1837,9 @@ export class MpegTsDemuxer extends Demuxer {
 			const isKnownSectionEnd = this.sectionEndPositions.has(endPos);
 			if (isKnownSectionEnd) {
 				mustAddSectionEnd = false;
+				if (this.sectionEndsBeforeMissingPackets.has(endPos)) {
+					(holes ??= []).push(chunksByteLength);
+				}
 				break;
 			}
 		}
@@ -1725,7 +1871,29 @@ export class MpegTsDemuxer extends Demuxer {
 			pid: firstPacket.pid,
 			payload: merged,
 			randomAccessIndicator,
+			holes: holes ?? NO_HOLES,
+			firstPacketHasErrors: firstPacket.transportErrorIndicator === 1,
 		};
+	}
+
+	/**
+	 * Whether the next TS packet of the PID with payload, from pos on, has the continuity counter that follows the
+	 * given one. That tells a duplicate packet from a muxer that never increments the counter, for which two identical
+	 * packets in a row are just data.
+	 */
+	async nextContinuityCounterFollows(pid: number, pos: number, counter: number) {
+		for (let i = 0; i < MAX_DUPLICATE_CHECK_PACKET_COUNT; i++, pos += this.packetStride) {
+			const packet = await this.readPacket(pos);
+			if (!packet) {
+				return false;
+			}
+
+			if (packet.pid === pid && packet.adaptationFieldControl & 0b01) {
+				return packet.continuityCounter === ((counter + 1) & 0xf);
+			}
+		}
+
+		return false;
 	}
 
 	/** Remembers that there are no TS packets of the PID from `start` to `end`, if that's worth remembering. */
@@ -2010,7 +2178,9 @@ export class MpegTsDemuxer extends Demuxer {
 			? slice
 			: await this.findPacket(pos, TS_PACKET_SIZE);
 		if (!packetSlice) {
-			return packetSlice === null ? { ...NOT_A_PACKET_HEADER, body: new Uint8Array(0) } : null;
+			return packetSlice === null
+				? { ...NOT_A_PACKET_HEADER, transportErrorIndicator: 0, continuityCounter: 0, body: new Uint8Array(0) }
+				: null;
 		}
 
 		return readPacketFields(readBytes(packetSlice, TS_PACKET_SIZE));
@@ -2172,6 +2342,8 @@ type TimestampedPesPacketHeader = PesPacketHeader & {
 
 type PesPacket = PesPacketHeader & {
 	data: Uint8Array<ArrayBufferLike>;
+	/** Where in the data some is missing, ascending */
+	holes: readonly number[];
 };
 
 const readPesPacketHeader = (demuxer: MpegTsDemuxer, section: Section): PesPacketHeader | null => {
@@ -2252,7 +2424,7 @@ const readPesPacket = (demuxer: MpegTsDemuxer, section: Section): PesPacket | nu
 	const bytePos = pesHeaderEndPos / 8;
 	assert(Number.isInteger(bytePos));
 
-	const data = section.payload.subarray(
+	let data = section.payload.subarray(
 		bytePos,
 		// "A value of 0 indicates that the PES packet length is neither specified nor bounded and is allowed only in
 		// PES packets whose payload consists of bytes from a video elementary stream contained in
@@ -2262,9 +2434,32 @@ const readPesPacket = (demuxer: MpegTsDemuxer, section: Section): PesPacket | nu
 			: section.payload.byteLength,
 	);
 
+	let holes = NO_HOLES;
+	if (section.firstPacketHasErrors) {
+		data = new Uint8Array(0);
+		holes = [0];
+	} else if (
+		section.holes.length > 0
+		// A PES packet that has all the data it says it has is only off in its continuity counters
+		&& !(
+			pesPacketLength > 0
+			&& section.payload.byteLength >= BYTES_UNTIL_END_OF_PES_PACKET_LENGTH + pesPacketLength
+		)
+	) {
+		const offsets: number[] = [];
+		for (const hole of section.holes) {
+			const offset = Math.min(Math.max(hole - bytePos, 0), data.byteLength);
+			if (offsets.at(-1) !== offset) {
+				offsets.push(offset);
+			}
+		}
+		holes = offsets;
+	}
+
 	return {
 		...header,
 		data,
+		holes,
 	};
 };
 
@@ -2914,6 +3109,34 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				}
 			}
 
+			// Inside a stretch of dropped video packets, the packet we're looking for comes before it
+			while (true) {
+				const startPos = windowStart.sectionStartPos;
+				const droppedRange = this.elementaryStream.droppedRanges.find(
+					x => x.start <= startPos && startPos < x.end,
+				);
+				if (!droppedRange) {
+					break;
+				}
+
+				while (windowStart.sectionStartPos > droppedRange.start) {
+					if (!await rewindByOnePesPacket()) {
+						break;
+					}
+				}
+
+				const rewoundFrom = windowStart.sectionStartPos;
+				for (let i = 0; i < reorderSize + 1; i++) {
+					if (!await rewindByOnePesPacket()) {
+						break;
+					}
+				}
+
+				if (windowStart.sectionStartPos === rewoundFrom) {
+					break; // The start of the track
+				}
+			}
+
 			let packet = await retrieveEncodedPacket(windowStart.sectionStartPos, isTargetPacket);
 
 			// A P/I frame followed in decode order by a run of B-frames longer than that is presented after them all,
@@ -3372,6 +3595,12 @@ class PacketReadingContext {
 	/** The start of the last PES packet in which an access unit began */
 	lastAccessUnitSectionStartPos = -1;
 	nextPts: number | null = null;
+	/** Positions where data is missing, ascending */
+	holes: number[] = [];
+	/** Whether the last packet found was skipped since data is missing in it */
+	skippedPacket = false;
+	/** The stretch of video packets being dropped, up to the next key frame */
+	droppedRange: { start: number; end: number } | null = null;
 
 	suppliedPacket: SuppliedPacket | null = null;
 
@@ -3380,6 +3609,10 @@ class PacketReadingContext {
 		this.pid = elementaryStream.pid;
 		this.demuxer = elementaryStream.demuxer;
 		this.startingPesPacket = startingPesPacket;
+
+		// Starting inside a stretch of dropped packets, like a lookup after a loss, keeps dropping them
+		const startPos = startingPesPacket.sectionStartPos;
+		this.droppedRange = elementaryStream.droppedRanges.find(x => x.start <= startPos && startPos < x.end) ?? null;
 	}
 
 	ensureBuffered(length: number) {
@@ -3434,6 +3667,9 @@ class PacketReadingContext {
 			}
 
 			this.pesPackets.push(pesPacket);
+			for (let i = 0; i < pesPacket.holes.length; i++) {
+				this.holes.push(this.endPos + pesPacket.holes[i]!);
+			}
 			this.endPos += pesPacket.data.byteLength;
 		}
 	}
@@ -3555,7 +3791,15 @@ class PacketReadingContext {
 		return false;
 	}
 
+	/** Marks the next packet as the supplied packet, if there is one, skipping packets that miss data. */
 	async markNextPacket() {
+		do {
+			this.skippedPacket = false;
+			await this.findNextPacket();
+		} while (this.skippedPacket);
+	}
+
+	async findNextPacket() {
 		assert(!this.suppliedPacket);
 
 		const elementaryStream = this.elementaryStream;
@@ -4310,6 +4554,25 @@ class PacketReadingContext {
 			);
 		}
 
+		// Data that went missing inside the packet, or right at its end (which, for a frame boundary we found right
+		// there, can only be the end of this packet), leaves it undecodable, and with WebCodecs, the decoder then fails
+		// altogether. So skip it: for video to the next access unit, for audio to right after the hole, where the next
+		// frame can be found again.
+		const packetEndPos = packetStartPos + packetLength;
+		const hole = this.holes.length > 0
+			? this.holes.find(x => x > packetStartPos && x <= packetEndPos)
+			: undefined;
+		if (hole !== undefined) {
+			if (this.elementaryStream.info.type === 'audio') {
+				this.seekTo(hole);
+			} else if (this.dropsRestOfGop()) {
+				this.extendDroppedRange(sequenceNumber);
+			}
+
+			this.skipPacket();
+			return;
+		}
+
 		let randomAccessIndicator = Math.max(
 			currentPesPacket.randomAccessIndicator,
 			ptsPesPacket?.randomAccessIndicator ?? 0,
@@ -4357,6 +4620,14 @@ class PacketReadingContext {
 			// We're reading packets before the decoder config is determined
 		}
 
+		if (this.droppedRange && randomAccessIndicator !== 1) {
+			// Still dropping, up to the next key frame
+			this.extendDroppedRange(sequenceNumber);
+			this.skipPacket();
+			return;
+		}
+
+		this.droppedRange = null;
 		this.suppliedPacket = {
 			pts,
 			intrinsicDuration,
@@ -4369,6 +4640,60 @@ class PacketReadingContext {
 
 		this.pesPackets.splice(0, this.currentPesPacketIndex);
 		this.currentPesPacketIndex = 0;
+		if (this.holes.length > 0) {
+			this.holes = this.holes.filter(x => x > this.currentPos);
+		}
+	}
+
+	/**
+	 * Whether the frames after one that lost data, up to the next key frame, are dropped too. That's needed where
+	 * frames can refer to frames that come later (B-frames): WebCodecs decoders in Chromium fail on such a frame when
+	 * its reference is missing. AVC streams without reordering (P-frames only) only lose the damaged frames, which
+	 * decoders handle like a gap in frame_num.
+	 */
+	dropsRestOfGop() {
+		const stream = this.elementaryStream;
+		if (stream.dropsRestOfGop === null) {
+			if (stream.info.type !== 'video' || stream.info.codec !== 'avc' || !stream.info.avcCodecInfo) {
+				return true; // Without knowing more, stay on the safe side
+			}
+
+			const spsUnit = stream.info.avcCodecInfo.sequenceParameterSets[0];
+			const spsInfo = spsUnit ? parseAvcSps(spsUnit) : null;
+			// Baseline has no B-slices
+			stream.dropsRestOfGop = !spsInfo || (spsInfo.numReorderFrames > 0 && spsInfo.profileIdc !== 66);
+		}
+
+		return stream.dropsRestOfGop;
+	}
+
+	/**
+	 * Drops the video packet that was just read (starting at the sequence number), as part of a stretch running up to
+	 * the next key frame: the frames after one that lost data can refer to it, and with WebCodecs, a frame whose
+	 * reference is missing can make the decoder fail just like a damaged one. The stretch is recorded so that contexts
+	 * starting inside it (lookups) drop the same packets.
+	 */
+	extendDroppedRange(sequenceNumber: number) {
+		const endSequenceNumber = this.getCurrentPesPacket().sectionStartPos
+			+ (this.currentPos - this.currentPesPacketPos);
+		if (!this.droppedRange) {
+			const ranges = this.elementaryStream.droppedRanges;
+			this.droppedRange = ranges.find(x => x.start <= sequenceNumber && sequenceNumber <= x.end) ?? null;
+			if (!this.droppedRange) {
+				this.droppedRange = { start: sequenceNumber, end: endSequenceNumber };
+				ranges.splice(binarySearchLessOrEqual(ranges, sequenceNumber, x => x.start) + 1, 0, this.droppedRange);
+			}
+		}
+
+		this.droppedRange.end = Math.max(this.droppedRange.end, endSequenceNumber);
+	}
+
+	/** Moves on from a packet that is left out. */
+	skipPacket() {
+		this.holes = this.holes.filter(x => x > this.currentPos);
+		this.pesPackets.splice(0, this.currentPesPacketIndex);
+		this.currentPesPacketIndex = 0;
+		this.skippedPacket = true;
 	}
 }
 
