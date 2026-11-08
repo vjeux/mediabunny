@@ -1711,6 +1711,19 @@ export class CanvasSource extends VideoSource {
 }
 
 /**
+ * Returns how much of a pause that started at `pauseStartTime` and ends now lies after `timelineStartTime`, the
+ * moment that maps to timestamp 0 (both in seconds, in the `performance.now()` time base). Only that part has to be
+ * removed from the timestamps of the media captured after the pause.
+ */
+const getPauseDurationOnTimeline = (pauseStartTime: number, timelineStartTime: number | null) => {
+	if (timelineStartTime === null) {
+		return 0; // The timeline hasn't started yet, so the entire pause precedes it
+	}
+
+	return Math.max(performance.now() / 1000 - Math.max(pauseStartTime, timelineStartTime), 0);
+};
+
+/**
  * Options for {@link MediaStreamVideoTrackSource}.
  * @group Media sources
  * @public
@@ -1769,6 +1782,16 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 	private _errorPromiseAccessed = false;
 	/** @internal */
 	private _paused = false;
+	/** @internal */
+	private _pauseStartTime = 0;
+	/**
+	 * The paused time, in seconds, removed from the timestamps of frames captured from now on. It's measured in wall
+	 * clock time rather than in dropped frames, so that sources paused and resumed together stay in sync.
+	 * @internal
+	 */
+	private _pausedTime = 0;
+	/** @internal */
+	private _firstFrameTime: number | null = null;
 	/** @internal */
 	private _lastVideoFrame: VideoFrame | null = null;
 	/** @internal */
@@ -1859,7 +1882,6 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		let lastFrameTime: number | null = null;
 		let frameCount = 0;
 		let errored = false;
-		let lastSampleTimestamp: number | null = null;
 		let timestampOffset = 0;
 
 		// An ended track can't produce any more frames, so we close this source. Otherwise, the output would keep
@@ -1941,24 +1963,13 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 			const currentTimestamp = videoFrame.timestamp / 1e6;
 
 			if (this._paused) {
-				const frameSeen = firstVideoFrameTimestamp !== null;
-				if (frameSeen) {
-					if (lastSampleTimestamp !== null && this._options.timestampBase !== 'unix') {
-						// In addition to dropping this frame, let's also keep track of the time we have lost due to the
-						// pause. Doing it like this instead of simply keeping track of the paused time is better since
-						// it retains the frame rate of the underlying source.
-						const timeDelta = currentTimestamp - lastSampleTimestamp;
-						timestampOffset -= timeDelta;
-					}
-					lastSampleTimestamp = currentTimestamp;
-				}
-
 				videoFrame.close();
 				return;
 			}
 
 			if (firstVideoFrameTimestamp === null) {
 				firstVideoFrameTimestamp = currentTimestamp;
+				this._firstFrameTime = now / 1000;
 
 				let target: number;
 				const timestampBase = this._options.timestampBase ?? 'synced-zero';
@@ -1979,16 +1990,15 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				timestampOffset = target - firstVideoFrameTimestamp;
 			}
 
-			lastSampleTimestamp = currentTimestamp;
-
 			if (this._encoder.getQueueSize() >= 8) {
 				// Drop frames if the encoder is overloaded
 				videoFrame.close();
 				return;
 			}
 
+			const pausedTime = this._options.timestampBase === 'unix' ? 0 : this._pausedTime;
 			const sample = new VideoSample(videoFrame, {
-				timestamp: currentTimestamp + timestampOffset,
+				timestamp: currentTimestamp + timestampOffset - pausedTime,
 			});
 
 			void this._encoder.add(sample, true)
@@ -2110,12 +2120,26 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 	 * while paused. This does *not* close the underlying `MediaStreamVideoTrack`, it just ignores its output.
 	 */
 	pause() {
+		if (this._paused) {
+			return;
+		}
+
 		this._paused = true;
+		this._pauseStartTime = performance.now() / 1000;
 	}
 
 	/** Resumes the capture of video frames after being paused. */
 	resume() {
+		if (!this._paused) {
+			return;
+		}
+
 		this._paused = false;
+
+		const timelineStartTime = this._options.timestampBase === 'zero'
+			? this._firstFrameTime
+			: (this._connectedTrack?.output._firstMediaStreamTimestamp ?? null);
+		this._pausedTime += getPauseDurationOnTimeline(this._pauseStartTime, timelineStartTime);
 	}
 
 	/** @internal */
@@ -3326,6 +3350,18 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	private _paused = false;
 	/** @internal */
 	private _trackEndedListener: (() => void) | null = null;
+	/** @internal */
+	private _pauseStartTime = 0;
+	/**
+	 * The paused time, in seconds, removed from the timestamps of audio captured from now on. It's measured in wall
+	 * clock time rather than in dropped audio, so that sources paused and resumed together stay in sync.
+	 * @internal
+	 */
+	private _pausedTime = 0;
+	/** @internal */
+	private _firstSampleTime: number | null = null;
+	/** @internal */
+	private _resumedSinceLastSample = false;
 
 	/** A promise that rejects upon any error within this source. This promise never resolves. */
 	get errorPromise() {
@@ -3384,8 +3420,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 		let firstAudioDataTimestamp: number | null = null;
 		let errored = false;
-		let lastSampleTimestamp: number | null = null;
 		let timestampOffset = 0;
+		let lastEndTimestamp: number | null = null;
 
 		const onAudioSample = (audioSample: AudioSample) => {
 			if (errored) {
@@ -3396,24 +3432,13 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 			const currentTimestamp = audioSample.timestamp;
 
 			if (this._paused) {
-				const dataSeen = firstAudioDataTimestamp !== null;
-				if (dataSeen) {
-					if (lastSampleTimestamp !== null && this._options.timestampBase !== 'unix') {
-						// In addition to dropping this sample, let's also keep track of the time we have lost due to
-						// the pause. Doing it like this instead of simply keeping track of the paused time is better
-						// since it retains the sample rate of the underlying source.
-						const timeDelta = currentTimestamp - lastSampleTimestamp;
-						timestampOffset -= timeDelta;
-					}
-					lastSampleTimestamp = currentTimestamp;
-				}
-
 				audioSample.close();
 				return;
 			}
 
 			if (firstAudioDataTimestamp === null) {
 				firstAudioDataTimestamp = audioSample.timestamp;
+				this._firstSampleTime = performance.now() / 1000;
 
 				let target: number;
 				const timestampBase = this._options.timestampBase ?? 'synced-zero';
@@ -3434,15 +3459,36 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 				timestampOffset = target - firstAudioDataTimestamp;
 			}
 
-			lastSampleTimestamp = currentTimestamp;
-
 			if (this._encoder.getQueueSize() >= 8) {
 				// Drop data if the encoder is overloaded
 				audioSample.close();
 				return;
 			}
 
-			audioSample.setTimestamp(currentTimestamp + timestampOffset);
+			const pausedTime = this._options.timestampBase === 'unix' ? 0 : this._pausedTime;
+			let timestamp = currentTimestamp + timestampOffset - pausedTime;
+
+			if (this._resumedSinceLastSample && lastEndTimestamp !== null && timestamp < lastEndTimestamp) {
+				// Since exactly the paused time is removed, the first audio after resuming can begin before the end of
+				// the last audio before pausing (audio data spans many milliseconds). Cut off the overlapping start to
+				// keep the audio in place, in sync with the other tracks.
+				const overlappingFrames = Math.round((lastEndTimestamp - timestamp) * audioSample.sampleRate);
+				if (overlappingFrames >= audioSample.numberOfFrames) {
+					audioSample.close();
+					return;
+				}
+
+				if (overlappingFrames > 0) {
+					const trimmed = audioSample.trim(overlappingFrames);
+					audioSample.close();
+					audioSample = trimmed;
+					timestamp += overlappingFrames / audioSample.sampleRate;
+				}
+			}
+
+			this._resumedSinceLastSample = false;
+			audioSample.setTimestamp(timestamp);
+			lastEndTimestamp = timestamp + audioSample.duration;
 
 			void this._encoder.add(audioSample, true)
 				.catch((error) => {
@@ -3536,12 +3582,27 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	 * while paused. This does *not* close the underlying `MediaStreamAudioTrack`, it just ignores its output.
 	 */
 	pause() {
+		if (this._paused) {
+			return;
+		}
+
 		this._paused = true;
+		this._pauseStartTime = performance.now() / 1000;
 	}
 
 	/** Resumes the capture of audio data after being paused. */
 	resume() {
+		if (!this._paused) {
+			return;
+		}
+
 		this._paused = false;
+		this._resumedSinceLastSample = true;
+
+		const timelineStartTime = this._options.timestampBase === 'zero'
+			? this._firstSampleTime
+			: (this._connectedTrack?.output._firstMediaStreamTimestamp ?? null);
+		this._pausedTime += getPauseDurationOnTimeline(this._pauseStartTime, timelineStartTime);
 	}
 
 	/** @internal */
