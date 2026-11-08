@@ -6,7 +6,7 @@ import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { BufferTarget } from '../../src/target.js';
+import { BufferTarget, NullTarget } from '../../src/target.js';
 import { CmafOutputFormat, Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
@@ -910,4 +910,79 @@ test('Opus sample entry and dOps both declare 48 kHz, whatever the input sample 
 		expect(entryRate).toBe(48000);
 		expect(inputSampleRate).toBe(48000);
 	}
+});
+
+test('In-memory Fast Start keeps chunk offsets right when a second track crosses 4 GiB late', async () => {
+	// Every packet is a view into this buffer, and the target drops the data, so the 5 GiB file never exists in memory
+	const buffer = new Uint8Array(138_000_100);
+	const videoSize = (i: number) => 138_000_000 + i;
+	const audioSize = (i: number, padding: number) => 100_000 + i + (i === 0 ? padding : 0);
+
+	const mux = async (padding: number) => {
+		let moov: Uint8Array | null = null;
+		const writePositions = new Map<number, number>(); // Packet size -> where it was written
+		const target = new NullTarget();
+		target.on('write', ({ start, end }) => writePositions.set(end - start, start));
+
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'in-memory', onMoov: data => moov = data.slice() }),
+			target,
+		});
+		const videoSource = new EncodedVideoPacketSource('vp9');
+		const audioSource = new EncodedAudioPacketSource('aac');
+		output.addVideoTrack(videoSource);
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		// One chunk per packet; the audio track ends 9 large video chunks before the end
+		for (let i = 0; i < 40; i++) {
+			await videoSource.add(
+				new EncodedPacket(buffer.subarray(0, videoSize(i)), i === 0 ? 'key' : 'delta', i, 1),
+				{ decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } },
+			);
+			if (i < 31) {
+				await audioSource.add(
+					new EncodedPacket(buffer.subarray(0, audioSize(i, padding)), 'key', i, 1),
+					{ decoderConfig: {
+						codec: 'mp4a.40.2',
+						numberOfChannels: 2,
+						sampleRate: 48000,
+						description: new Uint8Array([0x11, 0x90]),
+					} },
+				);
+			}
+		}
+		await output.finalize();
+
+		// The stco/co64 chunk offsets of each track
+		assert(moov);
+		const bytes: Uint8Array = moov;
+		const view = toDataView(bytes);
+		const offsetTables: number[][] = [];
+		for (let i = 0; i + 4 <= bytes.length; i++) {
+			const type = String.fromCharCode(...bytes.subarray(i, i + 4));
+			if (type === 'stco' || type === 'co64') {
+				offsetTables.push(Array.from({ length: view.getUint32(i + 8) }, (_, j) => type === 'co64'
+					? Number(view.getBigUint64(i + 12 + 8 * j))
+					: view.getUint32(i + 12 + 4 * j),
+				));
+			}
+		}
+
+		return { offsetTables, writePositions };
+	};
+
+	// The audio track's last chunk starts below 4 GiB, so only the video track needs co64. Before the moov grew by
+	// 4 bytes for each video chunk offset and the mdat header by 8 bytes, that audio chunk sat this much lower:
+	const unpadded = await mux(0);
+	const videoChunkCount = unpadded.offsetTables[0]!.length;
+	const lastAudioChunk = unpadded.offsetTables[1]!.at(-1)! - 4 * videoChunkCount - 8;
+
+	// Pad the audio so that this chunk starts just below 4 GiB in the first layout, but past it once the moov grew
+	const padding = 2 ** 32 - 8 - lastAudioChunk;
+	const { offsetTables, writePositions } = await mux(padding);
+	expect(offsetTables[1]!.at(-1)).toBeGreaterThanOrEqual(2 ** 32);
+
+	expect(offsetTables[0]).toEqual(offsetTables[0]!.map((_, i) => writePositions.get(videoSize(i))));
+	expect(offsetTables[1]).toEqual(offsetTables[1]!.map((_, i) => writePositions.get(audioSize(i, padding))));
 });
