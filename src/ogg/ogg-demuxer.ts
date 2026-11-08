@@ -19,6 +19,7 @@ import {
 	binarySearchLessOrEqual,
 	clamp,
 	findLast,
+	findLastIndex,
 	isThenable,
 	last,
 	roundIfAlmostInteger,
@@ -746,6 +747,15 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return encodedPacket;
 		}
 
+		// A single page's granule position may be bogus, as some muxers write 0 on pages holding audio (FFmpeg trac
+		// #3710). So the previous page's granule position must agree with the packets before it, which also keeps
+		// such a page from serving as the start of a gap.
+		const previousEndInSamples = prevMetadata.timestampInSamples + prevMetadata.durationInSamples;
+		const previousPageEndInSamples = this.granulePositionToTimestampInSamples(previousPage.granulePosition);
+		if (Math.abs(previousPageEndInSamples - previousEndInSamples) > tolerance) {
+			return encodedPacket;
+		}
+
 		// The granule positions of damaged pages may be anything
 		for (const checkedPage of [previousPage, page]) {
 			let slice = this.demuxer.reader.requestSlice(checkedPage.headerStartPos, checkedPage.totalSize);
@@ -757,6 +767,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			}
 		}
 
+		// Unlike a bogus granule position, a gap carries on to the next page
+		if (!await this.nextGranulePositionAgrees(page, durations.lastVorbisBlockSize, tolerance)) {
+			return encodedPacket;
+		}
+
 		return this.createEncodedPacketFromOggPacket(
 			metadata.packet,
 			{
@@ -766,6 +781,33 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			},
 			options,
 		);
+	}
+
+	/**
+	 * Whether the next page on which a packet ends has a granule position at least as far past the given page's as
+	 * the packets ending on it last (give or take the tolerance), or there's no such page to tell.
+	 */
+	async nextGranulePositionAgrees(page: Page, vorbisLastBlockSize: number | null, toleranceInSamples: number) {
+		const position = await this.demuxer.findNextPacketStart({
+			data: PLACEHOLDER_DATA,
+			endPage: page,
+			endSegmentIndex: findLastIndex([...page.lacingValues], x => x < 255),
+		});
+		if (!position) {
+			return true;
+		}
+
+		const packet = await this.demuxer.readPacket(position.startPage, position.startSegmentIndex);
+		if (!packet || packet.endPage.granulePosition < 0) {
+			return true;
+		}
+
+		const durations = await this.getDurationsOfPacketsEndingOnPage({ packet, vorbisLastBlockSize });
+		if (!durations) {
+			return true;
+		}
+
+		return packet.endPage.granulePosition - page.granulePosition - durations.sum >= -toleranceInSamples;
 	}
 
 	/** Whether pages of the bitstream are missing between the two given pages, as their sequence numbers show. */
@@ -802,9 +844,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 	/**
 	 * Returns the sum and the longest of the durations of the packets ending on the given packet's end page, starting
-	 * with that packet, or null if they can't be determined. The page's granule position is the end of the last one.
+	 * with that packet, and the last one's Vorbis block size, or null if they can't be determined. The page's granule
+	 * position is the end of the last one.
 	 */
-	async getDurationsOfPacketsEndingOnPage(metadata: EncodedPacketMetadata) {
+	async getDurationsOfPacketsEndingOnPage(metadata: Pick<EncodedPacketMetadata, 'packet' | 'vorbisLastBlockSize'>) {
 		const codecInfo = this.bitstream.codecInfo;
 		const page = metadata.packet.endPage;
 
@@ -851,7 +894,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				}
 			}
 
-			return { sum, longest };
+			return { sum, longest, lastVorbisBlockSize: vorbisBlockSize };
 		} catch {
 			return null; // A damaged packet, which is reported once it's read
 		}
