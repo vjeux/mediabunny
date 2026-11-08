@@ -557,7 +557,7 @@ test('UrlSource reads files larger than its cache in order from a server without
 		for (let i = 0; i < segmentSizeLength; i++) {
 			moved[segmentStart + 4 + i] = Math.floor(segmentSize / 256 ** (segmentSizeLength - 1 - i)) % 256;
 		}
-		moved[segmentStart + 4] |= 0x80 >> (segmentSizeLength - 1);
+		moved[segmentStart + 4] = moved[segmentStart + 4]! | (0x80 >> (segmentSizeLength - 1));
 		// The seek head entry of Tracks: its SeekID, then its 5-byte SeekPosition
 		const seekPosition = findId([0x53, 0xab, 0x84, ...tracksId]) + 7 + 3;
 		assert(moved[seekPosition - 1] === 0x85);
