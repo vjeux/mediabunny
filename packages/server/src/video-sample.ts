@@ -122,7 +122,11 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 	}
 
 	getSquarePixelHeight(): number {
-		if (this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den) {
+		if (
+			this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den
+			// FFmpeg uses 0/1 for an unknown aspect ratio, meaning square pixels
+			|| this.frame.sampleAspectRatio.num === 0
+		) {
 			return this.frame.height;
 		} else {
 			return Math.round(this.frame.height * this.frame.sampleAspectRatio.den / this.frame.sampleAspectRatio.num);
