@@ -6757,8 +6757,8 @@ const decryptCtr = async (
 		return new Uint8Array(plaintext);
 	};
 
-	if (!sampleEncryption.subsamples) {
-		// Whole sample is protected, no pattern
+	if (!sampleEncryption.subsamples || sampleEncryption.subsamples.length === 0) {
+		// Whole sample is protected, no pattern. Like FFmpeg, also for an entry that lists no subsamples.
 		return cryptApply(data);
 	}
 
@@ -6814,8 +6814,9 @@ const decryptCbcs = (
 	const skipByteBlock = encryptionInfo.defaultSkipByteBlock;
 	assert(cryptByteBlock !== null && skipByteBlock !== null);
 
-	if (!sampleEncryption.subsamples) {
-		// Whole-sample encryption: straightforward CBC over floor(size / 16) blocks, any trailing bytes stay clear
+	if (!sampleEncryption.subsamples || sampleEncryption.subsamples.length === 0) {
+		// Whole-sample encryption: straightforward CBC over floor(size / 16) blocks, any trailing bytes stay clear.
+		// Like FFmpeg, also for an entry that lists no subsamples.
 		const output = new Uint8Array(data);
 		const numBlocks = Math.floor(data.length / 16);
 
