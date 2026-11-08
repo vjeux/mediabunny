@@ -131,6 +131,10 @@ export interface InputTrackBacking {
 	getInternalCodecId(): MaybePromise<string | number | Uint8Array | null>;
 	getName(): MaybePromise<string | null>;
 	getLanguageCode(): MaybePromise<string>;
+	/** For the deprecated synchronous getters, when getName() may need to read media: what's known without reading */
+	getKnownName?(): string | null;
+	/** For the deprecated synchronous getters, when getLanguageCode() may need to read media */
+	getKnownLanguageCode?(): string;
 	getTimeResolution(): MaybePromise<number>;
 	isRelativeToUnixEpoch(): MaybePromise<boolean>;
 	getUnixTimeForTimestamp(timestamp: number): MaybePromise<number | null>;
@@ -259,6 +263,10 @@ export abstract class InputTrack {
 	 * @deprecated Use {@link InputTrack.getLanguageCode} instead.
 	 */
 	get languageCode() {
+		if (this._backing.getKnownLanguageCode) {
+			return this._backing.getKnownLanguageCode();
+		}
+
 		return requireSync(this._backing.getLanguageCode(), 'languageCode', 'getLanguageCode');
 	}
 
@@ -272,6 +280,10 @@ export abstract class InputTrack {
 	 * @deprecated Use {@link InputTrack.getName} instead.
 	 */
 	get name() {
+		if (this._backing.getKnownName) {
+			return this._backing.getKnownName();
+		}
+
 		return requireSync(this._backing.getName(), 'name', 'getName');
 	}
 
