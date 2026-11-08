@@ -89,10 +89,14 @@ export class AvFrameAudioSampleResource extends AudioSampleResource {
 	}
 }
 
-export const copyAudioSampleToAvFrame = (sample: AudioSample, frame: NodeAv.Frame) => {
+export const copyAudioSampleToAvFrame = (
+	sample: AudioSample,
+	frame: NodeAv.Frame,
+	format: AudioSampleFormat = sample.format,
+) => {
 	frame.unref();
 
-	frame.format = fromAudioSampleFormat(sample.format);
+	frame.format = fromAudioSampleFormat(format);
 	frame.nbSamples = sample.numberOfFrames;
 	frame.sampleRate = sample.sampleRate;
 	frame.channelLayout = getChannelLayout(sample.numberOfChannels);
@@ -101,6 +105,6 @@ export const copyAudioSampleToAvFrame = (sample: AudioSample, frame: NodeAv.Fram
 	assert(frame.data);
 
 	for (let i = 0; i < frame.data.length; i++) {
-		sample.copyTo(frame.data[i]!, { planeIndex: i });
+		sample.copyTo(frame.data[i]!, { planeIndex: i, format });
 	}
 };
