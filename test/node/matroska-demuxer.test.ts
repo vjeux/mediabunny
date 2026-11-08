@@ -790,3 +790,44 @@ test('Laced Opus frames at the end of a cluster get their own durations', async 
 		),
 	)).toEqual([[0, 0.02], [0.02, 0.02], [0.04, 0.02], [0.1, null]]);
 });
+
+test('EBML header with Void padding or a DocTypeExtension', async () => {
+	// Both may be larger than the 8 bytes an integer element can have
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const docTypeExtension = element(
+		0x4281, // DocTypeExtension
+		element(0x4283, ascii('extension-name')), // DocTypeExtensionName
+		element(0x4284, [1]), // DocTypeExtensionVersion
+	);
+
+	for (const extra of [element(EBMLId.Void, new Array<number>(16).fill(0)), docTypeExtension]) {
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska')), extra),
+			...element(EBMLId.Segment, element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, ascii('A_AC3')),
+			))),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		expect(await input.getTracks()).toHaveLength(1);
+	}
+});
