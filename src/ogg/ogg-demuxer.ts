@@ -616,8 +616,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return;
 		}
 
-		if (prevMetadata !== furthest) {
-			// Not read on from the furthest packet, so the pages in between are unknown
+		const prevEndPosition = prevMetadata && getPacketEndPosition(prevMetadata.packet);
+		const continuesNotedPages = prevEndPosition === (furthest && getPacketEndPosition(furthest.packet))
+			|| this.recentPages.some(page => page.headerStartPos === startPage.headerStartPos);
+		if (!continuesNotedPages) {
+			// Reading on started elsewhere (as after a lookup), so the pages in between are unknown
 			this.recentPages = [];
 		}
 		this.furthestPacketMetadata = metadata;
@@ -650,7 +653,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		let currentPos = page.headerStartPos + page.totalSize;
 		while (true) {
 			let slice = this.demuxer.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
 			if (!slice) {
 				return null; // The end of the file
 			}
@@ -787,15 +792,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 
 		// A source that was read in order may no longer hold the start of the file, where both lookup algorithms
-		// begin. If the packet lies past where reading on has got, let's scan on from one of the pages it reached last
-		// instead. The packet is then found as the binary search finds it, from the granule positions.
-		const furthest = this.furthestPacketMetadata;
+		// begin. If the packet doesn't lie before the pages that reading on has reached last, let's scan on from one of
+		// them instead. The packet is then found as the binary search finds it, from the granule positions.
 		const recentGranulePages = this.recentPages.filter(page => page.granulePosition !== -1);
-		const seedPage = scanOnFromRecentPages
-			&& this.sourceWasUnsized
-			&& this.firstPacketPosition
-			&& furthest
-			&& timestampInSamples >= furthest.timestampInSamples
+		const seedPage = scanOnFromRecentPages && this.sourceWasUnsized && this.firstPacketPosition
 			? findLast(
 				recentGranulePages.slice(1), // At least one before it, to step back from
 				page => this.granulePositionToTimestampInSamples(page.granulePosition) <= timestampInSamples,

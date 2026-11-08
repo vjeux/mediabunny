@@ -67,10 +67,38 @@ test('Ogg: Seeking forward in a stream longer than its cache, after playing part
 		}
 	}
 
-	for (const target of [packets[270]!, packets[280]!, packets.at(-1)!]) {
-		const packet = await sink.getPacket(target.timestamp);
-		expect([packet?.timestamp, packet?.byteLength]).toEqual([target.timestamp, target.byteLength]);
+	// Seek forward, play on a little from there, then seek forward again
+	let packet = await sink.getPacket(packets[250]!.timestamp);
+	expect([packet?.timestamp, packet?.byteLength]).toEqual([packets[250]!.timestamp, packets[250]!.byteLength]);
+	for (let i = 251; i <= 260; i++) {
+		packet = await sink.getNextPacket(packet!);
+		expect(packet?.timestamp).toBe(packets[i]!.timestamp);
 	}
+	for (const target of [packets[280]!, packets.at(-1)!]) {
+		const found = await sink.getPacket(target.timestamp);
+		expect([found?.timestamp, found?.byteLength]).toEqual([target.timestamp, target.byteLength]);
+	}
+});
+
+test('Ogg: Looking behind where reading got to, after a forward seek in a stream longer than its cache', async () => {
+	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/preroll-test.opus')));
+	using input = new Input({ source: streamedSource(file, 96 * 1024), formats: ALL_FORMATS });
+	using reference = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+	const referenceSink = new EncodedPacketSink((await reference.getPrimaryAudioTrack())!);
+
+	// Play up to 3 s, seek forward to 4.5 s, play on for 1 s, then look up 5 s, which lies behind where reading got to
+	for await (const packet of sink.packets()) {
+		if (packet.timestamp >= 3) {
+			break;
+		}
+	}
+	let packet = await sink.getPacket(4.5);
+	for (let i = 0; i < 50 && packet; i++) {
+		packet = await sink.getNextPacket(packet);
+	}
+	expect(packet?.timestamp).toBe((await referenceSink.getPacket(5.5))?.timestamp);
+	expect((await sink.getPacket(5))?.timestamp).toBe((await referenceSink.getPacket(5))?.timestamp);
 });
 
 test('Ogg: Looking up packets around where reading got to, in a stream that fits its cache', async () => {
