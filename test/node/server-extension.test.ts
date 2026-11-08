@@ -327,6 +327,36 @@ describe('Video', async () => {
 		});
 	});
 
+	test('Scalability modes other than a single layer are declined', async () => {
+		const size = { width: 128, height: 96 };
+		for (const codec of ['avc', 'hevc', 'vp8', 'vp9', 'av1'] as const) {
+			// The encoders make a single layer, whatever temporal or spatial layers were asked for
+			for (const scalabilityMode of ['L1T2', 'L1T3', 'L2T2', 'S2T1', 'foo']) {
+				const canEncode = await canEncodeVideo(codec, { ...size, scalabilityMode });
+				expect({ codec, scalabilityMode, canEncode }).toEqual({ codec, scalabilityMode, canEncode: false });
+			}
+
+			expect(await canEncodeVideo(codec, { ...size, scalabilityMode: 'L1T1' })).toBe(true);
+			expect(await canEncodeVideo(codec, size)).toBe(true);
+		}
+
+		// So encoding with one fails instead of silently giving a single layer
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'avc', quality: new Quality('medium'), scalabilityMode: 'L1T3' });
+		output.addVideoTrack(source);
+		await output.start();
+		const sample = new VideoSample(new Uint8Array(128 * 96 * 3 / 2).fill(128), {
+			format: 'I420',
+			codedWidth: 128,
+			codedHeight: 96,
+			timestamp: 0,
+			duration: 1 / 30,
+		});
+		await expect(source.add(sample)).rejects.toThrow();
+		sample.close();
+		await output.cancel();
+	});
+
 	test('AVC encode and decode, Annex B', async () => {
 		await encodeDecodeTest('avc', { avc: { format: 'annexb' } }, async (packet, meta, i) => {
 			expect(packet.duration).toBe(1 / 30);
