@@ -54,7 +54,8 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 	/** @internal */
 	abstract _close(): Promise<void>;
 	/**
-	 * Called when the output is canceled while finalizing, for a target that can hold finalization up forever.
+	 * Called when the output is canceled (while finalizing too), for a target that can hold canceling or finalization
+	 * up forever.
 	 * @internal
 	 */
 	_cancelFinalization() {}

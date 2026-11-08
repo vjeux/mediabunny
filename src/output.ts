@@ -997,6 +997,12 @@ export class Output<
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
 
+			// Closing a source, or a pending add, can be stuck on a StreamTarget whose sink stopped completing writes;
+			// the target gives up on its stream then
+			for (const target of this._unfinalizedTargets) {
+				target._cancelFinalization();
+			}
+
 			const release = await this._mutex.acquire();
 
 			try {

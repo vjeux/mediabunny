@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -118,6 +118,48 @@ test('Output.cancel() while finalizing gives up on a StreamTarget whose sink has
 			expect(output.state).toBe('finalized');
 		}
 	}
+}, 30_000);
+
+test('Output.cancel() gives up on a StreamTarget whose sink has stalled while a source is being closed', async () => {
+	let writes = 0;
+	const target = new StreamTarget(new WritableStream({
+		write: () => {
+			writes++;
+			if (writes > 2) {
+				// Never completes, like an upload over a hung connection
+				return new Promise<void>(() => {});
+			}
+		},
+	}, { highWaterMark: 1 }));
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source, { frameRate: 30 });
+	await output.start();
+
+	// Adding waits for the sink once it applies backpressure, so don't wait for that here
+	const decoderConfig = { codec: 'vp09.00.10.08', codedWidth: 320, codedHeight: 240 };
+	for (let i = 0; i < 300; i++) {
+		const packet = new EncodedPacket(new Uint8Array(20000), i % 30 === 0 ? 'key' : 'delta', i / 30, 1 / 30);
+		void source.add(packet, { decoderConfig }).catch(() => {});
+	}
+	await new Promise(resolve => setTimeout(resolve, 200));
+	expect(writes).toBe(3);
+
+	// Closing the source writes the rest of the track, which waits for the sink as well (once closing a source waits
+	// for its track to be written, as with #540), and canceling waits for that before closing the target
+	source.close();
+	await new Promise(resolve => setTimeout(resolve, 100));
+
+	const startTime = performance.now();
+	const result = await Promise.race([
+		output.cancel().then(() => 'canceled'),
+		new Promise(resolve => setTimeout(() => resolve('still pending'), 8000)),
+	]);
+	// Canceling stops waiting once the pending writes haven't made progress for 5 seconds. On main, it stayed pending
+	// forever.
+	expect(result).toBe('canceled');
+	expect(performance.now() - startTime).toBeLessThan(6500);
+	expect(output.state).toBe('canceled');
 }, 30_000);
 
 test('Output, onFinalize', async () => {
