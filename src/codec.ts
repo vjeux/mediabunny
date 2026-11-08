@@ -1497,6 +1497,16 @@ export const validateAudioChunkMetadata = (
 				+ ' Identification Header as specified in Section 5.1 of RFC 7845.',
 			);
 		}
+
+		if (!metadata.decoderConfig.description && metadata.decoderConfig.numberOfChannels > 2) {
+			// Without a description, channel mapping family 0 is implied, which only covers mono and stereo. Beyond
+			// that, the stream and coupled stream counts and the channel mapping can't be inferred.
+			throw new TypeError(
+				'Audio chunk metadata decoder configuration for Opus with more than two channels must include a'
+				+ ' description, which is expected to be an Identification Header as specified in Section 5.1 of'
+				+ ' RFC 7845.',
+			);
+		}
 	} else if (metadata.decoderConfig.codec.startsWith('vorbis')) {
 		// Vorbis-specific validation
 
