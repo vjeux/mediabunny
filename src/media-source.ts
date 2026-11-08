@@ -108,6 +108,8 @@ export abstract class MediaSource {
 	_connectedTrack: OutputTrack | null = null;
 	/** @internal */
 	_closingPromise: Promise<void> | null = null;
+	/** @internal Resolved by a force close (a cancel), which waits for an ongoing close and so has to cut it short. */
+	_forceCloseSignal = promiseWithResolvers();
 	/** @internal */
 	_closed = false;
 	/**
@@ -189,6 +191,10 @@ export abstract class MediaSource {
 
 	/** @internal */
 	async _flushOrWaitForOngoingClose(forceClose: boolean) {
+		if (forceClose) {
+			this._forceCloseSignal.resolve();
+		}
+
 		return this._closingPromise ??= (async () => {
 			await this._flushAndClose(forceClose);
 			this._closed = true;
@@ -1468,7 +1474,7 @@ class VideoEncoderWrapper {
 		this.createWebCodecsEncoders();
 	}
 
-	async flushAndClose(forceClose: boolean, initializationSettled = false) {
+	async flushAndClose(forceClose: boolean, initializationSettled = false): Promise<void> {
 		// When force closing, don't wait for an initialization that may never finish (one hanging in a platform codec,
 		// say), but close the encoder once the initialization has settled, either way (a failed one can still leave an
 		// encoder behind)
@@ -1479,8 +1485,18 @@ class VideoEncoderWrapper {
 		if (closeEncoderLater) {
 			const closeEncoder = () => this.flushAndClose(true, true);
 			void this.ensureEncoderPromise!.then(closeEncoder, closeEncoder).catch(() => {});
+		} else if (!forceClose && this.ensureEncoderPromise && !this.encoderInitialized) {
+			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first. A
+			// force close (a cancel) arriving meanwhile waits for this close, so it cuts the wait short and closes as
+			// forced, as the initialization may never finish
+			const forceCloseRequested = await Promise.race([
+				this.ensureEncoderPromise.then(() => false, () => false),
+				this.source._forceCloseSignal.promise.then(() => true),
+			]);
+			if (forceCloseRequested && !this.encoderInitialized) {
+				return this.flushAndClose(true);
+			}
 		} else {
-			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
 			await this.ensureEncoderPromise?.catch(() => {});
 		}
 
@@ -3616,7 +3632,7 @@ class AudioEncoderWrapper {
 		}
 	}
 
-	async flushAndClose(forceClose: boolean, initializationSettled = false) {
+	async flushAndClose(forceClose: boolean, initializationSettled = false): Promise<void> {
 		// When force closing, don't wait for an initialization that may never finish (one hanging in a platform codec,
 		// say), but close the encoder once the initialization has settled, either way (a failed one can still leave an
 		// encoder behind)
@@ -3627,8 +3643,18 @@ class AudioEncoderWrapper {
 		if (closeEncoderLater) {
 			const closeEncoder = () => this.flushAndClose(true, true);
 			void this.ensureEncoderPromise!.then(closeEncoder, closeEncoder).catch(() => {});
+		} else if (!forceClose && this.ensureEncoderPromise && !this.encoderInitialized) {
+			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first. A
+			// force close (a cancel) arriving meanwhile waits for this close, so it cuts the wait short and closes as
+			// forced, as the initialization may never finish
+			const forceCloseRequested = await Promise.race([
+				this.ensureEncoderPromise.then(() => false, () => false),
+				this.source._forceCloseSignal.promise.then(() => true),
+			]);
+			if (forceCloseRequested && !this.encoderInitialized) {
+				return this.flushAndClose(true);
+			}
 		} else {
-			// An encoder that's still initializing can't be flushed or closed yet, so let it finish (or fail) first
 			await this.ensureEncoderPromise?.catch(() => {});
 		}
 
