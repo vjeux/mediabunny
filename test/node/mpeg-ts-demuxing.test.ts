@@ -2686,10 +2686,9 @@ test('MPEG-TS with PES packets that have no PTS', async () => {
 	const videoSink = new EncodedPacketSink(videoTrack);
 	const videoPackets = await readAllPackets(videoSink);
 
-	// ffprobe reports PTS 1898214 for the first frame, 1945014 for the 14th, and none for the rest. ffprobe also lists
-	// a 16th frame, which the end of the file cuts short; it wouldn't decode, so Mediabunny drops it (#618).
+	// ffprobe reports PTS 1898214 for the first frame, 1945014 for the 14th, and none for the rest
 	expect(videoPackets.map(x => Math.round(x.timestamp * 90_000))).toEqual(
-		Array.from({ length: 15 }, (_, i) => 1898214 + 3600 * i),
+		Array.from({ length: 16 }, (_, i) => 1898214 + 3600 * i),
 	);
 	expect(videoPackets.every(x => x.duration === 0.04)).toBe(true);
 	await expectLookupsToFindEachPacket(videoSink, videoPackets);
@@ -4177,9 +4176,10 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 test('MPEG-TS drops the video frame that the end of the file cuts off', async () => {
 	// From L80's review. A recording stopped mid-write or a partial download ends inside a frame, which fails decoding
 	// (with WebCodecs at the final flush: "EncodingError: Error during flush.", which ends the whole run). Unbounded
-	// PES packets don't say how long they are, but muxers end each one with stuffing in its last TS packet, which a cut
-	// one lacks. 20 frames of a 64x64 x264 stream (SPS and PPS, then stub slices of 600 bytes, so each frame spans
-	// several TS packets).
+	// PES packets don't say how long they are, and muxers end each one with stuffing in its last TS packet, unless its
+	// data fills it exactly. So a frame without that stuffing is only dropped in a file that ends inside a TS packet.
+	// 20 frames of a 64x64 x264 stream (SPS and PPS, then stub slices of 600 bytes, so each frame spans several TS
+	// packets).
 	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
 		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
 	const pps = [0x68, 0xef, 0x8f, 0xcb];
@@ -4218,24 +4218,141 @@ test('MPEG-TS drops the video frame that the end of the file cuts off', async ()
 	const clean = await readFrames(bytes);
 	expect(clean).toHaveLength(20); // Complete PES packets end with stuffing
 
-	// Cut the file two TS packets into the last frame's PES packet, at a TS packet boundary or inside a TS packet
+	// Cut the file inside a TS packet, two TS packets into the last frame's PES packet: that frame goes. Cut at the TS
+	// packet boundary there instead, nothing tells it from a complete frame without stuffing, so it stays, as before.
 	const isVideoStart = (pos: number) => !!(bytes[pos + 1]! & 0x40)
 		&& (((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100;
 	let lastPesStart = bytes.length - 188;
 	while (!isVideoStart(lastPesStart)) {
 		lastPesStart -= 188;
 	}
-	for (const cutPos of [lastPesStart + 2 * 188, lastPesStart + 2 * 188 + 100]) {
-		const frames = await readFrames(bytes.subarray(0, cutPos));
-		expect(frames).toEqual(clean.slice(0, 19));
-	}
+	expect(await readFrames(bytes.subarray(0, lastPesStart + 2 * 188 + 100))).toEqual(clean.slice(0, 19));
+	const cutAtBoundary = await readFrames(bytes.subarray(0, lastPesStart + 2 * 188));
+	expect(cutAtBoundary.slice(0, 19)).toEqual(clean.slice(0, 19));
+	expect(cutAtBoundary).toHaveLength(20);
 
 	// When the file ends inside the first frame, the track still opens: its SPS and PPS are there
 	let firstPesStart = 0;
 	while (!isVideoStart(firstPesStart)) {
 		firstPesStart += 188;
 	}
-	expect(await readFrames(bytes.subarray(0, firstPesStart + 2 * 188))).toEqual([]);
+	expect(await readFrames(bytes.subarray(0, firstPesStart + 2 * 188 + 100))).toEqual([]);
+});
+
+test('MPEG-TS keeps the last video frame when its PES packet fills its last TS packet exactly', async () => {
+	// A PES packet whose data fills its last TS packet exactly ends without stuffing, which Mediabunny's own output
+	// does about once in 184 files (found by L15: 4 frames of an FFmpeg test clip converted to MPEG-TS read back as 3).
+	// In a file that ends there, on a TS packet boundary, that's a complete frame. H.264 and HEVC streams of stub
+	// frames, alone or with AAC, whose last frame has the size that makes this happen.
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const hex = (text: string) => [...text.matchAll(/../g)].map(x => parseInt(x[0], 16));
+	const avcParameterSets = [
+		...nalUnit(hex('6764000aacd3109b011000000300100000030320f1225380')),
+		...nalUnit(hex('68ef8fcb')),
+	];
+	// Those of test/public/hevc.ts
+	const hevcParameterSets = [
+		...nalUnit(hex('40010c01ffff016000000300900000030000030078959809')),
+		...nalUnit(hex('420101016000000300900000030000030078a003c08010e596566924cae6a0202036c20000030002000003003010')),
+		...nalUnit(hex('4401c172b46240')),
+	];
+	const aacConfig = {
+		codec: 'mp4a.40.2',
+		numberOfChannels: 2,
+		sampleRate: 48000,
+		description: new Uint8Array([0x11, 0x90]),
+	};
+
+	const mux = async (codec: 'avc' | 'hevc', withAudio: boolean, lastFrameSize: number) => {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const video = new EncodedVideoPacketSource(codec);
+		output.addVideoTrack(video, { frameRate: 25 });
+		const audio = new EncodedAudioPacketSource('aac');
+		if (withAudio) {
+			output.addAudioTrack(audio);
+		}
+		await output.start();
+
+		for (let i = 0; i < 10; i++) {
+			const size = i === 9 ? lastFrameSize : 400;
+			const header = codec === 'avc'
+				? [i === 0 ? 0x65 : 0x41, 0x88]
+				: [i === 0 ? 0x26 : 0x02, 0x01, 0x80];
+			const frame = nalUnit([...header, ...new Array<number>(size).fill(0x20 + i)]);
+			await video.add(
+				new EncodedPacket(
+					new Uint8Array(i === 0
+						? [...(codec === 'avc' ? avcParameterSets : hevcParameterSets), ...frame]
+						: frame),
+					i === 0 ? 'key' : 'delta',
+					i / 25,
+					1 / 25,
+				),
+				i === 0
+					? {
+							decoderConfig: codec === 'avc'
+								? { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 }
+								: { codec: 'hev1.1.6.L120.90', codedWidth: 1920, codedHeight: 1080 },
+						}
+					: undefined,
+			);
+
+			if (withAudio) {
+				// Raw AAC frames of 48 kHz stereo, two per video frame
+				for (let j = 0; j < 2; j++) {
+					const timestamp = (2 * i + j) * 1024 / 48000;
+					await audio.add(
+						new EncodedPacket(new Uint8Array(100).fill(0x10 + j), 'key', timestamp, 1024 / 48000),
+						i === 0 && j === 0 ? { decoderConfig: aacConfig } : undefined,
+					);
+				}
+			}
+		}
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	// Whether the video's last TS packet with payload carries payload only (no adaptation field, so no stuffing). The
+	// video PID is the one whose PES packets have stream_id 0xe0.
+	const lastVideoPacketIsFull = (bytes: Uint8Array) => {
+		const pidAt = (pos: number) => ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+		let videoPid = -1;
+		for (let pos = 0; pos < bytes.length && videoPid === -1; pos += 188) {
+			const payloadPos = pos + 4 + (bytes[pos + 3]! & 0x20 ? 1 + bytes[pos + 4]! : 0);
+			if (bytes[pos + 1]! & 0x40 && bytes[payloadPos] === 0 && bytes[payloadPos + 1] === 0
+				&& bytes[payloadPos + 2] === 1 && bytes[payloadPos + 3] === 0xe0) {
+				videoPid = pidAt(pos);
+			}
+		}
+
+		for (let pos = bytes.length - 188; pos >= 0; pos -= 188) {
+			const adaptationFieldControl = (bytes[pos + 3]! >> 4) & 0b11;
+			if (pidAt(pos) === videoPid && adaptationFieldControl & 0b01) {
+				return adaptationFieldControl === 0b01;
+			}
+		}
+		return false;
+	};
+
+	for (const [codec, withAudio] of [['avc', false], ['avc', true], ['hevc', false], ['hevc', true]] as const) {
+		let bytes: Uint8Array | null = null;
+		for (let size = 400; size < 400 + 188 && !bytes; size++) {
+			const candidate = await mux(codec, withAudio, size);
+			if (lastVideoPacketIsFull(candidate)) {
+				bytes = candidate;
+			}
+		}
+		assert(bytes);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(Math.round(packet.timestamp * 25));
+		}
+		expect(timestamps).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+	}
 });
 
 test('MPEG-TS reading at a position inside a PES packet leaves the PES packet whole', async () => {
