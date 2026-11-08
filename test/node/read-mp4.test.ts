@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
 	ALL_FORMATS,
+	AudioSampleSink,
 	BufferSource,
 	BufferTarget,
 	CustomSource,
@@ -4026,3 +4027,89 @@ test('An invalid stss entry of 0 does not make a video track only have key packe
 	expect(keyPacketCount).toBe(9);
 	expect(await track.hasOnlyKeyPackets()).toBe(false);
 });
+
+test('Sample rate not fitting the sample entry', async () => {
+	// Without a srat box, the sample entry just says 0, leaving the media timescale as the best guess
+	const sampleEntry = audioSampleEntry('ipcm', 0, 2, 16, 0, [
+		fullBox('pcmC', 0, 0, u8(1), u8(16)),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(pcmFile({
+			majorBrand: 'isom',
+			stsd: fullBox('stsd', 0, 0, u32(1), sampleEntry),
+			timescale: 96000,
+			sampleDuration: 1,
+			sampleSize: 4,
+			data: zeros(4 * 96),
+		})),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	expect(await track.getSampleRate()).toBe(96000);
+});
+
+test('MP4 and MOV audio above 65535 Hz, as Mediabunny writes it, decodes at its sample rate', async () => {
+	// The 16.16 sample rate field of the sample entry can't hold 96000, so Mediabunny and FFmpeg write 0 there
+	const readBack = async (format: Mp4OutputFormat | MovOutputFormat) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(2 * 960), 'key', 0, 0.01), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 96000 },
+		});
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		using sample = (await new AudioSampleSink(track).getSample(0))!;
+		return [await track.getSampleRate(), sample.sampleRate, sample.numberOfFrames, sample.duration];
+	};
+
+	expect(await readBack(new Mp4OutputFormat())).toEqual([96000, 96000, 960, 0.01]);
+	expect(await readBack(new MovOutputFormat())).toEqual([96000, 96000, 960, 0.01]);
+});
+
+const audioSampleEntry = (
+	name: string,
+	version: number,
+	channelCount: number,
+	sampleSize: number,
+	sampleRate: number,
+	extra: Bytes[] = [],
+) => box(
+	name, zeros(6), u16(1), u16(version), zeros(6), u16(channelCount), u16(sampleSize), zeros(4),
+	u32(0x10000 * sampleRate), ...extra,
+);
+
+const pcmFile = (options: {
+	majorBrand: string;
+	stsd: Bytes;
+	timescale: number;
+	sampleDuration: number;
+	sampleSize: number;
+	data: Uint8Array;
+}) => {
+	const ftyp = box('ftyp', ascii(options.majorBrand), u32(0), ascii(options.majorBrand));
+	const sampleCount = options.data.length / options.sampleSize;
+
+	return concat(
+		ftyp,
+		box('mdat', options.data),
+		box('moov',
+			mvhd(),
+			trak('soun', mdhd(options.timescale),
+				options.stsd,
+				fullBox('stts', 0, 0, u32(1), u32(sampleCount), u32(options.sampleDuration)),
+				fullBox('stsc', 0, 0, u32(1), u32(1), u32(sampleCount), u32(1)),
+				fullBox('stsz', 0, 0, u32(options.sampleSize), u32(sampleCount)),
+				fullBox('stco', 0, 0, u32(1), u32(ftyp.length + 8)),
+			),
+		),
+	);
+};
+
+const mdhd = (timescale: number) => fullBox('mdhd', 0, 0, zeros(8), u32(timescale), zeros(8));
