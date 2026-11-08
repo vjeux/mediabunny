@@ -1,9 +1,11 @@
 import { expect, test } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { ReadableStreamSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ALL_FORMATS, BufferSource, Input, FilePathSource } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const publicPath = (file: string) => path.join(__dirname, '../public', file);
@@ -196,6 +198,50 @@ test('MP3 duration metadata ignores a Lyrics3v2 tag at the end of the file', asy
 
 	using tagged = new Input({ source: new BufferSource(withTags), formats: ALL_FORMATS });
 	expect(await tagged.getDurationFromMetadata()).toBe(expected);
+});
+
+test('MP3 duration metadata of joined files from a stream, asked for after reading the packets', async () => {
+	// Two joined files, each an Info frame and 4000 frames (MPEG-1 Layer III, 128 kbps, 44.1 kHz, mono)
+	const bytes = new Uint8Array(2 * 4001 * 417);
+	for (let i = 0; i < 2 * 4001; i++) {
+		bytes.set([0xff, 0xfb, 0x90, 0xc0], i * 417);
+		if (i % 4001 === 0) {
+			bytes.set([...'Info'].map(char => char.charCodeAt(0)), i * 417 + 4 + 17); // Behind the side information
+			const view = new DataView(bytes.buffer, i * 417 + 4 + 17 + 4);
+			view.setUint32(0, 0x3); // Frame count and byte count present
+			view.setUint32(4, 4000);
+			view.setUint32(8, 4001 * 417);
+		}
+	}
+
+	using reference = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const expected = await reference.getDurationFromMetadata();
+	expect(expected).toBeCloseTo(8000 * 1152 / 44100, 0); // By the bitrate, since the files are joined
+
+	// A stream source keeps only the last MiB here, so the end of the first file is gone by the time all packets are
+	// read, and the check for joined files can't look at it then
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (let offset = 0; offset < bytes.length; offset += 65536) {
+				controller.enqueue(bytes.slice(offset, offset + 65536));
+			}
+			controller.close();
+		},
+	});
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 20 }),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		void packet;
+		packetCount++;
+	}
+	expect(packetCount).toBe(8000); // Not the Info frames
+	expect(await track.getDurationFromMetadata()).toBe(expected);
 });
 
 test('MP3 duration metadata', async () => {

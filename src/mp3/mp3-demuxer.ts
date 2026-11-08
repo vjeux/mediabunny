@@ -31,6 +31,8 @@ import {
 	computeAverageMp3FrameSize,
 	getMp3ChannelCount,
 	MP3_DECODER_DELAY,
+	MP3_FRAME_HEADER_SIZE,
+	readMp3FrameHeader,
 } from '../../shared/mp3-misc';
 import {
 	ID3_V1_TAG_SIZE,
@@ -72,6 +74,8 @@ export class Mp3Demuxer extends Demuxer {
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
 	primingDelay = 0;
+	/** Whether more MP3 audio follows the stream that the Xing/Info header describes, once the frames got there */
+	audioFollowsXingStream: boolean | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -212,6 +216,20 @@ export class Mp3Demuxer extends Demuxer {
 		this.loadedSamples.push(sample);
 		this.nextTimestampInSamples += header.audioSamplesInFrame;
 
+		if (
+			this.audioFollowsXingStream === null
+			&& this.xingFrameHeaderPos !== null
+			&& this.xingData?.fileSize
+			&& result.startPos + header.totalSize >= this.xingFrameHeaderPos + this.xingData.fileSize
+		) {
+			// Check for joined files (see getDurationFromHeaders) as the frames get to the end of the stream, while the
+			// data there is still at hand: sources that can only be read in order may not keep it
+			this.audioFollowsXingStream = await mp3AudioFollows(
+				this.reader,
+				this.xingFrameHeaderPos + this.xingData.fileSize,
+			);
+		}
+
 		return;
 	}
 
@@ -337,7 +355,7 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 			const streamEndPos = demuxer.xingFrameHeaderPos + streamSize;
 			if (
 				demuxer.reader.fileSize - streamEndPos > streamSize / 16
-				&& await mp3AudioFollows(demuxer.reader, streamEndPos)
+				&& (demuxer.audioFollowsXingStream ?? await mp3AudioFollows(demuxer.reader, streamEndPos))
 			) {
 				frameCount = null;
 			}
@@ -531,10 +549,11 @@ const MAX_GAP_BETWEEN_JOINED_STREAMS = 4096;
  * file: a frame with another one right behind it.
  */
 const mp3AudioFollows = async (reader: Reader, pos: number) => {
-	assert(reader.fileSize !== null);
+	// The file's size isn't known yet when this runs while reading an unsized source
+	const fileSize = reader.fileSize ?? Infinity;
 
 	// Skip the ID3v1 tag that ends a joined file, and the ID3v2 tags that start the next one
-	while (pos + ID3_V2_HEADER_SIZE <= reader.fileSize) {
+	while (pos + ID3_V2_HEADER_SIZE <= fileSize) {
 		let slice = reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
 		if (isThenable(slice)) {
 			slice = await slice;
@@ -560,7 +579,7 @@ const mp3AudioFollows = async (reader: Reader, pos: number) => {
 	const frame = await readNextMp3FrameHeader(
 		reader,
 		pos,
-		Math.min(pos + MAX_GAP_BETWEEN_JOINED_STREAMS, reader.fileSize),
+		Math.min(pos + MAX_GAP_BETWEEN_JOINED_STREAMS, fileSize),
 	);
 	if (!frame) {
 		return false;
@@ -568,6 +587,14 @@ const mp3AudioFollows = async (reader: Reader, pos: number) => {
 
 	// A frame header found in tags or other data is very unlikely to be followed by a second one
 	const nextFramePos = frame.startPos + frame.header.totalSize;
-	const nextFrame = await readNextMp3FrameHeader(reader, nextFramePos, nextFramePos + 1);
-	return nextFrame !== null;
+	let slice = reader.requestSlice(nextFramePos, MP3_FRAME_HEADER_SIZE);
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
+	if (!slice) {
+		return false;
+	}
+
+	const remainingBytes = reader.fileSize !== null ? reader.fileSize - nextFramePos : null;
+	return readMp3FrameHeader(readU32Be(slice), remainingBytes).header !== null;
 };
