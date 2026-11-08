@@ -39,6 +39,17 @@ test('Can decode transparent video', async () => {
 	await decodeTransparentVideoTest();
 });
 
+test('Can decode transparent video where navigator.hardwareConcurrency is missing', async () => {
+	// Some hardened environments don't have it, which made for an empty pool of color/alpha merge workers, so merging
+	// waited forever (found by the lane L89 review)
+	Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => undefined, configurable: true });
+	try {
+		await decodeTransparentVideoTest();
+	} finally {
+		delete (navigator as { hardwareConcurrency?: number }).hardwareConcurrency;
+	}
+});
+
 test('Can decode faulty transparent video and behaves gracefully', async () => {
 	using input = new Input({
 		source: new UrlSource('/transparency-faulty.webm'),

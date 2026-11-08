@@ -1588,7 +1588,8 @@ export class ColorAlphaMerger {
 				mergerWorkerUrl = URL.createObjectURL(blob);
 			}
 
-			const poolSize = clamp(navigator.hardwareConcurrency, 1, 4);
+			// hardwareConcurrency can be missing (in some hardened environments), which would make for an empty pool
+			const poolSize = clamp(navigator.hardwareConcurrency || 1, 1, 4);
 			let failedCount = 0;
 			for (let i = 0; i < poolSize; i++) {
 				const worker = new Worker(mergerWorkerUrl);
