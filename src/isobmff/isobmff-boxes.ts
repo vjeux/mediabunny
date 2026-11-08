@@ -458,7 +458,8 @@ export const mvhd = (
  */
 export const trak = (trackData: IsobmffTrackData, creationTime: number) => {
 	const trackMetadata = getTrackMetadata(trackData);
-	const needsEditList = trackData.startTimestampOffset !== null && trackData.startTimestampOffset !== 0;
+	const needsEditList = trackData.startTimestampOffset !== null
+		&& (trackData.startTimestampOffset !== 0 || trackData.compositionTimeOffsetShift !== 0);
 
 	return box('trak', undefined, [
 		tkhd(trackData, creationTime),
@@ -549,8 +550,9 @@ export const edts = (trackData: IsobmffTrackData) => {
 
 		const startOffset = getEmptyEdit(offset, trackData.timescale).duration;
 		const mediaDuration = intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE);
+		const mediaTime = trackData.compositionTimeOffsetShift;
 
-		const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration);
+		const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration) || !isI32(mediaTime);
 		const u32OrU64 = needs64Bits ? u64 : u32;
 		const i32OrI64 = needs64Bits ? i64 : i32;
 
@@ -565,14 +567,14 @@ export const edts = (trackData: IsobmffTrackData) => {
 
 				// #2
 				u32OrU64(mediaDuration), // Segment duration
-				i32OrI64(0), // Media time
+				i32OrI64(mediaTime), // Media time
 				fixed_16_16(1), // Media rate
 			]),
 		]);
 	} else {
 		// Negative offset: the negative section of the media is trimmed off
 
-		const mediaTime = intoTimescale(-offset, trackData.timescale);
+		const mediaTime = intoTimescale(-offset, trackData.timescale) + trackData.compositionTimeOffsetShift;
 		// Not the entire media is visible.
 		// For fragmented files, this value is zero, which simply means "unknown duration" in this case. Spec:
 		// "the segment_duration of this edit may be zero"
