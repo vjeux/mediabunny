@@ -3694,6 +3694,60 @@ test('Relative paths & isRoot', async () => {
 	await output.finalize();
 });
 
+test('RESOLUTION is the size the segments display, given whether they store the rotation', async () => {
+	// RESOLUTION "describes the optimal pixel resolution at which to display all the video in the Variant Stream"
+	// (RFC 8216, Section 4.3.4.2). The first 30 packets of video.mp4, 1920x1080 H.264.
+	using input = new Input({ source: new FilePathSource('./test/public/video.mp4'), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const decoderConfig = (await videoTrack.getDecoderConfig())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		packets.push(packet);
+		if (packets.length === 30) {
+			break;
+		}
+	}
+
+	const writeResolution = async (
+		segmentFormat: HlsOutputFormatOptions['segmentFormat'],
+		metadata: Parameters<Output['addVideoTrack']>[1],
+	) => {
+		const files = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+				return target;
+			}),
+		});
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source, metadata);
+		await output.start();
+		for (const [i, packet] of packets.entries()) {
+			await source.add(packet, i === 0 ? { decoderConfig } : undefined);
+		}
+		await output.finalize();
+
+		return new TextDecoder().decode(files.get('master.m3u8')).match(/RESOLUTION=(\d+x\d+)/)![1];
+	};
+
+	// CMAF stores the rotation, given as `rotation` or as a transformation matrix (which takes precedence)
+	expect(await writeResolution(new CmafOutputFormat(), { rotation: 90 })).toBe('1080x1920');
+	expect(await writeResolution(new CmafOutputFormat(), { transformationMatrix: [0, 1, 0, -1, 0, 0, 0, 0, 1] }))
+		.toBe('1080x1920');
+	expect(await writeResolution(new CmafOutputFormat(), {
+		rotation: 90,
+		transformationMatrix: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+	})).toBe('1920x1080');
+
+	// MPEG-TS can't store it, so its segments display the frames unrotated
+	expect(await writeResolution(new MpegTsOutputFormat(), { rotation: 90 })).toBe('1920x1080');
+	expect(await writeResolution(new MpegTsOutputFormat(), { transformationMatrix: [0, 1, 0, -1, 0, 0, 0, 0, 1] }))
+		.toBe('1920x1080');
+});
+
 test('Cross-variant timestamps, MPEG-TS', async () => {
 	await testCrossVariantTimestamps({
 		segmentFormat: new MpegTsOutputFormat(),
