@@ -85,6 +85,7 @@ import {
 	assertDefinedSize,
 	CODEC_STRING_MAP,
 	EBMLId,
+	fromMatroskaLanguageCode,
 	LEVEL_0_AND_1_EBML_IDS,
 	LEVEL_0_EBML_IDS,
 	LEVEL_1_EBML_IDS,
@@ -2133,6 +2134,9 @@ export class MatroskaDemuxer extends Demuxer {
 				if (!isIso639Dash2LanguageCode(this.currentTrack.languageCode)) {
 					this.currentTrack.languageCode = UNDETERMINED_LANGUAGE;
 				}
+
+				// For languages with two ISO 639-2 codes, the element holds the bibliographic one, like "ger" for "deu"
+				this.currentTrack.languageCode = fromMatroskaLanguageCode(this.currentTrack.languageCode);
 			}; break;
 
 			case EBMLId.LanguageBCP47: {

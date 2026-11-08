@@ -777,6 +777,30 @@ export const resync = async (reader: Reader, startPos: number, ids: EBMLId[], un
 	return null;
 };
 
+// For these languages, ISO 639-2 has a bibliographic code besides the terminology one that languageCode uses, and
+// Matroska's Language element uses the bibliographic one (RFC 9559, section 12)
+const ISO_639_2_TERMINOLOGY_TO_BIBLIOGRAPHIC: Record<string, string> = {
+	sqi: 'alb', hye: 'arm', eus: 'baq', mya: 'bur', zho: 'chi', ces: 'cze', nld: 'dut', fra: 'fre', kat: 'geo',
+	deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', mri: 'mao', msa: 'may', fas: 'per', ron: 'rum', slk: 'slo',
+	bod: 'tib', cym: 'wel',
+};
+const ISO_639_2_BIBLIOGRAPHIC_TO_TERMINOLOGY: Record<string, string> = {
+	...Object.fromEntries(Object.entries(ISO_639_2_TERMINOLOGY_TO_BIBLIOGRAPHIC).map(([t, b]) => [b, t])),
+	// Withdrawn in 2008 in favor of the terminology codes
+	scc: 'srp',
+	scr: 'hrv',
+};
+
+/** Gives the code for Matroska's Language element for an ISO 639-2/T language code. */
+export const toMatroskaLanguageCode = (languageCode: string) => {
+	return ISO_639_2_TERMINOLOGY_TO_BIBLIOGRAPHIC[languageCode] ?? languageCode;
+};
+
+/** Gives the ISO 639-2/T language code for the code in Matroska's Language element. */
+export const fromMatroskaLanguageCode = (code: string) => {
+	return ISO_639_2_BIBLIOGRAPHIC_TO_TERMINOLOGY[code] ?? code;
+};
+
 export const CODEC_STRING_MAP: Partial<Record<MediaCodec, string>> = {
 	'avc': 'V_MPEG4/ISO/AVC',
 	'hevc': 'V_MPEGH/ISO/HEVC',

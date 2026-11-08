@@ -2534,3 +2534,52 @@ test('Matroska LanguageBCP47 gives an ISO 639-2 language code', async () => {
 	// Control: Language alone
 	expect(await readLanguage(language('spa'))).toBe('spa');
 });
+
+test('Matroska Language with a bibliographic ISO 639-2 code gives the terminology code', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+
+	const readLanguage = async (language: string) => {
+		const bytes = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+					element(EBMLId.Language, ascii(language)),
+					element(EBMLId.Audio, element(EBMLId.BitDepth, [16])),
+				)),
+				element(
+					EBMLId.Cluster,
+					element(EBMLId.Timestamp, [0]),
+					element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 0, 0]),
+				),
+			),
+		]);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return (await input.getTracks())[0]!.getLanguageCode();
+	};
+
+	// RFC 9559, section 12: the element holds the bibliographic code, while languageCode is ISO 639-2/T (as in MP4)
+	expect(await readLanguage('ger')).toBe('deu');
+	expect(await readLanguage('fre')).toBe('fra');
+	expect(await readLanguage('chi')).toBe('zho');
+	expect(await readLanguage('scc')).toBe('srp'); // Withdrawn in 2008
+	// Terminology codes (FFmpeg writes what it's given) and codes without a variant stay as they are
+	expect(await readLanguage('deu')).toBe('deu');
+	expect(await readLanguage('eng')).toBe('eng');
+});
