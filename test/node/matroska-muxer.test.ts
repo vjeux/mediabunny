@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -209,3 +209,49 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('A VP9 track keeps the level its CodecPrivate gives', async () => {
+	// The uncompressed header of a 160x120 VP9 key frame (profile 0, 8-bit, BT.709)
+	const bits: number[] = [];
+	const push = (value: number, count: number) => {
+		for (let i = count - 1; i >= 0; i--) {
+			bits.push((value >> i) & 1);
+		}
+	};
+	push(2, 2); // Frame marker
+	push(0, 2); // Profile 0
+	push(0, 1); // show_existing_frame
+	push(0, 1); // Key frame
+	push(1, 1); // show_frame
+	push(0, 1); // error_resilient_mode
+	push(0x498342, 24); // Sync code
+	push(2, 3); // Color space BT.709
+	push(0, 1); // Limited range
+	push(159, 16); // Width - 1
+	push(119, 16); // Height - 1
+	const keyFrame = new Uint8Array(16);
+	for (const [i, bit] of bits.entries()) {
+		keyFrame[i >> 3] = keyFrame[i >> 3]! | (bit << (7 - (i & 7)));
+	}
+
+	const writeAndRead = async (codec: string) => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		const decoderConfig = { codec, codedWidth: 160, codedHeight: 120 };
+		await source.add(new EncodedPacket(keyFrame, 'key', 0, 1 / 30), { decoderConfig });
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return (await track.getDecoderConfig())!.codec;
+	};
+
+	// The frame size alone means level 1 (10), but an encoder can pick a higher level for its bitrate (level 1.1 here),
+	// which the codec string and so CodecPrivate hold
+	expect(await writeAndRead('vp09.00.11.08')).toBe('vp09.00.11.08');
+	// Control
+	expect(await writeAndRead('vp09.00.10.08')).toBe('vp09.00.10.08');
+});

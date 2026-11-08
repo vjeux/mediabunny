@@ -28,6 +28,7 @@ import {
 	PRORES_FOURCCS,
 	ProresFourCc,
 	VideoCodec,
+	VP9_LEVEL_TABLE,
 } from '../codec';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
@@ -261,6 +262,27 @@ type InternalTrack = {
 };
 type InternalVideoTrack = InternalTrack & { info: { type: 'video' } };
 type InternalAudioTrack = InternalTrack & { info: { type: 'audio' } };
+
+/**
+ * Reads the level from VP9's CodecPrivate (WebM's codec feature metadata: entries of an ID, a length and the value),
+ * if it holds a valid one.
+ */
+const getVp9LevelFromCodecPrivate = (codecPrivate: Uint8Array | null) => {
+	if (!codecPrivate) {
+		return null;
+	}
+
+	for (let i = 0; i + 2 <= codecPrivate.length; i += 2 + codecPrivate[i + 1]!) {
+		const id = codecPrivate[i]!;
+		const length = codecPrivate[i + 1]!;
+		if (id === 2 && length === 1 && i + 2 < codecPrivate.length) { // Level
+			const level = codecPrivate[i + 2]!;
+			return VP9_LEVEL_TABLE.some(x => x.level === level) ? level : null;
+		}
+	}
+
+	return null;
+};
 
 const METADATA_ELEMENTS = [
 	{ id: EBMLId.SeekHead, flag: 'seekHeadSeen' },
@@ -2707,6 +2729,18 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 		return 'video' as const;
 	}
 
+	private getVp9CodecInfo(firstPacket: EncodedPacket) {
+		const codecInfo = extractVp9CodecInfoFromPacket(firstPacket.data);
+		if (!codecInfo) {
+			return null;
+		}
+
+		// The frame only gives a level from its size; the writer may have picked a higher one (for its bitrate, for
+		// example), which CodecPrivate holds
+		const level = getVp9LevelFromCodecPrivate(this.internalTrack.codecPrivate);
+		return level !== null ? { ...codecInfo, level } : codecInfo;
+	}
+
 	override getCodec(): VideoCodec | null {
 		return this.internalTrack.info.codec;
 	}
@@ -2796,7 +2830,7 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 					? extractHevcDecoderConfigurationRecord(firstPacket.data)
 					: null,
 				vp9CodecInfo: this.internalTrack.info.codec === 'vp9' && firstPacket
-					? extractVp9CodecInfoFromPacket(firstPacket.data)
+					? this.getVp9CodecInfo(firstPacket)
 					: null,
 				av1CodecInfo: this.internalTrack.info.codec === 'av1' && firstPacket
 					? extractAv1CodecInfoFromPacket(firstPacket.data)
