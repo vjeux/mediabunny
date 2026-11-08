@@ -1153,3 +1153,46 @@ test('Fragmented MP4 does not keep the samples of fragments it already wrote', a
 	expect((await sink.getKeyPacket(50.5, { metadataOnly: true }))?.timestamp).toBe(50);
 	expect((await sink.getPacket(Infinity, { metadataOnly: true }))?.timestamp).toBeCloseTo(2999 / 30);
 });
+
+test('VP9 and AV1 codec strings whose fields do not fit vpcC or av1C are rejected', async () => {
+	const addFirstPacket = async (codec: string) => {
+		const target = new BufferTarget();
+		const output = new Output({ target, format: new Mp4OutputFormat() });
+		const source = new EncodedVideoPacketSource(codec.startsWith('av01') ? 'av1' : 'vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(8), 'key', 0, 1), {
+			decoderConfig: { codec, codedWidth: 64, codedHeight: 64 },
+		});
+		await output.finalize();
+		return new Uint8Array(target.buffer!);
+	};
+
+	// These used to be written as-is, e.g. level 40 went into av1C as seq_profile 1, seq_level_idx 8, and a VP9 bit
+	// depth of 16 became 0 in the 4-bit vpcC field
+	for (const codec of [
+		'vp09.04.10.08', // Profile
+		'vp09.00.13.08', // Level
+		'vp09.00.10.16', // Bit depth
+		'vp09.00.10.08.04.01.01.01.00', // Chroma subsampling
+		'vp09.00.10.08.01.01.01.01.02', // Full range flag
+		'av01.3.04M.08', // Profile
+		'av01.0.40M.08', // Level
+		'av01.0.04M.16', // Bit depth
+		'av01.0.04M.08.2.110.01.01.01.0', // Monochrome
+		'av01.0.04M.08.0.120.01.01.01.0', // Chroma subsampling
+		'av01.0.04M.08.0.101.01.01.01.0', // Chroma sample position without 4:2:0
+		'av01.0.04M.08.0.110.01.01.01.2', // Full range flag
+	]) {
+		await expect(addFirstPacket(codec), codec).rejects.toThrow(TypeError);
+	}
+
+	for (const codec of ['vp09.00.00.08', 'vp09.03.62.12.03.09.16.09.01', 'av01.2.31H.12.1.113.09.16.09.1']) {
+		const bytes = await addFirstPacket(codec);
+		expect(bytes.byteLength, codec).toBeGreaterThan(0);
+	}
+
+	const av1c = await addFirstPacket('av01.0.31M.10.0.112.09.16.09.0');
+	const av1cOffset = Buffer.from(av1c).indexOf('av1C') + 4;
+	expect([...av1c.subarray(av1cOffset, av1cOffset + 3)]).toEqual([0x81, 0x1f, 0x4e]); // Profile 0, level 31, 10-bit
+});
