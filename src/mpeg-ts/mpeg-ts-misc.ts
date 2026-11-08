@@ -71,7 +71,6 @@ export const findTsPacketLayout = (bytes: Uint8Array): TsPacketLayout | null => 
 
 export type TimestampWrapInfo = {
 	reference: number;
-	offset: number;
 };
 
 export const enum MpegTsStreamType {
@@ -114,23 +113,15 @@ export const secondsToMpegTsTimestamp = (seconds: number) => {
 export const createTimestampWrapInfo = (firstTimestamp: number): TimestampWrapInfo => {
 	const tolerance = 60 * MPEG_TS_TIMESCALE;
 	return {
-		reference: firstTimestamp - tolerance,
-		offset: firstTimestamp >= TIMESTAMP_MODULUS - tolerance
-			? -TIMESTAMP_MODULUS // Timestamps close to the modulus are treated as negative
-			: TIMESTAMP_MODULUS,
+		reference: firstTimestamp >= TIMESTAMP_MODULUS - tolerance
+			? firstTimestamp - tolerance - TIMESTAMP_MODULUS // Timestamps close to the modulus are treated as negative
+			: firstTimestamp - tolerance,
 	};
 };
 
 export const normalizeWrappedTimestamp = (timestamp: number, wrapInfo: TimestampWrapInfo) => {
-	const { reference, offset } = wrapInfo;
-	if (
-		(offset < 0 && timestamp >= reference)
-		|| (offset > 0 && timestamp < reference)
-	) {
-		return timestamp + offset;
-	}
-
-	return timestamp;
+	// Every timestamp is mapped into the modulus-wide window starting a bit below the first timestamp
+	return wrapInfo.reference + modEuclid(timestamp - wrapInfo.reference, TIMESTAMP_MODULUS);
 };
 
 // CRC-32 for MPEG-TS (polynomial 0x04C11DB7, initial value 0xFFFFFFFF)
