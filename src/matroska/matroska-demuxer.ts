@@ -244,6 +244,7 @@ type InternalTrack = {
 	codecDelayNs: number;
 	/** Converts the track's Track Ticks (block timestamps, BlockDuration) into Segment Ticks. */
 	trackTimestampScale: number;
+	seekPreRollNs: number;
 	name: string | null;
 	languageCode: string;
 	hasLanguageBcp47: boolean;
@@ -1677,6 +1678,7 @@ export class MatroskaDemuxer extends Demuxer {
 					codecDelay: 0,
 					codecDelayNs: 0,
 					trackTimestampScale: 1,
+					seekPreRollNs: 0,
 					name: null,
 					languageCode: 'eng', // The default in Matroska
 					hasLanguageBcp47: false,
@@ -2012,6 +2014,14 @@ export class MatroskaDemuxer extends Demuxer {
 				if (Number.isFinite(value) && value > 0) {
 					this.currentTrack.trackTimestampScale = value;
 				}
+			}; break;
+
+			case EBMLId.SeekPreRoll: {
+				if (!this.currentTrack) {
+					break;
+				}
+
+				this.currentTrack.seekPreRollNs = readUnsignedInt(slice, size);
 			}; break;
 
 			case EBMLId.Name: {
@@ -3686,6 +3696,11 @@ class MatroskaAudioTrackBacking extends MatroskaTrackBacking implements InputAud
 
 	getSampleRate() {
 		return this.internalTrack.info.sampleRate;
+	}
+
+	getContainerPreRollDuration() {
+		// SeekPreRoll: what the decoder must decode after a discontinuity before its output is valid
+		return this.internalTrack.seekPreRollNs / 1e9;
 	}
 
 	async getDecoderConfig(): Promise<AudioDecoderConfig | null> {
