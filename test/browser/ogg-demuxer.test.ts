@@ -377,9 +377,14 @@ test('reads a chain whose longer second link reuses the first link\'s serial num
 	const iteratedFirst = await readPackets(new BufferSource(file));
 	expect(iteratedFirst.packets).toHaveLength(20);
 
+	// Also when several lookups start at once on a fresh input
 	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
 	const track = (await input.getPrimaryAudioTrack())!;
-	expect(await track.computeDuration()).toBe(iteratedFirst.duration);
-	const lastPacket = await new EncodedPacketSink(track).getPacket(Infinity);
+	const [duration, otherDuration, lastPacket] = await Promise.all([
+		track.computeDuration(),
+		track.computeDuration(),
+		new EncodedPacketSink(track).getPacket(Infinity),
+	]);
+	expect([duration, otherDuration]).toEqual([iteratedFirst.duration, iteratedFirst.duration]);
 	expect(lastPacket?.timestamp).toBe(iteratedFirst.packets[19]!.timestamp);
 });

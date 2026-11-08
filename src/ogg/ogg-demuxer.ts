@@ -559,8 +559,10 @@ type OggLink = {
 	/** For Vorbis, the block size of the packet that precedes the link's first packet in the track. */
 	initialVorbisLastBlocksize: number | null;
 	/**
-	 * Where the link's last page ends, once known from reading on from the link's start. A lookup's bisection can't
-	 * tell, as it can land on a later link that reuses the serial number (which RFC 3533 forbids, but `cat` makes).
+	 * Where the link's last page ends, if known before any lookup: for a later link, where its intact part ends; for
+	 * the first, if it's short (see `getPacketInLink`). It's never taken from where a lookup or iteration happened to
+	 * get to, as a later link may reuse the serial number (which RFC 3533 forbids, but `cat` makes), and then what
+	 * lookups return would depend on what ran before.
 	 */
 	endPos: number | null;
 	/** The links that follow the link if it ends at the given position. */
@@ -582,7 +584,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	sequentialScanCache: EncodedPacketMetadata[] = [];
 	sequentialScanMutex = new AsyncMutex();
 	firstLinkPromise: Promise<OggLink> | null = null;
-	triedFindingFirstLinkEnd = false;
+	firstLinkEndSearch: Promise<void> | null = null;
 	warnedAboutIncompatibleLink = false;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
@@ -814,19 +816,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 	/**
 	 * Returns the link that follows the given one, if the file continues with a link that this track can continue
-	 * into. `end` is where the given link ends, which was reached by reading on from the link's start if
-	 * `isSequential`.
+	 * into. `end` is where the given link ends.
 	 */
-	getNextLink(
-		link: OggLink,
-		end: { lastPage: Page; timestampInSamples: number; vorbisBlockSize: number | null },
-		isSequential: boolean,
-	) {
+	getNextLink(link: OggLink, end: { lastPage: Page; timestampInSamples: number; vorbisBlockSize: number | null }) {
 		const endPos = end.lastPage.headerStartPos + end.lastPage.totalSize;
-		if (isSequential) {
-			link.endPos ??= endPos;
-		}
-
 		let nextPromise = link.nextLinks.get(endPos);
 		if (nextPromise) {
 			return nextPromise;
@@ -963,7 +956,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				lastPage: prevMetadata.packet.endPage,
 				timestampInSamples,
 				vorbisBlockSize: prevMetadata.vorbisBlockSize,
-			}, true);
+			});
 			if (!nextLink) {
 				return null;
 			}
@@ -1043,7 +1036,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				lastPage: metadata.packet.endPage,
 				timestampInSamples: metadata.timestampInSamples + metadata.durationInSamples,
 				vorbisBlockSize: metadata.vorbisBlockSize,
-			}, false);
+			});
 			if (!nextLink || timestampInSamples < nextLink.firstTimestampInSamples) {
 				return packet;
 			}
@@ -1057,7 +1050,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	 * Reads on from the link's first packet like iteration does, and returns where its last packet's page ends, or null
 	 * if the link goes on past `maxEndPos`.
 	 */
-	async findLinkEndSequentially(link: OggLink, maxEndPos = Infinity) {
+	async findLinkEndSequentially(link: OggLink, maxEndPos: number) {
 		assert(link.bitstream.lastMetadataPacket);
 		let position = await this.demuxer.findNextPacketStart(link.bitstream.lastMetadataPacket);
 		let lastPage = link.bitstream.lastMetadataPacket.endPage;
@@ -1080,11 +1073,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	/** Finds the last packet of the given link with a timestamp less than or equal to the given one. */
-	async getPacketInLink(
-		link: OggLink,
-		timestampInSamples: number,
-		options: PacketRetrievalOptions,
-	): Promise<EncodedPacket | null> {
+	async getPacketInLink(link: OggLink, timestampInSamples: number, options: PacketRetrievalOptions) {
 		assert(this.demuxer.reader.fileSize !== null);
 		const firstTimestampInSamples = link.firstTimestampInSamples;
 
@@ -1094,15 +1083,17 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return null;
 		}
 
-		if (link.bitstream === this.bitstream && !this.triedFindingFirstLinkEnd) {
+		if (link.bitstream === this.bitstream) {
 			// A later link may reuse our serial number (RFC 3533 forbids that, but concatenating files does it), and
 			// the bisection can't tell its pages from our link's. So let's try to find our link's end by reading on
-			// from its start like iteration does, which is cheap for a short link like an intro or a jingle.
-			this.triedFindingFirstLinkEnd = true;
-			link.endPos ??= await this.findLinkEndSequentially(
-				link,
-				startPosition.startPage.headerStartPos + FIRST_LINK_SCAN_SIZE,
-			);
+			// from its start like iteration does, which is cheap for a short link like an intro or a jingle. All
+			// lookups wait for this, so that they all search the same range.
+			await (this.firstLinkEndSearch ??= (async () => {
+				link.endPos ??= await this.findLinkEndSequentially(
+					link,
+					startPosition.startPage.headerStartPos + FIRST_LINK_SCAN_SIZE,
+				);
+			})());
 		}
 
 		let lowPage = startPosition.startPage;
@@ -1165,14 +1156,6 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				// to a later chained link reusing the serial number (RFC 3533 forbids that, but concatenating a file
 				// with itself makes it), so our link ends before it
 				if ((page.headerType & 0x02) || page.sequenceNumber <= lowPage.sequenceNumber) {
-					if (link.endPos === null) {
-						// The bisection may already have landed on other pages of such a link, as they can't be told
-						// apart from our link's own, so let's find our link's end by reading on from its start like
-						// iteration does, and search again before it
-						link.endPos = await this.findLinkEndSequentially(link);
-						return this.getPacketInLink(link, timestampInSamples, options);
-					}
-
 					high = page.headerStartPos;
 					continue outer;
 				}
