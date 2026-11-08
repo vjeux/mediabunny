@@ -1796,7 +1796,17 @@ const addQuickTimeMetadataTagBoxes = (boxes: Box[], tags: MetadataTags) => {
 };
 
 const metadataTagStringBoxShort = (name: string, value: string) => {
-	const encoded = textEncoder.encode(value);
+	let encoded = textEncoder.encode(value);
+
+	if (encoded.length > 0xffff) {
+		// The length field is 16-bit, so keep as many whole UTF-8 characters as fit
+		let end = 0xffff;
+		while ((encoded[end]! & 0xc0) === 0x80) {
+			end--;
+		}
+
+		encoded = encoded.subarray(0, end);
+	}
 
 	return box(name, [
 		u16(encoded.length),
