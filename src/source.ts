@@ -1972,9 +1972,12 @@ export class ReadableStreamSource extends Source {
 			// Do cache eviction, based on the distance from the last-requested index. It's important that we do it like
 			// this and not based on how far we've pulled the stream, because if the stream supplies data faster than it
 			// is being requested, we'd unnecessarily evict data that we still might need.
+			// A request can also reach past the end of the stream, though, so never measure from further than what has
+			// been pulled: otherwise, every chunk would be evicted as it arrives, and the cache would end up empty.
+			const evictionReference = Math.min(this._maxRequestedIndex, endIndex);
 			while (this._cache.length > 0) {
 				const firstEntry = this._cache[0]!;
-				const distance = this._maxRequestedIndex - firstEntry.end;
+				const distance = evictionReference - firstEntry.end;
 
 				if (distance <= this._maxCacheSize) {
 					break;
