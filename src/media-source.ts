@@ -3996,7 +3996,11 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 			this._scriptProcessorNode = this._audioContext.createScriptProcessor(4096);
 
 			if (this._audioContext.state === 'suspended') {
-				await this._audioContext.resume();
+				// A context that isn't allowed to start yet (as long as the page hasn't had a user gesture) only
+				// resolves this once it is, so don't wait for it: the audio comes in once the context runs. Waiting
+				// would keep the output from ever starting, and from being canceled or finalized, since those wait
+				// for the start.
+				this._audioContext.resume().catch(() => {});
 			}
 
 			sourceNode.connect(this._scriptProcessorNode);
