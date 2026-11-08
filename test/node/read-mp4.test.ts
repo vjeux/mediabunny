@@ -1687,3 +1687,70 @@ test('Pattern encryption whose last pattern ends inside the encrypted blocks', a
 		expect([...packet!.data]).toEqual(plaintext);
 	}
 });
+
+test('cbcs subsamples with the pattern 0:0 have all their complete blocks encrypted', async () => {
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const key = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+	const iv = Buffer.from('a0a1a2a3a4a5a6a7a8a9aaabacadaeaf', 'hex');
+	const keyId = zeros(16).map((_, i) => 0x10 + i);
+
+	// Two subsamples (5 clear + 100 protected, 3 clear + 40 protected); the CBC chain restarts at each one and
+	// trailing partial blocks stay clear
+	const plaintext = Array.from({ length: 148 }, (_, i) => (i * 7) & 0xff);
+	const ciphertext = [...plaintext];
+	for (const [offset, length] of [[5, 96], [108, 32]]) {
+		const cipher = createCipheriv('aes-128-cbc', key, iv).setAutoPadding(false);
+		ciphertext.splice(offset!, length!, ...cipher.update(Buffer.from(plaintext.slice(offset, offset! + length!))));
+	}
+
+	const tenc = box('tenc', [1, 0, 0, 0], [0, 0x00, 1, 0], keyId, [16, ...iv]);
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), box('sinf', box('frma', ascii('avc1')),
+		box('schm', zeros(4), ascii('cbcs'), u32(0x10000)), box('schi', tenc)));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const senc = box('senc', u32(2), u32(1), u16(2), u16(5), u32(100), u16(3), u32(40));
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(ciphertext.length)),
+		senc,
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', ciphertext),
+		])),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => key } },
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	expect([...packet!.data]).toEqual(plaintext);
+});
