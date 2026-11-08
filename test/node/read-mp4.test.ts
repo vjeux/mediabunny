@@ -205,6 +205,44 @@ test('PCM track with stsc not starting at the first chunk', async () => {
 	expect(packetCount).toBe(3);
 });
 
+test('Key frames of H.264 with several NAL units under one length (Android temporal layers)', async () => {
+	// Android's MPEG4Writer only turns the first start code of a frame into a length, so each frame of temporally
+	// layered video (as recorded by Samsung's slow motion modes) is an SVC prefix NAL unit, a start code and the slice,
+	// all under one length
+	const u32 = (value: number) => [value >>> 24, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+	// The avcC of ffmpeg -f lavfi -i testsrc2=size=1920x1080 -frames:v 1 -c:v libx264 -profile:v high out.mp4
+	const avcC = new Uint8Array('01640028ffe1001b67640028acd940780227e5c044000003000400000300c83c60c658010006'
+		.concat('68ebe3cb22c0fdf8f800').match(/../g)!.map(x => parseInt(x, 16)));
+	const prefixNalUnit = [0x6e, 0xc0, 0x80, 0x0f]; // nal_unit_type 14, as in the Samsung files
+	const idrSlice = [0x65, 0x88, 0x84, 0x00, 0x33, 0xff]; // nal_unit_type 5
+	const nonIdrSlice = [0x41, 0x9a, 0x02, 0x04, 0x11, 0xff]; // nal_unit_type 1
+
+	const layouts = [
+		(slice: number[]) => [...u32(8 + slice.length), ...prefixNalUnit, 0, 0, 0, 1, ...slice], // Android's
+		(slice: number[]) => [...u32(4), ...prefixNalUnit, ...u32(slice.length), ...slice], // One length per NAL unit
+	];
+
+	for (const frame of layouts) {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(frame(idrSlice)), 'key', 0, 1 / 30), {
+			decoderConfig: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080, description: avcC },
+		});
+		await source.add(new EncodedPacket(new Uint8Array(frame(nonIdrSlice)), 'delta', 1 / 30, 1 / 30));
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const sink = new EncodedPacketSink(track);
+
+		expect(await track.determinePacketType((await sink.getFirstPacket())!)).toBe('key');
+		expect(await track.determinePacketType((await sink.getPacket(1 / 30))!)).toBe('delta');
+		expect((await sink.getFirstKeyPacket({ verifyKeyPackets: true }))?.timestamp).toBe(0);
+	}
+});
+
 test('Missing tfdt and tfra entries referencing non-first samples', async () => {
 	// See https://github.com/Vanilagy/mediabunny/issues/578
 	const filePath = path.join(__dirname, '..', 'public/missing-tfdt.mp4');
