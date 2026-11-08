@@ -4,7 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { BufferSource, ReadableStreamSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { assert } from '../../src/misc.js';
@@ -111,4 +111,26 @@ test('An MP3 larger than the cache reads from a server that ignores range reques
 		Logging.level = previousLevel;
 		server.close();
 	}
+});
+
+test('An MP3 streamed with its last frame cut off counts only its complete frames', async () => {
+	// 400 frames (MPEG-1 Layer III, 128 kbps, 44.1 kHz), the last one 100 bytes short. Its header shows before the end
+	// of a source of unknown size does, so only reading all of the frame tells that it's cut off.
+	const bytes = new Uint8Array(400 * 417 - 100);
+	for (let i = 0; i < 400; i++) {
+		bytes.set([0xff, 0xfb, 0x90, 0x04], i * 417);
+	}
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (let offset = 0; offset < bytes.length; offset += 4096) {
+				controller.enqueue(bytes.slice(offset, offset + 4096));
+			}
+			controller.close();
+		},
+	});
+
+	using input = new Input({ source: new ReadableStreamSource(stream), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.computeDuration()).toBe(399 * 1152 / 44100);
 });

@@ -288,6 +288,17 @@ export class Mp3Demuxer extends Demuxer {
 				&& header.layer === ref.layer
 				&& getMp3ChannelCount(header.channel) === getMp3ChannelCount(ref.channel)
 			) {
+				if (this.reader.fileSize === null) {
+					// Without a known size, a frame cut off by the end of the file only shows when reading all of it
+					let frameSlice = this.reader.requestSlice(startPos, header.totalSize);
+					if (isThenable(frameSlice)) {
+						frameSlice = await frameSlice;
+					}
+					if (!frameSlice) {
+						return null;
+					}
+				}
+
 				return { header, startPos };
 			}
 		}
