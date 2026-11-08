@@ -1,6 +1,6 @@
 import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource, UrlSource, CustomSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers, clamp } from '../../src/misc.js';
 import {
@@ -1494,4 +1494,125 @@ test('Frame lookups at the live edge of a stream return without waiting for it t
 		expect(sample?.timestamp, `frame at ${timestamp}`).toBe(timestamp);
 		sample?.close();
 	}
+});
+
+test('Canvas iterators end on return() while a next() is still pending', async () => {
+	const settles = (promise: Promise<unknown>) => Promise.race([
+		promise.then(() => true, () => true),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1000)),
+	]);
+
+	// Timestamps that arrive on demand (from scrubbing, for example): two come in, then none for now
+	const timestampsThenStall = async function* () {
+		yield 0.5;
+		yield 1;
+		await new Promise(() => {});
+	};
+
+	{
+		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const canvases = new CanvasSink(track).canvasesAtTimestamps(timestampsThenStall());
+		await canvases.next();
+		const pendingNext = canvases.next(); // Waits for the next timestamp
+
+		// Async generator functions queued return() behind the pending next(), so neither ever settled and the decoder
+		// was never freed (found by lane L70)
+		expect(await settles(canvases.return())).toBe(true);
+		expect(await settles(pendingNext)).toBe(true);
+	}
+
+	// The same with canvases(), over a source whose second half never arrives (a stalled connection, for example)
+	const bytes = new Uint8Array(await (await fetch('/video.mp4')).arrayBuffer());
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => bytes.byteLength,
+			read: (start, end) => start < bytes.byteLength / 2 ? bytes.slice(start, end) : new Promise(() => {}),
+		}),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new CanvasSink(track);
+
+	const canvases = sink.canvases();
+	let pendingNext = canvases.next();
+	let canvasCount = 0;
+	while (await settles(pendingNext)) {
+		canvasCount++;
+		pendingNext = canvases.next();
+	}
+	expect(canvasCount).toBeGreaterThan(1);
+
+	expect(await settles(canvases.return())).toBe(true);
+	expect(await settles(pendingNext)).toBe(true);
+
+	if (typeof Symbol.asyncDispose === 'symbol') {
+		// Like async generators, the iterators can be declared with `await using`
+		const disposableCanvases = sink.canvases() as AsyncGenerator<unknown> & AsyncDisposable;
+		await disposableCanvases[Symbol.asyncDispose]();
+		expect(await disposableCanvases.next()).toEqual({ value: undefined, done: true });
+	}
+});
+
+test('Canvas iterators open no decoder until they are iterated', async () => {
+	// Counts the WebCodecs decoders and decoded frames that are open
+	const countOpen = async (run: (sink: CanvasSink) => Promise<void>) => {
+		let openDecoders = 0;
+		const frames: VideoFrame[] = [];
+		const OriginalVideoDecoder = globalThis.VideoDecoder;
+		globalThis.VideoDecoder = class extends OriginalVideoDecoder {
+			constructor(init: VideoDecoderInit) {
+				super({
+					...init,
+					output: (frame) => {
+						frames.push(frame);
+						init.output(frame);
+					},
+				});
+				openDecoders++;
+			}
+
+			override close() {
+				if (this.state !== 'closed') {
+					openDecoders--;
+				}
+				super.close();
+			}
+		};
+
+		try {
+			using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			await run(new CanvasSink(track));
+			await new Promise(resolve => setTimeout(resolve, 500));
+
+			// A closed frame has no format anymore
+			return { openDecoders, openFrames: frames.filter(frame => frame.format !== null).length };
+		} finally {
+			globalThis.VideoDecoder = OriginalVideoDecoder;
+		}
+	};
+
+	// An iterator created up front and pulled from on demand, for example (found by lane L46)
+	expect(await countOpen(async (sink) => {
+		void sink.canvases();
+		void sink.canvasesAtTimestamps([0.5, 1]);
+	})).toEqual({ openDecoders: 0, openFrames: 0 });
+
+	expect(await countOpen(async (sink) => {
+		const canvases = sink.canvases();
+		await canvases.next();
+		await canvases.return();
+		expect(await canvases.next()).toEqual({ value: undefined, done: true });
+	})).toEqual({ openDecoders: 0, openFrames: 0 });
+
+	expect(await countOpen(async (sink) => {
+		const canvases = sink.canvases();
+		await canvases.next();
+		await expect(canvases.throw(new Error('Stop'))).rejects.toThrow('Stop');
+	})).toEqual({ openDecoders: 0, openFrames: 0 });
 });
