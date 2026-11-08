@@ -1202,6 +1202,12 @@ let splitterWorkerUrl: string | null = null;
 /** Utility class for splitting a composite frame into separate color and alpha parts on the CPU in a worker. */
 export class ColorAlphaSplitter {
 	private worker: Worker | null = null;
+	/** Whether the worker started, which it may not (like under a CSP that forbids blob: workers). */
+	private workerStarted: Promise<boolean> | null = null;
+	private resolveWorkerStarted: ((started: boolean) => void) | null = null;
+	/** Runs the worker's code on this thread, for when the worker can't start. */
+	private localSplitter: ((request: ColorAlphaSplitterWorkerRequest) => void) | null = null;
+	private closed = false;
 	private pendingRequests = new Map<
 		number,
 		ReturnType<typeof promiseWithResolvers<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }>>
@@ -1209,8 +1215,36 @@ export class ColorAlphaSplitter {
 
 	private nextRequestId = 0;
 
-	split(sourceFrame: VideoFrame): Promise<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }> {
-		if (!this.worker) {
+	async split(sourceFrame: VideoFrame): Promise<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }> {
+		// A frame transferred to a worker that never starts would be lost, so wait until it has
+		this.workerStarted ??= this.startWorker();
+		const workerStarted = await this.workerStarted;
+
+		if (this.closed) {
+			sourceFrame.close();
+			throw new Error('Color/alpha splitter closed.');
+		}
+
+		const id = this.nextRequestId++;
+		const pending = promiseWithResolvers<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }>();
+		this.pendingRequests.set(id, pending);
+
+		if (workerStarted) {
+			assert(this.worker);
+			this.worker.postMessage({ id, sourceFrame }, { transfer: [sourceFrame] });
+		} else {
+			this.localSplitter ??= this.createLocalSplitter();
+			this.localSplitter({ id, sourceFrame });
+		}
+
+		return pending.promise;
+	}
+
+	private startWorker() {
+		const { promise, resolve } = promiseWithResolvers<boolean>();
+		this.resolveWorkerStarted = resolve;
+
+		try {
 			if (!splitterWorkerUrl) {
 				const blob = new Blob(
 					[`(${colorAlphaSplitterWorkerCode.toString()})()`],
@@ -1220,42 +1254,78 @@ export class ColorAlphaSplitter {
 			}
 
 			this.worker = new Worker(splitterWorkerUrl);
-
-			this.worker.addEventListener('message', (event: MessageEvent<ColorAlphaSplitterWorkerResponse>) => {
-				const data = event.data;
-				const pending = this.pendingRequests.get(data.id);
-				if (!pending) {
-					return;
-				}
-				this.pendingRequests.delete(data.id);
-
-				if ('error' in data) {
-					pending.reject(new Error(data.error));
-				} else {
-					pending.resolve({ colorFrame: data.colorFrame, alphaFrame: data.alphaFrame });
-				}
-			});
-
-			this.worker.addEventListener('error', (event) => {
-				const error = new Error(event.message || 'Color/alpha splitter worker error.');
-				for (const pending of this.pendingRequests.values()) {
-					pending.reject(error);
-				}
-				this.pendingRequests.clear();
-			});
+		} catch {
+			resolve(false);
+			return promise;
 		}
 
-		const id = this.nextRequestId++;
-		const pending = promiseWithResolvers<{ colorFrame: VideoFrame; alphaFrame: VideoFrame }>();
-		this.pendingRequests.set(id, pending);
-		this.worker.postMessage({ id, sourceFrame }, { transfer: [sourceFrame] });
+		let started = false;
+		this.worker.addEventListener('message', (event: MessageEvent<ColorAlphaSplitterWorkerMessage>) => {
+			if ('started' in event.data) {
+				started = true;
+				resolve(true);
+			} else {
+				this.handleResponse(event.data);
+			}
+		});
 
-		return pending.promise;
+		this.worker.addEventListener('error', (event) => {
+			if (!started) {
+				// It never ran (nothing was sent to it yet), so the splitting happens on this thread instead
+				this.worker?.terminate();
+				this.worker = null;
+				resolve(false);
+				return;
+			}
+
+			const error = new Error(event.message || 'Color/alpha splitter worker error.');
+			for (const pending of this.pendingRequests.values()) {
+				pending.reject(error);
+			}
+			this.pendingRequests.clear();
+		});
+
+		return promise;
+	}
+
+	private createLocalSplitter() {
+		let listener: ((event: MessageEvent<ColorAlphaSplitterWorkerRequest>) => void) | null = null;
+		colorAlphaSplitterWorkerCode({
+			addEventListener: (type, newListener) => {
+				listener = newListener;
+			},
+			postMessage: (message) => {
+				if (!('started' in message)) {
+					this.handleResponse(message);
+				}
+			},
+		});
+
+		return (request: ColorAlphaSplitterWorkerRequest) => {
+			assert(listener);
+			listener({ data: request } as MessageEvent<ColorAlphaSplitterWorkerRequest>);
+		};
+	}
+
+	private handleResponse(data: ColorAlphaSplitterWorkerResponse) {
+		const pending = this.pendingRequests.get(data.id);
+		if (!pending) {
+			return;
+		}
+		this.pendingRequests.delete(data.id);
+
+		if ('error' in data) {
+			pending.reject(new Error(data.error));
+		} else {
+			pending.resolve({ colorFrame: data.colorFrame, alphaFrame: data.alphaFrame });
+		}
 	}
 
 	close() {
+		this.closed = true;
 		this.worker?.terminate();
 		this.worker = null;
+		this.resolveWorkerStarted?.(false);
 
 		const error = new Error('Color/alpha splitter closed.');
 		for (const pending of this.pendingRequests.values()) {
@@ -1274,25 +1344,37 @@ type ColorAlphaSplitterWorkerResponse =
 	| { id: number; colorFrame: VideoFrame; alphaFrame: VideoFrame }
 	| { id: number; error: string };
 
-const colorAlphaSplitterWorkerCode = () => {
+type ColorAlphaSplitterWorkerMessage = ColorAlphaSplitterWorkerResponse | { started: true };
+
+/** What the splitter code needs of its worker scope, so that it can also run on the calling thread. */
+type ColorAlphaSplitterScope = {
+	addEventListener: (
+		type: 'message',
+		listener: (event: MessageEvent<ColorAlphaSplitterWorkerRequest>) => void,
+	) => void;
+	postMessage: (message: ColorAlphaSplitterWorkerMessage, options?: { transfer: Transferable[] }) => void;
+};
+
+const colorAlphaSplitterWorkerCode = (scope = self as unknown as ColorAlphaSplitterScope) => {
 	// Reused across frames as long as the size matches, since consecutive frames usually share dimensions.
 	let cpuSourceBuffer: Uint8Array | null = null;
 
 	// Serialize execution internally so concurrent requests don't race on the shared cpuSourceBuffer.
 	let chain: Promise<void> = Promise.resolve();
-	self.addEventListener('message', (event: MessageEvent<ColorAlphaSplitterWorkerRequest>) => {
+	scope.addEventListener('message', (event: MessageEvent<ColorAlphaSplitterWorkerRequest>) => {
 		const { id, sourceFrame } = event.data;
 		chain = chain.then(async () => {
 			try {
 				const { colorFrame, alphaFrame } = await split(sourceFrame);
-				self.postMessage({ id, colorFrame, alphaFrame }, { transfer: [colorFrame, alphaFrame] });
+				scope.postMessage({ id, colorFrame, alphaFrame }, { transfer: [colorFrame, alphaFrame] });
 			} catch (error) {
-				self.postMessage({ id, error: (error as Error).message });
+				scope.postMessage({ id, error: (error as Error).message });
 			} finally {
 				sourceFrame.close();
 			}
 		});
 	});
+	scope.postMessage({ started: true }); // Tells the splitter that frames can be sent
 
 	const split = async (sourceFrame: VideoFrame) => {
 		const format = sourceFrame.format as VideoSamplePixelFormat | null;
