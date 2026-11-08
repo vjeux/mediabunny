@@ -1106,3 +1106,45 @@ test('VideoSampleSource, cancel() while finalizing gets out of an encoder setup 
 		stuckInitEncoderActive = false;
 	}
 });
+
+test('VideoSampleSource, finished adds leave no waits behind', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				await new Promise(resolve => setTimeout(resolve, 1));
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+	// Each add waits for its turn and for the process function, either of which canceling cuts short
+	const waits = (videoSource as unknown as { _encoder: { releasableWaits: { size: number } } })._encoder
+		.releasableWaits;
+
+	const frame = (i: number) => new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: i / 30,
+		duration: 1 / 30,
+	});
+	for (let i = 0; i < 60; i++) {
+		await videoSource.add(frame(i));
+	}
+	expect(waits.size).toBe(0);
+
+	// Adds not awaited one by one: at most one wait per add going on (its turn or its process call)
+	const adds = Array.from({ length: 30 }, (_, i) => videoSource.add(frame(60 + i)));
+	expect(waits.size).toBeLessThanOrEqual(30);
+	await Promise.all(adds);
+	expect(waits.size).toBe(0);
+
+	await output.finalize();
+});
