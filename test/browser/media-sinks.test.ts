@@ -5,13 +5,13 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
-import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
-import { InputAudioTrack } from '../../src/input-track.js';
+import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { EncodedPacket } from '../../src/packet.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
@@ -363,4 +363,113 @@ test.for([
 		expect(expected).toContain(sample.timestamp);
 		break;
 	}
+});
+
+/** Whether the platform's decoder reports an error for a track's packets, decided with WebCodecs alone. */
+const nativeDecodingFails = async (track: InputVideoTrack | InputAudioTrack) => {
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+
+	let failed = false;
+	const onError = () => {
+		failed = true;
+	};
+	const decoder = track.isVideoTrack()
+		? new VideoDecoder({ output: frame => frame.close(), error: onError })
+		: new AudioDecoder({ output: data => data.close(), error: onError });
+	decoder.configure(decoderConfig as VideoDecoderConfig & AudioDecoderConfig);
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		if (decoder.state === 'closed') {
+			break;
+		}
+
+		if (decoder instanceof VideoDecoder) {
+			decoder.decode(packet.toEncodedVideoChunk());
+		} else {
+			decoder.decode(packet.toEncodedAudioChunk());
+		}
+	}
+	if (decoder.state !== 'closed') {
+		await decoder.flush().catch(onError);
+	}
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return failed;
+};
+
+test('A decoder failing on a frame before the last key frame still throws, instead of losing frames', async ({
+	skip,
+}) => {
+	// demo.mp4's first 53 frames in MPEG-TS (key frames at 0, 25 and 50), the frame 4 packets from the end, before
+	// the last key frame, cut to a third. The error surfaces as the decoder flushes, but decoding again from the last
+	// key frame must not count as recovering from it: the frames after the broken one would be lost unnoticed.
+	using mp4 = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+	const decoderConfig = await mp4Track.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	let index = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		const data = index === 49 ? packet.data.slice(0, Math.floor(packet.data.length / 3)) : packet.data;
+		await source.add(new EncodedPacket(data, packet.type, packet.timestamp, packet.duration), { decoderConfig });
+		if (++index === 53) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	skip(!(await nativeDecodingFails(track)), 'the decoder conceals the broken frame here');
+
+	const sink = new VideoSampleSink(track);
+	await expect((async () => {
+		for await (using sample of sink.samples()) {
+			void sample;
+		}
+	})()).rejects.toThrow();
+});
+
+test('Audio a decoder fails on still throws at the end', async ({ skip }) => {
+	// The first MP3 frames of a file with an invalid bitrate in their headers, in MP4. Audio decoders hold back no
+	// frames, so their failed flush has nothing to recover, and decoding again must not swallow its error.
+	using mp3 = new Input({ source: new UrlSource('/Toothsome-Meme.VBRv2.mp3'), formats: ALL_FORMATS });
+	const mp3Track = await mp3.getPrimaryAudioTrack();
+	assert(mp3Track);
+	const decoderConfig = await mp3Track.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('mp3');
+	output.addAudioTrack(source);
+	await output.start();
+	let index = 0;
+	for await (const packet of new EncodedPacketSink(mp3Track).packets()) {
+		const data = packet.data.slice();
+		data[2] = (data[2]! & 0x0f) | 0xf0; // Bitrate index 15, which is invalid
+		await source.add(new EncodedPacket(data, 'key', packet.timestamp, packet.duration), { decoderConfig });
+		if (++index === 3) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	skip(!(await nativeDecodingFails(track)), 'the decoder conceals the broken frames here');
+
+	await expect((async () => {
+		for await (using sample of new AudioSampleSink(track).samples()) {
+			void sample;
+		}
+	})()).rejects.toThrow();
 });
