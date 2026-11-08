@@ -489,8 +489,8 @@ export class Mp3InputFormat extends InputFormat {
 const WAVE_MPEG_AUDIO_FORMAT_TAGS = [0x0050, 0x0055];
 
 /** Reads the format tag in the "fmt " chunk of a WAVE file, or returns null if no such chunk precedes the data. */
-const readWaveFormatTag = async (input: Input, littleEndian: boolean) => {
-	let pos = 12;
+const readWaveFormatTag = async (input: Input, riffStart: number, littleEndian: boolean) => {
+	let pos = riffStart + 12;
 
 	// Few chunks come before the data, so looking at a bounded number of them is enough
 	for (let i = 0; i < 64; i++) {
@@ -530,7 +530,28 @@ const readWaveFormatTag = async (input: Input, littleEndian: boolean) => {
 export class WaveInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
-		let slice = input._reader.requestSlice(0, 12);
+		let currentPos = 0;
+
+		// Some taggers put ID3v2 tags in front of any file, even though they don't belong in RIFF. Skip them, like
+		// FFmpeg does.
+		while (true) {
+			let slice = input._reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				break;
+			}
+
+			const id3V2Header = readId3V2Header(slice);
+			if (!id3V2Header) {
+				break;
+			}
+
+			currentPos = slice.filePos + id3V2Header.size;
+		}
+
+		let slice = input._reader.requestSlice(currentPos, 12);
 		if (isThenable(slice)) slice = await slice;
 		if (!slice) return false;
 
@@ -548,7 +569,7 @@ export class WaveInputFormat extends InputFormat {
 
 		// MPEG audio in WAVE is left to the MP3 format, which reads the plain MPEG audio stream in the data chunk; the
 		// WAVE demuxer doesn't support it
-		const formatTag = await readWaveFormatTag(input, riffType !== 'RIFX');
+		const formatTag = await readWaveFormatTag(input, currentPos, riffType !== 'RIFX');
 		return formatTag === null || !WAVE_MPEG_AUDIO_FORMAT_TAGS.includes(formatTag);
 	}
 
