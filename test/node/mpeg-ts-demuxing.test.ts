@@ -4284,3 +4284,63 @@ test('MPEG-TS lookups at the end of a track whose last audio frame is cut off', 
 	using durationInput = new Input({ source: new BufferSource(cut), formats: ALL_FORMATS });
 	expect(await durationInput.computeDuration()).toBe(lastIterated.timestamp + 0.024);
 });
+
+test('MPEG-TS lookups find the frames before the first key frame that iteration keeps', async () => {
+	// From L46's review. A capture that starts at frame 3, mid-GOP, and where frame 5, before the first key frame,
+	// loses a TS packet: those frames are kept as they are, and a lookup on a fresh input at each frame's timestamp
+	// must find it, even before anything was read from the track's start. 20 frames of a 64x64 x264 stream (stub
+	// slices of 600 bytes), with key frames (carrying SPS and PPS) at 0 and 10.
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 20; i++) {
+		const isKey = i % 10 === 0;
+		const sliceData = Array.from({ length: 600 }, (_, j) => 0x20 + (7 * j + i) % 0x60);
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...sliceData]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+	const tsPackets = Array.from({ length: bytes.length / 188 }, (_, i) => bytes.slice(188 * i, 188 * (i + 1)));
+	const isVideo = (packet: Uint8Array) => (((packet[1]! & 0x1f) << 8) | packet[2]!) === 0x100;
+	const frameStarts = tsPackets.flatMap((packet, i) => (isVideo(packet) && packet[1]! & 0x40 ? [i] : []));
+
+	const damaged = tsPackets.filter(
+		(packet, i) => (!isVideo(packet) || i >= frameStarts[3]!) && i !== frameStarts[5]! + 1,
+	);
+	const data = new Uint8Array(188 * damaged.length);
+	damaged.forEach((packet, i) => data.set(packet, 188 * i));
+
+	using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const iterated: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		iterated.push(packet);
+	}
+	expect(iterated.map(x => Math.round(x.timestamp * 25))).toEqual(
+		[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+	);
+
+	for (const packet of iterated) {
+		using freshInput = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const freshTrack = await freshInput.getPrimaryVideoTrack();
+		assert(freshTrack);
+		const found = await new EncodedPacketSink(freshTrack).getPacket(packet.timestamp);
+		expect([found?.timestamp, found?.byteLength]).toEqual([packet.timestamp, packet.byteLength]);
+	}
+});
