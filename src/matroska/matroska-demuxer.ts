@@ -2728,8 +2728,13 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 		if ((info.codec === 'avc' || info.codec === 'hevc') && info.codecDescription) {
 			size = getFrameSizeFromParameterSets(info.codec, info.codecDescription, null);
 		} else if (info.codec) {
-			// Best effort: a first cluster that can't be read leaves the size unknown instead of failing the metadata
-			const packet = await this.getFirstPacket({}).catch(() => null);
+			// The first key frame carries the size (a cut stream may start with delta frames). Best effort: a cluster
+			// that can't be read leaves the size unknown instead of failing the metadata.
+			let packet = await this.getFirstPacket({}).catch(() => null);
+			if (packet && packet.type !== 'key') {
+				packet = await this.getNextKeyPacket(packet, {}).catch(() => null);
+			}
+
 			if (packet) {
 				if (info.codec === 'vp8') {
 					size = extractVp8FrameSizeFromPacket(packet.data);
