@@ -5,6 +5,8 @@ import { BufferTarget, StreamTarget } from '../../src/target.js';
 import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { canEncode, Quality } from '../../src/encode.js';
+import { CustomVideoEncoder, registerEncoder } from '../../src/custom-coder.js';
+import { VideoCodec } from '../../src/codec.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -1009,4 +1011,58 @@ test('VideoSampleSource, cancel() after close() gets out of a process() that nev
 	// Canceling forces the close, which doesn't wait for the stuck call
 	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
 	expect(await stateAfter(added, 1000)).toBe('fulfilled');
+});
+
+let stuckInitEncoderActive = false;
+/** A custom VP9 encoder whose initialization never finishes (like a codec stuck loading), when active. */
+class StuckInitVideoEncoder extends CustomVideoEncoder {
+	static override supports(codec: VideoCodec) {
+		return stuckInitEncoderActive && codec === 'vp9';
+	}
+
+	init() {
+		return new Promise<void>(() => {});
+	}
+
+	encode() {}
+	flush() {}
+	close() {}
+}
+registerEncoder(StuckInitVideoEncoder);
+
+test('VideoSampleSource, cancel() after close() gets out of an encoder setup that never finishes', async () => {
+	stuckInitEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('low'),
+		});
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: 0,
+			duration: 1 / 30,
+		})).catch(() => {});
+		await new Promise(resolve => setTimeout(resolve, 50));
+		videoSource.close(); // Waits for what was added, which waits for the encoder
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'fulfilled', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		// Canceling forces the close, which doesn't wait for the encoder
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	} finally {
+		stuckInitEncoderActive = false;
+	}
 });
