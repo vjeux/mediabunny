@@ -1512,11 +1512,11 @@ export class MatroskaDemuxer extends Demuxer {
 				throw new Error('Invalid block lacing: frame sizes don\'t match the block.');
 			}
 
-			let blockDuration = originalBlock.duration || frameCount * (track.defaultDuration ?? 0);
+			let blockDuration = originalBlock.duration || Math.round(frameCount * (track.defaultDuration ?? 0));
 			const frames = frameSizes.map(size => readBytes(slice, size));
 
-			// By default, distribute timestamps evenly across the block duration
-			let frameBoundaries = frames.map((_, i) => blockDuration * i / frameCount);
+			// By default, distribute timestamps evenly across the block duration while staying on the tick grid
+			let frameBoundaries = frames.map((_, i) => Math.floor(blockDuration * i / frameCount));
 
 			if (track.info?.type === 'audio' && (vorbisInfo || track.info.codec === 'opus')) {
 				const ticksPerSample = track.segment.timestampFactor / track.info.sampleRate;
