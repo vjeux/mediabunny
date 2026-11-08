@@ -25,6 +25,9 @@ import {
 	readBlockSize,
 	getBlockSizeOrUncommon,
 	readCodedNumber,
+	calculateCrc8,
+	calculateCrc16,
+	encodeCodedNumber,
 } from './flac-misc';
 import { Bitstream } from '../../shared/bitstream';
 
@@ -32,12 +35,47 @@ const FLAC_HEADER = /* #__PURE__ */ new Uint8Array([0x66, 0x4c, 0x61, 0x43]); //
 const STREAMINFO_SIZE = 38;
 const STREAMINFO_BLOCK_SIZE = 34;
 
+/**
+ * Returns the frame with its coded number (the frame or sample number) replaced by the given one, recomputing the
+ * header and frame checksums, or the frame itself if the number is unchanged.
+ */
+const renumberFrame = (frame: Uint8Array, codedNumberEnd: number, oldNumber: number, newNumber: number) => {
+	if (newNumber === oldNumber) {
+		return frame;
+	}
+
+	// The header continues with an uncommon block size and sample rate, if any, and ends with its CRC-8
+	const blockSizeBits = frame[2]! >> 4;
+	const sampleRateBits = frame[2]! & 0x0f;
+	const headerEnd = codedNumberEnd
+		+ (blockSizeBits === 6 ? 1 : blockSizeBits === 7 ? 2 : 0)
+		+ (sampleRateBits === 12 ? 1 : sampleRateBits === 13 || sampleRateBits === 14 ? 2 : 0);
+
+	const codedNumber = encodeCodedNumber(newNumber);
+	const result = new Uint8Array(frame.length - (codedNumberEnd - 4) + codedNumber.length);
+	result.set(frame.subarray(0, 4));
+	result.set(codedNumber, 4);
+	result.set(frame.subarray(codedNumberEnd, headerEnd), 4 + codedNumber.length);
+
+	const newHeaderEnd = headerEnd - codedNumberEnd + 4 + codedNumber.length;
+	result[newHeaderEnd] = calculateCrc8(result.subarray(0, newHeaderEnd));
+	result.set(frame.subarray(headerEnd + 1, frame.length - 2), newHeaderEnd + 1);
+
+	const crc16 = calculateCrc16(result.subarray(0, result.length - 2));
+	result[result.length - 2] = crc16 >> 8;
+	result[result.length - 1] = crc16 & 0xff;
+
+	return result;
+};
+
 export class FlacMuxer extends Muxer {
 	private writer!: Writer;
 	private metadataWritten = false;
 
 	private blockSizes: number[] = [];
 	private frameSizes: number[] = [];
+	private writtenFrameCount = 0;
+	private writtenSampleCount = 0;
 
 	private sampleRate: number | null = null;
 	private channels: number | null = null;
@@ -291,19 +329,34 @@ export class FlacMuxer extends Muxer {
 				throw new Error('Invalid FLAC frame: Invalid block size.');
 			}
 
-			readCodedNumber(slice); // num
+			const codedNumber = readCodedNumber(slice);
+			const codedNumberEnd = slice.filePos;
 			const blockSize = readBlockSize(slice, blockSizeOrUncommon);
+
+			// A frame's coded number must be the number of frames before it in the stream, or of samples with a
+			// variable block size (RFC 9639, section 9.1.5), which readers such as FFmpeg take timestamps from. Frames
+			// copied from elsewhere in a stream (as when trimming its start) carry their original numbers, so let's
+			// renumber them.
+			const hasVariableBlockSize = (packet.data[1]! & 0x01) === 1;
+			const data = renumberFrame(
+				packet.data,
+				codedNumberEnd,
+				codedNumber,
+				hasVariableBlockSize ? this.writtenSampleCount : this.writtenFrameCount,
+			);
+			this.writtenFrameCount++;
+			this.writtenSampleCount += blockSize;
 
 			if (!this.format._options.appendOnly) {
 				this.blockSizes.push(blockSize);
-				this.frameSizes.push(packet.data.length);
+				this.frameSizes.push(data.length);
 			}
 
 			const startPos = this.writer.getPos();
-			this.writer.write(packet.data);
+			this.writer.write(data);
 
 			if (this.format._options.onFrame) {
-				this.format._options.onFrame(packet.data, startPos);
+				this.format._options.onFrame(data, startPos);
 			}
 
 			await this.writer.flush();
