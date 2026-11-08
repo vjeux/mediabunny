@@ -120,6 +120,11 @@ const BLU_RAY_DTS_STREAM_TYPES = new Set<number>([
  * that doesn't: its audio would have shown up by then, and it may well hold none at all.
  */
 const MAX_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 22; // 4 MiB
+/**
+ * The same for sources of unknown size, which may not be able to go back that far to read the other streams from their
+ * start (a ReadableStreamSource only keeps what its cache holds)
+ */
+const MAX_STREAMED_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 20; // 1 MiB
 
 // Descriptors that make a private data stream something other than audio: VBI data, VBI teletext, teletext, DVB
 // subtitling, data broadcast ID, application signalling and ARIB data component
@@ -946,7 +951,11 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 
 				if (hasProgramMap && this.elementaryStreams.every(x => x.initialized || x.codecFromPayload)) {
-					privateDataProbeEndPos ??= currentPos + MAX_PRIVATE_DATA_PROBE_DISTANCE;
+					privateDataProbeEndPos ??= currentPos + (
+						this.reader.fileSizeNonStrict === null
+							? MAX_STREAMED_PRIVATE_DATA_PROBE_DISTANCE
+							: MAX_PRIVATE_DATA_PROBE_DISTANCE
+					);
 				}
 
 				const isDone = hasProgramMap && this.elementaryStreams.every(x => x.initialized);

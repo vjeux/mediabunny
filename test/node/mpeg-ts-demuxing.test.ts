@@ -11,6 +11,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -1048,8 +1049,12 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 		}
 		return crc >>> 0;
 	};
-	const withPrivateStreams = (extraPids: number[], extraPackets: Uint8Array[], nullPacketCount: number) => {
-		const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/mp3.ts')));
+	const withPrivateStreams = (
+		extraPids: number[],
+		extraPackets: Uint8Array[],
+		nullPacketCount: number,
+		bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/mp3.ts'))),
+	) => {
 		const pidAt = (pos: number) => ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
 		const packets: Uint8Array[] = [];
 		let pmtPid = -1;
@@ -1109,6 +1114,59 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 	expect(await withEmptyStream.input.getTracks()).toHaveLength(1);
 	expect(withEmptyStream.counter.bytes).toBeLessThan(8 * 2 ** 20); // 4 MiB past the MP3 stream's setup
 	withEmptyStream.input.dispose();
+
+	// Nor does it make a sequential source that keeps only what its cache holds (a ReadableStreamSource) read so far
+	// ahead that the other streams' start is gone (found in L15's streamed check): such sources look 1 MiB ahead. 6 MB
+	// of H.264 frames of 60 kB, written by Mediabunny, with such a stream added, read through a 2 MiB cache.
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		const isKey = i % 25 === 0;
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+		await videoSource.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const streamedFile = withPrivateStreams([0x1ff0], [], 0, new Uint8Array(output.target.buffer!));
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= streamedFile.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(streamedFile.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	{
+		using streamedInput = new Input({
+			source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 21 }),
+			formats: ALL_FORMATS,
+		});
+		const streamedTracks = await streamedInput.getTracks();
+		expect(streamedTracks.map(track => track.type)).toEqual(['video']);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(streamedTracks[0]!).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(packetCount).toBe(100);
+	}
 
 	// A stream whose first PES packet merely starts with an ADTS-like header, followed by random data, stays out
 	let seed = 1;
