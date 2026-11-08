@@ -2919,6 +2919,39 @@ test('ID3: Frame extending past the tag', async () => {
 	await expectGracefulRead(concat(id3Tag(3, 0, concat(ascii('TIT2'), u32(5), [0, 0])), flacFile(3)));
 });
 
+test('ID3v2.4: Plain instead of synchsafe frame sizes, as old iTunes versions wrote', async () => {
+	const mp3Frames = concatList(Array.from({ length: 10 }, () => concat([0xff, 0xfb, 0x90, 0x64], zeros(413))));
+	const plainSizeFrame = (id: string, data: Bytes) => concat(ascii(id), u32(data.length), [0, 0], data);
+	const readTags = async (body: Bytes) => {
+		using input = new Input({
+			source: new BufferSource(concat(id3Tag(4, 0, body), mp3Frames)),
+			formats: ALL_FORMATS,
+		});
+		return await input.getMetadataTags();
+	};
+
+	// The APIC frame's size of 1013, read as synchsafe, is 501
+	const image = Uint8Array.from({ length: 1000 }, (_, i) => (i * 7) & 0x7f);
+	const tags = await readTags(concat(
+		plainSizeFrame('TIT2', concat([0], ascii('Title'))),
+		plainSizeFrame('APIC', concat([0], ascii('image/png'), [0, 3, 0], image)),
+		plainSizeFrame('TPE1', concat([0], ascii('Artist'))),
+	));
+	expect(tags.images?.[0]?.data).toEqual(image);
+	expect(tags.artist).toBe('Artist');
+
+	// A size with a high bit set (0x180) can't be synchsafe, even where its synchsafe reading (0x80) looks valid by
+	// pointing at zeros
+	const highBitImage = new Uint8Array(0x180 - 13).fill(1);
+	highBitImage.fill(0, 0x80 - 13, 0x80 - 13 + 4);
+	const highBitTags = await readTags(concat(
+		plainSizeFrame('APIC', concat([0], ascii('image/png'), [0, 3, 0], highBitImage)),
+		plainSizeFrame('TIT2', concat([0], ascii('Title'))),
+	));
+	expect(highBitTags.images?.[0]?.data).toEqual(highBitImage);
+	expect(highBitTags.title).toBe('Title');
+});
+
 test('ID3v2.2: Picture at the end of the tag', async () => {
 	await expectGracefulRead(
 		concat(id3Tag(2, 0, concat(ascii('PIC'), [0, 0, 1, 0])), flacFile(3)),
