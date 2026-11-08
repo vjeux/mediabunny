@@ -2458,9 +2458,28 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 		return trafs;
 	};
 
+	// The first track's timescale, from the moov box (at the start of a single-file playlist's segments file)
+	const readTimescale = (bytes: Uint8Array) => {
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const find = (start: number, end: number, name: string) => {
+			for (let pos = start; pos < end; pos += view.getUint32(pos)) {
+				if (String.fromCharCode(...bytes.subarray(pos + 4, pos + 8)) === name) {
+					return pos;
+				}
+			}
+			return null;
+		};
+		const moov = find(0, bytes.byteLength, 'moov');
+		const trak = moov !== null ? find(moov + 8, moov + view.getUint32(moov), 'trak') : null;
+		const mdia = trak !== null ? find(trak + 8, trak + view.getUint32(trak), 'mdia') : null;
+		const mdhd = mdia !== null ? find(mdia + 8, mdia + view.getUint32(mdia), 'mdhd') : null;
+		return mdhd !== null ? view.getUint32(mdhd + (bytes[mdhd + 8] === 1 ? 28 : 20)) : null;
+	};
+
 	type TestPacket = { timestamp: number; type: 'key' | 'delta'; duration: number };
 
-	// Returns the joins between consecutive fragments of all segments: the next decode time minus the previous end
+	// Returns the joins between consecutive fragments of all segments (the next decode time minus the previous end),
+	// and the track's timescale when a segment file holds the moov box
 	const writeSegments = async (
 		segmentFormat: Mp4OutputFormat | CmafOutputFormat,
 		singleFilePerPlaylist: boolean,
@@ -2508,7 +2527,9 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 		const trafs = [...segments]
 			.sort(([a], [b]) => segmentNumber(a) - segmentNumber(b))
 			.flatMap(([, bytes]) => readTrafs(bytes));
-		return trafs.slice(1).map((x, i) => x.decodeTime - trafs[i]!.end);
+		const joins = trafs.slice(1).map((x, i) => x.decodeTime - trafs[i]!.end);
+		const timescale = [...segments.values()].map(readTimescale).find(x => x !== null) ?? null;
+		return { joins, timescale };
 	};
 
 	// Each segment is written by its own muxer, so each one's last sample kept its packet duration, which could reach
@@ -2527,7 +2548,7 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 			const timestamp = Math.round(i * 1001 / 30) / 1000;
 			packets.push({ timestamp, type: i % 60 === 0 ? 'key' : 'delta', duration: 1001 / 30000 });
 		}
-		expect(await writeSegments(segmentFormat, singleFilePerPlaylist, packets)).toEqual([0, 0, 0, 0]);
+		expect((await writeSegments(segmentFormat, singleFilePerPlaylist, packets)).joins).toEqual([0, 0, 0, 0]);
 
 		// 60 fps: frames are 16 or 17 ms apart and last 16.67 ms each, so some segments ended a third of a millisecond
 		// before the next one (9 GOPs, so that each segment has a single fragment)
@@ -2536,7 +2557,7 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 			const timestamp = Math.round(i * 1000 / 60) / 1000;
 			packets60.push({ timestamp, type: i % 66 === 0 ? 'key' : 'delta', duration: 1 / 60 });
 		}
-		const joins60 = await writeSegments(segmentFormat, singleFilePerPlaylist, packets60);
+		const { joins: joins60 } = await writeSegments(segmentFormat, singleFilePerPlaylist, packets60);
 		expect(joins60.length).toBeGreaterThan(3);
 		expect(joins60.filter(x => x !== 0)).toEqual([]);
 	}
@@ -2549,7 +2570,7 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 		const timestamp = Math.round(i * 1000 / 60) / 1000 + (i >= 330 ? 0.5 : 0);
 		paused.push({ timestamp, type: i % 66 === 0 ? 'key' : 'delta', duration: 1 / 60 });
 	}
-	const pausedJoins = await writeSegments(cmaf, true, paused);
+	const { joins: pausedJoins } = await writeSegments(cmaf, true, paused);
 	expect(pausedJoins.filter(x => x !== 0)).toHaveLength(1);
 	expect(pausedJoins.find(x => x !== 0)).toBeGreaterThan(1000);
 
@@ -2560,7 +2581,8 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 			dropped.push({ timestamp: i / 30, type: i % 30 === 0 ? 'key' : 'delta', duration: 1 / 30 });
 		}
 	}
-	expect(await writeSegments(cmaf, true, dropped, { frameRate: 30 })).toEqual([1]);
+	const { joins: droppedJoins, timescale } = await writeSegments(cmaf, true, dropped, { frameRate: 30 });
+	expect(droppedJoins).toEqual([timescale! / 30]); // One frame, in ticks of the frame rate or a multiple of it
 
 	// 44.1 kHz AAC with timestamps rounded to milliseconds, starting at -23 ms (encoder priming), with durations as
 	// Matroska gives them: the gap to the next block. Segments then don't start on whole ticks.
@@ -2569,7 +2591,7 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 	for (let i = 0; i < 1300; i++) {
 		aac.push({ timestamp: aacTimestamp(i), type: 'key', duration: aacTimestamp(i + 1) - aacTimestamp(i) });
 	}
-	const aacJoins = await writeSegments(cmaf, true, aac, { audio: true });
+	const { joins: aacJoins } = await writeSegments(cmaf, true, aac, { audio: true });
 	expect(aacJoins.length).toBeGreaterThan(10);
 	expect(aacJoins.filter(x => x !== 0)).toEqual([]);
 });
