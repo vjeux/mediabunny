@@ -60,6 +60,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >
           gh release upload ${{ github.event.release.tag_name }}
+          dist/bundles/mediabunny.js
+          dist/bundles/mediabunny.min.js
           dist/bundles/mediabunny.cjs
           dist/bundles/mediabunny.min.cjs
           dist/bundles/mediabunny.mjs
