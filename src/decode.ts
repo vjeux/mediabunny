@@ -16,6 +16,7 @@ import {
 	inferCodecFromCodecString,
 	MediaCodec,
 	PCM_AUDIO_CODECS,
+	validateCheckedCodecs,
 	VIDEO_CODECS,
 	VideoCodec,
 } from './codec';
@@ -245,6 +246,8 @@ export const getDecodableVideoCodecs = async (
 	checkedCodecs: VideoCodec[] = VIDEO_CODECS as unknown as VideoCodec[],
 	options?: SetOptional<VideoDecoderConfig, 'codec'>,
 ): Promise<VideoCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(codec => canDecodeVideo(codec, options)));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
@@ -258,6 +261,8 @@ export const getDecodableAudioCodecs = async (
 	checkedCodecs: AudioCodec[] = AUDIO_CODECS as unknown as AudioCodec[],
 	options?: SetOptional<AudioDecoderConfig, 'codec' | 'numberOfChannels' | 'sampleRate'>,
 ): Promise<AudioCodec[]> => {
+	validateCheckedCodecs(checkedCodecs);
+
 	const bools = await Promise.all(checkedCodecs.map(codec => canDecodeAudio(codec, options)));
 	return checkedCodecs.filter((_, i) => bools[i]);
 };
