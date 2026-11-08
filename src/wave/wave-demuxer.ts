@@ -94,9 +94,11 @@ export class WaveDemuxer extends Demuxer {
 					throw new Error('Invalid RF64 file: First chunk must be "ds64".');
 				}
 
-				if (!/^[\x20-\x7e]{4}$/.test(chunkId)) {
-					// Chunk IDs are four printable ASCII characters, so this isn't a chunk header but zeros or garbage,
-					// as in a damaged file. Walking it 8 bytes at a time could take forever, so the chunks end here.
+				if (this.dataStart !== -1 && !/^[\x20-\x7e]{4}$/.test(chunkId)) {
+					// Chunk IDs are four printable ASCII characters, so after the audio this isn't a chunk header but
+					// zeros or garbage, as at the end of a damaged file. Walking it 8 bytes at a time could take
+					// forever, so the chunks end here. (Before the data chunk, zeros between chunks are walked like
+					// FFmpeg does.)
 					break;
 				}
 
