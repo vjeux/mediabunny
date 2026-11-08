@@ -2069,10 +2069,12 @@ class AudioEncoderWrapper {
 
 	constructor(private source: AudioSource, private encodingConfig: AudioEncodingConfig) {}
 
-	async add(audioSample: AudioSample, shouldClose: boolean) {
+	async add(audioSample: AudioSample, shouldClose: boolean, skipAddValidation = false) {
 		try {
 			this.checkForEncoderError();
-			this.source._ensureValidAdd();
+			if (!skipAddValidation) {
+				this.source._ensureValidAdd();
+			}
 
 			// Ensure audio parameters remain constant
 			if (this.lastNumberOfChannels !== null && this.lastSampleRate !== null) {
@@ -3043,6 +3045,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	private _errorPromiseAccessed = false;
 	/** @internal */
 	private _paused = false;
+	/** @internal */
+	private _lastAddPromise = Promise.resolve();
 
 	/** A promise that rejects upon any error within this source. This promise never resolves. */
 	get errorPromise() {
@@ -3105,7 +3109,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let timestampOffset = 0;
 
 		const onAudioSample = (audioSample: AudioSample) => {
-			if (errored) {
+			if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
+				// We're shutting down, so this sample came in too late
 				audioSample.close();
 				return;
 			}
@@ -3161,13 +3166,26 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			audioSample.setTimestamp(currentTimestamp + timestampOffset);
 
-			void this._encoder.add(audioSample, true)
+			// The encoder can't handle overlapping adds (they'd corrupt resampling and PCM state), so chain them
+			this._lastAddPromise = this._lastAddPromise
+				.then(async () => {
+					if (errored || this._connectedTrack!.output.state === 'canceled') {
+						audioSample.close();
+						return;
+					}
+
+					// The sample was valid when captured, and a graceful close still wants it even if the output is
+					// finalizing by now
+					await this._encoder.add(audioSample, true, true);
+				})
 				.catch((error) => {
 					errored = true;
 
 					this._abortController?.abort();
 					this._promiseWithResolvers.reject(error);
-					void this._audioContext?.suspend();
+					if (this._audioContext && this._audioContext.state !== 'closed') {
+						void this._audioContext.suspend();
+					}
 				});
 		};
 
@@ -3248,6 +3266,11 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 				await this._audioContext.suspend();
 			}
 		} finally {
+			if (!forceClose) {
+				// Samples captured before closing began still belong in the file, so let all queued adds finish
+				await this._lastAddPromise;
+			}
+
 			// The encoder must be closed even if the track teardown above threw
 			await this._encoder.flushAndClose(forceClose);
 		}

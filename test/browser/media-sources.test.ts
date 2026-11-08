@@ -1,14 +1,14 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamAudioTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
-import { VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, Rotation } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
@@ -731,3 +731,98 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+/** A WAV file of a quiet 100 Hz sine, so smooth that consecutive samples differ by at most ~0.004. */
+const makeSineWavBlob = (seconds: number) => {
+	const sampleRate = 48000;
+	const frames = seconds * sampleRate;
+	const view = new DataView(new ArrayBuffer(44 + 2 * frames));
+	const writeString = (offset: number, text: string) => {
+		for (let i = 0; i < text.length; i++) {
+			view.setUint8(offset + i, text.charCodeAt(i));
+		}
+	};
+	writeString(0, 'RIFF');
+	view.setUint32(4, 36 + 2 * frames, true);
+	writeString(8, 'WAVEfmt ');
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true); // PCM
+	view.setUint16(22, 1, true); // Mono
+	view.setUint32(24, sampleRate, true);
+	view.setUint32(28, 2 * sampleRate, true);
+	view.setUint16(32, 2, true);
+	view.setUint16(34, 16, true);
+	writeString(36, 'data');
+	view.setUint32(40, 2 * frames, true);
+	for (let i = 0; i < frames; i++) {
+		view.setInt16(44 + 2 * i, Math.round(0.3 * 32767 * Math.sin(2 * Math.PI * 100 * i / sampleRate)), true);
+	}
+	return new Blob([view.buffer], { type: 'audio/wav' });
+};
+
+test('MediaStreamAudioTrackSource keeps audio in order when an async process function takes varying time', async ({
+	skip,
+}) => {
+	// Muted media may play without a user gesture, and its captureStream() still carries the audio
+	const media = document.createElement('video');
+	if (!('captureStream' in media) || typeof MediaStreamTrackProcessor === 'undefined') {
+		skip('Capturing a media element through MediaStreamTrackProcessor is not supported here');
+	}
+
+	const url = URL.createObjectURL(makeSineWavBlob(3));
+	media.src = url;
+	media.muted = true;
+	document.body.append(media);
+	const errors: unknown[] = [];
+	let output: Output<WavOutputFormat, BufferTarget>;
+	try {
+		await media.play();
+		const track = (media as HTMLVideoElement & { captureStream(): MediaStream })
+			.captureStream()
+			.getAudioTracks()[0]!;
+
+		output = new Output({
+			format: new WavOutputFormat(),
+			target: new BufferTarget(),
+		});
+		let calls = 0;
+		const audioSource = new MediaStreamAudioTrackSource(track, {
+			codec: 'pcm-f32',
+			transform: {
+				// Like an effect whose run time varies: every fourth chunk takes longer than the next two take to
+				// arrive (on average, it keeps up)
+				process: async (sample) => {
+					if (calls++ % 4 === 0) {
+						await new Promise(resolve => setTimeout(resolve, 25));
+					}
+					return sample;
+				},
+			},
+		});
+		audioSource.errorPromise.catch(error => errors.push(error));
+		output.addAudioTrack(audioSource);
+		await output.start();
+		await new Promise(resolve => setTimeout(resolve, 1500));
+		await output.finalize();
+		track.stop();
+	} finally {
+		media.pause();
+		media.remove();
+		URL.revokeObjectURL(url);
+	}
+
+	expect(errors).toEqual([]);
+
+	// Audio played out of order shows up as jumps in the sine
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const samples: number[] = [];
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		samples.push(...data);
+		sample.close();
+	}
+	expect(Math.max(...samples)).toBeGreaterThan(0.2); // Real audio was captured
+	const jumps = samples.filter((value, i) => i > 0 && Math.abs(value - samples[i - 1]!) > 0.05);
+	expect(jumps).toHaveLength(0);
+});
