@@ -634,7 +634,6 @@ export class HlsMuxer extends Muxer {
 		return true;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const playlist = this.playlists.find(x => x.tracks.includes(track));
 		assert(playlist); // If there isn't one then the assignment algo failed innit

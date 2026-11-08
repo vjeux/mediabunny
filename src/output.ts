@@ -946,13 +946,25 @@ export class Output<
 			// We want to call muxer.start immediately, so we avoid using an await here
 			const releasePromise = this._mutex.acquire();
 
+			let startFailed = false;
+			let startError: unknown = null;
+
 			try {
 				await this._muxer.start();
 
 				const promises = this.tracks.map(track => track.source._start());
 				await Promise.all(promises);
+			} catch (error) {
+				startFailed = true;
+				startError = error;
 			} finally {
 				(await releasePromise)();
+			}
+
+			if (startFailed) {
+				// The muxer is in an undefined state now, so don't let anything use the output anymore
+				await this.cancel().catch(() => {});
+				throw startError;
 			}
 		})();
 	}
@@ -995,7 +1007,8 @@ export class Output<
 			const release = await this._mutex.acquire();
 
 			try {
-				const promises = this.tracks.map(x => x.source._flushOrWaitForOngoingClose(true)); // Force close
+				// Force close. Errors don't matter anymore at this point, we just want everything released.
+				const promises = this.tracks.map(x => x.source._flushOrWaitForOngoingClose(true).catch(() => {}));
 				await Promise.all(promises);
 
 				await Promise.all([...this._unfinalizedTargets].map(target => target._close()));
