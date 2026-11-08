@@ -62,13 +62,6 @@ export type SourceEvents = {
 	};
 };
 
-let sourceFinalizationRegistry: FinalizationRegistry<() => unknown> | null = null;
-if (typeof FinalizationRegistry !== 'undefined') {
-	sourceFinalizationRegistry = new FinalizationRegistry((cleanup) => {
-		cleanup();
-	});
-}
-
 /**
  * The source base class, representing a resource from which bytes can be read.
  * @group Input sources
@@ -1363,6 +1356,14 @@ export type FilePathSourceOptions = {
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
+let filePathSourceFinalizationRegistry: FinalizationRegistry<FileHandle> | null = null;
+if (typeof FinalizationRegistry !== 'undefined') {
+	filePathSourceFinalizationRegistry = new FinalizationRegistry((fileHandle) => {
+		// If it's not closed, Node prints annoying warnings
+		void fileHandle.close();
+	});
+}
+
 /**
  * A source backed by a path to a file. Intended for server-side usage in Node, Bun, or Deno.
  *
@@ -1404,12 +1405,13 @@ export class FilePathSource extends PathedSource {
 		this._customSource = new CustomSource({
 			getSize: async () => {
 				const fileHandle = await node.fs.open(filePath, 'r');
-				this._fileHandle = fileHandle;
-
-				sourceFinalizationRegistry?.register(this, () => {
-					// If it's not closed, Node prints annoying warnings
+				if (this._disposed) {
 					void fileHandle.close();
-				}, this);
+					throw new InputDisposedError();
+				}
+
+				this._fileHandle = fileHandle;
+				filePathSourceFinalizationRegistry?.register(this, fileHandle, this);
 
 				const stats = await fileHandle.stat();
 				return stats.size;
@@ -1445,12 +1447,13 @@ export class FilePathSource extends PathedSource {
 
 	/** @internal */
 	_dispose() {
+		this._customSource._disposed = true;
 		this._customSource._dispose();
 
 		if (this._fileHandle) {
 			void this._fileHandle.close();
 			this._fileHandle = null;
-			sourceFinalizationRegistry?.unregister(this);
+			filePathSourceFinalizationRegistry?.unregister(this);
 		}
 	}
 }
