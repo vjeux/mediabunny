@@ -28,6 +28,7 @@ import {
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readBytes, Reader } from '../reader';
+import { Logging } from '../logging';
 import {
 	AdtsFrameHeader,
 	MIN_ADTS_FRAME_HEADER_SIZE,
@@ -128,13 +129,23 @@ export class AdtsDemuxer extends Demuxer {
 			this.firstFrameHeader = header;
 		}
 
-		const sampleRate = aacFrequencyTable[header.samplingFrequencyIndex];
+		const sampleRate = aacFrequencyTable[this.firstFrameHeader.samplingFrequencyIndex];
 		assert(sampleRate !== undefined);
-		const sampleDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
+
+		if (header.samplingFrequencyIndex !== this.firstFrameHeader.samplingFrequencyIndex) {
+			// Since a track can only have one sample rate, the stream ends here
+			Logging._warn(
+				`The sample rate changes mid-stream (from ${sampleRate} Hz to`
+				+ ` ${aacFrequencyTable[header.samplingFrequencyIndex]} Hz), which isn't properly supported or`
+				+ ` handled by Mediabunny.`,
+			);
+			this.lastSampleLoaded = true;
+			return;
+		}
 
 		const sample: Sample = {
 			timestamp: this.nextTimestampInSamples / sampleRate,
-			duration: sampleDuration,
+			duration: SAMPLES_PER_AAC_FRAME / sampleRate,
 			dataStart: header.startPos,
 			dataSize: header.frameLength,
 		};
