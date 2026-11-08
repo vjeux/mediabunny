@@ -31,6 +31,47 @@ import fs from 'node:fs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
+test('ID3v2.3 and v2.2 tags with whole-tag unsynchronisation', async () => {
+	const latin1 = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const utf16 = (text: string) => [0xff, 0xfe, ...[...text].flatMap(char => [char.charCodeAt(0), 0]), 0, 0];
+	// Unsynchronisation puts a zero byte after each 0xFF that a 0x00 or a byte of 0xE0 or more follows
+	const unsynchronize = (bytes: number[]) => bytes.flatMap((byte, i) => {
+		const next = bytes[i + 1];
+		return byte === 0xff && (next === undefined || next === 0 || next >= 0xe0) ? [byte, 0] : [byte];
+	});
+	const readTags = async (majorVersion: number, frames: number[]) => {
+		const body = unsynchronize(frames);
+		const tag = [...latin1('ID3'), majorVersion, 0, 0x80, 0, 0, body.length >> 7, body.length & 0x7f, ...body];
+		const bytes = new Uint8Array(tag.length + 10 * 417);
+		bytes.set(tag);
+		for (let i = 0; i < 10; i++) {
+			bytes.set([0xff, 0xfb, 0x90, 0x64], tag.length + i * 417); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
+		}
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return await input.getMetadataTags();
+	};
+
+	// The byte order mark of UTF-16 text and the start of a JPEG both get zero bytes stuffed in
+	const image = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0xff, 0xd9];
+
+	const v23Frame = (id: string, body: number[]) => [...latin1(id), 0, 0, 0, body.length, 0, 0, ...body];
+	const v23Tags = await readTags(3, [
+		...v23Frame('TIT2', [1, ...utf16('Title')]),
+		...v23Frame('APIC', [0, ...latin1('image/jpeg'), 0, 3, 0, ...image]),
+	]);
+	expect(v23Tags.title).toBe('Title');
+	expect(v23Tags.images?.[0]?.data).toEqual(new Uint8Array(image));
+
+	const v22Frame = (id: string, body: number[]) => [...latin1(id), 0, 0, body.length, ...body];
+	const v22Tags = await readTags(2, [
+		...v22Frame('TT2', [1, ...utf16('Title')]),
+		...v22Frame('PIC', [0, ...latin1('JPG'), 3, 0, ...image]),
+	]);
+	expect(v22Tags.title).toBe('Title');
+	expect(v22Tags.images?.[0]?.data).toEqual(new Uint8Array(image));
+});
+
 const createDummyAudioTrack = (codec: AudioCodec, output: Output) => {
 	const source = new EncodedAudioPacketSource(codec);
 	output.addAudioTrack(source);
