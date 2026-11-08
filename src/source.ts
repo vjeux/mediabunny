@@ -12,6 +12,7 @@ import {
 	binarySearchLessOrEqual,
 	clamp,
 	closedIntervalsOverlap,
+	DisposalSignal,
 	FilePath,
 	isNumber,
 	isThenable,
@@ -361,6 +362,11 @@ export const sourceRequestsAreEqual = (a: SourceRequest, b: SourceRequest) => {
  * @group Input sources
  */
 export class CustomPathedSource extends PathedSource {
+	/**
+	 * For reads waiting on the root request, whose handler may never settle, which disposing rejects.
+	 * @internal
+	 */
+	_disposalSignal = new DisposalSignal();
 	/** @internal */
 	_root: SourceRef | null = null;
 	/** @internal */
@@ -397,7 +403,8 @@ export class CustomPathedSource extends PathedSource {
 			}
 
 			if (this._rootRequest) {
-				return this._rootRequest.then(ref => ref.source._read(start, end, minReadPosition, maxReadPosition));
+				return this._disposalSignal.wait(this._rootRequest)
+					.then(ref => ref.source._read(start, end, minReadPosition, maxReadPosition));
 			}
 		}
 
@@ -422,6 +429,8 @@ export class CustomPathedSource extends PathedSource {
 				.then(ref => ref.free())
 				.catch(() => {});
 		}
+
+		this._disposalSignal.dispose(new InputDisposedError());
 	}
 }
 
@@ -1513,6 +1522,11 @@ export class CustomSource extends Source {
 	_orchestrator: ReadOrchestrator;
 	/** @internal */
 	_readers = new Set<ReadableStreamDefaultReader<Uint8Array>>();
+	/**
+	 * For reads waiting on a getSize call that may never settle, which disposing rejects.
+	 * @internal
+	 */
+	_disposalSignal = new DisposalSignal();
 
 	/** Creates a new {@link CustomSource} whose behavior is specified by `options`.  */
 	constructor(options: CustomSourceOptions) {
@@ -1575,7 +1589,8 @@ export class CustomSource extends Source {
 		const result = this._options.getSize();
 
 		if (isThenable(result)) {
-			return result.then((size) => {
+			// getSize may never settle (a HEAD request without a timeout, say), so stop waiting for it once disposed
+			return this._disposalSignal.wait(result).then((size) => {
 				if (!Number.isInteger(size) || size < 0) {
 					throw new TypeError('options.getSize must return or resolve to a non-negative integer.');
 				}
@@ -1686,6 +1701,7 @@ export class CustomSource extends Source {
 
 	/** @internal */
 	_dispose() {
+		this._disposalSignal.dispose(new InputDisposedError());
 		this._orchestrator.dispose();
 
 		for (const reader of this._readers) {
