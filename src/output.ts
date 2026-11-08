@@ -968,6 +968,15 @@ export class Output<
 	 * Cancels the creation of the output file, releasing internal resources like encoders and preventing further
 	 * samples from being added.
 	 *
+	 * When writing to a {@link StreamTarget}, this waits for its `WritableStream` to close, unless the stream's sink
+	 * has stalled on a write: once 5 seconds pass without any of the pending writes completing, this resolves, and the
+	 * stream closes in the background if the sink ever catches up.
+	 *
+	 * While the output is finalizing, this returns right away, and finalization goes on. Should the sink of a
+	 * {@link StreamTarget} then complete none of its pending writes for 5 seconds, finalization is given up on:
+	 * {@link Output.finalize} rejects, the output becomes canceled, and the stream closes in the background if the sink
+	 * ever catches up.
+	 *
 	 * @returns A promise that resolves once all internal resources have been released.
 	 */
 	async cancel() {
@@ -978,6 +987,11 @@ export class Output<
 			// is called
 			if (this.state === 'finalized') {
 				Logging._warn('Output has already been finalized.');
+			} else {
+				// Finalization can get stuck on a StreamTarget whose sink stopped completing writes; give up on it then
+				for (const target of this._unfinalizedTargets) {
+					target._cancelFinalization();
+				}
 			}
 
 			return;
@@ -985,6 +999,12 @@ export class Output<
 
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
+
+			// Closing a source, or a pending add, can be stuck on a StreamTarget whose sink stopped completing writes;
+			// the target gives up on its stream then
+			for (const target of this._unfinalizedTargets) {
+				target._cancelFinalization();
+			}
 
 			const release = await this._mutex.acquire();
 
