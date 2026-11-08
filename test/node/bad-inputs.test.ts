@@ -1830,6 +1830,20 @@ test('WAV: INFO sub-chunks without the pad byte after an odd size', async () => 
 	expect(tags.comment).toBe('Comment');
 });
 
+test('WAV: Corrupt INFO sub-chunk size after a padded odd-sized sub-chunk', async () => {
+	// INAM "Ab" with its pad byte, then IART claiming 16 MiB. Its header read a byte earlier mustn't give a garbage tag
+	const list = riffChunk('LIST', concat(
+		ascii('INFO'),
+		ascii('INAM'), u32le(3), ascii('Ab'), [0, 0],
+		ascii('IART'), u32le(0x01000000), new Uint8Array(120).fill(0x58),
+	));
+
+	using input = new Input({ source: new BufferSource(wav([fmtChunk(), list, dataChunk()])), formats: ALL_FORMATS });
+	const tags = await input.getMetadataTags();
+	expect(tags.title).toBe('Ab');
+	expect(Object.keys(tags.raw ?? {})).toEqual(['INAM']);
+});
+
 test('WAV: Short ds64 chunk', async () => {
 	await expectGracefulRead(wav([riffChunk('ds64', zeros(4)), fmtChunk(), dataChunk()], 'RF64'));
 });
