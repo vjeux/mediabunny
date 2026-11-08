@@ -29,7 +29,7 @@ import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from './adts/adts-reader';
 import { AdtsDemuxer } from './adts/adts-demuxer';
-import { readAscii, readBytes, readU32Be, readU64Be } from './reader';
+import { readAscii, readBytes, Reader, readU32Be, readU64Be } from './reader';
 import { FlacDemuxer } from './flac/flac-demuxer';
 import { MpegTsDemuxer } from './mpeg-ts/mpeg-ts-demuxer';
 import { findTsPacketLayout, TS_PACKET_LAYOUT_PROBE_SIZE, TS_PACKET_SIZE } from './mpeg-ts/mpeg-ts-misc';
@@ -329,6 +329,38 @@ export class WebMInputFormat extends MatroskaInputFormat {
 }
 
 /**
+ * Returns the position of the first non-zero byte at or after `pos`, looking at most `maxLength` bytes ahead (and
+ * returning the position where it stopped if there's none).
+ */
+const skipZeroBytes = async (reader: Reader, pos: number, maxLength: number) => {
+	const end = pos + maxLength;
+	// Start small: a source of unknown size (such as a live stream) only resolves a slice once all of it has come in,
+	// and there's usually no zero to skip. Grow the slices while zeros keep coming, up to 64 KiB.
+	let chunkSize = 16;
+
+	while (pos < end) {
+		let slice = reader.requestSliceRange(pos, 1, Math.min(chunkSize, end - pos));
+		chunkSize = Math.min(2 * chunkSize, 2 ** 16);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice || slice.length === 0) {
+			break;
+		}
+
+		const bytes = readBytes(slice, slice.length);
+		const index = bytes.findIndex(x => x !== 0);
+		if (index !== -1) {
+			return pos + index;
+		}
+
+		pos += bytes.length;
+	}
+
+	return pos;
+};
+
+/**
  * MP3 file format.
  *
  * Do not instantiate this class; use the {@link MP3} singleton instead.
@@ -353,6 +385,10 @@ export class Mp3InputFormat extends InputFormat {
 
 			currentPos = slice.filePos + id3V2Header.size;
 		}
+
+		// Skip a run of zero bytes before the first frame, as found in files whose ID3v2 tag was stripped by zeroing it
+		// out in place. Zeros can't form a frame header; FFmpeg's mp3_read_probe skips them the same way.
+		currentPos = await skipZeroBytes(input._reader, currentPos, 2 ** 20);
 
 		const firstResult = await readNextMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
 		if (!firstResult) {
