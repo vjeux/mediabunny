@@ -112,15 +112,17 @@ test('A 200 for a range request after 206s is asked for again past the HTTP cach
 
 	// The start of the file must still be readable after reading far into it. On main, the 200 made UrlSource read the
 	// file sequentially from then on, so the start had been evicted from its cache.
-	for (const start of [0, 3_000_000, 0]) {
+	for (const start of [0, 3_000_000, 0, 2_000_000]) {
 		const slice = await reader.requestSlice(start, 1000);
 		expect(slice).not.toBeNull();
 		expect(readBytes(slice!, 1000)).toEqual(data.subarray(start, start + 1000));
 	}
-	// The 200 was asked for again past the cache, at the same position, which got a 206
+	// The 200 was asked for again past the cache, at the same position, which got a 206; later requests skip the cache,
+	// which would answer each range it completes with such a 200
 	const firstRevalidated = requests.findIndex(request => request.endsWith(' 200'));
 	expect(firstRevalidated).toBeGreaterThan(0);
 	expect(requests[firstRevalidated + 1]).toBe(requests[firstRevalidated]!.replace(' 200', ' 206'));
+	expect(requests.filter(request => request.endsWith(' 200'))).toHaveLength(1);
 });
 
 const makeRampedUrl = () => {

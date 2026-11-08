@@ -781,6 +781,12 @@ export class UrlSource extends PathedSource {
 	 */
 	_rangeRequestsHonored = false;
 	/**
+	 * Whether the browser's HTTP cache has turned a range request into a 200 after the server honored one, after which
+	 * requests skip that cache: it would do the same for every range it completes.
+	 * @internal
+	 */
+	_bypassHttpCache = false;
+	/**
 	 * When the server doesn't support range requests, we abandon the orchestrator and instead defer to an internal
 	 * ReadableStreamSource wrapping the response body, which pulls new data only when reads demand it.
 	 * @internal
@@ -982,7 +988,7 @@ export class UrlSource extends PathedSource {
 				() => abortController.signal.aborted,
 			);
 
-			let response = await fetchFromCurrentPos();
+			let response = await fetchFromCurrentPos(this._bypassHttpCache ? 'no-store' : undefined);
 
 			const firefoxCachedStart = worker.currentPos === 0 && isFirefox();
 			if (response.status === 200 && (firefoxCachedStart || this._rangeRequestsHonored) && !this._usedForHls) {
@@ -994,6 +1000,7 @@ export class UrlSource extends PathedSource {
 				// so they keep the cached response.
 				void response.body?.cancel().catch(() => {});
 				response = await fetchFromCurrentPos('no-store');
+				this._bypassHttpCache ||= this._rangeRequestsHonored && response.status === 206;
 			}
 
 			if (response.status === 206) {
