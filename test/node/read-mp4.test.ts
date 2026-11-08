@@ -4619,3 +4619,61 @@ test('MP4 language stored as a bibliographic ISO 639-2 code', async () => {
 	assert(track);
 	expect(await track.getLanguageCode()).toBe('deu');
 });
+
+test('Samples of the chunks that a trailing stsc entry of zero samples per chunk covers', async () => {
+	// One video track of 8 samples (each filled with its index) in 2 chunks. Some writers end the stsc table with
+	// entries of zero samples per chunk; FFmpeg drops them, so the last real entry covers the chunks after it too.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (stscEntries: [firstChunk: number, samplesPerChunk: number][]) => {
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const firstChunkOffset = ftyp.length + 8;
+		const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(50),
+			box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(320), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(320), zeros(16), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(1000), u32(320), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), avc1),
+						box('stts', zeros(4), u32(1), u32(8), u32(40)),
+						box('stsc', zeros(4), u32(stscEntries.length),
+							...stscEntries.map(([firstChunk, samplesPerChunk]) => [
+								...u32(firstChunk), ...u32(samplesPerChunk), ...u32(1),
+							])),
+						box('stsz', zeros(4), u32(10), u32(8)),
+						box('stco', zeros(4), u32(2), u32(firstChunkOffset), u32(firstChunkOffset + 40)),
+					)),
+				),
+			),
+		);
+		const mdat = box('mdat', ...Array.from({ length: 8 }, (_, i) => new Array<number>(10).fill(i)));
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...mdat, ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packets: number[][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([packet.data[0]!, packet.timestamp]);
+		}
+		return packets;
+	};
+
+	const expected = Array.from({ length: 8 }, (_, i) => [i, i * 0.04]);
+	expect(await read([[1, 4]])).toEqual(expected);
+	expect(await read([[1, 4], [2, 0]])).toEqual(expected);
+	expect(await read([[1, 4], [2, 0], [3, 0]])).toEqual(expected);
+});
