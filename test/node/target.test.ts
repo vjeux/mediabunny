@@ -154,6 +154,52 @@ test('FilePathTarget leaves the file alone until there is something to write', a
 	await fs.rm(directory, { recursive: true });
 });
 
+test.each(['copy', 'transcode'] as const)(
+	'A Conversion whose StreamTarget fails to write rejects without unhandled rejections (%s)',
+	async (kind) => {
+		// Like streaming the output to an HTTP response whose client disconnects. The conversion then cancels its
+		// output, whose closing of the errored stream used to reject unhandled, which kills a Node process
+		const { StreamTarget } = await import('../../src/target.js');
+		const { WavOutputFormat } = await import('../../src/output-format.js');
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => void unhandledRejections.push(reason);
+		process.on('unhandledRejection', onUnhandledRejection);
+
+		try {
+			using input = new Input({
+				source: new FilePathSource(kind === 'copy'
+					? samplePath
+					: path.join(__dirname, '../public/glitch-hop-is-dead.wav')),
+				formats: ALL_FORMATS,
+			});
+			let bytesWritten = 0;
+			const output = new Output({
+				format: kind === 'copy' ? new Mp4OutputFormat() : new WavOutputFormat(),
+				target: new StreamTarget(new WritableStream({
+					write: (chunk: { data: Uint8Array }) => {
+						bytesWritten += chunk.data.byteLength;
+						if (bytesWritten > 2 ** 16) {
+							throw new Error('Client disconnected');
+						}
+					},
+				}), { chunked: true, chunkSize: 2 ** 14 }),
+			});
+			const conversion = await Conversion.init({
+				input,
+				output,
+				audio: kind === 'transcode' ? { sampleRate: 16000 } : undefined, // Resampling, so a PCM transcode
+				showWarnings: false,
+			});
+
+			await expect(conversion.execute()).rejects.toThrow('Client disconnected');
+			await new Promise(resolve => setTimeout(resolve, 100)); // Lets the cancel finish
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off('unhandledRejection', onUnhandledRejection);
+		}
+	},
+);
+
 test('BufferTarget internal buffer transfer on finalize', async () => {
 	const target = new BufferTarget();
 	target._write(new Uint8Array([1, 2, 3, 4, 5]), 0);
