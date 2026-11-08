@@ -458,6 +458,11 @@ export class FlacMuxer extends Muxer {
 				maximumBlockSize = 65535;
 				minimumFrameSize = 0;
 				maximumFrameSize = 0;
+			} else if (this.blockSizes.length === 1) {
+				// The only block is also the last one, so it's a fixed block size stream. Being the last block, it may
+				// be shorter than 16 samples, which STREAMINFO's block sizes must never go below
+				maximumBlockSize = Math.max(maximumBlockSize, 16);
+				minimumBlockSize = maximumBlockSize;
 			}
 
 			assert(this.channels !== null);
