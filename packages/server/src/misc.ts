@@ -8,6 +8,7 @@
 
 import { VideoSamplePixelFormat, MediaCodec } from 'mediabunny';
 import * as NodeAv from 'node-av';
+import os from 'node:os';
 import { _serverOptions } from './index';
 
 export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = {
@@ -27,6 +28,17 @@ export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = 
 	eac3: NodeAv.AV_CODEC_ID_EAC3,
 	dts: NodeAv.AV_CODEC_ID_DTS,
 	truehd: NodeAv.AV_CODEC_ID_TRUEHD,
+};
+
+/**
+ * The number of threads to run a codec on. libavcodec uses a single thread unless told otherwise (it's the FFmpeg CLI
+ * that defaults to automatic threading). Each thread holds frames of its own, so like Chromium's FFmpeg decoder, this
+ * scales with the resolution: 3 threads for 1080p, at least 2, and at most 8 (reached at 4K) or one per core.
+ */
+export const getCodecThreadCount = (width: number | undefined, height: number | undefined) => {
+	const cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+	const forResolution = Math.max(2, Math.floor((width || 1920) * (height || 1080) * 3 / (1920 * 1080)));
+	return Math.max(1, Math.min(forResolution, 8, cores));
 };
 
 let cachedHardwareContext: NodeAv.HardwareContext | null | undefined = undefined;
