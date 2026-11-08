@@ -2163,13 +2163,16 @@ test('Damaged or hostile sizes don\'t make reads buffer whole streams or allocat
 
 	// A server stating a huge file size, for an MP4 whose moov claims 4 GiB and a WAVE with a LIST chunk after its
 	// audio that claims about as much (read with the metadata tags). On main, both allocated a 4 GiB buffer and
-	// streamed into it until the server gave up, then failed with unrelated errors
+	// streamed into it until the server gave up; then the MP4 failed with an unrelated error, and the WAVE had no tags
 	const fmt = [...ascii('fmt '), ...le32(16), 1, 0, 2, 0, ...le32(44100), ...le32(176400), 4, 0, 16, 0];
 	const audio = [...ascii('data'), ...le32(4), 0, 0, 0, 0];
 	const hugeList = [...ascii('LIST'), ...le32(0xfffffff0)];
+	// The largest RIFF size that doesn't stand for an unknown size (0xFFFFFFFF, which would make whatever follows the
+	// LIST chunk, here the server's zeros, part of the file to look through too)
+	const riffSize = 0xfffffffe;
 	for (const head of [
 		[...ftyp, ...bigBoxHeader('moov', 1)],
-		[...ascii('RIFF'), ...le32(0xffffffff), ...ascii('WAVE'), ...fmt, ...audio, ...hugeList],
+		[...ascii('RIFF'), ...le32(riffSize), ...ascii('WAVE'), ...fmt, ...audio, ...hugeList],
 	]) {
 		const server = await startHostileServer(head);
 		try {
