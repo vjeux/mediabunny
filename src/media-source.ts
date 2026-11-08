@@ -752,7 +752,8 @@ class VideoEncoderWrapper {
 			}
 
 			if (!selected) {
-				if (typeof VideoEncoder === 'undefined') {
+				// With custom encoders registered (like @mediabunny/server's), it's this config they declined
+				if (typeof VideoEncoder === 'undefined' && customVideoEncoders.length === 0) {
 					throw new Error(missingWebCodecsClassMessage('VideoEncoder'));
 				}
 
@@ -763,11 +764,18 @@ class VideoEncoderWrapper {
 					quantizer !== null ? `quantizer ${quantizer}` : `${config.bitrate} bps`,
 				);
 
+				let missingClass = '';
+				if (typeof VideoEncoder === 'undefined') {
+					// Custom encoders were registered then, and none supports this config (an extension for other
+					// codecs, say), so say both
+					const message = missingWebCodecsClassMessage('VideoEncoder');
+					missingClass = ` No registered custom encoder supports it, and ${message}`;
+				}
 				throw new Error(
 					`This specific encoder configuration (${firstConfig.codec}, ${rateControls.join(' / ')},`
 					+ ` ${firstConfig.width}x${firstConfig.height}, hardware acceleration:`
 					+ ` ${firstConfig.hardwareAcceleration ?? 'no-preference'}) is not supported in this environment.`
-					+ ` Consider using another codec or changing your video parameters.`,
+					+ `${missingClass} Consider using another codec or changing your video parameters.`,
 				);
 			}
 
@@ -2443,25 +2451,35 @@ class AudioEncoderWrapper {
 			} else if ((PCM_AUDIO_CODECS as readonly string[]).includes(this.encodingConfig.codec)) {
 				this.initPcmEncoder();
 			} else {
-				if (typeof AudioEncoder === 'undefined') {
+				// With custom encoders registered (like @mediabunny/server's), it's this config they declined
+				if (typeof AudioEncoder === 'undefined' && customAudioEncoders.length === 0) {
 					throw new Error(missingWebCodecsClassMessage('AudioEncoder'));
 				}
 
-				let supported: boolean;
+				let supported = false;
 
-				try {
-					const support = await AudioEncoder.isConfigSupported(encoderConfig);
-					supported = support.supported ?? false;
-				} catch {
-					supported = false;
+				if (typeof AudioEncoder !== 'undefined') {
+					try {
+						const support = await AudioEncoder.isConfigSupported(encoderConfig);
+						supported = support.supported ?? false;
+					} catch {
+						// Not supported
+					}
 				}
 
 				if (!supported) {
+					let missingClass = '';
+					if (typeof AudioEncoder === 'undefined') {
+						// Custom encoders were registered then, and none supports this config (an extension for other
+						// codecs, say), so say both
+						const message = missingWebCodecsClassMessage('AudioEncoder');
+						missingClass = ` No registered custom encoder supports it, and ${message}`;
+					}
 					throw new Error(
 						`This specific encoder configuration (${encoderConfig.codec}, ${encoderConfig.bitrate} bps,`
 						+ ` ${encoderConfig.numberOfChannels} channels, ${encoderConfig.sampleRate} Hz) is not`
-						+ ` supported in this environment. Consider using another codec or changing your`
-						+ ` audio parameters.`,
+						+ ` supported in this environment.${missingClass} Consider using another codec or changing`
+						+ ` your audio parameters.`,
 					);
 				}
 
