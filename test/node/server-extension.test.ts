@@ -878,6 +878,41 @@ describe('Video', async () => {
 		await conversionRoundtrip('vp9');
 	});
 
+	test('AV1 encodes at target bitrates above SVT-AV1\'s 100 Mbps', async () => {
+		const encoder = new NodeAvVideoEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'av1';
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: buildVideoCodecString('av1', 64, 64, 200_000_000, false),
+			width: 64,
+			height: 64,
+			bitrate: 200_000_000,
+		} satisfies VideoEncoderConfig;
+
+		let packetCount = 0;
+		// @ts-expect-error Readonly
+		encoder.onPacket = () => {
+			packetCount++;
+		};
+
+		await encoder.init();
+		for (let i = 0; i < 3; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 3 / 2).fill(128), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await encoder.encode(sample, {});
+		}
+		await encoder.flush();
+		await encoder.close();
+
+		expect(packetCount).toBe(3);
+	});
+
 	test('AV1 conversion roundtrip', { timeout: 20_000 }, async () => {
 		await conversionRoundtrip('av1');
 	});
@@ -2124,6 +2159,53 @@ describe('Audio', async () => {
 			expect(sample.sampleRate).toBe(48000);
 			expect(sample.duration).toBe(0.032);
 		});
+	});
+
+	test('Opus, AC-3 and E-AC-3 encode at bitrates outside their encoders\' range', async () => {
+		// Encodes 1 s of loud noise, the hardest content to fit, and returns the average bitrate of the packets
+		const encodedBitrate = async (codec: AudioCodec, numberOfChannels: number, bitrate: number) => {
+			const sampleRate = 48000;
+			const encoder = new NodeAvAudioEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = codec;
+			// @ts-expect-error Readonly
+			encoder.config = { codec, sampleRate, numberOfChannels, bitrate } satisfies AudioEncoderConfig;
+
+			let bytes = 0;
+			let duration = 0;
+			// @ts-expect-error Readonly
+			encoder.onPacket = (packet: EncodedPacket) => {
+				bytes += packet.byteLength;
+				duration += packet.duration;
+			};
+
+			await encoder.init();
+			const data = new Float32Array(sampleRate * numberOfChannels);
+			let seed = 12345;
+			for (let i = 0; i < data.length; i++) {
+				seed = (seed * 48271) % 2147483647;
+				data[i] = 1.6 * (seed / 2147483647 - 0.5);
+			}
+			using sample = new AudioSample({ data, format: 'f32-planar', sampleRate, numberOfChannels, timestamp: 0 });
+			await encoder.encode(sample);
+			await encoder.flush();
+			await encoder.close();
+
+			expect(duration).toBeGreaterThan(0.9);
+			return bytes * 8 / duration;
+		};
+
+		// libopus takes at most 256 kbps per channel
+		expect(await encodedBitrate('opus', 1, 320_000)).toBeLessThan(270_000);
+		expect(await encodedBitrate('opus', 2, 1_000_000)).toBeLessThan(530_000);
+		// The AC-3 and E-AC-3 encoders fail the bit allocation of such content below some bitrate
+		expect(await encodedBitrate('ac3', 6, 32_000)).toBeGreaterThan(32_000);
+		expect(await encodedBitrate('eac3', 2, 16_000)).toBeGreaterThan(16_000);
+		expect(await encodedBitrate('eac3', 6, 40_000)).toBeGreaterThan(40_000);
+
+		// Bitrates in the range stay as they are
+		expect(await encodedBitrate('opus', 2, 128_000)).toBeLessThan(140_000);
+		expect(await encodedBitrate('ac3', 2, 192_000)).toBeCloseTo(192_000, -3);
 	});
 
 	test('DTS encode & decode', async () => {

@@ -412,6 +412,25 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	}
 }
 
+/**
+ * By channel count, the bitrates below which the AC-3 and E-AC-3 encoders, which open anyway, fail the bit allocation
+ * of frames that are hard to fit. Measured with loud white noise at 48 kHz, which needs the most.
+ */
+const AC3_MIN_BITRATES = [0, 0, 40_000, 48_000, 56_000, 56_000];
+const EAC3_MIN_BITRATES = [16_000, 32_000, 32_000, 48_000, 56_000, 56_000];
+
 const resolveBitrate = (config: AudioEncoderConfig, codec: AudioCodec) => {
-	return config.bitrate ?? new Quality('medium')._toAudioBitrate(codec) ?? 0;
+	const bitrate = config.bitrate ?? new Quality('medium')._toAudioBitrate(codec) ?? 0;
+
+	// Bitrates outside the encoders' range are moved into it, as encoders may miss their target bitrate. libopus takes
+	// at most 256 kbps per channel.
+	if (codec === 'opus') {
+		return Math.min(bitrate, 256_000 * config.numberOfChannels);
+	} else if (codec === 'ac3') {
+		return Math.max(bitrate, AC3_MIN_BITRATES[config.numberOfChannels - 1] ?? 0);
+	} else if (codec === 'eac3') {
+		return Math.max(bitrate, EAC3_MIN_BITRATES[config.numberOfChannels - 1] ?? 0);
+	}
+
+	return bitrate;
 };
