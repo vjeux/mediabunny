@@ -35,7 +35,7 @@ import { VideoSampleSource } from '../../src/media-source.js';
 import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
-import { toAvFrame } from '../../packages/server/src/index.js';
+import { _serverOptions, toAvFrame } from '../../packages/server/src/index.js';
 import * as NodeAv from 'node-av';
 
 beforeAll(() => {
@@ -472,6 +472,24 @@ describe('Video', async () => {
 
 			expect(buf[0]).toBeGreaterThan(250); // Quasi-white
 		});
+	});
+
+	test('Hardware encoder that fails to open falls back to software', async () => {
+		// CUDA contexts list av1_nvenc even on NVIDIA GPUs without AV1 encoding (RTX 30 and older), where, like on
+		// machines without an NVIDIA GPU, it fails to open
+		const hardwareCodec = NodeAv.Codec.findEncoderByName(NodeAv.FF_ENCODER_AV1_NVENC);
+		assert(hardwareCodec);
+		const hardwareContext = Object.assign(
+			Object.create(NodeAv.HardwareContext.prototype) as NodeAv.HardwareContext,
+			{ getEncoderCodec: () => hardwareCodec, getDecoderCodec: () => null },
+		);
+
+		_serverOptions.hardwareContext = () => hardwareContext;
+		try {
+			await encodeDecodeTest('av1', {}, async () => {}, async () => {});
+		} finally {
+			delete _serverOptions.hardwareContext;
+		}
 	});
 
 	const QUANTIZER_TEST_CODECS = [
