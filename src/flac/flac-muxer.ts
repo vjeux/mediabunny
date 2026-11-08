@@ -31,6 +31,7 @@ import { Bitstream } from '../../shared/bitstream';
 const FLAC_HEADER = /* #__PURE__ */ new Uint8Array([0x66, 0x4c, 0x61, 0x43]); // 'fLaC'
 const STREAMINFO_SIZE = 38;
 const STREAMINFO_BLOCK_SIZE = 34;
+const MAX_METADATA_BLOCK_SIZE = 2 ** 24 - 1;
 
 export class FlacMuxer extends Muxer {
 	private writer!: Writer;
@@ -178,11 +179,20 @@ export class FlacMuxer extends Muxer {
 		// 4 bytes: picture data length
 		// z bytes: picture data
 		// Total: 20 + x + y + z
+		const mimeTypeBytes = textEncoder.encode(picture.mimeType);
+		const descriptionBytes = textEncoder.encode(picture.description ?? '');
 		const headerSize
 			= 32
-				+ picture.mimeType.length
-				+ (picture.description?.length ?? 0)
+				+ mimeTypeBytes.length
+				+ descriptionBytes.length
 				+ picture.data.length;
+
+		if (headerSize > MAX_METADATA_BLOCK_SIZE) {
+			throw new Error(
+				`Picture is too big for FLAC: its metadata block would take ${headerSize} bytes, but FLAC metadata`
+				+ ` blocks can take at most ${MAX_METADATA_BLOCK_SIZE} bytes.`,
+			);
+		}
 
 		const header = new Uint8Array(headerSize);
 
@@ -193,14 +203,14 @@ export class FlacMuxer extends Muxer {
 			picture.kind === 'coverFront' ? 3 : picture.kind === 'coverBack' ? 4 : 0,
 		);
 		offset += 4;
-		dataView.setUint32(offset, picture.mimeType.length);
+		dataView.setUint32(offset, mimeTypeBytes.length);
 		offset += 4;
-		header.set(textEncoder.encode(picture.mimeType), 8);
-		offset += picture.mimeType.length;
-		dataView.setUint32(offset, picture.description?.length ?? 0);
+		header.set(mimeTypeBytes, offset);
+		offset += mimeTypeBytes.length;
+		dataView.setUint32(offset, descriptionBytes.length);
 		offset += 4;
-		header.set(textEncoder.encode(picture.description ?? ''), offset);
-		offset += picture.description?.length ?? 0;
+		header.set(descriptionBytes, offset);
+		offset += descriptionBytes.length;
 		offset += 4 + 4 + 4 + 4; // setting width, height, color depth, number of indexed colors to 0
 		dataView.setUint32(offset, picture.data.length);
 		offset += 4;
