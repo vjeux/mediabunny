@@ -397,6 +397,99 @@ const startRangelessServer = async (
 	};
 };
 
+test('UrlSource takes a 416 right where the data ends as the end of a resource of unknown size', async () => {
+	// A server that doesn't state the size of the resource: Content-Range "bytes a-b/*" without a Content-Length, as
+	// for a growing file, which cross-origin pages see without the Content-Range. It answers 416 past the end, without
+	// a readable Content-Range either. Each response carries the rest of the resource in one chunk, so a read ends
+	// exactly where the data does, without seeing the response end.
+	const makeFetchFn = (data: Uint8Array, contentRange: boolean, requestedRanges: string[] = []) => {
+		return async (url: string | URL | Request, init?: RequestInit) => {
+			const range = new Headers(init?.headers).get('Range')!;
+			requestedRanges.push(range);
+			const start = Number(/^bytes=(\d+)-$/.exec(range)![1]);
+			if (start >= data.length) {
+				return new Response(null, { status: 416, statusText: 'Range Not Satisfiable' });
+			}
+
+			const body = new ReadableStream<Uint8Array>({
+				start: (controller) => {
+					controller.enqueue(data.slice(start));
+					controller.close();
+				},
+			});
+			const headers = contentRange ? { 'Content-Range': `bytes ${start}-${data.length - 1}/*` } : undefined;
+			return new Response(body, { status: 206, headers });
+		};
+	};
+
+	const data = new Uint8Array(1_000_000).map((_, i) => i % 251);
+	for (const contentRange of [true, false]) {
+		const requestedRanges: string[] = [];
+		using ref = new UrlSource('https://cdn.example.com/media', {
+			fetchFn: makeFetchFn(data, contentRange, requestedRanges),
+		}).ref();
+		const reader = new Reader(ref.source);
+		expect(await reader.requestSlice(0, 16)).not.toBeNull();
+		// On main, this rejected with "Error fetching https://cdn.example.com/media: 416 Range Not Satisfiable"
+		const slice = await reader.requestSliceRange(999_900, 0, 1000);
+		expect(slice && readBytes(slice, slice.length)).toEqual(data.subarray(999_900));
+		expect(requestedRanges).toEqual(['bytes=0-', 'bytes=1000000-']);
+		expect(reader.fileSize).toBe(data.length);
+	}
+
+	// A demuxer reading past the end of a real file
+	const flacPath = path.join(__dirname, '..', 'public', 'sample.flac');
+	const countPackets = async (source: UrlSource | FilePathSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		let count = 0;
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			void packet;
+			count++;
+		}
+		return count;
+	};
+	const flac = new Uint8Array(fs.readFileSync(flacPath));
+	const flacSource = new UrlSource('https://cdn.example.com/sample.flac', { fetchFn: makeFetchFn(flac, false) });
+	expect(await countPackets(flacSource)).toBe(await countPackets(new FilePathSource(flacPath)));
+
+	// A server that ignores range requests (sequential mode), whose response dies right at the end, and that answers
+	// the request to resume with a 416
+	let requestCount = 0;
+	const sequentialFetchFn = async () => {
+		requestCount++;
+		if (requestCount > 1) {
+			return new Response(null, { status: 416, statusText: 'Range Not Satisfiable' });
+		}
+
+		let sent = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (sent) {
+					controller.error(new TypeError('network error'));
+				} else {
+					controller.enqueue(data.slice());
+					sent = true;
+				}
+			},
+		});
+		return new Response(body, { status: 200 });
+	};
+	const logs = captureLogs();
+	try {
+		using ref = new UrlSource('https://cdn.example.com/media', {
+			fetchFn: sequentialFetchFn,
+			getRetryDelay: () => 0,
+		}).ref();
+		const reader = new Reader(ref.source);
+		expect(await reader.requestSlice(0, data.length)).not.toBeNull();
+		const slice = await reader.requestSliceRange(999_990, 0, 1000);
+		expect(slice && readBytes(slice, slice.length)).toEqual(data.subarray(999_990));
+		expect(requestCount).toBe(2);
+	} finally {
+		logs.stop();
+	}
+});
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
