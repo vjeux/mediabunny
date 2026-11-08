@@ -1025,6 +1025,70 @@ test('Creation time not copied in conversion', async () => {
 	expect(readTags.creationTime).toEqual(new Date('2024-02-29T13:37:42.123Z'));
 });
 
+test('Read ID3v2 tags in front of the RIFF header of a WAV file', async () => {
+	// 1 s of 16-bit stereo silence at 8 kHz
+	const dataSize = 8000 * 4;
+	const wav = new Uint8Array(44 + dataSize);
+	const view = new DataView(wav.buffer);
+	wav.set([0x52, 0x49, 0x46, 0x46], 0); // 'RIFF'
+	view.setUint32(4, 36 + dataSize, true);
+	wav.set([0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20], 8); // 'WAVEfmt '
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true); // PCM
+	view.setUint16(22, 2, true);
+	view.setUint32(24, 8000, true);
+	view.setUint32(28, 8000 * 4, true);
+	view.setUint16(32, 4, true);
+	view.setUint16(34, 16, true);
+	wav.set([0x64, 0x61, 0x74, 0x61], 36); // 'data'
+	view.setUint32(40, dataSize, true);
+
+	// An ID3v2.3 tag with a TIT2 frame, as some taggers put in front of any file. FFmpeg and Chrome skip it.
+	const frame = [0x54, 0x49, 0x54, 0x32, 0, 0, 0, 6, 0, 0, 0, 0x48, 0x65, 0x6c, 0x6c, 0x6f]; // TIT2 'Hello'
+	const tag = new Uint8Array([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, frame.length, ...frame]);
+
+	const bytes = new Uint8Array(tag.length + wav.length);
+	bytes.set(tag);
+	bytes.set(wav, tag.length);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	expect((await input.getFormat()).name).toBe('WAVE');
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getCodec()).toBe('pcm-s16');
+	expect(await track.computeDuration()).toBe(1);
+	expect((await input.getMetadataTags()).title).toBe('Hello');
+});
+
+test('A WAV file holding MP3 audio with an ID3v2 tag in front still reads as MP3', async () => {
+	// MPEG audio in WAVE ("RIFF MP3") isn't supported by the WAVE demuxer, but with a tag in front, the MP3 format
+	// has always read its frames
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const le32 = (n: number) => [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, n >>> 24];
+	const le16 = (n: number) => [n & 0xff, (n >>> 8) & 0xff];
+	const frames: number[] = [];
+	for (let i = 0; i < 10; i++) {
+		frames.push(0xff, 0xfb, 0x90, 0x64, ...new Array<number>(413).fill(0)); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
+	}
+	// A 30-byte fmt chunk, as MPEGLAYER3WAVEFORMAT
+	const fmt = [
+		...ascii('fmt '), ...le32(30),
+		...le16(0x55), ...le16(2), ...le32(44100), ...le32(16000), ...le16(1), ...le16(0), // Format tag 0x55: MP3
+		...le16(12), ...le16(1), ...le32(2), ...le16(417), ...le16(1), ...le16(1393),
+	];
+	const body = [...ascii('WAVE'), ...fmt, ...ascii('data'), ...le32(frames.length), ...frames];
+	const riff = [...ascii('RIFF'), ...le32(body.length), ...body];
+	const tit2 = [...ascii('TIT2'), 0, 0, 0, 6, 0, 0, 0, ...ascii('Hello')];
+	const id3 = [...ascii('ID3'), 3, 0, 0, 0, 0, 0, tit2.length, ...tit2];
+	const bytes = new Uint8Array([...id3, ...riff]);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	expect((await input.getFormat()).name).toBe('MP3');
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect((await track.computePacketStats()).packetCount).toBe(10);
+	expect((await input.getMetadataTags()).title).toBe('Hello');
+});
+
 test('Creation time override in conversion', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
