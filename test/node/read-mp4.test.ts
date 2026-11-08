@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { deflateSync } from 'node:zlib';
 import {
 	ALL_FORMATS,
 	AudioSampleSink,
@@ -5663,3 +5664,131 @@ test('Files without an ftyp box', async () => {
 	const moovSize = moov(0).length;
 	expect(await read([...moov(moovSize + 8), ...mdat])).toEqual(['MP4', 'pcm-s16', 4 * frameCount]);
 });
+
+test('Compressed movie box', async () => {
+	// QuickTime's "Compress movie header" option stores the movie box as moov > cmov > dcom (the compression algorithm)
+	// + cmvd (the uncompressed size and the zlib data). One track of 16-bit stereo PCM at 8 kHz.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const frameCount = 800;
+
+	const head = [...box('ftyp', ascii('qt  '), u32(0x200), ascii('qt  ')), ...box('wide')];
+	const mdat = box('mdat', zeros(4 * frameCount));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(100), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(100), zeros(8), zeros(4), [1, 0], zeros(2), matrix,
+				zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(8000), u32(frameCount), zeros(4)),
+				box('hdlr', zeros(4), ascii('mhlr'), ascii('soun'), zeros(13)),
+				box('minf', box('smhd', zeros(8)), box('stbl',
+					box('stsd', zeros(4), u32(1), box('sowt', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4),
+						u32(8000 * 0x10000))),
+					box('stts', zeros(4), u32(1), u32(frameCount), u32(1)),
+					box('stsc', zeros(4), u32(1), u32(1), u32(frameCount), u32(1)),
+					box('stsz', zeros(4), u32(4), u32(frameCount)),
+					box('stco', zeros(4), u32(1), u32(head.length + 8)),
+				)),
+			),
+		),
+	);
+	const compressed = ({ algorithm = 'zlib', uncompressedSize = moov.length, corrupt = false } = {}) => {
+		const data = [...deflateSync(new Uint8Array(moov))];
+		if (corrupt) {
+			data[0] = 0; // The zlib header
+		}
+
+		return box('moov', box('cmov', box('dcom', ascii(algorithm)), box('cmvd', u32(uncompressedSize), data)));
+	};
+
+	const read = async (storedMoov: number[]) => {
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...head, ...mdat, ...storedMoov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return [
+			await track.getCodec(),
+			await track.computeDuration(),
+			(await new EncodedPacketSink(track).getFirstPacket())?.byteLength,
+		];
+	};
+
+	expect(await read(moov)).toEqual(['pcm-s16', 0.1, 4 * frameCount]); // The control
+	expect(await read(compressed())).toEqual(['pcm-s16', 0.1, 4 * frameCount]);
+	// An overstated declared size is fine, as the movie box's own size says where it ends
+	expect(await read(compressed({ uncompressedSize: 0xffffffff }))).toEqual(['pcm-s16', 0.1, 4 * frameCount]);
+
+	// The declared size bounds the decompressed data
+	await expect(read(compressed({ uncompressedSize: moov.length - 1 })))
+		.rejects.toThrow('Invalid compressed movie box: its data decompresses to more than its declared size.');
+	await expect(read(compressed({ algorithm: 'adec' })))
+		.rejects.toThrow('Unsupported compression algorithm \'adec\' for the compressed movie box.');
+	await expect(read(compressed({ corrupt: true })))
+		.rejects.toThrow('Invalid compressed movie box: its data couldn\'t be decompressed');
+});
+
+test('Compressed movie box that declares a huge size', async () => {
+	// The size a cmvd box declares is the file's word, so it can't bound the decompressed data on its own (found by
+	// the L46 review)
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: (number[] | Uint8Array)[]) => {
+		const bytes = contents.flatMap(content => [...content]);
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+
+	// Counts what the platform's DecompressionStream hands out
+	const OriginalDecompressionStream = globalThis.DecompressionStream;
+	let decompressedSize = 0;
+	globalThis.DecompressionStream = class extends OriginalDecompressionStream {
+		constructor(format: CompressionFormat) {
+			super(format);
+			const counter = new TransformStream<Uint8Array, Uint8Array>({
+				transform: (chunk, controller) => {
+					decompressedSize += chunk.length;
+					controller.enqueue(chunk);
+				},
+			});
+			Object.defineProperty(this, 'readable', { value: super.readable.pipeThrough(counter) });
+		}
+	} as typeof DecompressionStream;
+
+	const read = async (movieBoxData: Uint8Array) => {
+		decompressedSize = 0;
+		const bytes = new Uint8Array([
+			...box('ftyp', ascii('qt  '), u32(0x200), ascii('qt  ')),
+			...box('moov', box('cmov',
+				box('dcom', ascii('zlib')),
+				box('cmvd', u32(0xffffffff), deflateSync(movieBoxData, { level: 9 })),
+			)),
+		]);
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		await input.getTracks();
+	};
+
+	try {
+		// 256 MiB of zeros, which deflate to 260 kB
+		await expect(read(new Uint8Array(2 ** 28)))
+			.rejects.toThrow('Invalid compressed movie box: it doesn\'t hold a movie box.');
+		// Real compressed movie headers are a few MB at most
+		expect(decompressedSize).toBeLessThanOrEqual(65 * 2 ** 20);
+
+		// A movie box that says it's 128 MiB
+		const bigMovieBox = new Uint8Array(2 ** 20);
+		bigMovieBox.set([...u32(2 ** 27), ...ascii('moov')]);
+		await expect(read(bigMovieBox))
+			.rejects.toThrow('Unsupported compressed movie box: it decompresses to more than 64 MiB.');
+		expect(decompressedSize).toBeLessThanOrEqual(65 * 2 ** 20);
+	} finally {
+		globalThis.DecompressionStream = OriginalDecompressionStream;
+	}
+}, 60_000);
