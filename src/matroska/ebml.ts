@@ -102,6 +102,7 @@ export enum EBMLId {
 	CodecDelay = 0x56aa,
 	SeekPreRoll = 0x56bb,
 	DefaultDuration = 0x23e383,
+	TrackTimestampScale = 0x23314f,
 	Video = 0xe0,
 	PixelWidth = 0xb0,
 	PixelHeight = 0xba,
