@@ -1730,8 +1730,10 @@ export class VideoSample implements Disposable {
 			targetHeight = cropHeight;
 		}
 
-		targetWidth = roundToMultiple(targetWidth, options.roundDimensionsTo ?? 1);
-		targetHeight = roundToMultiple(targetHeight, options.roundDimensionsTo ?? 1);
+		// Extreme aspect ratios must not round a dimension down to zero
+		const multiple = options.roundDimensionsTo ?? 1;
+		targetWidth = Math.max(multiple, roundToMultiple(targetWidth, multiple));
+		targetHeight = Math.max(multiple, roundToMultiple(targetHeight, multiple));
 
 		const description: VideoSampleTransformationDescription = {
 			width: targetWidth,
@@ -2110,8 +2112,12 @@ export const clampCropRectangle = (crop: CropRectangle, outerWidth: number, oute
 	const width = Math.min(crop.width, outerWidth - left);
 	const height = Math.min(crop.height, outerHeight - top);
 
-	assert(width >= 0);
-	assert(height >= 0);
+	if (width === 0 || height === 0) {
+		throw new TypeError(
+			`The crop rectangle (left ${crop.left}, top ${crop.top}, ${crop.width}x${crop.height}) lies outside the`
+			+ ` ${outerWidth}x${outerHeight} frame.`,
+		);
+	}
 
 	return { left, top, width, height };
 };
@@ -2126,11 +2132,11 @@ export const validateCropRectangle = (crop: CropRectangle, prefix: string) => {
 	if (!Number.isInteger(crop.top) || crop.top < 0) {
 		throw new TypeError(prefix + 'crop.top must be a non-negative integer.');
 	}
-	if (!Number.isInteger(crop.width) || crop.width < 0) {
-		throw new TypeError(prefix + 'crop.width must be a non-negative integer.');
+	if (!Number.isInteger(crop.width) || crop.width <= 0) {
+		throw new TypeError(prefix + 'crop.width must be a positive integer.');
 	}
-	if (!Number.isInteger(crop.height) || crop.height < 0) {
-		throw new TypeError(prefix + 'crop.height must be a non-negative integer.');
+	if (!Number.isInteger(crop.height) || crop.height <= 0) {
+		throw new TypeError(prefix + 'crop.height must be a positive integer.');
 	}
 };
 
