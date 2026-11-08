@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { assert, promiseWithResolvers } from '../../src/misc.js';
+import { assert, promiseWithResolvers, clamp } from '../../src/misc.js';
 import { AudioBufferSink, AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
@@ -10,9 +10,9 @@ import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/me
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
-import { EncodedPacket } from '../../src/packet.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -800,4 +800,72 @@ test('Empty sample ranges yield nothing', async () => {
 
 		expect(timestamps).toEqual([]);
 	}
+});
+
+// One IDR, then I-frames with recovery point SEIs whose leading B-frames reference the previous GOP. The luma of each
+// frame encodes its index:
+// ffmpeg -f lavfi -i "nullsrc=s=64x64:r=30:d=2.5,geq=lum='mod(N\,16)*16+8':cb=128:cr=128,format=yuv420p" \
+//   -c:v libx264 -preset fast -bf 2 -x264-params "open-gop=1:keyint=30:min-keyint=30:scenecut=0" \
+//   -movflags +faststart open-gop-h264.mp4
+// ffmpeg -i open-gop-h264.mp4 -c copy open-gop-h264.ts
+const expectOpenGopSeeking = async (input: Input) => {
+	const track = (await input.getPrimaryVideoTrack())!;
+	const firstTimestamp = await track.getFirstTimestamp();
+	const sink = new VideoSampleSink(track);
+	const context = new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true })!;
+
+	for (const frame of [29, 30, 31, 32, 45, 59, 61]) {
+		const sample = await sink.getSample(firstTimestamp + (frame + 0.5) / 30);
+		expect(sample, `frame ${frame}`).not.toBeNull();
+		assert(sample);
+		expect(Math.round((sample.timestamp - firstTimestamp) * 30), `frame ${frame}`).toBe(frame);
+
+		sample.draw(context, 0, 0, 1, 1);
+		sample.close();
+		const expectedGray = clamp(Math.round(((frame % 16) * 16 + 8 - 16) * 255 / 219), 0, 255);
+		const gray = context.getImageData(0, 0, 1, 1).data[1]!;
+		expect(Math.abs(gray - expectedGray), `frame ${frame}`).toBeLessThan(6);
+	}
+};
+
+test('Seeking into open-GOP H.264 returns the right frames, MP4', async (context) => {
+	using input = new Input({ source: new UrlSource('/open-gop-h264.mp4'), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	// Outside Chromium, decoding starts at recovery points, which not every decoder can do (WebKitGTK's can't). So
+	// probe the platform's decoder with the recovery point at 1 s and the packets following it.
+	const packetSink = new EncodedPacketSink(track);
+	const recoveryPoint = (await packetSink.getKeyPacket(await track.getFirstTimestamp() + 1))!;
+	if (await track.determinePacketType(recoveryPoint) === 'key') {
+		let outputs = 0;
+		let failed = false;
+		const decoder = new VideoDecoder({
+			output: (frame) => {
+				outputs++;
+				frame.close();
+			},
+			error: () => failed = true,
+		});
+		decoder.configure((await track.getDecoderConfig())!);
+		let packet: EncodedPacket | null = recoveryPoint;
+		for (let i = 0; i < 8 && packet; i++) {
+			decoder.decode(packet.toEncodedVideoChunk());
+			packet = await packetSink.getNextPacket(packet);
+		}
+		await decoder.flush().catch(() => failed = true);
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+
+		if (failed || outputs === 0) {
+			context.skip();
+		}
+	}
+
+	await expectOpenGopSeeking(input);
+});
+
+test('Seeking into open-GOP H.264 returns the right frames, MPEG-TS', async () => {
+	using input = new Input({ source: new UrlSource('/open-gop-h264.ts'), formats: ALL_FORMATS });
+	await expectOpenGopSeeking(input);
 });
