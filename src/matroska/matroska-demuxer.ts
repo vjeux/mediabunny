@@ -15,8 +15,10 @@ import {
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	extractProresCodecInfoFromPacket,
+	extractAv1FrameSizeFromPacket,
 	extractVp8FrameSizeFromPacket,
 	extractVp9CodecInfoFromPacket,
+	extractVp9FrameSizeFromPacket,
 	HevcNalUnitType,
 	parseAvcSps,
 	parseHevcSps,
@@ -2750,9 +2752,9 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				if (info.codec === 'vp8') {
 					size = extractVp8FrameSizeFromPacket(packet.data);
 				} else if (info.codec === 'vp9') {
-					size = extractVp9CodecInfoFromPacket(packet.data);
+					size = extractVp9FrameSizeFromPacket(packet.data);
 				} else if (info.codec === 'av1') {
-					size = extractAv1CodecInfoFromPacket(packet.data);
+					size = extractAv1FrameSizeFromPacket(packet.data);
 				} else if (info.codec === 'avc' || info.codec === 'hevc') {
 					size = getFrameSizeFromParameterSets(info.codec, null, packet.data);
 				}
