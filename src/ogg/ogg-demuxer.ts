@@ -698,7 +698,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return this.getPacketSequential(timestamp, options);
 		}
 
-		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate, this.internalSampleRate);
+		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 		const firstTimestampInSamples = await this.getFirstTimestampInSamples();
 		if (timestampInSamples === firstTimestampInSamples) {
 			// Fast path for the first timestamp - avoids binary search when playing back from the start
@@ -1022,10 +1022,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		const release = await this.sequentialScanMutex.acquire(); // Requires exclusivity because we write to a cache
 
 		try {
-			const timestampInSamples = roundIfAlmostInteger(
-				timestamp * this.internalSampleRate,
-				this.internalSampleRate,
-			);
+			const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 			timestamp = timestampInSamples / this.internalSampleRate;
 
 			const index = binarySearchLessOrEqual(

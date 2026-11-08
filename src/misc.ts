@@ -760,7 +760,7 @@ export const UNDETERMINED_LANGUAGE = 'und';
 
 /**
  * Rounds a value in some time unit to the nearest integer when it's only a float error away from it. Pass how many of
- * those units make a second, for the tolerance near zero.
+ * those units make a second when that can be anything (a file's timescale), for the tolerance near zero.
  */
 export const roundIfAlmostInteger = (value: number, unitsPerSecond?: number) => {
 	const rounded = Math.round(value);
