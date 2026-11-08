@@ -1198,6 +1198,8 @@ const detectAvcChunkTimestampShift = () => {
 };
 
 let splitterWorkerUrl: string | null = null;
+// Set once a splitter worker couldn't start, so that later splitters don't try again (each try may file a CSP report)
+let splitterWorkerUnavailable = false;
 
 /** Utility class for splitting a composite frame into separate color and alpha parts on the CPU in a worker. */
 export class ColorAlphaSplitter {
@@ -1244,6 +1246,11 @@ export class ColorAlphaSplitter {
 		const { promise, resolve } = promiseWithResolvers<boolean>();
 		this.resolveWorkerStarted = resolve;
 
+		if (splitterWorkerUnavailable) {
+			resolve(false);
+			return promise;
+		}
+
 		try {
 			if (!splitterWorkerUrl) {
 				const blob = new Blob(
@@ -1255,6 +1262,7 @@ export class ColorAlphaSplitter {
 
 			this.worker = new Worker(splitterWorkerUrl);
 		} catch {
+			splitterWorkerUnavailable = true;
 			resolve(false);
 			return promise;
 		}
@@ -1272,6 +1280,7 @@ export class ColorAlphaSplitter {
 		this.worker.addEventListener('error', (event) => {
 			if (!started) {
 				// It never ran (nothing was sent to it yet), so the splitting happens on this thread instead
+				splitterWorkerUnavailable = true;
 				this.worker?.terminate();
 				this.worker = null;
 				resolve(false);

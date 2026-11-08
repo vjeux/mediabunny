@@ -47,23 +47,20 @@ const encodeTransparentVideo = async () => {
 };
 
 test('Transparent video encodes under a CSP without blob: workers', async () => {
-	// The color/alpha splitter normally runs in a blob: worker, which fails to load here
-	expect(await encodeTransparentVideo()).toBe(5);
-});
-
-test('Transparent video encodes where workers can\'t be constructed at all', async () => {
-	// Like under Trusted Types (require-trusted-types-for 'script'), where Chromium throws right away
+	// The color/alpha splitter normally runs in a blob: worker, which fails to load here. It's only tried once per page
 	const RealWorker = Worker;
-	globalThis.Worker = class {
-		constructor() {
-			throw new TypeError(
-				'Failed to construct \'Worker\': This document requires \'TrustedScriptURL\' assignment.',
-			);
+	let workerCount = 0;
+	globalThis.Worker = class extends RealWorker {
+		constructor(...args: ConstructorParameters<typeof Worker>) {
+			super(...args);
+			workerCount++;
 		}
-	} as unknown as typeof Worker;
+	};
 
 	try {
 		expect(await encodeTransparentVideo()).toBe(5);
+		expect(await encodeTransparentVideo()).toBe(5);
+		expect(workerCount).toBe(1);
 	} finally {
 		globalThis.Worker = RealWorker;
 	}
