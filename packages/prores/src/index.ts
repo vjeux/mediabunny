@@ -142,17 +142,21 @@ class ProresDecoder extends CustomVideoDecoder {
 			fullRange: result.colorRangeFull,
 		};
 
+		let pixelAspectRatio = result.pixelAspectRatio;
+		if (this.config.displayAspectWidth !== undefined && this.config.displayAspectHeight !== undefined) {
+			pixelAspectRatio = {
+				num: this.config.displayAspectWidth * result.visibleHeight,
+				den: this.config.displayAspectHeight * result.visibleWidth,
+			};
+		}
+
 		let displayWidth = result.visibleWidth;
 		let displayHeight = result.visibleHeight;
 
-		if (result.pixelAspectRatio.num > result.pixelAspectRatio.den) {
-			displayWidth = Math.round(
-				result.visibleWidth * result.pixelAspectRatio.num / result.pixelAspectRatio.den,
-			);
+		if (pixelAspectRatio.num > pixelAspectRatio.den) {
+			displayWidth = Math.round(result.visibleWidth * pixelAspectRatio.num / pixelAspectRatio.den);
 		} else {
-			displayHeight = Math.round(
-				result.visibleHeight * result.pixelAspectRatio.den / result.pixelAspectRatio.num,
-			);
+			displayHeight = Math.round(result.visibleHeight * pixelAspectRatio.den / pixelAspectRatio.num);
 		}
 
 		let sample: VideoSample;
