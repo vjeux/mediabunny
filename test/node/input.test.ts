@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, expectTypeOf, test } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,8 +6,9 @@ import { readFile } from 'node:fs/promises';
 import { Input, UnsupportedInputFormatError } from '../../src/input.js';
 import { ALL_FORMATS, MP3, MPEG_TS, ADTS, FLAC, OGG, WAVE } from '../../src/input-format.js';
 import { EncodedPacketSink, AudioSampleSink } from '../../src/media-sink.js';
-import { BufferSource, CustomPathedSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource, FilePathSource } from '../../src/source.js';
 import { assert } from '../../src/misc.js';
+import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { Output } from '../../src/output.js';
 import { HlsOutputFormat, MkvOutputFormat, Mp4OutputFormat, OutputFormat } from '../../src/output-format.js';
 import { BufferTarget, NullTarget, PathedTarget } from '../../src/target.js';
@@ -514,4 +515,26 @@ test('Converting a file with two audio tracks to HLS keeps the audio tracks apar
 
 	// HLS can't pair two audio tracks, which used to be logged as an illegal pairing taken over from the input
 	expect(warnings).toEqual([]);
+});
+
+test('Input track types are their literal kind, so they narrow track unions', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = await input.getPrimaryVideoTrack();
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(videoTrack && audioTrack);
+
+	// Like OutputVideoTrack and OutputAudioTrack (found by lane L71)
+	expectTypeOf(videoTrack.type).toEqualTypeOf<'video'>();
+	expectTypeOf(audioTrack.type).toEqualTypeOf<'audio'>();
+	expect(videoTrack.type).toBe('video');
+	expect(audioTrack.type).toBe('audio');
+
+	const tracks: (InputVideoTrack | InputAudioTrack)[] = [videoTrack, audioTrack];
+	for (const track of tracks) {
+		const size = track.type === 'video' ? await track.getCodedWidth() : await track.getNumberOfChannels();
+		expect(size).toBeGreaterThan(0);
+	}
 });
