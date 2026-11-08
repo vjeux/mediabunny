@@ -52,7 +52,7 @@ import {
 	Rotation,
 } from './misc';
 import { Output, OutputTrackGroup } from './output';
-import { Mp4OutputFormat } from './output-format';
+import { HlsOutputFormat, Mp4OutputFormat } from './output-format';
 import { EncodedPacket } from './packet';
 import {
 	AudioSample,
@@ -1659,8 +1659,10 @@ export class Conversion {
 						this._timestampOffset = Math.max(this._timestampOffset, -this._startTimestamp + correction);
 					} else {
 						needsTranscode = true;
+						// Not HLS: its MPEG-TS segments wrap around what the media timestamp base leaves negative
 						couldCopyWithNegativeTimestamps
-							= this.output.format.negativeTimestampSupport === 'prefer-non-negative';
+							= this.output.format.negativeTimestampSupport === 'prefer-non-negative'
+								&& !(this.output.format instanceof HlsOutputFormat);
 					}
 				}
 			}
@@ -2172,8 +2174,10 @@ export class Conversion {
 						this._timestampOffset = Math.max(this._timestampOffset, -this._startTimestamp + correction);
 					} else {
 						needsTranscode = true;
+						// Not HLS: its MPEG-TS segments wrap around what the media timestamp base leaves negative
 						couldCopyWithNegativeTimestamps
-							= this.output.format.negativeTimestampSupport === 'prefer-non-negative';
+							= this.output.format.negativeTimestampSupport === 'prefer-non-negative'
+								&& !(this.output.format instanceof HlsOutputFormat);
 					}
 				}
 			}
