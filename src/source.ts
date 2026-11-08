@@ -757,6 +757,11 @@ export class UrlSource extends PathedSource {
 	_url: string | URL | Request;
 	/** @internal */
 	_getRetryDelay: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
+	/**
+	 * Whether a response for this URL got through. After that, CORS can't be why a request fails.
+	 * @internal
+	 */
+	_responseReceived = false;
 	/** @internal */
 	_options: UrlSourceOptions;
 	/** @internal */
@@ -963,9 +968,21 @@ export class UrlSource extends PathedSource {
 		}
 
 		// The response got through CORS before its body failed, so the CORS heuristic doesn't apply (and would misfire
-		// in WebKit, which reports every response body error as "Load failed", like a CORS failure). Not passing the
-		// error skips it.
-		return DEFAULT_RETRY_DELAY(previousAttempts, null, this._url);
+		// in WebKit, which reports every response body error as "Load failed", like a CORS failure). It only looks at
+		// TypeErrors (what fetch() and failed bodies throw), so not passing those skips it, while other errors (such as
+		// an HTTP status) still reach the default.
+		return DEFAULT_RETRY_DELAY(previousAttempts, error instanceof TypeError ? null : error, this._url);
+	}
+
+	/**
+	 * The delay before retrying a failed fetch(). Once a response for this URL got through CORS, a failed fetch() is a
+	 * network failure (a reset connection, a network change), so it's treated like a failed response body.
+	 * @internal
+	 */
+	_getFetchRetryDelay(previousAttempts: number, error: unknown) {
+		return this._responseReceived
+			? this._getResumeDelay(previousAttempts, error)
+			: this._getRetryDelay(previousAttempts, error, this._url);
 	}
 
 	/** @internal */
@@ -993,7 +1010,7 @@ export class UrlSource extends PathedSource {
 					},
 					signal: abortController.signal,
 				}),
-				this._getRetryDelay,
+				(previousAttempts, error) => this._getFetchRetryDelay(previousAttempts, error),
 				() => abortController.signal.aborted,
 			);
 
@@ -1040,6 +1057,7 @@ export class UrlSource extends PathedSource {
 			}
 
 			this._fileSizeDetermined = true; // Yes, this is correct even if file size is still null
+			this._responseReceived = true;
 
 			if (!response.body) {
 				throw new Error(
@@ -1219,7 +1237,7 @@ export class UrlSource extends PathedSource {
 								},
 								signal: this._sequentialAbortController.signal,
 							}),
-							this._getRetryDelay,
+							(previousAttempts, error) => this._getFetchRetryDelay(previousAttempts, error),
 							() => this._disposed,
 						);
 
