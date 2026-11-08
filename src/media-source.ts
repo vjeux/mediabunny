@@ -432,6 +432,8 @@ class VideoEncoderWrapper {
 	/** Set when the output is canceled while finalizing; see `cancelPendingAdds()`. */
 	private pendingAddsCanceled = false;
 	private pendingAddsCanceledSignal = promiseWithResolvers();
+	/** How many process function calls are being waited for. */
+	private processCallsInFlight = 0;
 
 	/**
 	 * Whether samples received while the encoder is still being set up get copied into memory (and the originals
@@ -666,7 +668,13 @@ class VideoEncoderWrapper {
 				const pending = processed;
 				const canceled = Promise.race([this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
 				const whenCanceled = canceled.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
-				const result = await Promise.race([pending, whenCanceled]);
+				this.processCallsInFlight++;
+				let result;
+				try {
+					result = await Promise.race([pending, whenCanceled]);
+				} finally {
+					this.processCallsInFlight--;
+				}
 				if (result === PROCESS_CANCELED) {
 					// Whatever it returns once it does settle is dropped
 					void Promise.resolve(pending).then((late) => {
@@ -1501,8 +1509,15 @@ class VideoEncoderWrapper {
 		}
 	}
 
-	/** Stops waiting for added samples to be processed, and drops the ones that haven't been yet. */
+	/**
+	 * Stops waiting for a process function call still in flight, and drops the samples queued behind it. Without one,
+	 * nothing holds them up, so this does nothing and they all still go in.
+	 */
 	cancelPendingAdds() {
+		if (this.processCallsInFlight === 0) {
+			return;
+		}
+
 		this.pendingAddsCanceled = true;
 		this.pendingAddsCanceledSignal.resolve();
 	}

@@ -3965,3 +3965,37 @@ test('VideoSampleSource, cancel() while finalizing gets out of a process() that 
 	expect(await stateAfter(finalized, 1000)).toBe('fulfilled');
 	expect(await stateAfter(Promise.all(adds), 1000)).toBe('fulfilled');
 });
+
+test('VideoSampleSource, cancel() while finalizing keeps every frame without a process function', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let packets = 0;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		onEncodedPacket: () => {
+			packets++;
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	for (let i = 0; i < 6; i++) {
+		void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: i / 30,
+			duration: 1 / 30,
+		})).catch(() => {});
+	}
+
+	// Nothing can hold finalization up here, so canceling while it runs doesn't drop the frames still queued
+	const finalized = output.finalize();
+	await output.cancel();
+	await finalized;
+	expect(output.state).toBe('finalized');
+	expect(packets).toBe(6);
+});
