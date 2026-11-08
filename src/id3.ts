@@ -565,7 +565,9 @@ export class Id3V2Reader {
 			}
 
 			const sizeRaw = this.readU32();
-			let size = this.header.majorVersion === 4
+			// A size with any high bit set isn't synchsafe, leaving only the plain interpretation
+			const canBeSynchsafe = (sizeRaw & 0x80808080) === 0;
+			let size = this.header.majorVersion === 4 && canBeSynchsafe
 				? decodeSynchsafe(sizeRaw)
 				: sizeRaw;
 			const flags = this.readU16();
@@ -576,13 +578,13 @@ export class Id3V2Reader {
 			// tag.
 
 			const isSizeValid = (size: number) => {
-				const nextPos = this.pos + size;
+				const nextPos = headerEndPos + size;
 				if (nextPos > this.bytes.length) {
 					return false;
 				}
 
 				if (nextPos <= this.bytes.length - this.frameHeaderSize()) {
-					this.pos += size;
+					this.pos = nextPos;
 					const nextId = this.readAscii(4);
 					if (nextId !== '\x00\x00\x00\x00' && !/[0-9A-Z]{4}/.test(nextId)) {
 						return false;
@@ -592,7 +594,7 @@ export class Id3V2Reader {
 				return true;
 			};
 
-			if (!isSizeValid(size)) {
+			if (canBeSynchsafe && !isSizeValid(size)) {
 				// Flip the synchsafing, and try if this one makes more sense
 				const otherSize = this.header.majorVersion === 4
 					? sizeRaw
