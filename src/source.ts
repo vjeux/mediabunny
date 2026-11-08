@@ -929,10 +929,17 @@ export class UrlSource extends PathedSource {
 		}
 
 		// Without range requests, the resource can only be streamed from its start, and data further than the cache
-		// size behind the furthest read gets evicted. So data near the end can only be read without losing the data
-		// before it if all of it fits into the cache.
+		// size behind the furthest read gets evicted. So data near the end can only be read without losing data that
+		// reads have yet to get to if all of it fits into the cache, or once the stream has nearly reached the end:
+		// reading the end then only evicts data the reads have passed, keeping at least half the cache before it.
 		const size = this._getFileSize();
-		return typeof size === 'number' && size <= this._sequentialBacking._maxCacheSize;
+		if (typeof size !== 'number') {
+			return false;
+		}
+
+		const backing = this._sequentialBacking;
+		const end = this._offset + size;
+		return size <= backing._maxCacheSize || end - backing._currentIndex <= backing._maxCacheSize / 2;
 	}
 
 	/** @internal */

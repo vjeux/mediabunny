@@ -505,6 +505,21 @@ test('UrlSource reads files larger than its cache in order from a server without
 
 		expect(expected.every(count => count > 70)).toBe(true);
 		expect(counts).toEqual(expected);
+
+		// Optional reads near the end become possible once reading has nearly reached the end, as reading there then
+		// only evicts data that reads have passed (like tags after the data, read after the packets)
+		file = files[2]!;
+		using ref = new UrlSource(`http://localhost:${address.port}/media`, { maxCacheSize: 2 ** 16 }).ref();
+		const reader = new Reader(ref.source);
+		const chunkSize = 2 ** 14;
+		expect(await reader.requestSlice(0, chunkSize)).not.toBeNull();
+		expect(reader.randomAccessFileSize).toBeNull();
+		for (let pos = chunkSize; pos < file.length - chunkSize; pos += chunkSize) {
+			expect(await reader.requestSlice(pos, chunkSize)).not.toBeNull();
+		}
+		expect(reader.randomAccessFileSize).toBe(file.length);
+		const tail = await reader.requestSlice(file.length - 1000, 1000);
+		expect(tail && readBytes(tail, 1000)).toEqual(file.subarray(file.length - 1000));
 	} finally {
 		logs.stop();
 		server.close();
