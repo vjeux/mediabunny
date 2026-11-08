@@ -3359,3 +3359,35 @@ test('A moov box at the end of the file with a size of 0', async () => {
 		expect([packet?.timestamp, packet?.byteLength]).toEqual([0, 645]);
 	}
 });
+
+test('A movie matrix in an mvhd box after the trak boxes', async () => {
+	// The children of moov may come in any order (QuickTime File Format), so the movie header can follow the tracks
+	const readRotation = async (mvhdLast: boolean) => {
+		let bytes: Buffer = readFileSync(path.join(__dirname, '../public/sps-only-sar-h264.mp4'));
+		bytes.write('qt  ', 8, 'ascii');
+		const moovStart = bytes.indexOf('moov') - 4;
+		const mvhdStart = bytes.indexOf('mvhd') - 4;
+		const mvhdSize = bytes.readUInt32BE(mvhdStart);
+		assert(moovStart + bytes.readUInt32BE(moovStart) === bytes.length); // So moving mvhd to the end keeps it inside
+		assert(mvhdStart === moovStart + 8 && bytes[mvhdStart + 8] === 0); // First in moov, version 0
+
+		// A rotation by 90 degrees, [0, 1, 0; -1, 0, 0; 0, 0, 1] in 16.16 and 2.30 fixed point
+		[0, 0x10000, 0, -0x10000, 0, 0, 0, 0, 0x40000000].forEach((value, i) => {
+			bytes.writeUInt32BE(value >>> 0, mvhdStart + 44 + 4 * i);
+		});
+		if (mvhdLast) {
+			const mvhd = bytes.subarray(mvhdStart, mvhdStart + mvhdSize);
+			bytes = Buffer.concat([bytes.subarray(0, mvhdStart), bytes.subarray(mvhdStart + mvhdSize), mvhd]);
+		}
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		expect([packet?.timestamp, packet?.byteLength]).toEqual([0, 645]);
+		return track.getRotation();
+	};
+
+	expect(await readRotation(false)).toBe(90);
+	expect(await readRotation(true)).toBe(90);
+});
