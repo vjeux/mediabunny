@@ -15,9 +15,16 @@ import {
 	MaybePromise,
 	Rotation,
 	toArray,
+	toUint8Array,
 	TransformationMatrix,
 } from './misc';
-import { MetadataTags, TrackDisposition, validateMetadataTags, validateTrackDisposition } from './metadata';
+import {
+	cloneMetadataTags,
+	MetadataTags,
+	TrackDisposition,
+	validateMetadataTags,
+	validateTrackDisposition,
+} from './metadata';
 import { Muxer } from './muxer';
 import { OutputFormat } from './output-format';
 import { AudioSource, MediaSource, SubtitleSource, VideoSource } from './media-source';
@@ -334,6 +341,37 @@ export type AudioTrackMetadata = BaseTrackMetadata & {
  * @public
  */
 export type SubtitleTrackMetadata = BaseTrackMetadata & {};
+
+/**
+ * Copies track metadata along with its nested values, so that the track keeps what was passed when it was added:
+ * callers often reuse one object for several tracks, and changes made afterwards mustn't bypass the validation.
+ */
+const copyTrackMetadata = <T extends VideoTrackMetadata | AudioTrackMetadata | SubtitleTrackMetadata>(
+	metadata: T,
+): T => {
+	const copy = { ...metadata };
+	if (metadata.disposition) {
+		copy.disposition = { ...metadata.disposition };
+	}
+	if (Array.isArray(metadata.group)) {
+		copy.group = [...metadata.group];
+	}
+	if ('transformationMatrix' in metadata && metadata.transformationMatrix) {
+		(copy as VideoTrackMetadata).transformationMatrix = [...metadata.transformationMatrix] as TransformationMatrix;
+	}
+	if ('decoderConfig' in metadata && metadata.decoderConfig) {
+		const decoderConfig: VideoDecoderConfig | AudioDecoderConfig = { ...metadata.decoderConfig };
+		if (decoderConfig.description) {
+			decoderConfig.description = toUint8Array(decoderConfig.description).slice();
+		}
+		if ('colorSpace' in decoderConfig && decoderConfig.colorSpace) {
+			decoderConfig.colorSpace = { ...decoderConfig.colorSpace };
+		}
+		(copy as VideoTrackMetadata | AudioTrackMetadata).decoderConfig = decoderConfig;
+	}
+
+	return copy;
+};
 
 const validateBaseTrackMetadata = (metadata: BaseTrackMetadata) => {
 	if (!metadata || typeof metadata !== 'object') {
@@ -720,7 +758,7 @@ export class Output<
 			}
 		}
 
-		const metadataCopy = { ...metadata };
+		const metadataCopy = copyTrackMetadata(metadata);
 		metadataCopy.group ??= this.defaultTrackGroup;
 
 		return this._addTrack(new OutputVideoTrack(
@@ -746,7 +784,7 @@ export class Output<
 			}
 		}
 
-		const metadataCopy = { ...metadata };
+		const metadataCopy = copyTrackMetadata(metadata);
 		metadataCopy.group ??= this.defaultTrackGroup;
 
 		return this._addTrack(new OutputAudioTrack(
@@ -761,7 +799,7 @@ export class Output<
 		}
 		validateBaseTrackMetadata(metadata);
 
-		const metadataCopy = { ...metadata };
+		const metadataCopy = copyTrackMetadata(metadata);
 		metadataCopy.group ??= this.defaultTrackGroup;
 
 		return this._addTrack(new OutputSubtitleTrack(
@@ -782,7 +820,8 @@ export class Output<
 			throw new Error('Cannot set metadata tags after output has been started or canceled.');
 		}
 
-		this._metadataTags = tags;
+		// Copied, so that changing the object afterwards neither changes what's written nor skips the validation
+		this._metadataTags = cloneMetadataTags(tags);
 	}
 
 	/** @internal */

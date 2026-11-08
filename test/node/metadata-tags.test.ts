@@ -2330,6 +2330,25 @@ test('MP3 to MP3 conversion with images', async () => {
 	expect(tags.images).toHaveLength(1);
 });
 
+test('setMetadataTags keeps the tags as they were when set', async () => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const track = createDummyAudioTrack('aac', output);
+	const tags: MetadataTags = { title: 'Original', date: new Date(Date.UTC(2024, 0, 1)) };
+	output.setMetadataTags(tags);
+
+	tags.title = 'Changed';
+	tags.date!.setTime(NaN); // Fails the validation, and used to fail start() with "Invalid time value"
+
+	await output.start();
+	await track.addPacket();
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const readTags = await input.getMetadataTags();
+	expect(readTags.title).toBe('Original');
+	expect(readTags.date).toEqual(new Date(Date.UTC(2024, 0, 1)));
+});
+
 test('Creation time override, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
