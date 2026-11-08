@@ -6831,6 +6831,12 @@ const decryptSample = async (
 		})();
 
 		track.demuxer.decryptionKeyCache.set(keyId, promise);
+		// A failed resolution (an unreachable license server, for example) is tried again by the next sample
+		promise.catch(() => {
+			if (track.demuxer.decryptionKeyCache.get(keyId) === promise) {
+				track.demuxer.decryptionKeyCache.delete(keyId);
+			}
+		});
 		keyBytes = await promise;
 	}
 
