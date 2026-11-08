@@ -17,7 +17,7 @@ import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { countMovedArrayElements } from './array-moves.js';
-import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { InputTrack } from '../../src/input-track.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -3227,5 +3227,70 @@ test('MPEG-TS ignores a PMT that is not in effect yet', async () => {
 			count++;
 		}
 		expect(count).toBe(3);
+	}
+});
+
+test('MPEG-TS lookups past the end of a track, or in a gap of it, do not walk the rest of the file again', async () => {
+	// Two AAC tracks over 3 minutes, the second one only there for the first 18 seconds (like an audio PID that stops
+	// in a broadcast capture), or also for the last 18 seconds (one that stops for a while). Found by the L58 scale
+	// review.
+	for (const hasEnd of [false, true]) {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const main = new EncodedAudioPacketSource('aac');
+		const short = new EncodedAudioPacketSource('aac');
+		output.addAudioTrack(main);
+		output.addAudioTrack(short);
+		await output.start();
+
+		const decoderConfig = {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 2,
+			sampleRate: 48000,
+			description: new Uint8Array([0x11, 0x90]),
+		};
+		const frameDuration = 1024 / 48000;
+		const count = Math.round(180 / frameDuration);
+		const data = new Uint8Array(300).fill(0x21);
+		for (let i = 0; i < count; i++) {
+			const packet = new EncodedPacket(data, 'key', i * frameDuration, frameDuration);
+			await main.add(packet, { decoderConfig });
+			if (i < count / 10 || (hasEnd && i > count * 0.9)) {
+				await short.add(packet, { decoderConfig });
+			}
+		}
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		let bytesRead = 0;
+		using input = new Input({
+			formats: ALL_FORMATS,
+			source: new CustomSource({
+				// A cache much smaller than the file, as for any long recording
+				maxCacheSize: 2 ** 16,
+				getSize: () => bytes.byteLength,
+				read: (start, end) => {
+					bytesRead += end - start;
+					return bytes.subarray(start, end);
+				},
+			}),
+		});
+		const shortTrack = (await input.getAudioTracks())[1];
+		assert(shortTrack);
+		const sink = new EncodedPacketSink(shortTrack);
+
+		// Lookups within the track only read around the packet
+		bytesRead = 0;
+		expect((await sink.getPacket(10))!.timestamp).toBeCloseTo(10, 1);
+		expect(bytesRead).toBeLessThan(bytes.byteLength / 4);
+
+		// The first lookup past the part where the track is has to find out where it ends
+		expect((await sink.getPacket(60))!.timestamp).toBeCloseTo(18, 1);
+
+		for (const timestamp of [90, 120, 150]) {
+			bytesRead = 0;
+			expect((await sink.getPacket(timestamp))!.timestamp).toBeCloseTo(18, 1);
+			// Each of these read most of the file again, twice
+			expect(bytesRead).toBeLessThan(bytes.byteLength / 4);
+		}
 	}
 });
