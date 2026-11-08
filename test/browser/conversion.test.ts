@@ -21,6 +21,7 @@ import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
+import { CustomAudioEncoder, registerEncoder } from '../../src/custom-coder.js';
 
 test('Rotation is baked in when rerendering', async () => {
 	using input = new Input({
@@ -731,6 +732,95 @@ test('Composable conversion does not write metadata tags', async () => {
 	const outTags = await result.getMetadataTags();
 	// Only the user's tag is present; the input's tags were not copied
 	expect(outTags.comment).toBe('User-owned');
+});
+
+test('Canceling while an encoder is still initializing rejects execute()', async () => {
+	// An Opus encoder whose initialization never finishes, like one hanging in a platform codec
+	let hangingEncoderActive = true;
+	let initCalled = false;
+	class HangingInitEncoder extends CustomAudioEncoder {
+		static override supports(codec: string) {
+			return codec === 'opus' && hangingEncoderActive;
+		}
+
+		async init() {
+			initCalled = true;
+			await new Promise(() => {});
+		}
+
+		encode() {}
+		flush() {}
+		close() {}
+	}
+	registerEncoder(HangingInitEncoder);
+
+	try {
+		using input = new Input({ source: new UrlSource('/glitch-hop-is-dead.wav'), formats: ALL_FORMATS });
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, audio: { codec: 'opus' }, showWarnings: false });
+		const executePromise = conversion.execute().then(() => 'resolved', (error: Error) => error.name);
+		while (!initCalled) {
+			await new Promise(resolve => setTimeout(resolve, 5));
+		}
+
+		await conversion.cancel();
+		expect(await Promise.race([
+			executePromise,
+			new Promise(resolve => setTimeout(() => resolve('pending'), 2000)),
+		])).toBe('ConversionCanceledError');
+	} finally {
+		hangingEncoderActive = false;
+	}
+});
+
+test('Canceling from onProgress closes the encoders an initialization creates afterwards', async () => {
+	// The cancel can come while an encoder is still being set up (here, from the second progress report); the
+	// initialization then finishes afterwards, and the encoders it creates must still get closed
+	const { WebMOutputFormat } = await import('../../src/output-format.js');
+	const encoders: (VideoEncoder | AudioEncoder)[] = [];
+	const RealVideoEncoder = VideoEncoder;
+	const RealAudioEncoder = AudioEncoder;
+	globalThis.VideoEncoder = class extends RealVideoEncoder {
+		constructor(init: VideoEncoderInit) {
+			super(init);
+			encoders.push(this);
+		}
+	};
+	globalThis.AudioEncoder = class extends RealAudioEncoder {
+		constructor(init: AudioEncoderInit) {
+			super(init);
+			encoders.push(this);
+		}
+	};
+
+	try {
+		for (let i = 0; i < 3; i++) {
+			using input = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: { width: 160, codec: 'vp8' },
+				audio: { codec: 'opus' },
+				trim: { start: 0, end: 1.5 },
+				showWarnings: false,
+			});
+
+			let progressCount = 0;
+			conversion.onProgress = () => {
+				if (++progressCount === 2) {
+					queueMicrotask(() => void conversion.cancel());
+				}
+			};
+			await expect(conversion.execute()).rejects.toThrow(ConversionCanceledError);
+
+			await new Promise(resolve => setTimeout(resolve, 300)); // Lets pending initializations finish
+			expect(encoders.map(encoder => encoder.state)).toEqual(encoders.map(() => 'closed'));
+		}
+	} finally {
+		globalThis.VideoEncoder = RealVideoEncoder;
+		globalThis.AudioEncoder = RealAudioEncoder;
+	}
 });
 
 test('Canceling a composable conversion leaves the output usable', async () => {
