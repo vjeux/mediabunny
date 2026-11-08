@@ -107,6 +107,8 @@ export type WriteHlsOptions = {
 	audioMetadata?: AudioTrackMetadata;
 	/** Offset added to all source timestamps. */
 	timestampOffset?: number;
+	/** How many times to play the source media in a row, for longer streams. Defaults to 1. */
+	repeat?: number;
 };
 
 /** Writes the source media as HLS into memory, returning every written file. */
@@ -138,8 +140,20 @@ export const writeHls = async (options: WriteHlsOptions) => {
 	await output.start();
 
 	const offset = options.timestampOffset ?? 0;
-	const videoPackets = videoSource ? media.videoPackets : [];
-	const audioPackets = audioSource ? media.audioPackets : [];
+	const sourceVideoPackets = videoSource ? media.videoPackets : [];
+	const sourceAudioPackets = audioSource ? media.audioPackets : [];
+
+	// Each repetition starts where the previous one ends
+	const sourcePackets = [...sourceVideoPackets, ...sourceAudioPackets];
+	const period = Math.max(...sourcePackets.map(x => x.timestamp + x.duration))
+		- Math.min(...sourcePackets.map(x => x.timestamp));
+	const repeatPackets = (packets: EncodedPacket[]) => Array.from(
+		{ length: options.repeat ?? 1 },
+		(_, i) => packets.map(packet => packet.clone({ timestamp: packet.timestamp + i * period })),
+	).flat();
+	const videoPackets = repeatPackets(sourceVideoPackets);
+	const audioPackets = repeatPackets(sourceAudioPackets);
+
 	let videoIndex = 0;
 	let audioIndex = 0;
 
