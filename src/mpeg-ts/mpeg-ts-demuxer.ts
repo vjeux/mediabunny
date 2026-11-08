@@ -3025,7 +3025,14 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			const firstSection = this.elementaryStream.firstSection;
 			assert(firstSection);
 
-			let currentPos = firstSection.startPos;
+			// Usually it's the first one, which is in memory already: a source that keeps only what its cache holds
+			// may not be able to read the track's start again
+			const firstHeader = readPesPacketHeader(demuxer, firstSection);
+			if (firstHeader && firstHeader.pts !== null) {
+				return { header: firstHeader as TimestampedPesPacketHeader, section: firstSection };
+			}
+
+			let currentPos = firstSection.startPos + demuxer.packetStride;
 			while (true) {
 				const packetHeader = await demuxer.readPacketHeader(currentPos);
 				if (!packetHeader) {
@@ -3033,9 +3040,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				}
 
 				if (packetHeader.pid === this.elementaryStream.pid && packetHeader.payloadUnitStartIndicator === 1) {
-					const section = currentPos === firstSection.startPos
-						? firstSection
-						: await demuxer.readSection(currentPos, true);
+					const section = await demuxer.readSection(currentPos, true);
 					const header = section && readPesPacketHeader(demuxer, section);
 					if (section && header && header.pts !== null) {
 						return { header: header as TimestampedPesPacketHeader, section };
