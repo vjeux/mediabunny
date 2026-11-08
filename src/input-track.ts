@@ -470,14 +470,15 @@ export abstract class InputTrack {
 	 * Returns `true` if this track can be paired with the given track. Two tracks being pairable means they can be
 	 * presented (displayed) together.
 	 *
-	 * Returns `false` if `other` equals `this`.
+	 * Returns `false` if `other` equals `this` or is a track of the same type: tracks of the same type are alternatives
+	 * to each other (another language or camera angle, for example), not meant to be presented together.
 	 */
 	canBePairedWith(other: InputTrack) {
 		if (!(other instanceof InputTrack)) {
 			throw new TypeError('other must be an InputTrack.');
 		}
 
-		if (this.input !== other.input || this === other) {
+		if (this.input !== other.input || this === other || this.type === other.type) {
 			return false;
 		}
 
