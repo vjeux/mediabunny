@@ -72,6 +72,7 @@ import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
 
 export const GLOBAL_TIMESCALE = 57600; // LCM of a bunch of common frame rates (24, 25, 30, 60, 144, ...)
 const MIN_CHUNK_DURATION = 0.5; // In seconds
+const MAX_SILENCE_PIECE_SIZE = 2 ** 24; // In bytes
 
 export type Sample = {
 	timestamp: number;
@@ -966,17 +967,24 @@ export class IsobmffMuxer extends Muxer {
 			const { sampleSize, silentValue } = parsePcmCodec(
 				trackData.info.decoderConfig.codec as PcmAudioCodec,
 			);
-			const samplesNeeded = deltaInTimescale * trackData.info.numberOfChannels;
-			const data = new Uint8Array(sampleSize * samplesNeeded).fill(silentValue);
+			const bytesPerFrame = sampleSize * trackData.info.numberOfChannels;
+
+			// One sample covers the whole gap, as packet counts reserved with maximumPacketCount expect. Its data is a
+			// piece of silence of at most 16 MiB that's written repeatedly up to the sample's size, so that long gaps
+			// don't allocate all their silence at once.
+			const maxFramesPerPiece = Math.max(1, Math.floor(MAX_SILENCE_PIECE_SIZE / bytesPerFrame));
+			const piece = new Uint8Array(bytesPerFrame * Math.min(deltaInTimescale, maxFramesPerPiece))
+				.fill(silentValue);
 
 			const paddingSample = this.createSampleForTrack(
 				trackData,
-				new Uint8Array(data.buffer),
+				piece,
 				timestamp,
 				duration,
 				'key',
 				0,
 			);
+			paddingSample.size = bytesPerFrame * deltaInTimescale;
 			await this.registerSample(trackData, paddingSample);
 		}
 
@@ -1118,6 +1126,22 @@ export class IsobmffMuxer extends Muxer {
 		};
 
 		return sample;
+	}
+
+	/** Writes a sample's data. A padding sample's data is a piece of silence, repeated up to the sample's size. */
+	private writeSampleData(sample: Sample) {
+		const data = sample.data;
+		assert(this.writer);
+		assert(data);
+		assert(data.byteLength > 0 || sample.size === 0);
+
+		for (let written = 0; written < sample.size;) {
+			const bytes = Math.min(data.byteLength, sample.size - written);
+			this.writer.write(bytes === data.byteLength ? data : data.subarray(0, bytes));
+			written += bytes;
+		}
+
+		sample.data = null; // Can be GC'd
 	}
 
 	private processTimestamps(trackData: IsobmffTrackData, nextSample?: Sample) {
@@ -1431,9 +1455,7 @@ export class IsobmffMuxer extends Muxer {
 		// Write out the data
 		chunk.offset = this.writer.getPos();
 		for (const sample of chunk.samples) {
-			assert(sample.data);
-			this.writer.write(sample.data);
-			sample.data = null; // Can be GC'd
+			this.writeSampleData(sample);
 		}
 
 		await this.writer.flush();
@@ -1599,8 +1621,7 @@ export class IsobmffMuxer extends Muxer {
 		// Write sample data
 		for (const trackData of tracksInFragment) {
 			for (const sample of trackData.currentChunk!.samples) {
-				this.writer.write(sample.data!);
-				sample.data = null; // Can be GC'd
+				this.writeSampleData(sample);
 			}
 		}
 
@@ -1878,10 +1899,9 @@ export class IsobmffMuxer extends Muxer {
 
 				for (const chunk of this.finalizedChunks) {
 					chunk.offset = currentChunkPos;
-					for (const { data } of chunk.samples) {
-						assert(data);
-						currentChunkPos += data.byteLength;
-						mdatSize += data.byteLength;
+					for (const { size } of chunk.samples) {
+						currentChunkPos += size;
+						mdatSize += size;
 					}
 				}
 
@@ -1916,9 +1936,7 @@ export class IsobmffMuxer extends Muxer {
 
 			for (const chunk of this.finalizedChunks) {
 				for (const sample of chunk.samples) {
-					assert(sample.data);
-					this.writer.write(sample.data);
-					sample.data = null;
+					this.writeSampleData(sample);
 				}
 			}
 
