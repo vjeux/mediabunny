@@ -1708,3 +1708,71 @@ test('MPEG audio Layer I and II tracks', async () => {
 	expect(await Promise.all(tracks.map(x => x.getCodec()))).toEqual(['mp3', 'mp3', 'mp3']);
 	expect((await tracks[1]!.getDecoderConfig())!.codec).toBe('mp3');
 });
+
+test('TrackTimestampScale scales block timestamps and durations', async () => {
+	// Legacy (Matroska v1 to v3): block timestamps and BlockDuration are in Track Ticks, which TrackTimestampScale
+	// converts into the Segment Ticks of the cluster timestamp
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const float64 = (value: number) => {
+		const bytes = new Uint8Array(8);
+		new DataView(bytes.buffer).setFloat64(0, value);
+		return [...bytes];
+	};
+
+	const readTimings = async (trackTimestampScale: number) => {
+		const block = (timestamp: number) => element(
+			EBMLId.BlockGroup,
+			element(EBMLId.Block, [0x81, 0, timestamp, 0], new Array<number>(320).fill(0)), // 20 ms at 8 kHz
+			element(EBMLId.BlockDuration, [20]),
+		);
+
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, [...'matroska'].map(x => x.charCodeAt(0)))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, [...'A_PCM/INT/LIT'].map(x => x.charCodeAt(0))),
+					element(EBMLId.TrackTimestampScale, float64(trackTimestampScale)),
+					element(
+						EBMLId.Audio,
+						element(EBMLId.SamplingFrequency, float64(8000)),
+						element(EBMLId.Channels, [1]),
+						element(EBMLId.BitDepth, [16]),
+					),
+				)),
+				element(EBMLId.Cluster, element(EBMLId.Timestamp, [100]), block(0), block(20)),
+			),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const timings: number[][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timings.push([packet.timestamp, packet.duration]);
+		}
+		return timings;
+	};
+
+	expect(await readTimings(1)).toEqual([[0.1, 0.02], [0.12, 0.02]]);
+	expect(await readTimings(2)).toEqual([[0.1, 0.04], [0.14, 0.04]]); // Like FFmpeg
+});
