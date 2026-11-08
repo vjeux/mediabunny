@@ -301,6 +301,8 @@ type ElementaryStream = {
 	 * to the next key frame, as far as they've been read
 	 */
 	droppedRanges: { start: number; end: number }[];
+	/** The sequence number of the track's first key frame, once a context reading from the track's start found it */
+	firstKeyFrameSequenceNumber: number | null;
 	/** Whether a frame that lost data takes the frames up to the next key frame with it (see supplyPacket) */
 	dropsRestOfGop: boolean | null;
 };
@@ -954,6 +956,7 @@ export class MpegTsDemuxer extends Demuxer {
 						referencePesPackets: [],
 						droppedRanges: [],
 						dropsRestOfGop: null,
+						firstKeyFrameSequenceNumber: null,
 					});
 				}
 
@@ -1391,6 +1394,7 @@ export class MpegTsDemuxer extends Demuxer {
 								info,
 								referencePesPackets: [],
 								droppedRanges: [],
+								firstKeyFrameSequenceNumber: null,
 								dropsRestOfGop: null,
 							};
 
@@ -3782,6 +3786,8 @@ class PacketReadingContext {
 	skippedPacket = false;
 	/** The stretch of video packets being dropped, up to the next key frame */
 	droppedRange: { start: number; end: number } | null = null;
+	/** Whether this context supplied a key frame */
+	suppliedKeyFrame = false;
 
 	suppliedPacket: SuppliedPacket | null = null;
 
@@ -4759,17 +4765,6 @@ class PacketReadingContext {
 			return;
 		}
 
-		if (hole !== undefined && this.elementaryStream.info.decoderConfig) {
-			// A video frame that lost data. (While the stream is being set up, it's kept: setup only reads its
-			// parameter sets, which come first, and key frames can't be told yet to drop up to the next one.)
-			if (this.dropsRestOfGop()) {
-				this.extendDroppedRange(sequenceNumber);
-			}
-
-			this.skipPacket();
-			return;
-		}
-
 		let randomAccessIndicator = Math.max(
 			currentPesPacket.randomAccessIndicator,
 			ptsPesPacket?.randomAccessIndicator ?? 0,
@@ -4817,11 +4812,33 @@ class PacketReadingContext {
 			// We're reading packets before the decoder config is determined
 		}
 
-		if (this.droppedRange && randomAccessIndicator !== 1) {
-			// Still dropping, up to the next key frame
-			this.extendDroppedRange(sequenceNumber);
-			this.skipPacket();
-			return;
+		if (this.elementaryStream.info.type === 'video' && this.elementaryStream.info.decoderConfig) {
+			if (this.droppedRange && randomAccessIndicator !== 1) {
+				// Still dropping, up to the next key frame
+				this.extendDroppedRange(sequenceNumber);
+				this.skipPacket();
+				return;
+			}
+
+			// A video frame that lost data is dropped, with the rest of its GOP (see dropsRestOfGop), unless it comes
+			// before the track's first key frame, like in a capture that begins in the middle of a GOP: nothing
+			// decodes before that key frame anyway, so such frames are kept as they are. (While the stream is being set
+			// up, frames are kept too: setup only reads their parameter sets, which come first.)
+			if (hole !== undefined && (randomAccessIndicator === 1 || !this.isBeforeFirstKeyFrame(sequenceNumber))) {
+				if (this.dropsRestOfGop()) {
+					this.extendDroppedRange(sequenceNumber);
+				}
+
+				this.skipPacket();
+				return;
+			}
+
+			if (randomAccessIndicator === 1) {
+				if (!this.suppliedKeyFrame && this.startsAtTrackStart()) {
+					this.elementaryStream.firstKeyFrameSequenceNumber ??= sequenceNumber;
+				}
+				this.suppliedKeyFrame = true;
+			}
 		}
 
 		this.droppedRange = null;
@@ -4883,6 +4900,23 @@ class PacketReadingContext {
 		}
 
 		this.droppedRange.end = Math.max(this.droppedRange.end, endSequenceNumber);
+	}
+
+	/** Whether this context started reading at the track's first PES packet. */
+	startsAtTrackStart() {
+		return this.startingPesPacket.sectionStartPos === this.elementaryStream.firstSection?.startPos;
+	}
+
+	/** Whether the video packet starting at the sequence number comes before the track's first key frame. */
+	isBeforeFirstKeyFrame(sequenceNumber: number) {
+		if (this.suppliedKeyFrame) {
+			return false;
+		} else if (this.startsAtTrackStart()) {
+			return true; // This context would have supplied it
+		}
+
+		const first = this.elementaryStream.firstKeyFrameSequenceNumber;
+		return first !== null && sequenceNumber < first;
 	}
 
 	/** Moves on from a packet that is left out. */
