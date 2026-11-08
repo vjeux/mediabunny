@@ -359,15 +359,20 @@ export const sidx = (muxer: IsobmffMuxer, referencedSize: number) => {
 		duration = 0;
 	}
 
+	// The spec recommends using the timescale of the reference track, and readers like FFmpeg rely on it
+	const referenceTrack = muxer.trackDatas[0];
+	const referenceId = referenceTrack?.track.id ?? 1;
+	const timescale = referenceTrack?.timescale ?? GLOBAL_TIMESCALE;
+
 	return fullBox('sidx', 1, 0, [
-		u32(1), // Reference ID
-		u32(GLOBAL_TIMESCALE), // Timescale
-		u64(intoTimescale(earliestPresentationTime, GLOBAL_TIMESCALE)), // Earliest presentation time
+		u32(referenceId), // Reference ID
+		u32(timescale), // Timescale
+		u64(intoTimescale(earliestPresentationTime, timescale)), // Earliest presentation time
 		u64(0), // First offset
 		u16(0), // Reserved
 		u16(1), // Reference count
 		u32(referencedSize & 0x7fffffff), // Reference type (0) + referenced size
-		u32(intoTimescale(duration, GLOBAL_TIMESCALE)), // Subsegment duration
+		u32(intoTimescale(duration, timescale)), // Subsegment duration
 		u32(0), // Starts with SAP + SAP type + SAP delta time (no information provided)
 	]);
 };
