@@ -4205,6 +4205,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let errored = false;
 		let timestampOffset = 0;
 		let nextTimestamp: number | null = null; // Where the audio continues seamlessly
+		let lastCaptureTimestamp: number | null = null; // The previous sample's own timestamp
 
 		const addToEncoder = (audioSample: AudioSample) => {
 			void this._encoder.add(audioSample, true)
@@ -4274,11 +4275,19 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			const pausedTime = this._options.timestampBase === 'unix' ? 0 : this._pausedTime;
 			let timestamp = currentTimestamp + timestampOffset - pausedTime;
+			const previousCaptureTimestamp = lastCaptureTimestamp;
+			lastCaptureTimestamp = currentTimestamp;
 
 			if (nextTimestamp !== null) {
 				const deviation = timestamp - nextTimestamp;
 
-				if (!this._resumedSinceLastSample && Math.abs(deviation) <= MAX_AUDIO_TIMESTAMP_JITTER) {
+				if (previousCaptureTimestamp !== null && currentTimestamp <= previousCaptureTimestamp) {
+					// The capture timestamps stepped back, which the audio itself can't do (Chrome sometimes stamps the
+					// first chunk of a media element's capture tens of milliseconds ahead of the ones after it). They
+					// can't be trusted here, so the audio continues seamlessly, from now on.
+					timestampOffset += nextTimestamp - timestamp;
+					timestamp = nextTimestamp;
+				} else if (!this._resumedSinceLastSample && Math.abs(deviation) <= MAX_AUDIO_TIMESTAMP_JITTER) {
 					timestamp = nextTimestamp; // Timestamp jitter; the audio itself is continuous
 				} else if (deviation < 0) {
 					// This audio overlaps audio that's already been added: the sample clock ran ahead of the
