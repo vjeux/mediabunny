@@ -17,6 +17,7 @@ import {
 	binarySearchLessOrEqual,
 	bytesToBase64,
 	isThenable,
+	roundIfAlmostInteger,
 	textDecoder,
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
@@ -832,6 +833,12 @@ class FlacAudioTrackBacking implements InputAudioTrackBacking {
 		if (timestamp < 0) {
 			return null;
 		}
+
+		// Packet timestamps are sample counts divided by the sample rate, so let's put the timestamp on that grid too.
+		// Then a timestamp computed as a packet's timestamp plus its duration finds the next packet, as in the other
+		// formats, even where the sum comes out a little below the next packet's timestamp.
+		const sampleRate = this.demuxer.audioInfo.sampleRate;
+		timestamp = roundIfAlmostInteger(timestamp * sampleRate) / sampleRate;
 
 		const release = await this.demuxer.readingMutex.acquire();
 
