@@ -72,6 +72,30 @@ const createDummyAudioTrack = (codec: AudioCodec, output: Output) => {
 	};
 };
 
+const writeMp3 = async (tags: MetadataTags) => {
+	const output = new Output({
+		format: new Mp3OutputFormat(),
+		target: new BufferTarget(),
+	});
+	output.setMetadataTags(tags);
+
+	const dummyTrack = createDummyAudioTrack('mp3', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	return new Uint8Array(output.target.buffer!);
+};
+
+const readMetadataTags = async (bytes: Uint8Array) => {
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	return await input.getMetadataTags();
+};
+
 const coverArt = new Uint8Array(1024);
 coverArt[0] = 69;
 const songMetadata: MetadataTags = {
@@ -2069,6 +2093,17 @@ test('Default creation time, Matroska', async () => {
 	const readTags = await input.getMetadataTags();
 
 	expect(readTags.creationTime).toEqual(new Date('2024-02-29T13:37:42.123Z'));
+});
+
+test('Non-Latin-1 lyrics', async () => {
+	const lyrics = String.fromCharCode(0x6b4c, 0x8a5e);
+	const tags = await readMetadataTags(await writeMp3({
+		lyrics,
+		comment: 'Comment',
+	}));
+
+	expect(tags.lyrics).toBe(lyrics);
+	expect(tags.comment).toBe('Comment');
 });
 
 test('Creation time override, ISOBMFF', async () => {
