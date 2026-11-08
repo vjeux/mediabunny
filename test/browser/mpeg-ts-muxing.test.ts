@@ -739,6 +739,19 @@ test('MPEG-TS muxing with StreamTarget', async () => {
 	expect(videoPacketCount).toBe(frameCount);
 });
 
+test('Conversion of MP4 (H.264 + AAC with priming) to MPEG-TS keeps the audio', async () => {
+	// The AAC copy starts before zero, which MPEG-TS supports but discourages. Where the audio can't be transcoded
+	// instead (no AAC encoder, as in Chromium on Linux), it must still be copied rather than discarded
+	using input = new Input({ source: new UrlSource('/edts.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect((await result.getTracks()).map(track => track.type).sort()).toEqual(['audio', 'video']);
+});
+
 test('MPEG-TS muxing with negative start timestamps', async () => {
 	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1);
 });
