@@ -191,6 +191,13 @@ type InternalTrack = {
 		endDecodeTimestamp: number;
 		hasKeyFrame: boolean;
 	}[];
+	/**
+	 * Lets fragment scans skip the fragments without this track (before its start, in a gap in it, or after its end)
+	 * instead of walking them again. When a scan went past such fragments, this maps where it came from (the end of a
+	 * moof box with samples of this track, or 0 for the start of the file) to the offset of the next moof box with
+	 * samples of this track, or to Infinity if there was none before the end of the file.
+	 */
+	nextFragmentOffsets: Map<number, number>;
 	/** The segment durations of all edit list entries leading up to the main one (from which the offset is taken.) */
 	editListPreviousSegmentDurations: number;
 	/** The media time offset of the main edit list entry (with media time !== -1) */
@@ -932,6 +939,7 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentDecodeEnds: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
+				nextFragmentOffsets: new Map(),
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
 				hasEditList: foreignTrack.hasEditList,
@@ -1800,6 +1808,7 @@ export class IsobmffDemuxer extends Demuxer {
 					fragmentDecodeEnds: [],
 					currentFragmentState: null,
 					fragmentPositionCache: [],
+					nextFragmentOffsets: new Map(),
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
 					hasEditList: false,
@@ -5153,7 +5162,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		// one fragment is only final once no fragment before or after it can hold a later presentation timestamp.
 		matchByPresentationTimestamp = false,
 	): Promise<EncodedPacket | null> {
-		const { demuxer, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
+		const { demuxer, fragmentLookupTable, fragmentPositionCache, nextFragmentOffsets } = this.internalTrack;
 
 		let bestFragment: Fragment | null = null;
 		let bestSampleIndex = -1;
@@ -5260,10 +5269,35 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 
 			const scanStartPos = currentFragment ? currentFragment.moofOffset : currentPos;
+			// The end of the last moof box with samples of this track that this scan went past, and the number of moof
+			// boxes without samples of this track it went past since
+			let lastTrackFragmentEnd: number | null = null;
+			let fragmentsWithoutTrack = 0;
+			if (!currentFragment && currentPos === 0) {
+				// The start of the file works like the end of a fragment of this track
+				lastTrackFragmentEnd = 0;
+				currentPos = nextFragmentOffsets.get(0) ?? 0;
+			}
+			const reachedEnd = () => {
+				if (lastTrackFragmentEnd !== null && fragmentsWithoutTrack > 0) {
+					nextFragmentOffsets.set(lastTrackFragmentEnd, Infinity);
+				}
+			};
 
 			while (currentPos < stopPos) {
 				if (currentFragment) {
 					const trackData = currentFragment.trackData.get(this.internalTrack.id);
+					if (trackData) {
+						if (lastTrackFragmentEnd !== null && fragmentsWithoutTrack > 0) {
+							nextFragmentOffsets.set(lastTrackFragmentEnd, currentFragment.moofOffset);
+						}
+						// Here, currentPos is the end of the fragment's moof box
+						lastTrackFragmentEnd = currentPos;
+						fragmentsWithoutTrack = 0;
+					} else {
+						fragmentsWithoutTrack++;
+					}
+
 					const pastUpperBound = matchByPresentationTimestamp
 						// Only the first scan goes forward; scans further back must reach the fragments scanned before
 						? stopPos === Infinity && samplesPresentedAfter > maxReorderedSamples
@@ -5274,6 +5308,14 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					}
 
 					currentFragment = null; // So we don't process it again next iteration
+
+					const nextFragmentOffset = trackData && nextFragmentOffsets.get(currentPos);
+					if (nextFragmentOffset !== undefined) {
+						// A previous scan went from here to the next fragment of this track (or to the end of the
+						// file), so we can skip the fragments in between
+						currentPos = nextFragmentOffset;
+						continue;
+					}
 				}
 
 				const summary = demuxer.fragmentSummaries.get(currentPos);
@@ -5281,23 +5323,29 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					// We've read this fragment before and know it has nothing for this track, so let's not read it
 					// again
 					currentPos += summary.moofSize;
+					fragmentsWithoutTrack++;
 					continue;
 				}
 
 				// Load the header
 				let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 				if (isThenable(slice)) slice = await slice;
-				if (!slice) break;
+				if (!slice) {
+					reachedEnd();
+					break;
+				}
 
 				const boxStartPos = currentPos;
 				const boxInfo = readBoxHeader(slice);
 				if (!boxInfo) {
+					reachedEnd();
 					break;
 				}
 
 				if (boxInfo.name === 'moof') {
 					currentFragment = await demuxer.readFragment(boxStartPos);
 					if (!currentFragment) {
+						reachedEnd();
 						break;
 					}
 
