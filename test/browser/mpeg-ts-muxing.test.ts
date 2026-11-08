@@ -850,3 +850,138 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 		}).toEqual(expectedPacket);
 	}
 };
+
+test('MPEG-TS muxing with B-frames keeps DTS at or before PTS', async () => {
+	// Decode timestamps were the sorted presentation timestamps as is, so every B-frame was decoded after it was due
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// Two GOPs in decode order, presentation times given in frames
+	const frames = [0, 3, 1, 2, 6, 4, 5, 7, 10, 8, 9];
+	for (let i = 0; i < frames.length; i++) {
+		const isKey = i === 0 || i === 7;
+		const data = new Uint8Array([0, 0, 0, 1, isKey ? 0x65 : 0x41, 0x88]);
+		await source.add(new EncodedPacket(data, isKey ? 'key' : 'delta', frames[i]! / 30, 1 / 30), {
+			decoderConfig: { codec: 'avc1.42001f', codedWidth: 16, codedHeight: 16 },
+		});
+	}
+
+	await output.finalize();
+
+	const timestamps = readVideoPesTimestamps(new Uint8Array(output.target.buffer!));
+	expect(timestamps.map(x => x.pts)).toEqual(frames.map(x => 3000 * x));
+	expect(timestamps.map(x => x.dts)).toEqual([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(x => 3000 * x));
+});
+
+test('MPEG-TS muxing keeps DTS increasing when a later GOP reorders deeper', async () => {
+	// A GOP without B-frames, then one with a B-pyramid (x264 can pick no B-frames at first). Without an SPS saying
+	// how deeply the stream reorders, the second GOP's DTS are kept after the first one's. With one (x264's, from
+	// video.mp4: 2 frames), DTS are that far behind PTS from the start, like in FFmpeg. Also with x264's SPS: frames
+	// with irregular timing, and a lone frame (whose DTS needn't go before its PTS, as no GOP follows).
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const x264DecoderConfig = await videoTrack.getDecoderConfig();
+	assert(x264DecoderConfig);
+
+	const noSpsDecoderConfig = { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 };
+	const pyramid = [0, 1, 2, 3, 4, 8, 6, 5, 7, 9].map(x => x / 30);
+	const cases = [
+		{
+			decoderConfig: noSpsDecoderConfig,
+			timestamps: pyramid,
+			dts: [0, 3000, 6000, 9000, 9001, 9002, 12000, 15000, 18000, 21000],
+		},
+		{
+			decoderConfig: x264DecoderConfig,
+			timestamps: pyramid,
+			dts: [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(x => 3000 * x),
+		},
+		{ decoderConfig: x264DecoderConfig, timestamps: [0, 10.03, 1 / 120], dts: [-750, 0, 750] },
+		{ decoderConfig: x264DecoderConfig, timestamps: [0], dts: [0] },
+	];
+
+	for (const { decoderConfig, timestamps, dts } of cases) {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+
+		for (let i = 0; i < timestamps.length; i++) {
+			const isKey = i === 0 || (timestamps === pyramid && (i === 4 || i === 9));
+			// Length-prefixed NAL units with x264's decoder config
+			const startCode = decoderConfig === x264DecoderConfig ? [0, 0, 0, 2] : [0, 0, 0, 1];
+			const data = new Uint8Array([...startCode, isKey ? 0x65 : 0x41, 0x88]);
+			await source.add(new EncodedPacket(data, isKey ? 'key' : 'delta', timestamps[i]!, 1 / 30), {
+				decoderConfig,
+			});
+		}
+
+		await output.finalize();
+
+		const pesTimestamps = readVideoPesTimestamps(new Uint8Array(output.target.buffer!));
+		expect(pesTimestamps.map(x => x.pts)).toEqual(timestamps.map(x => Math.round(90_000 * x)));
+		expect(pesTimestamps.map(x => x.dts)).toEqual(dts);
+	}
+});
+
+test('MPEG-TS muxing gives the same DTS when remuxing its own output', async () => {
+	// DTS are worked out on the timestamps as written, in whole 90 kHz ticks, so the file remuxes into the same bytes.
+	// video.mp4's first 60 frames (x264 with B-frames), slowed down to 47.65 fps so frame times aren't whole ticks.
+	const remux = async (input: Input, timeScale: number) => {
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig);
+
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			const timestamp = packet.timestamp * timeScale;
+			await source.add(packet.clone({ timestamp, duration: packet.duration * timeScale }), { decoderConfig });
+			if (++count === 60) {
+				break;
+			}
+		}
+
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const firstPass = await remux(input, 30 / 47.65);
+	using reread = new Input({ source: new BufferSource(firstPass), formats: ALL_FORMATS });
+	const secondPass = await remux(reread, 1);
+
+	expect(readVideoPesTimestamps(secondPass)).toEqual(readVideoPesTimestamps(firstPass));
+	expect(secondPass).toEqual(firstPass);
+});
+
+/** Returns the PTS and DTS of the video PES packets (on PID 0x100), with negative ones as such. */
+const readVideoPesTimestamps = (bytes: Uint8Array) => {
+	const readTimestamp = (pos: number) => {
+		const value = ((bytes[pos]! >> 1) & 0x07) * 2 ** 30 + (bytes[pos + 1]! << 22) + ((bytes[pos + 2]! >> 1) << 15)
+			+ (bytes[pos + 3]! << 7) + (bytes[pos + 4]! >> 1);
+		return value >= 2 ** 32 ? value - 2 ** 33 : value; // Negative ones are written modulo 2^33
+	};
+
+	const timestamps: { pts: number; dts: number }[] = [];
+	for (let pos = 0; pos < bytes.length; pos += 188) {
+		if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && bytes[pos + 1]! & 0x40) {
+			const headerPos = pos + 4 + (bytes[pos + 3]! & 0x20 ? 1 + bytes[pos + 4]! : 0);
+			timestamps.push({ pts: readTimestamp(headerPos + 9), dts: readTimestamp(headerPos + 14) });
+		}
+	}
+
+	return timestamps;
+};
