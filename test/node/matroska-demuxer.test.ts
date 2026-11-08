@@ -745,3 +745,59 @@ test('EBML header with Void padding or a DocTypeExtension', async () => {
 		expect(await input.getTracks()).toHaveLength(1);
 	}
 });
+
+test('TrackType after the Video or Audio element', async () => {
+	// Element order within a TrackEntry is free
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(EBMLId.Segment, element(
+			EBMLId.Tracks,
+			element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.Video, element(EBMLId.PixelWidth, [0x01, 0x40]), element(EBMLId.PixelHeight, [0xf0])),
+				element(EBMLId.CodecID, ascii('V_VP8')),
+				element(EBMLId.TrackType, [1]),
+			),
+			element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [2]),
+				element(
+					EBMLId.Audio,
+					element(EBMLId.SamplingFrequency, [0x47, 0x3b, 0x80, 0]), // 48000
+					element(EBMLId.Channels, [2]),
+				),
+				element(EBMLId.CodecID, ascii('A_AC3')),
+				element(EBMLId.TrackType, [2]),
+			),
+		)),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await videoTrack.getCodedWidth()).toBe(320);
+	expect(await videoTrack.getCodedHeight()).toBe(240);
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	expect(await audioTrack.getSampleRate()).toBe(48000);
+	expect(await audioTrack.getNumberOfChannels()).toBe(2);
+});
