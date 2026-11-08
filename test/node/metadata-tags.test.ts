@@ -983,6 +983,28 @@ test('Picture descriptions with non-ASCII characters, FLAC', async () => {
 	expect(pictureFields).toEqual([[0, 0, 0, 0], [0, 0, 0, 0]]);
 });
 
+test('Metadata blocks too big for FLAC', async () => {
+	// A FLAC metadata block gives its length in 24 bits, which a bigger one used to overflow, so that nothing could
+	// read the file. It must throw instead.
+	const writeFlac = async (tags: Parameters<Output['setMetadataTags']>[0]) => {
+		const output = new Output({
+			format: new FlacOutputFormat(),
+			target: new BufferTarget(),
+		});
+		output.setMetadataTags(tags);
+		const dummyTrack = createDummyAudioTrack('flac', output);
+
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+	};
+
+	await expect(writeFlac({ title: 'a'.repeat(2 ** 24) })).rejects.toThrow('Metadata tags are too big for FLAC');
+	await expect(writeFlac({
+		images: [{ data: new Uint8Array(2 ** 24), kind: 'coverFront', mimeType: 'image/jpeg' }],
+	})).rejects.toThrow('Picture is too big for FLAC');
+});
+
 test('Creation time override, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),

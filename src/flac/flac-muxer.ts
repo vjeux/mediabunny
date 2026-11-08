@@ -246,6 +246,13 @@ export class FlacMuxer extends Muxer {
 			false,
 		);
 
+		if (vorbisComment.length > MAX_METADATA_BLOCK_SIZE) {
+			throw new Error(
+				`Metadata tags are too big for FLAC: their Vorbis comment block would take ${vorbisComment.length}`
+				+ ` bytes, but FLAC metadata blocks can take at most ${MAX_METADATA_BLOCK_SIZE} bytes.`,
+			);
+		}
+
 		const headerBitstream = new Bitstream(new Uint8Array(4));
 		headerBitstream.writeBits(1, 1); // Last metadata block -> true
 		headerBitstream.writeBits(7, FlacBlockType.VORBIS_COMMENT); // Type -> Vorbis comment
