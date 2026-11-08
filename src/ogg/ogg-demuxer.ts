@@ -46,6 +46,8 @@ const OPUS_IDENTIFICATION_HEADER_MIN_SIZE = 19;
 // and resampling the input first (as opusenc does for 44.1 kHz input, giving 356) adds up to a few hundred more. A
 // larger pre-skip crops the start of the stream, for which RFC 7845 (section 4.2) recommends at least 3840 samples.
 const MAX_ENCODER_PRE_SKIP = 1000;
+/** How far lookups read on from the start of a track's first link to find its end, before bisecting instead. */
+const FIRST_LINK_SCAN_SIZE = 2 ** 16;
 
 type LogicalBitstream = {
 	serialNumber: number;
@@ -580,6 +582,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	sequentialScanCache: EncodedPacketMetadata[] = [];
 	sequentialScanMutex = new AsyncMutex();
 	firstLinkPromise: Promise<OggLink> | null = null;
+	triedFindingFirstLinkEnd = false;
 	warnedAboutIncompatibleLink = false;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
@@ -1050,8 +1053,38 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		}
 	}
 
+	/**
+	 * Reads on from the link's first packet like iteration does, and returns where its last packet's page ends, or null
+	 * if the link goes on past `maxEndPos`.
+	 */
+	async findLinkEndSequentially(link: OggLink, maxEndPos = Infinity) {
+		assert(link.bitstream.lastMetadataPacket);
+		let position = await this.demuxer.findNextPacketStart(link.bitstream.lastMetadataPacket);
+		let lastPage = link.bitstream.lastMetadataPacket.endPage;
+
+		while (position) {
+			if (position.startPage.headerStartPos > maxEndPos) {
+				return null;
+			}
+
+			const packet = await this.demuxer.readPacket(position.startPage, position.startSegmentIndex);
+			if (!packet) {
+				break;
+			}
+
+			lastPage = packet.endPage;
+			position = await this.demuxer.findNextPacketStart(packet);
+		}
+
+		return lastPage.headerStartPos + lastPage.totalSize;
+	}
+
 	/** Finds the last packet of the given link with a timestamp less than or equal to the given one. */
-	async getPacketInLink(link: OggLink, timestampInSamples: number, options: PacketRetrievalOptions) {
+	async getPacketInLink(
+		link: OggLink,
+		timestampInSamples: number,
+		options: PacketRetrievalOptions,
+	): Promise<EncodedPacket | null> {
 		assert(this.demuxer.reader.fileSize !== null);
 		const firstTimestampInSamples = link.firstTimestampInSamples;
 
@@ -1059,6 +1092,17 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		const startPosition = await this.demuxer.findNextPacketStart(link.bitstream.lastMetadataPacket);
 		if (!startPosition) {
 			return null;
+		}
+
+		if (link.bitstream === this.bitstream && !this.triedFindingFirstLinkEnd) {
+			// A later link may reuse our serial number (RFC 3533 forbids that, but concatenating files does it), and
+			// the bisection can't tell its pages from our link's. So let's try to find our link's end by reading on
+			// from its start like iteration does, which is cheap for a short link like an intro or a jingle.
+			this.triedFindingFirstLinkEnd = true;
+			link.endPos ??= await this.findLinkEndSequentially(
+				link,
+				startPosition.startPage.headerStartPos + FIRST_LINK_SCAN_SIZE,
+			);
 		}
 
 		let lowPage = startPosition.startPage;
@@ -1121,6 +1165,14 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				// to a later chained link reusing the serial number (RFC 3533 forbids that, but concatenating a file
 				// with itself makes it), so our link ends before it
 				if ((page.headerType & 0x02) || page.sequenceNumber <= lowPage.sequenceNumber) {
+					if (link.endPos === null) {
+						// The bisection may already have landed on other pages of such a link, as they can't be told
+						// apart from our link's own, so let's find our link's end by reading on from its start like
+						// iteration does, and search again before it
+						link.endPos = await this.findLinkEndSequentially(link);
+						return this.getPacketInLink(link, timestampInSamples, options);
+					}
+
 					high = page.headerStartPos;
 					continue outer;
 				}

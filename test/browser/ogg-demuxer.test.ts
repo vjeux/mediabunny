@@ -339,3 +339,47 @@ test('reads a chain whose third link reuses the first link\'s serial number the 
 	}
 	expect(count).toBe(packetCount);
 });
+
+const OGG_CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+	let crc = n << 24;
+	for (let i = 0; i < 8; i++) {
+		crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
+	}
+	return crc >>> 0;
+});
+
+// Gives every page of the Ogg file the serial number, recomputing the page checksums
+const withSerialNumber = (file: Uint8Array, serialNumber: number) => {
+	const result = file.slice();
+	const view = new DataView(result.buffer);
+	for (let pos = 0; pos < result.length;) {
+		const segmentCount = result[pos + 26]!;
+		const lacingValues = result.subarray(pos + 27, pos + 27 + segmentCount);
+		const size = 27 + segmentCount + lacingValues.reduce((a, b) => a + b, 0);
+		view.setUint32(pos + 14, serialNumber, true);
+		view.setUint32(pos + 22, 0, true);
+		let crc = 0;
+		for (const byte of result.subarray(pos, pos + size)) {
+			crc = ((crc << 8) ^ OGG_CRC_TABLE[(crc >>> 24) ^ byte]!) >>> 0;
+		}
+		view.setUint32(pos + 22, crc, true);
+		pos += size;
+	}
+	return result;
+};
+
+test('reads a chain whose longer second link reuses the first link\'s serial number in any order', async () => {
+	// As from concatenating two files that FFmpeg wrote with -fflags +bitexact, which gives every Ogg file serial
+	// number 0. The bisection can't tell the second link's pages from the first link's.
+	const { links } = await remuxToOggLinks('/preroll-test.opus', [20]);
+	const serialNumber = new DataView(links[0]!.buffer).getUint32(14, true);
+	const file = concatBytes([links[0]!, withSerialNumber(links[1]!, serialNumber)]);
+	const iteratedFirst = await readPackets(new BufferSource(file));
+	expect(iteratedFirst.packets).toHaveLength(20);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBe(iteratedFirst.duration);
+	const lastPacket = await new EncodedPacketSink(track).getPacket(Infinity);
+	expect(lastPacket?.timestamp).toBe(iteratedFirst.packets[19]!.timestamp);
+});
