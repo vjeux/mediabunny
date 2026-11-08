@@ -1722,12 +1722,18 @@ export class HlsMuxer extends Muxer {
 				let peakDeclBitrate = 0;
 				let maxRefAverageBitrate = 0;
 
+				// The variant's own playlist can be the URI-less rendition of the group it references, in which case
+				// the group's renditions take the place of the variant's own media instead of adding to it
+				const ownPlaylistIsReferenced = decl.references.some(x => x.playlist === decl.playlist);
+
 				if (references.length > 0) {
-					const firstRef = renditionWithSegments ?? references[0]!;
-					const firstTrack = firstRef.playlist.tracks[0]!;
-					const trackData = this.trackDatas.find(x => x.track === firstTrack);
-					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
-					codecs.push(toHlsCodecString(codecString, firstRef.playlist.segmentFormat));
+					if (renditionWithSegments || !ownPlaylistIsReferenced) {
+						const firstRef = renditionWithSegments ?? references[0]!;
+						const firstTrack = firstRef.playlist.tracks[0]!;
+						const trackData = this.trackDatas.find(x => x.track === firstTrack);
+						const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
+						codecs.push(toHlsCodecString(codecString, firstRef.playlist.segmentFormat));
+					}
 
 					for (const ref of references) {
 						if (renditionWithSegments && ref.playlist.writtenSegments.length === 0) {
@@ -1741,8 +1747,9 @@ export class HlsMuxer extends Muxer {
 				}
 
 				assert(decl.playlist.peakBitrate !== null);
-				const ownPeakBitrate = renditionWithSegments ? 0 : decl.playlist.peakBitrate;
-				const ownAverageBitrate = renditionWithSegments ? 0 : decl.playlist.averageBitrate ?? 0;
+				const ownIsReplaced = !!renditionWithSegments || ownPlaylistIsReferenced;
+				const ownPeakBitrate = ownIsReplaced ? 0 : decl.playlist.peakBitrate;
+				const ownAverageBitrate = ownIsReplaced ? 0 : (decl.playlist.averageBitrate ?? 0);
 				const totalPeakBitrate = ownPeakBitrate + peakDeclBitrate;
 				const totalAverageBitrate = ownAverageBitrate + maxRefAverageBitrate;
 

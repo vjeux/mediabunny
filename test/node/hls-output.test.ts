@@ -593,6 +593,51 @@ test('Playlist assignment, multiple video and audio with multiple groups', async
 	expect(decl[7]!.references).toEqual(decl.slice(2, 4));
 });
 
+test('Playlist assignment, variant whose own playlist is a URI-less rendition counts it once', async () => {
+	// Master playlist of an audio-only output with one AAC track per language
+	const writeMaster = async (languages: string[]) => {
+		let master = '';
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new AdtsOutputFormat(),
+				onMaster: (text) => {
+					master = text;
+				},
+			}),
+			target: new PathedTarget('master.m3u8', () => new BufferTarget()),
+		});
+		const sources = languages.map(() => new EncodedAudioPacketSource('aac'));
+		sources.forEach((source, i) => output.addAudioTrack(source, { languageCode: languages[i] }));
+		await output.start();
+
+		const frame = new Uint8Array(200); // Same 200-byte ADTS frame (48 kHz stereo) in every track
+		frame.set([0xff, 0xf1, 0x4c, 0x80, 0x19, 0x1f, 0xfc]);
+		const decoderConfig = { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000 };
+		for (let i = 0; i < 200; i++) {
+			for (const source of sources) {
+				await source.add(
+					new EncodedPacket(frame, 'key', i * 1024 / 48000, 1024 / 48000),
+					i === 0 ? { decoderConfig } : undefined,
+				);
+			}
+		}
+		await output.finalize();
+		return master;
+	};
+
+	const single = await writeMaster(['eng']);
+	expect(single).toContain('CODECS="mp4a.40.2"'); // Control
+	const singleBandwidth = Number(/BANDWIDTH=(\d+)/.exec(single)![1]);
+
+	// Two languages: the variant points at playlist 1, which is also the group's URI-less first rendition. Its codec
+	// is listed once (a duplicate makes hls.js reject MP3 renditions), and the bandwidth is that of one rendition, the
+	// largest playable combination (RFC 8216, 4.3.4.2), not of two.
+	const multi = await writeMaster(['eng', 'fra']);
+	expect(multi).toMatch(/#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-1",NAME="eng-1"[^\n]*CHANNELS="2"\n/); // No URI
+	expect(multi).toContain('CODECS="mp4a.40.2",AUDIO="audio-1"');
+	expect(Number(/BANDWIDTH=(\d+)/.exec(multi)![1])).toBe(singleBandwidth);
+});
+
 test('Playlist assignment, video with multiple audio codecs', async () => {
 	const output = new Output({
 		format: new HlsOutputFormat({
