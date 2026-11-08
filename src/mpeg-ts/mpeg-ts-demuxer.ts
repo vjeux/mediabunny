@@ -178,6 +178,11 @@ type ElementaryStream = {
 		reorderSize: number;
 		/** How to find the field of a slice, for AVC streams that may contain field pictures. */
 		avcFieldCoding: AvcFieldCoding | null;
+		/**
+		 * How many frames can come before a frame in decode order but after it in presentation order
+		 * (num_reorder_frames, sps_max_num_reorder_pics)
+		 */
+		reorderFrameCount: number;
 	} | {
 		type: 'audio';
 		codec: AudioCodec;
@@ -234,6 +239,52 @@ type Section = {
 // Stream types for metadata rather than media (H.222.0 Table 2-34), like the ID3 timed metadata (0x15) that many HLS
 // streams carry. They're skipped like unsupported codecs, but without a note, since they aren't tracks to begin with.
 const METADATA_STREAM_TYPES = new Set<number>([0x15, 0x16, 0x17, 0x18, 0x19]);
+
+// The most B-frames x264 and x265 put between two P/I frames. The frame before such a run in decode order comes after
+// it in presentation order, however long the run is: the reorder depth doesn't bound that distance.
+const MAX_CONSECUTIVE_B_FRAMES = 16;
+
+/**
+ * Whether no PES packet before the given ones (by their timestamps, latest in decode order first) can be the one
+ * presented last at or before searchPts. A frame can come before at most reorderFrameCount frames in decode order
+ * that it's presented after, so once a packet presented at or before the best candidate has that many before it
+ * here, no earlier packet is presented after it, let alone between the candidate and searchPts.
+ */
+const lookupWindowIsComplete = (ptsInReverseDecodeOrder: number[], searchPts: number, reorderFrameCount: number) => {
+	let best = -Infinity;
+	for (const pts of ptsInReverseDecodeOrder) {
+		if (pts <= searchPts && pts > best) {
+			best = pts;
+		}
+	}
+
+	if (best === -Infinity) {
+		return false;
+	}
+	if (best === searchPts) {
+		return true; // Nothing can come closer
+	}
+
+	for (let i = 0; i < ptsInReverseDecodeOrder.length; i++) {
+		const pts = ptsInReverseDecodeOrder[i]!;
+		if (pts > best) {
+			continue;
+		}
+
+		let presentedLaterCount = 0;
+		for (let j = i + 1; j < ptsInReverseDecodeOrder.length; j++) {
+			if (ptsInReverseDecodeOrder[j]! > pts) {
+				presentedLaterCount++;
+			}
+		}
+
+		if (presentedLaterCount >= reorderFrameCount) {
+			return true;
+		}
+	}
+
+	return false;
+};
 
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
@@ -985,6 +1036,7 @@ export class MpegTsDemuxer extends Demuxer {
 									pixelAspectRatio: { num: 1, den: 1 },
 									reorderSize: -1,
 									avcFieldCoding: null,
+									reorderFrameCount: -1,
 								};
 							}; break;
 
@@ -1193,6 +1245,8 @@ export class MpegTsDemuxer extends Demuxer {
 											fullRange: !!spsInfo.fullRangeFlag,
 										};
 										elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+										// Without bitstream_restriction_flag, inferred as MaxDpbFrames
+										elementaryStream.info.reorderFrameCount = spsInfo.numReorderFrames;
 										elementaryStream.info.avcFieldCoding = spsInfo.frameMbsOnlyFlag
 											? null
 											: {
@@ -1259,6 +1313,8 @@ export class MpegTsDemuxer extends Demuxer {
 											fullRange: !!spsInfo.fullRangeFlag,
 										};
 										elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+										// maxDecFrameBuffering is sps_max_num_reorder_pics + 1 here
+										elementaryStream.info.reorderFrameCount = spsInfo.maxDecFrameBuffering - 1;
 
 										break;
 									} else {
@@ -2257,6 +2313,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 	abstract allPacketsAreKeyPackets(): boolean;
 	abstract getReorderSize(): number;
+	abstract getReorderFrameCount(): number;
 
 	/**
 	 * Returns the time between frames, as the median gap between the timestamps of the track's first packets. Since it
@@ -2557,6 +2614,10 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			return packet.pts <= searchPts && (!keyPacketsOnly || packet.randomAccessIndicator === 1);
 		};
 
+		// What the last retrieveEncodedPacket call found: the packet's pts, the next pts in presentation order (if
+		// read), and the smallest interval between the packets read
+		let lastRetrieval = null as { pts: number; nextPts: number | null; minInterval: number } | null;
+
 		const retrieveEncodedPacket = async (
 			sectionStartPos: number,
 			predicate: (packet: TimedSuppliedPacket) => boolean,
@@ -2599,6 +2660,19 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			}
 
 			const targetPacket = buffer.presentationOrderPackets[targetIndex]!;
+			let minInterval = Infinity;
+			for (let i = 1; i < buffer.presentationOrderPackets.length; i++) {
+				const interval = buffer.presentationOrderPackets[i]!.pts - buffer.presentationOrderPackets[i - 1]!.pts;
+				if (interval > 0) {
+					minInterval = Math.min(minInterval, interval);
+				}
+			}
+			lastRetrieval = {
+				pts: targetPacket.pts,
+				nextPts: buffer.presentationOrderPackets[targetIndex + 1]?.pts ?? null,
+				minInterval,
+			};
+
 			const lastDuration = targetIndex === 0
 				? 0
 				: targetPacket.pts - buffer.presentationOrderPackets[targetIndex - 1]!.pts;
@@ -2757,9 +2831,72 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 			// Rewind by reorderSize + 1 PES packets (even for audio! To ensure proper durations), but never past the
 			// track's first PES packet, since anything before it isn't part of the track
-			const startPos = await this.findTimedPesPacketBefore(currentPesHeader.sectionStartPos, reorderSize + 2);
+			let windowStart = currentPesHeader;
+			const visitedPts = [windowStart.pts];
+			const rewindByOnePesPacket = async () => {
+				let pos = windowStart.sectionStartPos - demuxer.packetStride;
 
-			return retrieveEncodedPacket(startPos, isTargetPacket);
+				while (pos >= firstSection.startPos) {
+					const packetHeader = await demuxer.readPacketHeader(pos);
+					if (!packetHeader) {
+						return false;
+					}
+
+					if (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1) {
+						const section = await demuxer.readSection(pos, false);
+						const header = section && readPesPacketHeader(demuxer, section);
+						if (header && header.pts !== null) {
+							windowStart = header as TimestampedPesPacketHeader;
+							visitedPts.push(windowStart.pts);
+							return true;
+						}
+					}
+
+					pos -= demuxer.packetStride;
+				}
+
+				return false; // We've hit the track's first PES packet, there's nothing more to rewind
+			};
+
+			for (let i = 0; i < reorderSize + 1; i++) {
+				if (!await rewindByOnePesPacket()) {
+					break;
+				}
+			}
+
+			let packet = await retrieveEncodedPacket(windowStart.sectionStartPos, isTargetPacket);
+
+			// A P/I frame followed in decode order by a run of B-frames longer than that is presented after them all,
+			// so it can come before the packets read. When the packet found isn't right at searchPts and the next one
+			// is unknown or further away than any two packets read (a frame may be missing in between), rewind further
+			// while the stream's signaled reorder depth doesn't rule out such an earlier packet.
+			const reorderFrameCount = this.getReorderFrameCount();
+			const retrieval = lastRetrieval;
+			if (
+				packet
+				&& retrieval
+				&& reorderFrameCount >= 0
+				&& retrieval.pts !== searchPts
+				&& (retrieval.nextPts === null || retrieval.nextPts - retrieval.pts > retrieval.minInterval)
+			) {
+				let rewound = false;
+				for (let i = 0; i < MAX_CONSECUTIVE_B_FRAMES; i++) {
+					if (
+						lookupWindowIsComplete(visitedPts, searchPts, reorderFrameCount)
+						|| !await rewindByOnePesPacket()
+					) {
+						break;
+					}
+
+					rewound = true;
+				}
+
+				if (rewound) {
+					packet = await retrieveEncodedPacket(windowStart.sectionStartPos, isTargetPacket);
+				}
+			}
+
+			return packet;
 		} else {
 			// Key packet lookup case. Slightly harder since the starting chunk may not have a key packet at all, which
 			// means we might need to search the previous chunks until we find something.
@@ -3014,6 +3151,10 @@ class MpegTsVideoTrackBacking extends MpegTsTrackBacking implements InputVideoTr
 	override getReorderSize(): number {
 		return this.elementaryStream.info.reorderSize;
 	}
+
+	override getReorderFrameCount(): number {
+		return this.elementaryStream.info.reorderFrameCount;
+	}
 }
 
 class MpegTsAudioTrackBacking extends MpegTsTrackBacking implements InputAudioTrackBacking {
@@ -3046,6 +3187,10 @@ class MpegTsAudioTrackBacking extends MpegTsTrackBacking implements InputAudioTr
 
 	override getReorderSize(): number {
 		return 0; // No reordering, since no B-frames because goated
+	}
+
+	override getReorderFrameCount(): number {
+		return 0;
 	}
 }
 
