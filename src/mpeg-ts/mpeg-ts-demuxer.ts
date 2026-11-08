@@ -92,6 +92,22 @@ import {
 } from './mpeg-ts-misc';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
+import { ReadableStreamSource, UrlSource } from '../source';
+
+/**
+ * How far reading can go past a position and still come back to it. Sources that only keep what their cache holds (a
+ * ReadableStreamSource, or a UrlSource whose server ignores range requests) can go half their cache, which stays clear
+ * of what gets evicted; the others, anywhere.
+ */
+const getReadBackDistance = (reader: Reader) => {
+	const source = reader.source;
+	const sequentialSource = source instanceof ReadableStreamSource
+		? source
+		: source instanceof UrlSource
+			? source._sequentialBacking
+			: null;
+	return sequentialSource ? sequentialSource._maxCacheSize / 2 : Infinity;
+};
 
 // Resources:
 // ISO/IEC 13818-1
@@ -115,6 +131,103 @@ const BLU_RAY_DTS_STREAM_TYPES = new Set<number>([
 	MpegTsStreamType.BLU_RAY_DTS_EXPRESS_SECONDARY,
 ]);
 
+/**
+ * How much further than the streams that say what they hold we look for the first PES packet of a private data stream
+ * that doesn't: its audio would have shown up by then, and it may well hold none at all.
+ */
+const MAX_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 22; // 4 MiB
+// The same for sources of unknown size
+const MAX_STREAMED_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 20; // 1 MiB
+
+// Descriptors that make a private data stream something other than audio: VBI data, VBI teletext, teletext, DVB
+// subtitling, data broadcast ID, application signalling and ARIB data component
+const NON_AUDIO_PRIVATE_DATA_DESCRIPTOR_TAGS = new Set<number>([0x45, 0x46, 0x56, 0x59, 0x66, 0x6f, 0xfd]);
+
+/**
+ * The codec, size and sample rate (or its code) of the audio frame whose header starts the bytes, for telling the codec
+ * of a stream that doesn't say what it is. Only headers that the code reading the stream's first frame accepts count.
+ */
+const probeAudioFrame = (bytes: Uint8Array): { codec: AudioCodec; frameSize: number; rate: number } | null => {
+	if (bytes.byteLength < MAX_ADTS_FRAME_HEADER_SIZE) {
+		return null;
+	}
+
+	if (bytes[0] === 0x0b && bytes[1] === 0x77) {
+		// AC-3 and E-AC-3 tell themselves apart by their bsid
+		const bsid = bytes[5]! >> 3;
+		if (bsid <= 8) {
+			const fscod = bytes[4]! >> 6;
+			const frmsizecod = bytes[4]! & 0x3f;
+			if (fscod === 3 || frmsizecod > 37 || !parseAc3SyncFrame(bytes)) {
+				return null;
+			}
+
+			return { codec: 'ac3', frameSize: AC3_FRAME_SIZES[3 * frmsizecod + fscod]!, rate: fscod };
+		} else if (bsid >= 11 && bsid <= 16) {
+			const frameInfo = parseEac3SyncFrame(bytes);
+			const sampleRate = frameInfo && getEac3SampleRate(frameInfo);
+			if (!sampleRate) {
+				return null;
+			}
+
+			const frmsiz = ((bytes[2]! & 0x07) << 8) | bytes[3]!;
+			return { codec: 'eac3', frameSize: (frmsiz + 1) * 2, rate: sampleRate };
+		}
+
+		return null;
+	}
+
+	if (bytes[0] === 0x7f && bytes[1] === 0xfe && bytes[2] === 0x80 && bytes[3] === 0x01) {
+		const frameInfo = parseDtsFrame(bytes);
+		return frameInfo && { codec: 'dts', frameSize: frameInfo.frameSize, rate: frameInfo.sampleRate };
+	}
+
+	if (bytes[0] === 0xff && (bytes[1]! & 0xf6) === 0xf0) {
+		// ADTS: a sample rate, a channel configuration, a frame length that holds the header, and one raw data block
+		const samplingFrequencyIndex = (bytes[2]! >> 2) & 0x0f;
+		const channelConfiguration = ((bytes[2]! & 0x01) << 2) | (bytes[3]! >> 6);
+		const frameLength = ((bytes[3]! & 0x03) << 11) | (bytes[4]! << 3) | (bytes[5]! >> 5);
+		const headerSize = bytes[1]! & 0x01 ? MAX_ADTS_FRAME_HEADER_SIZE - 2 : MAX_ADTS_FRAME_HEADER_SIZE;
+		const rawDataBlockCount = (bytes[6]! & 0x03) + 1;
+		if (
+			samplingFrequencyIndex >= aacFrequencyTable.length
+			|| channelConfiguration === 0
+			|| frameLength < headerSize
+			|| rawDataBlockCount !== 1
+		) {
+			return null;
+		}
+
+		return { codec: 'aac', frameSize: frameLength, rate: samplingFrequencyIndex };
+	}
+
+	if (bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0) {
+		const header = readMp3FrameHeader(readU32Be(FileSlice.tempFromBytes(bytes)), bytes.byteLength).header;
+		return header && { codec: 'mp3', frameSize: header.totalSize, rate: header.sampleRate };
+	}
+
+	return null;
+};
+
+/**
+ * Works out the codec of an audio stream that doesn't say what it is (a private data stream without descriptors, as
+ * FFmpeg's m2ts mode writes AAC) from its first PES packet. Like FFmpeg's probes, one header isn't enough: the next
+ * frame's header must follow with the same codec and sample rate, unless the frame fills the PES packet exactly.
+ */
+const getAudioCodecFromPayload = (data: Uint8Array): AudioCodec | null => {
+	const frame = probeAudioFrame(data);
+	if (!frame || frame.frameSize <= 0 || frame.frameSize > data.byteLength) {
+		return null;
+	}
+
+	if (frame.frameSize === data.byteLength) {
+		return frame.codec;
+	}
+
+	const nextFrame = probeAudioFrame(data.subarray(frame.frameSize));
+	return nextFrame && nextFrame.codec === frame.codec && nextFrame.rate === frame.rate ? frame.codec : null;
+};
+
 type ElementaryStream = {
 	demuxer: MpegTsDemuxer;
 	pid: number;
@@ -126,6 +239,8 @@ type ElementaryStream = {
 	 * compensate for another programmer's skill issue.
 	 */
 	canBeTrustedWithKeyPackets: boolean;
+	/** For private data streams that don't say what they hold: the first PES packet tells the audio codec. */
+	codecFromPayload: boolean;
 	info: {
 		type: 'video';
 		codec: VideoCodec;
@@ -230,8 +345,15 @@ export class MpegTsDemuxer extends Demuxer {
 			// Some files contain these multiple times, but we only care about their first appearance
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
+			// Where to stop looking for the private data streams that don't say what they hold
+			let privateDataProbeEndPos: number | null = null;
 
 			while (true) {
+				if (privateDataProbeEndPos !== null && currentPos >= privateDataProbeEndPos) {
+					// The private data streams that don't say what they hold didn't show up as audio we know
+					break;
+				}
+
 				const packetHeader = await this.readPacketHeader(currentPos);
 				if (!packetHeader) {
 					break;
@@ -367,6 +489,7 @@ export class MpegTsDemuxer extends Demuxer {
 						let hasAc3Descriptor = false;
 						let hasEac3Descriptor = false;
 						let hasDtsDescriptor = false;
+						let hasOtherDescriptor = false;
 						while (bitstream.pos < esInfoEndPos) {
 							const descriptorTag = bitstream.readBits(8);
 							const descriptorLength = bitstream.readBits(8);
@@ -382,13 +505,18 @@ export class MpegTsDemuxer extends Demuxer {
 								// DTS uses 'DTS1', 'DTS2' and 'DTS3' to also signal the stream's frame size,
 								// which we work out from the bitstream anyway
 								const formatIdentifier = bitstream.readBits(32);
-								hasDtsDescriptor ||= (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
+								const isDts = (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
+								hasDtsDescriptor ||= isDts;
+								hasOtherDescriptor ||= !isDts; // Says what the stream is, which isn't something we know
+							} else if (NON_AUDIO_PRIVATE_DATA_DESCRIPTOR_TAGS.has(descriptorTag)) {
+								hasOtherDescriptor = true;
 							}
 
 							bitstream.pos = descriptorEndPos;
 						}
 
 						let info: ElementaryStream['info'] | null = null;
+						let codecFromPayload = false;
 
 						// Blu-ray has its own stream types for the DTS extensions
 						const effectiveStreamType = isBluRayProgram && BLU_RAY_DTS_STREAM_TYPES.has(streamType)
@@ -485,6 +613,20 @@ export class MpegTsDemuxer extends Demuxer {
 										numberOfChannels: -1,
 										sampleRate: -1,
 									};
+								} else if (!hasOtherDescriptor) {
+									// Nothing says what the stream holds, as FFmpeg's m2ts mode writes AAC (and older
+									// FFmpeg versions wrote DTS), so let the first PES packet tell. The codec is a
+									// placeholder until then.
+									codecFromPayload = true;
+									info = {
+										type: 'audio',
+										codec: 'aac',
+										decoderConfig: null,
+										aacCodecInfo: null,
+										dtsFormat: null,
+										numberOfChannels: -1,
+										sampleRate: -1,
+									};
 								}
 							}; break;
 
@@ -510,6 +652,7 @@ export class MpegTsDemuxer extends Demuxer {
 								initialized: false,
 								firstSection: null,
 								canBeTrustedWithKeyPackets: false,
+								codecFromPayload,
 								info,
 								referencePesPackets: [],
 							});
@@ -526,6 +669,18 @@ export class MpegTsDemuxer extends Demuxer {
 							throw new Error(
 								`Couldn't read first PES packet for Elementary Stream with PID ${elementaryStream.pid}`,
 							);
+						}
+
+						if (elementaryStream.codecFromPayload) {
+							const codec = getAudioCodecFromPayload(pesPacket.data);
+							if (!codec || elementaryStream.info.type !== 'audio') {
+								// Not audio we know, so don't surface the stream, like any we don't support
+								this.elementaryStreams.splice(this.elementaryStreams.indexOf(elementaryStream), 1);
+								break outer;
+							}
+
+							elementaryStream.info.codec = codec;
+							elementaryStream.codecFromPayload = false;
 						}
 
 						elementaryStream.firstSection = section;
@@ -806,6 +961,22 @@ export class MpegTsDemuxer extends Demuxer {
 							elementaryStream.initialized = true;
 						}
 					}
+				}
+
+				if (hasProgramMap && this.elementaryStreams.every(x => x.initialized || x.codecFromPayload)) {
+					// Sources that only keep what their cache holds look only as far as they can still come back to the
+					// other streams' start from
+					const firstSectionPos = Math.min(
+						...this.elementaryStreams.map(x => x.firstSection?.startPos ?? Infinity),
+					);
+					privateDataProbeEndPos ??= Math.min(
+						currentPos + (
+							this.reader.fileSizeNonStrict === null
+								? MAX_STREAMED_PRIVATE_DATA_PROBE_DISTANCE
+								: MAX_PRIVATE_DATA_PROBE_DISTANCE
+						),
+						firstSectionPos + getReadBackDistance(this.reader),
+					);
 				}
 
 				const isDone = hasProgramMap && this.elementaryStreams.every(x => x.initialized);
