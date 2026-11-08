@@ -2808,6 +2808,18 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	 * doesn't depend on where reading started, it gives packets without a successor the same duration however they
 	 * were reached.
 	 */
+	/**
+	 * Packets without a successor (the last one, say) take the track's frame duration, which is measured at the start
+	 * of the stream (see getFrameDuration). This starts measuring it as reading starts: by the time it's needed, a
+	 * sequential source (a stream, a server that ignores range requests) may have evicted the start from its cache.
+	 * Errors surface where the duration is awaited.
+	 */
+	startMeasuringFrameDuration() {
+		if (this.elementaryStream.info.type === 'video') {
+			void this.getFrameDuration().catch(() => {});
+		}
+	}
+
 	getFrameDuration() {
 		return this.frameDuration ??= (async () => {
 			const firstSection = this.elementaryStream.firstSection;
@@ -2869,6 +2881,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+		this.startMeasuringFrameDuration();
 		const section = this.elementaryStream.firstSection;
 		assert(section);
 
@@ -2911,6 +2924,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		}
 
 		// No buffer, we gotta do some rereading
+		this.startMeasuringFrameDuration();
 		const sectionStartPos = this.packetSectionStarts.get(packet);
 		if (sectionStartPos === undefined) {
 			throw new Error('Packet was not created from this track.');
@@ -3057,6 +3071,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 	): Promise<EncodedPacket | null> {
 		const searchPts = roundIfAlmostInteger(timestamp * MPEG_TS_TIMESCALE);
+		this.startMeasuringFrameDuration();
 
 		const demuxer = this.elementaryStream.demuxer;
 		const { reader, seekChunkSize } = demuxer;
