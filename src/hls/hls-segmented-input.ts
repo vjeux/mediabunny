@@ -17,7 +17,6 @@ import {
 	assert,
 	binarySearchLessOrEqual,
 	arrayArgmin,
-	wait,
 	base64ToBytes,
 	clamp,
 	isThenable,
@@ -34,6 +33,7 @@ import {
 	SourceRequest,
 } from '../source';
 import { HlsDemuxer } from './hls-demuxer';
+import { InputDisposedError } from '../input';
 import {
 	AttributeList,
 	canIgnoreLine,
@@ -142,6 +142,35 @@ export class HlsSegmentedInput extends SegmentedInput {
 		this.nextLines = lines;
 	}
 
+	/** Cuts the current wait before a playlist reload short, if there is one. */
+	cancelReloadWait: (() => void) | null = null;
+
+	/** Waits before reloading the playlist. Disposing the input cuts the wait short with an InputDisposedError. */
+	waitBeforeReload(ms: number) {
+		return new Promise<void>((resolve, reject) => {
+			if (this.input._disposed) {
+				reject(new InputDisposedError());
+				return;
+			}
+
+			const timeoutId = setTimeout(() => {
+				this.cancelReloadWait = null;
+				resolve();
+			}, ms);
+
+			this.cancelReloadWait = () => {
+				clearTimeout(timeoutId);
+				this.cancelReloadWait = null;
+				reject(new InputDisposedError());
+			};
+		});
+	}
+
+	override dispose() {
+		this.cancelReloadWait?.();
+		super.dispose();
+	}
+
 	runUpdateSegments() {
 		return this.currentUpdateSegmentsPromise ??= (async () => {
 			try {
@@ -150,7 +179,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				// 6.3.4)
 				const remainingWaitTimeMs = this.getRemainingWaitTimeMs(true);
 				if (remainingWaitTimeMs > 0) {
-					await wait(remainingWaitTimeMs);
+					await this.waitBeforeReload(remainingWaitTimeMs);
 				}
 
 				this.lastSegmentUpdateTime = performance.now();
