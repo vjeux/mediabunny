@@ -2806,6 +2806,59 @@ test('Opus codec string in master playlist', async () => {
 	expect(await audioTrack.getCodec()).toBe('opus');
 });
 
+test('MP3 and FLAC codec strings in master playlist', async () => {
+	// WebCodecs calls them "mp3" and "flac", but CODECS takes RFC 6381 identifiers: "mp4a.40.34" and the ISOBMFF sample
+	// entry name "fLaC" (Apple's HLS authoring spec, "Values for the CODECS attribute"). hls.js rejects the whole
+	// manifest when given "mp3".
+	const writeAudioOnly = async (fileName: string, segmentFormat: HlsOutputFormatOptions['segmentFormat']) => {
+		using input = new Input({ source: new FilePathSource(`./test/public/${fileName}`), formats: ALL_FORMATS });
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(audioTrack);
+		const decoderConfig = (await audioTrack.getDecoderConfig())!;
+		const codec = (await audioTrack.getCodec())!;
+
+		let masterText = '';
+		const targets = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat, onMaster: (text) => { masterText = text; } }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				targets.set(request.path, target);
+				return target;
+			}),
+		});
+		const source = new EncodedAudioPacketSource(codec);
+		output.addAudioTrack(source);
+		await output.start();
+		for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+			if (packet.timestamp >= 3) {
+				break;
+			}
+			await source.add(packet, { decoderConfig });
+		}
+		await output.finalize();
+
+		return { masterText, targets, codec };
+	};
+
+	for (const [fileName, segmentFormat, codecString] of [
+		['Toothsome-Meme.VBRv2.mp3', new Mp3OutputFormat(), 'mp4a.40.34'],
+		['sample.flac', new CmafOutputFormat(), 'fLaC'],
+	] as const) {
+		const { masterText, targets, codec } = await writeAudioOnly(fileName, segmentFormat);
+		expect(masterText).toContain(`CODECS="${codecString}"`);
+
+		// The HLS input must understand the string the HLS output writes
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(targets.get(path)!.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(audioTrack);
+		expect(await audioTrack.getCodec()).toBe(codec);
+	}
+});
+
 test('Empty playlist bandwidth, from track metadata', async () => {
 	let masterText = '';
 
