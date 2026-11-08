@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { brotliCompressSync } from 'node:zlib';
 import { assert } from '../../src/misc.js';
 import { Reader, readBytes } from '../../src/reader.js';
@@ -79,6 +79,36 @@ test('UrlSource rejects a retry delay that isn\'t a non-negative finite number',
 });
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+test('UrlSource gives up on blob: and file: URLs that fail instead of retrying forever', async () => {
+	const getFormatOutcome = async (url: string) => {
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		return await Promise.race([
+			input.getFormat().then(
+				format => `resolved: ${format.name}`,
+				(error: unknown) => `rejected: ${String(error)}`,
+			),
+			new Promise<string>(resolve => setTimeout(() => resolve('pending after 3 s'), 3000)),
+		]);
+	};
+	const logs = captureLogs();
+
+	try {
+		// The Fetch standard reports a range at or past the end of a blob (here: bytes=0- on an empty one) as a network
+		// error, like a revoked blob: URL, and Node's fetch doesn't implement file: URLs at all
+		const emptyBlobUrl = URL.createObjectURL(new Blob([]));
+		const fileUrl = pathToFileURL(path.join(__dirname, '..', 'public', 'video.mp4')).href;
+
+		// On main, both keep retrying with exponential backoff
+		expect(await getFormatOutcome(emptyBlobUrl)).toMatch(/^rejected: TypeError/);
+		expect(await getFormatOutcome(fileUrl)).toMatch(/^rejected: TypeError/);
+		expect(logs.errors).toEqual([]); // No "Retrying failed fetch"
+
+		URL.revokeObjectURL(emptyBlobUrl);
+	} finally {
+		logs.stop();
+	}
+}, 10_000);
 const videoFilePath = path.join(__dirname, '..', 'public/video.mp4');
 
 test('UrlSource sends every value of a header given more than once in a header list', async () => {
