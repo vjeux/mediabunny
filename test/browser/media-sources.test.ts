@@ -2,9 +2,9 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { Quality } from '../../src/encode.js';
+import { canEncode, Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -731,3 +731,87 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test.for([{ frameRate: 30 }, { frameRate: null }])(
+	'MediaStreamVideoTrackSource encodes frames in order when an async process function takes varying time'
+	+ ' (frameRate: $frameRate)',
+	async ({ frameRate }, { skip }) => {
+		if (typeof VideoEncoder === 'undefined' || !(await canEncode('vp8'))) {
+			skip('VP8 encoding is not supported here');
+		}
+
+		// Stands in for MediaStreamTrackProcessor: a frame every 33 ms, like a camera
+		const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+		const realProcessor = globals.MediaStreamTrackProcessor;
+		let controller!: ReadableStreamDefaultController<VideoFrame>;
+		const readable = new ReadableStream<VideoFrame>({
+			start: (c) => {
+				controller = c;
+			},
+		});
+		globals.MediaStreamTrackProcessor = class {
+			readable = readable;
+		};
+		const start = performance.now();
+		const interval = setInterval(() => {
+			const frame = new VideoFrame(new Uint8Array(160 * 120 * 3 / 2).fill(128), {
+				format: 'I420',
+				codedWidth: 160,
+				codedHeight: 120,
+				timestamp: Math.round(1000 * (performance.now() - start)),
+			});
+			try {
+				controller.enqueue(frame);
+			} catch {
+				frame.close(); // The source stopped reading
+			}
+		}, 1000 / 30);
+		const canvas = document.createElement('canvas');
+		const track = canvas.captureStream().getVideoTracks()[0]!; // Only identifies the track
+
+		const timestamps: number[] = [];
+		const errors: unknown[] = [];
+		try {
+			const output = new Output({
+				format: new WebMOutputFormat(),
+				target: new BufferTarget(),
+			});
+			let calls = 0;
+			const videoSource = new MediaStreamVideoTrackSource(track, {
+				codec: 'vp8',
+				quality: new Quality('low'),
+				transform: {
+					// Like an effect whose run time varies per frame: every other frame takes 50 ms longer
+					process: async (sample) => {
+						if (calls++ % 2 === 0) {
+							await new Promise(resolve => setTimeout(resolve, 50));
+						}
+						return sample;
+					},
+				},
+				onEncodedPacket: (packet) => {
+					timestamps.push(packet.timestamp);
+				},
+			}, { frameRate });
+			videoSource.errorPromise.catch(error => errors.push(error));
+			output.addVideoTrack(videoSource);
+			await output.start();
+			await new Promise(resolve => setTimeout(resolve, 1500));
+			await output.finalize();
+		} finally {
+			clearInterval(interval);
+			try {
+				controller.close();
+			} catch {
+				// The source canceled the stream
+			}
+			globals.MediaStreamTrackProcessor = realProcessor;
+			track.stop();
+		}
+
+		expect(errors).toEqual([]);
+		expect(timestamps.length).toBeGreaterThan(20);
+		const backwards = timestamps.filter((timestamp, i) => i > 0 && timestamp < timestamps[i - 1]!);
+		expect(backwards).toEqual([]);
+	},
+);

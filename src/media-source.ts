@@ -313,15 +313,50 @@ class VideoEncoderWrapper {
 
 	private lastMuxerPromise: Promise<void> = Promise.resolve();
 	private closed = false;
+	/** Settles once the samples added so far have been processed and encoded, one at a time, in order. */
+	private addQueue: Promise<void> = Promise.resolve();
+	/** How many added samples are waiting for their turn or being processed. */
+	private queuedAddCount = 0;
 
 	constructor(private source: VideoSource, private encodingConfig: VideoEncodingConfig) {}
 
 	async add(videoSample: VideoSample, shouldClose: boolean, encodeOptions?: VideoEncoderEncodeOptions) {
+		try {
+			this.checkForEncoderError();
+			this.source._ensureValidAdd();
+		} catch (error) {
+			if (shouldClose) {
+				videoSample.close();
+			}
+			throw error;
+		}
+
+		// Samples are processed and encoded one at a time, in the order they were added: with an asynchronous
+		// transform or process function, a later sample would otherwise overtake an earlier one that takes longer
+		// (sources that don't wait for their adds, like MediaStreamVideoTrackSource, add while others are pending).
+		// They're validated before waiting their turn, so that one added before finalize() isn't rejected for it.
+		this.queuedAddCount++;
+		const added = this.addQueue.then(() => this.addInOrder(videoSample, shouldClose, encodeOptions));
+		this.addQueue = added.catch(() => {});
+		try {
+			await added;
+		} finally {
+			this.queuedAddCount--;
+		}
+	}
+
+	private async addInOrder(
+		videoSample: VideoSample,
+		shouldClose: boolean,
+		encodeOptions?: VideoEncoderEncodeOptions,
+	) {
 		const originalSample = videoSample;
 
 		try {
 			this.checkForEncoderError();
-			this.source._ensureValidAdd();
+			if (this.closed) {
+				return; // Canceled while waiting
+			}
 
 			const config = this.encodingConfig;
 			const sizeChangeBehavior = config.sizeChangeBehavior ?? 'deny';
@@ -1081,6 +1116,9 @@ class VideoEncoderWrapper {
 	async flushAndClose(forceClose: boolean) {
 		try {
 			if (!forceClose) {
+				// The samples added so far go in first
+				await this.addQueue;
+
 				this.checkForEncoderError();
 
 				// Final frame rate padding: fill remaining frames up to the last sample's original end timestamp
@@ -1138,12 +1176,16 @@ class VideoEncoderWrapper {
 	}
 
 	getQueueSize() {
+		// Samples waiting for their turn behind the one being processed count too, except while the encoder is being
+		// set up, so that a slow setup doesn't get the first frames dropped
+		const waitingAdds = this.encoderInitialized ? Math.max(this.queuedAddCount - 1, 0) : 0;
+
 		if (this.customEncoder) {
-			return this.customEncoderQueueSize;
+			return this.customEncoderQueueSize + waitingAdds;
 		} else {
 			// Because the color and alpha encoders are wired in series, there's no need to also include the alpha
 			// encoder's queue size here
-			return this.encoder?.encodeQueueSize ?? 0;
+			return (this.encoder?.encodeQueueSize ?? 0) + waitingAdds;
 		}
 	}
 
