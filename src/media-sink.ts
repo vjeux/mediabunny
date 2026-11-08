@@ -47,6 +47,7 @@ import {
 	promiseWithResolvers,
 	removeItem,
 	Rotation,
+	serializeNextCalls,
 	toAsyncIterator,
 	toDataView,
 	toUint8Array,
@@ -413,7 +414,7 @@ export class EncodedPacketSink {
 
 		const track = this._track;
 
-		return {
+		return serializeNextCalls<EncodedPacket>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -468,7 +469,7 @@ export class EncodedPacketSink {
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		});
 	}
 }
 
@@ -677,7 +678,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		return serializeNextCalls<MediaSample>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -721,7 +722,7 @@ export abstract class BaseMediaSampleSink<
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		});
 	}
 
 	/** @internal */
@@ -946,7 +947,7 @@ export abstract class BaseMediaSampleSink<
 			}
 		};
 
-		return {
+		return serializeNextCalls<MediaSample | null>({
 			async next() {
 				while (true) {
 					if (track.input._disposed) {
@@ -988,7 +989,7 @@ export abstract class BaseMediaSampleSink<
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-		};
+		});
 	}
 }
 
