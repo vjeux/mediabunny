@@ -515,6 +515,47 @@ describe('Video', async () => {
 		expect(keyFrameTimestamps).toEqual(interval === 10 ? [0] : [0, 1, 2]);
 	});
 
+	test('AV1 encoding stays near its target bitrate at any keyFrameInterval', { timeout: 60_000 }, async () => {
+		// Converts the 5 s test video to 640x360 AV1 at 30 fps and 500 kbps
+		const convertToAv1 = async (keyFrameInterval: number | undefined) => {
+			using input = new Input({ source: new FilePathSource('./test/public/video.mp4'), formats: ALL_FORMATS });
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: {
+					codec: 'av1',
+					width: 640,
+					frameRate: 30,
+					quality: new Quality({ bitrate: 500_000 }),
+					keyFrameInterval,
+				},
+				audio: { discard: true },
+			});
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await result.getPrimaryVideoTrack();
+			assert(track);
+			const keyFrameTimestamps: number[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				if (packet.type === 'key') {
+					keyFrameTimestamps.push(Math.round(packet.timestamp * 30) / 30);
+				}
+			}
+
+			return { bitrate: (await track.computePacketStats()).averageBitrate, keyFrameTimestamps };
+		};
+
+		// SVT-AV1 budgets each key frame against its intra period, which therefore has to match the requested interval
+		const cases = [[undefined, [0, 2, 4]], [1, [0, 1, 2, 3, 4]]] as const;
+		for (const [keyFrameInterval, keyFrameTimestamps] of cases) {
+			const { bitrate, keyFrameTimestamps: actual } = await convertToAv1(keyFrameInterval);
+			expect({ keyFrameInterval, keyFrameTimestamps: actual }).toEqual({ keyFrameInterval, keyFrameTimestamps });
+			expect(bitrate, `keyFrameInterval ${keyFrameInterval}`).toBeLessThan(1.25 * 500_000);
+		}
+	});
+
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },
