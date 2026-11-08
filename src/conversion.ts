@@ -713,6 +713,8 @@ export class Conversion {
 
 	/** @internal */
 	_state: 'idle' | 'executing' | 'canceled' | 'done' = 'idle';
+	/** @internal Resolved by cancel(), which a finalization in progress doesn't wait for. */
+	_canceledSignal = promiseWithResolvers();
 	/** @internal */
 	_options: ConversionOptions;
 	/** @internal */
@@ -1431,11 +1433,25 @@ export class Conversion {
 		}
 
 		const isDone = this._trackPumps.every(x => x.done);
-		this._state = isDone ? 'done' : 'idle';
+		if (!isDone || this._composable) {
+			this._state = isDone ? 'done' : 'idle';
+		}
 
 		if (isDone) {
 			if (!this._composable) {
-				await this.output.finalize();
+				// Still executing while the output finalizes, so that a cancel then (of a finalization stuck on a
+				// target whose stream never finishes closing, say) makes execute() throw rather than doing nothing
+				try {
+					await Promise.race([this.output.finalize(), this._canceledSignal.promise]);
+				} finally {
+					if ((this._state as Conversion['_state']) !== 'canceled') {
+						this._state = 'done';
+					}
+				}
+
+				if ((this._state as Conversion['_state']) === 'canceled') {
+					throw new ConversionCanceledError();
+				}
 			}
 
 			if (this._computeProgress) {
@@ -1447,8 +1463,8 @@ export class Conversion {
 	}
 
 	/**
-	 * Cancels the conversion process, causing any ongoing `execute` call to throw a `ConversionCanceledError`.
-	 * Does nothing if the conversion is already complete.
+	 * Cancels the conversion process, causing any ongoing `execute` call to throw a `ConversionCanceledError`, also
+	 * while it's finalizing the output. Does nothing if the conversion is already complete.
 	 */
 	async cancel() {
 		if (this._state === 'done') {
@@ -1461,6 +1477,7 @@ export class Conversion {
 		}
 
 		this._state = 'canceled';
+		this._canceledSignal.resolve();
 
 		// Wake all suspended track pumps so they can wind down
 		for (const pump of this._trackPumps) {
