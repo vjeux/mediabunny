@@ -1710,6 +1710,7 @@ export class IsobmffDemuxer extends Demuxer {
 			}; break;
 
 			case 'mvhd': {
+				const isFirstMovieHeader = this.movieTimescale === -1;
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
@@ -1738,6 +1739,14 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4 + 2 + 2 + 2 * 4); // Rate, volume, reserved
 				this.movieMatrix = readMatrix(slice);
+
+				if (isFirstMovieHeader) {
+					// The children of moov may come in any order (QuickTime File Format), so tracks may precede the
+					// mvhd box. Their matrices were composed with the identity matrix the movie matrix starts as.
+					for (const track of this.tracks) {
+						track.matrix = multiplyMatrices(track.matrix, this.movieMatrix);
+					}
+				}
 			}; break;
 
 			case 'trak': {
