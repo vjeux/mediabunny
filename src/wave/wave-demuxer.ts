@@ -12,7 +12,7 @@ import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { PacketRetrievalOptions } from '../media-sink';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
-import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
+import { assert, isThenable, roundIfAlmostInteger, UNDETERMINED_LANGUAGE } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
@@ -639,7 +639,8 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		assert(this.demuxer.audioInfo);
 
 		const packetIndex = Math.floor(Math.min(
-			timestamp * this.demuxer.audioInfo.sampleRate / PACKET_SIZE_IN_FRAMES,
+			// Rounded, since a packet's own timestamp can come out a hair below its first frame
+			roundIfAlmostInteger(timestamp * this.demuxer.audioInfo.sampleRate) / PACKET_SIZE_IN_FRAMES,
 			(this.demuxer.dataSize - 1) / (PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes),
 		));
 		if (packetIndex < 0) {
