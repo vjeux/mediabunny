@@ -25,6 +25,25 @@ export enum WaveFormat {
 	EXTENSIBLE = 0xFFFE,
 }
 
+// The sub-format GUIDs that hold a WAVE format tag in their first field, by their remaining 12 bytes (in the binary
+// layout): the KSDATAFORMAT_SUBTYPE_* GUIDs, the Ambisonic B-format ones, and those of a known broken writer. Same as
+// FFmpeg's (riffdec.c).
+const FORMAT_TAG_SUB_FORMAT_BASES = [
+	[0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+	[0x21, 0x07, 0xd3, 0x11, 0x86, 0x44, 0xc8, 0xc1, 0xca, 0x00, 0x00, 0x00],
+	[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa],
+];
+
+/** Formats a GUID given in its binary layout (first three fields little-endian). */
+const formatGuid = (bytes: Uint8Array) => {
+	const hex = (start: number, end: number, littleEndian: boolean) => {
+		const part = [...bytes.subarray(start, end)];
+		return (littleEndian ? part.reverse() : part).map(byte => byte.toString(16).padStart(2, '0')).join('');
+	};
+
+	return `{${hex(0, 4, true)}-${hex(4, 6, true)}-${hex(6, 8, true)}-${hex(8, 10, false)}-${hex(10, 16, false)}}`;
+};
+
 export class WaveDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -198,8 +217,22 @@ export class WaveDemuxer extends Demuxer {
 				slice.skip(2 + 4);
 				const subFormat = readBytes(slice, 16);
 
-				// Get actual format from subFormat GUID
-				formatTag = subFormat[0]! | (subFormat[1]! << 8);
+				// Get the actual format tag from the sub-format GUID. Other GUIDs denote other (vendor) formats, whose
+				// data mustn't be taken for PCM just because their first bytes happen to look like its tag.
+				const holdsFormatTag = FORMAT_TAG_SUB_FORMAT_BASES.some(
+					base => base.every((byte, i) => subFormat[4 + i] === byte),
+				);
+				if (!holdsFormatTag) {
+					throw new Error(
+						`Unsupported WAVE codec (sub-format GUID ${formatGuid(subFormat)}). Only integer/float PCM,`
+						+ ` A-law, and μ-law are supported.`,
+					);
+				}
+
+				// The whole first field, like FFmpeg: a GUID whose first field merely ends in a known tag isn't that
+				// format either
+				formatTag = (subFormat[0]! | (subFormat[1]! << 8) | (subFormat[2]! << 16) | (subFormat[3]! << 24))
+					>>> 0;
 			}
 		}
 
