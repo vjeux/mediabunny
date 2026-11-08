@@ -1,4 +1,5 @@
 import { expect, test, vi } from 'vitest';
+import { decodesPastNegativeTimestamps } from './helpers/platform-probes.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, CustomPathedSource, UrlSource, CustomSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -145,7 +146,9 @@ test('Fallback sample past the end survives iterator return', async () => {
 	sample.close();
 });
 
-test('Audio decoder pre-roll (AAC)', async () => {
+const NEGATIVE_TIMESTAMPS_SKIP_NOTE = 'the platform\'s audio decoders scramble negative timestamps (native probe)';
+
+test('Audio decoder pre-roll (AAC)', async ({ skip }) => {
 	using input = new Input({
 		source: new UrlSource('/demo.mp4'),
 		formats: ALL_FORMATS,
@@ -156,6 +159,8 @@ test('Audio decoder pre-roll (AAC)', async () => {
 
 	expect(await track.getCodec()).toBe('aac');
 	expect(await track.getPreRollDuration()).toBe(1024 / await track.getSampleRate());
+	// The file starts before zero (the AAC priming)
+	skip(!await decodesPastNegativeTimestamps(), NEGATIVE_TIMESTAMPS_SKIP_NOTE);
 
 	await testAudioDecoderPreRoll(track, -90);
 });
@@ -217,7 +222,7 @@ for (const { label, url, startsBelowZero } of heAacPreRollCases) {
 	});
 }
 
-test('Audio decoder pre-roll (Opus)', async () => {
+test('Audio decoder pre-roll (Opus)', async ({ skip }) => {
 	using input = new Input({
 		source: new UrlSource('/preroll-test.opus'),
 		formats: ALL_FORMATS,
@@ -228,6 +233,8 @@ test('Audio decoder pre-roll (Opus)', async () => {
 
 	expect(await track.getCodec()).toBe('opus');
 	expect(await track.getPreRollDuration()).toBe(OPUS_PRE_ROLL_DURATION);
+	// The file starts before zero (the Opus pre-skip)
+	skip(!await decodesPastNegativeTimestamps(), NEGATIVE_TIMESTAMPS_SKIP_NOTE);
 
 	await testAudioDecoderPreRoll(track, -90);
 });
@@ -486,26 +493,6 @@ test('Decoded audio stays contiguous when a packet is stamped like the one after
 	}
 });
 
-test('Decoded audio stays in order when a packet decodes to nothing', async ({ skip }) => {
-	skip(!(await vorbisDecodesNatively()), 'Vorbis can\'t be decoded here (native probe)');
-
-	await withDroppedAudioOutput(10, async () => {
-		using input = new Input({
-			source: new UrlSource('/vorbis-eos.ogg'), // Vorbis, so packet durations vary
-			formats: ALL_FORMATS,
-		});
-
-		const track = await input.getPrimaryAudioTrack();
-		assert(track);
-
-		let previousEnd = -Infinity;
-		for await (using sample of new AudioSampleSink(track).samples(0, 2)) {
-			expect(sample.timestamp).toBeGreaterThan(previousEnd - 1e-6); // No overlaps
-			previousEnd = sample.timestamp + sample.duration;
-		}
-	});
-});
-
 test('Samples at timestamps come out while timestamps are still coming in', async () => {
 	using input = new Input({
 		source: new UrlSource('/glitch-hop-is-dead.wav'),
@@ -539,101 +526,6 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
-});
-
-// Whether the platform decodes Vorbis is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
-// failure fails instead of skipping. Some platforms don't support Vorbis, and WebKitGTK's GStreamer decoder hangs
-// instead of decoding or failing. vorbis-probe.json holds a tiny stream, from
-// ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -t 0.06 -c:a libvorbis -q:a 0 (decoder config and packets).
-let vorbisDecodesNativelyPromise: Promise<boolean> | null = null;
-const vorbisDecodesNatively = () => vorbisDecodesNativelyPromise ??= (async () => {
-	const probe = await (await fetch('/vorbis-probe.json')).json() as {
-		codec: string;
-		sampleRate: number;
-		numberOfChannels: number;
-		description: string;
-		chunks: string[];
-	};
-	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
-	const config: AudioDecoderConfig = {
-		codec: probe.codec,
-		sampleRate: probe.sampleRate,
-		numberOfChannels: probe.numberOfChannels,
-		description: fromBase64(probe.description),
-	};
-
-	const decoders: AudioDecoder[] = [];
-	const decode = async () => {
-		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
-			return false;
-		}
-
-		let failed = false;
-		const decoder = new AudioDecoder({
-			output: data => data.close(),
-			error: () => {
-				failed = true;
-			},
-		});
-		decoders.push(decoder);
-		decoder.configure(config);
-		for (const [i, chunk] of probe.chunks.entries()) {
-			decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: i * 32000, data: fromBase64(chunk) }));
-		}
-		await decoder.flush();
-
-		return !failed;
-	};
-
-	try {
-		// A hung decoder (or a page whose decoding an earlier hang stalled) neither decodes nor fails
-		return await Promise.race([
-			decode(),
-			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
-		]);
-	} catch {
-		return false;
-	} finally {
-		for (const decoder of decoders) {
-			if (decoder.state !== 'closed') {
-				decoder.close();
-			}
-		}
-	}
-})();
-
-// vorbis-clicks.ogg was made with:
-// ffmpeg -f lavfi -i "aevalsrc=exprs='if(lt(mod(t\,0.5)\,0.004)\,0.8*sin(2*PI*1000*t)\,0)':s=44100:d=3" \
-//   -c:a libvorbis -q:a 4 vorbis-clicks.ogg
-test('Vorbis audio keeps its timing, also after seeking', async ({ skip }) => {
-	skip(!(await vorbisDecodesNatively()), 'Vorbis can\'t be decoded here (native probe)');
-
-	using input = new Input({
-		source: new UrlSource('/vorbis-clicks.ogg'),
-		formats: ALL_FORMATS,
-	});
-
-	const track = await input.getPrimaryAudioTrack();
-	assert(track);
-
-	const sink = new AudioSampleSink(track);
-
-	// A 1 kHz tone burst starts every 0.5 seconds
-	const findBurst = async (startTimestamp?: number) => {
-		for await (using sample of sink.samples(startTimestamp)) {
-			const index = getSampleData(sample).findIndex(x => Math.abs(x) > 0.3);
-			if (index !== -1) {
-				return sample.timestamp + index / sample.sampleRate;
-			}
-		}
-
-		return null;
-	};
-
-	expect(await findBurst()).toBeCloseTo(0, 3);
-	expect(await findBurst(0.9)).toBeCloseTo(1, 3);
-	expect(await findBurst(1.45)).toBeCloseTo(1.5, 3);
-	expect(await findBurst(2.2)).toBeCloseTo(2.5, 3);
 });
 
 test('Empty packets are skipped when decoding', async () => {
@@ -803,74 +695,6 @@ test('Sample ranges keep their exclusive end with timestamp tolerance', async ()
 		expect(range, file).toEqual(timestamps.slice(0, 2));
 	}
 });
-
-// WebKitGTK's GStreamer FLAC decoder fails, and then stalls every later audio decode on the page, so this comes last.
-// Whether the platform decodes FLAC is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
-// failure fails instead of skipping. The probe is the start of a tiny stream (as in the conformance suite), from
-// ffmpeg -f lavfi -i anullsrc=r=16000:cl=mono -t 0.1 -c:a flac ("fLaC" + the STREAMINFO block, then two frames).
-const flacDecodesNatively = async () => {
-	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
-	const decoder = new AudioDecoder({ output: data => data.close(), error: () => {} });
-	decoder.configure({
-		codec: 'flac',
-		sampleRate: 16000,
-		numberOfChannels: 1,
-		description: fromBase64('ZkxhQ4AAACIEgASAAAALAAANA+gA8AAABkCfCt/b50DLnNgYijV2HiR2'),
-	});
-	['//g1CAADAAAAakQ=', '//h1CAEBv70AAAAGlg=='].forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
-		type: 'key',
-		timestamp: i * 64000,
-		data: fromBase64(chunk),
-	})));
-
-	const decodes = await Promise.race([
-		decoder.flush().then(() => true, () => false),
-		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
-	]);
-	if (decoder.state !== 'closed') {
-		decoder.close();
-	}
-
-	return decodes;
-};
-
-// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet before it
-test.for(['/Toothsome-Meme.VBRv2.mp3', '/sample.flac'])(
-	'Audio lookups stay sample-exact where packets sit on the sample grid (%s)',
-	async (file, { skip }) => {
-		if (file.endsWith('.flac')) {
-			skip(!(await flacDecodesNatively()), 'FLAC can\'t be decoded here (native probe)');
-		}
-
-		using input = new Input({
-			source: new UrlSource(file),
-			formats: ALL_FORMATS,
-		});
-
-		const track = await input.getPrimaryAudioTrack();
-		assert(track);
-		const sampleRate = await track.getSampleRate();
-
-		// Far enough in that decoding doesn't start at the first packets, which start below 0 (MP3's encoder delay), as
-		// WebKitGTK's decoder scrambles the timestamps following a negative one. The MP3 pre-roll is over 2 s here.
-		const packetSink = new EncodedPacketSink(track);
-		const packet = await packetSink.getPacket(3);
-		assert(packet);
-		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
-		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
-
-		const sink = new AudioSampleSink(track);
-		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
-		using sampleAt = await sink.getSample(packet.timestamp);
-		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
-		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
-
-		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
-			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
-			break;
-		}
-	},
-);
 
 test('Empty sample ranges yield nothing', async () => {
 	using input = new Input({
@@ -2201,4 +2025,189 @@ test('Audio a decoder fails on still throws at the end', async ({ skip }) => {
 			void sample;
 		}
 	})()).rejects.toThrow();
+});
+
+// On WebKitGTK, the first native Vorbis or FLAC decode can stall every later audio decode on the page, so the tests
+// that decode Vorbis or FLAC come last (in this order), after every other audio test.
+// WebKitGTK's GStreamer FLAC decoder fails, and then stalls every later audio decode on the page, so this comes last.
+// Whether the platform decodes FLAC is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
+// failure fails instead of skipping. The probe is the start of a tiny stream (as in the conformance suite), from
+// ffmpeg -f lavfi -i anullsrc=r=16000:cl=mono -t 0.1 -c:a flac ("fLaC" + the STREAMINFO block, then two frames).
+const flacDecodesNatively = async () => {
+	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+	const decoder = new AudioDecoder({ output: data => data.close(), error: () => {} });
+	decoder.configure({
+		codec: 'flac',
+		sampleRate: 16000,
+		numberOfChannels: 1,
+		description: fromBase64('ZkxhQ4AAACIEgASAAAALAAANA+gA8AAABkCfCt/b50DLnNgYijV2HiR2'),
+	});
+	['//g1CAADAAAAakQ=', '//h1CAEBv70AAAAGlg=='].forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+		type: 'key',
+		timestamp: i * 64000,
+		data: fromBase64(chunk),
+	})));
+
+	const decodes = await Promise.race([
+		decoder.flush().then(() => true, () => false),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+	]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return decodes;
+};
+
+// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet before it
+test.for(['/Toothsome-Meme.VBRv2.mp3', '/sample.flac'])(
+	'Audio lookups stay sample-exact where packets sit on the sample grid (%s)',
+	async (file, { skip }) => {
+		if (file.endsWith('.flac')) {
+			skip(!(await flacDecodesNatively()), 'FLAC can\'t be decoded here (native probe)');
+		}
+
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sampleRate = await track.getSampleRate();
+
+		// Far enough in that decoding doesn't start at the first packets, which start below 0 (MP3's encoder delay), as
+		// WebKitGTK's decoder scrambles the timestamps following a negative one. The MP3 pre-roll is over 2 s here.
+		const packetSink = new EncodedPacketSink(track);
+		const packet = await packetSink.getPacket(3);
+		assert(packet);
+		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
+		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
+
+		const sink = new AudioSampleSink(track);
+		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
+		using sampleAt = await sink.getSample(packet.timestamp);
+		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
+
+		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
+			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+			break;
+		}
+	},
+);
+
+// Whether the platform decodes Vorbis is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
+// failure fails instead of skipping. Some platforms don't support Vorbis, and WebKitGTK's GStreamer decoder hangs
+// instead of decoding or failing. vorbis-probe.json holds a tiny stream, from
+// ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -t 0.06 -c:a libvorbis -q:a 0 (decoder config and packets).
+let vorbisDecodesNativelyPromise: Promise<boolean> | null = null;
+const vorbisDecodesNatively = () => vorbisDecodesNativelyPromise ??= (async () => {
+	const probe = await (await fetch('/vorbis-probe.json')).json() as {
+		codec: string;
+		sampleRate: number;
+		numberOfChannels: number;
+		description: string;
+		chunks: string[];
+	};
+	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+	const config: AudioDecoderConfig = {
+		codec: probe.codec,
+		sampleRate: probe.sampleRate,
+		numberOfChannels: probe.numberOfChannels,
+		description: fromBase64(probe.description),
+	};
+
+	const decoders: AudioDecoder[] = [];
+	const decode = async () => {
+		if (!(await AudioDecoder.isConfigSupported(config)).supported) {
+			return false;
+		}
+
+		let failed = false;
+		const decoder = new AudioDecoder({
+			output: data => data.close(),
+			error: () => {
+				failed = true;
+			},
+		});
+		decoders.push(decoder);
+		decoder.configure(config);
+		for (const [i, chunk] of probe.chunks.entries()) {
+			decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: i * 32000, data: fromBase64(chunk) }));
+		}
+		await decoder.flush();
+
+		return !failed;
+	};
+
+	try {
+		// A hung decoder (or a page whose decoding an earlier hang stalled) neither decodes nor fails
+		return await Promise.race([
+			decode(),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+		]);
+	} catch {
+		return false;
+	} finally {
+		for (const decoder of decoders) {
+			if (decoder.state !== 'closed') {
+				decoder.close();
+			}
+		}
+	}
+})();
+
+// vorbis-clicks.ogg was made with:
+// ffmpeg -f lavfi -i "aevalsrc=exprs='if(lt(mod(t\,0.5)\,0.004)\,0.8*sin(2*PI*1000*t)\,0)':s=44100:d=3" \
+//   -c:a libvorbis -q:a 4 vorbis-clicks.ogg
+test('Vorbis audio keeps its timing, also after seeking', async ({ skip }) => {
+	skip(!(await vorbisDecodesNatively()), 'Vorbis can\'t be decoded here (native probe)');
+
+	using input = new Input({
+		source: new UrlSource('/vorbis-clicks.ogg'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+
+	// A 1 kHz tone burst starts every 0.5 seconds
+	const findBurst = async (startTimestamp?: number) => {
+		for await (using sample of sink.samples(startTimestamp)) {
+			const index = getSampleData(sample).findIndex(x => Math.abs(x) > 0.3);
+			if (index !== -1) {
+				return sample.timestamp + index / sample.sampleRate;
+			}
+		}
+
+		return null;
+	};
+
+	expect(await findBurst()).toBeCloseTo(0, 3);
+	expect(await findBurst(0.9)).toBeCloseTo(1, 3);
+	expect(await findBurst(1.45)).toBeCloseTo(1.5, 3);
+	expect(await findBurst(2.2)).toBeCloseTo(2.5, 3);
+});
+
+test('Decoded audio stays in order when a packet decodes to nothing', async ({ skip }) => {
+	skip(!(await vorbisDecodesNatively()), 'Vorbis can\'t be decoded here (native probe)');
+
+	await withDroppedAudioOutput(10, async () => {
+		using input = new Input({
+			source: new UrlSource('/vorbis-eos.ogg'), // Vorbis, so packet durations vary
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		let previousEnd = -Infinity;
+		for await (using sample of new AudioSampleSink(track).samples(0, 2)) {
+			expect(sample.timestamp).toBeGreaterThan(previousEnd - 1e-6); // No overlaps
+			previousEnd = sample.timestamp + sample.duration;
+		}
+	});
 });

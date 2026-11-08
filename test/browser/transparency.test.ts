@@ -1,4 +1,5 @@
-import { expect, test } from 'vitest';
+import { expect, test, TestContext } from 'vitest';
+import { vp9EncoderKeepsRed } from './helpers/platform-probes.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -86,7 +87,7 @@ test('Can extract transparent frames via CanvasSink', async () => {
 	expect(imageData.data[3]).toBe(255);
 });
 
-const encodeTransparentVideoTest = async () => {
+const encodeTransparentVideoTest = async (annotate: TestContext['annotate']) => {
 	const output = new Output({
 		format: new WebMOutputFormat(),
 		target: new BufferTarget(),
@@ -151,10 +152,14 @@ const encodeTransparentVideoTest = async () => {
 	const pos2 = { x: 300, y: 300 }; // Dead center in the red square
 	const index2 = (pos2.x + pos2.y * probeCanvas.width) * 4;
 
-	// Red (within error)
-	expect(imageData.data[index2 + 0]).greaterThanOrEqual(253);
-	expect(imageData.data[index2 + 1]).lessThanOrEqual(3);
-	expect(imageData.data[index2 + 2]).lessThanOrEqual(3);
+	// Red (within error), where the platform's own VP9 encoder keeps red that exact
+	if (await vp9EncoderKeepsRed()) {
+		expect(imageData.data[index2 + 0]).greaterThanOrEqual(253);
+		expect(imageData.data[index2 + 1]).lessThanOrEqual(3);
+		expect(imageData.data[index2 + 2]).lessThanOrEqual(3);
+	} else {
+		await annotate('Colors not checked: the platform\'s VP9 encoder doesn\'t keep red that exact (native probe)');
+	}
 
 	expect(imageData.data[index2 + 3]).toBe(255); // Opaque
 
@@ -180,8 +185,8 @@ const encodeTransparentVideoTest = async () => {
 	expect(imageData.data[4 * (2 * probeCanvas.width + 2) + 3]).toBe(0); // Transparent
 };
 
-test('Can encode transparent video', async () => {
-	await encodeTransparentVideoTest();
+test('Can encode transparent video', async ({ annotate }) => {
+	await encodeTransparentVideoTest(annotate);
 });
 
 test('Can encode video with alternating transparency', async () => {

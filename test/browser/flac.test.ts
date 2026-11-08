@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { decodesFlac } from './helpers/platform-probes.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { FLAC, WAVE } from '../../src/input-format.js';
@@ -9,7 +10,9 @@ import { WavOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 
-test('can decode samples from a FLAC file', async () => {
+test('can decode samples from a FLAC file', async ({ skip }) => {
+	skip(!await decodesFlac(), 'the platform can\'t decode FLAC (native probe)');
+
 	using input = new Input({
 		source: new UrlSource('/sample.flac'),
 		formats: [FLAC],
@@ -24,7 +27,9 @@ test('can decode samples from a FLAC file', async () => {
 	expect(sample.timestamp).toBe(0.9287981859410431);
 });
 
-test('can convert a .flac to .wav', async () => {
+test('can convert a .flac to .wav', async ({ skip }) => {
+	skip(!await decodesFlac(), 'the platform can\'t decode FLAC (native probe)');
+
 	using input = new Input({
 		source: new UrlSource('/sample.flac'),
 		formats: [FLAC],

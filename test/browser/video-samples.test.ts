@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
 import { VideoSample, registerVideoSampleTransformer } from '../../src/sample.js';
 import { VideoSampleSource } from '../../src/media-source.js';
+import { copyToConvertsYuvToRgba } from './helpers/platform-probes.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -115,7 +116,7 @@ test('Copying into the sample\'s own pixel format, for VideoFrame- and ArrayBuff
 	}
 });
 
-test('copyTo and plane layouts', async () => {
+test('copyTo and plane layouts', async ({ skip }) => {
 	const buffer = new ArrayBuffer(1e7);
 
 	{
@@ -235,6 +236,11 @@ test('copyTo and plane layouts', async () => {
 			stride: 1280 / 2,
 		}]);
 
+		// Converted by the platform's VideoFrame.copyTo()
+		skip(
+			!await copyToConvertsYuvToRgba(),
+			'the platform\'s VideoFrame.copyTo() doesn\'t convert YUV to RGBA (native probe)',
+		);
 		const rgbLayout = await sample.copyTo(buffer, { format: 'RGBA' });
 
 		expect(rgbLayout).toEqual([{

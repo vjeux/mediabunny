@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { decoderKeepsFrameSizeOfNonSquarePixels } from './helpers/platform-probes.js';
 import { Conversion } from '../../src/conversion.js';
 import { ALL_FORMATS, MATROSKA, MP4, MPEG_TS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
@@ -11,7 +12,7 @@ import { BufferTarget } from '../../src/target.js';
 
 const SOURCE_PATH = '/sar_2x1.mp4';
 
-test('Pixel aspect ratio reading', async () => {
+test('Pixel aspect ratio reading', async ({ skip }) => {
 	using input = new Input({
 		source: new UrlSource(SOURCE_PATH),
 		formats: ALL_FORMATS,
@@ -29,6 +30,10 @@ test('Pixel aspect ratio reading', async () => {
 	assert(decoderConfig);
 	expect(decoderConfig.displayAspectWidth).toBe(await videoTrack.getSquarePixelWidth());
 	expect(decoderConfig.displayAspectHeight).toBe(await videoTrack.getSquarePixelHeight());
+	skip(
+		!await decoderKeepsFrameSizeOfNonSquarePixels(),
+		'the platform\'s video decoder rescales frames with non-square pixels (native probe)',
+	);
 
 	const sink = new VideoSampleSink(videoTrack);
 	using sample = (await sink.getSample(await videoTrack.getFirstTimestamp()))!;
