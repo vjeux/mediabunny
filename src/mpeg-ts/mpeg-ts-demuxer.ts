@@ -1999,7 +1999,8 @@ export class MpegTsDemuxer extends Demuxer {
 			}
 		}
 
-		if (mustAddSectionEnd) {
+		// (Only if a section was read: a position that holds no section start says nothing about where one ends.)
+		if (mustAddSectionEnd && firstPacket) {
 			this.sectionEndPositions.add(endPos);
 		}
 
