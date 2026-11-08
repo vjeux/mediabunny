@@ -1008,30 +1008,42 @@ test('MPEG-TS seeks ahead in a stream read past its cache', async () => {
 		}
 		await Promise.all(iterators.map(iterator => iterator.return?.()));
 
-		return await Promise.all(tracks.map(async (track) => {
+		// Then seek each to 5.5 s, one after the other
+		const result = [];
+		for (const track of tracks) {
 			const sink = new EncodedPacketSink(track);
 			const keyPacket = await sink.getKeyPacket(5.5);
 			const packet = await sink.getPacket(5.5);
-			return [track.type, keyPacket?.timestamp, packet?.timestamp];
-		}));
+			result.push([track.type, keyPacket?.timestamp, packet?.timestamp]);
+		}
+		return result;
+	};
+	const streamFrom = (data: Uint8Array) => {
+		let position = 0;
+		return new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (position >= data.length) {
+					controller.close();
+					return;
+				}
+
+				controller.enqueue(data.slice(position, position + 65536));
+				position += 65536;
+			},
+		});
 	};
 
 	const expected = await seek(new BufferSource(bytes), 4);
 	expect(expected).toEqual([['video', 5, 5.48], ['audio', expect.closeTo(5.5, 1), expect.closeTo(5.5, 1)]]);
 
-	let position = 0;
-	const stream = new ReadableStream<Uint8Array>({
-		pull: (controller) => {
-			if (position >= bytes.length) {
-				controller.close();
-				return;
-			}
+	const streamSource = new ReadableStreamSource(streamFrom(bytes), { maxCacheSize: 6 * 2 ** 20 });
+	expect(await seek(streamSource, 4)).toEqual(expected);
 
-			controller.enqueue(bytes.slice(position, position + 65536));
-			position += 65536;
-		},
-	});
-	expect(await seek(new ReadableStreamSource(stream, { maxCacheSize: 6 * 2 ** 20 }), 4)).toEqual(expected);
+	// From L46's review: seeking ahead by more than the cache (from 1 s, 6.8 MB further), the first track's lookup
+	// reads so far that the second one's start is gone too; it starts from where the first one read instead
+	const fromOneSecond = await seek(new BufferSource(bytes), 1);
+	expect(fromOneSecond).toEqual(expected);
+	expect(await seek(new ReadableStreamSource(streamFrom(bytes), { maxCacheSize: 2 ** 21 }), 1)).toEqual(expected);
 
 	const server = http.createServer((request, response) => {
 		response.writeHead(200, { 'Content-Length': bytes.byteLength });

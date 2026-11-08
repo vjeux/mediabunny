@@ -1476,6 +1476,66 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		// range requests) can't go back to what it's evicted, which a chunk or the start of the track may well be once
 		// reading is past its cache
 		const readsOnlyForward = getReadBackDistance(reader) !== Infinity;
+		const isReadable = async (pos: number) => {
+			try {
+				await reader.requestSlice(pos, 1);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		/**
+		 * The position to start from among the reference points of all streams with a PTS up to the given one: the
+		 * earliest one still there, for the most of what came before the packet (a key frame, say), give or take an
+		 * eighth of the cache, as the cache drops data from the front as reading goes on. (A stream's reference points
+		 * are in file order.)
+		 */
+		const findReadableReferencePos = async (maxPts: number) => {
+			const candidates = demuxer.elementaryStreams.map((stream) => {
+				const points = stream.referencePesPackets;
+				return { points, count: binarySearchLessOrEqual(points, maxPts, x => x.pts) + 1 };
+			});
+
+			// The earliest one still there
+			let earliestPos = Infinity;
+			for (const { points, count } of candidates) {
+				if (count === 0 || !await isReadable(points[count - 1]!.sectionStartPos)) {
+					continue;
+				}
+
+				let low = 0;
+				let high = count - 1;
+				while (low < high) {
+					const mid = Math.floor((low + high) / 2);
+					if (await isReadable(points[mid]!.sectionStartPos)) {
+						high = mid;
+					} else {
+						low = mid + 1;
+					}
+				}
+
+				earliestPos = Math.min(earliestPos, points[low]!.sectionStartPos);
+			}
+			if (earliestPos === Infinity) {
+				return null;
+			}
+
+			// Then the first one a bit after it, or the latest one if all are before that
+			const minPos = earliestPos + getReadBackDistance(reader) / 4;
+			let result = Infinity;
+			let latestPos = earliestPos;
+			for (const { points, count } of candidates) {
+				const index = binarySearchLessOrEqual(points, minPos - 1, x => x.sectionStartPos) + 1;
+				if (index < count) {
+					result = Math.min(result, points[index]!.sectionStartPos);
+				}
+				if (count > 0) {
+					latestPos = Math.max(latestPos, points[count - 1]!.sectionStartPos);
+				}
+			}
+
+			return result === Infinity ? latestPos : result;
+		};
 
 		const referencePesPackets = this.elementaryStream.referencePesPackets;
 		const referencePointIndex = binarySearchLessOrEqual(referencePesPackets, searchPts, x => x.pts);
@@ -1544,6 +1604,12 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			if (readsOnlyForward && referencePoint && referencePoint.sectionStartPos > scanStartPos) {
 				scanStartPos = referencePoint.sectionStartPos;
 			}
+		}
+
+		if (readsOnlyForward && !await isReadable(scanStartPos)) {
+			// Another track's lookup may have read so far ahead meanwhile that this one's start is gone too. Streams
+			// are interleaved by time, so start from what's left of where any of them was read before the packet
+			scanStartPos = await findReadableReferencePos(searchPts) ?? scanStartPos;
 		}
 
 		// Find the first PES packet at or after scanStartPos
