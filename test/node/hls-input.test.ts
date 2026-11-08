@@ -607,12 +607,12 @@ test.concurrent('Track disposition & metadata', { timeout: 15_000 }, async () =>
 
 	expect(audioTracks).toHaveLength(6);
 
-	expect(await audioTracks[0]!.getLanguageCode()).toBe('en');
-	expect(await audioTracks[1]!.getLanguageCode()).toBe('de');
-	expect(await audioTracks[2]!.getLanguageCode()).toBe('it');
-	expect(await audioTracks[3]!.getLanguageCode()).toBe('fr');
-	expect(await audioTracks[4]!.getLanguageCode()).toBe('es');
-	expect(await audioTracks[5]!.getLanguageCode()).toBe('en');
+	expect(await audioTracks[0]!.getLanguageCode()).toBe('eng');
+	expect(await audioTracks[1]!.getLanguageCode()).toBe('deu');
+	expect(await audioTracks[2]!.getLanguageCode()).toBe('ita');
+	expect(await audioTracks[3]!.getLanguageCode()).toBe('fra');
+	expect(await audioTracks[4]!.getLanguageCode()).toBe('spa');
+	expect(await audioTracks[5]!.getLanguageCode()).toBe('eng');
 
 	expect((await audioTracks[0]!.getDisposition()).primary).toBe(true);
 	expect((await audioTracks[1]!.getDisposition()).primary).toBe(false);
@@ -870,11 +870,11 @@ test.concurrent('Alternative audio only', { timeout: 15_000 }, async () => {
 	expect(tracks).toHaveLength(2);
 
 	expect(tracks[0]!.type).toBe('audio');
-	expect(await tracks[0]!.getLanguageCode()).toBe('en');
+	expect(await tracks[0]!.getLanguageCode()).toBe('eng');
 	expect(await tracks[0]!.getName()).toBe('English');
 
 	expect(tracks[1]!.type).toBe('audio');
-	expect(await tracks[1]!.getLanguageCode()).toBe('dubbing');
+	expect(await tracks[1]!.getLanguageCode()).toBe('und'); // LANGUAGE="dubbing", which isn't a language
 	expect(await tracks[1]!.getName()).toBe('Dubbing');
 });
 
@@ -909,9 +909,9 @@ test.concurrent('Advanced Apple HLS', { timeout: 30_000 }, async () => {
 	const audioSnapshots = await Promise.all(audioTracks.map(snapshotAudioTrack));
 	const videoSnapshots = await Promise.all(videoTracks.map(snapshotVideoTrack));
 
-	expect(audioSnapshots[0]).toMatchObject({ codec: 'aac', name: 'English', languageCode: 'en', codecParameterString: 'mp4a.40.2' });
-	expect(audioSnapshots[1]).toMatchObject({ codec: 'ac3', name: 'English', languageCode: 'en', codecParameterString: 'ac-3' });
-	expect(audioSnapshots[2]).toMatchObject({ codec: 'eac3', name: 'English', languageCode: 'en', codecParameterString: 'ec-3' });
+	expect(audioSnapshots[0]).toMatchObject({ codec: 'aac', name: 'English', languageCode: 'eng', codecParameterString: 'mp4a.40.2' });
+	expect(audioSnapshots[1]).toMatchObject({ codec: 'ac3', name: 'English', languageCode: 'eng', codecParameterString: 'ac-3' });
+	expect(audioSnapshots[2]).toMatchObject({ codec: 'eac3', name: 'English', languageCode: 'eng', codecParameterString: 'ec-3' });
 
 	expect(await audioTracks[0]!.getPairableVideoTracks()).toHaveLength(18);
 	expect(await audioTracks[1]!.getPairableVideoTracks()).toHaveLength(18);
@@ -2010,6 +2010,34 @@ test.concurrent('SourceRequest.isRoot', async () => {
 	assert(videoTrack);
 
 	await videoTrack.computeDuration();
+});
+
+test.concurrent('LANGUAGE (a BCP 47 tag) is reported as an ISO 639-2 language code', async () => {
+	// BCP 47 uses the two-letter ISO 639-1 codes where they exist ("en", not "eng"), and Conversion only keeps
+	// ISO 639-2 codes, as languageCode is documented
+	const languages = { 'en': 'eng', 'fr-CA': 'fra', 'zh-Hans': 'zho', 'deu': 'deu', 'x-klingon': 'und' };
+	const files: Record<string, string> = {
+		'master.m3u8': [
+			'#EXTM3U',
+			...Object.keys(languages).map((language, i) => '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",'
+				+ `NAME="Audio ${i}",LANGUAGE="${language}",URI="audio-${i}.m3u8"`),
+			'#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio"',
+			'video.m3u8',
+		].join('\n'),
+	};
+	for (const path of ['video.m3u8', ...Object.keys(languages).map((_, i) => `audio-${i}.m3u8`)]) {
+		files[path] = '#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n';
+	}
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => path === '0.ts'
+			? new FilePathSource('test/public/0.ts')
+			: new BufferSource(new TextEncoder().encode(files[path])),
+		),
+		formats: HLS_FORMATS,
+	});
+	const audioTracks = await input.getAudioTracks();
+	expect(await Promise.all(audioTracks.map(track => track.getLanguageCode()))).toEqual(Object.values(languages));
 });
 
 test.concurrent('#EXT-X-DEFINE NAME and VALUE variables are applied', async () => {
