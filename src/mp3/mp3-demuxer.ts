@@ -264,7 +264,6 @@ export class Mp3Demuxer extends Demuxer {
 			let id3V2HeaderFound = false;
 
 			for (const tag of this.leadingId3V2Tags ?? []) {
-				id3V2HeaderFound = true;
 				parseId3V2Tag(FileSlice.tempFromBytes(tag.bytes), tag.header, this.metadataTags);
 			}
 
@@ -290,7 +289,11 @@ export class Mp3Demuxer extends Demuxer {
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
-			if (!id3V2HeaderFound && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
+			const keptId3V2Tags = this.leadingId3V2Tags !== null && this.leadingId3V2Tags.length > 0;
+			if (
+				!id3V2HeaderFound && !keptId3V2Tags
+				&& this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE
+			) {
 				// Try reading an ID3v1 tag at the end of the file
 				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) slice = await slice;
