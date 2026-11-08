@@ -45,6 +45,8 @@ import { readNextMp3FrameHeader } from './mp3-reader';
 import { readAscii, readBytes, Reader, readU32Be, readU32Le } from '../reader';
 
 const APE_TAG_FOOTER_SIZE = 32;
+/** How far a frame may follow the previous one in damaged audio, to count as more audio */
+const MAX_GAP_IN_AUDIO = 4096;
 
 type Sample = {
 	timestamp: number;
@@ -153,7 +155,7 @@ export class Mp3Demuxer extends Demuxer {
 			// Real audio goes on frame after frame, but a lone frame may be bytes inside the APEv2 and ID3v1 tags at
 			// the end of the file. Only then are those looked up, since that reads the end of the file, which sources
 			// that can only be read in order stream to first.
-			if (this.firstFrameHeader && result && !(await this.isFollowedByFrame(result))) {
+			if (this.firstFrameHeader && result && !(await this.isFollowedByAudio(result))) {
 				this.audioEndPos = await (this.audioEndPosPromise ??= this.computeAudioEndPos());
 				if (this.audioEndPos !== null && result.startPos >= this.audioEndPos) {
 					result = null;
@@ -248,6 +250,25 @@ export class Mp3Demuxer extends Demuxer {
 		return;
 	}
 
+	/**
+	 * Whether more audio follows the given frame: another frame right behind it, or one behind a short gap (like a
+	 * damaged frame) that is itself followed by another frame
+	 */
+	async isFollowedByAudio(frame: { header: Mp3FrameHeader; startPos: number }) {
+		if (await this.isFollowedByFrame(frame)) {
+			return true;
+		}
+
+		const nextPos = frame.startPos + frame.header.totalSize;
+		const nextFrame = await readNextMp3FrameHeader(
+			this.reader,
+			nextPos,
+			nextPos + MAX_GAP_IN_AUDIO,
+			this.firstFrameHeader,
+		);
+		return nextFrame !== null && await this.isFollowedByFrame(nextFrame);
+	}
+
 	/** Whether another frame starts right where the given one ends (or a byte before, if it's a byte short). */
 	async isFollowedByFrame(frame: { header: Mp3FrameHeader; startPos: number }) {
 		const nextPos = frame.startPos + frame.header.totalSize;
@@ -260,7 +281,6 @@ export class Mp3Demuxer extends Demuxer {
 		return nextFrame !== null;
 	}
 
-	/** Skips the ID3v2 tags following the frame that ended at lastLoadedPos, returning where they end. */
 	/**
 	 * Returns the frame right after the previous one, which ended right after lastLoadedPos (or at it if it was a byte
 	 * short), if it matches the stream like readNextMp3FrameHeader requires
@@ -306,6 +326,7 @@ export class Mp3Demuxer extends Demuxer {
 		return null;
 	}
 
+	/** Skips the ID3v2 tags following the frame that ended at lastLoadedPos, returning where they end. */
 	async skipId3V2Tags(lastLoadedPos: number) {
 		let tagsEnd: number | null = null;
 		// The previous frame ended right after lastLoadedPos, or at it if it was a byte short

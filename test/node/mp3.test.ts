@@ -68,11 +68,19 @@ test('Does not read tags between or after MP3 frames as frames', async () => {
 });
 
 test('An MP3 larger than the cache reads from a server that ignores range requests', async () => {
-	const plain = fs.readFileSync(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3')); // 389 kB
+	const plain = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3'))); // 389 kB
 	// Junk behind the last frame, like the 0xdeadbeef padding of ExoPlayer's trailing-garbage test files. The search
 	// for the next frame runs through all of it, so what lies right behind the last frame must be looked at first.
 	const garbage = new Uint8Array(2 ** 18).map((_, i) => [0xde, 0xad, 0xbe, 0xef][i % 4]!);
-	let data = new Uint8Array(plain);
+	// Damaged audio, with a frame between two short gaps every 50 frames, so that no frame follows it directly. More
+	// audio follows it, though, so it doesn't call for looking at the end of the file, which would stream it first.
+	const frame = new Uint8Array(417);
+	frame.set([0xff, 0xfb, 0x90, 0x00]); // MPEG-1 Layer III, 128 kbps, 44.1 kHz
+	const damaged = Array.from({ length: 3000 }, (_, i) => i % 50 === 25
+		? [...new Uint8Array(2), ...frame, ...new Uint8Array(416)]
+		: [...frame]).flat();
+
+	let data = plain;
 	// Like Python's http.server: always the whole file, with its Content-Length
 	const server = http.createServer((req, res) => {
 		res.on('error', () => {});
@@ -84,8 +92,11 @@ test('An MP3 larger than the cache reads from a server that ignores range reques
 	Logging.level = LogLevel.Silent; // UrlSource warns about the missing range support
 
 	try {
-		for (const file of [new Uint8Array(plain), new Uint8Array([...plain, ...garbage])]) {
+		for (const file of [plain, new Uint8Array([...plain, ...garbage]), new Uint8Array(damaged)]) {
 			data = file;
+			using reference = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+			const referenceTrack = await reference.getPrimaryAudioTrack();
+			assert(referenceTrack);
 
 			// A 64 KiB cache stands in for the default 64 MiB one with an MP3 over 64 MiB (a long podcast, an
 			// audiobook). Looking for tags at the end of the file before reading the frames would stream the whole
@@ -99,13 +110,13 @@ test('An MP3 larger than the cache reads from a server that ignores range reques
 				void packet;
 				packetCount++;
 			}
-			expect(packetCount).toBe(1607);
+			expect(packetCount).toBe((await referenceTrack.computePacketStats()).packetCount);
 
 			using durationInput = new Input({
 				source: new UrlSource(url, { maxCacheSize: 2 ** 16 }),
 				formats: ALL_FORMATS,
 			});
-			expect(await durationInput.computeDuration()).toBeCloseTo(38.522, 3);
+			expect(await durationInput.computeDuration()).toBe(await referenceTrack.computeDuration());
 		}
 	} finally {
 		Logging.level = previousLevel;
