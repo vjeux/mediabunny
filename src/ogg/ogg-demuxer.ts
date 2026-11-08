@@ -17,6 +17,7 @@ import { Logging } from '../logging';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import {
 	assert,
+	assertNever,
 	AsyncMutex,
 	binarySearchLessOrEqual,
 	clamp,
@@ -950,9 +951,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return defaultTimestampInSamples;
 		}
 
-		// The first page on which a packet completes may have a granule position larger than the number of
-		// samples in the packets completing on it, meaning the stream starts at a later time. So, let's sum up the
-		// durations of these packets and compare.
+		// The first page on which any packet completes may have a granule position larger or smaller than the
+		// number of samples in the packets completing on it, meaning the stream starts at a different time. So,
+		// let's sum up the durations of these packets and compare.
 		let firstEndPage: Page | null = null;
 		let totalDurationInSamples = 0;
 		let firstPacketDurationInSamples: number | null = null;
@@ -986,13 +987,25 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		}
 		assert(firstPacketDurationInSamples !== null);
 
-		// A smaller granule position is only legal on the final page, where it signals end trimming. The Vorbis
-		// priming packet decodes to nothing though, so it's allowed to precede the granule position's origin.
-		const minStartInSamples = bitstream.codecInfo.codec === 'vorbis'
-			? -firstPacketDurationInSamples
-			: 0;
-		return defaultTimestampInSamples
-			+ Math.max(firstEndPage.granulePosition - totalDurationInSamples, minStartInSamples);
+		const startInSamples = firstEndPage.granulePosition - totalDurationInSamples;
+		if (firstEndPage.granulePosition !== -1 && !(firstEndPage.headerType & 0x04)) {
+			return defaultTimestampInSamples + startInSamples;
+		}
+
+		const codec = bitstream.codecInfo.codec;
+		assert(codec);
+
+		let minStartInSamples: number;
+		if (codec === 'vorbis') {
+			minStartInSamples = -firstPacketDurationInSamples;
+		} else if (codec === 'opus') {
+			minStartInSamples = 0;
+		} else {
+			assertNever(codec);
+			assert(false);
+		}
+
+		return defaultTimestampInSamples + Math.max(startInSamples, minStartInSamples);
 	}
 
 	/**

@@ -2477,6 +2477,46 @@ const opusPages = (options: { pageCount?: number; lastEos?: boolean } = {}) => {
 	return pages;
 };
 
+test('Ogg: Start trimming in the first audio page\'s granule position', async () => {
+	// Cutting a file with `ffmpeg -ss <t> -i in.ogg -c copy out.ogg` keeps the packets before the cut and lowers every
+	// granule position, so that the first audio page's is smaller than the samples on it: the samples before the cut
+	// are to be dropped (Vorbis I specification, appendix A.2)
+	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	const cut = file.slice();
+	const view = new DataView(cut.buffer);
+	for (let pos = 0; pos < cut.length;) {
+		const segmentCount = cut[pos + 26]!;
+		const size = 27 + segmentCount + cut.subarray(pos + 27, pos + 27 + segmentCount).reduce((a, b) => a + b, 0);
+		const granule = view.getBigInt64(pos + 6, true);
+		if (granule > 0n) {
+			view.setBigInt64(pos + 6, granule - 22050n, true); // Half a second at 44.1 kHz
+			view.setUint32(pos + 22, 0, true);
+			view.setUint32(pos + 22, oggCrc(cut.subarray(pos, pos + size)), true);
+		}
+		pos += size;
+	}
+
+	const read = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const timestamps: number[] = [];
+		let end = 0;
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			timestamps.push(packet.timestamp);
+			end = packet.timestamp + packet.duration;
+		}
+		using freshInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return { timestamps, end, duration: await (await freshInput.getPrimaryAudioTrack())!.computeDuration() };
+	};
+	const original = await read(file);
+	const trimmed = await read(cut);
+
+	// Every packet keeps its place, half a second earlier
+	expect(trimmed.timestamps).toHaveLength(original.timestamps.length);
+	expect(trimmed.timestamps[100]).toBeCloseTo(original.timestamps[100]! - 0.5, 9);
+	expect(trimmed.end).toBeCloseTo(original.end - 0.5, 9);
+	expect(trimmed.duration).toBeCloseTo(trimmed.end, 9);
+});
+
 const opusHead = () => concat(ascii('OpusHead'), [1, 2], u16le(312), u32le(48000), u16le(0), [0]);
 
 const opusTags = (comments: Bytes[]) => concatList([
