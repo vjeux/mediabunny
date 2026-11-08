@@ -15,6 +15,7 @@ import {
 	ReadableStreamSource,
 	Source,
 } from '../../src/index.js';
+import { Reader, readBytes } from '../../src/reader.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
 
 // Each test tests a malicious or malformed ("bad") file that once made the code hang, exhaust memory, burn CPU for way
@@ -3304,6 +3305,28 @@ test('PCM blocks not containing whole frames', async () => {
 
 		await expectGracefulDecode(matroska(info(), tracks(audioTrack), cluster(0, ...blocks)));
 	}
+});
+
+test('ReadableStreamSource keeps its cache after a read past the end of the stream', async () => {
+	// A 1 MiB stream with a 2 MiB cache, read at its start, then past its end (like a demuxer reading an element whose
+	// declared size runs past the end of a cut-off file), then at its start again
+	const data = new Uint8Array(2 ** 20).map((_, i) => i % 251);
+	const stream = new ReadableStream<Uint8Array>({
+		start: (controller) => {
+			for (let i = 0; i < data.length; i += 65536) {
+				controller.enqueue(data.slice(i, i + 65536));
+			}
+			controller.close();
+		},
+	});
+	const reader = new Reader(new ReadableStreamSource(stream, { maxCacheSize: 2 ** 21 }));
+
+	expect(await reader.requestSlice(0, 16)).not.toBeNull();
+	expect(await reader.requestSlice(2 ** 19, 2 ** 22)).toBeNull();
+	// On main, the read past the end evicted every chunk as it arrived, so this threw "Attempted to read data from an
+	// already-evicted part of the cache"
+	const slice = await reader.requestSlice(0, 16);
+	expect(slice && readBytes(slice, 16)).toEqual(data.subarray(0, 16));
 });
 
 test('Custom source smaller than the first read', async () => {
