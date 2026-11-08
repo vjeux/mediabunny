@@ -2370,8 +2370,13 @@ class AudioEncoderWrapper {
 			}
 
 			const config = this.encodingConfig;
-			const needsResample = config.transform?.numberOfChannels !== undefined
-				|| config.transform?.sampleRate !== undefined;
+			const needsResample = (
+				config.transform?.numberOfChannels !== undefined
+				&& config.transform.numberOfChannels !== audioSample.numberOfChannels
+			) || (
+				config.transform?.sampleRate !== undefined
+				&& config.transform.sampleRate !== audioSample.sampleRate
+			);
 
 			if (needsResample) {
 				if (!this.resampler) {
