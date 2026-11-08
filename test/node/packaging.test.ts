@@ -312,7 +312,7 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 	// flag has to be turned off in the same change as its fix, and anything else that goes wrong fails them too.
 	const KNOWN_FAILURES = {
 		'#314': true, // @mediabunny/server can't be loaded with require() and has its own copy of @mediabunny/prores
-		'#315': true, // Extensions loaded with require() register with a second copy of Mediabunny
+		'#315': true, // Extensions' CommonJS entry is their ESM bundle, and their ESM entry has CommonJS declarations
 		'#319': true, // @types/dom-webcodecs 0.1.13 conflicts with the DOM lib of TypeScript 5.8+
 		'#320': true, // The declarations need Disposable, which only the esnext lib or @types/node declare
 	};
@@ -585,9 +585,9 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 			`node-av/dist/api/demuxer.d.ts: TS2307: Cannot find module 'werift' or its corresponding type`
 			+ ' declarations.',
 		],
-		// Not fixed by any PR, under node16 (TypeScript 5.8+'s nodenext allows require() of ESM): the server's
-		// declarations are CommonJS-format (its package.json has no "type") and import ESM declarations (without
-		// skipLibCheck)...
+		// Under node16 (TypeScript 5.8+'s nodenext allows require() of ESM), the server's declarations are
+		// CommonJS-format (its package.json has no "type") and import ESM declarations (without skipLibCheck). ESM
+		// consumers get ESM declarations once #315 is in; for CommonJS consumers, no PR fixes it...
 		serverDeclarationsImportEsm: ['audio-sample', 'index', 'video-sample'].flatMap(file => [
 			'mediabunny', 'node-av',
 		].map(module => `@mediabunny/server/dist/modules/src/${file}.d.ts: TS1479: The current file is a CommonJS`
@@ -615,7 +615,7 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 			}
 			if (!scenario.coreOnly) {
 				expected.push(...DIAGNOSTICS.werift);
-				if (node16) {
+				if (node16 && (scenario.type === 'commonjs' || KNOWN_FAILURES['#315'])) {
 					expected.push(...DIAGNOSTICS.serverDeclarationsImportEsm);
 				}
 			}
