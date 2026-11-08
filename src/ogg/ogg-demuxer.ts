@@ -43,6 +43,12 @@ import {
 const MAX_LOGICAL_BITSTREAMS = 64;
 const VORBIS_IDENTIFICATION_HEADER_SIZE = 30;
 const OPUS_IDENTIFICATION_HEADER_MIN_SIZE = 19;
+// An encoder's pre-skip covers its algorithmic delay: libopus' lookahead is 312 samples (120 in its low-delay mode),
+// and resampling the input first (as opusenc does for 44.1 kHz input, giving 356) adds up to a few hundred more. A
+// larger pre-skip crops the start of the stream, for which RFC 7845 (section 4.2) recommends at least 3840 samples.
+const MAX_ENCODER_PRE_SKIP = 1000;
+/** How far lookups read on from the start of a track's first link to find its end, before bisecting instead. */
+const FIRST_LINK_SCAN_SIZE = 2 ** 16;
 
 type LogicalBitstream = {
 	serialNumber: number;
@@ -53,6 +59,8 @@ type LogicalBitstream = {
 	codecInfo: OggCodecInfo;
 
 	lastMetadataPacket: Packet | null;
+	/** The identification header, and for Vorbis also the setup header. */
+	headerPackets: Uint8Array[];
 };
 
 type Packet = {
@@ -65,6 +73,8 @@ export class OggDemuxer extends Demuxer {
 	reader: Reader;
 
 	metadataPromise: Promise<void> | null = null;
+	/** Whether pages (by position) of chained links have a matching checksum. */
+	pageIntactness = new Map<number, boolean>();
 	bitstreams: LogicalBitstream[] = [];
 	/** The logical bitstreams skipped for an invalid identification header, with the error. */
 	invalidHeaders: { serialNumber: number; error: string }[] = [];
@@ -114,43 +124,14 @@ export class OggDemuxer extends Demuxer {
 						opusInfo: null,
 					},
 					lastMetadataPacket: null,
+					headerPackets: [],
 				});
 
 				currentPos = page.headerStartPos + page.totalSize;
 			}
 
 			for (const bitstream of this.bitstreams) {
-				const firstPacket = await this.readPacket(bitstream.bosPage, 0);
-				if (!firstPacket) {
-					continue;
-				}
-
-				if (
-					// Check for Vorbis
-					firstPacket.data.byteLength >= VORBIS_IDENTIFICATION_HEADER_SIZE
-					&& firstPacket.data[0] === 0x01 // Packet type 1 = identification header
-					&& firstPacket.data[1] === 0x76 // 'v'
-					&& firstPacket.data[2] === 0x6f // 'o'
-					&& firstPacket.data[3] === 0x72 // 'r'
-					&& firstPacket.data[4] === 0x62 // 'b'
-					&& firstPacket.data[5] === 0x69 // 'i'
-					&& firstPacket.data[6] === 0x73 // 's'
-				) {
-					await this.readVorbisMetadata(firstPacket, bitstream);
-				} else if (
-					// Check for Opus
-					firstPacket.data.byteLength >= OPUS_IDENTIFICATION_HEADER_MIN_SIZE
-					&& firstPacket.data[0] === 0x4f // 'O'
-					&& firstPacket.data[1] === 0x70 // 'p'
-					&& firstPacket.data[2] === 0x75 // 'u'
-					&& firstPacket.data[3] === 0x73 // 's'
-					&& firstPacket.data[4] === 0x48 // 'H'
-					&& firstPacket.data[5] === 0x65 // 'e'
-					&& firstPacket.data[6] === 0x61 // 'a'
-					&& firstPacket.data[7] === 0x64 // 'd'
-				) {
-					await this.readOpusMetadata(firstPacket, bitstream);
-				}
+				await this.readCodecHeaders(bitstream, this.metadataTags);
 
 				if (bitstream.codecInfo.codec !== null) {
 					this.trackBackings.push(new OggAudioTrackBacking(bitstream, this));
@@ -168,7 +149,42 @@ export class OggDemuxer extends Demuxer {
 		})();
 	}
 
-	async readVorbisMetadata(firstPacket: Packet, bitstream: LogicalBitstream) {
+	/** Reads the header packets of a logical bitstream and sets its codec info if it's Vorbis or Opus. */
+	async readCodecHeaders(bitstream: LogicalBitstream, metadataTags: MetadataTags | null) {
+		const firstPacket = await this.readPacket(bitstream.bosPage, 0);
+		if (!firstPacket) {
+			return;
+		}
+
+		if (
+		// Check for Vorbis
+			firstPacket.data.byteLength >= VORBIS_IDENTIFICATION_HEADER_SIZE
+			&& firstPacket.data[0] === 0x01 // Packet type 1 = identification header
+			&& firstPacket.data[1] === 0x76 // 'v'
+			&& firstPacket.data[2] === 0x6f // 'o'
+			&& firstPacket.data[3] === 0x72 // 'r'
+			&& firstPacket.data[4] === 0x62 // 'b'
+			&& firstPacket.data[5] === 0x69 // 'i'
+			&& firstPacket.data[6] === 0x73 // 's'
+		) {
+			await this.readVorbisMetadata(firstPacket, bitstream, metadataTags);
+		} else if (
+		// Check for Opus
+			firstPacket.data.byteLength >= OPUS_IDENTIFICATION_HEADER_MIN_SIZE
+			&& firstPacket.data[0] === 0x4f // 'O'
+			&& firstPacket.data[1] === 0x70 // 'p'
+			&& firstPacket.data[2] === 0x75 // 'u'
+			&& firstPacket.data[3] === 0x73 // 's'
+			&& firstPacket.data[4] === 0x48 // 'H'
+			&& firstPacket.data[5] === 0x65 // 'e'
+			&& firstPacket.data[6] === 0x61 // 'a'
+			&& firstPacket.data[7] === 0x64 // 'd'
+		) {
+			await this.readOpusMetadata(firstPacket, bitstream, metadataTags);
+		}
+	}
+
+	async readVorbisMetadata(firstPacket: Packet, bitstream: LogicalBitstream, metadataTags: MetadataTags | null) {
 		let nextPacketPosition = await this.findNextPacketStart(firstPacket);
 		if (!nextPacketPosition) {
 			return;
@@ -242,6 +258,7 @@ export class OggDemuxer extends Demuxer {
 		bitstream.codecInfo.codec = 'vorbis';
 		bitstream.description = description;
 		bitstream.lastMetadataPacket = thirdPacket;
+		bitstream.headerPackets = [firstPacket.data, thirdPacket.data];
 
 		bitstream.numberOfChannels = numberOfChannels;
 		bitstream.sampleRate = sampleRate;
@@ -255,10 +272,12 @@ export class OggDemuxer extends Demuxer {
 			modeBlockflags: parseModesFromVorbisSetupPacket(thirdPacket.data).modeBlockflags,
 		};
 
-		readVorbisComments(secondPacket.data.subarray(7), this.metadataTags); // Skip header type and 'vorbis'
+		if (metadataTags) {
+			readVorbisComments(secondPacket.data.subarray(7), metadataTags); // Skip header type and 'vorbis'
+		}
 	}
 
-	async readOpusMetadata(firstPacket: Packet, bitstream: LogicalBitstream) {
+	async readOpusMetadata(firstPacket: Packet, bitstream: LogicalBitstream, metadataTags: MetadataTags | null) {
 		// From https://datatracker.ietf.org/doc/html/rfc7845#section-5:
 		// "An Ogg Opus logical stream contains exactly two mandatory header packets: an identification header and a
 		// comment header."
@@ -288,6 +307,7 @@ export class OggDemuxer extends Demuxer {
 		bitstream.codecInfo.codec = 'opus';
 		bitstream.description = firstPacket.data;
 		bitstream.lastMetadataPacket = secondPacket;
+		bitstream.headerPackets = [firstPacket.data];
 
 		bitstream.numberOfChannels = header.outputChannelCount;
 		bitstream.sampleRate = OPUS_SAMPLE_RATE; // Always the same
@@ -296,7 +316,109 @@ export class OggDemuxer extends Demuxer {
 			preSkip: header.preSkip,
 		};
 
-		readVorbisComments(secondPacket.data.subarray(8), this.metadataTags); // Skip 'OpusTags'
+		if (metadataTags) {
+			readVorbisComments(secondPacket.data.subarray(8), metadataTags); // Skip 'OpusTags'
+		}
+	}
+
+	/**
+	 * Checks the checksum of the pages of chained links (those of the file's first bitstreams aren't checked, to stay
+	 * as lenient as before), so that a damaged later link, as found where a stream capture broke off, ends the track
+	 * instead of handing damaged data to the decoder. FFmpeg also drops pages whose checksum doesn't match.
+	 */
+	async pageIsIntact(page: Page) {
+		if (this.bitstreams.some(x => x.serialNumber === page.serialNumber)) {
+			return true;
+		}
+
+		let result = this.pageIntactness.get(page.headerStartPos);
+		if (result === undefined) {
+			let slice = this.reader.requestSlice(page.headerStartPos, page.totalSize);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			result = !!slice && pageChecksumMatches(page, readBytes(slice, page.totalSize));
+			this.pageIntactness.set(page.headerStartPos, result);
+		}
+
+		return result;
+	}
+
+	/**
+	 * Follows the pages of a chained link's bitstream from its first page and returns where its intact part ends:
+	 * after its end-of-stream page, or at its first damaged page. Returns null if that can't be told, as the pages
+	 * stop being consecutive before either.
+	 */
+	async findIntactLinkEnd(bitstream: LogicalBitstream): Promise<number | null> {
+		let page = bitstream.bosPage;
+
+		while (true) {
+			if (!await this.pageIsIntact(page)) {
+				return page.headerStartPos;
+			}
+
+			const endPos = page.headerStartPos + page.totalSize;
+			if (page.headerType & 0x04) {
+				return endPos;
+			}
+
+			let slice = this.reader.requestSliceRange(endPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			const nextPage = slice && readPageHeader(slice);
+			if (!nextPage || nextPage.serialNumber !== bitstream.serialNumber) {
+				return null;
+			}
+
+			page = nextPage;
+		}
+	}
+
+	/**
+	 * Reads the logical bitstream of the chained link (RFC 3533, section 4) that starts with the page at the given
+	 * position, if there is one. Only links made of a single logical bitstream are read.
+	 */
+	async readChainedLink(pos: number): Promise<LogicalBitstream | null> {
+		let slice = this.reader.requestSliceRange(pos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		const bosPage = slice && readPageHeader(slice);
+		if (!bosPage || !(bosPage.headerType & 0x02)) {
+			return null;
+		}
+
+		slice = this.reader.requestSliceRange(
+			bosPage.headerStartPos + bosPage.totalSize,
+			MIN_PAGE_HEADER_SIZE,
+			MAX_PAGE_HEADER_SIZE,
+		);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		const nextPage = slice && readPageHeader(slice);
+		if (nextPage && (nextPage.headerType & 0x02)) {
+			return null; // A link with multiple logical bitstreams
+		}
+
+		const bitstream: LogicalBitstream = {
+			serialNumber: bosPage.serialNumber,
+			bosPage,
+			description: null,
+			numberOfChannels: -1,
+			sampleRate: -1,
+			codecInfo: {
+				codec: null,
+				vorbisInfo: null,
+				opusInfo: null,
+			},
+			lastMetadataPacket: null,
+			headerPackets: [],
+		};
+		await this.readCodecHeaders(bitstream, null);
+
+		return bitstream;
 	}
 
 	async readPacket(startPage: Page, startSegmentIndex: number): Promise<Packet | null> {
@@ -315,6 +437,10 @@ export class OggDemuxer extends Demuxer {
 
 		outer:
 		while (true) {
+			if (!await this.pageIsIntact(currentPage)) {
+				return null;
+			}
+
 			// Load the entire page data
 			let pageSlice = this.reader.requestSlice(currentPage.dataStartPos, currentPage.dataSize);
 			if (isThenable(pageSlice)) pageSlice = await pageSlice;
@@ -508,8 +634,32 @@ export class OggDemuxer extends Demuxer {
 	}
 }
 
+/**
+ * One link of a chained stream (RFC 3533, section 4): a logical bitstream that follows the previous link's last page.
+ * A track continues across links whose codec parameters match those of its first link.
+ */
+type OggLink = {
+	bitstream: LogicalBitstream;
+	/** Added to the timestamps derived from the link's own granule positions to get track timestamps. */
+	offsetInSamples: number;
+	/** Track timestamp of the link's first packet. */
+	firstTimestampInSamples: number;
+	/** For Vorbis, the block size of the packet that precedes the link's first packet in the track. */
+	initialVorbisLastBlocksize: number | null;
+	/**
+	 * Where the link's last page ends, if known before any lookup: for a later link, where its intact part ends; for
+	 * the first, if it's short (see `getPacketInLink`). It's never taken from where a lookup or iteration happened to
+	 * get to, as a later link may reuse the serial number (which RFC 3533 forbids, but `cat` makes), and then what
+	 * lookups return would depend on what ran before.
+	 */
+	endPos: number | null;
+	/** The links that follow the link if it ends at the given position. */
+	nextLinks: Map<number, Promise<OggLink | null>>;
+};
+
 type EncodedPacketMetadata = {
 	packet: Packet;
+	link: OggLink;
 	timestampInSamples: number;
 	durationInSamples: number;
 	vorbisLastBlockSize: number | null;
@@ -521,7 +671,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	encodedPacketToMetadata = new WeakMap<EncodedPacket, EncodedPacketMetadata>();
 	sequentialScanCache: EncodedPacketMetadata[] = [];
 	sequentialScanMutex = new AsyncMutex();
-	firstTimestampInSamplesPromise: Promise<number> | null = null;
+	firstLinkPromise: Promise<OggLink> | null = null;
+	firstLinkEndSearch: Promise<void> | null = null;
+	warnedAboutIncompatibleLink = false;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
 		// Opus always uses a fixed sample rate for its internal calculations, even if the actual rate is different
@@ -622,18 +774,19 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		};
 	}
 
-	granulePositionToTimestampInSamples(granulePosition: number) {
-		if (this.bitstream.codecInfo.codec === 'opus') {
-			assert(this.bitstream.codecInfo.opusInfo);
-			return granulePosition - this.bitstream.codecInfo.opusInfo.preSkip;
+	granulePositionToTimestampInSamples(link: Pick<OggLink, 'bitstream' | 'offsetInSamples'>, granulePosition: number) {
+		if (link.bitstream.codecInfo.codec === 'opus') {
+			assert(link.bitstream.codecInfo.opusInfo);
+			return link.offsetInSamples + granulePosition - link.bitstream.codecInfo.opusInfo.preSkip;
 		}
 
-		return granulePosition;
+		return link.offsetInSamples + granulePosition;
 	}
 
 	createEncodedPacketFromOggPacket(
 		packet: Packet | null,
 		additional: {
+			link: OggLink;
 			timestampInSamples: number;
 			vorbisLastBlocksize: number | null;
 		},
@@ -645,7 +798,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 		const sampleMetadata = extractSampleMetadata(
 			packet.data,
-			this.bitstream.codecInfo,
+			additional.link.bitstream.codecInfo,
 			additional.vorbisLastBlocksize,
 		);
 		const { vorbisBlockSize } = sampleMetadata;
@@ -655,7 +808,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		if (isEos && packet.endSegmentIndex === packet.endPage.lacingValues.length - 1) {
 			// This is the last packet of the bitstream. The final page's granule position may be smaller than what
 			// the packet durations imply, in which case the excess samples at the end are to be trimmed.
-			const endTimestampInSamples = this.granulePositionToTimestampInSamples(packet.endPage.granulePosition);
+			const endTimestampInSamples = this.granulePositionToTimestampInSamples(
+				additional.link,
+				packet.endPage.granulePosition,
+			);
 			durationInSamples = clamp(endTimestampInSamples - additional.timestampInSamples, 0, durationInSamples);
 		}
 
@@ -670,6 +826,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 		this.encodedPacketToMetadata.set(encodedPacket, {
 			packet,
+			link: additional.link,
 			timestampInSamples: additional.timestampInSamples,
 			durationInSamples,
 			vorbisLastBlockSize: additional.vorbisLastBlocksize,
@@ -678,60 +835,175 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		return encodedPacket;
 	}
 
-	getFirstTimestampInSamples() {
-		return this.firstTimestampInSamplesPromise ??= (async () => {
-			const defaultTimestampInSamples = this.granulePositionToTimestampInSamples(0);
+	getFirstLink() {
+		return this.firstLinkPromise ??= (async (): Promise<OggLink> => ({
+			bitstream: this.bitstream,
+			offsetInSamples: 0,
+			firstTimestampInSamples: await this.computeStartInSamples(this.bitstream, null),
+			initialVorbisLastBlocksize: null,
+			endPos: null,
+			nextLinks: new Map(),
+		}))();
+	}
 
-			assert(this.bitstream.lastMetadataPacket);
-			let position = await this.demuxer.findNextPacketStart(this.bitstream.lastMetadataPacket);
-			if (!position) {
-				return defaultTimestampInSamples;
+	/** Computes the timestamp of a bitstream's first packet, as derived from its own granule positions. */
+	async computeStartInSamples(bitstream: LogicalBitstream, initialVorbisLastBlocksize: number | null) {
+		const ownTimeline = { bitstream, offsetInSamples: 0 };
+		const defaultTimestampInSamples = this.granulePositionToTimestampInSamples(ownTimeline, 0);
+
+		assert(bitstream.lastMetadataPacket);
+		let position = await this.demuxer.findNextPacketStart(bitstream.lastMetadataPacket);
+		if (!position) {
+			return defaultTimestampInSamples;
+		}
+
+		// The first page on which a packet completes may have a granule position larger than the number of
+		// samples in the packets completing on it, meaning the stream starts at a later time. So, let's sum up the
+		// durations of these packets and compare.
+		let firstEndPage: Page | null = null;
+		let totalDurationInSamples = 0;
+		let firstPacketDurationInSamples: number | null = null;
+		let vorbisLastBlocksize = initialVorbisLastBlocksize;
+
+		while (position) {
+			const packet = await this.demuxer.readPacket(position.startPage, position.startSegmentIndex);
+			if (!packet) {
+				break;
 			}
 
-			// The first page on which a packet completes may have a granule position larger than the number of
-			// samples in the packets completing on it, meaning the stream starts at a later time. So, let's sum up the
-			// durations of these packets and compare.
-			let firstEndPage: Page | null = null;
-			let totalDurationInSamples = 0;
-			let firstPacketDurationInSamples: number | null = null;
-			let vorbisLastBlocksize: number | null = null;
+			firstEndPage ??= packet.endPage;
+			if (packet.endPage.headerStartPos !== firstEndPage.headerStartPos) {
+				break;
+			}
 
-			while (position) {
-				const packet = await this.demuxer.readPacket(position.startPage, position.startSegmentIndex);
-				if (!packet) {
-					break;
+			const { durationInSamples, vorbisBlockSize } = extractSampleMetadata(
+				packet.data,
+				bitstream.codecInfo,
+				vorbisLastBlocksize,
+			);
+			totalDurationInSamples += durationInSamples;
+			firstPacketDurationInSamples ??= durationInSamples;
+			vorbisLastBlocksize = vorbisBlockSize;
+
+			position = await this.demuxer.findNextPacketStart(packet);
+		}
+
+		if (!firstEndPage) {
+			return defaultTimestampInSamples;
+		}
+		assert(firstPacketDurationInSamples !== null);
+
+		// A smaller granule position is only legal on the final page, where it signals end trimming. The Vorbis
+		// priming packet decodes to nothing though, so it's allowed to precede the granule position's origin.
+		const minStartInSamples = bitstream.codecInfo.codec === 'vorbis'
+			? -firstPacketDurationInSamples
+			: 0;
+		return defaultTimestampInSamples
+			+ Math.max(firstEndPage.granulePosition - totalDurationInSamples, minStartInSamples);
+	}
+
+	/**
+	 * Returns the link that follows the given one, if the file continues with a link that this track can continue
+	 * into. `end` is where the given link ends.
+	 */
+	getNextLink(link: OggLink, end: { lastPage: Page; timestampInSamples: number; vorbisBlockSize: number | null }) {
+		const endPos = end.lastPage.headerStartPos + end.lastPage.totalSize;
+		let nextPromise = link.nextLinks.get(endPos);
+		if (nextPromise) {
+			return nextPromise;
+		}
+
+		nextPromise = (async () => {
+			const bitstream = await this.demuxer.readChainedLink(endPos);
+			if (!bitstream) {
+				return null; // The file doesn't continue with another link
+			}
+
+			const incompatibility = this.getLinkIncompatibility(bitstream);
+			if (incompatibility) {
+				if (!this.warnedAboutIncompatibleLink) {
+					this.warnedAboutIncompatibleLink = true;
+					Logging._warn(
+						'Ogg: The track ends before the chained logical bitstream at byte'
+						+ ` ${bitstream.bosPage.headerStartPos}, which ${incompatibility}.`,
+					);
 				}
 
-				firstEndPage ??= packet.endPage;
-				if (packet.endPage.headerStartPos !== firstEndPage.headerStartPos) {
-					break;
-				}
-
-				const { durationInSamples, vorbisBlockSize } = extractSampleMetadata(
-					packet.data,
-					this.bitstream.codecInfo,
-					vorbisLastBlocksize,
-				);
-				totalDurationInSamples += durationInSamples;
-				firstPacketDurationInSamples ??= durationInSamples;
-				vorbisLastBlocksize = vorbisBlockSize;
-
-				position = await this.demuxer.findNextPacketStart(packet);
+				return null;
 			}
 
-			if (!firstEndPage) {
-				return defaultTimestampInSamples;
-			}
-			assert(firstPacketDurationInSamples !== null);
+			// The link's first packet continues the track right where the previous link ended. The decoder isn't
+			// reset in between, so the samples that the encoder's pre-skip (or the Vorbis priming packet) would discard
+			// at the start of a stream are played, as Chrome does too: discarding them would need timestamps that
+			// overlap the previous link and may go backwards, which muxers reject. These are only a few milliseconds,
+			// as links with a larger, cropping pre-skip aren't continued into. A later start (as in a live capture)
+			// would leave a gap, so it's not kept either.
+			const startInSamples = await this.computeStartInSamples(bitstream, end.vorbisBlockSize);
 
-			// A smaller granule position is only legal on the final page, where it signals end trimming. The Vorbis
-			// priming packet decodes to nothing though, so it's allowed to precede the granule position's origin.
-			const minStartInSamples = this.bitstream.codecInfo.codec === 'vorbis'
-				? -firstPacketDurationInSamples
-				: 0;
-			return defaultTimestampInSamples
-				+ Math.max(firstEndPage.granulePosition - totalDurationInSamples, minStartInSamples);
+			return {
+				bitstream,
+				offsetInSamples: end.timestampInSamples - startInSamples,
+				firstTimestampInSamples: end.timestampInSamples,
+				initialVorbisLastBlocksize: end.vorbisBlockSize,
+				// Reading the link stops at a damaged page, so lookups must not look past it either
+				endPos: await this.demuxer.findIntactLinkEnd(bitstream),
+				nextLinks: new Map(),
+			};
 		})();
+		link.nextLinks.set(endPos, nextPromise);
+
+		return nextPromise;
+	}
+
+	/**
+	 * Returns why the track can't continue into the given link, or null if it can: the decoder configured for the
+	 * track's first link must be able to decode it, and its start must not be cropped.
+	 */
+	getLinkIncompatibility(bitstream: LogicalBitstream) {
+		const first = this.bitstream;
+		if (bitstream.serialNumber === first.serialNumber) {
+			return 'reuses the serial number';
+		}
+
+		const differentCodecParameters = 'has different codec parameters or damaged headers';
+		if (
+			bitstream.codecInfo.codec !== first.codecInfo.codec
+			|| bitstream.numberOfChannels !== first.numberOfChannels
+			|| bitstream.sampleRate !== first.sampleRate
+		) {
+			return differentCodecParameters;
+		}
+
+		const [firstIdentification, firstSetup] = first.headerPackets;
+		const [identification, setup] = bitstream.headerPackets;
+		assert(firstIdentification && identification);
+
+		if (first.codecInfo.codec === 'opus') {
+			// Everything but the pre-skip and the input sample rate (bytes 10 to 15) must match
+			const sameHeader = identification.length === firstIdentification.length
+				&& identification.every((byte, i) => (i >= 10 && i < 16) || byte === firstIdentification[i]);
+			if (!sameHeader) {
+				return differentCodecParameters;
+			}
+
+			// A pre-skip larger than any encoder's delay crops the start of the link (RFC 7845, section 4.2).
+			// Discarding those samples would take dropping decoded audio in the middle of the track, which isn't
+			// supported, and playing them would add audio that isn't part of the link.
+			assert(bitstream.codecInfo.opusInfo);
+			const preSkip = bitstream.codecInfo.opusInfo.preSkip;
+			if (preSkip > MAX_ENCODER_PRE_SKIP) {
+				return `has a pre-skip of ${preSkip} samples that crops its start (not supported mid-track)`;
+			}
+
+			return null;
+		}
+
+		// Vorbis: the same block sizes, and the same setup header with its codebooks and modes
+		assert(firstSetup && setup);
+		const sameHeaders = identification[28] === firstIdentification[28]
+			&& setup.length === firstSetup.length
+			&& setup.every((byte, i) => byte === firstSetup[i]);
+		return sameHeaders ? null : differentCodecParameters;
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions) {
@@ -741,13 +1013,14 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return null;
 		}
 
-		const timestampInSamples = await this.getFirstTimestampInSamples();
+		const link = await this.getFirstLink();
 		const packet = await this.demuxer.readPacket(packetPosition.startPage, packetPosition.startSegmentIndex);
 
 		return this.createEncodedPacketFromOggPacket(
 			packet,
 			{
-				timestampInSamples,
+				link,
+				timestampInSamples: link.firstTimestampInSamples,
 				vorbisLastBlocksize: null,
 			},
 			options,
@@ -760,12 +1033,31 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			throw new Error('Packet was not created from this track.');
 		}
 
-		const packetPosition = await this.demuxer.findNextPacketStart(prevMetadata.packet);
-		if (!packetPosition) {
-			return null;
-		}
+		let link = prevMetadata.link;
+		let timestampInSamples = prevMetadata.timestampInSamples + prevMetadata.durationInSamples;
+		const vorbisLastBlocksize = prevMetadata.vorbisBlockSize;
 
-		const timestampInSamples = prevMetadata.timestampInSamples + prevMetadata.durationInSamples;
+		let packetPosition = await this.demuxer.findNextPacketStart(prevMetadata.packet);
+		if (!packetPosition) {
+			// The link has ended, but the track may continue in the next one
+			const nextLink = await this.getNextLink(link, {
+				lastPage: prevMetadata.packet.endPage,
+				timestampInSamples,
+				vorbisBlockSize: prevMetadata.vorbisBlockSize,
+			});
+			if (!nextLink) {
+				return null;
+			}
+
+			assert(nextLink.bitstream.lastMetadataPacket);
+			packetPosition = await this.demuxer.findNextPacketStart(nextLink.bitstream.lastMetadataPacket);
+			if (!packetPosition) {
+				return null;
+			}
+
+			link = nextLink;
+			timestampInSamples = nextLink.firstTimestampInSamples;
+		}
 
 		const packet = await this.demuxer.readPacket(
 			packetPosition.startPage,
@@ -775,38 +1067,127 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		return this.createEncodedPacketFromOggPacket(
 			packet,
 			{
+				link,
 				timestampInSamples,
-				vorbisLastBlocksize: prevMetadata.vorbisBlockSize,
+				vorbisLastBlocksize,
 			},
 			options,
 		);
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
-		if (this.demuxer.reader.fileSize === null) {
-			// No file size known, can't do binary search, but fall back to sequential algo instead
+		if (this.demuxer.reader.fileSize === null || this.sequentialScanCache.length > 0) {
+			// No file size known, can't do binary search, but fall back to sequential algo instead. Once that has
+			// started, keep at it: checking for a chained link after the last page can make the size known, but the
+			// source, a stream, may no longer hold the data the binary search would read.
 			return this.getPacketSequential(timestamp, options);
 		}
 
 		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
-		const firstTimestampInSamples = await this.getFirstTimestampInSamples();
-		if (timestampInSamples === firstTimestampInSamples) {
+		let link = await this.getFirstLink();
+		if (timestampInSamples === link.firstTimestampInSamples) {
 			// Fast path for the first timestamp - avoids binary search when playing back from the start
 			return this.getFirstPacket(options);
 		}
-		if (timestampInSamples < firstTimestampInSamples) {
+		if (timestampInSamples < link.firstTimestampInSamples) {
 			// There's nothing here
 			return null;
 		}
 
-		assert(this.bitstream.lastMetadataPacket);
-		const startPosition = await this.demuxer.findNextPacketStart(this.bitstream.lastMetadataPacket);
+		let previousLink: OggLink | null = null;
+
+		while (true) {
+			const knownNextLink = link.endPos !== null ? link.nextLinks.get(link.endPos) : undefined;
+			if (knownNextLink) {
+				// We already know where the next link starts, so we can skip this one if the timestamp lies past it
+				const nextLink = await knownNextLink;
+				if (nextLink && timestampInSamples >= nextLink.firstTimestampInSamples) {
+					previousLink = link;
+					link = nextLink;
+					continue;
+				}
+			}
+
+			const packet = await this.getPacketInLink(link, timestampInSamples, options);
+			if (!packet) {
+				// A later link whose first packet can't be read (as it's damaged) ends the track, like in iteration
+				return previousLink && this.getPacketInLink(previousLink, timestampInSamples, options);
+			}
+
+			const metadata = this.encodedPacketToMetadata.get(packet);
+			assert(metadata);
+
+			if (await this.demuxer.findNextPacketStart(metadata.packet)) {
+				return packet;
+			}
+
+			// This is the link's last packet, and the timestamp might lie in the next link, which starts at its end
+			const nextLink = await this.getNextLink(link, {
+				lastPage: metadata.packet.endPage,
+				timestampInSamples: metadata.timestampInSamples + metadata.durationInSamples,
+				vorbisBlockSize: metadata.vorbisBlockSize,
+			});
+			if (!nextLink || timestampInSamples < nextLink.firstTimestampInSamples) {
+				return packet;
+			}
+
+			previousLink = link;
+			link = nextLink;
+		}
+	}
+
+	/**
+	 * Reads on from the link's first packet like iteration does, and returns where its last packet's page ends, or null
+	 * if the link goes on past `maxEndPos`.
+	 */
+	async findLinkEndSequentially(link: OggLink, maxEndPos: number) {
+		assert(link.bitstream.lastMetadataPacket);
+		let position = await this.demuxer.findNextPacketStart(link.bitstream.lastMetadataPacket);
+		let lastPage = link.bitstream.lastMetadataPacket.endPage;
+
+		while (position) {
+			if (position.startPage.headerStartPos > maxEndPos) {
+				return null;
+			}
+
+			const packet = await this.demuxer.readPacket(position.startPage, position.startSegmentIndex);
+			if (!packet) {
+				break;
+			}
+
+			lastPage = packet.endPage;
+			position = await this.demuxer.findNextPacketStart(packet);
+		}
+
+		return lastPage.headerStartPos + lastPage.totalSize;
+	}
+
+	/** Finds the last packet of the given link with a timestamp less than or equal to the given one. */
+	async getPacketInLink(link: OggLink, timestampInSamples: number, options: PacketRetrievalOptions) {
+		assert(this.demuxer.reader.fileSize !== null);
+		const firstTimestampInSamples = link.firstTimestampInSamples;
+
+		assert(link.bitstream.lastMetadataPacket);
+		const startPosition = await this.demuxer.findNextPacketStart(link.bitstream.lastMetadataPacket);
 		if (!startPosition) {
 			return null;
 		}
 
+		if (link.bitstream === this.bitstream) {
+			// A later link may reuse our serial number (RFC 3533 forbids that, but concatenating files does it), and
+			// the bisection can't tell its pages from our link's. So let's try to find our link's end by reading on
+			// from its start like iteration does, which is cheap for a short link like an intro or a jingle. All
+			// lookups wait for this, so that they all search the same range.
+			await (this.firstLinkEndSearch ??= (async () => {
+				link.endPos ??= await this.findLinkEndSequentially(
+					link,
+					startPosition.startPage.headerStartPos + FIRST_LINK_SCAN_SIZE,
+				);
+			})());
+		}
+
 		let lowPage = startPosition.startPage;
-		let high = this.demuxer.reader.fileSize;
+		let high = link.endPos ?? this.demuxer.reader.fileSize;
 
 		const lowPages: Page[] = [lowPage];
 
@@ -832,7 +1213,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				let searchSlice = this.demuxer.reader.requestSlice(searchStartPos, Math.max(until - searchStartPos, 0));
 				if (isThenable(searchSlice)) searchSlice = await searchSlice;
 
-				if (!searchSlice || !findNextPageHeader(searchSlice, until, this.bitstream.serialNumber)) {
+				if (!searchSlice || !findNextPageHeader(searchSlice, until, link.bitstream.serialNumber)) {
 					if (high <= mid + MIN_PAGE_HEADER_SIZE) {
 						// The range can't be narrowed any further
 						break outer;
@@ -856,9 +1237,17 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				// serial number is astronomically low, so we can be pretty sure a page with our serial is legit.
 				// Pages of other bitstreams (or junk) we simply scan past; validating them via their checksum instead
 				// could be abused to make us checksum huge amounts of data over and over.
-				if (!page || page.serialNumber !== this.bitstream.serialNumber) {
+				if (!page || page.serialNumber !== link.bitstream.serialNumber) {
 					searchStartPos = pageStartPos + 4; // 'OggS' is 4 bytes
 					continue;
+				}
+
+				// A page of our serial number that begins a logical bitstream, or that numbers its pages anew, belongs
+				// to a later chained link reusing the serial number (RFC 3533 forbids that, but concatenating a file
+				// with itself makes it), so our link ends before it
+				if ((page.headerType & 0x02) || page.sequenceNumber <= lowPage.sequenceNumber) {
+					high = page.headerStartPos;
+					continue outer;
 				}
 
 				const isContinuationPage = page.granulePosition === -1;
@@ -877,7 +1266,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 				// The page is valid and belongs to our bitstream; let's check its granule position to see where we
 				// need to take the bisection search.
-				if (this.granulePositionToTimestampInSamples(page.granulePosition) > timestampInSamples) {
+				if (this.granulePositionToTimestampInSamples(link, page.granulePosition) > timestampInSamples) {
 					high = page.headerStartPos;
 				} else {
 					lowPage = page;
@@ -911,7 +1300,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		while (true) {
 			// This loop must terminate as we'll eventually reach lowPage
 			if (
-				currentPage.serialNumber === this.bitstream.serialNumber
+				currentPage.serialNumber === link.bitstream.serialNumber
 				&& currentPage.granulePosition === lowPage.granulePosition
 			) {
 				break;
@@ -931,7 +1320,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 			currentPage = nextPage;
 
-			if (currentPage.serialNumber === this.bitstream.serialNumber) {
+			if (currentPage.serialNumber === link.bitstream.serialNumber) {
 				previousPages.push(currentPage);
 			}
 		}
@@ -1048,8 +1437,12 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				let encodedPacket = this.createEncodedPacketFromOggPacket(
 					packet,
 					{
+						link,
 						timestampInSamples: currentTimestampInSamples,
-						vorbisLastBlocksize: lastEncodedPacketMetadata?.vorbisBlockSize ?? null,
+						vorbisLastBlocksize: lastEncodedPacketMetadata
+							? lastEncodedPacketMetadata.vorbisBlockSize
+							// At the link's start, continue from the previous link
+							: currentTimestampIsCorrect ? link.initialVorbisLastBlocksize : null,
 					},
 					options,
 				);
@@ -1065,6 +1458,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				) {
 					// We know this packet end timestamp can be derived from the page's granule position
 					currentTimestampInSamples = this.granulePositionToTimestampInSamples(
+						link,
 						currentPage.granulePosition,
 					);
 					currentTimestampIsCorrect = true;
@@ -1073,6 +1467,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					encodedPacket = this.createEncodedPacketFromOggPacket(
 						packet,
 						{
+							link,
 							timestampInSamples: currentTimestampInSamples - encodedPacketMetadata.durationInSamples,
 							vorbisLastBlocksize: lastEncodedPacketMetadata?.vorbisBlockSize ?? null,
 						},
@@ -1135,6 +1530,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				currentPacket = this.createEncodedPacketFromOggPacket(
 					cacheEntry.packet,
 					{
+						link: cacheEntry.link,
 						timestampInSamples: cacheEntry.timestampInSamples,
 						vorbisLastBlocksize: cacheEntry.vorbisLastBlockSize,
 					},
