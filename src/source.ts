@@ -975,6 +975,19 @@ export class UrlSource extends PathedSource {
 			);
 
 			if (!response.ok) {
+				if (
+					response.status === 416
+					&& this._orchestrator.fileSize === null
+					&& worker.currentPos === this._orchestrator.suppliedEnd
+				) {
+					// No response has stated the size (Content-Range "bytes a-b/*", or hidden by CORS), the data
+					// received ends right here, and the server says there's nothing here: so the resource ends here
+					void response.body?.cancel().catch(() => {});
+					this._fileSizeDetermined = true;
+					this._orchestrator.onWorkerFinished(worker);
+					return;
+				}
+
 				// eslint-disable-next-line @typescript-eslint/no-base-to-string
 				throw new Error(`Error fetching ${String(this._url)}: ${response.status} ${response.statusText}`);
 			}
@@ -1201,6 +1214,14 @@ export class UrlSource extends PathedSource {
 						);
 
 						if (!newResponse.ok) {
+							if (newResponse.status === 416 && this._sequentialBacking?._endIndex === null) {
+								// Everything before streamPosition has been delivered, and the server says there's
+								// nothing after it: this is the end of a resource whose size no response stated
+								void newResponse.body?.cancel().catch(() => {});
+								controller.close();
+								return;
+							}
+
 							throw new Error(
 								// eslint-disable-next-line @typescript-eslint/no-base-to-string
 								`Error fetching ${String(this._url)}:`
@@ -2120,6 +2141,8 @@ type ReadWorker = {
  */
 class ReadOrchestrator {
 	fileSize: number | null = null;
+	/** Where the data supplied by the workers ends, as far as it goes */
+	suppliedEnd = 0;
 	nextAge = 0; // Used for multiple things
 	workers: ReadWorker[] = [];
 	cache: CacheEntry[] = [];
@@ -2532,6 +2555,7 @@ class ReadOrchestrator {
 			age: this.nextAge++,
 		});
 		worker.currentPos += bytes.length;
+		this.suppliedEnd = Math.max(this.suppliedEnd, worker.currentPos);
 
 		if (worker.currentPos > worker.targetPos) {
 			// In case it overshoots
