@@ -1157,3 +1157,52 @@ test('Last block of a cluster without BlockDuration or DefaultDuration (AAC, MP3
 	expect(await readDurations('A_EAC3', 48000, null, [0x0b, 0x77, 0x00, 0x3f, 0x10]))
 		.toEqual([0.01, 0.011, 0.011]);
 });
+
+test('Cluster without a Timestamp', async () => {
+	// Timestamp is mandatory in a Cluster; a broken file without it should read as if it were 0
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, ascii('A_AC3')),
+			)),
+			element(
+				EBMLId.Cluster,
+				element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 1]),
+				element(EBMLId.SimpleBlock, [0x81, 0, 32, 0x80, 2]),
+			),
+		),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	expect(packets.map(x => x.timestamp)).toEqual([0, 0.032]);
+});
