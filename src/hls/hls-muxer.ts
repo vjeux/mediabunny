@@ -1701,6 +1701,24 @@ export class HlsMuxer extends Muxer {
 						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
 						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
 					}
+
+					// CODECS lists each format present in any of the renditions (RFC 8216, Section 4.3.4.2), so a
+					// group's renditions can differ in codec
+					for (const ref of references) {
+						if (renditionWithSegments && ref.playlist.writtenSegments.length === 0) {
+							continue;
+						}
+
+						const refTrack = ref.playlist.tracks[0]!;
+						const refTrackData = this.trackDatas.find(x => x.track === refTrack);
+						const refCodecString = toHlsCodecString(
+							refTrackData?.info.decoderConfig.codec ?? refTrack.source._codec,
+							ref.playlist.segmentFormat,
+						);
+						if (!codecs.includes(refCodecString)) {
+							codecs.push(refCodecString);
+						}
+					}
 				}
 
 				assert(decl.playlist.peakBitrate !== null);
