@@ -1749,7 +1749,8 @@ export type FilePathSourceOptions = {
 };
 
 /**
- * A source backed by a path to a file. Intended for server-side usage in Node, Bun, or Deno.
+ * A source backed by a path to a file. Intended for server-side usage in Node, Bun, or Deno. The path must lead to a
+ * regular file; to read from a pipe or a device, use a {@link ReadableStreamSource}.
  *
  * Make sure to call `.dispose()` on the corresponding {@link Input} when done to explicitly free the internal file
  * handle acquired by this source.
@@ -1788,6 +1789,17 @@ export class FilePathSource extends PathedSource {
 		// Let's back this source with a CustomSource, makes the implementation very simple
 		this._customSource = new CustomSource({
 			getSize: async () => {
+				// Opening a named pipe waits for a writer, and pipes and devices state no size, so they'd read as
+				// empty files
+				const pathStats = await node.fs.stat(filePath);
+				if (!pathStats.isFile()) {
+					throw new TypeError(
+						`FilePathSource needs a regular file, but "${filePath}" isn't one (a named pipe, a device or a`
+						+ ' directory, say). To read from a pipe or a device, use a ReadableStreamSource, for example'
+						+ ' with Readable.toWeb(fs.createReadStream(path)).',
+					);
+				}
+
 				const fileHandle = await node.fs.open(filePath, 'r');
 				this._fileHandle = fileHandle;
 

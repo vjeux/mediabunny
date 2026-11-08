@@ -222,6 +222,45 @@ test('CustomSource releases stream readers after successful reads', async () => 
 	expect(streams.every(stream => !stream.locked)).toBe(true);
 });
 
+// Named pipes don't live in the file system on Windows
+test.skipIf(process.platform === 'win32')('FilePathSource refuses a named pipe instead of hanging', async () => {
+	const { execFileSync } = await import('node:child_process');
+	const fs = await import('node:fs');
+	const os = await import('node:os');
+	const fifoPath = path.join(os.tmpdir(), `mediabunny-fifo-${process.pid}-${Date.now()}`);
+	execFileSync('mkfifo', [fifoPath]);
+
+	const getFormatOutcome = async () => {
+		using input = new Input({ source: new FilePathSource(fifoPath), formats: ALL_FORMATS });
+		return await Promise.race([
+			input.getFormat().then(format => format.name, (error: unknown) => String(error)),
+			new Promise<string>(resolve => setTimeout(() => resolve('pending after 2 s'), 2000)),
+		]);
+	};
+	const error = /^TypeError: FilePathSource needs a regular file/;
+
+	try {
+		// Nothing writes to the pipe yet. On main, opening it waited for a writer, so this never settled.
+		expect(await getFormatOutcome()).toMatch(error);
+
+		// A valid MP3 written into the pipe. On main, the pipe stated a size of 0, so this was "unsupported format".
+		const mp3 = await readFile(path.join(__dirname, '..', 'public', 'Toothsome-Meme.VBRv2.mp3'));
+		const writer = fs.promises.open(fifoPath, 'w') // Opens once a reader does
+			.then(async (handle) => {
+				await handle.write(mp3.subarray(0, 32768)).catch(() => {});
+				await handle.close();
+			});
+		expect(await getFormatOutcome()).toMatch(error);
+
+		// Let the writer finish: open the reading end without waiting, then close it
+		const readFd = fs.openSync(fifoPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		await writer;
+		fs.closeSync(readFd);
+	} finally {
+		fs.unlinkSync(fifoPath);
+	}
+});
+
 test('CustomSource releases stream readers after read errors', async () => {
 	const error = new Error('Read failed');
 	const stream = new ReadableStream<Uint8Array>({
