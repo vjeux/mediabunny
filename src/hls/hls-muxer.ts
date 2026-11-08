@@ -1334,8 +1334,18 @@ export class HlsMuxer extends Muxer {
 			}
 
 			if (this.isLive) {
-				while (playlist.writtenSegments.length > this.maxLiveSegmentCount) {
+				// "The server MUST NOT remove a Media Segment from a Playlist file without an EXT-X-ENDLIST tag if that
+				// would produce a Playlist whose duration is less than three times the target duration." (RFC 8216,
+				// Section 6.2.2) So we may keep more segments than the maximum count.
+				const minPlaylistDuration = 3 * Math.ceil(this.targetSegmentDuration);
+				let playlistDuration = playlist.writtenSegments.reduce((sum, segment) => sum + segment.duration, 0);
+
+				while (
+					playlist.writtenSegments.length > this.maxLiveSegmentCount
+					&& playlistDuration - playlist.writtenSegments[0]!.duration >= minPlaylistDuration
+				) {
 					const popped = playlist.writtenSegments.shift()!;
+					playlistDuration -= popped.duration;
 					playlist.mediaSequence++;
 
 					if (!this.singleFilePerPlaylist) {
