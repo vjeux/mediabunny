@@ -1569,6 +1569,204 @@ test('Ogg: Vorbis with zero sample rate', async () => {
 	await expectGracefulRead(file, /Invalid Vorbis identification header/);
 });
 
+test('Ogg: Gaps in granule positions', async () => {
+	const readPackets = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const packets: { timestamp: number; duration: number; byteLength: number }[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			packets.push({ timestamp: packet.timestamp, duration: packet.duration, byteLength: packet.byteLength });
+		}
+		return packets;
+	};
+	const lookUp = async (file: Uint8Array, timestamp: number) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		return (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(timestamp))?.timestamp;
+	};
+
+	// Six pages of ten 20 ms Opus packets, with a second missing before the given page, as in a capture with a
+	// dropout, and optionally samples trimmed off the end
+	const opusFileWithGap = (gapBeforePage: number, trimmedSamples = 0) => {
+		const pages = [
+			oggPacketsPage({ headerType: 2 }, [opusHead()]),
+			oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		];
+		for (let i = 0; i < 6; i++) {
+			pages.push(oggPacketsPage({
+				headerType: i === 5 ? 4 : 0,
+				granule: 312 + 9600 * (i + 1) + (i >= gapBeforePage ? 48000 : 0) - (i === 5 ? trimmedSamples : 0),
+				sequence: 2 + i,
+			}, Array<Bytes>(10).fill(OPUS_PACKET)));
+		}
+		return concatList(pages);
+	};
+	const opusFile = opusFileWithGap(3);
+
+	const opusTimestamps = (await readPackets(opusFile)).map(x => x.timestamp);
+	expect(opusTimestamps).toHaveLength(60);
+	expect(opusTimestamps[29]).toBeCloseTo(0.58, 10);
+	expect(opusTimestamps[30]).toBeCloseTo(1.6, 10);
+	expect(opusTimestamps[59]).toBeCloseTo(2.18, 10);
+
+	// Lookups agree, and one within the gap returns the last packet before it
+	for (const timestamp of opusTimestamps) {
+		expect(await lookUp(opusFile, timestamp)).toBe(timestamp);
+	}
+	expect(await lookUp(opusFile, 1)).toBe(opusTimestamps[29]);
+
+	// End trimming on the final page still applies after an earlier gap
+	const trimmedPackets = await readPackets(opusFileWithGap(3, 100));
+	expect(trimmedPackets[59]!.timestamp).toBeCloseTo(2.18, 10);
+	expect(trimmedPackets[59]!.duration).toBeCloseTo(860 / 48000, 10);
+
+	// On the final page itself, a gap and end trimming can't be told apart, as its granule position only gives their
+	// difference. The stream still ends where that granule position says.
+	const lastPacket = (await readPackets(opusFileWithGap(5, 100)))[59]!;
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo((9600 * 6 + 48000 - 100) / 48000, 10);
+
+	// Where pages were lost, as their sequence numbers show, even a gap too short to count above counts, so that
+	// iteration agrees with lookups, which go by the granule positions. Here, the page holding the 11th packet is
+	// lost, either whole or holding the start of a packet that ends on the next page. That orphaned end isn't read as
+	// a packet with #371, and isn't counted below either way.
+	const lostPageFile = (withOrphanedEnd: boolean) => concatList([
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		oggPacketsPage({ granule: 312 + 9600, sequence: 2 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+		oggPacketsPage(
+			{ headerType: withOrphanedEnd ? 1 : 0, granule: 312 + 20160, sequence: 4 },
+			[...(withOrphanedEnd ? [zeros(10)] : []), ...Array<Bytes>(10).fill(OPUS_PACKET)],
+		),
+		oggPacketsPage({ headerType: 4, granule: 312 + 29760, sequence: 5 }, Array<Bytes>(10).fill(OPUS_PACKET)),
+	]);
+	for (const withOrphanedEnd of [false, true]) {
+		const file = lostPageFile(withOrphanedEnd);
+		const timestamps = (await readPackets(file)).filter(x => x.byteLength === 3).map(x => x.timestamp);
+		expect(timestamps.map(x => Math.round(x * 48000))).toEqual([
+			...Array.from({ length: 10 }, (_, i) => 960 * i),
+			...Array.from({ length: 20 }, (_, i) => 10560 + 960 * i),
+		]);
+		for (const timestamp of timestamps) {
+			expect(await lookUp(file, timestamp)).toBe(timestamp);
+		}
+	}
+
+	// The same in Vorbis, with a second missing before the sixth page of a file whose granule positions are off by
+	// a sample here and there, which isn't a gap
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	const gappedVorbisFile = vorbisFile.slice();
+	const view = new DataView(gappedVorbisFile.buffer);
+	for (let pos = 0, pageIndex = 0; pos < gappedVorbisFile.length; pageIndex++) {
+		const segmentCount = gappedVorbisFile[pos + 26]!;
+		const lacing = gappedVorbisFile.subarray(pos + 27, pos + 27 + segmentCount);
+		const pageSize = 27 + segmentCount + lacing.reduce((a, b) => a + b, 0);
+
+		if (pageIndex >= 5 && view.getInt32(pos + 10, true) === 0) {
+			view.setUint32(pos + 6, view.getUint32(pos + 6, true) + 44100, true);
+			view.setUint32(pos + 22, 0, true);
+			view.setUint32(pos + 22, oggCrc(gappedVorbisFile.subarray(pos, pos + pageSize)), true);
+		}
+
+		pos += pageSize;
+	}
+
+	const vorbisPackets = await readPackets(vorbisFile);
+	for (let i = 1; i < vorbisPackets.length; i++) {
+		const previous = vorbisPackets[i - 1]!;
+		expect(vorbisPackets[i]!.timestamp).toBeCloseTo(previous.timestamp + previous.duration, 10);
+	}
+
+	const gappedVorbisPackets = await readPackets(gappedVorbisFile);
+	expect(gappedVorbisPackets).toHaveLength(vorbisPackets.length);
+	const firstShifted = gappedVorbisPackets.findIndex((x, i) => x.timestamp !== vorbisPackets[i]!.timestamp);
+	expect(firstShifted).toBeGreaterThan(0);
+	for (let i = firstShifted; i < vorbisPackets.length; i++) {
+		expect(gappedVorbisPackets[i]!.timestamp).toBeCloseTo(vorbisPackets[i]!.timestamp + 1, 10);
+	}
+});
+
+test('Ogg: A single bogus granule position in a stream', async () => {
+	// Six pages of ten 20 ms Opus packets, with the third page's granule position replaced, as some muxers write 0 on
+	// pages holding audio (FFmpeg trac #3710). The pages after it agree with the packets again, so it isn't a gap.
+	const opusFileWithBogusGranule = (granule: number) => {
+		const pages = [
+			oggPacketsPage({ headerType: 2 }, [opusHead()]),
+			oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+		];
+		for (let i = 0; i < 6; i++) {
+			pages.push(oggPacketsPage({
+				headerType: i === 5 ? 4 : 0,
+				granule: i === 2 ? granule : 312 + 9600 * (i + 1),
+				sequence: 2 + i,
+			}, Array<Bytes>(10).fill(OPUS_PACKET)));
+		}
+		return concatList(pages);
+	};
+
+	for (const granule of [0, 2 ** 40]) {
+		using input = new Input({ source: new BufferSource(opusFileWithBogusGranule(granule)), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+
+		expect(timestamps.map(x => Math.round(x * 48000))).toEqual(Array.from({ length: 60 }, (_, i) => 960 * i));
+		expect(await track.computeDuration()).toBeCloseTo(1.2, 10);
+	}
+
+	// The same in Vorbis, with 0 as the fifth audio page's granule position
+	const readTimestamps = async (file: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+		return timestamps;
+	};
+	const vorbisFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg')));
+	const bogusVorbisFile = vorbisFile.slice();
+	const view = new DataView(bogusVorbisFile.buffer);
+	for (let pos = 0, audioPageCount = 0; pos < bogusVorbisFile.length;) {
+		const segmentCount = bogusVorbisFile[pos + 26]!;
+		const lacing = bogusVorbisFile.subarray(pos + 27, pos + 27 + segmentCount);
+		const pageSize = 27 + segmentCount + lacing.reduce((a, b) => a + b, 0);
+
+		if (view.getBigInt64(pos + 6, true) > 0n && ++audioPageCount === 5) {
+			view.setBigInt64(pos + 6, 0n, true);
+			view.setUint32(pos + 22, 0, true);
+			view.setUint32(pos + 22, oggCrc(bogusVorbisFile.subarray(pos, pos + pageSize)), true);
+		}
+
+		pos += pageSize;
+	}
+
+	expect(await readTimestamps(bogusVorbisFile)).toEqual(await readTimestamps(vorbisFile));
+});
+
+test('Ogg: The same bogus granule position on two consecutive pages', async () => {
+	// Twenty pages of one 20 ms Opus packet each (as FFmpeg writes with -page_duration 20000), the 10th and 11th with
+	// the same bogus granule position. Equal granule positions on two pages that each end a packet can't be a gap.
+	const pages = [
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+	];
+	for (let i = 0; i < 20; i++) {
+		pages.push(oggPacketsPage({
+			headerType: i === 19 ? 4 : 0,
+			granule: i === 9 || i === 10 ? 2 ** 40 : 312 + 960 * (i + 1),
+			sequence: 2 + i,
+		}, [OPUS_PACKET]));
+	}
+
+	using input = new Input({ source: new BufferSource(concatList(pages)), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		timestamps.push(packet.timestamp);
+	}
+
+	expect(timestamps.map(x => Math.round(x * 48000))).toEqual(Array.from({ length: 20 }, (_, i) => 960 * i));
+});
+
 const opusPages = (options: { pageCount?: number; lastEos?: boolean } = {}) => {
 	const pageCount = options.pageCount ?? 10;
 	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
