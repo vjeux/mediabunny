@@ -24,6 +24,7 @@ import {
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import {
 	Mp3FrameHeader,
+	MP3_FRAME_HEADER_SIZE,
 	getXingOffset,
 	INFO,
 	XING,
@@ -74,6 +75,7 @@ export class Mp3Demuxer extends Demuxer {
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
 	primingDelay = 0;
+	audioEndPosPromise: Promise<number | null> | null = null;
 	audioEndPos: number | null = null;
 
 	constructor(input: Input) {
@@ -84,8 +86,6 @@ export class Mp3Demuxer extends Demuxer {
 
 	async readMetadata() {
 		return this.metadataPromise ??= (async () => {
-			this.audioEndPos = await this.computeAudioEndPos();
-
 			// Keep loading until we find the first frame header
 			while (!this.firstFrameHeader && !this.lastSampleLoaded) {
 				await this.advanceReader();
@@ -130,7 +130,7 @@ export class Mp3Demuxer extends Demuxer {
 		let result = await readNextMp3FrameHeader(
 			this.reader,
 			this.lastLoadedPos,
-			this.audioEndPos,
+			this.audioEndPos ?? this.reader.fileSize,
 			this.firstFrameHeader,
 		);
 
@@ -143,9 +143,19 @@ export class Mp3Demuxer extends Demuxer {
 				result = await readNextMp3FrameHeader(
 					this.reader,
 					this.lastLoadedPos,
-					this.audioEndPos,
+					this.audioEndPos ?? this.reader.fileSize,
 					this.firstFrameHeader,
 				);
+			}
+
+			// Real audio goes on frame after frame, but a lone frame may be bytes inside the APEv2 and ID3v1 tags at
+			// the end of the file. Only then are those looked up, since that reads the end of the file, which sources
+			// that can only be read in order (like a UrlSource whose server ignores range requests) stream to first.
+			if (result && !(await this.isFollowedByFrame(result))) {
+				this.audioEndPos = await (this.audioEndPosPromise ??= this.computeAudioEndPos());
+				if (this.audioEndPos !== null && result.startPos >= this.audioEndPos) {
+					result = null;
+				}
 			}
 		}
 
@@ -234,6 +244,18 @@ export class Mp3Demuxer extends Demuxer {
 		this.nextTimestampInSamples += header.audioSamplesInFrame;
 
 		return;
+	}
+
+	/** Whether another frame starts right where the given one ends (or a byte before, if it's a byte short). */
+	async isFollowedByFrame(frame: { header: Mp3FrameHeader; startPos: number }) {
+		const nextPos = frame.startPos + frame.header.totalSize;
+		const nextFrame = await readNextMp3FrameHeader(
+			this.reader,
+			nextPos - 1,
+			nextPos + MP3_FRAME_HEADER_SIZE,
+			this.firstFrameHeader,
+		);
+		return nextFrame !== null;
 	}
 
 	/** Skips the ID3v2 tags following the frame that ended at lastLoadedPos, returning where they end. */
