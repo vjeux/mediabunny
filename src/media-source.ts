@@ -2772,18 +2772,32 @@ class AudioEncoderWrapper {
 			this.pcmStartTimestamp = timestamp;
 		}
 
-		// Read the whole sample interleaved into our reusable read buffer, growing it if needed
-		const isS32 = audioSample.format === 's32' || audioSample.format === 's32-planar';
-		const readFormat = isS32 ? 's32' : 'f32'; // Can't read in f32 due to precision loss
-		const scale = isS32 ? 1 / 2147483648 : 1;
+		// Read the whole sample interleaved into our reusable read buffer, growing it if needed. It's read in its own
+		// sample type and converted here: converting AudioData-backed samples is up to the browser otherwise, and
+		// Chrome scales positive values by 1/32767 (s16) and 1/127 (u8), which made copies off by one
+		const readFormat = toInterleavedAudioFormat(audioSample.format);
 
 		const allocationSize = audioSample.allocationSize({ planeIndex: 0, format: readFormat });
 		if (this.pcmReadBuffer.byteLength < allocationSize) {
 			this.pcmReadBuffer = new ArrayBuffer(allocationSize);
 		}
-		const values = isS32
-			? new Int32Array(this.pcmReadBuffer, 0, allocationSize / 4)
-			: new Float32Array(this.pcmReadBuffer, 0, allocationSize / 4);
+
+		let values: Uint8Array | Int16Array | Int32Array | Float32Array;
+		let bias = 0;
+		let scale = 1;
+		if (readFormat === 'u8') {
+			values = new Uint8Array(this.pcmReadBuffer, 0, allocationSize);
+			bias = -128;
+			scale = 1 / 128;
+		} else if (readFormat === 's16') {
+			values = new Int16Array(this.pcmReadBuffer, 0, allocationSize / 2);
+			scale = 1 / 32768;
+		} else if (readFormat === 's32') {
+			values = new Int32Array(this.pcmReadBuffer, 0, allocationSize / 4);
+			scale = 1 / 2147483648;
+		} else {
+			values = new Float32Array(this.pcmReadBuffer, 0, allocationSize / 4);
+		}
 		audioSample.copyTo(values, { planeIndex: 0, format: readFormat });
 
 		if (shouldClose) {
@@ -2805,7 +2819,7 @@ class AudioEncoderWrapper {
 				this.writeOutputValue(
 					this.pcmScratchView,
 					(valueOffset + i) * this.outputSampleSize,
-					values[readOffset + i]! * scale,
+					(values[readOffset + i]! + bias) * scale,
 				);
 			}
 
