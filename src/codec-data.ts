@@ -1848,7 +1848,7 @@ const VP9_COLOR_SPACE_TABLE = {
 
 export const extractVp9CodecInfoFromPacket = (
 	packet: Uint8Array,
-): Vp9CodecInfo | null => {
+): (Vp9CodecInfo & { width: number; height: number }) | null => {
 	// eslint-disable-next-line @stylistic/max-len
 	// https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf
 	// http://downloads.webmproject.org/docs/vp9/vp9-bitstream_superframe-and-uncompressed-header_v1.0.pdf
@@ -1968,7 +1968,26 @@ export const extractVp9CodecInfoFromPacket = (
 		colourPrimaries,
 		transferCharacteristics,
 		matrixCoefficients,
+		width,
+		height,
 	};
+};
+
+/** Reads the frame size from a VP8 key frame (RFC 6386, section 9.1). */
+export const extractVp8FrameSizeFromPacket = (packet: Uint8Array) => {
+	const isKeyFrame = packet.length >= 10 && (packet[0]! & 0x01) === 0;
+	if (!isKeyFrame || packet[3] !== 0x9d || packet[4] !== 0x01 || packet[5] !== 0x2a) {
+		return null;
+	}
+
+	// The upper two bits of each dimension are the upscaling mode
+	const width = (packet[6]! | (packet[7]! << 8)) & 0x3fff;
+	const height = (packet[8]! | (packet[9]! << 8)) & 0x3fff;
+	if (width === 0 || height === 0) {
+		return null;
+	}
+
+	return { width, height };
 };
 
 export const vp9CodecInfoHasColorInfo = (info: Vp9CodecInfo) => {
@@ -2067,7 +2086,7 @@ export const iterateAv1PacketObus = function* (packet: Uint8Array) {
  */
 export const extractAv1CodecInfoFromPacket = (
 	packet: Uint8Array,
-): Av1CodecInfo | null => {
+): (Av1CodecInfo & { width: number; height: number }) | null => {
 	// https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 
 	for (const { type, data } of iterateAv1PacketObus(packet)) {
@@ -2167,9 +2186,9 @@ export const extractAv1CodecInfoFromPacket = (
 		const frameWidthBitsMinus1 = bitstream.readBits(4);
 		const frameHeightBitsMinus1 = bitstream.readBits(4);
 		const n1 = frameWidthBitsMinus1 + 1;
-		bitstream.skipBits(n1); // max_frame_width_minus_1
+		const maxFrameWidthMinus1 = bitstream.readBits(n1);
 		const n2 = frameHeightBitsMinus1 + 1;
-		bitstream.skipBits(n2); // max_frame_height_minus_1
+		const maxFrameHeightMinus1 = bitstream.readBits(n2);
 
 		// Frame IDs
 		let frameIdNumbersPresentFlag = 0;
@@ -2301,6 +2320,8 @@ export const extractAv1CodecInfoFromPacket = (
 			colourPrimaries,
 			transferCharacteristics,
 			matrixCoefficients,
+			width: maxFrameWidthMinus1 + 1,
+			height: maxFrameHeightMinus1 + 1,
 		};
 	}
 
