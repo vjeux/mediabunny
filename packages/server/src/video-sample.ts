@@ -321,7 +321,11 @@ export const transformVideoSample = async (
 	let srcFrameOwned = false;
 
 	if (sample._data instanceof AvFrameVideoSampleResource) {
-		srcFrame = sample._data.frame;
+		// A reference of our own, taken before anything is awaited, so that the sample can be closed meanwhile
+		srcFrame = new NodeAv.Frame();
+		srcFrame.alloc();
+		srcFrame.ref(sample._data.frame);
+		srcFrameOwned = true;
 	} else {
 		if (sample.format === null) {
 			return null;
