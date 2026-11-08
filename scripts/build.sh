@@ -68,6 +68,9 @@ tsx scripts/check-docblocks.ts \
 # Checks that API docs are generatable
 npm run docs:generate -- --dry
 
+# API Extractor leaves `declare global` blocks out of the rollup, so add them for the global namespace declarations
+tsx scripts/add-global-declarations.ts dist/modules dist/mediabunny.d.ts
+
 # Appends stuff to the declaration files to register the global variables these libraries expose
 echo 'export as namespace Mediabunny;' >> dist/mediabunny.d.ts
 echo 'export as namespace MediabunnyMp3Encoder;' >> packages/mp3-encoder/dist/mediabunny-mp3-encoder.d.ts
