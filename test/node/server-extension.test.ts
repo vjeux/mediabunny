@@ -2269,59 +2269,82 @@ describe('Video', async () => {
 
 		await encoder.init();
 
-		// Encode a single white frame to get one packet (and the decoder config) to drive the loop with
-		const data = new Uint8Array(1920 * 1080 * 4).fill(0xff); // White
-		using bootstrapSample = new VideoSample(data, {
-			format: 'RGBX',
-			codedWidth: 1920,
-			codedHeight: 1080,
-			timestamp: 0,
-			duration: 1 / 30,
-		});
-		await encoder.encode(bootstrapSample, {});
-		await encoder.flush();
-		assert(decoderConfig);
-		assert(pendingPackets.length > 0);
+		// The native coders must be closed even when the test fails, as nothing else stops them
+		try {
+			// Encode a single white frame to get one packet (and the decoder config) to drive the loop with
+			const data = new Uint8Array(1920 * 1080 * 4).fill(0xff); // White
+			using bootstrapSample = new VideoSample(data, {
+				format: 'RGBX',
+				codedWidth: 1920,
+				codedHeight: 1080,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			await encoder.encode(bootstrapSample, {});
+			await encoder.flush();
+			assert(decoderConfig);
+			assert(pendingPackets.length > 0);
 
-		const sourcePacket = pendingPackets[0]!;
-		pendingPackets.length = 0;
-
-		const decoder = new NodeAvVideoDecoder();
-		// @ts-expect-error Readonly
-		decoder.codec = 'avc';
-		// @ts-expect-error Readonly
-		decoder.config = decoderConfig;
-		// @ts-expect-error Readonly
-		decoder.onSample = (sample: VideoSample) => {
-			decodedFrames.push(sample);
-		};
-		await decoder.init();
-
-		const iterations = 300;
-		let baselineRss = 0;
-
-		for (let i = 1; i <= iterations; i++) {
-			await decoder.decode(sourcePacket.clone({ timestamp: i / 30 }));
-
-			for (const frame of decodedFrames) {
-				await encoder.encode(frame, {});
-				frame.close();
-			}
-			decodedFrames.length = 0;
+			const sourcePacket = pendingPackets[0]!;
 			pendingPackets.length = 0;
 
-			if (i === 100) { // Should have stabilized by then
-				baselineRss = process.memoryUsage().rss;
+			const decoder = new NodeAvVideoDecoder();
+			// @ts-expect-error Readonly
+			decoder.codec = 'avc';
+			// @ts-expect-error Readonly
+			decoder.config = decoderConfig;
+			// @ts-expect-error Readonly
+			decoder.onSample = (sample: VideoSample) => {
+				decodedFrames.push(sample);
+			};
+			await decoder.init();
+
+			try {
+				let frameCount = 0;
+				let packetCount = 0;
+
+				// Decodes the packet again and re-encodes the result
+				const roundTripFrame = async () => {
+					frameCount++;
+					await decoder.decode(sourcePacket.clone({ timestamp: frameCount / 30 }));
+
+					for (const frame of decodedFrames) {
+						await encoder.encode(frame, {});
+						frame.close();
+					}
+					decodedFrames.length = 0;
+					packetCount += pendingPackets.length;
+					pendingPackets.length = 0;
+				};
+
+				// The encoder holds frames in its lookahead and in its frame threads, whose count grows with the CPU
+				// count, so memory keeps growing until well after the first packet comes out (at frame 50 to 81 on 2
+				// to 192 cores). Only measure from there, but within a bounded number of frames.
+				while (packetCount < 150) {
+					if (frameCount === 500) {
+						throw new Error(`The encoder output only ${packetCount} packets for ${frameCount} frames.`);
+					}
+
+					await roundTripFrame();
+				}
+
+				const baselineRss = process.memoryUsage().rss;
+
+				for (let i = 0; i < 200; i++) {
+					await roundTripFrame();
+				}
+
+				const growth = process.memoryUsage().rss - baselineRss;
+				expect(growth).toBeLessThan(10 * 1024 * 1024);
+			} finally {
+				await decoder.close();
 			}
+		} finally {
+			for (const frame of decodedFrames) {
+				frame.close();
+			}
+			await encoder.close();
 		}
-
-		const finalRss = process.memoryUsage().rss;
-		const growth = finalRss - baselineRss;
-
-		expect(growth).toBeLessThan(10 * 1024 * 1024);
-
-		await encoder.close();
-		await decoder.close();
 	});
 
 	test('No B-frames are skipped when decoding AVC', async () => {
