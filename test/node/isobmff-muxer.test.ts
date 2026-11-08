@@ -1534,6 +1534,49 @@ test('Chunks written in chronological order, in-memory Fast Start', async () => 
 	await testChunkOrder('in-memory');
 });
 
+test('AC-3 in MOV', async () => {
+	await testAc3InMov('ac3', 'ac-3', 'dac3');
+});
+
+test('E-AC-3 in MOV', async () => {
+	// Apple's players drop E-AC-3 tracks in MOV whose dec3 box isn't wrapped in a wave box
+	await testAc3InMov('eac3', 'ec-3', 'dec3');
+});
+
+const testAc3InMov = async (codec: 'ac3' | 'eac3', sampleEntryName: string, configBoxName: string) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, `../public/${codec}.mp4`)),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({
+		format: new MovOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({
+		input,
+		output,
+		showWarnings: false,
+	});
+	await conversion.execute();
+
+	// The config box goes into a wave box
+	const bytes = new Uint8Array(output.target.buffer!);
+	expect(findBox(bytes, [...STSD_PATH, sampleEntryName, 'wave', configBoxName])).not.toBeNull();
+
+	using outputAsInput = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await outputAsInput.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe(codec);
+	expect(await track.getNumberOfChannels()).toBe(6);
+	expect(await track.getSampleRate()).toBe(48000);
+};
+
 test('Chunks written in chronological order, reserved Fast Start', async () => {
 	await testChunkOrder('reserve');
 });

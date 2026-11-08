@@ -1214,7 +1214,11 @@ export const esds = (trackData: IsobmffAudioTrackData) => {
 export const wave = (trackData: IsobmffAudioTrackData) => {
 	return box('wave', undefined, [
 		frma(trackData),
-		enda(trackData),
+		trackData.track.source._codec === 'ac3'
+			? dac3(trackData)
+			: trackData.track.source._codec === 'eac3'
+				? dec3(trackData)
+				: enda(trackData),
 		box('\x00\x00\x00\x00'), // NULL tag at the end
 	]);
 };
@@ -2356,8 +2360,8 @@ const audioCodecToConfigurationBox = (codec: AudioCodec, isQuickTime: boolean) =
 		case 'opus': return dOps;
 		case 'vorbis': return esds;
 		case 'flac': return dfLa;
-		case 'ac3': return dac3;
-		case 'eac3': return dec3;
+		case 'ac3': return isQuickTime ? wave : dac3;
+		case 'eac3': return isQuickTime ? wave : dec3;
 		case 'dts': return ddts;
 		case 'truehd': return dmlp;
 	}
