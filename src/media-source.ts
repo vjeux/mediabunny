@@ -2544,21 +2544,6 @@ class AudioEncoderWrapper {
 	private async processAndEncode(audioSample: AudioSample, shouldClose: boolean) {
 		const config = this.encodingConfig;
 
-		if (
-			config.transform?.sampleFormat !== undefined
-			&& toInterleavedAudioFormat(audioSample.format) !== config.transform.sampleFormat
-		) {
-			// Do a sample format conversion
-			const newSample = audioSampleToInterleavedFormat(audioSample, config.transform.sampleFormat);
-
-			if (shouldClose) {
-				audioSample.close();
-			}
-
-			audioSample = newSample;
-			shouldClose = true;
-		}
-
 		if (config.transform?.process) {
 			try {
 				let processed = config.transform.process(audioSample);
@@ -2611,6 +2596,19 @@ class AudioEncoderWrapper {
 	 */
 	private async encodeSample(audioSample: AudioSample, shouldClose: boolean) {
 		try {
+			const sampleFormat = this.encodingConfig.transform?.sampleFormat;
+			if (sampleFormat !== undefined && toInterleavedAudioFormat(audioSample.format) !== sampleFormat) {
+				// Converted right before encoding, so that it also applies to the samples returned by process
+				const newSample = audioSampleToInterleavedFormat(audioSample, sampleFormat);
+
+				if (shouldClose) {
+					audioSample.close();
+				}
+
+				audioSample = newSample;
+				shouldClose = true;
+			}
+
 			if (!this.encoderInitialized) {
 				if (!this.ensureEncoderPromise) {
 					this.ensureEncoder(audioSample);
