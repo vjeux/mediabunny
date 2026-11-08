@@ -32,6 +32,7 @@ import {
 import {
 	AudioCodec,
 	generateAv1CodecConfigurationFromCodecString,
+	OPUS_SAMPLE_RATE,
 	parsePcmCodec,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
@@ -927,6 +928,9 @@ export const soundSampleDescription = (
 		version = 1;
 	}
 
+	// Opus-in-ISOBMFF fixes the sample entry's rate at 48 kHz, which must also match dOps' InputSampleRate
+	const sampleRate = trackData.track.source._codec === 'opus' ? OPUS_SAMPLE_RATE : trackData.info.sampleRate;
+
 	if (version === 0) {
 		contents = [
 			Array(6).fill(0), // Reserved
@@ -941,7 +945,7 @@ export const soundSampleDescription = (
 			trackData.track.source._codec === 'truehd'
 				? u32(trackData.info.sampleRate) // TrueHD stores the sample rate as a plain integer
 				: [
-						u16(trackData.info.sampleRate < 2 ** 16 ? trackData.info.sampleRate : 0), // Sample rate (upper)
+						u16(sampleRate < 2 ** 16 ? sampleRate : 0), // Sample rate (upper)
 						u16(0), // Sample rate (lower)
 					],
 		];
@@ -958,7 +962,7 @@ export const soundSampleDescription = (
 			u16(Math.min(sampleSizeInBits, 16)), // Sample size (bits)
 			i16(compressionId), // Compression ID
 			u16(0), // Packet size
-			u16(trackData.info.sampleRate < 2 ** 16 ? trackData.info.sampleRate : 0), // Sample rate (upper)
+			u16(sampleRate < 2 ** 16 ? sampleRate : 0), // Sample rate (upper)
 			u16(0), // Sample rate (lower)
 			isPcmCodec
 				? [
@@ -1068,7 +1072,6 @@ export const enda = (trackData: IsobmffAudioTrackData) => {
 export const dOps = (trackData: IsobmffAudioTrackData) => {
 	let outputChannelCount = trackData.info.numberOfChannels;
 	let preSkip = 312; // Default
-	let inputSampleRate = trackData.info.sampleRate;
 	let outputGain = 0;
 	let channelMappingFamily = 0;
 	let channelMappingTable: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -1084,7 +1087,6 @@ export const dOps = (trackData: IsobmffAudioTrackData) => {
 
 		outputChannelCount = header.outputChannelCount;
 		preSkip = header.preSkip;
-		inputSampleRate = header.inputSampleRate;
 		outputGain = header.outputGain;
 		channelMappingFamily = header.channelMappingFamily;
 
@@ -1098,7 +1100,9 @@ export const dOps = (trackData: IsobmffAudioTrackData) => {
 		u8(0), // Version
 		u8(outputChannelCount), // OutputChannelCount
 		u16(preSkip), // PreSkip
-		u32(inputSampleRate), // InputSampleRate
+		// The input sample rate is informational only (RFC 7845), but Chromium rejects the track unless it equals the
+		// sample entry's rate, which is always 48 kHz for Opus
+		u32(OPUS_SAMPLE_RATE), // InputSampleRate
 		i16(outputGain), // OutputGain
 		u8(channelMappingFamily), // ChannelMappingFamily
 		...channelMappingTable,
