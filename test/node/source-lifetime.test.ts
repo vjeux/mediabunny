@@ -32,6 +32,13 @@ test('Direct source disposal', async () => {
 	expect(source._disposed);
 });
 
+test('Input takes a readonly list of formats', async () => {
+	// Input never changes the list, so a readonly one (from `as const` or a frozen shared config) type-checks and works
+	const formats = Object.freeze([...ALL_FORMATS]);
+	using input = new Input({ source: new FilePathSource(path.join(__dirname, '../public/video.mp4')), formats });
+	expect(await input.getFormat()).toBe(MP4);
+});
+
 test('Implicit source disposal', async () => {
 	const filePath = path.join(__dirname, '../public/video.mp4');
 	const source = new FilePathSource(filePath);
