@@ -298,6 +298,8 @@ const oddH26xDimensionError = (codec: VideoCodec, width: number, height: number)
 
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
+	/** Resolved once the wrapper is closed, so that nothing keeps waiting for an encoder that may never come. */
+	private closedSignal = promiseWithResolvers();
 	private encoderInitialized = false;
 	private encoder: VideoEncoder | null = null;
 	private encoderConfig: VideoEncoderConfig | null = null;
@@ -611,7 +613,11 @@ class VideoEncoderWrapper {
 					// code paths are calling this method: It's important that the call that
 					// initialized the encoder go through this code first.
 					if (!this.encoderInitialized) {
-						await this.ensureEncoderPromise;
+						// Racing the close: an initialization may never finish (one hanging in a platform codec, say)
+						await Promise.race([this.ensureEncoderPromise, this.closedSignal.promise]);
+						if (this.closed) {
+							break;
+						}
 					}
 				}
 				assert(this.encoderInitialized);
@@ -957,6 +963,17 @@ class VideoEncoderWrapper {
 			assert(this.source._connectedTrack);
 			this.muxer = this.source._connectedTrack.output._muxer;
 
+			if (this.closed) {
+				// Closed (or canceled) while this initialization was pending, when there was no encoder to close yet:
+				// nothing else will close the ones just created
+				if (this.encoder && this.encoder.state !== 'closed') {
+					this.encoder.close();
+				}
+				if (this.alphaEncoder && this.alphaEncoder.state !== 'closed') {
+					this.alphaEncoder.close();
+				}
+			}
+
 			this.encoderInitialized = true;
 		})();
 
@@ -1294,6 +1311,7 @@ class VideoEncoderWrapper {
 			// This cleanup must also run when padding or flushing threw (e.g. due to an encoder error), otherwise
 			// samples, frames and encoders would be left dangling
 			this.closed = true;
+			this.closedSignal.resolve();
 
 			this.frameRateLastSample?.close();
 			this.frameRateLastSample = null;
@@ -2521,6 +2539,8 @@ const END_PADDING_SLACK = 0.01;
 
 class AudioEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
+	/** Resolved once the wrapper is closed, so that nothing keeps waiting for an encoder that may never come. */
+	private closedSignal = promiseWithResolvers();
 	private encoderInitialized = false;
 	private encoder: AudioEncoder | null = null;
 	private muxer: Muxer | null = null;
@@ -2719,7 +2739,11 @@ class AudioEncoderWrapper {
 				// calling this method: It's important that the call that initialized the encoder go through this
 				// code first.
 				if (!this.encoderInitialized) {
-					await this.ensureEncoderPromise;
+					// Racing the close: an initialization may never finish (one hanging in a platform codec, say)
+					await Promise.race([this.ensureEncoderPromise, this.closedSignal.promise]);
+					if (this.closed) {
+						return;
+					}
 				}
 			}
 			assert(this.encoderInitialized);
@@ -3082,6 +3106,12 @@ class AudioEncoderWrapper {
 			assert(this.source._connectedTrack);
 			this.muxer = this.source._connectedTrack.output._muxer;
 
+			if (this.closed && this.encoder && this.encoder.state !== 'closed') {
+				// Closed (or canceled) while this initialization was pending, when there was no encoder to close yet:
+				// nothing else will close the one just created
+				this.encoder.close();
+			}
+
 			this.encoderInitialized = true;
 		})();
 
@@ -3265,6 +3295,7 @@ class AudioEncoderWrapper {
 			// This cleanup must also run when flushing threw (e.g. due to an encoder error), otherwise the encoder
 			// would be left dangling
 			this.closed = true;
+			this.closedSignal.resolve();
 			this.resampler = null;
 
 			if (this.customEncoder) {
