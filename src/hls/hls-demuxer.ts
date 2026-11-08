@@ -682,6 +682,7 @@ export class HlsDemuxer extends Demuxer {
 
 abstract class HlsInputTrackBacking implements InputTrackBacking {
 	hydrationPromise: Promise<void> | null = null;
+	backingTrackPromise: Promise<InputTrackBacking> | null = null;
 
 	constructor(public internalTrack: InternalTrack) {}
 
@@ -690,6 +691,13 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 
 	hydrate() {
 		return this.hydrationPromise ??= (async () => {
+			this.internalTrack.backingTrack = await this.findBackingTrack();
+		})();
+	}
+
+	/** Finds the track in the media that this track stands for, without making it this track's backing track yet. */
+	findBackingTrack() {
+		return this.backingTrackPromise ??= (async () => {
 			const segmentedInput = this.internalTrack.demuxer.getSegmentedInputForPath(this.internalTrack.fullPath);
 
 			let trackBacking: InputTrackBacking | null = null;
@@ -724,7 +732,7 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 				throw new Error('Could not find matching track in underlying media data.');
 			}
 
-			this.internalTrack.backingTrack = trackBacking;
+			return trackBacking;
 		})();
 	}
 
@@ -735,6 +743,17 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 		}
 
 		return this.hydrate().then(fn);
+	}
+
+	/**
+	 * For optional metadata the playlist doesn't give: asks the media, and if that can't be read, sticks with the
+	 * playlist's answer. This doesn't make the media's track this track's backing track, which would switch other
+	 * metadata over to the media, even when that can't be read.
+	 */
+	fromMedia<T>(fn: (backingTrack: InputTrackBacking) => MaybePromise<T>, playlistValue: T): MaybePromise<T> {
+		const backingTrack = this.internalTrack.backingTrack;
+		const value = backingTrack ? fn(backingTrack) : this.findBackingTrack().then(fn);
+		return value instanceof Promise ? value.catch(() => playlistValue) : value;
 	}
 
 	getCodec(): MediaCodec | null {
@@ -762,12 +781,23 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 		return null;
 	}
 
-	getLanguageCode(): string {
-		return this.internalTrack.languageCode;
+	getLanguageCode(): MaybePromise<string> {
+		const { languageCode } = this.internalTrack;
+		if (languageCode !== UNDETERMINED_LANGUAGE) {
+			return languageCode;
+		}
+
+		// The playlist doesn't say (it never can for the tracks of a variant stream itself), but the media might
+		return this.fromMedia(backingTrack => backingTrack.getLanguageCode(), languageCode);
 	}
 
-	getName(): string | null {
-		return this.internalTrack.name;
+	getName(): MaybePromise<string | null> {
+		const { name } = this.internalTrack;
+		if (name !== null) {
+			return name;
+		}
+
+		return this.fromMedia(backingTrack => backingTrack.getName(), name);
 	}
 
 	getNumber(): number {
