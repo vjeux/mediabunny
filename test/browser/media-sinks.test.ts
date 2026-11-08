@@ -3,7 +3,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
-import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, CanvasSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -52,6 +52,22 @@ test('No B-frames are skipped when software-decoding AVC', async () => {
 	}
 
 	expect(count).toBe(48);
+});
+
+test('CanvasSinks built from one reused options object keep their own settings', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	const options: ConstructorParameters<typeof CanvasSink>[1] = { width: 160, fit: 'contain' };
+	const thumbnails = new CanvasSink(track, options);
+	options.width = 480;
+	const previews = new CanvasSink(track, options);
+	options.width = -1; // Too late to matter, and must not bypass the validation
+
+	const thumbnail = (await thumbnails.getCanvas(0))!.canvas;
+	const preview = (await previews.getCanvas(0))!.canvas;
+	expect(thumbnail.width).toBe(160);
+	expect(preview.width).toBe(480);
 });
 
 test('No B-frames are skipped when software-decoding AVC, Annex B edition', async () => {

@@ -125,6 +125,37 @@ test('VideoSampleSource, same-sized frames with width and height set', async () 
 	input.dispose();
 });
 
+test('VideoSampleSource, sources built from one reused config keep their own transform', async () => {
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const config: ConstructorParameters<typeof VideoSampleSource>[0] = {
+		codec: 'vp8',
+		quality: new Quality('medium'),
+		transform: { width: 64, height: 32, fit: 'fill' },
+	};
+	const sources: VideoSampleSource[] = [];
+	for (const [width, height] of [[64, 32], [32, 16]] as const) {
+		config.transform!.width = width;
+		config.transform!.height = height;
+		const source = new VideoSampleSource(config);
+		output.addVideoTrack(source);
+		sources.push(source);
+	}
+	config.transform!.width = -1; // Too late to matter, and must not bypass the validation
+
+	await output.start();
+	for (const source of sources) {
+		const sample = new VideoSample(makeCanvas(128, 64), { timestamp: 0, duration: 1 / 30 });
+		await source.add(sample);
+		sample.close();
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const tracks = await input.getVideoTracks();
+	expect(await Promise.all(tracks.map(track => track.getCodedWidth()))).toEqual([64, 32]);
+	expect(await Promise.all(tracks.map(track => track.getCodedHeight()))).toEqual([32, 16]);
+});
+
 test('VideoSampleSource, same-sized frames with rotation set to 90', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { rotate: 90 } },
