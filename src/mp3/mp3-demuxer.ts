@@ -32,6 +32,7 @@ import {
 	computeAverageMp3FrameSize,
 	getMp3ChannelCount,
 	MP3_DECODER_DELAY,
+	readMp3FrameHeader,
 } from '../../shared/mp3-misc';
 import {
 	ID3_V1_TAG_SIZE,
@@ -127,31 +128,32 @@ export class Mp3Demuxer extends Demuxer {
 			}
 		}
 
-		let result = await readNextMp3FrameHeader(
-			this.reader,
-			this.lastLoadedPos,
-			this.audioEndPos ?? this.reader.fileSize,
-			this.firstFrameHeader,
-		);
+		let result = this.firstFrameHeader ? await this.readDirectlyFollowingFrame() : null;
 
-		if (this.firstFrameHeader && (!result || result.startPos > this.lastLoadedPos + 1)) {
-			// No frame follows the previous one directly. If ID3v2 tags do (like in concatenated files), skip them
-			// instead of searching them for frames, since bytes inside them (like cover art) can look like frames.
-			const tagsEnd = await this.skipId3V2Tags(this.lastLoadedPos);
-			if (tagsEnd !== null) {
-				this.lastLoadedPos = tagsEnd;
-				result = await readNextMp3FrameHeader(
-					this.reader,
-					this.lastLoadedPos,
-					this.audioEndPos ?? this.reader.fileSize,
-					this.firstFrameHeader,
-				);
+		if (!result) {
+			if (this.firstFrameHeader) {
+				// No frame follows the previous one directly. If ID3v2 tags do (like in concatenated files), skip them
+				// instead of searching them for frames, since bytes inside them (like cover art) can look like frames.
+				// This looks right behind the previous frame before searching any further, since sources that can only
+				// be read in order (like a UrlSource whose server ignores range requests) may not keep what a long
+				// search went past.
+				const tagsEnd = await this.skipId3V2Tags(this.lastLoadedPos);
+				if (tagsEnd !== null) {
+					this.lastLoadedPos = tagsEnd;
+				}
 			}
+
+			result = await readNextMp3FrameHeader(
+				this.reader,
+				this.lastLoadedPos,
+				this.audioEndPos ?? this.reader.fileSize,
+				this.firstFrameHeader,
+			);
 
 			// Real audio goes on frame after frame, but a lone frame may be bytes inside the APEv2 and ID3v1 tags at
 			// the end of the file. Only then are those looked up, since that reads the end of the file, which sources
-			// that can only be read in order (like a UrlSource whose server ignores range requests) stream to first.
-			if (result && !(await this.isFollowedByFrame(result))) {
+			// that can only be read in order stream to first.
+			if (this.firstFrameHeader && result && !(await this.isFollowedByFrame(result))) {
 				this.audioEndPos = await (this.audioEndPosPromise ??= this.computeAudioEndPos());
 				if (this.audioEndPos !== null && result.startPos >= this.audioEndPos) {
 					result = null;
@@ -259,6 +261,40 @@ export class Mp3Demuxer extends Demuxer {
 	}
 
 	/** Skips the ID3v2 tags following the frame that ended at lastLoadedPos, returning where they end. */
+	/**
+	 * Returns the frame right after the previous one, which ended right after lastLoadedPos (or at it if it was a byte
+	 * short), if it matches the stream like readNextMp3FrameHeader requires
+	 */
+	async readDirectlyFollowingFrame() {
+		const ref = this.firstFrameHeader;
+		assert(ref);
+
+		let slice = this.reader.requestSlice(this.lastLoadedPos, MP3_FRAME_HEADER_SIZE + 1);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return null;
+		}
+
+		for (const startPos of [this.lastLoadedPos, this.lastLoadedPos + 1]) {
+			slice.filePos = startPos;
+			const remainingBytes = this.reader.fileSize !== null ? this.reader.fileSize - startPos : null;
+			const { header } = readMp3FrameHeader(readU32Be(slice), remainingBytes);
+			if (
+				header
+				&& header.sampleRate === ref.sampleRate
+				&& header.mpegVersionId === ref.mpegVersionId
+				&& header.layer === ref.layer
+				&& getMp3ChannelCount(header.channel) === getMp3ChannelCount(ref.channel)
+			) {
+				return { header, startPos };
+			}
+		}
+
+		return null;
+	}
+
 	async skipId3V2Tags(lastLoadedPos: number) {
 		let tagsEnd: number | null = null;
 		// The previous frame ended right after lastLoadedPos, or at it if it was a byte short

@@ -68,7 +68,11 @@ test('Does not read tags between or after MP3 frames as frames', async () => {
 });
 
 test('An MP3 larger than the cache reads from a server that ignores range requests', async () => {
-	const data = fs.readFileSync(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3')); // 389 kB
+	const plain = fs.readFileSync(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3')); // 389 kB
+	// Junk behind the last frame, like the 0xdeadbeef padding of ExoPlayer's trailing-garbage test files. The search
+	// for the next frame runs through all of it, so what lies right behind the last frame must be looked at first.
+	const garbage = new Uint8Array(2 ** 18).map((_, i) => [0xde, 0xad, 0xbe, 0xef][i % 4]!);
+	let data = new Uint8Array(plain);
 	// Like Python's http.server: always the whole file, with its Content-Length
 	const server = http.createServer((req, res) => {
 		res.on('error', () => {});
@@ -80,19 +84,29 @@ test('An MP3 larger than the cache reads from a server that ignores range reques
 	Logging.level = LogLevel.Silent; // UrlSource warns about the missing range support
 
 	try {
-		// A 64 KiB cache stands in for the default 64 MiB one with an MP3 over 64 MiB (a long podcast, an audiobook).
-		// Looking for tags at the end of the file before reading the frames would stream the whole file first, and the
-		// start would be gone by the time the frames are read.
-		using input = new Input({ source: new UrlSource(url, { maxCacheSize: 2 ** 16 }), formats: ALL_FORMATS });
-		const track = await input.getPrimaryAudioTrack();
-		assert(track);
+		for (const file of [new Uint8Array(plain), new Uint8Array([...plain, ...garbage])]) {
+			data = file;
 
-		let packetCount = 0;
-		for await (const packet of new EncodedPacketSink(track).packets()) {
-			void packet;
-			packetCount++;
+			// A 64 KiB cache stands in for the default 64 MiB one with an MP3 over 64 MiB (a long podcast, an
+			// audiobook). Looking for tags at the end of the file before reading the frames would stream the whole
+			// file first, and the start would be gone by the time the frames are read.
+			using input = new Input({ source: new UrlSource(url, { maxCacheSize: 2 ** 16 }), formats: ALL_FORMATS });
+			const track = await input.getPrimaryAudioTrack();
+			assert(track);
+
+			let packetCount = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				void packet;
+				packetCount++;
+			}
+			expect(packetCount).toBe(1607);
+
+			using durationInput = new Input({
+				source: new UrlSource(url, { maxCacheSize: 2 ** 16 }),
+				formats: ALL_FORMATS,
+			});
+			expect(await durationInput.computeDuration()).toBeCloseTo(38.522, 3);
 		}
-		expect(packetCount).toBe(1607);
 	} finally {
 		Logging.level = previousLevel;
 		server.close();
