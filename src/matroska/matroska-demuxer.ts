@@ -51,6 +51,7 @@ import {
 	COLOR_PRIMARIES_MAP_INVERSE,
 	colorSpaceIsComplete,
 	EMPTY_COLOR_SPACE,
+	getDisplayAspect,
 	isIso639Dash2LanguageCode,
 	isThenable,
 	last,
@@ -59,10 +60,12 @@ import {
 	DEG_TO_RAD,
 	multiplyMatrices,
 	normalizeRotation,
+	Rational,
 	Rotation,
 	rotationMatrix,
 	roundIfAlmostInteger,
 	scaleMatrix,
+	simplifyRational,
 	textDecoder,
 	toDataView,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
@@ -260,6 +263,8 @@ type InternalTrack = {
 			displayUnit: number | null;
 			squarePixelWidth: number;
 			squarePixelHeight: number;
+			/** Exact, unlike the square pixel size */
+			pixelAspectRatio: Rational;
 			horizontalScale: number;
 			verticalScale: number;
 			rotation: Rotation;
@@ -1791,6 +1796,7 @@ export class MatroskaDemuxer extends Demuxer {
 							const den = this.currentTrack.info.displayHeight * visibleWidth;
 
 							if (num > 0 && den > 0) {
+								this.currentTrack.info.pixelAspectRatio = simplifyRational({ num, den });
 								if (num > den) {
 									this.currentTrack.info.squarePixelWidth = Math.round(
 										this.currentTrack.info.width * num / den,
@@ -1951,6 +1957,7 @@ export class MatroskaDemuxer extends Demuxer {
 						displayUnit: null,
 						squarePixelWidth: -1,
 						squarePixelHeight: -1,
+						pixelAspectRatio: { num: 1, den: 1 },
 						horizontalScale: 1,
 						verticalScale: 1,
 						rotation: 0,
@@ -3607,6 +3614,10 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 		return this.internalTrack.info.squarePixelHeight;
 	}
 
+	getPixelAspectRatio() {
+		return this.internalTrack.info.pixelAspectRatio;
+	}
+
 	getTransformationMatrix() {
 		const info = this.internalTrack.info;
 
@@ -3705,12 +3716,11 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				colorSpace: this.internalTrack.info.colorSpace,
 			};
 
-			if (
-				this.internalTrack.info.width !== this.internalTrack.info.squarePixelWidth
-				|| this.internalTrack.info.height !== this.internalTrack.info.squarePixelHeight
-			) {
-				config.displayAspectWidth = this.internalTrack.info.squarePixelWidth;
-				config.displayAspectHeight = this.internalTrack.info.squarePixelHeight;
+			const { width, height, pixelAspectRatio } = this.internalTrack.info;
+			const displayAspect = getDisplayAspect(width, height, pixelAspectRatio);
+			if (displayAspect) {
+				config.displayAspectWidth = displayAspect.displayAspectWidth;
+				config.displayAspectHeight = displayAspect.displayAspectHeight;
 			}
 
 			return config;
