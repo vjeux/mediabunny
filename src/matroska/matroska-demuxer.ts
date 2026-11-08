@@ -114,6 +114,8 @@ type Segment = {
 	 */
 	/** The clusters read last, most recent last, kept so they don't need to be read again right away */
 	recentClusters: Cluster[];
+	/** The cluster read last */
+	readonly lastReadCluster: Cluster | null;
 	clusterSummaries: Map<number, ClusterSummary>; // Keyed by cluster position
 
 	metadataTags: MetadataTags;
@@ -474,6 +476,9 @@ export class MatroskaDemuxer extends Demuxer {
 			clusterSeekStartPos: segmentDataStart,
 
 			recentClusters: [],
+			get lastReadCluster() {
+				return last(this.recentClusters) ?? null;
+			},
 			clusterSummaries: new Map(),
 
 			metadataTags: {},
