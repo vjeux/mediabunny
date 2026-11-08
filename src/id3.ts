@@ -17,6 +17,7 @@ import {
 } from './metadata';
 import {
 	coalesceIndex,
+	createUtcDate,
 	TextDecoder,
 	textDecoder,
 	textEncoder,
@@ -227,6 +228,10 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 
 	let recordingTime: Date | null = null;
 
+	// ID3v2.3 splits the date into the year (TYER) and the day and month (TDAT), which may come in any order
+	let year: number | null = null;
+	let dayAndMonth: string | null = null;
+
 	while (reader.pos <= reader.bytes.length - reader.frameHeaderSize()) {
 		const frame = reader.readId3V2Frame();
 		if (!frame) {
@@ -383,8 +388,7 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 				tags.genre ??= genreText;
 			}; break;
 
-			case 'TDRC':
-			case 'TDAT': {
+			case 'TDRC': {
 				const dateText = reader.readId3V2EncodingAndText(frameEndPos);
 				const date = new Date(dateText);
 
@@ -397,12 +401,10 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 			case 'TYER':
 			case 'TYE': {
 				const yearText = reader.readId3V2EncodingAndText(frameEndPos);
-				const year = Number.parseInt(yearText, 10);
+				const parsedYear = Number.parseInt(yearText, 10);
 
-				if (Number.isInteger(year)) {
-					const date = new Date(String(year)); // String so that it parses as UTC
-					tags.date ??= date;
-					recordingTime ??= date;
+				if (Number.isInteger(parsedYear)) {
+					year ??= parsedYear;
 				}
 			}; break;
 
@@ -414,6 +416,11 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 					tags.date = date;
 					datesFromReleaseTime.add(tags);
 				}
+			}; break;
+
+			case 'TDAT':
+			case 'TDA': {
+				dayAndMonth ??= reader.readId3V2EncodingAndText(frameEndPos);
 			}; break;
 
 			case 'TBPM':
@@ -495,6 +502,26 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 
 		unwatchMetadataTagFields(tags);
 		reader.pos = nextFramePos;
+	}
+
+	if (year !== null) {
+		let date = createUtcDate(year);
+
+		const dayAndMonthMatch = /^(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])$/.exec(dayAndMonth ?? '');
+		if (dayAndMonthMatch) {
+			const day = Number(dayAndMonthMatch[1]);
+			const fullDate = createUtcDate(year, Number(dayAndMonthMatch[2]) - 1, day);
+
+			// Out-of-range fields like a February 31 would otherwise roll over
+			if (fullDate.getUTCDate() === day) {
+				date = fullDate;
+			}
+		}
+
+		if (!Number.isNaN(date.getTime())) {
+			tags.date ??= date;
+			recordingTime ??= date;
+		}
 	}
 
 	// A recording time replaces a date that a release time gave, from an earlier frame or tag. Done once the tag's
