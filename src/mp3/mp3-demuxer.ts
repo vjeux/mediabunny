@@ -39,7 +39,7 @@ import {
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
-import { readNextMp3FrameHeader } from './mp3-reader';
+import { findWaveDataChunk, readNextMp3FrameHeader } from './mp3-reader';
 import { readAscii, readBytes, Reader, readU32Be } from '../reader';
 
 type Sample = {
@@ -72,6 +72,8 @@ export class Mp3Demuxer extends Demuxer {
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
 	primingDelay = 0;
+	/** For MP3 in a WAVE file, where its data chunk ends */
+	dataEndPos: number | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -120,12 +122,19 @@ export class Mp3Demuxer extends Demuxer {
 
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
 			}
+
+			// MP3 in WAVE: the frames are in the data chunk, and the chunks after it (like an id3 chunk) aren't audio
+			const dataChunk = await findWaveDataChunk(this.reader, this.lastLoadedPos);
+			if (dataChunk) {
+				this.lastLoadedPos = dataChunk.start;
+				this.dataEndPos = dataChunk.end;
+			}
 		}
 
 		const result = await readNextMp3FrameHeader(
 			this.reader,
 			this.lastLoadedPos,
-			this.reader.fileSize,
+			this.dataEndPos ?? this.reader.fileSize,
 			this.firstFrameHeader,
 		);
 		if (!result) {
@@ -331,14 +340,20 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		} else if (!demuxer.xingData?.isVbr) {
 			// Not tagged as VBR, assuming CBR
 
-			if (demuxer.reader.fileSize !== null) {
+			// For MP3 in WAVE, the audio ends with the data chunk
+			let audioEndPos = demuxer.reader.fileSize;
+			if (demuxer.dataEndPos !== null) {
+				audioEndPos = Math.min(demuxer.dataEndPos, audioEndPos ?? Infinity);
+			}
+
+			if (audioEndPos !== null) {
 				const averageFrameSize = computeAverageMp3FrameSize(
 					demuxer.firstFrameHeader.lowSamplingFrequency,
 					demuxer.firstFrameHeader.layer,
 					demuxer.firstFrameHeader.bitrate,
 					demuxer.firstFrameHeader.sampleRate,
 				);
-				const frameCount = (demuxer.reader.fileSize - demuxer.firstFrameHeaderPos) / averageFrameSize;
+				const frameCount = (audioEndPos - demuxer.firstFrameHeaderPos) / averageFrameSize;
 
 				return (
 					Math.round(frameCount) * demuxer.firstFrameHeader.audioSamplesInFrame - demuxer.primingDelay
