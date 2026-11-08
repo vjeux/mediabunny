@@ -1,5 +1,26 @@
 import { expect, test } from 'vitest';
-import { ConcurrentRunner, promiseWithResolvers } from '../../src/misc.js';
+import { CallSerializer, ConcurrentRunner, promiseWithResolvers } from '../../src/misc.js';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+	ALL_FORMATS,
+	AudioCodec,
+	AudioSample,
+	AudioSampleSink,
+	AudioSampleSource,
+	BufferTarget,
+	CustomAudioDecoder,
+	CustomAudioEncoder,
+	EncodedPacket,
+	FilePathSource,
+	Input,
+	Output,
+	registerDecoder,
+	registerEncoder,
+	WebMOutputFormat,
+} from '../../src/index.js';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 test('parallelism of 1 runs tasks strictly sequentially', async () => {
 	const runner = new ConcurrentRunner(1);
@@ -131,6 +152,131 @@ test('simultaneous run calls respect parallelism', async () => {
 	deferreds[2]!.resolve();
 	deferreds[3]!.resolve();
 	await runner.flush();
+});
+
+test('CallSerializer keeps running calls after one of them failed', async () => {
+	const serializer = new CallSerializer();
+	const failed = serializer.call(() => {
+		throw new Error('Boom');
+	});
+	await expect(failed).rejects.toThrow('Boom');
+
+	let ran = false;
+	await serializer.call(() => {
+		ran = true;
+	});
+	expect(ran).toBe(true);
+});
+
+test('A custom decoder that fails gets closed, without an unhandled rejection', async () => {
+	// Registered decoders are global, and this is the only test in this file that decodes MP3
+	let closeCalls = 0;
+	let decodeCalls = 0;
+	class FailingMp3Decoder extends CustomAudioDecoder {
+		static override supports(codec: AudioCodec) {
+			return codec === 'mp3';
+		}
+
+		async init() {}
+
+		async decode(packet: EncodedPacket) {
+			decodeCalls++;
+			if (decodeCalls === 3) {
+				// Like a WebAssembly decoder hitting a damaged frame
+				throw new Error('Damaged packet');
+			}
+
+			this.onSample(new AudioSample({
+				data: new Float32Array(1152 * 2),
+				format: 'f32',
+				numberOfChannels: 2,
+				sampleRate: 44100,
+				timestamp: packet.timestamp,
+			}));
+		}
+
+		async flush() {}
+
+		close() {
+			closeCalls++;
+		}
+	}
+	registerDecoder(FailingMp3Decoder);
+
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => unhandled.push(reason);
+	process.on('unhandledRejection', onUnhandled);
+
+	try {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public', 'Toothsome-Meme.VBRv2.mp3')),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		const iterate = async () => {
+			for await (const sample of new AudioSampleSink(track).samples()) {
+				sample.close();
+			}
+		};
+		await expect(iterate()).rejects.toThrow('Damaged packet');
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(closeCalls).toBe(1);
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off('unhandledRejection', onUnhandled);
+	}
+});
+
+test('A custom encoder whose flush() fails makes finalize() reject, and gets closed', async () => {
+	// Registered encoders are global, and this is the only test in this file that encodes Opus
+	let flushCalls = 0;
+	let closeCalls = 0;
+	class FlushFailingOpusEncoder extends CustomAudioEncoder {
+		static override supports(codec: AudioCodec) {
+			return codec === 'opus';
+		}
+
+		init() {}
+
+		encode(sample: AudioSample) {
+			this.onPacket(
+				new EncodedPacket(new Uint8Array([0xfc, 0xff, 0xfe]), 'key', sample.timestamp, sample.duration),
+				{ decoderConfig: { codec: 'opus', sampleRate: 48000, numberOfChannels: 1 } },
+			);
+		}
+
+		flush() {
+			flushCalls++;
+			// Like a WebAssembly encoder failing on its last frames
+			throw new Error('Flush failed');
+		}
+
+		close() {
+			closeCalls++;
+		}
+	}
+	registerEncoder(FlushFailingOpusEncoder);
+
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const source = new AudioSampleSource({ codec: 'opus', bitrate: 64000 });
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 4; i++) {
+		using sample = new AudioSample({
+			data: new Float32Array(960),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: i * 0.02,
+		});
+		await source.add(sample);
+	}
+
+	await expect(output.finalize()).rejects.toThrow('Flush failed');
+	expect(flushCalls).toBe(1);
+	expect(closeCalls).toBe(1);
 });
 
 test('errored task surfaces on the next run call', async () => {
