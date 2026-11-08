@@ -148,6 +148,51 @@ test('Fragmented fMP4 with video+audio preserves B-frame CTS', async () => {
 	expect(timestamps).toEqual(originalTimestamps);
 });
 
+test('FLAC above 65535 Hz declares the greatest expressible division of its rate in the sample entry', async () => {
+	// "fLaC" + a last STREAMINFO block for 2-channel 16-bit audio at the given rate
+	const flacDescription = (sampleRate: number) => {
+		const bytes = new Uint8Array(4 + 4 + 34);
+		bytes.set([0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 34]);
+		bytes.set([0x10, 0x00, 0x10, 0x00], 8); // Min/max block size
+		bytes[18] = sampleRate >> 12; // 20 bits sample rate, 3 bits channels - 1, 5 bits bits per sample - 1
+		bytes[19] = (sampleRate >> 4) & 0xff;
+		bytes[20] = ((sampleRate & 0xf) << 4) | (1 << 1);
+		bytes[21] = 15 << 4;
+		return bytes;
+	};
+
+	// As FLAC-in-ISOBMFF requires: 48000 for 96 and 192 kHz, 65535 when no regular division fits
+	const cases: [number, number][] = [
+		[48000, 48000], [96000, 48000], [192000, 48000], [88200, 44100], [176400, 44100], [99999, 65535],
+	];
+	for (const [sampleRate, expected] of cases) {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('flac');
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(64), 'key', 0, 4096 / sampleRate), {
+			decoderConfig: {
+				codec: 'flac',
+				sampleRate,
+				numberOfChannels: 2,
+				description: flacDescription(sampleRate),
+			},
+		});
+		await output.finalize();
+
+		// The 16.16 sample rate sits 24 bytes into the AudioSampleEntry; it used to be 0 above 65535 Hz
+		const bytes = new Uint8Array(output.target.buffer!);
+		const entry = bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'fLaC');
+		expect(toDataView(bytes).getUint32(entry + 4 + 24) / 0x10000).toBe(expected);
+
+		// Readers get the actual rate from the dfLa box
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		expect(await track.getSampleRate()).toBe(sampleRate);
+	}
+});
+
 test('Zero start timestamp, regular MP4', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
