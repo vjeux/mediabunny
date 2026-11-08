@@ -5675,6 +5675,40 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 		);
 	}
 
+	getHasOnlyKeyPackets() {
+		const { demuxer } = this.internalTrack;
+		if (demuxer.isFragmented) {
+			// Fragments flag their samples themselves, and the metadata doesn't say anything about them
+			return null;
+		}
+
+		let sampleTable: SampleTable;
+		try {
+			sampleTable = demuxer.getSampleTableForTrack(this.internalTrack);
+		} catch {
+			return null; // A sample table that can't be read (a damaged file) says nothing either
+		}
+		if (sampleTable.sampleCount === 0) {
+			return null;
+		}
+
+		const { keySampleIndices, sampleCount } = sampleTable;
+		if (!keySampleIndices) {
+			return true; // Without an stss box, every sample is a sync sample (ISO/IEC 14496-12 8.6.2.1)
+		}
+
+		// Whether the stss box lists every sample. Invalid entries can leave the list unsorted (see the stss box), so
+		// count the distinct valid ones.
+		const listedSampleIndices = new Set<number>();
+		for (const sampleIndex of keySampleIndices) {
+			if (sampleIndex >= 0 && sampleIndex < sampleCount) {
+				listedSampleIndices.add(sampleIndex);
+			}
+		}
+
+		return listedSampleIndices.size === sampleCount;
+	}
+
 	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
 		if (!this.internalTrack.info.codec) {
 			return null;
