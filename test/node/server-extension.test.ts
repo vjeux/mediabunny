@@ -2172,7 +2172,8 @@ describe('Audio', async () => {
 			},
 		};
 
-		// Encodes 1 s and returns the average bitrate of the packets
+		// Encodes 1 s and returns the average bitrate of the packets but the last, whose duration can be cut to the
+		// samples it holds
 		const encodedBitrate = async (
 			codec: AudioCodec,
 			sampleRate: number,
@@ -2186,12 +2187,10 @@ describe('Audio', async () => {
 			// @ts-expect-error Readonly
 			encoder.config = { codec, sampleRate, numberOfChannels, bitrate } satisfies AudioEncoderConfig;
 
-			let bytes = 0;
-			let duration = 0;
+			const packets: EncodedPacket[] = [];
 			// @ts-expect-error Readonly
 			encoder.onPacket = (packet: EncodedPacket) => {
-				bytes += packet.byteLength;
-				duration += packet.duration;
+				packets.push(packet);
 			};
 
 			await encoder.init();
@@ -2206,8 +2205,10 @@ describe('Audio', async () => {
 			await encoder.flush();
 			await encoder.close();
 
+			const measured = packets.slice(0, -1);
+			const duration = measured.reduce((sum, packet) => sum + packet.duration, 0);
 			expect(duration).toBeGreaterThan(0.9);
-			return bytes * 8 / duration;
+			return measured.reduce((sum, packet) => sum + packet.byteLength, 0) * 8 / duration;
 		};
 
 		// libopus takes 500 bps to 256 kbps per channel
