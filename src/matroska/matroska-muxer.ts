@@ -42,6 +42,7 @@ import {
 	EBMLSignedInt,
 	EBMLUnicodeString,
 	EBMLWriter,
+	toMatroskaLanguageCode,
 } from './ebml';
 import { buildMatroskaMimeType } from './matroska-misc';
 import { MkvOutputFormat, WebMOutputFormat } from '../output-format';
@@ -438,7 +439,12 @@ export class MatroskaMuxer extends Muxer {
 					? { id: EBMLId.FlagCommentary, data: 1 }
 					: null,
 				{ id: EBMLId.FlagLacing, data: 0 },
-				{ id: EBMLId.Language, data: trackData.track.metadata.languageCode ?? UNDETERMINED_LANGUAGE },
+				{
+					id: EBMLId.Language,
+					// For languages with two ISO 639-2 codes, the element holds the bibliographic one, like "ger" for
+					// "deu" (RFC 9559, section 12)
+					data: toMatroskaLanguageCode(trackData.track.metadata.languageCode ?? UNDETERMINED_LANGUAGE),
+				},
 				{ id: EBMLId.CodecID, data: codecId },
 				trackData.codecPrivate
 					? { id: EBMLId.CodecPrivate, data: toUint8Array(trackData.codecPrivate) }
