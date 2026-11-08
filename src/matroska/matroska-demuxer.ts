@@ -2152,7 +2152,9 @@ export class MatroskaDemuxer extends Demuxer {
 
 				const sampleRate = readFloat(slice, size);
 				if (!(sampleRate > 0) || !Number.isFinite(sampleRate)) {
-					throw new Error('Invalid SamplingFrequency element: must be a positive, finite number.');
+					// Only this track is affected, so don't fail the whole file: treat it like a missing element
+					Logging._warn(`Track #${this.currentTrack.id} has an invalid SamplingFrequency; ignoring it.`);
+					break;
 				}
 
 				this.currentTrack.info.sampleRate = sampleRate;
@@ -2174,7 +2176,8 @@ export class MatroskaDemuxer extends Demuxer {
 
 				const numberOfChannels = readUnsignedInt(slice, size);
 				if (numberOfChannels === 0) {
-					throw new Error('Invalid Channels element: must not be 0.');
+					Logging._warn(`Track #${this.currentTrack.id} has an invalid Channels value of 0; ignoring it.`);
+					break;
 				}
 
 				this.currentTrack.info.numberOfChannels = numberOfChannels;
