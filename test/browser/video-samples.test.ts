@@ -678,3 +678,81 @@ test('Treat non-standard VideoFrame color space values as unknown', () => {
 	expect(sample.colorSpace.matrix).toBe('smpte170m');
 	expect(sample.colorSpace.fullRange).toBe(true);
 });
+
+test('init visibleRect and display size refine a wrapped VideoFrame', () => {
+	using source = makeCoordinateSample({});
+
+	// Pixels are only checked where the browser's own VideoFrame draws a visible rect correctly (WebKitGTK draws it
+	// from the frame's origin)
+	const uncropped = source.toVideoFrame();
+	const nativeCrop = new VideoFrame(uncropped, { visibleRect: { x: 2, y: 0, width: 2, height: 4 } });
+	const probe = new OffscreenCanvas(2, 4).getContext('2d', { willReadFrequently: true })!;
+	probe.drawImage(nativeCrop, 0, 0);
+	const browserDrawsCrops = pixelAt(probe.getImageData(0, 0, 2, 4).data, 2, 0, 0)[0] === 2;
+	nativeCrop.close();
+	uncropped.close();
+
+	const frame = source.toVideoFrame();
+	const cropped = new VideoSample(frame, { visibleRect: { left: 2, top: 0, width: 2, height: 4 } });
+	expect(cropped.visibleRect).toEqual({ left: 2, top: 0, width: 2, height: 4 });
+	expect([cropped.displayWidth, cropped.displayHeight]).toEqual([2, 4]);
+	if (browserDrawsCrops) {
+		const pixels = drawToPixels(cropped, 2, 4);
+		expect(pixelAt(pixels, 2, 0, 0)).toEqual([2, 0]);
+		expect(pixelAt(pixels, 2, 1, 3)).toEqual([3, 3]);
+	}
+
+	// The passed frame stays usable until the sample is closed
+	expect(frame.format).toBe('RGBA');
+	cropped.close();
+	expect(frame.format).toBe(null);
+
+	using stretched = new VideoSample(source.toVideoFrame(), { displayWidth: 8, displayHeight: 4 });
+	expect([stretched.displayWidth, stretched.displayHeight]).toEqual([8, 4]);
+	expect(stretched.pixelAspectRatio).toEqual({ num: 2, den: 1 });
+
+	// Like for ArrayBuffer-backed samples, the display size is the one after rotation
+	using rotated = new VideoSample(source.toVideoFrame(), { rotation: 90, displayWidth: 4, displayHeight: 8 });
+	expect([rotated.squarePixelWidth, rotated.squarePixelHeight]).toEqual([8, 4]);
+
+	// Image sources get cropped only once
+	const canvas = new OffscreenCanvas(4, 4);
+	source.draw(canvas.getContext('2d')!, 0, 0);
+	using fromCanvas = new VideoSample(canvas, {
+		timestamp: 0,
+		visibleRect: { left: 2, top: 2, width: 2, height: 2 },
+		displayWidth: 4,
+		displayHeight: 2,
+	});
+	expect([fromCanvas.codedWidth, fromCanvas.codedHeight]).toEqual([2, 2]);
+	expect([fromCanvas.displayWidth, fromCanvas.displayHeight]).toEqual([4, 2]);
+	if (browserDrawsCrops) {
+		expect(pixelAt(drawToPixels(fromCanvas, 4, 2), 4, 0, 0)).toEqual([2, 2]);
+	}
+});
+
+// Firefox's VideoFrame has no rotation
+const frameHasRotation = 'rotation' in VideoFrame.prototype;
+
+test.runIf(frameHasRotation)('init display size and crop of a VideoFrame with its own rotation', () => {
+	// Like Chrome's frames of EXIF-rotated images or rotated videos
+	const makeRotatedFrame = () => {
+		const canvas = new OffscreenCanvas(8, 4);
+		canvas.getContext('2d')!.fillRect(0, 0, 8, 4);
+		return new VideoFrame(canvas, { timestamp: 0, rotation: 90 } as VideoFrameInit);
+	};
+
+	// The display size in init is the one after all rotation, the frame's own included
+	for (const rotation of [0, 90] as const) {
+		using sample = new VideoSample(makeRotatedFrame(), { rotation, displayWidth: 16, displayHeight: 8 });
+		expect([sample.displayWidth, sample.displayHeight], `init rotation ${rotation}`).toEqual([16, 8]);
+	}
+
+	// The caller's frame is closed together with the sample
+	const inits = [{ visibleRect: { left: 0, top: 0, width: 4, height: 4 } }, { displayWidth: 16, displayHeight: 8 }];
+	for (const init of inits) {
+		const frame = makeRotatedFrame();
+		new VideoSample(frame, init).close();
+		expect(frame.format, JSON.stringify(init)).toBe(null);
+	}
+});
