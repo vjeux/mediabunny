@@ -1426,6 +1426,20 @@ export class IsobmffMuxer extends Muxer {
 	}
 
 	private async registerSample(trackData: IsobmffTrackData, sample: Sample) {
+		if (this.fastStart === 'reserve') {
+			// Checked before the sample enters the muxer, so that the add() going over the limit is the one rejected
+			// and the sample tables written on finalization stay consistent
+			const maximumPacketCount = trackData.track.metadata.maximumPacketCount;
+			assert(maximumPacketCount !== undefined);
+
+			if (trackData.samples.length + trackData.sampleQueue.length >= maximumPacketCount) {
+				throw new Error(
+					`Track #${trackData.track.id} has already reached the maximum packet count`
+					+ ` (${maximumPacketCount}). Either add less packets or increase the maximum packet count.`,
+				);
+			}
+		}
+
 		if (sample.type === 'key') {
 			this.processTimestamps(trackData, sample);
 		}
@@ -1438,18 +1452,6 @@ export class IsobmffMuxer extends Muxer {
 	private async addSampleToTrack(trackData: IsobmffTrackData, sample: Sample) {
 		if (!this.isFragmented) {
 			trackData.samples.push(sample);
-
-			if (this.fastStart === 'reserve') {
-				const maximumPacketCount = trackData.track.metadata.maximumPacketCount;
-				assert(maximumPacketCount !== undefined);
-
-				if (trackData.samples.length > maximumPacketCount) {
-					throw new Error(
-						`Track #${trackData.track.id} has already reached the maximum packet count`
-						+ ` (${maximumPacketCount}). Either add less packets or increase the maximum packet count.`,
-					);
-				}
-			}
 		}
 
 		let beginNewChunk = false;
