@@ -345,6 +345,8 @@ class VideoEncoderWrapper {
 	}
 
 	private lastMuxerPromise: Promise<void> = Promise.resolve();
+	/** How many adds are waiting for the writer to take what's been encoded so far; they still hold their samples. */
+	private writerWaitCount = 0;
 	private closed = false;
 
 	constructor(private source: VideoSource, private encodingConfig: VideoEncodingConfig) {}
@@ -712,7 +714,12 @@ class VideoEncoderWrapper {
 					}
 				}
 
-				await this.lastMuxerPromise; // Allow the writer to apply backpressure
+				this.writerWaitCount++;
+				try {
+					await this.lastMuxerPromise; // Allow the writer to apply backpressure
+				} finally {
+					this.writerWaitCount--;
+				}
 			}
 		} finally {
 			for (const sample of samplesToEncode) {
@@ -1274,13 +1281,17 @@ class VideoEncoderWrapper {
 		}
 	}
 
+	/**
+	 * How many samples this encoder is still working on: the ones queued in the encoder, and the ones whose add is
+	 * waiting for the writer to apply backpressure (they're held until then).
+	 */
 	getQueueSize() {
 		if (this.customEncoder) {
-			return this.customEncoderQueueSize;
+			return this.customEncoderQueueSize + this.writerWaitCount;
 		} else {
 			// Because the color and alpha encoders are wired in series, there's no need to also include the alpha
 			// encoder's queue size here
-			return this.encoder?.encodeQueueSize ?? 0;
+			return (this.encoder?.encodeQueueSize ?? 0) + this.writerWaitCount;
 		}
 	}
 
@@ -2166,7 +2177,8 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 			}
 
 			if (this._encoder.getQueueSize() >= 8) {
-				// Drop frames if the encoder is overloaded
+				// Drop frames if the encoder is overloaded or the output can't take its data fast enough, rather than
+				// holding on to them (frames may come from a small pool, like a camera's)
 				videoFrame.close();
 				return;
 			}
