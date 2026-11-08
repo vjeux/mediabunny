@@ -97,6 +97,111 @@ const av1SizeIsSupported = (config: VideoEncoderConfig) => {
 	return width >= 64 && height >= 64;
 };
 
+/**
+ * What a codec string asks for beyond the codec itself: a profile below High for AVC, and the bit depth (AVC High 10,
+ * HEVC Main 10, and the bit depth fields of VP9 and AV1). The encoders would otherwise apply their own defaults (the
+ * High profile for libx264, 8 bits everywhere) whatever was requested.
+ */
+const parseCodecStringRequirements = (codec: VideoCodec, codecString: string) => {
+	const parts = codecString.split('.');
+	let avcProfileIdc: number | null = null;
+	let avcProfile: NodeAv.AVProfile | null = null;
+	let bitDepth = 8;
+
+	if (codec === 'avc') {
+		const profileIdc = parseInt(parts[1]?.slice(0, 2) ?? '', 16);
+		avcProfileIdc = profileIdc;
+		// libx264 picks High (or above, like for lossless) by itself, so only the lower profiles need asking for
+		if (profileIdc === 66) {
+			avcProfile = NodeAv.AV_PROFILE_H264_BASELINE;
+		} else if (profileIdc === 77) {
+			avcProfile = NodeAv.AV_PROFILE_H264_MAIN;
+		} else if (profileIdc === 110) {
+			bitDepth = 10;
+		}
+	} else if (codec === 'hevc') {
+		// The general_profile_idc, after the optional profile space letter
+		bitDepth = Number(parts[1]?.replace(/^[ABC]/, '')) === 2 ? 10 : 8;
+	} else if (codec === 'vp9' || codec === 'av1') {
+		const fieldValue = Number(parts[3]);
+		bitDepth = fieldValue === 10 || fieldValue === 12 ? fieldValue : 8;
+	}
+
+	return { avcProfileIdc, avcProfile, bitDepth };
+};
+
+/**
+ * Whether the encoders here can produce what a codec string asks for. They encode 4:2:0 only: AVC in the Baseline,
+ * Main, High and High 10 profiles, HEVC in Main and Main 10, VP9 in profiles 0 (8-bit) and 2 (10 and 12-bit), and AV1
+ * in the Main profile at 8 or 10 bits. Anything else would come out as something other than what was asked for, so
+ * it's declined, as browsers do.
+ */
+const isProducibleCodecString = (codec: VideoCodec, codecString: string) => {
+	const parts = codecString.split('.');
+
+	if (codec === 'avc') {
+		return [66, 77, 100, 110].includes(parseInt(parts[1]?.slice(0, 2) ?? '', 16));
+	} else if (codec === 'hevc') {
+		// Profile space 0 (no letter), Main or Main 10
+		return parts[1] === '1' || parts[1] === '2';
+	} else if (codec === 'vp9') {
+		const profile = Number(parts[1]);
+		const bitDepth = Number(parts[3]);
+		// The optional chroma subsampling field: 0 and 1 are 4:2:0
+		const isYuv420 = parts[4] === undefined || Number(parts[4]) <= 1;
+		return isYuv420 && (profile === 0 ? bitDepth === 8 : profile === 2 && (bitDepth === 10 || bitDepth === 12));
+	} else if (codec === 'av1') {
+		const bitDepth = Number(parts[3]);
+		// The optional monochrome and chroma subsampling fields: 4:2:0 is 0 and 11x
+		const isYuv420 = (parts[4] === undefined || Number(parts[4]) === 0) && (parts[5] ?? '11').startsWith('11');
+		return parts[1] === '0' && (bitDepth === 8 || bitDepth === 10) && isYuv420;
+	}
+
+	return true;
+};
+
+/**
+ * Whether a codec string is producible (see isProducibleCodecString) and the software encoder has its bit depth.
+ */
+const canProduceCodecString = (codec: VideoCodec, codecString: string) => {
+	if (!isProducibleCodecString(codec, codecString)) {
+		return false;
+	}
+
+	// Hardware encoders fall back to the software encoder (for frames they can't take, say), so it has to have the bit
+	// depth. Some builds don't: node-av's libx265 for Windows is 8-bit only.
+	const { bitDepth } = parseCodecStringRequirements(codec, codecString);
+	if (bitDepth > 8) {
+		const softwareCodec = NodeAv.Codec.findEncoder(CODEC_TO_CODEC_ID[codec]!);
+		const format = bitDepth === 10 ? NodeAv.AV_PIX_FMT_YUV420P10LE : NodeAv.AV_PIX_FMT_YUV420P12LE;
+		return !!softwareCodec?.pixelFormats?.includes(format);
+	}
+
+	return true;
+};
+
+/**
+ * Whether a hardware encoder can give what a codec string asks for beyond the codec itself. NVENC is the only one we
+ * know how to ask for a lower AVC profile or a 10-bit HEVC or AV1 stream (from P010 frames); AVC High 10 it only has
+ * on recent GPUs. The software encoder is used otherwise.
+ */
+const hardwareCanHonorCodecString = (hardwareCodec: NodeAv.Codec, codec: VideoCodec, codecString: string) => {
+	const requirements = parseCodecStringRequirements(codec, codecString);
+	const isNvenc = !!hardwareCodec.name?.endsWith('_nvenc');
+
+	if (requirements.bitDepth > 8) {
+		return isNvenc
+			&& codec !== 'avc'
+			&& requirements.bitDepth === 10
+			&& !!hardwareCodec.pixelFormats?.includes(NodeAv.AV_PIX_FMT_P010LE);
+	}
+	if (requirements.avcProfile !== null) {
+		return isNvenc;
+	}
+
+	return true;
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -130,13 +235,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		}
 
 		if (config.bitrateMode === 'quantizer') {
-			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
+			return (codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1')
+				&& canProduceCodecString(codec, config.codec);
 		}
 
 		return (
 			codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
 			|| codec === 'prores'
-		);
+		) && canProduceCodecString(codec, config.codec);
 	}
 
 	async init(): Promise<void> {
@@ -181,6 +287,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				// NVENC is the only hardware encoder we know how to drive in constant-quantizer mode
 				hardwareCodec = null;
 			}
+			if (hardwareCodec && !hardwareCanHonorCodecString(hardwareCodec, this.codec, this.config.codec)) {
+				hardwareCodec = null;
+			}
 
 			codec = hardwareCodec ?? getSoftwareCodec();
 
@@ -214,6 +323,23 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			if (this.config.alpha === 'keep') {
 				pixelFormat = getAlphaPixelFormat(this.codec, this.avCodec.pixelFormats) ?? pixelFormat;
 			}
+		}
+
+		const requirements = parseCodecStringRequirements(this.codec, this.config.codec);
+		// Hardware encoders like NVENC take 10-bit frames as P010 instead
+		const requestedPixelFormat = requirements.bitDepth === 10
+			? this.avCodec.pixelFormats?.includes(NodeAv.AV_PIX_FMT_YUV420P10LE) === false
+				? NodeAv.AV_PIX_FMT_P010LE
+				: NodeAv.AV_PIX_FMT_YUV420P10LE
+			: requirements.bitDepth === 12
+				? NodeAv.AV_PIX_FMT_YUV420P12LE
+				: null;
+		if (
+			requestedPixelFormat !== null
+			&& pixelFormat === NodeAv.AV_PIX_FMT_YUV420P
+			&& this.avCodec.pixelFormats?.includes(requestedPixelFormat)
+		) {
+			pixelFormat = requestedPixelFormat;
 		}
 
 		const pixelAspectRatio = simplifyRational({
@@ -250,6 +376,18 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				// libx264 and libx265 ignore the maximum rate without a buffer size: one second's worth
 				codecContext.rcBufferSize = Number(codecContext.bitRate);
 			}
+		}
+
+		if (this.avCodec.name === 'libx264' && requirements.avcProfile !== null) {
+			codecContext.profile = requirements.avcProfile;
+		} else if (this.avCodec.name === 'h264_nvenc' && requirements.avcProfileIdc !== null) {
+			// NVENC defaults to Main, even for High (the default codec string)
+			const profile = { 66: 'baseline', 77: 'main', 100: 'high' }[requirements.avcProfileIdc];
+			if (profile) {
+				codecContext.setOption('profile', profile);
+			}
+		} else if (this.avCodec.name === 'hevc_nvenc' && requirements.bitDepth === 10) {
+			codecContext.setOption('profile', 'main10');
 		}
 
 		const isRealtime = this.config.latencyMode === 'realtime';
