@@ -984,8 +984,8 @@ export class MatroskaDemuxer extends Demuxer {
 			size = nextElementPos.pos - dataStartPos;
 		}
 
-		// Load the entire cluster
-		let dataSlice = this.reader.requestSlice(dataStartPos, size);
+		// Load the entire cluster, or whatever's left of it in case the file got cut off
+		let dataSlice = this.reader.requestSliceRange(dataStartPos, 0, size);
 		if (isThenable(dataSlice)) dataSlice = await dataSlice;
 
 		const cluster: Cluster = {

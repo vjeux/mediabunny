@@ -2295,3 +2295,81 @@ test('Attachments before the clusters are only read once the metadata tags are a
 		expect(images?.map(x => [x.name, x.data.length])).toEqual([['cover.png', image.length]]);
 	}
 });
+
+test('A cluster cut off by the end of the file keeps its complete blocks', async () => {
+	// As in an interrupted recording: the file ends in the middle of its last cluster
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const UNKNOWN_SIZE = [0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+	const element = (id: number, data: number[], unknownSize = false) => {
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = unknownSize
+			? UNKNOWN_SIZE
+			: [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	// Two clusters of ten 20 ms blocks, the second one cut off after its first `blocksLeft` blocks
+	const makeFile = (unknownSizes: boolean, blocksLeft: number) => {
+		const block = (relativeTimestamp: number) => element(
+			EBMLId.SimpleBlock,
+			[0x81, 0, relativeTimestamp, 0x80, ...new Array<number>(100).fill(0)],
+		);
+		const cluster = (timestamp: number) => element(EBMLId.Cluster, [
+			...element(EBMLId.Timestamp, [0, timestamp]),
+			...Array.from({ length: 10 }, (_, i) => block(20 * i)).flat(),
+		], unknownSizes);
+
+		const bytes = [
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('webm'))),
+			...element(EBMLId.Segment, [
+				...element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				...element(EBMLId.Tracks, element(EBMLId.TrackEntry, [
+					...element(EBMLId.TrackNumber, [1]),
+					...element(EBMLId.TrackType, [2]),
+					...element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+					...element(EBMLId.Audio, element(EBMLId.BitDepth, [16])),
+				])),
+				...cluster(0),
+				...cluster(200),
+			], unknownSizes),
+		];
+
+		// The end of the last cluster's Timestamp and first `blocksLeft` blocks, and a part of the next block
+		const blockSize = block(0).length;
+		const secondClusterEnd = bytes.length;
+		const cut = secondClusterEnd - (10 - blocksLeft) * blockSize + Math.floor(blockSize / 2);
+		return new Uint8Array(bytes.slice(0, cut));
+	};
+
+	const readTimestamps = async (file: Uint8Array) => {
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(Math.round(packet.timestamp * 1000));
+		}
+
+		// And looking up a packet in the cut-off cluster
+		const lookup = await new EncodedPacketSink(track).getPacket(0.25);
+		return { timestamps, lookup: lookup && Math.round(lookup.timestamp * 1000) };
+	};
+
+	const firstCluster = Array.from({ length: 10 }, (_, i) => 20 * i);
+	// Clusters of unknown size, as browsers' MediaRecorder writes them, and of known size, as FFmpeg does
+	for (const unknownSizes of [true, false]) {
+		expect(await readTimestamps(makeFile(unknownSizes, 4))).toEqual({
+			timestamps: [...firstCluster, 200, 220, 240, 260],
+			lookup: 240,
+		});
+	}
+});
