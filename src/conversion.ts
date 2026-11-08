@@ -376,8 +376,9 @@ export type ConversionAudioOptions = {
 	/**
 	 * Sets {@link BaseTrackMetadata.maximumPacketCount} for the output track. Only relevant when the output format
 	 * requires it (see {@link OutputFormat.requiresMaximumPacketCount}), in which case it is otherwise estimated
-	 * automatically. Set this field when the estimate doesn't work for you, for example when using a custom encoder
-	 * that produces unusually short packets. Required for live input tracks when no trim end is set.
+	 * automatically from the track's duration. Set this field when the estimate doesn't work for you, for example when
+	 * `process` makes the audio longer than the input, or when using a custom encoder that produces unusually short
+	 * packets. Required for live input tracks when no trim end is set.
 	 */
 	maximumPacketCount?: number;
 };
