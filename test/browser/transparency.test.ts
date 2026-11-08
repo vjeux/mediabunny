@@ -620,3 +620,84 @@ test('Encoding semi-transparent canvas content keeps the colors unpremultiplied'
 
 	expectStraightColors(await readColors(resizedOutput.target.buffer!));
 });
+
+test('Decoded frames with alpha keep the color space of the color stream', async ({ skip }) => {
+	// WebKitGTK's VideoFrame.copyTo() returns YUV planes unconverted when asked for RGBA, so the colors can't be read
+	// back there. This probes the browser itself, not Mediabunny.
+	const probe = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
+		format: 'I420',
+		codedWidth: 2,
+		codedHeight: 2,
+		timestamp: 0,
+	});
+	const probeRgba = new Uint8Array(16);
+	await probe.copyTo(probeRgba, { format: 'RGBA' }).catch(() => {});
+	probe.close();
+	skip(probeRgba[3] !== 255, 'VideoFrame.copyTo() does not convert YUV to RGBA here');
+
+	// Opaque gray bars encoded with alpha: 'keep', like a canvas recording from Chrome's MediaRecorder: the color
+	// stream comes out full range, and every packet carries alpha side data. Grays, so that only the range matters.
+	const colors = [[16, 16, 16], [64, 64, 64], [192, 192, 192], [240, 240, 240]];
+	const data = new Uint8Array(64 * 16 * 4);
+	for (let i = 0; i < 64 * 16; i++) {
+		data.set([...colors[Math.floor((i % 64) / 16)]!, 255], i * 4);
+	}
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new VideoSampleSource({ codec: 'vp9', bitrate: 8e6, alpha: 'keep' });
+	output.addVideoTrack(source);
+	await output.start();
+	using inputSample = new VideoSample(data, {
+		format: 'RGBA',
+		codedWidth: 64,
+		codedHeight: 16,
+		timestamp: 0,
+		duration: 1,
+	});
+	await source.add(inputSample);
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	const sink = new VideoSampleSink(videoTrack);
+	using sample = (await sink.getSample(0))!;
+	expect(sample.hasAlpha).toBe(true); // Went through the alpha merger
+
+	const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+	await sample.copyTo(rgba, { format: 'RGBA' });
+	for (let i = 0; i < colors.length; i++) {
+		const offset = (8 * 64 + i * 16 + 8) * 4;
+		const actual = Array.from(rgba.subarray(offset, offset + 3));
+		for (let j = 0; j < 3; j++) {
+			expect(Math.abs(actual[j]! - colors[i]![j]!), `${actual.join()} vs ${colors[i]!.join()}`)
+				.toBeLessThanOrEqual(6);
+		}
+	}
+});
+
+test('Decoded frames with alpha keep the display size of the color stream', async () => {
+	// The same 64x32 VP9 video with a 2:1 pixel aspect ratio (display size 128x32), with and without alpha, made with
+	// FFmpeg 7.0.2:
+	// ffmpeg -f lavfi -i "testsrc2=s=64x32:d=0.5:r=10,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':
+	//   cr='cr(X,Y)':a='X*4'" -vf setsar=2/1 -c:v libvpx-vp9 -pix_fmt yuva420p -b:v 1M vp9-alpha-anamorphic.webm
+	// ffmpeg -f lavfi -i "testsrc2=s=64x32:d=0.5:r=10" -vf setsar=2/1 -c:v libvpx-vp9 -b:v 1M vp9-anamorphic.webm
+	const firstSample = async (path: string) => {
+		using input = new Input({ source: new UrlSource(path), formats: ALL_FORMATS });
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		expect(await videoTrack.getDisplayWidth()).toBe(128);
+		return (await new VideoSampleSink(videoTrack).getSample(0))!;
+	};
+
+	using withAlpha = await firstSample('/vp9-alpha-anamorphic.webm');
+	using withoutAlpha = await firstSample('/vp9-anamorphic.webm');
+	expect(withAlpha.hasAlpha).toBe(true); // Went through the alpha merger
+
+	// Merging in the alpha must not change the display size (which is 128x32 where the decoder applies the configured
+	// display aspect: Chrome, Firefox)
+	expect([withAlpha.displayWidth, withAlpha.displayHeight])
+		.toEqual([withoutAlpha.displayWidth, withoutAlpha.displayHeight]);
+	expect(withAlpha.pixelAspectRatio).toEqual(withoutAlpha.pixelAspectRatio);
+});
