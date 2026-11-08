@@ -3590,3 +3590,53 @@ test('Fragmented lookups outside of a track\'s data don\'t rescan the fragments 
 		}
 	}
 }, 60_000);
+
+test('MP4 files cut off in their media data end with the last packet whose data is there', async () => {
+	// Ten 1-second VP8 frames of 1000 bytes each, with key frames at 0 and 5 s, cut off in the middle of frame 7, like
+	// an interrupted download. Reading the packets stops after frame 6, so lookups and the duration must agree.
+	const makeFile = async (format: Mp4OutputFormat) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(source);
+		await output.start();
+		for (let i = 0; i < 10; i++) {
+			await source.add(
+				new EncodedPacket(new Uint8Array(1000).fill(i + 1), i % 5 === 0 ? 'key' : 'delta', i, 1),
+				{ decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 } },
+			);
+		}
+		await output.finalize();
+
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	for (const fastStart of ['in-memory', 'fragmented'] as const) {
+		const full = await makeFile(new Mp4OutputFormat({ fastStart, minimumFragmentDuration: 100 }));
+		// Frame 7's bytes are all 8
+		const frame7Start = full.findIndex((_, i) => full.subarray(i, i + 1000).every(byte => byte === 8));
+		const cut = full.subarray(0, frame7Start + 500);
+
+		using input = new Input({ source: new BufferSource(cut), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const sink = new EncodedPacketSink(track);
+
+		const timestamps: number[] = [];
+		for await (const packet of sink.packets()) {
+			timestamps.push(packet.timestamp);
+		}
+		expect(timestamps).toEqual([0, 1, 2, 3, 4, 5, 6]);
+
+		expect((await sink.getPacket(8.5))?.timestamp).toBe(6);
+		expect((await sink.getPacket(Infinity))?.timestamp).toBe(6);
+		expect((await sink.getPacket(6.5))?.timestamp).toBe(6);
+		expect((await sink.getKeyPacket(8.5))?.timestamp).toBe(5);
+		expect(await sink.getNextPacket((await sink.getPacket(6))!)).toBeNull();
+		expect(await track.computeDuration()).toBe(7);
+
+		// The complete file
+		using fullInput = new Input({ source: new BufferSource(full), formats: ALL_FORMATS });
+		const fullTrack = (await fullInput.getPrimaryVideoTrack())!;
+		expect((await new EncodedPacketSink(fullTrack).getPacket(8.5))?.timestamp).toBe(8);
+		expect(await fullTrack.computeDuration()).toBe(10);
+	}
+});
