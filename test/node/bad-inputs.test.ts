@@ -2113,6 +2113,27 @@ test('Custom source smaller than the first read', async () => {
 	}
 });
 
+test('ReadableStreamSource rejects chunks that aren\'t Uint8Arrays, like CustomSource streams', async () => {
+	const getFormatFromChunk = async (chunk: unknown) => {
+		const stream = new ReadableStream({
+			start: (controller) => {
+				controller.enqueue(chunk);
+				controller.close();
+			},
+		});
+		const source = new ReadableStreamSource(stream as ReadableStream<Uint8Array>);
+		using input = new Input({ source, formats: ALL_FORMATS });
+		return await input.getFormat().then(format => format.name, (error: unknown) => String(error));
+	};
+	const error = 'TypeError: The stream of a ReadableStreamSource must yield Uint8Array chunks.';
+
+	// A WebSocket with binaryType 'arraybuffer' piped into a stream yields ArrayBuffers (on main: "TypeError:
+	// value.subarray is not a function")
+	expect(await getFormatFromChunk(new ArrayBuffer(64))).toBe(error);
+	// On main, sliced by element instead of by byte, so the bytes came out wrong (here: an unsupported format)
+	expect(await getFormatFromChunk(new Int16Array(32))).toBe(error);
+});
+
 const float64 = (value: number) => {
 	const bytes = new Uint8Array(8);
 	new DataView(bytes.buffer).setFloat64(0, value);
