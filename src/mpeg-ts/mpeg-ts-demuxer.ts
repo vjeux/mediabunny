@@ -81,7 +81,6 @@ import {
 } from '../../shared/mp3-misc';
 import { EncodedPacket, PacketType, PLACEHOLDER_DATA } from '../packet';
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
-import { ReadableStreamSource, UrlSource } from '../source';
 import {
 	buildMpegTsMimeType,
 	createTimestampWrapInfo,
@@ -93,6 +92,22 @@ import {
 } from './mpeg-ts-misc';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
+import { ReadableStreamSource, UrlSource } from '../source';
+
+/**
+ * How far reading can go past a position and still come back to it. Sources that only keep what their cache holds (a
+ * ReadableStreamSource, or a UrlSource whose server ignores range requests) can go half their cache, which stays clear
+ * of what gets evicted; the others, anywhere.
+ */
+const getReadBackDistance = (reader: Reader) => {
+	const source = reader.source;
+	const sequentialSource = source instanceof ReadableStreamSource
+		? source
+		: source instanceof UrlSource
+			? source._sequentialBacking
+			: null;
+	return sequentialSource ? sequentialSource._maxCacheSize / 2 : Infinity;
+};
 
 // Resources:
 // ISO/IEC 13818-1
@@ -1460,9 +1475,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		// A source that only keeps what its cache holds (a ReadableStreamSource, or a UrlSource whose server ignores
 		// range requests) can't go back to what it's evicted, which the chunk search or a scan from the start of the
 		// track would do once reading is past its cache: it reads on from the closest point before instead, however far
-		const source = reader.source;
-		const readsOnlyForward = source instanceof ReadableStreamSource
-			|| (source instanceof UrlSource && source._sequentialBacking !== null);
+		const readsOnlyForward = getReadBackDistance(reader) !== Infinity;
 
 		const referencePesPackets = this.elementaryStream.referencePesPackets;
 		const referencePointIndex = binarySearchLessOrEqual(referencePesPackets, searchPts, x => x.pts);
