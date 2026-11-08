@@ -1,9 +1,10 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource, UrlSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -11,6 +12,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +926,184 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS reads the packets in front of a late PAT and PMT', async () => {
+	// Found by L80. A capture of a broadcast starts somewhere between two of its PSI repetitions, so packets of the
+	// streams come before the first PAT and PMT. late-pmt.ts is the first 531 TS packets of FFmpeg's FATE sample
+	// h264/h264_intra_first-small.ts without its video (PID 0x12b5, whose first SPS only comes later): MP2 audio
+	// (0x12b2, 0x12b4) from TS packets 0 and 1, the PAT at packet 11 and the PMT at packet 17, of 24. Expected: the
+	// packets ffprobe reads (PTS, size); on main, the file opens with no tracks at all.
+	const readFirstPackets = async (bytes: Uint8Array, count: number) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const result: Record<number, number[][]> = {};
+		for (const track of await input.getTracks()) {
+			const packets: number[][] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push([Math.round(packet.timestamp * 90000), packet.byteLength]);
+				if (packets.length === count) {
+					break;
+				}
+			}
+			result[track.id] = packets;
+		}
+		return result;
+	};
+
+	const lateCapture = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/late-pmt.ts')));
+	expect(await readFirstPackets(lateCapture, Infinity)).toEqual({
+		[0x12b4]: [[212003457, 672], [212005617, 416]],
+		[0x12b2]: [[212002017, 672], [212004177, 672], [212006337, 112]],
+	});
+
+	// And synthetic ones: 30 AAC frames (stub payloads), with the PAT and PMT (the first two TS packets) moved behind
+	// the first 5 TS packets of media, or to the very end
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 30; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(100).fill(0x11), 'key', i * 1024 / 48000, 1024 / 48000),
+			i === 0
+				? {
+						decoderConfig: {
+							codec: 'mp4a.40.2',
+							numberOfChannels: 2,
+							sampleRate: 48000,
+							description: new Uint8Array([0x11, 0x90]),
+						},
+					}
+				: undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const movePsiBack = (count: number) => {
+		const result = new Uint8Array(bytes.length);
+		result.set(bytes.subarray(2 * 188, (2 + count) * 188), 0);
+		result.set(bytes.subarray(0, 2 * 188), count * 188);
+		result.set(bytes.subarray((2 + count) * 188), (2 + count) * 188);
+		return result;
+	};
+
+	const expected = await readFirstPackets(bytes, 30);
+	expect(Object.values(expected)[0]).toHaveLength(30);
+	expect(await readFirstPackets(movePsiBack(5), 30)).toEqual(expected);
+	expect(await readFirstPackets(movePsiBack(bytes.length / 188 - 2), 30)).toEqual(expected);
+
+	// Sources that only keep what their cache holds go back too, when it still holds the start (from L46's review):
+	// the same file through a ReadableStreamSource and a UrlSource whose server ignores range requests, 2 MiB caches
+	const lateBytes = movePsiBack(5);
+	const readFirstPacketsFrom = async (source: ReadableStreamSource | UrlSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const result: Record<number, number[][]> = {};
+		for (const track of await input.getTracks()) {
+			const packets: number[][] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push([Math.round(packet.timestamp * 90000), packet.byteLength]);
+			}
+			result[track.id] = packets;
+		}
+		return result;
+	};
+	let latePosition = 0;
+	const lateStream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (latePosition >= lateBytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(lateBytes.slice(latePosition, latePosition + 65536));
+			latePosition += 65536;
+		},
+	});
+	const lateStreamSource = new ReadableStreamSource(lateStream, { maxCacheSize: 2 ** 21 });
+	expect(await readFirstPacketsFrom(lateStreamSource)).toEqual(expected);
+	const lateServer = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': lateBytes.byteLength });
+		response.end(lateBytes);
+	});
+	await new Promise<void>(resolve => lateServer.listen(0, resolve));
+	try {
+		const address = lateServer.address();
+		assert(address && typeof address !== 'string');
+		expect(await readFirstPacketsFrom(new UrlSource(`http://localhost:${address.port}/late.ts`, {
+			maxCacheSize: 2 ** 21,
+			getRetryDelay: () => null,
+		}))).toEqual(expected);
+	} finally {
+		lateServer.closeAllConnections();
+		lateServer.close();
+	}
+
+	// When its cache doesn't hold the start anymore once the PMT is found, it reads on from there, as before (found in
+	// L15's "sized but not seekable" check). 4 seconds of frames of 60 kB with the
+	// PAT and PMT 3 MB in, from a server that ignores range requests through a UrlSource with a 1 MiB cache.
+	const nalUnit = (nalBytes: number[]) => [0, 0, 0, 1, ...nalBytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const videoOutput = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('avc');
+	videoOutput.addVideoTrack(videoSource, { frameRate: 25 });
+	await videoOutput.start();
+	for (let i = 0; i < 100; i++) {
+		const isKey = i % 25 === 0;
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+		await videoSource.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await videoOutput.finalize();
+	const videoBytes = new Uint8Array(videoOutput.target.buffer!);
+	const psiPos = Math.floor(3e6 / 188); // In TS packets
+	const lateVideo = new Uint8Array(videoBytes.length);
+	lateVideo.set(videoBytes.subarray(2 * 188, (2 + psiPos) * 188), 0);
+	lateVideo.set(videoBytes.subarray(0, 2 * 188), psiPos * 188);
+	lateVideo.set(videoBytes.subarray((2 + psiPos) * 188), (2 + psiPos) * 188);
+	let framesAfterPsi = 0;
+	for (let pos = (psiPos + 2) * 188; pos < lateVideo.length; pos += 188) {
+		const pid = ((lateVideo[pos + 1]! & 0x1f) << 8) | lateVideo[pos + 2]!;
+		if (pid === 0x100 && lateVideo[pos + 1]! & 0x40) {
+			framesAfterPsi++;
+		}
+	}
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': lateVideo.byteLength });
+		response.end(lateVideo);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using input = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 20,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(framesAfterPsi).toBeGreaterThan(40);
+		expect(packetCount).toBe(framesAfterPsi);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
 });
