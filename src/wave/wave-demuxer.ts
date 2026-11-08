@@ -17,7 +17,7 @@ import {
 	unwatchMetadataTagFields,
 	watchMetadataTagFields,
 } from '../metadata';
-import { assert, isThenable, roundIfAlmostInteger, UNDETERMINED_LANGUAGE } from '../misc';
+import { assert, isThenable, roundIfAlmostInteger, UNDETERMINED_LANGUAGE, createUtcDate } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
@@ -401,8 +401,9 @@ export class WaveDemuxer extends Demuxer {
 
 				case 'YEAR': {
 					const year = Number.parseInt(value, 10);
-					if (Number.isInteger(year) && year > 0) {
-						this.metadataTags.date ??= new Date(year, 0, 1);
+					const date = createUtcDate(year);
+					if (year > 0 && !Number.isNaN(date.getTime())) {
+						this.metadataTags.date ??= date;
 					}
 				}; break;
 
