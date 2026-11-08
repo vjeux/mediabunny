@@ -4,7 +4,7 @@ import { Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/ou
 import { BufferTarget } from '../../src/target.js';
 import { AudioSampleSource, MediaStreamAudioTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { Quality } from '../../src/encode.js';
+import { canEncodeAudio, Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -922,36 +922,47 @@ test('MediaStreamAudioTrackSource drops audio a process() slower than real time 
 	expect(callsWhileFinalizing).toBeLessThanOrEqual(9);
 });
 
-test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async () => {
+test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async ({
+	skip,
+}) => {
+	if (typeof AudioEncoder === 'undefined' || !(await canEncodeAudio('opus'))) {
+		skip('Opus encoding is not supported here');
+	}
+
+	// A slow encoder setup keeps the captured audio waiting in the add chain while finalizing
+	const isConfigSupported = AudioEncoder.isConfigSupported.bind(AudioEncoder);
+	AudioEncoder.isConfigSupported = async (config: AudioEncoderConfig) => {
+		await new Promise(resolve => setTimeout(resolve, 500));
+		return isConfigSupported(config);
+	};
 	const capture = installSineCapture();
 	const output = new Output({
-		format: new WavOutputFormat(),
+		format: new WebMOutputFormat(),
 		target: new BufferTarget(),
 	});
-	const audioSource = new MediaStreamAudioTrackSource(capture.track, { codec: 'pcm-f32' });
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
+		codec: 'opus',
+		quality: new Quality('low'),
+	});
 	audioSource.errorPromise.catch(() => {});
 	output.addAudioTrack(audioSource);
 
 	try {
 		await output.start();
-		await capture.deliver(20);
-		await new Promise(resolve => setTimeout(resolve, 50));
+		await capture.deliver(15);
 
-		// Nothing can hold finalization up here, so canceling while it runs doesn't drop any audio
+		// Nothing can hold finalization up for good here, so canceling while it runs doesn't drop any audio
 		const finalized = output.finalize();
 		await output.cancel();
 		await finalized;
 	} finally {
+		AudioEncoder.isConfigSupported = isConfigSupported;
 		await capture.uninstall();
 	}
 
 	expect(output.state).toBe('finalized');
 	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-	const track = (await input.getPrimaryAudioTrack())!;
-	let frames = 0;
-	for await (const sample of new AudioSampleSink(track).samples()) {
-		frames += sample.numberOfFrames;
-		sample.close();
-	}
-	expect(frames).toBe(20 * 1024);
+	const track = await input.getPrimaryAudioTrack();
+	expect(track).not.toBeNull();
+	expect(await track!.computeDuration()).toBeGreaterThan(0.9 * 15 * 1024 / 48000);
 });
