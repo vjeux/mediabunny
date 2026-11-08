@@ -58,7 +58,9 @@ export const readNextMp3FrameHeader = async (
 					// Unsized sources learn their size only once a read goes past their end, which the small slices
 					// above may not do, so make sure the frame isn't cut off by the end of the file before taking it
 					let frameSlice = reader.requestSlice(currentPos, result.header.totalSize);
-					if (isThenable(frameSlice)) frameSlice = await frameSlice;
+					if (isThenable(frameSlice)) {
+						frameSlice = await frameSlice;
+					}
 
 					if (!frameSlice) {
 						if (reader.fileSize === null) {
