@@ -272,3 +272,59 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Metadata duration of a track that starts late', async () => {
+	// 4 s of video (100 samples of 40 ms) that an edit list starts at 10 s. FFmpeg up to 6.0 writes the track's end
+	// time (14 s) as its mdhd duration when it writes an edit list, rather than the length of the media, like in
+	// androidx/media's test file bbb_800x640_768kbps_30fps_avc_2b_firstpts_10_sec.mp4.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const read = async (mdhdDuration: number) => {
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(50),
+			box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(14000), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(14000), zeros(16), matrix, u32(64 << 16),
+					u32(64 << 16)),
+				box('edts', box('elst', zeros(4), u32(2),
+					u32(10000), u32(0xffffffff), u32(0x10000), // 10 s of nothing
+					u32(4000), u32(0), u32(0x10000), // Then the media
+				)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(1000), u32(mdhdDuration), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), avc1),
+						box('stts', zeros(4), u32(1), u32(100), u32(40)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(100), u32(1)),
+						box('stsz', zeros(4), u32(1), u32(100)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...box('mdat', zeros(100)), ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getFirstTimestamp()).toBe(10);
+		expect(await track.computeDuration()).toBe(14);
+		return track.getDurationFromMetadata();
+	};
+
+	expect(await read(14000)).toBe(14);
+	expect(await read(4000)).toBe(14); // The length of the media, as the spec says
+	expect(await read(3000)).toBe(13); // Shorter than the samples: left as is
+});
