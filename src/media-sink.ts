@@ -3089,7 +3089,9 @@ export class CanvasSink {
 	/** @internal */
 	_videoSampleSink: VideoSampleSink;
 	/** @internal */
-	_canvasPool: (HTMLCanvasElement | OffscreenCanvas | null)[];
+	_poolSize: number;
+	/** @internal */
+	_canvasPool: (HTMLCanvasElement | OffscreenCanvas)[] = [];
 	/** @internal */
 	_nextCanvasIndex = 0;
 
@@ -3146,7 +3148,8 @@ export class CanvasSink {
 		this._options = options;
 		this._fit = options.fit ?? 'fill';
 		this._videoSampleSink = new VideoSampleSink(videoTrack, options.decoderOptions);
-		this._canvasPool = Array.from({ length: options.poolSize ?? 0 }, () => null);
+		// The pool fills up as canvases are created, so a large pool size doesn't allocate anything up front
+		this._poolSize = options.poolSize ?? 0;
 	}
 
 	/** @internal */
@@ -3199,7 +3202,7 @@ export class CanvasSink {
 	_videoSampleToWrappedCanvas(sample: VideoSample): WrappedCanvas {
 		const width = this._width;
 		const height = this._height;
-		let canvas = this._canvasPool[this._nextCanvasIndex];
+		let canvas = this._canvasPool[this._nextCanvasIndex] as HTMLCanvasElement | OffscreenCanvas | undefined;
 		let canvasIsNew = false;
 
 		if (!canvas) {
@@ -3212,15 +3215,15 @@ export class CanvasSink {
 				canvas = new OffscreenCanvas(width, height);
 			}
 
-			if (this._canvasPool.length > 0) {
+			if (this._poolSize > 0) {
 				this._canvasPool[this._nextCanvasIndex] = canvas;
 			}
 
 			canvasIsNew = true;
 		}
 
-		if (this._canvasPool.length > 0) {
-			this._nextCanvasIndex = (this._nextCanvasIndex + 1) % this._canvasPool.length;
+		if (this._poolSize > 0) {
+			this._nextCanvasIndex = (this._nextCanvasIndex + 1) % this._poolSize;
 		}
 
 		const context = canvas.getContext('2d', {
