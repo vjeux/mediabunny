@@ -1971,10 +1971,13 @@ type SuppliedPacket = {
 /** Parameter set NAL units by NAL unit type */
 type ParameterSets = Map<number, Uint8Array[]>;
 
+const AVC_PARAMETER_SET_TYPES = [AvcNalUnitType.SPS, AvcNalUnitType.PPS];
+const HEVC_PARAMETER_SET_TYPES = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+
 /** The NAL unit types of the parameter sets that a decoder needs, in the order they go in. */
-const getParameterSetTypes = (codec: 'avc' | 'hevc'): number[] => codec === 'avc'
-	? [AvcNalUnitType.SPS, AvcNalUnitType.PPS]
-	: [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+const getParameterSetTypes = (codec: 'avc' | 'hevc'): readonly number[] => codec === 'avc'
+	? AVC_PARAMETER_SET_TYPES
+	: HEVC_PARAMETER_SET_TYPES;
 
 const getNalUnitType = (codec: 'avc' | 'hevc', byte: number) => codec === 'avc'
 	? extractNalUnitTypeForAvc(byte)
@@ -1984,12 +1987,16 @@ const isVclNalUnitType = (codec: 'avc' | 'hevc', type: number) => codec === 'avc
 	? type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR
 	: type <= 31;
 
+/** Whether the VCL NAL unit type is that of an IDR picture (H.264) or an IRAP picture (HEVC). */
+const isRandomAccessNalUnitType = (codec: 'avc' | 'hevc', type: number) => codec === 'avc'
+	? type === AvcNalUnitType.IDR
+	: type >= HevcNalUnitType.BLA_W_LP && type <= HevcNalUnitType.RSV_IRAP_VCL23;
+
 /**
  * Collects the parameter sets in Annex B data, by type. For each type, it keeps those of the last access unit with any
- * (access units are told apart by their VCL NAL units). When stopping at the first VCL NAL unit, which is enough for
- * an access unit, only those before it count.
+ * (access units are told apart by their VCL NAL units).
  */
-const collectParameterSets = (data: Uint8Array, codec: 'avc' | 'hevc', stopAtVclNalUnit: boolean) => {
+const collectParameterSets = (data: Uint8Array, codec: 'avc' | 'hevc') => {
 	const types = getParameterSetTypes(codec);
 	const parameterSets: ParameterSets = new Map();
 	const typesOfCurrentAccessUnit = new Set<number>();
@@ -1997,10 +2004,6 @@ const collectParameterSets = (data: Uint8Array, codec: 'avc' | 'hevc', stopAtVcl
 	for (const location of iterateNalUnitsInAnnexB(data)) {
 		const type = getNalUnitType(codec, data[location.offset]!);
 		if (isVclNalUnitType(codec, type)) {
-			if (stopAtVclNalUnit) {
-				break;
-			}
-
 			typesOfCurrentAccessUnit.clear();
 		} else if (types.includes(type)) {
 			if (!typesOfCurrentAccessUnit.has(type)) {
@@ -2013,6 +2016,67 @@ const collectParameterSets = (data: Uint8Array, codec: 'avc' | 'hevc', stopAtVcl
 	}
 
 	return parameterSets;
+};
+
+/** The position of the next Annex B start code at or after pos, and its length, or null if there's none. */
+const findStartCode = (data: Uint8Array, pos: number) => {
+	while (true) {
+		const zeroIndex = data.indexOf(0, pos);
+		if (zeroIndex === -1 || zeroIndex + 2 >= data.length) {
+			return null;
+		}
+
+		if (data[zeroIndex + 1] === 0) {
+			if (data[zeroIndex + 2] === 1) {
+				return { pos: zeroIndex, length: 3 };
+			} else if (data[zeroIndex + 2] === 0 && data[zeroIndex + 3] === 1) {
+				return { pos: zeroIndex, length: 4 };
+			}
+		}
+
+		pos = zeroIndex + 1;
+	}
+};
+
+/**
+ * Reads the NAL units of an access unit (Annex B) up to its first VCL NAL unit, which is where its parameter sets
+ * are, without going through the rest. Returns those parameter sets, by type, and the first VCL NAL unit's type.
+ */
+const scanAccessUnitStart = (data: Uint8Array, codec: 'avc' | 'hevc') => {
+	const types = getParameterSetTypes(codec);
+	let parameterSets: ParameterSets | null = null;
+	let firstVclNalUnitType: number | null = null;
+
+	let startCode = findStartCode(data, 0);
+	while (startCode) {
+		const nalUnitStart = startCode.pos + startCode.length;
+		if (nalUnitStart >= data.length) {
+			break;
+		}
+
+		const type = getNalUnitType(codec, data[nalUnitStart]!);
+		if (isVclNalUnitType(codec, type)) {
+			firstVclNalUnitType = type;
+			break;
+		}
+
+		startCode = findStartCode(data, nalUnitStart + 1);
+		if (types.includes(type)) {
+			let nalUnitEnd = startCode?.pos ?? data.length;
+			while (nalUnitEnd > nalUnitStart && data[nalUnitEnd - 1] === 0) {
+				nalUnitEnd--; // trailing_zero_8bits
+			}
+
+			parameterSets ??= new Map();
+			let nalUnits = parameterSets.get(type);
+			if (!nalUnits) {
+				parameterSets.set(type, nalUnits = []);
+			}
+			nalUnits.push(data.slice(nalUnitStart, nalUnitEnd));
+		}
+	}
+
+	return { parameterSets, firstVclNalUnitType };
 };
 
 /** The parameter sets of a video stream's decoder config, which are its first ones. */
@@ -2087,7 +2151,7 @@ const findParameterSetsBefore = (elementaryStream: ElementaryVideoStream, endPos
 					continue;
 				}
 
-				for (const [type, nalUnits] of collectParameterSets(pesPacket.data, codec, false)) {
+				for (const [type, nalUnits] of collectParameterSets(pesPacket.data, codec)) {
 					if (!parameterSets.has(type)) {
 						parameterSets.set(type, nalUnits);
 					}
@@ -2298,9 +2362,9 @@ class PacketReadingContext {
 	/**
 	 * A decoder that starts at a key packet needs the parameter sets, which in Annex B come in-band, along with the
 	 * frames. Some streams only send them with some of their key frames, and the other key frames rely on those sent
-	 * before. A key packet without any parameter sets gets those in force before it inserted, the last of each type in
-	 * the stream, as FFmpeg's h264_mp4toannexb does. Reading along, a context keeps track of them; one that starts
-	 * further into the track looks back for them (see findParameterSetsBefore).
+	 * before. A key packet of an IDR/IRAP picture without any parameter sets gets those in force before it inserted,
+	 * the last of each type in the stream, as FFmpeg's h264_mp4toannexb does. Reading along, a context keeps track of
+	 * them; one that starts further into the track looks back for them (see findParameterSetsBefore).
 	 */
 	async addMissingParameterSets(packet: SuppliedPacket, codec: 'avc' | 'hevc') {
 		const elementaryStream = this.elementaryStream as ElementaryVideoStream;
@@ -2308,12 +2372,22 @@ class PacketReadingContext {
 			? getDecoderConfigParameterSets(elementaryStream)
 			: new Map();
 
-		const parameterSetsOfPacket = collectParameterSets(packet.data, codec, true);
-		for (const [type, nalUnits] of parameterSetsOfPacket) {
-			this.parameterSets.set(type, nalUnits);
+		const scanned = scanAccessUnitStart(packet.data, codec);
+		const parameterSetsOfPacket = scanned.parameterSets;
+		if (parameterSetsOfPacket) {
+			for (const [type, nalUnits] of parameterSetsOfPacket) {
+				this.parameterSets.set(type, nalUnits);
+			}
 		}
 
-		if (packet.randomAccessIndicator !== 1 || parameterSetsOfPacket.size > 0) {
+		// Only IDR/IRAP pictures (H.264/HEVC), from which decoding can start without anything before, get them: some
+		// muxers flag other frames as random access points too
+		if (
+			packet.randomAccessIndicator !== 1
+			|| parameterSetsOfPacket
+			|| scanned.firstVclNalUnitType === null
+			|| !isRandomAccessNalUnitType(codec, scanned.firstVclNalUnitType)
+		) {
 			return;
 		}
 
