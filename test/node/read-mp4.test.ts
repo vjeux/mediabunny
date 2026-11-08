@@ -3949,3 +3949,80 @@ test('Fragments without tfdt are placed the same whichever track is looked up fi
 	expect(fresh.duration).toBe(10);
 	expect(await readAudio(true)).toEqual(fresh);
 });
+
+test('Video tracks whose samples are all sync samples only have key packets', async () => {
+	// Without an stss box, every sample is a sync sample (ISO/IEC 14496-12 8.6.2.1); FFmpeg and Mediabunny leave it out
+	// for all-intra video. Fragments flag their samples themselves.
+	const read = async (types: ('key' | 'delta')[], fastStart?: 'fragmented') => {
+		const output = new Output({ format: new Mp4OutputFormat({ fastStart }), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		for (const [i, type] of types.entries()) {
+			await source.add(new EncodedPacket(new Uint8Array([i, 1, 2, 3]), type, i / 10, 1 / 10), {
+				decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+			});
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const packetTypes: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packetTypes.push(packet.type);
+		}
+
+		return { packetTypes, hasOnlyKeyPackets: await track.hasOnlyKeyPackets() };
+	};
+
+	expect(await read(['key', 'key', 'key', 'key'])).toEqual({
+		packetTypes: ['key', 'key', 'key', 'key'],
+		hasOnlyKeyPackets: true,
+	});
+	expect(await read(['key', 'delta', 'delta', 'key'])).toEqual({
+		packetTypes: ['key', 'delta', 'delta', 'key'],
+		hasOnlyKeyPackets: false,
+	});
+	// The metadata of fragmented files doesn't say, so it's up to the codec, as before
+	expect((await read(['key', 'key', 'key', 'key'], 'fragmented')).hasOnlyKeyPackets).toBe(false);
+});
+
+test('An invalid stss entry of 0 does not make a video track only have key packets', async () => {
+	// Ten samples, all key frames but the last, with an extra stss entry 0 at the end (entries are 1-based; a table
+	// starting at 0 would count from 0)
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+	for (let i = 0; i < 10; i++) {
+		await source.add(new EncodedPacket(new Uint8Array([i, 1, 2, 3]), i < 9 ? 'key' : 'delta', i / 10, 1 / 10), {
+			decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 },
+		});
+	}
+	await output.finalize();
+
+	// Append the entry, growing stss and its ancestors by 4 bytes. The moov box comes last, so no offsets change.
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = new DataView(bytes.buffer);
+	const findBox = (name: string) => bytes.findIndex(
+		(_, i) => new TextDecoder().decode(bytes.subarray(i + 4, i + 8)) === name,
+	);
+	const stss = findBox('stss');
+	const stssEnd = stss + view.getUint32(stss);
+	const damaged = new Uint8Array([...bytes.subarray(0, stssEnd), 0, 0, 0, 0, ...bytes.subarray(stssEnd)]);
+	const damagedView = new DataView(damaged.buffer);
+	damagedView.setUint32(stss + 12, view.getUint32(stss + 12) + 1); // Entry count
+	for (const name of ['stss', 'stbl', 'minf', 'mdia', 'trak', 'moov']) {
+		const position = findBox(name);
+		damagedView.setUint32(position, view.getUint32(position) + 4);
+	}
+
+	using input = new Input({ source: new BufferSource(damaged), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+	let keyPacketCount = 0;
+	for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+		keyPacketCount += packet.type === 'key' ? 1 : 0;
+	}
+	expect(keyPacketCount).toBe(9);
+	expect(await track.hasOnlyKeyPackets()).toBe(false);
+});
