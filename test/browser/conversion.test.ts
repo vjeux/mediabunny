@@ -23,6 +23,7 @@ import { EncodedPacket } from '../../src/packet.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
 import { VideoSample } from '../../src/sample.js';
+import { CustomVideoDecoder, registerDecoder } from '../../src/custom-coder.js';
 
 test('Rotation is baked in when rerendering', async () => {
 	using input = new Input({
@@ -1284,6 +1285,91 @@ test('Requested audio parameters apply when the decoded audio differs from the m
 			numberOfChannels: await wavTrack.getNumberOfChannels(),
 			sampleRate: await wavTrack.getSampleRate(),
 		}).toEqual({ numberOfChannels: 2, sampleRate: 44100, ...audio });
+	}
+});
+
+// video.mp4 is 1920x1080 H.264 High at level 4.0. Whether the platform has hardware video codecs is decided with
+// WebCodecs alone (Chromium refuses 'prefer-hardware' without them).
+const VIDEO_MP4_DECODER_CONFIG: VideoDecoderConfig = { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 };
+
+test('Video that the requested hardware acceleration can\'t decode is discarded', async (context) => {
+	const hardware = await VideoDecoder.isConfigSupported({
+		...VIDEO_MP4_DECODER_CONFIG,
+		hardwareAcceleration: 'prefer-hardware',
+	});
+	if (hardware.supported) {
+		context.skip('This platform decodes H.264 in hardware');
+	}
+
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		video: { forceTranscode: true, hardwareAcceleration: 'prefer-hardware' },
+		audio: { discard: true },
+		showWarnings: false,
+	});
+	expect(conversion.isValid).toBe(false);
+	expect(conversion.discardedTracks.map(x => x.reason)).toContain('undecodable_source_codec');
+
+	// Without the hint, it transcodes
+	using softwareInput = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const softwareOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const software = await Conversion.init({
+		input: softwareInput,
+		output: softwareOutput,
+		video: { forceTranscode: true, hardwareAcceleration: 'prefer-software' },
+		audio: { discard: true },
+		trim: { start: 0, end: 0.2 },
+		showWarnings: false,
+	});
+	expect(software.isValid).toBe(true);
+	await software.execute();
+});
+
+// Stands in for a hardware decoder where there is none, for the duration of a test
+let fakeHardwareDecoderEnabled = false;
+class FakeHardwareDecoder extends CustomVideoDecoder {
+	static override supports() {
+		return fakeHardwareDecoderEnabled;
+	}
+
+	init() {}
+	decode() {}
+	flush() {}
+	close() {}
+}
+
+test('Video that the requested hardware acceleration can\'t encode is discarded', async (context) => {
+	const hardware = await VideoEncoder.isConfigSupported({
+		codec: 'avc1.640028',
+		width: 1920,
+		height: 1080,
+		bitrate: 5_000_000,
+		hardwareAcceleration: 'prefer-hardware',
+	});
+	if (hardware.supported) {
+		context.skip('This platform encodes H.264 in hardware');
+	}
+
+	// Like a platform that decodes in hardware but has no hardware encoder for the codec (common for HEVC and AV1)
+	registerDecoder(FakeHardwareDecoder);
+	fakeHardwareDecoderEnabled = true;
+	try {
+		using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec: 'avc', forceTranscode: true, hardwareAcceleration: 'prefer-hardware' },
+			audio: { discard: true },
+			showWarnings: false,
+		});
+		expect(conversion.isValid).toBe(false);
+		expect(conversion.discardedTracks.map(x => x.reason)).toContain('no_encodable_target_codec');
+	} finally {
+		fakeHardwareDecoderEnabled = false;
 	}
 });
 

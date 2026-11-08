@@ -1548,7 +1548,7 @@ export const getFirstEncodableVideoCodec = async (
 		bitrate?: number | Quality;
 		/** The expected frame rate in frames per second, if known. */
 		frameRate?: number;
-	},
+	} & VideoEncodingAdditionalOptions,
 ): Promise<VideoCodec | null> => {
 	validateCheckedCodecIterable(checkedCodecs);
 
