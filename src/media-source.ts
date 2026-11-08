@@ -317,6 +317,8 @@ class VideoEncoderWrapper {
 	private addQueue: Promise<void> = Promise.resolve();
 	/** How many added samples are waiting for their turn or being processed. */
 	private queuedAddCount = 0;
+	/** Resolved once the wrapper is closed, so that adds queued behind one that never finishes don't wait forever. */
+	private closedSignal = promiseWithResolvers();
 
 	constructor(private source: VideoSource, private encodingConfig: VideoEncodingConfig) {}
 
@@ -336,7 +338,8 @@ class VideoEncoderWrapper {
 		// (sources that don't wait for their adds, like MediaStreamVideoTrackSource, add while others are pending).
 		// They're validated before waiting their turn, so that one added before finalize() isn't rejected for it.
 		this.queuedAddCount++;
-		const added = this.addQueue.then(() => this.addInOrder(videoSample, shouldClose, encodeOptions));
+		const added = Promise.race([this.addQueue, this.closedSignal.promise])
+			.then(() => this.addInOrder(videoSample, shouldClose, encodeOptions));
 		this.addQueue = added.catch(() => {});
 		try {
 			await added;
@@ -1148,6 +1151,7 @@ class VideoEncoderWrapper {
 			// This cleanup must also run when padding or flushing threw (e.g. due to an encoder error), otherwise
 			// samples, frames and encoders would be left dangling
 			this.closed = true;
+			this.closedSignal.resolve();
 
 			this.frameRateLastSample?.close();
 			this.frameRateLastSample = null;
