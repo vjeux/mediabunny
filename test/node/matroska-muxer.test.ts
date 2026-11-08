@@ -618,3 +618,57 @@ test('Frames that outgrow a 4-byte element size keep their size', async () => {
 	}
 	expect(sizes).toEqual(frameSizes);
 });
+
+test('Conversion of Ogg Opus to WebM copies the packets, keeping the pre-skip as CodecDelay', async () => {
+	// The first packet starts at -312/48000 s, the pre-skip
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/preroll-test.opus')),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const inputSink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+	const outputSink = new EncodedPacketSink((await result.getPrimaryAudioTrack())!);
+	const inputPackets: EncodedPacket[] = [];
+	const outputPackets: EncodedPacket[] = [];
+	for await (const packet of inputSink.packets()) {
+		inputPackets.push(packet);
+	}
+	for await (const packet of outputSink.packets()) {
+		outputPackets.push(packet);
+	}
+
+	expect(outputPackets).toHaveLength(inputPackets.length);
+	for (let i = 0; i < inputPackets.length; i++) {
+		expect(outputPackets[i]!.data).toEqual(inputPackets[i]!.data);
+		// Matroska stores milliseconds
+		expect(Math.abs(outputPackets[i]!.timestamp - inputPackets[i]!.timestamp)).toBeLessThanOrEqual(0.0005 + 1e-9);
+	}
+	expect(containsBytes(new Uint8Array(output.target.buffer!), [0x56, 0xaa])).toBe(true); // CodecDelay element ID
+});
+
+test('Conversion of Ogg Opus to WebM with a sub-millisecond start trim applies the trim or doesn\'t copy', async () => {
+	// Matroska's CodecDelay has to be the pre-skip, so the priming can't absorb an explicit trim
+	const trimStart = 0.0008;
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/preroll-test.opus')),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false, trim: { start: trimStart } });
+	if (!conversion.isValid) {
+		return; // Needs a transcode, which isn't available in Node
+	}
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const inputPacket = (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getPacket(0.2))!;
+	const outputPacket = (await new EncodedPacketSink((await result.getPrimaryAudioTrack())!).getPacket(0.2))!;
+	expect(outputPacket.data).toEqual(inputPacket.data);
+	// Matroska stores milliseconds
+	expect(Math.abs(outputPacket.timestamp - (inputPacket.timestamp - trimStart))).toBeLessThanOrEqual(0.0005 + 1e-9);
+});

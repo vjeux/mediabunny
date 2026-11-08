@@ -10,6 +10,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS, OggInputFormat } from '../../src/input-format.js';
 import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
+import { Conversion } from '../../src/conversion.js';
 
 test('maximumPageDuration option', async () => {
 	const sampleRate = 48000;
@@ -597,3 +598,117 @@ test('Vorbis timestamp gaps are kept in the granule positions', async () => {
 	}
 	expect(trimmedPacketEnds.get(3 + 99)).toBe(packetEnds.get(3 + 99)! - 100);
 });
+
+test.each(['/preroll-test.opus', '/vorbis-eos.ogg'])(
+	'Conversion of %s to Ogg copies the packets, keeping the priming before zero',
+	async (url) => {
+		// The first Opus packet starts at minus the pre-skip, the first Vorbis packet at minus its own duration (it
+		// decodes to nothing); the Ogg muxer puts granule position zero right after either
+		const readPackets = async (input: Input) => {
+			const track = await input.getPrimaryAudioTrack();
+			assert(track);
+
+			const packets: [number, number][] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push([packet.timestamp, packet.byteLength]);
+			}
+
+			return { codec: await track.getCodec(), packets };
+		};
+
+		using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const inputPackets = await readPackets(input);
+		expect(inputPackets.packets[0]![0]).toBeLessThan(0);
+		expect(await readPackets(result)).toEqual(inputPackets);
+	},
+);
+
+// Whether this browser decodes a file's audio, within a few seconds. Decided by WebCodecs: the file's first packets
+// through an AudioDecoder (WebKitGTK's Vorbis decoder hangs, say). Run inside the test that needs it, as late as
+// possible: a hung native decoder can stall the browser's later media work
+const decodesAudioNatively = async (url: string) => {
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	const decoderConfig = await track?.getDecoderConfig();
+	if (!track || !decoderConfig || !(await AudioDecoder.isConfigSupported(decoderConfig)).supported) {
+		return false;
+	}
+
+	let outputCount = 0;
+	const decoder = new AudioDecoder({
+		output: (audioData) => {
+			outputCount++;
+			audioData.close();
+		},
+		error: () => {},
+	});
+
+	try {
+		decoder.configure(decoderConfig);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			decoder.decode(packet.toEncodedAudioChunk());
+			if (++packetCount === 10) {
+				break;
+			}
+		}
+
+		const flushed = await Promise.race([
+			decoder.flush().then(() => true, () => false),
+			new Promise<boolean>(resolve => setTimeout(() => resolve(false), 3000)),
+		]);
+		return flushed && outputCount > 0;
+	} finally {
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+	}
+};
+
+const testTrimmedConversion = async (url: string, trimStart: number) => {
+	// The priming must not absorb an explicit trim
+	const readPackets = async (input: Input) => {
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		return packets;
+	};
+
+	using input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, trim: { start: trimStart } });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const inputPackets = await readPackets(input);
+	const outputPackets = await readPackets(result);
+
+	// Transcoding applies the trim; a copy has to move every packet earlier by it (Ogg stores whole samples)
+	if (outputPackets[10]!.byteLength === inputPackets[10]!.byteLength) {
+		expect(outputPackets[10]!.data).toEqual(inputPackets[10]!.data);
+		expect(Math.abs(outputPackets[10]!.timestamp - (inputPackets[10]!.timestamp - trimStart))).toBeLessThan(2.5e-5);
+	}
+};
+
+for (const [url, trimStart] of [
+	// Less than the 1 ms the pre-skip match allows for rounded sources
+	['/preroll-test.opus', 0.0008],
+	// Beyond the first packet, which starts 45 samples before zero and lasts 128 at 44.1 kHz, but less than 1 ms beyond
+	['/vorbis-eos.ogg', 0.0025],
+] as const) {
+	test(`Conversion of ${url} to Ogg with a start trim of ${trimStart} s applies the trim`, async ({ skip }) => {
+		// A trim this small makes the conversion transcode, which needs a decoder
+		skip(!(await decodesAudioNatively(url)), 'This browser can\'t decode the file');
+		await testTrimmedConversion(url, trimStart);
+	});
+}
