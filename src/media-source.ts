@@ -2070,6 +2070,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		let frameCount = 0;
 		let errored = false;
 		let timestampOffset = 0;
+		let lastAddedTimestamp: number | null = null; // Capture timestamp of the last frame handed to the encoder
 
 		// An ended track can't produce any more frames, so we close this source. Otherwise, the output would keep
 		// waiting for frames from this track, holding back the media of all other tracks until finalization.
@@ -2177,6 +2178,14 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				timestampOffset = target - firstVideoFrameTimestamp;
 			}
 
+			if (lastAddedTimestamp !== null && currentTimestamp <= lastAddedTimestamp) {
+				// Capture timestamps don't always increase (see https://crbug.com/618407). A frame stamped no later
+				// than the one before it would break the order of the packets: a key frame from before the previous
+				// GOP is rejected by the muxer, which fails the whole recording. So drop it.
+				videoFrame.close();
+				return;
+			}
+
 			if (this._encoder.getQueueSize() >= 8) {
 				// Drop frames if the encoder is overloaded or the output can't take its data fast enough, rather than
 				// holding on to them (frames may come from a small pool, like a camera's)
@@ -2184,6 +2193,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 				return;
 			}
 
+			lastAddedTimestamp = currentTimestamp;
 			const pausedTime = this._options.timestampBase === 'unix' ? 0 : this._pausedTime;
 			const sample = new VideoSample(videoFrame, {
 				timestamp: currentTimestamp + timestampOffset - pausedTime,
