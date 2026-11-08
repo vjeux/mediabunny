@@ -636,6 +636,41 @@ test('Playlist assignment, video with multiple audio codecs', async () => {
 	expect(decl[2]!.playlist).toBe(decl[3]!.playlist);
 });
 
+test('A rendition whose media starts more than half a day later, in fMP4 segments', async () => {
+	// The playlists all start at time 0, so the media of a rendition that starts later lies that far from where its
+	// playlist puts it. fMP4 timestamps don't wrap, so it must read back where its timestamps say, not shifted by the
+	// 2^33 / 90 kHz period at which MPEG-TS timestamps wrap around
+	const files = new Map<string, Uint8Array>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat() }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+			return target;
+		}),
+	});
+
+	const early = audioSource();
+	const late = audioSource();
+	output.addAudioTrack(early, { languageCode: 'eng' });
+	output.addAudioTrack(late, { languageCode: 'fra' });
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		await early.add(new EncodedPacket(aacPacketData, 'key', i * 1024 / 48000, 1024 / 48000), aacMetadata);
+	}
+	for (let i = 0; i < 10; i++) {
+		await late.add(new EncodedPacket(aacPacketData, 'key', 86400 + i * 1024 / 48000, 1024 / 48000), aacMetadata);
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+		formats: ALL_FORMATS,
+	});
+	const [earlyTrack, lateTrack] = await input.getAudioTracks();
+	expect(await lateTrack!.getFirstTimestamp() - await earlyTrack!.getFirstTimestamp()).toBeCloseTo(86400, 3);
+});
+
 test('Playlist assignment, audio with multiple video codecs', async () => {
 	const output = new Output({
 		format: new HlsOutputFormat({

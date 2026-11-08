@@ -10,6 +10,7 @@ import { TrackType } from './output';
 import { MediaCodec } from './codec';
 import { DurationMetadataRequestOptions } from './demuxer';
 import { Input } from './input';
+import { IsobmffInputFormat } from './input-format';
 import {
 	InputAudioTrack,
 	InputAudioTrackBacking,
@@ -193,12 +194,12 @@ export abstract class SegmentedInput {
 				+ await this.getMediaOffsetForDiscontinuity(segment.discontinuityNumber);
 
 			const period = this.getTimestampWrapPeriod();
-			if (period < Infinity) {
+			// fMP4 timestamps don't wrap around, and its media stays where they say, however far from the playlist
+			if (period < Infinity && !(await input.getFormat() instanceof IsobmffInputFormat)) {
 				// Media timestamps wrap around periodically (that's how MPEG-TS timestamps work). To make the entire
 				// timeline continuous and monotonic (even for live streams that go on forever), we do a simple trick:
 				// shift the media timestamps by multiples of the period length so that the first timestamp is closest
-				// to the segment's timestamp (which DOES rise monotonically). This even works correctly for
-				// non-wrapping formats like fMP4 because for them it's just a noop (or a constant shift for all media).
+				// to the segment's timestamp (which DOES rise monotonically).
 				const tracks = await input.getTracks();
 				const track = tracks.find(x => x.type === 'video') ?? tracks[0];
 				assert(track);
