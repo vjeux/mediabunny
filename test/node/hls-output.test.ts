@@ -2178,6 +2178,83 @@ test('Single-file mode with fragmented MP4 produces proper standalone segment fi
 	expect(timestamps).toEqual([10, 10.5, 11, 11.5, 12, 12.5, 13, 13.5]);
 });
 
+test('Single-file fragmented MP4 segments end where the next one starts', async () => {
+	// Each traf's decode time, and the decode time where its samples end
+	const readTrafs = (bytes: Uint8Array) => {
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+		const trafs: { decodeTime: number; end: number }[] = [];
+		for (let pos = 0; pos < bytes.byteLength; pos += view.getUint32(pos)) {
+			if (type(pos) !== 'moof') {
+				continue;
+			}
+
+			const traf = pos + 8 + view.getUint32(pos + 8); // After mfhd
+			let decodeTime = 0;
+			let defaultDuration = 0;
+			let duration = 0;
+			for (let child = traf + 8; child < traf + view.getUint32(traf); child += view.getUint32(child)) {
+				const flags = view.getUint32(child + 8) & 0xffffff;
+				if (type(child) === 'tfhd' && flags & 0x08) {
+					defaultDuration = view.getUint32(child + 16 + (flags & 0x01 ? 8 : 0) + (flags & 0x02 ? 4 : 0));
+				} else if (type(child) === 'tfdt') {
+					const isVersion1 = bytes[child + 8] === 1;
+					decodeTime = isVersion1 ? Number(view.getBigUint64(child + 12)) : view.getUint32(child + 12);
+				} else if (type(child) === 'trun') {
+					const sampleCount = view.getUint32(child + 12);
+					let entry = child + 16 + (flags & 0x01 ? 4 : 0) + (flags & 0x04 ? 4 : 0);
+					const entrySize = 4 * [0x100, 0x200, 0x400, 0x800].filter(x => flags & x).length;
+					for (let i = 0; i < sampleCount; i++, entry += entrySize) {
+						duration += flags & 0x100 ? view.getUint32(entry) : defaultDuration;
+					}
+				}
+			}
+			trafs.push({ decodeTime, end: decodeTime + duration });
+		}
+		return trafs;
+	};
+
+	// Packets with their exact durations, and packets without any
+	for (const duration of [1001 / 30000, 0]) {
+		let segments: ArrayBuffer | null = null;
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+				singleFilePerPlaylist: true,
+				targetDuration: 2,
+			}),
+			target: new PathedTarget('', (request) => {
+				const target = new BufferTarget();
+				if (request.path.includes('segment')) {
+					target.on('finalized', () => {
+						segments = target.buffer!;
+					});
+				}
+				return target;
+			}),
+		});
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+
+		// 29.97 fps with timestamps rounded to milliseconds, as in WebM files from FFmpeg, and a key frame every 2 s
+		for (let i = 0; i < 300; i++) {
+			const timestamp = Math.round(i * 1001 / 30) / 1000;
+			const packet = new EncodedPacket(new Uint8Array(1), i % 60 === 0 ? 'key' : 'delta', timestamp, duration);
+			await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 320, codedHeight: 180 } });
+		}
+		await output.finalize();
+
+		// A traf's decode time must be the sum of all earlier sample durations (ISO/IEC 14496-12). Each segment's
+		// last sample used to keep its packet duration: past the next segment's start, or 0 when packets had none.
+		const trafs = readTrafs(new Uint8Array(segments!));
+		expect(trafs).toHaveLength(5);
+		for (let i = 1; i < trafs.length; i++) {
+			expect(trafs[i]!.decodeTime).toBe(trafs[i - 1]!.end);
+		}
+	}
+});
+
 test('StreamTarget, write is called for each target', async () => {
 	const writeCounts = new Map<string, number>();
 

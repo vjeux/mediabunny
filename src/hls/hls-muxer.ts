@@ -1198,7 +1198,26 @@ export class HlsMuxer extends Muxer {
 
 				if (playlist.singleFile?.fragmentedIsobmffOutput) {
 					const muxer = playlist.singleFile.fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
-					await muxer.forceFragmentFinalization();
+
+					// The packets that start the next segment are already known, and end the durations of this
+					// segment's last samples
+					const nextKeyTimestamps = new Map<OutputTrack, number>();
+					const nextVideoPacket = videoTrack?.packets[videoEndIndex];
+					if (nextVideoPacket && videoSource?._connectedTrack) {
+						nextKeyTimestamps.set(
+							videoSource._connectedTrack,
+							this.toMediaTimestamp(nextVideoPacket.timestamp),
+						);
+					}
+					const nextAudioPacket = audioTrack?.packets[audioEndIndex];
+					if (nextAudioPacket && audioSource?._connectedTrack) {
+						nextKeyTimestamps.set(
+							audioSource._connectedTrack,
+							this.toMediaTimestamp(nextAudioPacket.timestamp),
+						);
+					}
+
+					await muxer.forceFragmentFinalization(nextKeyTimestamps);
 
 					if (
 						playlist.singleFile.fragmentedIsobmffOutput.firstMoofPosition !== null
