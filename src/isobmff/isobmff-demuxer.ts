@@ -4321,7 +4321,12 @@ const decryptSample = async (
 		keyBytes = await promise;
 	}
 
-	if (encryptionInfo.scheme === 'cenc' || encryptionInfo.scheme === 'cens') {
+	if (encryptionInfo.scheme === 'cenc') {
+		// 'cenc' has no pattern encryption (ISO/IEC 23001-7, 10.1), whatever a version 1 tenc box declares: its
+		// protected bytes are all encrypted, which Chromium goes by too
+		const withoutPattern = { ...encryptionInfo, defaultCryptByteBlock: 0, defaultSkipByteBlock: 0 };
+		return decryptCtr(keyBytes, withoutPattern, sampleEncryption, data);
+	} else if (encryptionInfo.scheme === 'cens') {
 		return decryptCtr(keyBytes, encryptionInfo, sampleEncryption, data);
 	} else {
 		return decryptCbcs(keyBytes, encryptionInfo, sampleEncryption, data);
