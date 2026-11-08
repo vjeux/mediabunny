@@ -2907,6 +2907,62 @@ describe('Audio', async () => {
 		}
 	});
 
+	test.each([3, 4, 5, 6, 7, 8])('Opus keeps the order of %i channels', async (numberOfChannels) => {
+		const frequencies = [300, 500, 700, 900, 1100, 1300, 1500, 1700];
+
+		// Goertzel: the power of one frequency in the signal
+		const power = (samples: Float32Array, frequency: number) => {
+			const k = 2 * Math.cos(2 * Math.PI * frequency / 48000);
+			let s1 = 0;
+			let s2 = 0;
+			for (const value of samples) {
+				const s = value + k * s1 - s2;
+				s2 = s1;
+				s1 = s;
+			}
+			return s1 * s1 + s2 * s2 - k * s1 * s2;
+		};
+
+		// A distinct tone per channel
+		const data = new Float32Array(48000 * numberOfChannels);
+		for (let c = 0; c < numberOfChannels; c++) {
+			for (let i = 0; i < 48000; i++) {
+				data[c * 48000 + i] = 0.3 * Math.sin(2 * Math.PI * frequencies[c]! * i / 48000);
+			}
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('very-high') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({
+			data,
+			format: 'f32-planar',
+			numberOfChannels,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		using decoded = (await new AudioSampleSink((await input.getPrimaryAudioTrack())!).getSample(0.5))!;
+
+		// The loudest tone of each decoded channel
+		const order: number[] = [];
+		for (let c = 0; c < numberOfChannels; c++) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: c, format: 'f32-planar' });
+			const powers = frequencies.map(frequency => power(channel, frequency));
+			order.push(powers.indexOf(Math.max(...powers)));
+		}
+
+		// Channel 3 of 6 to 8 is the LFE, which Opus low-passes, so it's left out
+		const hasLfe = numberOfChannels >= 6;
+		const expected = [...Array(numberOfChannels).keys()].filter(c => !hasLfe || c !== 3);
+		expect(order.filter((_, c) => !hasLfe || c !== 3)).toEqual(expected);
+	});
+
 	test('MP3 encode & decode', async () => {
 		await encodeDecodeTest('mp3', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
