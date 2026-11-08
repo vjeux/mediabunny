@@ -3579,7 +3579,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				}
 
 				sampleEncryption ??= getDefaultSampleEncryption(encryptionInfo);
-				if (sampleEncryption && (!group || group.isProtected)) {
+				if (sampleEncryption && encryptionInfo.defaultIsProtected !== false) {
 					data = await decryptSample(this.internalTrack, sampleEncryption, data, null, encryptionInfo);
 				}
 			}
@@ -3633,7 +3633,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					: this.internalTrack.encryptionInfo;
 				const sampleEncryption = fragmentSample.encryption ?? getDefaultSampleEncryption(encryptionInfo);
 
-				if (sampleEncryption && (!group || group.isProtected)) {
+				if (sampleEncryption && encryptionInfo.defaultIsProtected !== false) {
 					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment, encryptionInfo);
 				}
 			}
@@ -4352,7 +4352,8 @@ const resolveEncryptionAuxInfo = async (
 			iv.set(readBytes(slice, ivSize), 0);
 		} else if (constantIv) {
 			iv.set(constantIv, 0);
-		} else if (!group || group.isProtected) {
+		} else if (group ? group.isProtected : encryptionInfo.defaultIsProtected !== false) {
+			// A sample in no group takes tenc's protection, and an unprotected one has no IV
 			throw new Error('Invalid file: encrypted sample has no IV.');
 		}
 
@@ -4454,7 +4455,8 @@ const readSampleEncryptionBox = (slice: FileSlice, track: InternalTrack, trackDa
 			iv.set(readBytes(slice, ivSize), 0);
 		} else if (constantIv) {
 			iv.set(constantIv, 0);
-		} else if (!group || group.isProtected) {
+		} else if (group ? group.isProtected : track.encryptionInfo.defaultIsProtected !== false) {
+			// A sample in no group takes tenc's protection, and an unprotected one has no IV
 			throw new Error('Invalid file: encrypted sample has no IV.');
 		}
 
