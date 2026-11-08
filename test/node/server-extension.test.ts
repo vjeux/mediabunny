@@ -1761,6 +1761,35 @@ describe('Video', async () => {
 			expectColor(getColorAt(rgba, 400, 350, 150), [255, 0, 0]); // bottom-right (red)
 		});
 
+		test.each(['AVFrame', 'buffer'])('Closing a %s-backed sample while it is transformed', async (backing) => {
+			// Like in the browser, where the transform reads the sample before returning
+			let sample: VideoSample;
+			if (backing === 'AVFrame') {
+				const frame = new NodeAv.Frame();
+				frame.alloc();
+				frame.format = NodeAv.AV_PIX_FMT_YUV420P;
+				frame.width = 16;
+				frame.height = 16;
+				frame.sampleAspectRatio = new NodeAv.Rational(1, 1);
+				NodeAv.FFmpegError.throwIfError(frame.fromBuffer(Buffer.alloc(16 * 16 * 3 / 2, 100)), 'fromBuffer');
+				sample = new VideoSample(new AvFrameVideoSampleResource(frame), { timestamp: 0 });
+			} else {
+				sample = new VideoSample(new Uint8Array(16 * 16 * 3 / 2).fill(100), {
+					format: 'I420',
+					codedWidth: 16,
+					codedHeight: 16,
+					timestamp: 0,
+				});
+			}
+
+			const transformed = sample.transform({ width: 8 });
+			sample.close();
+
+			using result = await transformed;
+			expect(result.codedWidth).toBe(8);
+			await result.copyTo(new Uint8Array(result.allocationSize()));
+		});
+
 		test('VideoSample transformation via Conversion API', async () => {
 			using input = new Input({
 				source: new FilePathSource('./test/public/video.mp4'),
