@@ -4162,3 +4162,35 @@ test('MPEG-TS drops the video frame that the end of the file cuts off', async ()
 	}
 	expect(await readFrames(bytes.subarray(0, firstPesStart + 2 * 188))).toEqual([]);
 });
+
+test('MPEG-TS reading at a position inside a PES packet leaves the PES packet whole', async () => {
+	// In damaged files, a packet header and the packet read at the same position can disagree while the packet
+	// positions get resynced, so a section can be read where no section starts. That mustn't be remembered as a section
+	// end, which cut the PES packet around it short and ended iteration there (found by L15 on FFmpeg's aac_crash.ts
+	// sample, after a lookup at the end of the track).
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/0.ts')));
+	const readFrames = async (input: Input) => {
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const frames: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			frames.push(packet.byteLength);
+		}
+		return frames;
+	};
+
+	using cleanInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const clean = await readFrames(cleanInput);
+
+	// A video TS packet in the middle of a PES packet (PID 0x100, no payload_unit_start_indicator)
+	let pos = 188 * 1000;
+	while (!((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && !(bytes[pos + 1]! & 0x40))) {
+		pos += 188;
+	}
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	await input.getTracks();
+	const demuxer = (await input._demuxerPromise) as MpegTsDemuxer;
+	expect(await demuxer.readSection(pos, false)).toBe(null);
+	expect(await readFrames(input)).toEqual(clean);
+});
