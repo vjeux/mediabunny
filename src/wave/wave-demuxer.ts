@@ -53,6 +53,9 @@ export class WaveDemuxer extends Demuxer {
 	reader: Reader;
 
 	metadataPromise: Promise<void> | null = null;
+	/** Where the chunk walk stopped at the data chunk, as the chunks after it couldn't be read yet */
+	chunksAfterData: { pos: number; end: number | null; littleEndian: boolean } | null = null;
+	chunksAfterDataPromise: Promise<void> | null = null;
 	dataStart = -1;
 	dataSize = -1;
 	audioInfo: {
@@ -182,8 +185,15 @@ export class WaveDemuxer extends Demuxer {
 					const dataEnd = riffSizeIsUnknown ? this.reader.fileSize : totalFileSize;
 					this.dataSize = Math.max(Math.min(dataChunkSize, (dataEnd ?? Infinity) - this.dataStart), 0);
 
-					if (this.reader.fileSize === null) {
-						break; // Stop once we hit the data chunk
+					if (this.reader.randomAccessFileSize === null) {
+						// Stop once we hit the data chunk; the chunks after it are looked at once they can be read
+						// (see getMetadataTags)
+						this.chunksAfterData = {
+							pos: startPos + chunkSize + (chunkSize & 1),
+							end: totalFileSize,
+							littleEndian,
+						};
+						break;
 					}
 				} else if (chunkId === 'ds64') {
 					// File and data chunk sizes are defined in here instead
@@ -219,7 +229,7 @@ export class WaveDemuxer extends Demuxer {
 				} else if (chunkId === 'LIST' || chunkId === 'ID3 ' || chunkId === 'id3 ') {
 					const metadataChunk = { id: chunkId, pos: startPos, size: chunkSize, littleEndian };
 
-					if (this.reader.fileSize === null) {
+					if (this.reader.randomAccessFileSize === null) {
 						// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep
 						// what's behind, so their metadata chunks are read right away
 						await this.parseMetadataChunk(metadataChunk);
@@ -236,7 +246,7 @@ export class WaveDemuxer extends Demuxer {
 
 			for (const tag of prependedId3Tags) {
 				const metadataChunk = { id: 'ID3 ', pos: tag.pos, size: tag.size, littleEndian };
-				if (this.reader.fileSize === null) {
+				if (this.reader.randomAccessFileSize === null) {
 					await this.parseMetadataChunk(metadataChunk);
 				} else {
 					this.metadataChunks.push(metadataChunk);
@@ -562,6 +572,7 @@ export class WaveDemuxer extends Demuxer {
 	}
 
 	async getMetadataTags() {
+		await this.readChunksAfterData();
 		await this.readMetadata();
 
 		await (this.metadataChunksPromise ??= (async () => {
@@ -576,6 +587,45 @@ export class WaveDemuxer extends Demuxer {
 		}
 
 		return this.metadataTags;
+	}
+
+	/** If the chunk walk stopped at the data chunk, reads the chunks after it for the tags once they can be read */
+	async readChunksAfterData() {
+		await this.readMetadata();
+
+		if (this.chunksAfterData && this.reader.randomAccessFileSize !== null) {
+			// The chunks after the data, skipped when the file was opened, can be read by now (as once reads have
+			// nearly reached the end of a file that can only be streamed)
+			const { pos, end, littleEndian } = this.chunksAfterData;
+			this.chunksAfterData = null;
+
+			this.chunksAfterDataPromise = (async () => {
+				let currentPos = pos;
+				while (end === null || currentPos < end) {
+					let slice = this.reader.requestSlice(currentPos, 8);
+					if (isThenable(slice)) {
+						slice = await slice;
+					}
+					if (!slice) {
+						break;
+					}
+
+					const chunkId = readAscii(slice, 4);
+					const chunkSize = readU32(slice, littleEndian);
+					const startPos = slice.filePos;
+
+					if (chunkId === 'LIST') {
+						await this.parseListChunk(startPos, chunkSize, littleEndian);
+					} else if (chunkId === 'ID3 ' || chunkId === 'id3 ') {
+						await this.parseId3Chunk(startPos, chunkSize);
+					}
+
+					currentPos = startPos + chunkSize + (chunkSize & 1); // Handle padding
+				}
+			})();
+		}
+
+		await this.chunksAfterDataPromise;
 	}
 }
 

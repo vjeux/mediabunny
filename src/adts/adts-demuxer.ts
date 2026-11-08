@@ -238,8 +238,15 @@ export class AdtsDemuxer extends Demuxer {
 
 			// Like for MP3, fall back to an ID3v1 tag at the end of the file when the ID3v2 tags gave us no text fields
 			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
-			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
-				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
+			// Only with random access: a source read in order (like a UrlSource whose server ignores range requests)
+			// would have to stream to the end for it, losing what comes before
+			const randomAccessFileSize = this.reader.randomAccessFileSize;
+			if (
+				!hasTextFields
+				&& randomAccessFileSize !== null
+				&& randomAccessFileSize >= ID3_V1_TAG_SIZE
+			) {
+				let slice = this.reader.requestSlice(randomAccessFileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) {
 					slice = await slice;
 				}
