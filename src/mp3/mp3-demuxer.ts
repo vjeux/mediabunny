@@ -45,7 +45,7 @@ import {
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
-import { readNextMp3FrameHeader, readFirstMp3FrameHeader } from './mp3-reader';
+import { findWaveDataChunk, readNextMp3FrameHeader, readFirstMp3FrameHeader } from './mp3-reader';
 import { readAscii, readBytes, Reader, readU32Be, readU32Le, readU8 } from '../reader';
 
 const APE_TAG_FOOTER_SIZE = 32;
@@ -89,6 +89,14 @@ export class Mp3Demuxer extends Demuxer {
 	audioEndPos: number | null = null;
 	/** Whether more MP3 audio follows the stream that the Xing/Info header describes, once the frames got there */
 	audioFollowsXingStream: boolean | null = null;
+	/** For MP3 in a WAVE file, where its data chunk ends */
+	dataEndPos: number | null = null;
+
+	/** Where frame searches end: the end of the WAVE data chunk, of the audio before the end tags, or of the file */
+	get searchEndPos() {
+		const ends = [this.dataEndPos, this.audioEndPos, this.reader.fileSize].filter((x): x is number => x !== null);
+		return ends.length > 0 ? Math.min(...ends) : null;
+	}
 
 	constructor(input: Input) {
 		super(input);
@@ -139,6 +147,13 @@ export class Mp3Demuxer extends Demuxer {
 
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
 			}
+
+			// MP3 in WAVE: the frames are in the data chunk, and the chunks after it (like an id3 chunk) aren't audio
+			const dataChunk = await findWaveDataChunk(this.reader, this.lastLoadedPos);
+			if (dataChunk) {
+				this.lastLoadedPos = dataChunk.start;
+				this.dataEndPos = dataChunk.end;
+			}
 		}
 
 		let result = this.firstFrameHeader ? await this.readDirectlyFollowingFrame() : null;
@@ -162,13 +177,13 @@ export class Mp3Demuxer extends Demuxer {
 				? await readNextMp3FrameHeader(
 					this.reader,
 					this.lastLoadedPos,
-					this.audioEndPos ?? this.reader.fileSize,
+					this.searchEndPos,
 					this.firstFrameHeader,
 				)
 				: await readFirstMp3FrameHeader(
 					this.reader,
 					this.lastLoadedPos,
-					this.audioEndPos ?? this.reader.fileSize,
+					this.searchEndPos,
 				);
 
 			// Real audio goes on frame after frame, but a lone frame may be bytes inside the APEv2 and ID3v1 tags at
@@ -704,14 +719,20 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		} else if (!demuxer.xingData?.isVbr) {
 			// Not tagged as VBR, assuming CBR
 
-			if (demuxer.reader.fileSize !== null) {
+			// For MP3 in WAVE, the audio ends with the data chunk
+			let audioEndPos = demuxer.reader.fileSize;
+			if (demuxer.dataEndPos !== null) {
+				audioEndPos = Math.min(demuxer.dataEndPos, audioEndPos ?? Infinity);
+			}
+
+			if (audioEndPos !== null) {
 				const averageFrameSize = computeAverageMp3FrameSize(
 					demuxer.firstFrameHeader.lowSamplingFrequency,
 					demuxer.firstFrameHeader.layer,
 					demuxer.firstFrameHeader.bitrate,
 					demuxer.firstFrameHeader.sampleRate,
 				);
-				const frameCount = (demuxer.reader.fileSize - demuxer.firstFrameHeaderPos) / averageFrameSize;
+				const frameCount = (audioEndPos - demuxer.firstFrameHeaderPos) / averageFrameSize;
 
 				return (
 					Math.round(frameCount) * demuxer.firstFrameHeader.audioSamplesInFrame - demuxer.primingDelay
