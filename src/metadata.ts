@@ -281,6 +281,19 @@ export const validateMetadataTags = (tags: MetadataTags) => {
 	}
 };
 
+/**
+ * Formats a date as YYYY-MM-DD, the shape every format stores dates in. Returns null for years outside 0 to 9999,
+ * which those fields can't hold (toISOString uses the expanded ±YYYYYY form for them).
+ */
+export const formatMetadataDate = (date: Date) => {
+	const year = date.getUTCFullYear();
+	if (year < 0 || year > 9999) {
+		return null;
+	}
+
+	return date.toISOString().slice(0, 10);
+};
+
 export const metadataTagsAreEmpty = (tags: MetadataTags) => {
 	return tags.title === undefined
 		&& tags.description === undefined
