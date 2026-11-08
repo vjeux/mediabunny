@@ -4184,7 +4184,17 @@ export class IsobmffDemuxer extends Demuxer {
 						case '©nam':
 						case 'name': {
 							if (this.currentTrack) {
-								this.currentTrack.name = textDecoder.decode(readBytes(slice, boxInfo.contentSize));
+								let bytes = readBytes(slice, boxInfo.contentSize);
+								if (boxInfo.name === 'name') {
+									// Some writers end the string with a NUL, like a C string. Like FFmpeg, read it up
+									// to the first NUL.
+									const end = bytes.indexOf(0);
+									if (end !== -1) {
+										bytes = bytes.subarray(0, end);
+									}
+								}
+
+								this.currentTrack.name = textDecoder.decode(bytes);
 							} else {
 								this.metadataTags.title ??= readMetadataStringShort(slice);
 							}
