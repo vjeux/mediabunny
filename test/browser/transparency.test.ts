@@ -4,12 +4,13 @@ import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { CanvasSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { WebMOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { CanvasSource, VideoSampleSource } from '../../src/media-source.js';
 import { canEncodeVideo, Quality } from '../../src/encode.js';
 import { VideoSample } from '../../src/sample.js';
 import { Conversion } from '../../src/conversion.js';
+import { assert } from '../../src/misc.js';
 
 const decodeTransparentVideoTest = async () => {
 	using input = new Input({
@@ -384,4 +385,42 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	using sample = (await sink.getSample(await videoTrack.getFirstTimestamp()))!;
 	expect(sample.format).toContain('A');
 	expect(sample.hasAlpha).toBe(true);
+});
+
+test('Decodes the alpha of the first GOP of transparent AVC video', async ({ skip }) => {
+	// Chromium's first-packet workarounds rewrote the packet without its alpha side data, so the alpha decoder missed
+	// the first key frame and the whole first GOP came out opaque (found by the lane L90 review; bug-fix-mania's fix)
+	skip(
+		!(await canEncodeVideo('avc', { width: 64, height: 64, alpha: 'keep' })),
+		'there is no AVC encoder that keeps alpha here',
+	);
+
+	const canvas = new OffscreenCanvas(64, 64);
+	const context = canvas.getContext('2d');
+	assert(context);
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new CanvasSource(canvas, { codec: 'avc', quality: new Quality('high'), alpha: 'keep' });
+	output.addVideoTrack(source);
+	await output.start();
+	for (let i = 0; i < 10; i++) {
+		context.clearRect(0, 0, 64, 64);
+		context.fillStyle = 'red';
+		context.fillRect(0, 0, 32, 64); // The left half opaque, the right half fully transparent
+		await source.add(i / 30, 1 / 30);
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	using sample = await new VideoSampleSink(track).getSample(0);
+	assert(sample);
+	expect(sample.format).toBe('I420A');
+
+	const drawn = new OffscreenCanvas(64, 64);
+	const drawnContext = drawn.getContext('2d');
+	assert(drawnContext);
+	sample.draw(drawnContext, 0, 0);
+	expect(drawnContext.getImageData(16, 32, 1, 1).data[3]).toBe(255);
+	expect(drawnContext.getImageData(48, 32, 1, 1).data[3]).toBe(0);
 });

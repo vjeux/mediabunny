@@ -1127,6 +1127,8 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				insertSorted(this.inputTimestamps, packet.timestamp, x => x);
 			}
 
+			// The workarounds below only rewrite the color data, the alpha side data stays as is
+			let colorPacket = packet;
 			if (isChromium() && this.currentPacketIndex === 0) {
 				if (this.codec === 'avc') {
 					// Workaround for https://issues.chromium.org/issues/470109459
@@ -1173,17 +1175,17 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					}
 
 					const newData = concatAvcNalUnits(filteredNalUnits, this.decoderConfig);
-					packet = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
+					colorPacket = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
 				} else if (this.codec === 'hevc') {
 					// Workaround for https://issues.chromium.org/issues/507611247
 					const sanitizedData = sanitizeHevcPacketForChromium(packet.data, this.decoderConfig);
 					if (sanitizedData) {
-						packet = new EncodedPacket(sanitizedData, packet.type, packet.timestamp, packet.duration);
+						colorPacket = new EncodedPacket(sanitizedData, packet.type, packet.timestamp, packet.duration);
 					}
 				}
 			}
 
-			this.decoder.decode(packet.toEncodedVideoChunk());
+			this.decoder.decode(colorPacket.toEncodedVideoChunk());
 			this.decodeAlphaData(packet);
 		}
 
