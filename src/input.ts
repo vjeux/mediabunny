@@ -21,8 +21,9 @@ import {
 	toValidatedInputTrackQuery,
 	prefer,
 	desc,
+	validateDurationMetadataRequestOptions,
 } from './input-track';
-import { PacketRetrievalOptions } from './media-sink';
+import { PacketRetrievalOptions, validatePacketRetrievalOptions } from './media-sink';
 import {
 	arrayArgmin,
 	arrayCount,
@@ -336,8 +337,9 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * Note that this method is potentially expensive for inputs with many tracks (such as HLS manifests), since it
 	 * probes every track.
 	 */
-	async getFirstTimestamp(tracks?: InputTrack[]) {
+	async getFirstTimestamp(tracks?: readonly InputTrack[]) {
 		tracks ??= await this.getTracks();
+		validateTrackList(tracks);
 
 		const filtered = tracks.filter(x => x !== null);
 		if (filtered.length === 0) {
@@ -365,8 +367,13 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * ends. If you want to query the current duration of the media, set {@link PacketRetrievalOptions.skipLiveWait}
 	 * to `true` in the options.
 	 */
-	async computeDuration(tracks?: InputTrack[], options?: PacketRetrievalOptions) {
+	async computeDuration(tracks?: readonly InputTrack[], options?: PacketRetrievalOptions) {
+		if (options !== undefined) {
+			validatePacketRetrievalOptions(options);
+		}
+
 		tracks ??= await this.getTracks();
+		validateTrackList(tracks);
 
 		const filtered = tracks.filter(x => x !== null);
 		if (filtered.length === 0) {
@@ -389,8 +396,13 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	 * ends. If you want to query the current duration of the media, set
 	 * {@link DurationMetadataRequestOptions.skipLiveWait} to `true` in the options.
 	 */
-	async getDurationFromMetadata(tracks?: InputTrack[], options?: DurationMetadataRequestOptions) {
+	async getDurationFromMetadata(tracks?: readonly InputTrack[], options?: DurationMetadataRequestOptions) {
+		if (options !== undefined) {
+			validateDurationMetadataRequestOptions(options);
+		}
+
 		tracks ??= await this.getTracks();
+		validateTrackList(tracks);
 
 		const filtered = tracks.filter(x => x !== null);
 		const tracksDurations = await Promise.all(filtered.map(x => x.getDurationFromMetadata(options)));
@@ -562,6 +574,12 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		this.dispose();
 	}
 }
+
+const validateTrackList = (tracks: readonly (InputTrack | null)[]) => {
+	if (!Array.isArray(tracks) || tracks.some(track => track !== null && !(track instanceof InputTrack))) {
+		throw new TypeError('tracks, when provided, must be an array of InputTrack.');
+	}
+};
 
 /**
  * Thrown when trying to operate on an input that has an unsupported or unrecognizable format.
