@@ -1,3 +1,4 @@
+import { createCipheriv } from 'node:crypto';
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -271,4 +272,68 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('cenc samples are decrypted without a pattern even if their tenc box declares one', async () => {
+	// 'cenc' has no pattern encryption; this tenc box is version 1 with crypt:skip 1:9 anyway. Chromium ignores the
+	// pattern fields for cenc (its track_run_iterator only builds a pattern for cbcs). Found by L101.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const key = Buffer.alloc(16, 0x11);
+	const iv = zeros(8).fill(3);
+	const plaintext = Array.from({ length: 400 }, (_, i) => (i * 7) & 0xff);
+	// One subsample: 5 clear bytes, then 395 protected ones, all of them AES-CTR encrypted
+	const sample = [
+		...plaintext.slice(0, 5),
+		...createCipheriv('aes-128-ctr', key, Buffer.from([...iv, ...zeros(8)]))
+			.update(Buffer.from(plaintext.slice(5))),
+	];
+	const tenc = box('tenc', [1, 0, 0, 0], [0, 0x19, 1, 8], zeros(16).fill(0xa1));
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), box('sinf', box('frma', ascii('avc1')),
+		box('schm', zeros(4), ascii('cenc'), u32(0x10000)), box('schi', tenc)));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(sample.length)),
+		box('senc', u32(2), u32(1), iv, [0, 1], [0, 5], u32(395)),
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', sample),
+		])),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => key } },
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual([plaintext]);
 });
