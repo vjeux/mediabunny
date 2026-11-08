@@ -1,11 +1,11 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 
-import { StreamTarget } from '../../src/index.js';
+import { Mp4OutputFormat, StreamTarget } from '../../src/index.js';
 
 test('Output.cancel() waits for the stream of its StreamTarget to close, unless the sink has stalled', async () => {
 	for (const sink of ['instant', 'slow', 'stalled'] as const) {
