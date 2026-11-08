@@ -335,7 +335,10 @@ describe.skipIf(process.env['MEDIABUNNY_TEST_PACKAGING'] !== '1')('Packed packag
 		for (const tarball of fs.readdirSync(tarballs)) {
 			const extracted = path.join(project, 'extracted');
 			fs.mkdirSync(extracted);
-			execFileSync('tar', ['-xzf', path.join(tarballs, tarball), '-C', extracted, '--strip-components=1']);
+			// Relative paths, so that Windows' tar doesn't read a drive letter as a remote host
+			execFileSync('tar', ['-xzf', path.join('tarballs', tarball), '-C', 'extracted', '--strip-components=1'], {
+				cwd: project,
+			});
 			const { name } = readPackageJson(extracted);
 			fs.mkdirSync(path.dirname(path.join(project, 'node_modules', name)), { recursive: true });
 			fs.renameSync(extracted, path.join(project, 'node_modules', name));
@@ -692,12 +695,14 @@ export const runExtensions = async (frame: Parameters<typeof toAvFrame>[1]) => {
 						...scenario.options,
 					},
 				});
+				// TypeScript's file names use / on every platform
+				const toPosix = (value: string) => value.split(path.sep).join('/');
 				actual[name] = ts.getPreEmitDiagnostics(program).map((diagnostic) => {
 					const file = diagnostic.file
-						? diagnostic.file.fileName.replace(/^.*\/node_modules\//, '').replace(dir + '/', '')
+						? diagnostic.file.fileName.replace(/^.*\/node_modules\//, '').replace(`${toPosix(dir)}/`, '')
 						: '';
 					const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, ' ')
-						.replaceAll(project, '<project>');
+						.replaceAll(toPosix(project), '<project>');
 					return `${file}: TS${diagnostic.code}: ${message}`;
 				}).sort();
 				expected[name] = expectedDiagnostics(scenario, skipLibCheck);
