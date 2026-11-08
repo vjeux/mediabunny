@@ -801,3 +801,83 @@ test('Packet durations don\'t hold back the packets of a live stream', async () 
 	expect(full).toEqual([[1, 1], [4, 1], [2, 1], [3, 1], [7, 1], [5, 1], [6, 1]]);
 	expect(await readAll(input)).toEqual(full);
 });
+
+test('Packet durations from a stream whose earlier fragments are gone from its cache', async () => {
+	// A source that only keeps recent data can\'t go back to earlier fragments. Their boxes were read before, so the
+	// search for the last sample\'s successor in presentation order steps over them without reading them again (found
+	// by L15's streamed check of computeDuration()).
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const sampleSize = 4096;
+	const bytes = new Uint8Array([...box('ftyp', ascii('iso5'), u32(0)), ...box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)),
+					box('stsc', zeros(8)),
+					box('stsz', zeros(12)),
+					box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	),
+	// Decode order I P | B B P | B B, presented as I B B P B B P. The last fragment has no sync sample, so the one
+	// before it is looked at for the successor of its last frame
+	...[[1, 3], [0, 0, 3], [0, 0]].flatMap((compositionOffsets, i) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32([0, 2, 5][i]!)),
+			box('trun', u32(0xf01), u32(compositionOffsets.length), u32(dataOffset), ...compositionOffsets.map(
+				(offset, j) => [
+					...u32(1),
+					...u32(sampleSize),
+					...u32(i === 0 && j === 0 ? 0 : 0x10000),
+					...u32(offset),
+				],
+			)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [
+			...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)),
+			...box('mdat', zeros(compositionOffsets.length * sampleSize)),
+		];
+	})]);
+
+	const computeDuration = async (streamed: boolean) => {
+		let position = 0;
+		const source = streamed
+			? new ReadableStreamSource(new ReadableStream<Uint8Array>({
+				pull: (controller) => {
+					if (position >= bytes.length) {
+						controller.close();
+						return;
+					}
+
+					controller.enqueue(bytes.slice(position, position + 1024));
+					position += 1024;
+				},
+			}), { maxCacheSize: sampleSize })
+			: new BufferSource(bytes);
+
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const duration = await track.computeDuration();
+		return duration;
+	};
+
+	// The same as from a source that keeps everything
+	expect(await computeDuration(true)).toBe(await computeDuration(false));
+});

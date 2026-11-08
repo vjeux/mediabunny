@@ -372,6 +372,8 @@ export class IsobmffDemuxer extends Demuxer {
 	isFragmented = false;
 	fragmentTrackDefaults = new Map<number, FragmentTrackDefaults>();
 	psshBoxes: PsshBox[] = [];
+	/** The sizes of the mdat boxes right after moof boxes, keyed by their offset */
+	mdatSizes = new Map<number, number>();
 	currentFragment: Fragment | null = null;
 	isReadingTraf = false;
 	/**
@@ -844,6 +846,7 @@ export class IsobmffDemuxer extends Demuxer {
 			moofSize: fragment.moofSize,
 			trackIds: new Set(fragment.trackData.keys()),
 		});
+		rememberMdatSize(this, startPos + moofBoxInfo.totalSize);
 
 		for (const [, trackData] of fragment.trackData) {
 			const track = trackData.track;
@@ -3818,6 +3821,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				continue;
 			}
 
+			const mdatSize = demuxer.mdatSizes.get(pos);
+			if (mdatSize !== undefined) {
+				pos += mdatSize; // Without reading its header, which may be gone from the source by now
+				continue;
+			}
+
 			let slice = demuxer.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 			if (isThenable(slice)) {
 				if (!canWait) {
@@ -4859,6 +4868,33 @@ const decryptCbcs = (
 	}
 
 	return output;
+};
+
+/**
+ * Finding the next fragment means stepping over the mdat box after a moof box. Its size is remembered when the moof box
+ * is read: once the fragment's samples have been read, a source that only keeps recent data (a stream, or a server
+ * that ignores range requests) may no longer have its header.
+ */
+const rememberMdatSize = (demuxer: IsobmffDemuxer, mdatPos: number) => {
+	const remember = (slice: FileSlice | null) => {
+		const boxInfo = slice && readBoxHeader(slice);
+		if (boxInfo?.name === 'mdat' && boxInfo.totalSize > 0) {
+			demuxer.mdatSizes.set(mdatPos, boxInfo.totalSize);
+		}
+	};
+
+	try {
+		const slice = demuxer.reader.requestSliceRange(mdatPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+		if (isThenable(slice)) {
+			// Not waited for, so that nothing waits for media data that hasn't arrived yet (like in a live stream).
+			// It's there before the samples after it are.
+			slice.then(remember, () => {});
+		} else {
+			remember(slice);
+		}
+	} catch {
+		// The size is only remembered to save a read later, which then happens as before
+	}
 };
 
 const collectCryptRanges = (
