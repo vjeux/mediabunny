@@ -28,11 +28,11 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, OggOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
+import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { buildQuantizerEncodeOptions, canEncodeAudio, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
@@ -2023,6 +2023,138 @@ describe('Audio', async () => {
 				expect(sample.duration).toBe(0.02);
 			}
 		});
+	});
+
+	test.each([44100, 22050, 96000])('Opus encoding of %i Hz audio', async (sampleRate) => {
+		// Like WebCodecs encoders, rates libopus doesn't take are resampled to 48 kHz
+		expect(await canEncodeAudio('opus', { sampleRate, numberOfChannels: 2 })).toBe(true);
+
+		// One second of stereo silence with a 10 ms tone burst at 0.25 s
+		const data = new Float32Array(2 * sampleRate);
+		const burstStart = Math.round(0.25 * sampleRate);
+		for (let i = burstStart; i < burstStart + Math.round(0.01 * sampleRate); i++) {
+			data[2 * i] = data[2 * i + 1] = 0.8 * Math.sin(2 * Math.PI * 1000 * (i - burstStart) / sampleRate);
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getSampleRate()).toBe(48000);
+
+		// The burst is still at 0.25 s
+		let burstTimestamp: number | null = null;
+		for await (using decoded of new AudioSampleSink(track).samples()) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
+			const index = channel.findIndex(value => Math.abs(value) > 0.2);
+			if (index !== -1) {
+				burstTimestamp ??= decoded.timestamp + index / decoded.sampleRate;
+			}
+		}
+		expect(burstTimestamp).toBeCloseTo(0.25, 3);
+	});
+
+	test.each([
+		[44100, 1024],
+		[22050, 960],
+		[44100, 4410],
+	])('Opus encoding of %i Hz audio fed in %i-frame samples keeps its timing', async (sampleRate, chunkFrames) => {
+		// 10 s of stereo silence with a 1 ms tone burst at every second, fed in samples of the given size (1024 is an
+		// AAC decoder's), which the encoder resamples to 48 kHz
+		const duration = 10;
+		const data = new Float32Array(2 * duration * sampleRate);
+		for (let second = 0; second < duration; second++) {
+			const start = second * sampleRate;
+			for (let i = 0; i < Math.round(0.001 * sampleRate); i++) {
+				data[2 * (start + i)] = data[2 * (start + i) + 1] = 0.8 * Math.sin(2 * Math.PI * 1000 * i / sampleRate);
+			}
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+		for (let start = 0; start < duration * sampleRate; start += chunkFrames) {
+			const frames = Math.min(chunkFrames, duration * sampleRate - start);
+			using sample = new AudioSample({
+				data: data.subarray(2 * start, 2 * (start + frames)),
+				format: 'f32',
+				numberOfChannels: 2,
+				sampleRate,
+				timestamp: start / sampleRate,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		// Each burst is still at its second, and the audio still ends where the input does (give or take a frame)
+		const burstTimestamps: number[] = [];
+		let wasLoud = false;
+		let end = 0;
+		for await (using decoded of new AudioSampleSink(track).samples()) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
+			for (let i = 0; i < channel.length; i++) {
+				const isLoud = Math.abs(channel[i]!) > 0.2;
+				const timestamp = decoded.timestamp + i / decoded.sampleRate;
+				if (isLoud && !wasLoud && (burstTimestamps.length === 0 || timestamp > last(burstTimestamps)! + 0.5)) {
+					burstTimestamps.push(timestamp);
+				}
+				wasLoud = isLoud;
+			}
+			end = decoded.timestamp + decoded.duration;
+		}
+
+		expect(burstTimestamps).toHaveLength(duration);
+		for (let second = 0; second < duration; second++) {
+			expect(Math.abs(burstTimestamps[second]! - second)).toBeLessThan(0.002);
+		}
+		expect(end).toBeGreaterThan(duration - 0.001);
+		expect(end).toBeLessThan(duration + 0.03);
+	});
+
+	test.each([44100, 22050, 96000])('Opus encoding of %i Hz audio keeps its last samples', async (sampleRate) => {
+		// 1 s and 37 samples of stereo silence ending in a 5 ms tone that peaks on the last sample. The resampler
+		// holds back the input's last samples for its filter, and they must still come out at the end.
+		const frameCount = sampleRate + 37;
+		const data = new Float32Array(2 * frameCount);
+		for (let i = frameCount - Math.round(0.005 * sampleRate); i < frameCount; i++) {
+			data[2 * i] = data[2 * i + 1] = 0.8 * Math.cos(2 * Math.PI * 1000 * (frameCount - 1 - i) / sampleRate);
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('high') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		let lastLoudTimestamp = -1;
+		for await (using decoded of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
+			for (let i = 0; i < channel.length; i++) {
+				if (Math.abs(channel[i]!) > 0.2) {
+					lastLoudTimestamp = decoded.timestamp + i / decoded.sampleRate;
+				}
+			}
+		}
+
+		// The tone lasts until the input's end, give or take a few samples
+		expect(lastLoudTimestamp).toBeGreaterThan(frameCount / sampleRate - 0.0001);
+		expect(lastLoudTimestamp).toBeLessThan(frameCount / sampleRate + 0.0005);
 	});
 
 	test('MP3 encode & decode', async () => {
