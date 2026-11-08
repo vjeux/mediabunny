@@ -34,7 +34,7 @@ import { EncodedPacket } from '../../src/packet.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { PCM_AUDIO_CODECS } from '../../src/codec.js';
 import { VideoSample } from '../../src/sample.js';
-import { CustomVideoDecoder, registerDecoder } from '../../src/custom-coder.js';
+import { CustomVideoDecoder, registerDecoder, CustomAudioEncoder, registerEncoder } from '../../src/custom-coder.js';
 
 test('Rotation is baked in when rerendering', async () => {
 	using input = new Input({
@@ -881,6 +881,45 @@ test('Composable conversion does not write metadata tags', async () => {
 	const outTags = await result.getMetadataTags();
 	// Only the user's tag is present; the input's tags were not copied
 	expect(outTags.comment).toBe('User-owned');
+});
+
+test('Canceling while an encoder is still initializing rejects execute()', async () => {
+	// An Opus encoder whose initialization never finishes, like one hanging in a platform codec
+	let hangingEncoderActive = true;
+	let initCalled = false;
+	class HangingInitEncoder extends CustomAudioEncoder {
+		static override supports(codec: string) {
+			return codec === 'opus' && hangingEncoderActive;
+		}
+
+		async init() {
+			initCalled = true;
+			await new Promise(() => {});
+		}
+
+		encode() {}
+		flush() {}
+		close() {}
+	}
+	registerEncoder(HangingInitEncoder);
+
+	try {
+		using input = new Input({ source: new UrlSource('/glitch-hop-is-dead.wav'), formats: ALL_FORMATS });
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, audio: { codec: 'opus' }, showWarnings: false });
+		const executePromise = conversion.execute().then(() => 'resolved', (error: Error) => error.name);
+		while (!initCalled) {
+			await new Promise(resolve => setTimeout(resolve, 5));
+		}
+
+		await conversion.cancel();
+		expect(await Promise.race([
+			executePromise,
+			new Promise(resolve => setTimeout(() => resolve('pending'), 2000)),
+		])).toBe('ConversionCanceledError');
+	} finally {
+		hangingEncoderActive = false;
+	}
 });
 
 test('Canceling a composable conversion leaves the output usable', async () => {
