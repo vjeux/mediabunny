@@ -148,6 +148,14 @@ type InternalTrack = {
 	sampleTableByteOffset: number | null; // null when the track's sample table is another file (ominous ik 👀)
 	sampleTable: SampleTable | null;
 	fragmentLookupTable: FragmentLookupTableEntry[];
+	/**
+	 * Where each read fragment with samples of this track ends in decode time, sorted by moof offset. Unlike the
+	 * position cache, it holds every fragment, also those presented before the fragment preceding them.
+	 */
+	fragmentDecodeEnds: {
+		moofOffset: number;
+		endDecodeTimestamp: number;
+	}[];
 	currentFragmentState: FragmentTrackState | null;
 	/**
 	 * List of all encountered fragment offsets alongside their timestamps. This list never gets truncated, but memory
@@ -156,7 +164,7 @@ type InternalTrack = {
 	fragmentPositionCache: {
 		moofOffset: number;
 		startTimestamp: number;
-		endTimestamp: number;
+		endDecodeTimestamp: number;
 		hasKeyFrame: boolean;
 	}[];
 	/** The segment durations of all edit list entries leading up to the main one (from which the offset is taken.) */
@@ -861,6 +869,7 @@ export class IsobmffDemuxer extends Demuxer {
 				sampleTableByteOffset: null,
 				sampleTable: null,
 				fragmentLookupTable: [],
+				fragmentDecodeEnds: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
@@ -1261,15 +1270,17 @@ export class IsobmffDemuxer extends Demuxer {
 					const timestampOffset = lookupEntry.timestamp - sample.presentationTimestamp;
 					offsetFragmentTrackDataByTimestamp(trackData, timestampOffset);
 				} else {
-					const lastCacheIndex = binarySearchLessOrEqual(
-						fragmentPositionCache,
+					const previousIndex = binarySearchLessOrEqual(
+						track.fragmentDecodeEnds,
 						fragment.moofOffset - 1,
 						x => x.moofOffset,
 					);
-					if (lastCacheIndex !== -1) {
-						// Let's use the end timestamp of the previous fragment in the cache
-						const lastCache = fragmentPositionCache[lastCacheIndex]!;
-						offsetFragmentTrackDataByTimestamp(trackData, lastCache.endTimestamp);
+					if (previousIndex !== -1) {
+						// Let's continue decoding where the previous fragment left off
+						offsetFragmentTrackDataByTimestamp(
+							trackData,
+							track.fragmentDecodeEnds[previousIndex]!.endDecodeTimestamp,
+						);
 					} else {
 						// We're the first fragment I guess, "offset by 0"
 					}
@@ -1317,8 +1328,21 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentPositionCache.splice(insertionIndex + 1, 0, {
 					moofOffset: fragment.moofOffset,
 					startTimestamp: trackData.startTimestamp,
-					endTimestamp: trackData.endTimestamp,
+					endDecodeTimestamp: trackData.currentTimestamp,
 					hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
+				});
+			}
+
+			// Fragments without tfdt continue from here
+			const decodeEndIndex = binarySearchLessOrEqual(
+				track.fragmentDecodeEnds,
+				fragment.moofOffset,
+				x => x.moofOffset,
+			);
+			if (track.fragmentDecodeEnds[decodeEndIndex]?.moofOffset !== fragment.moofOffset) {
+				track.fragmentDecodeEnds.splice(decodeEndIndex + 1, 0, {
+					moofOffset: fragment.moofOffset,
+					endDecodeTimestamp: trackData.currentTimestamp,
 				});
 			}
 
@@ -1688,6 +1712,7 @@ export class IsobmffDemuxer extends Demuxer {
 					sampleTableByteOffset: -1,
 					sampleTable: null,
 					fragmentLookupTable: [],
+					fragmentDecodeEnds: [],
 					currentFragmentState: null,
 					fragmentPositionCache: [],
 					editListPreviousSegmentDurations: 0,
@@ -5795,6 +5820,7 @@ const countTimestampsAfter = (timestamps: number[], timestamp: number) => {
 };
 
 const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timestamp: number) => {
+	trackData.currentTimestamp += timestamp;
 	trackData.startTimestamp += timestamp;
 	trackData.endTimestamp += timestamp;
 
