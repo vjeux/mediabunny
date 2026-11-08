@@ -2,6 +2,7 @@ import { expect, test, vi } from 'vitest';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { PathedTarget } from '../../src/index.js';
 import { Input } from '../../src/input.js';
 import { MovOutputFormat, CmafOutputFormat, Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
@@ -342,6 +343,74 @@ test('Non-zero start timestamp, fragmented MP4', async () => {
 
 	expect(timestamps).toEqual([1, 1.1, 1.2, 1.3]);
 	expect(durations).toEqual([0.1, 0.1, 0.1, 0.1]);
+});
+
+test('Conversion fails instead of hanging when a closing track overruns the reserved packet count', async () => {
+	// 16 s of copyable video and PCM audio
+	const inputOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('vp8');
+	const audioSource = new EncodedAudioPacketSource('pcm-s16');
+	inputOutput.addVideoTrack(videoSource);
+	inputOutput.addAudioTrack(audioSource);
+	await inputOutput.start();
+	for (let i = 0; i < 160; i++) {
+		await videoSource.add(new EncodedPacket(new Uint8Array(100), i % 10 === 0 ? 'key' : 'delta', i / 10, 0.1), {
+			decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 },
+		});
+		await audioSource.add(new EncodedPacket(new Uint8Array(9600), 'key', i / 10, 0.1), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 },
+		});
+	}
+	await inputOutput.finalize();
+
+	using input = new Input({ source: new BufferSource(inputOutput.target.buffer!), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		audio: {
+			codec: 'pcm-s16',
+			// Doubles the audio, more than the estimated maximum packet count allows. When the copied video track
+			// closes, the audio waiting to be interleaved with it overruns that count
+			process: (sample) => {
+				const repeat = sample.clone();
+				repeat.setTimestamp(sample.timestamp + sample.duration);
+				return [sample, repeat];
+			},
+		},
+		showWarnings: false,
+	});
+
+	const outcome = await Promise.race([
+		conversion.execute().then(() => 'done', (error: unknown) => String(error)),
+		new Promise(resolve => setTimeout(() => resolve('hung'), 5000)),
+	]);
+	expect(outcome).toMatch(/Track #2 has already reached the maximum packet count/);
+});
+
+test('An output whose start() failed rejects packets and finalize() instead of hanging', async () => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new PathedTarget('out.mp4', async () => {
+			throw new Error('Could not create target');
+		}),
+	});
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+
+	await expect(output.start()).rejects.toThrow('Could not create target');
+
+	const settles = (promise: Promise<unknown>) => Promise.race([
+		promise.then(() => 'resolved', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('hung'), 2000)),
+	]);
+	expect(await settles((async () => source.add(
+		new EncodedPacket(new Uint8Array(400), 'key', 0, 0.01),
+		{ decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 48000 } },
+	))())).toBe('rejected');
+	expect(await settles(output.finalize())).toBe('rejected');
+	// Nothing can use the output anymore
+	expect(output.state).toBe('canceled');
 });
 
 test('Negative start timestamps, regular MP4', async () => {
