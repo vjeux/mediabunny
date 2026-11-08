@@ -2583,3 +2583,63 @@ test('Matroska Language with a bibliographic ISO 639-2 code gives the terminolog
 	expect(await readLanguage('deu')).toBe('deu');
 	expect(await readLanguage('eng')).toBe('eng');
 });
+
+test('A lone DisplayWidth or DisplayHeight keeps the other pixel dimension', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const uint = (id: number, value: number) => element(id, [(value >> 8) & 0xff, value & 0xff]);
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+
+	const getSquarePixelSize = async (width: number, height: number, ...displayElements: number[][]) => {
+		const bytes = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [1]),
+					element(EBMLId.CodecID, ascii('V_VP8')),
+					element(
+						EBMLId.Video,
+						uint(EBMLId.PixelWidth, width),
+						uint(EBMLId.PixelHeight, height),
+						...displayElements,
+					),
+				)),
+				element(
+					EBMLId.Cluster,
+					element(EBMLId.Timestamp, [0]),
+					element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 0]),
+				),
+			),
+		]);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return [await track.getSquarePixelWidth(), await track.getSquarePixelHeight()];
+	};
+
+	// RFC 9559, Table 8: with DisplayUnit 0 (pixels, the default), a missing display dimension defaults to the pixel
+	// one. The official Matroska test suite's test2.mkv is 1024x576 with only a DisplayWidth of 1354.
+	expect(await getSquarePixelSize(1024, 576, uint(EBMLId.DisplayWidth, 1354))).toEqual([1354, 576]);
+	expect(await getSquarePixelSize(1024, 576, uint(EBMLId.DisplayHeight, 432))).toEqual([1365, 576]);
+	// DisplayUnit 4 is "unknown", so it says nothing about the aspect ratio
+	const unknownUnit = uint(EBMLId.DisplayUnit, 4);
+	const display640x240 = [uint(EBMLId.DisplayWidth, 640), uint(EBMLId.DisplayHeight, 240)];
+	expect(await getSquarePixelSize(320, 240, ...display640x240, unknownUnit)).toEqual([320, 240]);
+	// Controls: both display dimensions given, and none
+	expect(await getSquarePixelSize(1024, 576, uint(EBMLId.DisplayWidth, 1354), uint(EBMLId.DisplayHeight, 576)))
+		.toEqual([1354, 576]);
+	expect(await getSquarePixelSize(1024, 576)).toEqual([1024, 576]);
+});
