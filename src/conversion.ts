@@ -1718,7 +1718,8 @@ export class Conversion {
 					}
 				} else if (
 					this.output.format.negativeTimestampSupport !== 'full'
-					&& effectiveStartTimestamp < this._startTimestamp
+					// Timestamps that the format still writes as non-negative ones can stay as they are
+					&& this._startTimestamp - effectiveStartTimestamp > this.output.format._negativeTimestampHeadroom
 				) {
 					const correction = Math.min(
 						this._startTimestamp - effectiveStartTimestamp,
@@ -2283,7 +2284,8 @@ export class Conversion {
 					}
 				} else if (
 					this.output.format.negativeTimestampSupport !== 'full'
-					&& startPacket.timestamp < this._startTimestamp
+					// Timestamps that the format still writes as non-negative ones can stay as they are
+					&& this._startTimestamp - startPacket.timestamp > this.output.format._negativeTimestampHeadroom
 					&& keptPriming === null
 				) {
 					const correction = Math.min(
