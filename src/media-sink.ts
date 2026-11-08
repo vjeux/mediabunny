@@ -2677,7 +2677,7 @@ const discardedPackets = new WeakMap<InputAudioTrack, Promise<number | null>>();
 const getDiscardedPacket = (track: InputAudioTrack, decoderConfig: AudioDecoderConfig) => {
 	let result = discardedPackets.get(track);
 	if (!result) {
-		result = (async () => {
+		const lookup = (async () => {
 			if (decoderConfig.codec.split('.')[0] !== 'mp4a') {
 				return null;
 			}
@@ -2714,7 +2714,16 @@ const getDiscardedPacket = (track: InputAudioTrack, decoderConfig: AudioDecoderC
 				}
 			}
 		})();
-		discardedPackets.set(track, result);
+		discardedPackets.set(track, lookup);
+
+		// A lookup that failed to read the first packet (on a read error, or once the input is disposed) is asked again
+		// next time
+		lookup.catch(() => {
+			if (discardedPackets.get(track) === lookup) {
+				discardedPackets.delete(track);
+			}
+		});
+		result = lookup;
 	}
 
 	return result;
@@ -2765,7 +2774,14 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		} else {
 			const decoder = new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
 			if (decoder.decoder) {
-				decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, decoderConfig);
+				try {
+					decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, decoderConfig);
+				} catch (error) {
+					// The lookup reads the first packet, which fails once the input is disposed. The decoder isn't
+					// handed out yet, so nothing else would close it.
+					decoder.close();
+					throw error;
+				}
 			}
 
 			return decoder;

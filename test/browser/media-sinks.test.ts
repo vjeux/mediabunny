@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
-import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { Input, InputDisposedError } from '../../src/input.js';
+import { BufferSource, CustomSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
@@ -464,4 +464,84 @@ test.for([
 		expect(sample.timestamp).toBe(timestamp);
 		expectSameAudio(getAudioSignature(sample), signature);
 	}
+});
+
+/** A source for a file that reads it like a network source would, with a delay per read, and can fail reads. */
+const createSlowSource = async (url: string) => {
+	const data = new Uint8Array(await (await fetch(url)).arrayBuffer());
+	const state = { failReads: false };
+	const source = new CustomSource({
+		getSize: () => data.byteLength,
+		read: async (start, end) => {
+			await new Promise(resolve => setTimeout(resolve, 20));
+			if (state.failReads) {
+				throw new Error('Read failed');
+			}
+
+			return data.slice(start, end);
+		},
+	});
+
+	return { source, state };
+};
+
+/** Records the AudioDecoders created while running the callback. */
+const recordAudioDecoders = async (callback: (decoders: AudioDecoder[]) => Promise<void>) => {
+	const globals = globalThis as { AudioDecoder: typeof AudioDecoder };
+	const OriginalAudioDecoder = globals.AudioDecoder;
+	const decoders: AudioDecoder[] = [];
+	globals.AudioDecoder = class extends OriginalAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			super(init);
+			decoders.push(this);
+		}
+	};
+
+	try {
+		await callback(decoders);
+	} finally {
+		globals.AudioDecoder = OriginalAudioDecoder;
+	}
+};
+
+test('Disposing the input while an AAC sink starts up leaves no AudioDecoder open', async () => {
+	// The sink created its decoder before reading the first packet (to tell libfaac's), which then failed with the
+	// input disposed, and nothing closed the decoder (found by the lane L94 review)
+	const { source } = await createSlowSource('/demo.mp4');
+	using input = new Input({ source, formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('aac');
+
+	await recordAudioDecoders(async (decoders) => {
+		const next = new AudioSampleSink(track).samples().next();
+		while (decoders.length === 0) {
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
+
+		input.dispose();
+		await expect(next).rejects.toBeInstanceOf(InputDisposedError);
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(decoders.map(x => x.state)).toEqual(decoders.map(() => 'closed'));
+	});
+});
+
+test('A read error while an AAC sink starts up doesn\'t fail later sinks', async () => {
+	// The first-packet lookup is done once per track, and kept its failure too
+	const { source, state } = await createSlowSource('/demo.mp4');
+	using input = new Input({ source, formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	await recordAudioDecoders(async (decoders) => {
+		state.failReads = true;
+		await expect(new AudioSampleSink(track).getSample(0)).rejects.toThrow('Read failed');
+		state.failReads = false;
+
+		using sample = await new AudioSampleSink(track).getSample(0);
+		expect(sample).not.toBe(null);
+
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(decoders.map(x => x.state)).toEqual(decoders.map(() => 'closed'));
+	});
 });
