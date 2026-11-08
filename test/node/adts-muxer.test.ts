@@ -10,6 +10,8 @@ import { BufferTarget } from '../../src/target.js';
 import { AdtsOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -114,4 +116,53 @@ test('ADTS muxer with ADTS input (passthrough)', { timeout: 15_000 }, async () =
 	expect(inputPacket).toBeNull();
 	expect(outputPacket).toBeNull();
 	expect(count).toBe(4557);
+});
+
+test('ADTS muxer with the decoder config given with the track instead of with the packets', async () => {
+	// Copies the first 10 packets of a file, giving the decoder config when adding the track, not with any packet
+	const copyPackets = async (file: string) => {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public', file)),
+			formats: ALL_FORMATS,
+		});
+		const inputTrack = await input.getPrimaryAudioTrack();
+		assert(inputTrack);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(inputTrack).packets()) {
+			packets.push(packet);
+			if (packets.length === 10) {
+				break;
+			}
+		}
+
+		const output = new Output({ format: new AdtsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('aac');
+		output.addAudioTrack(source, { decoderConfig: (await inputTrack.getDecoderConfig())! });
+		await output.start();
+		for (const packet of packets) {
+			await source.add(packet);
+		}
+		await output.finalize();
+
+		using outputAsInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const outputTrack = await outputAsInput.getPrimaryAudioTrack();
+		assert(outputTrack);
+
+		const outputPackets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
+			outputPackets.push(packet);
+		}
+		return { packets, outputPackets };
+	};
+
+	// Raw AAC (with a description), which gets an ADTS header in front of each packet
+	const fromMp4 = await copyPackets('video.mp4');
+	expect(fromMp4.outputPackets.map(packet => packet.data.subarray(7))).toEqual(
+		fromMp4.packets.map(packet => packet.data),
+	);
+
+	// ADTS frames (without a description), which are written as they are
+	const fromAdts = await copyPackets('sample3.aac');
+	expect(fromAdts.outputPackets.map(packet => packet.data)).toEqual(fromAdts.packets.map(packet => packet.data));
 });
