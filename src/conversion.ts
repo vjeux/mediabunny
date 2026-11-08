@@ -676,7 +676,8 @@ export type DiscardedTrack = {
 	 * - `'cannot_copy'`: {@link ConversionCopyOptions.mode} was set to `'forced'` but the track could not be copied
 	 * with the given copy configuration because it would require a transcode instead.
 	 * - `'unknown_maximum_packet_count'`: The output format requires a maximum packet count, but it can't be estimated
-	 * because the track is live and no trim end is set. Set it manually using the `maximumPacketCount` track option.
+	 * because the track's duration isn't known (it's live, or isn't in the metadata of an input that can only be read
+	 * sequentially) and no trim end is set. Set it manually using the `maximumPacketCount` track option.
 	 */
 	reason:
 		| 'discarded_by_user'
@@ -793,7 +794,9 @@ export class Conversion {
 	 *
 	 * As second argument, this callback receives the input time in seconds that has been processed.
 	 *
-	 * In order for progress to be computed, this property must be set before `execute` is called.
+	 * In order for progress to be computed, this property must be set before `execute` is called. Progress is relative
+	 * to the input's duration (or the trim range). When that isn't known ahead of time (live input, or an input that
+	 * can only be read sequentially and doesn't store its duration), progress stays at 0 until the conversion is done.
 	 */
 	onProgress?: (progress: number, processedTime: number) => unknown = undefined;
 	/** @internal */
@@ -1573,7 +1576,7 @@ export class Conversion {
 			this.output.format.requiresMaximumPacketCount
 			&& trackOptions.maximumPacketCount === undefined
 			&& this._endTimestamp === Infinity
-			&& await track.isLive()
+			&& await this._isTrackDurationUnknown(track)
 		) {
 			this.discardedTracks.push({
 				track,
@@ -2188,7 +2191,7 @@ export class Conversion {
 			this.output.format.requiresMaximumPacketCount
 			&& trackOptions.maximumPacketCount === undefined
 			&& this._endTimestamp === Infinity
-			&& await track.isLive()
+			&& await this._isTrackDurationUnknown(track)
 		) {
 			this.discardedTracks.push({
 				track,
@@ -2854,7 +2857,7 @@ export class Conversion {
 		let promise = this._trackDurations.get(track);
 		if (!promise) {
 			promise = (async () => {
-				if (await track.isLive()) {
+				if (await this._isTrackDurationUnknown(track)) {
 					return Infinity; // Upper bound (assuming no universe heat death)
 				}
 
@@ -2991,6 +2994,27 @@ export class Conversion {
 			this._lastProgress = newProgress;
 			this.onProgress?.(newProgress, minTimestamp);
 		}
+	}
+
+	/**
+	 * Whether a track's duration can't be known ahead of converting it: a live track's, or that of a track whose
+	 * duration isn't in its metadata when the input is a stream larger than its source's cache. Computing it would read
+	 * the whole input, evicting its start from the source before the conversion gets to read it.
+	 * @internal
+	 */
+	async _isTrackDurationUnknown(track: InputTrack) {
+		if (await track.isLive()) {
+			return true;
+		}
+
+		const source = this.input._rootSource;
+		if (!source._evictsReadData || (await track.getDurationFromMetadata()) !== null) {
+			return false;
+		}
+
+		// A stream that turns out to fit into the cache can still be read to its end
+		await source._readAheadWithinCache();
+		return source._evictsReadData;
 	}
 }
 
