@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
@@ -1909,3 +1909,48 @@ test('CMAF segments too long for the sidx subsegment duration are rejected inste
 
 	await expect(mux()).rejects.toThrow(/sidx/);
 });
+
+test('Finalizing a long MP4 writes its sample tables without building a nested array per sample', async () => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new NullTarget() });
+	const videoSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	// 2 hours of B-frames (decode order I P B) at a variable frame rate, so stsz, stts and ctts get an entry per sample
+	const decoderConfig = {
+		codec: 'avc1.42c01e',
+		codedWidth: 32,
+		codedHeight: 32,
+		description: new Uint8Array([
+			0x01, 0x42, 0xc0, 0x1e, 0xff, 0xe1, 0x00, 0x0a, 0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80, 0xbf, 0xe5, 0x84,
+			0x01, 0x00, 0x04, 0x68, 0xce, 0x3c, 0x80,
+		]),
+	};
+	const frameCount = 216_000;
+	const timestamp = (frame: number) => (frame * 33 + Math.floor(frame / 2)) / 1000;
+	const data = new Uint8Array(10);
+	for (let i = 0; i < frameCount; i += 3) {
+		for (const frame of [i, i + 2, i + 1]) {
+			const type = frame % 30 === 0 ? 'key' : 'delta';
+			const duration = timestamp(frame + 1) - timestamp(frame);
+			await videoSource.add(
+				new EncodedPacket(data, type, timestamp(frame), duration),
+				frame === 0 ? { decoderConfig } : undefined,
+			);
+		}
+	}
+
+	// box() takes nested number arrays and flattens them. Built that way, a table with an entry per sample costs about
+	// 200 bytes of short-lived memory per sample (+620 MB to finalize a million samples)
+	let largestFlattenedLength = 0;
+	const flat = Array.prototype.flat;
+	vi.spyOn(Array.prototype, 'flat').mockImplementation(function (this: unknown[], depth?: number) {
+		const result = flat.call(this, depth);
+		largestFlattenedLength = Math.max(largestFlattenedLength, result.length);
+		return result;
+	});
+	await output.finalize();
+
+	// On main, the stts and ctts payloads flattened to 1.7M numbers
+	expect(largestFlattenedLength).toBeLessThan(100_000);
+}, 60_000);
