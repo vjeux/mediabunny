@@ -26,8 +26,7 @@ export class WaveMuxer extends Muxer {
 	private riffWriter!: RiffWriter;
 	private headerWritten = false;
 	private dataSize = 0;
-	private sampleRate: number | null = null;
-	private sampleCount = 0;
+	private blockSize: number | null = null;
 
 	private riffSizePos: number | null = null;
 	private dataSizePos: number | null = null;
@@ -57,7 +56,6 @@ export class WaveMuxer extends Muxer {
 			validateAudioChunkMetadata({ decoderConfig: track.metadata.decoderConfig }, track.source._codec);
 
 			this.writeHeader(track, track.metadata.decoderConfig);
-			this.sampleRate = track.metadata.decoderConfig.sampleRate;
 			this.headerWritten = true;
 		}
 
@@ -87,7 +85,6 @@ export class WaveMuxer extends Muxer {
 				assert(meta.decoderConfig);
 
 				this.writeHeader(track, meta.decoderConfig);
-				this.sampleRate = meta.decoderConfig.sampleRate;
 				this.headerWritten = true;
 			}
 
@@ -102,7 +99,6 @@ export class WaveMuxer extends Muxer {
 
 			this.writer.write(packet.data);
 			this.dataSize += packet.data.byteLength;
-			this.sampleCount += Math.round(packet.duration * this.sampleRate!);
 
 			await this.writer.flush();
 		} finally {
@@ -137,6 +133,7 @@ export class WaveMuxer extends Muxer {
 		const channels = config.numberOfChannels;
 		const sampleRate = config.sampleRate;
 		const blockSize = pcmInfo.sampleSize * channels;
+		this.blockSize = blockSize;
 
 		// RIFF header
 		this.riffWriter.writeAscii(this.isRf64 ? 'RF64' : 'RIFF');
@@ -374,10 +371,11 @@ export class WaveMuxer extends Muxer {
 			this.writer.seek(this.ds64DataSizePos);
 			this.riffWriter.writeU64(this.dataSize);
 
-			// Write sample count
+			// Write sample count, going by the data since packet durations can be imprecise
 			assert(this.ds64SampleCountPos !== null);
+			assert(this.blockSize !== null);
 			this.writer.seek(this.ds64SampleCountPos);
-			this.riffWriter.writeU64(this.sampleCount);
+			this.riffWriter.writeU64(Math.floor(this.dataSize / this.blockSize));
 		} else {
 			// Write file size
 			assert(this.riffSizePos !== null);
