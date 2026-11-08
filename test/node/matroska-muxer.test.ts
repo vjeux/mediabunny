@@ -209,3 +209,69 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('A file rebuilt from the Matroska callbacks gets the final Segment header', async () => {
+	const write = async (appendOnly: boolean) => {
+		let rebuilt = new Uint8Array(0);
+		const segmentHeaderPositions: number[] = [];
+		// Each callback's data goes to its position in the file, as a target would write it
+		const place = (data: Uint8Array, position: number) => {
+			if (position + data.length > rebuilt.length) {
+				const grown = new Uint8Array(position + data.length);
+				grown.set(rebuilt);
+				rebuilt = grown;
+			}
+			rebuilt.set(data, position);
+		};
+
+		const output = new Output({
+			format: new MkvOutputFormat({
+				appendOnly,
+				minimumClusterDuration: 0.5,
+				onEbmlHeader: place,
+				onSegmentHeader: (data, position) => {
+					segmentHeaderPositions.push(position);
+					place(data, position);
+				},
+				onCluster: place,
+			}),
+			target: new BufferTarget(),
+		});
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source);
+		await output.start();
+
+		const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 };
+		for (let i = 0; i < 50; i++) {
+			const packet = new EncodedPacket(new Uint8Array(960), 'key', i * 0.04, 0.04);
+			await source.add(packet, i === 0 ? { decoderConfig } : undefined);
+		}
+		await output.finalize();
+
+		return { rebuilt, file: new Uint8Array(output.target.buffer!), segmentHeaderPositions };
+	};
+
+	// Finalizing fills in the Segment's size, the duration and the SeekHead, so the header is passed again
+	const { rebuilt, file, segmentHeaderPositions } = await write(false);
+	expect(segmentHeaderPositions).toHaveLength(2);
+	expect(segmentHeaderPositions[1]).toBe(segmentHeaderPositions[0]);
+	// The rebuilt file is the written file without the Cues at its end, which no callback passes
+	expect(rebuilt.length).toBeLessThan(file.length);
+	expect(rebuilt).toEqual(file.subarray(0, rebuilt.length));
+
+	using input = new Input({ source: new BufferSource(rebuilt), formats: ALL_FORMATS });
+	expect(await input.getDurationFromMetadata()).toBe(2);
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		void packet;
+		packetCount++;
+	}
+	expect(packetCount).toBe(50);
+
+	// Append-only output's header is final from the start
+	const appendOnly = await write(true);
+	expect(appendOnly.segmentHeaderPositions).toHaveLength(1);
+	expect(appendOnly.rebuilt).toEqual(appendOnly.file.subarray(0, appendOnly.rebuilt.length));
+});
