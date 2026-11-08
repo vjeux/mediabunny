@@ -1107,6 +1107,57 @@ test('MPEG-TS random_access_indicator on PES packets holding several frames', as
 	expect(demuxer.elementaryStreams.map(stream => stream.canBeTrustedWithKeyPackets)).toEqual([true]);
 });
 
+test('MPEG-TS with several programs uses the first one whose PMT shows up', async () => {
+	// Like a DVB capture: the PAT lists three programs, the first of which isn't in the file
+	const packets: Uint8Array[] = [];
+	const pushPacket = (pid: number, payload: number[], payloadUnitStart = true) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		packet.set([0x47, (payloadUnitStart ? 0x40 : 0) | (pid >> 8), pid & 0xff, 0x10 | (packets.length & 0xf)], 0);
+		packet.set(payload, 4);
+		packets.push(packet);
+	};
+	const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
+	const pmt = (programNumber: number, pid: number) => section([
+		0x02, 0xb0, 0x12, 0, programNumber, 0xc1, 0, 0, 0xe0 | (pid >> 8), pid & 0xff, 0xf0, 0x00,
+		0x0f, 0xe0 | (pid >> 8), pid & 0xff, 0xf0, 0x00, // AAC
+	]);
+	const adtsPes = (pts: number) => [
+		0, 0, 1, 0xc0, 0, 8 + 39, 0x84, 0x80, 5, 0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+		0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc, ...new Array<number>(32).fill(0), // AAC-LC, 48 kHz, stereo
+	];
+
+	pushPacket(0x0000, section([
+		0x00, 0xb0, 0x15, 0, 1, 0xc1, 0, 0,
+		0, 1, 0xf0, 0x00, // Program 1 -> PMT PID 0x1000
+		0, 2, 0xf0, 0x01, // Program 2 -> PMT PID 0x1001
+		0, 3, 0xf0, 0x02, // Program 3 -> PMT PID 0x1002
+	]));
+	pushPacket(0x1001, pmt(2, 0x102));
+	pushPacket(0x1002, pmt(3, 0x103));
+	for (let i = 0; i < 3; i++) {
+		pushPacket(0x102, adtsPes(1920 * i));
+		pushPacket(0x103, adtsPes(1920 * i));
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.id)).toEqual([0x102]);
+
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
+		expect(packet.byteLength).toBe(39);
+		packetCount++;
+	}
+	expect(packetCount).toBe(3);
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
