@@ -2162,9 +2162,24 @@ describe('Audio', async () => {
 	});
 
 	test('Opus, AC-3 and E-AC-3 encode at bitrates outside their encoders\' range', async () => {
-		// Encodes 1 s of loud noise, the hardest content to fit, and returns the average bitrate of the packets
-		const encodedBitrate = async (codec: AudioCodec, numberOfChannels: number, bitrate: number) => {
-			const sampleRate = 48000;
+		// Hard content to fit: loud white noise, and full-scale square waves (one frequency per channel)
+		const signals = {
+			noise: (channel: number, i: number) => {
+				return (Math.sin(i * 12.9898 + channel * 78.233) * 43758.5453 % 1) * 0.8;
+			},
+			square: (channel: number, i: number, sampleRate: number) => {
+				return Math.sin(2 * Math.PI * (1000 + 137 * channel) * i / sampleRate) >= 0 ? 1 : -1;
+			},
+		};
+
+		// Encodes 1 s and returns the average bitrate of the packets
+		const encodedBitrate = async (
+			codec: AudioCodec,
+			sampleRate: number,
+			numberOfChannels: number,
+			bitrate: number,
+			signal: keyof typeof signals = 'noise',
+		) => {
 			const encoder = new NodeAvAudioEncoder();
 			// @ts-expect-error Readonly
 			encoder.codec = codec;
@@ -2181,10 +2196,10 @@ describe('Audio', async () => {
 
 			await encoder.init();
 			const data = new Float32Array(sampleRate * numberOfChannels);
-			let seed = 12345;
-			for (let i = 0; i < data.length; i++) {
-				seed = (seed * 48271) % 2147483647;
-				data[i] = 1.6 * (seed / 2147483647 - 0.5);
+			for (let channel = 0; channel < numberOfChannels; channel++) {
+				for (let i = 0; i < sampleRate; i++) {
+					data[channel * sampleRate + i] = signals[signal](channel, i, sampleRate);
+				}
 			}
 			using sample = new AudioSample({ data, format: 'f32-planar', sampleRate, numberOfChannels, timestamp: 0 });
 			await encoder.encode(sample);
@@ -2195,17 +2210,23 @@ describe('Audio', async () => {
 			return bytes * 8 / duration;
 		};
 
-		// libopus takes at most 256 kbps per channel
-		expect(await encodedBitrate('opus', 1, 320_000)).toBeLessThan(270_000);
-		expect(await encodedBitrate('opus', 2, 1_000_000)).toBeLessThan(530_000);
+		// libopus takes 500 bps to 256 kbps per channel
+		expect(await encodedBitrate('opus', 48000, 1, 320_000)).toBeLessThan(270_000);
+		expect(await encodedBitrate('opus', 48000, 2, 1_000_000)).toBeLessThan(530_000);
+		expect(await encodedBitrate('opus', 48000, 1, 400)).toBeGreaterThan(0);
 		// The AC-3 and E-AC-3 encoders fail the bit allocation of such content below some bitrate
-		expect(await encodedBitrate('ac3', 6, 32_000)).toBeGreaterThan(32_000);
-		expect(await encodedBitrate('eac3', 2, 16_000)).toBeGreaterThan(16_000);
-		expect(await encodedBitrate('eac3', 6, 40_000)).toBeGreaterThan(40_000);
+		expect(await encodedBitrate('ac3', 48000, 6, 32_000)).toBeGreaterThan(32_000);
+		expect(await encodedBitrate('ac3', 48000, 6, 64_000, 'square')).toBeGreaterThan(64_000);
+		expect(await encodedBitrate('ac3', 48000, 2, 32_000, 'square')).toBeGreaterThan(32_000);
+		expect(await encodedBitrate('ac3', 32000, 4, 32_000, 'square')).toBeGreaterThan(32_000);
+		expect(await encodedBitrate('eac3', 48000, 2, 16_000)).toBeGreaterThan(16_000);
+		expect(await encodedBitrate('eac3', 48000, 6, 56_000, 'square')).toBeGreaterThan(56_000);
+		expect(await encodedBitrate('eac3', 44100, 4, 8_000, 'square')).toBeGreaterThan(8_000);
 
-		// Bitrates in the range stay as they are
-		expect(await encodedBitrate('opus', 2, 128_000)).toBeLessThan(140_000);
-		expect(await encodedBitrate('ac3', 2, 192_000)).toBeCloseTo(192_000, -3);
+		// Bitrates in the range stay as they are. Lower sample rates need less.
+		expect(await encodedBitrate('opus', 48000, 2, 128_000)).toBeLessThan(140_000);
+		expect(await encodedBitrate('ac3', 48000, 2, 192_000)).toBeCloseTo(192_000, -3);
+		expect(await encodedBitrate('ac3', 32000, 2, 32_000, 'square')).toBeCloseTo(32_000, -3);
 	});
 
 	test('DTS encode & decode', async () => {
