@@ -587,8 +587,23 @@ export class Output<
 		}
 	}
 
+	/**
+	 * Gets the target for a request the muxer makes as it runs (HLS segments and playlists), which it waits for while
+	 * holding its mutex. Once the output is canceled, the muxer gets a target discarding everything instead, rather
+	 * than waiting for one that may never come, so that the adds and the finalization waiting on it can finish. A
+	 * request that fails still fails as before.
+	 * @internal
+	 */
+	_getTarget(request: TargetRequest): Promise<Target> {
+		if (this.state === 'canceled') {
+			return Promise.resolve(new NullTarget());
+		}
+
+		return this._targetUnlessCanceled(this._requestTarget(request));
+	}
+
 	/** @internal */
-	async _getTarget(request: TargetRequest) {
+	async _requestTarget(request: TargetRequest) {
 		assert(this._target instanceof PathedTarget);
 
 		const target = await this._getTargetValidated(request);
@@ -701,16 +716,17 @@ export class Output<
 	 */
 	async _waitForTarget(target: MaybePromise<Target>): Promise<Target> {
 		try {
-			const result = await Promise.race([target, this._canceled.promise.then(() => null)]);
-			if (result && this.state !== 'canceled') {
-				return result;
-			}
-
-			return new NullTarget();
+			return await this._targetUnlessCanceled(target);
 		} catch (error) {
 			this._targetFailure ??= { error };
 			return new UnavailableTarget(error);
 		}
+	}
+
+	/** Resolves with the target, or with one discarding everything if the output is canceled before it comes. */
+	async _targetUnlessCanceled(target: MaybePromise<Target>): Promise<Target> {
+		const result = await Promise.race([target, this._canceled.promise.then(() => null)]);
+		return result && this.state !== 'canceled' ? result : new NullTarget();
 	}
 
 	/** Adds a video track to the output with the given source. Can only be called before the output is started. */

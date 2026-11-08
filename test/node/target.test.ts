@@ -216,6 +216,57 @@ test.each([
 	},
 );
 
+test.each(['MPEG-TS', 'CMAF'] as const)(
+	'Adds waiting behind an HLS target request that never settles settle once the output is canceled (%s segments)',
+	async (segmentFormatName) => {
+		// The HLS muxer asks for segment and playlist targets as it goes, while holding its mutex
+		const formats = await import('../../src/output-format.js');
+		const { PathedTarget } = await import('../../src/target.js');
+		const { EncodedVideoPacketSource } = await import('../../src/media-source.js');
+		const { EncodedPacket } = await import('../../src/packet.js');
+		const settlesWithin = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'resolved', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		for (const stuckRequest of [2, 3]) {
+			let requests = 0;
+			const output = new Output({
+				format: new formats.HlsOutputFormat({
+					segmentFormat: segmentFormatName === 'MPEG-TS'
+						? new formats.MpegTsOutputFormat()
+						: new formats.CmafOutputFormat(),
+					targetDuration: 1,
+				}),
+				// Like a request for a segment's upload URL that never gets an answer
+				target: new PathedTarget('', () => ++requests === stuckRequest
+					? new Promise<BufferTarget>(() => {})
+					: new BufferTarget()),
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+			await output.start();
+
+			const decoderConfig = {
+				codec: 'avc1.42001f',
+				codedWidth: 64,
+				codedHeight: 64,
+				description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+			};
+			const adds = Array.from({ length: 40 }, (_, i) => source.add(
+				new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', i * 0.1, 0.1),
+				i === 0 ? { decoderConfig } : undefined,
+			));
+			await new Promise(resolve => setTimeout(resolve, 100));
+			expect(requests, `request ${stuckRequest}`).toBeGreaterThanOrEqual(stuckRequest);
+
+			await output.cancel();
+			const results = await Promise.all(adds.map(add => settlesWithin(add, 1000)));
+			expect(results.filter(result => result === 'pending'), `request ${stuckRequest}`).toEqual([]);
+		}
+	},
+);
+
 test('BufferTarget onFinalize callback', async () => {
 	let received: ArrayBuffer | null = null;
 	let asyncCallbackDone = false;
