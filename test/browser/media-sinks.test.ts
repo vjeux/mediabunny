@@ -3,7 +3,7 @@ import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
-import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
+import { AudioSampleSink, CanvasSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -275,4 +275,20 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test('CanvasSink never deduces a canvas dimension of zero', async () => {
+	// cursed-vfr.mp4 is 3026x1386, so a width of 1 deduced a height of 0 (rounding 0.46), and the canvas couldn't be
+	// drawn to (found by the lane L89 review)
+	using input = new Input({ source: new UrlSource('/cursed-vfr.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sizes: string[] = [];
+	for (const options of [{ width: 4 }, { width: 1 }, { height: 1, rotation: 90 as const }]) {
+		const wrappedCanvas = await new CanvasSink(track, options).getCanvas(await track.getFirstTimestamp());
+		assert(wrappedCanvas);
+		sizes.push(`${wrappedCanvas.canvas.width}x${wrappedCanvas.canvas.height}`);
+	}
+	expect(sizes).toEqual(['4x2', '1x1', '1x1']); // The first one is the control
 });
