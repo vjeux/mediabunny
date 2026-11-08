@@ -652,7 +652,7 @@ export class InputVideoTrack extends InputTrack {
 		super(input, backing);
 	}
 
-	get type(): TrackType {
+	get type(): 'video' {
 		return 'video';
 	}
 
@@ -1158,7 +1158,7 @@ export class InputAudioTrack extends InputTrack {
 		super(input, backing);
 	}
 
-	get type(): TrackType {
+	get type(): 'audio' {
 		return 'audio';
 	}
 
