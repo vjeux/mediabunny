@@ -417,6 +417,10 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					this.config.bitrate ?? new Quality('medium')
 						._toVideoBitrate(this.codec, this.config.width, this.config.height),
 				);
+		if (this.avCodec.name === 'libsvtav1' && codecContext.bitRate > 100_000_000n) {
+			// SVT-AV1 refuses target bitrates above 100 Mbps, and encoders may miss their target bitrate
+			codecContext.bitRate = 100_000_000n;
+		}
 		codecContext.sampleAspectRatio = new NodeAv.Rational(pixelAspectRatio.num, pixelAspectRatio.den);
 
 		if (this.config.bitrateMode === 'constant') {
