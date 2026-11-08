@@ -169,9 +169,10 @@ export const iterateAvcNalUnits = (packetData: Uint8Array, decoderConfig: VideoD
 
 /**
  * Like {@link iterateAvcNalUnits}, but also yields the NAL units that follow a start code inside a length-prefixed NAL
- * unit. Android's MPEG4Writer only turns the first start code of a frame into a length, so a frame of several NAL units
- * (like the SVC prefix NAL unit and the slice of temporally layered video, as recorded by Samsung's slow motion modes)
- * ends up under a single length. Emulation prevention keeps start codes out of NAL units, so each begins a new one.
+ * unit. Some writers leave start codes in place: Samsung's slow motion recordings put each frame's SVC prefix NAL unit,
+ * a start code and the slice under a single length, and Android 8's MPEG4Writer only turned the start codes within a
+ * frame's first 64 bytes into lengths. Emulation prevention keeps start codes out of NAL units, so each begins a new
+ * one.
  */
 const iterateAvcNalUnitsIncludingEmbedded = function* (
 	packetData: Uint8Array,

@@ -228,9 +228,8 @@ const writeAvcFrames = async (frames: number[][]) => {
 };
 
 test('Key frames of H.264 with several NAL units under one length (Android temporal layers)', async () => {
-	// Android's MPEG4Writer only turns the first start code of a frame into a length, so each frame of temporally
-	// layered video (as recorded by Samsung's slow motion modes) is an SVC prefix NAL unit, a start code and the slice,
-	// all under one length
+	// Samsung's slow motion recordings (temporally layered video) put each frame's SVC prefix NAL unit, a start code and
+	// the slice under one length
 	const prefixNalUnit = [0x6e, 0xc0, 0x80, 0x0f]; // nal_unit_type 14, as in the Samsung files
 	const idrSlice = [0x65, 0x88, 0x84, 0x00, 0x33, 0xff]; // nal_unit_type 5
 	const nonIdrSlice = [0x41, 0x9a, 0x02, 0x04, 0x11, 0xff]; // nal_unit_type 1
