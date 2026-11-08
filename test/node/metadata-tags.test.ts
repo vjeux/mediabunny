@@ -2350,6 +2350,41 @@ test('Creation time not copied in conversion', async () => {
 	expect(readTags.creationTime).toEqual(new Date('2024-02-29T13:37:42.123Z'));
 });
 
+test('Read ID3v2 tags in front of the RIFF header of a WAV file', async () => {
+	// 1 s of 16-bit stereo silence at 8 kHz
+	const dataSize = 8000 * 4;
+	const wav = new Uint8Array(44 + dataSize);
+	const view = new DataView(wav.buffer);
+	wav.set([0x52, 0x49, 0x46, 0x46], 0); // 'RIFF'
+	view.setUint32(4, 36 + dataSize, true);
+	wav.set([0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20], 8); // 'WAVEfmt '
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true); // PCM
+	view.setUint16(22, 2, true);
+	view.setUint32(24, 8000, true);
+	view.setUint32(28, 8000 * 4, true);
+	view.setUint16(32, 4, true);
+	view.setUint16(34, 16, true);
+	wav.set([0x64, 0x61, 0x74, 0x61], 36); // 'data'
+	view.setUint32(40, dataSize, true);
+
+	// An ID3v2.3 tag with a TIT2 frame, as some taggers put in front of any file. FFmpeg and Chrome skip it.
+	const frame = [0x54, 0x49, 0x54, 0x32, 0, 0, 0, 6, 0, 0, 0, 0x48, 0x65, 0x6c, 0x6c, 0x6f]; // TIT2 'Hello'
+	const tag = new Uint8Array([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, frame.length, ...frame]);
+
+	const bytes = new Uint8Array(tag.length + wav.length);
+	bytes.set(tag);
+	bytes.set(wav, tag.length);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	expect((await input.getFormat()).name).toBe('WAVE');
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getCodec()).toBe('pcm-s16');
+	expect(await track.computeDuration()).toBe(1);
+	expect((await input.getMetadataTags()).title).toBe('Hello');
+});
+
 test('Creation time override in conversion', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),

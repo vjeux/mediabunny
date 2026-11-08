@@ -82,7 +82,31 @@ export class WaveDemuxer extends Demuxer {
 
 	async readMetadata() {
 		return this.metadataPromise ??= (async () => {
-			let slice = this.reader.requestSlice(0, 12);
+			// Some taggers put ID3v2 tags in front of the RIFF header, where they don't belong. Like FFmpeg, read past
+			// them, and take their tags after the ones inside the RIFF structure.
+			let riffStart = 0;
+			const prependedId3Tags: { pos: number; size: number }[] = [];
+
+			while (true) {
+				let slice = this.reader.requestSlice(riffStart, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					break;
+				}
+
+				const id3V2Header = readId3V2Header(slice);
+				if (!id3V2Header) {
+					break;
+				}
+
+				const size = ID3_V2_HEADER_SIZE + id3V2Header.size;
+				prependedId3Tags.push({ pos: riffStart, size });
+				riffStart += size;
+			}
+
+			let slice = this.reader.requestSlice(riffStart, 12);
 			if (isThenable(slice)) slice = await slice;
 			assert(slice);
 
@@ -99,7 +123,7 @@ export class WaveDemuxer extends Demuxer {
 
 			let totalFileSize = isRf64 || isUnknownSize(outerChunkSize)
 				? this.reader.fileSize
-				: Math.min(outerChunkSize + 8, this.reader.fileSize ?? Infinity);
+				: Math.min(riffStart + outerChunkSize + 8, this.reader.fileSize ?? Infinity);
 			const format = readAscii(slice, 4);
 
 			if (format !== 'WAVE') {
@@ -180,7 +204,7 @@ export class WaveDemuxer extends Demuxer {
 						}
 					}
 
-					totalFileSize = Math.min(riffChunkSize + 8, this.reader.fileSize ?? Infinity);
+					totalFileSize = Math.min(riffStart + riffChunkSize + 8, this.reader.fileSize ?? Infinity);
 				} else if (chunkId === 'LIST' || chunkId === 'ID3 ' || chunkId === 'id3 ') {
 					const metadataChunk = { id: chunkId, pos: startPos, size: chunkSize, littleEndian };
 
@@ -197,6 +221,15 @@ export class WaveDemuxer extends Demuxer {
 
 				currentPos = startPos + chunkSize + (chunkSize & 1); // Handle padding
 				chunksRead++;
+			}
+
+			for (const tag of prependedId3Tags) {
+				const metadataChunk = { id: 'ID3 ', pos: tag.pos, size: tag.size, littleEndian };
+				if (this.reader.fileSize === null) {
+					await this.parseMetadataChunk(metadataChunk);
+				} else {
+					this.metadataChunks.push(metadataChunk);
+				}
 			}
 
 			if (!this.audioInfo) {
