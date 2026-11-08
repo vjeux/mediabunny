@@ -3753,7 +3753,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				// avcC box lacks are taken from the first sample.
 				const record = deserializeAvcDecoderConfigurationRecord(this.internalTrack.info.codecDescription!);
 				if (record && (record.sequenceParameterSets.length === 0 || record.pictureParameterSets.length === 0)) {
-					const firstPacket = await this.getFirstPacket({});
+					const firstPacket = await this.getFirstPacketForCodecInfo(true);
 					const data = firstPacket?.data ?? new Uint8Array(0);
 					const lengthSize = (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
 					const sequenceParameterSets: Uint8Array[] = [];
@@ -3860,6 +3860,23 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 
 			return config;
 		})();
+	}
+
+	/**
+	 * The first packet, from which the codec info of the sample entry is completed or refined. An encrypted track's
+	 * packets can't be read without its key: then, if the sample entry has codec info (hasCodecInfo), null is
+	 * returned, and that info is used as it is, as metadata calls don't need the key.
+	 */
+	private async getFirstPacketForCodecInfo(hasCodecInfo: boolean) {
+		try {
+			return await this.getFirstPacket({});
+		} catch (error) {
+			if (hasCodecInfo && this.internalTrack.encryptionInfo) {
+				return null;
+			}
+
+			throw error;
+		}
 	}
 }
 
