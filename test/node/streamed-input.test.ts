@@ -2,7 +2,14 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
-import { ALL_FORMATS, EncodedPacketSink, Input, ReadableStreamSource } from '../../src/index.js';
+import {
+	ALL_FORMATS,
+	BufferSource,
+	EncodedPacket,
+	EncodedPacketSink,
+	Input,
+	ReadableStreamSource,
+} from '../../src/index.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -38,4 +45,27 @@ test('Ogg: Duration of a stream longer than its cache, after reading its packets
 
 	expect(await track.computeDuration()).toBe(end);
 	expect((await sink.getPacket(Infinity))?.timestamp).toBe(lastTimestamp);
+});
+
+test('Ogg: Seeking forward in a stream longer than its cache, after playing part of it', async () => {
+	// The lookup must read on from where playback got to: the start of the stream has left the cache by then
+	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/preroll-test.opus')));
+	const packets: EncodedPacket[] = [];
+	using reference = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	for await (const packet of new EncodedPacketSink((await reference.getPrimaryAudioTrack())!).packets()) {
+		packets.push(packet);
+	}
+
+	using input = new Input({ source: streamedSource(file, 32 * 1024), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+	for await (const packet of sink.packets()) {
+		if (packet.sequenceNumber === packets[225]!.sequenceNumber) {
+			break;
+		}
+	}
+
+	for (const target of [packets[270]!, packets[280]!, packets.at(-1)!]) {
+		const packet = await sink.getPacket(target.timestamp);
+		expect([packet?.timestamp, packet?.byteLength]).toEqual([target.timestamp, target.byteLength]);
+	}
 });

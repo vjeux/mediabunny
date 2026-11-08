@@ -438,8 +438,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	 * looked up by reading on, even once reaching the end of the stream has made its size known.
 	 */
 	sourceWasUnsized: boolean;
-	/** The track's last packet, once reading on has reached it. */
-	lastPacketMetadata: EncodedPacketMetadata | null = null;
+	/**
+	 * The packet furthest into the track read so far. Looking up packets past it reads on from it rather than from an
+	 * earlier point: that's cheaper, and a stream may no longer hold what's before it.
+	 */
+	furthestPacketMetadata: EncodedPacketMetadata | null = null;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
 		// Opus always uses a fixed sample rate for its internal calculations, even if the actual rate is different
@@ -587,13 +590,21 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			packet.data.byteLength,
 		);
 
-		this.encodedPacketToMetadata.set(encodedPacket, {
+		const metadata: EncodedPacketMetadata = {
 			packet,
 			timestampInSamples: additional.timestampInSamples,
 			durationInSamples,
 			vorbisLastBlockSize: additional.vorbisLastBlocksize,
 			vorbisBlockSize,
-		});
+		};
+		this.encodedPacketToMetadata.set(encodedPacket, metadata);
+		if (
+			!this.furthestPacketMetadata
+			|| metadata.timestampInSamples > this.furthestPacketMetadata.timestampInSamples
+		) {
+			this.furthestPacketMetadata = metadata;
+		}
+
 		return encodedPacket;
 	}
 
@@ -681,9 +692,6 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 		const packetPosition = await this.demuxer.findNextPacketStart(prevMetadata.packet);
 		if (!packetPosition) {
-			// This is the track's last packet. Let's remember it, so that looking it up again (as computeDuration()
-			// does) doesn't need to read on from the start of a stream, which the source may no longer hold.
-			this.lastPacketMetadata ??= prevMetadata;
 			return null;
 		}
 
@@ -1038,33 +1046,28 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 			timestamp = timestampInSamples / this.internalSampleRate;
 
-			if (this.lastPacketMetadata && timestampInSamples >= this.lastPacketMetadata.timestampInSamples) {
-				// It's the last packet, which reading on has already reached
-				return this.createEncodedPacketFromOggPacket(
-					this.lastPacketMetadata.packet,
-					{
-						timestampInSamples: this.lastPacketMetadata.timestampInSamples,
-						vorbisLastBlocksize: this.lastPacketMetadata.vorbisLastBlockSize,
-					},
-					options,
-				);
-			}
-
 			const index = binarySearchLessOrEqual(
 				this.sequentialScanCache,
 				timestampInSamples,
 				x => x.timestampInSamples,
 			);
 
+			// If the packet lies past the furthest packet read so far (as when seeking forward from where playback got
+			// to, or looking up the last packet after reading them all), let's read on from there. Otherwise, from a
+			// previous scan point, if there's one before the packet.
+			const furthest = this.furthestPacketMetadata;
+			const startMetadata = furthest && furthest.timestampInSamples <= timestampInSamples
+				? furthest
+				: index !== -1 ? this.sequentialScanCache[index]! : null;
+
 			let currentPacket: EncodedPacket | null;
-			if (index !== -1) {
-				// We don't need to start from the beginning, we can start at a previous scan point
-				const cacheEntry = this.sequentialScanCache[index]!;
+			if (startMetadata) {
+				// We don't need to start from the beginning
 				currentPacket = this.createEncodedPacketFromOggPacket(
-					cacheEntry.packet,
+					startMetadata.packet,
 					{
-						timestampInSamples: cacheEntry.timestampInSamples,
-						vorbisLastBlocksize: cacheEntry.vorbisLastBlockSize,
+						timestampInSamples: startMetadata.timestampInSamples,
+						vorbisLastBlocksize: startMetadata.vorbisLastBlockSize,
 					},
 					options,
 				);
