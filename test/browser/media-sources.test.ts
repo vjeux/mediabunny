@@ -732,9 +732,11 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 	return { input, track };
 };
 
-test('MediaStreamAudioTrackSource keeps audio in order when an async process function takes varying time', async () => {
-	// Stands in for MediaStreamTrackProcessor: continuous audio (a smooth 100 Hz sine) in 1024-frame chunks, one every
-	// 21.3 ms with steadily increasing timestamps, like a microphone
+/**
+ * Stands in for MediaStreamTrackProcessor with continuous audio (a smooth 100 Hz sine) in 1024-frame chunks with
+ * steadily increasing timestamps, like a microphone. `deliver(count)` delivers that many more chunks in real time.
+ */
+const installSineCapture = () => {
 	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
 	const realProcessor = globals.MediaStreamTrackProcessor;
 	let controller!: ReadableStreamDefaultController<AudioData>;
@@ -749,12 +751,59 @@ test('MediaStreamAudioTrackSource keeps audio in order when an async process fun
 	const audioContext = new AudioContext();
 	const track = audioContext.createMediaStreamDestination().stream.getAudioTracks()[0]!; // Only identifies the track
 
+	const chunks: AudioData[] = [];
+	const deliver = async (count: number) => {
+		const start = performance.now();
+		for (let i = 0; i < count; i++) {
+			while (performance.now() - start < 1000 * 1024 * i / 48000) {
+				await new Promise(resolve => setTimeout(resolve, 2));
+			}
+
+			const index = chunks.length;
+			const data = new Float32Array(1024);
+			for (let j = 0; j < 1024; j++) {
+				data[j] = 0.3 * Math.sin(2 * Math.PI * 100 * (1024 * index + j) / 48000);
+			}
+			const chunk = new AudioData({
+				format: 'f32-planar',
+				sampleRate: 48000,
+				numberOfChannels: 1,
+				numberOfFrames: 1024,
+				timestamp: Math.round(1e6 * 1024 * index / 48000),
+				data,
+			});
+			chunks.push(chunk);
+			controller.enqueue(chunk);
+		}
+	};
+
+	const uninstall = async () => {
+		try {
+			controller.close();
+		} catch {
+			// The source canceled the stream
+		}
+		globals.MediaStreamTrackProcessor = realProcessor;
+		track.stop();
+		await audioContext.close();
+	};
+
+	return { track, chunks, deliver, uninstall };
+};
+
+const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+	promise.then(() => 'fulfilled', () => 'rejected'),
+	new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+]);
+
+test('MediaStreamAudioTrackSource keeps audio in order when an async process function takes varying time', async () => {
+	const capture = installSineCapture();
 	const output = new Output({
 		format: new WavOutputFormat(),
 		target: new BufferTarget(),
 	});
 	let calls = 0;
-	const audioSource = new MediaStreamAudioTrackSource(track, {
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
 		codec: 'pcm-f32',
 		transform: {
 			// Like an effect whose run time varies: every fourth chunk takes longer than the next one takes to arrive
@@ -771,42 +820,13 @@ test('MediaStreamAudioTrackSource keeps audio in order when an async process fun
 	audioSource.errorPromise.catch(error => errors.push(error));
 	output.addAudioTrack(audioSource);
 
-	let deliveredFrames = 0;
 	try {
 		await output.start();
-
-		const start = performance.now();
-		for (let i = 0; i < 40; i++) {
-			while (performance.now() - start < 1000 * 1024 * i / 48000) {
-				await new Promise(resolve => setTimeout(resolve, 2));
-			}
-
-			const data = new Float32Array(1024);
-			for (let j = 0; j < 1024; j++) {
-				data[j] = 0.3 * Math.sin(2 * Math.PI * 100 * (1024 * i + j) / 48000);
-			}
-			controller.enqueue(new AudioData({
-				format: 'f32-planar',
-				sampleRate: 48000,
-				numberOfChannels: 1,
-				numberOfFrames: 1024,
-				timestamp: Math.round(1e6 * 1024 * i / 48000),
-				data,
-			}));
-			deliveredFrames += 1024;
-		}
-
+		await capture.deliver(40);
 		await new Promise(resolve => setTimeout(resolve, 100)); // Lets the last chunks through process()
 		await output.finalize();
 	} finally {
-		try {
-			controller.close();
-		} catch {
-			// The source canceled the stream
-		}
-		globals.MediaStreamTrackProcessor = realProcessor;
-		track.stop();
-		await audioContext.close();
+		await capture.uninstall();
 	}
 
 	expect(errors).toEqual([]);
@@ -820,7 +840,84 @@ test('MediaStreamAudioTrackSource keeps audio in order when an async process fun
 		samples.push(...data);
 		sample.close();
 	}
-	expect(samples).toHaveLength(deliveredFrames);
+	expect(samples).toHaveLength(40 * 1024);
 	const jumps = samples.filter((value, i) => i > 0 && Math.abs(value - samples[i - 1]!) > 0.05);
 	expect(jumps).toHaveLength(0);
+});
+
+test('MediaStreamAudioTrackSource, cancel() while finalizing gets out of a process() that never finishes', async () => {
+	const capture = installSineCapture();
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 4) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	audioSource.errorPromise.catch(() => {});
+	output.addAudioTrack(audioSource);
+
+	try {
+		await output.start();
+		await capture.deliver(20);
+
+		// Finalizing waits for the audio captured before it, so the stuck chunk holds it up...
+		const finalized = output.finalize();
+		expect(await stateAfter(finalized, 500)).toBe('pending');
+
+		// ...until the output is canceled, which drops the waiting chunks and lets finalization complete
+		expect(await stateAfter(output.cancel(), 2000)).toBe('fulfilled');
+		expect(await stateAfter(finalized, 1000)).toBe('fulfilled');
+		expect(capture.chunks.filter(chunk => chunk.format !== null)).toHaveLength(0); // All closed
+	} finally {
+		await capture.uninstall();
+	}
+});
+
+test('MediaStreamAudioTrackSource drops audio a process() slower than real time can\'t keep up with', async () => {
+	const capture = installSineCapture();
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let finalizing = false;
+	let callsWhileFinalizing = 0;
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
+		codec: 'pcm-f32',
+		transform: {
+			// Takes twice as long as the audio it processes
+			process: async (sample) => {
+				if (finalizing) {
+					callsWhileFinalizing++;
+				}
+				await new Promise(resolve => setTimeout(resolve, 2000 * sample.duration));
+				return sample;
+			},
+		},
+	});
+	const errors: unknown[] = [];
+	audioSource.errorPromise.catch(error => errors.push(error));
+	output.addAudioTrack(audioSource);
+
+	try {
+		await output.start();
+		await capture.deliver(70);
+		finalizing = true;
+		await output.finalize();
+	} finally {
+		await capture.uninstall();
+	}
+
+	// Like for an overloaded encoder, only a few chunks wait their turn, instead of everything not processed yet
+	expect(errors).toEqual([]);
+	expect(callsWhileFinalizing).toBeLessThanOrEqual(9);
 });

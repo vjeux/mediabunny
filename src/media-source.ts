@@ -138,6 +138,12 @@ export abstract class MediaSource {
 	/** @internal */
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async _flushAndClose(forceClose: boolean) {}
+	/**
+	 * Called when the output is canceled while finalizing: stops waiting for the samples added before finalizing to
+	 * be processed (a process function that never settles would hold finalization up forever) and drops them.
+	 * @internal
+	 */
+	_cancelPendingAdds() {}
 
 	/**
 	 * Closes this source. This prevents future samples from being added and signals to the output file that no further
@@ -248,6 +254,9 @@ export class EncodedVideoPacketSource extends VideoSource {
 		return this._connectedTrack!.output._muxer.addEncodedVideoPacket(this._connectedTrack!, packet, meta);
 	}
 }
+
+/** What waiting for a process function's result gives when the output got canceled first. */
+const PROCESS_CANCELED: unique symbol = Symbol('process canceled');
 
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
@@ -2066,6 +2075,8 @@ class AudioEncoderWrapper {
 
 	private lastMuxerPromise: Promise<void> = Promise.resolve();
 	private closed = false;
+	/** Resolved when waiting for a process function's result should stop; see `cancelPendingAdds()`. */
+	private pendingAddsCanceledSignal = promiseWithResolvers();
 
 	constructor(private source: AudioSource, private encodingConfig: AudioEncodingConfig) {}
 
@@ -2147,7 +2158,23 @@ class AudioEncoderWrapper {
 			try {
 				let processed = config.transform.process(audioSample);
 				if (isThenable(processed)) {
-					processed = await processed;
+					// Don't wait past the output being canceled (a call that never settles would hold everything up)
+					const pending = processed;
+					const whenCanceled = this.pendingAddsCanceledSignal.promise
+						.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
+					const result = await Promise.race([pending, whenCanceled]);
+					if (result === PROCESS_CANCELED) {
+						// Whatever it returns once it does settle is dropped
+						void Promise.resolve(pending).then((late) => {
+							for (const x of Array.isArray(late) ? late : [late]) {
+								if (x instanceof AudioSample && x !== audioSample) {
+									x.close();
+								}
+							}
+						}, () => {});
+						return;
+					}
+					processed = result;
 				}
 
 				if (processed === null) {
@@ -2677,6 +2704,11 @@ class AudioEncoderWrapper {
 		}
 	}
 
+	/** Stops waiting for a pending process function call. */
+	cancelPendingAdds() {
+		this.pendingAddsCanceledSignal.resolve();
+	}
+
 	getQueueSize() {
 		if (this.customEncoder) {
 			return this.customEncoderQueueSize;
@@ -3047,6 +3079,15 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	private _paused = false;
 	/** @internal */
 	private _lastAddPromise = Promise.resolve();
+	/**
+	 * Samples waiting in the add chain, closed if the chain gets abandoned (the output is canceled).
+	 * @internal
+	 */
+	private _chainedSamples = new Set<AudioSample>();
+	/** @internal */
+	private _pendingAddsCanceled = false;
+	/** @internal */
+	private _pendingAddsCanceledSignal = promiseWithResolvers();
 
 	/** A promise that rejects upon any error within this source. This promise never resolves. */
 	get errorPromise() {
@@ -3107,6 +3148,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		let errored = false;
 		let lastSampleTimestamp: number | null = null;
 		let timestampOffset = 0;
+		let chainedAdds = 0; // Adds waiting in the add chain, or being made
+		let encoderSetUp = false; // Known once an add has gone through
 
 		const onAudioSample = (audioSample: AudioSample) => {
 			if (errored || this._closingPromise || this._connectedTrack!.output.state !== 'started') {
@@ -3158,7 +3201,10 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 
 			lastSampleTimestamp = currentTimestamp;
 
-			if (this._encoder.getQueueSize() >= 8) {
+			// Adds waiting their turn in the chain count too (except while the encoder is being set up), so that a
+			// process function slower than real time drops audio instead of making the chain grow without bounds
+			const waitingAdds = encoderSetUp ? Math.max(chainedAdds - 1, 0) : 0;
+			if (this._encoder.getQueueSize() + waitingAdds >= 8) {
 				// Drop data if the encoder is overloaded
 				audioSample.close();
 				return;
@@ -3167,9 +3213,12 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 			audioSample.setTimestamp(currentTimestamp + timestampOffset);
 
 			// The encoder can't handle overlapping adds (they'd corrupt resampling and PCM state), so chain them
+			chainedAdds++;
+			this._chainedSamples.add(audioSample);
 			this._lastAddPromise = this._lastAddPromise
 				.then(async () => {
-					if (errored || this._connectedTrack!.output.state === 'canceled') {
+					this._chainedSamples.delete(audioSample);
+					if (errored || this._pendingAddsCanceled || this._connectedTrack!.output.state === 'canceled') {
 						audioSample.close();
 						return;
 					}
@@ -3177,6 +3226,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 					// The sample was valid when captured, and a graceful close still wants it even if the output is
 					// finalizing by now
 					await this._encoder.add(audioSample, true, true);
+					encoderSetUp = true;
 				})
 				.catch((error) => {
 					errored = true;
@@ -3186,6 +3236,9 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 					if (this._audioContext && this._audioContext.state !== 'closed') {
 						void this._audioContext.suspend();
 					}
+				})
+				.finally(() => {
+					chainedAdds--;
 				});
 		};
 
@@ -3252,6 +3305,25 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	}
 
 	/** @internal */
+	override _cancelPendingAdds() {
+		this._pendingAddsCanceled = true;
+		this._pendingAddsCanceledSignal.resolve();
+		this._abandonChainedAdds();
+	}
+
+	/**
+	 * Closes the samples still waiting in the add chain and stops waiting for a pending process function call.
+	 * @internal
+	 */
+	private _abandonChainedAdds() {
+		for (const sample of this._chainedSamples) {
+			sample.close();
+		}
+		this._chainedSamples.clear();
+		this._encoder.cancelPendingAdds();
+	}
+
+	/** @internal */
 	override async _flushAndClose(forceClose: boolean) {
 		try {
 			if (this._abortController) {
@@ -3267,8 +3339,11 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 			}
 		} finally {
 			if (!forceClose) {
-				// Samples captured before closing began still belong in the file, so let all queued adds finish
-				await this._lastAddPromise;
+				// Samples captured before closing began still belong in the file, so let all queued adds finish (unless
+				// the output gets canceled meanwhile)
+				await Promise.race([this._lastAddPromise, this._pendingAddsCanceledSignal.promise]);
+			} else {
+				this._abandonChainedAdds();
 			}
 
 			// The encoder must be closed even if the track teardown above threw

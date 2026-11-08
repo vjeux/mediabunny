@@ -143,7 +143,7 @@ type AudioEncodingConfig = {
 - `transform`: Optional transformations to apply to the audio samples before they are passed to the encoder.
 	- `numberOfChannels`: The desired number of output channels to up/downmix to.
 	- `sampleRate`: The desired output sample rate in hertz to resample to.
-	- `process`: Allows for custom user-defined processing of audio samples, e.g. for applying audio effects or timestamp modifications. Called for each audio sample after resampling and remixing. For a `MediaStreamAudioTrackSource`, it's called one sample at a time and in order, and finalizing the output waits for the calls of the samples captured before it, so a promise that never settles keeps it from finishing. Must return an `AudioSample`, an array of them, or `null` for dropping the sample.
+	- `process`: Allows for custom user-defined processing of audio samples, e.g. for applying audio effects or timestamp modifications. Called for each audio sample after resampling and remixing. For a `MediaStreamAudioTrackSource`, it's called one sample at a time and in order, and finalizing the output waits for the calls of the samples captured before it, so a promise that never settles keeps it from finishing until the output is canceled. Must return an `AudioSample`, an array of them, or `null` for dropping the sample.
 - `onEncodedPacket`: Called for each successfully encoded packet. Useful for determining encoding progress.	
 - `onEncoderConfig`: Called when the internal encoder config, as used by the WebCodecs API, is created. You can use this to introspect the full codec string.
 

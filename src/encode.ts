@@ -489,7 +489,8 @@ export type AudioTransformOptions = {
 	 * Allows for custom user-defined processing of audio samples, e.g. for applying audio effects or timestamp
 	 * modifications. Called for each audio sample after resampling and remixing. For a
 	 * `MediaStreamAudioTrackSource`, it's called one sample at a time and in order, and finalizing the output
-	 * waits for the calls of the samples captured before it, so a promise that never settles keeps it from finishing.
+	 * waits for the calls of the samples captured before it, so a promise that never settles keeps it from finishing
+	 * until the output is canceled.
 	 *
 	 * Must return an {@link AudioSample}, an array of them, or `null` for dropping the sample.
 	 */
