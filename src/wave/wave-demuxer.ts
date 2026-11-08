@@ -65,6 +65,12 @@ export class WaveDemuxer extends Demuxer {
 
 			const outerChunkSize = readU32(slice, littleEndian);
 
+			// Sizes that don't fit into 32 bits are left at 0xFFFFFFFF by FFmpeg (as are all sizes it can't seek back
+			// to, like when writing to a pipe). Like FFmpeg, we take such a data chunk to extend to the end of the
+			// file. Chunks are still only looked for within the stated RIFF size.
+			const isUnknownSize = (size: number) => size === 0xffffffff && this.reader.fileSize !== null;
+			const riffSizeIsUnknown = !isRf64 && isUnknownSize(outerChunkSize);
+
 			let totalFileSize = isRf64
 				? this.reader.fileSize
 				: Math.min(outerChunkSize + 8, this.reader.fileSize ?? Infinity);
@@ -84,20 +90,33 @@ export class WaveDemuxer extends Demuxer {
 				if (!slice) break;
 
 				const chunkId = readAscii(slice, 4);
-				const chunkSize = readU32(slice, littleEndian);
+				let chunkSize = readU32(slice, littleEndian);
 				const startPos = slice.filePos;
 
 				if (isRf64 && chunksRead === 0 && chunkId !== 'ds64') {
 					throw new Error('Invalid RF64 file: First chunk must be "ds64".');
 				}
 
+				if (this.dataStart !== -1 && !/^[\x20-\x7e]{4}$/.test(chunkId)) {
+					// Chunk IDs are four printable ASCII characters, so after the audio this isn't a chunk header but
+					// zeros or garbage, as at the end of a damaged file. Walking it 8 bytes at a time could take
+					// forever, so the chunks end here. (Before the data chunk, zeros between chunks are walked like
+					// FFmpeg does.)
+					break;
+				}
+
 				if (chunkId === 'fmt ') {
 					await this.parseFmtChunk(startPos, chunkSize, littleEndian);
 				} else if (chunkId === 'data') {
+					if (!isRf64 && isUnknownSize(chunkSize)) {
+						chunkSize = this.reader.fileSize! - startPos;
+					}
+
 					dataChunkSize ??= chunkSize;
 
 					this.dataStart = slice.filePos;
-					this.dataSize = Math.max(Math.min(dataChunkSize, (totalFileSize ?? Infinity) - this.dataStart), 0);
+					const dataEnd = riffSizeIsUnknown ? this.reader.fileSize : totalFileSize;
+					this.dataSize = Math.max(Math.min(dataChunkSize, (dataEnd ?? Infinity) - this.dataStart), 0);
 
 					if (this.reader.fileSize === null) {
 						break; // Stop once we hit the data chunk
