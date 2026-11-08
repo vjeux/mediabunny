@@ -11,6 +11,7 @@ import {
 	addAvcBitstreamRestriction,
 	AvcNalUnitType,
 	concatAvcNalUnits,
+	concatHevcNalUnits,
 	deserializeAvcDecoderConfigurationRecord,
 	determineVideoPacketType,
 	extractNalUnitTypeForAvc,
@@ -938,6 +939,83 @@ export abstract class BaseMediaSampleSink<
 	}
 }
 
+const isParameterSet = (nalUnit: Uint8Array, codec: 'avc' | 'hevc') => {
+	if (codec === 'avc') {
+		const type = extractNalUnitTypeForAvc(nalUnit[0]!);
+		return type === AvcNalUnitType.SPS || type === AvcNalUnitType.PPS;
+	} else {
+		const type = extractNalUnitTypeForHevc(nalUnit[0]!);
+		return type === HevcNalUnitType.VPS_NUT || type === HevcNalUnitType.SPS_NUT || type === HevcNalUnitType.PPS_NUT;
+	}
+};
+
+const getNalUnits = (data: Uint8Array, codec: 'avc' | 'hevc', decoderConfig: VideoDecoderConfig) => {
+	const locations = codec === 'avc'
+		? iterateAvcNalUnits(data, decoderConfig)
+		: iterateHevcNalUnits(data, decoderConfig);
+	return [...locations].map(loc => data.subarray(loc.offset, loc.offset + loc.length));
+};
+
+const firstParameterSets = new WeakMap<InputVideoTrack, Promise<Uint8Array[] | null>>();
+
+/**
+ * Gets the parameter sets (SPS and PPS, and VPS for HEVC) of an Annex B AVC or HEVC track's first key packet, read once
+ * per track. Encoders can write them in the first key frame only (x264 does unless told to repeat them), which leaves
+ * a decoder that starts at a later key frame without them. FFmpeg then uses the first ones too (as the stream's
+ * extradata).
+ */
+const getFirstParameterSets = (track: InputVideoTrack, codec: 'avc' | 'hevc', decoderConfig: VideoDecoderConfig) => {
+	let result = firstParameterSets.get(track);
+	if (!result) {
+		result = (async () => {
+			const keyPacket = await new EncodedPacketSink(track).getFirstKeyPacket({ verifyKeyPackets: true });
+			if (!keyPacket) {
+				return null;
+			}
+
+			const parameterSets = getNalUnits(keyPacket.data, codec, decoderConfig)
+				.filter(x => isParameterSet(x, codec))
+				.map(x => x.slice());
+			return parameterSets.length > 0 ? parameterSets : null;
+		})();
+		firstParameterSets.set(track, result);
+		result.catch(() => firstParameterSets.delete(track));
+	}
+
+	return result;
+};
+
+/**
+ * Puts the given parameter sets into an Annex B AVC or HEVC key packet that lacks them, right after its access unit
+ * delimiter if it starts with one, where they go.
+ */
+const addMissingParameterSets = (
+	packet: EncodedPacket,
+	parameterSets: Uint8Array[],
+	codec: 'avc' | 'hevc',
+	decoderConfig: VideoDecoderConfig,
+) => {
+	const getType = (nalUnit: Uint8Array) => codec === 'avc'
+		? extractNalUnitTypeForAvc(nalUnit[0]!)
+		: extractNalUnitTypeForHevc(nalUnit[0]!);
+
+	const nalUnits = getNalUnits(packet.data, codec, decoderConfig);
+	const types = new Set(nalUnits.map(getType));
+	const missing = parameterSets.filter(x => !types.has(getType(x)));
+	if (missing.length === 0) {
+		return packet;
+	}
+
+	const audType = codec === 'avc' ? AvcNalUnitType.AUD : HevcNalUnitType.AUD_NUT;
+	const insertionIndex = nalUnits.length > 0 && getType(nalUnits[0]!) === audType ? 1 : 0;
+	nalUnits.splice(insertionIndex, 0, ...missing);
+
+	const data = codec === 'avc'
+		? concatAvcNalUnits(nalUnits, decoderConfig)
+		: concatHevcNalUnits(nalUnits, decoderConfig);
+	return packet.clone({ data });
+};
+
 class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	decoder: VideoDecoder | null = null;
 
@@ -949,6 +1027,8 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	sampleQueue: VideoSample[] = []; // Safari-specific thing, check usage.
 	currentPacketIndex = 0;
 	raslSkipped = false; // For HEVC stuff
+	/** The parameter sets of an Annex B AVC or HEVC track's first key packet (see getFirstParameterSets). */
+	parameterSets: Uint8Array[] | null = null;
 
 	// Alpha stuff
 	alphaDecoder: VideoDecoder | null = null;
@@ -1109,6 +1189,17 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			}
 
 			this.raslSkipped = true;
+		}
+
+		if (
+			this.currentPacketIndex === 0
+			&& packet.type === 'key'
+			&& this.parameterSets
+			&& !this.decoderConfig.description
+			&& (this.codec === 'avc' || this.codec === 'hevc')
+		) {
+			// Decoding starts here, so the decoder needs the parameter sets, which the packet may lack
+			packet = addMissingParameterSets(packet, this.parameterSets, this.codec, this.decoderConfig);
 		}
 
 		if (this.customDecoder) {
@@ -1935,7 +2026,20 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 			optimizeForLatency: this._decoderOptions.optimizeForLatency,
 		};
 
-		return new VideoDecoderWrapper(onSample, onError, codec, decoderConfig, rotation, flip, timeResolution);
+		const decoder = new VideoDecoderWrapper(
+			onSample,
+			onError,
+			codec,
+			decoderConfig,
+			rotation,
+			flip,
+			timeResolution,
+		);
+		if ((codec === 'avc' || codec === 'hevc') && !decoderConfig.description) {
+			decoder.parameterSets = await getFirstParameterSets(this._track, codec, decoderConfig);
+		}
+
+		return decoder;
 	}
 
 	/** @internal */

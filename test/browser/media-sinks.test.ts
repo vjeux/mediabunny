@@ -6,11 +6,14 @@ import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
+import { AudioSample, AudioSampleCopyToOptions, VideoSample } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack } from '../../src/input-track.js';
+import { EncodedPacket } from '../../src/packet.js';
+import { deserializeAvcDecoderConfigurationRecord } from '../../src/codec-data.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -275,4 +278,97 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test('Annex B H.264 whose parameter sets are only in the first key frame decodes from any key frame', async () => {
+	// demo.mp4's H.264 (a key frame every second) in MPEG-TS, with its SPS and PPS only in the first key frame, as
+	// x264 writes them unless told to repeat them. A decoder that starts at a later key frame lacked them, so lookups
+	// there threw or gave nothing (found by lanes L15 and L46, with issue1315's test.ts).
+	using mp4 = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+	const mp4DecoderConfig = await mp4Track.getDecoderConfig();
+	assert(mp4DecoderConfig?.description);
+	const record = deserializeAvcDecoderConfigurationRecord(
+		new Uint8Array(mp4DecoderConfig.description as ArrayBuffer),
+	);
+	assert(record);
+
+	/** Length-prefixed NAL units to Annex B, after the given extra NAL units. */
+	const toAnnexB = (data: Uint8Array, extraNalUnits: Uint8Array[]) => {
+		const lengthSize = record.lengthSizeMinusOne + 1;
+		const nalUnits = [...extraNalUnits];
+		for (let offset = 0; offset < data.length;) {
+			let length = 0;
+			for (let i = 0; i < lengthSize; i++) {
+				length = length * 256 + data[offset++]!;
+			}
+
+			nalUnits.push(data.subarray(offset, offset + length));
+			offset += length;
+		}
+
+		const result = new Uint8Array(nalUnits.reduce((sum, x) => sum + 4 + x.length, 0));
+		let position = 0;
+		for (const nalUnit of nalUnits) {
+			result.set([0, 0, 0, 1], position);
+			result.set(nalUnit, position + 4);
+			position += 4 + nalUnit.length;
+		}
+		return result;
+	};
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	let isFirstPacket = true;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		const parameterSets = isFirstPacket ? [...record.sequenceParameterSets, ...record.pictureParameterSets] : [];
+		await source.add(
+			new EncodedPacket(toAnnexB(packet.data, parameterSets), packet.type, packet.timestamp, packet.duration),
+			isFirstPacket
+				? { decoderConfig: { ...mp4DecoderConfig, description: undefined } } // Annex B
+				: undefined,
+		);
+		isFirstPacket = false;
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const keyTimestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		if (packet.type === 'key') {
+			keyTimestamps.push(packet.timestamp);
+		}
+	}
+	expect(keyTimestamps.length).toBeGreaterThan(2);
+
+	const getChecksum = async (sample: VideoSample) => {
+		const data = new Uint8Array(sample.allocationSize());
+		await sample.copyTo(data);
+		expect(data.some(x => x !== 0)).toBe(true);
+		return data.reduce((sum, x, i) => (sum + x * (i % 251 + 1)) % 1_000_000_007, 0);
+	};
+
+	const sink = new VideoSampleSink(track);
+	const checksums = new Map<number, number>();
+	for await (using sample of sink.samples()) {
+		checksums.set(sample.timestamp, await getChecksum(sample));
+	}
+
+	for (const timestamp of keyTimestamps.slice(1)) {
+		using sample = await sink.getSample(timestamp);
+		expect(sample?.timestamp, `getSample(${timestamp})`).toBe(timestamp);
+		expect(await getChecksum(sample!)).toBe(checksums.get(timestamp));
+
+		const range: number[] = [];
+		for await (using rangeSample of sink.samples(timestamp, timestamp + 0.2)) {
+			range.push(rangeSample.timestamp);
+			expect(await getChecksum(rangeSample)).toBe(checksums.get(rangeSample.timestamp));
+		}
+		expect(range.length, `samples(${timestamp}, …)`).toBeGreaterThan(0);
+	}
 });

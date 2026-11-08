@@ -7,10 +7,17 @@ import fs from 'node:fs';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { CustomVideoDecoder, customVideoDecoders, registerDecoder } from '../../src/custom-coder.js';
+import { canDecodeVideoMemo } from '../../src/decode.js';
+import { VideoSample } from '../../src/sample.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +928,106 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('HEVC with parameter sets only in its first key frame gets them where decoding starts later', async () => {
+	// hevc.ts's key frame twice, a second apart, the second time without its VPS, SPS and PPS, as encoders write them
+	// unless told to repeat them. The decoder that starts at the second one needs them, right after the AUD.
+	using source = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'hevc.ts')),
+		formats: ALL_FORMATS,
+	});
+	const sourceTrack = await source.getPrimaryVideoTrack();
+	assert(sourceTrack);
+	const decoderConfig = await sourceTrack.getDecoderConfig();
+	assert(decoderConfig && !decoderConfig.description);
+	const keyPacket = await new EncodedPacketSink(sourceTrack).getFirstKeyPacket();
+	assert(keyPacket);
+
+	const getNalUnits = (data: Uint8Array) => {
+		const starts: number[] = [];
+		for (let i = 0; i + 2 < data.length; i++) {
+			if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+				starts.push(i + 3);
+			}
+		}
+		return starts.map((start, i) => {
+			let end = i + 1 < starts.length ? starts[i + 1]! - 3 : data.length;
+			while (end > start && data[end - 1] === 0) {
+				end--;
+			}
+			return data.subarray(start, end);
+		});
+	};
+	const getType = (nalUnit: Uint8Array) => (nalUnit[0]! >> 1) & 0x3f;
+	const toAnnexB = (nalUnits: Uint8Array[]) => {
+		const result = new Uint8Array(nalUnits.reduce((sum, x) => sum + 4 + x.length, 0));
+		let position = 0;
+		for (const nalUnit of nalUnits) {
+			result.set([0, 0, 0, 1], position);
+			result.set(nalUnit, position + 4);
+			position += 4 + nalUnit.length;
+		}
+		return result;
+	};
+
+	const nalUnits = getNalUnits(keyPacket.data);
+	expect(nalUnits.map(getType).slice(0, 4)).toEqual([35, 32, 33, 34]); // AUD, VPS, SPS, PPS
+	const withoutParameterSets = toAnnexB(nalUnits.filter(x => ![32, 33, 34].includes(getType(x))));
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('hevc');
+	output.addVideoTrack(videoSource);
+	await output.start();
+	await videoSource.add(new EncodedPacket(keyPacket.data, 'key', 0, 1), { decoderConfig });
+	await videoSource.add(new EncodedPacket(withoutParameterSets, 'key', 1, 1));
+	await output.finalize();
+
+	const firstPacketTypes: number[][] = [];
+	class RecordingDecoder extends CustomVideoDecoder {
+		packetCount = 0;
+
+		static override supports(codec: string) {
+			return codec === 'hevc';
+		}
+
+		init() {}
+
+		decode(packet: EncodedPacket) {
+			if (this.packetCount++ === 0) {
+				firstPacketTypes.push(getNalUnits(packet.data).map(getType));
+			}
+
+			this.onSample(new VideoSample(new Uint8Array(16 * 16 * 4), {
+				format: 'RGBA',
+				codedWidth: 16,
+				codedHeight: 16,
+				timestamp: packet.timestamp,
+				duration: packet.duration,
+			}));
+		}
+
+		flush() {}
+		close() {}
+	}
+
+	registerDecoder(RecordingDecoder);
+	try {
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const sink = new VideoSampleSink(track);
+
+		using sample = await sink.getSample(1);
+		expect(sample?.timestamp).toBe(1);
+		expect(firstPacketTypes.at(-1)!.slice(0, 4)).toEqual([35, 32, 33, 34]);
+
+		// A key frame with its own parameter sets stays as it is
+		using firstSample = await sink.getSample(0);
+		expect(firstSample?.timestamp).toBe(0);
+		expect(firstPacketTypes.at(-1)).toEqual(nalUnits.map(getType));
+	} finally {
+		customVideoDecoders.splice(customVideoDecoders.indexOf(RecordingDecoder), 1);
+		canDecodeVideoMemo.clear();
+	}
 });
