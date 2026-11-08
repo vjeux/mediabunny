@@ -1046,6 +1046,21 @@ test('MPEG-TS seeks ahead in a stream read past its cache', async () => {
 			getRetryDelay: () => null,
 		});
 		expect(await seek(urlSource, 4)).toEqual(expected);
+
+		// Without reading along, such a source still finds the end of each track from the chunks it holds, after the
+		// video's duration read the whole file
+		using input = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 6 * 2 ** 20,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const videoTrack = await input.getPrimaryVideoTrack();
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(videoTrack && audioTrack);
+		expect(await videoTrack.computeDuration()).toBeCloseTo(6);
+		expect(await audioTrack.computeDuration()).toBeCloseTo(audioFrame * audioFrameDuration);
 	} finally {
 		server.closeAllConnections();
 		server.close();

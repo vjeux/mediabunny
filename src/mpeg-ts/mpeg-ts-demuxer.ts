@@ -1473,20 +1473,20 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		let scanStartPos: number;
 
 		// A source that only keeps what its cache holds (a ReadableStreamSource, or a UrlSource whose server ignores
-		// range requests) can't go back to what it's evicted, which the chunk search or a scan from the start of the
-		// track would do once reading is past its cache: it reads on from the closest point before instead, however far
+		// range requests) can't go back to what it's evicted, which a chunk or the start of the track may well be once
+		// reading is past its cache
 		const readsOnlyForward = getReadBackDistance(reader) !== Infinity;
 
 		const referencePesPackets = this.elementaryStream.referencePesPackets;
 		const referencePointIndex = binarySearchLessOrEqual(referencePesPackets, searchPts, x => x.pts);
 		const referencePoint = referencePointIndex !== -1 ? referencePesPackets[referencePointIndex]! : null;
-		if (referencePoint && (searchPts - referencePoint.pts < MPEG_TS_TIMESCALE / 2 || readsOnlyForward)) {
+		if (referencePoint && searchPts - referencePoint.pts < MPEG_TS_TIMESCALE / 2) {
 			// Reference point ain't too far away, prefer it over the chunk search
 			scanStartPos = referencePoint.sectionStartPos;
 		} else {
 			let startChunkIndex = 0;
 
-			if (reader.fileSize !== null && !readsOnlyForward) {
+			if (reader.fileSize !== null) {
 				const numChunks = Math.ceil(reader.fileSize / seekChunkSize);
 
 				if (numChunks > 1) {
@@ -1501,7 +1501,20 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 							+ firstPesPacketHeader.sectionStartPos;
 						const chunkEndPos = chunkStartPos + seekChunkSize;
 
-						const result = await findFirstPesPacketHeaderInChunk(chunkStartPos, chunkEndPos, false);
+						let result: Awaited<ReturnType<typeof findFirstPesPacketHeaderInChunk>>;
+						try {
+							result = await findFirstPesPacketHeaderInChunk(chunkStartPos, chunkEndPos, false);
+						} catch (error) {
+							if (!readsOnlyForward) {
+								throw error;
+							}
+
+							// Evicted, so it comes before what the cache holds: before the packet too, if that can be
+							// found at all
+							startChunkIndex = mid;
+							low = mid + 1;
+							continue;
+						}
 
 						if (!result) {
 							// No PES packet found in this chunk, search left
@@ -1525,6 +1538,12 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				startChunkIndex * seekChunkSize,
 				demuxer.packetStride,
 			) + firstPesPacketHeader.sectionStartPos;
+
+			// Such sources read on from the closest reference point before the packet instead, however far, when it's
+			// further than that: reading recorded it as it went, so it's still there
+			if (readsOnlyForward && referencePoint && referencePoint.sectionStartPos > scanStartPos) {
+				scanStartPos = referencePoint.sectionStartPos;
+			}
 		}
 
 		// Find the first PES packet at or after scanStartPos
