@@ -301,7 +301,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		if (this.packetEmitted) {
 			metadata = {};
 		} else {
-			const codecString = this.config.codec;
+			let codecString = this.config.codec;
 			let description = this.codecContext.extraData
 				? toUint8Array(this.codecContext.extraData)
 				: undefined;
@@ -310,6 +310,10 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 				if (!description) {
 					throw new Error('Extradata expected for AAC.');
 				}
+
+				// The configured codec string guesses HE-AAC at low sample rates, but FFmpeg's encoder only makes
+				// AAC-LC, so take the object type from what it actually produced
+				codecString = `mp4a.40.${parseAacAudioSpecificConfig(description).objectType}`;
 
 				// eslint-disable-next-line @stylistic/max-len
 				// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
