@@ -51,7 +51,6 @@ import {
 	COLOR_PRIMARIES_MAP_INVERSE,
 	colorSpaceIsComplete,
 	EMPTY_COLOR_SPACE,
-	findLastIndex,
 	isIso639Dash2LanguageCode,
 	isThenable,
 	last,
@@ -3025,10 +3024,21 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					return { blockIndex: -1, correctBlockFound: false };
 				}
 
-				const index = findLastIndex(trackData.presentationTimestamps, (x) => {
-					const block = trackData.blocks[x.blockIndex]!;
-					return block.isKeyFrame && x.timestamp <= timestampInTimescale;
-				});
+				// The timestamps are sorted, so find the last one at or before the timestamp and walk back to a key
+				// frame from there, instead of scanning all of the cluster's blocks on every lookup
+				let index = binarySearchLessOrEqual(
+					trackData.presentationTimestamps,
+					timestampInTimescale,
+					x => x.timestamp,
+				);
+				while (index !== -1) {
+					const block = trackData.blocks[trackData.presentationTimestamps[index]!.blockIndex]!;
+					if (block.isKeyFrame) {
+						break;
+					}
+
+					index--;
+				}
 
 				const blockIndex = index !== -1 ? trackData.presentationTimestamps[index]!.blockIndex : -1;
 				const correctBlockFound = index !== -1 && isSafelyBeforeEnd(trackData, timestampInTimescale);
