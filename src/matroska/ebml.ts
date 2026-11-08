@@ -137,6 +137,7 @@ export enum EBMLId {
 	CueTrack = 0xf7,
 	CueClusterPosition = 0xf1,
 	CueRelativePosition = 0xf0,
+	CueDuration = 0xb2,
 	Colour = 0x55b0,
 	MatrixCoefficients = 0x55b1,
 	TransferCharacteristics = 0x55ba,
