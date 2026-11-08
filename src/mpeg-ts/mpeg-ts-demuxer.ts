@@ -301,8 +301,13 @@ type ElementaryStream = {
 	 * to the next key frame, as far as they've been read
 	 */
 	droppedRanges: { start: number; end: number }[];
-	/** Where the track's first key frame starts (a sequence number), once known; see ensureFirstKeyFrameIsKnown */
+	/** Where the track's first key frame starts (a sequence number), once known (see isBeforeFirstKeyFrame) */
 	firstKeyFrameSequenceNumber: number | null;
+	/** Video packets starting before this sequence number are known to come before the track's first key frame */
+	keyFrameFreeEnd: number;
+	/** The last search for the first key frame (see searchFirstKeyFrame), and its context reading from the start */
+	firstKeyFrameSearch: Promise<void> | null;
+	firstKeyFrameSearchContext: PacketReadingContext | null;
 	/** Whether a frame that lost data takes the frames up to the next key frame with it (see supplyPacket) */
 	dropsRestOfGop: boolean | null;
 };
@@ -489,12 +494,6 @@ const hasStuffing = (packet: TsPacket) => {
 
 	return length > usedLength;
 };
-
-/**
- * How many video packets the search for a track's first key frame reads at most. Without a key frame that early, the
- * packets read count as the ones before it.
- */
-const MAX_FIRST_KEY_FRAME_SEARCH_COUNT = 1024;
 
 /** For sections and PES packets without holes, so that they don't need an array of their own */
 const NO_HOLES: readonly number[] = Object.freeze([]);
@@ -963,6 +962,9 @@ export class MpegTsDemuxer extends Demuxer {
 						droppedRanges: [],
 						dropsRestOfGop: null,
 						firstKeyFrameSequenceNumber: null,
+						keyFrameFreeEnd: 0,
+						firstKeyFrameSearch: null,
+						firstKeyFrameSearchContext: null,
 					});
 				}
 
@@ -1401,6 +1403,9 @@ export class MpegTsDemuxer extends Demuxer {
 								referencePesPackets: [],
 								droppedRanges: [],
 								firstKeyFrameSequenceNumber: null,
+								keyFrameFreeEnd: 0,
+								firstKeyFrameSearch: null,
+								firstKeyFrameSearchContext: null,
 								dropsRestOfGop: null,
 							};
 
@@ -2646,7 +2651,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	packetSectionStarts = new WeakMap<EncodedPacket, number>();
 	frameDuration: Promise<number> | null = null;
 	firstTimedPesPacket: Promise<{ header: TimestampedPesPacketHeader; section: Section } | null> | null = null;
-	firstKeyFrameSearch: Promise<void> | null = null;
 
 	constructor(public elementaryStream: ElementaryStream) {}
 
@@ -2803,42 +2807,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		);
 	}
 
-	/**
-	 * Makes sure the track's first key frame is known, which tells whether data lost in a video frame drops the frames
-	 * after it (see PacketReadingContext.isBeforeFirstKeyFrame), so that every way of reading agrees.
-	 */
-	ensureFirstKeyFrameIsKnown() {
-		const stream = this.elementaryStream;
-		if (stream.info.type !== 'video' || stream.firstKeyFrameSequenceNumber !== null) {
-			return;
-		}
-
-		return this.firstKeyFrameSearch ??= (async () => {
-			const section = stream.firstSection;
-			assert(section);
-			const pesPacket = readPesPacket(stream.demuxer, section);
-			assert(pesPacket);
-
-			// Reading from the track's start, the context notes the first key frame it meets
-			const context = new PacketReadingContext(stream, pesPacket);
-			let endSequenceNumber = 0;
-			for (let i = 0; i < MAX_FIRST_KEY_FRAME_SEARCH_COUNT && stream.firstKeyFrameSequenceNumber === null; i++) {
-				context.suppliedPacket = null;
-				await context.markNextPacket();
-				const suppliedPacket = context.suppliedPacket as SuppliedPacket | null; // (markNextPacket sets it)
-				if (!suppliedPacket) {
-					break;
-				}
-
-				endSequenceNumber = suppliedPacket.sequenceNumber + 1;
-			}
-
-			stream.firstKeyFrameSequenceNumber ??= endSequenceNumber;
-		})();
-	}
-
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
-		await this.ensureFirstKeyFrameIsKnown();
 		const section = this.elementaryStream.firstSection;
 		assert(section);
 
@@ -2881,7 +2850,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		}
 
 		// No buffer, we gotta do some rereading
-		await this.ensureFirstKeyFrameIsKnown();
 		const sectionStartPos = this.packetSectionStarts.get(packet);
 		if (sectionStartPos === undefined) {
 			throw new Error('Packet was not created from this track.');
@@ -3028,7 +2996,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 	): Promise<EncodedPacket | null> {
 		const searchPts = roundIfAlmostInteger(timestamp * MPEG_TS_TIMESCALE);
-		await this.ensureFirstKeyFrameIsKnown();
 
 		const demuxer = this.elementaryStream.demuxer;
 		const { reader, seekChunkSize } = demuxer;
@@ -3830,8 +3797,10 @@ class PacketReadingContext {
 	skippedPacket = false;
 	/** The stretch of video packets being dropped, up to the next key frame */
 	droppedRange: { start: number; end: number } | null = null;
-	/** Whether this context supplied a key frame */
-	suppliedKeyFrame = false;
+	/** Whether this context met a key frame (supplied or dropped) */
+	metKeyFrame = false;
+	/** A packet that lost data, read again once the search for the track's first key frame tells what to do with it */
+	firstKeyFrameSearchTarget: number | null = null;
 
 	suppliedPacket: SuppliedPacket | null = null;
 
@@ -4027,6 +3996,12 @@ class PacketReadingContext {
 		do {
 			this.skippedPacket = false;
 			await this.findNextPacket();
+
+			if (this.firstKeyFrameSearchTarget !== null) {
+				await searchFirstKeyFrame(this.elementaryStream, this.firstKeyFrameSearchTarget);
+				this.firstKeyFrameSearchTarget = null;
+				this.skippedPacket = true; // To read the packet again
+			}
 		} while (this.skippedPacket);
 	}
 
@@ -4711,6 +4686,8 @@ class PacketReadingContext {
 		droppedRanges: { start: number; end: number }[] = [],
 	) {
 		const currentPesPacket = this.getCurrentPesPacket();
+		// For reading the packet again (see firstKeyFrameSearchTarget)
+		const { lastPtsSectionStartPos, nextPts } = this;
 		const hasUnusedPts = (pesPacket: PesPacket) => {
 			return pesPacket.pts !== null && pesPacket.sectionStartPos > this.lastPtsSectionStartPos;
 		};
@@ -4864,25 +4841,40 @@ class PacketReadingContext {
 				return;
 			}
 
+			// Reading from the track's start, a context learns where its first key frame is
+			const stream = this.elementaryStream;
+			if (randomAccessIndicator === 1) {
+				if (!this.metKeyFrame && this.startsAtTrackStart()) {
+					stream.firstKeyFrameSequenceNumber ??= sequenceNumber;
+				}
+				this.metKeyFrame = true;
+			} else if (!this.metKeyFrame && this.startsAtTrackStart()) {
+				stream.keyFrameFreeEnd = Math.max(stream.keyFrameFreeEnd, sequenceNumber + 1);
+			}
+
 			// A video frame that lost data is dropped, with the rest of its GOP (see dropsRestOfGop), unless it comes
 			// before the track's first key frame, like in a capture that begins in the middle of a GOP: nothing
 			// decodes before that key frame anyway, so such frames are kept as they are. (While the stream is being set
 			// up, frames are kept too: setup only reads their parameter sets, which come first.)
-			if (randomAccessIndicator === 1 && this.startsAtTrackStart() && !this.suppliedKeyFrame) {
-				this.elementaryStream.firstKeyFrameSequenceNumber ??= sequenceNumber;
-			}
-
-			if (hole !== undefined && (randomAccessIndicator === 1 || !this.isBeforeFirstKeyFrame(sequenceNumber))) {
-				if (this.dropsRestOfGop()) {
-					this.extendDroppedRange(sequenceNumber);
+			if (hole !== undefined) {
+				const isBeforeFirstKeyFrame = randomAccessIndicator !== 1 && this.isBeforeFirstKeyFrame(sequenceNumber);
+				if (isBeforeFirstKeyFrame === null) {
+					// Not known yet: find out, then read the packet again
+					this.firstKeyFrameSearchTarget = sequenceNumber;
+					this.lastPtsSectionStartPos = lastPtsSectionStartPos;
+					this.nextPts = nextPts;
+					this.seekTo(packetStartPos);
+					return;
 				}
 
-				this.skipPacket();
-				return;
-			}
+				if (!isBeforeFirstKeyFrame) {
+					if (this.dropsRestOfGop()) {
+						this.extendDroppedRange(sequenceNumber);
+					}
 
-			if (randomAccessIndicator === 1) {
-				this.suppliedKeyFrame = true;
+					this.skipPacket();
+					return;
+				}
 			}
 		}
 
@@ -4952,16 +4944,23 @@ class PacketReadingContext {
 		return this.startingPesPacket.sectionStartPos === this.elementaryStream.firstSection?.startPos;
 	}
 
-	/** Whether the video packet starting at the sequence number comes before the track's first key frame. */
+	/**
+	 * Whether the video packet starting at the sequence number comes before the track's first key frame, or null if
+	 * that isn't known yet (see searchFirstKeyFrame).
+	 */
 	isBeforeFirstKeyFrame(sequenceNumber: number) {
-		const first = this.elementaryStream.firstKeyFrameSequenceNumber;
-		if (first !== null) {
-			return sequenceNumber < first;
+		const stream = this.elementaryStream;
+		if (stream.firstKeyFrameSequenceNumber !== null) {
+			return sequenceNumber < stream.firstKeyFrameSequenceNumber;
+		} else if (sequenceNumber < stream.keyFrameFreeEnd) {
+			return true;
+		} else if (this.metKeyFrame) {
+			return false;
+		} else if (this.startsAtTrackStart()) {
+			return true; // It would have met the key frame
 		}
 
-		// Only a context reading from the track's start gets here (others wait for the search), and it would have met
-		// the key frame
-		return this.startsAtTrackStart() && !this.suppliedKeyFrame;
+		return null;
 	}
 
 	/** Moves on from a packet that is left out. */
@@ -4972,6 +4971,42 @@ class PacketReadingContext {
 		this.skippedPacket = true;
 	}
 }
+
+/**
+ * Reads the video track from its start until it's known whether the packet starting at the sequence number comes
+ * before the track's first key frame (see PacketReadingContext.isBeforeFirstKeyFrame), so that every way of reading
+ * agrees on it. Only a packet that lost data needs to know, so clean files never pay for this; and the reading goes on
+ * from where it stopped the next time.
+ */
+const searchFirstKeyFrame = (stream: ElementaryStream, sequenceNumber: number): Promise<void> => {
+	const previous = stream.firstKeyFrameSearch;
+
+	return stream.firstKeyFrameSearch = (async () => {
+		await previous;
+
+		if (!stream.firstKeyFrameSearchContext) {
+			const section = stream.firstSection;
+			assert(section);
+			const pesPacket = readPesPacket(stream.demuxer, section);
+			assert(pesPacket);
+
+			// Reading from the track's start, the context notes the first key frame it meets
+			stream.firstKeyFrameSearchContext = new PacketReadingContext(stream, pesPacket);
+		}
+
+		const context = stream.firstKeyFrameSearchContext;
+		while (stream.firstKeyFrameSequenceNumber === null && stream.keyFrameFreeEnd <= sequenceNumber) {
+			context.suppliedPacket = null;
+			await context.markNextPacket();
+			const suppliedPacket = context.suppliedPacket as SuppliedPacket | null; // (markNextPacket sets it)
+			if (!suppliedPacket) {
+				stream.keyFrameFreeEnd = Infinity; // No key frame at all
+			} else if (stream.firstKeyFrameSequenceNumber === null) {
+				stream.keyFrameFreeEnd = Math.max(stream.keyFrameFreeEnd, suppliedPacket.sequenceNumber + 1);
+			}
+		}
+	})();
+};
 
 /**
  * A buffer that simulates decoder frame reordering to compute packet durations. Packets arrive in decode order but
