@@ -479,7 +479,7 @@ export class HlsMuxer extends Muxer {
 			const id = this.playlists.length + 1;
 			const path = await this.getPlaylistPath({
 				n: id,
-				tracks,
+				tracks: [...tracks], // Copied, so that the callback can't change the playlist through it
 				segmentFormat: format,
 			});
 			validatePlaylistPath(path);
@@ -1757,7 +1757,7 @@ const validateInitPath = (path: string) => {
 const toPlaylistInfo = (playlist: Playlist): HlsOutputPlaylistInfo => {
 	return {
 		n: playlist.id,
-		tracks: playlist.tracks,
+		tracks: [...playlist.tracks], // Copied, so that callbacks can't change the playlist through it
 		segmentFormat: playlist.segmentFormat,
 	};
 };

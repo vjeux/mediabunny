@@ -2039,6 +2039,73 @@ test('write, onSegment, onPlaylist, onMaster events', async () => {
 	expect(onMaster.mock.calls[0]![0]).toContain('#EXTM3U');
 });
 
+test('Callbacks can change the track lists they receive without changing the playlists', async () => {
+	let master = '';
+	const trackCounts: number[] = [];
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			onSegment: (_, info) => {
+				trackCounts.push(info.playlist.tracks.length);
+				info.playlist.tracks.length = 1; // A callback filtering the list for its own use
+			},
+			onMaster: (content) => {
+				master = content;
+			},
+		}),
+		target: new PathedTarget('', () => new BufferTarget()),
+	});
+
+	const video = videoSource();
+	const audio = audioSource();
+	output.addVideoTrack(video);
+	output.addAudioTrack(audio);
+	await output.start();
+	for (const timestamp of [0, 2, 4, 6]) {
+		await video.add(new EncodedPacket(avcPacketData, 'key', timestamp, 2), avcMetadata);
+		await audio.add(new EncodedPacket(aacPacketData, 'key', timestamp, 2), aacMetadata);
+	}
+	await output.finalize();
+
+	// The master playlist still advertises both tracks' codecs, and every callback got both tracks
+	expect(master).toMatch(/CODECS="avc1\.[0-9A-Fa-f]+,mp4a\.40\.2"/);
+	expect(trackCounts.length).toBeGreaterThan(1);
+	expect(trackCounts.every(count => count === 2)).toBe(true);
+});
+
+test('getPlaylistPath can change the track list it receives without changing the playlist', async () => {
+	let master = '';
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			getPlaylistPath: (info) => {
+				const count = info.tracks.length;
+				info.tracks.reverse(); // A callback sorting/filtering the list for its own use
+				info.tracks.length = 1;
+				return `playlist-${info.n}-${count}.m3u8`;
+			},
+			onMaster: (content) => {
+				master = content;
+			},
+		}),
+		target: new PathedTarget('', () => new BufferTarget()),
+	});
+
+	const video = videoSource();
+	const audio = audioSource();
+	output.addVideoTrack(video);
+	output.addAudioTrack(audio);
+	await output.start();
+	for (const timestamp of [0, 2, 4, 6]) {
+		await video.add(new EncodedPacket(avcPacketData, 'key', timestamp, 2), avcMetadata);
+		await audio.add(new EncodedPacket(aacPacketData, 'key', timestamp, 2), aacMetadata);
+	}
+	await output.finalize();
+
+	expect(master).toContain('playlist-1-2.m3u8');
+	expect(master).toMatch(/CODECS="avc1\.[0-9A-Fa-f]+,mp4a\.40\.2"/);
+});
+
 test('Single-file mode', async () => {
 	let playlistText: string | null = null;
 	const segmentPaths = new Set<string>();
