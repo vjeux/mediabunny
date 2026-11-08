@@ -1006,6 +1006,12 @@ export const normalizeHeaders = (headers: HeadersInit): Record<string, string> =
 	return headers;
 };
 
+/**
+ * HTTP statuses of failures that can go away when the request is made again (server errors, timeouts, rate limiting),
+ * which are retried like network errors.
+ */
+const TRANSIENT_HTTP_STATUSES = [408, 429, 500, 502, 503, 504];
+
 export const retriedFetch = async (
 	fetchFn: typeof fetch,
 	url: string | URL | Request,
@@ -1016,19 +1022,46 @@ export const retriedFetch = async (
 	let attempts = 0;
 
 	while (true) {
+		let response: Response | null = null;
+
 		try {
-			return await fetchFn(url, requestInit);
+			response = await fetchFn(url, requestInit);
+			if (!TRANSIENT_HTTP_STATUSES.includes(response.status)) {
+				return response;
+			}
+
+			// The status lets retry policies tell this apart from a network error
+			throw Object.assign(
+				new Error(
+					`Error fetching ${url instanceof Request ? url.url : String(url)}: ${response.status}`
+					+ ` ${response.statusText}`,
+				),
+				{ status: response.status },
+			);
 		} catch (error) {
 			if (shouldStop()) {
+				void response?.body?.cancel().catch(() => {});
 				throw error;
 			}
 
 			attempts++;
-			const retryDelayInSeconds = getRetryDelay(attempts, error, url);
+			let retryDelayInSeconds: number | null;
+			try {
+				retryDelayInSeconds = getRetryDelay(attempts, error, url);
+			} catch (policyError) {
+				void response?.body?.cancel().catch(() => {});
+				throw policyError;
+			}
 
 			if (retryDelayInSeconds === null) {
+				if (response) {
+					return response; // The caller reports the failed response
+				}
+
 				throw error;
 			}
+
+			void response?.body?.cancel().catch(() => {}); // Frees the connection
 
 			Logging._error('Retrying failed fetch. Error:', error);
 
