@@ -37,6 +37,14 @@ export abstract class Demuxer {
 	abstract getMimeType(): Promise<string>;
 	abstract getMetadataTags(): Promise<MetadataTags>;
 
+	/**
+	 * Returns the keys of the raw metadata tags that were read from ID3v2 tags in a container whose own tags are of
+	 * another kind (WAVE, FLAC), so that conversions don't write them back as native tags.
+	 */
+	async getId3RawMetadataTagKeys(): Promise<Set<string>> {
+		return new Set();
+	}
+
 	dispose() {
 		// Can be overridden
 	}
