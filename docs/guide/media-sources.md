@@ -308,6 +308,8 @@ await packetSource.add(packet2);
 > [!IMPORTANT]
 > You must add the packets in decode order.
 
+The output keeps a reference to each packet's `data` until it has written the packet, which can be long after `add` resolved; it doesn't copy it. So don't modify or reuse a packet's buffer after adding it: if your encoder hands out views into memory it overwrites (a reused buffer, or a WebAssembly heap), copy the data first, for example with `data.slice()`.
+
 You will need to provide additional metadata alongside your first call to `add` to give the `Output` more information about the shape and form of the video data. This metadata must be in the form of the WebCodecs API's `EncodedVideoChunkMetadata`. It might look like this:
 ```ts
 await packetSource.add(firstPacket, {
@@ -470,6 +472,8 @@ const packetSource = new EncodedAudioPacketSource('aac');
 
 await packetSource.add(packet);
 ```
+
+As with video, don't modify or reuse a packet's buffer after adding it; see [`EncodedVideoPacketSource`](#encodedvideopacketsource).
 
 You will need to provide additional metadata alongside your first call to `add` to give the `Output` more information about the shape and form of the audio data. This metadata must be in the form of the WebCodecs API's `EncodedAudioChunkMetadata`. It might look like this:
 ```ts
