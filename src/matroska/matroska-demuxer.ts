@@ -335,7 +335,7 @@ export class MatroskaDemuxer extends Demuxer {
 		// Load metadata tags from each segment lazily (only once)
 		for (const segment of this.segments) {
 			if (!segment.metadataTagsPromise) {
-				if (this.reader.fileSize !== null) {
+				if (this.reader.randomAccessFileSize !== null) {
 					segment.metadataTagsPromise = this.loadSegmentMetadata(segment);
 				} else {
 					// The seeking would be too crazy, let's not
@@ -392,11 +392,11 @@ export class MatroskaDemuxer extends Demuxer {
 						break;
 					}
 
-					if (this.reader.fileSize === null) {
+					if (this.reader.randomAccessFileSize === null) {
 						break; // Stop at the first segment
 					}
 				} else if (id === EBMLId.Cluster) {
-					if (this.reader.fileSize === null) {
+					if (this.reader.randomAccessFileSize === null) {
 						break; // Shouldn't be reached anyway, since we stop at the first segment
 					}
 
@@ -538,7 +538,7 @@ export class MatroskaDemuxer extends Demuxer {
 			}
 		}
 
-		if (this.reader.fileSize !== null) {
+		if (this.reader.randomAccessFileSize !== null) {
 			// Seek heads can sometimes point to other seek heads, so follow them until there are no unvisited
 			// ones left. Following a seek head appends its entries to the list we're iterating over.
 			for (let i = 0; i < this.currentSegment.seekEntries.length; i++) {
@@ -577,7 +577,7 @@ export class MatroskaDemuxer extends Demuxer {
 		// Sort the seek entries by file position so reading them exhibits a sequential pattern
 		this.currentSegment.seekEntries.sort((a, b) => a.segmentPosition - b.segmentPosition);
 
-		if (this.reader.fileSize !== null) {
+		if (this.reader.randomAccessFileSize !== null) {
 			// Use the seek head to read missing metadata elements
 			for (const seekEntry of this.currentSegment.seekEntries) {
 				const target = METADATA_ELEMENTS.find(x => x.id === seekEntry.id);

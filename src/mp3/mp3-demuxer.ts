@@ -259,9 +259,10 @@ export class Mp3Demuxer extends Demuxer {
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
-			if (!id3V2HeaderFound && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
+			const randomAccessFileSize = this.reader.randomAccessFileSize;
+			if (!id3V2HeaderFound && randomAccessFileSize !== null && randomAccessFileSize >= ID3_V1_TAG_SIZE) {
 				// Try reading an ID3v1 tag at the end of the file
-				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
+				let slice = this.reader.requestSlice(randomAccessFileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) slice = await slice;
 				assert(slice);
 

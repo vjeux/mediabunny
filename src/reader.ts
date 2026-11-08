@@ -26,6 +26,16 @@ export class Reader {
 		return this.source._getFileSize() ?? null;
 	}
 
+	/**
+	 * The file size, or null if the source is unsized or can't read near the end of the file without discarding the
+	 * data before it (such as a UrlSource whose server ignores range requests, for a file larger than its cache). Use
+	 * this instead of fileSize to decide whether to make optional reads near the end of the file.
+	 */
+	get randomAccessFileSize(): number | null {
+		const fileSize = this.fileSize;
+		return fileSize !== null && this.source._supportsRandomAccess() ? fileSize : null;
+	}
+
 	requestSlice(start: number, length: number): MaybePromise<FileSlice | null> {
 		if (this.source._disposed) {
 			throw new InputDisposedError();

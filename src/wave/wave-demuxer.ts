@@ -96,7 +96,7 @@ export class WaveDemuxer extends Demuxer {
 					this.dataStart = slice.filePos;
 					this.dataSize = Math.max(Math.min(dataChunkSize, (totalFileSize ?? Infinity) - this.dataStart), 0);
 
-					if (this.reader.fileSize === null) {
+					if (this.reader.randomAccessFileSize === null) {
 						break; // Stop once we hit the data chunk
 					}
 				} else if (chunkId === 'ds64') {
