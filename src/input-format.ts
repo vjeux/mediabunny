@@ -1025,7 +1025,9 @@ export type HlsInputFormatOptions = {
 	 * to the Unix epoch.
 	 *
 	 * Defaults to `true`, meaning packet timestamps map directly to wall-clock time. This guarantees AV sync across
-	 * multiple tracks, even with gaps present.
+	 * multiple tracks, even with gaps present. A date lying more than a second before the end of the timeline so far
+	 * (like clips out of chronological order, or a clock that was reset) doesn't send the timeline back in time,
+	 * though: the timeline continues there, and {@link InputTrack.getUnixTimeForTimestamp} gives the date.
 	 *
 	 * When you don't want this mapping, you can set this value to `false`. In addition to timestamps not being Unix
 	 * timestamps anymore, any gaps in the playlist are also naturally removed. When `false`, you can still access the

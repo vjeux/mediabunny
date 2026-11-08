@@ -97,6 +97,8 @@ export type HlsSegmentLocation = {
 
 // Way more than any real duration, but small enough to keep all timestamp (and derived sequence number) math finite
 const MAX_DURATION = 1e9; // In seconds
+/** How far, in seconds, a date may lie before the end of the previous segment and still be followed. */
+const MAX_DATE_TIME_OVERLAP = 1;
 
 /** Whether two EXT-X-MAP tags declare the same unencrypted init section. */
 const isSameInitSegment = (a: HlsSegment, b: HlsSegment | null) => b !== null
@@ -717,8 +719,12 @@ export class HlsSegmentedInput extends SegmentedInput {
 				lastProgramDateTimeSeconds = dateTimeSeconds;
 				accumulatedUnixTime = dateTimeSeconds;
 
-				if (offsetTimestampsByDateTime) {
-					accumulatedTime = dateTimeSeconds; // Snap the accumulated time into Unix space
+				// Snap the accumulated time into Unix space, but not back to before where the timeline already got:
+				// an earlier date (clips out of chronological order, a clock that was reset) would make the timeline go
+				// back in time. Small overlaps are fine; servers may use them to account for clock drift (RFC 8216bis
+				// 6.2.1).
+				if (offsetTimestampsByDateTime && dateTimeSeconds >= accumulatedTime - MAX_DATE_TIME_OVERLAP) {
+					accumulatedTime = dateTimeSeconds;
 				}
 			} else if (line === TAG_GAP) {
 				nextSegmentIsGap = true;
