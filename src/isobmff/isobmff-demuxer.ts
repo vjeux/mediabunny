@@ -426,6 +426,13 @@ export class IsobmffDemuxer extends Demuxer {
 					this.moovSlice = moovSlice;
 					this.readContiguousBoxes(this.moovSlice);
 
+					const compressedMovieBox = this.movieTimescale === -1 ? readCompressedMovieBox(moovSlice) : null;
+					if (compressedMovieBox) {
+						// Read the movie box that the compressed one holds instead
+						this.moovSlice = await decompressMovieBox(compressedMovieBox);
+						this.readContiguousBoxes(this.moovSlice);
+					}
+
 					if (this.movieTimescale === -1) {
 						throw new Error('Invalid moov box: missing mvhd box.');
 					}
@@ -4051,6 +4058,141 @@ const getNextPresentationTimestamp = (sampleTable: SampleTable, sampleIndex: num
 	}
 
 	return nextTimestamp;
+};
+
+type CompressedMovieBox = {
+	uncompressedSize: number;
+	data: Uint8Array;
+};
+
+/**
+ * QuickTime can store the movie box compressed (its "Compress movie header" option): the movie box then holds a cmov
+ * box with the compression algorithm (dcom) and the compressed movie box (cmvd). Returns those, or null if the movie
+ * box isn't compressed.
+ */
+const readCompressedMovieBox = (moovSlice: FileSlice): CompressedMovieBox | null => {
+	const slice = moovSlice.slice(moovSlice.start); // From the start, whatever was read from the movie box before
+	const cmovInfo = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readBoxHeader(slice) : null;
+	if (cmovInfo?.name !== 'cmov' || cmovInfo.contentSize > slice.remainingLength) {
+		return null;
+	}
+
+	const cmovSlice = slice.slice(slice.filePos, cmovInfo.contentSize);
+	let algorithm: string | null = null;
+	let compressedMovieBox: CompressedMovieBox | null = null;
+
+	while (cmovSlice.remainingLength >= MIN_BOX_HEADER_SIZE) {
+		const boxStartPos = cmovSlice.filePos;
+		const boxInfo = readBoxHeader(cmovSlice);
+		if (!boxInfo || boxInfo.contentSize > cmovSlice.remainingLength) {
+			break;
+		}
+
+		if (boxInfo.name === 'dcom' && boxInfo.contentSize >= 4) {
+			algorithm = readAscii(cmovSlice, 4);
+		} else if (boxInfo.name === 'cmvd' && boxInfo.contentSize >= 4) {
+			const uncompressedSize = readU32Be(cmovSlice);
+			compressedMovieBox = { uncompressedSize, data: readBytes(cmovSlice, boxInfo.contentSize - 4) };
+		}
+
+		cmovSlice.filePos = boxStartPos + boxInfo.totalSize;
+	}
+
+	if (algorithm !== 'zlib') {
+		throw new Error(`Unsupported compression algorithm '${algorithm}' for the compressed movie box.`);
+	}
+	if (!compressedMovieBox) {
+		throw new Error('Invalid compressed movie box: missing cmvd box.');
+	}
+
+	return compressedMovieBox;
+};
+
+/**
+ * The most a compressed movie box may decompress to. Real ones are a few megabytes at most, and the size the cmvd box
+ * declares can't bound the data on its own: a file of 1 MB can declare 4 GiB.
+ */
+const MAX_DECOMPRESSED_MOVIE_BOX_SIZE = 2 ** 26;
+
+/** Returns a slice over the contents of the movie box that a compressed movie box holds. */
+const decompressMovieBox = async ({ uncompressedSize, data }: CompressedMovieBox) => {
+	if (typeof DecompressionStream === 'undefined') {
+		throw new Error('Reading a compressed movie box requires DecompressionStream, which isn\'t available here.');
+	}
+
+	const stream = new DecompressionStream('deflate'); // The zlib format
+	const writer = stream.writable.getWriter();
+	writer.write(data as Uint8Array<ArrayBuffer>).then(() => writer.close()).catch(() => {}); // Reading reports errors
+	const reader = stream.readable.getReader();
+
+	const chunks: Uint8Array[] = [];
+	let decompressedSize = 0;
+	const joinChunks = (length: number) => {
+		const bytes = new Uint8Array(length);
+		let offset = 0;
+		for (const chunk of chunks) {
+			const part = chunk.subarray(0, length - offset);
+			bytes.set(part, offset);
+			offset += part.length;
+		}
+
+		return bytes;
+	};
+	const fail = (message: string) => {
+		reader.cancel().catch(() => {});
+		return new Error(message);
+	};
+
+	// The data must start with a movie box no bigger than the declared size and the limit, and decompression stops at
+	// its end. That way, data that isn't a movie box fails with its first bytes, and no file can make this decompress
+	// more than the limit.
+	let movieBoxSize: number | null = null;
+	while (movieBoxSize === null || decompressedSize < movieBoxSize) {
+		let result: ReadableStreamReadResult<Uint8Array>;
+		try {
+			result = await reader.read();
+		} catch (error) {
+			const detail = error instanceof Error && error.message ? ` (${error.message})` : '';
+			throw new Error(`Invalid compressed movie box: its data couldn't be decompressed${detail}.`);
+		}
+		if (result.done) {
+			break;
+		}
+
+		chunks.push(result.value);
+		decompressedSize += result.value.length;
+
+		if (movieBoxSize === null) {
+			const head = joinChunks(Math.min(decompressedSize, MAX_BOX_HEADER_SIZE));
+			const headerIsComplete = head.length === MAX_BOX_HEADER_SIZE
+				|| (head.length >= MIN_BOX_HEADER_SIZE && toDataView(head).getUint32(0) !== 1); // 1: a 64-bit size
+			if (!headerIsComplete) {
+				continue;
+			}
+
+			const boxInfo = readBoxHeader(FileSlice.tempFromBytes(head));
+			if (boxInfo?.name !== 'moov') {
+				throw fail('Invalid compressed movie box: it doesn\'t hold a movie box.');
+			}
+			if (boxInfo.totalSize > uncompressedSize) {
+				throw fail('Invalid compressed movie box: its data decompresses to more than its declared size.');
+			}
+			if (boxInfo.totalSize > MAX_DECOMPRESSED_MOVIE_BOX_SIZE) {
+				throw fail('Unsupported compressed movie box: it decompresses to more than 64 MiB.');
+			}
+
+			movieBoxSize = boxInfo.totalSize;
+		}
+	}
+
+	reader.cancel().catch(() => {}); // Whatever follows the movie box isn't needed
+	if (movieBoxSize === null || decompressedSize < movieBoxSize) {
+		throw new Error('Invalid compressed movie box: it doesn\'t hold a movie box.');
+	}
+
+	const decompressedSlice = FileSlice.tempFromBytes(joinChunks(movieBoxSize));
+	const moovInfo = readBoxHeader(decompressedSlice)!;
+	return decompressedSlice.slice(decompressedSlice.filePos, moovInfo.contentSize);
 };
 
 const findFirstSampleInEntry = (
