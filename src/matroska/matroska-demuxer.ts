@@ -406,7 +406,8 @@ export class MatroskaDemuxer extends Demuxer {
 	currentCueTime: number | null = null;
 	currentDecodingInstruction: DecodingInstruction | null = null;
 	currentTagTargetIsMovie: boolean = true;
-	currentSimpleTagName: string | null = null;
+	/** The SimpleTag being read; SimpleTags can be nested to describe their parent (e.g. ARTIST > SORT_WITH). */
+	currentSimpleTag: { name: string | null; parent: MatroskaDemuxer['currentSimpleTag'] } | null = null;
 	currentAttachedFile: {
 		fileUid: bigint | null;
 		fileName: string | null;
@@ -2260,26 +2261,61 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.SimpleTag: {
 				if (!this.currentTagTargetIsMovie) break;
 
-				this.currentSimpleTagName = null;
-				this.readContiguousElements(slice.slice(dataStartPos, size));
+				const parent = this.currentSimpleTag;
+				this.currentSimpleTag = { name: null, parent };
+
+				try {
+					// The tag's value and the tags nested in it need its name, but TagName may come after them, so
+					// let's read it first
+					const children = slice.slice(dataStartPos, size);
+					while (children.remainingLength >= MIN_HEADER_SIZE) {
+						const childStartPos = children.filePos;
+						const childHeader = readElementHeader(children);
+						if (!childHeader || childHeader.size === undefined) {
+							break;
+						}
+
+						if (childHeader.id === EBMLId.TagName) {
+							children.filePos = childStartPos;
+							this.traverseElement(children);
+							break;
+						}
+
+						children.skip(childHeader.size);
+					}
+
+					this.readContiguousElements(slice.slice(dataStartPos, size));
+				} finally {
+					this.currentSimpleTag = parent;
+				}
 			}; break;
 
 			case EBMLId.TagName: {
-				this.currentSimpleTagName = readUnicodeString(slice, size);
+				if (!this.currentSimpleTag) {
+					break;
+				}
+
+				this.currentSimpleTag.name = readUnicodeString(slice, size);
 			}; break;
 
-			case EBMLId.TagString: {
-				if (!this.currentSimpleTagName) break;
-
-				const value = readUnicodeString(slice, size);
-				this.processTagValue(this.currentSimpleTagName, value);
-			}; break;
-
+			case EBMLId.TagString:
 			case EBMLId.TagBinary: {
-				if (!this.currentSimpleTagName) break;
+				// Like FFmpeg, nested tags are named after their parents, e.g. ARTIST/SORT_WITH
+				let name: string | null = null;
+				for (let tag = this.currentSimpleTag; tag; tag = tag.parent) {
+					if (tag.name === null) {
+						name = null;
+						break;
+					}
 
-				const value = readBytes(slice, size);
-				this.processTagValue(this.currentSimpleTagName, value);
+					name = name === null ? tag.name : `${tag.name}/${name}`;
+				}
+				if (name === null) {
+					break;
+				}
+
+				const value = id === EBMLId.TagString ? readUnicodeString(slice, size) : readBytes(slice, size);
+				this.processTagValue(name, value);
 			}; break;
 
 			case EBMLId.AttachedFile: {
