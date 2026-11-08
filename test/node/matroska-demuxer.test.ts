@@ -8,6 +8,7 @@ import {
 	BufferTarget,
 	CustomSource,
 	EncodedPacket,
+	EncodedAudioPacketSource,
 	EncodedPacketSink,
 	EncodedVideoPacketSource,
 	FilePathSource,
@@ -1689,4 +1690,83 @@ test('TrackTimestampScale scales block timestamps and durations', async () => {
 
 	expect(await readTimings(1)).toEqual([[0.1, 0.02], [0.12, 0.02]]);
 	expect(await readTimings(2)).toEqual([[0.1, 0.04], [0.14, 0.04]]); // Like FFmpeg
+});
+
+test('A SeekPreRoll longer than the codec\'s pre-roll is honored', async () => {
+	// SeekPreRoll is how much the decoder must decode after a discontinuity before its output is valid
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const uint32 = (value: number) => [value >>> 24, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+
+	const getPreRollDuration = async (seekPreRollNs: number | null) => {
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('webm'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, ascii('A_OPUS')),
+					element(EBMLId.CodecPrivate, [...ascii('OpusHead'), 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0]),
+					...(seekPreRollNs === null ? [] : [element(EBMLId.SeekPreRoll, uint32(seekPreRollNs))]),
+					element(EBMLId.Audio, element(EBMLId.Channels, [2])),
+				)),
+				element(
+					EBMLId.Cluster,
+					element(EBMLId.Timestamp, [0]),
+					element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x80, 0xfc, 0xff]),
+				),
+			),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return track.getPreRollDuration();
+	};
+
+	expect(await getPreRollDuration(800_000_000)).toBe(0.8);
+	// The 80 ms that Opus files usually declare, or none, leaves the codec's own (more conservative) pre-roll
+	expect(await getPreRollDuration(80_000_000)).toBe(0.4);
+	expect(await getPreRollDuration(null)).toBe(0.4);
+
+	// SeekPreRoll is in whole nanoseconds, so the codec's own pre-roll comes back rounded (Mediabunny's muxer writes it
+	// for every audio track). That doesn't count as more: AAC at 44.1 kHz keeps 1024 / 44100 s after a round trip.
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array([0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c]), 'key', 0, 1024 / 44100), {
+		decoderConfig: {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 1,
+			sampleRate: 44100,
+			description: new Uint8Array([0x12, 0x08]), // AAC-LC, 44.1 kHz, mono
+		},
+	});
+	await output.finalize();
+
+	using roundTripped = new Input({
+		source: new BufferSource(new Uint8Array(output.target.buffer!)),
+		formats: ALL_FORMATS,
+	});
+	const aacTrack = await roundTripped.getPrimaryAudioTrack();
+	assert(aacTrack);
+	expect(await aacTrack.getPreRollDuration()).toBe(1024 / 44100);
 });
