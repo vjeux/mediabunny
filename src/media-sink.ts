@@ -1213,6 +1213,8 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	finalSamples: { sample: VideoSample | null }[] = [];
 	mergeAlphaPromises: Promise<void>[] = [];
 	flushing = false;
+	/** A closed decoder reports and emits nothing more (decoding again after a failed flush closes it early) */
+	closed = false;
 
 	// Needed for a Chromium for Android workaround
 	frameCopyContext: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
@@ -1246,7 +1248,9 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			};
 			// @ts-expect-error It's technically readonly
 			this.customDecoder.onError = (error) => {
-				onError(error);
+				if (!this.closed) {
+					onError(error);
+				}
 			};
 
 			void this.customDecoderCallSerializer
@@ -1363,7 +1367,11 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			this.customDecoderQueueSize++;
 			void this.customDecoderCallSerializer
 				.call(() => this.customDecoder!.decode(packet))
-				.catch(error => this.onError(error))
+				.catch((error) => {
+					if (!this.closed) {
+						this.onError(error);
+					}
+				})
 				.finally(() => {
 					this.customDecoderQueueSize--;
 					this.onDequeue?.();
@@ -1606,6 +1614,12 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	finalizeAndEmitSample(sample: VideoSample) {
+		if (this.closed) {
+			// A custom decoder can still emit after it was closed
+			sample.close();
+			return;
+		}
+
 		// Round the timestamps to the time resolution
 		sample.setTimestamp(Math.round(sample.timestamp * this.timeResolution) / this.timeResolution);
 		sample.setDuration(Math.round(sample.duration * this.timeResolution) / this.timeResolution);
@@ -1636,6 +1650,14 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				result.sample = new VideoSample(finalFrame);
 			}
 
+			if (this.closed) {
+				// The decoder got closed while merging (such as when decoding again after a failed flush), so the
+				// sample is no longer wanted
+				removeItem(this.finalSamples, result);
+				result.sample.close();
+				return;
+			}
+
 			// Emit any leading samples that are ready, preserving input order
 			while (this.finalSamples.length > 0 && this.finalSamples[0]!.sample !== null) {
 				const next = this.finalSamples.shift()!;
@@ -1643,7 +1665,10 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			}
 		} catch (error) {
 			removeItem(this.finalSamples, result);
-			this.onError(error);
+			if (!this.closed) {
+				// Closing the decoder rejects the merges still running, which is no error
+				this.onError(error);
+			}
 		} finally {
 			removeItem(this.mergeAlphaPromises, resolver.promise);
 			resolver.resolve();
@@ -1744,6 +1769,8 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	close() {
+		this.closed = true;
+
 		if (this.customDecoder) {
 			void this.customDecoderCallSerializer.call(() => this.customDecoder!.close());
 		} else {
@@ -1762,6 +1789,12 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			this.alphaQueue.length = 0;
 
 			this.merger?.close();
+
+			// Merged samples waiting behind an earlier merge are no longer wanted either
+			for (const entry of this.finalSamples) {
+				entry.sample?.close();
+			}
+			this.finalSamples.length = 0;
 		}
 
 		for (const sample of this.sampleQueue) {

@@ -5,7 +5,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
@@ -363,6 +363,82 @@ test.for([
 		expect(expected).toContain(sample.timestamp);
 		break;
 	}
+});
+
+test('Transparent video whose last frame was cut short decodes all other frames', async () => {
+	// demo.mp4's first 40 frames in Matroska, with alpha as Mediabunny writes it (a second H.264 stream, here the same
+	// one), the last frame's color data cut short midway through a NAL unit. Decoding again after the failed flush
+	// closed the old decoder while its color/alpha merges were still running, and their rejections made the iterators
+	// throw "Color/alpha merger closed." (found by the lane L89 review).
+	using mp4 = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+	const decoderConfig = await mp4Track.getDecoderConfig();
+	assert(decoderConfig);
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		packets.push(packet);
+		if (packets.length === 40) {
+			break;
+		}
+	}
+
+	/** Keeps the NAL units of a length-prefixed H.264 packet up to about half its size, the last one cut short. */
+	const cutShort = (data: Uint8Array) => {
+		const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+		const end = data.length >> 1;
+		let offset = 0;
+		while (offset + 4 + view.getUint32(offset) <= end) {
+			offset += 4 + view.getUint32(offset);
+		}
+		const result = data.slice(0, end);
+		new DataView(result.buffer).setUint32(offset, end - offset - 4);
+		return result;
+	};
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	for (const [i, packet] of packets.entries()) {
+		const data = i === packets.length - 1 ? cutShort(packet.data) : packet.data;
+		await source.add(
+			new EncodedPacket(data, packet.type, packet.timestamp, packet.duration, undefined, undefined, {
+				alpha: packet.data,
+			}),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.canBeTransparent()).toBe(true);
+	const cutTimestamp = packets.at(-1)!.timestamp;
+	const otherTimestamps = packets.slice(0, -1).map(x => x.timestamp).sort((a, b) => a - b);
+
+	// All frames but the cut one, which a decoder can also decode as far as it goes
+	const sink = new VideoSampleSink(track);
+	const timestamps: number[] = [];
+	for await (using sample of sink.samples()) {
+		timestamps.push(sample.timestamp);
+	}
+	expect(timestamps.filter(x => x !== cutTimestamp)).toEqual(otherTimestamps);
+
+	const queries = [...otherTimestamps, cutTimestamp].sort((a, b) => a - b);
+	let index = 0;
+	for await (using sample of sink.samplesAtTimestamps(queries)) {
+		assert(sample);
+		const query = queries[index++]!;
+		if (query !== cutTimestamp) {
+			expect(sample.timestamp).toBe(query);
+		}
+	}
+	expect(index).toBe(queries.length);
+
+	using cutSample = await sink.getSample(cutTimestamp);
+	expect([cutTimestamp, otherTimestamps.filter(x => x < cutTimestamp).at(-1)]).toContain(cutSample?.timestamp);
 });
 
 /** Whether the platform's decoder reports an error for a track's packets, decided with WebCodecs alone. */
