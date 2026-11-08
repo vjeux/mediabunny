@@ -4648,3 +4648,84 @@ test('MPEG-TS lookups find field pictures behind long runs of B-fields', async (
 		expect(found?.timestamp).toBe(packet.timestamp);
 	}
 });
+
+test('MPEG-TS gives key packets without parameter sets the ones in force before them', async () => {
+	// From L15's review. In Annex B, a decoder that starts at a key frame needs the parameter sets in-band, but some
+	// streams only send them with some key frames: the others rely on those sent before. Some broadcast encoders also
+	// send a PPS of different content with each GOP, so it's the last ones that count, not the first. 16 stub frames,
+	// a key frame every 4: frame 0 has a VPS (HEVC), an SPS and a PPS, frame 4 another PPS, frames 8 and 12 none.
+	const hex = (text: string) => [...text.matchAll(/../g)].map(x => parseInt(x[0], 16));
+	const annexB = (nalUnits: number[][]) => new Uint8Array(nalUnits.flatMap(nalUnit => [0, 0, 0, 1, ...nalUnit]));
+	const codecs = {
+		avc: {
+			aud: [0x09, 0xf0], // The one the muxer writes
+			parameterSets: [hex('6764000aacd3109b011000000300100000030320f1225380')],
+			pps: hex('68ef8fcb'),
+			otherPps: hex('68ee3c80'),
+			keySlice: [0x65, 0x88, 0x80, 0x40],
+			deltaSlice: [0x41, 0x9a, 0x80, 0x40],
+			decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 },
+		},
+		hevc: {
+			aud: [0x46, 0x01], // The one the muxer writes
+			// Those of test/public/hevc.ts
+			parameterSets: [
+				hex('40010c01ffff016000000300900000030000030078959809'),
+				hex('420101016000000300900000030000030078a003c08010e596566924cae6a0202036c20000030002000003003010'),
+			],
+			pps: hex('4401c172b46240'),
+			otherPps: hex('4401c172b44240'),
+			keySlice: [0x26, 0x01, 0xaf, 0x80, 0x40],
+			deltaSlice: [0x02, 0x01, 0xd0, 0x80, 0x40],
+			decoderConfig: { codec: 'hev1.1.6.L120.90', codedWidth: 1920, codedHeight: 1080 },
+		},
+	};
+
+	for (const [codec, nal] of Object.entries(codecs) as ['avc' | 'hevc', typeof codecs.avc][]) {
+		const frames = Array.from({ length: 16 }, (_, i) => {
+			if (i % 4 !== 0) {
+				return [nal.aud, [...nal.deltaSlice, ...new Array<number>(16).fill(i)]];
+			}
+
+			const parameterSets = i === 0 ? [...nal.parameterSets, nal.pps] : i === 4 ? [nal.otherPps] : [];
+			return [nal.aud, ...parameterSets, [...nal.keySlice, ...new Array<number>(16).fill(i)]];
+		});
+
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource(codec);
+		output.addVideoTrack(source, { frameRate: 25 });
+		await output.start();
+		for (const [i, nalUnits] of frames.entries()) {
+			await source.add(
+				new EncodedPacket(annexB(nalUnits), i % 4 === 0 ? 'key' : 'delta', i / 25, 1 / 25),
+				i === 0 ? { decoderConfig: nal.decoderConfig } : undefined,
+			);
+		}
+		await output.finalize();
+		const bytes = new Uint8Array(output.target.buffer!);
+
+		// Frames 8 and 12 get the SPS (and VPS) of frame 0 and the PPS of frame 4, right after their access unit
+		// delimiter; nothing else changes
+		const expected = frames.map((nalUnits, i) => annexB(
+			i === 8 || i === 12 ? [nal.aud, ...nal.parameterSets, nal.otherPps, ...nalUnits.slice(1)] : nalUnits,
+		));
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		expect(packets.map(x => [...x.data])).toEqual(expected.map(x => [...x]));
+
+		// A lookup on a fresh input finds them too, looking back from where it starts reading
+		for (const i of [8, 12]) {
+			using freshInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+			const freshTrack = await freshInput.getPrimaryVideoTrack();
+			assert(freshTrack);
+			const packet = await new EncodedPacketSink(freshTrack).getPacket(i / 25);
+			expect([...packet!.data]).toEqual([...expected[i]!]);
+		}
+	}
+});
