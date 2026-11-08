@@ -2646,6 +2646,23 @@ test('WAV: Short id3 chunk', async () => {
 	await expectGracefulRead(wav([fmtChunk(), riffChunk('id3 ', ascii('ID3\x03')), dataChunk()]));
 });
 
+test('WAV: Second fmt chunk behind the data', async () => {
+	// The last format chunk used to win when the file size was known, but the first one when reading a stream, which
+	// stops at the data chunk. FFmpeg also takes the first one.
+	const file = wav([
+		fmtChunk({ channels: 1, sampleRate: 48000, blockAlign: 2 }),
+		dataChunk(96000), // 1 s
+		fmtChunk({ channels: 1, sampleRate: 8000, blockAlign: 2 }),
+	]);
+
+	for (const source of [new BufferSource(file), streamedSource(file)]) {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getSampleRate()).toBe(48000);
+		expect(await input.computeDuration()).toBe(1);
+	}
+});
+
 test('WAV: Block alignment not matching the channel count', async () => {
 	// The PCM decoder used to compute a fractional number of frames
 	await expectGracefulDecode(wav([fmtChunk({ channels: 3, blockAlign: 4 }), dataChunk()]));
