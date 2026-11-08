@@ -3172,3 +3172,104 @@ test('MediaStreamVideoTrackSource, increasing capture timestamps keep every fram
 	expect(error).toBe(null);
 	expect(packetTimestamps).toHaveLength(24);
 });
+
+/**
+ * Runs `callback` with MediaStreamTrackProcessor hidden, so that MediaStreamAudioTrackSource captures through an
+ * AudioContext, as it does in browsers without MediaStreamTrackProcessor (Firefox, Safari).
+ */
+const withoutMediaStreamTrackProcessor = async <T>(callback: () => Promise<T>) => {
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const processor = globals.MediaStreamTrackProcessor;
+	globals.MediaStreamTrackProcessor = undefined;
+	try {
+		return await callback();
+	} finally {
+		globals.MediaStreamTrackProcessor = processor;
+	}
+};
+
+const settlesWithin = (promise: Promise<unknown>, ms: number) => Promise.race([
+	promise.then(() => 'resolved' as const, () => 'rejected' as const),
+	new Promise<'pending'>(resolve => setTimeout(() => resolve('pending'), ms)),
+]);
+
+test.for(['cancel', 'finalize'] as const)(
+	'MediaStreamAudioTrackSource, an AudioContext that can\'t start yet doesn\'t block the output (%s)',
+	async (ending) => {
+		// Without a user gesture on the page, an AudioContext can't start, and its resume() stays pending until then.
+		// That's simulated for the context the source creates, whatever this browser's autoplay policy is.
+		const RealAudioContext = globalThis.AudioContext;
+		const createdContexts: AudioContext[] = [];
+		class NotAllowedToStartAudioContext extends RealAudioContext {
+			constructor(options?: AudioContextOptions) {
+				super(options);
+				createdContexts.push(this);
+				Object.defineProperty(this, 'state', { get: () => 'suspended' });
+			}
+
+			override resume() {
+				return new Promise<void>(() => {});
+			}
+		}
+
+		const trackContext = new RealAudioContext();
+		const track = trackContext.createMediaStreamDestination().stream.getAudioTracks()[0]!;
+		globalThis.AudioContext = NotAllowedToStartAudioContext;
+		try {
+			const output = new Output({
+				format: new WebMOutputFormat(),
+				target: new BufferTarget(),
+			});
+			const audioSource = new MediaStreamAudioTrackSource(track, { codec: 'opus', quality: new Quality('low') });
+			audioSource.errorPromise.catch(() => {});
+			output.addAudioTrack(audioSource);
+
+			expect(await withoutMediaStreamTrackProcessor(() => settlesWithin(output.start(), 2000))).toBe('resolved');
+			const ended = ending === 'cancel' ? output.cancel() : output.finalize();
+			expect(await settlesWithin(ended, 2000)).toBe('resolved');
+		} finally {
+			globalThis.AudioContext = RealAudioContext;
+			track.stop();
+			await Promise.all([trackContext, ...createdContexts].map(context => context.close()));
+		}
+	},
+);
+
+test('MediaStreamAudioTrackSource without MediaStreamTrackProcessor records once its AudioContext runs', async ({
+	skip,
+}) => {
+	const trackContext = new AudioContext();
+	await Promise.race([trackContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
+	if (trackContext.state !== 'running') {
+		await trackContext.close();
+		skip('Web Audio cannot run here without a user gesture');
+	}
+
+	// A continuous tone
+	const destination = trackContext.createMediaStreamDestination();
+	const oscillator = trackContext.createOscillator();
+	oscillator.connect(destination);
+	oscillator.start();
+	const track = destination.stream.getAudioTracks()[0]!;
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(track, { codec: 'opus', quality: new Quality('low') });
+	const errors: unknown[] = [];
+	audioSource.errorPromise.catch(error => errors.push(error));
+	output.addAudioTrack(audioSource);
+	await withoutMediaStreamTrackProcessor(() => output.start());
+	await new Promise(resolve => setTimeout(resolve, 1000));
+	// (An audio callback already queued when finalize() starts can still run after it; that's a separate issue)
+	const errorsWhileRecording = [...errors];
+	await output.finalize();
+	track.stop();
+	await trackContext.close();
+
+	expect(errorsWhileRecording).toEqual([]);
+	const { input, track: audioTrack } = await readBackAudioTrack(output.target.buffer!);
+	expect(await audioTrack.computeDuration()).toBeGreaterThan(0.5);
+	input.dispose();
+});
