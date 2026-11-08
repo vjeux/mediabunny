@@ -89,6 +89,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 	rootPath: string;
 	demuxer: HlsDemuxer;
 	segments: HlsSegment[] = [];
+	/** For each segment, the segment that the Unix time in effect for it was given for */
+	unixTimeAnchors = new WeakMap<HlsSegment, HlsSegment>();
 	nextLines: string[] | null = null;
 	currentUpdateSegmentsPromise: Promise<void> | null = null;
 	streamHasEnded = false;
@@ -916,6 +918,44 @@ export class HlsSegmentedInput extends SegmentedInput {
 		}
 
 		return null;
+	}
+
+	getUnixTimeAnchor(segment: HlsSegment) {
+		const dateTime = segment.lastProgramDateTimeSeconds;
+		if (dateTime === null || segment.index === -1) {
+			return null;
+		}
+
+		// The earliest of the consecutive segments in the segment's discontinuity that have the same
+		// #EXT-X-PROGRAM-DATE-TIME in effect: the segment the date was given for, unless that's in an earlier
+		// discontinuity or no longer listed (its Unix time is extrapolated from the date by the playlist then)
+		const chain: HlsSegment[] = [];
+		let anchor = segment;
+		while (true) {
+			const knownAnchor = this.unixTimeAnchors.get(anchor);
+			if (knownAnchor) {
+				anchor = knownAnchor;
+				break;
+			}
+
+			chain.push(anchor);
+			const previous = this.segments[anchor.index - 1];
+			if (
+				!previous
+				|| previous.discontinuityNumber !== segment.discontinuityNumber
+				|| previous.lastProgramDateTimeSeconds !== dateTime
+			) {
+				break;
+			}
+
+			anchor = previous;
+		}
+
+		for (const chainSegment of chain) {
+			this.unixTimeAnchors.set(chainSegment, anchor);
+		}
+
+		return anchor;
 	}
 
 	getTimestampWrapPeriod() {
