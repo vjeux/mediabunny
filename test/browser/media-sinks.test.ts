@@ -1,5 +1,5 @@
-import { expect, test } from 'vitest';
-import { Input } from '../../src/input.js';
+import { expect, test, vi } from 'vitest';
+import { Input, InputDisposedError } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
@@ -275,4 +275,40 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test('Decoding with a hardware acceleration the decoder refuses fails with the decodability error', async (context) => {
+	// video.mp4 is 1920x1080 H.264 High at level 4.0; Chromium refuses 'prefer-hardware' without hardware decoding
+	const hardware = await VideoDecoder.isConfigSupported({
+		codec: 'avc1.640028',
+		codedWidth: 1920,
+		codedHeight: 1080,
+		hardwareAcceleration: 'prefer-hardware',
+	});
+	if (hardware.supported) {
+		context.skip('This platform decodes H.264 in hardware');
+	}
+
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sink = new VideoSampleSink(track, { hardwareAcceleration: 'prefer-hardware' });
+	await expect(sink.getSample(0)).rejects.toThrow(
+		'This video track cannot be decoded in this environment with hardwareAcceleration \'prefer-hardware\'.',
+	);
+
+	using sample = await new VideoSampleSink(track, { hardwareAcceleration: 'prefer-software' }).getSample(0);
+	expect(sample?.timestamp).toBe(0);
+});
+
+test('Disposing the input during a video sink\'s decodability check rejects with InputDisposedError', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	// Like an input disposed while the sink reads the decoder config to check it
+	vi.spyOn(track, 'getDecoderConfig').mockRejectedValue(new InputDisposedError());
+
+	// Not "can't be decoded": the check was canceled, which says nothing about decodability
+	await expect(new VideoSampleSink(track).getSample(0)).rejects.toBeInstanceOf(InputDisposedError);
 });
