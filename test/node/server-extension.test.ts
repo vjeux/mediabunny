@@ -2845,6 +2845,29 @@ describe('Video', async () => {
 	});
 });
 
+test('Hardware detection runs with FFmpeg logging silenced', async () => {
+	// Probing logs an FFmpeg error for every hardware API that isn't there, which would reach stderr whatever
+	// Mediabunny's log level. A fresh module instance, so the hardware context hasn't been detected and cached yet.
+	vi.resetModules();
+	const { getHardwareContext } = await import('../../packages/server/src/misc.js');
+
+	const levelBefore = NodeAv.Log.getLevel();
+	const levelsDuringDetection: number[] = [];
+	const spy = vi.spyOn(NodeAv.HardwareContext, 'auto').mockImplementation(() => {
+		levelsDuringDetection.push(NodeAv.Log.getLevel());
+		return null;
+	});
+
+	try {
+		getHardwareContext();
+	} finally {
+		spy.mockRestore();
+	}
+
+	expect(levelsDuringDetection).toEqual([NodeAv.AV_LOG_QUIET]);
+	expect(NodeAv.Log.getLevel()).toBe(levelBefore);
+});
+
 describe('Audio', async () => {
 	/** A DTS bitrate that clears the encoder's per-frame minimum at the 48 kHz stereo the tests here use. */
 	const DTS_BITRATE = 768000;
