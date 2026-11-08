@@ -1,13 +1,7 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import {
-	CmafOutputFormat,
-	MkvOutputFormat,
-	Mp4OutputFormat,
-	MpegTsOutputFormat,
-	OutputFormat,
-} from '../../src/output-format.js';
-import { BufferTarget, PathedTarget, Target } from '../../src/target.js';
+import { MkvOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 
@@ -41,19 +35,25 @@ test('Output, onFinalize', async () => {
 	expect(callCount).toBe(1);
 });
 
-test.each([
-	['MP4', () => new Mp4OutputFormat(), false],
-	['Matroska', () => new MkvOutputFormat(), false],
-	['MPEG-TS', () => new MpegTsOutputFormat(), false],
-	['CMAF', () => new CmafOutputFormat(), true],
-] as [string, () => OutputFormat, boolean][])(
+test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
 	'Canceling an output whose target callback is still pending at start (%s)',
-	async (_, createFormat, usesInitTarget) => {
+	async (formatName) => {
 		// The callback may never settle (an upload URL request without a timeout, a file picker left open), and a
 		// cancel mustn't wait for it
+		const { CmafOutputFormat, Mp4OutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
+		const { PathedTarget } = await import('../../src/target.js');
+		const createFormat = () => formatName === 'MP4'
+			? new Mp4OutputFormat()
+			: formatName === 'Matroska'
+				? new MkvOutputFormat()
+				: formatName === 'MPEG-TS'
+					? new MpegTsOutputFormat()
+					: new CmafOutputFormat();
+		const usesInitTarget = formatName === 'CMAF';
+
 		for (const settlesLate of [false, true]) {
-			let resolveTarget: ((target: Target) => void) | null = null;
-			const getTarget = () => new Promise<Target>((resolve) => {
+			let resolveTarget: ((target: BufferTarget) => void) | null = null;
+			const getTarget = () => new Promise<BufferTarget>((resolve) => {
 				resolveTarget = resolve;
 			});
 			const output = new Output({
