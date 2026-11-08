@@ -144,6 +144,12 @@ export abstract class MediaSource {
 	/** @internal */
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async _flushAndClose(forceClose: boolean) {}
+	/**
+	 * Called when the output is canceled while finalizing: stops waiting for the samples added before finalizing to
+	 * be processed (a process function that never settles would hold finalization up forever) and drops them.
+	 * @internal
+	 */
+	_cancelPendingAdds() {}
 
 	/**
 	 * Closes this source. This prevents future samples from being added and signals to the output file that no further
@@ -345,6 +351,9 @@ const copyVideoSampleIntoMemory = async (videoSample: VideoSample) => {
 	}
 };
 
+/** What waiting for a process function's result gives when the output got canceled first. */
+const PROCESS_CANCELED: unique symbol = Symbol('process canceled');
+
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
 	/**
@@ -428,6 +437,9 @@ class VideoEncoderWrapper {
 	private addQueue: Promise<void> = Promise.resolve();
 	/** How many added samples are waiting for their turn or being processed. */
 	private queuedAddCount = 0;
+	/** Set when the output is canceled while finalizing; see `cancelPendingAdds()`. */
+	private pendingAddsCanceled = false;
+	private pendingAddsCanceledSignal = promiseWithResolvers();
 
 	/**
 	 * Whether samples received while the encoder is still being set up get copied into memory (and the originals
@@ -473,7 +485,8 @@ class VideoEncoderWrapper {
 		}
 
 		this.queuedAddCount++;
-		const added = Promise.race([this.addQueue, this.closedSignal.promise]).then(async () => {
+		const turn = Promise.race([this.addQueue, this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
+		const added = turn.then(async () => {
 			const sample = copy ? await copy : videoSample;
 			await this.addInOrder(sample, shouldClose, encodeOptions);
 		});
@@ -495,7 +508,7 @@ class VideoEncoderWrapper {
 
 		try {
 			this.checkForEncoderError();
-			if (this.closed) {
+			if (this.closed || this.pendingAddsCanceled) {
 				return; // Canceled while waiting
 			}
 
@@ -673,7 +686,24 @@ class VideoEncoderWrapper {
 		if (config.transform?.process) {
 			let processed = config.transform.process(videoSample);
 			if (isThenable(processed)) {
-				processed = await processed;
+				// Don't wait past the output being canceled (a call that never settles would hold everything up)
+				const pending = processed;
+				const canceled = Promise.race([this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
+				const whenCanceled = canceled.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
+				const result = await Promise.race([pending, whenCanceled]);
+				if (result === PROCESS_CANCELED) {
+					// Whatever it returns once it does settle is dropped
+					void Promise.resolve(pending).then((late) => {
+						for (const x of Array.isArray(late) ? late : [late]) {
+							const isFrame = typeof VideoFrame !== 'undefined' && x instanceof VideoFrame;
+							if ((x instanceof VideoSample && x !== videoSample) || isFrame) {
+								x.close();
+							}
+						}
+					}, () => {});
+					return;
+				}
+				processed = result;
 			}
 
 			if (processed === null) {
@@ -1448,8 +1478,8 @@ class VideoEncoderWrapper {
 
 		try {
 			if (!forceClose) {
-				// The samples added so far go in first
-				await this.addQueue;
+				// The samples added so far go in first (unless the output gets canceled meanwhile)
+				await Promise.race([this.addQueue, this.pendingAddsCanceledSignal.promise]);
 
 				this.checkForEncoderError();
 
@@ -1516,6 +1546,12 @@ class VideoEncoderWrapper {
 		if (!forceClose) {
 			this.checkForEncoderError();
 		}
+	}
+
+	/** Stops waiting for added samples to be processed, and drops the ones that haven't been yet. */
+	cancelPendingAdds() {
+		this.pendingAddsCanceled = true;
+		this.pendingAddsCanceledSignal.resolve();
 	}
 
 	/**
@@ -2166,6 +2202,11 @@ export class VideoSampleSource extends VideoSource {
 	override _flushAndClose(forceClose: boolean) {
 		return this._encoder.flushAndClose(forceClose);
 	}
+
+	/** @internal */
+	override _cancelPendingAdds() {
+		this._encoder.cancelPendingAdds();
+	}
 }
 
 /**
@@ -2222,6 +2263,11 @@ export class CanvasSource extends VideoSource {
 	/** @internal */
 	override _flushAndClose(forceClose: boolean) {
 		return this._encoder.flushAndClose(forceClose);
+	}
+
+	/** @internal */
+	override _cancelPendingAdds() {
+		this._encoder.cancelPendingAdds();
 	}
 }
 
@@ -2683,6 +2729,11 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 			? this._firstFrameTime
 			: (this._connectedTrack?.output._firstMediaStreamTimestamp ?? null);
 		this._pausedTime += getPauseDurationOnTimeline(this._pauseStartTime, timelineStartTime);
+	}
+
+	/** @internal */
+	override _cancelPendingAdds() {
+		this._encoder.cancelPendingAdds();
 	}
 
 	/** @internal */

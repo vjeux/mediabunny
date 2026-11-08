@@ -1062,6 +1062,10 @@ export class Output<
 	 * has stalled on a write: once 5 seconds pass without any of the pending writes completing, this resolves, and the
 	 * stream closes in the background if the sink ever catches up.
 	 *
+	 * While the output is finalizing, this instead stops waiting for the samples added before finalizing to be
+	 * processed by a `process` function (they're dropped), so that one that never settles can't hold finalization up
+	 * forever; the returned promise then resolves once finalization has completed.
+	 *
 	 * While the output is finalizing, this returns right away, and finalization goes on. Should the sink of a
 	 * {@link StreamTarget} then complete none of its pending writes for 5 seconds, finalization is given up on:
 	 * {@link Output.finalize} rejects, the output becomes canceled, and the stream closes in the background if the sink
@@ -1072,18 +1076,22 @@ export class Output<
 	async cancel() {
 		if (this.state === 'canceled') {
 			return this._cancelPromise ?? undefined;
-		} else if (this.state === 'finalizing' || this.state === 'finalized') {
-			// Don't wanna warn when finalizing since that shows a warning when finalization fails and then cancel
-			// is called
-			if (this.state === 'finalized') {
-				Logging._warn('Output has already been finalized.');
-			} else {
-				// Finalization can get stuck on a StreamTarget whose sink stopped completing writes; give up on it then
-				for (const target of this._unfinalizedTargets) {
-					target._cancelFinalization();
-				}
+		} else if (this.state === 'finalized') {
+			Logging._warn('Output has already been finalized.');
+			return;
+		} else if (this.state === 'finalizing') {
+			// Finalization waits for the samples added before it to be processed, which a process function that never
+			// settles would hold up forever. Stop waiting for them (they're dropped), so that it can complete.
+			for (const track of this.tracks) {
+				track.source._cancelPendingAdds();
 			}
 
+			// Finalization can get stuck on a StreamTarget whose sink stopped completing writes; give up on it then
+			for (const target of this._unfinalizedTargets) {
+				target._cancelFinalization();
+			}
+
+			await this._finalizePromise?.catch(() => {});
 			return;
 		}
 
