@@ -2120,6 +2120,20 @@ test('Damaged or hostile sizes don\'t make reads buffer whole streams or allocat
 	await expect(moovInput.getTracks()).rejects.toThrow(message);
 	expect(moovStream.stats.pulled).toBeLessThan(4 * 2 ** 20);
 
+	// A damaged size in a stream that ends shortly after it still reads as cut off, like from memory
+	const shortFile = new Uint8Array([...ftyp, ...bigBoxHeader('moov', 0x100), ...new Array<number>(1000).fill(0)]);
+	const shortStream = new ReadableStream<Uint8Array>({
+		start: (controller) => {
+			controller.enqueue(shortFile);
+			controller.close();
+		},
+	});
+	const getTracksOutcome = (input: Input) => input.getTracks()
+		.then(tracks => `${tracks.length} tracks`, (error: unknown) => String(error));
+	using shortStreamInput = new Input({ source: new ReadableStreamSource(shortStream), formats: ALL_FORMATS });
+	using shortBufferInput = new Input({ source: new BufferSource(shortFile), formats: ALL_FORMATS });
+	expect(await getTracksOutcome(shortStreamInput)).toBe(await getTracksOutcome(shortBufferInput));
+
 	// A live fragmented MP4 whose first moof claims 2^40 bytes
 	const file = readFileSync(path.join(__dirname, '../public/rotate-buck-bunny.mp4'));
 	const moofStream = makeStream([...file.subarray(0, 1152), ...bigBoxHeader('moof', 0x100)]); // After ftyp + moov

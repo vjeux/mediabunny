@@ -17,6 +17,8 @@ import { DEFAULT_MAX_READ_POSITION, DEFAULT_MIN_READ_POSITION, Source } from './
  * ID3v2 tag (at most 256 MiB), a single uncompressed 8K frame (about 265 MB) and HLS playlists.
  */
 const MAX_SLICE_LENGTH = 2 ** 30; // 1 GiB
+/** How far a source of unknown size is read to find out whether it ends shortly after an over-large read's start */
+const END_PROBE_LENGTH = 2 ** 20; // 1 MiB
 
 const sliceTooLargeError = (start: number, length: number) => new Error(
 	`Refusing to read ${length} bytes at once (at byte ${start}): no valid file needs a single read over 1 GiB, so`
@@ -53,8 +55,29 @@ export class Reader {
 		}
 
 		if (length > MAX_SLICE_LENGTH) {
-			// Throw rather than return null, which would look like the end of the file
-			throw sliceTooLargeError(start, length);
+			if (this.fileSizeNonStrict !== null) {
+				// Throw rather than return null, which would look like the end of the file
+				throw sliceTooLargeError(start, length);
+			}
+
+			// The size isn't known yet. If the file ends shortly after start, this read runs past its end, as a damaged
+			// size in a cut-off file does, and returns null like it would with the size known. Find out with a bounded
+			// read instead of holding everything that arrives until the whole length has come in.
+			const probe = this.source._read(
+				start,
+				start + END_PROBE_LENGTH,
+				DEFAULT_MIN_READ_POSITION,
+				DEFAULT_MAX_READ_POSITION,
+			);
+			const afterProbe = () => {
+				if (this.fileSizeNonStrict !== null && start + length > this.fileSizeNonStrict) {
+					return null;
+				}
+
+				throw sliceTooLargeError(start, length);
+			};
+
+			return isThenable(probe) ? probe.then(afterProbe) : afterProbe();
 		}
 
 		if (length === 0) {
