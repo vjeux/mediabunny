@@ -421,7 +421,7 @@ export type HlsOutputFormatOptions = {
 
 	When `false` (the default), all playlists will only be emitted once, upon output finalization.
 - `maxLiveSegmentCount`\
-	When in live mode, this controls the maximum number of segments contained in each playlist. Defaults to `Infinity`, meaning playlists continually grow in size.
+	When in live mode, this controls the maximum number of segments contained in each playlist. Defaults to `Infinity`, meaning playlists continually grow in size. Playlists keep more segments when fewer wouldn't add up to three times the target duration, the minimum length of a live playlist in HLS.
 - `getPlaylistPath`\
 	Returns the file path for a given media playlist. If the returned path is relative, it is relative to the root path.
 
