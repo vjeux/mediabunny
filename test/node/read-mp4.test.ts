@@ -4432,3 +4432,89 @@ test('A failed key resolution is tried again for later samples', async () => {
 	expect([...(await sink.getFirstPacket())!.data]).toEqual(plaintext);
 	expect(resolveCount).toBe(2);
 });
+
+test('Samples encrypted with an unsupported protection scheme throw instead of coming back as ciphertext', async () => {
+	// 'cbc1' (ISO/IEC 23001-7), 'piff' (PIFF 1.1, Smooth Streaming) and a sinf without schm can't be decrypted
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const plaintext = [0, 0, 0, 12, 0x65, ...zeros(12)];
+	const iv = [...zeros(7), 1];
+	const ciphertext = [
+		...createCipheriv('aes-128-ctr', key, Buffer.from([...iv, ...zeros(8)])).update(Buffer.from(plaintext)),
+	];
+	const sampleEntry = (name: string, ...children: number[][]) => box(name, zeros(6), [0, 1], zeros(16),
+		[0, 64, 0, 64], zeros(12), [0, 1], zeros(32), [0, 24, 0xff, 0xff],
+		box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]), ...children);
+	const encv = (scheme: string | null) => sampleEntry('encv', box('sinf', box('frma', ascii('avc1')),
+		...(scheme ? [box('schm', u32(0), ascii(scheme), u32(0x10000))] : []),
+		box('schi', box('tenc', u32(0), [0, 0, 1, 8], zeros(16)))));
+	const trak = (sampleEntries: number[][], ...stbl: number[][]) => box('trak',
+		box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(1), zeros(16), matrix, u32(64 << 16), u32(64 << 16)),
+		box('mdia',
+			box('mdhd', zeros(12), u32(10), u32(1), [0x55, 0xc4, 0, 0]),
+			box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+			box('minf', box('stbl', box('stsd', u32(0), u32(sampleEntries.length), ...sampleEntries), ...stbl)),
+		),
+	);
+	const mvhd = box('mvhd', zeros(12), u32(10), u32(1), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28));
+	const ftyp = box('ftyp', ascii('iso6'), u32(0));
+	const fragmented = (sampleEntries: number[][], sampleDescriptionIndex: number, data: number[]) => {
+		const moof = (dataOffset: number) => box('moof', box('mfhd', u32(0), u32(1)), box('traf',
+			box('tfhd', u32(0x020002), u32(1), u32(sampleDescriptionIndex)),
+			box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(data.length)),
+			box('senc', u32(0), u32(1), iv),
+		));
+		return [
+			...ftyp,
+			...box('moov',
+				mvhd,
+				trak(sampleEntries, box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)),
+					box('stco', zeros(8))),
+				box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+			),
+			...moof(moof(0).length + 8),
+			...box('mdat', data),
+		];
+	};
+	const regular = (sampleEntries: number[][]) => {
+		const moov = (mdatStart: number) => box('moov', mvhd, trak(sampleEntries,
+			box('stts', u32(0), u32(1), u32(1), u32(1)),
+			box('stsc', u32(0), u32(1), u32(1), u32(1), u32(1)),
+			box('stsz', u32(0), u32(ciphertext.length), u32(1)),
+			box('stco', u32(0), u32(1), u32(mdatStart + 8 + iv.length)),
+			box('saiz', u32(0), [iv.length], u32(1)),
+			box('saio', u32(0), u32(1), u32(mdatStart + 8)),
+		));
+		const mdatStart = ftyp.length + moov(0).length;
+		return [...ftyp, ...moov(mdatStart), ...box('mdat', iv, ciphertext)];
+	};
+	const readFirstPacket = async (bytes: number[]) => {
+		using input = new Input({
+			source: new BufferSource(new Uint8Array(bytes)),
+			formats: ALL_FORMATS,
+			formatOptions: { isobmff: { resolveKeyId: () => key } },
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		return [...packet!.data];
+	};
+
+	expect(await readFirstPacket(fragmented([encv('cenc')], 1, ciphertext))).toEqual(plaintext);
+	expect(await readFirstPacket(regular([encv('cenc')]))).toEqual(plaintext);
+	for (const scheme of ['cbc1', 'piff', null]) {
+		await expect(readFirstPacket(fragmented([encv(scheme)], 1, ciphertext)))
+			.rejects.toThrow(/unsupported protection scheme/);
+		await expect(readFirstPacket(regular([encv(scheme)]))).rejects.toThrow(/unsupported protection scheme/);
+	}
+
+	// Clear lead samples, which use a clear sample description, can still be read
+	expect(await readFirstPacket(fragmented([encv('cbc1'), sampleEntry('avc1')], 2, plaintext))).toEqual(plaintext);
+});
