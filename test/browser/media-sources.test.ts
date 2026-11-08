@@ -4562,3 +4562,41 @@ test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio wit
 	expect(track).not.toBeNull();
 	expect(await track!.computeDuration()).toBeGreaterThan(0.9 * 15 * 1024 / 48000);
 });
+
+test('VideoSampleSource, cancel() while finalizing doesn\'t wait behind a stalled target', async () => {
+	// A stream whose sink stops completing writes once finalizing starts, like a hung upload
+	let stalled = false;
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new StreamTarget(new WritableStream({
+			write: () => (stalled ? new Promise<void>(() => {}) : undefined),
+		})),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+	for (let i = 0; i < 3; i++) {
+		await videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: i / 30,
+			duration: 1 / 30,
+		}));
+	}
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	stalled = true;
+	const finalized = output.finalize();
+	expect(await stateAfter(finalized, 300)).toBe('pending'); // The sink holds it up
+
+	// Canceling can't get the sink going again, but it mustn't get stuck behind it either
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+});
