@@ -116,19 +116,66 @@ test.each(['synchronous', 'never settling'] as const)(
 	},
 );
 
-test.each(['MP4', 'Matroska', 'MPEG-TS'] as const)(
+test.each([
+	['MP4', null],
+	['Matroska', null],
+	['MPEG-TS', null],
+	['WAVE', 'glitch-hop-is-dead.wav'],
+	['ADTS', 'sample3.aac'],
+	['Ogg', 'preroll-test.opus'],
+	['FLAC', 'sample.flac'],
+	['MP3', 'Toothsome-Meme.VBRv2.mp3'],
+] as const)(
 	'An add issued while the start is still running settles when the start is canceled or its target fails (%s)',
-	async (formatName) => {
+	async (formatName, audioFile) => {
 		// The muxer holds its mutex while it waits for its target at start, and adds wait for that mutex
-		const { MkvOutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
+		const formats = await import('../../src/output-format.js');
 		const { PathedTarget } = await import('../../src/target.js');
-		const { EncodedVideoPacketSource } = await import('../../src/media-source.js');
+		const { EncodedAudioPacketSource, EncodedVideoPacketSource } = await import('../../src/media-source.js');
+		const { EncodedPacketSink } = await import('../../src/media-sink.js');
 		const { EncodedPacket } = await import('../../src/packet.js');
-		const createFormat = () => formatName === 'MP4'
-			? new Mp4OutputFormat()
-			: formatName === 'Matroska'
-				? new MkvOutputFormat()
-				: new MpegTsOutputFormat();
+		const createFormat = {
+			'MP4': () => new formats.Mp4OutputFormat(),
+			'Matroska': () => new formats.MkvOutputFormat(),
+			'MPEG-TS': () => new formats.MpegTsOutputFormat(),
+			'WAVE': () => new formats.WavOutputFormat(),
+			'ADTS': () => new formats.AdtsOutputFormat(),
+			'Ogg': () => new formats.OggOutputFormat(),
+			'FLAC': () => new formats.FlacOutputFormat(),
+			'MP3': () => new formats.Mp3OutputFormat(),
+		}[formatName];
+
+		// A video track gets an AVC packet, an audio track the first packet of a file in a codec the format holds
+		let addTrack: (output: Output) => () => Promise<void>;
+		if (audioFile === null) {
+			addTrack = (output) => {
+				const source = new EncodedVideoPacketSource('avc');
+				output.addVideoTrack(source);
+				return () => source.add(new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', 0, 1 / 30), {
+					decoderConfig: {
+						codec: 'avc1.42001f',
+						codedWidth: 64,
+						codedHeight: 64,
+						description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+					},
+				});
+			};
+		} else {
+			using input = new Input({
+				source: new FilePathSource(path.join(__dirname, '../public', audioFile)),
+				formats: ALL_FORMATS,
+			});
+			const track = (await input.getPrimaryAudioTrack())!;
+			const codec = (await track.getCodec())!;
+			const decoderConfig = (await track.getDecoderConfig())!;
+			const packet = (await new EncodedPacketSink(track).getFirstPacket())!;
+			addTrack = (output) => {
+				const source = new EncodedAudioPacketSource(codec);
+				output.addAudioTrack(source);
+				return () => source.add(packet, { decoderConfig });
+			};
+		}
+
 		const settlesWithin = (promise: Promise<unknown>, ms: number) => Promise.race([
 			promise.then(() => 'resolved', () => 'rejected'),
 			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
@@ -146,18 +193,10 @@ test.each(['MP4', 'Matroska', 'MPEG-TS'] as const)(
 						}
 					})),
 			});
-			const source = new EncodedVideoPacketSource('avc');
-			output.addVideoTrack(source);
+			const addPacket = addTrack(output);
 
 			const start = output.start();
-			const add = source.add(new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', 0, 1 / 30), {
-				decoderConfig: {
-					codec: 'avc1.42001f',
-					codedWidth: 64,
-					codedHeight: 64,
-					description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
-				},
-			});
+			const add = addPacket();
 
 			if (scenario === 'target fails') {
 				await expect(start).rejects.toThrow('No target');
