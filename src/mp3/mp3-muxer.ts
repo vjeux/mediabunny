@@ -84,7 +84,10 @@ export class Mp3Muxer extends Muxer {
 					throw new Error('Invalid MP3 header in sample.');
 				}
 
-				if (!this.xingFrameData) {
+				if (!this.xingFrameData && header.layer !== 1) {
+					// Xing frames only exist for Layer III; with Layers I and II, decoders would play one as audio
+					this.writeXingHeader = false;
+				} else if (!this.xingFrameData) {
 					const xingOffset = getXingOffset(header.mpegVersionId, header.channel);
 					if (view.byteLength >= xingOffset + 4) {
 						const word = view.getUint32(xingOffset, false);
