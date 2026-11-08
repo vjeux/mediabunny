@@ -1336,6 +1336,53 @@ test('Trim wholly past media data, copy', async () => {
 	expect(await newInput.getPrimaryAudioTrack()).toBeNull(); // No audio data
 });
 
+test('Conversion with onProgress of a streamed input larger than the source\'s cache', async () => {
+	// ADTS stores no duration, which on a source that only keeps part of a stream can't be computed ahead of the
+	// conversion: that would read the whole input and evict its start before the conversion reads it
+	const { ReadableStreamSource } = await import('../../src/source.js');
+	const { AdtsOutputFormat: Adts } = await import('../../src/output-format.js');
+	const bytes = new Uint8Array(await (await fetch('/sample3.aac')).arrayBuffer());
+	const createInput = (maxCacheSize: number) => new Input({
+		source: new ReadableStreamSource(new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (let i = 0; i < 2; i++) { // About 3.5 MB of ADTS
+					for (let offset = 0; offset < bytes.length; offset += 2 ** 16) {
+						controller.enqueue(bytes.slice(offset, offset + 2 ** 16));
+					}
+				}
+				controller.close();
+			},
+		}), { maxCacheSize }),
+		formats: ALL_FORMATS,
+	});
+
+	for (const maxCacheSize of [2 ** 20, Infinity]) {
+		using input = createInput(maxCacheSize);
+		const output = new Output({ format: new Adts(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, showWarnings: false });
+		const progressValues: number[] = [];
+		conversion.onProgress = progress => progressValues.push(progress);
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryAudioTrack();
+		assert(track);
+		expect((await track.computePacketStats()).packetCount).toBeGreaterThan(2000);
+		expect(progressValues.at(-1)).toBe(1);
+		// With a bounded cache, the total isn't known ahead of time; with an unbounded one, it still is
+		expect(progressValues.some(progress => progress > 0 && progress < 1)).toBe(maxCacheSize === Infinity);
+	}
+
+	// A format that needs to know the packet count ahead of time can't estimate it then
+	using input = createInput(2 ** 20);
+	const conversion = await Conversion.init({
+		input,
+		output: new Output({ format: new Mp4OutputFormat({ fastStart: 'reserve' }), target: new BufferTarget() }),
+		showWarnings: false,
+	});
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual(['unknown_maximum_packet_count']);
+});
+
 test('Reserved fast start, copy', async () => {
 	await testReservedFastStart({});
 });
