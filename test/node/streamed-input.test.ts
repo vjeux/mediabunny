@@ -33,18 +33,19 @@ test('Ogg: Duration of a stream longer than its cache, after reading its packets
 	// Reading to the end of the stream makes its size known, but the source can't read back what has left its cache,
 	// which a binary search for the last packet would do
 	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/preroll-test.opus')));
+	using reference = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const referenceTrack = (await reference.getPrimaryAudioTrack())!;
+	const referenceLastPacket = await new EncodedPacketSink(referenceTrack).getPacket(Infinity);
+
 	using input = new Input({ source: streamedSource(file, 32 * 1024), formats: ALL_FORMATS });
 	const track = (await input.getPrimaryAudioTrack())!;
 	const sink = new EncodedPacketSink(track);
-	let lastTimestamp = 0;
-	let end = 0;
 	for await (const packet of sink.packets()) {
-		lastTimestamp = packet.timestamp;
-		end = packet.timestamp + packet.duration;
+		void packet;
 	}
 
-	expect(await track.computeDuration()).toBe(end);
-	expect((await sink.getPacket(Infinity))?.timestamp).toBe(lastTimestamp);
+	expect(await track.computeDuration()).toBe(await referenceTrack.computeDuration());
+	expect((await sink.getPacket(Infinity))?.timestamp).toBe(referenceLastPacket?.timestamp);
 });
 
 test('Ogg: Seeking forward in a stream longer than its cache, after playing part of it', async () => {
@@ -56,7 +57,9 @@ test('Ogg: Seeking forward in a stream longer than its cache, after playing part
 		packets.push(packet);
 	}
 
-	using input = new Input({ source: streamedSource(file, 32 * 1024), formats: ALL_FORMATS });
+	// The pages of this file are 1 s long, and a lookup reads the packet ending the page before, so the cache holds a
+	// few pages
+	using input = new Input({ source: streamedSource(file, 64 * 1024), formats: ALL_FORMATS });
 	const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
 	for await (const packet of sink.packets()) {
 		if (packet.sequenceNumber === packets[225]!.sequenceNumber) {
@@ -67,5 +70,25 @@ test('Ogg: Seeking forward in a stream longer than its cache, after playing part
 	for (const target of [packets[270]!, packets[280]!, packets.at(-1)!]) {
 		const packet = await sink.getPacket(target.timestamp);
 		expect([packet?.timestamp, packet?.byteLength]).toEqual([target.timestamp, target.byteLength]);
+	}
+});
+
+test('Ogg: Looking up packets around where reading got to, in a stream that fits its cache', async () => {
+	const file = new Uint8Array(readFileSync(path.join(__dirname, '../public/preroll-test.opus'))); // 6 s, 301 packets
+	using input = new Input({ source: streamedSource(file, 1024 * 1024), formats: ALL_FORMATS }); // The whole file fits
+	using reference = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getPrimaryAudioTrack())!);
+	const referenceSink = new EncodedPacketSink((await reference.getPrimaryAudioTrack())!);
+
+	// Read up to 1 s, seek forward to 4.5 s, then look up 2.5 s, which is behind where reading got to
+	for await (const packet of sink.packets()) {
+		if (packet.timestamp >= 1) {
+			break;
+		}
+	}
+	for (const timestamp of [4.5, 2.5, 0.5, 5.5]) {
+		const packet = await sink.getPacket(timestamp);
+		const expected = await referenceSink.getPacket(timestamp);
+		expect(packet?.timestamp).toBe(expected?.timestamp);
 	}
 });

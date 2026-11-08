@@ -40,6 +40,10 @@ import {
 const MAX_LOGICAL_BITSTREAMS = 64;
 const VORBIS_IDENTIFICATION_HEADER_SIZE = 30;
 const OPUS_IDENTIFICATION_HEADER_MIN_SIZE = 19;
+/** How many of the pages that reading on has reached last a track keeps, to look up later packets from. */
+const MAX_RECENT_PAGES = 8;
+
+const getPacketEndPosition = (packet: Packet) => packet.endPage.headerStartPos + packet.endSegmentIndex;
 
 type LogicalBitstream = {
 	serialNumber: number;
@@ -434,15 +438,16 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	firstTimestampInSamplesPromise: Promise<number> | null = null;
 	/**
 	 * Whether the file size was unknown when the track was read, as with a ReadableStreamSource. Such a source is read
-	 * in order and can't read back what has left its cache, which a binary search would do, so packets are always
-	 * looked up by reading on, even once reaching the end of the stream has made its size known.
+	 * in order and can't read back what has left its cache, so lookups past where reading got to don't go back to the
+	 * start of the file (see `getPacket`).
 	 */
 	sourceWasUnsized: boolean;
-	/**
-	 * The packet furthest into the track read so far. Looking up packets past it reads on from it rather than from an
-	 * earlier point: that's cheaper, and a stream may no longer hold what's before it.
-	 */
+	/** The packet furthest into the track that reading on (iteration, or a sequential lookup) has reached. */
 	furthestPacketMetadata: EncodedPacketMetadata | null = null;
+	/** The pages of the last packets that reading on has reached, in file order. */
+	recentPages: Page[] = [];
+	/** Where the first packet starts, once known. */
+	firstPacketPosition: { startPage: Page; startSegmentIndex: number } | null = null;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
 		// Opus always uses a fixed sample rate for its internal calculations, even if the actual rate is different
@@ -590,22 +595,76 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			packet.data.byteLength,
 		);
 
-		const metadata: EncodedPacketMetadata = {
+		this.encodedPacketToMetadata.set(encodedPacket, {
 			packet,
 			timestampInSamples: additional.timestampInSamples,
 			durationInSamples,
 			vorbisLastBlockSize: additional.vorbisLastBlocksize,
 			vorbisBlockSize,
-		};
-		this.encodedPacketToMetadata.set(encodedPacket, metadata);
-		if (
-			!this.furthestPacketMetadata
-			|| metadata.timestampInSamples > this.furthestPacketMetadata.timestampInSamples
-		) {
-			this.furthestPacketMetadata = metadata;
+		});
+		return encodedPacket;
+	}
+
+	/**
+	 * Notes how far reading on has got, once it has read a packet (starting on the given page) after the given one, or
+	 * after none for the first packet.
+	 */
+	advanceFrontier(prevMetadata: EncodedPacketMetadata | null, encodedPacket: EncodedPacket | null, startPage: Page) {
+		const metadata = encodedPacket && this.encodedPacketToMetadata.get(encodedPacket);
+		const furthest = this.furthestPacketMetadata;
+		if (!metadata || (furthest && getPacketEndPosition(metadata.packet) <= getPacketEndPosition(furthest.packet))) {
+			return;
 		}
 
-		return encodedPacket;
+		if (prevMetadata !== furthest) {
+			// Not read on from the furthest packet, so the pages in between are unknown
+			this.recentPages = [];
+		}
+		this.furthestPacketMetadata = metadata;
+		this.addRecentPage(startPage);
+		this.addRecentPage(metadata.packet.endPage);
+	}
+
+	/** Notes a page that reading on has reached, if it comes after the ones noted so far. */
+	addRecentPage(page: Page) {
+		const lastPage = this.recentPages.at(-1);
+		if (lastPage && page.headerStartPos <= lastPage.headerStartPos) {
+			return;
+		}
+
+		this.recentPages.push(page);
+		if (this.recentPages.length > MAX_RECENT_PAGES) {
+			this.recentPages.shift();
+		}
+	}
+
+	/**
+	 * Reads the page of this logical bitstream after the given one, as reading on would. Returns null at the end of the
+	 * logical bitstream or of the file, and undefined where something other than a page comes first.
+	 */
+	async readPageAfter(page: Page) {
+		if (page.headerType & 0x04) {
+			return null; // It's the last page of the logical bitstream
+		}
+
+		let currentPos = page.headerStartPos + page.totalSize;
+		while (true) {
+			let slice = this.demuxer.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
+			if (isThenable(slice)) slice = await slice;
+			if (!slice) {
+				return null; // The end of the file
+			}
+
+			const nextPage = readPageHeader(slice);
+			if (!nextPage) {
+				return undefined;
+			}
+			if (nextPage.serialNumber === page.serialNumber) {
+				return nextPage;
+			}
+
+			currentPos = nextPage.headerStartPos + nextPage.totalSize;
+		}
 	}
 
 	getFirstTimestampInSamples() {
@@ -671,10 +730,12 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return null;
 		}
 
+		this.firstPacketPosition ??= packetPosition;
+
 		const timestampInSamples = await this.getFirstTimestampInSamples();
 		const packet = await this.demuxer.readPacket(packetPosition.startPage, packetPosition.startSegmentIndex);
 
-		return this.createEncodedPacketFromOggPacket(
+		const encodedPacket = this.createEncodedPacketFromOggPacket(
 			packet,
 			{
 				timestampInSamples,
@@ -682,6 +743,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			},
 			options,
 		);
+		this.advanceFrontier(null, encodedPacket, packetPosition.startPage);
+
+		return encodedPacket;
 	}
 
 	async getNextPacket(prevPacket: EncodedPacket, options: PacketRetrievalOptions) {
@@ -702,7 +766,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			packetPosition.startSegmentIndex,
 		);
 
-		return this.createEncodedPacketFromOggPacket(
+		const encodedPacket = this.createEncodedPacketFromOggPacket(
 			packet,
 			{
 				timestampInSamples,
@@ -710,16 +774,39 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			},
 			options,
 		);
+		this.advanceFrontier(prevMetadata, encodedPacket, packetPosition.startPage);
+
+		return encodedPacket;
 	}
 
-	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
-		if (this.sourceWasUnsized || this.demuxer.reader.fileSize === null) {
-			// No file size known (or not from the start), can't do binary search, but fall back to sequential algo
-			// instead
+	async getPacket(
+		timestamp: number,
+		options: PacketRetrievalOptions,
+		scanOnFromRecentPages = true,
+	): Promise<EncodedPacket | null> {
+		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
+
+		// A source that was read in order may no longer hold the start of the file, where both lookup algorithms
+		// begin. If the packet lies past where reading on has got, let's scan on from one of the pages it reached last
+		// instead. The packet is then found as the binary search finds it, from the granule positions.
+		const furthest = this.furthestPacketMetadata;
+		const recentGranulePages = this.recentPages.filter(page => page.granulePosition !== -1);
+		const seedPage = scanOnFromRecentPages
+			&& this.sourceWasUnsized
+			&& this.firstPacketPosition
+			&& furthest
+			&& timestampInSamples >= furthest.timestampInSamples
+			? findLast(
+				recentGranulePages.slice(1), // At least one before it, to step back from
+				page => this.granulePositionToTimestampInSamples(page.granulePosition) <= timestampInSamples,
+			) ?? null
+			: null;
+
+		if (!seedPage && this.demuxer.reader.fileSize === null) {
+			// No file size known, can't do binary search, but fall back to sequential algo instead
 			return this.getPacketSequential(timestamp, options);
 		}
 
-		const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 		const firstTimestampInSamples = await this.getFirstTimestampInSamples();
 		if (timestampInSamples === firstTimestampInSamples) {
 			// Fast path for the first timestamp - avoids binary search when playing back from the start
@@ -730,16 +817,23 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return null;
 		}
 
-		assert(this.bitstream.lastMetadataPacket);
-		const startPosition = await this.demuxer.findNextPacketStart(this.bitstream.lastMetadataPacket);
+		let startPosition = this.firstPacketPosition;
+		if (!seedPage) {
+			assert(this.bitstream.lastMetadataPacket);
+			startPosition = await this.demuxer.findNextPacketStart(this.bitstream.lastMetadataPacket);
+		}
 		if (!startPosition) {
 			return null;
 		}
 
-		let lowPage = startPosition.startPage;
-		let high = this.demuxer.reader.fileSize;
+		let lowPage = seedPage ?? startPosition.startPage;
+		let high = seedPage
+			? seedPage.headerStartPos + seedPage.totalSize // There's nothing to search when scanning on (see below)
+			: this.demuxer.reader.fileSize!;
 
-		const lowPages: Page[] = [lowPage];
+		const lowPages: Page[] = seedPage
+			? recentGranulePages.filter(page => page.headerStartPos <= seedPage.headerStartPos)
+			: [lowPage];
 
 		// First, let's perform a binary search (bisection search) on the file to find the approximate page where
 		// we'll find the packet. We want to find a page whose end packet position is less than or equal to the
@@ -827,6 +921,13 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				lowerPage = otherLowPage;
 			}
 		}
+		if (seedPage) {
+			// Not the start of the file, which may be gone, but two of the recent pages before this one, so that the
+			// packets ending on the page before can be stepped back to
+			const earlierPages = lowPages.filter(page => page.headerStartPos < lowPage.headerStartPos
+				&& page.granulePosition !== lowPage.granulePosition);
+			lowerPage = earlierPages.at(-2) ?? earlierPages.at(-1) ?? lowPage;
+		}
 
 		let currentPage = lowerPage;
 		// Keep track of the pages we traversed, we need these later for backwards seeking
@@ -857,6 +958,35 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 			if (currentPage.serialNumber === this.bitstream.serialNumber) {
 				previousPages.push(currentPage);
+			}
+		}
+
+		if (seedPage) {
+			// Now scan on page by page, as reading on would, up to the last page whose granule position isn't past the
+			// packet
+			let page = currentPage;
+			while (true) {
+				const nextPage = await this.readPageAfter(page);
+				if (nextPage === undefined) {
+					// Reading on stops at junk, but the binary search may find pages past it, so let's look the
+					// packet up as usual
+					return this.getPacket(timestamp, options, false);
+				}
+				if (!nextPage) {
+					break;
+				}
+
+				page = nextPage;
+				previousPages.push(page);
+				this.addRecentPage(page);
+				if (page.granulePosition === -1) {
+					continue;
+				}
+				if (this.granulePositionToTimestampInSamples(page.granulePosition) > timestampInSamples) {
+					break;
+				}
+
+				currentPage = page;
 			}
 		}
 
@@ -1052,22 +1182,15 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				x => x.timestampInSamples,
 			);
 
-			// If the packet lies past the furthest packet read so far (as when seeking forward from where playback got
-			// to, or looking up the last packet after reading them all), let's read on from there. Otherwise, from a
-			// previous scan point, if there's one before the packet.
-			const furthest = this.furthestPacketMetadata;
-			const startMetadata = furthest && furthest.timestampInSamples <= timestampInSamples
-				? furthest
-				: index !== -1 ? this.sequentialScanCache[index]! : null;
-
 			let currentPacket: EncodedPacket | null;
-			if (startMetadata) {
-				// We don't need to start from the beginning
+			if (index !== -1) {
+				// We don't need to start from the beginning, we can start at a previous scan point
+				const cacheEntry = this.sequentialScanCache[index]!;
 				currentPacket = this.createEncodedPacketFromOggPacket(
-					startMetadata.packet,
+					cacheEntry.packet,
 					{
-						timestampInSamples: startMetadata.timestampInSamples,
-						vorbisLastBlocksize: startMetadata.vorbisLastBlockSize,
+						timestampInSamples: cacheEntry.timestampInSamples,
+						vorbisLastBlocksize: cacheEntry.vorbisLastBlockSize,
 					},
 					options,
 				);
