@@ -1,5 +1,6 @@
 import { expect, test, vi } from 'vitest';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
@@ -611,6 +612,52 @@ test('PCM audio, no silence padding with approximate timestamps', async () => {
 });
 
 // https://github.com/Vanilagy/mediabunny/pull/391
+test('Zero-duration WebVTT cues are dropped rather than hanging or crashing the muxer', () => {
+	const cases: Record<string, string> = {
+		alone: '00:01.000 --> 00:01.000\nZero\n',
+		insideAnotherCue: '00:00.000 --> 00:02.000\nLong\n\n00:01.000 --> 00:01.000\nZero\n',
+		betweenTwoCues: '00:00.000 --> 00:01.000\nA\n\n00:01.000 --> 00:01.000\nZero\n\n00:01.000 --> 00:02.000\nB\n',
+	};
+
+	// Muxing used to loop forever on such cues without ever yielding to timers (or to hit an assertion), so it runs
+	// in a child process that a timeout can kill. It prints the cue texts of each output file's payl boxes.
+	const script = `
+		const { Output, BufferTarget, Mp4OutputFormat, TextSubtitleSource } = await import(process.env.MEDIABUNNY);
+		for (const fastStart of [false, 'fragmented']) {
+			for (const [name, cues] of Object.entries(JSON.parse(process.env.CASES))) {
+				const output = new Output({ format: new Mp4OutputFormat({ fastStart }), target: new BufferTarget() });
+				const source = new TextSubtitleSource('webvtt');
+				output.addSubtitleTrack(source);
+				await output.start();
+				await source.add('WEBVTT\\n\\n' + cues);
+				await output.finalize().catch(error => console.log(error.message));
+
+				const text = new TextDecoder().decode(output.target.buffer ?? new ArrayBuffer(0));
+				const texts = [...new Set([...text.matchAll(/payl(\\w+)/g)].map(match => match[1]))];
+				console.log(name + ', ' + fastStart + ': ' + texts.join(' '));
+			}
+		}
+	`;
+	const args = ['--max-old-space-size=256', '--import', 'tsx', '--input-type=module', '-e', script];
+	const result = spawnSync(process.execPath, args, {
+		encoding: 'utf8',
+		timeout: 10_000,
+		env: {
+			...process.env,
+			MEDIABUNNY: new URL('../../src/index.ts', import.meta.url).href,
+			CASES: JSON.stringify(cases),
+		},
+	});
+
+	expect(result.signal).toBe(null); // Not killed by the timeout or by running out of memory
+	expect(result.stderr).toBe('');
+	expect(result.stdout.trim().split('\n')).toEqual([false, 'fragmented'].flatMap(fastStart => [
+		`alone, ${fastStart}: `,
+		`insideAnotherCue, ${fastStart}: Long`,
+		`betweenTwoCues, ${fastStart}: A B`,
+	]));
+}, 60_000);
+
 test('At least one track is enabled even if all are added disabled', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),

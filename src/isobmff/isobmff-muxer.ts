@@ -179,7 +179,11 @@ export type IsobmffTrackData = {
 		config: SubtitleConfig;
 	};
 	lastCueEndTimestamp: number | null;
-	cueQueue: SubtitleCue[];
+	cueQueue: {
+		cue: SubtitleCue;
+		start: number;
+		end: number;
+	}[];
 	nextSourceId: number;
 	cueToSourceId: WeakMap<SubtitleCue, number>;
 });
@@ -1050,8 +1054,20 @@ export class IsobmffMuxer extends Muxer {
 			this.validateTimestamp(trackData.track, cue.timestamp, true);
 
 			if (track.source._codec === 'webvtt') {
-				trackData.cueQueue.push(cue);
-				await this.processWebVTTCues(trackData, cue.timestamp);
+				// Snapping to the timescale makes touching cues compare equal despite floating point error
+				const start = intoTimescale(cue.timestamp, trackData.timescale) / trackData.timescale;
+				const end = intoTimescale(cue.timestamp + cue.duration, trackData.timescale) / trackData.timescale;
+
+				// Cues without duration are never visible and can't be laid out into samples, so they're dropped
+				if (end > start) {
+					trackData.cueQueue.push({
+						cue,
+						start,
+						end,
+					});
+				}
+
+				await this.processWebVTTCues(trackData, start);
 			} else {
 				// TODO
 			}
@@ -1065,15 +1081,15 @@ export class IsobmffMuxer extends Muxer {
 		// overlapping samples require special logic. The algorithm produces the format specified in ISO 14496-30.
 
 		while (trackData.cueQueue.length > 0) {
-			trackData.lastCueEndTimestamp ??= Math.min(0, trackData.cueQueue[0]!.timestamp);
+			trackData.lastCueEndTimestamp ??= Math.min(0, trackData.cueQueue[0]!.start);
 
 			const timestamps = new Set<number>([]);
-			for (const cue of trackData.cueQueue) {
-				assert(cue.timestamp <= until);
-				assert(trackData.lastCueEndTimestamp <= cue.timestamp + cue.duration);
+			for (const { start, end } of trackData.cueQueue) {
+				assert(start <= until);
+				assert(trackData.lastCueEndTimestamp <= end);
 
-				timestamps.add(Math.max(cue.timestamp, trackData.lastCueEndTimestamp)); // Start timestamp
-				timestamps.add(cue.timestamp + cue.duration); // End timestamp
+				timestamps.add(Math.max(start, trackData.lastCueEndTimestamp)); // Start timestamp
+				timestamps.add(end); // End timestamp
 			}
 
 			const sortedTimestamps = [...timestamps].sort((a, b) => a - b);
@@ -1109,9 +1125,9 @@ export class IsobmffMuxer extends Muxer {
 			this.auxWriter.seek(0);
 
 			for (let i = 0; i < trackData.cueQueue.length; i++) {
-				const cue = trackData.cueQueue[i]!;
+				const { cue, start, end } = trackData.cueQueue[i]!;
 
-				if (cue.timestamp >= sampleEnd) {
+				if (start >= sampleEnd) {
 					break;
 				}
 
@@ -1119,9 +1135,8 @@ export class IsobmffMuxer extends Muxer {
 				const containsTimestamp = inlineTimestampRegex.test(cue.text);
 				const isFirstSampleOfCue = !trackData.cueToSourceId.has(cue);
 
-				const endTimestamp = cue.timestamp + cue.duration;
 				let sourceId = trackData.cueToSourceId.get(cue);
-				if (sourceId === undefined && sampleEnd < endTimestamp) {
+				if (sourceId === undefined && sampleEnd < end) {
 					// We know this cue will appear in more than one sample, therefore we need to mark it with a
 					// unique ID
 					sourceId = trackData.nextSourceId++;
@@ -1143,7 +1158,7 @@ export class IsobmffMuxer extends Muxer {
 				);
 				this.auxBoxWriter.writeBox(box);
 
-				if (endTimestamp === sampleEnd) {
+				if (end === sampleEnd) {
 					// The cue won't appear in any future sample, so we're done with it
 					trackData.cueQueue.splice(i--, 1);
 				}
