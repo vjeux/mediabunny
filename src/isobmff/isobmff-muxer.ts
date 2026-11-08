@@ -407,7 +407,10 @@ export class IsobmffMuxer extends Muxer {
 
 		const codecStrings = this.trackDatas.map((trackData) => {
 			if (trackData.type === 'video') {
-				return trackData.info.decoderConfig.codec;
+				// HEVC is always written with an 'hvc1' sample entry, which is what the codec string has to name
+				return trackData.track.source._codec === 'hevc'
+					? trackData.info.decoderConfig.codec.replace(/^hev1\./, 'hvc1.')
+					: trackData.info.decoderConfig.codec;
 			} else if (trackData.type === 'audio') {
 				return trackData.info.decoderConfig.codec;
 			} else {
