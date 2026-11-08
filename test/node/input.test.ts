@@ -63,7 +63,7 @@ test.for(['video', 'audio'] as const)(
 	'A %s track the registered custom decoders decline is reported as undecodable, not as missing WebCodecs',
 	async (type) => {
 		// Node has no WebCodecs. With custom decoders registered (like @mediabunny/server's) that all decline the
-		// track, the sinks blamed the missing WebCodecs class instead (found by the lane L93 review)
+		// track, the sinks only blamed the missing WebCodecs class (found by the lane L93 review)
 		registerDecoder(type === 'video' ? DecliningVideoDecoder : DecliningAudioDecoder);
 		try {
 			using input = new Input({
@@ -76,7 +76,12 @@ test.for(['video', 'audio'] as const)(
 				? new VideoSampleSink(videoTrack!).getSample(0)
 				: new AudioSampleSink(audioTrack!).getSample(0);
 
-			await expect(sample).rejects.toThrow(`This ${type} track cannot be decoded in this environment.`);
+			// Both facts: the registered decoders may be for other codecs
+			const className = type === 'video' ? 'VideoDecoder' : 'AudioDecoder';
+			await expect(sample).rejects.toThrow(
+				`This ${type} track cannot be decoded in this environment. No registered custom decoder supports it,`
+				+ ` and ${className} is not available in this environment.`,
+			);
 		} finally {
 			if (type === 'video') {
 				customVideoDecoders.splice(customVideoDecoders.indexOf(DecliningVideoDecoder), 1);

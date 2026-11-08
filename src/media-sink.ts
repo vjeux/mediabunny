@@ -1912,14 +1912,17 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		onError: (error: unknown) => unknown,
 	) {
 		if (!(await this._track.canDecode())) {
-			// Only blame the missing class when nothing else could have decoded the track
 			if (typeof VideoDecoder === 'undefined' && customVideoDecoders.length === 0) {
 				throw new Error(missingWebCodecsClassMessage('VideoDecoder'));
 			}
 
+			// Custom decoders were registered then, and none supports this track (say, an extension for other codecs)
+			const missingClass = typeof VideoDecoder === 'undefined'
+				? ' No registered custom decoder supports it, and ' + missingWebCodecsClassMessage('VideoDecoder')
+				: '';
 			throw new Error(
-				'This video track cannot be decoded in this environment. Make sure to check decodability before using'
-				+ ' a track.',
+				`This video track cannot be decoded in this environment.${missingClass} Make sure to check decodability`
+				+ ' before using a track.',
 			);
 		}
 
@@ -2685,14 +2688,17 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		onError: (error: unknown) => unknown,
 	) {
 		if (!(await this._track.canDecode())) {
-			// Only blame the missing class when nothing else could have decoded the track
 			if (typeof AudioDecoder === 'undefined' && customAudioDecoders.length === 0) {
 				throw new Error(missingWebCodecsClassMessage('AudioDecoder'));
 			}
 
+			// Custom decoders were registered then, and none supports this track (say, an extension for other codecs)
+			const missingClass = typeof AudioDecoder === 'undefined'
+				? ' No registered custom decoder supports it, and ' + missingWebCodecsClassMessage('AudioDecoder')
+				: '';
 			throw new Error(
-				'This audio track cannot be decoded in this environment. Make sure to check decodability before using'
-				+ ' a track.',
+				`This audio track cannot be decoded in this environment.${missingClass} Make sure to check decodability`
+				+ ' before using a track.',
 			);
 		}
 
