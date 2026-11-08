@@ -987,6 +987,65 @@ test('MPEG-TS finds frames that come before a run of B-frames longer than the re
 	}
 });
 
+test('MPEG-TS lookups at the end of a stream read through a small cache', async () => {
+	// Found in L15's streamed check. Through a ReadableStreamSource, which keeps only what its cache holds, the data
+	// further back that the search for a frame behind a run of B-frames reads may be gone; the lookup then goes with
+	// what it found. The same x264 SPS (num_reorder_frames 1) and runs of 16 B-frames, with frames of 100 kB, read
+	// through a 1 MiB cache.
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const slice = (header: number, frame: number) => nalUnit([header, 0x88, ...new Array<number>(100_000).fill(frame)]);
+
+	const step = 17;
+	const frameCount = 2 * step + 1;
+	const decodeOrder = [0];
+	for (let anchor = step; anchor < frameCount; anchor += step) {
+		decodeOrder.push(anchor);
+		for (let frame = anchor - 16; frame < anchor; frame++) {
+			decodeOrder.push(frame);
+		}
+	}
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (const frame of decodeOrder) {
+		const isKey = frame === 0;
+		const data = isKey
+			? [...nalUnit(sps), ...nalUnit(pps), ...slice(0x65, frame)]
+			: slice(frame % step === 0 ? 0x41 : 0x01, frame);
+		await source.add(
+			new EncodedPacket(new Uint8Array(data), isKey ? 'key' : 'delta', frame / 25, 1 / 25),
+			isKey ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= bytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(bytes.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 20 }),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.computeDuration()).toBeGreaterThan(0);
+});
+
 test('MPEG-TS lookups find field pictures behind long runs of B-fields', async () => {
 	// From L25's and L80's reviews, like FFmpeg's spatial_direct_mode_is_not_implemented.ts sample: interlaced H.264
 	// (frame_mbs_only_flag 0, a reorder depth of 4 frames) whose fields come in PES packets of their own, each anchor

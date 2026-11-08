@@ -1740,21 +1740,26 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				&& retrieval.pts !== searchPts
 				&& (retrieval.nextPts === null || retrieval.nextPts - retrieval.pts > retrieval.minInterval)
 			) {
-				let rewound = false;
-				const maxCount = this.getPacketsPerFrame() * MAX_CONSECUTIVE_B_FRAMES;
-				for (let i = 0; i < maxCount; i++) {
-					if (
-						lookupWindowIsComplete(visitedPts, searchPts, reorderFrameCount)
-						|| !await rewindByOnePesPacket()
-					) {
-						break;
+				try {
+					let rewound = false;
+					const maxCount = this.getPacketsPerFrame() * MAX_CONSECUTIVE_B_FRAMES;
+					for (let i = 0; i < maxCount; i++) {
+						if (
+							lookupWindowIsComplete(visitedPts, searchPts, reorderFrameCount)
+							|| !await rewindByOnePesPacket()
+						) {
+							break;
+						}
+
+						rewound = true;
 					}
 
-					rewound = true;
-				}
-
-				if (rewound) {
-					packet = await retrieveEncodedPacket(windowStart.sectionStartPos, p => p.pts <= searchPts);
+					if (rewound) {
+						packet = await retrieveEncodedPacket(windowStart.sectionStartPos, p => p.pts <= searchPts);
+					}
+				} catch {
+					// The data further back can't be read anymore (a sequential source, like a ReadableStreamSource,
+					// keeps only what its cache holds), so let's go with the packet found
 				}
 			}
 
