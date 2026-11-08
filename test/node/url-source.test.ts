@@ -20,6 +20,48 @@ import {
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const videoFilePath = path.join(__dirname, '..', 'public/video.mp4');
 
+test('UrlSource sends every value of a header given more than once in a header list', async () => {
+	let received: string | string[] | undefined;
+	let receivedRange: string | undefined;
+	const server = http.createServer((req, res) => {
+		received = req.headers['x-tag'];
+		receivedRange = req.headers.range;
+		const start = Number(/^bytes=(\d+)-$/.exec(req.headers.range ?? '')?.[1] ?? 0);
+		res.writeHead(206, { 'Content-Range': `bytes ${start}-199/200`, 'Content-Length': 200 - start });
+		res.end(Buffer.alloc(200 - start));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const url = `http://localhost:${address.port}/data.bin`;
+
+		const headerLists: [string, string][][] = [[['X-Tag', 'a'], ['X-Tag', 'b']], [['x-tag', 'a'], ['X-Tag', 'b']]];
+		for (const headers of headerLists) {
+			// What fetch() itself sends for this header list: both values
+			await (await fetch(url, { headers })).arrayBuffer();
+			const expected = received;
+			expect(expected).toBe('a, b');
+
+			using ref = new UrlSource(url, { requestInit: { headers } }).ref();
+			await new Reader(ref.source).requestSlice(0, 4);
+			expect(received).toBe(expected);
+		}
+
+		// Range is the exception: UrlSource maps it onto a byte offset, and the last one given is used
+		const rangeHeaders: [string, string][] = [['Range', 'bytes=100-'], ['Range', 'bytes=7-']];
+		using ref = new UrlSource(url, { requestInit: { headers: rangeHeaders } }).ref();
+		await new Reader(ref.source).requestSlice(0, 4);
+		expect(receivedRange).toBe('bytes=7-');
+		expect(await ref.source.getSizeOrNull()).toBe(193);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 test('UrlSource works against a server without range request support', async () => {
 	const server = await startRangelessServer();
 	const logs = captureLogs();
