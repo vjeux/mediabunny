@@ -1550,6 +1550,56 @@ describe('Video', async () => {
 		expect(count).toBe(48);
 	});
 
+	test.each(['avc', 'vp9', 'av1'] as const)('%s encodes frames in the stream\'s color space', async (codec) => {
+		// Six frames of one color, Y/U/V 80/200/90, the first three tagged BT.709 limited range and the last three
+		// BT.601 (smpte170m) full range. The stream's color space comes from the first frame, so the others must be
+		// converted to it rather than encoded as they are.
+		const bt709Limited = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false } as const;
+		const bt601Full = {
+			primaries: 'smpte170m',
+			transfer: 'smpte170m',
+			matrix: 'smpte170m',
+			fullRange: true,
+		} as const;
+		// What Y/U/V 80/200/90 is in RGB with either (H.273)
+		const expectedRgb = [[5, 78, 226], [27, 82, 208]];
+
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec, bitrate: 2e6 });
+		output.addVideoTrack(source);
+		await output.start();
+		for (let i = 0; i < 6; i++) {
+			const data = new Uint8Array(64 * 64 * 3 / 2);
+			data.fill(80, 0, 64 * 64);
+			data.fill(200, 64 * 64, 64 * 64 * 5 / 4);
+			data.fill(90, 64 * 64 * 5 / 4);
+			using sample = new VideoSample(data, {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+				colorSpace: i < 3 ? bt709Limited : bt601Full,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		let i = 0;
+		for await (using sample of new VideoSampleSink((await input.getPrimaryVideoTrack())!).samples()) {
+			const rgba = new Uint8Array(64 * 64 * 4);
+			await sample.copyTo(rgba, { format: 'RGBA' });
+			const center = (32 * 64 + 32) * 4;
+			const expected = expectedRgb[i < 3 ? 0 : 1]!;
+			for (let c = 0; c < 3; c++) {
+				expect(Math.abs(rgba[center + c]! - expected[c]!), `frame ${i}`).toBeLessThanOrEqual(4);
+			}
+			i++;
+		}
+		expect(i).toBe(6);
+	});
+
 	describe('VideoSample transformation', () => {
 		// 400x400 image: red everywhere, with a 200x200 blue square filling the bottom-left quadrant.
 		const TEST_IMAGE = (() => {
