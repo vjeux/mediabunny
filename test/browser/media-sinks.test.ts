@@ -6,6 +6,7 @@ import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
@@ -275,4 +276,72 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test('Video whose last frame was cut short decodes all other frames', async () => {
+	// The first 40 frames of video.mp4 in MPEG-TS, the file cut one TS packet into the last frame, as a recording
+	// that stopped mid-frame leaves it. Chromium's decoder fails its flush on the truncated frame, losing the frames it
+	// still held, so that samples() threw after 37 frames (found by lanes L15 and L80 in real files).
+	using mp4 = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+	const decoderConfig = await mp4Track.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		await source.add(packet, packetCount === 0 ? { decoderConfig } : undefined);
+		if (++packetCount === 40) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	// The last TS packet starting a video PES (payload_unit_start_indicator set, stream ID 0xe0) starts the last frame
+	const bytes = new Uint8Array(output.target.buffer!);
+	let lastFrameOffset = -1;
+	for (let offset = 0; offset < bytes.length; offset += 188) {
+		const payloadOffset = offset + 4 + ((bytes[offset + 3]! & 0x20) ? 1 + bytes[offset + 4]! : 0);
+		if ((bytes[offset + 1]! & 0x40) && bytes[payloadOffset + 3] === 0xe0) {
+			lastFrameOffset = offset;
+		}
+	}
+	assert(lastFrameOffset !== -1);
+
+	using input = new Input({
+		source: new BufferSource(bytes.slice(0, lastFrameOffset + 188)),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packetTimestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packetTimestamps.push(packet.timestamp);
+	}
+	expect(packetTimestamps).toHaveLength(40);
+	const cutTimestamp = packetTimestamps.at(-1)!;
+	const otherTimestamps = packetTimestamps.slice(0, -1).sort((a, b) => a - b);
+
+	// All frames but the cut one, which a decoder can also decode as far as it goes
+	const sink = new VideoSampleSink(track);
+	const timestamps: number[] = [];
+	for await (using sample of sink.samples()) {
+		timestamps.push(sample.timestamp);
+	}
+	expect(timestamps.filter(x => x !== cutTimestamp)).toEqual(otherTimestamps);
+
+	const queries = [...otherTimestamps, cutTimestamp].sort((a, b) => a - b);
+	let index = 0;
+	for await (using sample of sink.samplesAtTimestamps(queries)) {
+		assert(sample);
+		const query = queries[index++]!;
+		if (query !== cutTimestamp) {
+			expect(sample.timestamp).toBe(query);
+		}
+	}
+	expect(index).toBe(queries.length);
 });
