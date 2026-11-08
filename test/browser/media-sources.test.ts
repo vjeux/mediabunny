@@ -19,6 +19,57 @@ import { EncodedPacket } from '../../src/packet.js';
 import { assert, Rotation, toDataView } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
+// First in this file on purpose: the priming of an encoder is only measured for its first use on the page
+test('AudioSampleSource, encoding starts even when measuring the encoder\'s priming hangs', async () => {
+	// The measurement decodes the encoder's output, and some platform decoders never finish flushing (WebKitGTK's
+	// Vorbis decoder). Emulated by an AudioDecoder whose flush() never settles
+	let decoderCount = 0;
+	const RealAudioDecoder = AudioDecoder;
+	globalThis.AudioDecoder = class extends RealAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			super(init);
+			decoderCount++;
+		}
+
+		override flush() {
+			return new Promise<void>(() => {});
+		}
+	};
+
+	const encode = async () => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+
+		using sample = new AudioSample({
+			data: new Float32Array(960),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		await output.finalize();
+		return 'finalized';
+	};
+
+	try {
+		for (let i = 1; i <= 2; i++) {
+			expect(await Promise.race([
+				encode(),
+				new Promise(resolve => setTimeout(() => resolve('hung'), 6000)),
+			])).toBe('finalized');
+
+			// The timed-out measurement isn't remembered, so the next encoder measures again (and nothing stays cached
+			// for the tests after this one)
+			expect(decoderCount).toBe(i);
+		}
+	} finally {
+		globalThis.AudioDecoder = RealAudioDecoder;
+	}
+}, 15_000);
+
 test('VideoSampleSource, normal usage', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium') },

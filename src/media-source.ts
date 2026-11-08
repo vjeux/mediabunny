@@ -3300,6 +3300,7 @@ class AudioEncoderWrapper {
 }
 
 const audioEncoderPrimingShiftPromises = new Map<string, Promise<number>>();
+const AUDIO_ENCODER_PRIMING_MEASUREMENT_TIMEOUT = 3000; // In milliseconds
 
 // WebCodecs audio encoders have encoder priming delay but don't surface this delay whatsoever, meaning they typically
 // just emit audio at incorrect timestamps. This priming delay depends heavily on the browser-OS combo, so instead of
@@ -3372,6 +3373,21 @@ const detectAudioEncoderPrimingShift = (
 			},
 		});
 
+		// The measurement relies on the platform's codecs, which can hang (WebKitGTK's Vorbis decoder never finishes
+		// flushing), so it gives up after a while rather than never letting the encoding start
+		let timedOut = false;
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<void>((resolve) => {
+			timeoutId = setTimeout(() => {
+				timedOut = true;
+				resolve();
+			}, AUDIO_ENCODER_PRIMING_MEASUREMENT_TIMEOUT);
+		});
+		const withinDeadline = async (promise: Promise<void>) => {
+			promise.catch(() => {}); // Rejects when the codec gets closed after the deadline
+			await Promise.race([promise, deadline]);
+		};
+
 		try {
 			encoder.configure(encoderConfig);
 
@@ -3393,26 +3409,46 @@ const detectAudioEncoderPrimingShift = (
 			encoder.encode(audioData);
 			audioData.close();
 
-			await encoder.flush();
+			await withinDeadline(encoder.flush());
 
-			assert(decoderConfig);
-			fixAudioDecoderConfig(codec, encoderConfig, decoderConfig);
+			if (!timedOut) {
+				assert(decoderConfig);
+				fixAudioDecoderConfig(codec, encoderConfig, decoderConfig);
 
-			decoder.configure(decoderConfig);
-			for (const chunk of chunks) {
-				decoder.decode(chunk);
+				decoder.configure(decoderConfig);
+				for (const chunk of chunks) {
+					decoder.decode(chunk);
+				}
+
+				await withinDeadline(decoder.flush());
 			}
-
-			await decoder.flush();
 		} catch (error) {
 			throw codecError ?? error;
 		} finally {
+			clearTimeout(timeoutId);
+
 			if (encoder.state !== 'closed') {
 				encoder.close();
 			}
 			if (decoder.state !== 'closed') {
 				decoder.close();
 			}
+		}
+
+		if (timedOut) {
+			Logging._warn(
+				`Measuring the priming of the ${codecString} encoder timed out; assuming none, so the encoded audio may`
+				+ ` be shifted by the encoder's delay.`,
+			);
+
+			// Not remembered, as the platform may just have been slow (found by identity rather than by key, so that
+			// this doesn't depend on how the cache is keyed)
+			for (const [key, value] of audioEncoderPrimingShiftPromises) {
+				if (value === promise) {
+					audioEncoderPrimingShiftPromises.delete(key);
+				}
+			}
+			return 0;
 		}
 
 		assert(peakIndex !== null);
