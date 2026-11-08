@@ -785,3 +785,23 @@ test.for(['/Toothsome-Meme.VBRv2.mp3', '/sample.flac'])(
 		}
 	},
 );
+
+test('Empty sample ranges yield nothing', async () => {
+	using input = new Input({
+		source: new UrlSource('/video.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sink = new VideoSampleSink(track);
+	for (const [start, end] of [[1, 1], [1, 0.5]] as const) {
+		const timestamps: number[] = [];
+		for await (using sample of sink.samples(start, end)) {
+			timestamps.push(sample.timestamp);
+		}
+
+		expect(timestamps).toEqual([]);
+	}
+});
