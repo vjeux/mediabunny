@@ -197,6 +197,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (!lines) {
 			using ref = await this.demuxer.input._getSourceUncached({ path: this.rootPath, isRoot: false });
 			const reader = new Reader(ref.source);
+			// A pathed source's own path only changes while loading if it was redirected
+			const pathBeforeLoading = ref.source instanceof PathedSource ? ref.source.rootPath : null;
 
 			// Check the start first, so that we don't read some (potentially huge) file in its entirety that isn't even
 			// a playlist
@@ -214,8 +216,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 			assert(slice);
 			lines = readAllLines(slice, slice.length, { ignore: canIgnoreLine });
 
-			if (ref.source instanceof PathedSource) {
-				// Copy back the source's path to become aware of potential redirects
+			if (ref.source instanceof PathedSource && ref.source.rootPath !== pathBeforeLoading) {
+				// Copy back the source's path to become aware of the redirect. Otherwise, the requested path stays the
+				// base: a CustomPathedSource's resolver may serve it from elsewhere (e.g. a FilePathSource in some
+				// directory), and the paths it receives should stay in one namespace.
 				this.rootPath = ref.source.rootPath;
 			}
 		}
