@@ -7,9 +7,14 @@
   "module": "./dist/bundles/mediabunny-prores.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
-    "types": "./dist/modules/src/index.d.ts",
-    "import": "./dist/bundles/mediabunny-prores.mjs",
-    "require": "./dist/bundles/mediabunny-prores.cjs"
+    "import": {
+      "types": "./dist/mediabunny-prores.d.mts",
+      "default": "./dist/bundles/mediabunny-prores.mjs"
+    },
+    "require": {
+      "types": "./dist/modules/src/index.d.ts",
+      "default": "./dist/bundles/mediabunny-prores.cjs"
+    }
   },
   "files": [
     "README.md",

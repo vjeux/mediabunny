@@ -7,9 +7,14 @@
   "module": "./dist/bundles/mediabunny-mp3-encoder.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
-    "types": "./dist/modules/src/index.d.ts",
-    "import": "./dist/bundles/mediabunny-mp3-encoder.mjs",
-    "require": "./dist/bundles/mediabunny-mp3-encoder.cjs"
+    "import": {
+      "types": "./dist/mediabunny-mp3-encoder.d.mts",
+      "default": "./dist/bundles/mediabunny-mp3-encoder.mjs"
+    },
+    "require": {
+      "types": "./dist/modules/src/index.d.ts",
+      "default": "./dist/bundles/mediabunny-mp3-encoder.cjs"
+    }
   },
   "files": [
     "README.md",

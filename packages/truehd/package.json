@@ -7,9 +7,14 @@
   "module": "./dist/bundles/mediabunny-truehd.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
-    "types": "./dist/modules/src/index.d.ts",
-    "import": "./dist/bundles/mediabunny-truehd.mjs",
-    "require": "./dist/bundles/mediabunny-truehd.cjs"
+    "import": {
+      "types": "./dist/mediabunny-truehd.d.mts",
+      "default": "./dist/bundles/mediabunny-truehd.mjs"
+    },
+    "require": {
+      "types": "./dist/modules/src/index.d.ts",
+      "default": "./dist/bundles/mediabunny-truehd.cjs"
+    }
   },
   "files": [
     "README.md",

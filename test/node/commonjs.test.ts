@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import { expect, test } from 'vitest';
 
 // Runs in a child process because vitest resolves these packages through aliases, while this needs Node's own
@@ -71,3 +72,35 @@ test('Extensions loaded with require() register with the CommonJS build of Media
 		logged: [], // No "Mediabunny was loaded twice"
 	});
 }, 60_000);
+
+test('Extensions\' ESM and CommonJS entries come with declarations of their own module format', () => {
+	// TypeScript reads .d.ts files of packages that aren't "type": "module" as CommonJS, and .d.mts files as ESM. With
+	// one .d.ts for both entries, it would allow `import x from '@mediabunny/…'` in ESM, which Node rejects.
+	for (const dir of fs.readdirSync('packages')) {
+		const pkg = JSON.parse(fs.readFileSync(`packages/${dir}/package.json`, 'utf8')) as {
+			name: string;
+			type?: string;
+			exports: Record<string, Record<string, string>>;
+		};
+		expect(pkg.type, pkg.name).toBeUndefined();
+		expect(pkg.exports, pkg.name).toEqual({
+			import: {
+				types: `./dist/mediabunny-${dir}.d.mts`,
+				default: `./dist/bundles/mediabunny-${dir}.mjs`,
+			},
+			require: {
+				types: './dist/modules/src/index.d.ts',
+				default: `./dist/bundles/mediabunny-${dir}.cjs`,
+			},
+		});
+	}
+
+	// The build creates the ESM declarations from each extension's declaration rollup
+	const buildScript = fs.readFileSync('scripts/build.sh', 'utf8');
+	expect(buildScript).toContain(
+		'cp packages/$name/dist/mediabunny-$name.d.ts packages/$name/dist/mediabunny-$name.d.mts',
+	);
+	for (const dir of fs.readdirSync('packages')) {
+		expect(buildScript, dir).toMatch(new RegExp(`for name in [a-z0-9 -]*\\b${dir}\\b`));
+	}
+});
