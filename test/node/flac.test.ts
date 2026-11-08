@@ -18,6 +18,63 @@ import { EncodedPacket } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
+test('reads frames whose header gives the sample rate in kHz', async () => {
+	const crc8 = (bytes: number[]) => {
+		let crc = 0;
+		for (const byte of bytes) {
+			crc ^= byte;
+			for (let i = 0; i < 8; i++) {
+				crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+			}
+		}
+		return crc;
+	};
+	const crc16 = (bytes: number[]) => {
+		let crc = 0;
+		for (const byte of bytes) {
+			crc ^= byte << 8;
+			for (let i = 0; i < 8; i++) {
+				crc = crc & 0x8000 ? ((crc << 1) ^ 0x8005) & 0xffff : (crc << 1) & 0xffff;
+			}
+		}
+		return crc;
+	};
+
+	// Mono 8-bit silence in VERBATIM frames of 192 samples. The frame header gives the sample rate with its code and
+	// the bytes after the frame number (RFC 9639, section 9.1.2): code 0b1100 is the rate in kHz, as FFmpeg and libFLAC
+	// write for 12, 39, 44 and 64 kHz, for example, and 0b1101 the rate in Hz.
+	const flacFile = (sampleRate: number, rateCode: number, rateBytes: number[]) => {
+		const streamInfo = [0x00, 0xc0, 0x00, 0xc0, 0, 0, 0, 0, 0, 0]; // Block sizes 192, frame sizes unknown
+		const packed = (BigInt(sampleRate) << 44n) | (7n << 36n) | BigInt(192 * 5); // Mono, 8 bits per sample
+		for (let i = 7; i >= 0; i--) {
+			streamInfo.push(Number((packed >> BigInt(8 * i)) & 0xffn));
+		}
+		streamInfo.push(...new Array<number>(16).fill(0)); // MD5
+		const bytes = [0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34, ...streamInfo]; // 'fLaC', last block: STREAMINFO
+		for (let frameNumber = 0; frameNumber < 5; frameNumber++) {
+			const header = [0xff, 0xf8, 0x10 | rateCode, 0x02, frameNumber, ...rateBytes];
+			header.push(crc8(header));
+			const frame = [...header, 0x02, ...new Array<number>(192).fill(0)];
+			const crc = crc16(frame);
+			bytes.push(...frame, crc >> 8, crc & 0xff);
+		}
+		return new Uint8Array(bytes);
+	};
+
+	for (const [sampleRate, rateCode, rateBytes] of [[12000, 0b1100, [12]], [35000, 0b1101, [0x88, 0xb8]]] as const) {
+		const bytes = flacFile(sampleRate, rateCode, [...rateBytes]);
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.duration).toBeCloseTo(192 / sampleRate, 9);
+			packetCount++;
+		}
+		expect(packetCount).toBe(5);
+	}
+});
+
 test('can loop over all samples', async () => {
 	const filePath = path.join(__dirname, '..', 'public/sample.flac');
 	using input = new Input({
