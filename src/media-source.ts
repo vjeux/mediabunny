@@ -139,10 +139,10 @@ export abstract class MediaSource {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async _flushAndClose(forceClose: boolean) {}
 	/**
-	 * Stops waiting for the samples added so far to be processed and drops them, so that a process function call (or,
-	 * with `always`, an encoder initialization) that never settles can't hold finalization or a graceful close up
-	 * forever. Called when the output is canceled while finalizing, where it only applies with a process function call
-	 * in flight, and with `always` when a graceful close is under way as the output gets canceled.
+	 * Stops waiting for the samples added so far to be processed and drops them, so that a process function call or an
+	 * encoder initialization that never settles can't hold finalization or a graceful close up forever. Called when
+	 * the output is canceled while finalizing, where it only applies with such a call or initialization in flight, and
+	 * with `always` when a graceful close is under way as the output gets canceled.
 	 * @internal
 	 */
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -1228,12 +1228,20 @@ class VideoEncoderWrapper {
 	}
 
 	/**
-	 * Stops waiting for a process function call still in flight, and drops the samples queued behind it. Without one,
-	 * nothing holds them up, so this does nothing and they all still go in, unless `always` is set (the output is being
-	 * canceled, and something else, like an encoder initialization, may hold them up).
+	 * Whether the samples added so far are held up by something that may never finish: a process function call or an
+	 * encoder initialization in flight.
+	 */
+	isHeldUp() {
+		return this.processCallsInFlight > 0 || (this.ensureEncoderPromise !== null && !this.encoderInitialized);
+	}
+
+	/**
+	 * Stops waiting for a process function call or an encoder initialization still in flight, and drops the samples
+	 * queued behind it. Without either, nothing holds them up, so this does nothing and they all still go in, unless
+	 * `always` is set (the output is being canceled).
 	 */
 	cancelPendingAdds(always = false) {
-		if (!always && this.processCallsInFlight === 0) {
+		if (!always && !this.isHeldUp()) {
 			return;
 		}
 

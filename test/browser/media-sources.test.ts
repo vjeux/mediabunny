@@ -1066,3 +1066,43 @@ test('VideoSampleSource, cancel() after close() gets out of an encoder setup tha
 		stuckInitEncoderActive = false;
 	}
 });
+
+test('VideoSampleSource, cancel() while finalizing gets out of an encoder setup that never finishes', async () => {
+	stuckInitEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('low'),
+		});
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		for (let i = 0; i < 2; i++) {
+			void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+				format: 'RGBA',
+				codedWidth: 160,
+				codedHeight: 120,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			})).catch(() => {});
+		}
+
+		const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'fulfilled', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		// Finalizing waits for the frames added before it, which wait for the encoder, until the output is canceled,
+		// which drops them and lets finalization go on
+		const finalized = output.finalize();
+		await new Promise(resolve => setTimeout(resolve, 50));
+		await output.cancel();
+		expect(await stateAfter(finalized, 1000)).not.toBe('pending');
+	} finally {
+		stuckInitEncoderActive = false;
+	}
+});
