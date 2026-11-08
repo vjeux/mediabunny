@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { isRecordStringString } from './misc';
+import { isRecordStringString, isUint8Array, uint8ArrayFromOtherRealm } from './misc';
 
 /**
  * Represents descriptive (non-technical) metadata about a media file, such as title, author, date, cover art, or other
@@ -175,6 +175,8 @@ export class RichImageData {
 		/** An RFC 6838 MIME type (e.g. image/jpeg, image/png, etc.) */
 		public mimeType: string,
 	) {
+		data = uint8ArrayFromOtherRealm(data); // instanceof Uint8Array rejects Uint8Arrays of other realms
+		this.data = data;
 		if (!(data instanceof Uint8Array)) {
 			throw new TypeError('data must be a Uint8Array.');
 		}
@@ -202,6 +204,8 @@ export class AttachedFile {
 		/** A description of the file. */
 		public description?: string,
 	) {
+		data = uint8ArrayFromOtherRealm(data); // instanceof Uint8Array rejects Uint8Arrays of other realms
+		this.data = data;
 		if (!(data instanceof Uint8Array)) {
 			throw new TypeError('data must be a Uint8Array.');
 		}
@@ -215,6 +219,44 @@ export class AttachedFile {
 			throw new TypeError('description, when provided, must be a string.');
 		}
 	}
+};
+
+/**
+ * Returns the tags with their Uint8Arrays created in another realm (see {@link uint8ArrayFromOtherRealm}) replaced by
+ * ones of this realm over the same memory, as the writers check for Uint8Array. Copies only what it changes.
+ */
+export const localizeMetadataTagBytes = (tags: MetadataTags): MetadataTags => {
+	let result = tags;
+
+	if (tags.images?.some(image => uint8ArrayFromOtherRealm(image.data) !== image.data)) {
+		result = {
+			...result,
+			images: tags.images.map(image => ({ ...image, data: uint8ArrayFromOtherRealm(image.data) })),
+		};
+	}
+
+	if (tags.raw) {
+		let raw: NonNullable<MetadataTags['raw']> | null = null;
+		for (const key in tags.raw) {
+			const value = tags.raw[key]!;
+			const localized = Array.isArray(value)
+				? (value as unknown[]).map(item => uint8ArrayFromOtherRealm(item))
+				: uint8ArrayFromOtherRealm(value);
+			const changed = Array.isArray(value)
+				? (localized as unknown[]).some((item, i) => item !== value[i])
+				: localized !== value;
+			if (changed) {
+				raw ??= { ...tags.raw };
+				raw[key] = localized as typeof value;
+			}
+		}
+
+		if (raw) {
+			result = { ...result, raw };
+		}
+	}
+
+	return result;
 };
 
 export const validateMetadataTags = (tags: MetadataTags) => {
@@ -284,7 +326,7 @@ export const validateMetadataTags = (tags: MetadataTags) => {
 			if (!image || typeof image !== 'object') {
 				throw new TypeError('Each image in tags.images must be an object.');
 			}
-			if (!(image.data instanceof Uint8Array)) {
+			if (!isUint8Array(image.data)) {
 				throw new TypeError('Each image.data must be a Uint8Array.');
 			}
 			if (typeof image.mimeType !== 'string') {
@@ -308,8 +350,8 @@ export const validateMetadataTags = (tags: MetadataTags) => {
 				value !== null
 				&& typeof value !== 'string'
 				&& !(Array.isArray(value) && value.every(x => typeof x === 'string'))
-				&& !(value instanceof Uint8Array)
-				&& !(Array.isArray(value) && value.every(x => x instanceof Uint8Array))
+				&& !isUint8Array(value)
+				&& !(Array.isArray(value) && value.every(x => isUint8Array(x)))
 				&& !(value instanceof RichImageData)
 				&& !(value instanceof AttachedFile)
 				&& !isRecordStringString(value)
