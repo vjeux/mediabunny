@@ -998,7 +998,8 @@ export class Output<
 	 *
 	 * While the output is finalizing, this instead stops waiting for a `process` function call still in flight and
 	 * drops the samples queued behind it, so that a call that never settles can't hold finalization up forever (without
-	 * such a call, nothing is dropped); the returned promise then resolves once finalization has completed.
+	 * such a call, nothing is dropped). Finalization then goes on by itself, and the returned promise resolves right
+	 * away.
 	 *
 	 * @returns A promise that resolves once all internal resources have been released.
 	 */
@@ -1011,12 +1012,12 @@ export class Output<
 		} else if (this.state === 'finalizing') {
 			// Finalization waits for the samples added before it to be processed, which a process function call that
 			// never settles would hold up forever. Stop waiting for such a call and drop the samples queued behind it,
-			// so that finalization can complete.
+			// so that finalization can go on. Don't wait for it here, though: something else, like a target whose
+			// sink stopped completing writes, may hold it up as well.
 			for (const track of this.tracks) {
 				track.source._cancelPendingAdds();
 			}
 
-			await this._finalizePromise?.catch(() => {});
 			return;
 		}
 
