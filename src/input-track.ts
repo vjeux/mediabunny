@@ -142,6 +142,11 @@ export interface InputTrackBacking {
 	getLiveRefreshInterval(): Promise<number | null>;
 	getHasOnlyKeyPackets?(): MaybePromise<boolean | null>;
 	getDecoderConfig(): Promise<VideoDecoderConfig | AudioDecoderConfig | null>;
+	/**
+	 * The decoder config a packet needs when it's not the track's, as for HLS segments after a discontinuity with a new
+	 * init section. Returns null for packets that use the track's decoder config.
+	 */
+	getDecoderConfigForPacket?(packet: EncodedPacket): VideoDecoderConfig | AudioDecoderConfig | null;
 	getMetadataCodecParameterString?(): MaybePromise<string | null>;
 
 	getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null>;

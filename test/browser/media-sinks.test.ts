@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -1133,4 +1133,61 @@ test('Decoding with a hardware acceleration the decoder refuses fails with the d
 
 	using sample = await new VideoSampleSink(track, { hardwareAcceleration: 'prefer-software' }).getSample(0);
 	expect(sample?.timestamp).toBe(0);
+});
+
+test('HLS: video after a discontinuity with a new EXT-X-MAP decodes with its own parameter sets', async () => {
+	// Two x264 encodes with different SPS/PPS (64x48 baseline, then 96x96 high), the way an ad break stitched into a
+	// stream brings its own init section
+	using input = new Input({ source: new UrlSource('/hls-disc/disc.m3u8'), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const sizes: string[] = [];
+	for await (const sample of new VideoSampleSink(videoTrack).samples()) {
+		sizes.push(`${sample.codedWidth}x${sample.codedHeight}`);
+		sample.close();
+	}
+
+	expect(sizes).toEqual([...Array<string>(10).fill('64x48'), ...Array<string>(10).fill('96x96')]);
+});
+
+test('HLS: video returning from an ad break to the first EXT-X-MAP decodes with its parameter sets', async () => {
+	// Content, an ad break with its own init section, then content with the first init section again: the decoder has
+	// just received the ad's parameter sets under the same IDs, so the returning content must send its own
+	using input = new Input({ source: new UrlSource('/hls-disc/disc-return.m3u8'), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const sink = new VideoSampleSink(videoTrack);
+
+	// The decoder is also reconfigured at each switch, for decoders that don't apply new parameter sets from the
+	// bitstream (WebKit's keeps the first resolution)
+	const configuredSizes: string[] = [];
+	const configureSpy = vi.spyOn(VideoDecoder.prototype, 'configure');
+
+	const sizes: string[] = [];
+	try {
+		for await (const sample of sink.samples()) {
+			sizes.push(`${sample.codedWidth}x${sample.codedHeight}`);
+			sample.close();
+		}
+	} finally {
+		for (const [config] of configureSpy.mock.calls) {
+			configuredSizes.push(`${config.codedWidth}x${config.codedHeight}`);
+		}
+		configureSpy.mockRestore();
+	}
+	expect(configuredSizes).toEqual(['64x48', '96x96', '64x48']);
+	expect(sizes).toEqual([
+		...Array<string>(10).fill('64x48'),
+		...Array<string>(10).fill('96x96'),
+		...Array<string>(10).fill('64x48'),
+	]);
+
+	// Lookups that jump back and forth across the ad break in one decoding run
+	const lookups: (string | null)[] = [];
+	for await (const sample of sink.samplesAtTimestamps([1.5, 0.5, 2.5, 1.2])) {
+		lookups.push(sample && `${sample.codedWidth}x${sample.codedHeight}`);
+		sample?.close();
+	}
+	expect(lookups).toEqual(['96x96', '64x48', '64x48', '96x96']);
 });
