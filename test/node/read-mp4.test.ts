@@ -4178,3 +4178,72 @@ test('Sample auxiliary information with one saio offset per track run or chunk',
 		expect(packets).toEqual(plaintexts);
 	}
 });
+
+test('A failed key resolution is tried again for later samples', async () => {
+	// E.g. a license server that's briefly unreachable: the next packet read asks resolveKeyId again
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const encv = box('encv', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(12), [0, 1], zeros(32),
+		[0, 24, 0xff, 0xff], box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+		box('sinf', box('frma', ascii('avc1')), box('schm', u32(0), ascii('cenc'), u32(0x10000)),
+			box('schi', box('tenc', u32(0), [0, 0, 1, 8], zeros(16)))));
+	const plaintext = [0, 0, 0, 12, 0x65, ...zeros(12)];
+	const iv = [...zeros(7), 1];
+	const ciphertext = [...createCipheriv('aes-128-ctr', key, Buffer.from([...iv, ...zeros(8)]))
+		.update(Buffer.from(plaintext))];
+	const moof = (dataOffset: number) => box('moof', box('mfhd', u32(0), u32(1)), box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(ciphertext.length)),
+		box('senc', u32(0), u32(1), iv),
+	));
+	const file = new Uint8Array([
+		...box('ftyp', ascii('iso6'), u32(0)),
+		...box('moov',
+			box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(1), encv),
+						box('stts', zeros(8)),
+						box('stsc', zeros(8)),
+						box('stsz', zeros(12)),
+						box('stco', zeros(8)),
+					)),
+				),
+			),
+			box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+		),
+		...moof(moof(0).length + 8),
+		...box('mdat', ciphertext),
+	]);
+
+	let resolveCount = 0;
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+		formatOptions: { isobmff: { resolveKeyId: () => {
+			resolveCount++;
+			if (resolveCount === 1) {
+				throw new Error('License server unavailable');
+			}
+			return key;
+		} } },
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	await expect(sink.getFirstPacket()).rejects.toThrow('License server unavailable');
+	expect([...(await sink.getFirstPacket())!.data]).toEqual(plaintext);
+	expect(resolveCount).toBe(2);
+});
