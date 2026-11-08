@@ -7,9 +7,10 @@
  */
 
 import { validateAudioChunkMetadata } from '../codec';
-import { createVorbisComments, FlacBlockType } from '../codec-data';
+import { createVorbisComments, FlacBlockType, getRawPictureLinks } from '../codec-data';
 import {
 	assert,
+	base64ToBytes,
 	textEncoder,
 	toDataView,
 	toUint8Array,
@@ -277,9 +278,33 @@ export class FlacMuxer extends Muxer {
 			this.writePictureBlock(picture);
 		}
 
+		// Picture links (media type "-->") aren't among the images, but among the raw tags as METADATA_BLOCK_PICTURE
+		// comments, which hold PICTURE blocks. So let's write them as such, and not into the Vorbis comment block.
+		const links = getRawPictureLinks(this.output._metadataTags);
+		for (const link of links) {
+			const block = base64ToBytes(link);
+			const headerBitstream = new Bitstream(new Uint8Array(4));
+			headerBitstream.writeBits(1, 0); // Last metadata block -> false, will be continued by vorbis comment
+			headerBitstream.writeBits(7, FlacBlockType.PICTURE); // Type -> Picture
+			headerBitstream.writeBits(24, block.length);
+			this.writer.write(headerBitstream.bytes);
+			this.writer.write(block);
+		}
+
+		const tags = { ...this.output._metadataTags };
+		const rawPictures = tags.raw?.['METADATA_BLOCK_PICTURE'];
+		if (links.length > 0 && rawPictures !== undefined) {
+			const otherRawPictures = (Array.isArray(rawPictures) ? rawPictures as unknown[] : [rawPictures])
+				.filter(x => !links.includes(x as string));
+			tags.raw = { ...tags.raw, METADATA_BLOCK_PICTURE: otherRawPictures as string[] };
+			if (otherRawPictures.length === 0) {
+				delete tags.raw['METADATA_BLOCK_PICTURE'];
+			}
+		}
+
 		const vorbisComment = createVorbisComments(
 			new Uint8Array(0),
-			this.output._metadataTags,
+			tags,
 			false,
 		);
 
