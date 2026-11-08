@@ -762,6 +762,18 @@ const DEFAULT_RETRY_DELAY
 const warnedOrigins = new Set<string>();
 
 /**
+ * Whether the body of a response has a content coding, in which case its Content-Range and Content-Length count
+ * encoded bytes. "identity" isn't one: RFC 9110 reserves it as a synonym for "no encoding".
+ */
+const hasContentCoding = (response: Response) => {
+	const value = response.headers.get('Content-Encoding');
+	return value !== null && value.split(',').some((coding) => {
+		const normalized = coding.trim().toLowerCase();
+		return normalized !== '' && normalized !== 'identity';
+	});
+};
+
+/**
  * Options for {@link UrlSource}.
  * @group Input sources
  * @public
@@ -1081,7 +1093,7 @@ export class UrlSource extends PathedSource {
 				// Content-Range/Length fields are meaningless if Content-Encoding is present: they count encoded
 				// bytes, while the reader addresses decoded ones. This holds for 206 responses too - some CDNs do
 				// answer range requests with a content coding, stating the compressed total (stupid!)
-				&& !response.headers.has('Content-Encoding')
+				&& !hasContentCoding(response)
 				// CORS requests may have Content-Encoding but they hide it from us
 				&& (response.status === 206 || response.type === 'basic')
 			) {
@@ -1161,7 +1173,7 @@ export class UrlSource extends PathedSource {
 			// requested position; Chromium's media loader handles such responses the same way. Content-Range counts
 			// encoded bytes when Content-Encoding is present, so it can't be used then.
 			let bytesToSkip = 0;
-			const enclosedRange = response.headers.has('Content-Encoding')
+			const enclosedRange = hasContentCoding(response)
 				? null
 				: parseContentRange(response.headers.get('Content-Range'));
 			if (enclosedRange) {
@@ -1289,7 +1301,7 @@ export class UrlSource extends PathedSource {
 		let length: number | null = null;
 
 		// Lengths count encoded bytes when Content-Encoding is present (and CORS responses may hide that header)
-		if (!response.headers.has('Content-Encoding')) {
+		if (!hasContentCoding(response)) {
 			if (response.status === 206) {
 				const match = /\/(\d+)\s*$/.exec(response.headers.get('Content-Range') ?? '');
 				length = match ? Number(match[1]) : null; // A complete length of '*' is unknown
@@ -1392,7 +1404,7 @@ export class UrlSource extends PathedSource {
 						// we need to skip over everything we already delivered. Cursed! A 206 response states
 						// where its range starts, which may lie before the requested position.
 						if (newResponse.status === 206) {
-							const enclosedRange = newResponse.headers.has('Content-Encoding')
+							const enclosedRange = hasContentCoding(newResponse)
 								? null
 								: parseContentRange(newResponse.headers.get('Content-Range'));
 							const rangeStart = enclosedRange?.start ?? streamPosition;
