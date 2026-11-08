@@ -496,7 +496,10 @@ export type BlobSourceOptions = {
 	 */
 	useStreamReader?: boolean;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -741,7 +744,10 @@ export type UrlSourceOptions = {
 	 */
 	fetchFn?: typeof fetch;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -1359,7 +1365,10 @@ export type FilePathSourceOptions = {
 	/** The maximum number of bytes the cache is allowed to hold in memory. Defaults to 8 MiB. */
 	maxCacheSize?: number;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -1496,7 +1505,10 @@ export type CustomSourceOptions = {
 	 */
 	prefetchProfile?: 'none' | 'fileSystem' | 'network';
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -1731,6 +1743,19 @@ type SlicePart = {
 };
 
 /**
+ * Reports an error from a read nobody is waiting for, such as one prefetching data ahead of the reads. Throwing it
+ * would make it an unhandled rejection, which terminates a Node.js process. A read that needs the data requests it
+ * again, and gets any error itself.
+ */
+const reportUnawaitedError = (error: unknown, handleUnhandledError: ((error: unknown) => unknown) | undefined) => {
+	if (handleUnhandledError) {
+		handleUnhandledError(error);
+	} else {
+		Logging._error('A background read failed; the data will be requested again when a read needs it.', error);
+	}
+};
+
+/**
  * Options for {@link ReadableStreamSource}.
  * @group Input sources
  * @public
@@ -1739,7 +1764,10 @@ export type ReadableStreamSourceOptions = {
 	/** The maximum number of bytes the cache is allowed to hold in memory. Defaults to 32 MiB. */
 	maxCacheSize?: number;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -1900,10 +1928,8 @@ export class ReadableStreamSource extends Source {
 					if (this._pendingSlices.length > 0) {
 						this._pendingSlices.forEach(x => x.reject(error)); // Make sure to propagate any errors
 						this._pendingSlices.length = 0;
-					} else if (this._handleUnhandledError) {
-						this._handleUnhandledError(error);
 					} else {
-						throw error; // So it doesn't get swallowed
+						reportUnawaitedError(error, this._handleUnhandledError);
 					}
 				});
 		}
@@ -2353,11 +2379,7 @@ class ReadOrchestrator {
 				}
 
 				// Nobody's awaiting this result but an errored read is still notable
-				if (this.options.handleUnhandledError) {
-					this.options.handleUnhandledError(error);
-				} else {
-					throw error;
-				}
+				reportUnawaitedError(error, this.options.handleUnhandledError);
 			});
 		}
 
@@ -2475,11 +2497,7 @@ class ReadOrchestrator {
 					worker.pendingSlices.forEach(x => x.reject(error)); // Make sure to propagate any errors
 					worker.pendingSlices.length = 0;
 				} else if (!worker.aborted && !this.disposed) {
-					if (this.options.handleUnhandledError) {
-						this.options.handleUnhandledError(error);
-					} else {
-						throw error; // So it doesn't get swallowed
-					}
+					reportUnawaitedError(error, this.options.handleUnhandledError);
 				}
 			})
 			.finally(() => {
