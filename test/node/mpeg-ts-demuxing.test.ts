@@ -1,9 +1,10 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource, UrlSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -11,6 +12,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { BufferTarget } from '../../src/target.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { Output } from '../../src/output.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +926,155 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS seeks ahead in a stream read past its cache', async () => {
+	// Found by L95. Through a source that only keeps what its cache holds (a ReadableStreamSource, or a UrlSource whose
+	// server ignores range requests), a player reads the tracks in order and then seeks ahead. The lookup must read on
+	// from where reading got to, not go back to the start of the track, which is gone by then. 6 seconds of 64x64
+	// H.264 frames of 60 kB (a key frame every second) with AAC, 9 MB, through 6 MiB caches (the video sink reads
+	// ahead of the audio one).
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const videoSource = new EncodedVideoPacketSource('avc');
+	const audioSource = new EncodedAudioPacketSource('aac');
+	output.addVideoTrack(videoSource, { frameRate: 25 });
+	output.addAudioTrack(audioSource);
+	await output.start();
+	const audioFrameDuration = 1024 / 48000;
+	let audioFrame = 0;
+	for (let i = 0; i < 150; i++) {
+		const isKey = i % 25 === 0;
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+		await videoSource.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+		for (; audioFrame * audioFrameDuration < (i + 1) / 25; audioFrame++) {
+			await audioSource.add(
+				new EncodedPacket(
+					new Uint8Array(20).fill(0x11),
+					'key',
+					audioFrame * audioFrameDuration,
+					audioFrameDuration,
+				),
+				audioFrame === 0
+					? {
+							decoderConfig: {
+								codec: 'mp4a.40.2',
+								numberOfChannels: 2,
+								sampleRate: 48000,
+								description: new Uint8Array([0x11, 0x90]),
+							},
+						}
+					: undefined,
+			);
+		}
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const seek = async (source: BufferSource | ReadableStreamSource | UrlSource, playUntil: number) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const tracks = await input.getTracks();
+
+		// Play both tracks in timestamp order
+		const iterators = tracks.map(track => new EncodedPacketSink(track).packets()[Symbol.asyncIterator]());
+		const nexts = await Promise.all(iterators.map(iterator => iterator.next()));
+		const timestampOf = (i: number) => {
+			const result = nexts[i]!;
+			return result.done ? Infinity : result.value.timestamp;
+		};
+		while (true) {
+			let next = 0;
+			for (let i = 1; i < nexts.length; i++) {
+				if (timestampOf(i) < timestampOf(next)) {
+					next = i;
+				}
+			}
+			if (timestampOf(next) > playUntil) {
+				break;
+			}
+
+			nexts[next] = await iterators[next]!.next();
+		}
+		await Promise.all(iterators.map(iterator => iterator.return?.()));
+
+		// Then seek each to 5.5 s, one after the other
+		const result = [];
+		for (const track of tracks) {
+			const sink = new EncodedPacketSink(track);
+			const keyPacket = await sink.getKeyPacket(5.5);
+			const packet = await sink.getPacket(5.5);
+			result.push([track.type, keyPacket?.timestamp, packet?.timestamp]);
+		}
+		return result;
+	};
+	const streamFrom = (data: Uint8Array) => {
+		let position = 0;
+		return new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (position >= data.length) {
+					controller.close();
+					return;
+				}
+
+				controller.enqueue(data.slice(position, position + 65536));
+				position += 65536;
+			},
+		});
+	};
+
+	const expected = await seek(new BufferSource(bytes), 4);
+	expect(expected).toEqual([['video', 5, 5.48], ['audio', expect.closeTo(5.5, 1), expect.closeTo(5.5, 1)]]);
+
+	const streamSource = new ReadableStreamSource(streamFrom(bytes), { maxCacheSize: 6 * 2 ** 20 });
+	expect(await seek(streamSource, 4)).toEqual(expected);
+
+	// From L46's review: seeking ahead by more than the cache (from 1 s, 6.8 MB further), the first track's lookup
+	// reads so far that the second one's start is gone too; it starts from where the first one read instead
+	const fromOneSecond = await seek(new BufferSource(bytes), 1);
+	expect(fromOneSecond).toEqual(expected);
+	expect(await seek(new ReadableStreamSource(streamFrom(bytes), { maxCacheSize: 2 ** 21 }), 1)).toEqual(expected);
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': bytes.byteLength });
+		response.end(bytes);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const urlSource = new UrlSource(`http://localhost:${address.port}/video.ts`, {
+			maxCacheSize: 6 * 2 ** 20,
+			getRetryDelay: () => null,
+		});
+		expect(await seek(urlSource, 4)).toEqual(expected);
+
+		// Without reading along, such a source still finds the end of each track from the chunks it holds, after the
+		// video's duration read the whole file
+		using input = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 6 * 2 ** 20,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const videoTrack = await input.getPrimaryVideoTrack();
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(videoTrack && audioTrack);
+		expect(await videoTrack.computeDuration()).toBeCloseTo(6);
+		expect(await audioTrack.computeDuration()).toBeCloseTo(audioFrame * audioFrameDuration);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
 });
