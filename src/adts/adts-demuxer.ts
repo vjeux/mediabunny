@@ -153,7 +153,18 @@ export class AdtsDemuxer extends Demuxer {
 				continue;
 			}
 
-			if (this.reader.fileSize !== null && header.startPos + header.frameLength > this.reader.fileSize) {
+			if (this.reader.fileSize === null) {
+				// The size of unsized sources is only known once a read goes past their end, so check that the whole
+				// frame is there. If it isn't, the frame was cut off by the end of the file.
+				let frameSlice = this.reader.requestSlice(header.startPos, header.frameLength);
+				if (isThenable(frameSlice)) {
+					frameSlice = await frameSlice;
+				}
+				if (!frameSlice) {
+					this.lastSampleLoaded = true;
+					return;
+				}
+			} else if (header.startPos + header.frameLength > this.reader.fileSize) {
 				// Frame doesn't fit in the rest of the file
 				this.lastSampleLoaded = true;
 				return;
