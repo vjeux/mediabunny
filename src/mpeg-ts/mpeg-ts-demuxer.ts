@@ -129,6 +129,14 @@ const MAX_STREAM_START_DELAY = 120 * MPEG_TS_TIMESCALE;
 
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 const ISO_639_LANGUAGE_DESCRIPTOR_TAG = 0x0a;
+const CA_DESCRIPTOR_TAG = 0x09;
+
+/**
+ * How far past the first PMT of a program we can't read anything from we look for another program, as the PMTs of
+ * some programs listed in the PAT may never show up. DVB repeats each PMT at least every half second, which this covers
+ * at up to 130 Mbit/s.
+ */
+const MAX_PROGRAM_SEARCH_SIZE = 2 ** 23; // 8 MiB
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
 const HDMV_FORMAT_IDENTIFIER = 0x48444d56;
@@ -1001,10 +1009,61 @@ export class MpegTsDemuxer extends Demuxer {
 			// Where to stop looking for the private data streams that don't say what they hold
 			let privateDataProbeEndPos: number | null = null;
 
+			// The programs whose PMT has shown up. When the PAT lists several, the ones with scrambled streams
+			// (conditional access) or no supported ones are only fallen back to if no better one shows up: first one
+			// whose other streams are clear, else the first one.
+			const seenProgramMapPids = new Set<number>();
+			type FallbackProgram = {
+				pmtPos: number;
+				pmtPid: number;
+				streams: ElementaryStream[];
+				clearStreams: ElementaryStream[];
+			};
+			let partlyScrambledProgram: FallbackProgram | null = null;
+			let unreadableProgram: FallbackProgram | null = null;
+
+			// Uses the best fallback program, reading its streams from the start of the file (their PES packets can
+			// come before the PMT)
+			const useFallbackProgram = () => {
+				const program = partlyScrambledProgram ?? unreadableProgram;
+				if (hasProgramMap || !program) {
+					return false;
+				}
+
+				if (programMapPids.size <= 1) {
+					// With a single program, its streams are what the file holds (descrambled recordings may keep the
+					// CA descriptors)
+					this.elementaryStreams.push(...program.streams);
+				} else if (program.streams.length > 0 && program.clearStreams.length === 0) {
+					throw new Error(
+						'All programs of this transport stream are scrambled (conditional access) or have no supported'
+						+ ' stream, so none of its streams can be read.',
+					);
+				} else {
+					this.elementaryStreams.push(...program.clearStreams);
+				}
+
+				hasProgramMap = true;
+				programMapSectionPid = program.pmtPid;
+				currentPos = this.packetOffset;
+				return true;
+			};
+
+			const hasSeenAllPrograms = () => hasProgramAssociationTable
+				&& [...programMapPids].every(pid => seenProgramMapPids.has(pid));
+
 			while (true) {
 				if (privateDataProbeEndPos !== null && currentPos >= privateDataProbeEndPos) {
 					// The private data streams that don't say what they hold didn't show up as audio we know
 					break;
+				}
+
+				const firstFallbackPmtPos = Math.min(
+					partlyScrambledProgram?.pmtPos ?? Infinity,
+					unreadableProgram?.pmtPos ?? Infinity,
+				);
+				if (currentPos - firstFallbackPmtPos > MAX_PROGRAM_SEARCH_SIZE) {
+					useFallbackProgram();
 				}
 
 				const packetHeader = await this.readPacketHeader(currentPos);
@@ -1022,7 +1081,7 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 
 				if (!packetHeader) {
-					if (await adoptInitProgramMap()) {
+					if (useFallbackProgram() || await adoptInitProgramMap()) {
 						continue;
 					}
 
@@ -1096,7 +1155,7 @@ export class MpegTsDemuxer extends Demuxer {
 					!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
 				);
 				if (!section) {
-					if (await adoptInitProgramMap()) {
+					if (useFallbackProgram() || await adoptInitProgramMap()) {
 						continue;
 					}
 
@@ -1168,9 +1227,16 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					hasProgramAssociationTable = true;
+
+					if (hasSeenAllPrograms() && useFallbackProgram()) {
+						// The PMTs came before the PAT, so there's no better program to find
+						continue;
+					}
 				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap && isInEffect) {
 					// Broadcast captures often carry several programs. We present just one, so let's use the first one
-					// whose PMT shows up (some programs listed in the PAT may not even be in the capture).
+					// whose PMT shows up (some programs listed in the PAT may not even be in the capture) and that has
+					// a stream we can read: pay-TV programs are scrambled, and radio ones may only have unsupported
+					// streams.
 					const intactSection = await this.findIntactPsiSection(
 						section,
 						PROGRAM_MAP_TABLE_ID,
@@ -1198,13 +1264,17 @@ export class MpegTsDemuxer extends Demuxer {
 					// descriptor is what tells us we're looking at a Blu-ray-derived stream.
 					const programInfoEndPos = bitstream.pos + 8 * programInfoLength;
 					let isBluRayProgram = false;
+					// Conditional access means the program's packets are scrambled
+					let isScrambledProgram = false;
 
 					while (bitstream.pos < programInfoEndPos) {
 						const descriptorTag = bitstream.readBits(8);
 						const descriptorLength = bitstream.readBits(8);
 						const descriptorEndPos = bitstream.pos + 8 * descriptorLength;
 
-						if (descriptorTag === REGISTRATION_DESCRIPTOR_TAG && descriptorLength >= 4) {
+						if (descriptorTag === CA_DESCRIPTOR_TAG) {
+							isScrambledProgram = true;
+						} else if (descriptorTag === REGISTRATION_DESCRIPTOR_TAG && descriptorLength >= 4) {
 							const formatIdentifier = bitstream.readBits(32);
 							isBluRayProgram ||= formatIdentifier === HDMV_FORMAT_IDENTIFIER
 								|| formatIdentifier === HDPR_FORMAT_IDENTIFIER;
@@ -1214,6 +1284,9 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					bitstream.pos = programInfoEndPos;
+
+					const streams: ElementaryStream[] = [];
+					const scrambledPids = new Set<number>();
 
 					while (8 * (sectionLength + BYTES_BEFORE_SECTION_LENGTH) - bitstream.pos > BITS_IN_CRC_32) {
 						const streamType = bitstream.readBits(8);
@@ -1236,7 +1309,9 @@ export class MpegTsDemuxer extends Demuxer {
 							const descriptorLength = bitstream.readBits(8);
 							const descriptorEndPos = bitstream.pos + 8 * descriptorLength;
 
-							if (descriptorTag === 0x6a) {
+							if (descriptorTag === CA_DESCRIPTOR_TAG) {
+								scrambledPids.add(elementaryPid);
+							} else if (descriptorTag === 0x6a) {
 								hasAc3Descriptor = true;
 							} else if (descriptorTag === 0x7a || descriptorTag === 0xcc) {
 								hasEac3Descriptor = true;
@@ -1430,23 +1505,48 @@ export class MpegTsDemuxer extends Demuxer {
 
 							// Some PMTs list a PID twice, with the later entry describing the stream better (like an
 							// AC-3 descriptor after MPEG audio), so that one wins, as in FFmpeg
-							const index = this.elementaryStreams.findIndex(x => x.pid === elementaryPid);
+							const index = streams.findIndex(x => x.pid === elementaryPid);
 							if (index === -1) {
-								this.elementaryStreams.push(elementaryStream);
+								streams.push(elementaryStream);
 							} else {
-								this.elementaryStreams[index] = elementaryStream;
+								streams[index] = elementaryStream;
 							}
 						}
 					}
 
-					hasProgramMap = true;
-					programMapSectionPid = section.pid;
+					seenProgramMapPids.add(section.pid);
+					const clearStreams = isScrambledProgram
+						? []
+						: streams.filter(stream => !scrambledPids.has(stream.pid));
 
-					if (this.elementaryStreams.some(x => !x.initialized)) {
-						// PES packets can come before the PMT, like in a capture of a broadcast that starts between two
-						// of its PSI repetitions, so look for each stream's first PES packet from the start of the file
-						currentPos = this.packetOffset;
-						continue;
+					if (
+						(hasProgramAssociationTable && programMapPids.size <= 1)
+						|| (streams.length > 0 && clearStreams.length === streams.length)
+					) {
+						// The only program, or one that's entirely clear
+						this.elementaryStreams.push(...streams);
+						hasProgramMap = true;
+						programMapSectionPid = section.pid;
+
+						if (this.elementaryStreams.some(x => !x.initialized)) {
+							// PES packets can come before the PMT, like in a capture of a broadcast that starts between
+							// two of its PSI repetitions, so look for each stream's first PES packet from the start of
+							// the file
+							currentPos = this.packetOffset;
+							continue;
+						}
+					} else {
+						const program = { pmtPos: currentPos, pmtPid: section.pid, streams, clearStreams };
+						if (clearStreams.length > 0) {
+							partlyScrambledProgram ??= program;
+						} else {
+							unreadableProgram ??= program;
+						}
+
+						if (hasSeenAllPrograms() && useFallbackProgram()) {
+							// There's no better program to find, so its streams are read from the start of the file
+							continue;
+						}
 					}
 				} else {
 					const elementaryStream = this.elementaryStreams.find(x => x.pid === section.pid);
