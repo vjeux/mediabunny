@@ -54,6 +54,23 @@ export const readNextMp3FrameHeader = async (
 					&& getMp3ChannelCount(result.header.channel) === getMp3ChannelCount(ref.channel)
 				))
 			) {
+				if (reader.fileSize === null) {
+					// Unsized sources learn their size only once a read goes past their end, which the small slices
+					// above may not do, so make sure the frame isn't cut off by the end of the file before taking it
+					let frameSlice = reader.requestSlice(currentPos, result.header.totalSize);
+					if (isThenable(frameSlice)) frameSlice = await frameSlice;
+
+					if (!frameSlice) {
+						if (reader.fileSize === null) {
+							return null;
+						}
+
+						// Now that the file size is known, look at this position again
+						slice.filePos = posBeforeRead;
+						continue;
+					}
+				}
+
 				return { header: result.header, startPos: currentPos };
 			}
 
