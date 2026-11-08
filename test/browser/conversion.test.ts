@@ -949,6 +949,79 @@ test('Track capacity works correctly with composable conversions', async () => {
 	expect(conversion.discardedTracks[0]!.reason).toBe('max_track_count_reached');
 });
 
+test('Track capacity works correctly with composable conversions initialized concurrently', async () => {
+	using input = new Input({
+		source: new UrlSource('/video.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({ format: new AdtsOutputFormat(), target: new BufferTarget() });
+	const conversions = await Promise.all([0, 1].map(() => Conversion.init({
+		input,
+		output,
+		composable: true,
+		video: { discard: true },
+		showWarnings: false,
+	})));
+
+	// ADTS has room for a single track: one conversion gets it, the other discards its audio track
+	expect(output.tracks).toHaveLength(1);
+	expect(conversions.map(x => x.utilizedTracks.length)).toEqual([1, 0]);
+	expect(conversions[1]!.discardedTracks.map(x => x.reason)).toContain('max_track_count_reached');
+});
+
+test('Two non-composable conversions initialized concurrently can\'t both claim one output', async () => {
+	using input = new Input({
+		source: new UrlSource('/video.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const results = await Promise.allSettled([
+		Conversion.init({ input, output, showWarnings: false }),
+		Conversion.init({ input, output, showWarnings: false }),
+	]);
+
+	// Like when initialized one after the other, the second one finds the output taken
+	expect(results.map(x => x.status)).toEqual(['fulfilled', 'rejected']);
+	expect(String((results[1] as PromiseRejectedResult).reason)).toMatch(/must be fresh/);
+	expect(output.tracks).toHaveLength(2);
+});
+
+test('An output stays fresh after a non-composable conversion fails to initialize on it', async () => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+
+	// The first conversion fails during init, as its input can't be read
+	using badInput = new Input({ source: new BufferSource(new Uint8Array(1000)), formats: ALL_FORMATS });
+	await expect(Conversion.init({ input: badInput, output, showWarnings: false })).rejects.toThrow(/unsupported/i);
+	expect(output.tracks).toHaveLength(0);
+
+	// Nothing was added to the output, so another conversion can still take it over
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const conversion = await Conversion.init({ input, output, trim: { end: 0.5 }, showWarnings: false });
+	await conversion.execute();
+	expect(output.state).toBe('finalized');
+});
+
+test('An output stays fresh after a composable conversion that added no track to it', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+
+	await Conversion.init({
+		input,
+		output,
+		composable: true,
+		video: { discard: true },
+		audio: { discard: true },
+		showWarnings: false,
+	});
+	expect(output.tracks).toHaveLength(0);
+
+	const conversion = await Conversion.init({ input, output, trim: { end: 0.3 }, showWarnings: false });
+	await conversion.execute();
+	expect(output.state).toBe('finalized');
+});
+
 test('Blank execute', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
