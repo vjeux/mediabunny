@@ -1579,7 +1579,12 @@ export class MatroskaMuxer extends Muxer {
 			if (block.chunk.type === 'key' && !firstKeyBlockPerTrack.has(block.trackData)) {
 				firstKeyBlockPerTrack.set(block.trackData, block);
 			}
-			lastBlockPerTrack.set(block.trackData, block);
+
+			// In presentation order:
+			const lastBlock = lastBlockPerTrack.get(block.trackData);
+			if (!lastBlock || block.msTimestamp >= lastBlock.msTimestamp) {
+				lastBlockPerTrack.set(block.trackData, block);
+			}
 		}
 
 		const blockElements = new Map<ClusterBlock, EBML>();
