@@ -628,3 +628,40 @@ test('Treat non-standard VideoFrame color space values as unknown', () => {
 	expect(sample.colorSpace.matrix).toBe('smpte170m');
 	expect(sample.colorSpace.fullRange).toBe(true);
 });
+
+test('draw takes the drawImage call shapes, with destination sizes in pairs', () => {
+	const canvas = new OffscreenCanvas(8, 8);
+	const context = canvas.getContext('2d')!;
+	using sample = new VideoSample(new Uint8Array(4 * 4 * 4).fill(255), {
+		format: 'RGBA',
+		codedWidth: 4,
+		codedHeight: 4,
+		timestamp: 0,
+	});
+
+	const drawnPixels = (draw: () => void) => {
+		context.clearRect(0, 0, 8, 8);
+		draw();
+		const data = context.getImageData(0, 0, 8, 8).data;
+		let count = 0;
+		for (let i = 3; i < data.length; i += 4) {
+			count += data[i]! > 0 ? 1 : 0;
+		}
+		return count;
+	};
+
+	expect(drawnPixels(() => sample.draw(context, 0, 0))).toBe(16);
+	expect(drawnPixels(() => sample.draw(context, 0, 0, 8, 8))).toBe(64);
+	expect(drawnPixels(() => sample.draw(context, 0, 0, 2, 2, 0, 0))).toBe(4);
+	expect(drawnPixels(() => sample.draw(context, 0, 0, 2, 2, 0, 0, 6, 6))).toBe(36);
+
+	// A destination width without a height has no meaning, so it doesn't type-check, and it throws
+	expect(() => {
+		// @ts-expect-error dWidth needs dHeight
+		sample.draw(context, 0, 0, 5);
+	}).toThrow(new TypeError('dHeight must be a non-negative number.'));
+	expect(() => {
+		// @ts-expect-error dWidth needs dHeight
+		sample.draw(context, 0, 0, 2, 2, 0, 0, 5);
+	}).toThrow(new TypeError('dHeight must be a non-negative number.'));
+});
