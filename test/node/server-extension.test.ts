@@ -29,7 +29,7 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { FlacOutputFormat, Mp4OutputFormat, OggOutputFormat } from '../../src/output-format.js';
+import { FlacOutputFormat, Mp4OutputFormat, OggOutputFormat, MkvOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
@@ -3219,6 +3219,64 @@ describe('Audio', async () => {
 			}
 		}
 		expect(burstTimestamp).toBeCloseTo(0.25, 3);
+	});
+
+	test.each([
+		['opus', ['s16', 'f32']],
+		['opus', ['f32-planar', 's16', 'f32']],
+		['flac', ['s16', 'f32-planar', 's16']],
+	] as const)('%s encoding takes samples whose format changes (%j)', async (codec, formats) => {
+		// Like WebCodecs encoders, only the sample rate and channel count have to stay the same from one sample to the
+		// next. 0.1 s of a quarter-scale stereo sine per format, all of whose values are exact in 16 bits.
+		const frames = 4800;
+		const values = Int16Array.from(
+			{ length: frames * formats.length },
+			(_, i) => Math.round(8192 * Math.sin(i / 20)),
+		);
+
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec, quality: new Quality('high') });
+		output.addAudioTrack(source);
+		await output.start();
+
+		for (let i = 0; i < formats.length; i++) {
+			const format = formats[i]!;
+			const chunk = [...values.subarray(i * frames, (i + 1) * frames)];
+			let data: Int16Array | Float32Array;
+			if (format === 's16') {
+				data = new Int16Array(chunk.flatMap(value => [value, value]));
+			} else if (format === 'f32') {
+				data = new Float32Array(chunk.flatMap(value => [value / 32768, value / 32768]));
+			} else {
+				data = new Float32Array([...chunk, ...chunk].map(value => value / 32768));
+			}
+
+			using sample = new AudioSample({
+				data,
+				format,
+				numberOfChannels: 2,
+				sampleRate: 48000,
+				timestamp: i * 0.1,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		if (codec === 'flac') {
+			// Lossless, so every sample comes back (followed by the padding of the last block)
+			const decoded: number[] = [];
+			for await (using sample of new AudioSampleSink(track).samples()) {
+				const channel = new Int16Array(sample.numberOfFrames);
+				sample.copyTo(channel, { planeIndex: 0, format: 's16-planar' });
+				decoded.push(...channel);
+			}
+			expect(decoded.slice(0, values.length)).toEqual([...values]);
+		} else {
+			expect(await track.computeDuration()).toBeCloseTo(0.1 * formats.length, 2);
+		}
 	});
 
 	test('MP3 encode & decode', async () => {

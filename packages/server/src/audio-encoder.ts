@@ -44,6 +44,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	avCodec!: NodeAv.Codec;
 
 	inputParametersKey: string | null = null;
+	inputSampleFormat: AudioSampleFormat | null = null;
 	resamplerInputSampleRate: number | null = null;
 	nextResamplerPts: bigint | null = null;
 	inputEndPts: bigint | null = null;
@@ -189,15 +190,19 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			assert(this.codecContext);
 		}
 
-		if (audioSample._data instanceof AvFrameAudioSampleResource) {
+		// The resampler is set up for the first sample's format, so later samples are converted to it. Unlike the
+		// sample rate and channel count, the format may change from one sample to the next.
+		const sampleFormat = this.inputSampleFormat ?? audioSample.format;
+		if (audioSample._data instanceof AvFrameAudioSampleResource && audioSample.format === sampleFormat) {
 			// Release any buffers still referenced from the previous encode before reffing the new frame, otherwise
 			// av_frame_ref leaks them
 			// https://github.com/Vanilagy/mediabunny/issues/392
 			this.frame.unref();
 			this.frame.ref(audioSample._data.frame);
 		} else {
-			copyAudioSampleToAvFrame(audioSample, this.frame);
+			copyAudioSampleToAvFrame(audioSample, this.frame, sampleFormat);
 		}
+		this.inputSampleFormat = sampleFormat;
 
 		if (this.codec === 'aac') {
 			replaceNonFiniteSamples(this.frame);
@@ -493,6 +498,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		this.resampler?.free();
 		this.resampler = null;
 		this.inputParametersKey = null;
+		this.inputSampleFormat = null;
 		this.resamplerInputSampleRate = null;
 		this.nextResamplerPts = null;
 		this.dstFrame?.free();
