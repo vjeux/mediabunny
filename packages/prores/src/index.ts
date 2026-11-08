@@ -25,6 +25,20 @@ if ((globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL]) {
 }
 (globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL] = true;
 
+/**
+ * TurboRes starts one worker per core unless told otherwise, but its throughput stops growing at around 16 workers.
+ * Beyond that, workers only cost: with shared memory (Node, cross-origin isolated pages) they burn CPU and even slow
+ * decoding down, and without it every worker gets its own WASM memory, of which Chromium only reserves address space
+ * for about a hundred per page, after which starting more workers fails and decoding hangs.
+ */
+const MAX_WORKERS = 16;
+
+/**
+ * TurboRes decoders share their workers, but decoders that are created at the same time each start a full set of them,
+ * so they're created one after another.
+ */
+let lastDecoderCreation: Promise<unknown> = Promise.resolve();
+
 class ProresDecoder extends CustomVideoDecoder {
 	private decoder: Decoder | null = null;
 	private framePool: Frame[] = [];
@@ -68,11 +82,18 @@ class ProresDecoder extends CustomVideoDecoder {
 			ProresDecoder._supportedVideoFrameFormats ??= ProresDecoder._determineSupportedVideoFrameFormats();
 		}
 
-		const decoder = await Decoder.create({
+		// Node 20 and older have no navigator, in which case TurboRes asks the OS for the core count itself
+		const hardwareConcurrency = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : undefined;
+
+		const creation = lastDecoderCreation.then(() => Decoder.create({
 			proresFourCc: this.config.codec as ProresFourCc,
 			useSharedMemory: Decoder.canUseSharedMemory(),
+			concurrency: hardwareConcurrency ? Math.min(hardwareConcurrency, MAX_WORKERS) : undefined,
 			allowedOutputFormats: ProresDecoder._supportedVideoFrameFormats ?? undefined,
-		});
+		}));
+		lastDecoderCreation = creation.catch(() => {});
+
+		const decoder = await creation;
 		if (decoder instanceof Error) {
 			throw decoder;
 		}
