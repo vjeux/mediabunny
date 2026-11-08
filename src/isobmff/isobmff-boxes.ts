@@ -199,6 +199,11 @@ const i64 = (value: number) => {
 	return [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]] as number[];
 };
 
+const f64 = (value: number) => {
+	view.setFloat64(0, value, false);
+	return [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]] as number[];
+};
+
 const fixed_8_8 = (value: number) => {
 	view.setInt16(0, 2 ** 8 * value, false);
 	return [bytes[0], bytes[1]] as number[];
@@ -1010,9 +1015,13 @@ export const soundSampleDescription = (
 	compressionType: string,
 	trackData: IsobmffAudioTrackData,
 ) => {
-	let version = 0;
+	let version: 0 | 1 | 2 = 0;
 	let contents: NestedNumberArray;
 	let sampleSizeInBits = 16;
+	let configurationBox = audioCodecToConfigurationBox(
+		trackData.track.source._codec,
+		trackData.muxer.isQuickTime,
+	)?.(trackData) ?? null;
 
 	const isPcmCodec = (PCM_AUDIO_CODECS as readonly AudioCodec[]).includes(trackData.track.source._codec);
 	if (isPcmCodec) {
@@ -1028,7 +1037,8 @@ export const soundSampleDescription = (
 
 	// TrueHD's sample entry is defined on top of version 0, with its own sample rate layout
 	if (trackData.muxer.isQuickTime && trackData.track.source._codec !== 'truehd') {
-		version = 1;
+		// Version 1 can't represent sample rates of 2^16 and up
+		version = trackData.info.sampleRate < 2 ** 16 ? 1 : 2;
 	}
 
 	// Opus-in-ISOBMFF fixes the sample entry's rate at 48 kHz, which must also match dOps' InputSampleRate
@@ -1060,7 +1070,7 @@ export const soundSampleDescription = (
 						u16(0), // Sample rate (lower)
 					],
 		];
-	} else {
+	} else if (version === 1) {
 		const compressionId = isPcmCodec ? 0 : -2;
 
 		contents = [
@@ -1088,10 +1098,58 @@ export const soundSampleDescription = (
 					],
 			u32(2), // Bytes per sample (constant in FFmpeg)
 		];
+	} else if (version === 2) {
+		let formatSpecificFlags = 0;
+		if (isPcmCodec) {
+			const { dataType, littleEndian } = parsePcmCodec(trackData.track.source._codec as PcmAudioCodec);
+
+			if (dataType !== 'ulaw' && dataType !== 'alaw') {
+				// Linear PCM must use the lpcm format with version 2, which is fully described by these flags
+				compressionType = 'lpcm';
+				configurationBox = null;
+				formatSpecificFlags = (dataType === 'float' ? 1 : 0) // Float
+					| (littleEndian ? 0 : 2) // Big-endian
+					| (dataType === 'signed' ? 4 : 0) // Signed integer
+					| 8; // Packed
+			}
+		}
+
+		contents = [
+			Array(6).fill(0), // Reserved
+			u16(1), // Data reference index
+			u16(version), // Version
+			u16(0), // Revision level
+			u32(0), // Vendor
+			u16(3), // Always 3
+			u16(16), // Always 16
+			i16(-2), // Always -2
+			u16(0), // Always 0
+			u32(0x10000), // Always 65536
+			u32(72), // Size of struct only
+			f64(trackData.info.sampleRate), // Sample rate
+			u32(trackData.info.numberOfChannels), // Number of channels
+			u32(0x7f000000), // Always 0x7f000000
+			isPcmCodec
+				? [
+						u32(sampleSizeInBits), // Constant bits per channel
+						u32(formatSpecificFlags), // Format-specific flags
+						u32(trackData.info.numberOfChannels * sampleSizeInBits / 8), // Constant bytes per audio packet
+						u32(1), // Constant LPCM frames per audio packet
+					]
+				: [
+						u32(0), // Constant bits per channel (variable)
+						u32(0), // Format-specific flags
+						u32(0), // Constant bytes per audio packet (variable)
+						u32(0), // Constant LPCM frames per audio packet (variable)
+					],
+		];
+	} else {
+		assertNever(version);
+		assert(false);
 	}
 
 	return box(compressionType, contents, [
-		audioCodecToConfigurationBox(trackData.track.source._codec, trackData.muxer.isQuickTime)?.(trackData) ?? null,
+		configurationBox,
 		btrt(trackData),
 	]);
 };
