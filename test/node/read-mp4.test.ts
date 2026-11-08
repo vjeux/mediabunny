@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import fs from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -282,7 +282,7 @@ test('Fragmented MP4 whose fragments are larger than the source\'s cache', async
 	// failed after the first fragment larger than the cache. A fragment holds everything between two key frames in
 	// Mediabunny's own fragmented output and FFmpeg's frag_keyframe, so long GOPs make such fragments (found by L91).
 	const readPacketTimestamps = async (fileName: string, maxCacheSize?: number) => {
-		const data = new Uint8Array(await fs.readFile(path.join(__dirname, '..', 'public', fileName)));
+		const data = new Uint8Array(await readFile(path.join(__dirname, '..', 'public', fileName)));
 		let position = 0;
 		const source = maxCacheSize === undefined
 			? new BufferSource(data)
