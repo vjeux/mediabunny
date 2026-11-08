@@ -44,7 +44,7 @@ import {
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
 import { SubtitleCue, SubtitleMetadata } from '../subtitles';
-import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
+import { NullTarget, PathedTarget, RangedTarget, Target, TargetRequest } from '../target';
 import { HLS_MIME_TYPE, TIMESTAMP_PRIV_OWNER } from './hls-misc';
 import { secondsToMpegTsTimestamp } from '../mpeg-ts/mpeg-ts-misc';
 import { GLOBAL_TIMESCALE, type IsobmffMuxer } from '../isobmff/isobmff-muxer';
@@ -1130,7 +1130,12 @@ export class HlsMuxer extends Muxer {
 
 								if (request.isRoot) {
 									if (playlist.singleFile) {
-										const slice = playlist.singleFile.target.slice(playlist.singleFile.nextOffset);
+										// The playlist starts and ends the single file itself (see onPlaylistDone)
+										const slice = new RangedTarget(
+											playlist.singleFile.target,
+											playlist.singleFile.nextOffset,
+											false,
+										);
 										slice.on('write', ({ end }) => segmentSize = Math.max(segmentSize, end));
 
 										return slice;
@@ -1162,7 +1167,11 @@ export class HlsMuxer extends Muxer {
 									info: null,
 								};
 
-								const slice = playlist.singleFile.target.slice(playlist.singleFile.nextOffset);
+								const slice = new RangedTarget(
+									playlist.singleFile.target,
+									playlist.singleFile.nextOffset,
+									false, // Started and ended by the playlist
+								);
 								slice.on('write', ({ end }) => {
 									playlist.initSegment!.byteSize = Math.max(playlist.initSegment!.byteSize, end);
 								});

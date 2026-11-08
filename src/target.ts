@@ -42,6 +42,12 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 
 	/** @internal */
 	_monotonicity: boolean | null = null; // null = unknown
+	/**
+	 * How the slices of this target created with {@link Target.slice} use it: how many have started it and not yet
+	 * finished, and whether the last of them finalized or closed it.
+	 * @internal
+	 */
+	_sliceUsage = { users: 0, ended: false };
 
 	/** @internal */
 	abstract _start(): void;
@@ -83,14 +89,16 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 	/**
 	 * Returns a new {@link RangedTarget} that writes data to this target using the given offset.
 	 *
-	 * Useful for writing a file into a section of a larger file.
+	 * Useful for writing a file into a section of a larger file. The slice manages this target: it starts this target
+	 * when its output starts, and finalizes it (or closes it, on cancelation) once every slice of this target in use
+	 * is done. So don't use this target in an output directly.
 	 */
 	slice(offset: number) {
 		if (!Number.isInteger(offset) || offset < 0) {
 			throw new TypeError('offset must be a non-negative integer.');
 		}
 
-		return new RangedTarget(this, offset);
+		return new RangedTarget(this, offset, true);
 	}
 }
 
@@ -852,17 +860,42 @@ export class RangedTarget extends Target {
 	_baseTarget: Target;
 	/** @internal */
 	_offset: number;
+	/**
+	 * Whether this slice starts and ends its base target. Slices made by {@link Target.slice} do; the HLS muxer
+	 * manages the targets it slices itself.
+	 * @internal
+	 */
+	_managesBase: boolean;
+	/** @internal */
+	_usingBase = false;
 
 	/** @internal */
-	constructor(baseTarget: Target, offset: number) {
+	constructor(baseTarget: Target, offset: number, managesBase: boolean) {
 		super();
 
 		this._baseTarget = baseTarget;
 		this._offset = offset;
+		this._managesBase = managesBase;
 	}
 
 	/** @internal */
-	_start() {}
+	_start() {
+		if (!this._managesBase) {
+			return;
+		}
+
+		const usage = this._baseTarget._sliceUsage;
+		if (usage.ended) {
+			throw new Error('Cannot use a slice of a target that has already been finalized or closed.');
+		}
+
+		if (usage.users === 0) {
+			this._baseTarget._start();
+		}
+
+		usage.users++;
+		this._usingBase = true;
+	}
 
 	/** @internal */
 	_write(data: Uint8Array, pos: number): void {
@@ -877,11 +910,47 @@ export class RangedTarget extends Target {
 
 	/** @internal */
 	async _finalize() {
+		if (this._stopUsingBase()) {
+			try {
+				await this._baseTarget._flush();
+				await this._baseTarget._finalize();
+			} catch (error) {
+				// Like Output does for a target that failed to finalize
+				await this._baseTarget._close().catch(() => {});
+				throw error;
+			}
+		}
+
 		this._emit('finalized');
 	}
 
 	/** @internal */
-	async _close() {}
+	async _close() {
+		if (this._stopUsingBase()) {
+			await this._baseTarget._close();
+		}
+	}
+
+	/**
+	 * Gives up this slice's use of the base target. Returns true if it was the last slice using it, which then has to
+	 * end the base target.
+	 * @internal
+	 */
+	_stopUsingBase() {
+		if (!this._usingBase) {
+			return false;
+		}
+
+		this._usingBase = false;
+		const usage = this._baseTarget._sliceUsage;
+		usage.users--;
+		if (usage.users > 0) {
+			return false;
+		}
+
+		usage.ended = true; // Set right away, so that no slice can start while the base target is being ended
+		return true;
+	}
 
 	/** @internal */
 	override _setMonotonicity(monotonicity: boolean): void {
