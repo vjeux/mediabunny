@@ -427,7 +427,28 @@ export class Mp3InputFormat extends InputFormat {
 export class WaveInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
-		let slice = input._reader.requestSlice(0, 12);
+		let currentPos = 0;
+
+		// Some taggers put ID3v2 tags in front of any file, even though they don't belong in RIFF. Skip them, like
+		// FFmpeg does.
+		while (true) {
+			let slice = input._reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				break;
+			}
+
+			const id3V2Header = readId3V2Header(slice);
+			if (!id3V2Header) {
+				break;
+			}
+
+			currentPos = slice.filePos + id3V2Header.size;
+		}
+
+		let slice = input._reader.requestSlice(currentPos, 12);
 		if (isThenable(slice)) slice = await slice;
 		if (!slice) return false;
 
