@@ -315,3 +315,27 @@ test('ends the track at a damaged page of a chained link', async ({ skip }) => {
 	}
 	expect(decodedFrames).toBeGreaterThan(duration * 48000 - 1);
 });
+
+test('reads a chain whose third link reuses the first link\'s serial number the same in any order', async () => {
+	// As from concatenating a file, another one and the first one again. RFC 3533 requires unique serial numbers, so
+	// the track ends before the third link, whether it's iterated or looked up first.
+	const { links, packetCount } = await remuxToOggLinks('/preroll-test.opus', [100]);
+	const file = concatBytes([links[0]!, links[1]!, links[0]!]);
+	const iteratedFirst = await readPackets(new BufferSource(file));
+	expect(iteratedFirst.packets).toHaveLength(packetCount);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBe(iteratedFirst.duration);
+
+	const sink = new EncodedPacketSink(track);
+	for (const packet of [iteratedFirst.packets[99]!, iteratedFirst.packets[100]!, iteratedFirst.packets.at(-1)!]) {
+		expect((await sink.getPacket(packet.timestamp))?.byteLength).toBe(packet.byteLength);
+	}
+	let count = 0;
+	for await (const packet of sink.packets()) {
+		expect(packet.timestamp).toBe(iteratedFirst.packets[count]!.timestamp);
+		count++;
+	}
+	expect(count).toBe(packetCount);
+});

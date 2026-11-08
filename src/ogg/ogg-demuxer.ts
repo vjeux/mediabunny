@@ -556,9 +556,13 @@ type OggLink = {
 	firstTimestampInSamples: number;
 	/** For Vorbis, the block size of the packet that precedes the link's first packet in the track. */
 	initialVorbisLastBlocksize: number | null;
-	/** Where the link's last page ends, once known. */
+	/**
+	 * Where the link's last page ends, once known from reading on from the link's start. A lookup's bisection can't
+	 * tell, as it can land on a later link that reuses the serial number (which RFC 3533 forbids, but `cat` makes).
+	 */
 	endPos: number | null;
-	nextPromise: Promise<OggLink | null> | null;
+	/** The links that follow the link if it ends at the given position. */
+	nextLinks: Map<number, Promise<OggLink | null>>;
 };
 
 type EncodedPacketMetadata = {
@@ -745,7 +749,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			firstTimestampInSamples: await this.computeStartInSamples(this.bitstream, null),
 			initialVorbisLastBlocksize: null,
 			endPos: null,
-			nextPromise: null,
+			nextLinks: new Map(),
 		}))();
 	}
 
@@ -807,13 +811,26 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 	/**
 	 * Returns the link that follows the given one, if the file continues with a link that this track can continue
-	 * into. `end` is where the given link ends.
+	 * into. `end` is where the given link ends, which was reached by reading on from the link's start if
+	 * `isSequential`.
 	 */
-	getNextLink(link: OggLink, end: { lastPage: Page; timestampInSamples: number; vorbisBlockSize: number | null }) {
-		link.endPos ??= end.lastPage.headerStartPos + end.lastPage.totalSize;
+	getNextLink(
+		link: OggLink,
+		end: { lastPage: Page; timestampInSamples: number; vorbisBlockSize: number | null },
+		isSequential: boolean,
+	) {
+		const endPos = end.lastPage.headerStartPos + end.lastPage.totalSize;
+		if (isSequential) {
+			link.endPos ??= endPos;
+		}
 
-		return link.nextPromise ??= (async () => {
-			const bitstream = await this.demuxer.readChainedLink(link.endPos!);
+		let nextPromise = link.nextLinks.get(endPos);
+		if (nextPromise) {
+			return nextPromise;
+		}
+
+		nextPromise = (async () => {
+			const bitstream = await this.demuxer.readChainedLink(endPos);
 			if (!bitstream) {
 				return null; // The file doesn't continue with another link
 			}
@@ -846,9 +863,12 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				initialVorbisLastBlocksize: end.vorbisBlockSize,
 				// Reading the link stops at a damaged page, so lookups must not look past it either
 				endPos: await this.demuxer.findIntactLinkEnd(bitstream),
-				nextPromise: null,
+				nextLinks: new Map(),
 			};
 		})();
+		link.nextLinks.set(endPos, nextPromise);
+
+		return nextPromise;
 	}
 
 	/**
@@ -940,7 +960,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				lastPage: prevMetadata.packet.endPage,
 				timestampInSamples,
 				vorbisBlockSize: prevMetadata.vorbisBlockSize,
-			});
+			}, true);
 			if (!nextLink) {
 				return null;
 			}
@@ -991,9 +1011,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		let previousLink: OggLink | null = null;
 
 		while (true) {
-			if (link.nextPromise) {
+			const knownNextLink = link.endPos !== null ? link.nextLinks.get(link.endPos) : undefined;
+			if (knownNextLink) {
 				// We already know where the next link starts, so we can skip this one if the timestamp lies past it
-				const nextLink = await link.nextPromise;
+				const nextLink = await knownNextLink;
 				if (nextLink && timestampInSamples >= nextLink.firstTimestampInSamples) {
 					previousLink = link;
 					link = nextLink;
@@ -1019,7 +1040,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				lastPage: metadata.packet.endPage,
 				timestampInSamples: metadata.timestampInSamples + metadata.durationInSamples,
 				vorbisBlockSize: metadata.vorbisBlockSize,
-			});
+			}, false);
 			if (!nextLink || timestampInSamples < nextLink.firstTimestampInSamples) {
 				return packet;
 			}
@@ -1094,6 +1115,14 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				if (!page || page.serialNumber !== link.bitstream.serialNumber) {
 					searchStartPos = pageStartPos + 4; // 'OggS' is 4 bytes
 					continue;
+				}
+
+				// A page of our serial number that begins a logical bitstream, or that numbers its pages anew, belongs
+				// to a later chained link reusing the serial number (RFC 3533 forbids that, but concatenating a file
+				// with itself makes it), so our link ends before it
+				if ((page.headerType & 0x02) || page.sequenceNumber <= lowPage.sequenceNumber) {
+					high = page.headerStartPos;
+					continue outer;
 				}
 
 				const isContinuationPage = page.granulePosition === -1;
