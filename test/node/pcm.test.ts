@@ -15,6 +15,7 @@ import { AudioCodec, PcmAudioCodec } from '../../src/codec.js';
 import { CustomAudioDecoder, registerDecoder } from '../../src/custom-coder.js';
 import { toUint8Array, uint8ArraysAreEqual } from '../../src/misc.js';
 import { fromAlaw, fromUlaw, toAlaw, toUlaw } from '../../src/pcm.js';
+import { Conversion, ConversionAudioOptions } from '../../src/conversion.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -439,5 +440,41 @@ test('A registered custom decoder takes precedence over the built-in PCM decoder
 		expect(data[0]).toBe(0.5);
 	} finally {
 		active = false;
+	}
+});
+
+const convertToWave = async (audio: ConversionAudioOptions) => {
+	using input = new Input({
+		source: new FilePathSource(
+			path.join(fileURLToPath(new URL('.', import.meta.url)), '../public/glitch-hop-is-dead.wav'),
+		),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, audio, trim: { end: 1 }, showWarnings: false });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await result.getPrimaryAudioTrack())!;
+	using sample = (await new AudioSampleSink(track).getSample(0.5))!;
+	const data = new Float32Array(sample.numberOfFrames);
+	sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+
+	return { codec: await track.getCodec(), data };
+};
+
+test.each([
+	['s32', 'pcm-s32'],
+	['f32', 'pcm-f32'],
+	['u8', 'pcm-u8'],
+] as const)('Conversion into WAVE with sampleFormat %s writes %s', async (sampleFormat, expectedCodec) => {
+	const result = await convertToWave({ sampleFormat });
+	expect(result.codec).toBe(expectedCodec);
+
+	const reference = await convertToWave({ forceTranscode: true });
+	expect(reference.codec).toBe('pcm-s16'); // The default without a sample format
+	if (sampleFormat !== 'u8') {
+		// The 16-bit source survives these exactly
+		expect(result.data).toEqual(reference.data);
 	}
 });
