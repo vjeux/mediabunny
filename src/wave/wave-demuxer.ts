@@ -405,8 +405,12 @@ export class WaveDemuxer extends Demuxer {
 				let currentPos = pos;
 				while (end === null || currentPos < end) {
 					let slice = this.reader.requestSlice(currentPos, 8);
-					if (isThenable(slice)) slice = await slice;
-					if (!slice) break;
+					if (isThenable(slice)) {
+						slice = await slice;
+					}
+					if (!slice) {
+						break;
+					}
 
 					const chunkId = readAscii(slice, 4);
 					const chunkSize = readU32(slice, littleEndian);
