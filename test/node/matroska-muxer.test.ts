@@ -200,6 +200,47 @@ test('Negative audio start timestamps via CodecDelay', async () => {
 	}
 });
 
+// Nothing can decode AAC, AC-3 or HEVC in Node, so these tracks can only be copied. Their copies start slightly before
+// zero (the AAC priming, the AC-3 pre-roll, a source starting at -5 ms, or the lead-in from the previous key frame),
+// which Matroska supports but discourages: the default copy mode must still copy them rather than discard them
+test.each([
+	['edts.mp4', {}], // H.264 + AAC with priming
+	['ac3.mkv', {}], // AC-3 starting at -5 ms
+	['ac3.mp4', { trim: { start: 1, end: 2 } }], // The AC-3 pre-roll starts before the trim start
+	['video-h265.mp4', { trim: { start: 1, end: 2 } }], // HEVC trimmed between key frames, + AAC
+] as [string, { trim?: { start: number; end: number } }][])(
+	'Conversion of %s to Matroska copies the tracks that can only be copied with a negative start (%o)',
+	async (fileName, options) => {
+		const convert = async (copyMode: 'preferred' | 'forced') => {
+			using input = new Input({
+				source: new FilePathSource(path.join(__dirname, '../public', fileName)),
+				formats: ALL_FORMATS,
+			});
+			const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+			const conversion = await Conversion.init({
+				input,
+				output,
+				...options,
+				copy: { mode: copyMode },
+				showWarnings: false,
+			});
+			expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const tracks = await result.getTracks();
+			return {
+				types: tracks.map(track => track.type),
+				firstTimestamps: await Promise.all(tracks.map(track => track.getFirstTimestamp())),
+			};
+		};
+
+		const preferred = await convert('preferred');
+		expect(preferred).toEqual(await convert('forced'));
+		expect(Math.min(...preferred.firstTimestamps)).toBeLessThan(0);
+	},
+);
+
 const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 	for (let i = 0; i <= haystack.length - needle.length; i++) {
 		if (needle.every((byte, j) => haystack[i + j] === byte)) {
