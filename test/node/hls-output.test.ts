@@ -3059,6 +3059,28 @@ segment-1-2.ts
 
 	await source.add(new EncodedPacket(avcPacketData, 'key', 6, 0.5), avcMetadata);
 
+	// A live playlist must span three target durations, so nothing can be popped yet
+	expect(writtenTexts.get('playlist-1.m3u8')).toBe(`#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-INDEPENDENT-SEGMENTS
+
+#EXTINF:2,
+segment-1-1.ts
+#EXTINF:2,
+segment-1-2.ts
+#EXTINF:2,
+segment-1-3.ts
+`);
+	expect(poppedSegments).toHaveLength(0);
+
+	await source.add(new EncodedPacket(avcPacketData, 'delta', 6.5, 0.5), avcMetadata);
+	await source.add(new EncodedPacket(avcPacketData, 'delta', 7, 0.5), avcMetadata);
+	await source.add(new EncodedPacket(avcPacketData, 'delta', 7.5, 0.5), avcMetadata);
+
+	await source.add(new EncodedPacket(avcPacketData, 'key', 8, 0.5), avcMetadata);
+
 	expect(writtenTexts.get('playlist-1.m3u8')).toBe(`#EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-TARGETDURATION:2
@@ -3069,6 +3091,8 @@ segment-1-2.ts
 segment-1-2.ts
 #EXTINF:2,
 segment-1-3.ts
+#EXTINF:2,
+segment-1-4.ts
 `);
 
 	expect(poppedSegments).toHaveLength(1);
@@ -3076,9 +3100,9 @@ segment-1-3.ts
 	expect(poppedSegments[0]!.info.n).toBe(1);
 	expect(poppedSegments[0]!.info.isSingleFile).toBe(false);
 
-	await source.add(new EncodedPacket(avcPacketData, 'delta', 6.5, 0.5), avcMetadata);
-	await source.add(new EncodedPacket(avcPacketData, 'delta', 7, 0.5), avcMetadata);
-	await source.add(new EncodedPacket(avcPacketData, 'delta', 7.5, 0.5), avcMetadata);
+	await source.add(new EncodedPacket(avcPacketData, 'delta', 8.5, 0.5), avcMetadata);
+	await source.add(new EncodedPacket(avcPacketData, 'delta', 9, 0.5), avcMetadata);
+	await source.add(new EncodedPacket(avcPacketData, 'delta', 9.5, 0.5), avcMetadata);
 
 	await output.finalize();
 
@@ -3092,6 +3116,8 @@ segment-1-3.ts
 segment-1-3.ts
 #EXTINF:2,
 segment-1-4.ts
+#EXTINF:2,
+segment-1-5.ts
 
 #EXT-X-ENDLIST
 `);
@@ -3150,9 +3176,57 @@ test('Live mode, maxLiveSegmentCount with singleFilePerPlaylist', async () => {
 
 	expect(onSegmentPopped).not.toHaveBeenCalled();
 
-	// Popping still happened
+	// Popping still happened, down to the three target durations a live playlist must span
 	const extinfCount = (lastPlaylistText.match(/#EXTINF:/g) ?? []).length;
-	expect(extinfCount).toBe(2);
+	expect(extinfCount).toBe(3);
+});
+
+test('Live mode, popping segments never leaves less than three target durations in a playlist', async () => {
+	// RFC 8216, Section 6.2.2: "The server MUST NOT remove a Media Segment from a Playlist file without an
+	// EXT-X-ENDLIST tag if that would produce a Playlist whose duration is less than three times the target duration."
+	const playlistTexts: string[] = [];
+
+	const output = new Output({
+		format: new HlsOutputFormat({
+			segmentFormat: new MpegTsOutputFormat(),
+			live: true,
+			maxLiveSegmentCount: 3,
+			onPlaylist: (content) => {
+				playlistTexts.push(content);
+			},
+		}),
+		target: new PathedTarget('master.m3u8', () => new BufferTarget()),
+	});
+
+	const source = videoSource();
+	output.addVideoTrack(source);
+
+	await output.start();
+
+	// A key frame every 1.5 seconds makes 1.5-second segments under the default target duration of 2 seconds
+	for (let timestamp = 0; timestamp < 12; timestamp += 0.5) {
+		await source.add(
+			new EncodedPacket(avcPacketData, timestamp % 1.5 === 0 ? 'key' : 'delta', timestamp, 0.5),
+			avcMetadata,
+		);
+	}
+
+	await output.finalize();
+
+	let poppedPlaylistCount = 0;
+	for (const text of playlistTexts) {
+		const mediaSequence = Number(text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/)![1]);
+		if (mediaSequence === 0 || text.includes('#EXT-X-ENDLIST')) {
+			continue;
+		}
+
+		poppedPlaylistCount++;
+		const durations = [...text.matchAll(/#EXTINF:([\d.]+),/g)].map(match => Number(match[1]));
+		expect(durations.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(3 * 2);
+		expect(durations).toHaveLength(4); // But no more segments than needed
+	}
+
+	expect(poppedPlaylistCount).toBeGreaterThan(0);
 });
 
 test('Append-only stream', async () => {
