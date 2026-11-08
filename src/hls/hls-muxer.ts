@@ -48,6 +48,7 @@ import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
 import { HLS_MIME_TYPE, TIMESTAMP_PRIV_OWNER } from './hls-misc';
 import { secondsToMpegTsTimestamp } from '../mpeg-ts/mpeg-ts-misc';
 import { GLOBAL_TIMESCALE, type IsobmffMuxer } from '../isobmff/isobmff-muxer';
+import { MpegTsMuxer } from '../mpeg-ts/mpeg-ts-muxer';
 
 /** The VIDEO-RANGE of video with the given decoder config (draft-pantos-hls-rfc8216bis, Section 4.4.6.2). */
 const getVideoRange = (decoderConfig: VideoDecoderConfig) => {
@@ -129,6 +130,11 @@ type Playlist = {
 		 */
 		fragmentedIsobmffOutput: FragmentedIsobmffOutput | null;
 	} | null;
+	/**
+	 * The MPEG-TS continuity counters, which go on from one segment to the next: players read the segments as one
+	 * transport stream, also when they're separate files
+	 */
+	continuityCounters: Map<number, number>;
 
 	// For HLS, having a single mutex is too coarse. Every playlist is basically independent and therefore we can have
 	// a per-playlist mutex instead of a per-muxer one. This means two packets from different playlists coming in don't
@@ -537,6 +543,7 @@ export class HlsMuxer extends Muxer {
 				mediaSequence: 0,
 				done: false,
 				singleFile: null,
+				continuityCounters: new Map(),
 				mutex: new AsyncMutex(),
 			};
 			this.playlists.push(playlist);
@@ -1215,6 +1222,12 @@ export class HlsMuxer extends Muxer {
 
 							output.setMetadataTags({ raw: { PRIV: priv } });
 						}
+					}
+
+					if (output._muxer instanceof MpegTsMuxer) {
+						// The segments make up one transport stream, so its continuity counters must not start over
+						// (like in FFmpeg's HLS muxer; Apple's HLS authoring spec 7.2 requires them to be sequential)
+						output._muxer.continuityCounters = playlist.continuityCounters;
 					}
 
 					await output.start();
