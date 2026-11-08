@@ -38,6 +38,31 @@ test('WebVTT timestamps with a one-digit hour field are read as hours', async ()
 	expect(cueTexts).toEqual(['A <00:00:00.250>a', 'B <00:00:00.500>b', 'C <00:00:00.750>c']);
 });
 
+test('WebVTT cue text keeps its leading and trailing whitespace lines', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(source);
+
+	await output.start();
+
+	// YouTube's automatic captions keep a two-line layout with a line holding a single space; Chrome and FFmpeg keep it
+	await source.add('WEBVTT\nKind: captions\nLanguage: en\n\n'
+		+ '00:00:00.000 --> 00:00:02.000 align:start position:0%\n \nhello<00:00:00.480><c> world</c>\n\n'
+		+ '00:00:02.000 --> 00:00:02.010 align:start position:0%\nhello world\n \n\n'
+		+ '00:00:02.010 --> 00:00:04.000\n  indented\ntrailing  \n');
+
+	await output.finalize();
+
+	// Matroska stores the text of each cue as is
+	const written = new TextDecoder().decode(output.target.buffer!);
+	const cueTexts = [' \nhello<00:00:00.480><c> world</c>', 'hello world\n ', '  indented\ntrailing  '];
+	expect(cueTexts.filter(cueText => !written.includes(cueText))).toEqual([]);
+});
+
 test('ISOBMFF muxing', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
