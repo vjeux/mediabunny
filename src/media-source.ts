@@ -309,6 +309,7 @@ class VideoEncoderWrapper {
 	private lastMultipleOfKeyFrameInterval = -1;
 	private emittedEncoderPackets = 0;
 	private chunkTimestampsAreShiftedByDuration = false; // See detectAvcChunkTimestampShift
+	private encoderTimestampOffset: number | null = null; // See shiftFrameForEncoder
 
 	// Tracks the input dimensions of the first frame
 	private codedWidth: number | null = null;
@@ -677,7 +678,7 @@ class VideoEncoderWrapper {
 				} else {
 					assert(this.encoder);
 
-					const videoFrame = sampleToEncode.toVideoFrame();
+					let videoFrame = sampleToEncode.toVideoFrame();
 
 					const preciseTimingIndex = binarySearchLessOrEqual(
 						this.preciseTimings,
@@ -710,6 +711,8 @@ class VideoEncoderWrapper {
 							this.preciseTimings.shift();
 						}
 					}
+
+					videoFrame = this.shiftFrameForEncoder(videoFrame);
 
 					if (!this.alphaEncoder) {
 						// No alpha encoder, simple case
@@ -1176,6 +1179,11 @@ class VideoEncoderWrapper {
 		}
 
 		let microsecondTimestamp = colorChunk.timestamp;
+		if (this.encoderTimestampOffset) {
+			// The encoder got the frame's timestamp shifted, so undo that (see shiftFrameForEncoder)
+			microsecondTimestamp -= this.encoderTimestampOffset;
+			packet = packet.clone({ timestamp: microsecondTimestamp / 1e6 });
+		}
 		if (this.chunkTimestampsAreShiftedByDuration) {
 			// The encoder added the frame's duration to its timestamp, so undo that
 			microsecondTimestamp -= colorChunk.duration ?? 0;
@@ -1223,6 +1231,27 @@ class VideoEncoderWrapper {
 				});
 
 		this.emittedEncoderPackets++;
+	}
+
+	/**
+	 * Some encoders can't take negative timestamps: Windows' Media Foundation hardware encoders (as used by Chrome)
+	 * wrap them around and stall. So when the first frame's timestamp is negative, every frame reaches the encoder
+	 * shifted by a constant offset that makes it non-negative, which is subtracted from the encoded chunks again.
+	 */
+	private shiftFrameForEncoder(videoFrame: VideoFrame) {
+		this.encoderTimestampOffset ??= videoFrame.timestamp < 0
+			? Math.ceil(-videoFrame.timestamp / 1e6) * 1e6 // Whole seconds, in microseconds
+			: 0;
+		if (this.encoderTimestampOffset === 0) {
+			return videoFrame;
+		}
+
+		const shiftedFrame = new VideoFrame(videoFrame, {
+			timestamp: videoFrame.timestamp + this.encoderTimestampOffset,
+		});
+		videoFrame.close();
+
+		return shiftedFrame;
 	}
 
 	// Browsers may reclaim codecs that have been inactive for a while (see
