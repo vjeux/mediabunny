@@ -11,6 +11,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +925,179 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS finds frames that come before a run of B-frames longer than the reorder depth', async () => {
+	// Found by L80. The P/I frame before a run of B-frames in decode order is presented after all of them, so it's as
+	// far back as the run is long, which the reorder depth doesn't bound: here num_reorder_frames is 1 and
+	// max_dec_frame_buffering 2, with runs of up to 16 B-frames (the most x264 and x265 make), as made by x264 with
+	// b-pyramid=none, x265 at slower presets or hardware encoders. SPS and PPS of a 64x64 x264 stream; the slices are
+	// stubs with first_mb_in_slice = 0. Then a 1920x1080 level 4.0 SPS without VUI, whose inferred reorder depth
+	// (MaxDpbFrames) is 4, with runs of 7.
+	const x264Sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00,
+		0x00, 0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const unsignaledSps = [0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0x40];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const slice = (header: number) => nalUnit([header, 0x88, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+
+	for (const [bFrameCount, sps] of [[2, x264Sps], [5, x264Sps], [16, x264Sps], [7, unsignaledSps]] as const) {
+		// I0 P(n+1) B1..Bn P(2n+2) ..., with n B-frames between P/I frames and no pyramid
+		const step = bFrameCount + 1;
+		const frameCount = 4 * step + 1;
+		const decodeOrder = [0];
+		for (let anchor = step; anchor < frameCount; anchor += step) {
+			decodeOrder.push(anchor);
+			for (let frame = anchor - bFrameCount; frame < anchor; frame++) {
+				decodeOrder.push(frame);
+			}
+		}
+
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source, { frameRate: 25 });
+		await output.start();
+		for (const frame of decodeOrder) {
+			const isKey = frame === 0;
+			const data = isKey
+				? [...nalUnit(sps), ...nalUnit(pps), ...slice(0x65)]
+				: slice(frame % step === 0 ? 0x41 : 0x01);
+			await source.add(
+				new EncodedPacket(new Uint8Array(data), isKey ? 'key' : 'delta', frame / 25, 1 / 25),
+				isKey ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+			);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const sink = new EncodedPacketSink(track);
+		const start = await track.getFirstTimestamp();
+
+		// Every frame's own timestamp finds it
+		const found: number[] = [];
+		for (let frame = 0; frame < frameCount; frame++) {
+			const packet = await sink.getPacket(start + frame / 25);
+			assert(packet);
+			found.push(Math.round((packet.timestamp - start) * 25));
+		}
+		expect({ bFrameCount, found }).toEqual({ bFrameCount, found: [...Array(frameCount).keys()] });
+		expect(await track.computeDuration() - start).toBeCloseTo(frameCount / 25);
+	}
+});
+
+test('MPEG-TS lookups at the end of a stream read through a small cache', async () => {
+	// Found in L15's streamed check. Through a ReadableStreamSource, which keeps only what its cache holds, the data
+	// further back that the search for a frame behind a run of B-frames reads may be gone; the lookup then goes with
+	// what it found. The same x264 SPS (num_reorder_frames 1) and runs of 16 B-frames, with frames of 100 kB, read
+	// through a 1 MiB cache.
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const slice = (header: number, frame: number) => nalUnit([header, 0x88, ...new Array<number>(100_000).fill(frame)]);
+
+	const step = 17;
+	const frameCount = 2 * step + 1;
+	const decodeOrder = [0];
+	for (let anchor = step; anchor < frameCount; anchor += step) {
+		decodeOrder.push(anchor);
+		for (let frame = anchor - 16; frame < anchor; frame++) {
+			decodeOrder.push(frame);
+		}
+	}
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (const frame of decodeOrder) {
+		const isKey = frame === 0;
+		const data = isKey
+			? [...nalUnit(sps), ...nalUnit(pps), ...slice(0x65, frame)]
+			: slice(frame % step === 0 ? 0x41 : 0x01, frame);
+		await source.add(
+			new EncodedPacket(new Uint8Array(data), isKey ? 'key' : 'delta', frame / 25, 1 / 25),
+			isKey ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= bytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(bytes.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 20 }),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.computeDuration()).toBeGreaterThan(0);
+});
+
+test('MPEG-TS lookups find field pictures behind long runs of B-fields', async () => {
+	// From L25's and L80's reviews, like FFmpeg's spatial_direct_mode_is_not_implemented.ts sample: interlaced H.264
+	// (frame_mbs_only_flag 0, a reorder depth of 4 frames) whose fields come in PES packets of their own, each anchor
+	// field pair followed in decode order by 14 B-fields shown before it. The SPS and PPS are that sample's.
+	const sps = [0x67, 0x64, 0x00, 0x28, 0xac, 0x72, 0x94, 0x07, 0x80, 0x44, 0x7d, 0xe0, 0x2d, 0x40, 0x40, 0x40, 0x7c,
+		0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xca, 0x50];
+	const pps = [0x68, 0xfa, 0x42, 0x5c, 0x30];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+
+	// Fields at 50 per second: an I field pair, then groups of 16 fields in decode order: the anchor pair, then B-field
+	// pairs in hierarchical order
+	const fieldNumbers = [0, 1];
+	for (let group = 0; group < 3; group++) {
+		const base = 2 + 16 * group;
+		fieldNumbers.push(...[14, 15, 6, 7, 2, 3, 0, 1, 4, 5, 10, 11, 8, 9, 12, 13].map(x => base + x));
+	}
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 50 });
+	await output.start();
+	for (let i = 0; i < fieldNumbers.length; i++) {
+		const sliceData = Array.from({ length: 300 }, (_, j) => 0x20 + (7 * j + i) % 0x60);
+		const slice = nalUnit([i < 2 ? 0x65 : 0x41, 0x88, ...sliceData]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(i === 0 ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				i < 2 ? 'key' : 'delta',
+				fieldNumbers[i]! / 50,
+				1 / 50,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1088 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+	expect(packets.map(x => Math.round(x.timestamp * 50))).toEqual(fieldNumbers);
+
+	// A cold lookup at each field's timestamp finds that field
+	for (const packet of packets) {
+		using coldInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const coldTrack = await coldInput.getPrimaryVideoTrack();
+		assert(coldTrack);
+		const found = await new EncodedPacketSink(coldTrack).getPacket(packet.timestamp);
+		expect(found?.timestamp).toBe(packet.timestamp);
+	}
 });
