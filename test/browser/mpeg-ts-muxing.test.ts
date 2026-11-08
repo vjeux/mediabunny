@@ -8,6 +8,7 @@ import { BufferTarget, StreamTarget, StreamTargetChunk } from '../../src/target.
 import { CanvasSource, EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { assert } from '../../src/misc.js';
 import { Conversion } from '../../src/conversion.js';
 
@@ -340,6 +341,31 @@ test('MPEG-TS muxing with HEVC and MP3', async () => {
 
 	expect(videoDuration).toBeCloseTo(4.933333333333334, 1);
 	expect(audioDuration).toBeCloseTo(5, 1);
+});
+
+test('Unrepresentable AAC channel configuration', async () => {
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// What FFmpeg's encoder writes for 7.1: channel configuration 12, too large for the 3-bit ADTS field
+	const addPacket = () => source.add(
+		new EncodedPacket(new Uint8Array(16), 'key', 0, 1024 / 48000),
+		{
+			decoderConfig: {
+				codec: 'mp4a.40.2',
+				numberOfChannels: 8,
+				sampleRate: 48000,
+				description: new Uint8Array([0x11, 0xe0, 0x56, 0xe5, 0x00]),
+			},
+		},
+	);
+	await expect(addPacket()).rejects.toThrow('channel configuration 12');
 });
 
 test('MPEG-TS muxing with no data', async () => {

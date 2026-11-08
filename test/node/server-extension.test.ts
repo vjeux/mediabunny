@@ -34,6 +34,7 @@ import { Conversion } from '../../src/conversion.js';
 import { VideoSampleSource } from '../../src/media-source.js';
 import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
+import { AdtsOutputFormat, AudioSampleSource, MpegTsOutputFormat } from '../../src/index.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
 import * as NodeAv from 'node-av';
@@ -2383,6 +2384,53 @@ describe('Audio', async () => {
 
 	test('TrueHD conversion roundtrip', async () => {
 		await conversionRoundtrip('truehd');
+	});
+
+	test('7.1 AAC can\'t be written to ADTS or MPEG-TS', async () => {
+		// FFmpeg's encoder signals 7.1 with channel configuration 12, which doesn't fit the 3-bit field of ADTS
+		// headers. It used to be cut to 4, so the headers said 4.0 while the data held 8 channels, and the files didn't
+		// decode.
+		expect(NodeAvAudioEncoder.supports('aac', {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 8,
+			sampleRate: 48000,
+			// @ts-expect-error Fucky type
+			aac: { format: 'adts' },
+		})).toBe(false);
+		expect(NodeAvAudioEncoder.supports('aac', { codec: 'mp4a.40.2', numberOfChannels: 8, sampleRate: 48000 }))
+			.toBe(true);
+
+		const encode = async (format: AdtsOutputFormat | MpegTsOutputFormat, numberOfChannels: number) => {
+			const output = new Output({ format, target: new BufferTarget() });
+			const source = new AudioSampleSource({ codec: 'aac', bitrate: 512e3 });
+			output.addAudioTrack(source);
+			await output.start();
+
+			// 1 s of a different tone on each channel
+			const data = new Float32Array(numberOfChannels * 48000);
+			for (let i = 0; i < data.length; i++) {
+				const frequency = 300 + 150 * (i % numberOfChannels);
+				data[i] = 0.2 * Math.sin(2 * Math.PI * frequency * Math.floor(i / numberOfChannels) / 48000);
+			}
+			using sample = new AudioSample({ data, format: 'f32', numberOfChannels, sampleRate: 48000, timestamp: 0 });
+			await source.add(sample);
+			await output.finalize();
+
+			return output.target.buffer!;
+		};
+
+		for (const createFormat of [() => new AdtsOutputFormat(), () => new MpegTsOutputFormat()]) {
+			await expect(encode(createFormat(), 8)).rejects.toThrow('channel configuration 12');
+
+			// 5.1 still works
+			using input = new Input({
+				source: new BufferSource(await encode(createFormat(), 6)),
+				formats: ALL_FORMATS,
+			});
+			const track = await input.getPrimaryAudioTrack();
+			assert(track);
+			expect(await track.getNumberOfChannels()).toBe(6);
+		}
 	});
 
 	const conversionRoundtrip = async (codec: AudioCodec) => {

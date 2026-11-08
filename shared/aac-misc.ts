@@ -215,6 +215,9 @@ export const buildAdtsHeaderTemplate = (config: AacAudioSpecificConfig): AdtsHea
 	const bitstream = new Bitstream(header);
 
 	const { coreObjectType, frequencyIndex, channelConfiguration } = config;
+	if (channelConfiguration > 7) {
+		throw new Error(`AAC channel configuration ${channelConfiguration} can't be stored in ADTS.`);
+	}
 	const profile = coreObjectType - 1;
 
 	bitstream.writeBits(12, 0b1111_11111111); // Syncword
