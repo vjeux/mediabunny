@@ -191,6 +191,21 @@ test('VideoSampleSource, changing dimensions with passThrough, width and height 
 	expect(samples[1]).toMatchObject({ codedWidth: 50, codedHeight: 80 });
 });
 
+test('VideoSampleSource, encoding rotated video frames', async () => {
+	const buffer = await encodeFrames(
+		{ codec: 'vp8', quality: new Quality('medium') },
+		[{ width: 200, height: 100, rotation: 90 }, { width: 200, height: 100, rotation: 90 }],
+	);
+
+	const samples = await readBackSamples(buffer);
+
+	// They were encoded with no regard for the rotation metadata
+	for (const sample of samples) {
+		expect(sample.codedWidth).toBe(200);
+		expect(sample.codedHeight).toBe(100);
+	}
+});
+
 test('VideoSampleSource on a track with only key packets encodes every frame as a key frame', async () => {
 	// The way to make an HLS I-frame playlist track; the track can't hold anything but key frames
 	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
@@ -216,21 +231,6 @@ test('VideoSampleSource on a track with only key packets encodes every frame as 
 		types.push(packet.type);
 	}
 	expect(types).toEqual(Array<string>(30).fill('key'));
-});
-
-test('VideoSampleSource, encoding rotated video frames', async () => {
-	const buffer = await encodeFrames(
-		{ codec: 'vp8', quality: new Quality('medium') },
-		[{ width: 200, height: 100, rotation: 90 }, { width: 200, height: 100, rotation: 90 }],
-	);
-
-	const samples = await readBackSamples(buffer);
-
-	// They were encoded with no regard for the rotation metadata
-	for (const sample of samples) {
-		expect(sample.codedWidth).toBe(200);
-		expect(sample.codedHeight).toBe(100);
-	}
 });
 
 test('VideoSampleSource, flip is baked in via transform', async () => {
