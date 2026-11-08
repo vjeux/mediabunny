@@ -1536,8 +1536,9 @@ export class VideoSample implements Disposable {
 	 * Converts this video sample to a
 	 * [`CanvasImageSource`](https://udn.realityripple.com/docs/Web/API/CanvasImageSource) for drawing to a canvas.
 	 *
-	 * You must use the value returned by this method immediately, as any VideoFrame created internally may
-	 * automatically be closed in the next microtask.
+	 * The returned value belongs to the sample, so don't close it. It may be a VideoFrame created internally, which is
+	 * automatically closed in the next microtask (so use it immediately), or the sample's own VideoFrame, which
+	 * closing would invalidate.
 	 */
 	toCanvasImageSource() {
 		if (this._closed) {
