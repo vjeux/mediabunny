@@ -29,6 +29,7 @@ import { BufferSource, CustomPathedSource, FilePathSource } from '../../src/sour
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Logging, LogLevel } from '../../src/logging.js';
 const videoSource = (codec: VideoCodec = 'avc') => new EncodedVideoPacketSource(codec);
 const audioSource = (codec: AudioCodec = 'aac') => new EncodedAudioPacketSource(codec);
 
@@ -4470,4 +4471,42 @@ test('A URI-less rendition with an empty playlist is left out when its variant u
 		expect(await Promise.all(tracks.map(x => x.getName()))).toEqual(['Main']);
 		expect((await new EncodedPacketSink(tracks[0]!).getFirstPacket())?.timestamp).toBe(0);
 	}
+});
+
+test('HLS output with MPEG-TS segments reports an SPS that does not parse once, not once per segment', async () => {
+	// From L94's review. Every segment has a muxer of its own, which reads how far the stream reorders from its SPS;
+	// the SPS is the same for all of them, so a broken one is reported once. 10 segments, with an SPS cut short.
+	const errors: string[] = [];
+	const unsubscribe = Logging.on('error', args => errors.push(args.map(String).join(' ')));
+	const previousLevel = Logging.level;
+	Logging.level = LogLevel.Silent;
+	try {
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1 }),
+			target: new PathedTarget('master.m3u8', () => new BufferTarget()),
+		});
+		const source = videoSource('avc');
+		output.addVideoTrack(source, { frameRate: 2 });
+		await output.start();
+
+		const sps = [0x67, 0x42, 0x00, 0x1f];
+		const pps = [0x68, 0xce, 0x38, 0x80];
+		const description = new Uint8Array([
+			1, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0, sps.length, ...sps, 1, 0, pps.length, ...pps,
+		]);
+		for (let i = 0; i < 20; i++) {
+			await source.add(
+				new EncodedPacket(new Uint8Array([0, 0, 0, 4, 0x65, 0x88, 0x80, 0x40]), 'key', i / 2, 1 / 2),
+				i === 0
+					? { decoderConfig: { codec: 'avc1.42001f', codedWidth: 64, codedHeight: 64, description } }
+					: undefined,
+			);
+		}
+		await output.finalize();
+	} finally {
+		unsubscribe();
+		Logging.level = previousLevel;
+	}
+
+	expect(errors.filter(x => x.includes('Error parsing AVC SPS'))).toHaveLength(1);
 });
