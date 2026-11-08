@@ -1732,3 +1732,65 @@ test('16-bit samples in a QuickTime raw sample entry', async () => {
 	expect(await read(8)).toEqual(['pcm-u8', 960, 0.01]);
 	expect(await read(16)).toEqual(['pcm-s16be', 1920, 0.01]);
 });
+
+test('Fragment data after the traf of a track that is not read', async () => {
+	// Without base data offsets in tfhd, a traf's data follows the previous traf's data (like FFmpeg's
+	// omit_tfhd_offset), so the skipped subtitle track's data must be accounted for
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const trak = (id: number, handlerType: string, sampleEntry: number[]) => box('trak',
+		box('tkhd', u32(3), zeros(8), u32(id), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+		box('mdia',
+			box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+			box('hdlr', zeros(8), ascii(handlerType), zeros(13)),
+			box('minf', box('stbl',
+				box('stsd', u32(0), u32(1), sampleEntry),
+				box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+			)),
+		),
+	);
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		trak(1, 'text', box('tx3g', zeros(38))),
+		trak(2, 'vide', box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+		box('mvex',
+			box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0)),
+			box('trex', u32(0), u32(2), u32(1), u32(1), u32(0), u32(0)),
+		),
+	);
+
+	const subtitleSamples = [[1, 1, 1, 1, 1], [2, 2, 2]];
+	const videoSamples = [[3, 3, 3, 3], [4, 4, 4, 4, 4, 4]];
+	const trun = (dataOffset: number, sampleSizes: number[]) => box('trun', u32(0x000301), u32(sampleSizes.length),
+		u32(dataOffset), ...sampleSizes.map(size => [...u32(1), ...u32(size)]));
+	const moof = (subtitleDataOffset: number) => box('moof',
+		box('mfhd', u32(0), u32(1)),
+		box('traf', box('tfhd', u32(0), u32(1)), box('tfdt', u32(0), u32(0)),
+			trun(subtitleDataOffset, subtitleSamples.map(x => x.length))),
+		// The base data offset is the end of the subtitle data, where the video data starts
+		box('traf', box('tfhd', u32(0x000020), u32(2), u32(0)), box('tfdt', u32(0), u32(0)),
+			trun(0, videoSamples.map(x => x.length))),
+	);
+	const moofSize = moof(0).length;
+	const fragment = [...moof(moofSize + 8), ...box('mdat', ...subtitleSamples, ...videoSamples)];
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...box('ftyp', ascii('iso5'), u32(0)), ...moov, ...fragment])),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual(videoSamples);
+});
