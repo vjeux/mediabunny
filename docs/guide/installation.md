@@ -23,6 +23,17 @@ bun add mediabunny
 
 ::: info
 Requires any JavaScript environment that can run ECMAScript 2021 or later. Mediabunny is expected to be run in modern browsers. For types, TypeScript 5.7 or later is required.
+
+Mediabunny's type declarations use types from TypeScript's `DOM` library (such as `HTMLCanvasElement` and `AudioBuffer`), so include `"DOM"` in your tsconfig's `lib`, also in Node, Bun and Deno projects. Without it, the declarations don't type-check, and enabling `skipLibCheck` instead only hides that: the types that depend on it silently become `any`. In a Web Worker project, use `"WebWorker"` instead of `"DOM"` and enable `skipLibCheck`; DOM-only types such as `HTMLCanvasElement` and `AudioBuffer` then become `any`.
+
+For example:
+```json
+{
+	"compilerOptions": {
+		"lib": ["ES2022", "DOM"]
+	}
+}
+```
 :::
 
 Then, simply import it like this:
