@@ -8,8 +8,8 @@ import { Output } from '../../src/output.js';
 import { Mp3OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
 import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
 import { Conversion } from '../../src/conversion.js';
 
@@ -64,6 +64,33 @@ test('MP3 file holding a single frame', async () => {
 		}
 		expect(count).toBe(1);
 	}
+});
+
+test('MP3 output of Layer II audio gets no Xing frame, which decoders would play as audio', async () => {
+	// MPEG-1 Layer II, 192 kbps, 48 kHz, no CRC: 576-byte frames of 1152 samples
+	const frame = new Uint8Array(576);
+	frame.set([0xff, 0xfd, 0xa4, 0x00]);
+
+	const output = new Output({
+		format: new Mp3OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('mp3');
+	output.addAudioTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 10; i++) {
+		await source.add(
+			new EncodedPacket(frame, 'key', i * 0.024, 0.024),
+			i === 0 ? { decoderConfig: { codec: 'mp3', sampleRate: 48000, numberOfChannels: 2 } } : undefined,
+		);
+	}
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	expect(bytes.byteLength).toBe(10 * 576);
+	expect([...bytes.subarray(0, 4)]).toEqual([0xff, 0xfd, 0xa4, 0x00]);
 });
 
 test('Muxing without Xing header', async () => {
