@@ -22,7 +22,7 @@ import { MetadataTags, TrackDisposition, validateMetadataTags, validateTrackDisp
 import { Muxer } from './muxer';
 import { OutputFormat } from './output-format';
 import { AudioSource, MediaSource, SubtitleSource, VideoSource } from './media-source';
-import { PathedTarget, Target, TargetRequest } from './target';
+import { NullTarget, PathedTarget, Target, TargetRequest } from './target';
 import { Writer } from './writer';
 import { Logging } from './logging';
 import { EncodedPacket } from './packet';
@@ -422,6 +422,20 @@ export type OutputEvents = {
 	};
 };
 
+/** Discards everything and fails to finalize: what the muxer writes to when its target couldn't be had. */
+class UnavailableTarget extends NullTarget {
+	_error: unknown;
+
+	constructor(error: unknown) {
+		super();
+		this._error = error;
+	}
+
+	override async _finalize() {
+		throw this._error;
+	}
+}
+
 /**
  * Main class orchestrating the creation of new media files.
  * @group Output files
@@ -456,6 +470,8 @@ export class Output<
 	_muxer: Muxer;
 	/** @internal */
 	_unfinalizedTargets = new Set<Target>();
+	/** @internal Set when a target that the muxer needed at start couldn't be had (see _waitForTarget). */
+	_targetFailure: { error: unknown } | null = null;
 	/** @internal */
 	_rootWriterPromise: Promise<Writer> | null = null;
 	/** @internal */
@@ -594,23 +610,25 @@ export class Output<
 	}
 
 	/** @internal */
-	async _getInitTarget(): Promise<T> {
+	_getInitTarget(): Promise<Target> {
 		assert(this._initTarget !== null);
 
 		if (this._initTarget instanceof Target) {
-			return this._initTarget;
+			return this._waitForTarget(this._initTarget);
 		}
 
-		const target = await this._initTarget();
+		const initTarget = this._initTarget;
+		return this._waitForTarget((async () => {
+			const target = await initTarget();
 
-		if (this.state === 'canceled') {
-			// Arrived after a cancel (which doesn't wait for it), so don't let anything write into it
-			await target._close();
-			throw new Error('Output has been canceled.');
-		}
+			if (this.state === 'canceled') {
+				await target._close();
+			} else {
+				this._rememberTarget(target);
+			}
 
-		this._rememberTarget(target);
-		return target;
+			return target;
+		})());
 	}
 
 	/** @internal */
@@ -663,17 +681,34 @@ export class Output<
 	/** @internal */
 	_getRootWriter(isMonotonic: boolean | ((target: Target) => boolean)) {
 		return this._rootWriterPromise ??= (async () => {
-			const target = await this._getRootTarget();
-			if (this.state === 'canceled') {
-				// Arrived after a cancel (which doesn't wait for it, and has closed it), so don't let anything write
-				// into it
-				throw new Error('Output has been canceled.');
-			}
+			const target = await this._waitForTarget(this._getRootTarget());
 
 			const writer = new Writer(target, typeof isMonotonic === 'boolean' ? isMonotonic : isMonotonic(target));
 			writer.start();
 			return writer;
 		})();
+	}
+
+	/**
+	 * Waits for a target that the muxer is about to write to as it starts, while holding its mutex. A cancel doesn't
+	 * wait for the target (which may never come), and a target may fail to come. In both cases, the muxer gets a target
+	 * discarding everything instead: its start then finishes and releases the mutex, rather than leaving the adds and
+	 * the finalization waiting on it forever. A target arriving after a cancel is closed and never written to, and one
+	 * that couldn't be had makes start() reject with its error, and the finalization too.
+	 * @internal
+	 */
+	async _waitForTarget(target: MaybePromise<Target>): Promise<Target> {
+		try {
+			const result = await Promise.race([target, this._canceled.promise.then(() => null)]);
+			if (result && this.state !== 'canceled') {
+				return result;
+			}
+
+			return new NullTarget();
+		} catch (error) {
+			this._targetFailure ??= { error };
+			return new UnavailableTarget(error);
+		}
 	}
 
 	/** Adds a video track to the output with the given source. Can only be called before the output is started. */
@@ -960,6 +995,9 @@ export class Output<
 				await Promise.race([muxerStartPromise, this._canceled.promise]);
 				if ((this.state as Output['state']) === 'canceled') {
 					return;
+				}
+				if (this._targetFailure) {
+					throw this._targetFailure.error;
 				}
 
 				const promises = this.tracks.map(track => track.source._start());

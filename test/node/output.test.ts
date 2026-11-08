@@ -106,6 +106,65 @@ test.each(['synchronous', 'never settling'] as const)(
 	},
 );
 
+test.each(['MP4', 'Matroska', 'MPEG-TS'] as const)(
+	'An add issued while the start is still running settles when the start is canceled or its target fails (%s)',
+	async (formatName) => {
+		// The muxer holds its mutex while it waits for its target at start, and adds wait for that mutex
+		const { Mp4OutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
+		const { PathedTarget } = await import('../../src/target.js');
+		const createFormat = () => formatName === 'MP4'
+			? new Mp4OutputFormat()
+			: formatName === 'Matroska'
+				? new MkvOutputFormat()
+				: new MpegTsOutputFormat();
+		const settlesWithin = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'resolved', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		const scenarios = ['canceled same tick', 'canceled while the target is pending', 'target fails'] as const;
+		for (const scenario of scenarios) {
+			const output = new Output({
+				format: createFormat(),
+				target: scenario === 'canceled same tick'
+					? new BufferTarget()
+					: new PathedTarget('file', () => new Promise<BufferTarget>((_, reject) => {
+						if (scenario === 'target fails') {
+							setTimeout(() => reject(new Error('No target')), 20);
+						}
+					})),
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+
+			const start = output.start();
+			const add = source.add(new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', 0, 1 / 30), {
+				decoderConfig: {
+					codec: 'avc1.42001f',
+					codedWidth: 64,
+					codedHeight: 64,
+					description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+				},
+			});
+
+			if (scenario === 'target fails') {
+				await expect(start).rejects.toThrow('No target');
+				expect(await settlesWithin(add, 1000), scenario).not.toBe('pending');
+				expect(await settlesWithin(output.finalize(), 1000), scenario).toBe('rejected');
+				continue;
+			}
+
+			if (scenario === 'canceled while the target is pending') {
+				await new Promise(resolve => setTimeout(resolve, 20));
+			}
+			const cancel = output.cancel();
+			expect(await settlesWithin(add, 1000), scenario).toBe('resolved'); // As when the start had finished
+			expect(await settlesWithin(start, 1000), scenario).toBe('resolved');
+			expect(await settlesWithin(cancel, 1000), scenario).toBe('resolved');
+		}
+	},
+);
+
 test('Output, onFinalize', async () => {
 	let callCount = 0;
 	const output = new Output({
