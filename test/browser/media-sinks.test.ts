@@ -1689,3 +1689,58 @@ test('Returning from sample iterators at the live edge closes the decoder', asyn
 		globalThis.VideoDecoder = OriginalVideoDecoder;
 	}
 });
+
+test.each([
+	['its own pre-skip', null],
+	['a pre-skip longer than the pre-roll', 24000],
+])('Opus audio looked up mid-stream matches decoding from the start, with %s', async (_, preSkip) => {
+	// preroll-test.opus remuxed into an MP4 whose OpusHead declares the given pre-skip (in 48 kHz samples). Writers can
+	// grow the pre-skip to cover a trimmed start, and Chromium's opus-trimming-test.mp4 has one of 1.37 s (found by
+	// lane L79).
+	using oggInput = new Input({ source: new UrlSource('/preroll-test.opus'), formats: ALL_FORMATS });
+	const oggTrack = await oggInput.getPrimaryAudioTrack();
+	assert(oggTrack);
+	const decoderConfig = await oggTrack.getDecoderConfig();
+	assert(decoderConfig?.description);
+	const opusHead = new Uint8Array(decoderConfig.description as Uint8Array).slice();
+	if (preSkip !== null) {
+		new DataView(opusHead.buffer).setUint16(10, preSkip, true);
+	}
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(source);
+	await output.start();
+	for await (const packet of new EncodedPacketSink(oggTrack).packets()) {
+		await source.add(packet, { decoderConfig: { ...decoderConfig, description: opusHead } });
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const sink = new AudioSampleSink(track);
+
+	const timestamps: number[] = [];
+	for await (using sample of sink.samples()) {
+		timestamps.push(sample.timestamp);
+	}
+
+	// Decoders discard the pre-skip again whenever decoding starts over, which swallowed the audio that was asked for
+	// when the pre-skip is longer than the pre-roll
+	for (const timestamp of [1, 2.01, 4.5]) {
+		const expected = timestamps.filter(x => x <= timestamp).at(-1);
+		using sample = await sink.getSample(timestamp);
+		expect(sample?.timestamp, `getSample(${timestamp})`).toBeCloseTo(expected!, 6);
+
+		const range: number[] = [];
+		for await (using rangeSample of sink.samples(timestamp, timestamp + 0.5)) {
+			range.push(rangeSample.timestamp);
+		}
+		const expectedRange = timestamps.filter((x, i) => (
+			x < timestamp + 0.5 && (x >= timestamp || timestamps[i + 1]! > timestamp)
+		));
+		expect(range.length, `samples(${timestamp}, ${timestamp + 0.5})`).toBe(expectedRange.length);
+		range.forEach((x, i) => expect(x).toBeCloseTo(expectedRange[i]!, 6));
+	}
+});

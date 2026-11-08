@@ -3632,6 +3632,16 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		const preRollDuration = await this._track.getPreRollDuration();
 		assert(preRollDuration !== null); // The decoder was created, so the codec is known
 
+		// Decoders discard the Opus pre-skip again whenever decoding starts over, so decoding mid-stream has to reach
+		// back by it too: otherwise, a pre-skip longer than the pre-roll swallows the audio that was asked for
+		if ((await this._track.getCodec()) === 'opus') {
+			const decoderConfig = await this._track.getDecoderConfig();
+			if (decoderConfig?.description) {
+				const { preSkip } = parseOpusIdentificationHeader(toUint8Array(decoderConfig.description));
+				return preRollDuration + preSkip / OPUS_SAMPLE_RATE;
+			}
+		}
+
 		return preRollDuration;
 	}
 
