@@ -1833,32 +1833,33 @@ export class IsobmffMuxer extends Muxer {
 		return upperBound;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const release = await this.mutex.acquire();
 
-		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			await this.writePendingEac3Sample(trackData);
+		try {
+			const trackData = this.trackDatas.find(x => x.track === track);
+			if (trackData) {
+				await this.writePendingEac3Sample(trackData);
 
-			// Flush the remaining cues while the track is still open: a closed track no longer holds back fragments, so
-			// its last samples could otherwise get written before their timestamps are processed
-			if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
-				await this.processWebVTTCues(trackData, Infinity);
+				// Flush the remaining cues while the track is still open: a closed track no longer holds back
+				// fragments, so its last samples could otherwise get written before their timestamps are processed
+				if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
+					await this.processWebVTTCues(trackData, Infinity);
+				}
+
+				trackData.closed = true;
+				this.processTimestamps(trackData);
 			}
 
-			trackData.closed = true;
-			this.processTimestamps(trackData);
+			if (this.allTracksAreKnown()) {
+				this.allTracksKnown.resolve();
+			}
+
+			// Since a track is now closed, we may be able to write out chunks that were previously waiting
+			await this.interleaveSamples();
+		} finally {
+			release();
 		}
-
-		if (this.allTracksAreKnown()) {
-			this.allTracksKnown.resolve();
-		}
-
-		// Since a track is now closed, we may be able to write out chunks that were previously waiting
-		await this.interleaveSamples();
-
-		release();
 	}
 
 	ensureOneEnabledTrack() {
