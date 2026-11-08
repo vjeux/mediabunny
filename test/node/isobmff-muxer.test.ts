@@ -1401,3 +1401,62 @@ test('PCM tracks with more frames than the sample tables count are rejected inst
 
 	await expect(mux()).rejects.toThrow(/more than 4294967295 PCM audio frames/);
 });
+
+test.each([false, 'in-memory', 'reserve'] as const)(
+	'Long gaps between PCM packets are written as silence in pieces of at most 16 MiB (fastStart %s)',
+	async (fastStart) => {
+		const target = new BufferTarget();
+		const writeSizes: number[] = [];
+		target.on('write', ({ start, end }) => writeSizes.push(end - start));
+
+		const output = new Output({ format: new MovOutputFormat({ fastStart }), target });
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source, { maximumPacketCount: 3 });
+		await output.start();
+
+		// One second of 48 kHz stereo, a 100-second gap (19.2 MB of silence), then another second
+		const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 48000 };
+		await source.add(new EncodedPacket(new Uint8Array(192000).fill(0x11), 'key', 0, 1), { decoderConfig });
+		await source.add(new EncodedPacket(new Uint8Array(192000).fill(0x22), 'key', 101, 1));
+		await output.finalize();
+
+		// The padding used to be written as one 19.2 MB sample
+		expect(Math.max(...writeSizes)).toBe(2 ** 24);
+
+		using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.computeDuration()).toBe(102);
+
+		// The audio around the gap is where it belongs
+		const sink = new EncodedPacketSink(track);
+		for (const [timestamp, value] of [[0.5, 0x11], [50, 0], [100.9, 0], [101.5, 0x22]]) {
+			const packet = (await sink.getPacket(timestamp!))!;
+			expect(packet.data.every(x => x === value)).toBe(true);
+		}
+	},
+);
+
+test.each([10, 200])(
+	'Gaps of %i seconds between PCM packets are padded with one sample, within the reserved packet count',
+	async (gap) => {
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'reserve' }),
+			target: new BufferTarget(),
+		});
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source, { maximumPacketCount: 4 });
+		await output.start();
+
+		// Three 10 ms packets with a gap after the first. At 48 kHz mono s16, 200 seconds of silence are 19.2 MB,
+		// more than one 16 MiB piece.
+		const decoderConfig = { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 };
+		for (const timestamp of [0, gap + 0.01, gap + 0.02]) {
+			await source.add(new EncodedPacket(new Uint8Array(960), 'key', timestamp, 0.01), { decoderConfig });
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.computeDuration()).toBeCloseTo(gap + 0.03, 9);
+	},
+);
