@@ -3429,6 +3429,53 @@ test('PRIV timestamps in packed audio segments, WAV', async () => {
 	await testPackedAudioPrivTimestamps('glitch-hop-is-dead.wav', new WavOutputFormat({ metadataFormat: 'id3' }));
 });
 
+test('MP3 segments start with audio, not with a Xing frame', async () => {
+	const targets = new Map<string, BufferTarget>();
+
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new Mp3OutputFormat() }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+
+			return target;
+		}),
+	});
+
+	using sourceInput = new Input({
+		source: new FilePathSource('./test/public/Toothsome-Meme.VBRv2.mp3'),
+		formats: ALL_FORMATS,
+	});
+	const sourceTrack = await sourceInput.getPrimaryAudioTrack();
+	assert(sourceTrack);
+	const decoderConfig = await sourceTrack.getDecoderConfig();
+	assert(decoderConfig);
+
+	const source = new EncodedAudioPacketSource('mp3');
+	output.addAudioTrack(source);
+
+	await output.start();
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		await source.add(packet, { decoderConfig });
+	}
+	await output.finalize();
+
+	const segmentPaths = [...targets.keys()].filter(path => path.endsWith('.mp3'));
+	expect(segmentPaths.length).toBeGreaterThan(1);
+
+	for (const path of segmentPaths) {
+		const bytes = new Uint8Array(targets.get(path)!.buffer!);
+
+		// Skip the ID3v2 tag holding the PRIV timestamp; the first MPEG frame follows it
+		expect(new TextDecoder().decode(bytes.subarray(0, 3))).toBe('ID3');
+		const tagSize = 10 + ((bytes[6]! << 21) | (bytes[7]! << 14) | (bytes[8]! << 7) | bytes[9]!);
+
+		// A Xing/Info frame would be read as an extra frame of silence by players
+		const frameStart = new TextDecoder('latin1').decode(bytes.subarray(tagSize, tagSize + 64));
+		expect(/Xing|Info/.test(frameStart)).toBe(false);
+	}
+});
+
 const testPackedAudioPrivTimestamps = async (
 	fileName: string,
 	segmentFormat: HlsOutputFormatOptions['segmentFormat'],
