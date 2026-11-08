@@ -491,6 +491,9 @@ const hasStuffing = (packet: TsPacket) => {
 /** For sections and PES packets without holes, so that they don't need an array of their own */
 const NO_HOLES: readonly number[] = Object.freeze([]);
 
+/** How many PES packets further back a lookup may look when the PES packets it read have no packet it is after */
+const MAX_LOOKUP_WINDOW_EXTENSION = 4;
+
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
@@ -3336,6 +3339,17 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				}
 			}
 
+			// When PES packets don't start with frames, the frame a lookup is after can start in a PES packet before
+			// the window, like the last complete one when the end of the file cuts off the frames that start in the
+			// window. Widen it then.
+			for (let i = 0; !packet && i < MAX_LOOKUP_WINDOW_EXTENSION; i++) {
+				if (!await rewindByOnePesPacket()) {
+					break;
+				}
+
+				packet = await retrieveEncodedPacket(windowStart.sectionStartPos, isTargetPacket);
+			}
+
 			return packet;
 		} else {
 			// Key packet lookup case. Slightly harder since the starting chunk may not have a key packet at all, which
@@ -4939,10 +4953,11 @@ class PacketBuffer {
 		if (presentationIndex === -1 || presentationIndex === this.presentationOrderPackets.length - 1) {
 			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). For video,
 			// whose frames may be reordered, the packets around it depend on where reading started, so use the
-			// track's frame duration.
+			// track's frame duration. For audio, without a previous duration either (a lookup that only found this
+			// packet), take the one its data implies.
 			duration = this.backing.elementaryStream.info.type === 'video'
 				? await this.backing.getFrameDuration()
-				: this.lastDuration; // Reasonable heuristic
+				: this.lastDuration || packet.intrinsicDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
 			duration = nextPacket.pts - packet.pts;
