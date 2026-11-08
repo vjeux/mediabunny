@@ -2458,12 +2458,15 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 		return trafs;
 	};
 
-	const configurations = [
-		{ segmentFormat: new CmafOutputFormat(), singleFilePerPlaylist: false },
-		{ segmentFormat: new CmafOutputFormat(), singleFilePerPlaylist: true },
-		{ segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }), singleFilePerPlaylist: false },
-	];
-	for (const { segmentFormat, singleFilePerPlaylist } of configurations) {
+	type TestPacket = { timestamp: number; type: 'key' | 'delta'; duration: number };
+
+	// Returns the joins between consecutive fragments of all segments: the next decode time minus the previous end
+	const writeSegments = async (
+		segmentFormat: Mp4OutputFormat | CmafOutputFormat,
+		singleFilePerPlaylist: boolean,
+		packets: TestPacket[],
+		options: { audio?: boolean; frameRate?: number } = {},
+	) => {
 		const segments = new Map<string, Uint8Array>();
 		const output = new Output({
 			format: new HlsOutputFormat({ segmentFormat, singleFilePerPlaylist, targetDuration: 2 }),
@@ -2477,31 +2480,98 @@ test('Fragmented MP4 and CMAF segments end where the next segment starts', async
 				return target;
 			}),
 		});
-		const source = new EncodedVideoPacketSource('vp9');
-		output.addVideoTrack(source);
-		await output.start();
-
-		// 29.97 fps with timestamps rounded to milliseconds, as in WebM files from FFmpeg, and a key frame every 2 s
-		for (let i = 0; i < 300; i++) {
-			const timestamp = Math.round(i * 1001 / 30) / 1000;
-			const type = i % 60 === 0 ? 'key' : 'delta';
-			const packet = new EncodedPacket(new Uint8Array(1), type, timestamp, 1001 / 30000);
-			await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 320, codedHeight: 180 } });
+		if (options.audio) {
+			const source = new EncodedAudioPacketSource('aac');
+			output.addAudioTrack(source);
+			await output.start();
+			const decoderConfig = {
+				codec: 'mp4a.40.2',
+				sampleRate: 44100,
+				numberOfChannels: 2,
+				description: new Uint8Array([0x12, 0x10]),
+			};
+			for (const { timestamp, type, duration } of packets) {
+				await source.add(new EncodedPacket(new Uint8Array(20), type, timestamp, duration), { decoderConfig });
+			}
+		} else {
+			const source = new EncodedVideoPacketSource('vp9');
+			output.addVideoTrack(source, { frameRate: options.frameRate });
+			await output.start();
+			const decoderConfig = { codec: 'vp09.00.10.08', codedWidth: 320, codedHeight: 180 };
+			for (const { timestamp, type, duration } of packets) {
+				await source.add(new EncodedPacket(new Uint8Array(1), type, timestamp, duration), { decoderConfig });
+			}
 		}
 		await output.finalize();
 
-		// Each segment is written by its own muxer, so each one's last sample kept its packet duration, which reached
-		// past the next segment's start. A traf's decode time must be the sum of all earlier sample durations
-		// (ISO/IEC 14496-12), also across segments, which players append one after the other.
 		const segmentNumber = (path: string) => Number(/(\d+)\.[a-z0-9]+$/.exec(path)![1]);
 		const trafs = [...segments]
 			.sort(([a], [b]) => segmentNumber(a) - segmentNumber(b))
 			.flatMap(([, bytes]) => readTrafs(bytes));
-		expect(trafs).toHaveLength(5);
-		for (let i = 1; i < trafs.length; i++) {
-			expect(trafs[i]!.decodeTime).toBe(trafs[i - 1]!.end);
+		return trafs.slice(1).map((x, i) => x.decodeTime - trafs[i]!.end);
+	};
+
+	// Each segment is written by its own muxer, so each one's last sample kept its packet duration, which could reach
+	// past the next segment's start or end before it. A traf's decode time must be the sum of all earlier sample
+	// durations (ISO/IEC 14496-12), also across segments, which players append one after the other.
+	const configurations = [
+		{ segmentFormat: new CmafOutputFormat(), singleFilePerPlaylist: false },
+		{ segmentFormat: new CmafOutputFormat(), singleFilePerPlaylist: true },
+		{ segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }), singleFilePerPlaylist: false },
+	];
+	for (const { segmentFormat, singleFilePerPlaylist } of configurations) {
+		// 29.97 fps with timestamps rounded to milliseconds, as in WebM files from FFmpeg, and a key frame every 2 s:
+		// each segment's last sample reached up to a third of a millisecond past the next segment's start
+		const packets: TestPacket[] = [];
+		for (let i = 0; i < 300; i++) {
+			const timestamp = Math.round(i * 1001 / 30) / 1000;
+			packets.push({ timestamp, type: i % 60 === 0 ? 'key' : 'delta', duration: 1001 / 30000 });
+		}
+		expect(await writeSegments(segmentFormat, singleFilePerPlaylist, packets)).toEqual([0, 0, 0, 0]);
+
+		// 60 fps: frames are 16 or 17 ms apart and last 16.67 ms each, so some segments ended a third of a millisecond
+		// before the next one (9 GOPs, so that each segment has a single fragment)
+		const packets60: TestPacket[] = [];
+		for (let i = 0; i < 594; i++) {
+			const timestamp = Math.round(i * 1000 / 60) / 1000;
+			packets60.push({ timestamp, type: i % 66 === 0 ? 'key' : 'delta', duration: 1 / 60 });
+		}
+		const joins60 = await writeSegments(segmentFormat, singleFilePerPlaylist, packets60);
+		expect(joins60.length).toBeGreaterThan(3);
+		expect(joins60.filter(x => x !== 0)).toEqual([]);
+	}
+
+	const cmaf = new CmafOutputFormat();
+
+	// A real pause before a segment's first key frame stays
+	const paused: TestPacket[] = [];
+	for (let i = 0; i < 594; i++) {
+		const timestamp = Math.round(i * 1000 / 60) / 1000 + (i >= 330 ? 0.5 : 0);
+		paused.push({ timestamp, type: i % 66 === 0 ? 'key' : 'delta', duration: 1 / 60 });
+	}
+	const pausedJoins = await writeSegments(cmaf, true, paused);
+	expect(pausedJoins.filter(x => x !== 0)).toHaveLength(1);
+	expect(pausedJoins.find(x => x !== 0)).toBeGreaterThan(1000);
+
+	// So does a frame dropped right before one, even when that's a single tick of a frame rate timescale
+	const dropped: TestPacket[] = [];
+	for (let i = 0; i < 90; i++) {
+		if (i !== 59) {
+			dropped.push({ timestamp: i / 30, type: i % 30 === 0 ? 'key' : 'delta', duration: 1 / 30 });
 		}
 	}
+	expect(await writeSegments(cmaf, true, dropped, { frameRate: 30 })).toEqual([1]);
+
+	// 44.1 kHz AAC with timestamps rounded to milliseconds, starting at -23 ms (encoder priming), with durations as
+	// Matroska gives them: the gap to the next block. Segments then don't start on whole ticks.
+	const aacTimestamp = (index: number) => Math.round((index - 1) * 1024 / 44.1) / 1000;
+	const aac: TestPacket[] = [];
+	for (let i = 0; i < 1300; i++) {
+		aac.push({ timestamp: aacTimestamp(i), type: 'key', duration: aacTimestamp(i + 1) - aacTimestamp(i) });
+	}
+	const aacJoins = await writeSegments(cmaf, true, aac, { audio: true });
+	expect(aacJoins.length).toBeGreaterThan(10);
+	expect(aacJoins.filter(x => x !== 0)).toEqual([]);
 });
 
 test('Sparse tracks in segments, MPEG-TS', async () => {
