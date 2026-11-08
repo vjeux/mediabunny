@@ -312,6 +312,110 @@ test('AAC config with channel configuration 0 but no program config element', as
 	expect((await track.getDecoderConfig())!.numberOfChannels).toBe(2);
 });
 
+// The avcC of ffmpeg -f lavfi -i testsrc2=size=1920x1080 -frames:v 1 -c:v libx264 -profile:v high out.mp4
+const X264_AVCC = new Uint8Array('01640028ffe1001b67640028acd940780227e5c044000003000400000300c83c60c658010006'
+	.concat('68ebe3cb22c0fdf8f800').match(/../g)!.map(x => parseInt(x, 16)));
+
+/** Writes the given length-prefixed H.264 frames into an MP4 at 30 fps, each marked as a key frame there. */
+const writeAvcFrames = async (frames: number[][]) => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	for (let i = 0; i < frames.length; i++) {
+		const packet = new EncodedPacket(new Uint8Array(frames[i]!), 'key', i / 30, 1 / 30);
+		await source.add(packet, i === 0
+			? { decoderConfig: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080, description: X264_AVCC } }
+			: undefined);
+	}
+	await output.finalize();
+	return output.target.buffer!;
+};
+
+test('Key frames of H.264 with several NAL units under one length (Android temporal layers)', async () => {
+	// Android's MPEG4Writer only turns the first start code of a frame into a length, so each frame of temporally
+	// layered video (as recorded by Samsung's slow motion modes) is an SVC prefix NAL unit, a start code and the slice,
+	// all under one length
+	const prefixNalUnit = [0x6e, 0xc0, 0x80, 0x0f]; // nal_unit_type 14, as in the Samsung files
+	const idrSlice = [0x65, 0x88, 0x84, 0x00, 0x33, 0xff]; // nal_unit_type 5
+	const nonIdrSlice = [0x41, 0x9a, 0x02, 0x04, 0x11, 0xff]; // nal_unit_type 1
+
+	const layouts = [
+		(slice: number[]) => [...u32(8 + slice.length), ...prefixNalUnit, 0, 0, 0, 1, ...slice], // Android's
+		(slice: number[]) => [...u32(4), ...prefixNalUnit, ...u32(slice.length), ...slice], // One length per NAL unit
+	];
+
+	for (const frame of layouts) {
+		using input = new Input({
+			source: new BufferSource(await writeAvcFrames([frame(idrSlice), frame(nonIdrSlice)])),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const sink = new EncodedPacketSink(track);
+
+		expect(await track.determinePacketType((await sink.getFirstPacket())!)).toBe('key');
+		expect(await track.determinePacketType((await sink.getPacket(1 / 30))!)).toBe('delta');
+		expect((await sink.getKeyPacket(1 / 30, { verifyKeyPackets: true }))?.timestamp).toBe(0);
+	}
+});
+
+test('H.264 packet types come from the length-prefixed slices when there are any', async () => {
+	// An unregistered user data SEI whose payload a writer failed to escape (against H.264 7.4.1), so that it holds a
+	// start code followed by a NAL unit header
+	const sei = (nalUnitHeader: number) => {
+		const payload = [...Array.from({ length: 16 }, (_, i) => 0x10 + i), 0x41, 0, 0, 1, nalUnitHeader, 0x88, 0x84];
+		return [0x06, 0x05, payload.length, ...payload, 0x80];
+	};
+	const slice = (nalUnitHeader: number) => [nalUnitHeader, 0x88, 0x84, 0x21, 0xa0, 0x5c, 0x37];
+	const lengthPrefixed = (...nalUnits: number[][]) => nalUnits.flatMap(x => [...u32(x.length), ...x]);
+
+	using input = new Input({
+		source: new BufferSource(await writeAvcFrames([
+			lengthPrefixed(slice(0x65)), // IDR
+			lengthPrefixed(sei(0x65), slice(0x41)), // Not IDR, although the SEI holds "00 00 01 65"
+			lengthPrefixed(sei(0x41), slice(0x65)), // IDR, although the SEI holds "00 00 01 41"
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+	const sink = new EncodedPacketSink(track);
+
+	const types: (string | null)[] = [];
+	for await (const packet of sink.packets()) {
+		types.push(await track.determinePacketType(packet));
+	}
+	expect(types).toEqual(['key', 'delta', 'key']);
+
+	expect((await sink.getKeyPacket(1.5 / 30, { verifyKeyPackets: true }))?.timestamp).toBe(0);
+	expect((await sink.getKeyPacket(2.5 / 30, { verifyKeyPackets: true }))?.timestamp).toBeCloseTo(2 / 30);
+});
+
+test('H.264 packet types ignore start codes in the bytes a broken length runs into', async () => {
+	// As in broken files from the wild: after a few NAL units, a length that runs far past the end of the packet, over
+	// bytes that happen to hold a start code and an IDR slice header
+	const lengthPrefixed = (...nalUnits: number[][]) => nalUnits.flatMap(x => [...u32(x.length), ...x]);
+	const brokenUnit = [...u32(0x5dc72a9a), 0x5d, 0x11, 0x22, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xff];
+	const sei = [0x06, 0x05, 0x10, ...Array.from({ length: 16 }, (_, i) => 0x10 + i), 0x80];
+	const sps = [0x67, 0x64, 0x00, 0x28, 0xac, 0xd9];
+
+	using input = new Input({
+		source: new BufferSource(await writeAvcFrames([
+			[...lengthPrefixed(sei, [0x16, 0x01, 0x02]), ...brokenUnit],
+			[...lengthPrefixed(sps), ...brokenUnit],
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+	const sink = new EncodedPacketSink(track);
+
+	const types: (string | null)[] = [];
+	for await (const packet of sink.packets()) {
+		types.push(await track.determinePacketType(packet));
+	}
+	expect(types).toEqual(['delta', 'delta']);
+	expect(await sink.getFirstKeyPacket({ verifyKeyPackets: true })).toBe(null);
+});
+
 test('Missing tfdt and tfra entries referencing non-first samples', async () => {
 	// See https://github.com/Vanilagy/mediabunny/issues/578
 	const filePath = path.join(__dirname, '..', 'public/missing-tfdt.mp4');
