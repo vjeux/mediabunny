@@ -66,7 +66,6 @@ import {
 	binarySearchLessOrEqual,
 	bytesToHexString,
 	COLOR_PRIMARIES_MAP_INVERSE,
-	findLastIndex,
 	IDENTITY_MATRIX,
 	isIso639Dash2LanguageCode,
 	isThenable,
@@ -3345,10 +3344,21 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					return { sampleIndex: -1, correctSampleFound: false };
 				}
 
-				const index = findLastIndex(trackData.presentationTimestamps, (x) => {
-					const sample = trackData.samples[x.sampleIndex]!;
-					return sample.isKeyFrame && x.presentationTimestamp <= timestampInTimescale;
-				});
+				// The timestamps are sorted, so find the last one at or before the timestamp and walk back to a key
+				// frame from there, instead of scanning all of the fragment's samples on every lookup
+				let index = binarySearchLessOrEqual(
+					trackData.presentationTimestamps,
+					timestampInTimescale,
+					x => x.presentationTimestamp,
+				);
+				while (index !== -1) {
+					const sample = trackData.samples[trackData.presentationTimestamps[index]!.sampleIndex]!;
+					if (sample.isKeyFrame) {
+						break;
+					}
+
+					index--;
+				}
 
 				const sampleIndex = index !== -1 ? trackData.presentationTimestamps[index]!.sampleIndex : -1;
 				const correctSampleFound = index !== -1 && timestampInTimescale < trackData.endTimestamp;
