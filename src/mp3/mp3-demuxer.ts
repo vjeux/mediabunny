@@ -420,11 +420,13 @@ export class Mp3Demuxer extends Demuxer {
 	 * them (like cover art in an APEv2 tag) aren't mistaken for frames.
 	 */
 	async computeAudioEndPos() {
-		if (this.reader.fileSize === null) {
+		// Reading the end of a file that can only be streamed would discard the data before it
+		const fileSize = this.reader.randomAccessFileSize;
+		if (fileSize === null) {
 			return null;
 		}
 
-		let endPos = this.reader.fileSize;
+		let endPos = fileSize;
 
 		if (endPos >= ID3_V1_TAG_SIZE) {
 			let slice = this.reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
