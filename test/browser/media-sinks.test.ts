@@ -1,6 +1,6 @@
 import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers, clamp } from '../../src/misc.js';
 import {
@@ -1190,4 +1190,131 @@ test('HLS: video returning from an ad break to the first EXT-X-MAP decodes with 
 		sample?.close();
 	}
 	expect(lookups).toEqual(['96x96', '64x48', '64x48', '96x96']);
+});
+
+test('HLS: audio after a discontinuity with a new EXT-X-MAP decodes with its own AudioSpecificConfig', async () => {
+	// AAC-LC 48 kHz stereo, then an ad break as AAC-LC 22.05 kHz mono with its own init section, then the first again
+	using input = new Input({ source: new UrlSource('/hls-disc-audio/adisc.m3u8'), formats: ALL_FORMATS });
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+
+	const sink = new AudioSampleSink(audioTrack);
+	const periods: { format: string; frames: number; start: number; end: number }[] = [];
+	let offGrid = 0;
+	for await (const sample of sink.samples()) {
+		// Timestamps are rounded to the sample rate of their own period
+		if (Math.abs(sample.timestamp * sample.sampleRate - Math.round(sample.timestamp * sample.sampleRate)) > 1e-6) {
+			offGrid++;
+		}
+		const format = `${sample.sampleRate} Hz, ${sample.numberOfChannels} ch`;
+		const last = periods[periods.length - 1];
+		if (last?.format === format) {
+			last.frames += sample.numberOfFrames;
+			last.end = sample.timestamp + sample.duration;
+		} else {
+			periods.push({
+				format,
+				frames: sample.numberOfFrames,
+				start: sample.timestamp,
+				end: sample.timestamp + sample.duration,
+			});
+		}
+		sample.close();
+	}
+
+	expect(periods.map(x => x.format)).toEqual(['48000 Hz, 2 ch', '22050 Hz, 1 ch', '48000 Hz, 2 ch']);
+	// Every period decodes completely (48 and 23 AAC frames of 1024 samples) and in its place on the timeline
+	expect(periods.map(x => x.frames)).toEqual([48 * 1024, 23 * 1024, 48 * 1024]);
+	// Each period starts at its first packet: the timeline restarts with the decoder
+	expect(periods[1]!.start).toBeCloseTo(1.021333, 4); // Rounded to the sample rate
+	expect(periods[2]!.start).toBeCloseTo(1.021333 + 1.04644, 4);
+	expect(offGrid).toBe(0);
+
+	// Decoding that starts in the ad break, and lookups across the switches
+	const samples = [];
+	for await (const sample of sink.samplesAtTimestamps([1.5, 0.5, 2.5])) {
+		samples.push(sample && `${sample.sampleRate} Hz, ${sample.numberOfChannels} ch`);
+		sample?.close();
+	}
+	expect(samples).toEqual(['22050 Hz, 1 ch', '48000 Hz, 2 ch', '48000 Hz, 2 ch']);
+	const adSample = await sink.getSample(1.5);
+	expect(adSample?.sampleRate).toBe(22050);
+	adSample?.close();
+});
+
+test('HLS: audio after a decoder config switch starts at its first packet, wherever the previous ended', async () => {
+	// The ad's EXTINF is a bit longer than its audio, so the content after it starts after a little gap
+	const playlist = new TextDecoder().decode(await (await fetch('/hls-disc-audio/adisc.m3u8')).arrayBuffer())
+		.replace('#EXTINF:1.04644,', '#EXTINF:1.06,');
+	using input = new Input({
+		source: new CustomPathedSource('p.m3u8', ({ path }) => (path === 'p.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new UrlSource('/hls-disc-audio/' + path))),
+		formats: ALL_FORMATS,
+	});
+	const starts: number[] = [];
+	let lastRate = 0;
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		if (sample.sampleRate !== lastRate) {
+			starts.push(sample.timestamp);
+			lastRate = sample.sampleRate;
+		}
+		sample.close();
+	}
+	expect(starts).toHaveLength(3);
+	expect(starts[1]).toBeCloseTo(1.021333, 4);
+	expect(starts[2]).toBeCloseTo(1.021333 + 1.06, 4);
+});
+
+test('HLS: an ad break of several segments sharing an init section decodes like the ad alone', async () => {
+	const segment = (init: string, name: string, discontinuity: boolean) =>
+		`${discontinuity ? '#EXT-X-DISCONTINUITY\n' : ''}#EXT-X-MAP:URI="${init}"\n#EXTINF:1.0,\n${name}\n`;
+	const playlist = (body: string) => `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n${body}#EXT-X-ENDLIST\n`;
+
+	// Channel 0 of every decoded sample at 22.05 kHz (the ad's rate), concatenated
+	const decodeAd = async (text: string) => {
+		using input = new Input({
+			source: new CustomPathedSource('p.m3u8', ({ path }) => (path === 'p.m3u8'
+				? new BufferSource(new TextEncoder().encode(text))
+				: new UrlSource('/hls-disc-audio/' + path))),
+			formats: ALL_FORMATS,
+		});
+		const chunks: Float32Array[] = [];
+		for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+			if (sample.sampleRate === 22050) {
+				const data = new Float32Array(sample.numberOfFrames);
+				sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+				chunks.push(data);
+			}
+			sample.close();
+		}
+		const result = new Float32Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
+		let offset = 0;
+		for (const chunk of chunks) {
+			result.set(chunk, offset);
+			offset += chunk.length;
+		}
+		return result;
+	};
+
+	// Content (48 kHz stereo), then an ad break (22.05 kHz mono) of two segments with the same init section: the
+	// decoder switches once, and keeps its state between the ad's segments
+	const withContent = await decodeAd(playlist(
+		segment('c_init.mp4', 'c_0.m4s', false)
+		+ segment('d_init.mp4', 'd_0.m4s', true)
+		+ segment('d_init.mp4', 'd_0.m4s', true),
+	));
+	// The same two ad segments without content before them: no switch at all
+	const alone = await decodeAd(playlist(
+		segment('d_init.mp4', 'd_0.m4s', false)
+		+ segment('d_init.mp4', 'd_0.m4s', true),
+	));
+
+	expect(withContent.length).toBe(alone.length);
+	expect(alone.length).toBe(2 * 23 * 1024);
+	let maxDifference = 0;
+	for (let i = 0; i < alone.length; i++) {
+		maxDifference = Math.max(maxDifference, Math.abs(withContent[i]! - alone[i]!));
+	}
+	expect(maxDifference).toBeLessThan(1e-4);
 });
