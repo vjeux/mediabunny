@@ -6684,20 +6684,18 @@ const decryptSample = async (
 		}
 
 		const promise = (async () => {
-			let psshBoxes = track.demuxer.psshBoxes;
-			if (fragment) {
-				psshBoxes = [
-					...psshBoxes,
-					...fragment.psshBoxes,
-				].filter(x => x.keyIds === null || x.keyIds.includes(keyId));
+			// The boxes that apply to this key ID, from the moov box and the fragment
+			const psshBoxes = [
+				...track.demuxer.psshBoxes,
+				...(fragment?.psshBoxes ?? []),
+			].filter(x => x.keyIds === null || x.keyIds.includes(keyId));
 
-				// Filter out duplicates
-				for (let i = 0; i < psshBoxes.length - 1; i++) {
-					for (let j = i + 1; j < psshBoxes.length; j++) {
-						if (psshBoxesAreEqual(psshBoxes[i]!, psshBoxes[j]!)) {
-							psshBoxes.splice(j, 1);
-							j--;
-						}
+			// Filter out duplicates
+			for (let i = 0; i < psshBoxes.length - 1; i++) {
+				for (let j = i + 1; j < psshBoxes.length; j++) {
+					if (psshBoxesAreEqual(psshBoxes[i]!, psshBoxes[j]!)) {
+						psshBoxes.splice(j, 1);
+						j--;
 					}
 				}
 			}
