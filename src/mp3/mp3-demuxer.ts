@@ -18,6 +18,7 @@ import {
 	binarySearchExact,
 	binarySearchLessOrEqual,
 	isThenable,
+	roundIfAlmostInteger,
 	toDataView,
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
@@ -759,10 +760,15 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		const release = await this.demuxer.readingMutex.acquire();
 
 		try {
+			// Packet timestamps are whole numbers of samples, so snap timestamps that are a float error away from one
+			// (like the sum of a packet's timestamp and duration) onto it, like the other demuxers do
+			const sampleRate = this.getSampleRate();
+			const searchTimestamp = roundIfAlmostInteger(timestamp * sampleRate) / sampleRate;
+
 			while (true) {
 				const index = binarySearchLessOrEqual(
 					this.demuxer.loadedSamples,
-					timestamp,
+					searchTimestamp,
 					x => x.timestamp,
 				);
 
