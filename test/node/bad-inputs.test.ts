@@ -13,8 +13,6 @@ import {
 	Source,
 } from '../../src/index.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
-import type { IsobmffDemuxer } from '../../src/isobmff/isobmff-demuxer.js';
-import type { MatroskaDemuxer } from '../../src/matroska/matroska-demuxer.js';
 
 // Each test tests a malicious or malformed ("bad") file that once made the code hang, exhaust memory, burn CPU for way
 // too long, or fail in an unintended way (a failed assertion or an implicit error). The tests make sure the files
@@ -2102,10 +2100,9 @@ test('Key packet verification in a big fragment of fake key frames', async () =>
 		source: new BufferSource(mp4(moov, [fragment(fragment(0).length + 8), box('mdat', data)])),
 		formats: ALL_FORMATS,
 	});
-	const sink = new EncodedPacketSink((await input.getVideoTracks())[0]!);
-	await sink.getFirstPacket(); // Loads the fragment
-	const isobmffDemuxer = (await input._demuxerPromise) as IsobmffDemuxer;
-	const flagReads = countKeyFrameFlagReads(isobmffDemuxer.lastReadFragment!.trackData.get(1)!.samples);
+	const track = (await input.getVideoTracks())[0]!;
+	const sink = new EncodedPacketSink(track);
+	const flagReads = countKeyFrameFlagReads(await loadedSamples(track, sink));
 
 	const packet = await sink.getKeyPacket(Infinity, { verifyKeyPackets: true });
 	expect(packet!.timestamp).toBe(0);
@@ -2121,17 +2118,32 @@ test('Key packet verification in a big fragment of fake key frames', async () =>
 		source: new BufferSource(matroska(info(), tracks(videoTrack(1)), cluster(0, concatList(blocks)))),
 		formats: ALL_FORMATS,
 	});
-	const matroskaSink = new EncodedPacketSink((await matroskaInput.getVideoTracks())[0]!);
-	await matroskaSink.getFirstPacket(); // Loads the cluster
-	const matroskaDemuxer = (await matroskaInput._demuxerPromise) as MatroskaDemuxer;
-	const loadedCluster = matroskaDemuxer.segments[0]!.lastReadCluster!;
-	const matroskaFlagReads = countKeyFrameFlagReads([...loadedCluster.trackData.values()][0]!.blocks);
+	const matroskaTrack = (await matroskaInput.getVideoTracks())[0]!;
+	const matroskaSink = new EncodedPacketSink(matroskaTrack);
+	const matroskaFlagReads = countKeyFrameFlagReads(await loadedSamples(matroskaTrack, matroskaSink));
 
 	const matroskaPacket = await matroskaSink.getKeyPacket(Infinity, { verifyKeyPackets: true });
 	expect(matroskaPacket!.timestamp).toBe(0);
 	expect(matroskaFlagReads.count).toBeGreaterThanOrEqual(sampleCount - 1);
 	expect(matroskaFlagReads.count).toBeLessThan(10 * sampleCount);
 });
+
+// The samples of the fragment (or cluster) holding the track's first packet, as the demuxer holds them in memory, found
+// through the packet's location
+const loadedSamples = async (track: { _backing: unknown }, sink: EncodedPacketSink) => {
+	type Flags = { isKeyFrame: boolean }[];
+	type Location = { fragment?: Group; cluster?: Group };
+	type Group = { trackData: Map<number, { samples?: Flags; blocks?: Flags }> };
+	const backing = track._backing as {
+		packetToFragmentLocation?: WeakMap<object, Location>;
+		packetToClusterLocation?: WeakMap<object, Location>;
+	};
+
+	const packet = (await sink.getFirstPacket())!;
+	const location = (backing.packetToFragmentLocation ?? backing.packetToClusterLocation)!.get(packet)!;
+	const trackData = [...(location.fragment ?? location.cluster)!.trackData.values()][0]!;
+	return (trackData.samples ?? trackData.blocks)!;
+};
 
 const countKeyFrameFlagReads = (samples: { isKeyFrame: boolean }[]) => {
 	const reads = { count: 0 };
