@@ -2,7 +2,17 @@ import { expect, test } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_FORMATS, BufferSource, Input, FilePathSource } from '../../src/index.js';
+import {
+	ALL_FORMATS,
+	BufferSource,
+	Input,
+	FilePathSource,
+	BufferTarget,
+	EncodedAudioPacketSource,
+	EncodedPacket,
+	Mp4OutputFormat,
+	Output,
+} from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -281,4 +291,99 @@ test('MP3 priming from an iTunes gapless comment in an ID3v2.4 tag with plain fr
 	const audioTrack = await input.getPrimaryAudioTrack();
 	assert(audioTrack);
 	expect(await audioTrack.getFirstTimestamp()).toBe(-528 / 44100);
+});
+
+test('Fragmented MP4 duration metadata', async () => {
+	// Two seconds of PCM audio, all in fragments
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 20; i++) {
+		await source.add(new EncodedPacket(new Uint8Array(9600), 'key', i / 10, 1 / 10), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 48000 },
+		});
+	}
+	await output.finalize();
+	const file = new Uint8Array(output.target.buffer!);
+
+	const findBox = (bytes: Uint8Array, type: string) => {
+		for (let i = 0; i + 8 <= bytes.byteLength; i++) {
+			if (new TextDecoder().decode(bytes.subarray(i + 4, i + 8)) === type) {
+				return i;
+			}
+		}
+
+		throw new Error(`No ${type} box`);
+	};
+	// Writes the duration field of the first box of this type (version 0 mvhd, tkhd or mdhd)
+	const setDuration = (bytes: Uint8Array, type: string, duration: number) => {
+		const offset = findBox(bytes, type) + 8 + 4 + 8 + (type === 'tkhd' ? 8 : 4);
+		expect(bytes[offset - (type === 'tkhd' ? 20 : 16)]).toBe(0); // Version 0
+		new DataView(bytes.buffer, bytes.byteOffset).setUint32(offset, duration);
+	};
+	const readDurations = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		return [await track.getDurationFromMetadata(), await track.computeDuration()];
+	};
+
+	// Nothing says how long the fragments are
+	expect(await readDurations(file)).toEqual([null, 2]);
+
+	// Chrome's MediaRecorder writes every duration in the moov box in milliseconds, even in the mdhd box (whose
+	// timescale is 48000 here). The mdhd box only describes the samples in the moov box anyway, and there are none.
+	const chromeLike = file.slice();
+	expect(new DataView(chromeLike.buffer).getUint32(findBox(chromeLike, 'mvhd') + 20)).toBe(57600); // Timescale
+	setDuration(chromeLike, 'mvhd', 2 * 57600);
+	setDuration(chromeLike, 'tkhd', 2 * 57600);
+	setDuration(chromeLike, 'mdhd', 2000);
+	expect(await readDurations(chromeLike)).toEqual([2, 2]);
+
+	// The mehd box gives the duration including the fragments, in the movie timescale
+	const mvex = findBox(file, 'mvex');
+	const moov = findBox(file, 'moov');
+	const mfra = findBox(file, 'mfra'); // Holds moof offsets that inserting a box would invalidate, so drop it
+	const mehd = new Uint8Array([0, 0, 0, 16, ...new TextEncoder().encode('mehd'), 0, 0, 0, 0, 0, 0, 0, 0]);
+	new DataView(mehd.buffer).setUint32(12, 2.5 * 57600);
+	const withMehd = new Uint8Array([...file.subarray(0, mvex + 8), ...mehd, ...file.subarray(mvex + 8, mfra)]);
+	const view = new DataView(withMehd.buffer);
+	view.setUint32(mvex, view.getUint32(mvex) + 16);
+	view.setUint32(moov, view.getUint32(moov) + 16);
+	expect(await readDurations(withMehd)).toEqual([2.5, 2]);
+});
+
+test('Fragmented MP4 duration metadata with a damaged sample table', async () => {
+	// Two fragmented PCM tracks, the second of which has an stts box claiming 1000 entries that aren't there
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target: new BufferTarget() });
+	const sources = [new EncodedAudioPacketSource('pcm-s16'), new EncodedAudioPacketSource('pcm-s16')];
+	for (const source of sources) {
+		output.addAudioTrack(source);
+	}
+	await output.start();
+	for (let i = 0; i < 50; i++) {
+		for (const source of sources) {
+			await source.add(new EncodedPacket(new Uint8Array(320), 'key', i * 0.02, 0.02), {
+				decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 8000 },
+			});
+		}
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const sttsPositions: number[] = [];
+	for (let i = 0; i + 4 <= bytes.byteLength; i++) {
+		if (new TextDecoder().decode(bytes.subarray(i, i + 4)) === 'stts') {
+			sttsPositions.push(i);
+		}
+	}
+	new DataView(bytes.buffer).setUint32(sttsPositions[1]! + 8, 1000); // The entry count, after version and flags
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tracks = await input.getTracks();
+	expect(await tracks[0]!.computeDuration()).toBeCloseTo(1, 5);
+
+	// Unknown, as before, rather than an error
+	expect(await tracks[1]!.getDurationFromMetadata()).toBe(null);
+	expect(await input.getDurationFromMetadata()).toBe(null);
 });
