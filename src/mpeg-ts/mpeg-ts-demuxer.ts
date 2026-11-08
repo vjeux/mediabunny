@@ -286,6 +286,42 @@ const lookupWindowIsComplete = (ptsInReverseDecodeOrder: number[], searchPts: nu
 	return false;
 };
 
+/**
+ * The fields of an ADTS frame header needed to find frames, without rejecting what readAdtsFrameHeader doesn't
+ * support (which would make every header-like byte sequence inside a frame an error).
+ */
+const peekAdtsFrameHeader = (bytes: Uint8Array) => {
+	if (bytes[0] !== 0xff || (bytes[1]! & 0xf6) !== 0xf0) {
+		return null; // No syncword, or not layer 0
+	}
+
+	const samplingFrequencyIndex = (bytes[2]! >> 2) & 0x0f;
+	const frameLength = ((bytes[3]! & 0x03) << 11) | (bytes[4]! << 3) | (bytes[5]! >> 5);
+	const headerSize = (bytes[1]! & 0x01) ? MIN_ADTS_FRAME_HEADER_SIZE : MIN_ADTS_FRAME_HEADER_SIZE + 2; // CRC
+	if (samplingFrequencyIndex >= aacFrequencyTable.length || frameLength < headerSize) {
+		return null; // The frame must at least contain its own header
+	}
+
+	return { samplingFrequencyIndex, frameLength };
+};
+
+/** For the frame sync check: the size and sample rate (index) of the ADTS frame whose header starts the bytes. */
+const readAdtsSyncHeader = (bytes: Uint8Array) => {
+	const header = peekAdtsFrameHeader(bytes);
+	return header && { frameSize: header.frameLength, rate: header.samplingFrequencyIndex };
+};
+
+/** For the frame sync check: the size and sample rate of the MP3 frame whose header starts the bytes. */
+const readMp3SyncHeader = (bytes: Uint8Array) => {
+	const header = readMp3FrameHeader(toDataView(bytes).getUint32(0), null).header;
+	return header && { frameSize: header.totalSize, rate: header.sampleRate };
+};
+
+/** For the frame sync check: an AC-3 sync word, which E-AC-3 dependent substreams after a core start with too. */
+const readAc3SyncHeader = (bytes: Uint8Array) => {
+	return bytes[0] === 0x0b && bytes[1] === 0x77 ? { frameSize: 0, rate: 0 } : null;
+};
+
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
@@ -3835,16 +3871,21 @@ class PacketReadingContext {
 						}
 
 						const headerBytes = this.readBytes(MAX_ADTS_FRAME_HEADER_SIZE);
-						const header = readAdtsFrameHeader(FileSlice.tempFromBytes(headerBytes));
+						const candidate = peekAdtsFrameHeader(headerBytes);
+
+						const isFrameStart = candidate && await this.isFrameStart(
+							possibleHeaderStartPos,
+							candidate.frameLength,
+							candidate.samplingFrequencyIndex,
+							MIN_ADTS_FRAME_HEADER_SIZE,
+							readAdtsSyncHeader,
+						);
+						// Throws for frames we don't support
+						const header = isFrameStart ? readAdtsFrameHeader(FileSlice.tempFromBytes(headerBytes)) : null;
 
 						if (header) {
-							this.seekTo(possibleHeaderStartPos);
-
-							let remaining = this.ensureBuffered(header.frameLength);
-							if (isThenable(remaining)) remaining = await remaining;
-
 							return this.supplyPacket(
-								remaining,
+								header.frameLength,
 								Math.round(
 									SAMPLES_PER_AAC_FRAME * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 								),
@@ -3871,15 +3912,20 @@ class PacketReadingContext {
 						const word = toDataView(headerBytes).getUint32(0);
 						const result = readMp3FrameHeader(word, null);
 
-						if (result.header) {
-							this.seekTo(possibleHeaderStartPos);
-
-							let remaining = this.ensureBuffered(result.header.totalSize);
-							if (isThenable(remaining)) remaining = await remaining;
-
-							const duration = result.header.audioSamplesInFrame * MPEG_TS_TIMESCALE
+						const header = result.header;
+						if (
+							header
+							&& await this.isFrameStart(
+								possibleHeaderStartPos,
+								header.totalSize,
+								header.sampleRate,
+								MP3_FRAME_HEADER_SIZE,
+								readMp3SyncHeader,
+							)
+						) {
+							const duration = header.audioSamplesInFrame * MPEG_TS_TIMESCALE
 								/ elementaryStream.info.sampleRate;
-							return this.supplyPacket(remaining, Math.round(duration));
+							return this.supplyPacket(header.totalSize, Math.round(duration));
 						} else {
 							this.seekTo(possibleHeaderStartPos + 1);
 						}
@@ -3919,15 +3965,15 @@ class PacketReadingContext {
 						const frameSize = AC3_FRAME_SIZES[3 * frmsizecod + fscod];
 						assert(frameSize !== undefined);
 
-						this.seekTo(possibleSyncPos);
-
-						remaining = this.ensureBuffered(frameSize);
-						if (isThenable(remaining)) remaining = await remaining;
+						if (!await this.isFrameStart(possibleSyncPos, frameSize, 0, 2, readAc3SyncHeader)) {
+							this.seekTo(possibleSyncPos + 1);
+							continue;
+						}
 
 						const duration = Math.round(
 							AC3_SAMPLES_PER_FRAME * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
-						return this.supplyPacket(remaining, duration);
+						return this.supplyPacket(frameSize, duration);
 					} else if (codec === 'eac3') {
 						if (byte !== 0x0b) {
 							continue;
@@ -4008,17 +4054,15 @@ class PacketReadingContext {
 							frameSize += 2 * ((((nextHeaderBytes[2]! & 0x07) << 8) | nextHeaderBytes[3]!) + 1);
 						}
 
-						this.seekTo(possibleSyncPos);
-
-						remaining = this.ensureBuffered(frameSize);
-						if (isThenable(remaining)) {
-							remaining = await remaining;
+						if (!await this.isFrameStart(possibleSyncPos, frameSize, 0, 2, readAc3SyncHeader)) {
+							this.seekTo(possibleSyncPos + 1);
+							continue;
 						}
 
 						const duration = Math.round(
 							samplesPerFrame * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
-						return this.supplyPacket(remaining, duration);
+						return this.supplyPacket(frameSize, duration);
 					} else if (codec === 'dts') {
 						if (byte !== 0x7f && byte !== 0x64) {
 							continue;
@@ -4098,10 +4142,14 @@ class PacketReadingContext {
 						remaining = this.ensureBuffered(frameSize);
 						if (isThenable(remaining)) remaining = await remaining;
 
+						if (remaining < frameSize) {
+							return; // The data ends inside the frame, which wouldn't decode
+						}
+
 						const duration = Math.round(
 							sampleCount * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
-						return this.supplyPacket(remaining, duration);
+						return this.supplyPacket(frameSize, duration);
 					} else {
 						throw new Error('Unhandled.');
 					}
@@ -4112,6 +4160,56 @@ class PacketReadingContext {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Whether the frame header found at pos starts a frame of the given size and sample rate. Sync words also show up
+	 * inside frames, notably at the start of a PES packet that begins with the tail of a frame
+	 * (data_alignment_indicator 0), so like Chromium's MPEG-2 TS parsers, it only does if another header of the
+	 * stream follows the frame (readHeader parses the headerSize bytes there). That one must have the same sample
+	 * rate, or else be followed by a header of its own rate: a sample rate change. If the data ends right after the
+	 * frame, it's the last frame, but a frame cut short by the end of the data doesn't count, since it wouldn't
+	 * decode (the ADTS and MP3 demuxers drop it too). Leaves the position at pos.
+	 */
+	async isFrameStart(
+		pos: number,
+		frameSize: number,
+		rate: number,
+		headerSize: number,
+		readHeader: (bytes: Uint8Array) => { frameSize: number; rate: number } | null,
+	) {
+		// The header at the given distance from pos: 'end' if the data ends there (or less than a header after it),
+		// null if the data ends before it or there's no header
+		const readHeaderAt = async (distance: number) => {
+			this.seekTo(pos);
+			let remaining = this.ensureBuffered(distance + headerSize);
+			if (isThenable(remaining)) {
+				remaining = await remaining;
+			}
+
+			if (remaining < distance + headerSize) {
+				return remaining >= distance ? 'end' as const : null;
+			}
+
+			this.seekTo(pos + distance);
+			return readHeader(this.readBytes(headerSize));
+		};
+
+		let result = false;
+		const next = await readHeaderAt(frameSize);
+		if (next === 'end') {
+			result = true;
+		} else if (next) {
+			if (next.rate === rate) {
+				result = true;
+			} else {
+				const afterNext = await readHeaderAt(frameSize + next.frameSize);
+				result = afterNext === 'end' || afterNext?.rate === next.rate;
+			}
+		}
+
+		this.seekTo(pos);
+		return result;
 	}
 
 	/**
