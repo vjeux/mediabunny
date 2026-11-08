@@ -1340,3 +1340,61 @@ test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async
 	const edts = box('edts', box('elst', zeros(4), u32(1), u32(4096 - 1024), u32(1024), u32(0x10000)));
 	expect(await firstTimestamp(build(edts))).toBeCloseTo(-1024 / 44100, 12);
 });
+
+test('Tracks whose hdlr box comes after minf', async () => {
+	// Box order within mdia is free; some MPEG-4 Systems encoders write mdhd, minf, hdlr
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const avcC = box('avcC', [1, 0x42, 0, 0x1e, 0xff, 0xe0, 0]);
+	const avc1 = box('avc1', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(50), avcC);
+	const mp4a = box('mp4a', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4), u32(44100 * 0x10000), box('esds',
+		zeros(4), [3, 25, 0, 1, 0], [4, 17, 0x40, 0x15, ...zeros(11)], [5, 2, 0x12, 0x10], [6, 1, 2],
+	));
+
+	const trak = (id: number, handlerType: string, timescale: number, entry: number[], chunkOffset: number) => box(
+		'trak',
+		box('tkhd', u32(3), zeros(8), u32(id), zeros(24), matrix, zeros(8)),
+		box('mdia',
+			box('mdhd', zeros(12), u32(timescale), u32(0), [0x55, 0xc4, 0, 0]),
+			box('minf', box('stbl',
+				box('stsd', u32(0), u32(1), entry),
+				box('stts', u32(0), u32(1), u32(2), u32(timescale / 10)),
+				box('stsc', u32(0), u32(1), u32(1), u32(2), u32(1)),
+				box('stsz', u32(0), u32(5), u32(2)),
+				box('stco', u32(0), u32(1), u32(chunkOffset)),
+			)),
+			box('hdlr', zeros(8), ascii(handlerType), zeros(13)),
+		),
+	);
+	const moov = (dataStart: number) => box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		trak(1, 'vide', 30, avc1, dataStart),
+		trak(2, 'soun', 44100, mp4a, dataStart + 10),
+	);
+	const ftyp = box('ftyp', ascii('mp42'), u32(0), ascii('mp42'));
+	const moovSize = moov(0).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...ftyp,
+			...moov(ftyp.length + moovSize + 8),
+			...box('mdat', zeros(20)),
+		])),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(videoTrack && audioTrack);
+	expect(await videoTrack.getCodec()).toBe('avc');
+	expect(await videoTrack.getCodedWidth()).toBe(64);
+	expect(await audioTrack.getCodec()).toBe('aac');
+	expect(await audioTrack.getSampleRate()).toBe(44100);
+	expect(await videoTrack.computeDuration()).toBeCloseTo(0.2);
+});

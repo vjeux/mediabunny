@@ -1183,7 +1183,31 @@ export class IsobmffDemuxer extends Demuxer {
 		const boxEndPos = startPos + boxInfo.totalSize;
 
 		switch (boxInfo.name) {
-			case 'mdia':
+			case 'mdia': {
+				const mdiaSlice = slice.slice(contentStartPos, boxInfo.contentSize);
+
+				// The handler type decides how the sample descriptions in minf are read, but ISO/IEC 14496-12 doesn't
+				// require hdlr to come before minf (some MPEG-4 Systems encoders put it last), so read it first
+				while (mdiaSlice.remainingLength >= MIN_BOX_HEADER_SIZE) {
+					const childStartPos = mdiaSlice.filePos;
+					const childInfo = readBoxHeader(mdiaSlice);
+					if (!childInfo) {
+						break;
+					}
+
+					if (childInfo.name === 'hdlr') {
+						mdiaSlice.filePos = childStartPos;
+						this.traverseBox(mdiaSlice);
+						break;
+					}
+
+					mdiaSlice.filePos = childStartPos + childInfo.totalSize;
+				}
+
+				mdiaSlice.filePos = contentStartPos;
+				this.readContiguousBoxes(mdiaSlice);
+			}; break;
+
 			case 'minf':
 			case 'dinf':
 			case 'mfra':
@@ -1417,8 +1441,9 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(8); // Version + flags + pre-defined
 				const handlerType = readAscii(slice, 4);
 
+				// The media handler is read ahead of the other boxes in mdia, so it may have been read already
 				if (handlerType === 'vide') {
-					track.info = {
+					track.info ??= {
 						type: 'video',
 						width: -1,
 						height: -1,
@@ -1437,7 +1462,7 @@ export class IsobmffDemuxer extends Demuxer {
 						proresFormat: null,
 					};
 				} else if (handlerType === 'soun') {
-					track.info = {
+					track.info ??= {
 						type: 'audio',
 						numberOfChannels: -1,
 						sampleRate: -1,
