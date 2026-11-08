@@ -758,11 +758,20 @@ export const modEuclid = (value: number, modulus: number) => {
 
 export const UNDETERMINED_LANGUAGE = 'und';
 
-export const roundIfAlmostInteger = (value: number) => {
+/**
+ * Rounds a value in some time unit to the nearest integer when it's only a float error away from it. Pass how many of
+ * those units make a second when that can be anything (a file's timescale), for the tolerance near zero.
+ */
+export const roundIfAlmostInteger = (value: number, unitsPerSecond?: number) => {
 	const rounded = Math.round(value);
 
-	if (Math.abs(value / rounded - 1) < 10 * Number.EPSILON) {
-		return rounded;
+	// The tolerance is relative to the value, with an absolute floor: near zero (a result of 0, or a small one computed
+	// by cancellation, like the end of a packet that starts before zero: -0.025 + 0.026), a float error exceeds any
+	// tolerance relative to the result. The floor is a picosecond, whatever the unit (a billionth of a unit when it's
+	// unknown), so it's far above the float errors near zero and far below any time difference that matters.
+	const floor = unitsPerSecond !== undefined ? 1e-12 * unitsPerSecond : 1e-9;
+	if (Math.abs(value - rounded) < floor || Math.abs(value / rounded - 1) < 10 * Number.EPSILON) {
+		return rounded === 0 ? 0 : rounded; // Not -0
 	} else {
 		return value;
 	}
