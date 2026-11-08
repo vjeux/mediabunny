@@ -2510,6 +2510,62 @@ test('I-frame stream', async () => {
 	expect(masterText).not.toContain('#EXT-X-STREAM-INF:');
 });
 
+test('I-frame stream, read back (a multivariant playlist with only I-frame variants)', async () => {
+	// Mediabunny writes a video track declared with hasOnlyKeyPackets as an I-frame variant
+	// (#EXT-X-I-FRAME-STREAM-INF), so HLS of only such a track has no regular variant to take timestamps from
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceVideoTrack = await sourceInput.getPrimaryVideoTrack();
+	assert(sourceVideoTrack);
+	const decoderConfig = await sourceVideoTrack.getDecoderConfig();
+	assert(decoderConfig);
+	const keyPacket = await new EncodedPacketSink(sourceVideoTrack).getFirstKeyPacket();
+	assert(keyPacket);
+
+	const check = async (segmentFormat: MpegTsOutputFormat | CmafOutputFormat) => {
+		const files = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat, targetDuration: 1 }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+				return target;
+			}),
+		});
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source, { hasOnlyKeyPackets: true });
+		await output.start();
+		for (let i = 0; i < 72; i++) {
+			const packet = new EncodedPacket(keyPacket.data, 'key', i / 24, 1 / 24);
+			await source.add(packet, i === 0 ? { decoderConfig } : undefined);
+		}
+		await output.finalize();
+
+		const master = new TextDecoder().decode(files.get('master.m3u8'));
+		expect(master).toContain('#EXT-X-I-FRAME-STREAM-INF');
+		expect(master).not.toContain('#EXT-X-STREAM-INF');
+
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+			formats: ALL_FORMATS,
+		});
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.hasOnlyKeyPackets()).toBe(true);
+
+		const sink = new EncodedPacketSink(videoTrack);
+		let packetCount = 0;
+		for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+			expect(packet.type).toBe('key');
+			packetCount++;
+		}
+		expect(packetCount).toBe(72);
+		expect(await input.computeDuration()).toBeCloseTo(3, 5);
+	};
+
+	await check(new MpegTsOutputFormat());
+	await check(new CmafOutputFormat());
+});
+
 test('I-frame stream, pairing warning', async () => {
 	const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
