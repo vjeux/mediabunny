@@ -873,6 +873,11 @@ export class UrlSource extends PathedSource {
 	_url: string | URL | Request;
 	/** @internal */
 	_getRetryDelay: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
+	/**
+	 * Whether a response for this URL got through. After that, CORS can't be why a request fails.
+	 * @internal
+	 */
+	_responseReceived = false;
 	/** @internal */
 	_options: UrlSourceOptions;
 	/** @internal */
@@ -1116,6 +1121,41 @@ export class UrlSource extends PathedSource {
 		}
 	}
 
+	/**
+	 * The delay before resuming a response body that failed partway: from the user's getRetryDelay if there's one,
+	 * else from the default policy without its CORS heuristic.
+	 * @internal
+	 */
+	_getResumeDelay(previousAttempts: number, error: unknown) {
+		if (this._options.getRetryDelay) {
+			return this._getRetryDelay(previousAttempts, error, this._url);
+		}
+
+		// blob:, data: and file: URLs are read without touching the network, so retrying can't fix a failure
+		const url = this._url;
+		const href = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+		if (/^\s*(?:blob|data|file):/i.test(href)) {
+			return null;
+		}
+
+		// The response got through CORS before its body failed, so the CORS heuristic doesn't apply (and would misfire
+		// in WebKit, which reports every response body error as "Load failed", like a CORS failure). It only looks at
+		// TypeErrors (what fetch() and failed bodies throw), so not passing those skips it, while other errors (such as
+		// an HTTP status) still reach the default.
+		return DEFAULT_RETRY_DELAY(previousAttempts, error instanceof TypeError ? null : error, this._url);
+	}
+
+	/**
+	 * The delay before retrying a failed fetch(). Once a response for this URL got through CORS, a failed fetch() is a
+	 * network failure (a reset connection, a network change), so it's treated like a failed response body.
+	 * @internal
+	 */
+	_getFetchRetryDelay(previousAttempts: number, error: unknown) {
+		return this._responseReceived
+			? this._getResumeDelay(previousAttempts, error)
+			: this._getRetryDelay(previousAttempts, error, this._url);
+	}
+
 	/** @internal */
 	private async _runWorker(worker: ReadWorker) {
 		// Responses in a row that failed or ended without getting us any further, for getRetryDelay
@@ -1143,11 +1183,16 @@ export class UrlSource extends PathedSource {
 					signal: abortController.signal,
 					...(cache && { cache }),
 				}),
-				this._getRetryDelay,
+				(previousAttempts, error) => this._getFetchRetryDelay(previousAttempts, error),
 				() => abortController.signal.aborted,
 			);
 
 			let response = await fetchFromCurrentPos();
+
+			if (response.ok) {
+				// It got through CORS. Recorded as soon as it arrives, before anything may request the URL again.
+				this._responseReceived = true;
+			}
 
 			const firefoxCachedStart = worker.currentPos === 0 && isFirefox();
 			if (response.status === 200 && (firefoxCachedStart || this._rangeRequestsHonored) && !this._usedForHls) {
@@ -1305,7 +1350,7 @@ export class UrlSource extends PathedSource {
 					}
 					consecutiveFailedResponses++;
 
-					const retryDelayInSeconds = this._getRetryDelay(consecutiveFailedResponses, error, this._url);
+					const retryDelayInSeconds = this._getResumeDelay(consecutiveFailedResponses, error);
 					if (retryDelayInSeconds !== null) {
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
 						await wait(1000 * retryDelayInSeconds, abortController.signal);
@@ -1445,7 +1490,7 @@ export class UrlSource extends PathedSource {
 						}
 
 						consecutiveFailedResponses++;
-						const retryDelayInSeconds = this._getRetryDelay(consecutiveFailedResponses, error, this._url);
+						const retryDelayInSeconds = this._getResumeDelay(consecutiveFailedResponses, error);
 						if (retryDelayInSeconds === null) {
 							throw error;
 						}
@@ -1468,7 +1513,7 @@ export class UrlSource extends PathedSource {
 								},
 								signal: this._sequentialAbortController.signal,
 							}),
-							this._getRetryDelay,
+							(previousAttempts, error) => this._getFetchRetryDelay(previousAttempts, error),
 							() => this._disposed,
 						);
 
