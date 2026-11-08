@@ -208,7 +208,7 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 	const bytes = readBytes(slice, dataSize);
 	const reader = new Id3V2Reader(header, bytes);
 
-	if ((header.flags & Id3V2HeaderFlags.Unsynchronisation) && header.majorVersion === 3) {
+	if ((header.flags & Id3V2HeaderFlags.Unsynchronisation) && header.majorVersion <= 3) {
 		reader.ununsynchronizeAll();
 	}
 
@@ -552,22 +552,24 @@ export class Id3V2Reader {
 	}
 
 	ununsynchronizeAll() {
-		const newBytes: number[] = [];
+		// Removing bytes can only make it shorter
+		const newBytes = new Uint8Array(this.bytes.length);
+		let newLength = 0;
 
 		for (let i = 0; i < this.bytes.length; i++) {
 			const value1 = this.bytes[i]!;
-			newBytes.push(value1);
+			newBytes[newLength++] = value1;
 
 			if (value1 === 0xff && i !== this.bytes.length - 1) {
-				const value2 = this.bytes[i]!;
+				const value2 = this.bytes[i + 1]!;
 				if (value2 === 0x00) {
 					i++;
 				}
 			}
 		}
 
-		this.bytes = new Uint8Array(newBytes);
-		this.view = new DataView(this.bytes.buffer);
+		this.bytes = newBytes.subarray(0, newLength);
+		this.view = toDataView(this.bytes);
 	}
 
 	ununsynchronizeRegion(start: number, end: number) {
