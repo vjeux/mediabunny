@@ -740,8 +740,8 @@ export class IsobmffDemuxer extends Demuxer {
 					await this.applyReferencedSampleDescriptions(startPos + boxInfo.totalSize);
 
 					lookForMfraBox = this.isFragmented
-						&& this.reader.fileSize !== null
-						&& this.reader.fileSize > startPos + boxInfo.totalSize; // There's more after the moov box
+						&& this.reader.randomAccessFileSize !== null // Not if the file can only be streamed
+						&& this.reader.randomAccessFileSize > startPos + boxInfo.totalSize; // More after the moov box
 					foundMovieBoxes = true;
 
 					break;

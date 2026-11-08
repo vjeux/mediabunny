@@ -8,12 +8,18 @@ import { assert } from '../../src/misc.js';
 import { Reader, readBytes } from '../../src/reader.js';
 import {
 	ALL_FORMATS,
+	BufferSource,
+	BufferTarget,
 	EncodedPacket,
 	EncodedPacketSink,
+	EncodedVideoPacketSource,
 	FilePathSource,
 	Input,
 	Logging,
 	LogLevel,
+	MkvOutputFormat,
+	Mp4OutputFormat,
+	Output,
 	UrlSource,
 } from '../../src/index.js';
 
@@ -1134,4 +1140,91 @@ test('UrlSource with a small cache only requests what fits into it', async () =>
 	// Main made 28k requests, transferring 13.8 GB of this 1.9 MB file
 	expect(requestCount).toBeLessThan(1000);
 	expect(transferredBytes).toBeLessThan(10 * file.length);
+});
+
+test('UrlSource reads files larger than its cache in order from a server without range support', async () => {
+	// 300 VP9 packets of 1 kB with a key frame every second, in small fragments or clusters
+	const buildVideoFile = async (format: Mp4OutputFormat | MkvOutputFormat) => {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source, { frameRate: 30 });
+		await output.start();
+		for (let i = 0; i < 300; i++) {
+			const type = i % 30 === 0 ? 'key' : 'delta';
+			const packet = new EncodedPacket(new Uint8Array(1000).fill(i), type, i / 30, 1 / 30);
+			await source.add(packet, {
+				decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 320, codedHeight: 240 },
+			});
+		}
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	// 16-bit stereo 48 kHz WAVE with 600 kB of audio, then a LIST INFO chunk (where many taggers put it)
+	const list = Buffer.from('LIST\x12\0\0\0INFOINAM\x06\0\0\0Title\0', 'latin1');
+	const waveHeader = Buffer.alloc(44);
+	waveHeader.write('RIFF', 0);
+	waveHeader.writeUInt32LE(36 + 600_000 + list.length, 4);
+	waveHeader.write('WAVEfmt ', 8);
+	waveHeader.writeUInt32LE(16, 16);
+	waveHeader.writeUInt16LE(1, 20);
+	waveHeader.writeUInt16LE(2, 22);
+	waveHeader.writeUInt32LE(48000, 24);
+	waveHeader.writeUInt32LE(48000 * 4, 28);
+	waveHeader.writeUInt16LE(4, 32);
+	waveHeader.writeUInt16LE(16, 34);
+	waveHeader.write('data', 36);
+	waveHeader.writeUInt32LE(600_000, 40);
+
+	// An MP3 without an ID3v2 tag, for which reading the metadata tags looks for an ID3v1 tag at the end
+	const mp3 = fs.readFileSync(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3'));
+	assert(mp3.toString('latin1', 0, 3) === 'ID3');
+	const id3V2Size = ((mp3[6]! & 0x7f) << 21) | ((mp3[7]! & 0x7f) << 14) | ((mp3[8]! & 0x7f) << 7) | (mp3[9]! & 0x7f);
+
+	const files = [
+		await buildVideoFile(new Mp4OutputFormat({ fastStart: 'fragmented' })),
+		await buildVideoFile(new MkvOutputFormat()),
+		new Uint8Array(Buffer.concat([waveHeader, Buffer.alloc(600_000), list])),
+		new Uint8Array(mp3.subarray(10 + id3V2Size)),
+	];
+
+	// Like `python3 -m http.server`: Range is ignored, and the whole file comes back as a 200 with a Content-Length
+	let file = files[0]!;
+	const server = http.createServer((req, res) => res.writeHead(200, { 'Content-Length': file.length }).end(file));
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	const logs = captureLogs(); // UrlSource warns that it can only read sequentially
+
+	const countPackets = async (source: UrlSource | BufferSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		await input.getMetadataTags();
+		const track = (await input.getPrimaryVideoTrack()) ?? (await input.getPrimaryAudioTrack());
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track!).packets()) {
+			count += packet.data.length > 0 ? 1 : 0;
+		}
+
+		return count;
+	};
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+
+		// Reading must not need data that streaming has already evicted from the 64 KiB cache, so all the packets come
+		// out, like from memory. On main, each file fails with "Attempted to read data from an already-evicted part of
+		// the cache".
+		const expected: number[] = [];
+		const counts: (number | string)[] = [];
+		for (file of files) {
+			expected.push(await countPackets(new BufferSource(file)));
+			const source = new UrlSource(`http://localhost:${address.port}/media`, { maxCacheSize: 2 ** 16 });
+			counts.push(await countPackets(source).catch((error: unknown) => String(error).slice(0, 80)));
+		}
+
+		expect(expected.every(count => count > 70)).toBe(true);
+		expect(counts).toEqual(expected);
+	} finally {
+		logs.stop();
+		server.close();
+	}
 });
