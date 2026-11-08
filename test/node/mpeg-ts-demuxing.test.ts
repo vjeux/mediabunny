@@ -5312,8 +5312,10 @@ test('MPEG-TS searches for an intact PMT copy only where it can go back to', asy
 	await output.finalize();
 	const bytes = new Uint8Array(output.target.buffer!);
 
-	// Its only PMT gets a bad CRC, and it's read from a stream through a ReadableStreamSource with a 2 MiB cache. The
-	// search for an intact copy must stay within what the cache keeps, as reading goes back to the PMT afterwards.
+	// Its only PMT gets a bad CRC, and it's read from a stream through a ReadableStreamSource with a 2 MiB cache, then
+	// from a server that ignores range requests through a UrlSource, which knows the size but reads in order too. As
+	// reading goes back to the PMT after a search for an intact copy, such sources search only as far as they can still
+	// come back from.
 	const damaged = bytes.slice();
 	const pmtPos = 188; // After the PAT
 	expect(((damaged[pmtPos + 1]! & 0x1f) << 8) | damaged[pmtPos + 2]!).toBe(0x1000);
@@ -5345,6 +5347,77 @@ test('MPEG-TS searches for an intact PMT copy only where it can go back to', asy
 			packetCount++;
 		}
 		expect(packetCount).toBe(100);
+	}
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': damaged.byteLength });
+		response.end(damaged);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using input = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 21,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(packetCount).toBe(100);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+
+	// Within that, they find an intact copy as well as other sources do (from L46's review): mp3.ts, whose first PMT
+	// has a damaged stream type, through the same two sources
+	const mp3Bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/mp3.ts')));
+	for (let pos = 0; pos < mp3Bytes.length; pos += 188) {
+		if ((((mp3Bytes[pos + 1]! & 0x1f) << 8) | mp3Bytes[pos + 2]!) === 0x1000 && mp3Bytes[pos + 1]! & 0x40) {
+			mp3Bytes[pos + 5 + mp3Bytes[pos + 4]! + 12] = 0x13; // stream_type 0x03 (MPEG-1 audio) -> 0x13
+			break;
+		}
+	}
+	const readCodecs = async (source: ReadableStreamSource | UrlSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		return Promise.all((await input.getTracks()).map(track => track.getCodec()));
+	};
+	let mp3Position = 0;
+	const mp3Stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (mp3Position >= mp3Bytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(mp3Bytes.slice(mp3Position, mp3Position + 65536));
+			mp3Position += 65536;
+		},
+	});
+	expect(await readCodecs(new ReadableStreamSource(mp3Stream, { maxCacheSize: 2 ** 21 }))).toEqual(['mp3']);
+	const mp3Server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': mp3Bytes.byteLength });
+		response.end(mp3Bytes);
+	});
+	await new Promise<void>(resolve => mp3Server.listen(0, resolve));
+	try {
+		const address = mp3Server.address();
+		assert(address && typeof address !== 'string');
+		expect(await readCodecs(new UrlSource(`http://localhost:${address.port}/mp3.ts`, {
+			maxCacheSize: 2 ** 21,
+			getRetryDelay: () => null,
+		}))).toEqual(['mp3']);
+	} finally {
+		mp3Server.closeAllConnections();
+		mp3Server.close();
 	}
 
 	// Some data before the PAT that looks like a PMT (a table_id of 2) but has a bad CRC isn't searched for: without a
