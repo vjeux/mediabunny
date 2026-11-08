@@ -238,7 +238,11 @@ test('Sample retrieval within Opus pre-skip', async () => {
 
 	expect(results[2]!.timestamp).toBe(firstSampleTimestamp);
 
-	expect(results[3]!.timestamp).toBeLessThanOrEqual(1);
+	// A lookup counts a sample starting up to one tick of the time resolution after the timestamp, since the packet
+	// timestamps are rounded to it. WebKitGTK's decoder, which shifts its output by a fraction of a millisecond, gets
+	// such a sample here.
+	const tick = 1 / await track.getTimeResolution();
+	expect(results[3]!.timestamp).toBeLessThanOrEqual(1 + tick);
 	expect(results[3]!.timestamp + results[3]!.duration).toBeGreaterThan(1);
 });
 
