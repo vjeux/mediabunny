@@ -11,6 +11,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { InputTrack } from '../../src/input-track.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -774,8 +775,9 @@ test('MPEG-TS partial reading', async () => {
 
 	await input.getTracks();
 
-	// Not much of the file has been read since we only requested metadata
-	expect(maxEnd).toBeLessThanOrEqual(86480);
+	// Not much of the file has been read since we only requested metadata (up to the sync byte of the packet after the
+	// last one)
+	expect(maxEnd).toBeLessThanOrEqual(86481);
 });
 
 test('MPEG-TS init input without stream data', async () => {
@@ -921,4 +923,120 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS resyncs after bytes were added or lost', async () => {
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/mp3.ts')));
+
+	const readPackets = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const sink = new EncodedPacketSink(track);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of sink.packets()) {
+			packets.push(packet);
+		}
+
+		// Lookups find the same packets
+		for (const packet of packets.slice(-20)) {
+			expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
+		}
+
+		return packets.map(x => x.timestamp);
+	};
+
+	/** Replaces `removedCount` bytes in the middle of a TS packet with `addedCount` ones. */
+	const damage = (removedCount: number, addedCount: number) => {
+		const pos = 188 * 372 + 64;
+		const result = new Uint8Array(bytes.length - removedCount + addedCount).fill(0x55);
+		result.set(bytes.subarray(0, pos));
+		result.set(bytes.subarray(pos + removedCount), pos + addedCount);
+		return result;
+	};
+
+	const original = await readPackets(bytes);
+	expect(original).toHaveLength(210);
+
+	// Like ffprobe, we get all frames back. Chromium's extra-nalu.ts test file has 24 stray bytes.
+	expect(await readPackets(damage(0, 1))).toEqual(original);
+	expect(await readPackets(damage(0, 24))).toEqual(original);
+	expect(await readPackets(damage(0, 500))).toEqual(original);
+
+	// Lost bytes damage a frame, but the ones after it are all there
+	expect((await readPackets(damage(1, 0))).slice(-100)).toEqual(original.slice(-100));
+	expect((await readPackets(damage(100, 0))).slice(-100)).toEqual(original.slice(-100));
+
+	// Junk at the end
+	const withJunk = new Uint8Array(bytes.length + 1000);
+	withJunk.set(bytes);
+	expect(await readPackets(withJunk)).toEqual(original);
+
+	// Junk of 191 to 360 bytes after every 4 packets, like ExoPlayer's ts/sample_with_junk test file (found by L92), so
+	// that only the first two packets of each 4 have two more after them in a row
+	const parts: Uint8Array[] = [bytes.subarray(0, 188 * 8)];
+	let seed = 1;
+	for (let pos = 188 * 8; pos < bytes.length; pos += 188 * 4) {
+		seed = (seed * 1103515245 + 12345) >>> 0;
+		parts.push(Uint8Array.from({ length: 191 + seed % 170 }, (_, i) => i), bytes.subarray(pos, pos + 188 * 4));
+	}
+	const withJunkEveryFourPackets = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+	parts.reduce((pos, part) => (withJunkEveryFourPackets.set(part, pos), pos + part.length), 0);
+	expect(await readPackets(withJunkEveryFourPackets)).toEqual(original);
+});
+
+test('MPEG-TS with stray bytes between packets', async () => {
+	// The first two packets (PAT and PMT), the 24 stray bytes after packet 556 and the 500 packets after them from
+	// Chromium's media/test/data/extra-nalu.ts
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/stray-bytes.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const readPackets = async (track: InputTrack | null) => {
+		assert(track);
+		const packets: [number, number][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([Math.round(packet.timestamp * 90_000), packet.data.byteLength]);
+		}
+
+		return packets;
+	};
+
+	// What ffprobe reads after the stray bytes (it merges the key frame with the PES packet holding its parameter sets)
+	expect(await readPackets(await input.getPrimaryAudioTrack())).toEqual([[199355326, 360], [199357416, 360]]);
+	expect((await readPackets(await input.getPrimaryVideoTrack()))[1]).toEqual([199367280, 17829]);
+});
+
+test('MPEG-TS reading at a position inside a PES packet leaves the PES packet whole', async () => {
+	// In damaged files, a packet header and the packet read at the same position can disagree while the packet
+	// positions get resynced, so a section can be read where no section starts. That mustn't be remembered as a section
+	// end, which cut the PES packet around it short and ended iteration there (found by L15 on FFmpeg's aac_crash.ts
+	// sample, after a lookup at the end of the track).
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/0.ts')));
+	const readFrames = async (input: Input) => {
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const frames: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			frames.push(packet.byteLength);
+		}
+		return frames;
+	};
+
+	using cleanInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const clean = await readFrames(cleanInput);
+
+	// A video TS packet in the middle of a PES packet (PID 0x100, no payload_unit_start_indicator)
+	let pos = 188 * 1000;
+	while (!((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && !(bytes[pos + 1]! & 0x40))) {
+		pos += 188;
+	}
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	await input.getTracks();
+	const demuxer = (await input._demuxerPromise) as MpegTsDemuxer;
+	expect(await demuxer.readSection(pos, false)).toBe(null);
+	expect(await readFrames(input)).toEqual(clean);
 });
