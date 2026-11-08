@@ -1052,6 +1052,50 @@ test.concurrent('#EXT-X-I-FRAME-STREAM-INF tags are parsed properly', async () =
 	expect(await tracks[0]!.hasOnlyKeyPackets()).toBe(true);
 });
 
+test.concurrent('#EXT-X-ENDLIST can appear anywhere in a media playlist', async () => {
+	const openPlaylist = (playlist: string) => new Input({
+		source: new CustomPathedSource('playlist.m3u8', ({ path }) => path === 'playlist.m3u8'
+			? new BufferSource(new TextEncoder().encode(playlist))
+			: new FilePathSource('./test/public/0.ts')),
+		formats: HLS_FORMATS,
+	});
+
+	// "It MAY occur anywhere in the Media Playlist file" (RFC 8216, Section 4.3.3.4): before, between and after the
+	// two segments
+	for (const position of [0, 1, 2]) {
+		const lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:5'];
+		for (let i = 0; i <= 2; i++) {
+			if (i === position) {
+				lines.push('#EXT-X-ENDLIST');
+			}
+			if (i === 1) {
+				lines.push('#EXT-X-DISCONTINUITY');
+			}
+			if (i < 2) {
+				lines.push('#EXTINF:5,', '0.ts');
+			}
+		}
+
+		using input = openPlaylist(lines.join('\n') + '\n');
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.isLive()).toBe(false);
+		expect(await videoTrack.getDurationFromMetadata()).toBe(10);
+
+		// Both segments are read: a packet of the second one, which starts at 5 s
+		const sink = new EncodedPacketSink(videoTrack);
+		expect((await sink.getFirstPacket())?.timestamp).toBe(0);
+		expect((await sink.getPacket(7.5))?.timestamp).toBeGreaterThanOrEqual(5);
+	}
+
+	// Lines after the tag that aren't a segment's URI are ignored, like before, e.g. an error page a server appended
+	using input = openPlaylist('#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n0.ts\n#EXT-X-ENDLIST\n</body></html>\n');
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await videoTrack.getDurationFromMetadata()).toBe(5);
+	expect(await new EncodedPacketSink(videoTrack).getPacket(2.5)).not.toBeNull();
+});
+
 test.concurrent('#EXT-X-I-FRAME-STREAM-INF tags without BANDWIDTH attribute are rejected', async () => {
 	const text = `#EXTM3U
 #EXT-X-I-FRAME-STREAM-INF:CODECS="avc1.4D401E",RESOLUTION=480x270,URI="7f2459cb12854fdbbc7ec1e7279da179/f74fb10563564130a4702743d64112a3/index_11.m3u8"
