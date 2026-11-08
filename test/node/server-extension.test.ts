@@ -2976,6 +2976,55 @@ describe('Audio', async () => {
 		});
 	});
 
+	// Encodes `values` (one channel) to FLAC and returns its bit depth and the decoded values, as s32
+	const flacRoundTrip = async (data: Int16Array | Int32Array | Float32Array, sampleFormat?: 's32') => {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'flac', transform: { sampleFormat } });
+		output.addAudioTrack(source);
+		await output.start();
+
+		const format = data instanceof Int16Array ? 's16' : data instanceof Int32Array ? 's32' : 'f32';
+		using sample = new AudioSample({ data, format, numberOfChannels: 1, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		// The STREAMINFO block (after 'fLaC' and its 4-byte header) holds the bits per sample minus 1 in 5 bits
+		const streamInfo = toUint8Array((await track.getDecoderConfig())!.description!).subarray(8);
+		const bitsPerSample = (((streamInfo[12]! & 0x01) << 4) | (streamInfo[13]! >> 4)) + 1;
+
+		const decoded: number[] = [];
+		for await (using decodedSample of new AudioSampleSink(track).samples()) {
+			const values = new Int32Array(decodedSample.numberOfFrames);
+			decodedSample.copyTo(values, { planeIndex: 0, format: 's32' });
+			decoded.push(...values);
+		}
+
+		// Only the input's length: the encoder may pad the last block
+		return { bitsPerSample, decoded: decoded.slice(0, data.length) };
+	};
+
+	test('FLAC encoding keeps 24-bit input lossless', async () => {
+		// 24-bit values in a 32-bit container
+		const values = Int32Array.from({ length: 4800 }, (_, i) => (Math.round(Math.sin(i / 7) * 3e6) + (i % 5)) * 256);
+
+		const fromS32 = await flacRoundTrip(values);
+		expect(fromS32.bitsPerSample).toBe(24);
+		expect(fromS32.decoded).toEqual([...values]);
+
+		// transform.sampleFormat controls the bit depth
+		const fromF32 = await flacRoundTrip(Float32Array.from(values, x => x / 2 ** 31), 's32');
+		expect(fromF32.bitsPerSample).toBe(24);
+		expect(fromF32.decoded).toEqual([...values]);
+
+		// 16-bit input stays 16-bit
+		const values16 = Int16Array.from({ length: 4800 }, (_, i) => Math.round(Math.sin(i / 7) * 12000) + (i % 5));
+		const fromS16 = await flacRoundTrip(values16);
+		expect(fromS16.bitsPerSample).toBe(16);
+		expect(fromS16.decoded).toEqual(Array.from(values16, x => x * 65536));
+	});
+
 	test('AC-3 encode & decode', async () => {
 		await encodeDecodeTest('ac3', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
