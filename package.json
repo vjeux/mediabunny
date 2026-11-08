@@ -11,8 +11,16 @@
   "main": "./dist/bundles/mediabunny.cjs",
   "module": "./dist/modules/src/index.js",
   "types": "./dist/modules/src/index.d.ts",
+  "typesVersions": {
+    "<5.8": {
+      "dist/modules/src/index.d.ts": [
+        "types/ts5.7/index.d.ts"
+      ]
+    }
+  },
   "exports": {
     ".": {
+      "types@<5.8": "./types/ts5.7/index.d.ts",
       "types": "./dist/modules/src/index.d.ts",
       "browser": {
         "import": "./dist/modules/src/index.js",
@@ -30,7 +38,8 @@
     "package.json",
     "LICENSE",
     "dist",
-    "src"
+    "src",
+    "types"
   ],
   "browser": {
     "./dist/modules/src/node.js": false,
@@ -76,7 +85,7 @@
   },
   "dependencies": {
     "@types/dom-mediacapture-transform": "^0.1.11",
-    "@types/dom-webcodecs": "0.1.13"
+    "@types/dom-webcodecs": "0.1.19"
   },
   "devDependencies": {
     "@eslint/js": "^9.22.0",
