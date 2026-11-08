@@ -1,16 +1,18 @@
 import { expect, test } from 'vitest';
-import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { Input, InputDisposedError } from '../../src/input.js';
+import { BufferSource, CustomSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, MpegTsOutputFormat, OutputFormat } from '../../src/output-format.js';
+import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack } from '../../src/input-track.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -275,4 +277,271 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+// WebKitGTK's decoders scramble the timestamps that follow a negative one
+const decodesNegativeTimestamps = async () => {
+	const timestamps: number[] = [];
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			timestamps.push(data.timestamp);
+			data.close();
+		},
+		error: () => {},
+	});
+	decoder.configure({ codec: 'pcm-s16', sampleRate: 48000, numberOfChannels: 1 });
+	for (const timestamp of [-20000, 0, 20000]) {
+		decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp, data: new Uint8Array(1920) }));
+	}
+	await decoder.flush();
+	decoder.close();
+
+	return timestamps.join() === '-20000,0,20000';
+};
+
+// FFmpeg's AAC decoder, which Chromium and Firefox use, discards the first frame of AAC from libfaac as encoder
+// priming. It recognizes such AAC by the encoder name in a fill element of the first frame, which FFmpeg's own encoder
+// writes too, one byte earlier: demo.mp4's AAC with that name changed is such AAC (found by lane L79, with Chromium's
+// bear.mp4).
+const withLibfaacName = (data: Uint8Array) => {
+	data = data.slice();
+	const offset = new TextDecoder('latin1').decode(data).indexOf('Lavc');
+	assert(offset !== -1);
+	data.set(new TextEncoder().encode(' libfaac 1.28'), offset);
+	return data;
+};
+
+/** Remuxes the first second of demo.mp4's AAC, which starts a frame below 0. */
+const remuxDemoAac = async (options: {
+	libfaac: boolean;
+	format?: OutputFormat;
+	shiftInFrames?: number;
+	firstSharesTimestamp?: boolean;
+}) => {
+	using input = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+	const frameDuration = 1024 / decoderConfig.sampleRate;
+
+	const output = new Output({ format: options.format ?? new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	let isFirstPacket = true;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		if (packet.timestamp >= 1) {
+			break;
+		}
+
+		const data = options.libfaac && isFirstPacket ? withLibfaacName(packet.data) : packet.data;
+		let timestamp = packet.timestamp + (options.shiftInFrames ?? 1) * frameDuration;
+		let duration = packet.duration;
+		if (options.firstSharesTimestamp && isFirstPacket) {
+			// As in Chromium's bear-1280x720.mp4: the first packet lasts 0 and shares its timestamp with the next
+			timestamp += frameDuration;
+			duration = 0;
+		}
+
+		await source.add(new EncodedPacket(data, packet.type, timestamp, duration), { decoderConfig });
+		isFirstPacket = false;
+	}
+	await output.finalize();
+
+	return new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+};
+
+/**
+ * Whether the platform's decoder discards the track's first frame and stamps the next two apart, decided with WebCodecs
+ * alone. WebKitGTK's stamps the frames after a discarded one with the timestamps of the packets before them.
+ */
+const decoderDiscardsFirstFrame = async (track: InputAudioTrack) => {
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+
+	const timestamps: number[] = [];
+	const decoder = new AudioDecoder({
+		output: (data) => {
+			timestamps.push(data.timestamp);
+			data.close();
+		},
+		error: () => {},
+	});
+	decoder.configure(decoderConfig);
+	const packetSink = new EncodedPacketSink(track);
+	let packet = await packetSink.getFirstPacket();
+	for (let i = 0; i < 3 && packet; i++) {
+		decoder.decode(packet.toEncodedAudioChunk());
+		packet = await packetSink.getNextPacket(packet);
+	}
+	await decoder.flush();
+	decoder.close();
+
+	return timestamps.length === 2 && timestamps[1]! > timestamps[0]!;
+};
+
+const getAudioSignature = (sample: AudioSample) => {
+	const data = new Float32Array(sample.numberOfFrames);
+	sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+	return [...data.subarray(0, 64)].map(x => x.toFixed(6)).join();
+};
+
+// Decoding from a frame earlier (the pre-roll) isn't bit-exact, unlike a frame's worth of other audio
+const expectSameAudio = (signature: string, expected: string) => {
+	const values = signature.split(',').map(Number);
+	const expectedValues = expected.split(',').map(Number);
+	expect(Math.max(...values.map((x, i) => Math.abs(x - expectedValues[i]!)))).toBeLessThan(0.001);
+};
+
+const decodeAudioTrack = async (input: Input) => {
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const samples: { timestamp: number; signature: string }[] = [];
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		samples.push({ timestamp: sample.timestamp, signature: getAudioSignature(sample) });
+	}
+	return { track, samples };
+};
+
+test.for([
+	['at 0', 1],
+	['below 0, as an edit list leaves it', 0],
+] as const)('AAC that decoders start a frame late keeps the timestamps of its packets, starting %s', async (
+	[, shiftInFrames],
+	{ skip },
+) => {
+	if (shiftInFrames === 0) {
+		// Chromium stamps the audio after a discarded frame with the first packet's timestamp, unless that's negative
+		skip(!(await decodesNegativeTimestamps()), 'the decoder scrambles negative timestamps here');
+	}
+
+	using original = await remuxDemoAac({ libfaac: false, shiftInFrames });
+	using libfaac = await remuxDemoAac({ libfaac: true, shiftInFrames });
+	const { samples: originalSamples } = await decodeAudioTrack(original);
+	const { track, samples } = await decodeAudioTrack(libfaac);
+
+	// The same audio at the same timestamps, but for the first frame where the decoder discards it
+	expect(samples.length).toBeGreaterThanOrEqual(originalSamples.length - 1);
+	expect(samples).toEqual(originalSamples.slice(originalSamples.length - samples.length));
+
+	const sink = new AudioSampleSink(track);
+	for (const { timestamp, signature } of samples.slice(0, 3)) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBe(timestamp);
+		expectSameAudio(getAudioSignature(sample), signature);
+	}
+});
+
+test.for([
+	['MP4 whose first two packets share a timestamp', () => new Mp4OutputFormat(), true],
+	['MPEG-TS, with its ADTS headers', () => new MpegTsOutputFormat(), false],
+] as const)('AAC that decoders start a frame late is timed from its second packet: %s', async (
+	[, createFormat, firstSharesTimestamp],
+	{ skip },
+) => {
+	// As FFmpeg times it (found by lane L46)
+	using input = await remuxDemoAac({ libfaac: true, format: createFormat(), firstSharesTimestamp });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	skip(
+		!(await decoderDiscardsFirstFrame(track)),
+		'the decoder keeps the first frame here, or stamps the next ones alike',
+	);
+	const packetTimestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packetTimestamps.push(packet.timestamp);
+	}
+
+	const { samples } = await decodeAudioTrack(input);
+	expect(samples.map(x => x.timestamp)).toEqual(packetTimestamps.slice(1));
+
+	const sink = new AudioSampleSink(track);
+	for (const { timestamp, signature } of samples.slice(0, 3)) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBe(timestamp);
+		expectSameAudio(getAudioSignature(sample), signature);
+	}
+});
+
+/** A source for a file that reads it like a network source would, with a delay per read, and can fail reads. */
+const createSlowSource = async (url: string) => {
+	const data = new Uint8Array(await (await fetch(url)).arrayBuffer());
+	const state = { failReads: false };
+	const source = new CustomSource({
+		getSize: () => data.byteLength,
+		read: async (start, end) => {
+			await new Promise(resolve => setTimeout(resolve, 20));
+			if (state.failReads) {
+				throw new Error('Read failed');
+			}
+
+			return data.slice(start, end);
+		},
+	});
+
+	return { source, state };
+};
+
+/** Records the AudioDecoders created while running the callback. */
+const recordAudioDecoders = async (callback: (decoders: AudioDecoder[]) => Promise<void>) => {
+	const globals = globalThis as { AudioDecoder: typeof AudioDecoder };
+	const OriginalAudioDecoder = globals.AudioDecoder;
+	const decoders: AudioDecoder[] = [];
+	globals.AudioDecoder = class extends OriginalAudioDecoder {
+		constructor(init: AudioDecoderInit) {
+			super(init);
+			decoders.push(this);
+		}
+	};
+
+	try {
+		await callback(decoders);
+	} finally {
+		globals.AudioDecoder = OriginalAudioDecoder;
+	}
+};
+
+test('Disposing the input while an AAC sink starts up leaves no AudioDecoder open', async () => {
+	// The sink created its decoder before reading the first packet (to tell libfaac's), which then failed with the
+	// input disposed, and nothing closed the decoder (found by the lane L94 review)
+	const { source } = await createSlowSource('/demo.mp4');
+	using input = new Input({ source, formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('aac');
+
+	await recordAudioDecoders(async (decoders) => {
+		const next = new AudioSampleSink(track).samples().next();
+		while (decoders.length === 0) {
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
+
+		input.dispose();
+		await expect(next).rejects.toBeInstanceOf(InputDisposedError);
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(decoders.map(x => x.state)).toEqual(decoders.map(() => 'closed'));
+	});
+});
+
+test('A read error while an AAC sink starts up doesn\'t fail later sinks', async () => {
+	// The first-packet lookup is done once per track, and kept its failure too
+	const { source, state } = await createSlowSource('/demo.mp4');
+	using input = new Input({ source, formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	await recordAudioDecoders(async (decoders) => {
+		state.failReads = true;
+		await expect(new AudioSampleSink(track).getSample(0)).rejects.toThrow('Read failed');
+		state.failReads = false;
+
+		using sample = await new AudioSampleSink(track).getSample(0);
+		expect(sample).not.toBe(null);
+
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(decoders.map(x => x.state)).toEqual(decoders.map(() => 'closed'));
+	});
 });

@@ -15,6 +15,7 @@ import {
 	determineVideoPacketType,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
+	hasLibfaacSignature,
 	HevcNalUnitType,
 	iterateAvcNalUnits,
 	iterateHevcNalUnits,
@@ -2322,6 +2323,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
+	// The sequence number of a packet the decoder emits nothing for (libfaac's priming, see getDiscardedPacket)
+	discardedPacketSequenceNumber: number | null = null;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
@@ -2439,7 +2442,11 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		} else {
 			assert(this.decoder);
 
-			this.expectedFirstTimestamp ??= packet.timestamp;
+			// The first output comes from the packet after a discarded one
+			if (packet.sequenceNumber !== this.discardedPacketSequenceNumber) {
+				this.expectedFirstTimestamp ??= packet.timestamp;
+			}
+
 			this.decoder.decode(packet.toEncodedAudioChunk());
 		}
 	}
@@ -2658,6 +2665,70 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 }
 
+const discardedPackets = new WeakMap<InputAudioTrack, Promise<number | null>>();
+
+/**
+ * Gets the sequence number of the track's first packet if the platform's decoder emits nothing for it. FFmpeg's AAC
+ * decoder (in Chromium and Firefox) discards the first frame of AAC from libfaac as encoder priming, and Chromium then
+ * stamps the next frame's audio with the first packet's timestamp, unless that's negative. Whether the decoder discards
+ * the frame depends on which one the platform uses, so it's asked of the decoder itself, once per track. The packet is
+ * told by its sequence number, since the next one can share its timestamp.
+ */
+const getDiscardedPacket = (track: InputAudioTrack, decoderConfig: AudioDecoderConfig) => {
+	let result = discardedPackets.get(track);
+	if (!result) {
+		const lookup = (async () => {
+			if (decoderConfig.codec.split('.')[0] !== 'mp4a') {
+				return null;
+			}
+
+			const firstPacket = await new EncodedPacketSink(track).getFirstPacket();
+			if (!firstPacket || firstPacket.sequenceNumber < 0 || !hasLibfaacSignature(firstPacket.data)) {
+				return null;
+			}
+
+			let outputCount = 0;
+			const decoder = new AudioDecoder({
+				output: (data) => {
+					outputCount++;
+					data.close();
+				},
+				error: () => {},
+			});
+
+			try {
+				decoder.configure(decoderConfig);
+				decoder.decode(firstPacket.toEncodedAudioChunk());
+
+				// Nothing is known of a decoder that doesn't finish, as if it kept the frame
+				const finished = await Promise.race([
+					decoder.flush().then(() => true),
+					new Promise<boolean>(resolve => setTimeout(() => resolve(false), 3000)),
+				]);
+				return finished && outputCount === 0 ? firstPacket.sequenceNumber : null;
+			} catch {
+				return null;
+			} finally {
+				if (decoder.state !== 'closed') {
+					decoder.close();
+				}
+			}
+		})();
+		discardedPackets.set(track, lookup);
+
+		// A lookup that failed to read the first packet (on a read error, or once the input is disposed) is asked again
+		// next time
+		lookup.catch(() => {
+			if (discardedPackets.get(track) === lookup) {
+				discardedPackets.delete(track);
+			}
+		});
+		result = lookup;
+	}
+
+	return result;
+};
+
 /**
  * Sink for retrieving decoded audio samples from an audio track.
  * @group Media sinks
@@ -2701,7 +2772,19 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			const decoder = new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			if (decoder.decoder) {
+				try {
+					decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, decoderConfig);
+				} catch (error) {
+					// The lookup reads the first packet, which fails once the input is disposed. The decoder isn't
+					// handed out yet, so nothing else would close it.
+					decoder.close();
+					throw error;
+				}
+			}
+
+			return decoder;
 		}
 	}
 
