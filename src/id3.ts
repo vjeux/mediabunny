@@ -163,6 +163,10 @@ export const readId3V2Header = (slice: FileSlice): Id3V2Header | null => {
 	return { majorVersion, revision, flags, size };
 };
 
+// The metadata tags whose date was taken from a release time (TDRL), which a recording time found later still replaces
+// (callers parse consecutive tags into the same object)
+const datesFromReleaseTime = new WeakSet<MetadataTags>();
+
 export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
 	// https://id3.org/id3v2.3.0
 
@@ -195,6 +199,8 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 			reader.pos += extendedHeaderSize - 4; // The extended header size includes itself
 		}
 	}
+
+	let recordingTime: Date | null = null;
 
 	while (reader.pos <= reader.bytes.length - reader.frameHeaderSize()) {
 		const frame = reader.readId3V2Frame();
@@ -358,6 +364,7 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 
 				if (!Number.isNaN(date.getTime())) {
 					tags.date ??= date;
+					recordingTime ??= date;
 				}
 			}; break;
 
@@ -367,7 +374,19 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 				const year = Number.parseInt(yearText, 10);
 
 				if (Number.isInteger(year)) {
-					tags.date ??= new Date(String(year)); // String so that it parses as UTC
+					const date = new Date(String(year)); // String so that it parses as UTC
+					tags.date ??= date;
+					recordingTime ??= date;
+				}
+			}; break;
+
+			case 'TDRL': {
+				// Without a recording time, fall back to the release time (ID3v2.4), like FFmpeg does
+				const date = new Date(reader.readId3V2EncodingAndText(frameEndPos));
+
+				if (!Number.isNaN(date.getTime()) && tags.date === undefined) {
+					tags.date = date;
+					datesFromReleaseTime.add(tags);
 				}
 			}; break;
 
@@ -445,6 +464,13 @@ export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: Metad
 		}
 
 		reader.pos = nextFramePos;
+	}
+
+	// A recording time replaces a date that a release time gave, from an earlier frame or tag. Done once the tag's
+	// frames have been read, as reading each frame only sets fields that aren't set yet.
+	if (recordingTime && datesFromReleaseTime.has(tags)) {
+		tags.date = recordingTime;
+		datesFromReleaseTime.delete(tags);
 	}
 };
 
