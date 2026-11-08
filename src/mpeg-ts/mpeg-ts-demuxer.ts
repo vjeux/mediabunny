@@ -81,7 +81,7 @@ import {
 } from '../../shared/mp3-misc';
 import { EncodedPacket, PacketType, PLACEHOLDER_DATA } from '../packet';
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
-import { UrlSource } from '../source';
+import { ReadableStreamSource, UrlSource } from '../source';
 import {
 	buildMpegTsMimeType,
 	computeMpegTsCrc32,
@@ -184,8 +184,25 @@ const ignoredStreamTypes = new Set<number>();
 // seconds (ETSI TR 101 290), so we stop once the media has progressed by a few seconds, or after a few more damaged
 // copies (the muxer writes bad CRCs). FFmpeg only takes damaged sections after 10 of them in a row on a PID.
 const MAX_PSI_SECTION_REPETITION_DISTANCE = 4 * 1024 * 1024;
+// The same for sources of unknown size
+const MAX_STREAMED_PSI_SECTION_REPETITION_DISTANCE = 1024 * 1024;
 const MAX_PSI_SECTION_REPETITION_DELAY = 2 * MPEG_TS_TIMESCALE;
 const MAX_DAMAGED_PSI_SECTION_COPY_COUNT = 2;
+
+/**
+ * How far reading can go past a position and still come back to it. Sources that only keep what their cache holds (a
+ * ReadableStreamSource, or a UrlSource whose server ignores range requests) can go half their cache, which stays clear
+ * of what gets evicted; the others, anywhere.
+ */
+const getReadBackDistance = (reader: Reader) => {
+	const source = reader.source;
+	const sequentialSource = source instanceof ReadableStreamSource
+		? source
+		: source instanceof UrlSource
+			? source._sequentialBacking
+			: null;
+	return sequentialSource ? sequentialSource._maxCacheSize / 2 : Infinity;
+};
 
 const getPsiTableId = (payload: Uint8Array) => payload[1 + (payload[0] ?? 0)] ?? null;
 
@@ -1046,16 +1063,14 @@ export class MpegTsDemuxer extends Demuxer {
 			return section;
 		}
 
-		// Sources that only keep what their cache holds (a ReadableStreamSource, whose size is unknown, or a UrlSource
-		// whose server ignores range requests) can't go back to the section after looking ahead, so they take it as is
-		if (
+		// Reading goes back to the section after the search, so sources that only keep what their cache holds look only
+		// as far as they can still come back from
+		const endPos = section.startPos + Math.min(
 			this.reader.fileSizeNonStrict === null
-			|| (this.reader.source instanceof UrlSource && this.reader.source._sequentialBacking)
-		) {
-			return section;
-		}
-
-		const endPos = section.startPos + MAX_PSI_SECTION_REPETITION_DISTANCE;
+				? MAX_STREAMED_PSI_SECTION_REPETITION_DISTANCE
+				: MAX_PSI_SECTION_REPETITION_DISTANCE,
+			getReadBackDistance(this.reader),
+		);
 		const firstPtsByPid = new Map<number, number>();
 		let damagedCopyCount = 0;
 
