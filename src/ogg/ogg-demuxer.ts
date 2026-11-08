@@ -762,12 +762,21 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	sequentialScanMutex = new AsyncMutex();
 	firstLinkPromise: Promise<OggLink> | null = null;
 	warnedAboutIncompatibleLink = false;
+	/**
+	 * Whether the file size was unknown when the track was read, as with a ReadableStreamSource. Such a source is read
+	 * in order and can't read back what has left its cache, which a binary search would do, so packets are always
+	 * looked up by reading on, even once reaching the end of the stream has made its size known.
+	 */
+	sourceWasUnsized: boolean;
+	/** The track's last packet, once reading on has reached it. */
+	lastPacketMetadata: EncodedPacketMetadata | null = null;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
 		// Opus always uses a fixed sample rate for its internal calculations, even if the actual rate is different
 		this.internalSampleRate = bitstream.codecInfo.codec === 'opus'
 			? OPUS_SAMPLE_RATE
 			: bitstream.sampleRate;
+		this.sourceWasUnsized = demuxer.reader.fileSizeNonStrict === null;
 	}
 
 	getType() {
@@ -1145,12 +1154,16 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				vorbisBlockSize: prevMetadata.vorbisBlockSize,
 			});
 			if (!nextLink) {
+				// This is the track's last packet. Let's remember it, so that looking it up again (as computeDuration()
+				// does) doesn't need to read on from the start of a stream, which the source may no longer hold.
+				this.lastPacketMetadata ??= prevMetadata;
 				return null;
 			}
 
 			assert(nextLink.bitstream.lastMetadataPacket);
 			packetPosition = await this.demuxer.findNextPacketStart(nextLink.bitstream.lastMetadataPacket);
 			if (!packetPosition) {
+				this.lastPacketMetadata ??= prevMetadata;
 				return null;
 			}
 
@@ -1339,10 +1352,13 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
-		if (this.demuxer.reader.fileSize === null || this.sequentialScanCache.length > 0) {
-			// No file size known, can't do binary search, but fall back to sequential algo instead. Once that has
-			// started, keep at it: checking for a chained link after the last page can make the size known, but the
-			// source, a stream, may no longer hold the data the binary search would read.
+		if (
+			this.sourceWasUnsized
+			|| this.demuxer.reader.fileSize === null
+			|| this.demuxer.reader.randomAccessFileSize === null
+		) {
+			// No file size known (or not from the start), or no random access, can't do binary search, but fall back to
+			// sequential algo instead
 			return this.getPacketSequential(timestamp, options);
 		}
 
@@ -1937,6 +1953,19 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		try {
 			const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 			timestamp = timestampInSamples / this.internalSampleRate;
+
+			if (this.lastPacketMetadata && timestampInSamples >= this.lastPacketMetadata.timestampInSamples) {
+				// It's the last packet, which reading on has already reached
+				return this.createEncodedPacketFromOggPacket(
+					this.lastPacketMetadata.packet,
+					{
+						link: this.lastPacketMetadata.link,
+						timestampInSamples: this.lastPacketMetadata.timestampInSamples,
+						vorbisLastBlocksize: this.lastPacketMetadata.vorbisLastBlockSize,
+					},
+					options,
+				);
+			}
 
 			const index = binarySearchLessOrEqual(
 				this.sequentialScanCache,
