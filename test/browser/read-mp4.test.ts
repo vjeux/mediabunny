@@ -1,11 +1,12 @@
 import { expect, test } from 'vitest';
+import { decodesPastNegativeTimestamps } from './helpers/platform-probes.js';
 import { Input } from '../../src/input.js';
 import { BlobSource, UrlSource, BufferSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert } from '../../src/misc.js';
 
-test('Encrypted MP4 without senc', async () => {
+test('Encrypted MP4 without senc', async ({ skip }) => {
 	using input = new Input({
 		source: new UrlSource('/639955605-b752f7ad-7ce8-43c2-8ae9-88e74c6ae696.mp4'),
 		formats: ALL_FORMATS,
@@ -18,6 +19,11 @@ test('Encrypted MP4 without senc', async () => {
 
 	const audioTrack = await input.getPrimaryAudioTrack();
 	assert(audioTrack);
+	// The audio starts before zero (the AAC priming)
+	skip(
+		!await decodesPastNegativeTimestamps(),
+		'the platform\'s audio decoders scramble negative timestamps (native probe)',
+	);
 
 	// Test that it can decode
 	const sink = new AudioSampleSink(audioTrack);

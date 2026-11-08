@@ -1,5 +1,6 @@
 import { expect, test, vi } from 'vitest';
 import { Output } from '../../src/output.js';
+import { opusEncoderTimesItsPackets } from './helpers/platform-probes.js';
 import { OggOutputFormat } from '../../src/output-format.js';
 import { BufferTarget, NullTarget } from '../../src/target.js';
 import { AudioBufferSource, EncodedAudioPacketSource } from '../../src/media-source.js';
@@ -12,7 +13,10 @@ import { ALL_FORMATS, OggInputFormat } from '../../src/input-format.js';
 import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { Conversion } from '../../src/conversion.js';
 
-test('maximumPageDuration option', async () => {
+test('maximumPageDuration option', async ({ skip }) => {
+	// The page counts follow the timing of the encoded packets
+	skip(!await opusEncoderTimesItsPackets(), 'the platform\'s Opus encoder mistimes its packets (native probe)');
+
 	const sampleRate = 48000;
 	const durationSeconds = 2;
 	const audioBuffer = new AudioBuffer({ numberOfChannels: 1, length: sampleRate * durationSeconds, sampleRate });
