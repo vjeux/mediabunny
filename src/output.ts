@@ -13,6 +13,7 @@ import {
 	isIso639Dash2LanguageCode,
 	isThenable,
 	MaybePromise,
+	promiseWithResolvers,
 	Rotation,
 	toArray,
 	toUint8Array,
@@ -503,6 +504,8 @@ export class Output<
 	/** @internal */
 	_cancelPromise: Promise<void> | null = null;
 	/** @internal */
+	_canceled = promiseWithResolvers();
+	/** @internal */
 	_finalizePromise: Promise<void> | null = null;
 	/** @internal */
 	_mutex = new AsyncMutex();
@@ -644,11 +647,12 @@ export class Output<
 		this._emit('target', { target, request: null, isRoot: false });
 
 		if (this.state === 'canceled') {
+			// Arrived after a cancel (which doesn't wait for it), so don't let anything write into it
 			await target._close();
-		} else {
-			this._rememberTarget(target);
+			throw new Error('Output has been canceled.');
 		}
 
+		this._rememberTarget(target);
 		return target;
 	}
 
@@ -703,6 +707,11 @@ export class Output<
 	_getRootWriter(isMonotonic: boolean | ((target: Target) => boolean)) {
 		return this._rootWriterPromise ??= (async () => {
 			const target = await this._getRootTarget();
+			if (this.state === 'canceled') {
+				// Arrived after a cancel (which doesn't wait for it, and has closed it), so don't let anything write
+				// into it
+				throw new Error('Output has been canceled.');
+			}
 
 			const writer = new Writer(target, typeof isMonotonic === 'boolean' ? isMonotonic : isMonotonic(target));
 			writer.start();
@@ -991,7 +1000,16 @@ export class Output<
 			let startError: unknown = null;
 
 			try {
-				await this._muxer.start();
+				// The muxer may have to wait for its target (an async PathedTarget or initTarget callback, which might
+				// never settle). A cancel must not wait behind that: it ends the start (which resolves, as when the
+				// cancel comes after the start), and a target that still arrives afterwards gets closed and isn't
+				// written to (see _getRootTarget and _getRootWriter)
+				const muxerStartPromise = this._muxer.start();
+				muxerStartPromise.catch(() => {}); // It fails on a target arriving after the cancel
+				await Promise.race([muxerStartPromise, this._canceled.promise]);
+				if ((this.state as Output['state']) === 'canceled') {
+					return;
+				}
 
 				const promises = this.tracks.map(track => track.source._start());
 				await Promise.all(promises);
@@ -1054,6 +1072,7 @@ export class Output<
 
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
+			this._canceled.resolve();
 
 			const release = await this._mutex.acquire();
 

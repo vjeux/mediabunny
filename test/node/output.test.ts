@@ -155,6 +155,107 @@ test('Output.cancel() while finalizing gives up on a StreamTarget whose sink has
 	}
 }, 30_000);
 
+test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
+	'Canceling an output whose target callback is still pending at start (%s)',
+	async (formatName) => {
+		// The callback may never settle (an upload URL request without a timeout, a file picker left open), and a
+		// cancel mustn't wait for it
+		const { CmafOutputFormat, Mp4OutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
+		const { PathedTarget, StreamTarget } = await import('../../src/target.js');
+		type StreamTargetChunk = import('../../src/target.js').StreamTargetChunk;
+		const createFormat = () => formatName === 'MP4'
+			? new Mp4OutputFormat()
+			: formatName === 'Matroska'
+				? new MkvOutputFormat()
+				: formatName === 'MPEG-TS'
+					? new MpegTsOutputFormat()
+					: new CmafOutputFormat();
+		const usesInitTarget = formatName === 'CMAF';
+
+		for (const settlesLate of [false, true]) {
+			let resolveTarget: ((target: BufferTarget | InstanceType<typeof StreamTarget>) => void) | null = null;
+			const getTarget = () => new Promise<BufferTarget | InstanceType<typeof StreamTarget>>((resolve) => {
+				resolveTarget = resolve;
+			});
+			const output = new Output({
+				format: createFormat(),
+				target: usesInitTarget
+					? new PathedTarget('stream.mp4', () => new BufferTarget())
+					: new PathedTarget('file', getTarget),
+				initTarget: usesInitTarget ? getTarget : undefined,
+			});
+			output.addVideoTrack(new EncodedVideoPacketSource('avc'));
+
+			const start = output.start();
+			const startResult = start.then(() => 'started', (error: Error) => error.message);
+			await new Promise(resolve => setTimeout(resolve, 50));
+			expect(resolveTarget).not.toBeNull(); // The start waits for the target
+
+			const cancelResult = await Promise.race([
+				output.cancel().then(() => 'canceled'),
+				new Promise(resolve => setTimeout(() => resolve('pending'), 2000)),
+			]);
+			expect(cancelResult).toBe('canceled');
+			expect(await startResult).toBe('started'); // As when the cancel comes after the start
+			expect(output.state).toBe('canceled');
+
+			if (settlesLate) {
+				// A target that still arrives gets closed, and nothing gets written into it
+				const writes: number[] = [];
+				const writable = new WritableStream<StreamTargetChunk>({
+					write: chunk => void writes.push(chunk.data.byteLength),
+				});
+				const lateTarget = new StreamTarget(writable);
+				let closed = false;
+				const close = lateTarget._close.bind(lateTarget);
+				lateTarget._close = async () => {
+					closed = true;
+					await close();
+				};
+				resolveTarget!(lateTarget);
+				await new Promise(resolve => setTimeout(resolve, 50));
+				expect(closed).toBe(true);
+				expect(writes).toEqual([]);
+				expect(writable.locked).toBe(false); // The caller's stream stays theirs
+			}
+		}
+	},
+);
+
+test.each(['synchronous', 'never settling'] as const)(
+	'Canceling right after an unawaited start() rejects nothing (%s target)',
+	async (targetKind) => {
+		const { Mp4OutputFormat } = await import('../../src/output-format.js');
+		const { PathedTarget } = await import('../../src/target.js');
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => void unhandledRejections.push(reason);
+		process.on('unhandledRejection', onUnhandledRejection);
+
+		try {
+			const output = new Output({
+				format: new Mp4OutputFormat(),
+				target: targetKind === 'synchronous'
+					? new BufferTarget()
+					: new PathedTarget('file.mp4', () => new Promise<BufferTarget>(() => {})),
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+
+			void output.start();
+			await output.cancel();
+			await new Promise(resolve => setTimeout(resolve, 50));
+
+			expect(unhandledRejections).toEqual([]);
+			expect(output.state).toBe('canceled');
+			// As on main after a cancel
+			await expect((async () => source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1)))())
+				.rejects.toThrow('Output has been canceled.');
+		} finally {
+			process.off('unhandledRejection', onUnhandledRejection);
+		}
+	},
+);
+
 test('Output, onFinalize', async () => {
 	let callCount = 0;
 	const output = new Output({
