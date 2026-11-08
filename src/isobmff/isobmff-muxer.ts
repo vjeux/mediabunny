@@ -67,6 +67,8 @@ export type Sample = {
 	type: PacketType;
 	timescaleUnitsToNextSample: number;
 	prerollSamples: number;
+	/** For the last sample before a key frame: that key frame's timestamp, once known. */
+	nextKeyTimestamp?: number;
 };
 
 type Chunk = {
@@ -206,6 +208,35 @@ export const presentationSpan = (trackData: IsobmffTrackData) => {
 	}
 
 	return maxEndTimestamp - minTimestamp;
+};
+
+/**
+ * Returns the duration to give the last sample before a key frame (the last sample of a fragment, when one starts at
+ * that key frame), given its own duration and its distance to the key frame, both in timescale units. A fragment's
+ * decode time is the sum of all earlier sample durations, so the sample should end exactly where the next fragment
+ * starts.
+ */
+const getDurationUntilKeyFrame = (duration: number, distance: number, timescale: number) => {
+	if (duration === 0) {
+		// Unknown duration, so the distance is the best guess. It's actually correct most of the time, since typically,
+		// no delta frame with a lower timestamp follows the key frame (although it can happen).
+		return distance;
+	}
+
+	if (distance >= 0 && distance < duration) {
+		// The sample's own duration reaches past the key frame, which would overlap the next fragment
+		return distance;
+	}
+
+	if (distance > duration && distance - duration <= Math.min(timescale / 1000, duration / 2) + 0.5) {
+		// A gap of up to a millisecond (and half the sample) comes from timestamps rounded more coarsely than the
+		// durations (like Matroska's milliseconds), so close it. Real gaps are kept, and so is the extra time of an
+		// open GOP's leading frames (presented before the key frame but decoded after it), which is at least a frame
+		// long.
+		return distance;
+	}
+
+	return duration;
 };
 
 export class IsobmffMuxer extends Muxer {
@@ -1155,19 +1186,17 @@ export class IsobmffMuxer extends Muxer {
 		if (nextSample !== undefined) {
 			assert(nextSample.type === 'key');
 
-			// Given the next sample, we can make a guess about the duration of the last sample. This avoids having
-			// the last sample's duration in each fragment be "0" for fragmented files. The guess we make here is
-			// actually correct most of the time, since typically, no delta frame with a lower timestamp follows the key
-			// frame (although it can happen).
+			// Given the next sample, we can adjust the duration of the last sample to it. This avoids having the last
+			// sample's duration in each fragment be "0" for fragmented files, or overlap or miss the next fragment.
 			const timescaleUnits = intoTimescale(nextSample.timestamp, trackData.timescale, false);
 			const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
-			if (trackData.lastSample.timescaleUnitsToNextSample === 0) {
-				trackData.lastSample.timescaleUnitsToNextSample = delta;
-			} else if (delta >= 0 && delta < trackData.lastSample.timescaleUnitsToNextSample) {
-				// The sample's own duration reaches past the next key frame, which would make it overlap the next
-				// fragment: a fragment's decode time is the sum of all earlier samples' durations
-				trackData.lastSample.timescaleUnitsToNextSample = delta;
-			}
+			trackData.lastSample.timescaleUnitsToNextSample = getDurationUntilKeyFrame(
+				trackData.lastSample.timescaleUnitsToNextSample,
+				delta,
+				trackData.timescale,
+			);
+			// A fragment starting at the key frame has its decode time rounded differently, see alignWithNextFragments
+			trackData.lastSample.nextKeyTimestamp = nextSample.timestamp;
 		}
 	}
 
@@ -1319,6 +1348,38 @@ export class IsobmffMuxer extends Muxer {
 		await this.writer.flush();
 	}
 
+	/**
+	 * Makes each track's last sample in a fragment about to be written end exactly where the track's next fragment
+	 * starts, when that one starts at the key frame following the sample. processTimestamps already adjusted the
+	 * sample's duration, but in units counted from the track's first decode time, which can be a tick off from those
+	 * the fragments' decode times are written in when the track doesn't start on a whole tick (e.g. AAC with priming).
+	 */
+	private alignWithNextFragments(tracks: IsobmffTrackData[]) {
+		for (const trackData of tracks) {
+			const chunk = trackData.currentChunk;
+			const lastSample = chunk && last(chunk.samples);
+			if (!lastSample || lastSample.nextKeyTimestamp === undefined) {
+				continue;
+			}
+			assert(trackData.startTimestampOffset !== null);
+
+			// In the timescale units the fragments' decode times are written in (rounded, see tfdt)
+			const toWrittenTime = (timestamp: number) => {
+				return intoTimescale(timestamp - trackData.startTimestampOffset!, trackData.timescale);
+			};
+			let lastSampleStart = toWrittenTime(chunk.startTimestamp);
+			for (let i = 0; i < chunk.samples.length - 1; i++) {
+				lastSampleStart += chunk.samples[i]!.timescaleUnitsToNextSample;
+			}
+
+			lastSample.timescaleUnitsToNextSample = getDurationUntilKeyFrame(
+				lastSample.timescaleUnitsToNextSample,
+				toWrittenTime(lastSample.nextKeyTimestamp) - lastSampleStart,
+				trackData.timescale,
+			);
+		}
+	}
+
 	private async interleaveSamples(isFinalCall = false) {
 		if (!isFinalCall && !this.allTracksAreKnown()) {
 			return; // We can't interleave yet as we don't yet know how many tracks we'll truly have
@@ -1412,6 +1473,7 @@ export class IsobmffMuxer extends Muxer {
 		}
 
 		const fragmentNumber = this.nextFragmentNumber++;
+		this.alignWithNextFragments(tracksInFragment);
 
 		// Create an initial moof box and measure it; we need this to know where the following mdat box will begin
 		const moofBox = moof(fragmentNumber, tracksInFragment);
@@ -1607,10 +1669,10 @@ export class IsobmffMuxer extends Muxer {
 		}
 	}
 
-	/** Internal function for external callers who want to full control fragment boundaries. */
 	/**
-	 * Ends the current fragment. The timestamps of the key packets that will start the next one, when known, end the
-	 * durations of each track's last samples, like they do when fragments are cut automatically.
+	 * Internal function for external callers who want full control over fragment boundaries: ends the current
+	 * fragment. The timestamps of the key packets that will start the next one, when known, end the durations of each
+	 * track's last samples, like they do when fragments are cut automatically.
 	 */
 	async forceFragmentFinalization(nextKeyTimestamps?: Map<OutputTrack, number>) {
 		assert(this.isFragmented);
