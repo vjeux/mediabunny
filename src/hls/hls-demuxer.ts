@@ -93,6 +93,12 @@ export class HlsDemuxer extends Demuxer {
 	segmentedInputs: HlsSegmentedInput[] = [];
 	hasMasterPlaylist = true;
 	masterPlaylistVariables: HlsPlaylistVariables | null = null;
+	/**
+	 * For each discontinuity: whether its timeline snaps to its program date times or continues the timeline so far.
+	 * Decided once for all playlists (by the reference playlist, when it lists the discontinuity), so that they place
+	 * the discontinuity alike.
+	 */
+	discontinuitiesFollowingDates = new Map<number, boolean>();
 	mediaOffsets = new Map<number, Promise<number>>();
 	timelineSegmentedInputPromise: Promise<HlsSegmentedInput> | null = null;
 
