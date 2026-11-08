@@ -2344,7 +2344,10 @@ export const extractAv1CodecInfoFromPacket = (packet: Uint8Array): Av1CodecInfo 
 	return parseAv1SequenceHeader(packet)?.codecInfo ?? null;
 };
 
-/** Reads the maximum frame size from an AV1 sequence header OBU in a packet. */
+/**
+ * Reads the maximum frame size from an AV1 sequence header OBU in a packet. Frames can be smaller (with
+ * frame_size_override_flag), so it's an upper bound; encoders usually code every frame at this size.
+ */
 export const extractAv1FrameSizeFromPacket = (packet: Uint8Array) => {
 	const header = parseAv1SequenceHeader(packet);
 	return header && { width: header.width, height: header.height };
