@@ -5858,6 +5858,20 @@ class PacketBuffer {
 		assert(this.reorderSize >= 0);
 	}
 
+	/** The median time between the buffered packets in presentation order, if there are any two. */
+	getBufferedFrameDuration() {
+		const gaps: number[] = [];
+		for (let i = 1; i < this.presentationOrderPackets.length; i++) {
+			const gap = this.presentationOrderPackets[i]!.pts - this.presentationOrderPackets[i - 1]!.pts;
+			if (gap > 0) {
+				gaps.push(gap);
+			}
+		}
+
+		gaps.sort((a, b) => a - b);
+		return gaps[Math.floor((gaps.length - 1) / 2)] ?? null;
+	}
+
 	async readNext(): Promise<{ packet: TimedSuppliedPacket; duration: number } | null> {
 		if (this.decodeOrderPackets.length === 0) {
 			// We need the next packet
@@ -5880,11 +5894,13 @@ class PacketBuffer {
 			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). For video,
 			// whose frames may be reordered, the packets around it depend on where reading started, so use the
 			// track's frame duration (unless the stream's start, where it's measured, can't be read anymore, as from a
-			// source that keeps only what its cache holds and was read further first: then it's the heuristic). For
-			// audio, without a previous duration either (a lookup that only found this packet), take the one its data
-			// implies.
+			// source that keeps only what its cache holds and was read further first: then it's measured on the
+			// packets at hand, which a gap before the packet doesn't throw off as the last duration would). For audio,
+			// without a previous duration either (a lookup that only found this packet), take the one its data implies.
 			duration = this.backing.elementaryStream.info.type === 'video'
-				? await this.backing.getFrameDuration().catch(() => this.lastDuration || packet.intrinsicDuration)
+				? await this.backing.getFrameDuration().catch(() => {
+					return this.getBufferedFrameDuration() ?? (this.lastDuration || packet.intrinsicDuration);
+				})
 				: this.lastDuration || packet.intrinsicDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
