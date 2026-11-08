@@ -581,9 +581,33 @@ export class WaveInputFormat extends InputFormat {
 export class OggInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
-		let slice = input._reader.requestSlice(0, 4);
-		if (isThenable(slice)) slice = await slice;
-		if (!slice) return false;
+		let currentPos = 0;
+
+		// Some taggers put ID3v2 tags at the start of any file, skip 'em
+		while (true) {
+			let slice = input._reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				break;
+			}
+
+			const id3V2Header = readId3V2Header(slice);
+			if (!id3V2Header) {
+				break;
+			}
+
+			currentPos = slice.filePos + id3V2Header.size;
+		}
+
+		let slice = input._reader.requestSlice(currentPos, 4);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return false;
+		}
 
 		return readAscii(slice, 4) === 'OggS';
 	}
