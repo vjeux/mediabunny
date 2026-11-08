@@ -1,9 +1,10 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource, UrlSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -11,6 +12,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +926,184 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS packet durations with B-frames do not depend on how the packets were reached', async () => {
+	// The first 40 packets of an HEVC video with B-frames, so that the last frame shown is followed by a gap (the
+	// frames filling it come later in the stream)
+	using mp4 = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video-h265.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('hevc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		await source.add(packet, count === 0 ? { decoderConfig: (await mp4Track.getDecoderConfig())! } : undefined);
+		if (++count === 40) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets: EncodedPacket[] = [];
+	for await (const packet of sink.packets()) {
+		packets.push(packet);
+	}
+
+	// The last frame lasts one frame, however it's reached
+	const lastPacket = packets.reduce((a, b) => b.timestamp > a.timestamp ? b : a);
+	expect(lastPacket.timestamp).toBeCloseTo(1.4);
+	expect(lastPacket.duration).toBeCloseTo(1 / 30);
+	expect((await sink.getPacket(Infinity))!.duration).toBe(lastPacket.duration);
+	expect(await track.computeDuration()).toBeCloseTo(1.4 + 1 / 30);
+});
+
+test('MPEG-TS gives the last frame of variable frame rate video a typical frame duration', async () => {
+	// Frames 17.7, 20.3 and 10.9 ms long at the start, then 29 ms ones (seen in HLS streams, where every segment's
+	// last frame has no successor)
+	using mp4 = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/cursed-vfr.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const timestamps = [0, 0.0177, 0.038, 0.0489];
+	while (timestamps.length < 24) {
+		timestamps.push(timestamps.at(-1)! + 0.029);
+	}
+
+	let i = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		const timestamp = timestamps[i]!;
+		const duration = i + 1 < timestamps.length ? timestamps[i + 1]! - timestamp : 0.029;
+		await source.add(
+			packet.clone({ timestamp, duration }),
+			i === 0 ? { decoderConfig: (await mp4Track.getDecoderConfig())! } : undefined,
+		);
+		if (++i === timestamps.length) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const lastPacket = await sink.getPacket(Infinity);
+	expect(lastPacket?.duration).toBeCloseTo(0.029);
+	expect(await track.computeDuration()).toBeCloseTo(timestamps.at(-1)! + 0.029);
+});
+
+test('MPEG-TS read from a stream larger than the source cache reads to its last packet', async () => {
+	// Found by L91. Like FFmpeg's `-f mpegts pipe:1` output read through a ReadableStreamSource (whose cache holds
+	// 32 MiB by default): the cache only keeps the most recent data. The last packet takes the frame duration measured
+	// at the start of the stream, which must not be read only once the start is long evicted.
+	const data = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/0.ts'))); // 1.9 MB
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= data.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(data.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 19 }),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		expect(packet.duration).toBeGreaterThan(0);
+		packetCount++;
+	}
+	expect(packetCount).toBe(298);
+
+	// A server that ignores range requests makes a UrlSource read in order too, though it knows the size. Looking up
+	// the end, for the duration, reads past the stream's start before the frame duration is measured there; the last
+	// packet then takes the frame duration measured on the packets at hand (found in L15's "sized but not seekable"
+	// checks: polsat_1080i_hevc.ts, whose last key frame follows a gap of 0.3 s, ended 0.28 s late). 4 seconds of
+	// frames of 60 kB with two B-frames per P-frame, then a key frame after a gap of 9 frames, more than one seek
+	// chunk, read through a 1 MiB cache.
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	// I0 P3 B1 B2 P6 B4 B5 ... P96 B94 B95, then I105
+	const decodeOrder = [0];
+	for (let anchor = 3; anchor <= 96; anchor += 3) {
+		decodeOrder.push(anchor, anchor - 2, anchor - 1);
+	}
+	decodeOrder.push(105);
+	for (const frame of decodeOrder) {
+		const isKey = frame === 0 || frame === 105;
+		const header = isKey ? 0x65 : frame % 3 === 0 ? 0x41 : 0x01;
+		const slice = nalUnit([header, 0x88, ...new Array<number>(60_000).fill(0x20 + frame % 50)]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				frame / 25,
+				1 / 25,
+			),
+			frame === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+	const sizedInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const sizedDuration = await (await sizedInput.getPrimaryVideoTrack())!.computeDuration();
+	sizedInput.dispose();
+	expect(sizedDuration).toBeCloseTo(106 / 25);
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': bytes.byteLength });
+		response.end(bytes);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using urlInput = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 20,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const urlTrack = await urlInput.getPrimaryVideoTrack();
+		assert(urlTrack);
+		expect(await urlTrack.computeDuration()).toBeCloseTo(sizedDuration);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
 });

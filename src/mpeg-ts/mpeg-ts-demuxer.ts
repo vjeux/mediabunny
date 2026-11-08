@@ -178,6 +178,9 @@ type Section = {
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
+// How many PTS values at least to measure a video track's frame duration from
+const MIN_FRAME_DURATION_PTS_COUNT = 16;
+
 export class MpegTsDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -1180,6 +1183,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	packetBuffers = new WeakMap<EncodedPacket, PacketBuffer>();
 	/** Used for recreating PacketBuffers if necessary. */
 	packetSectionStarts = new WeakMap<EncodedPacket, number>();
+	frameDuration: Promise<number> | null = null;
 
 	constructor(public elementaryStream: ElementaryStream) {}
 
@@ -1267,6 +1271,69 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	abstract allPacketsAreKeyPackets(): boolean;
 	abstract getReorderSize(): number;
 
+	/**
+	 * Returns the time between frames, as the median gap between the presentation timestamps of the track's first
+	 * PES packets. Since it doesn't depend on where reading started, it gives packets without a successor the same
+	 * duration however they were reached.
+	 */
+	/**
+	 * Packets without a successor (the last one, say) take the track's frame duration, which is measured at the start
+	 * of the stream (see getFrameDuration). This starts measuring it as reading starts: by the time it's needed, a
+	 * sequential source (a stream, a server that ignores range requests) may have evicted the start from its cache.
+	 * Errors surface where the duration is awaited.
+	 */
+	startMeasuringFrameDuration() {
+		if (this.elementaryStream.info.type === 'video') {
+			void this.getFrameDuration().catch(() => {});
+		}
+	}
+
+	getFrameDuration() {
+		return this.frameDuration ??= (async () => {
+			const demuxer = this.elementaryStream.demuxer;
+			const firstSection = this.elementaryStream.firstSection;
+			assert(firstSection);
+
+			// Enough to see every frame of a reordering window in presentation order, and not to be thrown off by a few
+			// irregular frames at the start
+			const ptsCount = Math.max(2 * (this.getReorderSize() + 1) + 2, MIN_FRAME_DURATION_PTS_COUNT);
+			const ptsValues: number[] = [];
+
+			let currentPos = firstSection.startPos;
+			while (ptsValues.length < ptsCount) {
+				const packetHeader = await demuxer.readPacketHeader(currentPos);
+				if (!packetHeader) {
+					break;
+				}
+
+				if (packetHeader.pid === this.elementaryStream.pid && packetHeader.payloadUnitStartIndicator === 1) {
+					const section = await demuxer.readSection(currentPos, false);
+					const pesPacketHeader = section && readPesPacketHeader(demuxer, section, false);
+					if (pesPacketHeader && pesPacketHeader.pts !== null) {
+						ptsValues.push(pesPacketHeader.pts);
+					}
+				}
+
+				currentPos += demuxer.packetStride;
+			}
+
+			ptsValues.sort((a, b) => a - b);
+
+			const gaps: number[] = [];
+			for (let i = 1; i < ptsValues.length; i++) {
+				const gap = ptsValues[i]! - ptsValues[i - 1]!;
+				if (gap > 0) {
+					gaps.push(gap);
+				}
+			}
+
+			// The median, since frames the window ends before (reordering) make a few gaps too long, and variable frame
+			// rates make some too short
+			gaps.sort((a, b) => a - b);
+			return gaps[Math.floor((gaps.length - 1) / 2)] ?? 0;
+		})();
+	}
+
 	createEncodedPacket(
 		suppliedPacket: SuppliedPacket,
 		duration: number,
@@ -1293,6 +1360,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+		this.startMeasuringFrameDuration();
 		const section = this.elementaryStream.firstSection;
 		assert(section);
 
@@ -1335,6 +1403,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		}
 
 		// No buffer, we gotta do some rereading
+		this.startMeasuringFrameDuration();
 		const sectionStartPos = this.packetSectionStarts.get(packet);
 		if (sectionStartPos === undefined) {
 			throw new Error('Packet was not created from this track.');
@@ -1404,6 +1473,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 	): Promise<EncodedPacket | null> {
 		const searchPts = roundIfAlmostInteger(timestamp * MPEG_TS_TIMESCALE);
+		this.startMeasuringFrameDuration();
 
 		const demuxer = this.elementaryStream.demuxer;
 		const { reader, seekChunkSize } = demuxer;
@@ -2660,6 +2730,20 @@ class PacketBuffer {
 		assert(this.reorderSize >= 0);
 	}
 
+	/** The median time between the buffered packets in presentation order, if there are any two. */
+	getBufferedFrameDuration() {
+		const gaps: number[] = [];
+		for (let i = 1; i < this.presentationOrderPackets.length; i++) {
+			const gap = this.presentationOrderPackets[i]!.pts - this.presentationOrderPackets[i - 1]!.pts;
+			if (gap > 0) {
+				gaps.push(gap);
+			}
+		}
+
+		gaps.sort((a, b) => a - b);
+		return gaps[Math.floor((gaps.length - 1) / 2)] ?? null;
+	}
+
 	async readNext(): Promise<{ packet: SuppliedPacket; duration: number } | null> {
 		if (this.decodeOrderPackets.length === 0) {
 			// We need the next packet
@@ -2679,8 +2763,16 @@ class PacketBuffer {
 
 		let duration: number;
 		if (presentationIndex === -1 || presentationIndex === this.presentationOrderPackets.length - 1) {
-			// The packet has no known successor (or isn't even placed yet when timestamps are messed up)
-			duration = this.lastDuration; // Reasonable heuristic
+			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). For video,
+			// whose frames may be reordered, the packets around it depend on where reading started, so use the
+			// track's frame duration. (Unless the stream's start, where it's measured, can't be read anymore, as from
+			// a source that keeps only what its cache holds and was read further first: then it's measured on the
+			// packets at hand, which a gap before the packet doesn't throw off as the last duration would.)
+			duration = this.backing.elementaryStream.info.type === 'video'
+				? await this.backing.getFrameDuration().catch(() => {
+					return this.getBufferedFrameDuration() ?? this.lastDuration;
+				})
+				: this.lastDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
 			duration = nextPacket.pts - packet.pts;
