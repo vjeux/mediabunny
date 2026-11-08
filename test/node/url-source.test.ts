@@ -521,6 +521,59 @@ test('UrlSource reads files larger than its cache in order from a server without
 		const tail = await reader.requestSlice(file.length - 1000, 1000);
 		expect(tail && readBytes(tail, 1000)).toEqual(file.subarray(file.length - 1000));
 
+		// A Matroska file whose Tracks come after its clusters, where only the seek head points to them (like
+		// ExoPlayer's sample_last_cluster.mkv): Tracks are needed to read the file at all, so they're read even when
+		// the file can only be streamed. The Tracks element is moved to the end, a Void element taking its place.
+		const mkv = files[1]!;
+		const tracksId = [0x16, 0x54, 0xae, 0x6b];
+		const findId = (id: number[], from = 0) => {
+			for (let i = from; i < mkv.length - id.length; i++) {
+				if (id.every((byte, j) => mkv[i + j] === byte)) {
+					return i;
+				}
+			}
+			throw new Error('Element not found');
+		};
+		const sizeLength = (pos: number) => Math.clz32(mkv[pos]!) - 23; // Of a variable-length integer
+		const elementEnd = (pos: number) => { // For the 4-byte IDs of the top-level elements
+			let size = mkv[pos + 4]! & (0xff >> sizeLength(pos + 4));
+			for (let i = 1; i < sizeLength(pos + 4); i++) {
+				size = size * 256 + mkv[pos + 4 + i]!;
+			}
+			return pos + 4 + sizeLength(pos + 4) + size;
+		};
+		const segmentStart = findId([0x18, 0x53, 0x80, 0x67]);
+		const segmentDataStart = segmentStart + 4 + sizeLength(segmentStart + 4);
+		const tracksStart = findId(tracksId, elementEnd(segmentDataStart)); // After the seek head, which lists it
+		const tracksLength = elementEnd(tracksStart) - tracksStart;
+		assert(tracksLength < 256 + 9);
+		const moved = new Uint8Array(mkv.length + tracksLength);
+		moved.set(mkv);
+		moved.set(mkv.subarray(tracksStart, tracksStart + tracksLength), mkv.length);
+		moved.fill(0, tracksStart, tracksStart + tracksLength);
+		moved.set([0xec, 0x01, 0, 0, 0, 0, 0, 0, tracksLength - 9], tracksStart); // Void, with an 8-byte size
+		const segmentSize = moved.length - segmentDataStart;
+		const segmentSizeLength = sizeLength(segmentStart + 4);
+		for (let i = 0; i < segmentSizeLength; i++) {
+			moved[segmentStart + 4 + i] = Math.floor(segmentSize / 256 ** (segmentSizeLength - 1 - i)) % 256;
+		}
+		moved[segmentStart + 4] |= 0x80 >> (segmentSizeLength - 1);
+		// The seek head entry of Tracks: its SeekID, then its 5-byte SeekPosition
+		const seekPosition = findId([0x53, 0xab, 0x84, ...tracksId]) + 7 + 3;
+		assert(moved[seekPosition - 1] === 0x85);
+		for (let i = 0; i < 5; i++) {
+			moved[seekPosition + i] = Math.floor((mkv.length - segmentDataStart) / 256 ** (4 - i)) % 256;
+		}
+		file = moved;
+		using bufferInput = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		expect(await bufferInput.getTracks()).toHaveLength(1);
+		using mkvInput = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/media`, { maxCacheSize: 2 ** 16 }),
+			formats: ALL_FORMATS,
+		});
+		expect(await mkvInput.getTracks()).toHaveLength(1);
+		file = files[2]!;
+
 		// So the WAVE's LIST chunk after the audio, skipped when the file was opened, is read for the tags once the
 		// packets have been read
 		using input = new Input({
