@@ -91,8 +91,9 @@ export type ConversionOptions = {
 	 * Video-specific options. When passing an object, the same options are applied to all video tracks. When passing a
 	 * function, it will be invoked for each video track and is expected to return or resolve to the options
 	 * for that specific track. The function is passed an instance of {@link InputVideoTrack} as well as a number `n`,
-	 * which is the 1-based index of the track in the list of all video tracks. Using `n` is deprecated, prefer the
-	 * identical `track.number` instead.
+	 * which is the 1-based index of the track among the video tracks this function is called for. With
+	 * `tracks: 'primary'` (the default for HLS inputs), this can differ from `track.number`, the track's index among
+	 * all video tracks of the input. Using `n` is deprecated, prefer `track.number` instead.
 	 *
 	 * When passing an array of a function that returns an array, one output track per array element will be created,
 	 * allowing for "fan-out". Useful for creating multiple variants from a single track, for example with different
@@ -108,8 +109,9 @@ export type ConversionOptions = {
 	 * Audio-specific options. When passing an object, the same options are applied to all audio tracks. When passing a
 	 * function, it will be invoked for each audio track and is expected to return or resolve to the options
 	 * for that specific track. The function is passed an instance of {@link InputAudioTrack} as well as a number `n`,
-	 * which is the 1-based index of the track in the list of all audio tracks. Using `n` is deprecated, prefer the
-	 * identical `track.number` instead.
+	 * which is the 1-based index of the track among the audio tracks this function is called for. With
+	 * `tracks: 'primary'` (the default for HLS inputs), this can differ from `track.number`, the track's index among
+	 * all audio tracks of the input. Using `n` is deprecated, prefer `track.number` instead.
 	 *
 	 * When passing an array of a function that returns an array, one output track per array element will be created,
 	 * allowing for "fan-out". Useful for creating multiple variants from a single track, for example with different

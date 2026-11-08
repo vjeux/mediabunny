@@ -239,7 +239,7 @@ Use the `codec` property to control the codec of the output track. This should b
 
 Use the `quality` property to control the quality of the output video. For example, you can use this field to compress the video track. See [Encoding quality](./media-sources#encoding-quality) for more. If this property is set, transcoding will always happen. If this property is not set but transcoding is still required, `new Quality('high')` will be used as the value.
 
-Use the `keyFrameInterval` property to control the maximum interval in seconds between key frames in the output video. Setting this fields forces a transcode.
+Use the `keyFrameInterval` property to control how often key frames are placed in the output video, in seconds: the first frame at or after each multiple of the interval becomes a key frame, so adjacent key frames can be up to one frame further apart than the interval. Setting this field forces a transcode.
 If you want to prevent direct copying of media data and force a transcoding step, use `forceTranscode: true`.
 
 Use the `hardwareAcceleration` property to control whether hardware or software acceleration is used for video transcoding. It applies to both the decoding and the encoding of the video.
@@ -250,7 +250,7 @@ The `process` property can be used to define a custom video sample processing fu
 
 An example:
 ```ts
-let ctx: CanvasRenderingContext2D | null = null;
+let ctx: OffscreenCanvasRenderingContext2D | null = null;
 const conversion = await Conversion.init({
 	video: {
 		process: (sample) => {
@@ -294,6 +294,7 @@ type ConversionAudioOptions = {
 	>;
 	processedNumberOfChannels?: number;
 	processedSampleRate?: number;
+	group?: OutputTrackGroup | OutputTrackGroup[];
 	maximumPacketCount?: number;
 };
 
@@ -407,8 +408,8 @@ Use the `trim` property in the conversion options to extract only a section of t
 type ConversionOptions = {
 	// ...
 	trim?: {
-		start: number; // in seconds
-		end: number; // in seconds
+		start?: number; // in seconds
+		end?: number; // in seconds
 	};
 	// ...
 };
@@ -445,10 +446,8 @@ const conversion = await Conversion.init({
 });
 ```
 
-::: warning
-Setting `start` to a value other than the default will currently force a *transcode* of both video and audio.
-
-In a future version of Mediabunny, the fast "packet copy path" that is currently reachable by leaving `start` unset, may be made available for any arbitrary trim range.
+::: info
+Setting `start` doesn't force a transcode by itself: media data is still copied whenever possible, starting at a key frame. See [Copying media data](#copying-media-data) for how the copied region is chosen and how to control it.
 :::
 
 ## Copying media data
@@ -630,6 +629,7 @@ import {
 	BufferTarget,
 	Conversion,
 	AudioBufferSource,
+	Quality,
 } from 'mediabunny';
 
 const input = new Input({ ... });
