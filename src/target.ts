@@ -61,6 +61,15 @@ export abstract class Target extends EventEmitter<TargetEvents> {
 	abstract _close(): Promise<void>;
 
 	/**
+	 * Like `_flush`, but also writes out the data the target would otherwise hold back (like the data of a chunk that
+	 * hasn't been filled yet), and resolves once all of it has been written.
+	 * @internal
+	 */
+	async _flushAll(): Promise<void> {
+		await this._flush();
+	}
+
+	/**
 	 * Called each time data is written to the target. Will be called with the byte range into which data was written.
 	 *
 	 * Use this callback to track the size of the output file as it grows. But be warned, this function is chatty and
@@ -276,7 +285,9 @@ export type StreamTargetOptions = {
 	/**
 	 * When setting this to true, data created by the output will first be accumulated and only written out
 	 * once it has reached sufficient size, using a default chunk size of 16 MiB. This is useful for reducing the total
-	 * amount of writes, at the cost of latency.
+	 * amount of writes, at the cost of latency. The exception is when the output needs its data written out before it
+	 * goes on, like a live HLS playlist listing byte ranges of a single segment file: then partial chunks are written
+	 * out too.
 	 */
 	chunked?: boolean;
 	/** When using `chunked: true`, this specifies the maximum size of each chunk. Defaults to 16 MiB. */
@@ -352,6 +363,8 @@ export class StreamTarget extends Target {
 	_pendingWrites = 0;
 	/** @internal */
 	_completedWrites = 0;
+	/** @internal */
+	_lastStreamWrite: Promise<void> | null = null;
 
 	// These variables regard chunked mode:
 	/** @internal */
@@ -492,7 +505,7 @@ export class StreamTarget extends Target {
 		assert(this._streamWriter);
 
 		this._pendingWrites++;
-		void this._streamWriter.write({ type: 'write', data, position })
+		this._lastStreamWrite = this._streamWriter.write({ type: 'write', data, position })
 			.then(() => {
 				this._completedWrites++;
 			}, (error) => {
@@ -630,6 +643,22 @@ export class StreamTarget extends Target {
 	}
 
 	/** @internal */
+	override async _flushAll() {
+		await this._flush();
+
+		if (this._chunked) {
+			this._tryToFlushChunks(true);
+		}
+
+		await this._lastStreamWrite;
+
+		if (this._writeError !== null) {
+			// eslint-disable-next-line @typescript-eslint/only-throw-error
+			throw this._writeError;
+		}
+	}
+
+	/** @internal */
 	async _finalize() {
 		if (this._chunked) {
 			this._tryToFlushChunks(true);
@@ -743,6 +772,11 @@ export class AppendOnlyStreamTarget extends Target {
 	}
 
 	/** @internal */
+	override _flushAll(): Promise<void> {
+		return this._streamTarget._flushAll();
+	}
+
+	/** @internal */
 	_finalize(): Promise<void> {
 		return this._streamTarget._finalize();
 	}
@@ -852,6 +886,11 @@ export class FilePathTarget extends Target {
 	}
 
 	/** @internal */
+	override async _flushAll() {
+		return this._streamTarget._flushAll();
+	}
+
+	/** @internal */
 	async _finalize() {
 		await this._streamTarget._finalize();
 		this._emit('finalized');
@@ -954,6 +993,11 @@ export class RangedTarget extends Target {
 	/** @internal */
 	_flush() {
 		return this._baseTarget._flush();
+	}
+
+	/** @internal */
+	override _flushAll() {
+		return this._baseTarget._flushAll();
 	}
 
 	/** @internal */
