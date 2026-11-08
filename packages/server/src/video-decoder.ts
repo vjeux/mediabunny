@@ -8,7 +8,7 @@
 
 import { CustomVideoDecoder, VideoCodec, EncodedPacket, VideoSample, type MaybePromise, Rational } from 'mediabunny';
 import * as NodeAv from 'node-av';
-import { CODEC_TO_CODEC_ID, getHardwareDecoderCodec } from './misc';
+import { CODEC_TO_CODEC_ID, getCodecThreadCount, getHardwareDecoderCodec } from './misc';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
 import { AvFrameVideoSampleResource } from './video-sample';
 
@@ -82,9 +82,21 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			: null;
 		codecContext.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
 
-		// Honor inferred H.264 reorder buffering even when bitstream restrictions aren't explicitly signaled
-		// See https://github.com/Vanilagy/mediabunny/issues/488
-		const options = NodeAv.Dictionary.fromObject({ strict: NodeAv.FF_COMPLIANCE_STRICT });
+		// Threaded decoding gives the exact same frames. Frame threading, which most decoders support and which is
+		// by far the fastest, holds back up to one frame per thread until more packets come in or the decoder is
+		// flushed, so it's left out when the decoder is asked to minimize latency.
+		codecContext.threadCount = getCodecThreadCount();
+		codecContext.threadType = this.config.optimizeForLatency
+			? NodeAv.FF_THREAD_SLICE
+			: (NodeAv.FF_THREAD_FRAME | NodeAv.FF_THREAD_SLICE) as NodeAv.AVThreadType;
+
+		const options = NodeAv.Dictionary.fromObject({
+			// Honor inferred H.264 reorder buffering even when bitstream restrictions aren't explicitly signaled
+			// See https://github.com/Vanilagy/mediabunny/issues/488
+			strict: NodeAv.FF_COMPLIANCE_STRICT,
+			// dav1d does its own frame threading, with the same delay
+			...(this.config.optimizeForLatency && codec.name === 'libdav1d' ? { max_frame_delay: 1 } : {}),
+		});
 
 		const ret = await codecContext.open2(codec, options);
 		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');

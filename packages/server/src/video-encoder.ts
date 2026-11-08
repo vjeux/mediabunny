@@ -18,6 +18,7 @@ import {
 import * as NodeAv from 'node-av';
 import {
 	CODEC_TO_CODEC_ID,
+	getCodecThreadCount,
 	getHardwareEncoderCodec,
 	isRgbPixelFormat,
 	unmapColorPrimaries,
@@ -210,6 +211,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				codecContext.setOption('cpu-used', '8');
 			}
 		} else if (this.avCodec.name === 'libvpx-vp9') {
+			// libvpx encodes VP9 tile columns in parallel, which gives the exact same bytes as a single thread. (Unlike
+			// VP8 and libx265, whose output changes with the thread count, so they're left as they are.)
+			codecContext.threadCount = getCodecThreadCount();
 			codecContext.setOption('deadline', 'realtime');
 
 			if (isRealtime) {

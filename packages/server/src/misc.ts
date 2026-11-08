@@ -8,6 +8,7 @@
 
 import { VideoSamplePixelFormat, MediaCodec } from 'mediabunny';
 import * as NodeAv from 'node-av';
+import os from 'node:os';
 import { _serverOptions } from './index';
 
 export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = {
@@ -27,6 +28,16 @@ export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = 
 	eac3: NodeAv.AV_CODEC_ID_EAC3,
 	dts: NodeAv.AV_CODEC_ID_DTS,
 	truehd: NodeAv.AV_CODEC_ID_TRUEHD,
+};
+
+/**
+ * The number of threads to run a codec on. libavcodec uses a single thread unless told otherwise (it's the FFmpeg CLI
+ * that defaults to automatic threading), so this picks one thread per core, up to libavcodec's own cap for automatic
+ * thread counts: beyond that, more threads mostly add memory and delay.
+ */
+export const getCodecThreadCount = () => {
+	const cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+	return Math.max(1, Math.min(cores, 16));
 };
 
 let cachedHardwareContext: NodeAv.HardwareContext | null | undefined = undefined;
