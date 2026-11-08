@@ -9,6 +9,7 @@
 import { OPUS_SAMPLE_RATE } from '../codec';
 import { parseModesFromVorbisSetupPacket, parseOpusIdentificationHeader, readVorbisComments } from '../codec-data';
 import { Demuxer } from '../demuxer';
+import { ID3_V2_HEADER_SIZE, readId3V2Header } from '../id3';
 import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { PacketRetrievalOptions } from '../media-sink';
@@ -91,6 +92,25 @@ export class OggDemuxer extends Demuxer {
 	async readMetadata() {
 		return this.metadataPromise ??= (async () => {
 			let currentPos = 0;
+
+			// Some taggers put ID3v2 tags at the start of any file. Ogg has its own tags (the comment headers), so like
+			// FFmpeg, let's just skip them.
+			while (true) {
+				let slice = this.reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					break;
+				}
+
+				const id3V2Header = readId3V2Header(slice);
+				if (!id3V2Header) {
+					break;
+				}
+
+				currentPos = slice.filePos + id3V2Header.size;
+			}
 
 			while (true) {
 				let slice = this.reader.requestSliceRange(currentPos, MIN_PAGE_HEADER_SIZE, MAX_PAGE_HEADER_SIZE);
