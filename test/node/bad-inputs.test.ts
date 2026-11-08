@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from 'vitest';
 import {
+	ADTS,
 	ALL_FORMATS,
 	AudioSampleSink,
 	BufferSource,
@@ -2715,6 +2716,24 @@ test('ADTS: Frame with reserved sampling frequency index', async () => {
 test('ADTS: Bare frame header at the end of the file', async () => {
 	await expectGracefulRead(concat(...Array.from({ length: 5 }, () => adtsFrame(10)), adtsHeader(7)));
 	await expectGracefulRead(concat(adtsHeader(7), [0]));
+});
+
+test('ADTS: Last frame cut off by the end of an unsized source', async () => {
+	// A streamed source's size is only known once a read goes past its end, so the cut-off last frame used to be taken
+	// as a packet: it counted toward the duration, and the last packet couldn't be read
+	const frameCount = 400;
+	const frames = concatList(Array.from({ length: frameCount }, () => adtsFrame(293))); // 300 bytes each
+	const file = frames.subarray(0, frames.length - 100);
+	const frameDuration = 1024 / 44100;
+
+	using input = new Input({ source: streamedSource(file), formats: [ADTS] });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBeCloseTo((frameCount - 1) * frameDuration, 6);
+
+	using otherInput = new Input({ source: streamedSource(file), formats: [ADTS] });
+	const otherTrack = (await otherInput.getPrimaryAudioTrack())!;
+	const lastPacket = await new EncodedPacketSink(otherTrack).getPacket(Infinity);
+	expect(lastPacket?.timestamp).toBeCloseTo((frameCount - 2) * frameDuration, 6);
 });
 
 test('WAV: With zero block alignment', async () => {
