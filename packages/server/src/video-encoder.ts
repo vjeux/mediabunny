@@ -668,10 +668,25 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 		let frameToEncode = this.frame;
 
+		// The stream's color space comes from the first frame, and containers carry one per track, so a later frame
+		// with another matrix or range is converted to it. An unspecified matrix leaves nothing to convert to, while an
+		// unspecified range is encoded as limited.
+		const isFullRange = (range: NodeAv.AVColorRange) => range === NodeAv.AVCOL_RANGE_JPEG;
+		const colorSpaceDiffers
+			= (
+				this.frame.colorSpace !== NodeAv.AVCOL_SPC_UNSPECIFIED
+				&& this.codecContext.colorSpace !== NodeAv.AVCOL_SPC_UNSPECIFIED
+				&& this.frame.colorSpace !== this.codecContext.colorSpace
+			) || (
+				this.frame.colorRange !== NodeAv.AVCOL_RANGE_UNSPECIFIED
+				&& isFullRange(this.frame.colorRange) !== isFullRange(this.codecContext.colorRange)
+			);
+
 		const requiresScaler
 			= this.codecContext.pixelFormat !== this.frame.format
 				|| this.config.width !== this.frame.width
-				|| this.codecContext.height !== this.frame.height;
+				|| this.codecContext.height !== this.frame.height
+				|| colorSpaceDiffers;
 
 		if (requiresScaler) {
 			if (!this.scaler) {
