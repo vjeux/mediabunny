@@ -1464,6 +1464,12 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 						break;
 					}
 				}
+
+				if (currentSegmentIndex === currentPage.lacingValues.length) {
+					// We couldn't step back, as the page chain is broken (like when a page header was found inside
+					// another page's data), so there's no packet start to read from
+					return null;
+				}
 			}
 		}
 
