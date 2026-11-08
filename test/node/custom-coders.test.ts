@@ -71,6 +71,12 @@ test.each(['audio', 'video'] as const)(
 		}
 		registerEncoder(type === 'audio' ? DecliningAudioEncoder : DecliningVideoEncoder);
 
-		await expect(encodeWithoutEncoder(type)).rejects.toThrow('This specific encoder configuration');
+		const error = await encodeWithoutEncoder(type).then(() => null, (error: Error) => error);
+		expect(error?.message)
+			.toMatch(/^This specific encoder configuration \(.*\) is not supported in this environment\./);
+		// Still saying that the WebCodecs class is missing, in case the registered encoders are for other codecs
+		expect(error?.message).toContain(
+			`No registered custom encoder supports it, and ${className} is not available in this environment.`,
+		);
 	},
 );

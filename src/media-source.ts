@@ -764,11 +764,15 @@ class VideoEncoderWrapper {
 					quantizer !== null ? `quantizer ${quantizer}` : `${config.bitrate} bps`,
 				);
 
+				// Custom encoders were registered then, and none supports this config (say, an extension for other codecs)
+				const missingClass = typeof VideoEncoder === 'undefined'
+					? ' No registered custom encoder supports it, and ' + missingWebCodecsClassMessage('VideoEncoder')
+					: '';
 				throw new Error(
 					`This specific encoder configuration (${firstConfig.codec}, ${rateControls.join(' / ')},`
 					+ ` ${firstConfig.width}x${firstConfig.height}, hardware acceleration:`
 					+ ` ${firstConfig.hardwareAcceleration ?? 'no-preference'}) is not supported in this environment.`
-					+ ` Consider using another codec or changing your video parameters.`,
+					+ `${missingClass} Consider using another codec or changing your video parameters.`,
 				);
 			}
 
@@ -2461,11 +2465,16 @@ class AudioEncoderWrapper {
 				}
 
 				if (!supported) {
+					// Custom encoders were registered then, and none supports this config (say, an extension for
+					// other codecs)
+					const missingClass = typeof AudioEncoder === 'undefined'
+						? ' No registered custom encoder supports it, and ' + missingWebCodecsClassMessage('AudioEncoder')
+						: '';
 					throw new Error(
 						`This specific encoder configuration (${encoderConfig.codec}, ${encoderConfig.bitrate} bps,`
 						+ ` ${encoderConfig.numberOfChannels} channels, ${encoderConfig.sampleRate} Hz) is not`
-						+ ` supported in this environment. Consider using another codec or changing your`
-						+ ` audio parameters.`,
+						+ ` supported in this environment.${missingClass} Consider using another codec or changing`
+						+ ` your audio parameters.`,
 					);
 				}
 
