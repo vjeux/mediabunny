@@ -1202,6 +1202,125 @@ test('MPEG-TS with several programs uses the first one whose PMT shows up', asyn
 	expect(packetCount).toBe(3);
 });
 
+test('MPEG-TS with several programs skips the ones it can\'t read anything from', async () => {
+	// Like a DVB multiplex: pay-TV programs are scrambled, which their PMT says with a CA descriptor (for the program
+	// or for a stream), and radio programs may only have streams we don't support (LATM AAC here)
+	const caDescriptor = [0x09, 0x04, 0x01, 0x00, 0xe0, 0x50];
+	type Program = { pmtPid: number; descriptors: number[]; streams: [number, number, number[]][]; inFile: boolean };
+
+	const buildFile = (programs: Program[], pmtFirst: boolean) => {
+		const packets: Uint8Array[] = [];
+		const counters = new Map<number, number>();
+		const pushPacket = (pid: number, payload: number[]) => {
+			const packet = new Uint8Array(188).fill(0xff);
+			const counter = counters.get(pid) ?? 0;
+			counters.set(pid, (counter + 1) & 0xf);
+			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, 0x10 | counter, ...payload], 0);
+			packets.push(packet);
+		};
+		const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
+		const adtsPes = (pts: number) => [
+			0, 0, 1, 0xc0, 0, 8 + 39, 0x84, 0x80, 5, 0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+			0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc, ...new Array<number>(32).fill(0), // AAC-LC, 48 kHz, stereo
+		];
+
+		const patEntries = programs.flatMap((program, i) => [
+			0, i + 1, 0xe0 | (program.pmtPid >> 8), program.pmtPid & 0xff,
+		]);
+		const pat = section([0x00, 0xb0, 9 + patEntries.length, 0, 1, 0xc1, 0, 0, ...patEntries]);
+		const pushPat = () => pushPacket(0x0000, pat);
+		if (!pmtFirst) {
+			pushPat();
+		}
+
+		programs.forEach((program, i) => {
+			if (pmtFirst && i === 1) {
+				pushPat();
+			}
+			if (!program.inFile) {
+				return;
+			}
+
+			const body = [
+				0, i + 1, 0xc1, 0, 0, 0xff, 0xff, 0xf0, program.descriptors.length, ...program.descriptors,
+				...program.streams.flatMap(([streamType, pid, descriptors]) => [
+					streamType, 0xe0 | (pid >> 8), pid & 0xff, 0xf0, descriptors.length, ...descriptors,
+				]),
+			];
+			pushPacket(program.pmtPid, section([0x02, 0xb0, body.length + 4, ...body]));
+		});
+
+		for (let i = 0; i < 3; i++) {
+			for (const program of programs) {
+				for (const [, pid] of program.streams) {
+					pushPacket(pid, adtsPes(1920 * i));
+				}
+			}
+		}
+
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+		return bytes;
+	};
+
+	const readTracks = async (programs: Program[], pmtFirst = false) => {
+		using input = new Input({
+			source: new BufferSource(buildFile(programs, pmtFirst)),
+			formats: ALL_FORMATS,
+		});
+
+		const result: [number, number][] = [];
+		for (const track of await input.getTracks()) {
+			let packetCount = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				void packet;
+				packetCount++;
+			}
+			result.push([track.id, packetCount]);
+		}
+
+		return result;
+	};
+
+	const scrambled: Program = {
+		pmtPid: 0x1000,
+		descriptors: caDescriptor,
+		streams: [[0x0f, 0x101, []]],
+		inFile: true,
+	};
+	const radio: Program = { pmtPid: 0x1001, descriptors: [], streams: [[0x11, 0x102, []]], inFile: true };
+	const scrambledStream: Program = {
+		pmtPid: 0x1002,
+		descriptors: [],
+		streams: [[0x0f, 0x103, caDescriptor]],
+		inFile: true,
+	};
+	const clear: Program = { pmtPid: 0x1003, descriptors: [], streams: [[0x0f, 0x104, []]], inFile: true };
+	const partlyScrambled: Program = {
+		pmtPid: 0x1004,
+		descriptors: [],
+		streams: [[0x0f, 0x105, caDescriptor], [0x0f, 0x106, []]],
+		inFile: true,
+	};
+
+	// The first program that's entirely clear, also when the first PMT comes before the PAT
+	expect(await readTracks([scrambled, radio, scrambledStream, clear])).toEqual([[0x104, 3]]);
+	expect(await readTracks([scrambled, radio, scrambledStream, clear], true)).toEqual([[0x104, 3]]);
+	expect(await readTracks([partlyScrambled, clear])).toEqual([[0x104, 3]]);
+
+	// Else the clear streams of the first program that has some, once all programs showed up
+	expect(await readTracks([scrambled, partlyScrambled, radio])).toEqual([[0x106, 3]]);
+
+	// When no program has a stream we can read, a clear error, also when a program's PMT never shows up (rather than
+	// reading the whole file)
+	await expect(readTracks([scrambled, radio])).rejects.toThrow(/scrambled/);
+	await expect(readTracks([{ ...clear, inFile: false }, scrambled])).rejects.toThrow(/scrambled/);
+
+	// A single program is read as it is, as recordings that were descrambled may keep their CA descriptors
+	expect(await readTracks([scrambled])).toEqual([[0x101, 3]]);
+	expect(await readTracks([partlyScrambled])).toEqual([[0x105, 3], [0x106, 3]]);
+});
+
 test('MPEG-TS with an unreadable stream still opens with its other streams', async () => {
 	// The PMT declares H.264 video, MPEG audio that actually carries AC-3 (as some broadcast muxers mislabel it) and
 	// AAC whose PES packets are scrambled
