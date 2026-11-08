@@ -1044,8 +1044,8 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 	}
 	expect(packetCount).toBe(298);
 
-	// A server that ignores range requests makes a UrlSource read in order too, though it knows the size. Looking up the
-	// end, for the duration, reads past the stream's start before the frame duration is measured there; the last
+	// A server that ignores range requests makes a UrlSource read in order too, though it knows the size. Looking up
+	// the end, for the duration, reads past the stream's start before the frame duration is measured there; the last
 	// packet then takes the duration before it (found in L15's "sized but not seekable" check). 4 seconds of frames
 	// of 60 kB, more than one seek chunk, read through a 1 MiB cache.
 	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
