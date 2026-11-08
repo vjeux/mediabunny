@@ -149,12 +149,24 @@ export class Mp4InputFormat extends IsobmffInputFormat {
 			}
 
 			const fourCc = readAscii(slice, 4);
-			if (fourCc === 'moof' || fourCc === 'sidx') { // Seen in HLS for example
+			if (
+				// Seen in HLS for example, or in normal files without an ftyp box
+				fourCc === 'moof'
+				|| fourCc === 'sidx'
+				|| fourCc === 'moov'
+				|| fourCc === 'mdat'
+			) {
 				return true;
-			} else if (fourCc === 'emsg' || fourCc === 'prft' || fourCc === 'free') {
-				// These are boxes that can appear before the first moof in DASH Media Segments. They're a strong signal
-				// that this is indeed an fMP4 segment, but just to be sure, let's walk the box structure to make sure
-				// it stays sane.
+			} else if (
+				fourCc === 'emsg'
+				|| fourCc === 'prft'
+				|| fourCc === 'free'
+				|| fourCc === 'skip'
+				|| fourCc === 'wide'
+			) {
+				// These are boxes that can appear before the first moof in DASH Media Segments, or before the moov or
+				// mdat box in files without ftyp box. They're a strong signal that this is indeed ISOBMFF, but just to
+				// be sure, let's walk the box structure to make sure it stays sane.
 				pos += size;
 			} else {
 				return false;

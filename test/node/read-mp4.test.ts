@@ -272,3 +272,60 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Files without an ftyp box', async () => {
+	// The original QuickTime file format has no ftyp box: a movie can start with a 'wide' placeholder, the media data
+	// and the movie box, like androidx/media's test file sample_with_original_quicktime_specification.mov. One track of
+	// 16-bit stereo PCM at 8 kHz.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const frameCount = 800;
+
+	const moov = (chunkOffset: number) => box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(100), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(100), zeros(8), zeros(4), [1, 0], zeros(2), matrix,
+				zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(8000), u32(frameCount), zeros(4)),
+				box('hdlr', zeros(4), ascii('mhlr'), ascii('soun'), zeros(13)),
+				box('minf', box('smhd', zeros(8)), box('stbl',
+					box('stsd', zeros(4), u32(1), box('sowt', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4),
+						u32(8000 * 0x10000))),
+					box('stts', zeros(4), u32(1), u32(frameCount), u32(1)),
+					box('stsc', zeros(4), u32(1), u32(1), u32(frameCount), u32(1)),
+					box('stsz', zeros(4), u32(4), u32(frameCount)),
+					box('stco', zeros(4), u32(1), u32(chunkOffset)),
+				)),
+			),
+		),
+	);
+	const mdat = box('mdat', zeros(4 * frameCount));
+
+	const read = async (bytes: number[]) => {
+		using input = new Input({ source: new BufferSource(new Uint8Array(bytes)), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return [
+			(await input.getFormat()).name,
+			await track.getCodec(),
+			(await new EncodedPacketSink(track).getFirstPacket())?.byteLength,
+		];
+	};
+
+	const ftyp = box('ftyp', ascii('qt  '), u32(0x200), ascii('qt  '));
+	const wide = box('wide');
+	// With an ftyp box (the control)
+	expect(await read([...ftyp, ...wide, ...mdat, ...moov(ftyp.length + wide.length + 8)]))
+		.toEqual(['QuickTime File Format', 'pcm-s16', 4 * frameCount]);
+	// Without one, the file reads as MP4, as there's no brand to say it's QuickTime
+	expect(await read([...wide, ...mdat, ...moov(wide.length + 8)])).toEqual(['MP4', 'pcm-s16', 4 * frameCount]);
+	const moovSize = moov(0).length;
+	expect(await read([...moov(moovSize + 8), ...mdat])).toEqual(['MP4', 'pcm-s16', 4 * frameCount]);
+});
