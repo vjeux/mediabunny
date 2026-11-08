@@ -942,20 +942,20 @@ export class MatroskaDemuxer extends Demuxer {
 				throw new Error('Invalid block lacing: frame sizes don\'t match the block.');
 			}
 
-			const blockDuration = originalBlock.duration || frameCount * (track.defaultDuration ?? 0);
+			const blockDuration = originalBlock.duration || Math.round(frameCount * (track.defaultDuration ?? 0));
 
 			// Now, let's replace the block with one block per frame
 			for (let i = 0; i < frameCount; i++) {
 				const frameSize = frameSizes[i]!;
 				const frameData = readBytes(slice, frameSize);
 
-				// Distribute timestamps evenly across the block duration
-				const frameTimestamp = originalBlock.timestamp + (blockDuration * i / frameCount);
-				const frameDuration = blockDuration / frameCount;
+				// Distribute timestamps evenly across the block duration while staying on the tick grid
+				const frameStart = Math.floor(blockDuration * i / frameCount);
+				const frameEnd = Math.floor(blockDuration * (i + 1) / frameCount);
 
 				expandedBlocks.push({
-					timestamp: frameTimestamp,
-					duration: frameDuration,
+					timestamp: originalBlock.timestamp + frameStart,
+					duration: frameEnd - frameStart,
 					isKeyFrame: originalBlock.isKeyFrame,
 					data: frameData,
 					lacing: BlockLacing.None,
