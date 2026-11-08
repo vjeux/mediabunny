@@ -2383,7 +2383,7 @@ const ComputeLayoutAndAllocationSize = (
 		// Set computedLayout’s sourceLeftBytes...
 		computedLayout.sourceLeftBytes = Math.floor(Math.trunc(parsedRect.x || 0) / sampleWidth) * sampleBytes;
 		// Set computedLayout’s sourceWidthBytes...
-		computedLayout.sourceWidthBytes = Math.floor(Math.trunc(parsedRect.width || 0) / sampleWidth) * sampleBytes;
+		computedLayout.sourceWidthBytes = Math.ceil(Math.trunc(parsedRect.width || 0) / sampleWidth) * sampleBytes;
 
 		// If layout is not undefined:
 		if (layout !== undefined) {
