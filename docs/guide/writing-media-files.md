@@ -238,6 +238,8 @@ writer.
 After calling `cancel`, adding more media data to the output results in an error.
 :::
 
+Calling `cancel` while the output is finalizing doesn't cancel the file: finalization waits for the samples added before it to be processed by a `process` function, and `cancel` stops waiting for such a call (or an encoder initialization) still in flight and drops the samples queued behind it, so that one that never settles can't hold finalization up forever. Without either, nothing is dropped. It resolves right away; finalization then goes on by itself.
+
 In our example, we would do this:
 ```ts	
 clearInterval(intervalId); // Stops the canvas loop
