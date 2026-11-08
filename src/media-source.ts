@@ -2077,6 +2077,15 @@ class AudioEncoderWrapper {
 	private closed = false;
 	/** Resolved when waiting for a process function's result should stop; see `cancelPendingAdds()`. */
 	private pendingAddsCanceledSignal = promiseWithResolvers();
+	/**
+	 * Resolved once the wrapper is closed, so that neither a process function call that never settles nor the adds
+	 * queued behind it are waited for.
+	 */
+	private closedSignal = promiseWithResolvers();
+	/** Set when the output is canceled while finalizing; see `cancelPendingAdds()`. */
+	private pendingAddsCanceled = false;
+	/** Settles once the samples added so far have been processed and encoded, one at a time, in order. */
+	private addQueue: Promise<void> = Promise.resolve();
 	/** How many process function calls are being waited for. */
 	processCallsInFlight = 0;
 
@@ -2087,6 +2096,29 @@ class AudioEncoderWrapper {
 			this.checkForEncoderError();
 			if (!skipAddValidation) {
 				this.source._ensureValidAdd();
+			}
+		} catch (error) {
+			if (shouldClose) {
+				audioSample.close();
+			}
+			throw error;
+		}
+
+		// Samples are processed and encoded one at a time, in the order they were added: with an asynchronous process
+		// function, a later sample would otherwise overtake an earlier one that takes longer (when adds aren't awaited
+		// one by one). They're validated before waiting their turn, so that one added before finalize() isn't rejected
+		// for it.
+		const turn = Promise.race([this.addQueue, this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
+		const added = turn.then(() => this.addInOrder(audioSample, shouldClose));
+		this.addQueue = added.catch(() => {});
+		await added;
+	}
+
+	private async addInOrder(audioSample: AudioSample, shouldClose: boolean) {
+		try {
+			this.checkForEncoderError();
+			if (this.closed || this.pendingAddsCanceled) {
+				return; // Canceled while waiting
 			}
 
 			// Ensure audio parameters remain constant
@@ -2162,8 +2194,8 @@ class AudioEncoderWrapper {
 				if (isThenable(processed)) {
 					// Don't wait past the output being canceled (a call that never settles would hold everything up)
 					const pending = processed;
-					const whenCanceled = this.pendingAddsCanceledSignal.promise
-						.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
+					const canceled = Promise.race([this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
+					const whenCanceled = canceled.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
 					this.processCallsInFlight++;
 					let result;
 					try {
@@ -2672,6 +2704,9 @@ class AudioEncoderWrapper {
 	async flushAndClose(forceClose: boolean) {
 		try {
 			if (!forceClose) {
+				// The samples added so far go in first (unless the output gets canceled meanwhile)
+				await Promise.race([this.addQueue, this.pendingAddsCanceledSignal.promise]);
+
 				this.checkForEncoderError();
 
 				// Finalize the resampler to flush any buffered audio
@@ -2697,6 +2732,7 @@ class AudioEncoderWrapper {
 			// This cleanup must also run when flushing threw (e.g. due to an encoder error), otherwise the encoder
 			// would be left dangling
 			this.closed = true;
+			this.closedSignal.resolve();
 			this.resampler = null;
 
 			if (this.customEncoder) {
@@ -2712,8 +2748,16 @@ class AudioEncoderWrapper {
 		}
 	}
 
-	/** Stops waiting for a pending process function call. */
+	/**
+	 * Stops waiting for a process function call still in flight, and drops the samples queued behind it. Without one,
+	 * nothing holds them up, so this does nothing and they all still go in.
+	 */
 	cancelPendingAdds() {
+		if (this.processCallsInFlight === 0) {
+			return;
+		}
+
+		this.pendingAddsCanceled = true;
 		this.pendingAddsCanceledSignal.resolve();
 	}
 
@@ -2961,6 +3005,11 @@ export class AudioSampleSource extends AudioSource {
 	override _flushAndClose(forceClose: boolean) {
 		return this._encoder.flushAndClose(forceClose);
 	}
+
+	/** @internal */
+	override _cancelPendingAdds() {
+		this._encoder.cancelPendingAdds();
+	}
 }
 
 /**
@@ -3030,6 +3079,11 @@ export class AudioBufferSource extends AudioSource {
 	/** @internal */
 	override _flushAndClose(forceClose: boolean) {
 		return this._encoder.flushAndClose(forceClose);
+	}
+
+	/** @internal */
+	override _cancelPendingAdds() {
+		this._encoder.cancelPendingAdds();
 	}
 }
 
