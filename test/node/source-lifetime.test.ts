@@ -198,3 +198,15 @@ test('FilePathSource fills reads that the file system answers in parts', async (
 		await rm(filePath, { force: true });
 	}
 });
+
+test('CustomSource rejects falsy prefetchProfile values it cannot use', async () => {
+	for (const prefetchProfile of ['', false, 0, null]) {
+		expect(() => new CustomSource({
+			getSize: () => 1024,
+			read: (start, end) => new Uint8Array(end - start),
+			prefetchProfile: prefetchProfile as never,
+		})).toThrow(new TypeError(
+			'options.prefetchProfile, when provided, must be one of \'none\', \'fileSystem\' or \'network\'.',
+		));
+	}
+});
