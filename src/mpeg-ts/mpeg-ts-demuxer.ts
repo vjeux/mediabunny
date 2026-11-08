@@ -1403,7 +1403,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		keyframesOnly: boolean,
 		options: PacketRetrievalOptions,
 	): Promise<EncodedPacket | null> {
-		const searchPts = roundIfAlmostInteger(timestamp * MPEG_TS_TIMESCALE);
+		const searchPts = roundIfAlmostInteger(timestamp * MPEG_TS_TIMESCALE, MPEG_TS_TIMESCALE);
 
 		const demuxer = this.elementaryStream.demuxer;
 		const { reader, seekChunkSize } = demuxer;

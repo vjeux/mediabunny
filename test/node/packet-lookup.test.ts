@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -35,14 +36,16 @@ test('Packet lookups treat float noise around zero like float noise around any o
 
 test('roundIfAlmostInteger snaps float noise near zero too', () => {
 	// The end of a packet that starts before zero, in milliseconds (Matroska) and in samples at 44.1 kHz (an MP4 with
-	// an edit list), and float noise below zero in 90 kHz ticks (MPEG-TS)
-	expect(roundIfAlmostInteger((-0.025 + 0.026) * 1000)).toBe(1);
-	expect(roundIfAlmostInteger((-1146 / 44100 + 1152 / 44100) * 44100)).toBe(6);
-	expect(roundIfAlmostInteger((0.3 - 0.1 - 0.1 - 0.1) * 90000)).toBe(0);
+	// an edit list), and float noise below zero in 90 kHz ticks (MPEG-TS), and both in nanoseconds (Matroska too)
+	expect(roundIfAlmostInteger((-0.025 + 0.026) * 1000, 1000)).toBe(1);
+	expect(roundIfAlmostInteger((-1146 / 44100 + 1152 / 44100) * 44100, 44100)).toBe(6);
+	expect(roundIfAlmostInteger((0.3 - 0.1 - 0.1 - 0.1) * 90000, 90000)).toBe(0);
+	expect(roundIfAlmostInteger((-0.025 + 0.026) * 1e9, 1e9)).toBe(1e6);
+	expect(roundIfAlmostInteger((0.3 - 0.1 - 0.1 - 0.1) * 1e9, 1e9)).toBe(0);
 
 	// What isn't float noise stays as is, even a tenth of a microsecond off on a track whose timescale is 1
 	expect(roundIfAlmostInteger(0.001)).toBe(0.001);
-	expect(roundIfAlmostInteger(-1.0000001)).toBe(-1.0000001);
+	expect(roundIfAlmostInteger(-1.0000001, 1)).toBe(-1.0000001);
 	expect(roundIfAlmostInteger(-0.4)).toBe(-0.4);
 	expect(roundIfAlmostInteger(2.5)).toBe(2.5);
 	expect(roundIfAlmostInteger(1e9 + 0.5)).toBe(1e9 + 0.5);
@@ -65,5 +68,19 @@ test('Packet lookups just before a packet on a track whose timescale is 1 return
 	const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
 	expect((await sink.getPacket(2))?.timestamp).toBe(2);
 	expect((await sink.getPacket(2 - 1e-7))?.timestamp).toBe(1);
+	expect((await sink.getPacket(0.3 - 0.1 - 0.1 - 0.1))?.timestamp).toBe(0);
+});
+
+test('Packet lookups snap float noise near zero on a Matroska track with nanosecond ticks too', async () => {
+	// frames.webm with its TimestampScale changed from 1000000 (milliseconds) to 1 (nanoseconds), keeping its size
+	const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '..', 'public', 'frames.webm')));
+	const timestampScale = [0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40];
+	const index = bytes.findIndex((_, i) => timestampScale.every((byte, j) => bytes[i + j] === byte));
+	expect(index).toBeGreaterThan(0);
+	bytes.set([0x00, 0x00, 0x01], index + 4);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+	expect((await sink.getPacket(0))?.timestamp).toBe(0);
 	expect((await sink.getPacket(0.3 - 0.1 - 0.1 - 0.1))?.timestamp).toBe(0);
 });
