@@ -243,7 +243,7 @@ export const getDecodableCodecs = async (): Promise<MediaCodec[]> => {
  * @public
  */
 export const getDecodableVideoCodecs = async (
-	checkedCodecs: VideoCodec[] = VIDEO_CODECS as unknown as VideoCodec[],
+	checkedCodecs: readonly VideoCodec[] = VIDEO_CODECS,
 	options?: SetOptional<VideoDecoderConfig, 'codec'>,
 ): Promise<VideoCodec[]> => {
 	validateCheckedCodecs(checkedCodecs);
@@ -258,7 +258,7 @@ export const getDecodableVideoCodecs = async (
  * @public
  */
 export const getDecodableAudioCodecs = async (
-	checkedCodecs: AudioCodec[] = AUDIO_CODECS as unknown as AudioCodec[],
+	checkedCodecs: readonly AudioCodec[] = AUDIO_CODECS,
 	options?: SetOptional<AudioDecoderConfig, 'codec' | 'numberOfChannels' | 'sampleRate'>,
 ): Promise<AudioCodec[]> => {
 	validateCheckedCodecs(checkedCodecs);
