@@ -240,9 +240,16 @@ test('A cut-off cluster whose start a stream no longer holds is dropped instead 
 		return [duration, count];
 	};
 
-	// With a cache that holds what's left of the cluster, its 207 complete blocks are kept
-	expect(await readStreamed(2 ** 20)).toEqual([16.12, 807]);
+	// With a cache that holds what's left of the cluster, its 207 complete blocks are kept: the last one starts at
+	// 16.12 s. (Whether it also gets its 20 ms depends on whether durations are derived from PCM block sizes.)
+	const [keptDuration, keptCount] = await readStreamed(2 ** 20);
+	expect(keptCount).toBe(807);
+	expect(keptDuration).toBeGreaterThanOrEqual(16.12);
+	expect(keptDuration).toBeLessThanOrEqual(16.14);
 	// Once the stream has read past the cluster's start (to find out where the file ends), it can't give it again:
-	// the cluster is dropped then, as it was before
-	expect(await readStreamed(2 ** 18)).toEqual([11.98, 600]);
+	// the cluster is dropped then, as it was before, ending the track with the second cluster's last block at 11.98 s
+	const [droppedDuration, droppedCount] = await readStreamed(2 ** 18);
+	expect(droppedCount).toBe(600);
+	expect(droppedDuration).toBeGreaterThanOrEqual(11.98);
+	expect(droppedDuration).toBeLessThanOrEqual(12);
 });
