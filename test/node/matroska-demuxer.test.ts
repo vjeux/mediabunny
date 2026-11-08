@@ -1665,3 +1665,46 @@ test('An invalid SamplingFrequency or Channels value only affects its own track'
 	expect([await zeroChannels.getSampleRate(), await zeroChannels.getNumberOfChannels()]).toEqual([48000, 1]);
 	expect((await new EncodedPacketSink(zeroRate).getFirstPacket())?.data).toEqual(new Uint8Array([2]));
 });
+
+test('MPEG audio Layer I and II tracks', async () => {
+	// FFmpeg writes MP2 (e.g. DVB broadcast audio) as A_MPEG/L2. Like in MP4 and MPEG-TS, all three layers go by 'mp3',
+	// which WebCodecs decodes.
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const audioTrack = (trackNumber: number, codecId: string) => element(
+		EBMLId.TrackEntry,
+		element(EBMLId.TrackNumber, [trackNumber]),
+		element(EBMLId.TrackType, [2]),
+		element(EBMLId.CodecID, ascii(codecId)),
+		element(EBMLId.Audio, element(EBMLId.SamplingFrequency, [0x47, 0x3b, 0x80, 0])), // 48000
+	);
+
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(EBMLId.Segment, element(
+			EBMLId.Tracks,
+			audioTrack(1, 'A_MPEG/L1'),
+			audioTrack(2, 'A_MPEG/L2'),
+			audioTrack(3, 'A_MPEG/L3'),
+		)),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getAudioTracks();
+	expect(await Promise.all(tracks.map(x => x.getCodec()))).toEqual(['mp3', 'mp3', 'mp3']);
+	expect((await tracks[1]!.getDecoderConfig())!.codec).toBe('mp3');
+});
