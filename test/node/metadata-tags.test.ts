@@ -2199,6 +2199,32 @@ test('Picture descriptions with non-ASCII characters, FLAC', async () => {
 	expect(pictureFields).toEqual([[0, 0, 0, 0], [0, 0, 0, 0]]);
 });
 
+test('MP3 to MP3 conversion with images', async () => {
+	using input = new Input({
+		source: new BufferSource(await writeMp3({
+			images: [{
+				data: new Uint8Array([1, 2, 3]),
+				mimeType: 'image/png',
+				kind: 'coverFront',
+			}],
+		})),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({
+		format: new Mp3OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({
+		input,
+		output,
+	});
+	await conversion.execute();
+
+	const tags = await readMetadataTags(new Uint8Array(output.target.buffer!));
+	expect(tags.images).toHaveLength(1);
+});
+
 test('Creation time override, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
