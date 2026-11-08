@@ -1272,7 +1272,7 @@ export class IsobmffMuxer extends Muxer {
 		sample.data = null; // Can be GC'd
 	}
 
-	private processTimestamps(trackData: IsobmffTrackData, nextSample?: Sample) {
+	private processTimestamps(trackData: IsobmffTrackData, nextSample?: Pick<Sample, 'timestamp' | 'type'>) {
 		if (trackData.timestampProcessingQueue.length === 0) {
 			return;
 		}
@@ -1971,7 +1971,11 @@ export class IsobmffMuxer extends Muxer {
 	}
 
 	/** Internal function for external callers who want to full control fragment boundaries. */
-	async forceFragmentFinalization() {
+	/**
+	 * Ends the current fragment. The timestamps of the key packets that will start the next one, when known, end the
+	 * durations of each track's last samples, like they do when fragments are cut automatically.
+	 */
+	async forceFragmentFinalization(nextKeyTimestamps?: Map<OutputTrack, number>) {
 		assert(this.isFragmented);
 
 		const release = await this.mutex.acquire();
@@ -1982,7 +1986,11 @@ export class IsobmffMuxer extends Muxer {
 					await this.processWebVTTCues(trackData, Infinity);
 				}
 
-				this.processTimestamps(trackData);
+				const nextKeyTimestamp = nextKeyTimestamps?.get(trackData.track);
+				this.processTimestamps(
+					trackData,
+					nextKeyTimestamp !== undefined ? { timestamp: nextKeyTimestamp, type: 'key' } : undefined,
+				);
 			}
 
 			await this.interleaveSamples(true);
