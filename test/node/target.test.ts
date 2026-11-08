@@ -18,7 +18,7 @@ import {
 } from '../../src/target.js';
 import type { FileHandle } from 'node:fs/promises';
 import { rm } from 'node:fs/promises';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, CmafOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -248,4 +248,30 @@ test('StreamTarget in chunked mode handles a write spanning many chunks', async 
 		result.set(write.data, write.position);
 	}
 	expect(result.every((byte, i) => byte === data[i])).toBe(true);
+});
+
+test.each(['a target', 'a function'])('Output emits a target event for the CMAF init target, given as %s', async (
+	kind,
+) => {
+	const initTarget = new BufferTarget();
+	const output = new Output({
+		format: new CmafOutputFormat(),
+		target: new BufferTarget(),
+		initTarget: kind === 'a target' ? initTarget : () => initTarget,
+	});
+
+	const events: { target: Target; isRoot: boolean }[] = [];
+	output.on('target', ({ target, isRoot }) => events.push({ target, isRoot }));
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	const description = new Uint8Array([0x11, 0x88]);
+	await source.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 0.02), {
+		decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: 1, sampleRate: 48000, description },
+	});
+	await output.finalize();
+
+	expect(initTarget.buffer).not.toBeNull(); // The init segment was written to it
+	expect(events.filter(x => x.target === initTarget)).toEqual([{ target: initTarget, isRoot: false }]);
 });
