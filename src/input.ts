@@ -54,7 +54,7 @@ export const ENCRYPTION_KEY_CACHE_GROUP = 2;
  */
 export type InputOptions<S extends Source = Source> = {
 	/** A list of supported formats. If the source file is not of one of these formats, then it cannot be read. */
-	formats: InputFormat[];
+	formats: readonly InputFormat[];
 	/**
 	 * The source from which data will be read. When given a {@link SourceRef}, the input takes it over: it frees the
 	 * ref when disposed, so don't free it yourself.
@@ -113,7 +113,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	/** @internal */
 	_rootRef: SourceRef<S>;
 	/** @internal */
-	_formats: InputFormat[];
+	_formats: readonly InputFormat[];
 	/** @internal */
 	_initInput: Input | null;
 	/** @internal */
