@@ -285,14 +285,14 @@ export class FlacMuxer extends Muxer {
 			// The frame header fields read below take 4 bytes, then the coded frame or sample number as many bytes
 			// as its first byte has leading 1 bits (at least 1), then an uncommon block size 1 or 2 bytes (RFC 9639,
 			// section 9.1). A packet too short for them isn't a FLAC frame.
-			const data = packet.data;
+			const packetData = packet.data;
 			let codedNumberLength = 0;
-			while (codedNumberLength < 8 && ((data[4] ?? 0) << codedNumberLength) & 0x80) {
+			while (codedNumberLength < 8 && ((packetData[4] ?? 0) << codedNumberLength) & 0x80) {
 				codedNumberLength++;
 			}
-			const blockSizeBits = (data[2] ?? 0) >> 4;
+			const blockSizeBits = (packetData[2] ?? 0) >> 4;
 			const uncommonBlockSizeLength = blockSizeBits === 0b0110 ? 1 : blockSizeBits === 0b0111 ? 2 : 0;
-			if (data.length < 4 + Math.max(codedNumberLength, 1) + uncommonBlockSizeLength) {
+			if (packetData.length < 4 + Math.max(codedNumberLength, 1) + uncommonBlockSizeLength) {
 				throw new Error('Invalid FLAC frame: Too short.');
 			}
 
