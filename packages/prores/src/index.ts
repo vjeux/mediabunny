@@ -68,9 +68,13 @@ class ProresDecoder extends CustomVideoDecoder {
 			ProresDecoder._supportedVideoFrameFormats ??= ProresDecoder._determineSupportedVideoFrameFormats();
 		}
 
+		// Without workers, TurboRes decodes on this thread, which blocks it, but works
+		const useWorkers = await canRunWasmInWorkers();
+
 		const decoder = await Decoder.create({
 			proresFourCc: this.config.codec as ProresFourCc,
 			useSharedMemory: Decoder.canUseSharedMemory(),
+			concurrency: useWorkers ? undefined : 0,
 			allowedOutputFormats: ProresDecoder._supportedVideoFrameFormats ?? undefined,
 		});
 		if (decoder instanceof Error) {
@@ -232,6 +236,41 @@ class ProresDecoder extends CustomVideoDecoder {
 		}
 	}
 }
+
+let workersCanRunWasm: Promise<boolean> | null = null;
+
+/**
+ * Whether the page can start a module worker from a blob: URL and compile WebAssembly in it, which is how TurboRes runs
+ * its decoding threads. A Content Security Policy can forbid either, and then TurboRes waits for its workers forever.
+ * Checked once per page; true where TurboRes uses worker_threads instead (Node and Bun, like its own check).
+ */
+const canRunWasmInWorkers = () => {
+	return workersCanRunWasm ??= new Promise<boolean>((resolve) => {
+		if (typeof Worker === 'undefined' || 'Bun' in globalThis || typeof URL.createObjectURL !== 'function') {
+			resolve(true);
+			return;
+		}
+
+		// Instantiates the smallest WebAssembly module there is: its magic number and version
+		const source = 'WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]))'
+			+ '.then(() => postMessage(true), () => postMessage(false));';
+		const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+		let worker: Worker | null = null;
+		const finish = (result: boolean) => {
+			worker?.terminate();
+			URL.revokeObjectURL(url);
+			resolve(result);
+		};
+
+		try {
+			worker = new Worker(url, { type: 'module' }); // Like TurboRes's workers (and Deno only has module workers)
+			worker.addEventListener('message', event => finish(event.data === true));
+			worker.addEventListener('error', () => finish(false));
+		} catch {
+			finish(false);
+		}
+	});
+};
 
 let registered = false;
 
