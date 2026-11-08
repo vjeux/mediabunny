@@ -952,7 +952,15 @@ export const soundSampleDescription = (
 	}
 
 	// Opus-in-ISOBMFF fixes the sample entry's rate at 48 kHz, which must also match dOps' InputSampleRate
-	const sampleRate = trackData.track.source._codec === 'opus' ? OPUS_SAMPLE_RATE : trackData.info.sampleRate;
+	let sampleRate = trackData.track.source._codec === 'opus' ? OPUS_SAMPLE_RATE : trackData.info.sampleRate;
+	if (trackData.track.source._codec === 'flac') {
+		// FLAC-in-ISOBMFF stores rates above 65535 Hz as their greatest expressible regular division (48 kHz for 96 and
+		// 192 kHz), or else as 65535 Hz. Readers take the actual rate from dfLa.
+		while (sampleRate > 0xffff && sampleRate % 2 === 0) {
+			sampleRate /= 2;
+		}
+		sampleRate = Math.min(sampleRate, 0xffff);
+	}
 
 	if (version === 0) {
 		contents = [
