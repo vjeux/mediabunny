@@ -2580,3 +2580,89 @@ test('QuickTime text in Mac Roman with a trailing NUL', async () => {
 		expect(await readTitle(bytes)).toBe(title);
 	}
 });
+
+test('Encryption info in the senc box of a non-fragmented file', async () => {
+	// FFmpeg writes a senc box into the sample table of non-fragmented CENC files, plus saiz and saio boxes pointing
+	// into it. Older versions got the saio offset wrong (FFmpeg's FATE sample mov/mov-3elist-encrypted.mov), and the
+	// senc box alone is valid too.
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const key = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+	const keyId = zeros(16).map((_, i) => 0x10 + i);
+
+	// Two samples with 4 clear bytes each, the rest encrypted with AES-CTR
+	const ivs = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]];
+	const plaintexts = [Array.from({ length: 40 }, (_, i) => i), Array.from({ length: 24 }, (_, i) => 100 + i)];
+	const ciphertexts = plaintexts.map((data, i) => {
+		const counter = Buffer.alloc(16);
+		counter.set(ivs[i]!);
+		return [...data.slice(0, 4), ...createCipheriv('aes-128-ctr', key, counter).update(Buffer.from(data.slice(4)))];
+	});
+
+	const build = (auxInfo: 'none' | 'wrong-saio') => {
+		const tenc = box('tenc', zeros(4), [0, 0, 1, 8], keyId);
+		const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), box('sinf', box('frma', ascii('avc1')),
+			box('schm', zeros(4), ascii('cenc'), u32(0x10000)), box('schi', tenc)));
+		const senc = box('senc', u32(2), u32(2), ...plaintexts.map((data, i) => {
+			return [...ivs[i]!, ...u16(1), ...u16(4), ...u32(data.length - 4)];
+		}));
+		const moov = (chunkOffset: number, sencPos: number) => box('moov',
+			box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(10), u32(2), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(1), encv),
+						box('stts', u32(0), u32(1), u32(2), u32(1)),
+						box('stsc', u32(0), u32(1), u32(1), u32(2), u32(1)),
+						box('stsz', u32(0), u32(0), u32(2), ...ciphertexts.map(x => u32(x.length))),
+						box('stco', u32(0), u32(1), u32(chunkOffset)),
+						senc,
+						// Pointing at the start of the senc box rather than at its first entry
+						...(auxInfo === 'wrong-saio'
+							? [box('saio', u32(0), u32(1), u32(sencPos)), box('saiz', u32(0), [16], u32(2))]
+							: []),
+					)),
+				),
+			),
+		);
+
+		const ftyp = box('ftyp', ascii('isom'), u32(0), ascii('isom'));
+		const draft = new Uint8Array([...ftyp, ...moov(0, 0)]);
+		const sencPos = draft.findIndex((_, i) => String.fromCharCode(...draft.subarray(i, i + 4)) === 'senc') - 4;
+
+		return new Uint8Array([
+			...ftyp,
+			...moov(draft.length + 8, sencPos),
+			...box('mdat', ...ciphertexts),
+		]);
+	};
+
+	const decrypt = async (bytes: Uint8Array) => {
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+			formatOptions: { isobmff: { resolveKeyId: () => key } },
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const packets: number[][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([...packet.data]);
+		}
+		return packets;
+	};
+
+	expect(await decrypt(build('wrong-saio'))).toEqual(plaintexts);
+	expect(await decrypt(build('none'))).toEqual(plaintexts);
+});
