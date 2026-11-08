@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
-import { BufferTarget, StreamTarget } from '../../src/target.js';
+import { BufferTarget, StreamTarget, StreamTargetChunk } from '../../src/target.js';
 import {
 	AudioBufferSource,
 	AudioSampleSource,
@@ -929,28 +929,20 @@ test('MediaStreamAudioTrackSource drops audio a process() slower than real time 
 	expect(callsWhileFinalizing).toBeLessThanOrEqual(9);
 });
 
-test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async ({
-	skip,
-}) => {
-	if (typeof AudioEncoder === 'undefined' || !(await canEncodeAudio('opus'))) {
-		skip('Opus encoding is not supported here');
-	}
-
-	// A slow encoder setup keeps the captured audio waiting in the add chain while finalizing
-	const isConfigSupported = AudioEncoder.isConfigSupported.bind(AudioEncoder);
-	AudioEncoder.isConfigSupported = async (config: AudioEncoderConfig) => {
-		await new Promise(resolve => setTimeout(resolve, 500));
-		return isConfigSupported(config);
-	};
+test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async () => {
 	const capture = installSineCapture();
+	// A slow sink keeps the captured audio waiting in the add chain while finalizing, though nothing is stuck
+	const chunks: StreamTargetChunk[] = [];
 	const output = new Output({
-		format: new WebMOutputFormat(),
-		target: new BufferTarget(),
+		format: new WavOutputFormat(),
+		target: new StreamTarget(new WritableStream<StreamTargetChunk>({
+			write: async (chunk) => {
+				chunks.push({ ...chunk, data: chunk.data.slice() });
+				await new Promise(resolve => setTimeout(resolve, 20));
+			},
+		})),
 	});
-	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
-		codec: 'opus',
-		quality: new Quality('low'),
-	});
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, { codec: 'pcm-f32' });
 	audioSource.errorPromise.catch(() => {});
 	output.addAudioTrack(audioSource);
 
@@ -963,15 +955,21 @@ test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio wit
 		await output.cancel();
 		await finalized;
 	} finally {
-		AudioEncoder.isConfigSupported = isConfigSupported;
 		await capture.uninstall();
 	}
 
 	expect(output.state).toBe('finalized');
-	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-	const track = await input.getPrimaryAudioTrack();
-	expect(track).not.toBeNull();
-	expect(await track!.computeDuration()).toBeGreaterThan(0.9 * 15 * 1024 / 48000);
+	const file = new Uint8Array(Math.max(...chunks.map(chunk => chunk.position + chunk.data.byteLength)));
+	for (const chunk of chunks) {
+		file.set(chunk.data, chunk.position);
+	}
+	using input = new Input({ source: new BufferSource(file.buffer), formats: ALL_FORMATS });
+	let frames = 0;
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		frames += sample.numberOfFrames;
+		sample.close();
+	}
+	expect(frames).toBe(15 * 1024);
 });
 
 test('MediaStreamAudioTrackSource, cancel() while finalizing doesn\'t wait behind a stalled target', async () => {
@@ -1254,6 +1252,31 @@ test('AudioSampleSource, cancel() after close() gets out of an encoder setup tha
 
 		// Canceling forces the close, which doesn't wait for the encoder
 		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	} finally {
+		stuckInitAudioEncoderActive = false;
+	}
+});
+
+test('AudioSampleSource, cancel() while finalizing gets out of an encoder setup that never finishes', async () => {
+	stuckInitAudioEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new MkvOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const audioSource = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		void audioSource.add(makeConstantSample(0)).catch(() => {});
+		void audioSource.add(makeConstantSample(1)).catch(() => {});
+
+		// Finalizing waits for the samples added before it, which wait for the encoder, until the output is canceled,
+		// which drops them and lets finalization go on
+		const finalized = output.finalize();
+		await new Promise(resolve => setTimeout(resolve, 50));
+		await output.cancel();
+		expect(await stateAfter(finalized, 1000)).not.toBe('pending');
 	} finally {
 		stuckInitAudioEncoderActive = false;
 	}
