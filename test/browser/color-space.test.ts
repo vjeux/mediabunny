@@ -256,26 +256,40 @@ test('VP8 and untagged VP9 decode with the BT.601 matrix', async ({ skip }) => {
 	const decoderAppliesConfigMatrix = async () => {
 		using input = new Input({ source: new UrlSource('/vp9-untagged-bars.webm'), formats: ALL_FORMATS });
 		const videoTrack = (await input.getPrimaryVideoTrack())!;
-		const { codec } = (await videoTrack.getDecoderConfig())!;
+		const decoderConfig = (await videoTrack.getDecoderConfig())!;
 		const packet = (await new EncodedPacketSink(videoTrack).getFirstPacket())!;
 
 		const frames: VideoFrame[] = [];
-		// Errors reject flush()
 		const decoder = new VideoDecoder({ output: frame => frames.push(frame), error: () => {} });
-		decoder.configure({
-			codec,
-			colorSpace: { matrix: 'smpte170m', primaries: 'bt709', transfer: 'bt709', fullRange: false },
-		});
-		decoder.decode(packet.toEncodedVideoChunk());
-		await decoder.flush();
-		decoder.close();
-		const frame = frames[0]!;
+		try {
+			// Mediabunny's own config (its coded size keeps hardware decoders that can't take a frame this small out),
+			// with the BT.601 matrix
+			decoder.configure({
+				...decoderConfig,
+				colorSpace: { matrix: 'smpte170m', primaries: 'bt709', transfer: 'bt709', fullRange: false },
+			});
+			decoder.decode(packet.toEncodedVideoChunk());
+			await decoder.flush();
+		} catch {
+			// The browser can't decode the file on its own, so it can't be probed
+			return false;
+		} finally {
+			if (decoder.state !== 'closed') {
+				decoder.close();
+			}
+		}
 
+		const frame = frames[0];
+		if (!frame) {
+			return false;
+		}
+
+		const { width, height } = frame.visibleRect!;
 		const rgba = new Uint8Array(frame.allocationSize({ format: 'RGBA' }));
 		await frame.copyTo(rgba, { format: 'RGBA' });
-		frame.close();
+		frames.forEach(x => x.close());
 		// The green channel of the red bar: 0 with the BT.601 matrix, 24 with BT.709
-		return rgba[(32 * 64 + 8) * 4 + 1]! <= 4;
+		return rgba[(Math.floor(height / 2) * width + 8) * 4 + 1]! <= 4;
 	};
 	const paths = ['/vp8-bars.webm', ...(await decoderAppliesConfigMatrix() ? ['/vp9-untagged-bars.webm'] : [])];
 	for (const path of paths) {
