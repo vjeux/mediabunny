@@ -11,6 +11,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Logging, LogLevel } from '../../src/logging.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -1080,4 +1081,142 @@ test('MPEG-TS random_access_indicator on non-key frames does not make them key p
 		expect(packets.map(packet => packet.type)).toEqual(packets.map((_, i) => i === 0 ? 'key' : 'delta'));
 		expect(keyPacket.sequenceNumber).toBe(packets[0]!.sequenceNumber);
 	}
+});
+
+test('MPEG-TS metadata reading gives up on declared streams that never show up, and finds late ones', async () => {
+	// The PMT declares two AAC streams. 20 minutes of the first one, one ADTS frame per PES packet and TS packet. The
+	// second one is never sent (like a recording that dropped a language), starts 3 minutes in, or is only there for
+	// 5 seconds a minute in.
+	const buildFile = (secondStreamFrames: [number, number] | null) => {
+		const packets: Uint8Array[] = [];
+		const continuityCounters = new Map<number, number>();
+		const pushPacket = (pid: number, payload: Uint8Array, isSection: boolean) => {
+			const packet = new Uint8Array(188).fill(0xff);
+			const cc = continuityCounters.get(pid) ?? 0;
+			continuityCounters.set(pid, (cc + 1) & 0xf);
+			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff], 0);
+			if (isSection || payload.length === 184) {
+				packet[3] = 0x10 | cc;
+				packet.set(payload, 4);
+			} else {
+				packet[3] = 0x30 | cc; // Adaptation field stuffing
+				packet[4] = 183 - payload.length;
+				packet[5] = 0x00;
+				packet.set(payload, 188 - payload.length);
+			}
+			packets.push(packet);
+		};
+		const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
+
+		pushPacket(0x0000, new Uint8Array(section([0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00])), true);
+		pushPacket(0x1000, new Uint8Array(section([
+			0x02, 0xb0, 0x17, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00,
+			0x0f, 0xe1, 0x00, 0xf0, 0x00, // AAC on PID 0x100
+			0x0f, 0xe1, 0x01, 0xf0, 0x00, // AAC on PID 0x101
+		])), true);
+
+		const adtsFrame = new Uint8Array(39); // LC, 48 kHz, stereo, 39 bytes
+		adtsFrame.set([0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc]);
+		const pushFrame = (pid: number, pts: number) => {
+			const pes = new Uint8Array(14 + adtsFrame.length);
+			pes.set([0, 0, 1, 0xc0, 0, 8 + adtsFrame.length, 0x84, 0x80, 5]);
+			pes.set([0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1], 9);
+			pes.set([(pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1], 12);
+			pes.set(adtsFrame, 14);
+			pushPacket(pid, pes, false);
+		};
+
+		const frameCount = Math.round(1200 * 48000 / 1024);
+		for (let i = 0; i < frameCount; i++) {
+			const pts = Math.round(i * 1024 * 90000 / 48000);
+			pushFrame(0x100, pts);
+			if (secondStreamFrames && i >= secondStreamFrames[0] && i < secondStreamFrames[1]) {
+				pushFrame(0x101, pts);
+			}
+		}
+
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+		return bytes;
+	};
+
+	const getTracks = async (
+		bytes: Uint8Array,
+		options: { maxMissingStreamScanSize?: number; unknownSize?: boolean } = {},
+	) => {
+		let bytesRead = 0;
+		let readCount = 0;
+		const warnings: string[] = [];
+		const previousLogLevel = Logging.level;
+		Logging.level = LogLevel.Silent;
+		const stopCapturing = Logging.on('warn', args => warnings.push(args.map(String).join(' ')));
+
+		try {
+			using input = new Input({
+				source: options.unknownSize
+					? new ReadableStreamSource(new ReadableStream({
+						start(controller) {
+							for (let i = 0; i < bytes.length; i += 2 ** 16) {
+								controller.enqueue(bytes.slice(i, i + 2 ** 16));
+							}
+							controller.close();
+						},
+					}))
+					: new CustomSource({
+						getSize: () => bytes.byteLength,
+						read: (start, end) => {
+							bytesRead += end - start;
+							readCount++;
+							return bytes.subarray(start, end);
+						},
+					}),
+				formats: ALL_FORMATS,
+			});
+
+			if (options.maxMissingStreamScanSize !== undefined) {
+				const demuxer = (await input._getDemuxer()) as MpegTsDemuxer;
+				demuxer.maxMissingStreamScanSize = options.maxMissingStreamScanSize;
+			}
+
+			const tracks = await input.getTracks();
+			return {
+				bytesRead,
+				readCount,
+				warnings: warnings.filter(warning => warning.includes('declared but')),
+				tracks: await Promise.all(tracks.map(async track => [track.id, await track.getFirstTimestamp()])),
+			};
+		} finally {
+			stopCapturing();
+			Logging.level = previousLogLevel;
+		}
+	};
+
+	// Never sent: the file gets scanned for it in large chunks, instead of packet by packet (tens of thousands of
+	// reads). The whole file was scanned, so nothing was left out that's in it, and there's no warning.
+	const absent = buildFile(null);
+	const absentResult = await getTracks(absent);
+	expect(absentResult.tracks).toEqual([[0x100, 0]]);
+	expect(absentResult.readCount).toBeLessThan(2000);
+	expect(absentResult.warnings).toEqual([]);
+
+	const late = buildFile([8400, Infinity]); // 179.2 s
+	expect(await getTracks(late)).toMatchObject({ tracks: [[0x100, 0], [0x101, 179.2]], warnings: [] });
+
+	// Only there for a moment, between spots a sampling approach would look at
+	const brief = buildFile([2850, 3085]); // 60.8 s to 65.8 s
+	expect(await getTracks(brief)).toMatchObject({ tracks: [[0x100, 0], [0x101, 60.8]], warnings: [] });
+
+	// When the search gives up before the end of the file (it scans 256 MiB, here less), a stream that starts later
+	// is left out, with a warning
+	const limited = await getTracks(late, { maxMissingStreamScanSize: 2 ** 20 });
+	expect(limited.tracks).toEqual([[0x100, 0]]);
+	expect(limited.bytesRead).toBeLessThan(late.byteLength / 3);
+	expect(limited.warnings).toEqual([expect.stringContaining('within 1 MiB of the file')]);
+	expect(limited.warnings[0]).toContain('PID 257 (stream_type 0x0f)');
+
+	// The same for sources of unknown size, where the search gives up after 2 minutes of media
+	const unknownSize = await getTracks(late, { unknownSize: true });
+	expect(unknownSize.tracks).toEqual([[0x100, 0]]);
+	expect(unknownSize.warnings).toEqual([expect.stringContaining('within the first 120 seconds of media')]);
+	expect(unknownSize.warnings[0]).toContain('PID 257 (stream_type 0x0f)');
 });
