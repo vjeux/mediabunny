@@ -2751,9 +2751,10 @@ class PacketBuffer {
 		if (presentationIndex === -1 || presentationIndex === this.presentationOrderPackets.length - 1) {
 			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). For video,
 			// whose frames may be reordered, the packets around it depend on where reading started, so use the
-			// track's frame duration.
+			// track's frame duration. (Unless the stream's start, where it's measured, can't be read anymore, as from
+			// a source that keeps only what its cache holds and was read further first: then it's the heuristic.)
 			duration = this.backing.elementaryStream.info.type === 'video'
-				? await this.backing.getFrameDuration()
+				? await this.backing.getFrameDuration().catch(() => this.lastDuration)
 				: this.lastDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
