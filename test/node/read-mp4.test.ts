@@ -15,6 +15,7 @@ import {
 	Mp4OutputFormat,
 	Output,
 } from '../../src/index.js';
+import { deserializeHevcDecoderConfigurationRecord } from '../../src/codec-data.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -271,4 +272,62 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('hev1 video with its parameter sets only in-band', async () => {
+	// An hvcC box without parameter set arrays, as 'hev1' allows (ISO/IEC 14496-15) and GPAC writes with
+	// xps_inband=all: the parameter sets of x265's HDR10 output (BT.2020, PQ) come in-band only, with the first
+	// sample. They used to stay out of the description, so the color space was empty (found by L99).
+	const vps = [64, 1, 12, 1, 255, 255, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 146, 128, 144];
+	const sps = [
+		66, 1, 1, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 160, 10, 8, 15, 19, 101, 146, 164, 147, 43, 195, 154,
+		132, 136, 4, 130, 0, 0, 3, 0, 2, 0, 0, 3, 0, 60, 16,
+	];
+	const pps = [68, 1, 193, 114, 180, 98, 64];
+	const slice = [38, 1, 175, 0, 0]; // An IDR slice header, enough for reading
+	const lengthPrefixed = (...nalUnits: number[][]) => {
+		return nalUnits.flatMap(nalUnit => [0, 0, 0, nalUnit.length, ...nalUnit]);
+	};
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('hevc');
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(lengthPrefixed(vps, sps, pps, slice)), 'key', 0, 1 / 30), {
+		decoderConfig: {
+			codec: 'hev1.2.4.L60.90',
+			codedWidth: 320,
+			codedHeight: 240,
+			// The record's fields, with no arrays
+			description: new Uint8Array([
+				1, 2, 32, 0, 0, 0, 144, 0, 0, 0, 0, 0, 60, 240, 0, 252, 253, 250, 250, 0, 0, 15, 0,
+			]),
+		},
+	});
+	await source.add(new EncodedPacket(new Uint8Array(lengthPrefixed([2, 1, 208, 0])), 'delta', 1 / 30, 1 / 30));
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	expect(await track.getColorSpace()).toEqual({
+		primaries: 'bt2020',
+		transfer: 'pq',
+		matrix: 'bt2020-ncl',
+		fullRange: false,
+	});
+	expect(await track.hasHighDynamicRange()).toBe(true);
+
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig?.description);
+	const record = deserializeHevcDecoderConfigurationRecord(toUint8Array(decoderConfig.description));
+	expect(record?.arrays.map(x => [x.nalUnitType, x.nalUnits.map(nalUnit => [...nalUnit])])).toEqual([
+		[32, [vps]],
+		[33, [sps]],
+		[34, [pps]],
+	]);
 });
