@@ -342,6 +342,126 @@ test('RGB conversion for ArrayBuffer-backed data', async () => {
 	}
 });
 
+test('RGB conversion for ArrayBuffer-backed data converts into the target color space', async () => {
+	// Not every browser's VideoFrame converts color spaces correctly here (Firefox ignores the color space of a Display
+	// P3 frame, WebKitGTK copies RGB planes verbatim). Mediabunny then copies the pixels as they are, only reordering
+	// the channels, like it always did.
+	const nativeOrange = async (primaries: string, options: VideoFrameCopyToOptions) => {
+		const frame = new VideoFrame(new Uint8Array([200, 100, 50, 255]), {
+			format: 'RGBA',
+			codedWidth: 1,
+			codedHeight: 1,
+			timestamp: 0,
+			colorSpace: {
+				primaries: primaries as VideoColorPrimaries, transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true,
+			},
+		});
+		const bytes = new Uint8Array(4);
+		await frame.copyTo(bytes, options);
+		frame.close();
+		return bytes;
+	};
+	const toDisplayP3 = await nativeOrange('bt709', { format: 'BGRA', colorSpace: 'display-p3' });
+	const toSrgb = await nativeOrange('smpte432', { format: 'RGBA', colorSpace: 'srgb' });
+	const browserConverts = toDisplayP3[2]! > toDisplayP3[0]! && toDisplayP3[0] !== 50 && toSrgb[0] !== 200;
+	const asIs = (bytes: Uint8Array, format: string) => {
+		const result = [...bytes];
+		if (format.startsWith('BGR')) {
+			for (let i = 0; i < result.length; i += 4) {
+				[result[i], result[i + 2]] = [result[i + 2]!, result[i]!];
+			}
+		}
+		return result;
+	};
+
+	const data = new Uint8Array([200, 100, 50, 255, 0, 255, 0, 255]);
+	const displayP3 = {
+		primaries: 'smpte432' as VideoColorPrimaries,
+		transfer: 'iec61966-2-1' as VideoTransferCharacteristics,
+		matrix: 'rgb' as VideoMatrixCoefficients,
+		fullRange: true,
+	};
+
+	// Same results as VideoFrame, for sRGB and Display P3 data
+	for (const colorSpace of [undefined, displayP3]) {
+		const init = { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0, colorSpace } as const;
+		using sample = new VideoSample(data, init);
+		const frame = new VideoFrame(data, init);
+		const optionSets: VideoFrameCopyToOptions[] = [
+			{ format: 'RGBA' },
+			{ format: 'BGRA', colorSpace: 'srgb' },
+			{ format: 'RGBA', colorSpace: 'display-p3' },
+			{ format: 'BGRX', colorSpace: 'display-p3' },
+		];
+		for (const options of optionSets) {
+			const actual = new Uint8Array(8);
+			await sample.copyTo(actual, options);
+			if (browserConverts) {
+				const expected = new Uint8Array(8);
+				await frame.copyTo(expected, options);
+				expect([...actual], JSON.stringify({ colorSpace, options })).toEqual([...expected]);
+			} else {
+				expect([...actual], JSON.stringify({ colorSpace, options })).toEqual(asIs(data, options.format!));
+			}
+		}
+		frame.close();
+	}
+
+	if (!browserConverts) {
+		return;
+	}
+
+	// A visible rect that doesn't start at the origin: R, G, B, orange cropped to G, B
+	const pixels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 128, 0, 255]);
+	const croppedInit = { format: 'RGBA', codedWidth: 4, codedHeight: 1, timestamp: 0 } as const;
+	using cropped = new VideoSample(pixels, { ...croppedInit, visibleRect: { left: 1, top: 0, width: 2, height: 1 } });
+	const croppedFrame = new VideoFrame(pixels, { ...croppedInit, visibleRect: { x: 1, y: 0, width: 2, height: 1 } });
+	const croppedOptionSets: VideoFrameCopyToOptions[] = [
+		{ format: 'RGBA', colorSpace: 'display-p3' },
+		{ format: 'BGRA', colorSpace: 'display-p3', rect: { x: 1, y: 0, width: 1, height: 1 } },
+	];
+	for (const options of croppedOptionSets) {
+		const expected = new Uint8Array(croppedFrame.allocationSize(options));
+		await croppedFrame.copyTo(expected, options);
+		const actual = new Uint8Array(cropped.allocationSize(options));
+		await cropped.copyTo(actual, options);
+		expect([...actual], JSON.stringify(options)).toEqual([...expected]);
+	}
+	croppedFrame.close();
+
+	// E.g. sRGB orange as Display P3 (this point is only reached where the browser's VideoFrame converts, see above)
+	using srgbSample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0 });
+	const p3Bytes = new Uint8Array(8);
+	await srgbSample.copyTo(p3Bytes, { format: 'RGBA', colorSpace: 'display-p3' });
+	[187, 105, 62].forEach((value, i) => expect(Math.abs(p3Bytes[i]! - value)).toBeLessThanOrEqual(2));
+});
+
+test('Closing a sample right after calling copyTo() still copies it, also when converting color spaces', async () => {
+	const displayP3 = {
+		primaries: 'smpte432' as VideoColorPrimaries,
+		transfer: 'iec61966-2-1' as VideoTransferCharacteristics,
+		matrix: 'rgb' as VideoMatrixCoefficients,
+		fullRange: true,
+	};
+
+	for (const colorSpace of [displayP3, undefined]) {
+		const sample = new VideoSample(new Uint8Array([200, 100, 50, 255]), {
+			format: 'RGBA',
+			codedWidth: 1,
+			codedHeight: 1,
+			timestamp: 0,
+			colorSpace,
+		});
+
+		// As with VideoFrame, the copy reads the pixels as they are when copyTo() is called
+		const bytes = new Uint8Array(4);
+		const promise = sample.copyTo(bytes, { format: 'RGBA' });
+		sample.close();
+		await expect(promise).resolves.toBeDefined();
+		expect(bytes[3]).toBe(255);
+	}
+});
+
 test('crop (rect option) for ArrayBuffer-backed data', async () => {
 	// 4x4 RGBA image where each pixel's R/G channels encode (x, y)
 	const width = 4;
