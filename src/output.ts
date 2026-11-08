@@ -17,7 +17,13 @@ import {
 	toArray,
 	TransformationMatrix,
 } from './misc';
-import { MetadataTags, TrackDisposition, validateMetadataTags, validateTrackDisposition } from './metadata';
+import {
+	localizeMetadataTagBytes,
+	MetadataTags,
+	TrackDisposition,
+	validateMetadataTags,
+	validateTrackDisposition,
+} from './metadata';
 import { Muxer } from './muxer';
 import { OutputFormat } from './output-format';
 import { AudioSource, MediaSource, SubtitleSource, VideoSource } from './media-source';
@@ -772,6 +778,7 @@ export class Output<
 	 */
 	setMetadataTags(tags: MetadataTags) {
 		validateMetadataTags(tags);
+		tags = localizeMetadataTagBytes(tags);
 
 		if (this.state !== 'pending') {
 			throw new Error('Cannot set metadata tags after output has been started or canceled.');

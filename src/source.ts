@@ -24,6 +24,10 @@ import {
 	retriedFetch,
 	toDataView,
 	toUint8Array,
+	arrayBufferFromOtherRealm,
+	isBlob,
+	isReadableStream,
+	isUint8Array,
 	wait,
 	EventEmitter,
 } from './misc';
@@ -443,6 +447,10 @@ export class BufferSource extends Source {
 	 * or `ArrayBufferView`.
 	 */
 	constructor(buffer: AllowSharedBufferSource) {
+		// An ArrayBuffer created in another realm (an iframe, a Node.js vm context, Jest's jsdom environment) is
+		// genuine, but instanceof rejects it, so it's taken through a view of this realm (views of any realm work as
+		// they are)
+		buffer = arrayBufferFromOtherRealm(buffer);
 		if (
 			!(buffer instanceof ArrayBuffer)
 			&& !(typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer)
@@ -530,7 +538,7 @@ export class BlobSource extends Source {
 	 * [`Blob`](https://developer.mozilla.org/en-US/docs/Web/API/Blob).
 	 */
 	constructor(blob: Blob, options: BlobSourceOptions = {}) {
-		if (!(blob instanceof Blob)) {
+		if (!isBlob(blob)) {
 			throw new TypeError('blob must be a Blob.');
 		}
 		if (!options || typeof options !== 'object') {
@@ -1615,14 +1623,14 @@ export class CustomSource extends Source {
 			if (isThenable(data)) data = await data;
 
 			if (worker.aborted) {
-				if (data instanceof ReadableStream) {
+				if (isReadableStream(data)) {
 					await data.cancel().catch(() => {});
 				}
 				break;
 			}
 
-			if (data instanceof Uint8Array) {
-				data = toUint8Array(data); // Normalize things like Node.js Buffer to Uint8Array
+			if (isUint8Array(data)) {
+				data = toUint8Array(data); // Normalize things like Node.js Buffer, or a Uint8Array of another realm
 
 				if (data.length !== originalTargetPos - worker.currentPos) {
 					// Yes, we're that strict
@@ -1635,7 +1643,7 @@ export class CustomSource extends Source {
 
 				this._dispatchRead(worker.currentPos, worker.currentPos + data.length);
 				this._orchestrator.supplyWorkerData(worker, data);
-			} else if (data instanceof ReadableStream) {
+			} else if (isReadableStream(data)) {
 				const reader = data.getReader();
 				this._readers.add(reader);
 
@@ -1657,7 +1665,7 @@ export class CustomSource extends Source {
 							break;
 						}
 
-						if (!(value instanceof Uint8Array)) {
+						if (!isUint8Array(value)) {
 							throw new TypeError(
 								'ReadableStream returned by options.read must yield Uint8Array chunks.',
 							);
@@ -1789,7 +1797,7 @@ export class ReadableStreamSource extends Source {
 
 	/** Creates a new {@link ReadableStreamSource} backed by the specified `ReadableStream<Uint8Array>`. */
 	constructor(stream: ReadableStream<Uint8Array>, options: ReadableStreamSourceOptions = {}) {
-		if (!(stream instanceof ReadableStream)) {
+		if (!isReadableStream(stream)) {
 			throw new TypeError('stream must be a ReadableStream.');
 		}
 		if (!options || typeof options !== 'object') {
