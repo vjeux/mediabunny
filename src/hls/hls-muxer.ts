@@ -40,6 +40,7 @@ import {
 	HlsOutputSegmentInfo,
 	Mp3OutputFormat,
 	IsobmffOutputFormat,
+	MpegTsOutputFormat,
 	OutputFormat,
 } from '../output-format';
 import { Writer } from '../writer';
@@ -212,6 +213,18 @@ export class HlsMuxer extends Muxer {
 		this.maxLiveSegmentCount = format._options.maxLiveSegmentCount ?? Infinity;
 		this.mediaTimestampBase = format._options.mediaTimestampBase ?? 10;
 		this.globalTargetDuration = this.targetSegmentDuration;
+
+		if (
+			toArray(format._options.segmentFormat).some((segmentFormat) => {
+				return segmentFormat instanceof MpegTsOutputFormat && !!segmentFormat._options.timestampOffset;
+			})
+		) {
+			Logging._warn(
+				'The timestampOffset of an MpegTsOutputFormat is ignored for HLS segments, whose media starts at the'
+				+ ' HLS output\'s mediaTimestampBase like that of the other segment formats. Set mediaTimestampBase'
+				+ ' instead.',
+			);
+		}
 
 		this.getPlaylistPath = format._options.getPlaylistPath
 			?? (({ n }) => `playlist-${n}.m3u8`);
@@ -2016,6 +2029,12 @@ const validateInitPath = (path: string) => {
 };
 
 const toSegmentOutputFormat = (format: OutputFormat) => {
+	if (format instanceof MpegTsOutputFormat && format._options.timestampOffset) {
+		// All segment media starts at mediaTimestampBase. An extra offset would only move the MPEG-TS segments, away
+		// from the packed audio and CMAF segments of other playlists, which players align them with.
+		return new MpegTsOutputFormat({ ...format._options, timestampOffset: 0 });
+	}
+
 	if (format instanceof Mp3OutputFormat) {
 		// The Xing frame describes an entire MP3 file. At the start of a packed audio segment, players read it as an
 		// extra frame of audio (FFmpeg does), so every segment would gain a frame of silence.
