@@ -206,6 +206,8 @@ export const readFreeformMetadataItem = (slice: FileSlice, contentSize: number) 
 	return { mean, name, data };
 };
 
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
 export const readDataBox = (slice: FileSlice) => {
 	if (slice.remainingLength < MIN_BOX_HEADER_SIZE) {
 		return null;
@@ -228,8 +230,19 @@ export const readDataBox = (slice: FileSlice) => {
 	switch (typeIndicator) {
 		case 1: return textDecoder.decode(data); // UTF-8
 		case 2: return new TextDecoder('utf-16be').decode(data); // UTF-16-BE
-		case 13: return new RichImageData(data, 'image/jpeg');
-		case 14: return new RichImageData(data, 'image/png');
+		case 13: // JPEG
+		case 14: { // PNG
+			// Like in FFmpeg, the image's signature wins over the type, which taggers get wrong: mutagen, for one,
+			// writes PNG images with the JPEG type unless told otherwise
+			let mimeType = typeIndicator === 13 ? 'image/jpeg' : 'image/png';
+			if (PNG_SIGNATURE.every((byte, i) => data[i] === byte)) {
+				mimeType = 'image/png';
+			} else if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+				mimeType = 'image/jpeg';
+			}
+
+			return new RichImageData(data, mimeType);
+		}
 		case 27: return new RichImageData(data, 'image/bmp');
 
 		default: return data;
