@@ -24,7 +24,7 @@ import { MatroskaDemuxer } from './matroska/matroska-demuxer';
 import { Mp3Demuxer } from './mp3/mp3-demuxer';
 import { MP3_FRAME_HEADER_SIZE, getXingOffset, INFO, XING } from '../shared/mp3-misc';
 import { ID3_V2_HEADER_SIZE, readId3V2Header } from './id3';
-import { readNextMp3FrameHeader } from './mp3/mp3-reader';
+import { findWaveDataChunk, readNextMp3FrameHeader } from './mp3/mp3-reader';
 import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from './adts/adts-reader';
@@ -352,6 +352,12 @@ export class Mp3InputFormat extends InputFormat {
 			}
 
 			currentPos = slice.filePos + id3V2Header.size;
+		}
+
+		// MP3 in WAVE: the frames are in the data chunk, which can start further in (behind a JUNK or bext chunk)
+		const dataChunk = await findWaveDataChunk(input._reader, currentPos);
+		if (dataChunk) {
+			currentPos = dataChunk.start;
 		}
 
 		const firstResult = await readNextMp3FrameHeader(input._reader, currentPos, currentPos + 4096);
