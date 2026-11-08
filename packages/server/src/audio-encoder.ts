@@ -51,10 +51,14 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 	static override supports(codec: AudioCodec, config: AudioEncoderConfig): boolean {
 		const { numberOfChannels, sampleRate } = config;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
+		const isAdts = (config as any).aac?.format === 'adts';
 
 		return (
 			codec === 'aac' && numberOfChannels >= 1 && numberOfChannels <= 48
 			&& AAC_SAMPLE_RATES.includes(sampleRate)
+			// FFmpeg's encoder signals 7.1 with channel configuration 12, too large for the ADTS header's 3 bits
+			&& !(isAdts && numberOfChannels === 8)
 		) || (
 			codec === 'opus' && numberOfChannels >= 1 && numberOfChannels <= 255
 			&& OPUS_SAMPLE_RATES.includes(sampleRate)
