@@ -1322,3 +1322,49 @@ test('HLS: an ad break of several segments sharing an init section decodes like 
 	}
 	expect(maxDifference).toBeLessThan(1e-4);
 });
+
+test('Annex B AVC decodes when the first packet has its parameter sets before the AUD', async () => {
+	// Where the start code of the next NAL unit of the given type begins (4-byte or 3-byte)
+	const findStartCode = (bytes: Uint8Array, nalUnitType: number, from = 0) => {
+		for (let i = from; i + 3 < bytes.length; i++) {
+			if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1 && (bytes[i + 3]! & 0x1f) === nalUnitType) {
+				return i > from && bytes[i - 1] === 0 ? i - 1 : i;
+			}
+		}
+		throw new Error(`No NAL unit of type ${nalUnitType}`);
+	};
+
+	const decodeAll = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		// Annex B with the parameter sets in-band
+		expect((await track.getDecoderConfig())!.description).toBeUndefined();
+
+		let count = 0;
+		for await (const sample of new VideoSampleSink(track).samples()) {
+			count++;
+			sample.close();
+		}
+		return count;
+	};
+
+	// The first sample of annex-b.mp4 is AUD, SPS, PPS, NAL unit 14, IDR slice. Some muxers put the parameter sets in
+	// front of the AUD (found by lane L66; FFmpeg trac #697's sample carries them in a PES packet of their own), so
+	// rewrite it to SPS, PPS, AUD, ... in place.
+	const original = new Uint8Array(await (await fetch('/annex-b.mp4')).arrayBuffer());
+	const audStart = findStartCode(original, 9);
+	const spsStart = findStartCode(original, 7, audStart + 4);
+	const ppsStart = findStartCode(original, 8, spsStart + 4);
+	const afterPps = findStartCode(original, 14, ppsStart + 4);
+	expect(spsStart).toBe(audStart + 6); // 00 00 00 01 09 xx
+
+	const reordered = original.slice();
+	const parameterSets = original.subarray(spsStart, afterPps);
+	reordered.set(parameterSets, audStart);
+	reordered.set(original.subarray(audStart, spsStart), audStart + parameterSets.length);
+
+	const frameCount = await decodeAll(original);
+	expect(frameCount).toBeGreaterThan(0);
+	expect(await decodeAll(reordered)).toBe(frameCount);
+});
