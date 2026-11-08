@@ -183,6 +183,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 		let headerRead = false;
 		let accumulatedTime = 0;
+		// A date that the accumulated time may snap to, at the next segment (which it's for)
+		let pendingDateTimeSeconds: number | null = null;
 		let accumulatedUnixTime: number | null = null;
 		let nextSegmentDuration: number | null = null;
 		let currentKey: HlsEncryptionInfo | null = null;
@@ -267,6 +269,26 @@ export class HlsSegmentedInput extends SegmentedInput {
 						view.setUint32(12, nextSequenceNumber);
 
 						key = { ...key, iv };
+					}
+
+					if (pendingDateTimeSeconds !== null) {
+						// Snap the accumulated time into Unix space, but not back to before where the timeline already
+						// got: an earlier date (clips out of chronological order, a clock that was reset) would make
+						// the timeline go back in time. Small overlaps are fine; servers may use them to account for
+						// clock drift (RFC 8216bis 6.2.1). The first date of a discontinuity decides for the whole
+						// discontinuity, and for all playlists: their timelines end a bit apart, but they must place
+						// the discontinuity alike.
+						const decisions = this.demuxer.discontinuitiesFollowingDates;
+						let followsDates = decisions.get(nextDiscontinuityNumber);
+						if (followsDates === undefined) {
+							followsDates = pendingDateTimeSeconds >= accumulatedTime - MAX_DATE_TIME_OVERLAP;
+							decisions.set(nextDiscontinuityNumber, followsDates);
+						}
+
+						if (followsDates) {
+							accumulatedTime = pendingDateTimeSeconds;
+						}
+						pendingDateTimeSeconds = null;
 					}
 
 					const fullPath = joinPaths(this.rootPath, variables.substitute(line));
@@ -526,17 +548,18 @@ export class HlsSegmentedInput extends SegmentedInput {
 							segment.timestamp = segment.unixEpochTimestamp;
 						}
 					}
+
+					if (offsetTimestampsByDateTime) {
+						accumulatedTime = dateTimeSeconds; // Where the moved segments end
+					}
 				}
 
 				lastProgramDateTimeSeconds = dateTimeSeconds;
 				accumulatedUnixTime = dateTimeSeconds;
 
-				// Snap the accumulated time into Unix space, but not back to before where the timeline already got:
-				// an earlier date (clips out of chronological order, a clock that was reset) would make the timeline go
-				// back in time. Small overlaps are fine; servers may use them to account for clock drift (RFC 8216bis
-				// 6.2.1).
-				if (offsetTimestampsByDateTime && dateTimeSeconds >= accumulatedTime - MAX_DATE_TIME_OVERLAP) {
-					accumulatedTime = dateTimeSeconds;
+				if (offsetTimestampsByDateTime) {
+					// Applied at the segment it's for, whose discontinuity can still be declared after this tag
+					pendingDateTimeSeconds = dateTimeSeconds;
 				}
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
