@@ -1033,6 +1033,10 @@ class SegmentedInputInputVideoTrackBacking
 		return this.delegate(() => this.firstInputTrack!._backing.getSquarePixelHeight());
 	}
 
+	getPixelAspectRatio() {
+		return this.delegate(() => this.firstInputTrack!._backing.getPixelAspectRatio?.() ?? null);
+	}
+
 	getTransformationMatrix() {
 		return this.delegate(() => this.firstInputTrack!._backing.getTransformationMatrix());
 	}
