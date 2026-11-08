@@ -1772,6 +1772,25 @@ test('ADTS: Frame with zero length', async () => {
 	await expectGracefulRead(concat(adtsHeader(0), zeros(16)));
 });
 
+test('MP3: Damaged first frame behind a Xing frame', async () => {
+	// MPEG-1 Layer III, 128 kbps, 44.1 kHz, joint stereo: 417-byte frames
+	const frame = () => concat([0xff, 0xfb, 0x90, 0x64], zeros(413));
+	const xingFrame = frame();
+	xingFrame.set(ascii('Xing'), 36);
+	// The first audio frame's sync is damaged, and its data holds what looks like a 48 kHz frame header
+	const damagedFrame = frame();
+	damagedFrame[0] = 0x7f;
+	damagedFrame.set([0xff, 0xfb, 0x94, 0x44], 40);
+
+	using input = new Input({
+		source: new BufferSource(concat(xingFrame, damagedFrame, ...Array.from({ length: 39 }, frame))),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getSampleRate()).toBe(44100);
+	expect((await track.computePacketStats()).packetCount).toBe(39);
+});
+
 test('ADTS: Frame with reserved sampling frequency index', async () => {
 	await expectGracefulRead(concatList(Array.from({ length: 5 }, () => adtsFrame(10, 13))));
 });
