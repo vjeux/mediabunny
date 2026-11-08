@@ -6,7 +6,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { parsePcmCodec, PCM_AUDIO_CODECS, PcmAudioCodec, VideoCodec, AudioCodec, OPUS_SAMPLE_RATE } from './codec';
+import {
+	parsePcmCodec,
+	PCM_AUDIO_CODECS,
+	PcmAudioCodec,
+	VideoCodec,
+	AudioCodec,
+	OPUS_SAMPLE_RATE,
+	toChromiumCompatibleColorCodecString,
+} from './codec';
 import {
 	addAvcBitstreamRestriction,
 	AvcNalUnitType,
@@ -1065,6 +1073,11 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 						},
 					};
 				}
+
+				this.decoderConfig = {
+					...this.decoderConfig,
+					codec: toChromiumCompatibleColorCodecString(this.decoderConfig.codec),
+				};
 			}
 
 			const stack = new Error('Decoding error').stack;

@@ -192,6 +192,33 @@ const expectSimilarData = (actual: Float32Array, expected: Float32Array, maxErro
 	expect(20 * Math.log10(maxDifference)).toBeLessThan(maxErrorDb);
 };
 
+test.each([
+	// ffmpeg -f lavfi -i testsrc2=s=64x64:r=10 -frames:v 3 -vf format=yuv420p10le,setparams=colorspace=ictcp:\
+	//   color_primaries=bt2020:color_trc=smpte2084:range=tv -c:v libaom-av1 -cpu-used 8 -b:v 100k -colorspace ictcp \
+	//   -color_primaries bt2020 -color_trc smpte2084 -color_range tv av1-ictcp-pq.mkv
+	['/av1-ictcp-pq.mkv', 'av01.0.00M.10.0.110.09.16.14.0'], // ICtCp matrix (14)
+	// The same with -vf format=yuv420p,setparams=colorspace=bt2020c:color_primaries=bt2020:color_trc=bt2020-10:range=tv
+	//   -c:v libvpx-vp9 -b:v 100k -colorspace bt2020c -color_primaries bt2020 -color_trc bt2020-10 vp9-bt2020-cl.mp4
+	['/vp9-bt2020-cl.mp4', 'vp09.00.10.08.01.09.14.10.00'], // BT.2020 constant-luminance matrix (10)
+])('Decoding %s, whose codec string has a color value Chromium rejects', async (path, codecString) => {
+	using input = new Input({
+		source: new UrlSource(path),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	// The codec string stays exact, but decoding mustn't depend on the browser knowing every color value in it
+	expect((await track.getDecoderConfig())!.codec).toBe(codecString);
+	expect(await track.canDecode()).toBe(true);
+
+	let count = 0;
+	for await (using sample of new VideoSampleSink(track).samples()) {
+		expect(sample.displayWidth).toBe(64);
+		count++;
+	}
+	expect(count).toBe(3);
+});
+
 test('Sample retrieval within Opus pre-skip', async () => {
 	using input = new Input({
 		source: new UrlSource('/demo.webm'),
