@@ -93,6 +93,13 @@ test('UrlSource resumes a cross-origin response body that fails with WebKit\'s "
 			expect(readBytes(slice!, 400_000)).toEqual(data.subarray(0, 400_000));
 			expect(requestedRanges).toEqual(['bytes=0-', 'bytes=100000-']);
 		}
+
+		// A blob: URL is read without touching the network, so retrying its failed body can't help: give up instead
+		const requestedRanges: string[] = [];
+		const blobUrl = 'blob:https://example.com/00000000-0000-0000-0000-000000000000';
+		using ref = new UrlSource(blobUrl, { fetchFn: makeFetchFn(true, requestedRanges) }).ref();
+		await expect(Promise.resolve(new Reader(ref.source).requestSlice(0, 400_000))).rejects.toThrow('Load failed');
+		expect(requestedRanges).toEqual(['bytes=0-']);
 	} finally {
 		Logging.level = previousLevel;
 	}

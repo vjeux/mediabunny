@@ -702,11 +702,6 @@ const DEFAULT_RETRY_DELAY
 		return Math.min(2 ** (previousAttempts - 2), 16);
 	}) satisfies UrlSourceOptions['getRetryDelay'];
 
-// Used instead of the default getRetryDelay when a response body fails partway. That response already got through
-// CORS, so the CORS heuristic doesn't apply (and would misfire in WebKit, which reports every response body error as
-// "Load failed", the text it also uses for CORS failures).
-const DEFAULT_RESUME_DELAY = (previousAttempts: number) => Math.min(2 ** (previousAttempts - 2), 16);
-
 const warnedOrigins = new Set<string>();
 
 /**
@@ -952,13 +947,25 @@ export class UrlSource extends PathedSource {
 
 	/**
 	 * The delay before resuming a response body that failed partway: from the user's getRetryDelay if there's one,
-	 * else from a default without the CORS heuristic.
+	 * else from the default policy without its CORS heuristic.
 	 * @internal
 	 */
 	_getResumeDelay(previousAttempts: number, error: unknown) {
-		return this._options.getRetryDelay
-			? this._getRetryDelay(previousAttempts, error, this._url)
-			: DEFAULT_RESUME_DELAY(previousAttempts);
+		if (this._options.getRetryDelay) {
+			return this._getRetryDelay(previousAttempts, error, this._url);
+		}
+
+		// blob:, data: and file: URLs are read without touching the network, so retrying can't fix a failure
+		const url = this._url;
+		const href = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+		if (/^\s*(?:blob|data|file):/i.test(href)) {
+			return null;
+		}
+
+		// The response got through CORS before its body failed, so the CORS heuristic doesn't apply (and would misfire
+		// in WebKit, which reports every response body error as "Load failed", like a CORS failure). Not passing the
+		// error skips it.
+		return DEFAULT_RETRY_DELAY(previousAttempts, null, this._url);
 	}
 
 	/** @internal */
