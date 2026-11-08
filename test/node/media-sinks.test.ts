@@ -73,3 +73,41 @@ test('packets() keeps a constant cost per packet when its queue runs far ahead',
 	// Linear: each entry is moved at most about once (main moved ~5e9)
 	expect(movedElements).toBeLessThan(2 * count);
 });
+
+test('packets() reads at most 1024 packets ahead of a fast consumer', async () => {
+	const count = 200_000;
+
+	// With a frozen clock, all packets dequeued so far count as the last second's
+	vi.spyOn(performance, 'now').mockReturnValue(0);
+
+	using input = new Input({ source: new BufferSource(createAdtsFile(count)), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	expect(track).not.toBeNull();
+	const sink = new EncodedPacketSink(track!);
+
+	let fetchedCount = 0;
+	const getFirstPacket = sink.getFirstPacket.bind(sink);
+	const getNextPacket = sink.getNextPacket.bind(sink);
+	sink.getFirstPacket = async (options) => {
+		fetchedCount++;
+		return getFirstPacket(options);
+	};
+	sink.getNextPacket = async (packet, options) => {
+		fetchedCount++;
+		return getNextPacket(packet, options);
+	};
+
+	const packets = sink.packets(undefined, undefined, { metadataOnly: true });
+	for (let i = 0; i < count / 2; i++) {
+		await packets.next();
+	}
+
+	// Let the iterator read ahead as far as it wants while the consumer pauses. The queue used to grow to a second's
+	// worth of dequeued packets, which is tens of thousands for a fast consumer
+	await new Promise(resolve => setTimeout(resolve, 200));
+	const readAheadCount = fetchedCount - count / 2;
+	await packets.return();
+
+	// The queue, plus the packet the pump is holding
+	expect(readAheadCount).toBeLessThanOrEqual(1024 + 2);
+});

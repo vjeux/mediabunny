@@ -363,8 +363,13 @@ export class EncodedPacketSink {
 		// in bulk since shift() is O(n) for large arrays, and fast consumers dequeue over 100k packets per second.
 		const timestamps: number[] = [];
 		let timestampsStart = 0;
-		// The queue should always be big enough to hold 1 second worth of packets
-		const maxQueueSize = () => Math.max(2, timestamps.length - timestampsStart);
+		// The queue should always be big enough to hold 1 second worth of packets, but no more than a fixed number:
+		// fast consumers dequeue tens of thousands of packets per second, and reading that far ahead costs memory (and
+		// can make streamed sources evict data that another track still needs)
+		const maxQueueSize = () => Math.min(
+			MAX_QUEUED_PACKETS,
+			Math.max(2, timestamps.length - timestampsStart),
+		);
 
 		// The following is the "pump" process that keeps pumping packets into the queue
 		(async () => {
@@ -458,6 +463,7 @@ export class EncodedPacketSink {
 }
 
 const MAX_QUEUE_SIZE = 4;
+const MAX_QUEUED_PACKETS = 1024;
 
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
