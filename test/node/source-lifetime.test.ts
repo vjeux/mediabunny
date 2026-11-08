@@ -184,7 +184,11 @@ test('Declarations of the disposable classes compile without TypeScript\'s esnex
 		},
 	});
 	const errorsInOwnDeclarations = ts.getPreEmitDiagnostics(consumer)
-		.filter(diagnostic => diagnostic.file?.fileName.startsWith(path.join(outDir, 'src')))
+		.filter((diagnostic) => {
+			// TypeScript's file names use / on every platform
+			const file = diagnostic.file && path.relative(outDir, diagnostic.file.fileName).split(path.sep).join('/');
+			return file?.startsWith('src/');
+		})
 		.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, ' '));
 	expect(errorsInOwnDeclarations).toEqual([]);
 }, 60_000);
