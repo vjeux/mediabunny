@@ -2470,17 +2470,6 @@ export class Conversion {
 		return Math.ceil(1.5 * packetRate * duration) + 64;
 	}
 
-	/**
-	 * Whether a track's duration can't be known ahead of converting it: a live track's, or that of a track whose
-	 * duration isn't in its metadata when the input can only be read sequentially. Computing it would read the whole
-	 * input, evicting its start from the source before the conversion gets to read it.
-	 * @internal
-	 */
-	async _isTrackDurationUnknown(track: InputTrack) {
-		return await track.isLive()
-			|| (this.input._rootSource._evictsReadData && (await track.getDurationFromMetadata()) === null);
-	}
-
 	/** @internal */
 	_getTrackDuration(track: InputTrack) {
 		let promise = this._trackDurations.get(track);
@@ -2589,6 +2578,17 @@ export class Conversion {
 			this._lastProgress = newProgress;
 			this.onProgress?.(newProgress, minTimestamp);
 		}
+	}
+
+	/**
+	 * Whether a track's duration can't be known ahead of converting it: a live track's, or that of a track whose
+	 * duration isn't in its metadata when the input can only be read sequentially. Computing it would read the whole
+	 * input, evicting its start from the source before the conversion gets to read it.
+	 * @internal
+	 */
+	async _isTrackDurationUnknown(track: InputTrack) {
+		return await track.isLive()
+			|| (this.input._rootSource._evictsReadData && (await track.getDurationFromMetadata()) === null);
 	}
 }
 
