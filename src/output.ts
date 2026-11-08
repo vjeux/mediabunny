@@ -965,9 +965,9 @@ export class Output<
 	 * Cancels the creation of the output file, releasing internal resources like encoders and preventing further
 	 * samples from being added.
 	 *
-	 * While the output is finalizing, this instead stops waiting for the samples added before finalizing to be
-	 * processed by a `process` function (they're dropped), so that one that never settles can't hold finalization up
-	 * forever; the returned promise then resolves once finalization has completed.
+	 * While the output is finalizing, this instead stops waiting for a `process` function call still in flight and
+	 * drops the samples queued behind it, so that a call that never settles can't hold finalization up forever (without
+	 * such a call, nothing is dropped); the returned promise then resolves once finalization has completed.
 	 *
 	 * @returns A promise that resolves once all internal resources have been released.
 	 */
@@ -978,8 +978,9 @@ export class Output<
 			Logging._warn('Output has already been finalized.');
 			return;
 		} else if (this.state === 'finalizing') {
-			// Finalization waits for the samples added before it to be processed, which a process function that never
-			// settles would hold up forever. Stop waiting for them (they're dropped), so that it can complete.
+			// Finalization waits for the samples added before it to be processed, which a process function call that
+			// never settles would hold up forever. Stop waiting for such a call and drop the samples queued behind it,
+			// so that finalization can complete.
 			for (const track of this.tracks) {
 				track.source._cancelPendingAdds();
 			}
