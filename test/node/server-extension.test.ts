@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test } from 'vitest';
+import { beforeAll, describe, expect, test, vi } from 'vitest';
 import fs from 'node:fs';
 import { registerMediabunnyServer } from '@mediabunny/server';
 import { Input } from '../../src/input.js';
@@ -373,6 +373,139 @@ describe('Video', async () => {
 
 			expect(buf[0]).toBe(255); // White
 		});
+	});
+
+	test('Encoding honors the profile and bit depth asked for in fullCodecString, or declines it', async () => {
+		// Encodes five mid-gray 320x240 frames (big enough for hardware encoders to take) and returns the codec string
+		// of the written track
+		const writtenCodecString = async (codec: VideoCodec, fullCodecString: string | undefined, bitDepth: number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const quality = new Quality({ bitrate: 500_000 });
+			const source = new VideoSampleSource({ codec, quality, fullCodecString });
+			output.addVideoTrack(source);
+
+			try {
+				await output.start();
+				for (let i = 0; i < 5; i++) {
+					const sampleCount = 320 * 240 * 3 / 2;
+					const data = bitDepth === 8
+						? new Uint8Array(sampleCount).fill(128)
+						: new Uint8Array(new Uint16Array(sampleCount).fill(128 << (bitDepth - 8)).buffer);
+					const sample = new VideoSample(data, {
+						format: bitDepth === 8 ? 'I420' : bitDepth === 10 ? 'I420P10' : 'I420P12',
+						codedWidth: 320,
+						codedHeight: 240,
+						timestamp: i / 30,
+						duration: 1 / 30,
+					});
+					try {
+						await source.add(sample);
+					} finally {
+						sample.close();
+					}
+				}
+				await output.finalize();
+			} catch (error) {
+				await output.cancel();
+				throw error;
+			}
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			return await track.getCodecParameterString();
+		};
+
+		const honored: [codec: VideoCodec, fullCodecString: string, bitDepth: number, written: RegExp][] = [
+			// AVC Baseline, Main and High 10 (libx264 picks High by itself)
+			['avc', 'avc1.42001f', 8, /^avc1\.42/],
+			['avc', 'avc1.4d001f', 8, /^avc1\.4d/],
+			['avc', 'avc1.6e001f', 10, /^avc1\.6e/],
+			// HEVC Main 10, and the bit depth fields of VP9 and AV1
+			['hevc', 'hvc1.2.4.L93.B0', 10, /^(hev1|hvc1)\.2\./],
+			['vp9', 'vp09.02.10.10', 10, /^vp09\.02\.\d\d\.10/],
+			['vp9', 'vp09.02.10.12', 12, /^vp09\.02\.\d\d\.12/],
+			['av1', 'av01.0.04M.10', 10, /^av01\.0\.\d\d[MH]\.10/],
+		];
+		// Builds whose software encoder lacks a bit depth (node-av's libx265 for Windows is 8-bit only) decline it, as
+		// hardware encoders fall back to the software one
+		const softwareCodecIds: Partial<Record<VideoCodec, NodeAv.AVCodecID>> = {
+			avc: NodeAv.AV_CODEC_ID_H264,
+			hevc: NodeAv.AV_CODEC_ID_HEVC,
+			vp9: NodeAv.AV_CODEC_ID_VP9,
+			av1: NodeAv.AV_CODEC_ID_AV1,
+		};
+		const softwareHasBitDepth = (codec: VideoCodec, bitDepth: number) => {
+			const format = bitDepth === 10 ? NodeAv.AV_PIX_FMT_YUV420P10LE : NodeAv.AV_PIX_FMT_YUV420P12LE;
+			const softwareCodec = NodeAv.Codec.findEncoder(softwareCodecIds[codec]!);
+			return bitDepth === 8 || !!softwareCodec?.pixelFormats?.includes(format);
+		};
+
+		for (const [codec, fullCodecString, bitDepth, written] of honored) {
+			const encodable = softwareHasBitDepth(codec, bitDepth);
+			const canEncode = await canEncodeVideo(codec, { width: 320, height: 240, fullCodecString });
+			expect({ fullCodecString, canEncode }).toEqual({ fullCodecString, canEncode: encodable });
+			if (encodable) {
+				expect(await writtenCodecString(codec, fullCodecString, bitDepth)).toMatch(written);
+			} else {
+				await expect(writtenCodecString(codec, fullCodecString, bitDepth)).rejects.toThrow();
+			}
+		}
+
+		// What these encoders can't produce is declined, as browsers do, rather than encoded as something else
+		const declined: [codec: VideoCodec, fullCodecString: string][] = [
+			['avc', 'avc1.7a0028'], // High 4:2:2
+			['avc', 'avc1.f40028'], // High 4:4:4 Predictive
+			['avc', 'avc1.58001f'], // Extended
+			['hevc', 'hvc1.4.10.L93.B0'], // Range extensions
+			['vp9', 'vp09.01.10.08'], // Profile 1 (4:2:2, 4:4:0 or 4:4:4)
+			['vp9', 'vp09.00.10.10'], // Profile 0 is 8-bit only
+			['av1', 'av01.1.04M.08'], // High (4:4:4)
+			['av1', 'av01.0.04M.12'], // 12 bits needs the Professional profile
+		];
+		for (const [codec, fullCodecString] of declined) {
+			const canEncode = await canEncodeVideo(codec, { width: 320, height: 240, fullCodecString });
+			expect({ fullCodecString, canEncode }).toEqual({ fullCodecString, canEncode: false });
+			await expect(writtenCodecString(codec, fullCodecString, 8)).rejects.toThrow();
+		}
+
+		// Without a codec string, the encoders' defaults stay: High, Main, and 8 bits even from 10-bit frames
+		expect(await writtenCodecString('avc', undefined, 8)).toMatch(/^avc1\.64/);
+		expect(await writtenCodecString('hevc', undefined, 10)).toMatch(/^(hev1|hvc1)\.1\./);
+		expect(await writtenCodecString('vp9', undefined, 10)).toMatch(/^vp09\.00\.\d\d\.08/);
+		expect(await writtenCodecString('av1', undefined, 10)).toMatch(/^av01\.0\.\d\d[MH]\.08/);
+	});
+
+	test('Codec strings asking for a bit depth the software encoder lacks are declined', async () => {
+		// node-av's libx265 for Windows is 8-bit only; simulate that by hiding its 10-bit format
+		const findEncoder = NodeAv.Codec.findEncoder.bind(NodeAv.Codec);
+		const spy = vi.spyOn(NodeAv.Codec, 'findEncoder').mockImplementation((id) => {
+			const codec = findEncoder(id);
+			if (!codec || id !== NodeAv.AV_CODEC_ID_HEVC) {
+				return codec;
+			}
+
+			return new Proxy(codec, {
+				get: (target, property) => {
+					if (property === 'pixelFormats') {
+						return [NodeAv.AV_PIX_FMT_YUV420P];
+					}
+					const value = Reflect.get(target, property) as unknown;
+					return typeof value === 'function' ? (value as () => unknown).bind(target) : value;
+				},
+			});
+		});
+
+		try {
+			// A frame size no other test uses, so that canEncodeVideo isn't answered from its memo
+			const config = { width: 80, height: 48, fullCodecString: 'hvc1.2.4.L93.B0' };
+			expect(await canEncodeVideo('hevc', config)).toBe(false);
+			expect(await canEncodeVideo('hevc', { ...config, hardwareAcceleration: 'prefer-software' })).toBe(false);
+			// 8-bit Main is still fine
+			expect(await canEncodeVideo('hevc', { ...config, fullCodecString: 'hvc1.1.6.L93.B0' })).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	test('VP8 encode and decode', async () => {
