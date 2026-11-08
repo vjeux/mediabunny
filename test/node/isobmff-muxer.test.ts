@@ -417,6 +417,48 @@ test('Negative start timestamps, regular MP4', async () => {
 	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1, false);
 });
 
+test('Video wider or higher than 65535 pixels is rejected instead of written as 0 pixels', async () => {
+	const muxVp9 = async (width: number, height: number) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1 / 30), {
+			decoderConfig: { codec: 'vp09.00.10.08', codedWidth: width, codedHeight: height },
+		});
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	// 65535 is the most the sample entry's 16-bit fields hold
+	using input = new Input({ source: new BufferSource(await muxVp9(65535, 65535)), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect([await track.getCodedWidth(), await track.getCodedHeight()]).toEqual([65535, 65535]);
+
+	// One more used to wrap to 0, which is what readers then got (AV1 and VP9 allow 65536)
+	await expect(muxVp9(65536, 64)).rejects.toThrow('at most 65535x65535');
+	await expect(muxVp9(64, 65536)).rejects.toThrow('at most 65535x65535');
+
+	// A size declared with the track is rejected when the track is added: rejecting it once started would leave the
+	// output hanging
+	const settles = (promise: Promise<unknown>) => Promise.race([
+		promise.then(() => 'resolved', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('hung'), 2000)),
+	]);
+	const declaredConfig = (codedWidth: number) => ({ codec: 'vp09.00.10.08', codedWidth, codedHeight: 16 });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	expect(() => output.addVideoTrack(new EncodedVideoPacketSource('vp9'), { decoderConfig: declaredConfig(65536) }))
+		.toThrow('at most 65535x65535');
+
+	// The output is still usable
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source, { decoderConfig: declaredConfig(64) });
+	expect(await settles(output.start())).toBe('resolved');
+	expect(await settles(source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1 / 30)))).toBe('resolved');
+	expect(await settles(output.finalize())).toBe('resolved');
+});
+
 test('Negative start timestamps, fragmented MP4', async () => {
 	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1, true);
 });

@@ -24,6 +24,7 @@ import { FlacMuxer } from './flac/flac-muxer';
 import { parseOpusIdentificationHeader } from './codec-data';
 import { EncodedPacket } from './packet';
 import { IsobmffMuxer } from './isobmff/isobmff-muxer';
+import { validateIsobmffVideoSize } from './isobmff/isobmff-misc';
 import { MatroskaMuxer } from './matroska/matroska-muxer';
 import { MediaSource } from './media-source';
 import { Mp3Muxer } from './mp3/mp3-muxer';
@@ -183,6 +184,11 @@ export abstract class OutputFormat {
 	_canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
 		return false;
 	}
+
+	/** @internal */
+	// Throws if the format can't hold a track as declared, before the output starts
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_validateTrack(track: OutputTrack) {}
 }
 
 /**
@@ -282,6 +288,15 @@ export type IsobmffOutputFormatOptions = {
 export abstract class IsobmffOutputFormat extends OutputFormat {
 	/** @internal */
 	_options: IsobmffOutputFormatOptions;
+
+	/** @internal */
+	override _validateTrack(track: OutputTrack) {
+		// A size declared with the track is checked here, so that it can't make the output fail once started
+		const decoderConfig = track.isVideoTrack() ? track.metadata.decoderConfig : undefined;
+		if (decoderConfig?.codedWidth !== undefined && decoderConfig.codedHeight !== undefined) {
+			validateIsobmffVideoSize(decoderConfig.codedWidth, decoderConfig.codedHeight);
+		}
+	}
 
 	/** Internal constructor. */
 	constructor(options: IsobmffOutputFormatOptions = {}) {
