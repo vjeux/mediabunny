@@ -62,17 +62,25 @@ test('UrlSource reads a relative URL from a server without range request support
 	// In a worker, there's no window to resolve a relative URL against, while fetch resolves it against the worker's
 	// location. Here, the fetch function does that, and either returns the response as is, or rebuilds it (as caching
 	// layers and header-rewriting wrappers do), which leaves it without a url; a worker's location is stood in for.
-	for (const rebuilt of [false, true]) {
+	// Last, an absolute URL where reading location throws, as in Deno without --location.
+	for (const mode of ['relative', 'rebuilt', 'throwing location'] as const) {
 		const server = await startRangelessServer();
 		const logs = captureLogs();
-		const globals = globalThis as unknown as { location?: URL };
+		const rebuilt = mode === 'rebuilt';
 		if (rebuilt) {
-			globals.location = new URL(server.url);
+			Object.defineProperty(globalThis, 'location', { value: new URL(server.url), configurable: true });
+		} else if (mode === 'throwing location') {
+			Object.defineProperty(globalThis, 'location', {
+				get: () => {
+					throw new ReferenceError('Access to "location", run again with --location <href>.');
+				},
+				configurable: true,
+			});
 		}
 
 		try {
 			using input = new Input({
-				source: new UrlSource('video.mp4', {
+				source: new UrlSource(mode === 'throwing location' ? server.url : 'video.mp4', {
 					fetchFn: async (url, init) => {
 						const response = await fetch(new URL(url as string, server.url), init);
 						return rebuilt ? new Response(response.body, response) : response;
@@ -93,11 +101,11 @@ test('UrlSource reads a relative URL from a server without range request support
 				packetCount++;
 			}
 
-			expect(packetCount).toBe(125);
+			expect(packetCount, mode).toBe(125);
 			const warning = `HTTP server (origin ${new URL(server.url).origin}) did not respond to a range request`;
-			expect(logs.warnings.filter(x => x.includes(warning))).toHaveLength(1);
+			expect(logs.warnings.filter(x => x.includes(warning)), mode).toHaveLength(1);
 		} finally {
-			delete globals.location;
+			Reflect.deleteProperty(globalThis, 'location');
 			logs.stop();
 			server.close();
 		}
