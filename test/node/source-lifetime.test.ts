@@ -21,6 +21,35 @@ import { Logging } from '../../src/logging.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
+// Linux lists the open files of the process
+test.skipIf(process.platform !== 'linux')('FilePathSource disposed while opening its file closes it', async () => {
+	const fs = await import('node:fs');
+	const filePath = path.join(__dirname, '../public/video.mp4');
+	const openFileCount = () => fs.readdirSync('/proc/self/fd').length;
+	const before = openFileCount();
+
+	const outcomes = new Set<string>();
+	for (let i = 0; i < 50; i++) {
+		const input = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+		const format = input.getFormat().then(
+			() => 'read',
+			(error: unknown) => error instanceof InputDisposedError ? 'InputDisposedError' : String(error),
+		);
+		input.dispose(); // While its file is still opening
+		outcomes.add(await format);
+	}
+
+	// Each pending read rejects with InputDisposedError. On main, they failed with "Assertion failed."
+	expect([...outcomes]).toEqual(['InputDisposedError']);
+
+	// And each file gets closed again. On main, each one stayed open.
+	const deadline = Date.now() + 2000;
+	while (openFileCount() > before && Date.now() < deadline) {
+		await new Promise(resolve => setTimeout(resolve, 20));
+	}
+	expect(openFileCount()).toBeLessThanOrEqual(before);
+});
+
 test('Direct source disposal', async () => {
 	const filePath = path.join(__dirname, '../public/video.mp4');
 	const source = new FilePathSource(filePath);
