@@ -251,6 +251,7 @@ export class MpegTsDemuxer extends Demuxer {
 			// that data be gone after all (a source that only keeps what its cache holds evicts as it reads on)
 			let goingBack: {
 				resumePos: number;
+				maxSectionEndPos: number;
 				streams: {
 					stream: ElementaryStream;
 					state: Pick<
@@ -268,7 +269,11 @@ export class MpegTsDemuxer extends Demuxer {
 				this.timestampWrapInfo = going.timestampWrapInfo;
 				currentPos = going.resumePos;
 				goingBack = null;
+				readsOnFromPmt = true;
 			};
+			// Set when reading on from the PMT after all, which the cache may not hold anymore either (reading a
+			// stream's first frame can read far ahead)
+			let readsOnFromPmt = false;
 
 			while (true) {
 				if (goingBack && currentPos >= goingBack.resumePos) {
@@ -279,13 +284,21 @@ export class MpegTsDemuxer extends Demuxer {
 				try {
 					packetHeader = await this.readPacketHeader(currentPos);
 				} catch (error) {
-					if (!goingBack) {
-						throw error;
+					if (goingBack) {
+						readOnFromPmt(goingBack);
+						continue;
 					}
 
-					readOnFromPmt(goingBack);
-					continue;
+					if (readsOnFromPmt) {
+						// Then read on from where the cache holds data again
+						readsOnFromPmt = false;
+						currentPos = await this.findReadablePos(currentPos);
+						continue;
+					}
+
+					throw error;
 				}
+				readsOnFromPmt = false;
 				if (!packetHeader) {
 					break;
 				}
@@ -304,6 +317,17 @@ export class MpegTsDemuxer extends Demuxer {
 					)
 				) {
 					// Don't care about this PID (anymore)
+					currentPos += this.packetStride;
+					continue;
+				}
+
+				if (
+					goingBack
+					&& goingBack.maxSectionEndPos !== Infinity
+					&& !await this.pesPacketEndsBefore(currentPos, packetHeader.pid, goingBack.maxSectionEndPos)
+				) {
+					// Reading this PES packet in full would read so far ahead that a source that only keeps what its
+					// cache holds would lose the rest of the way back to the PMT, so its stream starts after the PMT
 					currentPos += this.packetStride;
 					continue;
 				}
@@ -590,10 +614,13 @@ export class MpegTsDemuxer extends Demuxer {
 					// it's all still there
 					if (
 						this.elementaryStreams.some(x => !x.initialized)
+						&& currentPos + this.packetStride <= this.packetOffset + 1.5 * getReadBackDistance(this.reader)
 						&& await this.canReadAgain(this.packetOffset, currentPos)
 					) {
 						goingBack = {
 							resumePos: currentPos + this.packetStride,
+							// Reads up to there keep the start in the cache (within three quarters of it)
+							maxSectionEndPos: this.packetOffset + 1.5 * getReadBackDistance(this.reader),
 							streams: this.elementaryStreams.map(stream => ({
 								stream,
 								state: {
@@ -1060,6 +1087,31 @@ export class MpegTsDemuxer extends Demuxer {
 			payload: merged,
 			randomAccessIndicator,
 		};
+	}
+
+	/** Returns the first position from the given one on, in steps of TS packets, whose data can still be read. */
+	async findReadablePos(pos: number) {
+		const step = 64 * this.packetStride;
+		while (!await this.canReadAgain(pos, pos + 1)) {
+			pos += step;
+		}
+
+		return pos;
+	}
+
+	/**
+	 * Checks that the PES packet starting at the given position ends, as another one of its PID starts, before the end
+	 * position, from the TS packet headers.
+	 */
+	async pesPacketEndsBefore(pos: number, pid: number, endPos: number) {
+		for (let currentPos = pos + this.packetStride; currentPos < endPos; currentPos += this.packetStride) {
+			const packetHeader = await this.readPacketHeader(currentPos);
+			if (!packetHeader || (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1)) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
