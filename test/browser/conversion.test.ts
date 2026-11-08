@@ -775,6 +775,43 @@ test('Canceling a composable conversion leaves the output usable', async () => {
 	expect(await audioTrack!.getCodec()).toBe('aac');
 });
 
+test('Canceling while the output finalizes makes execute() throw', async () => {
+	const { StreamTarget } = await import('../../src/target.js');
+	using input = new Input({
+		source: new UrlSource('/video.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	// A stream whose close never completes, like a file commit or an upload that never gets its response
+	let closing = false;
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new StreamTarget(new WritableStream({
+			close: () => {
+				closing = true;
+				return new Promise<void>(() => {});
+			},
+		})),
+	});
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+
+	const executePromise = conversion.execute();
+	executePromise.catch(() => {});
+	for (let i = 0; i < 500 && !closing; i++) {
+		await new Promise(resolve => setTimeout(resolve, 10));
+	}
+	expect(closing).toBe(true);
+	expect(output.state).toBe('finalizing');
+
+	const timeout = (ms: number) => new Promise(resolve => setTimeout(() => resolve('pending'), ms));
+	expect(await Promise.race([conversion.cancel().then(() => 'resolved'), timeout(1000)])).toBe('resolved');
+	expect(await Promise.race([
+		executePromise.then(() => 'resolved', (error: unknown) => error instanceof ConversionCanceledError),
+		timeout(1000),
+	])).toBe(true);
+	expect(conversion.state).toBe('canceled');
+});
+
 test('Track capacity works correctly with composable conversions', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
