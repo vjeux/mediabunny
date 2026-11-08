@@ -578,6 +578,8 @@ export class IsobmffDemuxer extends Demuxer {
 	/** Whether the file ends inside the moov box (or the moov box's size goes past the end of the file) */
 	moovIsCutOff = false;
 	movieDurationInTimescale = -1;
+	/** From the mehd box: the duration of a fragmented movie including its fragments, in the movie timescale */
+	fragmentedMovieDurationInTimescale = -1;
 	movieMatrix = IDENTITY_MATRIX;
 	isQuickTime = false;
 	metadataTags: MetadataTags = {};
@@ -924,6 +926,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 		this.movieTimescale = initDemuxer.movieTimescale;
 		this.movieDurationInTimescale = initDemuxer.movieDurationInTimescale;
+		this.fragmentedMovieDurationInTimescale = initDemuxer.fragmentedMovieDurationInTimescale;
 		this.movieMatrix = initDemuxer.movieMatrix;
 		this.metadataTags = initDemuxer.metadataTags;
 		this.isFragmented = true;
@@ -3287,8 +3290,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				const fragmentDuration = version === 1 ? readU64Be(slice) : readU32Be(slice);
-				this.movieDurationInTimescale = fragmentDuration;
+				this.fragmentedMovieDurationInTimescale = version === 1 ? readU64Be(slice) : readU32Be(slice);
 			}; break;
 
 			case 'trex': {
@@ -4481,6 +4483,31 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 	async getDurationFromMetadata() {
 		const track = this.internalTrack;
+		const { demuxer } = track;
+
+		if (demuxer.isFragmented) {
+			// The mdhd box only describes the samples in the moov box, while the mehd box gives the movie's duration
+			// including its fragments (ISO/IEC 14496-12 8.8.2)
+			if (demuxer.fragmentedMovieDurationInTimescale > 0) {
+				return demuxer.fragmentedMovieDurationInTimescale / demuxer.movieTimescale;
+			}
+
+			let hasSamplesInMoov: boolean | null = null;
+			try {
+				hasSamplesInMoov = !sampleTableIsEmpty(demuxer.getSampleTableForTrack(track));
+			} catch {
+				// A sample table that can't be read (a damaged file) leaves it to the mdhd box, as before
+			}
+
+			if (hasSamplesInMoov === false) {
+				// All of the samples are in fragments, so the mdhd box has nothing to describe; Chromium's muxer even
+				// writes milliseconds there. Like Chromium, fall back to the mvhd box's duration.
+				return demuxer.movieDurationInTimescale > 0
+					? demuxer.movieDurationInTimescale / demuxer.movieTimescale
+					: null;
+			}
+		}
+
 		let durationInMediaTimescale = track.durationInMediaTimescale;
 		if (durationInMediaTimescale <= 0) {
 			// The duration is often zero for fragmented files for example; return `null` to signal that the duration
