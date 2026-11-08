@@ -638,3 +638,146 @@ test('Empty PCM packets are skipped when decoding', async () => {
 	}
 	expect(bufferFrames).toEqual([2, 2]);
 });
+
+test('Decoded audio samples can be looked up by their own timestamps (Matroska)', async () => {
+	using input = new Input({
+		source: new UrlSource('/demo.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const sink = new AudioSampleSink(track);
+	const samples: { timestamp: number; numberOfFrames: number }[] = [];
+	for await (using sample of sink.samples(0, 1)) {
+		samples.push({ timestamp: sample.timestamp, numberOfFrames: sample.numberOfFrames });
+	}
+
+	// Matroska stores packet timestamps in milliseconds, while decoded audio is timed by its sample count. Decoding
+	// from elsewhere can move a sample by up to that precision, but must not give the sample before it (20 ms earlier).
+	for (const { timestamp, numberOfFrames } of samples.slice(1)) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBeCloseTo(timestamp, 2);
+		expect(sample.numberOfFrames).toBe(numberOfFrames);
+
+		for await (using first of sink.samples(timestamp)) {
+			expect(first.timestamp).toBeCloseTo(timestamp, 2);
+			break;
+		}
+	}
+});
+
+test('Sample ranges keep their exclusive end with timestamp tolerance', async () => {
+	// Video has no tolerance, PCM WAVE packets sit on the sample grid, Matroska audio is compared within a millisecond
+	const sinks = [
+		['/video.mp4', 'video'],
+		['/glitch-hop-is-dead.wav', 'audio'],
+		['/demo.webm', 'audio'],
+	] as const;
+
+	for (const [file, type] of sinks) {
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = type === 'video' ? await input.getPrimaryVideoTrack() : await input.getPrimaryAudioTrack();
+		assert(track);
+		const sink = track.isVideoTrack() ? new VideoSampleSink(track) : new AudioSampleSink(track);
+
+		const timestamps: number[] = [];
+		for await (using sample of sink.samples()) {
+			timestamps.push(sample.timestamp);
+			if (timestamps.length === 3) {
+				break;
+			}
+		}
+
+		// The first sample, at the start of an empty range, isn't yielded
+		const first = timestamps[0]!;
+		const emptyRange: number[] = [];
+		for await (using sample of sink.samples(first, first)) {
+			emptyRange.push(sample.timestamp);
+		}
+		expect(emptyRange, file).toEqual([]);
+
+		// A range ending at the third sample yields the first two
+		const third = timestamps[2];
+		assert(third !== undefined);
+		const range: number[] = [];
+		for await (using sample of sink.samples(first, third)) {
+			range.push(sample.timestamp);
+		}
+		expect(range, file).toEqual(timestamps.slice(0, 2));
+	}
+});
+
+// WebKitGTK's GStreamer FLAC decoder fails, and then stalls every later audio decode on the page, so this comes last.
+// Whether the platform decodes FLAC is decided with WebCodecs alone, never with Mediabunny, so that a Mediabunny
+// failure fails instead of skipping. The probe is the start of a tiny stream (as in the conformance suite), from
+// ffmpeg -f lavfi -i anullsrc=r=16000:cl=mono -t 0.1 -c:a flac ("fLaC" + the STREAMINFO block, then two frames).
+const flacDecodesNatively = async () => {
+	const fromBase64 = (base64: string) => Uint8Array.from(atob(base64), x => x.charCodeAt(0));
+	const decoder = new AudioDecoder({ output: data => data.close(), error: () => {} });
+	decoder.configure({
+		codec: 'flac',
+		sampleRate: 16000,
+		numberOfChannels: 1,
+		description: fromBase64('ZkxhQ4AAACIEgASAAAALAAANA+gA8AAABkCfCt/b50DLnNgYijV2HiR2'),
+	});
+	['//g1CAADAAAAakQ=', '//h1CAEBv70AAAAGlg=='].forEach((chunk, i) => decoder.decode(new EncodedAudioChunk({
+		type: 'key',
+		timestamp: i * 64000,
+		data: fromBase64(chunk),
+	})));
+
+	const decodes = await Promise.race([
+		decoder.flush().then(() => true, () => false),
+		new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+	]);
+	if (decoder.state !== 'closed') {
+		decoder.close();
+	}
+
+	return decodes;
+};
+
+// MP3 and FLAC time packets in samples, so a timestamp one sample before a packet still belongs to the packet before it
+test.for(['/Toothsome-Meme.VBRv2.mp3', '/sample.flac'])(
+	'Audio lookups stay sample-exact where packets sit on the sample grid (%s)',
+	async (file, { skip }) => {
+		if (file.endsWith('.flac')) {
+			skip(!(await flacDecodesNatively()), 'FLAC can\'t be decoded here (native probe)');
+		}
+
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sampleRate = await track.getSampleRate();
+
+		// Far enough in that decoding doesn't start at the first packets, which start below 0 (MP3's encoder delay), as
+		// WebKitGTK's decoder scrambles the timestamps following a negative one. The MP3 pre-roll is over 2 s here.
+		const packetSink = new EncodedPacketSink(track);
+		const packet = await packetSink.getPacket(3);
+		assert(packet);
+		const previousPacket = await packetSink.getPacket(packet.timestamp - 1 / sampleRate);
+		assert(previousPacket && previousPacket.timestamp < packet.timestamp);
+
+		const sink = new AudioSampleSink(track);
+		using sampleBefore = await sink.getSample(packet.timestamp - 1 / sampleRate);
+		using sampleAt = await sink.getSample(packet.timestamp);
+		expect(sampleBefore?.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+		expect(sampleAt?.timestamp).toBeCloseTo(packet.timestamp, 6);
+
+		for await (using first of sink.samples(packet.timestamp - 1 / sampleRate)) {
+			expect(first.timestamp).toBeCloseTo(previousPacket.timestamp, 6);
+			break;
+		}
+	},
+);
