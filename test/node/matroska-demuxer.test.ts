@@ -4,11 +4,13 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import {
 	ALL_FORMATS,
+	BufferSource,
 	CustomSource,
 	EncodedPacketSink,
 	FilePathSource,
 	Input,
 } from '../../src/index.js';
+import { EBMLId } from '../../src/matroska/ebml.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -81,4 +83,53 @@ test('Key packet lookup past position cache entries', async () => {
 	const keyPacket = await sink.getKeyPacket(55.29);
 	expect(keyPacket?.timestamp).toBe(50);
 	expect(bytesRead).toBeLessThan(0.05 * buffer.byteLength);
+});
+
+test('getPacket at the end of a packet that starts before zero returns the next packet', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const block = (timestamp: number) => element(
+		EBMLId.SimpleBlock,
+		[0x81, (timestamp >> 8) & 0xff, timestamp & 0xff, 0x80, 0, 0],
+	);
+
+	// As FFmpeg writes MP3 in Matroska: the first packet starts before zero, at -25 ms, and lasts 26 ms
+	const bytes = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+				element(EBMLId.Audio, element(EBMLId.BitDepth, [16])),
+			)),
+			element(EBMLId.Cluster, element(EBMLId.Timestamp, [0]), block(-25), block(1), block(27)),
+		),
+	]);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const first = await sink.getFirstPacket();
+	assert(first);
+	expect([first.timestamp, first.duration]).toEqual([-0.025, 0.026]);
+	// -0.025 + 0.026 is 0.0009999999999999974 in floating point
+	expect((await sink.getPacket(first.timestamp + first.duration))?.timestamp).toBe(0.001);
+	// Controls
+	expect((await sink.getPacket(0.001))?.timestamp).toBe(0.001);
+	expect((await sink.getPacket(0.0005))?.timestamp).toBe(-0.025);
 });

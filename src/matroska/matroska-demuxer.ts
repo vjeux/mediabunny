@@ -2270,8 +2270,11 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 	private intoTimescale(timestamp: number) {
 		// Do a little rounding to catch cases where the result is very close to an integer. If it is, it's likely
 		// that the number was originally an integer divided by the timescale. For stability, it's best
-		// to return the integer in this case.
-		return roundIfAlmostInteger(timestamp * this.internalTrack.segment.timestampFactor)
+		// to return the integer in this case. Near zero, a computed timestamp's float error can exceed the relative
+		// tolerance (the end of a packet that starts before zero, -0.025 + 0.026), so tiny absolute errors count too.
+		const ticks = timestamp * this.internalTrack.segment.timestampFactor;
+		const rounded = Math.round(ticks);
+		return (Math.abs(ticks - rounded) < 1e-6 ? rounded : roundIfAlmostInteger(ticks))
 			+ this.internalTrack.codecDelay;
 	}
 
