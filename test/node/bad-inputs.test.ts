@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import { expect, test } from 'vitest';
 import {
 	ALL_FORMATS,
@@ -11,6 +12,7 @@ import {
 	Input,
 	ReadableStreamSource,
 	Source,
+	UrlSource,
 } from '../../src/index.js';
 import { EBMLId } from '../../src/matroska/ebml.js';
 
@@ -2058,6 +2060,96 @@ const hlsSource = (files: Record<string, string | Uint8Array>, onRequest?: () =>
 };
 
 const hlsSegment = () => readFileSync(path.join(__dirname, '../public/mp3.ts')).subarray(0, 188 * 60);
+
+test('Damaged or hostile sizes don\'t make reads buffer whole streams or allocate huge buffers', async () => {
+	const ascii = (text: string) => Array.from(text, c => c.charCodeAt(0));
+	const le32 = (n: number) => [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, n >>> 24];
+	const ftyp = [0, 0, 0, 16, ...ascii('ftypisom'), 0, 0, 2, 0];
+	// An MP4 box header with a 64-bit size of sizeHigh * 2^32 bytes
+	const bigBoxHeader = (type: string, sizeHigh: number) => [
+		0, 0, 0, 1, ...ascii(type), 0, 0, sizeHigh >> 8, sizeHigh & 0xff, 0, 0, 0, 0,
+	];
+
+	// The given bytes followed by up to 256 MiB of zeros, counting how much has been pulled
+	const makeStream = (head: number[]) => {
+		const stats = { pulled: 0 };
+		const stream = new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				if (stats.pulled >= 256 * 2 ** 20) {
+					controller.close();
+				} else {
+					const chunk = stats.pulled === 0 ? new Uint8Array(head) : new Uint8Array(2 ** 20);
+					controller.enqueue(chunk);
+					stats.pulled += chunk.length;
+				}
+			},
+		});
+		return { source: new ReadableStreamSource(stream), stats };
+	};
+
+	// A server that claims 2 TiB, sends the given bytes and 64 MiB of zeros, then drops the connection
+	const startHostileServer = async (head: number[]) => {
+		const server = http.createServer((req, res) => {
+			const start = Number(/bytes=(\d+)-/.exec(req.headers.range!)![1]);
+			res.on('error', () => {});
+			res.writeHead(206, { 'Content-Range': `bytes ${start}-${2 ** 41 - 1}/${2 ** 41}` });
+			res.write(Buffer.from(head.slice(start)));
+			let sentBytes = 0;
+			const sendMore = () => {
+				while (sentBytes < 64 * 2 ** 20 && res.write(Buffer.alloc(2 ** 20))) {
+					sentBytes += 2 ** 20;
+				}
+				if (sentBytes < 64 * 2 ** 20) {
+					res.once('drain', sendMore);
+				} else {
+					res.destroy();
+				}
+			};
+			sendMore();
+		});
+		await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+		return server;
+	};
+
+	const message = 'a single read over 1 GiB';
+
+	// A source of unknown size, like an upload read with new ReadableStreamSource(Readable.toWeb(request)). On main,
+	// everything after the moov header was held in memory waiting for the box to end (here 256 MiB, else unbounded)
+	const moovStream = makeStream([...ftyp, ...bigBoxHeader('moov', 0x100)]); // 2^40 bytes
+	using moovInput = new Input({ source: moovStream.source, formats: ALL_FORMATS });
+	await expect(moovInput.getTracks()).rejects.toThrow(message);
+	expect(moovStream.stats.pulled).toBeLessThan(4 * 2 ** 20);
+
+	// A live fragmented MP4 whose first moof claims 2^40 bytes
+	const file = readFileSync(path.join(__dirname, '../public/rotate-buck-bunny.mp4'));
+	const moofStream = makeStream([...file.subarray(0, 1152), ...bigBoxHeader('moof', 0x100)]); // After ftyp + moov
+	using moofInput = new Input({ source: moofStream.source, formats: ALL_FORMATS });
+	const packets = new EncodedPacketSink((await moofInput.getPrimaryVideoTrack())!).packets();
+	await expect(packets.next()).rejects.toThrow(message);
+	expect(moofStream.stats.pulled).toBeLessThan(4 * 2 ** 20);
+
+	// A server stating a huge file size, for an MP4 whose moov claims 4 GiB and a WAVE whose LIST chunk claims about as
+	// much. On main, both streamed until the server gave up, reading the MP4 allocated a 4 GiB buffer, and both then
+	// failed with unrelated errors
+	const fmt = [...ascii('fmt '), ...le32(16), 1, 0, 2, 0, ...le32(44100), ...le32(176400), 4, 0, 16, 0];
+	for (const head of [
+		[...ftyp, ...bigBoxHeader('moov', 1)],
+		[...ascii('RIFF'), ...le32(0xffffffff), ...ascii('WAVE'), ...fmt, ...ascii('LIST'), ...le32(0xfffffff0)],
+	]) {
+		const server = await startHostileServer(head);
+		try {
+			const address = server.address() as { port: number };
+			using input = new Input({
+				source: new UrlSource(`http://127.0.0.1:${address.port}/file`, { getRetryDelay: () => null }),
+				formats: ALL_FORMATS,
+			});
+			await expect(input.getTracks()).rejects.toThrow(message);
+		} finally {
+			server.closeAllConnections();
+			server.close();
+		}
+	}
+});
 
 test('Key packet verification with timestamps beyond float precision', async () => {
 	// Stepping back from the fake key frame by one time unit is a no-op at this magnitude, so it used to request the
