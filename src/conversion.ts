@@ -1542,13 +1542,14 @@ export class Conversion {
 		);
 		let outputTrackRotation = totalRotation;
 		let outputTrackFlip = totalFlip;
-		// When the transformation is left untouched, we forward the input's full matrix so nothing gets lost
-		let outputTrackMatrix = trackOptions.rotate || trackOptions.flip
-			? null
-			: await track.getTransformationMatrix();
 		const canUseRotationMetadata = this.output.format.supportsVideoTransformationMetadata
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			&& (trackOptions.allowTransformationMetadata ?? trackOptions.allowRotationMetadata ?? true);
+		// When the transformation is left untouched, we forward the input's full matrix so nothing gets lost, unless
+		// transformation metadata isn't to be used at all
+		let outputTrackMatrix = trackOptions.rotate || trackOptions.flip || !canUseRotationMetadata
+			? null
+			: await track.getTransformationMatrix();
 
 		const squarePixelWidth = await track.getSquarePixelWidth();
 		const squarePixelHeight = await track.getSquarePixelHeight();
