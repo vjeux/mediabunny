@@ -145,6 +145,31 @@ export class HlsSegmentedInput extends SegmentedInput {
 	 * Reads and parses the segment info from the playlist file. When called more than one, it updates the existing
 	 * segments by appending the new ones. Existing segments are never removed.
 	 */
+	/**
+	 * Makes sure the reference playlist has been read. Whether a discontinuity follows its program date times is up to
+	 * the reference playlist, so that where the discontinuity lands doesn't depend on which playlist is read first.
+	 */
+	async loadReferencePlaylist() {
+		if (!this.demuxer.hasMasterPlaylist || !this.demuxer.internalTracks) {
+			return;
+		}
+
+		try {
+			const reference = this.demuxer.getReferenceSegmentedInput();
+			if (reference === this) {
+				return;
+			}
+
+			if (reference.currentUpdateSegmentsPromise) {
+				await reference.currentUpdateSegmentsPromise;
+			} else if (reference.lastSegmentUpdateTime === -Infinity) {
+				await reference.runUpdateSegments();
+			}
+		} catch {
+			// Then this playlist decides for itself
+		}
+	}
+
 	async updateSegments() {
 		let lines = this.nextLines;
 		this.nextLines = null;
@@ -176,6 +201,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 		}
 
 		const offsetTimestampsByDateTime = this.input._formatOptions.hls?.offsetTimestampsByDateTime !== false;
+		if (offsetTimestampsByDateTime && lines.some(line => line.startsWith(TAG_PROGRAM_DATE_TIME))) {
+			await this.loadReferencePlaylist();
+		}
 		const variables = new HlsPlaylistVariables(
 			this.rootPath,
 			this.demuxer.hasMasterPlaylist ? this.demuxer.masterPlaylistVariables : null,
@@ -277,7 +305,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						// the timeline go back in time. Small overlaps are fine; servers may use them to account for
 						// clock drift (RFC 8216bis 6.2.1). The first date of a discontinuity decides for the whole
 						// discontinuity, and for all playlists: their timelines end a bit apart, but they must place
-						// the discontinuity alike.
+						// the discontinuity alike. The reference playlist, read first, decides when it can.
 						const decisions = this.demuxer.discontinuitiesFollowingDates;
 						let followsDates = decisions.get(nextDiscontinuityNumber);
 						if (followsDates === undefined) {

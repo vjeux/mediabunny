@@ -2596,13 +2596,35 @@ test('Renditions dated alike take the same decision for a discontinuity dated ea
 		}
 	}
 
-	using input = new Input({
+	const openInput = () => new Input({
 		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
 		formats: ALL_FORMATS,
 	});
+
+	using input = openInput();
 	const audioTrack = (await input.getPrimaryAudioTrack())!;
 	const metadataDuration = (await audioTrack.getDurationFromMetadata())!;
 	expect(Math.abs(metadataDuration - await audioTrack.computeDuration())).toBeLessThan(0.1);
+
+	// Nor does where the discontinuity lands depend on which track is read first
+	const getSecondClipStart = async (firstTrackType: 'video' | 'audio') => {
+		using orderInput = openInput();
+		const firstTrack = (await orderInput.getTracks()).find(track => track.type === firstTrackType)!;
+		const firstSink = new EncodedPacketSink(firstTrack);
+		for await (const packet of firstSink.packets(undefined, undefined, { metadataOnly: true })) {
+			void packet;
+		}
+
+		const videoTrack = (await orderInput.getPrimaryVideoTrack())!;
+		const timestamps: number[] = [];
+		const sink = new EncodedPacketSink(videoTrack);
+		for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+			timestamps.push(packet.timestamp);
+		}
+
+		return timestamps[50]!; // The second clip's first frame
+	};
+	expect(await getSecondClipStart('audio')).toBeCloseTo(await getSecondClipStart('video'), 3);
 });
 
 test('Sparse tracks in segments, fragmented MP4 + single file', async () => {
