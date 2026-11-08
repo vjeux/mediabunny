@@ -911,6 +911,19 @@ export class VideoSample implements Disposable {
 	 * @returns The byte layout of the planes of the copied data.
 	 */
 	async copyTo(destination: AllowSharedBufferSource, options: VideoFrameCopyToOptions = {}): Promise<PlaneLayout[]> {
+		return this._copyTo(destination, options, true);
+	}
+
+	/**
+	 * `convertColorSpace` is false for samples returned by toRgbSample(), whose pixels are in the requested color
+	 * space already.
+	 * @internal
+	 */
+	async _copyTo(
+		destination: AllowSharedBufferSource,
+		options: VideoFrameCopyToOptions,
+		convertColorSpace: boolean,
+	): Promise<PlaneLayout[]> {
 		if (!isAllowSharedBufferSource(destination)) {
 			throw new TypeError('destination must be an ArrayBuffer or an ArrayBuffer view.');
 		}
@@ -924,9 +937,45 @@ export class VideoSample implements Disposable {
 		}
 
 		assert(this._data !== null);
+		// Like VideoFrame.copyTo(), the copy reads the pixels as they are when it's called, even if the sample is
+		// closed before the copy (which may wait for the conversion probe) finishes
+		const data = this._data;
+		const layout = this._layout;
 
-		if (isVideoFrame(this._data)) {
-			return this._data.copyTo(destination, options);
+		if (isVideoFrame(data)) {
+			return data.copyTo(destination, options);
+		}
+
+		// Copying into an RGB format converts the pixels into options.colorSpace (sRGB by default). We can't convert
+		// between color spaces ourselves, so let VideoFrame do it when the sample's RGB data is in another one, if this
+		// platform's VideoFrame can; otherwise, the pixels are copied as they are below. Custom resources are left
+		// alone, since they convert colors in toRgbSample().
+		if (
+			convertColorSpace
+			&& data instanceof Uint8Array
+			&& options.format
+			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
+			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(this.format!)
+			&& !isInPredefinedColorSpace(this.colorSpace, options.colorSpace ?? 'srgb')
+			&& await canConvertRgbColorSpaces()
+		) {
+			// Wrap exactly the visible rect: the smallest coded size containing it, with the strides of the layout
+			// (toVideoFrame() would reset a visible rect that doesn't start at the origin)
+			const visible = this.visibleRect;
+			const tempFrame = new VideoFrame(data, {
+				format: this.format as VideoPixelFormat,
+				codedWidth: visible.left + visible.width,
+				codedHeight: visible.top + visible.height,
+				layout: layout!,
+				visibleRect: { x: visible.left, y: visible.top, width: visible.width, height: visible.height },
+				timestamp: this.microsecondTimestamp,
+				colorSpace: this.colorSpace,
+			});
+			try {
+				return await tempFrame.copyTo(destination, options);
+			} finally {
+				tempFrame.close();
+			}
 		}
 
 		// Detect non-RGB to RGB conversion
@@ -936,8 +985,8 @@ export class VideoSample implements Disposable {
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
 		) {
 			// RGB conversion for custom VideoSampleResource
-			if (this._data instanceof VideoSampleResource) {
-				using rgbSample = await this._data.toRgbSample(
+			if (data instanceof VideoSampleResource) {
+				using rgbSample = await data.toRgbSample(
 					{
 						timestamp: this.timestamp,
 						duration: this.duration,
@@ -957,7 +1006,8 @@ export class VideoSample implements Disposable {
 				}
 				// Note that we DON'T force the RGB format to be exactly what was requested; any RGB format will do
 
-				return await rgbSample.copyTo(destination, options); // 'await' is intentional here cuz of using
+				// 'await' is intentional here cuz of using
+				return await rgbSample._copyTo(destination, options, false);
 			} else {
 				if (typeof VideoFrame === 'undefined') {
 					throw new Error(
@@ -989,8 +1039,8 @@ export class VideoSample implements Disposable {
 		const planeConfigs = getPlaneConfigs(this.format);
 		let dataPlanes: VideoDataPlane[];
 
-		if (this._data instanceof VideoSampleResource) {
-			let result = this._data.getDataPlanes();
+		if (data instanceof VideoSampleResource) {
+			let result = data.getDataPlanes();
 			if (isThenable(result)) result = await result;
 
 			if (
@@ -1004,15 +1054,15 @@ export class VideoSample implements Disposable {
 			}
 
 			dataPlanes = result;
-		} else if (this._data instanceof Uint8Array) {
-			assert(this._layout);
-			assert(this._layout.length === planeConfigs.length);
+		} else if (data instanceof Uint8Array) {
+			assert(layout);
+			assert(layout.length === planeConfigs.length);
 
-			dataPlanes = this._layout.map((planeLayout, i) => {
+			dataPlanes = layout.map((planeLayout, i) => {
 				const height = Math.ceil(this.codedHeight / planeConfigs[i]!.heightDivisor);
 
 				return {
-					data: (this._data as Uint8Array).subarray(
+					data: data.subarray(
 						planeLayout.offset,
 						planeLayout.offset + planeLayout.stride * height,
 					),
@@ -1020,7 +1070,7 @@ export class VideoSample implements Disposable {
 				};
 			});
 		} else {
-			const canvas = this._data;
+			const canvas = data;
 			const context = canvas.getContext('2d');
 			assert(context); // We already got it earlier so it's definitely available
 
@@ -2095,6 +2145,70 @@ const isVideoFrame = (x: unknown): x is VideoFrame => {
 type OrientedVideoFrame = VideoFrame & {
 	rotation?: number;
 	flip?: boolean;
+};
+
+/**
+ * Whether RGB data in the given color space is already in the given predefined color space. Like Chrome, this treats
+ * unspecified members and the BT.709 transfer function as sRGB.
+ */
+const isInPredefinedColorSpace = (colorSpace: VideoSampleColorSpace, target: PredefinedColorSpace) => {
+	const primaries = colorSpace.primaries as string | null;
+	const transfer = colorSpace.transfer as string | null;
+	if (target === 'display-p3') {
+		return primaries === 'smpte432' && transfer === 'iec61966-2-1';
+	}
+
+	return (primaries === null || primaries === 'bt709')
+		&& (transfer === null || transfer === 'iec61966-2-1' || transfer === 'bt709');
+};
+
+let rgbColorSpaceConversionSupport: Promise<boolean> | null = null;
+
+/**
+ * Whether this platform's VideoFrame converts RGB pixels between color spaces and channel orders in copyTo(), as the
+ * spec requires. Not all do: Firefox ignores the color space of a Display P3 frame, WebKitGTK copies RGB planes
+ * verbatim.
+ */
+const canConvertRgbColorSpaces = () => {
+	return rgbColorSpaceConversionSupport ??= (async () => {
+		if (typeof VideoFrame === 'undefined') {
+			return false;
+		}
+
+		const copyOrange = async (primaries: string, options: VideoFrameCopyToOptions) => {
+			const frame = new VideoFrame(new Uint8Array([200, 100, 50, 255]), {
+				format: 'RGBA',
+				codedWidth: 1,
+				codedHeight: 1,
+				timestamp: 0,
+				colorSpace: {
+					primaries: primaries as VideoColorPrimaries,
+					transfer: 'iec61966-2-1',
+					matrix: 'rgb',
+					fullRange: true,
+				},
+			});
+			const bytes = new Uint8Array(4);
+			try {
+				await frame.copyTo(bytes, options);
+			} finally {
+				frame.close();
+			}
+			return bytes;
+		};
+
+		try {
+			// sRGB orange copied as Display P3 BGRA must change color and have red and blue swapped, and Display P3
+			// orange copied as sRGB must change color
+			const toDisplayP3 = await copyOrange('bt709', { format: 'BGRA', colorSpace: 'display-p3' });
+			const toSrgb = await copyOrange('smpte432', { format: 'RGBA', colorSpace: 'srgb' });
+			return toDisplayP3[2]! > toDisplayP3[0]!
+				&& (toDisplayP3[0] !== 50 || toDisplayP3[2] !== 200)
+				&& (toSrgb[0] !== 200 || toSrgb[2] !== 50);
+		} catch {
+			return false;
+		}
+	})();
 };
 
 /**
