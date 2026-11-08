@@ -462,8 +462,8 @@ export class Output<
 	_startPromise: Promise<void> | null = null;
 	/** @internal */
 	_cancelPromise: Promise<void> | null = null;
-	/** @internal Resolved once the output is canceled. */
-	_canceledSignal = promiseWithResolvers();
+	/** @internal */
+	_canceled = promiseWithResolvers();
 	/** @internal */
 	_finalizePromise: Promise<void> | null = null;
 	/** @internal */
@@ -957,7 +957,7 @@ export class Output<
 				// written to (see _getRootTarget and _getRootWriter)
 				const muxerStartPromise = this._muxer.start();
 				muxerStartPromise.catch(() => {}); // It fails on a target arriving after the cancel
-				await Promise.race([muxerStartPromise, this._canceledSignal.promise]);
+				await Promise.race([muxerStartPromise, this._canceled.promise]);
 				if ((this.state as Output['state']) === 'canceled') {
 					return;
 				}
@@ -1000,7 +1000,7 @@ export class Output<
 
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
-			this._canceledSignal.resolve();
+			this._canceled.resolve();
 
 			const release = await this._mutex.acquire();
 
