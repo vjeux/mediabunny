@@ -236,7 +236,7 @@ type InternalTrack = {
 			height: number;
 			displayWidth: number | null;
 			displayHeight: number | null;
-			displayUnit: number | null;
+			displayUnit: number;
 			squarePixelWidth: number;
 			squarePixelHeight: number;
 			horizontalScale: number;
@@ -1197,12 +1197,20 @@ export class MatroskaDemuxer extends Demuxer {
 						this.currentTrack.info.squarePixelWidth = this.currentTrack.info.width;
 						this.currentTrack.info.squarePixelHeight = this.currentTrack.info.height;
 
+						let displayWidth = this.currentTrack.info.displayWidth;
+						let displayHeight = this.currentTrack.info.displayHeight;
+						if (this.currentTrack.info.displayUnit === 0) {
+							displayWidth ??= this.currentTrack.info.width;
+							displayHeight ??= this.currentTrack.info.height;
+						}
+
 						if (
-							this.currentTrack.info.displayWidth !== null
-							&& this.currentTrack.info.displayHeight !== null
+							this.currentTrack.info.displayUnit !== 4 // "unknown"
+							&& displayWidth !== null
+							&& displayHeight !== null
 						) {
-							const num = this.currentTrack.info.displayWidth * this.currentTrack.info.height;
-							const den = this.currentTrack.info.displayHeight * this.currentTrack.info.width;
+							const num = displayWidth * this.currentTrack.info.height;
+							const den = displayHeight * this.currentTrack.info.width;
 
 							if (num > 0 && den > 0) {
 								if (num > den) {
@@ -1338,7 +1346,7 @@ export class MatroskaDemuxer extends Demuxer {
 						height: -1,
 						displayWidth: null,
 						displayHeight: null,
-						displayUnit: null,
+						displayUnit: 0, // Pixels
 						squarePixelWidth: -1,
 						squarePixelHeight: -1,
 						horizontalScale: 1,
