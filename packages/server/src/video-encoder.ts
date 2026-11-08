@@ -72,6 +72,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
+		if (config.scalabilityMode !== undefined && config.scalabilityMode !== 'L1T1') {
+			// The encoders here make a single layer, so other scalability modes are declined, as browsers decline the
+			// ones they can't make
+			return false;
+		}
+
 		if (config.bitrateMode === 'quantizer') {
 			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
 		}
