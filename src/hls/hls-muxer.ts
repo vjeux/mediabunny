@@ -1301,6 +1301,7 @@ export class HlsMuxer extends Muxer {
 
 						const offsetPacket = packet.clone({
 							timestamp: this.toMediaTimestamp(packet.timestamp),
+							duration: getSegmentPacketDuration(videoTrack.packets, i, videoEndIndex),
 						});
 
 						await videoSource.add(offsetPacket, meta);
@@ -1317,6 +1318,7 @@ export class HlsMuxer extends Muxer {
 
 						const offsetPacket = packet.clone({
 							timestamp: this.toMediaTimestamp(packet.timestamp),
+							duration: getSegmentPacketDuration(audioTrack.packets, i, audioEndIndex),
 						});
 
 						await audioSource.add(offsetPacket, meta);
@@ -1976,6 +1978,32 @@ export class HlsMuxer extends Muxer {
 		}
 	}
 }
+
+/**
+ * Returns the duration with which a segment's packet is written. A segment's last packet without a duration would
+ * end the segment's media there, one frame before the next segment starts, since the segment's own muxer never sees
+ * the next packet to fill in the gap (unlike a single fragmented MP4 file's muxer). So, give it the duration up to the
+ * next segment's start, as far as its packets are known yet.
+ */
+const getSegmentPacketDuration = (packets: EncodedPacket[], index: number, endIndex: number) => {
+	const packet = packets[index]!;
+	if (packet.duration > 0 || index !== endIndex - 1 || endIndex >= packets.length) {
+		return packet.duration;
+	}
+
+	// With B-frames, the last packet isn't necessarily the last one presented
+	let maxTimestamp = -Infinity;
+	for (let i = 0; i < endIndex; i++) {
+		maxTimestamp = Math.max(maxTimestamp, packets[i]!.timestamp);
+	}
+	// With open GOPs, frames decoded after the next segment's key frame can be presented before it
+	let nextTimestamp = Infinity;
+	for (let i = endIndex; i < packets.length; i++) {
+		nextTimestamp = Math.min(nextTimestamp, packets[i]!.timestamp);
+	}
+
+	return Math.max(0, nextTimestamp - maxTimestamp);
+};
 
 const validatePlaylistPath = (path: string) => {
 	if (typeof path !== 'string') {

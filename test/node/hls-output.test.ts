@@ -4054,6 +4054,74 @@ const testCrossVariantTimestamps = async (hlsOptions: HlsOutputFormatOptions) =>
 	expect(audioTimestamps).toEqual([-0.5, 0, 0.5, 1, 1.5, 2, 2.5, 3]);
 };
 
+test('CMAF segments stay contiguous when packets have no duration', async () => {
+	// Packets without a duration (e.g. from WebCodecs chunks of frames without one) end each segment's fragment with a
+	// sample of duration 0 unless the next segment's start fills it in, as the fragmented MP4 muxer does for its own
+	// fragments: "the track fragment decode time MUST be consistent with the decode time and duration of the previous
+	// segment" (Apple HLS authoring spec, 7.3)
+	const check = async (packetsHaveDurations: boolean, singleFilePerPlaylist: boolean) => {
+		const targets = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new CmafOutputFormat(),
+				targetDuration: 1,
+				singleFilePerPlaylist,
+			}),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				targets.set(request.path, target);
+				return target;
+			}),
+		});
+		const video = videoSource();
+		const audio = audioSource();
+		output.addVideoTrack(video, { frameRate: 25 });
+		output.addAudioTrack(audio);
+		await output.start();
+
+		const audioFrameDuration = 1024 / 48000;
+		let audioIndex = 0;
+		for (let i = 0; i < 75; i++) {
+			const timestamp = i / 25;
+			const type = i % 25 === 0 ? 'key' : 'delta';
+			const duration = packetsHaveDurations ? 1 / 25 : 0;
+			await video.add(new EncodedPacket(avcPacketData, type, timestamp, duration), avcMetadata);
+			for (; audioIndex * audioFrameDuration < timestamp + 1 / 25; audioIndex++) {
+				await audio.add(new EncodedPacket(
+					aacPacketData,
+					'key',
+					audioIndex * audioFrameDuration,
+					packetsHaveDurations ? audioFrameDuration : 0,
+				), aacMetadata);
+			}
+		}
+		await output.finalize();
+
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(targets.get(path)!.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		for (const track of await input.getTracks()) {
+			const sink = new EncodedPacketSink(track);
+			const packets: EncodedPacket[] = [];
+			for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+				packets.push(packet);
+			}
+			expect(packets.length).toBeGreaterThan(50);
+
+			// Every packet ends where the next one starts, across segment boundaries too. Only the very last packet's
+			// duration is unknown when it has none.
+			for (let i = 0; i < packets.length - 1; i++) {
+				expect(packets[i]!.timestamp + packets[i]!.duration).toBeCloseTo(packets[i + 1]!.timestamp, 4);
+			}
+		}
+	};
+
+	await check(true, false);
+	await check(false, false);
+	await check(false, true);
+});
+
 test('PRIV timestamps in packed audio segments, ADTS', async () => {
 	await testPackedAudioPrivTimestamps('sample3.aac', new AdtsOutputFormat());
 });
