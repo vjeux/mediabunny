@@ -13,6 +13,7 @@ import {
 	isIso639Dash2LanguageCode,
 	isThenable,
 	MaybePromise,
+	promiseWithResolvers,
 	Rotation,
 	toArray,
 	TransformationMatrix,
@@ -461,6 +462,8 @@ export class Output<
 	_startPromise: Promise<void> | null = null;
 	/** @internal */
 	_cancelPromise: Promise<void> | null = null;
+	/** @internal */
+	_canceled = promiseWithResolvers();
 	/** @internal */
 	_finalizePromise: Promise<void> | null = null;
 	/** @internal */
@@ -955,10 +958,17 @@ export class Output<
 	/**
 	 * Resolves with the full MIME type of the output file, including track codecs.
 	 *
-	 * The returned promise will resolve only once the precise codec strings of all tracks are known.
+	 * The returned promise will resolve only once the precise codec strings of all tracks are known. If the output is
+	 * canceled before that, the promise rejects.
 	 */
 	getMimeType() {
-		return this._muxer.getMimeType();
+		return Promise.race([
+			this._muxer.getMimeType(),
+			// Codec strings still unknown once the output is canceled will never be known
+			this._canceled.promise.then(() => {
+				throw new Error('Output has been canceled.');
+			}),
+		]);
 	}
 
 	/**
@@ -982,6 +992,7 @@ export class Output<
 
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
+			this._canceled.resolve();
 
 			const release = await this._mutex.acquire();
 
