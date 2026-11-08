@@ -2120,19 +2120,38 @@ test('Damaged or hostile sizes don\'t make reads buffer whole streams or allocat
 	await expect(moovInput.getTracks()).rejects.toThrow(message);
 	expect(moovStream.stats.pulled).toBeLessThan(4 * 2 ** 20);
 
-	// A damaged size in a stream that ends shortly after it still reads as cut off, like from memory
-	const shortFile = new Uint8Array([...ftyp, ...bigBoxHeader('moov', 0x100), ...new Array<number>(1000).fill(0)]);
-	const shortStream = new ReadableStream<Uint8Array>({
+	// A damaged size in a stream that ends shortly after it still reads as cut off, like from memory: a moov box, and
+	// the only sample of a small MP4 (like a fuzzed crash test), claiming 4 GiB
+	const countPackets = async (source: Source) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		try {
+			const counts: number[] = [];
+			for (const track of await input.getTracks()) {
+				let count = 0;
+				for await (const packet of new EncodedPacketSink(track).packets()) {
+					void packet;
+					count++;
+				}
+				counts.push(count);
+			}
+			return counts;
+		} catch (error) {
+			return String(error);
+		}
+	};
+	const streamOf = (data: Uint8Array) => new ReadableStreamSource(new ReadableStream<Uint8Array>({
 		start: (controller) => {
-			controller.enqueue(shortFile);
+			controller.enqueue(data);
 			controller.close();
 		},
-	});
-	const getTracksOutcome = (input: Input) => input.getTracks()
-		.then(tracks => `${tracks.length} tracks`, (error: unknown) => String(error));
-	using shortStreamInput = new Input({ source: new ReadableStreamSource(shortStream), formats: ALL_FORMATS });
-	using shortBufferInput = new Input({ source: new BufferSource(shortFile), formats: ALL_FORMATS });
-	expect(await getTracksOutcome(shortStreamInput)).toBe(await getTracksOutcome(shortBufferInput));
+	}));
+	const shortMoovFile = new Uint8Array([...ftyp, ...bigBoxHeader('moov', 1), ...new Array<number>(1000).fill(0)]);
+	const shortSampleFile = new Uint8Array(readFileSync(path.join(__dirname, '../public/sps-only-sar-h264.mp4')));
+	const stsz = Buffer.from(shortSampleFile).indexOf('stsz');
+	new DataView(shortSampleFile.buffer).setUint32(stsz + 8, 0xf8000004); // The sample size
+	for (const shortFile of [shortMoovFile, shortSampleFile]) {
+		expect(await countPackets(streamOf(shortFile))).toEqual(await countPackets(new BufferSource(shortFile)));
+	}
 
 	// A live fragmented MP4 whose first moof claims 2^40 bytes
 	const file = readFileSync(path.join(__dirname, '../public/rotate-buck-bunny.mp4'));
