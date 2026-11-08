@@ -58,7 +58,9 @@ export class EncodedPacket {
 	constructor(
 		/**
 		 * The encoded data of this packet. For any given codec, this data must adhere to the format specified in the
-		 * Mediabunny Codec Registry.
+		 * Mediabunny Codec Registry. The data is not copied: when the packet is added to an output, the output may read
+		 * it until the packet has been written, so don't modify or reuse the underlying buffer after creating the
+		 * packet.
 		 */
 		public readonly data: Uint8Array,
 		/** The type of this packet. */

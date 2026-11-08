@@ -113,6 +113,8 @@ const encodedVideoData = new Uint8Array([...]);
 const encodedPacket = new EncodedPacket(encodedVideoData, 'key', 5, 1/24);
 ```
 
+`EncodedPacket` doesn't copy `data` (or `sideData.alpha`): the packet references your buffer. When the packet goes to an [`Output`](./writing-media-files), the output may read that buffer until it has written the packet, long after `add` resolved. So don't modify or reuse the buffer afterwards; if it's a view into memory you overwrite, such as a reused buffer or a WebAssembly heap, pass a copy (`data.slice()`).
+
 Alternatively, if you're coming from WebCodecs encoded chunks, you can create an `EncodedPacket` from them:
 ```ts
 import { EncodedPacket } from 'mediabunny';
