@@ -441,11 +441,26 @@ export class OggMuxer extends Muxer {
 				modeBlockflags: parseModesFromVorbisSetupPacket(setupHeader).modeBlockflags,
 			};
 		} else if (trackData.track.source._codec === 'opus') {
-			if (!meta.decoderConfig.description) {
+			let identificationHeader: Uint8Array;
+			if (meta.decoderConfig.description) {
+				identificationHeader = toUint8Array(meta.decoderConfig.description);
+			} else if (meta.decoderConfig.numberOfChannels <= 2) {
+				// WebCodecs allows Opus without a description. With up to two channels (channel mapping family 0), the
+				// identification header (RFC 7845, section 5.1) follows from the config. Nothing says to drop any
+				// samples, so its pre-skip is 0, as WebCodecs then assumes.
+				identificationHeader = new Uint8Array(19);
+				const view = toDataView(identificationHeader);
+				view.setUint32(0, 0x4f707573, false); // 'Opus'
+				view.setUint32(4, 0x48656164, false); // 'Head'
+				view.setUint8(8, 1); // Version
+				view.setUint8(9, meta.decoderConfig.numberOfChannels);
+				view.setUint16(10, 0, true); // Pre-skip
+				view.setUint32(12, meta.decoderConfig.sampleRate, true); // Input sample rate
+				view.setInt16(16, 0, true); // Output gain
+				view.setUint8(18, 0); // Channel mapping family
+			} else {
 				throw new TypeError('For Ogg, Opus decoder description is required.');
 			}
-
-			const identificationHeader = toUint8Array(meta.decoderConfig.description);
 
 			const commentHeaderHeader = new Uint8Array(8);
 			const commentHeaderHeaderView = toDataView(commentHeaderHeader);
