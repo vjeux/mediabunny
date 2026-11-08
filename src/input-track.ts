@@ -16,7 +16,7 @@ import {
 } from './codec';
 import { determineAudioPacketType, determineVideoPacketType } from './codec-data';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
-import { Input } from './input';
+import { Input, InputDisposedError } from './input';
 import { Logging } from './logging';
 import { EncodedPacketSink, PacketRetrievalOptions } from './media-sink';
 import {
@@ -878,6 +878,10 @@ export class InputVideoTrack extends InputTrack {
 			const support = await VideoDecoder.isConfigSupported(decoderConfig);
 			return support.supported === true;
 		} catch (error) {
+			if (error instanceof InputDisposedError) {
+				throw error; // The check was canceled, which says nothing about decodability
+			}
+
 			Logging._error('Error during decodability check:', error);
 			return false;
 		}
@@ -1190,6 +1194,10 @@ export class InputAudioTrack extends InputTrack {
 				return support.supported === true;
 			}
 		} catch (error) {
+			if (error instanceof InputDisposedError) {
+				throw error; // The check was canceled, which says nothing about decodability
+			}
+
 			Logging._error('Error during decodability check:', error);
 			return false;
 		}
