@@ -702,6 +702,11 @@ const DEFAULT_RETRY_DELAY
 		return Math.min(2 ** (previousAttempts - 2), 16);
 	}) satisfies UrlSourceOptions['getRetryDelay'];
 
+// Used instead of the default getRetryDelay when a response body fails partway. That response already got through
+// CORS, so the CORS heuristic doesn't apply (and would misfire in WebKit, which reports every response body error as
+// "Load failed", the text it also uses for CORS failures).
+const DEFAULT_RESUME_DELAY = (previousAttempts: number) => Math.min(2 ** (previousAttempts - 2), 16);
+
 const warnedOrigins = new Set<string>();
 
 /**
@@ -945,6 +950,17 @@ export class UrlSource extends PathedSource {
 		}
 	}
 
+	/**
+	 * The delay before resuming a response body that failed partway: from the user's getRetryDelay if there's one,
+	 * else from a default without the CORS heuristic.
+	 * @internal
+	 */
+	_getResumeDelay(previousAttempts: number, error: unknown) {
+		return this._options.getRetryDelay
+			? this._getRetryDelay(previousAttempts, error, this._url)
+			: DEFAULT_RESUME_DELAY(previousAttempts);
+	}
+
 	/** @internal */
 	private async _runWorker(worker: ReadWorker) {
 		let consecutiveEmptyResponses = 0;
@@ -1084,7 +1100,7 @@ export class UrlSource extends PathedSource {
 						throw error;
 					}
 
-					const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
+					const retryDelayInSeconds = this._getResumeDelay(1, error);
 					if (retryDelayInSeconds !== null) {
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
 						await wait(1000 * retryDelayInSeconds);
@@ -1173,7 +1189,7 @@ export class UrlSource extends PathedSource {
 							throw error;
 						}
 
-						const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
+						const retryDelayInSeconds = this._getResumeDelay(1, error);
 						if (retryDelayInSeconds === null) {
 							throw error;
 						}
