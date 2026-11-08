@@ -12,6 +12,7 @@ import {
 	MediaCodec,
 	getMinimumAudioPacketSize,
 	NON_PCM_AUDIO_CODECS,
+	PCM_AUDIO_CODECS,
 	VIDEO_CODECS,
 	VideoCodec,
 } from './codec';
@@ -2413,6 +2414,20 @@ export class Conversion {
 
 			if (trackOptions.codec) {
 				audioCodecs = audioCodecs.filter(codec => codec === trackOptions.codec);
+			} else if (trackOptions.sampleFormat !== undefined) {
+				// Among the PCM codecs, prefer the one that stores the requested sample format as is, since setting it
+				// is how the bit depth is chosen (the compressed codecs keep their precedence)
+				const pcmCodec = `pcm-${trackOptions.sampleFormat}` as const;
+				const firstPcmIndex = audioCodecs.findIndex(
+					codec => (PCM_AUDIO_CODECS as readonly string[]).includes(codec),
+				);
+				if (firstPcmIndex !== -1 && audioCodecs.includes(pcmCodec)) {
+					audioCodecs = [
+						...audioCodecs.slice(0, firstPcmIndex),
+						pcmCodec,
+						...audioCodecs.slice(firstPcmIndex).filter(codec => codec !== pcmCodec),
+					];
+				}
 			}
 
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
