@@ -2261,6 +2261,35 @@ test('Ogg: Opus comments with many repeated keys', async () => {
 	]));
 });
 
+test('Ogg: Pages where packets end but with granule position -1', async () => {
+	// RFC 3533 reserves -1 for pages on which no packet ends, but some muxers write it on others too, as in the
+	// aoTuV-encoded file of FFmpeg trac ticket #2893 and FFmpeg's FATE vector vorbis/beta4-test_small.ogg
+	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
+	for (let i = 0; i < 10; i++) {
+		pages.push(oggPacketsPage({
+			headerType: i === 9 ? 4 : 0,
+			granule: i > 0 && i < 9 ? -1 : 9600 * (i + 1),
+			sequence: 2 + i,
+		}, Array<Bytes>(10).fill(OPUS_PACKET)));
+	}
+	const file = concatList(pages);
+
+	// 100 packets of 20 ms, the first one starting at minus the pre-skip
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+		timestamps.push(packet.timestamp);
+	}
+	expect(timestamps).toHaveLength(100);
+	expect(timestamps.at(-1)).toBeCloseTo(99 * 0.02 - 312 / 48000, 9);
+
+	// Looking up the last packet, as for the duration, gives the same
+	using freshInput = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = (await freshInput.getPrimaryAudioTrack())!;
+	expect((await new EncodedPacketSink(track).getPacket(Infinity))!.timestamp).toBeCloseTo(timestamps.at(-1)!, 9);
+	expect(await track.computeDuration()).toBeCloseTo(100 * 0.02 - 312 / 48000, 9);
+});
+
 test('Ogg: Short Vorbis identification header', async () => {
 	const file = readFileSync(path.join(__dirname, '../public/vorbis-eos.ogg'));
 	const firstPageLength = 27 + file[26]! + file.subarray(27, 27 + file[26]!).reduce((a, b) => a + b, 0);
