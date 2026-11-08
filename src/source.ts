@@ -1035,7 +1035,7 @@ export class UrlSource extends PathedSource {
 
 				if (!this._usedForHls) {
 					const url = new URL(
-						this._url instanceof Request ? this._url.url : this._url,
+						response.url || (this._url instanceof Request ? this._url.url : this._url),
 						typeof window !== 'undefined' ? window.location.href : undefined,
 					);
 
