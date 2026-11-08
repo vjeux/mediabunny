@@ -1458,6 +1458,62 @@ const findBtrtBoxes = (bytes: Uint8Array) => {
 	return boxes;
 };
 
+test('Fragmented MP4 samples end where the next fragment starts with millisecond timestamps', async () => {
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// 29.97 fps with timestamps rounded to milliseconds and exact frame durations, as in WebM files from FFmpeg
+	for (let i = 0; i < 300; i++) {
+		const timestamp = Math.round(i * 1001 / 30) / 1000;
+		const packet = new EncodedPacket(new Uint8Array(16), i % 30 === 0 ? 'key' : 'delta', timestamp, 1001 / 30000);
+		await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+	}
+	await output.finalize();
+
+	// Each traf's decode time and the sum of its sample durations
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = toDataView(bytes);
+	const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+	const fragments: { decodeTime: number; duration: number }[] = [];
+	for (let pos = 0; pos < bytes.byteLength; pos += view.getUint32(pos)) {
+		if (type(pos) !== 'moof') {
+			continue;
+		}
+
+		const traf = pos + 8 + view.getUint32(pos + 8); // After mfhd
+		let decodeTime = 0;
+		let defaultDuration = 0;
+		let duration = 0;
+		for (let child = traf + 8; child < traf + view.getUint32(traf); child += view.getUint32(child)) {
+			const flags = view.getUint32(child + 8) & 0xffffff;
+			if (type(child) === 'tfhd' && flags & 0x08) {
+				defaultDuration = view.getUint32(child + 16 + (flags & 0x01 ? 8 : 0) + (flags & 0x02 ? 4 : 0));
+			} else if (type(child) === 'tfdt') {
+				const isVersion1 = bytes[child + 8] === 1;
+				decodeTime = isVersion1 ? Number(view.getBigUint64(child + 12)) : view.getUint32(child + 12);
+			} else if (type(child) === 'trun') {
+				const sampleCount = view.getUint32(child + 12);
+				let entry = child + 16 + (flags & 0x01 ? 4 : 0) + (flags & 0x04 ? 4 : 0);
+				const entrySize = 4 * [0x100, 0x200, 0x400, 0x800].filter(x => flags & x).length;
+				for (let i = 0; i < sampleCount; i++, entry += entrySize) {
+					duration += flags & 0x100 ? view.getUint32(entry) : defaultDuration;
+				}
+			}
+		}
+		fragments.push({ decodeTime, duration });
+	}
+
+	// ISO/IEC 14496-12: a fragment's decode time is the sum of the durations of all earlier samples. Each fragment's
+	// last sample used to keep its packet duration, ending up to a third of a millisecond after the next fragment's
+	// start, which readers adding up durations accumulate.
+	expect(fragments).toHaveLength(10);
+	for (let i = 1; i < fragments.length; i++) {
+		expect(fragments[i]!.decodeTime).toBe(fragments[i - 1]!.decodeTime + fragments[i - 1]!.duration);
+	}
+});
+
 test('Chunks written in chronological order, no Fast Start', async () => {
 	await testChunkOrder(false);
 });
