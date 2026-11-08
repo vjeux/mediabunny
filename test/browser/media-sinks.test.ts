@@ -367,27 +367,35 @@ test.for([
 
 /** Whether the platform's decoder reports an error for a track's packets, decided with WebCodecs alone. */
 const nativeDecodingFails = async (track: InputVideoTrack | InputAudioTrack) => {
-	const decoderConfig = await track.getDecoderConfig();
-	assert(decoderConfig);
-
 	let failed = false;
 	const onError = () => {
 		failed = true;
 	};
-	const decoder = track.isVideoTrack()
-		? new VideoDecoder({ output: frame => frame.close(), error: onError })
-		: new AudioDecoder({ output: data => data.close(), error: onError });
-	decoder.configure(decoderConfig as VideoDecoderConfig & AudioDecoderConfig);
+
+	let decoder: VideoDecoder | AudioDecoder;
+	let decode: (packet: EncodedPacket) => void;
+	if (track.isVideoTrack()) {
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig);
+		const videoDecoder = new VideoDecoder({ output: frame => frame.close(), error: onError });
+		videoDecoder.configure(decoderConfig);
+		decoder = videoDecoder;
+		decode = packet => videoDecoder.decode(packet.toEncodedVideoChunk());
+	} else {
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig);
+		const audioDecoder = new AudioDecoder({ output: data => data.close(), error: onError });
+		audioDecoder.configure(decoderConfig);
+		decoder = audioDecoder;
+		decode = packet => audioDecoder.decode(packet.toEncodedAudioChunk());
+	}
+
 	for await (const packet of new EncodedPacketSink(track).packets()) {
 		if (decoder.state === 'closed') {
 			break;
 		}
 
-		if (decoder instanceof VideoDecoder) {
-			decoder.decode(packet.toEncodedVideoChunk());
-		} else {
-			decoder.decode(packet.toEncodedAudioChunk());
-		}
+		decode(packet);
 	}
 	if (decoder.state !== 'closed') {
 		await decoder.flush().catch(onError);
