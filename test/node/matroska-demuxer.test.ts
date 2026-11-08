@@ -151,4 +151,50 @@ test('Matroska video without a usable PixelWidth/PixelHeight takes the size from
 	// Without a size in the bitstream either, the size stays unknown, and the decoder config leaves it out (a coded
 	// size of 0 makes decoders reject the config)
 	expect(await readVideo([], new Array<number>(30).fill(0xff))).toEqual([0, 0, undefined, undefined]);
+
+	// A track without any key frame isn't read in full looking for one: 4 MiB of 64 KiB delta frames
+	const deltaFrame = [0x81, 0, 0, 0, 0x01, ...new Array<number>(65536).fill(0)];
+	const clusters: Uint8Array[] = [];
+	for (let i = 0; i < 64; i++) {
+		clusters.push(new Uint8Array(element(
+			EBMLId.Cluster,
+			element(EBMLId.Timestamp, [(i * 40) >> 8, (i * 40) & 0xff]),
+			element(EBMLId.SimpleBlock, deltaFrame),
+		)));
+	}
+	const header = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, ascii('webm'))),
+		EBMLId.Segment >>> 24, (EBMLId.Segment >>> 16) & 0xff, (EBMLId.Segment >>> 8) & 0xff, EBMLId.Segment & 0xff,
+		0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Unknown size
+		...element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+		...element(EBMLId.Tracks, element(
+			EBMLId.TrackEntry,
+			element(EBMLId.TrackNumber, [1]),
+			element(EBMLId.TrackType, [1]),
+			element(EBMLId.CodecID, ascii('V_VP8')),
+			element(EBMLId.Video, ...pixelSize(0, 0)),
+		)),
+	]);
+	const file = new Uint8Array(header.length + clusters.reduce((sum, x) => sum + x.length, 0));
+	let offset = 0;
+	for (const part of [header, ...clusters]) {
+		file.set(part, offset);
+		offset += part.length;
+	}
+
+	let bytesRead = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => file.length,
+			read: (start, end) => {
+				bytesRead += end - start;
+				return file.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getCodedWidth()).toBe(0);
+	expect(bytesRead).toBeLessThan(2 * 2 ** 20);
 });

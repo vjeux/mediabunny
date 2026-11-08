@@ -295,6 +295,8 @@ const METADATA_ELEMENTS = [
 ] as const;
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
 const MAX_ELEMENT_NESTING_DEPTH = 64;
+// How far into a track the first key frame is looked for when the container doesn't give the frame size
+const MAX_FRAME_SIZE_PROBE_BYTES = 2 ** 20;
 
 export class MatroskaDemuxer extends Demuxer {
 	reader: Reader;
@@ -2728,11 +2730,20 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 		if ((info.codec === 'avc' || info.codec === 'hevc') && info.codecDescription) {
 			size = getFrameSizeFromParameterSets(info.codec, info.codecDescription, null);
 		} else if (info.codec) {
-			// The first key frame carries the size (a cut stream may start with delta frames). Best effort: a cluster
-			// that can't be read leaves the size unknown instead of failing the metadata.
+			// The first key frame carries the size (a cut stream may start with delta frames). It's only looked for in
+			// the first megabyte, since a track without any key frame would otherwise be read in full; the size is only
+			// informational then, as decoders take it from the bitstream. Best effort: a cluster that can't be read
+			// leaves the size unknown instead of failing the metadata.
 			let packet = await this.getFirstPacket({}).catch(() => null);
-			if (packet && packet.type !== 'key') {
-				packet = await this.getNextKeyPacket(packet, {}).catch(() => null);
+			const firstClusterPos = packet && this.packetToClusterLocation.get(packet)!.cluster.elementStartPos;
+			while (packet && packet.type !== 'key') {
+				const clusterPos = this.packetToClusterLocation.get(packet)!.cluster.elementStartPos;
+				if (clusterPos - firstClusterPos! > MAX_FRAME_SIZE_PROBE_BYTES) {
+					packet = null;
+					break;
+				}
+
+				packet = await this.getNextPacket(packet, {}).catch(() => null);
 			}
 
 			if (packet) {
