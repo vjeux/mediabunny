@@ -235,6 +235,56 @@ describe('Video', async () => {
 		await encoder.close();
 	});
 
+	test('Realtime encoding emits a packet for every frame without holding frames back', async () => {
+		// Encodes 30 frames one by one and returns how many went in without a packet coming out yet
+		const getEncoderLag = async (codec: VideoCodec, latencyMode: 'quality' | 'realtime') => {
+			const encoder = new NodeAvVideoEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = codec;
+			// @ts-expect-error Readonly
+			encoder.config = {
+				codec: buildVideoCodecString(codec, 320, 240, 500_000, false),
+				width: 320,
+				height: 240,
+				bitrate: 500_000,
+				latencyMode,
+			} satisfies VideoEncoderConfig;
+
+			let packetCount = 0;
+			// @ts-expect-error Readonly
+			encoder.onPacket = () => {
+				packetCount++;
+			};
+
+			await encoder.init();
+			const frameCount = 30;
+			for (let i = 0; i < frameCount; i++) {
+				const data = new Uint8Array(320 * 240 * 3 / 2).fill(128);
+				data.fill(i * 8, 0, 320 * 240);
+				const sample = new VideoSample(data, {
+					format: 'I420',
+					codedWidth: 320,
+					codedHeight: 240,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await encoder.encode(sample, {});
+				sample.close();
+			}
+			const lag = frameCount - packetCount;
+
+			await encoder.flush();
+			await encoder.close();
+			return lag;
+		};
+
+		for (const codec of ['avc', 'hevc', 'vp8', 'vp9', 'av1'] as const) {
+			expect({ codec, lag: await getEncoderLag(codec, 'realtime') }).toEqual({ codec, lag: 0 });
+		}
+		// Quality mode keeps its lookahead
+		expect(await getEncoderLag('vp9', 'quality')).toBeGreaterThan(0);
+	});
+
 	test('AVC encode and decode, length-prefixed', async () => {
 		await encodeDecodeTest('avc', {}, async (packet, meta, i) => {
 			expect(packet.duration).toBe(1 / 30);

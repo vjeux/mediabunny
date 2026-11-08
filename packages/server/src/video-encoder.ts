@@ -419,6 +419,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			if (isRealtime) {
 				codecContext.setOption('cpu-used', '8');
+				// libvpx otherwise holds back 25 frames to look for alternate reference frames
+				codecContext.setOption('lag-in-frames', '0');
 			} else {
 				codecContext.setOption('cpu-used', '5');
 			}
@@ -429,12 +431,27 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			if (isRealtime) {
 				codecContext.setOption('preset', '12');
+				// The default random access prediction structure holds back dozens of frames, the low-delay one none.
+				// It can't do variable bitrate, so bitrates are kept constant.
+				codecContext.setOption(
+					'svtav1-params',
+					this.config.bitrateMode === 'quantizer' ? 'pred-struct=1' : 'pred-struct=1:rc=2',
+				);
 			}
 		} else if (this.avCodec.name === 'h264_nvenc') {
 			// When we force a key frame, we want a true IDR frame, not just an I frame
 			codecContext.setOption('forced-idr', '1');
 		} else if (this.avCodec.name === 'hevc_nvenc') {
 			codecContext.setOption('forced-idr', '1');
+		}
+
+		if (isRealtime && this.avCodec.name?.endsWith('_nvenc')) {
+			// NVENC otherwise uses B-frames and holds frames back for its output queue and lookahead
+			codecContext.setOption('tune', 'ull');
+			codecContext.setOption('zerolatency', '1');
+			codecContext.setOption('delay', '0');
+			codecContext.setOption('rc-lookahead', '0');
+			codecContext.maxBFrames = 0;
 		}
 
 		if (this.config.bitrateMode === 'quantizer') {
