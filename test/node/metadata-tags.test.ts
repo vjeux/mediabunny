@@ -66,6 +66,30 @@ const createDummyAudioTrack = (codec: AudioCodec, output: Output) => {
 	};
 };
 
+const writeMp3 = async (tags: MetadataTags) => {
+	const output = new Output({
+		format: new Mp3OutputFormat(),
+		target: new BufferTarget(),
+	});
+	output.setMetadataTags(tags);
+
+	const dummyTrack = createDummyAudioTrack('mp3', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	return new Uint8Array(output.target.buffer!);
+};
+
+const readMetadataTags = async (bytes: Uint8Array) => {
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	return await input.getMetadataTags();
+};
+
 const coverArt = new Uint8Array(1024);
 coverArt[0] = 69;
 const songMetadata: MetadataTags = {
@@ -934,6 +958,32 @@ test('Creation time override, ISOBMFF', async () => {
 	const nullReadTags = await nullInput.getMetadataTags();
 
 	expect(nullReadTags.creationTime).toBeUndefined();
+});
+
+test('MP3 to MP3 conversion with images', async () => {
+	using input = new Input({
+		source: new BufferSource(await writeMp3({
+			images: [{
+				data: new Uint8Array([1, 2, 3]),
+				mimeType: 'image/png',
+				kind: 'coverFront',
+			}],
+		})),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({
+		format: new Mp3OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({
+		input,
+		output,
+	});
+	await conversion.execute();
+
+	const tags = await readMetadataTags(new Uint8Array(output.target.buffer!));
+	expect(tags.images).toHaveLength(1);
 });
 
 test('Creation time override, Matroska', async () => {

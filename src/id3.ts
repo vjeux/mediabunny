@@ -787,6 +787,7 @@ export class Id3V2Writer {
 						const description = image.description ?? '';
 						this.writeId3V2ApicFrame(image.mimeType, pictureType, description, image.data);
 					}
+					writtenTags.add('APIC');
 				}; break;
 
 				case 'tracksTotal':
