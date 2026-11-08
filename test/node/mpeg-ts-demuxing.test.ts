@@ -1227,3 +1227,57 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 	}
 	withFakeAudio.input.dispose();
 });
+
+test('MPEG-TS reads a small file the same from sources that can\'t go back as from a buffer', async () => {
+	// From L46's review. A file that fits in the cache of a source that only keeps what its cache holds (a
+	// ReadableStreamSource, or a UrlSource whose server ignores range requests) can still be looked through and gone
+	// back in, so the AAC that FFmpeg's m2ts mode writes as private data without descriptors is found there too
+	const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/aac-private-data.m2ts'))); // 0.4 MB
+	const readTracks = async (source: BufferSource | ReadableStreamSource | UrlSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const result: string[] = [];
+		for (const track of await input.getTracks()) {
+			let count = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				count += packet.byteLength > 0 ? 1 : 0;
+			}
+			result.push(`${track.type} ${await track.getCodec()} ${count}`);
+		}
+		return result;
+	};
+
+	const expected = await readTracks(new BufferSource(bytes));
+	expect(expected.map(x => x.split(' ')[0])).toEqual(['video', 'audio']);
+
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= bytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(bytes.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	expect(await readTracks(new ReadableStreamSource(stream, { maxCacheSize: 2 ** 21 }))).toEqual(expected);
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': bytes.byteLength });
+		response.end(bytes);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const source = new UrlSource(`http://localhost:${address.port}/video.ts`, {
+			maxCacheSize: 2 ** 21,
+			getRetryDelay: () => null,
+		});
+		expect(await readTracks(source)).toEqual(expected);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
