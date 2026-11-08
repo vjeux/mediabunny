@@ -999,7 +999,10 @@ export const vpcC = (trackData: IsobmffVideoTrackData) => {
 
 /** AV1 Configuration Box: Provides additional information to the decoder. */
 export const av1C = (trackData: IsobmffVideoTrackData) => {
-	return box('av1C', generateAv1CodecConfigurationFromCodecString(trackData.info.decoderConfig.codec));
+	return box('av1C', [
+		generateAv1CodecConfigurationFromCodecString(trackData.info.decoderConfig.codec),
+		[...(trackData.info.av1SequenceHeaderObu ?? [])], // configOBUs
+	]);
 };
 
 /** Sound Sample Description Box: Contains information that defines how to interpret sound media data. */
