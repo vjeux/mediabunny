@@ -717,7 +717,9 @@ export class MatroskaDemuxer extends Demuxer {
 			// cluster is lost, as it was before.
 			try {
 				dataSlice = this.reader.requestSlice(dataStartPos, fileSize - dataStartPos);
-				if (isThenable(dataSlice)) dataSlice = await dataSlice;
+				if (isThenable(dataSlice)) {
+					dataSlice = await dataSlice;
+				}
 			} catch {
 				dataSlice = null;
 			}
