@@ -239,7 +239,7 @@ Use the `codec` property to control the codec of the output track. This should b
 
 Use the `quality` property to control the quality of the output video. For example, you can use this field to compress the video track. See [Encoding quality](./media-sources#encoding-quality) for more. If this property is set, transcoding will always happen. If this property is not set but transcoding is still required, `new Quality('high')` will be used as the value.
 
-Use the `keyFrameInterval` property to control the maximum interval in seconds between key frames in the output video. Setting this field forces a transcode.
+Use the `keyFrameInterval` property to control how often key frames are placed in the output video, in seconds: the first frame at or after each multiple of the interval becomes a key frame, so adjacent key frames can be up to one frame further apart than the interval. Setting this field forces a transcode.
 If you want to prevent direct copying of media data and force a transcoding step, use `forceTranscode: true`.
 
 Use the `hardwareAcceleration` property to control whether hardware or software acceleration is used for video transcoding. It applies to both the decoding and the encoding of the video.
