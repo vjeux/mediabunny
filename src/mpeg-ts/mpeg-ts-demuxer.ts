@@ -100,6 +100,21 @@ const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expect
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
 const REGISTRATION_DESCRIPTOR_TAG = 0x05;
+const CA_DESCRIPTOR_TAG = 0x09;
+
+/**
+ * How far past the first PMT of a program we'd rather not use (its streams have CA descriptors) we look for a better
+ * program, as the PMTs of some programs listed in the PAT may never show up. DVB repeats each PMT at least every half
+ * second, which this covers at up to 130 Mbit/s.
+ */
+const MAX_PROGRAM_SEARCH_SIZE = 2 ** 23; // 8 MiB
+/**
+ * The same for sources of unknown size, and once one of the programs waiting turns out readable (its packets aren't
+ * scrambled): reading may not be able to go back further to read the program's streams once it's chosen, as with a
+ * ReadableStreamSource, or a UrlSource whose server ignores range requests (which can't be told apart from a seekable
+ * source). This still covers PMTs repeated every 0.1 s at up to 80 Mbit/s.
+ */
+const MAX_STREAMED_PROGRAM_SEARCH_SIZE = 2 ** 20; // 1 MiB
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
 const HDMV_FORMAT_IDENTIFIER = 0x48444d56;
@@ -160,6 +175,8 @@ type ElementaryAudioStream = ElementaryStream & { info: { type: 'audio' } };
 type TsPacketHeader = {
 	payloadUnitStartIndicator: number;
 	pid: number;
+	/** Nonzero when the packet's payload is scrambled (conditional access) */
+	transportScramblingControl: number;
 	adaptationFieldControl: number;
 };
 
@@ -226,14 +243,86 @@ export class MpegTsDemuxer extends Demuxer {
 			this.minReferencePointByteDistance = MIN_REFERENCE_POINT_PACKET_DISTANCE * this.packetStride;
 
 			let currentPos = this.packetOffset;
-			let programMapPid: number | null = null;
+			// The PIDs of the PMTs of all programs, as listed by the PAT
+			const programMapPids = new Set<number>();
 			// Some files contain these multiple times, but we only care about their first appearance
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
 
+			// The programs whose PMT has shown up. When the PAT lists several, the ones with CA descriptors
+			// (conditional access, which usually means scrambled packets) or no supported streams are only fallen back
+			// to if no better one shows up: first one with streams without a CA descriptor, else the first one. CA
+			// descriptors are often left in recordings that aren't scrambled, though, so whether a stream is scrambled
+			// is decided by its packets, which we watch while waiting: once a program turns out readable, a short wait
+			// for a better one is enough.
+			const seenProgramMapPids = new Set<number>();
+			type FallbackProgram = { pmtPos: number; streams: ElementaryStream[] };
+			// The first program with streams both with and without CA descriptors, the first with streams that all
+			// have one, and the first without any supported stream
+			let partlyScrambledProgram: FallbackProgram | null = null;
+			let scrambledProgram: FallbackProgram | null = null;
+			let emptyProgram: FallbackProgram | null = null;
+			// Whether the TS packet holding the first PES packet of a stream of one of these programs was scrambled
+			const firstPesPacketScrambling = new Map<number, boolean>();
+			let hasReadableFallbackProgram = false;
+
+			// Uses the given program. Without a program, sections were read as contiguous, which cuts PES packets
+			// short at the first packet of another PID, so the section ends recorded since can't be trusted.
+			const useProgram = (program: FallbackProgram, goBack: boolean) => {
+				this.elementaryStreams.push(...program.streams);
+				hasProgramMap = true;
+				this.sectionEndPositions.length = 0;
+
+				if (goBack) {
+					// Read its streams' first PES packets from its PMT on
+					currentPos = program.pmtPos;
+				}
+			};
+
+			// Uses the best fallback program, once no better one is to be expected
+			const useFallbackProgram = () => {
+				const program = partlyScrambledProgram ?? scrambledProgram ?? emptyProgram;
+				if (hasProgramMap || !program) {
+					return false;
+				}
+
+				const scrambling = program.streams.map(stream => firstPesPacketScrambling.get(stream.pid));
+				if (scrambling.length > 0 && scrambling.every(scrambled => scrambled === true)) {
+					// Every stream showed up scrambled, so there's nothing to go back for
+					throw new Error(
+						'The streams of this transport stream are scrambled (conditional access), so they can\'t be'
+						+ ' read.',
+					);
+				}
+
+				// Only the streams that showed up clear need going back to. The others are read from here on, the
+				// scrambled ones to be left out when they show up again.
+				useProgram(program, scrambling.includes(false));
+				return true;
+			};
+
+			const hasSeenAllPrograms = () => hasProgramAssociationTable
+				&& [...programMapPids].every(pid => seenProgramMapPids.has(pid));
+
 			while (true) {
+				// A program without supported streams doesn't need to be gone back to, so it can wait for the end
+				const firstFallbackPmtPos = Math.min(
+					partlyScrambledProgram?.pmtPos ?? Infinity,
+					scrambledProgram?.pmtPos ?? Infinity,
+				);
+				const maxProgramSearchSize = this.reader.fileSizeNonStrict === null || hasReadableFallbackProgram
+					? MAX_STREAMED_PROGRAM_SEARCH_SIZE
+					: MAX_PROGRAM_SEARCH_SIZE;
+				if (currentPos - firstFallbackPmtPos > maxProgramSearchSize) {
+					useFallbackProgram();
+				}
+
 				const packetHeader = await this.readPacketHeader(currentPos);
 				if (!packetHeader) {
+					if (useFallbackProgram()) {
+						continue;
+					}
+
 					break;
 				}
 
@@ -241,6 +330,17 @@ export class MpegTsDemuxer extends Demuxer {
 					// Not the start of a section
 					currentPos += this.packetStride;
 					continue;
+				}
+
+				if (!hasProgramMap && !firstPesPacketScrambling.has(packetHeader.pid)) {
+					const isFallbackStream = [partlyScrambledProgram, scrambledProgram]
+						.some(x => x?.streams.some(stream => stream.pid === packetHeader.pid));
+					if (isFallbackStream) {
+						const isScrambled = packetHeader.transportScramblingControl !== 0;
+						firstPesPacketScrambling.set(packetHeader.pid, isScrambled);
+						// Its program can be read, whatever its CA descriptors say
+						hasReadableFallbackProgram ||= !isScrambled;
+					}
 				}
 
 				if (
@@ -258,6 +358,10 @@ export class MpegTsDemuxer extends Demuxer {
 					!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
 				);
 				if (!section) {
+					if (useFallbackProgram()) {
+						continue;
+					}
+
 					break;
 				}
 
@@ -301,20 +405,25 @@ export class MpegTsDemuxer extends Demuxer {
 						const id = bitstream.readBits(13);
 
 						if (programNumber !== 0) {
-							if (programMapPid !== null) {
-								throw new Error('Only files with a single program are supported.');
-							} else {
-								programMapPid = id;
-							}
+							programMapPids.add(id);
 						}
 					}
 
-					if (programMapPid === null) {
+					if (programMapPids.size === 0) {
 						throw new Error('Program Association Table must link to a Program Map Table.');
 					}
 
 					hasProgramAssociationTable = true;
-				} else if ((section.pid === programMapPid || isProbablyProgramMap) && !hasProgramMap) {
+
+					if (hasSeenAllPrograms()) {
+						// The PMTs came before the PAT, so there's no better program to find
+						useFallbackProgram();
+					}
+				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap) {
+					// Broadcast captures often carry several programs. We present just one, so let's use the first one
+					// whose PMT shows up (some programs listed in the PAT may not even be in the capture) and that has
+					// a stream we can read: pay-TV programs are scrambled, and radio ones may only have unsupported
+					// streams.
 					const bitstream = new Bitstream(section.payload);
 					const pointerField = bitstream.readAlignedByte();
 
@@ -337,13 +446,17 @@ export class MpegTsDemuxer extends Demuxer {
 					// descriptor is what tells us we're looking at a Blu-ray-derived stream.
 					const programInfoEndPos = bitstream.pos + 8 * programInfoLength;
 					let isBluRayProgram = false;
+					// Conditional access, which usually means the program's packets are scrambled
+					let hasProgramCaDescriptor = false;
 
 					while (bitstream.pos < programInfoEndPos) {
 						const descriptorTag = bitstream.readBits(8);
 						const descriptorLength = bitstream.readBits(8);
 						const descriptorEndPos = bitstream.pos + 8 * descriptorLength;
 
-						if (descriptorTag === REGISTRATION_DESCRIPTOR_TAG && descriptorLength >= 4) {
+						if (descriptorTag === CA_DESCRIPTOR_TAG) {
+							hasProgramCaDescriptor = true;
+						} else if (descriptorTag === REGISTRATION_DESCRIPTOR_TAG && descriptorLength >= 4) {
 							const formatIdentifier = bitstream.readBits(32);
 							isBluRayProgram ||= formatIdentifier === HDMV_FORMAT_IDENTIFIER
 								|| formatIdentifier === HDPR_FORMAT_IDENTIFIER;
@@ -353,6 +466,9 @@ export class MpegTsDemuxer extends Demuxer {
 					}
 
 					bitstream.pos = programInfoEndPos;
+
+					const streams: ElementaryStream[] = [];
+					const caDescriptorPids = new Set<number>();
 
 					while (8 * (sectionLength + BYTES_BEFORE_SECTION_LENGTH) - bitstream.pos > BITS_IN_CRC_32) {
 						const streamType = bitstream.readBits(8);
@@ -372,7 +488,9 @@ export class MpegTsDemuxer extends Demuxer {
 							const descriptorLength = bitstream.readBits(8);
 							const descriptorEndPos = bitstream.pos + 8 * descriptorLength;
 
-							if (descriptorTag === 0x6a) {
+							if (descriptorTag === CA_DESCRIPTOR_TAG) {
+								caDescriptorPids.add(elementaryPid);
+							} else if (descriptorTag === 0x6a) {
 								hasAc3Descriptor = true;
 							} else if (descriptorTag === 0x7a || descriptorTag === 0xcc) {
 								hasEac3Descriptor = true;
@@ -503,7 +621,7 @@ export class MpegTsDemuxer extends Demuxer {
 						}
 
 						if (info) {
-							this.elementaryStreams.push({
+							streams.push({
 								demuxer: this,
 								pid: elementaryPid,
 								streamType,
@@ -516,11 +634,50 @@ export class MpegTsDemuxer extends Demuxer {
 						}
 					}
 
-					hasProgramMap = true;
+					seenProgramMapPids.add(section.pid);
+					const streamsWithoutCa = hasProgramCaDescriptor
+						? []
+						: streams.filter(stream => !caDescriptorPids.has(stream.pid));
+
+					if (
+						(hasProgramAssociationTable && programMapPids.size <= 1)
+						|| (streams.length > 0 && streamsWithoutCa.length === streams.length)
+					) {
+						// The only program, or one without CA descriptors
+						this.elementaryStreams.push(...streams);
+						hasProgramMap = true;
+					} else {
+						const program = { pmtPos: currentPos, streams };
+						if (streamsWithoutCa.length > 0) {
+							partlyScrambledProgram ??= program;
+						} else if (streams.length > 0) {
+							scrambledProgram ??= program;
+						} else {
+							emptyProgram ??= program;
+						}
+
+						if (hasSeenAllPrograms()) {
+							// There's no better program to find
+							useFallbackProgram();
+						}
+					}
 				} else {
 					const elementaryStream = this.elementaryStreams.find(x => x.pid === section.pid);
 					outer:
 					if (elementaryStream && !elementaryStream.initialized) {
+						if (packetHeader.transportScramblingControl !== 0) {
+							// The stream is scrambled (conditional access), so we can't read it
+							this.elementaryStreams.splice(this.elementaryStreams.indexOf(elementaryStream), 1);
+							if (this.elementaryStreams.length === 0) {
+								throw new Error(
+									'The streams of this transport stream are scrambled (conditional access), so they'
+									+ ' can\'t be read.',
+								);
+							}
+
+							break outer;
+						}
+
 						const pesPacket = readPesPacket(this, section, true);
 						if (!pesPacket) {
 							throw new Error(
@@ -991,7 +1148,6 @@ export class MpegTsDemuxer extends Demuxer {
 		const pid = nextTwoBytes & 0x1FFF;
 
 		const nextByte = readU8(slice);
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
 		const transportScramblingControl = nextByte >> 6;
 		const adaptationFieldControl = (nextByte >> 4) & 0x3;
 		// eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -1000,6 +1156,7 @@ export class MpegTsDemuxer extends Demuxer {
 		return {
 			payloadUnitStartIndicator,
 			pid,
+			transportScramblingControl,
 			adaptationFieldControl,
 		};
 	}
@@ -1029,7 +1186,6 @@ export class MpegTsDemuxer extends Demuxer {
 		const pid = nextTwoBytes & 0x1FFF;
 
 		const nextByte = bytes[3]!;
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
 		const transportScramblingControl = nextByte >> 6;
 		const adaptationFieldControl = (nextByte >> 4) & 0x3;
 		// eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -1038,6 +1194,7 @@ export class MpegTsDemuxer extends Demuxer {
 		return {
 			payloadUnitStartIndicator,
 			pid,
+			transportScramblingControl,
 			adaptationFieldControl,
 			body: bytes.subarray(4),
 		};
