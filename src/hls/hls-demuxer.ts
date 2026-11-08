@@ -53,6 +53,11 @@ type InternalTrack = {
 	averageBitrate: number | null;
 	name: string | null;
 	hasOnlyKeyPackets: boolean;
+	/**
+	 * Index of the track among the streams of its type in its playlist's media. Several renditions without a URI all
+	 * live in the variant's media, as its first, second, ... stream of their type.
+	 */
+	embeddedIndex: number;
 
 	info: {
 		type: 'video';
@@ -378,6 +383,7 @@ export class HlsDemuxer extends Demuxer {
 								autoselect: true,
 								languageCode: UNDETERMINED_LANGUAGE,
 								lineNumber: variantStream.lineNumber,
+								embeddedIndex: 0,
 								fullPath: variantStream.fullPath,
 								fullCodecString: videoCodecString,
 								pairingMask: 1n << BigInt(i),
@@ -392,6 +398,8 @@ export class HlsDemuxer extends Demuxer {
 								},
 							});
 						} else {
+							let uriLessCount = 0;
+
 							for (const mediaTag of mediaTags) {
 								const groupId = mediaTag.attributes.get('group-id')!;
 								const type = mediaTag.attributes.get('type')!;
@@ -399,6 +407,8 @@ export class HlsDemuxer extends Demuxer {
 								if (groupId !== videoGroupId || type.toLowerCase() !== 'video') {
 									continue;
 								}
+
+								const embeddedIndex = mediaTag.fullPath === null ? uriLessCount++ : 0;
 
 								const resolution = mediaTag.attributes.get('resolution')
 									?? variantStream.attributes.get('resolution');
@@ -423,6 +433,7 @@ export class HlsDemuxer extends Demuxer {
 										|| getMediaTagAutoselect(mediaTag.attributes),
 									languageCode: preprocessLanguageCode(mediaTag.attributes.get('language')),
 									lineNumber: mediaTag.lineNumber,
+									embeddedIndex,
 									fullPath: mediaTag.fullPath ?? variantStream.fullPath,
 									fullCodecString: videoCodecString,
 									pairingMask: 1n << BigInt(i),
@@ -464,6 +475,7 @@ export class HlsDemuxer extends Demuxer {
 								autoselect: true,
 								languageCode: UNDETERMINED_LANGUAGE,
 								lineNumber: variantStream.lineNumber,
+								embeddedIndex: 0,
 								fullPath: variantStream.fullPath,
 								fullCodecString: audioCodecString,
 								pairingMask: 1n << BigInt(i),
@@ -482,6 +494,8 @@ export class HlsDemuxer extends Demuxer {
 								},
 							});
 						} else {
+							let uriLessCount = 0;
+
 							for (const mediaTag of mediaTags) {
 								const groupId = mediaTag.attributes.get('group-id')!;
 								const type = mediaTag.attributes.get('type')!;
@@ -489,6 +503,8 @@ export class HlsDemuxer extends Demuxer {
 								if (groupId !== audioGroupId || type.toLowerCase() !== 'audio') {
 									continue;
 								}
+
+								const embeddedIndex = mediaTag.fullPath === null ? uriLessCount++ : 0;
 
 								const channels = mediaTag.attributes.get('channels')
 									?? variantStream.attributes.get('channels');
@@ -506,6 +522,7 @@ export class HlsDemuxer extends Demuxer {
 										|| getMediaTagAutoselect(mediaTag.attributes),
 									languageCode: preprocessLanguageCode(mediaTag.attributes.get('language')),
 									lineNumber: mediaTag.lineNumber,
+									embeddedIndex,
 									fullPath: mediaTag.fullPath ?? variantStream.fullPath,
 									fullCodecString: audioCodecString,
 									pairingMask: 1n << BigInt(i),
@@ -534,7 +551,9 @@ export class HlsDemuxer extends Demuxer {
 			const internalTracks: InternalTrack[] = [];
 			const addInternalTrack = (track: InternalTrack) => {
 				const existingTrack = internalTracks.find(x =>
-					x.fullPath === track.fullPath && x.info.type === track.info.type,
+					x.fullPath === track.fullPath
+					&& x.info.type === track.info.type
+					&& x.embeddedIndex === track.embeddedIndex,
 				);
 
 				if (existingTrack) {
@@ -782,22 +801,21 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 				// Avoids reading fields on the track
 				trackBacking = matchingType[0]!;
 			} else {
-				if (this instanceof HlsInputVideoTrackBacking) {
-					for (const backing of matchingType) {
-						if ((await backing.getCodec()) === this.getCodec()) {
-							trackBacking = backing;
-							break;
-						}
-					}
+				// The first, second, ... stream of the type for the first, second, ... rendition without a URI, as long
+				// as its codec matches
+				const indexed = matchingType[this.internalTrack.embeddedIndex];
+				if (indexed && (await indexed.getCodec()) === this.getCodec()) {
+					trackBacking = indexed;
 				} else {
-					assert(this instanceof HlsInputAudioTrackBacking);
-
+					const matchingCodec: InputTrackBacking[] = [];
 					for (const backing of matchingType) {
 						if ((await backing.getCodec()) === this.getCodec()) {
-							trackBacking = backing;
-							break;
+							matchingCodec.push(backing);
 						}
 					}
+
+					const index = Math.min(this.internalTrack.embeddedIndex, matchingCodec.length - 1);
+					trackBacking = matchingCodec[index] ?? null;
 				}
 			}
 

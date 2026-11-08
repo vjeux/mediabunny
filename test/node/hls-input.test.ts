@@ -1209,6 +1209,66 @@ variant.m3u8
 	}
 });
 
+test.concurrent('Several audio renditions without a URI map to the audio streams of the variant\'s media', async () => {
+	// One MPEG-TS file with two AAC streams of different lengths, described by two URI-less renditions: "a missing URI
+	// attribute indicates that the media data for this Rendition is included in the Media Playlist of any
+	// EXT-X-STREAM-INF tag referencing this EXT-X-MEDIA tag" (RFC 8216, Section 4.3.4.1)
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceAudioTrack = await sourceInput.getPrimaryAudioTrack();
+	assert(sourceAudioTrack);
+	const decoderConfig = (await sourceAudioTrack.getDecoderConfig())!;
+	const audioPackets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(sourceAudioTrack).packets()) {
+		audioPackets.push(packet);
+	}
+
+	const target = new BufferTarget();
+	const output = new Output({ format: new MpegTsOutputFormat(), target });
+	const englishSource = new EncodedAudioPacketSource('aac');
+	const frenchSource = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(englishSource);
+	output.addAudioTrack(frenchSource);
+	await output.start();
+	for (const [i, packet] of audioPackets.entries()) {
+		await englishSource.add(packet, { decoderConfig });
+		if (i < 200) {
+			await frenchSource.add(packet, { decoderConfig });
+		}
+	}
+	await output.finalize();
+	const tsFile = new Uint8Array(target.buffer!);
+
+	const master = `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="French",LANGUAGE="fr",DEFAULT=YES,AUTOSELECT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=256000,CODECS="mp4a.40.2",AUDIO="audio"
+muxed.m3u8
+`;
+	const mediaPlaylist = '#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:9.1,\nmuxed.ts\n#EXT-X-ENDLIST\n';
+
+	using input = new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(
+			path === 'muxed.ts' ? tsFile : new TextEncoder().encode(path === 'master.m3u8' ? master : mediaPlaylist),
+		)),
+		formats: HLS_FORMATS,
+	});
+
+	const audioTracks = await input.getAudioTracks();
+	expect(await Promise.all(audioTracks.map(x => x.getName()))).toEqual(['English', 'French']);
+	expect((await Promise.all(audioTracks.map(x => x.getDisposition()))).map(x => x.primary)).toEqual([false, true]);
+
+	// Each rendition reads its own stream
+	const packetCounts: number[] = [];
+	for (const track of audioTracks) {
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			count += packet.type === 'key' ? 1 : 0;
+		}
+		packetCounts.push(count);
+	}
+	expect(packetCounts).toEqual([audioPackets.length, 200]);
+});
+
 test.concurrent('Missing media tag codec', async () => {
 	using input = new Input({
 		source: new UrlSource('https://playertest.longtailvideo.com/adaptive/elephants_dream_v4/index.m3u8'),
