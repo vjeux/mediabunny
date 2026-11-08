@@ -2109,7 +2109,7 @@ const parameterSetSearches = new WeakMap<ElementaryStream, Map<number, Promise<P
 /**
  * Finds the parameter sets in force right before the given position in a video stream: for each type, those of the
  * last PES packet with any. If there are none within MAX_PARAMETER_SET_SEARCH_DISTANCE, or before the track's first
- * PES packet, the decoder config's, which are the stream's first ones, are taken.
+ * PES packet, or in what can still be read, the decoder config's, which are the stream's first ones, are taken.
  */
 const findParameterSetsBefore = (elementaryStream: ElementaryVideoStream, endPos: number) => {
 	let searches = parameterSetSearches.get(elementaryStream);
@@ -2132,30 +2132,35 @@ const findParameterSetsBefore = (elementaryStream: ElementaryVideoStream, endPos
 				endPos - MAX_PARAMETER_SET_SEARCH_DISTANCE,
 			);
 
-			for (let pos = endPos - demuxer.packetStride; pos >= minPos; pos -= demuxer.packetStride) {
-				if (types.every(type => parameterSets.has(type))) {
-					break;
-				}
+			try {
+				for (let pos = endPos - demuxer.packetStride; pos >= minPos; pos -= demuxer.packetStride) {
+					if (types.every(type => parameterSets.has(type))) {
+						break;
+					}
 
-				const packetHeader = await demuxer.readPacketHeader(pos);
-				if (!packetHeader) {
-					break;
-				}
-				if (packetHeader.pid !== elementaryStream.pid || packetHeader.payloadUnitStartIndicator !== 1) {
-					continue;
-				}
+					const packetHeader = await demuxer.readPacketHeader(pos);
+					if (!packetHeader) {
+						break;
+					}
+					if (packetHeader.pid !== elementaryStream.pid || packetHeader.payloadUnitStartIndicator !== 1) {
+						continue;
+					}
 
-				const section = await demuxer.readSection(pos, true);
-				const pesPacket = section && readPesPacket(demuxer, section, false);
-				if (!pesPacket) {
-					continue;
-				}
+					const section = await demuxer.readSection(pos, true);
+					const pesPacket = section && readPesPacket(demuxer, section, false);
+					if (!pesPacket) {
+						continue;
+					}
 
-				for (const [type, nalUnits] of collectParameterSets(pesPacket.data, codec)) {
-					if (!parameterSets.has(type)) {
-						parameterSets.set(type, nalUnits);
+					for (const [type, nalUnits] of collectParameterSets(pesPacket.data, codec)) {
+						if (!parameterSets.has(type)) {
+							parameterSets.set(type, nalUnits);
+						}
 					}
 				}
+			} catch {
+				// The data further back can't be read anymore (a sequential source, like a ReadableStreamSource,
+				// keeps only what its cache holds), so let's go with what we have
 			}
 
 			for (const [type, nalUnits] of getDecoderConfigParameterSets(elementaryStream)) {

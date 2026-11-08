@@ -1006,4 +1006,53 @@ test('MPEG-TS gives key packets without parameter sets the ones in force before 
 			expect([...packet!.data]).toEqual([...expected[i]!]);
 		}
 	}
+
+	// Through a sequential source that keeps only what its cache holds (a ReadableStreamSource), looking back may run
+	// into data that's gone; the decoder config's parameter sets are taken then (found in L15's streamed check). 40
+	// frames of 100 kB, a key frame every 13 with SPS and PPS only in the first, read through a 1 MiB cache: the
+	// duration's lookup at the end meets the key frame of frame 39.
+	const nal = codecs.avc;
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 40; i++) {
+		const isKey = i % 13 === 0;
+		const slice = [...(isKey ? nal.keySlice : nal.deltaSlice), ...new Array<number>(100_000).fill(i)];
+		await source.add(
+			new EncodedPacket(
+				annexB(i === 0 ? [nal.aud, ...nal.parameterSets, nal.pps, slice] : [nal.aud, slice]),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: nal.decoderConfig } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= bytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(bytes.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 20 }),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.computeDuration()).toBeCloseTo(40 / 25);
+	const packet = await new EncodedPacketSink(track).getPacket(39 / 25);
+	expect([...packet!.data.subarray(0, 50)]).toEqual([
+		...annexB([nal.aud, ...nal.parameterSets, nal.pps, nal.keySlice]),
+	].slice(0, 50));
 });
