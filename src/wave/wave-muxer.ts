@@ -305,7 +305,8 @@ export class WaveMuxer extends Muxer {
 		if (metadata.raw) {
 			for (const key in metadata.raw) {
 				const value = metadata.raw[key];
-				if (value == null || key.length !== 4 || writtenTags.has(key)) {
+				// Chunk IDs are four ASCII characters; other keys would take more bytes and break the chunk layout
+				if (value == null || !/^[\x20-\x7e]{4}$/.test(key) || writtenTags.has(key)) {
 					continue;
 				}
 
