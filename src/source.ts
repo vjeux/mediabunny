@@ -95,6 +95,23 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 * @internal
 	 */
 	_usedForHls = false;
+
+	/**
+	 * Whether this source may evict data it has read, being unable to read it again (it reads a stream sequentially
+	 * and only keeps a bounded part of it). Reading the whole input ahead of time then evicts its start.
+	 * @internal
+	 */
+	get _evictsReadData() {
+		return false;
+	}
+
+	/**
+	 * For a source that evicts data it has read: reads ahead as far as it can without evicting anything, so that a
+	 * stream that fits into it no longer counts as evicting.
+	 * @internal
+	 */
+	async _readAheadWithinCache() {}
+
 	/**
 	 * FinalizationRegistry for rogue refs to this source that didn't get freed. It lives on the Source itself so that
 	 * in case the Source transitively points back to itself and forms a cycle (for example through a custom
@@ -783,6 +800,17 @@ export class UrlSource extends PathedSource {
 	_abortControllers = new Map<ReadWorker, AbortController>();
 	/** @internal */
 	_sequentialAbortController: AbortController | null = null;
+
+	/** @internal */
+	override get _evictsReadData() {
+		// Only when streaming the resource, because the server doesn't honor range requests
+		return this._sequentialBacking?._evictsReadData ?? false;
+	}
+
+	/** @internal */
+	override async _readAheadWithinCache() {
+		await this._sequentialBacking?._readAheadWithinCache();
+	}
 
 	/**
 	 * Creates a new {@link UrlSource} backed by the resource at the specified URL.
@@ -1786,6 +1814,29 @@ export class ReadableStreamSource extends Source {
 	 */
 	_cacheMissErrorMessage = 'Attempted to read data from an already-evicted part of the cache. With'
 		+ ' ReadableStreamSource, you must access the data more sequentially or increase the size of its cache.';
+
+	/** @internal */
+	override get _evictsReadData() {
+		// Unless the whole stream is known to fit into the cache
+		return this._maxCacheSize !== Infinity && (this._endIndex === null || this._endIndex > this._maxCacheSize);
+	}
+
+	/** @internal */
+	override async _readAheadWithinCache() {
+		if (
+			!this._evictsReadData
+			|| this._maxCacheSize < 1
+			// Already pulled (or requested) past the cache's size, so the stream doesn't fit
+			|| this._currentIndex >= this._maxCacheSize
+			|| this._maxRequestedIndex > this._maxCacheSize
+		) {
+			return;
+		}
+
+		// Reading up to the cache's size from the start evicts nothing. The stream either ends before that (and its
+		// size is then known) or is larger than the cache
+		await this._read(this._maxCacheSize - 1, this._maxCacheSize);
+	}
 
 	/** Creates a new {@link ReadableStreamSource} backed by the specified `ReadableStream<Uint8Array>`. */
 	constructor(stream: ReadableStream<Uint8Array>, options: ReadableStreamSourceOptions = {}) {

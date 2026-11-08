@@ -1404,6 +1404,74 @@ test('Reserved fast start, manual maximum packet count', async () => {
 	await expect(conversion.execute()).rejects.toThrow('maximum packet count');
 });
 
+test('Conversion with onProgress of a streamed input without a stored duration', async () => {
+	// ADTS stores no duration, which on a source that only keeps part of a stream can't be computed ahead of the
+	// conversion when the stream is larger than the cache: that would read the whole input, evicting its start before
+	// the conversion reads it. A stream that fits into the cache can still be read ahead
+	const { ReadableStreamSource } = await import('../../src/source.js');
+	const { AdtsOutputFormat: Adts } = await import('../../src/output-format.js');
+	const bytes = new Uint8Array(await (await fetch('/sample3.aac')).arrayBuffer());
+	const createInput = (maxCacheSize: number | undefined) => new Input({
+		source: new ReadableStreamSource(new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (let i = 0; i < 2; i++) { // About 3.5 MB of ADTS
+					for (let offset = 0; offset < bytes.length; offset += 2 ** 16) {
+						controller.enqueue(bytes.slice(offset, offset + 2 ** 16));
+					}
+				}
+				controller.close();
+			},
+		}), { maxCacheSize }),
+		formats: ALL_FORMATS,
+	});
+
+	// A 1 MiB cache, and the default one (32 MiB), into which this stream fits
+	for (const maxCacheSize of [2 ** 20, undefined]) {
+		const fitsIntoCache = maxCacheSize === undefined;
+
+		using input = createInput(maxCacheSize);
+		const output = new Output({ format: new Adts(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, showWarnings: false });
+		const progressValues: number[] = [];
+		conversion.onProgress = progress => progressValues.push(progress);
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryAudioTrack();
+		assert(track);
+		const { packetCount } = await track.computePacketStats();
+		expect(packetCount).toBeGreaterThan(2000);
+		expect(progressValues.at(-1)).toBe(1);
+		// The total is only known ahead of time when the stream fits into the cache
+		expect(progressValues.some(progress => progress > 0 && progress < 1)).toBe(fitsIntoCache);
+
+		// Same for a format that needs to estimate the packet count ahead of time
+		using reserveInput = createInput(maxCacheSize);
+		const reserveOutput = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'reserve' }),
+			target: new BufferTarget(),
+		});
+		const reserveConversion = await Conversion.init({
+			input: reserveInput,
+			output: reserveOutput,
+			showWarnings: false,
+		});
+		if (!fitsIntoCache) {
+			expect(reserveConversion.discardedTracks.map(x => x.reason)).toEqual(['unknown_maximum_packet_count']);
+			continue;
+		}
+
+		await reserveConversion.execute();
+		using reserveResult = new Input({
+			source: new BufferSource(reserveOutput.target.buffer!),
+			formats: ALL_FORMATS,
+		});
+		const reserveTrack = await reserveResult.getPrimaryAudioTrack();
+		assert(reserveTrack);
+		expect((await reserveTrack.computePacketStats()).packetCount).toBe(packetCount);
+	}
+});
+
 test('Maximum packet count is not set when not required', async () => {
 	using input = new Input({
 		source: new UrlSource('/demo.mp4'),
