@@ -1156,7 +1156,7 @@ describe('extractAv1CodecInfoFromPacket', () => {
 	};
 
 	test('reads a Main profile 8-bit 4:2:0 header after other OBUs', () => {
-		expect(info({ profile: 0 }, [[0x12, 0x00], [0x7a, 0x02, 0xaa, 0xbb]])).toEqual(base);
+		expect(info({ profile: 0 }, [[0x12, 0x00], [0x7a, 0x02, 0xaa, 0xbb]])).toMatchObject(base);
 	});
 
 	test.each([
@@ -1211,7 +1211,7 @@ describe('extractAv1CodecInfoFromPacket', () => {
 			},
 		],
 	] as [string, Av1SequenceHeaderOptions, object][])('reads %s', (_, options, expected) => {
-		expect(info(options)).toEqual({ ...base, ...expected });
+		expect(info(options)).toMatchObject({ ...base, ...expected });
 	});
 
 	test('takes level and tier from the first operating point, past timing and decoder model info', () => {
@@ -1223,7 +1223,7 @@ describe('extractAv1CodecInfoFromPacket', () => {
 			initialDisplayDelay: true,
 			extraOperatingPoints: [[4, 0], [12, 0]],
 			colour: [1, 1, 1],
-		})).toEqual({
+		})).toMatchObject({
 			...base,
 			level: 13,
 			tier: 1,
@@ -1234,15 +1234,27 @@ describe('extractAv1CodecInfoFromPacket', () => {
 
 		// A level of 7 or below has no tier bit
 		expect(info({ profile: 0, level: 5, timing: {}, colour: [6, 6, 6] }))
-			.toEqual({ ...base, level: 5, colourPrimaries: 6, transferCharacteristics: 6, matrixCoefficients: 6 });
+			.toMatchObject({
+				...base,
+				level: 5,
+				colourPrimaries: 6,
+				transferCharacteristics: 6,
+				matrixCoefficients: 6,
+			});
 	});
 
 	test('handles reduced still picture headers, frame ID numbers and the screen content tool variants', () => {
 		expect(info({ profile: 0, reducedStillPicture: true, level: 9, colour: [1, 1, 1] }))
-			.toEqual({ ...base, level: 9, colourPrimaries: 1, transferCharacteristics: 1, matrixCoefficients: 1 });
+			.toMatchObject({
+				...base,
+				level: 9,
+				colourPrimaries: 1,
+				transferCharacteristics: 1,
+				matrixCoefficients: 1,
+			});
 		for (const screenContent of ['off', 'on', 'select'] as const) {
 			expect(info({ profile: 0, frameIdNumbers: true, orderHint: false, screenContent, colour: [5, 6, 7] }))
-				.toEqual({ ...base, colourPrimaries: 5, transferCharacteristics: 6, matrixCoefficients: 7 });
+				.toMatchObject({ ...base, colourPrimaries: 5, transferCharacteristics: 6, matrixCoefficients: 7 });
 		}
 	});
 

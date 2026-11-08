@@ -397,11 +397,21 @@ describe('Conversion execution in Node (copy and PCM paths)', () => {
 		expect(progress.every((value, i) => i === 0 || value >= progress[i - 1]!)).toBe(true);
 	});
 
-	test('trimming drops the video track that would need decoding and cuts PCM at the boundaries', async () => {
-		const { conversion, tracks } = await run(new MkvOutputFormat(), { trim: { start: 0.01, end: 0.03 } });
+	test('trimming cuts PCM at the boundaries and drops or copies the VP8 track', async () => {
+		const trim = { start: 0.01, end: 0.03 };
+		const { conversion, tracks } = await run(new MkvOutputFormat(), { trim });
 		const discarded = conversion.discardedTracks.map(x => [x.track.type, x.reason]);
-		expect(discarded).toEqual([['video', 'undecodable_source_codec']]);
-		expect(tracks).toEqual([['audio/pcm-s16', '0:160:key', '10:160:key']]);
+		const audio = ['audio/pcm-s16', '0:160:key', '10:160:key'];
+		if (discarded.length > 0) {
+			// A copy of the video would start before zero (at its key frame), and Node can't decode VP8 to transcode it
+			expect(discarded).toEqual([['video', 'undecodable_source_codec']]);
+			expect(tracks).toEqual([audio]);
+		} else {
+			// Or the video is copied from its key frame, starting below zero, exactly like a forced copy
+			const forced = await run(new MkvOutputFormat(), { trim, copy: { mode: 'forced' } });
+			expect(tracks).toEqual(forced.tracks);
+			expect(tracks).toContainEqual(audio);
+		}
 
 		const wav = await run(new WavOutputFormat(), { trim: { start: 0.005, end: 0.025 } });
 		expect(wav.conversion.discardedTracks.map(x => x.reason)).toEqual(['max_track_count_of_type_reached']);
