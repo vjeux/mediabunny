@@ -1658,6 +1658,12 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
+				if (boxInfo.contentSize < 4) {
+					// FFmpeg writes an empty av1C box when the encoder has no extradata yet (fragmented output), so
+					// let's get the info from the sequence header in the first packet instead
+					break;
+				}
+
 				slice.skip(1); // Marker + version
 
 				const secondByte = readU8(slice);
