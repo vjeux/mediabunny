@@ -531,8 +531,13 @@ export class VideoSample implements Disposable {
 					displayWidth: frameRotation % 180 === 0 ? data.displayWidth : data.displayHeight,
 					displayHeight: frameRotation % 180 === 0 ? data.displayHeight : data.displayWidth,
 				} as VideoFrameInit);
-				// Keep the caller's frame open for as long as the sample, as if the sample held it directly
-				this._passedFrame = data;
+				// Keep the caller's frame open for as long as the sample, as if the sample held it directly. A frame
+				// of our own that gets replaced is closed.
+				if (this._passedFrame === null) {
+					this._passedFrame = data;
+				} else {
+					data.close();
+				}
 				data = unorientedFrame;
 			}
 
