@@ -1536,8 +1536,9 @@ export class VideoSample implements Disposable {
 	 * Converts this video sample to a
 	 * [`CanvasImageSource`](https://udn.realityripple.com/docs/Web/API/CanvasImageSource) for drawing to a canvas.
 	 *
-	 * You must use the value returned by this method immediately, as any VideoFrame created internally may
-	 * automatically be closed in the next microtask.
+	 * The returned value belongs to the sample, so don't close it. It may be a VideoFrame created internally, which is
+	 * automatically closed in the next microtask (so use it immediately), or the sample's own VideoFrame, which
+	 * closing would invalidate.
 	 */
 	toCanvasImageSource() {
 		if (this._closed) {
@@ -3205,8 +3206,9 @@ export class AudioSample implements Disposable {
 	}
 
 	/**
-	 * Creates AudioSamples from an AudioBuffer, starting at the given timestamp in seconds. Typically creates exactly
-	 * one sample, but may create multiple if the AudioBuffer is exceedingly large.
+	 * Creates AudioSamples from an AudioBuffer, starting at the given timestamp in seconds. Each sample holds at most
+	 * 240,000 values (5 seconds of mono or 2.5 seconds of stereo 48 kHz audio), so longer buffers yield multiple
+	 * samples.
 	 */
 	static fromAudioBuffer(audioBuffer: AudioBuffer, timestamp: number) {
 		if (!(audioBuffer instanceof AudioBuffer)) {

@@ -89,7 +89,10 @@ export abstract class CustomVideoEncoder {
 	readonly codec!: VideoCodec;
 	/** Config for the encoder. */
 	readonly config!: VideoEncoderConfig;
-	/** The callback to call when an EncodedPacket is available. */
+	/**
+	 * The callback to call when an EncodedPacket is available. The packet's data is not copied, so don't modify or
+	 * reuse its buffer afterwards (copy views into a reused buffer or a WebAssembly heap first).
+	 */
 	readonly onPacket!: (packet: EncodedPacket, meta?: EncodedVideoChunkMetadata) => unknown;
 	/** The callback to call to surface out-of-band errors that can't be surfaced through the main methods. */
 	readonly onError!: (error: unknown) => undefined;
@@ -121,7 +124,10 @@ export abstract class CustomAudioEncoder {
 	readonly codec!: AudioCodec;
 	/** Config for the encoder. */
 	readonly config!: AudioEncoderConfig;
-	/** The callback to call when an EncodedPacket is available. */
+	/**
+	 * The callback to call when an EncodedPacket is available. The packet's data is not copied, so don't modify or
+	 * reuse its buffer afterwards (copy views into a reused buffer or a WebAssembly heap first).
+	 */
 	readonly onPacket!: (packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) => unknown;
 	/** The callback to call to surface out-of-band errors that can't be surfaced through the main methods. */
 	readonly onError!: (error: unknown) => undefined;
