@@ -2288,3 +2288,19 @@ test('Audio a decoder fails on still throws at the end', async ({ skip }) => {
 		}
 	})()).rejects.toThrow();
 });
+
+test('CanvasSink never deduces a canvas dimension of zero', async () => {
+	// cursed-vfr.mp4 is 3026x1386, so a width of 1 deduced a height of 0 (rounding 0.46), and the canvas couldn't be
+	// drawn to (found by the lane L89 review)
+	using input = new Input({ source: new UrlSource('/cursed-vfr.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const sizes: string[] = [];
+	for (const options of [{ width: 4 }, { width: 1 }, { height: 1, rotation: 90 as const }]) {
+		const wrappedCanvas = await new CanvasSink(track, options).getCanvas(await track.getFirstTimestamp());
+		assert(wrappedCanvas);
+		sizes.push(`${wrappedCanvas.canvas.width}x${wrappedCanvas.canvas.height}`);
+	}
+	expect(sizes).toEqual(['4x2', '1x1', '1x1']); // The first one is the control
+});

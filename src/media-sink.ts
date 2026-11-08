@@ -3053,13 +3053,14 @@ export class CanvasSink {
 				: [rotatedWidth, rotatedHeight];
 			const originalAspectRatio = width / height;
 
-			// If width and height aren't defined together, deduce the missing value using the aspect ratio
+			// If width and height aren't defined together, deduce the missing value using the aspect ratio. Extreme
+			// aspect ratios must not round it down to zero, which can't be drawn.
 			if (options.width !== undefined && options.height === undefined) {
 				width = options.width;
-				height = Math.round(width / originalAspectRatio);
+				height = Math.max(1, Math.round(width / originalAspectRatio));
 			} else if (options.width === undefined && options.height !== undefined) {
 				height = options.height;
-				width = Math.round(height * originalAspectRatio);
+				width = Math.max(1, Math.round(height * originalAspectRatio));
 			} else if (options.width !== undefined && options.height !== undefined) {
 				width = options.width;
 				height = options.height;
