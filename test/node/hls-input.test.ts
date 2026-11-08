@@ -1429,6 +1429,97 @@ root.m3u8
 	await expect(input.getTracks()).rejects.toThrow('unsupported');
 });
 
+test.concurrent('A CODECS attribute may list several codecs of one media type', async () => {
+	// CODECS lists "every media format present in any Media Segment in any of the Renditions specified by the
+	// Variant Stream" (RFC 8216bis, Section 4.4.6.2), e.g. for an audio group with an AAC and an AC-3 rendition
+	const openMaster = (master: string, files: Record<string, Uint8Array> = {}) => new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => {
+			if (path.endsWith('.m3u8')) {
+				const segment = { 'ac3.m3u8': 'ac3.ts', 'muxed.m3u8': 'muxed.ts' }[path] ?? '0.ts';
+				return new BufferSource(new TextEncoder().encode(path === 'master.m3u8'
+					? master
+					: `#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:5,\n${segment}\n#EXT-X-ENDLIST\n`,
+				));
+			}
+
+			return files[path] ? new BufferSource(files[path]) : new FilePathSource(`./test/public/${path}`);
+		}),
+		formats: HLS_FORMATS,
+	});
+
+	const readAudioCodecs = async (input: Input) => {
+		const audioTracks = await input.getAudioTracks();
+		return Promise.all(audioTracks.map(x => x.getCodec()));
+	};
+
+	// An audio group with an AAC and an AC-3 rendition
+	const checkGroup = async (codecs: string, secondUri: string, expectedCodecs: string[]) => {
+		using input = openMaster(`#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Stereo",DEFAULT=YES,URI="aac.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Other",URI="${secondUri}"
+#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS="${codecs}",AUDIO="audio"
+video.m3u8
+`);
+		expect(await input.getVideoTracks()).toHaveLength(1);
+		expect(await readAudioCodecs(input)).toEqual(expectedCodecs);
+
+		const audioTracks = await input.getAudioTracks();
+		for (const track of audioTracks) {
+			expect(await new EncodedPacketSink(track).getFirstPacket()).not.toBeNull();
+		}
+	};
+	await checkGroup('avc1.64000d,mp4a.40.2,ac-3', 'ac3.m3u8', ['aac', 'ac3']);
+	// AAC-LC and HE-AAC renditions
+	await checkGroup('avc1.64000d,mp4a.40.2,mp4a.40.5', 'aac-he.m3u8', ['aac', 'aac']);
+
+	// A variant without groups whose own media holds an AAC and an AC-3 stream
+	const readPackets = async (path: string) => {
+		using sourceInput = new Input({ source: new FilePathSource(path), formats: ALL_FORMATS });
+		const track = await sourceInput.getPrimaryAudioTrack();
+		assert(track);
+		const decoderConfig = (await track.getDecoderConfig())!;
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		return { packets, decoderConfig };
+	};
+	const aac = await readPackets('./test/public/0.ts');
+	const ac3 = await readPackets('./test/public/ac3.ts');
+
+	const target = new BufferTarget();
+	const output = new Output({ format: new MpegTsOutputFormat(), target });
+	const aacSource = new EncodedAudioPacketSource('aac');
+	const ac3Source = new EncodedAudioPacketSource('ac3');
+	output.addAudioTrack(aacSource);
+	output.addAudioTrack(ac3Source);
+	await output.start();
+	for (const packet of aac.packets) {
+		await aacSource.add(packet, { decoderConfig: aac.decoderConfig });
+	}
+	for (const packet of ac3.packets) {
+		await ac3Source.add(packet, { decoderConfig: ac3.decoderConfig });
+	}
+	await output.finalize();
+
+	using muxedInput = openMaster(`#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS="mp4a.40.2,ac-3"
+muxed.m3u8
+`, { 'muxed.ts': new Uint8Array(target.buffer!) });
+	expect(await readAudioCodecs(muxedInput)).toEqual(['aac', 'ac3']);
+
+	const packetCounts: number[] = [];
+	for (const track of await muxedInput.getAudioTracks()) {
+		const sink = new EncodedPacketSink(track);
+		let count = 0;
+		for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+			count++;
+		}
+		packetCounts.push(count);
+	}
+	expect(packetCounts).toEqual([aac.packets.length, ac3.packets.length]);
+});
+
 test.concurrent('Widevine encryption (SAMPLE-AES-CTR) fails without keys', async () => {
 	using input = new Input({
 		source: new UrlSource('https://storage.googleapis.com/shaka-demo-assets/angel-one-widevine-hls/hls.m3u8'),
@@ -3195,3 +3286,68 @@ const stripId3V2Tags = (bytes: Uint8Array) => {
 
 	return bytes;
 };
+
+test.concurrent('URI-less renditions read their own streams when the variant mixes audio codecs', async () => {
+	// One MPEG-TS whose audio streams are described, in order, by URI-less renditions with CODECS="mp4a.40.2,ac-3".
+	// Each rendition's codec must be read from, and its track bound to, the same stream. (Found by review lane L46 on
+	// the merge of #389 and #392.)
+	const readSource = async (path: string) => {
+		using input = new Input({ source: new FilePathSource(path), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		return { codec: (await track.getCodec())!, packets, decoderConfig: (await track.getDecoderConfig())! };
+	};
+
+	const readRenditions = async (streams: { name: string; path: string; count?: number }[]) => {
+		const target = new BufferTarget();
+		const output = new Output({ format: new MpegTsOutputFormat(), target });
+		const sourceStreams = await Promise.all(streams.map(x => readSource(x.path)));
+		const packetSources = sourceStreams.map(x => new EncodedAudioPacketSource(x.codec));
+		for (const packetSource of packetSources) {
+			output.addAudioTrack(packetSource);
+		}
+		await output.start();
+		for (const [i, { packets, decoderConfig }] of sourceStreams.entries()) {
+			for (const packet of packets.slice(0, streams[i]!.count)) {
+				await packetSources[i]!.add(packet, { decoderConfig });
+			}
+		}
+		await output.finalize();
+		const tsFile = new Uint8Array(target.buffer!);
+
+		const master = '#EXTM3U\n'
+			+ streams.map(x => `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${x.name}",AUTOSELECT=YES\n`).join('')
+			+ '#EXT-X-STREAM-INF:BANDWIDTH=512000,CODECS="mp4a.40.2,ac-3",AUDIO="audio"\nmuxed.m3u8\n';
+		const mediaPlaylist = '#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:9.1,\nmuxed.ts\n#EXT-X-ENDLIST\n';
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(
+				path === 'muxed.ts' ? tsFile : new TextEncoder().encode(path === 'master.m3u8' ? master : mediaPlaylist),
+			)),
+			formats: HLS_FORMATS,
+		});
+
+		const result: string[] = [];
+		for (const track of await input.getAudioTracks()) {
+			const sink = new EncodedPacketSink(track);
+			let count = 0;
+			for (let packet = await sink.getFirstPacket(); packet; packet = await sink.getNextPacket(packet)) {
+				count++;
+			}
+			result.push(`${await track.getName()} ${await track.getCodec()} ${count}`);
+		}
+		return result;
+	};
+
+	const surround = { name: 'Surround', path: './test/public/ac3.ts' }; // 63 AC-3 packets
+	const english = { name: 'English', path: './test/public/edts.mp4' }; // 390 AAC packets
+	const french = { name: 'French', path: './test/public/edts.mp4', count: 200 };
+
+	expect(await readRenditions([english, french, surround]))
+		.toEqual(['English aac 390', 'French aac 200', 'Surround ac3 63']);
+	expect(await readRenditions([surround, english, french]))
+		.toEqual(['Surround ac3 63', 'English aac 390', 'French aac 200']);
+});
