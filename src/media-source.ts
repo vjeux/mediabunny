@@ -764,10 +764,13 @@ class VideoEncoderWrapper {
 					quantizer !== null ? `quantizer ${quantizer}` : `${config.bitrate} bps`,
 				);
 
-				// Custom encoders were registered then, and none supports this config (say, an extension for other codecs)
-				const missingClass = typeof VideoEncoder === 'undefined'
-					? ' No registered custom encoder supports it, and ' + missingWebCodecsClassMessage('VideoEncoder')
-					: '';
+				let missingClass = '';
+				if (typeof VideoEncoder === 'undefined') {
+					// Custom encoders were registered then, and none supports this config (an extension for other
+					// codecs, say), so say both
+					const message = missingWebCodecsClassMessage('VideoEncoder');
+					missingClass = ` No registered custom encoder supports it, and ${message}`;
+				}
 				throw new Error(
 					`This specific encoder configuration (${firstConfig.codec}, ${rateControls.join(' / ')},`
 					+ ` ${firstConfig.width}x${firstConfig.height}, hardware acceleration:`
@@ -2465,11 +2468,13 @@ class AudioEncoderWrapper {
 				}
 
 				if (!supported) {
-					// Custom encoders were registered then, and none supports this config (say, an extension for
-					// other codecs)
-					const missingClass = typeof AudioEncoder === 'undefined'
-						? ' No registered custom encoder supports it, and ' + missingWebCodecsClassMessage('AudioEncoder')
-						: '';
+					let missingClass = '';
+					if (typeof AudioEncoder === 'undefined') {
+						// Custom encoders were registered then, and none supports this config (an extension for other
+						// codecs, say), so say both
+						const message = missingWebCodecsClassMessage('AudioEncoder');
+						missingClass = ` No registered custom encoder supports it, and ${message}`;
+					}
 					throw new Error(
 						`This specific encoder configuration (${encoderConfig.codec}, ${encoderConfig.bitrate} bps,`
 						+ ` ${encoderConfig.numberOfChannels} channels, ${encoderConfig.sampleRate} Hz) is not`
