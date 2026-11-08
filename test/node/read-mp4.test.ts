@@ -15,6 +15,7 @@ import {
 	MovOutputFormat,
 	Mp4OutputFormat,
 	Output,
+	ReadableStreamSource,
 } from '../../src/index.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
@@ -694,4 +695,109 @@ test('Packet durations of frames presented at the same time, fragmented or not',
 	expect(await readDurations(nonFragmented())).toEqual(expected);
 	expect(await readDurations(fragmented([8]))).toEqual(expected);
 	expect(await readDurations(fragmented([3, 3, 2]))).toEqual(expected); // Both pairs span fragments
+});
+
+test('Packet durations don\'t hold back the packets of a live stream', async () => {
+	// A fragmented MP4 read while it's being written. A packet whose duration depends on the next fragment comes out
+	// with the duration its own fragment gives it as long as that fragment hasn't arrived, rather than one fragment
+	// late (found by L91).
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const head = [...box('ftyp', ascii('iso5'), u32(0)), ...box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)),
+					box('stsc', zeros(8)),
+					box('stsz', zeros(12)),
+					box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	)];
+
+	// Decode order I P | B B P | B B with a decode duration of 1 each, presented as I B B P B B P
+	const fragments = [[1, 3], [0, 0, 3], [0, 0]].map((compositionOffsets, i) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32([0, 2, 5][i]!)),
+			box('trun', u32(0xf01), u32(compositionOffsets.length), u32(dataOffset), ...compositionOffsets.map(
+				(offset, j) => [...u32(1), ...u32(1), ...u32(i === 0 && j === 0 ? 0 : 0x10000), ...u32(offset)],
+			)),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		return [
+			...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)),
+			...box('mdat', zeros(compositionOffsets.length)),
+		];
+	});
+
+	const readAll = async (input: Input) => {
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packets: number[][] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push([Math.round(packet.timestamp * 10), Math.round(packet.duration * 10)]);
+		}
+		return packets;
+	};
+
+	// The first fragment has been written, the stream is still open
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+	const stream = new ReadableStream<Uint8Array>({
+		start: (streamController) => {
+			controller = streamController;
+			controller.enqueue(new Uint8Array([...head, ...fragments[0]!]));
+		},
+	});
+	using input = new Input({ source: new ReadableStreamSource(stream), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const iterator = new EncodedPacketSink(track).packets();
+	const live: number[][] = [];
+	let next = iterator.next();
+	while (true) {
+		const result = await Promise.race([next, new Promise<null>(resolve => setTimeout(() => resolve(null), 500))]);
+		if (!result || result.done) {
+			break;
+		}
+
+		live.push([Math.round(result.value.timestamp * 10), Math.round(result.value.duration * 10)]);
+		next = iterator.next();
+	}
+
+	// Both packets of the first fragment. The I frame lasts until the B frame in the next fragment, but until that
+	// fragment is there, it lasts until the P frame, as on main.
+	expect(live).toEqual([[1, 3], [4, 1]]);
+
+	// The rest of the stream
+	controller.enqueue(new Uint8Array([...fragments[1]!, ...fragments[2]!]));
+	controller.close();
+	const rest: number[] = [];
+	for (let result = await next; !result.done; result = await iterator.next()) {
+		rest.push(Math.round(result.value.timestamp * 10));
+	}
+	expect(rest).toEqual([2, 3, 7, 5, 6]);
+
+	// Once everything has arrived, the packets are the same as from a file that's there in full
+	using fullInput = new Input({
+		source: new BufferSource(new Uint8Array([...head, ...fragments.flat()])),
+		formats: ALL_FORMATS,
+	});
+	const full = await readAll(fullInput);
+	expect(full).toEqual([[1, 1], [4, 1], [2, 1], [3, 1], [7, 1], [5, 1], [6, 1]]);
+	expect(await readAll(input)).toEqual(full);
 });

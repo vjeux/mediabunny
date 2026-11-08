@@ -3609,6 +3609,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			// samples decoded before them are presented at or after it
 			const laterPresentations = [presentation];
 			let latestTimestamp = presentation.timestamps.at(-1) ?? -Infinity;
+			// A source of unknown size may be a live stream whose next fragment hasn't arrived yet, which must not hold
+			// back the packets that have
+			const canWait = this.internalTrack.demuxer.reader.fileSizeNonStrict !== null;
 			let laterSampleCount = 0;
 			let moofOffset = fragment.moofOffset;
 			while (
@@ -3618,9 +3621,15 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				// No conforming stream presents that many samples decoded after a sample before it
 				&& (nextTimestamp !== Infinity || laterSampleCount <= MAX_REORDERED_SAMPLES)
 			) {
-				let next = this.getNextFragmentPresentation(moofOffset);
+				let next = this.getNextFragmentPresentation(moofOffset, canWait);
 				if (isThenable(next)) {
 					next = await next;
+				}
+				if (next === undefined) {
+					// The next fragment isn't there yet. Rather than waiting for it, the sample keeps the duration its
+					// own fragment gives it, as before. That isn't remembered, so that once the fragment has arrived,
+					// the duration is taken from the presentation order.
+					return sample.duration;
 				}
 				// A sync sample is presented after every sample decoded before it, so one presented earlier means that
 				// the fragments overlap (cut or edited content), which nothing reorders across
@@ -3694,12 +3703,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 	/**
 	 * The presentation of the next fragment holding this track after the one at the given offset, if any. Returns
-	 * synchronously once known.
+	 * synchronously once known. Without canWait, it returns undefined instead of waiting for data, see findTrackMoof.
 	 */
-	private getNextFragmentPresentation(moofOffset: number): MaybePromise<{
+	private getNextFragmentPresentation(moofOffset: number, canWait = true): MaybePromise<{
 		moofOffset: number;
 		presentation: FragmentPresentation;
-	} | null> {
+	} | null | undefined> {
 		const { fragmentPresentations } = this.internalTrack;
 		const presentation = fragmentPresentations!.get(moofOffset)!;
 
@@ -3713,7 +3722,14 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		}
 
 		return (async () => {
-			presentation.nextMoofOffset ??= await this.findTrackMoof(moofOffset + presentation.moofSize);
+			if (presentation.nextMoofOffset === undefined) {
+				const nextMoofOffset = await this.findTrackMoof(moofOffset + presentation.moofSize, canWait);
+				if (nextMoofOffset === undefined) {
+					return undefined; // Not there yet
+				}
+
+				presentation.nextMoofOffset = nextMoofOffset;
+			}
 			if (presentation.nextMoofOffset === null) {
 				return null;
 			}
@@ -3761,7 +3777,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		const candidates = [knownOffset, lookupEntry?.moofOffset, cacheEntry?.moofOffset]
 			.filter((x): x is number => x != null && x < moofOffset);
 		let currentOffset = candidates.length > 0 ? Math.max(...candidates) : await this.findTrackMoof(0);
-		if (currentOffset === null || currentOffset >= moofOffset) {
+		if (currentOffset == null || currentOffset >= moofOffset) {
 			return null;
 		}
 
@@ -3783,8 +3799,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		}
 	}
 
-	/** The offset of the first moof box holding this track at or after the given position, if any. */
-	private async findTrackMoof(pos: number) {
+	/**
+	 * The offset of the first moof box holding this track at or after the given position, if any. Without canWait, it
+	 * only goes through data that can be read right away, and returns undefined where it would have to wait for more,
+	 * like at the current end of a live stream.
+	 */
+	private async findTrackMoof(pos: number, canWait = true): Promise<number | null | undefined> {
 		const { demuxer } = this.internalTrack;
 
 		while (true) {
@@ -3800,6 +3820,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			let slice = demuxer.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 			if (isThenable(slice)) {
+				if (!canWait) {
+					slice.catch(() => {}); // Nobody waits for it
+					return undefined;
+				}
+
 				slice = await slice;
 			}
 			const boxInfo = slice && readBoxHeader(slice);
@@ -3808,6 +3833,14 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 
 			if (boxInfo.name === 'moof') {
+				if (!canWait) {
+					const moofSlice = demuxer.reader.requestSlice(pos, boxInfo.totalSize);
+					if (isThenable(moofSlice)) {
+						moofSlice.catch(() => {});
+						return undefined;
+					}
+				}
+
 				const fragment = await demuxer.readFragment(pos);
 				if (!fragment) {
 					return null;
