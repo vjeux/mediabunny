@@ -1078,8 +1078,11 @@ export class Id3V2Writer {
 
 	writeId3V2LyricsFrame(lyrics: string) {
 		const useIso88591 = isIso88591Compatible(lyrics);
+		const textDataLength = useIso88591
+			? lyrics.length
+			: textEncoder.encode(lyrics).byteLength;
 		const shortDescription = '';
-		const frameSize = 1 + 3 + shortDescription.length + 1 + lyrics.length + 1;
+		const frameSize = 1 + 3 + shortDescription.length + 1 + textDataLength + 1;
 
 		this.writeAscii('USLT');
 		this.writeSynchsafeU32(frameSize);
