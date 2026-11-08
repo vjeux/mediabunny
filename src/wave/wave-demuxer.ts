@@ -229,11 +229,20 @@ export class WaveDemuxer extends Demuxer {
 		}
 
 		let currentPos = slice.filePos;
+		let skippedPadByte = false;
 		while (currentPos <= startPos + size - 8) {
 			slice.filePos = currentPos;
 
-			const chunkName = readAscii(slice, 4);
-			const chunkSize = readU32(slice, littleEndian);
+			let chunkName = readAscii(slice, 4);
+			let chunkSize = readU32(slice, littleEndian);
+			if (chunkSize > slice.remainingLength && skippedPadByte) {
+				// Some writers leave out the pad byte after odd-sized sub-chunks, so like FFmpeg, see if this sub-chunk
+				// starts a byte earlier
+				currentPos--;
+				slice.filePos = currentPos;
+				chunkName = readAscii(slice, 4);
+				chunkSize = readU32(slice, littleEndian);
+			}
 			if (chunkSize > slice.remainingLength) {
 				break; // The sub-chunk doesn't fit into the LIST chunk
 			}
@@ -308,6 +317,7 @@ export class WaveDemuxer extends Demuxer {
 				}; break;
 			}
 
+			skippedPadByte = (chunkSize & 1) === 1;
 			currentPos += 8 + chunkSize + (chunkSize & 1); // Handle padding
 		}
 	}
