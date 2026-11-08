@@ -55,9 +55,10 @@ const AVC_AUD_NAL = new Uint8Array([0x09, 0xF0]);
 // More than the deepest reordering AVC and HEVC allow (16 frames), for streams reordering further than they say
 const MAX_REORDER_DEPTH = 64;
 
-// The reorder frame count of each decoder config's stream. An HLS output gives the muxer of every segment the same
-// decoder config, so its SPS is parsed (and an SPS that doesn't parse reported) once per track, not once per segment.
-const reorderFrameCounts = new WeakMap<VideoDecoderConfig, number | null>();
+// The reorder frame count of the SPS last found for a decoder config. An HLS output gives the muxer of every segment
+// the same decoder config, so the SPS is parsed (and one that doesn't parse reported) once per track, not once per
+// segment. The SPS itself is compared, since a decoder config object may be reused for streams with other ones.
+const reorderFrameCounts = new WeakMap<VideoDecoderConfig, { sps: Uint8Array; reorderFrameCount: number | null }>();
 const HEVC_AUD_NAL = new Uint8Array([0x46, 0x01]);
 
 type MpegTsTrackData = {
@@ -349,15 +350,12 @@ export class MpegTsMuxer extends Muxer {
 				}
 			}
 
-			const decoderConfig = meta?.decoderConfig;
-			let reorderFrameCount = decoderConfig && reorderFrameCounts.get(decoderConfig);
-			if (reorderFrameCount === undefined) {
-				reorderFrameCount = this.getReorderFrameCount(trackData, packet.data, codec as 'avc' | 'hevc');
-				if (decoderConfig) {
-					reorderFrameCounts.set(decoderConfig, reorderFrameCount);
-				}
-			}
-			trackData.reorderFrameCount = reorderFrameCount;
+			trackData.reorderFrameCount = this.getReorderFrameCount(
+				trackData,
+				packet.data,
+				codec as 'avc' | 'hevc',
+				meta?.decoderConfig,
+			);
 		}
 
 		if (trackData.inputIsAnnexB) {
@@ -371,7 +369,12 @@ export class MpegTsMuxer extends Muxer {
 	 * Returns how many frames the stream reorders at most, as its SPS says: AVC's num_reorder_frames (only when it's
 	 * given, the inferred one can be much larger than what's used) or HEVC's sps_max_num_reorder_pics.
 	 */
-	private getReorderFrameCount(trackData: MpegTsTrackData, data: Uint8Array, codec: 'avc' | 'hevc') {
+	private getReorderFrameCount(
+		trackData: MpegTsTrackData,
+		data: Uint8Array,
+		codec: 'avc' | 'hevc',
+		decoderConfig?: VideoDecoderConfig,
+	) {
 		let sps = codec === 'avc'
 			? trackData.avcDecoderConfig?.sequenceParameterSets[0]
 			: trackData.hevcDecoderConfig?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
@@ -393,13 +396,27 @@ export class MpegTsMuxer extends Muxer {
 			return null;
 		}
 
-		if (codec === 'avc') {
-			const info = parseAvcSps(sps);
-			return info?.bitstreamRestrictionFlag ? info.numReorderFrames : null;
-		} else {
-			const info = parseHevcSps(sps);
-			return info ? info.maxDecFrameBuffering - 1 : null; // That's sps_max_num_reorder_pics + 1
+		const spsBytes = sps;
+		const cached = decoderConfig && reorderFrameCounts.get(decoderConfig);
+		if (cached && cached.sps.length === spsBytes.length && cached.sps.every((byte, i) => byte === spsBytes[i])) {
+			return cached.reorderFrameCount;
 		}
+
+		let reorderFrameCount: number | null;
+		if (codec === 'avc') {
+			const info = parseAvcSps(spsBytes);
+			reorderFrameCount = info?.bitstreamRestrictionFlag ? info.numReorderFrames : null;
+		} else {
+			const info = parseHevcSps(spsBytes);
+			reorderFrameCount = info ? info.maxDecFrameBuffering - 1 : null; // That's sps_max_num_reorder_pics + 1
+		}
+
+		if (decoderConfig) {
+			// (A copy, so as not to keep the packet it's in)
+			reorderFrameCounts.set(decoderConfig, { sps: spsBytes.slice(), reorderFrameCount });
+		}
+
+		return reorderFrameCount;
 	}
 
 	private prepareAnnexBVideoPacket(data: Uint8Array, codec: 'avc' | 'hevc'): Uint8Array {

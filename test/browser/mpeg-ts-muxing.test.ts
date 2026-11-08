@@ -845,7 +845,13 @@ test('MPEG-TS muxing keeps DTS increasing when a later GOP reorders deeper', asy
 
 	const noSpsDecoderConfig = { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 };
 	const pyramid = [0, 1, 2, 3, 4, 8, 6, 5, 7, 9].map(x => x / 30);
-	const cases = [
+	// x264's SPS, for Annex B packets carrying it in-band
+	const avcC = new Uint8Array(x264DecoderConfig.description as ArrayBuffer);
+	const x264Sps = [...avcC.subarray(8, 8 + ((avcC[6]! << 8) | avcC[7]!))];
+	// One decoder config object, reused for a stream with x264's SPS in-band and then for one without it: the second
+	// one doesn't take the first one's reordering (from L46's review)
+	const sharedDecoderConfig = { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 };
+	const cases: { decoderConfig: VideoDecoderConfig; timestamps: number[]; dts: number[]; inBandSps?: boolean }[] = [
 		{
 			decoderConfig: noSpsDecoderConfig,
 			timestamps: pyramid,
@@ -858,9 +864,20 @@ test('MPEG-TS muxing keeps DTS increasing when a later GOP reorders deeper', asy
 		},
 		{ decoderConfig: x264DecoderConfig, timestamps: [0, 10.03, 1 / 120], dts: [-750, 0, 750] },
 		{ decoderConfig: x264DecoderConfig, timestamps: [0], dts: [0] },
+		{
+			decoderConfig: sharedDecoderConfig,
+			timestamps: pyramid,
+			dts: [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(x => 3000 * x),
+			inBandSps: true,
+		},
+		{
+			decoderConfig: sharedDecoderConfig,
+			timestamps: pyramid,
+			dts: [0, 3000, 6000, 9000, 9001, 9002, 12000, 15000, 18000, 21000],
+		},
 	];
 
-	for (const { decoderConfig, timestamps, dts } of cases) {
+	for (const { decoderConfig, timestamps, dts, inBandSps } of cases) {
 		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
 		const source = new EncodedVideoPacketSource('avc');
 		output.addVideoTrack(source);
@@ -870,7 +887,8 @@ test('MPEG-TS muxing keeps DTS increasing when a later GOP reorders deeper', asy
 			const isKey = i === 0 || (timestamps === pyramid && (i === 4 || i === 9));
 			// Length-prefixed NAL units with x264's decoder config
 			const startCode = decoderConfig === x264DecoderConfig ? [0, 0, 0, 2] : [0, 0, 0, 1];
-			const data = new Uint8Array([...startCode, isKey ? 0x65 : 0x41, 0x88]);
+			const sps = inBandSps && isKey ? [0, 0, 0, 1, ...x264Sps] : [];
+			const data = new Uint8Array([...sps, ...startCode, isKey ? 0x65 : 0x41, 0x88]);
 			await source.add(new EncodedPacket(data, isKey ? 'key' : 'delta', timestamps[i]!, 1 / 30), {
 				decoderConfig,
 			});
