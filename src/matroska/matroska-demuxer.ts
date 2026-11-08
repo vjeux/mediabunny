@@ -780,6 +780,14 @@ export class MatroskaDemuxer extends Demuxer {
 				if (slice) {
 					this.readContiguousElements(slice);
 				}
+			} else if (id === EBMLId.Attachments && size !== undefined && this.reader.fileSize !== null) {
+				// Attachments (fonts, cover art) can be large, so they're only read once the metadata tags are asked
+				// for, like when the seek head points to them. (A source of unknown size gets read in order, so there,
+				// they're read right away.)
+				const segmentPosition = elementStartPos - segmentDataStart;
+				if (!this.currentSegment.seekEntries.some(x => x.id === id && x.segmentPosition === segmentPosition)) {
+					this.currentSegment.seekEntries.push({ id, segmentPosition });
+				}
 			} else if (id === EBMLId.Tags || id === EBMLId.Attachments) {
 				// Metadata found at the beginning of the segment, great, let's parse it
 				if (id === EBMLId.Tags) {
