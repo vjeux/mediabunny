@@ -56,6 +56,9 @@ export class SubtitleParser {
 				throw new Error('WebVTT preamble incorrect.');
 			}
 
+			// The header holds at least the WEBVTT line, so that line can't be the identifier of a cue that directly
+			// follows it (W3C WebVTT parser: a line containing "-->" ends the header)
+			cueBlockHeaderRegex.lastIndex = text.indexOf('\n') + 1;
 			match = cueBlockHeaderRegex.exec(text);
 			const preamble = text.slice(0, match?.index ?? text.length).trimEnd();
 
