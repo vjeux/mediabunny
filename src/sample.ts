@@ -3690,8 +3690,9 @@ export class AudioSample implements Disposable {
 	}
 
 	/**
-	 * Creates AudioSamples from an AudioBuffer, starting at the given timestamp in seconds. Typically creates exactly
-	 * one sample, but may create multiple if the AudioBuffer is exceedingly large.
+	 * Creates AudioSamples from an AudioBuffer, starting at the given timestamp in seconds. Each sample holds at most
+	 * 240,000 values (5 seconds of mono or 2.5 seconds of stereo 48 kHz audio), so longer buffers yield multiple
+	 * samples.
 	 */
 	static fromAudioBuffer(audioBuffer: AudioBuffer, timestamp: number) {
 		if (typeof AudioBuffer === 'undefined' || !(audioBuffer instanceof AudioBuffer)) {
