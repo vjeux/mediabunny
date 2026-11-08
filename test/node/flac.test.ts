@@ -665,10 +665,15 @@ test('can read a FLAC file with leading ID3v2 tags', async () => {
 		return result;
 	};
 
+	// The same, as an album artist (TPE2) tag, which the FLAC's Vorbis comments don't hold
+	const albumArtistTag = createId3V23TitleTag('ID3 album artist');
+	albumArtistTag.set([0x54, 0x50, 0x45, 0x32], 10);
+
 	using input = new Input({
 		source: new BufferSource(concatenateBytes(
 			createId3V23TitleTag('First tag'),
 			createId3V23TitleTag('Second tag'),
+			albumArtistTag,
 			await fs.readFile(new URL('../public/sample.flac', import.meta.url)),
 		)),
 		formats: ALL_FORMATS,
@@ -687,7 +692,9 @@ test('can read a FLAC file with leading ID3v2 tags', async () => {
 	expect(firstPacket.timestamp).toBe(0);
 
 	const metadataTags = await input.getMetadataTags();
-	expect(metadataTags.title).toBe('First tag');
+	// The Vorbis comments, FLAC's own tags, take precedence, while fields only the ID3 tags hold are kept
+	expect(metadataTags.title).toBe('The Happy Meeting');
+	expect(metadataTags.albumArtist).toBe('ID3 album artist');
 	expect(metadataTags.raw!['TIT2']).toBe('First tag');
 	expect(metadataTags.raw!['TITLE']).toBe('The Happy Meeting');
 });
