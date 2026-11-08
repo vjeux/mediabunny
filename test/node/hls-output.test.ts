@@ -3349,8 +3349,16 @@ test('Tracks of a variant stream take their language and name from the media whe
 
 	using masterInput = openInput('master.m3u8');
 	const track = (await masterInput.getPrimaryAudioTrack())!;
+	// The deprecated synchronous getters still work. They don't read media, so they give the playlist's values until
+	// it has been read.
+	const getKnownLanguageAndName = (inputTrack: InputAudioTrack) => {
+		// eslint-disable-next-line @typescript-eslint/no-deprecated -- what's being tested
+		return [inputTrack.languageCode, inputTrack.name];
+	};
+	expect(getKnownLanguageAndName(track)).toEqual(['und', null]);
 	expect(await track.getLanguageCode()).toBe('fra');
 	expect(await track.getName()).toBe('Français');
+	expect(getKnownLanguageAndName(track)).toEqual(['fra', 'Français']);
 
 	// When the media can't be read, these optional values stay what the playlist says instead of failing, and the
 	// metadata that the playlist does give still comes from it

@@ -683,6 +683,8 @@ export class HlsDemuxer extends Demuxer {
 abstract class HlsInputTrackBacking implements InputTrackBacking {
 	hydrationPromise: Promise<void> | null = null;
 	backingTrackPromise: Promise<InputTrackBacking> | null = null;
+	/** The media's track, once metadata has been read from it */
+	readBackingTrack: InputTrackBacking | null = null;
 
 	constructor(public internalTrack: InternalTrack) {}
 
@@ -751,9 +753,30 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 	 * metadata over to the media, even when that can't be read.
 	 */
 	fromMedia<T>(fn: (backingTrack: InputTrackBacking) => MaybePromise<T>, playlistValue: T): MaybePromise<T> {
-		const backingTrack = this.internalTrack.backingTrack;
-		const value = backingTrack ? fn(backingTrack) : this.findBackingTrack().then(fn);
-		return value instanceof Promise ? value.catch(() => playlistValue) : value;
+		const ask = async (backingTrack: InputTrackBacking) => {
+			const value = await fn(backingTrack);
+			this.readBackingTrack = backingTrack;
+			return value;
+		};
+
+		const backingTrack = this.readBackingTrack ?? this.internalTrack.backingTrack;
+		const value = backingTrack ? ask(backingTrack) : this.findBackingTrack().then(ask);
+		return value.catch(() => playlistValue);
+	}
+
+	/**
+	 * The synchronous counterpart of fromMedia, for the deprecated synchronous getters: what the media says if it has
+	 * already been read for it, and the playlist's value otherwise, without reading anything.
+	 */
+	knownFromMedia<T>(fn: (backingTrack: InputTrackBacking) => MaybePromise<T>, playlistValue: T): T {
+		if (this.readBackingTrack) {
+			const value = fn(this.readBackingTrack);
+			if (!(value instanceof Promise)) {
+				return value;
+			}
+		}
+
+		return playlistValue;
 	}
 
 	getCodec(): MediaCodec | null {
@@ -798,6 +821,24 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 		}
 
 		return this.fromMedia(backingTrack => backingTrack.getName(), name);
+	}
+
+	getKnownLanguageCode(): string {
+		const { languageCode } = this.internalTrack;
+		if (languageCode !== UNDETERMINED_LANGUAGE) {
+			return languageCode;
+		}
+
+		return this.knownFromMedia(backingTrack => backingTrack.getLanguageCode(), languageCode);
+	}
+
+	getKnownName(): string | null {
+		const { name } = this.internalTrack;
+		if (name !== null) {
+			return name;
+		}
+
+		return this.knownFromMedia(backingTrack => backingTrack.getName(), name);
 	}
 
 	getNumber(): number {
