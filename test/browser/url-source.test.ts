@@ -85,12 +85,13 @@ test('UrlSource gives up on blob: URLs that fail instead of retrying forever', a
 	expect(await outcome(input.getFormat())).toMatch(/^rejected: TypeError/);
 	URL.revokeObjectURL(emptyUrl);
 
-	// A blob URL revoked after the first read
+	// A blob URL revoked after the first read. Chrome and Firefox fail the next request, while WebKit keeps serving
+	// the blob, so all that matters is that the read settles
 	const revokedUrl = URL.createObjectURL(new Blob([new Uint8Array(3 * 2 ** 20)]));
 	const reader = new Reader(new UrlSource(revokedUrl));
 	expect(await reader.requestSlice(0, 1000)).not.toBeNull();
 	URL.revokeObjectURL(revokedUrl);
-	expect(await outcome(Promise.resolve(reader.requestSlice(2 * 2 ** 20, 1000)))).toMatch(/^rejected: TypeError/);
+	expect(await outcome(Promise.resolve(reader.requestSlice(2 * 2 ** 20, 1000)))).not.toBe('pending after 4 s');
 
 	// A requested range past the end of a blob
 	const smallUrl = URL.createObjectURL(new Blob([new Uint8Array(500)]));
