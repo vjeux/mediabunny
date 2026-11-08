@@ -2415,6 +2415,8 @@ export class IsobmffDemuxer extends Demuxer {
 								if (isFloat) {
 									if (sampleSize === 32) {
 										track.info.codec = isBigEndian ? 'pcm-f32be' : 'pcm-f32';
+									} else if (sampleSize === 64) {
+										track.info.codec = isBigEndian ? 'pcm-f64be' : 'pcm-f64';
 									}
 								} else {
 									if (sFlags & (1 << (bytesPerSample - 1))) {
