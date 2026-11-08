@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AudioSampleSource } from '../../src/media-source.js';
@@ -114,3 +114,41 @@ const encodeAndDecodeFirstSample = async (audioSample: AudioSample) => {
 
 	return { sample, size: output.target.buffer!.byteLength };
 };
+
+test('FLAC encoder instances leave no Blob URL of their worker registered', async () => {
+	registerFlacEncoder();
+
+	// Each encoder instance starts a worker from a Blob URL of its script. A URL that stays registered keeps the
+	// script in memory for as long as the page lives, even after the worker is gone.
+	const createSpy = vi.spyOn(URL, 'createObjectURL');
+	const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+
+	try {
+		for (let i = 0; i < 3; i++) {
+			const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+			const audioSource = new AudioSampleSource({ codec: 'flac' });
+			output.addAudioTrack(audioSource);
+			await output.start();
+
+			const sample = new AudioSample({
+				data: new Float32Array(4800),
+				format: 'f32',
+				numberOfChannels: 1,
+				sampleRate: 48000,
+				timestamp: 0,
+			});
+			await audioSource.add(sample);
+			sample.close();
+			await output.finalize(); // Closes the encoder, which terminates its worker
+		}
+
+		const created = createSpy.mock.results.map(result => result.value as string);
+		const revoked = revokeSpy.mock.calls.map(call => call[0]);
+
+		expect(created.length).toBeGreaterThanOrEqual(3);
+		expect(created.filter(url => !revoked.includes(url))).toEqual([]);
+	} finally {
+		createSpy.mockRestore();
+		revokeSpy.mockRestore();
+	}
+});
