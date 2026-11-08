@@ -15,8 +15,9 @@ import {
 	readMp3FrameHeader,
 	XING,
 } from '../../shared/mp3-misc';
+import { ID3_V1_TAG_SIZE } from '../id3';
 import { isThenable } from '../misc';
-import { Reader, readU32Be } from '../reader';
+import { readAscii, Reader, readU32Be } from '../reader';
 
 export const readNextMp3FrameHeader = async (
 	reader: Reader,
@@ -129,6 +130,24 @@ const isConfirmedMp3Frame = async (reader: Reader, pos: number, header: Mp3Frame
 		&& getMp3ChannelCount(nextHeader.channel) === getMp3ChannelCount(header.channel);
 };
 
+/** Whether a run of frames ending at the given position ends with the file, or with an ID3v1 tag that ends it. */
+const endsWithFile = async (reader: Reader, pos: number) => {
+	if (pos === reader.fileSize) {
+		return true;
+	}
+
+	if (pos + ID3_V1_TAG_SIZE !== reader.fileSize) {
+		return false;
+	}
+
+	let slice = reader.requestSlice(pos, 3);
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
+
+	return !!slice && readAscii(slice, 3) === 'TAG';
+};
+
 /**
  * Finds the first MP3 frame from startPos on. Unlike readNextMp3FrameHeader, this skips false syncs, like the ones in
  * the middle of a frame when the data starts mid-stream: a frame header only counts if its frame holds a Xing/Info
@@ -197,8 +216,9 @@ export const readFirstMp3FrameHeader = async (
 			nextPos += header.totalSize;
 		}
 
-		// A first frame whose run ends with the file is fine too (like a file with a single frame)
-		if (runIsLongEnough() || (requiredRunLength === 0 && nextPos === reader.fileSize)) {
+		// A first frame whose run ends with the file is fine too (like a file with a single frame), also when only an
+		// ID3v1 tag follows it
+		if (runIsLongEnough() || (requiredRunLength === 0 && await endsWithFile(reader, nextPos))) {
 			return result;
 		}
 
