@@ -2,7 +2,12 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget, StreamTarget } from '../../src/target.js';
-import { AudioSampleSource, MediaStreamAudioTrackSource, VideoSampleSource } from '../../src/media-source.js';
+import {
+	AudioBufferSource,
+	AudioSampleSource,
+	MediaStreamAudioTrackSource,
+	VideoSampleSource,
+} from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { canEncodeAudio, Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
@@ -1106,4 +1111,46 @@ test('AudioSampleSource, cancel() while finalizing gets out of a process() that 
 	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
 	expect(await stateAfter(finalized, 1000)).toBe('fulfilled');
 	expect(await stateAfter(Promise.all(adds), 1000)).toBe('fulfilled');
+});
+
+test('AudioBufferSource encodes in order when adds aren\'t awaited and process() takes varying time', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioBufferSource({
+		codec: 'pcm-f32',
+		transform: {
+			// Like an effect whose run time varies per sample
+			process: async (sample) => {
+				const index = Math.round(100 * sample.timestamp);
+				await new Promise(resolve => setTimeout(resolve, (7 * index) % 11));
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const adds: Promise<void>[] = [];
+	for (let i = 0; i < 24; i++) {
+		const audioBuffer = new AudioBuffer({ length: 480, sampleRate: 48000, numberOfChannels: 1 });
+		audioBuffer.copyToChannel(new Float32Array(480).fill(i / 1000), 0);
+		adds.push(audioSource.add(audioBuffer));
+	}
+	await Promise.all(adds);
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const samples: number[] = [];
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		samples.push(...data);
+		sample.close();
+	}
+
+	expect(samples).toHaveLength(24 * 480);
+	const blocks = Array.from({ length: 24 }, (_, i) => samples[480 * i]);
+	expect(blocks).toEqual(Array.from({ length: 24 }, (_, i) => Math.fround(i / 1000)));
 });
