@@ -813,6 +813,30 @@ test('Read and write metadata, Ogg', async () => {
 	expect(readTags.raw!['COMPOSER']).toBe('Hans Zimmer');
 });
 
+test('Read metadata of Ogg files with several logical streams once', async () => {
+	// Each logical stream carries its own comment header, with the same tags
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	output.setMetadataTags({
+		title: 'Title',
+		images: songMetadata.images,
+		raw: { ARTIST: ['Artist A', 'Artist B'] },
+	});
+	const dummyTracks = [createDummyAudioTrack('opus', output), createDummyAudioTrack('opus', output)];
+	await output.start();
+	for (const dummyTrack of dummyTracks) {
+		await dummyTrack.addPacket();
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect(await input.getAudioTracks()).toHaveLength(2);
+	const tags = await input.getMetadataTags();
+	expect(tags.title).toBe('Title');
+	expect(tags.raw!['TITLE']).toBe('Title');
+	expect(tags.raw!['ARTIST']).toEqual(['Artist A', 'Artist B']);
+	expect(tags.images).toHaveLength(1);
+});
+
 test('Read and write metadata, FLAC', async () => {
 	const output = new Output({
 		format: new FlacOutputFormat(),
