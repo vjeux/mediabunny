@@ -47,6 +47,32 @@ test('Negative audio timestamps are preserved', async () => {
 	}
 });
 
+test('CanvasSink fills its canvas pool as canvases are needed, whatever the pool size', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	// Every slot used to be allocated up front: 2^32 and up threw "Invalid array length", 1e9 ran out of memory
+	for (const poolSize of [2 ** 32, Number.MAX_SAFE_INTEGER]) {
+		const sink = new CanvasSink(track, { poolSize, width: 16, height: 16, fit: 'fill' });
+		const canvases: (HTMLCanvasElement | OffscreenCanvas)[] = [];
+		for await (const wrapped of sink.canvases(0, 0.2)) {
+			canvases.push(wrapped.canvas);
+		}
+		expect(canvases.length).toBeGreaterThan(2);
+		expect(new Set(canvases).size).toBe(canvases.length); // The pool never wraps around
+	}
+
+	// A small pool still reuses its canvases round-robin
+	const sink = new CanvasSink(track, { poolSize: 2, width: 16, height: 16, fit: 'fill' });
+	const canvases: (HTMLCanvasElement | OffscreenCanvas)[] = [];
+	for (const timestamp of [0, 0.1, 0.2, 0.3]) {
+		canvases.push((await sink.getCanvas(timestamp))!.canvas);
+	}
+	expect(canvases[1]).not.toBe(canvases[0]);
+	expect(canvases[2]).toBe(canvases[0]);
+	expect(canvases[3]).toBe(canvases[1]);
+});
+
 test('No B-frames are skipped when software-decoding AVC', async () => {
 	using input = new Input({
 		source: new UrlSource('/missing-reorder-metadata-v1.mp4'),
