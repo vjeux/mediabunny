@@ -1067,6 +1067,48 @@ describe('Video', async () => {
 		expect(sampleCount).toBe(packetTimestamps.length);
 	};
 
+	test('Decoded samples carry the color space of the decoder config', async () => {
+		// 16x16 gray, one frame, VP9 profile 2 tagged BT.2020/PQ. The VP9 bitstream itself can only signal the matrix,
+		// so the primaries and transfer are only in the WebM Colour element:
+		// ffmpeg -f lavfi -i "color=gray:s=16x16:r=10:d=0.1" -c:v libvpx-vp9 -pix_fmt yuv420p10le -profile:v 2
+		//   -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv vp9-pq-16x16.webm
+		using input = new Input({
+			source: new FilePathSource('./test/public/vp9-pq-16x16.webm'),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const expected = { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false };
+		expect((await track.getDecoderConfig())!.colorSpace).toEqual(expected);
+
+		// Like in WebCodecs, the config's color space applies to the decoded samples
+		using sample = (await new VideoSampleSink(track).getSample(0))!;
+		expect(sample.colorSpace.toJSON()).toEqual(expected);
+	});
+
+	test('Decoded H.264 samples take the container\'s color space where the bitstream has none', async () => {
+		// 16x16 orange-red, one frame of H.264 whose VUI signals no color, with BT.601 color in the MP4 colr box:
+		// ffmpeg -f lavfi -i "color=c=0xC83020:s=16x16:r=10:d=0.1" -c:v libx264 -pix_fmt yuv420p untagged.mp4
+		// ffmpeg -i untagged.mp4 -c copy -color_primaries smpte170m -color_trc smpte170m -colorspace smpte170m
+		//   -color_range tv -movflags +write_colr h264-untagged-colr-bt601.mp4
+		using input = new Input({
+			source: new FilePathSource('./test/public/h264-untagged-colr-bt601.mp4'),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const expected = { primaries: 'smpte170m', transfer: 'smpte170m', matrix: 'smpte170m', fullRange: false };
+		expect((await track.getDecoderConfig())!.colorSpace).toEqual(expected);
+
+		using sample = (await new VideoSampleSink(track).getSample(0))!;
+		expect(sample.colorSpace.toJSON()).toEqual(expected);
+
+		// Converted to RGB with the BT.601 matrix, as Chromium does
+		const rgba = new Uint8Array(16 * 16 * 4);
+		await sample.copyTo(rgba, { format: 'RGBA' });
+		expect(Math.abs(rgba[0]! - 200)).toBeLessThanOrEqual(3);
+		expect(Math.abs(rgba[1]! - 48)).toBeLessThanOrEqual(3);
+		expect(Math.abs(rgba[2]! - 32)).toBeLessThanOrEqual(3);
+	});
+
 	test('Color space, RGB to BT.709 encode', async () => {
 		const width = 320;
 		const height = 180;
