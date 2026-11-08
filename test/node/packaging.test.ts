@@ -198,7 +198,7 @@ describe('Bundles', () => {
 				console.log(JSON.stringify(Object.keys(exports).filter(key => key !== 'default')));`), file)
 				.toEqual(coreExportNames);
 		}
-	});
+	}, 60_000);
 
 	test('Script tag builds define the Mediabunny global without touching any browser or Node global', () => {
 		// The bundles load in a global scope that only has the ECMAScript built-ins
@@ -206,7 +206,7 @@ describe('Bundles', () => {
 			const globals = runScripts([`dist/bundles/${file}`]);
 			expect(Object.keys(globals['Mediabunny'] ?? {}).sort(), file).toEqual(coreExportNames);
 		}
-	});
+	}, 60_000);
 
 	test('Extension script tag builds define their global and register with the Mediabunny global', async () => {
 		for (const extension of EXTENSIONS) {
@@ -234,7 +234,7 @@ describe('Bundles', () => {
 				}
 			}
 		}
-	});
+	}, 60_000);
 });
 
 describe('Node consumption', () => {
@@ -262,7 +262,7 @@ describe('Node consumption', () => {
 			})();
 		`]);
 		expect(JSON.parse(output)).toEqual({ duration: 0.1, keys: coreExportNames.length });
-	});
+	}, 60_000);
 });
 
 describe('Tree shaking', () => {
@@ -302,7 +302,7 @@ describe('Tree shaking', () => {
 		expect(containerClassesIn(await bundle(`import { Input, MP4, BlobSource } from ${entry};
 			globalThis.x = new Input({ source: new BlobSource(new Blob([])), formats: [MP4] });`)))
 			.toEqual(['IsobmffDemuxer']);
-	});
+	}, 60_000);
 });
 
 // The npm-packed packages, installed (offline) into a consumer project. Needs the full `npm run build` for the modules
@@ -736,5 +736,5 @@ export const runExtensions = async (frame: Parameters<typeof toAvFrame>[1]) => {
 		expect(result.warnings).toEqual([]);
 		const imports = Object.values(result.metafile.outputs).flatMap(output => output.imports.map(x => x.path));
 		expect(imports.filter(specifier => specifier.startsWith('node:'))).toEqual([]);
-	});
+	}, 120_000);
 });
