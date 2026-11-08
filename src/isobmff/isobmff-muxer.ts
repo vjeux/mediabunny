@@ -1530,7 +1530,7 @@ export class IsobmffMuxer extends Muxer {
 			if (this.isFragmented) {
 				// We can only finalize this fragment (and begin a new one) if we know that each track will be able to
 				// start the new one with a key frame.
-				const keyFrameQueuedEverywhere = this.trackDatas.every((otherTrackData) => {
+				const startsWithKeyFrame = (otherTrackData: IsobmffTrackData) => {
 					if (trackData === otherTrackData) {
 						return sample.type === 'key';
 					}
@@ -1541,7 +1541,8 @@ export class IsobmffMuxer extends Muxer {
 					}
 
 					return otherTrackData.closed;
-				});
+				};
+				const keyFrameQueuedEverywhere = this.trackDatas.every(startsWithKeyFrame);
 
 				// The first fragment comes with the moov box, whose edit lists need the start offset of every track
 				const startOffsetsKnown = this.wroteFragmentedHeader
@@ -1555,6 +1556,24 @@ export class IsobmffMuxer extends Muxer {
 				) {
 					beginNewChunk = true;
 					await this.finalizeFragment();
+				} else if (
+					// When the key frames of several video tracks don't line up, the condition above may never hold. A
+					// video key frame then ends a fragment for the tracks that can start the next one with a key frame,
+					// while the others keep their chunk until they can.
+					!keyFrameQueuedEverywhere
+					&& trackData.type === 'video'
+					&& sample.type === 'key'
+					&& currentChunkDuration >= this.minimumFragmentDuration
+					// Another track's sample with this same timestamp may have been written already
+					&& sample.timestamp >= this.maxWrittenTimestamp
+					// The first fragment comes with the moov box, whose edit lists need the start offset of every track
+					&& (
+						this.wroteFragmentedHeader
+						|| this.trackDatas.every(x => x.startTimestampOffset !== null || x.closed)
+					)
+				) {
+					beginNewChunk = true;
+					await this.finalizeFragment(undefined, this.trackDatas.filter(startsWithKeyFrame));
 				}
 			} else {
 				beginNewChunk = currentChunkDuration >= MIN_CHUNK_DURATION; // Chunk is long enough, we need a new one
@@ -1672,7 +1691,7 @@ export class IsobmffMuxer extends Muxer {
 		}
 	}
 
-	private async finalizeFragment(flushWriter = !this.isCmaf) {
+	private async finalizeFragment(flushWriter = !this.isCmaf, tracks = this.trackDatas) {
 		assert(this.isFragmented);
 
 		if (!this.wroteFragmentedHeader) {
@@ -1718,7 +1737,7 @@ export class IsobmffMuxer extends Muxer {
 		assert(this.boxWriter);
 
 		// Not all tracks need to be present in every fragment
-		const tracksInFragment = this.trackDatas.filter(x => x.currentChunk);
+		const tracksInFragment = tracks.filter(x => x.currentChunk);
 
 		if (tracksInFragment.length === 0) {
 			// Zero tracks in this fragment and thus no fragment data
