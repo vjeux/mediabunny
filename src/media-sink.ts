@@ -697,7 +697,8 @@ export abstract class BaseMediaSampleSink<
 
 			const onSample = (sample: MediaSample) => {
 				onQueueDequeue();
-				if (sample.timestamp <= skipSamplesUpTo) {
+				// Only samples decoded before an error are delivered, and decoding again skips those emitted already
+				if (hasOutOfBandError || sample.timestamp <= skipSamplesUpTo) {
 					sample.close();
 					return;
 				}
@@ -782,7 +783,7 @@ export abstract class BaseMediaSampleSink<
 			const packets = packetSink.packets(keyPacket ?? undefined, endPacket, packetRetrievalOptions);
 			await unlessTerminated(packets.next()); // Skip the start packet as we already have it
 
-			while (currentPacket && !ended && !this._track.input._disposed) {
+			while (currentPacket && !ended && !hasOutOfBandError && !this._track.input._disposed) {
 				if (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE) {
 					({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 					await queueDequeue;
@@ -802,7 +803,7 @@ export abstract class BaseMediaSampleSink<
 
 			await packets.return();
 
-			if (!terminated && !this._track.input._disposed) {
+			if (!terminated && !hasOutOfBandError && !this._track.input._disposed) {
 				const errors: unknown[] = heldBackErrors = [];
 				let flushError: unknown = null;
 				let flushFailed = false;
@@ -845,7 +846,12 @@ export abstract class BaseMediaSampleSink<
 
 					let packet: EncodedPacket | null = retryStart;
 					let maxTimestamp = decodedPackets.maxTimestampBeforeLast;
-					while (packet && packet.sequenceNumber < lastPacket.sequenceNumber && !terminated) {
+					while (
+						packet
+						&& packet.sequenceNumber < lastPacket.sequenceNumber
+						&& !terminated
+						&& !hasOutOfBandError
+					) {
 						if (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE) {
 							({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 							await queueDequeue;
@@ -857,7 +863,7 @@ export abstract class BaseMediaSampleSink<
 						packet = await packetSink.getNextPacket(packet, packetRetrievalOptions);
 					}
 
-					if (!terminated) {
+					if (!terminated && !hasOutOfBandError) {
 						await decoder.flush();
 
 						// Decoding again must have given back frames, or already had every frame but the last packet's.
@@ -872,7 +878,8 @@ export abstract class BaseMediaSampleSink<
 				}
 			}
 
-			if (!firstSampleQueued && lastSample) {
+			// After an error, we can't know whether this is the last sample starting at or before the start timestamp
+			if (!firstSampleQueued && lastSample && !hasOutOfBandError) {
 				sampleQueue.push(lastSample);
 				lastSample = null;
 			}
@@ -915,16 +922,17 @@ export abstract class BaseMediaSampleSink<
 						throw new InputDisposedError();
 					} else if (terminated) {
 						return { value: undefined, done: true };
+					} else if (sampleQueue.length > 0) {
+						// Samples decoded before an error still come first
+						const value = sampleQueue.shift()!;
+						onQueueDequeue();
+						return { value, done: false };
 					} else if (hasOutOfBandError) {
 						terminated = true;
 						ended = true;
 						onTerminated();
 						closeSamples();
 						throw outOfBandError;
-					} else if (sampleQueue.length > 0) {
-						const value = sampleQueue.shift()!;
-						onQueueDequeue();
-						return { value, done: false };
 					} else if (!decoderIsFlushed) {
 						await queueNotEmpty;
 					} else {
@@ -1032,7 +1040,8 @@ export abstract class BaseMediaSampleSink<
 			const onSample = (sample: MediaSample) => {
 				onQueueDequeue();
 
-				if (terminated || sample.timestamp <= skipSamplesUpTo) {
+				// Only samples decoded before an error are delivered, and decoding again skips those emitted already
+				if (terminated || hasOutOfBandError || sample.timestamp <= skipSamplesUpTo) {
 					sample.close();
 					return;
 				}
@@ -1094,12 +1103,16 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				while (currentPacket.sequenceNumber < maxSequenceNumber) {
-					while (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE && !terminated) {
+					while (
+						sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE
+						&& !terminated
+						&& !hasOutOfBandError
+					) {
 						({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 						await queueDequeue;
 					}
 
-					if (terminated) {
+					if (terminated || hasOutOfBandError) {
 						break;
 					}
 
@@ -1201,13 +1214,22 @@ export abstract class BaseMediaSampleSink<
 
 					let packet: EncodedPacket | null = retryStart;
 					let maxTimestamp = decodedPackets.maxTimestampBeforeLast;
-					while (packet && packet.sequenceNumber < lastPacket.sequenceNumber && !terminated) {
-						while (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE && !terminated) {
+					while (
+						packet
+						&& packet.sequenceNumber < lastPacket.sequenceNumber
+						&& !terminated
+						&& !hasOutOfBandError
+					) {
+						while (
+							sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE
+							&& !terminated
+							&& !hasOutOfBandError
+						) {
 							({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 							await queueDequeue;
 						}
 
-						if (terminated) {
+						if (terminated || hasOutOfBandError) {
 							break;
 						}
 
@@ -1216,7 +1238,7 @@ export abstract class BaseMediaSampleSink<
 						packet = await packetSink.getNextPacket(packet, retrievalOptions);
 					}
 
-					if (!terminated) {
+					if (!terminated && !hasOutOfBandError) {
 						await decoder.flush();
 
 						// Decoding again must have given back frames, or already had every frame but the last packet's.
@@ -1242,7 +1264,7 @@ export abstract class BaseMediaSampleSink<
 			for await (const timestamp of timestampIterator) {
 				validateTimestamp(timestamp);
 
-				if (terminated || this._track.input._disposed) {
+				if (terminated || hasOutOfBandError || this._track.input._disposed) {
 					break;
 				}
 
@@ -1303,7 +1325,7 @@ export abstract class BaseMediaSampleSink<
 				await decodePackets();
 			}
 
-			if (!terminated && !this._track.input._disposed) {
+			if (!terminated && !hasOutOfBandError && !this._track.input._disposed) {
 				await flushDecoder();
 			}
 
@@ -1345,16 +1367,17 @@ export abstract class BaseMediaSampleSink<
 						throw new InputDisposedError();
 					} else if (terminated) {
 						return { value: undefined, done: true };
+					} else if (sampleQueue.length > 0) {
+						// Samples decoded before an error still come first
+						const value = sampleQueue.shift();
+						assert(value !== undefined);
+						onQueueDequeue();
+						return { value, done: false };
 					} else if (hasOutOfBandError) {
 						terminated = true;
 						onTerminated();
 						closeSamples();
 						throw outOfBandError;
-					} else if (sampleQueue.length > 0) {
-						const value = sampleQueue.shift();
-						assert(value !== undefined);
-						onQueueDequeue();
-						return { value, done: false };
 					} else if (!decoderIsFlushed) {
 						await queueNotEmpty;
 					} else {
@@ -1525,6 +1548,8 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	alphaRaslSkipped = false; // For HEVC stuff
 	finalSamples: { sample: VideoSample | null }[] = [];
 	mergeAlphaPromises: Promise<void>[] = [];
+	/** The first decoder error of a video with alpha, which is reported once the samples decoded before it are out */
+	decoderError: { error: unknown; reported: Promise<void> } | null = null;
 	flushing = false;
 	/** A closed decoder reports and emits nothing more (decoding again after a failed flush closes it early) */
 	closed = false;
@@ -1590,13 +1615,61 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				},
 				error: (error) => {
 					error.stack = stack; // Provide a more useful stack trace, the default one sucks
-					this.onError(error);
+					this.reportDecoderError(error);
 				},
 			});
 			this.decoder.addEventListener('dequeue', () => {
 				this.onDequeue?.();
 			});
 			this.decoder.configure(this.decoderConfig);
+		}
+	}
+
+	/**
+	 * Reports a decoder error. With alpha, that waits until the samples decoded before it are out: the other decoder
+	 * first outputs what it was given, and the color/alpha merges still running finish.
+	 */
+	reportDecoderError(error: unknown) {
+		if (this.decoderError) {
+			return; // The first error is the one reported
+		}
+
+		if (!this.alphaDecoder && this.mergeAlphaPromises.length === 0) {
+			this.emitHeldBackSamples();
+			this.onError(error);
+			return;
+		}
+
+		this.decoderError = {
+			error,
+			reported: (async () => {
+				this.flushing = true;
+				for (const decoder of [this.decoder, this.alphaDecoder]) {
+					if (decoder?.state === 'configured') {
+						// An error of its own changes nothing, as the first error is the one reported
+						await decoder.flush().catch(() => {});
+					}
+				}
+				await this.settleMerges();
+				this.emitHeldBackSamples();
+				this.onError(error);
+			})(),
+		};
+	}
+
+	/** Emits the samples that WebKit's ordering workaround holds back, when no more frames come after them. */
+	emitHeldBackSamples() {
+		for (const sample of this.sampleQueue) {
+			this.finalizeAndEmitSample(sample);
+		}
+
+		this.sampleQueue.length = 0;
+	}
+
+	/** Waits until no color/alpha merge is running anymore, including the ones that start meanwhile. */
+	async settleMerges() {
+		while (this.mergeAlphaPromises.length > 0) {
+			await Promise.all([...this.mergeAlphaPromises]);
 		}
 	}
 
@@ -1702,6 +1775,10 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	decode(packet: EncodedPacket) {
+		if (this.decoderError) {
+			return; // Decoding ends with that error
+		}
+
 		if (packet.byteLength === 0) {
 			// Empty packets hold no frame (MP4 allows zero-size samples), and decoders error out on them
 			return;
@@ -1855,6 +1932,12 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	decodeAlphaData(packet: EncodedPacket) {
+		if (this.decoderError) {
+			// The color decoder can report its error right inside decode() (Chromium's sometimes does), and reporting
+			// it flushes the alpha decoder, which would then want a key frame
+			return;
+		}
+
 		if (!packet.sideData.alpha) {
 			// No alpha side data in the packet, most common case
 			this.pushNullAlphaFrame();
@@ -1910,7 +1993,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				},
 				error: (error) => {
 					error.stack = stack; // Provide a more useful stack trace, the default one sucks
-					this.onError(error);
+					this.reportDecoderError(error);
 				},
 			});
 			this.alphaDecoder.addEventListener('dequeue', () => {
@@ -2182,10 +2265,23 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		} else {
 			assert(this.decoder);
 			this.flushing = true;
-			await Promise.all([
-				this.decoder.flush(),
-				this.alphaDecoder?.flush(),
-			]);
+			try {
+				if (!this.decoderError) {
+					await Promise.all([
+						this.decoder.flush(),
+						this.alphaDecoder?.flush(),
+					]);
+				}
+			} catch (error) {
+				this.reportDecoderError(error); // The same error the decoder reports
+				if (!this.decoderError) {
+					throw error;
+				}
+			}
+			if (this.decoderError) {
+				await this.decoderError.reported;
+				throw this.decoderError.error;
+			}
 			this.flushing = false;
 			await Promise.all(this.mergeAlphaPromises);
 
@@ -2203,11 +2299,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		}
 
 		if (isWebKit()) {
-			for (const sample of this.sampleQueue) {
-				this.finalizeAndEmitSample(sample);
-			}
-
-			this.sampleQueue.length = 0;
+			this.emitHeldBackSamples();
 		}
 
 		this.currentPacketIndex = 0;
