@@ -12,7 +12,12 @@ import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { PacketRetrievalOptions } from '../media-sink';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
-import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
+import {
+	assert,
+	floorToMultiple,
+	isThenable,
+	UNDETERMINED_LANGUAGE,
+} from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
@@ -31,6 +36,7 @@ export class WaveDemuxer extends Demuxer {
 	metadataPromise: Promise<void> | null = null;
 	dataStart = -1;
 	dataSize = -1;
+	dataSizeCapped = false;
 	audioInfo: {
 		format: number;
 		numberOfChannels: number;
@@ -40,7 +46,6 @@ export class WaveDemuxer extends Demuxer {
 	} | null = null;
 
 	trackBackings: WaveAudioTrackBacking[] = [];
-	lastKnownPacketIndex = 0;
 	metadataTags: MetadataTags = {};
 
 	constructor(input: Input) {
@@ -133,6 +138,7 @@ export class WaveDemuxer extends Demuxer {
 
 			const blockSize = this.audioInfo.blockSizeInBytes;
 			this.dataSize = Math.floor(this.dataSize / blockSize) * blockSize;
+			this.maybeCapDataSize();
 
 			this.trackBackings.push(new WaveAudioTrackBacking(this));
 		})();
@@ -366,6 +372,25 @@ export class WaveDemuxer extends Demuxer {
 		assert(false);
 	}
 
+	maybeCapDataSize() {
+		assert(this.audioInfo);
+
+		if (this.dataSizeCapped) {
+			return;
+		}
+
+		// With unsized sources, we may only get to know the file size after the init logic, so this may only happen
+		// later on
+		const fileSize = this.reader.fileSize;
+		if (fileSize !== null) {
+			this.dataSize = Math.min(
+				this.dataSize,
+				floorToMultiple(fileSize - this.dataStart, this.audioInfo.blockSizeInBytes),
+			);
+			this.dataSizeCapped = true;
+		}
+	}
+
 	async getMimeType() {
 		return 'audio/wav';
 	}
@@ -487,17 +512,19 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		assert(packetIndex >= 0);
 
 		assert(this.demuxer.audioInfo);
-		const startOffset = packetIndex * PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes;
+		const blockSize = this.demuxer.audioInfo.blockSizeInBytes;
+
+		this.demuxer.maybeCapDataSize();
+		const fileSize = this.demuxer.reader.fileSize;
+
+		const startOffset = packetIndex * PACKET_SIZE_IN_FRAMES * blockSize;
 		if (startOffset >= this.demuxer.dataSize) {
 			return null;
 		}
 
-		const sizeInBytes = Math.min(
-			PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes,
-			this.demuxer.dataSize - startOffset,
-		);
+		const sizeInBytes = Math.min(PACKET_SIZE_IN_FRAMES * blockSize, this.demuxer.dataSize - startOffset);
 
-		if (this.demuxer.reader.fileSize === null) {
+		if (fileSize === null) {
 			// If the file size is unknown, we weren't able to cap the dataSize in the init logic and we instead have to
 			// rely on the headers telling us how large the file is. But, these might be wrong, so let's check if the
 			// requested slice actually exists.
@@ -506,7 +533,9 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 			if (isThenable(slice)) slice = await slice;
 
 			if (!slice) {
-				return null;
+				// It doesn't, but the failed read has told us the file size, so let's try again with a capped dataSize
+				assert(this.demuxer.reader.fileSize !== null);
+				return this.getPacketAtIndex(packetIndex, options);
 			}
 		}
 
@@ -522,12 +551,7 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		}
 
 		const timestamp = packetIndex * PACKET_SIZE_IN_FRAMES / this.demuxer.audioInfo.sampleRate;
-		const duration = sizeInBytes / this.demuxer.audioInfo.blockSizeInBytes / this.demuxer.audioInfo.sampleRate;
-
-		this.demuxer.lastKnownPacketIndex = Math.max(
-			packetIndex,
-			this.demuxer.lastKnownPacketIndex,
-		);
+		const duration = sizeInBytes / blockSize / this.demuxer.audioInfo.sampleRate;
 
 		return new EncodedPacket(
 			data,
@@ -543,7 +567,7 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		return this.getPacketAtIndex(0, options);
 	}
 
-	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
+	async getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		assert(this.demuxer.audioInfo);
 
 		const packetIndex = Math.floor(Math.min(
@@ -559,25 +583,9 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 			return packet;
 		}
 
-		if (packetIndex === 0) {
-			return null; // Empty data chunk
-		}
-
-		assert(this.demuxer.reader.fileSize === null);
-
-		// The file is shorter than we thought, meaning the packet we were looking for doesn't exist. So, let's find
-		// the last packet by doing a sequential scan, instead.
-		let currentPacket = await this.getPacketAtIndex(this.demuxer.lastKnownPacketIndex, options);
-		while (currentPacket) {
-			const nextPacket = await this.getNextPacket(currentPacket, options);
-			if (!nextPacket) {
-				break;
-			}
-
-			currentPacket = nextPacket;
-		}
-
-		return currentPacket;
+		// The file is shorter than we thought, meaning the packet we were looking for doesn't exist. But by now, the
+		// dataSize has been capped to the actual data, so let's try again.
+		return this.getPacket(timestamp, options);
 	}
 
 	getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions) {
