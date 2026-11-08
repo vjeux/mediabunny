@@ -2,9 +2,9 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { Quality } from '../../src/encode.js';
+import { canEncode, Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -731,3 +731,61 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test('MediaStreamVideoTrackSource, a capture that changes size keeps recording with \'contain\'', async ({ skip }) => {
+	if (typeof VideoEncoder === 'undefined' || !(await canEncode('vp8'))) {
+		skip('VP8 encoding is not supported here');
+	}
+
+	const record = async (sizeChangeBehavior: 'contain' | undefined) => {
+		const canvas = document.createElement('canvas');
+		canvas.width = 320;
+		canvas.height = 240;
+		const context = canvas.getContext('2d')!;
+		let frame = 0;
+		const draw = () => {
+			context.fillStyle = `hsl(${(frame++ * 10) % 360}, 80%, 50%)`;
+			context.fillRect(0, 0, canvas.width, canvas.height);
+		};
+		draw();
+		const interval = setInterval(draw, 16);
+		const track = canvas.captureStream(30).getVideoTracks()[0]!;
+
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		let packets = 0;
+		const videoSource = new MediaStreamVideoTrackSource(track, {
+			codec: 'vp8',
+			quality: new Quality('low'),
+			sizeChangeBehavior,
+			onEncodedPacket: () => {
+				packets++;
+			},
+		}, { frameRate: 30 });
+		const errors: unknown[] = [];
+		videoSource.errorPromise.catch(error => errors.push(error));
+		output.addVideoTrack(videoSource);
+		try {
+			await output.start();
+			await new Promise(resolve => setTimeout(resolve, 500));
+			canvas.width = 480; // Like a shared tab whose window gets resized
+			await new Promise(resolve => setTimeout(resolve, 500));
+			await output.finalize().catch(() => {});
+		} finally {
+			clearInterval(interval);
+			track.stop();
+		}
+
+		return { packets, errors };
+	};
+
+	const contained = await record('contain');
+	expect(contained.errors).toEqual([]);
+	expect(contained.packets).toBeGreaterThan(20);
+
+	// By default, the size change is an error that stops the capture
+	const denied = await record(undefined);
+	expect(String(denied.errors[0])).toContain('Video sample size must remain constant');
+});

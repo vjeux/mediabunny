@@ -259,11 +259,15 @@ const videoTrack = stream.getVideoTracks()[0];
 const videoTrackSource = new MediaStreamVideoTrackSource(videoTrack, {
 	codec: 'vp9',
 	quality: new Quality({ bitrate: 1e7 }),
+	// A shared tab or window changes size when the user resizes it
+	sizeChangeBehavior: 'contain',
 });
 
 // Make sure to allow any internal errors to properly bubble up
 videoTrackSource.errorPromise.catch((error) => ...);
 ```
+
+A shared tab or window changes its frame size whenever it's resized during the recording. By default (`sizeChangeBehavior: 'deny'`), the first such change is an error that stops the capture; with `'contain'`, later frames are fitted into the first frame's size instead. See [Video encoding config](#video-encoding-config) for the other options.
 
 This source requires no additional method calls; data will automatically be captured and piped to the output file as soon as `start()` is called on the `Output`. Make sure to `stop()` on `videoTrack` after finalizing the `Output` if you don't need the user's media anymore.
 
