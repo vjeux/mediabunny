@@ -1203,19 +1203,26 @@ test('MPEG-TS with several programs uses the first one whose PMT shows up', asyn
 });
 
 test('MPEG-TS with several programs skips the ones it can\'t read anything from', async () => {
-	// Like a DVB multiplex: pay-TV programs are scrambled, which their PMT says with a CA descriptor (for the program
-	// or for a stream), and radio programs may only have streams we don't support (LATM AAC here)
+	// Like a DVB multiplex: pay-TV programs are scrambled (transport_scrambling_control), which their PMT says with a
+	// CA descriptor (for the program or for a stream), and radio programs may only have streams we don't support (LATM
+	// AAC here). Recordings may keep the CA descriptors of packets that aren't scrambled.
 	const caDescriptor = [0x09, 0x04, 0x01, 0x00, 0xe0, 0x50];
-	type Program = { pmtPid: number; descriptors: number[]; streams: [number, number, number[]][]; inFile: boolean };
+	type Program = {
+		pmtPid: number;
+		descriptors: number[];
+		streams: [number, number, number[]][];
+		inFile: boolean;
+		scrambledPids?: number[];
+	};
 
 	const buildFile = (programs: Program[], pmtFirst: boolean) => {
 		const packets: Uint8Array[] = [];
 		const counters = new Map<number, number>();
-		const pushPacket = (pid: number, payload: number[]) => {
+		const pushPacket = (pid: number, payload: number[], scrambled = false) => {
 			const packet = new Uint8Array(188).fill(0xff);
 			const counter = counters.get(pid) ?? 0;
 			counters.set(pid, (counter + 1) & 0xf);
-			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, 0x10 | counter, ...payload], 0);
+			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, (scrambled ? 0x80 : 0) | 0x10 | counter, ...payload], 0);
 			packets.push(packet);
 		};
 		const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
@@ -1253,7 +1260,11 @@ test('MPEG-TS with several programs skips the ones it can\'t read anything from'
 		for (let i = 0; i < 3; i++) {
 			for (const program of programs) {
 				for (const [, pid] of program.streams) {
-					pushPacket(pid, adtsPes(1920 * i));
+					if (program.scrambledPids?.includes(pid)) {
+						pushPacket(pid, Array.from({ length: 184 }, (_, j) => (37 * j + i) & 0xff), true);
+					} else {
+						pushPacket(pid, adtsPes(1920 * i));
+					}
 				}
 			}
 		}
@@ -1287,6 +1298,7 @@ test('MPEG-TS with several programs skips the ones it can\'t read anything from'
 		descriptors: caDescriptor,
 		streams: [[0x0f, 0x101, []]],
 		inFile: true,
+		scrambledPids: [0x101],
 	};
 	const radio: Program = { pmtPid: 0x1001, descriptors: [], streams: [[0x11, 0x102, []]], inFile: true };
 	const scrambledStream: Program = {
@@ -1294,6 +1306,7 @@ test('MPEG-TS with several programs skips the ones it can\'t read anything from'
 		descriptors: [],
 		streams: [[0x0f, 0x103, caDescriptor]],
 		inFile: true,
+		scrambledPids: [0x103],
 	};
 	const clear: Program = { pmtPid: 0x1003, descriptors: [], streams: [[0x0f, 0x104, []]], inFile: true };
 	const partlyScrambled: Program = {
@@ -1301,24 +1314,96 @@ test('MPEG-TS with several programs skips the ones it can\'t read anything from'
 		descriptors: [],
 		streams: [[0x0f, 0x105, caDescriptor], [0x0f, 0x106, []]],
 		inFile: true,
+		scrambledPids: [0x105],
 	};
+	// CA descriptors on packets that aren't scrambled, as recordings may keep them
+	const unscrambled: Program = { ...scrambled, pmtPid: 0x1005, streams: [[0x0f, 0x107, []]], scrambledPids: [] };
 
-	// The first program that's entirely clear, also when the first PMT comes before the PAT
+	// The first program without CA descriptors, also when the first PMT comes before the PAT
 	expect(await readTracks([scrambled, radio, scrambledStream, clear])).toEqual([[0x104, 3]]);
 	expect(await readTracks([scrambled, radio, scrambledStream, clear], true)).toEqual([[0x104, 3]]);
 	expect(await readTracks([partlyScrambled, clear])).toEqual([[0x104, 3]]);
 
-	// Else the clear streams of the first program that has some, once all programs showed up
+	// Else the first program with streams without one, once all programs showed up, without its streams that
+	// turn out scrambled
 	expect(await readTracks([scrambled, partlyScrambled, radio])).toEqual([[0x106, 3]]);
 
-	// When no program has a stream we can read, a clear error, also when a program's PMT never shows up (rather than
+	// Else the first program, which is read when its packets aren't scrambled despite the CA descriptors
+	expect(await readTracks([unscrambled, scrambled])).toEqual([[0x107, 3]]);
+
+	// When all its streams are scrambled, an error saying so, also when a program's PMT never shows up (rather than
 	// reading the whole file)
-	await expect(readTracks([scrambled, radio])).rejects.toThrow(/scrambled/);
+	await expect(readTracks([scrambled, scrambledStream])).rejects.toThrow(/scrambled/);
 	await expect(readTracks([{ ...clear, inFile: false }, scrambled])).rejects.toThrow(/scrambled/);
 
-	// A single program is read as it is, as recordings that were descrambled may keep their CA descriptors
-	expect(await readTracks([scrambled])).toEqual([[0x101, 3]]);
-	expect(await readTracks([partlyScrambled])).toEqual([[0x105, 3], [0x106, 3]]);
+	// A single program is read as on main, CA descriptors or not, leaving out the streams that are scrambled
+	expect(await readTracks([unscrambled])).toEqual([[0x107, 3]]);
+	expect(await readTracks([partlyScrambled])).toEqual([[0x106, 3]]);
+});
+
+test('MPEG-TS with several programs keeps interleaved PES packets whole when the choice waits', async () => {
+	// The PAT lists two programs, but only the PMT of the first, which has a CA descriptor (over packets that aren't
+	// scrambled), is in the file, so the choice waits for the end of the file. Its two AAC streams have 300-byte frames
+	// spanning two TS packets each, interleaved as in broadcast captures.
+	const packets: Uint8Array[] = [];
+	const counters = new Map<number, number>();
+	const pushPacket = (pid: number, payload: number[], payloadUnitStart: boolean) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		const counter = counters.get(pid) ?? 0;
+		counters.set(pid, (counter + 1) & 0xf);
+		const stuffing = 184 - payload.length;
+		const adaptationFieldControl = stuffing > 0 ? 0x30 : 0x10;
+		packet.set([0x47, (payloadUnitStart ? 0x40 : 0) | (pid >> 8), pid & 0xff, adaptationFieldControl | counter]);
+		if (stuffing > 0) {
+			packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+		}
+		packet.set(payload, 4 + stuffing);
+		packets.push(packet);
+	};
+	const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
+	const caDescriptor = [0x09, 0x04, 0x0b, 0x00, 0xff, 0xf0];
+
+	pushPacket(0x0000, section([0x00, 0xb0, 0x11, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 2, 0xf0, 0x01]), true);
+	const pmtBody = [
+		0, 1, 0xc1, 0, 0, 0xe1, 0x01, 0xf0, caDescriptor.length, ...caDescriptor,
+		0x0f, 0xe1, 0x01, 0xf0, 0x00,
+		0x0f, 0xe1, 0x02, 0xf0, 0x00,
+	];
+	pushPacket(0x1000, section([0x02, 0xb0, pmtBody.length + 4, ...pmtBody]), true);
+
+	const frameLength = 300;
+	const pes = (pts: number) => [
+		0, 0, 1, 0xc0, ((8 + frameLength) >> 8) & 0xff, (8 + frameLength) & 0xff, 0x84, 0x80, 5,
+		0x21, 0, 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+		0xff, 0xf1, 0x4c, 0x80, (frameLength >> 3) & 0xff, ((frameLength & 7) << 5) | 0x1f, 0xfc, // ADTS
+		...new Array<number>(frameLength - 7).fill(0x11),
+	];
+	for (let i = 0; i < 6; i++) {
+		const first = pes(1920 * i);
+		const second = pes(1920 * i);
+		pushPacket(0x101, first.slice(0, 184), true);
+		pushPacket(0x102, second.slice(0, 184), true);
+		pushPacket(0x101, first.slice(184), false);
+		pushPacket(0x102, second.slice(184), false);
+	}
+
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.id)).toEqual([0x101, 0x102]);
+	for (const track of tracks) {
+		const sizes: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			sizes.push(packet.byteLength);
+		}
+		expect(sizes).toEqual(new Array<number>(6).fill(frameLength));
+	}
 });
 
 test('MPEG-TS with an unreadable stream still opens with its other streams', async () => {
