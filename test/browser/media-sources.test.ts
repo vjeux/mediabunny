@@ -15,7 +15,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { EncodedPacketSink, VideoSampleSink, AudioSampleSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
-import { assert, Rotation } from '../../src/misc.js';
+import { assert, Rotation, toDataView } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
 test('VideoSampleSource, normal usage', async () => {
@@ -1052,6 +1052,92 @@ test('canEncodeAudio only reports configs that encode audibly', async () => {
 
 		expect(peak, `${numberOfChannels} channels`).toBeGreaterThan(0.1);
 	}
+});
+
+let opusTimestampsFollowAudioResult: Promise<boolean> | null = null;
+
+/**
+ * Whether the platform's Opus encoder stamps its chunks along the audio, checked with WebCodecs alone. WebKitGTK's
+ * gives every chunk the timestamp of the audio data it came from (and its decoder shifts by the pre-skip instead of
+ * trimming it), so the timing of encoded Opus can't be checked there.
+ */
+const opusTimestampsFollowAudio = () => opusTimestampsFollowAudioResult ??= (async () => {
+	const config: AudioEncoderConfig = { codec: 'opus', sampleRate: 16000, numberOfChannels: 1, bitrate: 32_000 };
+
+	try {
+		if (!(await AudioEncoder.isConfigSupported(config)).supported) {
+			return false;
+		}
+
+		const timestamps: number[] = [];
+		const encoder = new AudioEncoder({
+			output: (chunk) => {
+				timestamps.push(chunk.timestamp);
+			},
+			error: () => {},
+		});
+		encoder.configure(config);
+		const data = new AudioData({
+			format: 'f32',
+			sampleRate: 16000,
+			numberOfChannels: 1,
+			numberOfFrames: 8000,
+			timestamp: 0,
+			data: new Float32Array(8000),
+		});
+		encoder.encode(data);
+		data.close();
+		await encoder.flush();
+		encoder.close();
+
+		// Half a second of audio comes out as about 25 chunks of 20 ms
+		return timestamps.length > 1
+			&& timestamps.every((timestamp, i) => i === 0 || timestamp > timestamps[i - 1]!)
+			&& timestamps[timestamps.length - 1]! >= 300_000;
+	} catch {
+		return false;
+	}
+})();
+
+test('AudioSampleSource, Opus encoding of 16 kHz audio keeps its timing', async ({ skip }) => {
+	if (!await opusTimestampsFollowAudio()) {
+		skip('The platform\'s Opus encoder doesn\'t stamp its chunks along the audio');
+	}
+
+	const sampleRate = 16000;
+	const data = new Float32Array(sampleRate);
+	for (let i = 0; i < data.length; i++) {
+		data[i] = 0.1 * Math.sin(2 * Math.PI * 440 * i / sampleRate);
+	}
+	data[sampleRate / 4] = 0.9; // A click at 0.25 s
+
+	const buffer = await encodeAudio(
+		{ codec: 'opus', quality: new Quality('medium') },
+		new AudioSample({ data, format: 'f32', sampleRate, numberOfChannels: 1, timestamp: 0 }),
+	);
+
+	const { input, track } = await readBackAudioTrack(buffer);
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig?.description);
+	// RFC 7845 counts the pre-skip in 48 kHz samples: 312 is libopus's 6.5 ms lookahead
+	expect(toDataView(decoderConfig.description).getUint16(10, true)).toBe(312);
+
+	let peakTime = 0;
+	let peakValue = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+
+		for (let i = 0; i < values.length; i++) {
+			if (Math.abs(values[i]!) > peakValue) {
+				peakValue = Math.abs(values[i]!);
+				peakTime = sample.timestamp + i / sample.sampleRate;
+			}
+		}
+	}
+
+	expect(Math.abs(peakTime - 0.25)).toBeLessThan(0.001);
+	input.dispose();
 });
 
 const makeSineWave = (
