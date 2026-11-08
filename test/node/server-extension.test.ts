@@ -882,6 +882,37 @@ describe('Video', async () => {
 		await conversionRoundtrip('av1');
 	});
 
+	test('AV1 conversion of 300 fps footage', { timeout: 30_000 }, async () => {
+		// One second of 300 fps AVC, as slow-motion recordings are
+		const sourceOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const videoSource = new VideoSampleSource({ codec: 'avc', quality: new Quality('low') });
+		sourceOutput.addVideoTrack(videoSource);
+		await sourceOutput.start();
+		for (let i = 0; i < 300; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 3 / 2).fill(i % 256), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 300,
+				duration: 1 / 300,
+			});
+			await videoSource.add(sample);
+		}
+		await sourceOutput.finalize();
+
+		// The encoder is told the source's frame rate, which SVT-AV1 takes only up to 240 fps
+		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video: { codec: 'av1' } });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getCodec()).toBe('av1');
+		expect((await track.computePacketStats()).packetCount).toBe(300);
+	});
+
 	test('ProRes conversion roundtrip', { timeout: 30_000 }, async () => {
 		await conversionRoundtrip('prores');
 	});
