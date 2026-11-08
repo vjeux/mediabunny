@@ -9,6 +9,7 @@ import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { StreamTarget, type StreamTargetChunk } from '../../src/target.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { IsobmffOutputFormat } from '../../src/output-format.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget, NullTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
@@ -1188,6 +1189,81 @@ test('btrt boxes computed from packet sizes, regular MP4', async () => {
 	expect(await audioTrack.getBitrate()).toBe(318224);
 	expect(await audioTrack.getAverageBitrate()).toBe(317375);
 });
+
+test('AAC sample entry above 65535 Hz, MOV', async () => {
+	const output = new Output({
+		format: new MovOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	const decoderConfig = {
+		codec: 'mp4a.40.2',
+		numberOfChannels: 2,
+		sampleRate: 96000,
+		description: new Uint8Array([0x10, 0x10]), // AAC-LC, 96 kHz, stereo
+	};
+	await source.add(new EncodedPacket(new Uint8Array(100), 'key', 0, 1024 / 96000), { decoderConfig });
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const sampleEntry = findBox(bytes, [...STSD_PATH, 'mp4a']);
+	assert(sampleEntry);
+
+	const view = toDataView(bytes);
+	const version = view.getUint16(sampleEntry.contentStart + 8);
+	const sampleRate = view.getFloat64(sampleEntry.contentStart + 32);
+	expect(version).toBe(2);
+	expect(sampleRate).toBe(96000);
+	expect(findBox(bytes, [...STSD_PATH, 'mp4a', 'esds'])).not.toBeNull();
+});
+
+test('PCM above 65535 Hz, MOV', async () => {
+	await testPcmAbove65535Hz(new MovOutputFormat());
+});
+
+const testPcmAbove65535Hz = async (format: IsobmffOutputFormat) => {
+	const output = new Output({
+		format,
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('pcm-s24');
+	output.addAudioTrack(source);
+	await output.start();
+
+	const decoderConfig = {
+		codec: 'pcm-s24',
+		numberOfChannels: 2,
+		sampleRate: 96000,
+	};
+	const data = new Uint8Array(6 * 960).map((_, i) => i);
+	await source.add(new EncodedPacket(data, 'key', 0, 960 / 96000), { decoderConfig });
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('pcm-s24');
+	expect(await track.getSampleRate()).toBe(96000);
+	expect(await track.getNumberOfChannels()).toBe(2);
+
+	const readData: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		readData.push(...packet.data);
+	}
+
+	expect(new Uint8Array(readData)).toEqual(data);
+
+	return new Uint8Array(output.target.buffer!);
+};
 
 test('btrt boxes copied from input metadata in conversion, fragmented MP4', async () => {
 	const bytes = await copyVideoMp4(new Mp4OutputFormat({ fastStart: 'fragmented' }));
