@@ -1236,8 +1236,10 @@ export const base64ToBytes = (base64: string) => {
 export const bytesToBase64 = (bytes: Uint8Array) => {
 	let string = '';
 
-	for (let i = 0; i < bytes.length; i++) {
-		string += String.fromCharCode(bytes[i]!);
+	// In chunks: a string built one character at a time is a rope of one node per byte until it's flattened, which
+	// takes hundreds of MB for a cover of a few MB
+	for (let i = 0; i < bytes.length; i += 0x8000) {
+		string += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
 	}
 
 	return btoa(string);
