@@ -17,8 +17,8 @@ import {
 } from './codec';
 import {
 	AudioEncodingConfig,
+	canEncodeVideo,
 	getEncodableAudioCodecs,
-	getFirstEncodableVideoCodec,
 	Quality,
 	resolveQuality,
 	VideoEncodingConfig,
@@ -1804,15 +1804,31 @@ export class Conversion {
 			const quality = resolveQuality(trackOptions.quality, trackOptions.bitrate)
 				?? new Quality('high');
 
-			const encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, {
-				width: trackOptions.process && trackOptions.processedWidth
-					? trackOptions.processedWidth
-					: width,
-				height: trackOptions.process && trackOptions.processedHeight
-					? trackOptions.processedHeight
-					: height,
-				quality,
-			});
+			let encodableCodec: VideoCodec | null = null;
+			for (const codec of videoCodecs) {
+				// These codecs require even dimensions, so odd ones get rounded up for them, like requested ones do
+				const needsEvenDimensions = codec === 'avc' || codec === 'hevc';
+				const canEncode = await canEncodeVideo(codec, {
+					width: trackOptions.process && trackOptions.processedWidth
+						? trackOptions.processedWidth
+						: needsEvenDimensions ? ceilToMultipleOfTwo(width) : width,
+					height: trackOptions.process && trackOptions.processedHeight
+						? trackOptions.processedHeight
+						: needsEvenDimensions ? ceilToMultipleOfTwo(height) : height,
+					quality,
+				});
+
+				if (canEncode) {
+					encodableCodec = codec;
+					if (needsEvenDimensions) {
+						width = ceilToMultipleOfTwo(width);
+						height = ceilToMultipleOfTwo(height);
+					}
+
+					break;
+				}
+			}
+
 			if (!encodableCodec) {
 				this.discardedTracks.push({
 					track,
