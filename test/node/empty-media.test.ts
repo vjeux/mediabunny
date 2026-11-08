@@ -621,6 +621,35 @@ test('Empty FLAC with declared decoder config', async () => {
 	expect((await audioTrack.computePacketStats()).packetCount).toBe(0);
 });
 
+test('FLAC packets too short for a frame header', async () => {
+	// A STREAMINFO metadata block for a 44100 Hz mono, 16-bit stream
+	const description = new Uint8Array(4 + 4 + 34);
+	description.set([0x66, 0x4c, 0x61, 0x43]); // 'fLaC'
+	description[4] = 0x80; // Last metadata block, type STREAMINFO
+	description[7] = 34; // Block size
+	const streamInfo = new Bitstream(description.subarray(8));
+	streamInfo.writeBits(16, 4096); // Minimum block size
+	streamInfo.writeBits(16, 4096); // Maximum block size
+	streamInfo.skipBits(48); // Minimum and maximum frame size
+	streamInfo.writeBits(20, 44100); // Sample rate
+	streamInfo.writeBits(3, 0); // Channels - 1
+	streamInfo.writeBits(5, 15); // Bits per sample - 1
+	const decoderConfig = { codec: 'flac', sampleRate: 44100, numberOfChannels: 1, description };
+
+	// A frame header for 4096 samples cut short, and one whose coded number takes 7 bytes but has only 2
+	const header = [0xff, 0xf8, 0xc9, 0x08, 0x00, 0x00];
+	const longCodedNumber = [0xff, 0xf8, 0xc9, 0x08, 0xfe, 0x00];
+	for (const bytes of [[], header.slice(0, 3), header.slice(0, 4), longCodedNumber]) {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('flac');
+		output.addAudioTrack(source);
+		await output.start();
+
+		const packet = new EncodedPacket(new Uint8Array(bytes), 'key', 0, 4096 / 44100);
+		await expect(source.add(packet, { decoderConfig })).rejects.toThrow('Invalid FLAC frame: Too short.');
+	}
+});
+
 test('Empty MPEG-TS', async () => {
 	const output = new Output({
 		format: new MpegTsOutputFormat(),
