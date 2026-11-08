@@ -28,7 +28,7 @@ type SubtitleParserOptions = {
 	output: (cue: SubtitleCue, metadata: SubtitleMetadata) => unknown;
 };
 
-const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
+const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s*-->\s*((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
 const preambleStartRegex = /^WEBVTT(.|\n)*?\n{2}/;
 export const inlineTimestampRegex = /<(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})>/g;
 
