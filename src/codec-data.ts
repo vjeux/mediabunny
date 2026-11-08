@@ -168,6 +168,50 @@ export const iterateAvcNalUnits = (packetData: Uint8Array, decoderConfig: VideoD
 	}
 };
 
+/**
+ * Like {@link iterateAvcNalUnits}, but also yields the NAL units that follow a start code inside a length-prefixed NAL
+ * unit. Android's MPEG4Writer only turns the first start code of a frame into a length, so a frame of several NAL units
+ * (like the SVC prefix NAL unit and the slice of temporally layered video, as recorded by Samsung's slow motion modes)
+ * ends up under a single length. Emulation prevention keeps start codes out of NAL units, so each begins a new one.
+ */
+const iterateAvcNalUnitsIncludingEmbedded = function* (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+): Generator<NalUnitLocation> {
+	for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
+		if (!decoderConfig.description) {
+			// Annex B, where every start code already begins a NAL unit
+			yield loc;
+			continue;
+		}
+
+		const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
+		let foundStartCode = false;
+
+		for (const embeddedLoc of iterateNalUnitsInAnnexB(nalUnit)) {
+			if (!foundStartCode) {
+				foundStartCode = true;
+
+				// The NAL unit before the first start code. Zero bytes right before a start code are never part of a
+				// NAL unit (they belong to a 4-byte start code or are trailing zeros).
+				let length = embeddedLoc.offset - 3;
+				while (length > 0 && nalUnit[length - 1] === 0) {
+					length--;
+				}
+				if (length > 0) {
+					yield { offset: loc.offset, length };
+				}
+			}
+
+			yield { offset: loc.offset + embeddedLoc.offset, length: embeddedLoc.length };
+		}
+
+		if (!foundStartCode) {
+			yield loc;
+		}
+	}
+};
+
 export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
@@ -2856,7 +2900,24 @@ export const determineVideoPacketType = (
 		case 'avc': {
 			let hasSps = false;
 
-			for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
+			// Only a frame without any length-prefixed slice hides its slices behind start codes. Elsewhere, a start
+			// code that a writer failed to escape (say, in an SEI payload before the slice) mustn't decide the type.
+			let hasLengthPrefixedSlice = false;
+			if (decoderConfig.description) {
+				for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
+					const type = extractNalUnitTypeForAvc(packetData[loc.offset]!);
+					if (type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR) {
+						hasLengthPrefixedSlice = true;
+						break;
+					}
+				}
+			}
+
+			const nalUnits = hasLengthPrefixedSlice
+				? iterateAvcNalUnits(packetData, decoderConfig)
+				: iterateAvcNalUnitsIncludingEmbedded(packetData, decoderConfig);
+
+			for (const loc of nalUnits) {
 				const nalTypeByte = packetData[loc.offset]!;
 				const type = extractNalUnitTypeForAvc(nalTypeByte);
 
