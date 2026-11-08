@@ -552,6 +552,153 @@ describe('Video', async () => {
 		])).toBeNull();
 	});
 
+	test.each([
+		['avc', 10],
+		['avc', 1],
+		['vp9', 10],
+		['vp9', 1],
+		['hevc', 10],
+		['hevc', 1],
+		['av1', 10],
+		['av1', 1],
+	] as [VideoCodec, number][])('%s key frames only at a keyFrameInterval of %i s', async (codec, interval) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec, quality: new Quality('low'), keyFrameInterval: interval });
+		output.addVideoTrack(source, { frameRate: 30 });
+		await output.start();
+
+		// 3 s at 30 fps of a slowly changing gray
+		for (let i = 0; i < 90; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 1.5).fill(100 + i), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+		const keyFrameTimestamps: number[] = [];
+		for await (const packet of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+			if (packet.type === 'key') {
+				keyFrameTimestamps.push(Math.round(packet.timestamp * 30) / 30);
+			}
+		}
+
+		// The encoder adds no key frames of its own, as with WebCodecs encoders
+		expect(keyFrameTimestamps).toEqual(interval === 10 ? [0] : [0, 1, 2]);
+	});
+
+	test('AV1 encoding stays near its target bitrate at any keyFrameInterval', { timeout: 60_000 }, async () => {
+		// Converts the 5 s test video to 640x360 AV1 at 30 fps and 500 kbps
+		const convertToAv1 = async (keyFrameInterval: number | undefined) => {
+			using input = new Input({ source: new FilePathSource('./test/public/video.mp4'), formats: ALL_FORMATS });
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: {
+					codec: 'av1',
+					width: 640,
+					frameRate: 30,
+					quality: new Quality({ bitrate: 500_000 }),
+					keyFrameInterval,
+				},
+				audio: { discard: true },
+			});
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await result.getPrimaryVideoTrack();
+			assert(track);
+			const keyFrameTimestamps: number[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				if (packet.type === 'key') {
+					keyFrameTimestamps.push(Math.round(packet.timestamp * 30) / 30);
+				}
+			}
+
+			return { bitrate: (await track.computePacketStats()).averageBitrate, keyFrameTimestamps };
+		};
+
+		// SVT-AV1 budgets each key frame against its intra period, which therefore has to match the requested interval
+		const cases = [[undefined, [0, 2, 4]], [1, [0, 1, 2, 3, 4]]] as const;
+		for (const [keyFrameInterval, keyFrameTimestamps] of cases) {
+			const { bitrate, keyFrameTimestamps: actual } = await convertToAv1(keyFrameInterval);
+			expect({ keyFrameInterval, keyFrameTimestamps: actual }).toEqual({ keyFrameInterval, keyFrameTimestamps });
+			expect(bitrate, `keyFrameInterval ${keyFrameInterval}`).toBeLessThan(1.25 * 500_000);
+		}
+	});
+
+	test('AV1 key frames stay where requested when frames come slightly faster than declared or irregularly', {
+		timeout: 60_000,
+	}, async () => {
+		// Encodes frames at the given timestamps with a declared 30 fps and returns the indices of the key frames,
+		// along with those of the frames the default keyFrameInterval of 2 s requests them for. Indices, since the
+		// declared frame rate snaps the written timestamps to its grid.
+		const keyFrames = async (timestamps: number[]) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'av1', quality: new Quality({ bitrate: 500_000 }) });
+			output.addVideoTrack(source, { frameRate: 30 });
+			await output.start();
+
+			for (let i = 0; i < timestamps.length; i++) {
+				const data = new Uint8Array(160 * 120 * 3 / 2).fill(128);
+				for (let j = 0; j < 160 * 120; j++) {
+					data[j] = (j * 7 + i * 3) & 0xff;
+				}
+				const sample = new VideoSample(data, {
+					format: 'I420',
+					codedWidth: 160,
+					codedHeight: 120,
+					timestamp: timestamps[i]!,
+					duration: (timestamps[i + 1] ?? timestamps[i]! + 1 / 30) - timestamps[i]!,
+				});
+				await source.add(sample);
+				sample.close();
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			const actual: number[] = [];
+			let index = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				if (packet.type === 'key') {
+					actual.push(index);
+				}
+				index++;
+			}
+			expect(index).toBe(timestamps.length);
+			const requested = timestamps.flatMap((timestamp, i) => {
+				return i === 0 || Math.floor(timestamp / 2) > Math.floor(timestamps[i - 1]! / 2) ? [i] : [];
+			});
+
+			return { actual, requested };
+		};
+
+		// 30.4 fps declared as 30: each 2 s interval holds a frame more than SVT-AV1's intra period would at 30 fps
+		const faster = await keyFrames(Array.from({ length: 300 }, (_, i) => i / 30.4));
+		expect(faster.actual).toEqual(faster.requested);
+
+		// About 30 fps, with frame durations varying by up to 20%
+		let seed = 12345;
+		let timestamp = 0;
+		const irregular: number[] = [];
+		for (let i = 0; i < 300; i++) {
+			irregular.push(timestamp);
+			seed = (seed * 48271) % 2147483647;
+			timestamp += (1 + 0.2 * (2 * seed / 2147483647 - 1)) / 30;
+		}
+		const jittered = await keyFrames(irregular);
+		expect(jittered.actual).toEqual(jittered.requested);
+	});
+
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },
