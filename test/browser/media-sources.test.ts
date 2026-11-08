@@ -1,8 +1,13 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
-import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
+import { BufferTarget, StreamTarget } from '../../src/target.js';
+import {
+	AudioSampleSource,
+	MediaStreamVideoTrackSource,
+	VideoSampleSource,
+	MediaStreamAudioTrackSource,
+} from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { canEncodeAudio, Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
@@ -1237,3 +1242,260 @@ test('MediaStreamVideoTrackSource, records every requested frame of a captureStr
 	expect((await videoTrack.computePacketStats()).packetCount).toBe(10);
 	input.dispose();
 });
+
+test.for(['audio', 'video'] as const)(
+	'MediaStream sources, an ended %s track stops holding back the other track',
+	async (endingTrack, { skip }) => {
+		if (typeof MediaStreamTrackGenerator === 'undefined') {
+			skip('Needs MediaStreamTrackGenerator (Chromium)');
+		}
+
+		const videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
+		const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
+		const videoWriter = videoGenerator.writable.getWriter();
+		const audioWriter = audioGenerator.writable.getWriter();
+
+		let trackEndedAt: number | null = null;
+		let lateFragments = 0;
+		const output = new Output({
+			format: new Mp4OutputFormat({
+				fastStart: 'fragmented',
+				minimumFragmentDuration: 0.25,
+				onMoof: () => {
+					// Count the fragments written well after the track ended
+					if (trackEndedAt !== null && performance.now() - trackEndedAt > 300) {
+						lateFragments++;
+					}
+				},
+			}),
+			target: new StreamTarget(new WritableStream()),
+		});
+
+		const videoSource = new MediaStreamVideoTrackSource(videoGenerator as unknown as MediaStreamVideoTrack, {
+			codec: 'vp8',
+			quality: new Quality('low'),
+			keyFrameInterval: 0.25,
+		});
+		const audioSource = new MediaStreamAudioTrackSource(audioGenerator as unknown as MediaStreamAudioTrack, {
+			codec: 'opus',
+			quality: new Quality('low'),
+		});
+		const errors: unknown[] = [];
+		videoSource.errorPromise.catch(error => errors.push(error));
+		audioSource.errorPromise.catch(error => errors.push(error));
+
+		output.addVideoTrack(videoSource);
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		// Feed both tracks in real time, end one of them after 0.6 s and keep feeding the other for another second
+		const canvas = new OffscreenCanvas(64, 48);
+		const context = canvas.getContext('2d')!;
+		const start = performance.now();
+		let videoFrames = 0;
+		let audioChunks = 0;
+
+		while (performance.now() - start < 1600) {
+			const elapsed = performance.now() - start;
+
+			if (elapsed >= 600 && trackEndedAt === null) {
+				await (endingTrack === 'audio' ? audioWriter : videoWriter).close();
+				trackEndedAt = performance.now();
+			}
+
+			while (audioChunks * 10 <= elapsed && (endingTrack !== 'audio' || trackEndedAt === null)) {
+				await audioWriter.write(new AudioData({
+					format: 'f32-planar',
+					sampleRate: 48000,
+					numberOfChannels: 1,
+					numberOfFrames: 480,
+					timestamp: 1000 * (start + 10 * audioChunks),
+					data: new Float32Array(480),
+				}));
+				audioChunks++;
+			}
+
+			while (videoFrames * 40 <= elapsed && (endingTrack !== 'video' || trackEndedAt === null)) {
+				context.fillStyle = `rgb(${videoFrames * 5}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+				await videoWriter.write(new VideoFrame(canvas, { timestamp: 1000 * (start + 40 * videoFrames) }));
+				videoFrames++;
+			}
+
+			await new Promise(resolve => setTimeout(resolve, 5));
+		}
+
+		const lateFragmentsBeforeFinalize = lateFragments;
+		await output.finalize();
+
+		expect(errors).toEqual([]);
+		expect(lateFragmentsBeforeFinalize).toBeGreaterThan(0);
+	},
+);
+
+/** Whether workers have MediaStreamTrackProcessor (Safari); MediaStreamVideoTrackSource then captures video there. */
+const hasWorkerTrackProcessor = async () => {
+	const url = URL.createObjectURL(new Blob(
+		['postMessage(typeof MediaStreamTrackProcessor !== \'undefined\')'],
+		{ type: 'application/javascript' },
+	));
+	const worker = new Worker(url);
+	const supported = await new Promise<boolean>((resolve) => {
+		worker.onmessage = event => resolve(event.data as boolean);
+	});
+	worker.terminate();
+	URL.revokeObjectURL(url);
+	return supported;
+};
+
+test.for(['video', 'audio'] as const)(
+	'MediaStream sources, track.stop() closes the %s source when capturing without MediaStreamTrackProcessor',
+	async (kind, { skip }) => {
+		// Without MediaStreamTrackProcessor (Firefox, Safari), video is sampled from a <video> element and audio comes
+		// through a ScriptProcessorNode. Stopping a track with track.stop() fires no 'ended' event.
+		if (kind === 'video' && await hasWorkerTrackProcessor()) {
+			skip('Captures video through MediaStreamTrackProcessor in a worker here, not through a <video> element');
+		}
+
+		let track: MediaStreamVideoTrack | MediaStreamAudioTrack;
+		let audioContext: AudioContext | null = null;
+		let stopDrawing = () => {};
+		if (kind === 'video') {
+			const canvas = document.createElement('canvas');
+			canvas.width = 64;
+			canvas.height = 48;
+			document.body.appendChild(canvas);
+			const context = canvas.getContext('2d')!;
+			let frame = 0;
+			const drawInterval = setInterval(() => {
+				context.fillStyle = `rgb(${frame++ % 256}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+			}, 20);
+			stopDrawing = () => {
+				clearInterval(drawInterval);
+				canvas.remove();
+			};
+			track = canvas.captureStream(30).getVideoTracks()[0]!;
+		} else {
+			audioContext = new AudioContext();
+			await Promise.race([audioContext.resume(), new Promise(resolve => setTimeout(resolve, 1000))]);
+			if (audioContext.state !== 'running') {
+				await audioContext.close();
+				skip('Web Audio cannot run here without a user gesture');
+			}
+			const destination = audioContext.createMediaStreamDestination();
+			const oscillator = audioContext.createOscillator();
+			oscillator.connect(destination);
+			oscillator.start();
+			track = destination.stream.getAudioTracks()[0]!;
+		}
+
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const errors: unknown[] = [];
+		if (track.kind === 'video') {
+			// Sampling from a <video> element needs a frame rate, which Firefox and Safari don't report for canvas
+			// capture tracks
+			const source = new MediaStreamVideoTrackSource(
+				track,
+				{ codec: 'vp8', quality: new Quality('low') },
+				{ frameRate: 30 },
+			);
+			source.errorPromise.catch(error => errors.push(error));
+			output.addVideoTrack(source);
+		} else {
+			const source = new MediaStreamAudioTrackSource(track, { codec: 'opus', quality: new Quality('low') });
+			source.errorPromise.catch(error => errors.push(error));
+			output.addAudioTrack(source);
+		}
+
+		const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+		const processor = globals.MediaStreamTrackProcessor;
+		globals.MediaStreamTrackProcessor = undefined;
+		try {
+			await output.start();
+		} finally {
+			globals.MediaStreamTrackProcessor = processor;
+		}
+
+		await new Promise(resolve => setTimeout(resolve, 600));
+		track.stop();
+		await new Promise(resolve => setTimeout(resolve, 600));
+		await output.finalize();
+		stopDrawing();
+		await audioContext?.close();
+
+		expect(errors).toEqual([]);
+
+		// The recording ends where the track was stopped, instead of repeating the last frame (or silence) until
+		// finalize()
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const duration = await input.computeDuration();
+		expect(duration).toBeGreaterThan(0.3);
+		expect(duration).toBeLessThan(0.9);
+	},
+);
+
+test.for(['video', 'audio'] as const)(
+	'MediaStream sources, an already-ended %s track closes its source instead of failing start()',
+	async (endedKind, { skip }) => {
+		if (typeof MediaStreamTrackGenerator === 'undefined') {
+			skip('Needs MediaStreamTrackGenerator (Chromium)');
+		}
+
+		const videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
+		const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
+		(endedKind === 'video' ? videoGenerator : audioGenerator).stop();
+
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new MediaStreamVideoTrackSource(
+			videoGenerator as unknown as MediaStreamVideoTrack,
+			{ codec: 'vp8', quality: new Quality('low') },
+			{ frameRate: null },
+		);
+		const audioSource = new MediaStreamAudioTrackSource(audioGenerator as unknown as MediaStreamAudioTrack, {
+			codec: 'opus',
+			quality: new Quality('low'),
+		});
+		const errors: unknown[] = [];
+		videoSource.errorPromise.catch(error => errors.push(error));
+		audioSource.errorPromise.catch(error => errors.push(error));
+		output.addVideoTrack(videoSource);
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		// The other track records as usual
+		const canvas = new OffscreenCanvas(64, 48);
+		const context = canvas.getContext('2d')!;
+		const videoWriter = endedKind === 'audio' ? videoGenerator.writable.getWriter() : null;
+		const audioWriter = endedKind === 'video' ? audioGenerator.writable.getWriter() : null;
+		for (let i = 0; i < 30; i++) {
+			if (videoWriter) {
+				context.fillStyle = `rgb(${8 * i}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+				await videoWriter.write(new VideoFrame(canvas, { timestamp: 33333 * i }));
+			} else {
+				await audioWriter!.write(new AudioData({
+					format: 'f32-planar',
+					sampleRate: 48000,
+					numberOfChannels: 1,
+					numberOfFrames: 480,
+					timestamp: 10000 * i,
+					data: new Float32Array(480),
+				}));
+			}
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		await output.finalize();
+
+		expect(errors).toEqual([]);
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const tracks = await input.getTracks();
+		expect(tracks.map(track => track.type)).toEqual([endedKind === 'video' ? 'audio' : 'video']);
+	},
+);
