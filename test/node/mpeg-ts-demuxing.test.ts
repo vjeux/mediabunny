@@ -3354,3 +3354,69 @@ test('MPEG-TS finds frames that come before a run of B-frames longer than the re
 		expect(await track.computeDuration() - start).toBeCloseTo(frameCount / 25);
 	}
 });
+
+test('MPEG-TS reads the packets in front of a late PAT and PMT', async () => {
+	// Found by L80. A capture of a broadcast starts somewhere between two of its PSI repetitions, so packets of the
+	// streams come before the first PAT and PMT. late-pmt.ts is the first 531 TS packets of FFmpeg's FATE sample
+	// h264/h264_intra_first-small.ts without its video (PID 0x12b5, whose first SPS only comes later): MP2 audio
+	// (0x12b2, 0x12b4) from TS packets 0 and 1, the PAT at packet 11 and the PMT at packet 17, of 24. Expected: the
+	// packets ffprobe reads (PTS, size); on main, the file opens with no tracks at all.
+	const readFirstPackets = async (bytes: Uint8Array, count: number) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const result: Record<number, number[][]> = {};
+		for (const track of await input.getTracks()) {
+			const packets: number[][] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push([Math.round(packet.timestamp * 90000), packet.byteLength]);
+				if (packets.length === count) {
+					break;
+				}
+			}
+			result[track.id] = packets;
+		}
+		return result;
+	};
+
+	const lateCapture = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/late-pmt.ts')));
+	expect(await readFirstPackets(lateCapture, Infinity)).toEqual({
+		[0x12b4]: [[212003457, 672], [212005617, 416]],
+		[0x12b2]: [[212002017, 672], [212004177, 672], [212006337, 112]],
+	});
+
+	// And synthetic ones: 30 AAC frames (stub payloads), with the PAT and PMT (the first two TS packets) moved behind
+	// the first 5 TS packets of media, or to the very end
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 30; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(100).fill(0x11), 'key', i * 1024 / 48000, 1024 / 48000),
+			i === 0
+				? {
+						decoderConfig: {
+							codec: 'mp4a.40.2',
+							numberOfChannels: 2,
+							sampleRate: 48000,
+							description: new Uint8Array([0x11, 0x90]),
+						},
+					}
+				: undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const movePsiBack = (count: number) => {
+		const result = new Uint8Array(bytes.length);
+		result.set(bytes.subarray(2 * 188, (2 + count) * 188), 0);
+		result.set(bytes.subarray(0, 2 * 188), count * 188);
+		result.set(bytes.subarray((2 + count) * 188), (2 + count) * 188);
+		return result;
+	};
+
+	const expected = await readFirstPackets(bytes, 30);
+	expect(Object.values(expected)[0]).toHaveLength(30);
+	expect(await readFirstPackets(movePsiBack(5), 30)).toEqual(expected);
+	expect(await readFirstPackets(movePsiBack(bytes.length / 188 - 2), 30)).toEqual(expected);
+});
