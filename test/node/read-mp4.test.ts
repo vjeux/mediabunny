@@ -20,6 +20,7 @@ import {
 	Output,
 	ReadableStreamSource,
 } from '../../src/index.js';
+import { iterateNalUnitsInLengthPrefixed } from '../../src/codec-data.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -2783,5 +2784,276 @@ test('Video sample entries with zero dimensions', async () => {
 
 		// The SPS says 64×64 with a pixel aspect ratio that gives a display size of 64×114
 		expect(await readDimensions(bytes)).toEqual([64, 64, 64, 114, 64, 64]);
+	}
+});
+
+test('AVC and HEVC tracks whose sample descriptions carry different parameter sets', async () => {
+	// FFmpeg starts a new sample description when the parameter sets change mid-stream (FATE's
+	// h264/extradata-reload-multi-stsd.mov and its HEVC twin, whose avcC/hvcC records these are). Each key sample gets
+	// its own description's parameter sets in band, as Chromium does, so that the decoder switches.
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const hex = (text: string) => text.match(/../g)!.map(x => parseInt(x, 16));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const nal = (bytes: number[], lengthSize = 4) => [...(lengthSize === 4 ? u32 : u16)(bytes.length), ...bytes];
+
+	const records = {
+		avc: [
+			'0164000cffe100196764000cacd941011b011000000300100000030320f142996001000668ebe3cb22c0fdf8f800',
+			'0164000bffe100186764000bacd942046c0440000003004000000c83c50a658001000668ebe3cb22c0fdf8f800',
+		].map(hex),
+		hevc: [
+			'0101600000009000000000001ef000fdfdf8f800000f03a00001001840010c01ffff01600000030090000003000003001e9598'
+			+ '09a10001002942010101600000030090000003000003001ea0102020596566924caf01010000030001000003001908a2000100'
+			+ '074401c172b42240',
+			'0101600000009000000000003cf000fdfdf8f800000f03a00001001840010c01ffff01600000030090000003000003003c9598'
+			+ '09a10001002842010101600000030090000003000003003ca0102010165959a4932bc04040000003004000000642a200010007'
+			+ '4401c172b42240',
+		].map(hex),
+	};
+	// The parameter set NAL units of each record, in order
+	const parameterSets = {
+		avc: records.avc.map((record) => {
+			const spsLength = record[6]! << 8 | record[7]!;
+			const pps = record.slice(8 + spsLength + 1);
+			return [record.slice(8, 8 + spsLength), pps.slice(2, 2 + (pps[0]! << 8 | pps[1]!))];
+		}),
+		hevc: records.hevc.map((record) => {
+			const units: number[][] = [];
+			let pos = 23;
+			for (let i = 0; i < record[22]!; i++) {
+				const count = record[pos + 1]! << 8 | record[pos + 2]!;
+				pos += 3;
+				for (let j = 0; j < count; j++) {
+					const length = record[pos]! << 8 | record[pos + 1]!;
+					units.push(record.slice(pos + 2, pos + 2 + length));
+					pos += 2 + length;
+				}
+			}
+			return units;
+		}),
+	};
+
+	const read = async (codec: 'avc' | 'hevc', secondLengthSize: 2 | 4) => {
+		const secondRecord = records[codec][1]!.slice();
+		const lengthSizePos = codec === 'avc' ? 4 : 21;
+		secondRecord[lengthSizePos] = (secondRecord[lengthSizePos]! & 0xfc) | (secondLengthSize - 1);
+		const entry = (record: number[]) => box(codec === 'avc' ? 'avc1' : 'hvc1', zeros(6), u16(1), zeros(16),
+			u16(128), u16(128), zeros(50), box(codec === 'avc' ? 'avcC' : 'hvcC', record));
+
+		// Key, delta with the first description, then key, delta with the second
+		const slices = [[0x65, 1, 1], [0x41, 2], [0x65, 3, 3], [0x41, 4]].map(x => codec === 'hevc' ? [0x26, ...x] : x);
+		const samples = slices.map((slice, i) => nal(slice, i < 2 ? 4 : secondLengthSize));
+
+		const moov = (chunkOffsets: number[]) => box('moov',
+			box('mvhd', zeros(12), u32(25), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(128 << 16), u32(128 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(25), u32(4), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(2), entry(records[codec][0]!), entry(secondRecord)),
+						box('stts', u32(0), u32(1), u32(4), u32(1)),
+						box('stss', u32(0), u32(2), u32(1), u32(3)),
+						box('stsc', u32(0), u32(2), u32(1), u32(2), u32(1), u32(2), u32(2), u32(2)),
+						box('stsz', u32(0), u32(0), u32(4), ...samples.map(x => u32(x.length))),
+						box('stco', u32(0), u32(2), ...chunkOffsets.map(u32)),
+					)),
+				),
+			),
+		);
+		const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+		const dataStart = ftyp.length + moov([0, 0]).length + 8;
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([
+				...ftyp,
+				...moov([dataStart, dataStart + samples[0]!.length + samples[1]!.length]),
+				...box('mdat', ...samples),
+			])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const description = (await track.getDecoderConfig())!.description as Uint8Array;
+		const configLengthSize = (description[codec === 'avc' ? 4 : 21]! & 0b11) + 1;
+
+		const sink = new EncodedPacketSink(track);
+		const packets: number[][] = [];
+		for await (const packet of sink.packets()) {
+			const metadataOnly = await sink.getPacket(packet.timestamp, { metadataOnly: true });
+			expect(metadataOnly?.byteLength).toBe(packet.byteLength);
+			packets.push([...packet.data]);
+		}
+
+		return { packets, slices, configLengthSize };
+	};
+
+	for (const codec of ['avc', 'hevc'] as const) {
+		for (const secondLengthSize of [4, 2] as const) {
+			const { packets, slices, configLengthSize } = await read(codec, secondLengthSize);
+			const [first, second] = parameterSets[codec];
+			const configNal = (bytes: number[]) => nal(bytes, configLengthSize);
+
+			// All with the length prefix size of the decoder config
+			expect(packets).toEqual([
+				[...first!.flatMap(configNal), ...configNal(slices[0]!)],
+				configNal(slices[1]!),
+				[...second!.flatMap(configNal), ...configNal(slices[2]!)],
+				configNal(slices[3]!),
+			]);
+		}
+	}
+});
+
+test('Fragments whose sample description changes the parameter sets', async () => {
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const nal = (bytes: number[]) => [...u32(bytes.length), ...bytes];
+
+	// Two avcC records with made-up parameter sets (an SPS of the right profile, then a PPS)
+	const sps = [[0x67, 0x42, 0xc0, 0x0d, 0xd9, 0x01, 0x01, 0x80], [0x67, 0x42, 0xc0, 0x0d, 0xd9, 0x02, 0x02, 0x80]];
+	const pps = [[0x68, 0xce, 0x3c, 0x80], [0x68, 0xce, 0x38, 0x80]];
+	const avc1 = (i: number) => box('avc1', zeros(6), u16(1), zeros(16), u16(16), u16(16), zeros(50),
+		box('avcC', [1, 0x42, 0xc0, 0x0d, 0xff, 0xe1], u16(sps[i]!.length), sps[i]!, [1], u16(pps[i]!.length),
+			pps[i]!));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(25), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(16 << 16), u32(16 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(25), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(2), avc1(0), avc1(1)),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	const slices = [[0x65, 1], [0x41, 2], [0x65, 3]];
+	// The first fragment uses the first sample description, the second one the second
+	const fragment = (sequence: number, sampleDescriptionIndex: number, sampleSlices: number[][], start: number) => {
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020002), u32(1), u32(sampleDescriptionIndex)),
+			box('tfdt', u32(0), u32(start)),
+			box('trun', u32(0x701), u32(sampleSlices.length), u32(dataOffset), ...sampleSlices.map((slice, i) => [
+				...u32(1), ...u32(slice.length + 4), ...u32(i === 0 ? 0x02000000 : 0x01010000),
+			])),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(sequence)), traf(0)).length;
+		return [
+			...box('moof', box('mfhd', u32(0), u32(sequence)), traf(moofSize + 8)),
+			...box('mdat', ...sampleSlices.map(nal)),
+		];
+	};
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso5'), u32(0)),
+			...moov,
+			...fragment(1, 1, slices.slice(0, 2), 0),
+			...fragment(2, 2, slices.slice(2), 2),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([...packet.data]);
+	}
+	expect(packets).toEqual([
+		[...nal(sps[0]!), ...nal(pps[0]!), ...nal(slices[0]!)],
+		nal(slices[1]!),
+		[...nal(sps[1]!), ...nal(pps[1]!), ...nal(slices[2]!)],
+	]);
+});
+
+test('Sample descriptions with NAL unit length prefixes of different sizes', async () => {
+	// Prefixes are only ever widened, to the largest size among the descriptions, so a 300-byte NAL unit keeps its
+	// length even when the decoder config's own description uses 1-byte prefixes
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const hex = (text: string) => text.match(/../g)!.map(x => parseInt(x, 16));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const entry = (record: number[]) => box('avc1', zeros(6), u16(1), zeros(16), u16(128), u16(128), zeros(50),
+		box('avcC', record));
+
+	for (const smallLengthSize of [1, 2]) {
+		// 4-byte prefixes
+		const first = hex('0164000cffe100196764000cacd941011b011000000300100000030320f14299600100'
+			+ '0668ebe3cb22c0fdf8f800');
+		const second = hex('0164000bffe100186764000bacd942046c0440000003004000000c83c50a65800100'
+			+ '0668ebe3cb22c0fdf8f800');
+		second[4] = 0xfc | (smallLengthSize - 1);
+
+		const largeNalUnit = [0x65, ...new Array<number>(299).fill(0xaa)];
+		// The first chunk uses the description with small prefixes, so that one gives the decoder config
+		const samples = [[...(smallLengthSize === 1 ? [3] : u16(3)), 0x65, 1, 1], [...u32(300), ...largeNalUnit]];
+		const moov = (chunkOffsets: number[]) => box('moov',
+			box('mvhd', zeros(12), u32(25), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(128 << 16), u32(128 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(25), u32(2), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(2), entry(first), entry(second)),
+						box('stts', u32(0), u32(1), u32(2), u32(1)),
+						box('stsc', u32(0), u32(2), u32(1), u32(1), u32(2), u32(2), u32(1), u32(1)),
+						box('stsz', u32(0), u32(0), u32(2), ...samples.map(x => u32(x.length))),
+						box('stco', u32(0), u32(2), ...chunkOffsets.map(u32)),
+					)),
+				),
+			),
+		);
+		const ftyp = box('ftyp', ascii('qt  '), u32(0), ascii('qt  '));
+		const dataStart = ftyp.length + moov([0, 0]).length + 8;
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([
+				...ftyp,
+				...moov([dataStart, dataStart + samples[0]!.length]),
+				...box('mdat', ...samples),
+			])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		const description = (await track.getDecoderConfig())!.description as Uint8Array;
+		expect(description[4]! & 0b11).toBe(3); // 4-byte prefixes
+
+		const sink = new EncodedPacketSink(track);
+		const packet = await sink.getPacket(0.04);
+		assert(packet);
+		const nalUnits = [...iterateNalUnitsInLengthPrefixed(packet.data, 4)];
+		expect(nalUnits.map(x => x.length).at(-1)).toBe(300);
+		expect((await sink.getPacket(0.04, { metadataOnly: true }))?.byteLength).toBe(packet.byteLength);
 	}
 });
