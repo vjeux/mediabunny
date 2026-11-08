@@ -43,7 +43,7 @@ import {
 	InputTrackBacking,
 	InputVideoTrackBacking,
 } from '../input-track';
-import { AttachedFile, DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
+import { AttachedFile, AttachedImage, DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { PacketRetrievalOptions } from '../media-sink';
 import {
 	assert,
@@ -436,6 +436,29 @@ const getPacketSampleCount = (track: InternalTrack, data: Uint8Array): number | 
 	}
 };
 
+/**
+ * Ranks the Matroska spec's cover art file names, best first: cover.*, cover_land.*, small_cover.*, small_cover_land.*.
+ * Returns null for other names.
+ */
+const getCoverArtRank = (fileName: string | null | undefined) => {
+	const match = fileName && /^(small_)?cover(_land)?\./.exec(fileName.toLowerCase());
+	return match ? (match[1] ? 2 : 0) + (match[2] ? 1 : 0) : null;
+};
+
+/**
+ * The spec's cover art names are versions of the same cover, so the best one there is the front cover (cover.*
+ * always). Done once all attachments are read, whatever their order.
+ */
+const pickFrontCover = (images: AttachedImage[]) => {
+	const ranks = images.map(image => getCoverArtRank(image.name));
+	const bestRank = Math.min(...ranks.map(rank => rank ?? Infinity));
+	images.forEach((image, i) => {
+		if (ranks[i] !== null) {
+			image.kind = ranks[i] === bestRank ? 'coverFront' : 'unknown';
+		}
+	});
+};
+
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
 const MAX_SCANNED_NEXT_CLUSTER_ELEMENTS = 256;
 const MAX_ELEMENT_NESTING_DEPTH = 64;
@@ -579,6 +602,10 @@ export class MatroskaDemuxer extends Demuxer {
 		let metadataTags: MetadataTags = {};
 		for (const segment of this.segments) {
 			metadataTags = { ...metadataTags, ...segment.metadataTags };
+		}
+
+		if (metadataTags.images) {
+			pickFrontCover(metadataTags.images);
 		}
 
 		return metadataTags;
@@ -2617,13 +2644,12 @@ export class MatroskaDemuxer extends Demuxer {
 					const fileName = this.currentAttachedFile.fileName;
 					let kind: 'coverFront' | 'coverBack' | 'unknown' = 'unknown';
 
-					if (fileName) {
-						const lowerName = fileName.toLowerCase();
-						if (lowerName.startsWith('cover.')) {
-							kind = 'coverFront';
-						} else if (lowerName.startsWith('back.')) {
-							kind = 'coverBack';
-						}
+					// The Matroska spec names cover art cover.(jpg|png), with versions of the same cover prefixed with
+					// small_ (smaller) or suffixed with _land (landscape); getMetadataTags() picks the front cover
+					if (getCoverArtRank(fileName) !== null) {
+						kind = 'coverFront';
+					} else if (fileName?.toLowerCase().startsWith('back.')) {
+						kind = 'coverBack';
 					}
 
 					tags.images ??= [];
