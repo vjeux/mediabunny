@@ -415,8 +415,8 @@ test('Decodes the alpha of the first GOP of transparent AVC video', async ({ ski
 	assert(track);
 	using sample = await new VideoSampleSink(track).getSample(0);
 	assert(sample);
-	expect(sample.format).toBe('I420A');
 
+	// The format with alpha differs by browser (I420A in Chromium, BGRA in Firefox), so check the pixels
 	const drawn = new OffscreenCanvas(64, 64);
 	const drawnContext = drawn.getContext('2d');
 	assert(drawnContext);
