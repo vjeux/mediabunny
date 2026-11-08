@@ -1612,12 +1612,13 @@ export class IsobmffMuxer extends Muxer {
 
 		const trackData = this.trackDatas.find(x => x.track === track);
 		if (trackData) {
-			trackData.closed = true;
-
+			// Flush the remaining cues while the track is still open: a closed track no longer holds back fragments, so
+			// its last samples could otherwise get written before their timestamps are processed
 			if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
 				await this.processWebVTTCues(trackData, Infinity);
 			}
 
+			trackData.closed = true;
 			this.processTimestamps(trackData);
 		}
 
@@ -1683,12 +1684,12 @@ export class IsobmffMuxer extends Muxer {
 		this.ensureOneEnabledTrack();
 
 		for (const trackData of this.trackDatas) {
-			trackData.closed = true;
-
+			// Like in onTrackClose, the remaining cues are flushed before the track counts as closed
 			if (trackData.type === 'subtitle' && trackData.track.source._codec === 'webvtt') {
 				await this.processWebVTTCues(trackData, Infinity);
 			}
 
+			trackData.closed = true;
 			this.processTimestamps(trackData);
 		}
 
