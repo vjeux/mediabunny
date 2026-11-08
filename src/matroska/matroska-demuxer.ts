@@ -86,6 +86,7 @@ import {
 	EBML_DATE_EPOCH,
 } from './ebml';
 import { buildMatroskaMimeType } from './matroska-misc';
+import { buildAacAudioSpecificConfig } from '../../shared/aac-misc';
 import { FileSlice, readBytes, Reader, readI16Be, readU8 } from '../reader';
 
 type Segment = {
@@ -256,6 +257,7 @@ type InternalTrack = {
 			type: 'audio';
 			numberOfChannels: number;
 			sampleRate: number;
+			outputSampleRate: number | null;
 			bitDepth: number;
 			codec: AudioCodec | null;
 			codecDescription: Uint8Array | null;
@@ -287,6 +289,48 @@ const holdsKeyFrameAtOrBefore = (entry: InternalTrack['clusterPositionCache'][nu
 const trackMayReorder = (track: InternalTrack) => {
 	return track.info?.type === 'video'
 		&& (track.info.codec === 'avc' || track.info.codec === 'hevc' || track.info.codec === null);
+};
+
+/**
+ * Builds the AudioSpecificConfig for the deprecated `A_AAC/MPEG2/...` and `A_AAC/MPEG4/...` codec IDs, which name the
+ * AAC profile in the codec ID and come without CodecPrivate (written by old versions of mkvmerge, among others). Like
+ * FFmpeg's Matroska demuxer, the config is derived from the codec ID and the audio settings.
+ */
+const buildLegacyAacAudioSpecificConfig = (
+	codecId: string,
+	sampleRate: number,
+	outputSampleRate: number,
+	numberOfChannels: number,
+) => {
+	if (!/^A_AAC\/MPEG[24]\//.test(codecId)) {
+		return null;
+	}
+
+	let objectType: number;
+	if (codecId.includes('SBR')) {
+		objectType = 5;
+	} else if (codecId.includes('MAIN')) {
+		objectType = 1;
+	} else if (codecId.includes('LC')) {
+		objectType = 2;
+	} else if (codecId.includes('SSR')) {
+		objectType = 3;
+	} else {
+		objectType = 4; // LTP
+	}
+
+	try {
+		return buildAacAudioSpecificConfig({
+			objectType,
+			// SamplingFrequency is the core coder's rate and OutputSamplingFrequency the rate after SBR (usually twice
+			// as high). Signaling SBR explicitly with that output rate covers downsampled SBR (equal rates) as well.
+			coreSampleRate: sampleRate,
+			outputSampleRate: objectType === 5 ? outputSampleRate : sampleRate,
+			outputNumberOfChannels: numberOfChannels,
+		});
+	} catch {
+		return null; // Channel count that can't be signaled without a PCE
+	}
 };
 
 export class MatroskaDemuxer extends Demuxer {
@@ -1276,7 +1320,24 @@ export class MatroskaDemuxer extends Demuxer {
 								isMpeg2: this.currentTrack.codecId.includes('MPEG2'),
 								objectType: null,
 							};
-							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
+							if (this.currentTrack.codecPrivate?.byteLength) {
+								this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
+							} else {
+								const outputSampleRate = this.currentTrack.info.outputSampleRate
+									?? this.currentTrack.info.sampleRate;
+								const description = buildLegacyAacAudioSpecificConfig(
+									this.currentTrack.codecId,
+									this.currentTrack.info.sampleRate,
+									outputSampleRate,
+									this.currentTrack.info.numberOfChannels,
+								);
+
+								this.currentTrack.info.codecDescription = description;
+								if (description && this.currentTrack.codecId.includes('SBR')) {
+									// What the decoder outputs
+									this.currentTrack.info.sampleRate = outputSampleRate;
+								}
+							}
 						} else if (this.currentTrack.codecId === CODEC_STRING_MAP.mp3) {
 							this.currentTrack.info.codec = 'mp3';
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.opus) {
@@ -1377,6 +1438,7 @@ export class MatroskaDemuxer extends Demuxer {
 						type: 'audio',
 						numberOfChannels: 1, // Default value
 						sampleRate: 8000, // Default value
+						outputSampleRate: null, // Defaults to sampleRate
 						bitDepth: -1,
 						codec: null,
 						codecDescription: null,
@@ -1635,6 +1697,17 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 
 				this.currentTrack.info.sampleRate = sampleRate;
+			}; break;
+
+			case EBMLId.OutputSamplingFrequency: {
+				if (this.currentTrack?.info?.type !== 'audio') {
+					break;
+				}
+
+				const outputSampleRate = readFloat(slice, size);
+				if (outputSampleRate > 0 && Number.isFinite(outputSampleRate)) {
+					this.currentTrack.info.outputSampleRate = outputSampleRate;
+				}
 			}; break;
 
 			case EBMLId.Channels: {
