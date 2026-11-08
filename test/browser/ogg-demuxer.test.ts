@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, ReadableStreamSource, UrlSource } from '../../src/source.js';
+import { BufferSource, CustomSource, ReadableStreamSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AudioBufferSink, AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -400,4 +400,32 @@ test('looks up the last packet of a stream after computing its duration', async 
 	const duration = await track.computeDuration();
 	const lastPacket = await new EncodedPacketSink(track).getPacket(Infinity);
 	expect(lastPacket!.timestamp + lastPacket!.duration).toBeCloseTo(duration, 9);
+});
+
+test('reads all links of a chained file from a source that can only read forward', async () => {
+	// As from a server that ignores range requests: the file size is known, but data that has left the cache can't be
+	// read again, so iteration must read the file in order, also across links
+	const { links, packetCount } = await remuxToOggLinks('/preroll-test.opus', [100, 220]);
+	const file = concatBytes(links);
+	let readUpTo = 0;
+	const source = new CustomSource({
+		getSize: () => file.length,
+		read: (start, end) => {
+			if (start < readUpTo - 32 * 1024) {
+				throw new Error(`Read back to byte ${start} after reading up to byte ${readUpTo}`);
+			}
+			readUpTo = Math.max(readUpTo, end);
+			return file.slice(start, end);
+		},
+		maxCacheSize: 32 * 1024,
+		prefetchProfile: 'none',
+	});
+
+	using input = new Input({ source, formats: ALL_FORMATS });
+	let count = 0;
+	for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+		expect(packet.byteLength).toBeGreaterThan(0);
+		count++;
+	}
+	expect(count).toBe(packetCount);
 });
