@@ -1463,7 +1463,7 @@ export const getEncodableCodecs = async (): Promise<MediaCodec[]> => {
  * @public
  */
 export const getEncodableVideoCodecs = async (
-	checkedCodecs: VideoCodec[] = VIDEO_CODECS as unknown as VideoCodec[],
+	checkedCodecs: readonly VideoCodec[] = VIDEO_CODECS,
 	options?: {
 		/** The width of the video in pixels. */
 		width?: number;
@@ -1493,7 +1493,7 @@ export const getEncodableVideoCodecs = async (
  * @public
  */
 export const getEncodableAudioCodecs = async (
-	checkedCodecs: AudioCodec[] = AUDIO_CODECS as unknown as AudioCodec[],
+	checkedCodecs: readonly AudioCodec[] = AUDIO_CODECS,
 	options?: {
 		/** The number of audio channels. */
 		numberOfChannels?: number;
@@ -1521,7 +1521,7 @@ export const getEncodableAudioCodecs = async (
  * @public
  */
 export const getEncodableSubtitleCodecs = async (
-	checkedCodecs: SubtitleCodec[] = SUBTITLE_CODECS as unknown as SubtitleCodec[],
+	checkedCodecs: readonly SubtitleCodec[] = SUBTITLE_CODECS,
 ): Promise<SubtitleCodec[]> => {
 	validateCheckedCodecs(checkedCodecs);
 
@@ -1535,7 +1535,7 @@ export const getEncodableSubtitleCodecs = async (
  * @public
  */
 export const getFirstEncodableVideoCodec = async (
-	checkedCodecs: VideoCodec[],
+	checkedCodecs: readonly VideoCodec[],
 	options?: {
 		/** The width of the video in pixels. */
 		width?: number;
@@ -1570,7 +1570,7 @@ export const getFirstEncodableVideoCodec = async (
  * @public
  */
 export const getFirstEncodableAudioCodec = async (
-	checkedCodecs: AudioCodec[],
+	checkedCodecs: readonly AudioCodec[],
 	options?: {
 		/** The number of audio channels. */
 		numberOfChannels?: number;
@@ -1603,7 +1603,7 @@ export const getFirstEncodableAudioCodec = async (
  * @public
  */
 export const getFirstEncodableSubtitleCodec = async (
-	checkedCodecs: SubtitleCodec[],
+	checkedCodecs: readonly SubtitleCodec[],
 ): Promise<SubtitleCodec | null> => {
 	validateCheckedCodecIterable(checkedCodecs);
 
