@@ -1396,6 +1396,14 @@ export class HlsMuxer extends Muxer {
 					segmentSize
 						= playlist.singleFile.fragmentedIsobmffOutput.currentFileSize - playlist.singleFile.nextOffset;
 				} else {
+					output._muxer.setNextSegmentTimestamps(this.getNextSegmentTimestamps(
+						videoTrack?.packets[videoEndIndex] ?? null,
+						videoSource,
+						audioTrack?.packets[audioEndIndex] ?? null,
+						audioSource,
+						videoShift,
+						audioShift,
+					));
 					await output.finalize();
 				}
 			} catch (e) {
@@ -1503,6 +1511,29 @@ export class HlsMuxer extends Muxer {
 		// The media's own timestamps are decoupled from the input timestamps (which may well be huge Unix timestamps)
 		assert(this.firstPacketTimestamp !== null);
 		return timestamp - this.firstPacketTimestamp + this.mediaTimestampBase;
+	}
+
+	/**
+	 * Returns, per track of a segment's output, the media timestamp at which the next segment starts: that of the
+	 * packet that will start it, when it's known already.
+	 */
+	private getNextSegmentTimestamps(
+		nextVideoPacket: EncodedPacket | null,
+		videoSource: EncodedVideoPacketSource | null,
+		nextAudioPacket: EncodedPacket | null,
+		audioSource: EncodedAudioPacketSource | null,
+		videoShift: number,
+		audioShift: number,
+	) {
+		const timestamps = new Map<OutputTrack, number>();
+		if (nextVideoPacket && videoSource?._connectedTrack) {
+			timestamps.set(videoSource._connectedTrack, this.toMediaTimestamp(nextVideoPacket.timestamp) + videoShift);
+		}
+		if (nextAudioPacket && audioSource?._connectedTrack) {
+			timestamps.set(audioSource._connectedTrack, this.toMediaTimestamp(nextAudioPacket.timestamp) + audioShift);
+		}
+
+		return timestamps;
 	}
 
 	private async onPlaylistDone(playlist: Playlist) {
