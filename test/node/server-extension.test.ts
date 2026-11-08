@@ -4122,6 +4122,40 @@ describe('Audio', async () => {
 		expect(end).toBeLessThan(duration + 0.03);
 	});
 
+	test.each([44100, 22050, 96000])('Opus encoding of %i Hz audio keeps its last samples', async (sampleRate) => {
+		// 1 s and 37 samples of stereo silence ending in a 5 ms tone that peaks on the last sample. The resampler
+		// holds back the input's last samples for its filter, and they must still come out at the end.
+		const frameCount = sampleRate + 37;
+		const data = new Float32Array(2 * frameCount);
+		for (let i = frameCount - Math.round(0.005 * sampleRate); i < frameCount; i++) {
+			data[2 * i] = data[2 * i + 1] = 0.8 * Math.cos(2 * Math.PI * 1000 * (frameCount - 1 - i) / sampleRate);
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('high') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		let lastLoudTimestamp = -1;
+		for await (using decoded of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
+			for (let i = 0; i < channel.length; i++) {
+				if (Math.abs(channel[i]!) > 0.2) {
+					lastLoudTimestamp = decoded.timestamp + i / decoded.sampleRate;
+				}
+			}
+		}
+
+		// The tone lasts until the input's end, give or take a few samples
+		expect(lastLoudTimestamp).toBeGreaterThan(frameCount / sampleRate - 0.0001);
+		expect(lastLoudTimestamp).toBeLessThan(frameCount / sampleRate + 0.0005);
+	});
+
 	test('MP3 encode & decode', async () => {
 		await encodeDecodeTest('mp3', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
