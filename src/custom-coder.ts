@@ -93,6 +93,11 @@ export abstract class CustomVideoEncoder {
 	readonly onPacket!: (packet: EncodedPacket, meta?: EncodedVideoChunkMetadata) => unknown;
 	/** The callback to call to surface out-of-band errors that can't be surfaced through the main methods. */
 	readonly onError!: (error: unknown) => undefined;
+	/**
+	 * The interval in seconds at which key frames are requested through the encode options, 0 for every frame.
+	 * @internal
+	 */
+	_keyFrameInterval = 2;
 
 	/** Returns true if and only if the encoder can encode the given codec configuration. */
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars

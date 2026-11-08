@@ -789,6 +789,7 @@ class VideoEncoderWrapper {
 				this.customEncoder.codec = this.encodingConfig.codec;
 				// @ts-expect-error It's technically readonly
 				this.customEncoder.config = encoderConfig;
+				this.customEncoder._keyFrameInterval = this.encodingConfig.keyFrameInterval ?? 2;
 				// @ts-expect-error It's technically readonly
 				this.customEncoder.onPacket = (packet, meta) => {
 					if (!(packet instanceof EncodedPacket)) {

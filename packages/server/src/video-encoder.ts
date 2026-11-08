@@ -163,8 +163,20 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.height = this.config.height;
 		codecContext.pixelFormat = pixelFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, 1e6);
-		codecContext.gopSize = 60;
-		codecContext.framerate = new NodeAv.Rational(Math.round(this.config.framerate ?? 0) || 30, 1);
+		const frameRate = Math.round(this.config.framerate ?? 0) || 30;
+		// Mediabunny requests every key frame itself (keyFrameInterval), so the encoder must not insert its own on a
+		// schedule of its own
+		codecContext.gopSize = 100_000;
+		if (this.avCodec.name === 'libsvtav1') {
+			// SVT-AV1's rate control budgets each key frame against its intra period, so key frames requested within a
+			// longer one get far too many bits (a third over the target bitrate). Its period is matched to the
+			// requested interval instead, plus a frame, so that a frame rate slightly below the real one doesn't end it
+			// before the next request. A requested key frame restarts it, so it adds no key frames of its own, unless
+			// the frame rate is unknown and above the 30 fps assumed then (as with the fixed period of 60 before).
+			const intervalFrameRate = this.config.framerate || 30;
+			codecContext.gopSize = Math.max(Math.ceil(this._keyFrameInterval * intervalFrameRate) + 1, 2);
+		}
+		codecContext.framerate = new NodeAv.Rational(frameRate, 1);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate
 		// control mode
 		codecContext.bitRate = this.config.bitrateMode === 'quantizer'
