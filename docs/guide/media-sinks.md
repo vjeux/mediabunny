@@ -110,6 +110,8 @@ import { EncodedPacketSink } from 'mediabunny';
 const sink = new EncodedPacketSink(track);
 ```
 
+The packets it returns may share memory with the input: their `data` can be a view into a [`BufferSource`](./reading-media-files#buffersource)'s buffer or into the input's read cache. Copy `data` before modifying it (for example, before rewriting AVC length prefixes into Annex B start codes in place); otherwise, later reads of the same input return the modified bytes.
+
 You can retrieve specific packets given a timestamp in seconds:
 ```ts
 await sink.getPacket(5); // => EncodedPacket | null
