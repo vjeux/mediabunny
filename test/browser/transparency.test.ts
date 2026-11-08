@@ -6,11 +6,12 @@ import { CanvasSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { CanvasSource, VideoSampleSource } from '../../src/media-source.js';
+import { CanvasSource, EncodedVideoPacketSource, VideoSampleSource } from '../../src/media-source.js';
 import { canEncodeVideo, Quality } from '../../src/encode.js';
 import { VideoSample } from '../../src/sample.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 const decodeTransparentVideoTest = async () => {
 	using input = new Input({
@@ -387,40 +388,51 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	expect(sample.hasAlpha).toBe(true);
 });
 
-test('Decodes the alpha of the first GOP of transparent AVC video', async ({ skip }) => {
+test('Decodes the alpha of the first GOP of transparent AVC video', async () => {
 	// Chromium's first-packet workarounds rewrote the packet without its alpha side data, so the alpha decoder missed
-	// the first key frame and the whole first GOP came out opaque (found by the lane L90 review; bug-fix-mania's fix)
-	skip(
-		!(await canEncodeVideo('avc', { width: 64, height: 64, alpha: 'keep' })),
-		'there is no AVC encoder that keeps alpha here',
-	);
+	// the first key frame and the whole first GOP came out opaque (found by the lane L90 review; bug-fix-mania's fix).
+	// The file is demo.mp4's first GOP in Matroska with its own H.264 stream as the alpha, so the alpha is the luma.
+	using mp4 = new Input({ source: new UrlSource('/demo.mp4'), formats: ALL_FORMATS });
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+	const decoderConfig = await mp4Track.getDecoderConfig();
+	assert(decoderConfig);
 
-	const canvas = new OffscreenCanvas(64, 64);
-	const context = canvas.getContext('2d');
-	assert(context);
 	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
-	const source = new CanvasSource(canvas, { codec: 'avc', quality: new Quality('high'), alpha: 'keep' });
+	const source = new EncodedVideoPacketSource('avc');
 	output.addVideoTrack(source);
 	await output.start();
-	for (let i = 0; i < 10; i++) {
-		context.clearRect(0, 0, 64, 64);
-		context.fillStyle = 'red';
-		context.fillRect(0, 0, 32, 64); // The left half opaque, the right half fully transparent
-		await source.add(i / 30, 1 / 30);
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		if (packetCount > 0 && packet.type === 'key') {
+			break; // Only the first GOP
+		}
+
+		await source.add(
+			new EncodedPacket(packet.data, packet.type, packet.timestamp, packet.duration, undefined, undefined, {
+				alpha: packet.data,
+			}),
+			packetCount === 0 ? { decoderConfig } : undefined,
+		);
+		packetCount++;
 	}
 	await output.finalize();
 
 	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
 	const track = await input.getPrimaryVideoTrack();
 	assert(track);
-	using sample = await new VideoSampleSink(track).getSample(0);
+	using sample = await new VideoSampleSink(track).getSample(await track.getFirstTimestamp());
 	assert(sample);
 
-	// The format with alpha differs by browser (I420A in Chromium, BGRA in Firefox), so check the pixels
-	const drawn = new OffscreenCanvas(64, 64);
-	const drawnContext = drawn.getContext('2d');
-	assert(drawnContext);
-	sample.draw(drawnContext, 0, 0);
-	expect(drawnContext.getImageData(16, 32, 1, 1).data[3]).toBe(255);
-	expect(drawnContext.getImageData(48, 32, 1, 1).data[3]).toBe(0);
+	// The alpha follows the picture's brightness, where an opaque frame has 255 everywhere
+	const canvas = new OffscreenCanvas(sample.displayWidth, sample.displayHeight);
+	const context = canvas.getContext('2d');
+	assert(context);
+	sample.draw(context, 0, 0);
+	const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+	let minAlpha = 255;
+	for (let i = 3; i < pixels.length; i += 4) {
+		minAlpha = Math.min(minAlpha, pixels[i]!);
+	}
+	expect(minAlpha).toBeLessThan(128);
 });
