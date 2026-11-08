@@ -7,6 +7,7 @@ import {
 	BufferSource,
 	BufferTarget,
 	CustomSource,
+	EncodedAudioPacketSource,
 	EncodedPacket,
 	EncodedPacketSink,
 	EncodedVideoPacketSource,
@@ -2131,4 +2132,69 @@ test('Codec info from the sample description the samples use', async () => {
 	expect(await read([mp3, aac], 1, null)).toBe('mp3');
 	// tfhd wins over a valid trex index, however many boxes come before the first moof box
 	expect(await read([aac, mp3], 1, 2, 8)).toBe('mp3');
+});
+
+test('Vorbis with length-prefixed headers in esds', async () => {
+	// gpac (samples.ffmpeg.org MPEG-4/vorbis-in-mp4/*.mp4) prefixes each Vorbis header with a 16-bit length instead of
+	// the Xiph lacing that decoders expect
+	using oggInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/vorbis-eos.ogg')),
+		formats: ALL_FORMATS,
+	});
+	const oggTrack = await oggInput.getPrimaryAudioTrack();
+	assert(oggTrack);
+	const oggConfig = (await oggTrack.getDecoderConfig())!;
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('vorbis');
+	output.addAudioTrack(source);
+	await output.start();
+	let i = 0;
+	for await (const packet of new EncodedPacketSink(oggTrack).packets()) {
+		await source.add(packet, i === 0 ? { decoderConfig: oggConfig } : undefined);
+		if (++i === 10) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	// Split the Xiph-laced headers, which only works for this fixture's small comment header
+	const laced = toUint8Array(oggConfig.description!);
+	expect([laced[0], laced[1]]).toEqual([2, 30]);
+	const identification = laced.subarray(3, 3 + 30);
+	const comment = laced.subarray(3 + 30, 3 + 30 + laced[2]!);
+	const setup = laced.subarray(3 + 30 + laced[2]!);
+
+	// Rewrite the description in place. The length prefixes take 3 more bytes than the segment table, so make up for
+	// it by cutting 3 bytes off the vendor string in the comment header.
+	const view = new DataView(comment.buffer, comment.byteOffset);
+	const vendorLength = view.getUint32(7, true);
+	const shortComment = new Uint8Array([
+		...comment.subarray(0, 7),
+		0, 0, 0, 0, // Vendor length, set below
+		...comment.subarray(11, 11 + vendorLength - 3),
+		...comment.subarray(11 + vendorLength),
+	]);
+	new DataView(shortComment.buffer).setUint32(7, vendorLength - 3, true);
+	const lengthPrefixed = new Uint8Array([
+		0, 30, ...identification,
+		shortComment.length >> 8, shortComment.length & 0xff, ...shortComment,
+		setup.length >> 8, setup.length & 0xff, ...setup,
+	]);
+	expect(lengthPrefixed.length).toBe(laced.length);
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const descriptionPos = bytes.findIndex((_, pos) => laced.every((byte, j) => bytes[pos + j] === byte));
+	expect(descriptionPos).toBeGreaterThan(0);
+	bytes.set(lengthPrefixed, descriptionPos);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const config = (await track.getDecoderConfig())!;
+
+	const expectedDescription = [2, 30, shortComment.length, ...identification, ...shortComment, ...setup];
+	expect([...toUint8Array(config.description!)]).toEqual(expectedDescription);
+	expect(config.numberOfChannels).toBe(oggConfig.numberOfChannels);
+	expect(config.sampleRate).toBe(oggConfig.sampleRate);
 });
