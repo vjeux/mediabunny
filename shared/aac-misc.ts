@@ -271,6 +271,9 @@ export type AdtsHeaderTemplate = {
 
 export const buildAdtsHeaderTemplate = (config: AacAudioSpecificConfig): AdtsHeaderTemplate => {
 	const { coreObjectType, frequencyIndex, channelConfiguration, programConfigElement } = config;
+	if (channelConfiguration > 7) {
+		throw new Error(`AAC channel configuration ${channelConfiguration} can't be stored in ADTS.`);
+	}
 
 	// With ADTS, a channel layout described by a PCE has to be inside the frames, so we stick it at the end
 	// of the header
