@@ -1855,7 +1855,7 @@ export type CustomSourceOptions = {
 	 * Called when data is requested. Must return or resolve to the bytes from the specified byte range, or a stream
 	 * that yields these bytes.
 	 *
-	 * You are guaranteed that `0 <= start < end < fileSize`.
+	 * You are guaranteed that `0 <= start < end <= fileSize`.
 	 */
 	read: (start: number, end: number) => MaybePromise<Uint8Array | ReadableStream<Uint8Array>>;
 

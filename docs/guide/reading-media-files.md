@@ -156,7 +156,9 @@ track.type; // => 'video' | 'audio' | 'subtitle';
 track.isVideoTrack(); // => boolean
 track.isAudioTrack(); // => boolean
 
-// Retrieve the track's language as an ISO 639-2/T language code.
+// Retrieve the track's language as an ISO 639-2 language code, as stored in the
+// file: Matroska uses the bibliographic form (e.g. 'ger'), MP4 usually the
+// terminology form (e.g. 'deu').
 // Resolves to 'und' (undetermined) if the language isn't known.
 await track.getLanguageCode(); // => string
 
@@ -173,7 +175,7 @@ await track.getBitrate(); // => number | null
 // The track's average bitrate, if exposed by the file metadata:
 await track.getAverageBitrate(); // => number | null
 
-// Whether all packets in the track are key packets:
+// Whether the track's metadata says that all its packets are key packets:
 await track.hasOnlyKeyPackets(); // => boolean
 
 // Whether the track is currently live (meaning new media data is still being added):
@@ -189,7 +191,7 @@ You can query metadata related to the track's codec:
 ```ts
 await track.getCodec(); // => MediaCodec | null
 ```
-This field is `null` when the track's codec couldn't be recognized or is not supported by Mediabunny. See [Codecs](./supported-formats-and-codecs#codecs) for the full list of supported codecs. When Mediabunny doesn't recognize the format, you can still use the `internalCodecId` field to figure out the codec of the track, although its format depends on the container format used and is not homogenized by Mediabunny.
+This field is `null` when the track's codec couldn't be recognized or is not supported by Mediabunny. See [Codecs](./supported-formats-and-codecs#codecs) for the full list of supported codecs. MP4/MOV and Matroska/WebM files still list tracks whose codec Mediabunny doesn't recognize, and you can use `getInternalCodecId()` to figure out their codec, although its format depends on the container format used and is not homogenized by Mediabunny. MPEG-TS and Ogg files leave such tracks out, and reading a WAVE file with an unsupported codec throws an error.
 
 You can also extract the full codec parameter string from the track, as specified in the [Mediabunny Codec Registry](/codec-registry/overview):
 ```ts
@@ -211,7 +213,7 @@ You can compute the track's specific duration in seconds like so:
 ```ts
 await track.computeDuration(); // => 1902.4615
 ```
-Analogous to the `Input`'s duration, this is identical to the end timestamp of the last sample. A track's duration may be shorter than the `Input`'s total duration if the `Input` has multiple tracks which differ in length.
+Analogous to the `Input`'s duration, this is the end timestamp of the last sample, rounded to the track's time resolution (see below). A track's duration may be shorter than the `Input`'s total duration if the `Input` has multiple tracks which differ in length.
 
 You can also retrieve the approximate duration based on metadata in the file:
 ```ts
@@ -236,9 +238,11 @@ Another metric related to track timing info is its *time resolution*, which is g
 ```ts
 await track.getTimeResolution(); // => 24
 ```
-Intuitively, this is the maximum possible "frame rate" of the track (assuming that no two samples have the same timestamp). Mathematically, if $x$ is equal to a track's time resolution, then all timestamps and durations of that track can be expressed as:
+Intuitively, this is the maximum possible "frame rate" of the track (assuming that no two samples have the same timestamp). Mathematically, if $x$ is equal to a track's time resolution, then all timestamps of that track can be expressed as:
 
 $$ \frac{k}{x},\quad k \in \mathbb{Z} $$
+
+Packet durations can be finer than that: Matroska's `DefaultDuration`, for example, has nanosecond precision.
 
 ::: info
 This field only gives an upper bound on a track's frame rate. To determine a video track's actual frame rate based on its frames, compute its [frame rate metrics](#frame-rate-metrics).
@@ -395,7 +399,7 @@ For example, here's the decoder configuration for an AAC audio track:
 	sampleRate: 44100,
 	description: new Uint8Array([
 		// Bytes of the AudioSpecificConfig
-		17, 144,
+		18, 16,
 	]),
 }
 ```
@@ -477,9 +481,14 @@ We may want to extract downscaled thumbnails from a video track:
 import { CanvasSink } from 'mediabunny';
 
 const videoTrack = await input.getPrimaryVideoTrack();
+if (!videoTrack) {
+	throw new Error('No video track.');
+}
+
 const sink = new CanvasSink(videoTrack, {
 	width: 320,
 	height: 180,
+	fit: 'contain',
 });
 
 const startTimestamp = await videoTrack.getFirstTimestamp();
@@ -534,6 +543,38 @@ await decoder.flush();
 ```
 
 As you can see, media sinks are incredibly versatile and allow for efficient, sparse reading of media data within the input file.
+
+## Encrypted files
+
+MP4 files (including fragmented MP4 and MOV) encrypted with Common Encryption, using the `cenc`, `cens` or `cbcs` scheme, can be read if you provide the decryption keys. For each key ID it encounters, Mediabunny calls `formatOptions.isobmff.resolveKeyId` with the key ID as a 32-character lowercase hex string, together with the file's Protection System Specific Header (PSSH) boxes for that key ID. Return the key as a 32-character hex string or a 16-byte `Uint8Array`:
+```ts
+import { Input, ALL_FORMATS, BlobSource } from 'mediabunny';
+
+// Maps each key ID to its decryption key
+const keyMap = new Map([
+	['00112233445566778899aabbccddeeff', 'aabbccddeeff00112233445566778899'],
+]);
+
+const input = new Input({
+	source: new BlobSource(file),
+	formats: ALL_FORMATS,
+	formatOptions: {
+		isobmff: {
+			resolveKeyId: ({ keyId, psshBoxes }) => {
+				// psshBoxes can be used to obtain the key from a DRM license server
+				const key = keyMap.get(keyId);
+				if (!key) {
+					throw new Error('Unknown key ID.');
+				}
+
+				return key;
+			},
+		},
+	},
+});
+```
+
+Without `resolveKeyId`, reading an encrypted sample throws an error. The same option decrypts `SAMPLE-AES` HLS content; see [Reading HLS](./reading-hls#encrypted-content).
 
 ## Disposing inputs
 
@@ -604,7 +645,7 @@ This source is backed by an underlying [`Blob`](https://developer.mozilla.org/en
 import { BlobSource } from 'mediabunny';
 
 fileInput.addEventListener('change', (event) => {
-	const file = event.target.files[0];
+	const file = (event.target as HTMLInputElement).files![0];
 	const source = new BlobSource(file);
 });
 ```
@@ -615,6 +656,11 @@ type BlobSourceOptions = {
 	// The maximum number of bytes the cache is allowed to hold
 	// in memory. Defaults to 8 MiB.
 	maxCacheSize?: number;
+
+	// Whether to read the blob through a ReadableStream reader.
+	// Defaults to true; set to false to use a slower but more
+	// stable reading method if you hit (very rare) browser bugs.
+	useStreamReader?: boolean;
 
 	// Handles errors that occur while no read is pending
 	handleUnhandledError?: (error: unknown) => unknown;
@@ -643,7 +689,7 @@ type UrlSourceOptions = {
 	getRetryDelay?: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
 
 	// The maximum number of bytes the cache is allowed to hold
-	// in memory. Defaults to 8 MiB.
+	// in memory. Defaults to 64 MiB.
 	maxCacheSize?: number;
 
 	// The maximum number of parallel requests to use for fetching. Defaults to 2.
@@ -780,13 +826,13 @@ type MaybePromise<T> = T | Promise<T>;
 - `getSize`\
 	Called when the size of the entire file is requested. Must return or resolve to the size in bytes. This function is guaranteed to be called before `read`.
 - `read`\
-	Called when data is requested. Must return or resolve to the bytes from the specified byte range, or a stream that yields these bytes. You are guaranteed that `0 <= start < end < fileSize`.
+	Called when data is requested. Must return or resolve to the bytes from the specified byte range, or a stream that yields these bytes. You are guaranteed that `0 <= start < end <= fileSize`.
 - `dispose`\
 	Called when the `Input` driven by this source is disposed.
 - `maxCacheSize`\
 	The maximum number of bytes the cache is allowed to hold in memory. Defaults to 8 MiB.
 - `prefetchProfile`\
-	Specifies the prefetch profile that the reader should use with this source. A prefetch propfile specifies the pattern with which bytes outside of the requested range are preloaded to reduce latency for future reads.
+	Specifies the prefetch profile that the reader should use with this source. A prefetch profile specifies the pattern with which bytes outside of the requested range are preloaded to reduce latency for future reads.
 	- `'none'` (default): No prefetching; only the data needed in the moment is requested.
 	- `'fileSystem'`: File system-optimized prefetching: a small amount of data is prefetched bidirectionally, aligned with page boundaries.
 	- `'network'`: Network-optimized prefetching, or more generally, prefetching optimized for any high-latency environment: tries to minimize the amount of read calls and aggressively prefetches data when sequential access patterns are detected.
@@ -814,12 +860,12 @@ writer.write(chunk2);
 writer.close();
 ```
 
-This source is *unsized*, meaning calls to `.getSize()` will throw and readers are more limited due to the lack of random file access. You should only use this source with sequential access patterns, such as reading all packets from start to end or doing conversions. This source does not work well with random access patterns unless you increase its max cache size.
+This source is *unsized*, meaning calls to `.getSize()` will throw and readers are more limited due to the lack of random file access. You should only use this source with sequential access patterns, such as reading all packets from start to end or doing conversions. This source does not work well with random access patterns unless you increase its max cache size. MP4 and MOV files without Fast Start (their `moov` box comes after the media data, as in FFmpeg's default output) are such a case: converting one needs the entire file to fit in the cache.
 
 ```ts
 type ReadableStreamSourceOptions = {
 	// The maximum number of bytes the cache is allowed to hold
-	// in memory. Defaults to 16 MiB.
+	// in memory. Defaults to 32 MiB.
 	maxCacheSize?: number;
 
 	// Handles errors that occur while no read is pending
