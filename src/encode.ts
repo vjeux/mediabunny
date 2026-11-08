@@ -137,7 +137,9 @@ export type VideoTransformOptions = {
 	 * Allows for custom user-defined processing of video frames, e.g. for applying overlays, color transformations,
 	 * or timestamp modifications. Will be called for each video frame after transformations and frame rate
 	 * corrections, one frame at a time and in order: the next frame waits until the returned promise settles. So don't
-	 * wait for an `add()` on the same source inside it, as that add waits for it in turn.
+	 * wait for an `add()` on the same source inside it, as that add waits for it in turn. Finalizing the output also
+	 * waits for the calls of the frames added before it, so a promise that never settles keeps it from finishing until
+	 * the output is canceled.
 	 *
 	 * Must return a {@link VideoSample}, a {@link VideoSampleResource} or a `CanvasImageSource`, an array of them, or
 	 * `null` for dropping the frame. When non-timestamped data is returned, the timestamp and duration from the input

@@ -996,18 +996,26 @@ export class Output<
 	 * has stalled on a write: once 5 seconds pass without any of the pending writes completing, this resolves, and the
 	 * stream closes in the background if the sink ever catches up.
 	 *
+	 * While the output is finalizing, this instead stops waiting for the samples added before finalizing to be
+	 * processed by a `process` function (they're dropped), so that one that never settles can't hold finalization up
+	 * forever; the returned promise then resolves once finalization has completed.
+	 *
 	 * @returns A promise that resolves once all internal resources have been released.
 	 */
 	async cancel() {
 		if (this.state === 'canceled') {
 			return this._cancelPromise ?? undefined;
-		} else if (this.state === 'finalizing' || this.state === 'finalized') {
-			// Don't wanna warn when finalizing since that shows a warning when finalization fails and then cancel
-			// is called
-			if (this.state === 'finalized') {
-				Logging._warn('Output has already been finalized.');
+		} else if (this.state === 'finalized') {
+			Logging._warn('Output has already been finalized.');
+			return;
+		} else if (this.state === 'finalizing') {
+			// Finalization waits for the samples added before it to be processed, which a process function that never
+			// settles would hold up forever. Stop waiting for them (they're dropped), so that it can complete.
+			for (const track of this.tracks) {
+				track.source._cancelPendingAdds();
 			}
 
+			await this._finalizePromise?.catch(() => {});
 			return;
 		}
 
