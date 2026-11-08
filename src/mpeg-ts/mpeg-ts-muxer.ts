@@ -41,6 +41,7 @@ import { EncodedPacket } from '../packet';
 import { Writer } from '../writer';
 import {
 	buildMpegTsMimeType,
+	computeMpegTsCrc32,
 	MpegTsStreamType,
 	secondsToMpegTsTimestamp,
 	TS_PACKET_SIZE,
@@ -774,30 +775,6 @@ export class MpegTsMuxer extends Muxer {
 		release();
 	}
 }
-
-// CRC-32 for MPEG-TS (polynomial 0x04C11DB7, initial value 0xFFFFFFFF)
-const MPEG_TS_CRC_POLYNOMIAL = 0x04c11db7;
-const MPEG_TS_CRC_TABLE = new Uint32Array(256);
-for (let n = 0; n < 256; n++) {
-	let crc = n << 24;
-
-	for (let k = 0; k < 8; k++) {
-		crc = (crc & 0x80000000)
-			? ((crc << 1) ^ MPEG_TS_CRC_POLYNOMIAL)
-			: (crc << 1);
-	}
-
-	MPEG_TS_CRC_TABLE[n] = (crc >>> 0) & 0xffffffff;
-}
-
-const computeMpegTsCrc32 = (data: Uint8Array) => {
-	let crc = 0xFFFFFFFF;
-	for (let i = 0; i < data.length; i++) {
-		const byte = data[i]!;
-		crc = ((crc << 8) ^ MPEG_TS_CRC_TABLE[(crc >>> 24) ^ byte]!) >>> 0;
-	}
-	return crc;
-};
 
 const PAT_SECTION = new Uint8Array(16);
 {
