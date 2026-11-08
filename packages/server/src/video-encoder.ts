@@ -52,6 +52,35 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
 };
 
+// Codecs whose bitstream can carry alpha: VP8 and VP9 (as a second stream), HEVC (as an extra layer) and ProRes 4444
+const ALPHA_CAPABLE_CODECS: VideoCodec[] = ['vp8', 'vp9', 'hevc', 'prores'];
+
+/**
+ * The pixel format to encode with when keeping alpha, or null for the default one. Codecs that can't carry alpha
+ * (AVC, AV1) never get an alpha format: it would drop the alpha anyway, only changing the stream's format (to 4:4:4
+ * 10-bit for libx264) or the input format (to RGBA for NVENC).
+ */
+export const getAlphaPixelFormat = (codec: VideoCodec, pixelFormats: NodeAv.AVPixelFormat[]) => {
+	if (!ALPHA_CAPABLE_CODECS.includes(codec)) {
+		return null;
+	}
+
+	// Going by FFmpeg's names for them, planar (yuva420p, gbrap10le) and packed: prores_videotoolbox only takes alpha
+	// as ayuv64le or bgra
+	const alphaFormats = pixelFormats.filter(
+		format => /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|ayuv|vuya)/.test(NodeAv.avGetPixFmtName(format) ?? ''),
+	);
+
+	if (alphaFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
+		return NodeAv.AV_PIX_FMT_YUVA420P;
+	} else if (alphaFormats.length === 0) {
+		return null;
+	}
+
+	// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a high-quality YUVA source
+	return NodeAv.avcodecFindBestPixFmtOfList(alphaFormats, NodeAv.AV_PIX_FMT_YUVA444P12LE);
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -150,16 +179,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 
 			if (this.config.alpha === 'keep') {
-				if (this.avCodec.pixelFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
-					pixelFormat = NodeAv.AV_PIX_FMT_YUVA420P;
-				} else {
-					// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a
-					// high-quality YUVA source
-					pixelFormat = NodeAv.avcodecFindBestPixFmtOfList(
-						this.avCodec.pixelFormats,
-						NodeAv.AV_PIX_FMT_YUVA444P12LE,
-					);
-				}
+				pixelFormat = getAlphaPixelFormat(this.codec, this.avCodec.pixelFormats) ?? pixelFormat;
 			}
 		}
 
