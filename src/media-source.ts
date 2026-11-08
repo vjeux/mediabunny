@@ -204,6 +204,14 @@ export abstract class VideoSource extends MediaSource {
 	}
 }
 
+/** Whether a sample holds 8-bit SDR video, which drawing it through a canvas doesn't degrade. */
+const isEightBitSdrSample = (sample: VideoSample) => {
+	const isHighBitDepth = sample.format !== null && (sample.format.includes('P10') || sample.format.includes('P12'));
+	const transfer = sample.colorSpace.transfer as string | null;
+	const isHdr = transfer === 'pq' || transfer === 'hlg';
+	return !isHighBitDepth && !isHdr;
+};
+
 const maybeEnsureIsKeyPacket = (track: OutputVideoTrack, packet: EncodedPacket) => {
 	if (track.metadata.hasOnlyKeyPackets && packet.type !== 'key') {
 		throw new Error('Cannot add non-key packets to a hasOnlyKeyPackets video track.');
@@ -353,11 +361,14 @@ class VideoEncoderWrapper {
 				|| config.transform?.crop !== undefined
 				|| config.transform?.force === true;
 			// With fill/contain/cover, frames of a new size are drawn through a canvas. Draw the others the same way,
-			// so that every frame reaches the encoder in the same color space (the encoder can't switch it mid-track)
+			// so that every frame reaches the encoder in the same color space (the encoder can't switch it mid-track).
+			// Not high-bit-depth or HDR frames, though, which the 8-bit sRGB canvas would degrade
 			const fitsSizeChanges = sizeChangeBehavior === 'fill'
 				|| sizeChangeBehavior === 'contain'
 				|| sizeChangeBehavior === 'cover';
-			const needsTransform = hasTransformConfig || fitsSizeChanges;
+			const needsTransform = hasTransformConfig
+				|| (isSizeChange && sizeChangeBehavior !== 'passThrough')
+				|| (fitsSizeChanges && isEightBitSdrSample(videoSample));
 
 			if (needsTransform) {
 				let targetWidth = config.transform?.width;
