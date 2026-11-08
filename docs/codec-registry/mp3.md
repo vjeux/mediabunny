@@ -30,9 +30,11 @@ The packet's type is always `'key'`.
 
 ## `AudioDecoderConfig` codec string
 
-```ts
-'mp3'
-```
+This codec has multiple equivalent codec strings:
+
+- `'mp3'`
+- `'mp4a.69'`
+- `'mp4a.6B'`
 
 ## `AudioDecoderConfig` description
 
