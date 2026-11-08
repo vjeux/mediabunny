@@ -1972,14 +1972,23 @@ export class Conversion {
 
 		let maximumPacketCount = trackOptions.maximumPacketCount;
 		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
-			// Frames map 1:1 to packets, so the input's packet rate is a good stand-in unless the frame rate is changed
-			const packetRate = trackOptions.frameRate
-				?? (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
-			const startTimestamp = needsTranscode
-				? this._startTimestamp
-				: copyStartPacket?.timestamp ?? this._startTimestamp;
+			if (!trackOptions.frameRate && !await track.isLive()) {
+				// Frames map 1:1 to packets. The frame rate can vary wildly within a file (think screen recordings,
+				// which only produce frames when something changes), so count the packets instead of extrapolating
+				// from the rate of the first ones.
+				const packetCount = await this._countPacketsInTrimRange(track, needsTranscode ? null : copyStartPacket);
+				// With the same generous margin as the rate-based estimate, so this is never tighter for constant-rate
+				// input (the 64 also covers B-frames presented before the end that come after it in decode order)
+				maximumPacketCount = Math.ceil(1.5 * packetCount) + 64;
+			} else {
+				const packetRate = trackOptions.frameRate
+					?? (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				const startTimestamp = needsTranscode
+					? this._startTimestamp
+					: copyStartPacket?.timestamp ?? this._startTimestamp;
 
-			maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
+				maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
+			}
 		}
 
 		this.output.addVideoTrack(videoSource, {
@@ -2437,19 +2446,25 @@ export class Conversion {
 
 		let maximumPacketCount = trackOptions.maximumPacketCount;
 		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
-			let packetRate: number;
-			if (needsTranscode) {
-				assert(outputCodec);
-				packetRate = sampleRate / getMinimumAudioPacketSize(outputCodec, sampleRate);
+			if (!needsTranscode && !await track.isLive()) {
+				// Copied packets can come at a varying rate too (think Opus with DTX, which only sends a packet
+				// every 400 ms during silence), so count them, with the rate-based estimate's margin
+				maximumPacketCount = Math.ceil(1.5 * await this._countPacketsInTrimRange(track, copyStartPacket)) + 64;
 			} else {
-				packetRate = (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				let packetRate: number;
+				if (needsTranscode) {
+					assert(outputCodec);
+					packetRate = sampleRate / getMinimumAudioPacketSize(outputCodec, sampleRate);
+				} else {
+					packetRate = (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+				}
+
+				const startTimestamp = needsTranscode
+					? this._startTimestamp
+					: copyStartPacket?.timestamp ?? this._startTimestamp;
+
+				maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
 			}
-
-			const startTimestamp = needsTranscode
-				? this._startTimestamp
-				: copyStartPacket?.timestamp ?? this._startTimestamp;
-
-			maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
 		}
 
 		this.output.addAudioTrack(audioSource, {
@@ -2477,6 +2492,30 @@ export class Conversion {
 
 		// Let's give this a generous margin
 		return Math.ceil(1.5 * packetRate * duration) + 64;
+	}
+
+	/**
+	 * Counts the packets from the given start packet (or the key packet at the trim start) up to the trim end.
+	 * @internal
+	 */
+	async _countPacketsInTrimRange(track: InputTrack, startPacket: EncodedPacket | null) {
+		const sink = new EncodedPacketSink(track);
+		startPacket ??= await sink.getKeyPacket(this._startTimestamp, { metadataOnly: true })
+			?? await sink.getFirstPacket({ metadataOnly: true });
+		if (!startPacket) {
+			return 0;
+		}
+
+		let count = 0;
+		for await (const packet of sink.packets(startPacket, undefined, { metadataOnly: true })) {
+			if (packet.timestamp >= this._endTimestamp) {
+				break;
+			}
+
+			count++;
+		}
+
+		return count;
 	}
 
 	/** @internal */
