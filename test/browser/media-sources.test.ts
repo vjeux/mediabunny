@@ -9,6 +9,7 @@ import {
 	VideoSampleSource,
 	MediaStreamAudioTrackSource,
 	CanvasSource,
+	AudioBufferSource,
 } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { canEncodeAudio, Quality, VideoTransformOptions, canEncode } from '../../src/encode.js';
@@ -4523,28 +4524,20 @@ test('VideoSampleSource, cancel() while finalizing keeps every frame without a p
 	expect(packets).toBe(6);
 });
 
-test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async ({
-	skip,
-}) => {
-	if (typeof AudioEncoder === 'undefined' || !(await canEncodeAudio('opus'))) {
-		skip('Opus encoding is not supported here');
-	}
-
-	// A slow encoder setup keeps the captured audio waiting in the add chain while finalizing
-	const isConfigSupported = AudioEncoder.isConfigSupported.bind(AudioEncoder);
-	AudioEncoder.isConfigSupported = async (config: AudioEncoderConfig) => {
-		await new Promise(resolve => setTimeout(resolve, 500));
-		return isConfigSupported(config);
-	};
+test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async () => {
 	const capture = installSineCapture();
+	// A slow sink keeps the captured audio waiting in the add chain while finalizing, though nothing is stuck
+	const chunks: StreamTargetChunk[] = [];
 	const output = new Output({
-		format: new WebMOutputFormat(),
-		target: new BufferTarget(),
+		format: new WavOutputFormat(),
+		target: new StreamTarget(new WritableStream<StreamTargetChunk>({
+			write: async (chunk) => {
+				chunks.push({ ...chunk, data: chunk.data.slice() });
+				await new Promise(resolve => setTimeout(resolve, 20));
+			},
+		})),
 	});
-	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
-		codec: 'opus',
-		quality: new Quality('low'),
-	});
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, { codec: 'pcm-f32' });
 	audioSource.errorPromise.catch(() => {});
 	output.addAudioTrack(audioSource);
 
@@ -4557,15 +4550,21 @@ test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio wit
 		await output.cancel();
 		await finalized;
 	} finally {
-		AudioEncoder.isConfigSupported = isConfigSupported;
 		await capture.uninstall();
 	}
 
 	expect(output.state).toBe('finalized');
-	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-	const track = await input.getPrimaryAudioTrack();
-	expect(track).not.toBeNull();
-	expect(await track!.computeDuration()).toBeGreaterThan(0.9 * 15 * 1024 / 48000);
+	const file = new Uint8Array(Math.max(...chunks.map(chunk => chunk.position + chunk.data.byteLength)));
+	for (const chunk of chunks) {
+		file.set(chunk.data, chunk.position);
+	}
+	using input = new Input({ source: new BufferSource(file.buffer), formats: ALL_FORMATS });
+	let frames = 0;
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		frames += sample.numberOfFrames;
+		sample.close();
+	}
+	expect(frames).toBe(15 * 1024);
 });
 
 test('VideoSampleSource, cancel() while finalizing doesn\'t wait behind a stalled target', async () => {
@@ -4804,6 +4803,320 @@ test('VideoSampleSource, finished adds leave no waits behind', async () => {
 
 	// Adds not awaited one by one: at most one wait per add going on (its turn or its process call)
 	const adds = Array.from({ length: 30 }, (_, i) => videoSource.add(frame(60 + i)));
+	expect(waits.size).toBeLessThanOrEqual(30);
+	await Promise.all(adds);
+	expect(waits.size).toBe(0);
+
+	await output.finalize();
+});
+
+/** A 10 ms sample whose every value is `index / 1000`. */
+const makeConstantSample = (index: number) => new AudioSample({
+	format: 'f32-planar',
+	sampleRate: 48000,
+	numberOfChannels: 1,
+	timestamp: index / 100,
+	data: new Float32Array(480).fill(index / 1000),
+});
+
+test('AudioSampleSource encodes in order when adds aren\'t awaited and process() takes varying time', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-f32',
+		transform: {
+			// Like an effect whose run time varies per sample
+			process: async (sample) => {
+				const index = Math.round(100 * sample.timestamp);
+				await new Promise(resolve => setTimeout(resolve, (7 * index) % 11));
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const adds: Promise<void>[] = [];
+	for (let i = 0; i < 24; i++) {
+		adds.push(audioSource.add(makeConstantSample(i)));
+	}
+	await Promise.all(adds);
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const samples: number[] = [];
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		samples.push(...data);
+		sample.close();
+	}
+
+	// Every sample, in order, with no silence between them
+	expect(samples).toHaveLength(24 * 480);
+	const blocks = Array.from({ length: 24 }, (_, i) => samples[480 * i]);
+	expect(blocks).toEqual(Array.from({ length: 24 }, (_, i) => Math.fround(i / 1000)));
+});
+
+test('AudioSampleSource, canceling the output gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 1) {
+					await new Promise(() => {}); // A stuck effect, like one waiting for a worker that never answers
+				}
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const adds = [0, 1, 2, 3].map(i => audioSource.add(makeConstantSample(i)));
+	await new Promise(resolve => setTimeout(resolve, 200));
+	await output.cancel();
+
+	// The add stuck in the process function and the ones queued behind it settle once the output is canceled
+	expect(await stateAfter(Promise.allSettled(adds), 1000)).toBe('fulfilled');
+});
+
+test('AudioSampleSource, cancel() while finalizing gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 2) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const adds = [0, 1, 2, 3, 4].map(i => audioSource.add(makeConstantSample(i)).catch(() => {}));
+	await new Promise(resolve => setTimeout(resolve, 200));
+
+	// Finalizing waits for the samples added before it, so the stuck one holds it up...
+	const finalized = output.finalize();
+	expect(await stateAfter(finalized, 500)).toBe('pending');
+
+	// ...until the output is canceled, which drops them and lets finalization complete
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	expect(await stateAfter(finalized, 1000)).toBe('fulfilled');
+	expect(await stateAfter(Promise.all(adds), 1000)).toBe('fulfilled');
+});
+
+test('AudioBufferSource encodes in order when adds aren\'t awaited and process() takes varying time', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioBufferSource({
+		codec: 'pcm-f32',
+		transform: {
+			// Like an effect whose run time varies per sample
+			process: async (sample) => {
+				const index = Math.round(100 * sample.timestamp);
+				await new Promise(resolve => setTimeout(resolve, (7 * index) % 11));
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const adds: Promise<void>[] = [];
+	for (let i = 0; i < 24; i++) {
+		const audioBuffer = new AudioBuffer({ length: 480, sampleRate: 48000, numberOfChannels: 1 });
+		audioBuffer.copyToChannel(new Float32Array(480).fill(i / 1000), 0);
+		adds.push(audioSource.add(audioBuffer));
+	}
+	await Promise.all(adds);
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const samples: number[] = [];
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		samples.push(...data);
+		sample.close();
+	}
+
+	expect(samples).toHaveLength(24 * 480);
+	const blocks = Array.from({ length: 24 }, (_, i) => samples[480 * i]);
+	expect(blocks).toEqual(Array.from({ length: 24 }, (_, i) => Math.fround(i / 1000)));
+});
+
+test('AudioSampleSource, cancel() after close() gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				await new Promise(() => {}); // A stuck effect
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const added = audioSource.add(makeConstantSample(0)).catch(() => {});
+	await new Promise(resolve => setTimeout(resolve, 50));
+	audioSource.close(); // Like stopping a recording: waits for what was added
+	await new Promise(resolve => setTimeout(resolve, 100));
+
+	// Canceling forces the close, which doesn't wait for the stuck call
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	expect(await stateAfter(added, 1000)).toBe('fulfilled');
+});
+
+test('MediaStreamAudioTrackSource, cancel() after close() gets out of a process() that never finishes', async () => {
+	const capture = installSineCapture();
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 2) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	audioSource.errorPromise.catch(() => {});
+	output.addAudioTrack(audioSource);
+
+	try {
+		await output.start();
+		await capture.deliver(6);
+		audioSource.close(); // Like stopping a recording: waits for the audio captured so far
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		// Canceling forces the close, which doesn't wait for the stuck call
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+		expect(capture.chunks.filter(chunk => chunk.format !== null)).toHaveLength(0); // All closed
+	} finally {
+		await capture.uninstall();
+	}
+});
+
+let stuckInitAudioEncoderActive = false;
+/** A custom FLAC encoder whose initialization never finishes (like a codec stuck loading), when active. */
+class StuckInitAudioEncoder extends CustomAudioEncoder {
+	static override supports(codec: AudioCodec) {
+		return stuckInitAudioEncoderActive && codec === 'flac';
+	}
+
+	init() {
+		return new Promise<void>(() => {});
+	}
+
+	encode() {}
+	flush() {}
+	close() {}
+}
+registerEncoder(StuckInitAudioEncoder);
+
+test('AudioSampleSource, cancel() after close() gets out of an encoder setup that never finishes', async () => {
+	stuckInitAudioEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new MkvOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const audioSource = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		void audioSource.add(makeConstantSample(0)).catch(() => {});
+		await new Promise(resolve => setTimeout(resolve, 50));
+		audioSource.close(); // Waits for what was added, which waits for the encoder
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		// Canceling forces the close, which doesn't wait for the encoder
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	} finally {
+		stuckInitAudioEncoderActive = false;
+	}
+});
+
+test('AudioSampleSource, cancel() while finalizing gets out of an encoder setup that never finishes', async () => {
+	stuckInitAudioEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new MkvOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const audioSource = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		void audioSource.add(makeConstantSample(0)).catch(() => {});
+		void audioSource.add(makeConstantSample(1)).catch(() => {});
+
+		// Finalizing waits for the samples added before it, which wait for the encoder, until the output is canceled,
+		// which drops them and lets finalization go on
+		const finalized = output.finalize();
+		await new Promise(resolve => setTimeout(resolve, 50));
+		await output.cancel();
+		expect(await stateAfter(finalized, 1000)).not.toBe('pending');
+	} finally {
+		stuckInitAudioEncoderActive = false;
+	}
+});
+
+test('AudioSampleSource, finished adds leave no waits behind', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				await new Promise(resolve => setTimeout(resolve, 1));
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+	// Each add waits for its turn and for the process function, either of which canceling cuts short
+	const waits = (audioSource as unknown as { _encoder: { releasableWaits: { size: number } } })._encoder
+		.releasableWaits;
+
+	for (let i = 0; i < 60; i++) {
+		await audioSource.add(makeConstantSample(i));
+	}
+	expect(waits.size).toBe(0);
+
+	// Adds not awaited one by one: at most one wait per add going on (its turn or its process call)
+	const adds = Array.from({ length: 30 }, (_, i) => audioSource.add(makeConstantSample(60 + i)));
 	expect(waits.size).toBeLessThanOrEqual(30);
 	await Promise.all(adds);
 	expect(waits.size).toBe(0);
