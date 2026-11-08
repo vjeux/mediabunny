@@ -205,7 +205,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		} else if (this.avCodec.name === 'libvpx-vp9') {
 			// libvpx encodes VP9 tile columns in parallel, which gives the exact same bytes as a single thread. (Unlike
 			// VP8 and libx265, whose output changes with the thread count, so they're left as they are.)
-			codecContext.threadCount = getCodecThreadCount();
+			codecContext.threadCount = getCodecThreadCount(this.config.width, this.config.height);
 			codecContext.setOption('deadline', 'realtime');
 
 			if (isRealtime) {

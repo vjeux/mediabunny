@@ -85,7 +85,7 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		// Threaded decoding gives the exact same frames. Frame threading, which most decoders support and which is
 		// by far the fastest, holds back up to one frame per thread until more packets come in or the decoder is
 		// flushed, so it's left out when the decoder is asked to minimize latency.
-		codecContext.threadCount = getCodecThreadCount();
+		codecContext.threadCount = getCodecThreadCount(this.config.codedWidth, this.config.codedHeight);
 		codecContext.threadType = this.config.optimizeForLatency
 			? NodeAv.FF_THREAD_SLICE
 			: (NodeAv.FF_THREAD_FRAME | NodeAv.FF_THREAD_SLICE) as NodeAv.AVThreadType;

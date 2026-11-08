@@ -32,12 +32,13 @@ export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = 
 
 /**
  * The number of threads to run a codec on. libavcodec uses a single thread unless told otherwise (it's the FFmpeg CLI
- * that defaults to automatic threading), so this picks one thread per core, up to libavcodec's own cap for automatic
- * thread counts: beyond that, more threads mostly add memory and delay.
+ * that defaults to automatic threading). Each thread holds frames of its own, so like Chromium's FFmpeg decoder, this
+ * scales with the resolution: 3 threads for 1080p, at least 2, and at most 8 (reached at 4K) or one per core.
  */
-export const getCodecThreadCount = () => {
+export const getCodecThreadCount = (width: number | undefined, height: number | undefined) => {
 	const cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
-	return Math.max(1, Math.min(cores, 16));
+	const forResolution = Math.max(2, Math.floor((width || 1920) * (height || 1080) * 3 / (1920 * 1080)));
+	return Math.max(1, Math.min(forResolution, 8, cores));
 };
 
 let cachedHardwareContext: NodeAv.HardwareContext | null | undefined = undefined;

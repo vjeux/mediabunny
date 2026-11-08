@@ -36,6 +36,7 @@ import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
 import { toAvFrame } from '../../packages/server/src/index.js';
+import { getCodecThreadCount } from '../../packages/server/src/misc.js';
 import * as NodeAv from 'node-av';
 import os from 'node:os';
 import { createHash } from 'node:crypto';
@@ -1574,6 +1575,17 @@ describe('Video', async () => {
 				Object.defineProperty(prototype, 'open2', descriptor);
 			}
 		};
+
+		test('Codecs run on a number of threads that scales with the resolution', () => {
+			// Each thread holds frames of its own, so like in Chromium, more threads are only used for more pixels
+			const cores = os.availableParallelism();
+			expect(getCodecThreadCount(640, 360)).toBe(Math.min(2, cores));
+			expect(getCodecThreadCount(1920, 1080)).toBe(Math.min(3, cores));
+			expect(getCodecThreadCount(undefined, undefined)).toBe(Math.min(3, cores));
+			expect(getCodecThreadCount(2560, 1440)).toBe(Math.min(5, cores));
+			expect(getCodecThreadCount(3840, 2160)).toBe(Math.min(8, cores));
+			expect(getCodecThreadCount(7680, 4320)).toBe(Math.min(8, cores));
+		});
 
 		const fingerprint = (data: Uint8Array) => createHash('sha256').update(data).digest('hex');
 
