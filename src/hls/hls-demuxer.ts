@@ -127,8 +127,9 @@ export class HlsDemuxer extends Demuxer {
 				} else if (line.startsWith(TAG_STREAM_INF)) {
 					const streamInfLineNumber = i;
 					let playlistPath = lines[++i];
-					if (playlistPath === undefined) {
-						throw new Error('Incorrect M3U8 file; a line must follow the #EXT-X-STREAM-INF tag.');
+					if (playlistPath === undefined || playlistPath.startsWith('#')) {
+						// "Every EXT-X-STREAM-INF tag MUST be followed by a URI line"
+						throw new Error('Incorrect M3U8 file; a URI must follow the #EXT-X-STREAM-INF tag.');
 					}
 
 					playlistPath = variables.substitute(playlistPath);
