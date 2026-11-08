@@ -680,3 +680,29 @@ test('init visibleRect and display size refine a wrapped VideoFrame', () => {
 		expect(pixelAt(drawToPixels(fromCanvas, 4, 2), 4, 0, 0)).toEqual([2, 2]);
 	}
 });
+
+// Firefox's VideoFrame has no rotation
+const frameHasRotation = 'rotation' in VideoFrame.prototype;
+
+test.runIf(frameHasRotation)('init display size and crop of a VideoFrame with its own rotation', () => {
+	// Like Chrome's frames of EXIF-rotated images or rotated videos
+	const makeRotatedFrame = () => {
+		const canvas = new OffscreenCanvas(8, 4);
+		canvas.getContext('2d')!.fillRect(0, 0, 8, 4);
+		return new VideoFrame(canvas, { timestamp: 0, rotation: 90 } as VideoFrameInit);
+	};
+
+	// The display size in init is the one after all rotation, the frame's own included
+	for (const rotation of [0, 90] as const) {
+		using sample = new VideoSample(makeRotatedFrame(), { rotation, displayWidth: 16, displayHeight: 8 });
+		expect([sample.displayWidth, sample.displayHeight], `init rotation ${rotation}`).toEqual([16, 8]);
+	}
+
+	// The caller's frame is closed together with the sample
+	const inits = [{ visibleRect: { left: 0, top: 0, width: 4, height: 4 } }, { displayWidth: 16, displayHeight: 8 }];
+	for (const init of inits) {
+		const frame = makeRotatedFrame();
+		new VideoSample(frame, init).close();
+		expect(frame.format, JSON.stringify(init)).toBe(null);
+	}
+});

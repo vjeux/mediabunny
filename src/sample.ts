@@ -536,8 +536,10 @@ export class VideoSample implements Disposable {
 
 			if (init?.visibleRect !== undefined || init?.displayWidth !== undefined) {
 				// Crop and/or rescale the frame, like the VideoFrame constructor does. The display size in init is the
-				// one after rotation, which isn't passed on to the frame, so undo it.
-				const quarterTurn = (init.rotation ?? 0) % 180 !== 0;
+				// one after all rotation, the frame's own included, while VideoFrame takes the one before its rotation
+				// (init's rotation isn't passed on to the frame), so undo it.
+				const frameRotation = (data as VideoFrame & { rotation?: number }).rotation ?? 0;
+				const quarterTurn = (frameRotation + (init.rotation ?? 0)) % 180 !== 0;
 				const refinedFrame = new VideoFrame(data, {
 					visibleRect: init.visibleRect && {
 						x: init.visibleRect.left,
@@ -548,8 +550,13 @@ export class VideoSample implements Disposable {
 					displayWidth: quarterTurn ? init.displayHeight : init.displayWidth,
 					displayHeight: quarterTurn ? init.displayWidth : init.displayHeight,
 				});
-				// Keep the caller's frame open for as long as the sample, as if the sample held it directly
-				this._passedFrame = data;
+				// Keep the caller's frame open for as long as the sample, as if the sample held it directly. A frame
+				// of our own that gets replaced is closed.
+				if (this._passedFrame === null) {
+					this._passedFrame = data;
+				} else {
+					data.close();
+				}
 				data = refinedFrame;
 			}
 
