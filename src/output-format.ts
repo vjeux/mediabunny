@@ -510,7 +510,8 @@ export type MkvOutputFormatOptions = {
 	 *
 	 * Unless `appendOnly` is set, some of the header's values (the Segment's size, the duration and the positions in
 	 * the SeekHead) are only known once the output is finalized. The callback is then called again with the final
-	 * header data, at the same position.
+	 * header data, at the same position and with the same length: write it over the first one, or skip it when
+	 * streaming the data in order (for live streaming, use `appendOnly`).
 	 *
 	 * @param data - The raw bytes.
 	 * @param position - The byte offset of the data in the file.

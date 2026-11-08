@@ -177,7 +177,7 @@ type MkvOutputFormatOptions = {
 - `onEbmlHeader`\
 	Will be called once the EBML header of the output file has been written.
 - `onSegmentHeader`\
-	Will be called once the header part of the Matroska Segment element has been written. The header data includes the Segment element and everything inside it, up to (but excluding) the first Matroska Cluster. Unless `appendOnly` is set, some of the header's values (the Segment's size, the duration and the positions in the SeekHead) are only known once the output is finalized; the callback is then called again with the final header data, at the same position.
+	Will be called once the header part of the Matroska Segment element has been written. The header data includes the Segment element and everything inside it, up to (but excluding) the first Matroska Cluster. Unless `appendOnly` is set, some of the header's values (the Segment's size, the duration and the positions in the SeekHead) are only known once the output is finalized; the callback is then called again with the final header data, at the same position and with the same length. Write it over the first one, or skip it when streaming the data in order (for live streaming, use `appendOnly`).
 - `onCluster`\
 	Will be called for each finalized Matroska Cluster of the output file. The cluster's start timestamp in seconds is also passed.
 
