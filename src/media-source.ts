@@ -139,12 +139,14 @@ export abstract class MediaSource {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async _flushAndClose(forceClose: boolean) {}
 	/**
-	 * Called when the output is canceled while finalizing, or while a graceful close is under way: stops waiting for
-	 * the samples added before to be processed (a process function that never settles would hold finalization or the
-	 * close up forever) and drops them.
+	 * Stops waiting for the samples added so far to be processed and drops them, so that a process function call (or,
+	 * with `always`, an encoder initialization) that never settles can't hold finalization or a graceful close up
+	 * forever. Called when the output is canceled while finalizing, where it only applies with a process function call
+	 * in flight, and with `always` when a graceful close is under way as the output gets canceled.
 	 * @internal
 	 */
-	_cancelPendingAdds() {}
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_cancelPendingAdds(always = false) {}
 
 	/**
 	 * Closes this source. This prevents future samples from being added and signals to the output file that no further
@@ -182,9 +184,10 @@ export abstract class MediaSource {
 	/** @internal */
 	async _flushOrWaitForOngoingClose(forceClose: boolean) {
 		if (forceClose && this._closingPromise) {
-			// A graceful close under way (from close()) may be waiting for a process function call that never settles;
-			// forcing the close stops waiting for it
-			this._cancelPendingAdds();
+			// A graceful close under way (from close()) waits for the samples added before it, which a process function
+			// call or an encoder initialization that never settles would hold up forever. The output is being canceled,
+			// so stop waiting for them.
+			this._cancelPendingAdds(true);
 		}
 
 		return this._closingPromise ??= (async () => {
@@ -2716,8 +2719,9 @@ class AudioEncoderWrapper {
 
 				this.checkForEncoderError();
 
-				// Finalize the resampler to flush any buffered audio
-				if (this.resampler) {
+				// Finalize the resampler to flush any buffered audio (not when the queued samples got dropped, as that
+				// audio would wait for the encoder all the same)
+				if (this.resampler && !this.pendingAddsCanceled) {
 					await this.resampler.finalize();
 				}
 
@@ -2757,10 +2761,11 @@ class AudioEncoderWrapper {
 
 	/**
 	 * Stops waiting for a process function call still in flight, and drops the samples queued behind it. Without one,
-	 * nothing holds them up, so this does nothing and they all still go in.
+	 * nothing holds them up, so this does nothing and they all still go in, unless `always` is set (the output is being
+	 * canceled, and something else, like an encoder initialization, may hold them up).
 	 */
-	cancelPendingAdds() {
-		if (this.processCallsInFlight === 0) {
+	cancelPendingAdds(always = false) {
+		if (!always && this.processCallsInFlight === 0) {
 			return;
 		}
 
@@ -3014,8 +3019,8 @@ export class AudioSampleSource extends AudioSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 }
 
@@ -3089,8 +3094,8 @@ export class AudioBufferSource extends AudioSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 }
 
@@ -3374,8 +3379,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		if (this._encoder.processCallsInFlight === 0) {
+	override _cancelPendingAdds(always = false) {
+		if (!always && this._encoder.processCallsInFlight === 0) {
 			return; // Nothing holds the chain up, so all of it still goes in
 		}
 
@@ -3393,7 +3398,7 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 			sample.close();
 		}
 		this._chainedSamples.clear();
-		this._encoder.cancelPendingAdds();
+		this._encoder.cancelPendingAdds(true);
 	}
 
 	/** @internal */

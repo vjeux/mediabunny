@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget, StreamTarget } from '../../src/target.js';
 import {
 	AudioBufferSource,
@@ -10,6 +10,8 @@ import {
 } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { canEncodeAudio, Quality } from '../../src/encode.js';
+import { CustomAudioEncoder, registerEncoder } from '../../src/custom-coder.js';
+import { AudioCodec } from '../../src/codec.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -1214,5 +1216,45 @@ test('MediaStreamAudioTrackSource, cancel() after close() gets out of a process(
 		expect(capture.chunks.filter(chunk => chunk.format !== null)).toHaveLength(0); // All closed
 	} finally {
 		await capture.uninstall();
+	}
+});
+
+let stuckInitAudioEncoderActive = false;
+/** A custom FLAC encoder whose initialization never finishes (like a codec stuck loading), when active. */
+class StuckInitAudioEncoder extends CustomAudioEncoder {
+	static override supports(codec: AudioCodec) {
+		return stuckInitAudioEncoderActive && codec === 'flac';
+	}
+
+	init() {
+		return new Promise<void>(() => {});
+	}
+
+	encode() {}
+	flush() {}
+	close() {}
+}
+registerEncoder(StuckInitAudioEncoder);
+
+test('AudioSampleSource, cancel() after close() gets out of an encoder setup that never finishes', async () => {
+	stuckInitAudioEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new MkvOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const audioSource = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		void audioSource.add(makeConstantSample(0)).catch(() => {});
+		await new Promise(resolve => setTimeout(resolve, 50));
+		audioSource.close(); // Waits for what was added, which waits for the encoder
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		// Canceling forces the close, which doesn't wait for the encoder
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	} finally {
+		stuckInitAudioEncoderActive = false;
 	}
 });
