@@ -275,6 +275,8 @@ type FragmentTrackData = {
 	}[];
 	startTimestampIsFinal: boolean;
 	trunSampleCounts: number[];
+	/** Whether runs of PCM samples were merged into bigger samples, so that sample numbers past 1 don't match */
+	samplesAreGrouped: boolean;
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 };
 
@@ -333,6 +335,8 @@ type SampleEncryptionAuxInfo = {
 
 // Anything beyond this is malicious
 const MAX_BOX_NESTING_DEPTH = 64;
+/** The size up to which runs of PCM samples of one frame each are merged into one sample, in fragments */
+const MAX_GROUPED_PCM_SAMPLE_SIZE = 2 ** 16;
 
 export class IsobmffDemuxer extends Demuxer {
 	reader: Reader;
@@ -846,7 +850,8 @@ export class IsobmffDemuxer extends Demuxer {
 				const lookupEntry = track.fragmentLookupTable[lookupEntryIndex];
 				const lookupEntryIsValid = lookupEntry
 					&& trackData.trunSampleCounts.length >= lookupEntry.trunNumber
-					&& trackData.trunSampleCounts[lookupEntry.trunNumber - 1]! >= lookupEntry.sampleNumber;
+					&& trackData.trunSampleCounts[lookupEntry.trunNumber - 1]! >= lookupEntry.sampleNumber
+					&& (lookupEntry.sampleNumber === 1 || !trackData.samplesAreGrouped);
 
 				if (lookupEntryIsValid) {
 					// We ignore traf number here, since we've already matched based on track ID
@@ -2566,7 +2571,26 @@ export class IsobmffDemuxer extends Demuxer {
 					throw new Error('Invalid trun box: sample values are missing and there are no defaults.');
 				}
 
-				this.currentFragment.sampleCount += sampleCount;
+				// PCM is often stored with one sample per frame (GPAC and Bento4 do so in fragments), which makes tens
+				// of thousands of samples per second. Like the PCM transform of sample tables, runs of such samples
+				// become bigger samples (never across track runs). Without per-sample values, they all have the default
+				// size, so they can be stepped through a group at a time.
+				const pcmFrameSize = track.info?.type === 'audio'
+					&& track.info.codec !== null
+					&& (PCM_AUDIO_CODECS as readonly string[]).includes(track.info.codec)
+					&& !sampleCompositionTimeOffsetsPresent
+					&& !track.encryptionInfo
+					? parsePcmCodec(track.info.codec as PcmAudioCodec).sampleSize * track.info.numberOfChannels
+					: 0;
+				const samplesPerStep = pcmFrameSize > 0
+					&& !sampleDurationPresent
+					&& !sampleSizePresent
+					&& !sampleFlagsPresent
+					&& defaultSampleSize === pcmFrameSize
+					? Math.floor(MAX_GROUPED_PCM_SAMPLE_SIZE / pcmFrameSize)
+					: 1;
+
+				this.currentFragment.sampleCount += Math.ceil(sampleCount / samplesPerStep);
 				if (this.currentFragment.sampleCount > 2 ** 20) {
 					// Safety measure
 					throw new Error('Too many (> 2^20) samples in fragment.');
@@ -2604,26 +2628,30 @@ export class IsobmffDemuxer extends Demuxer {
 						presentationTimestamps: [],
 						startTimestampIsFinal: false,
 						trunSampleCounts: [],
+						samplesAreGrouped: false,
 						encryptionAuxInfo: null,
 					};
 					this.currentFragment.trackData.set(track.id, trackData);
 				}
 
+				const trunStartSampleCount = trackData.samples.length;
 				trackData.trunSampleCounts.push(sampleCount);
 
-				for (let i = 0; i < sampleCount; i++) {
+				for (let i = 0; i < sampleCount; i += samplesPerStep) {
+					const stepSampleCount = Math.min(samplesPerStep, sampleCount - i);
+
 					let sampleDuration: number;
 					if (sampleDurationPresent) {
 						sampleDuration = readU32Be(slice);
 					} else {
-						sampleDuration = defaultSampleDuration!;
+						sampleDuration = defaultSampleDuration! * stepSampleCount;
 					}
 
 					let sampleSize: number;
 					if (sampleSizePresent) {
 						sampleSize = readU32Be(slice);
 					} else {
-						sampleSize = defaultSampleSize!;
+						sampleSize = defaultSampleSize! * stepSampleCount;
 					}
 
 					let sampleFlags: number;
@@ -2646,6 +2674,25 @@ export class IsobmffDemuxer extends Demuxer {
 
 					const isKeyFrame = !(sampleFlags & 0x00010000);
 
+					const previousSample = trackData.samples.length > trunStartSampleCount
+						? last(trackData.samples)!
+						: null;
+					if (
+						pcmFrameSize > 0
+						&& sampleSize === pcmFrameSize
+						&& previousSample
+						&& previousSample.byteOffset + previousSample.byteSize === trackData.currentOffset
+						&& previousSample.byteSize + sampleSize <= MAX_GROUPED_PCM_SAMPLE_SIZE
+						// A key frame doesn't go into a sample that isn't one
+						&& (previousSample.isKeyFrame || !isKeyFrame)
+					) {
+						previousSample.duration += sampleDuration;
+						previousSample.byteSize += sampleSize;
+						trackData.currentOffset += sampleSize;
+						trackData.currentTimestamp += sampleDuration;
+						continue;
+					}
+
 					trackData.samples.push({
 						presentationTimestamp: trackData.currentTimestamp + sampleCompositionTimeOffset,
 						duration: sampleDuration,
@@ -2657,6 +2704,12 @@ export class IsobmffDemuxer extends Demuxer {
 
 					trackData.currentOffset += sampleSize;
 					trackData.currentTimestamp += sampleDuration;
+				}
+
+				const trunSampleCount = trackData.samples.length - trunStartSampleCount;
+				if (trunSampleCount < sampleCount) {
+					trackData.trunSampleCounts[trackData.trunSampleCounts.length - 1] = trunSampleCount;
+					trackData.samplesAreGrouped = true;
 				}
 
 				this.currentFragment.implicitBaseDataOffset = trackData.currentOffset;

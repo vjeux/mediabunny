@@ -272,3 +272,102 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+test('Fragmented PCM with one sample per frame', async () => {
+	// GPAC and Bento4 store PCM in fragments with one sample per frame. That made one packet per frame, and a fragment
+	// of more than 2^20 frames (21.8 s at 48 kHz) couldn't be read at all. Like in sample tables, runs of such samples
+	// now make packets of up to 64 KiB.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const ftyp = box('ftyp', ascii('iso6'), u32(0), ascii('iso6'));
+	const monoPcm = box('ipcm', zeros(6), [0, 1], zeros(8), [0, 1, 0, 16], zeros(4), u32(48000 * 0x10000),
+		box('pcmC', zeros(4), [1, 16]));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(1000), zeros(4), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(16), zeros(4), [1, 0], zeros(2), matrix, zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(48000), zeros(4), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('smhd', zeros(8)), box('stbl',
+					box('stsd', zeros(4), u32(1), monoPcm),
+					box('stts', zeros(8)),
+					box('stsc', zeros(8)),
+					box('stsz', zeros(12)),
+					box('stco', zeros(8)),
+				)),
+			),
+		),
+		// Each sample lasts one frame and has its size, 2 bytes, unless the trun box says otherwise
+		box('mvex', box('trex', zeros(4), u32(1), u32(1), u32(1), u32(2), u32(0x02000000))),
+	);
+
+	const read = async (sampleCount: number, { sampleSize, lookupSampleNumber }: {
+		sampleSize?: number; // In the trun box, for each sample
+		lookupSampleNumber?: number; // Of a tfra box entry, which is only used without a tfdt box
+	} = {}) => {
+		const dataSize = sampleCount * (sampleSize ?? 2);
+		const moof = (dataOffset: number) => box('moof', box('mfhd', zeros(4), u32(1)), box('traf',
+			box('tfhd', [0, 2, 0, 0], u32(1)),
+			lookupSampleNumber ? [] : box('tfdt', zeros(8)),
+			box('trun', [0, 0, sampleSize ? 2 : 0, 1], u32(sampleCount), u32(dataOffset),
+				sampleSize ? zeros(sampleCount).flatMap(() => u32(sampleSize)) : []),
+		));
+		const head = [...ftyp, ...moov, ...moof(moof(0).length + 8)];
+
+		let mfra: number[] = [];
+		if (lookupSampleNumber) {
+			// Says that this sample of the fragment is at 1/48000 s (as the second one of a frame each would be)
+			const tfra = box('tfra', zeros(4), u32(1), zeros(4), u32(1),
+				u32(1), u32(ftyp.length + moov.length), [1, 1, lookupSampleNumber]);
+			mfra = box('mfra', tfra, box('mfro', zeros(4), u32(8 + tfra.length + 16)));
+		}
+
+		const bytes = new Uint8Array(head.length + 8 + dataSize + mfra.length);
+		bytes.set(head);
+		bytes.set([...u32(8 + dataSize), ...ascii('mdat')], head.length);
+		bytes.set(mfra, head.length + 8 + dataSize);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		return {
+			timestamps: packets.map(packet => packet.timestamp * 48000),
+			sizes: packets.map(packet => packet.byteLength),
+			duration: await track.computeDuration(),
+		};
+	};
+
+	// More than 2^20 frames, with every value from the defaults (like GPAC writes it)
+	const long = await read(1_100_000);
+	expect(long.timestamps.length).toBe(Math.ceil(1_100_000 / 32768));
+	expect(long.timestamps[0]).toBe(0);
+	expect(long.sizes.reduce((a, b) => a + b)).toBe(2_200_000);
+	expect(long.duration).toBeCloseTo(1_100_000 / 48000, 6);
+
+	// One second with a size for each sample (like Bento4 writes it)
+	expect(await read(48_000, { sampleSize: 2 })).toEqual({
+		timestamps: [0, 32768],
+		sizes: [65536, 30464],
+		duration: 1,
+	});
+
+	// Samples of more than one frame stay as they are
+	expect((await read(3, { sampleSize: 4096 })).sizes).toEqual([4096, 4096, 4096]);
+
+	// A tfra box entry can't point into a merged sample: it's ignored, so the fragment starts at 0 like without it
+	expect((await read(48_000, { lookupSampleNumber: 2 })).timestamps).toEqual([0, 32768]);
+	expect((await read(48_000, { lookupSampleNumber: 1 })).timestamps).toEqual([1, 32769]);
+});
