@@ -561,6 +561,63 @@ test('Empty ADTS with declared decoder config', async () => {
 	await expect(output.finalize()).rejects.toThrow('Cannot finalize an empty ADTS file');
 });
 
+test.each([
+	['fragmented MP4', () => new Mp4OutputFormat({ fastStart: 'fragmented' })],
+	['Matroska', () => new MkvOutputFormat()],
+	['CMAF', () => new CmafOutputFormat()],
+] as const)('getMimeType() rejects once a %s output is canceled before its codecs are known', async (
+	_,
+	createFormat,
+) => {
+	// Like MSE code waiting for the MIME type of a recording that gets canceled before its first frames: the codec
+	// strings will never be known then
+	const unhandledRejections: unknown[] = [];
+	const onUnhandledRejection = (reason: unknown) => void unhandledRejections.push(reason);
+	process.on('unhandledRejection', onUnhandledRejection);
+
+	try {
+		const createOutput = () => {
+			const output = new Output({
+				format: createFormat(),
+				target: new BufferTarget(),
+				initTarget: createFormat() instanceof CmafOutputFormat ? new BufferTarget() : undefined,
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+			return { output, source };
+		};
+
+		const { output } = createOutput();
+		await output.start();
+		const pending = output.getMimeType();
+		await output.cancel();
+		await expect(pending).rejects.toThrow('Output has been canceled.');
+		await expect(output.getMimeType()).rejects.toThrow('Output has been canceled.'); // Later calls too
+
+		// Canceled once the MIME type is known, or without anyone asking for it: nothing rejects
+		const known = createOutput();
+		await known.output.start();
+		await known.source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1 / 30), {
+			decoderConfig: {
+				codec: 'avc1.42001f',
+				codedWidth: 64,
+				codedHeight: 64,
+				description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+			},
+		});
+		expect(await known.output.getMimeType()).toContain('avc1.42001f');
+		await known.output.cancel();
+		const unasked = createOutput();
+		await unasked.output.start();
+		await unasked.output.cancel();
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(unhandledRejections).toEqual([]);
+	} finally {
+		process.off('unhandledRejection', onUnhandledRejection);
+	}
+});
+
 test('Empty FLAC', async () => {
 	const output = new Output({
 		format: new FlacOutputFormat(),
