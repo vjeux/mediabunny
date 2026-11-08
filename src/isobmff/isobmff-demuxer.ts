@@ -84,6 +84,7 @@ import {
 	HEX_STRING_REGEX,
 	EMPTY_COLOR_SPACE,
 	colorSpaceIsComplete,
+	MaybePromise,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import {
@@ -159,6 +160,10 @@ type InternalTrack = {
 	editListOffset: number;
 	/** See getMaxReorderedSamples; computed on first use */
 	maxReorderedSamples?: number;
+	/** For tracks that can reorder samples, what each fragment read so far presents, by moof offset */
+	fragmentPresentations?: Map<number, FragmentPresentation>;
+	/** The keys of fragmentPresentations, sorted */
+	fragmentPresentationOffsets?: number[];
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
@@ -309,6 +314,19 @@ type Fragment = {
 	sampleCount: number;
 };
 
+/** What a fragment presents of a track; see getFragmentSampleDuration */
+type FragmentPresentation = {
+	moofSize: number;
+	/** The presentation timestamps of the track's samples, sorted */
+	timestamps: number[];
+	/** The earliest presentation timestamp of a sync sample, or Infinity */
+	minSyncTimestamp: number;
+	/** The offset of the next moof box holding the track, once known (null for none) */
+	nextMoofOffset?: number | null;
+	/** Durations computed so far, by sample index */
+	durations: Map<number, number>;
+};
+
 type FragmentSummary = {
 	moofSize: number;
 	trackIds: Set<number>; // The tracks with samples in the fragment
@@ -365,6 +383,8 @@ export class IsobmffDemuxer extends Demuxer {
 	isFragmented = false;
 	fragmentTrackDefaults = new Map<number, FragmentTrackDefaults>();
 	psshBoxes: PsshBox[] = [];
+	/** The sizes of the mdat boxes right after moof boxes, keyed by their offset */
+	mdatSizes = new Map<number, number>();
 	currentFragment: Fragment | null = null;
 	isReadingTraf = false;
 	/**
@@ -907,7 +927,9 @@ export class IsobmffDemuxer extends Demuxer {
 		const moofBoxInfo = readBoxHeader(headerSlice);
 		assert(moofBoxInfo?.name === 'moof');
 
-		let entireSlice = this.reader.requestSlice(startPos, moofBoxInfo.totalSize);
+		// With a known file size, the header of the box after the moof box is read along with it, see rememberMdatSize
+		const readSize = moofBoxInfo.totalSize + (this.reader.fileSizeNonStrict !== null ? MAX_BOX_HEADER_SIZE : 0);
+		let entireSlice = this.reader.requestSliceRange(startPos, moofBoxInfo.totalSize, readSize);
 		if (isThenable(entireSlice)) entireSlice = await entireSlice;
 		if (!entireSlice) return null; // The moof box is cut off
 
@@ -920,6 +942,7 @@ export class IsobmffDemuxer extends Demuxer {
 			moofSize: fragment.moofSize,
 			trackIds: new Set(fragment.trackData.keys()),
 		});
+		rememberMdatSize(this, startPos + moofBoxInfo.totalSize, entireSlice);
 
 		for (const [, trackData] of fragment.trackData) {
 			const track = trackData.track;
@@ -975,6 +998,27 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				trackData.startTimestampIsFinal = true;
+			}
+
+			if (getMaxReorderedSamples(track) > 0 && !track.fragmentPresentations?.has(fragment.moofOffset)) {
+				let minSyncTimestamp = Infinity;
+				for (const sample of trackData.samples) {
+					if (sample.isKeyFrame) {
+						minSyncTimestamp = Math.min(minSyncTimestamp, sample.presentationTimestamp);
+					}
+				}
+
+				track.fragmentPresentations ??= new Map();
+				track.fragmentPresentations.set(fragment.moofOffset, {
+					moofSize: fragment.moofSize,
+					timestamps: trackData.presentationTimestamps.map(x => x.presentationTimestamp),
+					minSyncTimestamp,
+					durations: new Map(),
+				});
+
+				const offsets = track.fragmentPresentationOffsets ??= [];
+				const offsetIndex = binarySearchLessOrEqual(offsets, fragment.moofOffset, x => x) + 1;
+				offsets.splice(offsetIndex, 0, fragment.moofOffset);
 			}
 
 			// Let's remember that a fragment with a given timestamp is here, speeding up future lookups if no
@@ -3661,7 +3705,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 		const timestamp = (fragmentSample.presentationTimestamp - this.internalTrack.editListOffset)
 			/ this.internalTrack.timescale;
-		const duration = fragmentSample.duration / this.internalTrack.timescale;
+		const duration = await this.getFragmentSampleDuration(fragment, sampleIndex) / this.internalTrack.timescale;
 		const packet = new EncodedPacket(
 			data,
 			fragmentSample.isKeyFrame ? 'key' : 'delta',
@@ -3674,6 +3718,288 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		this.packetToFragmentLocation.set(packet, { fragment, sampleIndex });
 
 		return packet;
+	}
+
+	/**
+	 * A fragment's sample lasts until the next sample in presentation order, which, with B-frames in fragments that
+	 * don't start a GOP, can sit in a fragment decoded before or after this one. Unless the fragment itself proves that
+	 * no other one holds it, the adjacent fragments are looked at until the stream guarantees that no further one can:
+	 * no sample is presented before more than maxReorderedSamples samples decoded before it, and no sample decoded
+	 * before a sync sample is presented after it. The scans are bounded so that broken files stay cheap.
+	 */
+	private async getFragmentSampleDuration(fragment: Fragment, sampleIndex: number) {
+		const trackData = fragment.trackData.get(this.internalTrack.id)!;
+		const sample = trackData.samples[sampleIndex]!;
+		const maxReorderedSamples = getMaxReorderedSamples(this.internalTrack);
+		const presentation = this.internalTrack.fragmentPresentations?.get(fragment.moofOffset);
+		if (maxReorderedSamples === 0 || !presentation) {
+			return sample.duration; // Presentation order is decode order, so no other fragment can come in between
+		}
+
+		const knownDuration = presentation.durations.get(sampleIndex);
+		if (knownDuration !== undefined) {
+			return knownDuration;
+		}
+
+		const timestamp = sample.presentationTimestamp;
+		// Samples presented at the same time are ordered by decoding, as in non-fragmented files, so a sample decoded
+		// after this one at the same timestamp ends it: later in this fragment, or in a later fragment
+		const lastAtTimestamp = searchTimestamps(presentation.timestamps, timestamp, false) - 1;
+		let nextTimestamp = trackData.presentationTimestamps[lastAtTimestamp]!.sampleIndex !== sampleIndex
+			? timestamp
+			: getNextTimestamp(presentation.timestamps, timestamp);
+		let presentedAfterNext = countTimestampsFrom(presentation.timestamps, nextTimestamp);
+
+		if (
+			nextTimestamp > timestamp
+			&& (presentedAfterNext <= maxReorderedSamples || presentation.minSyncTimestamp > timestamp)
+		) {
+			// Later fragments can't hold a sample presented before nextTimestamp once more than maxReorderedSamples
+			// samples decoded before them are presented at or after it
+			const laterPresentations = [presentation];
+			let latestTimestamp = presentation.timestamps.at(-1) ?? -Infinity;
+			// A source of unknown size may be a live stream whose next fragment hasn't arrived yet, which must not hold
+			// back the packets that have, or a stream whose cache can't hold the rest of this fragment. Then only
+			// fragments read before are looked at.
+			const canWait = this.internalTrack.demuxer.reader.fileSizeNonStrict !== null;
+			let laterSampleCount = 0;
+			let moofOffset = fragment.moofOffset;
+			while (
+				nextTimestamp > timestamp
+				&& presentedAfterNext <= maxReorderedSamples
+				&& laterSampleCount <= MAX_SCANNED_SAMPLES
+				// No conforming stream presents that many samples decoded after a sample before it
+				&& (nextTimestamp !== Infinity || laterSampleCount <= MAX_REORDERED_SAMPLES)
+			) {
+				let next = this.getNextFragmentPresentation(moofOffset, canWait);
+				if (isThenable(next)) {
+					next = await next;
+				}
+				if (next === undefined) {
+					// The next fragment hasn't been read yet. Rather than reading it, the sample keeps the duration its
+					// own fragment gives it, as before. That isn't remembered, so that once the fragment has been read,
+					// the duration is taken from the presentation order.
+					return sample.duration;
+				}
+				// A sync sample is presented after every sample decoded before it, so one presented earlier means that
+				// the fragments overlap (cut or edited content), which nothing reorders across
+				if (!next || next.presentation.minSyncTimestamp <= latestTimestamp) {
+					break;
+				}
+
+				moofOffset = next.moofOffset;
+				laterPresentations.push(next.presentation);
+				latestTimestamp = Math.max(latestTimestamp, next.presentation.timestamps.at(-1) ?? -Infinity);
+				laterSampleCount += next.presentation.timestamps.length;
+
+				// A later fragment's sample at the same timestamp is decoded after this one, so it counts too
+				const candidate = next.presentation.timestamps[
+					searchTimestamps(next.presentation.timestamps, timestamp, true)
+				] ?? Infinity;
+				if (candidate < nextTimestamp) {
+					nextTimestamp = candidate;
+					presentedAfterNext = 0;
+					for (const { timestamps } of laterPresentations) {
+						presentedAfterNext += countTimestampsFrom(timestamps, nextTimestamp);
+					}
+				} else {
+					presentedAfterNext += countTimestampsFrom(next.presentation.timestamps, nextTimestamp);
+				}
+			}
+
+			// Earlier fragments can't hold one once a sync sample presented at or before the sample has been seen,
+			// or all of the at most maxReorderedSamples samples decoded before it and presented after it
+			let syncTimestamp = presentation.minSyncTimestamp;
+			if (syncTimestamp > timestamp && nextTimestamp > timestamp) {
+				let presentedAfterSample = 0;
+				for (let i = 0; i < sampleIndex; i++) {
+					if (trackData.samples[i]!.presentationTimestamp > timestamp) {
+						presentedAfterSample++;
+					}
+				}
+
+				let earlierSampleCount = 0;
+				moofOffset = fragment.moofOffset;
+				while (
+					syncTimestamp > timestamp
+					&& presentedAfterSample < maxReorderedSamples
+					&& earlierSampleCount <= MAX_SCANNED_SAMPLES
+				) {
+					let previous = this.getPreviousFragmentPresentation(moofOffset);
+					if (isThenable(previous)) {
+						previous = await previous;
+					}
+					// Same for an earlier fragment presenting a sample after a later sync sample
+					if (!previous || (previous.presentation.timestamps.at(-1) ?? -Infinity) >= syncTimestamp) {
+						break;
+					}
+
+					const { timestamps } = previous.presentation;
+					moofOffset = previous.moofOffset;
+					nextTimestamp = Math.min(nextTimestamp, getNextTimestamp(timestamps, timestamp));
+					syncTimestamp = Math.min(syncTimestamp, previous.presentation.minSyncTimestamp);
+					presentedAfterSample += countTimestampsAfter(timestamps, timestamp);
+					earlierSampleCount += timestamps.length;
+				}
+			}
+		}
+
+		// Without any later sample, the sample keeps its own duration
+		const duration = nextTimestamp === Infinity ? sample.duration : nextTimestamp - timestamp;
+		presentation.durations.set(sampleIndex, duration);
+
+		return duration;
+	}
+
+	/**
+	 * The presentation of the next fragment holding this track after the one at the given offset, if any. Returns
+	 * synchronously once known. Without canWait, it returns undefined instead of reading the file, see findTrackMoof.
+	 */
+	private getNextFragmentPresentation(moofOffset: number, canWait = true): MaybePromise<{
+		moofOffset: number;
+		presentation: FragmentPresentation;
+	} | null | undefined> {
+		const { fragmentPresentations } = this.internalTrack;
+		const presentation = fragmentPresentations!.get(moofOffset)!;
+
+		const nextMoofOffset = presentation.nextMoofOffset;
+		const next = nextMoofOffset != null ? fragmentPresentations!.get(nextMoofOffset) : undefined;
+		if (next) {
+			return { moofOffset: nextMoofOffset!, presentation: next };
+		}
+		if (nextMoofOffset === null) {
+			return null;
+		}
+
+		return (async () => {
+			if (presentation.nextMoofOffset === undefined) {
+				const nextMoofOffset = await this.findTrackMoof(moofOffset + presentation.moofSize, canWait);
+				if (nextMoofOffset === undefined) {
+					return undefined; // Not there yet
+				}
+
+				presentation.nextMoofOffset = nextMoofOffset;
+			}
+			if (presentation.nextMoofOffset === null) {
+				return null;
+			}
+
+			if (!fragmentPresentations!.has(presentation.nextMoofOffset)) {
+				await this.internalTrack.demuxer.readFragment(presentation.nextMoofOffset);
+			}
+			const next = fragmentPresentations!.get(presentation.nextMoofOffset);
+			return next ? { moofOffset: presentation.nextMoofOffset, presentation: next } : null;
+		})();
+	}
+
+	/**
+	 * The presentation of the fragment holding this track right before the one at the given offset, if any. Returns
+	 * synchronously once known.
+	 */
+	private getPreviousFragmentPresentation(moofOffset: number): MaybePromise<{
+		moofOffset: number;
+		presentation: FragmentPresentation;
+	} | null> {
+		const { fragmentPresentations, fragmentPresentationOffsets } = this.internalTrack;
+
+		const index = binarySearchLessOrEqual(fragmentPresentationOffsets!, moofOffset - 1, x => x);
+		const candidateOffset = fragmentPresentationOffsets![index];
+		const candidate = candidateOffset !== undefined ? fragmentPresentations!.get(candidateOffset) : undefined;
+		if (candidate?.nextMoofOffset === moofOffset) {
+			return { moofOffset: candidateOffset!, presentation: candidate };
+		}
+
+		return this.findPreviousFragmentPresentation(moofOffset, candidateOffset ?? null);
+	}
+
+	private async findPreviousFragmentPresentation(moofOffset: number, knownOffset: number | null) {
+		const { fragmentPresentations, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
+
+		// Boxes can only be walked forward, so start at the closest earlier fragment of this track we know of: one read
+		// before, or one the fragment index (tfra) or the position cache points to. Only without any, at the file
+		// start.
+		const lookupEntry = fragmentLookupTable[
+			binarySearchLessOrEqual(fragmentLookupTable, moofOffset - 1, x => x.moofOffset)
+		];
+		const cacheEntry = fragmentPositionCache[
+			binarySearchLessOrEqual(fragmentPositionCache, moofOffset - 1, x => x.moofOffset)
+		];
+		const candidates = [knownOffset, lookupEntry?.moofOffset, cacheEntry?.moofOffset]
+			.filter((x): x is number => x != null && x < moofOffset);
+		let currentOffset = candidates.length > 0 ? Math.max(...candidates) : await this.findTrackMoof(0);
+		if (currentOffset == null || currentOffset >= moofOffset) {
+			return null;
+		}
+
+		if (!fragmentPresentations!.has(currentOffset)) {
+			await this.internalTrack.demuxer.readFragment(currentOffset);
+		}
+		let previous = { moofOffset: currentOffset, presentation: fragmentPresentations!.get(currentOffset)! };
+		while (true) {
+			let next = this.getNextFragmentPresentation(currentOffset);
+			if (isThenable(next)) {
+				next = await next;
+			}
+			if (!next || next.moofOffset >= moofOffset) {
+				return previous;
+			}
+
+			previous = next;
+			currentOffset = next.moofOffset;
+		}
+	}
+
+	/**
+	 * The offset of the first moof box holding this track at or after the given position, if any. Without canWait, it
+	 * only goes through boxes read before, and returns undefined where it would have to read the file.
+	 */
+	private async findTrackMoof(pos: number, canWait = true): Promise<number | null | undefined> {
+		const { demuxer } = this.internalTrack;
+
+		while (true) {
+			const summary = demuxer.fragmentSummaries.get(pos);
+			if (summary) {
+				if (summary.trackIds.has(this.internalTrack.id)) {
+					return pos;
+				}
+
+				pos += summary.moofSize;
+				continue;
+			}
+
+			const mdatSize = demuxer.mdatSizes.get(pos);
+			if (mdatSize !== undefined) {
+				pos += mdatSize; // Without reading its header, which may be gone from the source by now
+				continue;
+			}
+
+			if (!canWait) {
+				// Even a read that isn't waited for makes a stream fetch data, which can push data still to be read
+				// out of its cache
+				return undefined;
+			}
+
+			let slice = demuxer.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			const boxInfo = slice && readBoxHeader(slice);
+			if (!boxInfo) {
+				return null;
+			}
+
+			if (boxInfo.name === 'moof') {
+				const fragment = await demuxer.readFragment(pos);
+				if (!fragment) {
+					return null;
+				}
+				if (fragment.trackData.has(this.internalTrack.id)) {
+					return pos;
+				}
+			}
+
+			pos += boxInfo.totalSize;
+		}
 	}
 
 	/** Looks for a packet in the fragments while trying to load as few fragments as possible to retrieve it. */
@@ -4311,6 +4637,9 @@ const getNextKeyframeIndexForSample = (sampleTable: SampleTable, sampleIndex: nu
  */
 const MAX_REORDERED_SAMPLES = 32;
 
+/** How many samples of other fragments are looked at, at most, to find where a fragment's sample ends */
+const MAX_SCANNED_SAMPLES = 4 * (MAX_REORDERED_SAMPLES + 1);
+
 /** The most samples that can precede any sample of the track in decoding order and follow it in presentation order. */
 const getMaxReorderedSamples = (track: InternalTrack) => {
 	if (track.maxReorderedSamples !== undefined) {
@@ -4345,6 +4674,37 @@ const getMaxReorderedSamples = (track: InternalTrack) => {
 	}
 
 	return track.maxReorderedSamples = maxReorderedSamples;
+};
+
+/** The index of the first of the sorted timestamps that is after the given one (or equal to it, if inclusive) */
+const searchTimestamps = (timestamps: number[], timestamp: number, inclusive: boolean) => {
+	let low = 0;
+	let high = timestamps.length;
+	while (low < high) {
+		const middle = (low + high) >> 1;
+		if (inclusive ? timestamps[middle]! < timestamp : timestamps[middle]! <= timestamp) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+
+	return low;
+};
+
+/** The earliest of the sorted timestamps after the given one, or Infinity */
+const getNextTimestamp = (timestamps: number[], timestamp: number) => {
+	return timestamps[searchTimestamps(timestamps, timestamp, false)] ?? Infinity;
+};
+
+/** How many of the sorted timestamps are at or after the given one */
+const countTimestampsFrom = (timestamps: number[], timestamp: number) => {
+	return timestamps.length - searchTimestamps(timestamps, timestamp, true);
+};
+
+/** How many of the sorted timestamps are after the given one */
+const countTimestampsAfter = (timestamps: number[], timestamp: number) => {
+	return timestamps.length - searchTimestamps(timestamps, timestamp, false);
 };
 
 const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timestamp: number) => {
@@ -4718,6 +5078,38 @@ const decryptCbcs = (
 	}
 
 	return output;
+};
+
+/**
+ * Finding the next fragment means stepping over the mdat box after a moof box. Its size is remembered when the moof box
+ * is read: once the fragment's samples have been read, a source that only keeps recent data (a stream, or a server
+ * that ignores range requests) may no longer have its header.
+ */
+const rememberMdatSize = (demuxer: IsobmffDemuxer, mdatPos: number, moofSlice: FileSlice) => {
+	const remember = (slice: FileSlice | null) => {
+		const boxInfo = slice && readBoxHeader(slice);
+		if (boxInfo?.name === 'mdat' && boxInfo.totalSize > 0) {
+			demuxer.mdatSizes.set(mdatPos, boxInfo.totalSize);
+		}
+	};
+
+	if (moofSlice.end - mdatPos >= MAX_BOX_HEADER_SIZE) {
+		remember(moofSlice.slice(mdatPos, MAX_BOX_HEADER_SIZE)); // Read along with the moof box
+		return;
+	}
+
+	try {
+		const slice = demuxer.reader.requestSliceRange(mdatPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+		if (isThenable(slice)) {
+			// Not waited for, so that nothing waits for media data that hasn't arrived yet (like in a live stream).
+			// It's there before the samples after it are.
+			slice.then(remember, () => {});
+		} else {
+			remember(slice);
+		}
+	} catch {
+		// The size is only remembered to save a read later, which then happens as before
+	}
 };
 
 const collectCryptRanges = (
