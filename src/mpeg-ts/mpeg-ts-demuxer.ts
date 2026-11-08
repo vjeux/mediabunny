@@ -251,7 +251,6 @@ export class MpegTsDemuxer extends Demuxer {
 			// that data be gone after all (a source that only keeps what its cache holds evicts as it reads on)
 			let goingBack: {
 				resumePos: number;
-				maxSectionEndPos: number;
 				streams: {
 					stream: ElementaryStream;
 					state: Pick<
@@ -323,11 +322,16 @@ export class MpegTsDemuxer extends Demuxer {
 
 				if (
 					goingBack
-					&& goingBack.maxSectionEndPos !== Infinity
-					&& !await this.pesPacketEndsBefore(currentPos, packetHeader.pid, goingBack.maxSectionEndPos)
+					&& getReadBackDistance(this.reader) !== Infinity
+					&& !await this.pesPacketEndsBefore(
+						currentPos,
+						packetHeader.pid,
+						currentPos + 1.5 * getReadBackDistance(this.reader),
+					)
 				) {
 					// Reading this PES packet in full would read so far ahead that a source that only keeps what its
-					// cache holds would lose the rest of the way back to the PMT, so its stream starts after the PMT
+					// cache holds would lose the rest of the way back to the PMT (within three quarters of the cache
+					// is safe), so its stream starts after the PMT
 					currentPos += this.packetStride;
 					continue;
 				}
@@ -614,13 +618,10 @@ export class MpegTsDemuxer extends Demuxer {
 					// it's all still there
 					if (
 						this.elementaryStreams.some(x => !x.initialized)
-						&& currentPos + this.packetStride <= this.packetOffset + 1.5 * getReadBackDistance(this.reader)
 						&& await this.canReadAgain(this.packetOffset, currentPos)
 					) {
 						goingBack = {
 							resumePos: currentPos + this.packetStride,
-							// Reads up to there keep the start in the cache (within three quarters of it)
-							maxSectionEndPos: this.packetOffset + 1.5 * getReadBackDistance(this.reader),
 							streams: this.elementaryStreams.map(stream => ({
 								stream,
 								state: {
