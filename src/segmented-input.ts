@@ -94,6 +94,7 @@ export abstract class SegmentedInput {
 	// Roughly maps local segment timestamps onto actual packet timestamps
 	learnedSegmentTimestampOffset: number | null = null;
 	segmentMediaOffsets = new WeakMap<Segment, Promise<number>>();
+	segmentMediaStarts = new WeakMap<Segment, Promise<number | null>>();
 
 	constructor(input: Input, path: string, trackDeclarations: SegmentedInputTrackDeclaration[] | null) {
 		this.input = input;
@@ -112,6 +113,11 @@ export abstract class SegmentedInput {
 	abstract getFirstSegmentTimestampOffset(): Promise<number>;
 	abstract getRawTimestampOffset(input: Input): Promise<number | null>; // Needed to make things like MP3/ADTS work
 	abstract getTimestampWrapPeriod(): number;
+	/**
+	 * Returns the segment that the Unix time in effect for the given segment was given for: the segment itself, or
+	 * the earliest one it's extrapolated from by media time, or `null` if there's no such segment.
+	 */
+	abstract getUnixTimeAnchor(segment: Segment): Segment | null;
 
 	/**
 	 * Whether the segments come with more than one init section, whose codec parameters may then differ from segment to
@@ -199,6 +205,81 @@ export abstract class SegmentedInput {
 
 			return backings;
 		})();
+	}
+
+	/** Returns where the media of a segment starts on the global timeline, for its main (video, if any) track. */
+	getSegmentMediaStart(segment: Segment) {
+		let promise = this.segmentMediaStarts.get(segment);
+		if (promise) {
+			return promise;
+		}
+
+		promise = (async () => {
+			const input = this.getInputForSegment(segment);
+			const tracks = await input.getTracks();
+			// The same track that the media offsets line up with the playlist
+			const track = tracks.find(x => x.type === 'video') ?? tracks[0];
+			if (!track) {
+				return null;
+			}
+
+			// Rounded like the timestamps of its packets, so that its first packet starts exactly there
+			return roundToDivisor(
+				await track.getFirstTimestamp() + await this.getMediaOffset(segment, input),
+				await track.getTimeResolution(),
+			);
+		})();
+		this.segmentMediaStarts.set(segment, promise);
+
+		// Not kept when it failed
+		promise.catch(() => {
+			if (this.segmentMediaStarts.get(segment) === promise) {
+				this.segmentMediaStarts.delete(segment);
+			}
+		});
+
+		return promise;
+	}
+
+	/**
+	 * Returns the segment whose media holds the given timestamp (or that comes last before it), going by where the
+	 * segments' media actually starts: from the segment the playlist's timeline gives, which dates and durations can
+	 * have moved away from the media.
+	 */
+	async getSegmentWithMediaAt(timestamp: number) {
+		let segment = await this.getSegmentAt(timestamp, { skipLiveWait: true });
+		segment ??= await this.getFirstSegment({ skipLiveWait: true });
+		if (!segment) {
+			return null;
+		}
+
+		// Each walk goes one way only, so this ends
+		while (true) {
+			const mediaStart = await this.getSegmentMediaStart(segment);
+			if (mediaStart === null || mediaStart <= timestamp) {
+				break;
+			}
+
+			const previousSegment = await this.getPreviousSegment(segment, { skipLiveWait: true });
+			if (!previousSegment) {
+				break;
+			}
+			segment = previousSegment;
+		}
+		while (true) {
+			const nextSegment = await this.getNextSegment(segment, { skipLiveWait: true });
+			if (!nextSegment) {
+				break;
+			}
+
+			const nextMediaStart = await this.getSegmentMediaStart(nextSegment);
+			if (nextMediaStart === null || nextMediaStart > timestamp) {
+				break;
+			}
+			segment = nextSegment;
+		}
+
+		return segment;
 	}
 
 	getMediaOffset(segment: Segment, input: Input) {
@@ -439,8 +520,34 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		return this.segmentedInput.firstSegment.unixEpochTimestamp === this.segmentedInput.firstSegment.timestamp;
 	}
 
-	getUnixTimeForTimestamp(timestamp: number) {
-		return this.segmentedInput.getUnixTimeForTimestamp(timestamp);
+	async getUnixTimeForTimestamp(timestamp: number) {
+		const unixTime = await this.segmentedInput.getUnixTimeForTimestamp(timestamp);
+		if (unixTime === null) {
+			return null;
+		}
+
+		// A Unix time is given for the first sample of a segment (RFC 8216, Section 4.3.2.6), and later segments are
+		// dated from it by media time. The playlist's timeline, given by segment durations and dates, needn't match
+		// where the media actually is: dates can drift away from the media. So measure from where the media of the
+		// segment the Unix time was given for actually starts.
+		try {
+			const segment = await this.segmentedInput.getSegmentWithMediaAt(timestamp);
+			const anchor = segment ? this.segmentedInput.getUnixTimeAnchor(segment) : null;
+			if (anchor && anchor.unixEpochTimestamp !== null) {
+				const anchorMediaStart = await this.segmentedInput.getSegmentMediaStart(anchor);
+				if (anchorMediaStart !== null) {
+					return anchor.unixEpochTimestamp + timestamp - anchorMediaStart;
+				}
+			}
+		} catch (error) {
+			if (this.segmentedInput.input._disposed) {
+				throw error;
+			}
+
+			// The media can't be read, so the playlist's timeline is all there is
+		}
+
+		return unixTime;
 	}
 
 	getBitrate() {
