@@ -176,6 +176,8 @@ enum BlockLacing {
 type ClusterBlock = {
 	timestamp: number;
 	duration: number;
+	/** Whether the block came with a BlockDuration, which can be 0. Without one, its duration is inferred. */
+	hasBlockDuration?: boolean;
 	isKeyFrame: boolean;
 	data: Uint8Array;
 	lacing: BlockLacing;
@@ -1017,10 +1019,21 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 
 				if (i < trackData.presentationTimestamps.length - 1) {
-					// Update block durations based on presentation order
-					const nextEntry = trackData.presentationTimestamps[i + 1]!;
-					currentBlock.duration = nextEntry.timestamp - currentBlock.timestamp;
-				} else if (currentBlock.duration === 0) {
+					if (!currentBlock.hasBlockDuration) {
+						// Without a BlockDuration, a frame lasts the track's DefaultDuration, or else until the next
+						// block in presentation order (RFC 9559, BlockDuration). Laced blocks still span the gap to
+						// the next block, which their frames are spread over: frame count times DefaultDuration often
+						// doesn't fit the block timestamps (rounded to the timestamp scale, or a DefaultDuration that
+						// is really the block's duration), and the frames would overlap the next block.
+						// The DefaultDuration is rounded to whole ticks, so that durations stay multiples of the time
+						// resolution like the timestamps.
+						const nextEntry = trackData.presentationTimestamps[i + 1]!;
+						const isLaced = currentBlock.lacing !== BlockLacing.None;
+						currentBlock.duration = track.defaultDuration !== null && !isLaced
+							? Math.round(track.defaultDuration)
+							: nextEntry.timestamp - currentBlock.timestamp;
+					}
+				} else if (!currentBlock.hasBlockDuration) {
 					if (track.defaultDuration != null) {
 						if (currentBlock.lacing === BlockLacing.None) {
 							currentBlock.duration = track.defaultDuration;
@@ -2382,6 +2395,7 @@ export class MatroskaDemuxer extends Demuxer {
 				if (!this.currentBlock) break;
 
 				this.currentBlock.duration = readUnsignedInt(slice, size);
+				this.currentBlock.hasBlockDuration = true;
 			}; break;
 
 			case EBMLId.ReferenceBlock: {
