@@ -780,7 +780,7 @@ type MaybePromise<T> = T | Promise<T>;
 	- `'fileSystem'`: File system-optimized prefetching: a small amount of data is prefetched bidirectionally, aligned with page boundaries.
 	- `'network'`: Network-optimized prefetching, or more generally, prefetching optimized for any high-latency environment: tries to minimize the amount of read calls and aggressively prefetches data when sequential access patterns are detected.
 - `handleUnhandledError`\
-	Handles errors that occur while no read is pending. By default, these become unhandled promise rejections.
+	Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the data is requested again once a read needs it.
 
 ::: info
 `CustomSource` was previously known as `StreamSource` and is still available under that alias, but usage of `StreamSource` is deprecated.

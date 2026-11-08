@@ -397,6 +397,71 @@ const startRangelessServer = async (
 	};
 };
 
+test('A failed prefetch nobody waits for doesn\'t become an unhandled rejection', async () => {
+	// In Node, an unhandled rejection terminates the process (since Node 15), however the app handles its own reads
+	const unhandledRejections: unknown[] = [];
+	const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+	process.on('unhandledRejection', onUnhandledRejection);
+	const logs = captureLogs();
+
+	const data = new Uint8Array(4 * 2 ** 20).map((_, i) => i % 251);
+	let requestedRanges: string[] = [];
+	// The second request fails, like a presigned URL that has expired, or a CDN answering 503 under load
+	const server = http.createServer((req, res) => {
+		requestedRanges.push(req.headers.range!);
+		res.on('error', () => {});
+		if (requestedRanges.length === 2) {
+			res.writeHead(403).end();
+			return;
+		}
+
+		const start = Number(/bytes=(\d+)-/.exec(req.headers.range!)![1]);
+		res.writeHead(206, { 'Content-Range': `bytes ${start}-${data.length - 1}/${data.length}` });
+		res.end(data.subarray(start));
+	});
+	await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+	// Reads at the start, then later on, served from the cache but prefetching what comes next: request 2
+	const readWhilePrefetchFails = async (reader: Reader) => {
+		requestedRanges = [];
+		expect(await reader.requestSlice(0, 10)).not.toBeNull();
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(await reader.requestSlice(300_000, 10)).not.toBeNull();
+		await new Promise(resolve => setTimeout(resolve, 200));
+		expect(requestedRanges).toHaveLength(2);
+	};
+
+	try {
+		const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/video.mp4`;
+
+		using ref = new UrlSource(url).ref();
+		const reader = new Reader(ref.source);
+		await readWhilePrefetchFails(reader);
+		expect(unhandledRejections).toEqual([]); // On main: [Error: Error fetching …: 403 Forbidden]
+		expect(logs.errors.some(error => error.includes('403'))).toBe(true); // Still reported
+
+		// A read that needs the data that failed to prefetch requests it again (and would get any error itself)
+		const position = Number(/bytes=(\d+)-/.exec(requestedRanges[1]!)![1]) + 10;
+		const slice = await reader.requestSlice(position, 1000);
+		expect(slice && readBytes(slice, 1000)).toEqual(data.subarray(position, position + 1000));
+		expect(requestedRanges).toHaveLength(3);
+
+		// A handler still gets the error instead
+		logs.errors.length = 0;
+		const handledErrors: unknown[] = [];
+		using handledRef = new UrlSource(url, { handleUnhandledError: error => handledErrors.push(error) }).ref();
+		await readWhilePrefetchFails(new Reader(handledRef.source));
+		expect(String(handledErrors)).toContain('403');
+		expect(logs.errors).toEqual([]);
+		expect(unhandledRejections).toEqual([]);
+	} finally {
+		process.off('unhandledRejection', onUnhandledRejection);
+		logs.stop();
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 /** Collects logged warnings and errors, keeping the console clean while doing so. */
 const captureLogs = () => {
 	const warnings: string[] = [];
