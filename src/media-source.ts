@@ -352,7 +352,12 @@ class VideoEncoderWrapper {
 				|| config.transform?.flip !== undefined
 				|| config.transform?.crop !== undefined
 				|| config.transform?.force === true;
-			const needsTransform = hasTransformConfig || (isSizeChange && sizeChangeBehavior !== 'passThrough');
+			// With fill/contain/cover, frames of a new size are drawn through a canvas. Draw the others the same way,
+			// so that every frame reaches the encoder in the same color space (the encoder can't switch it mid-track)
+			const fitsSizeChanges = sizeChangeBehavior === 'fill'
+				|| sizeChangeBehavior === 'contain'
+				|| sizeChangeBehavior === 'cover';
+			const needsTransform = hasTransformConfig || fitsSizeChanges;
 
 			if (needsTransform) {
 				let targetWidth = config.transform?.width;

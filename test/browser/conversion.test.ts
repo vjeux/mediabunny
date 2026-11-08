@@ -1336,6 +1336,106 @@ test('Trim wholly past media data, copy', async () => {
 	expect(await newInput.getPrimaryAudioTrack()).toBeNull(); // No audio data
 });
 
+// An I420 sample in BT.709 limited range, like decoded video, filled with one sRGB color
+const makeFilledI420Sample = async (width: number, height: number, rgb: number[], timestamp: number) => {
+	const { VideoSample } = await import('../../src/sample.js');
+	const [r, g, b] = rgb.map(value => value / 255) as [number, number, number];
+	const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+	const data = new Uint8Array(width * height * 3 / 2);
+	data.fill(Math.round(16 + 219 * y), 0, width * height);
+	data.fill(Math.round(128 + 224 * (b - y) / 1.8556), width * height, width * height * 5 / 4);
+	data.fill(Math.round(128 + 224 * (r - y) / 1.5748), width * height * 5 / 4);
+	return new VideoSample(data, {
+		format: 'I420',
+		codedWidth: width,
+		codedHeight: height,
+		timestamp,
+		duration: 1 / 30,
+		colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
+	});
+};
+
+// A VP9 WebM whose resolution switches 160x120 → 320x240 → 160x120 mid-stream, like a WebRTC or MediaRecorder
+// recording: three separately encoded segments, concatenated packet by packet
+const makeResolutionSwitchingVp9 = async (rgb: number[]) => {
+	const { WebMOutputFormat } = await import('../../src/output-format.js');
+	const { EncodedVideoPacketSource, VideoSampleSource } = await import('../../src/media-source.js');
+	const segments: { packets: EncodedPacket[]; config: VideoDecoderConfig }[] = [];
+	for (const [width, height] of [[160, 120], [320, 240], [160, 120]] as const) {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'vp9', quality: new Quality('high') });
+		output.addVideoTrack(source);
+		await output.start();
+		for (let i = 0; i < 10; i++) {
+			using sample = await makeFilledI420Sample(width, height, rgb, i / 30);
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		segments.push({ packets, config: (await track.getDecoderConfig())! });
+	}
+
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+	for (const [index, segment] of segments.entries()) {
+		for (const packet of segment.packets) {
+			await source.add(
+				packet.clone({ timestamp: index * 10 / 30 + packet.timestamp }),
+				index === 0 && packet === segment.packets[0] ? { decoderConfig: segment.config } : undefined,
+			);
+		}
+	}
+	await output.finalize();
+	return output.target.buffer!;
+};
+
+test('Conversion with fit keeps the colors of a video whose resolution changes', async () => {
+	// Frames of the original size used to reach the encoder as decoded (YUV), and resized ones through a canvas
+	// (sRGB), which the encoder took for a color space change the container can't express
+	const { WebMOutputFormat } = await import('../../src/output-format.js');
+	const { VideoSampleSink } = await import('../../src/media-sink.js');
+	const rgb = [220, 40, 20];
+	const inputBuffer = await makeResolutionSwitchingVp9(rgb);
+
+	for (const fit of ['contain', 'fill', 'cover'] as const) {
+		using input = new Input({ source: new BufferSource(inputBuffer), formats: ALL_FORMATS });
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec: 'vp9', forceTranscode: true, fit },
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		const canvas = new OffscreenCanvas(16, 16);
+		const context = canvas.getContext('2d', { willReadFrequently: true })!;
+		let index = 0;
+		for await (using sample of new VideoSampleSink(track).samples()) {
+			sample.draw(context, 0, 0, 16, 16);
+			const color = [...context.getImageData(8, 8, 1, 1).data.slice(0, 3)];
+			// Frames 10 to 19 came in at 320x240 and were fitted to 160x120
+			for (let channel = 0; channel < 3; channel++) {
+				expect(Math.abs(color[channel]! - rgb[channel]!), `${fit}, frame ${index}: ${color.join(',')}`)
+					.toBeLessThanOrEqual(4);
+			}
+			index++;
+		}
+		expect(index).toBe(30);
+	}
+}, 60_000);
+
 test('Reserved fast start, copy', async () => {
 	await testReservedFastStart({});
 });
