@@ -1582,6 +1582,93 @@ test.concurrent('Widevine encryption (SAMPLE-AES-CTR) fails without keys', async
 	await expect(sink.getPacket(Infinity)).rejects.toThrow();
 });
 
+test.concurrent('PSSH boxes from #EXT-X-KEY tags of every KEYFORMAT reach the key resolver', async () => {
+	// Multi-DRM playlists list one key per DRM system, which all apply to the same segments (RFC 8216, 4.3.2.4).
+	// Widevine's carries its pssh box in a data URI, which the key resolver needs when the init segment has none.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const key = hexStringToBytes('00112233445566778899aabbccddeeff');
+	const cryptoKey = await crypto.subtle.importKey('raw', key, 'AES-CTR', false, ['encrypt']);
+	const encrypt = async (iv: number[], data: number[]) => [...new Uint8Array(await crypto.subtle.encrypt(
+		{ name: 'AES-CTR', counter: new Uint8Array([...iv, ...zeros(8)]), length: 64 },
+		cryptoKey,
+		new Uint8Array(data),
+	))];
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const encv = box(
+		'encv', zeros(6), [0, 1], zeros(16), [0, 64, 0, 64], zeros(12), [0, 1], zeros(32), [0, 24, 0xff, 0xff],
+		box('avcC', [1, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+		box('sinf', box('frma', ascii('avc1')), box('schm', u32(0), ascii('cenc'), u32(0x10000)),
+			box('schi', box('tenc', u32(0), [0, 0, 1, 8], zeros(16)))),
+	);
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl', box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)))),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const plaintext = [0, 0, 0, 12, 0x65, ...zeros(12)];
+	// A one-sample fragment, encrypted with the given IV
+	const fragment = async (index: number) => {
+		const iv = [...zeros(7), index];
+		const ciphertext = await encrypt(iv, plaintext);
+		const moof = (dataOffset: number) => box('moof', box('mfhd', u32(0), u32(index + 1)), box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(index)),
+			box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(ciphertext.length)),
+			box('senc', u32(0), u32(1), iv),
+		));
+		return [...moof(moof(0).length + 8), ...box('mdat', ciphertext)];
+	};
+	const file = new Uint8Array([...box('ftyp', ascii('iso6'), u32(0)), ...moov, ...await fragment(1)]);
+	const widevineSystemId = 'edef8ba979d64acea3c827dcd51d21ed';
+	const pssh = box('pssh', u32(0), [...hexStringToBytes(widevineSystemId)], u32(2), [8, 1]);
+	const widevineKey = `#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="data:text/plain;base64,${btoa(String.fromCharCode(...pssh))}"`
+		+ ',KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"';
+	const playReadyKey = '#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="data:text/plain;base64,AAAA",'
+		+ 'KEYFORMAT="com.microsoft.playready"';
+
+	// Whichever order the keys come in
+	for (const keys of [[widevineKey, playReadyKey], [playReadyKey, widevineKey]]) {
+		const playlist = new TextEncoder().encode([
+			'#EXTM3U', '#EXT-X-VERSION:6', '#EXT-X-TARGETDURATION:1', '#EXT-X-PLAYLIST-TYPE:VOD',
+			...keys,
+			'#EXTINF:0.1,', 'segment.mp4', '#EXT-X-ENDLIST',
+		].join('\n'));
+
+		const systemIds: string[][] = [];
+		const input = new Input({
+			source: new CustomPathedSource('https://example.com/playlist.m3u8', ({ path }) => new BufferSource(
+				path.endsWith('.m3u8') ? playlist : file,
+			)),
+			formats: ALL_FORMATS,
+			formatOptions: { isobmff: { resolveKeyId: ({ psshBoxes }) => {
+				systemIds.push(psshBoxes.map(x => x.systemId));
+				return key;
+			} } },
+		});
+
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		expect([...packet!.data]).toEqual(plaintext);
+		expect(systemIds).toEqual([[widevineSystemId]]);
+		input.dispose();
+	}
+});
+
 test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with string keys', async () => {
 	const keyMap = new Map([
 		['4d97930a3d7b55fa81d0028653f5e499', '429ec76475e7a952d224d8ef867f12b6'],
