@@ -1009,6 +1009,30 @@ test.concurrent('Mp4InputFormat recognises a CMAF segment that starts with sidx'
 	expect(await input.getFormat()).toBe(MP4);
 });
 
+test.concurrent('The DEFAULT=YES renditions are the primary tracks', async () => {
+	const text = `#EXTM3U
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="video",NAME="Close-up",AUTOSELECT=YES,DEFAULT=NO,URI="close-up.m3u8"
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="video",NAME="Wide",AUTOSELECT=YES,DEFAULT=YES,URI="wide.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Français",LANGUAGE="fr",AUTOSELECT=YES,DEFAULT=NO,URI="fr.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="en",AUTOSELECT=YES,DEFAULT=YES,URI="en.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1280000,CODECS="avc1.64001f,mp4a.40.2",VIDEO="video",AUDIO="audio"
+wide.m3u8
+`;
+
+	using input = new Input({
+		formats: HLS_FORMATS,
+		source: new CustomPathedSource('master.m3u8', () => new BufferSource(new TextEncoder().encode(text))),
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	expect(await videoTrack.getName()).toBe('Wide');
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	expect(await audioTrack.getName()).toBe('English');
+});
+
 test.concurrent('#EXT-X-I-FRAME-STREAM-INF tags are parsed properly', async () => {
 	const text = `#EXTM3U
 #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=256000,CODECS="avc1.4D401E",RESOLUTION=480x270,URI="7f2459cb12854fdbbc7ec1e7279da179/f74fb10563564130a4702743d64112a3/index_11.m3u8"
