@@ -81,7 +81,6 @@ import {
 } from '../../shared/mp3-misc';
 import { EncodedPacket, PacketType, PLACEHOLDER_DATA } from '../packet';
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
-import { ReadableStreamSource, UrlSource } from '../source';
 import {
 	buildMpegTsMimeType,
 	createTimestampWrapInfo,
@@ -93,6 +92,22 @@ import {
 } from './mpeg-ts-misc';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
+import { ReadableStreamSource, UrlSource } from '../source';
+
+/**
+ * How far reading can go past a position and still come back to it. Sources that only keep what their cache holds (a
+ * ReadableStreamSource, or a UrlSource whose server ignores range requests) can go half their cache, which stays clear
+ * of what gets evicted; the others, anywhere.
+ */
+const getReadBackDistance = (reader: Reader) => {
+	const source = reader.source;
+	const sequentialSource = source instanceof ReadableStreamSource
+		? source
+		: source instanceof UrlSource
+			? source._sequentialBacking
+			: null;
+	return sequentialSource ? sequentialSource._maxCacheSize / 2 : Infinity;
+};
 
 // Resources:
 // ISO/IEC 13818-1
@@ -123,21 +138,6 @@ const BLU_RAY_DTS_STREAM_TYPES = new Set<number>([
 const MAX_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 22; // 4 MiB
 // The same for sources of unknown size
 const MAX_STREAMED_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 20; // 1 MiB
-
-/**
- * How far reading can go past a position and still come back to it. Sources that only keep what their cache holds (a
- * ReadableStreamSource, or a UrlSource whose server ignores range requests) can go half their cache, which stays clear
- * of what gets evicted; the others, anywhere.
- */
-const getReadBackDistance = (reader: Reader) => {
-	const source = reader.source;
-	const sequentialSource = source instanceof ReadableStreamSource
-		? source
-		: source instanceof UrlSource
-			? source._sequentialBacking
-			: null;
-	return sequentialSource ? sequentialSource._maxCacheSize / 2 : Infinity;
-};
 
 // Descriptors that make a private data stream something other than audio: VBI data, VBI teletext, teletext, DVB
 // subtitling, data broadcast ID, application signalling and ARIB data component
