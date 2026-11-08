@@ -427,7 +427,9 @@ export class IsobmffDemuxer extends Demuxer {
 						// end of the file. Take what's there: the boxes before that point are complete. (The box is
 						// asked for whole first, so that a read too large to make fails as such.)
 						moovSlice = this.reader.requestSliceRange(slice.filePos, 0, boxInfo.contentSize);
-						if (isThenable(moovSlice)) moovSlice = await moovSlice;
+						if (isThenable(moovSlice)) {
+							moovSlice = await moovSlice;
+						}
 					}
 					if (!moovSlice) break;
 
