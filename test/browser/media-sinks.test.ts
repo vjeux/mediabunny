@@ -1616,3 +1616,80 @@ test('Canvas iterators open no decoder until they are iterated', async () => {
 		await expect(canvases.throw(new Error('Stop'))).rejects.toThrow('Stop');
 	})).toEqual({ openDecoders: 0, openFrames: 0 });
 });
+
+test('Returning from sample iterators at the live edge closes the decoder', async () => {
+	// A live HLS stream (no EXT-X-ENDLIST) whose next segment never comes, as when its encoder stopped. Segments made
+	// with ffmpeg -f lavfi -i testsrc2=size=160x120:rate=25:duration=2 -c:v libx264 -g 12 -bf 2 -f hls -hls_time 0.5
+	const playlist = [
+		'#EXTM3U',
+		'#EXT-X-VERSION:3',
+		'#EXT-X-TARGETDURATION:1',
+		'#EXT-X-MEDIA-SEQUENCE:0',
+		'#EXTINF:0.96,',
+		'segment0.ts',
+		'#EXTINF:0.48,',
+		'segment1.ts',
+		'#EXTINF:0.48,',
+		'segment2.ts',
+	].join('\n');
+
+	let openDecoders = 0;
+	const OriginalVideoDecoder = globalThis.VideoDecoder;
+	globalThis.VideoDecoder = class extends OriginalVideoDecoder {
+		constructor(init: VideoDecoderInit) {
+			super(init);
+			openDecoders++;
+		}
+
+		override close() {
+			if (this.state !== 'closed') {
+				openDecoders--;
+			}
+			super.close();
+		}
+	};
+
+	try {
+		using input = new Input({
+			source: new CustomPathedSource('index.m3u8', ({ path }) => path === 'index.m3u8'
+				? new BufferSource(new TextEncoder().encode(playlist))
+				: new UrlSource('/hls-live/' + path)),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const sink = new VideoSampleSink(track);
+
+		const timeout = (ms: number) => new Promise<null>(resolve => setTimeout(() => resolve(null), ms));
+		const pullUntilStuck = async (samples: AsyncGenerator<VideoSample | null, void, unknown>) => {
+			let sampleCount = 0;
+			while (true) {
+				const result = await Promise.race([samples.next(), timeout(1000)]);
+				if (!result) {
+					return sampleCount; // Waiting for the live stream to go on
+				}
+
+				expect(result.done).toBe(false);
+				result.value?.close();
+				sampleCount++;
+			}
+		};
+
+		// Found by lane L70: the decoder stayed open until the stream went on, or the input was disposed
+		const samples = sink.samples();
+		expect(await pullUntilStuck(samples)).toBeGreaterThan(0);
+		await samples.return();
+		await timeout(100);
+		expect(openDecoders).toBe(0);
+
+		// A timestamp the stream hasn't reached yet
+		const samplesAtTimestamps = sink.samplesAtTimestamps([10]);
+		expect(await pullUntilStuck(samplesAtTimestamps)).toBe(0);
+		expect(openDecoders).toBe(1);
+		await samplesAtTimestamps.return();
+		await timeout(100);
+		expect(openDecoders).toBe(0);
+	} finally {
+		globalThis.VideoDecoder = OriginalVideoDecoder;
+	}
+});
