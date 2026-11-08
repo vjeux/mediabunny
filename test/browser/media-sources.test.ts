@@ -775,6 +775,14 @@ const measureBeepToFlashOffset = async (hideMediaStreamTrackProcessor: boolean) 
 		return null;
 	}
 
+	// Even then, the output may only report its timing a while later (Chrome on Windows); the beeps are scheduled from
+	// currentTime if it never does
+	const outputWaitStart = performance.now();
+	const hasOutputTiming = () => (audioContext.getOutputTimestamp().performanceTime ?? 0) > 0;
+	while (!hasOutputTiming() && performance.now() - outputWaitStart < 1000) {
+		await new Promise(resolve => setTimeout(resolve, 10));
+	}
+
 	const destination = audioContext.createMediaStreamDestination();
 	const oscillator = audioContext.createOscillator();
 	oscillator.frequency.value = 1000;
@@ -813,8 +821,11 @@ const measureBeepToFlashOffset = async (hideMediaStreamTrackProcessor: boolean) 
 	// Schedule the beeps at the same moments the flashes start
 	const start = performance.now() + 300;
 	const { contextTime, performanceTime } = audioContext.getOutputTimestamp();
+	const startContextTime = contextTime !== undefined && performanceTime !== undefined && performanceTime > 0
+		? contextTime + (start - performanceTime) / 1000
+		: audioContext.currentTime + (start - performance.now()) / 1000;
 	for (let i = 0; i < 6; i++) {
-		const beepTime = contextTime! + (start + 500 * i - performanceTime!) / 1000;
+		const beepTime = startContextTime + 0.5 * i;
 		gain.gain.setValueAtTime(0.5, beepTime);
 		gain.gain.setValueAtTime(0, beepTime + 0.1);
 	}
