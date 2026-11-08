@@ -577,6 +577,9 @@ const MAX_PSI_SECTION_SCAN_PACKETS = 1000;
 // seconds (ETSI TR 101 290), so we stop once the media has progressed by a few seconds, or after a few more damaged
 // copies (the muxer writes bad CRCs). FFmpeg only takes damaged sections after 10 of them in a row on a PID.
 const MAX_PSI_SECTION_REPETITION_DISTANCE = 4 * 1024 * 1024;
+// The same for sources of unknown size, which may not be able to go back that far to read on after the section once
+// the search is done (a ReadableStreamSource only keeps what its cache holds)
+const MAX_STREAMED_PSI_SECTION_REPETITION_DISTANCE = 1024 * 1024;
 const MAX_PSI_SECTION_REPETITION_DELAY = 2 * MPEG_TS_TIMESCALE;
 const MAX_DAMAGED_PSI_SECTION_COPY_COUNT = 2;
 
@@ -1171,11 +1174,11 @@ export class MpegTsDemuxer extends Demuxer {
 				} else if ((programMapPids.has(section.pid) || isProbablyProgramMap) && !hasProgramMap && isInEffect) {
 					// Broadcast captures often carry several programs. We present just one, so let's use the first one
 					// whose PMT shows up (some programs listed in the PAT may not even be in the capture).
-					const intactSection = await this.findIntactPsiSection(
-						section,
-						PROGRAM_MAP_TABLE_ID,
-						takesTablesNotInEffect,
-					);
+					// A PMT we only guess at (no PAT names its PID) isn't searched for: if it's damaged, it may well be
+					// some other data that looks like one, and the search would read far ahead for nothing
+					const intactSection = programMapPids.has(section.pid)
+						? await this.findIntactPsiSection(section, PROGRAM_MAP_TABLE_ID, takesTablesNotInEffect)
+						: section;
 					const bitstream = new Bitstream(intactSection.payload);
 					const pointerField = bitstream.readAlignedByte();
 
@@ -2318,7 +2321,11 @@ export class MpegTsDemuxer extends Demuxer {
 			return section;
 		}
 
-		const endPos = section.startPos + MAX_PSI_SECTION_REPETITION_DISTANCE;
+		const endPos = section.startPos + (
+			this.reader.fileSizeNonStrict === null
+				? MAX_STREAMED_PSI_SECTION_REPETITION_DISTANCE
+				: MAX_PSI_SECTION_REPETITION_DISTANCE
+		);
 		const firstPtsByPid = new Map<number, number>();
 		let damagedCopyCount = 0;
 
