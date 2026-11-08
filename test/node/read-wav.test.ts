@@ -66,3 +66,56 @@ test('WAVE files past 4 GiB whose sizes are 0xFFFFFFFF are read to the end', asy
 	const lastPacket = (await new EncodedPacketSink(track).getPacket(duration, { metadataOnly: true }))!;
 	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(duration, 6);
 });
+
+test.each([
+	['right after the data chunk', null, 0],
+	['after a skipped chunk of 1 MiB', 'JUNK', 2 ** 20],
+	['after a skipped chunk of 0xFFFFFFF0 bytes', 'JUNK', 0xfffffff0],
+	['after a LIST chunk of 1 MiB', 'LIST', 2 ** 20],
+] as const)('WAVE chunk walks stop at zeros %s instead of crawling through them', async (_, chunkId, chunkSize) => {
+	// A RIFF chunk of unknown size and 4 bytes of audio, then zeros (after one more chunk), from a source claiming
+	// 2 TiB like a server stating a huge size. The zeros used to be walked as empty chunks, 8 bytes at a time, up to
+	// the stated RIFF size (4 GiB) or, for a RIFF size of 0xFFFFFFFF, the stated file size.
+	const header = new Uint8Array(64);
+	const view = new DataView(header.buffer);
+	header.set(new TextEncoder().encode('RIFF'), 0);
+	view.setUint32(4, 0xffffffff, true);
+	header.set(new TextEncoder().encode('WAVEfmt '), 8);
+	view.setUint32(16, 16, true); // fmt chunk size
+	view.setUint16(20, 1, true); // PCM
+	view.setUint16(22, 2, true); // Channels
+	view.setUint32(24, 44100, true); // Sample rate
+	view.setUint32(28, 4 * 44100, true); // Bytes per second
+	view.setUint16(32, 4, true); // Block align
+	view.setUint16(34, 16, true); // Bits per sample
+	header.set(new TextEncoder().encode('data'), 36);
+	view.setUint32(40, 4, true);
+	if (chunkId) {
+		header.set(new TextEncoder().encode(chunkId), 48);
+		view.setUint32(52, chunkSize, true);
+	}
+
+	let reads = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => 2 ** 41,
+			read: (start, end) => {
+				if (++reads > 1000) {
+					throw new Error('Too many reads');
+				}
+
+				const bytes = new Uint8Array(end - start);
+				if (start < header.length) {
+					bytes.set(header.subarray(start, Math.min(end, header.length)));
+				}
+				return bytes;
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getDurationFromMetadata()).toBe(1 / 44100);
+	expect(await input.getMetadataTags()).toEqual({});
+	expect(reads).toBeLessThan(10);
+});

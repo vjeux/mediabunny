@@ -63,10 +63,12 @@ export class WaveDemuxer extends Demuxer {
 			const outerChunkSize = readU32(slice, littleEndian);
 
 			// Sizes that don't fit into 32 bits are left at 0xFFFFFFFF by FFmpeg (as are all sizes it can't seek back
-			// to, like when writing to a pipe). Like FFmpeg, we take such a chunk to extend to the end of the file.
+			// to, like when writing to a pipe). Like FFmpeg, we take such a data chunk to extend to the end of the
+			// file. Chunks are still only looked for within the stated RIFF size.
 			const isUnknownSize = (size: number) => size === 0xffffffff && this.reader.fileSize !== null;
+			const riffSizeIsUnknown = !isRf64 && isUnknownSize(outerChunkSize);
 
-			let totalFileSize = isRf64 || isUnknownSize(outerChunkSize)
+			let totalFileSize = isRf64
 				? this.reader.fileSize
 				: Math.min(outerChunkSize + 8, this.reader.fileSize ?? Infinity);
 			const format = readAscii(slice, 4);
@@ -92,6 +94,12 @@ export class WaveDemuxer extends Demuxer {
 					throw new Error('Invalid RF64 file: First chunk must be "ds64".');
 				}
 
+				if (!/^[\x20-\x7e]{4}$/.test(chunkId)) {
+					// Chunk IDs are four printable ASCII characters, so this isn't a chunk header but zeros or garbage,
+					// as in a damaged file. Walking it 8 bytes at a time could take forever, so the chunks end here.
+					break;
+				}
+
 				if (chunkId === 'fmt ') {
 					await this.parseFmtChunk(startPos, chunkSize, littleEndian);
 				} else if (chunkId === 'data') {
@@ -102,7 +110,8 @@ export class WaveDemuxer extends Demuxer {
 					dataChunkSize ??= chunkSize;
 
 					this.dataStart = slice.filePos;
-					this.dataSize = Math.max(Math.min(dataChunkSize, (totalFileSize ?? Infinity) - this.dataStart), 0);
+					const dataEnd = riffSizeIsUnknown ? this.reader.fileSize : totalFileSize;
+					this.dataSize = Math.max(Math.min(dataChunkSize, (dataEnd ?? Infinity) - this.dataStart), 0);
 
 					if (this.reader.fileSize === null) {
 						break; // Stop once we hit the data chunk
