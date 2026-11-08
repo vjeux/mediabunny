@@ -18,6 +18,8 @@ import {
 	UrlSource,
 } from 'mediabunny';
 import fs from 'node:fs';
+import { createCipheriv } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
@@ -2358,6 +2360,55 @@ test.concurrent('Long reads release the sources of segments that dropped out of 
 
 	// The first segment's input still works: it requests its source again
 	expect((await sink.getNextPacket(firstPacket))?.timestamp).toBe(secondPacket.timestamp);
+});
+
+test('Keys of unsupported KEYFORMATs are ignored when a supported key applies to the segment', async () => {
+	// RFC 8216, Section 6.3.6: "A client MUST ignore any EXT-X-KEY tag with an unsupported or unrecognized KEYFORMAT
+	// attribute, to allow for cross-device addressability." Keys of several formats may apply to the same segments
+	// (Section 4.3.2.4), and only if none of them is supported should playback fail.
+	const key = new Uint8Array(16).fill(7);
+	const cipher = createCipheriv('aes-128-cbc', key, new Uint8Array(16)); // The IV is the media sequence number, 0
+	const segment = new Uint8Array(Buffer.concat([cipher.update(readFileSync('./test/public/0.ts')), cipher.final()]));
+
+	const identityKey = '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"';
+	const otherKeys = [
+		'#EXT-X-KEY:METHOD=AES-128,URI="https://drm.example/key",KEYFORMAT="com.example.drm"',
+		'#EXT-X-KEY:METHOD=AES-256,URI="https://drm.example/key",KEYFORMAT="com.example.future"',
+	];
+
+	const open = (keys: string[]) => {
+		const playlist = ['#EXTM3U', '#EXT-X-VERSION:5', '#EXT-X-TARGETDURATION:5', ...keys, '#EXTINF:4.988,', 'segment.ts',
+			'#EXT-X-ENDLIST'].join('\n');
+		const files: Record<string, Uint8Array> = {
+			'playlist.m3u8': new TextEncoder().encode(playlist),
+			'key.bin': key,
+			'segment.ts': segment,
+		};
+
+		return new Input({
+			source: new CustomPathedSource('playlist.m3u8', ({ path }) => new BufferSource(files[path]!)),
+			formats: ALL_FORMATS,
+		});
+	};
+
+	const readFirstVideoPacket = async (keys: string[]) => {
+		using input = open(keys);
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+
+		return await new EncodedPacketSink(videoTrack).getFirstPacket();
+	};
+
+	const readTracks = async (keys: string[]) => {
+		using input = open(keys);
+		return await input.getTracks();
+	};
+
+	for (const otherKey of otherKeys) {
+		expect((await readFirstVideoPacket([identityKey, otherKey]))?.type).toBe('key');
+		expect((await readFirstVideoPacket([otherKey, identityKey]))?.type).toBe('key');
+		await expect(readTracks([otherKey])).rejects.toThrow(/KEYFORMAT|Unsupported encryption method/);
+	}
 });
 
 const fetchBytes = async (url: string) => {
