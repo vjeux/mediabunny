@@ -1499,3 +1499,96 @@ test.for(['video', 'audio'] as const)(
 		expect(tracks.map(track => track.type)).toEqual([endedKind === 'video' ? 'audio' : 'video']);
 	},
 );
+
+test('MediaStream sources, pausing and resuming keeps audio and video in sync', async ({ skip }) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator (Chromium)');
+	}
+
+	// A video track that emits no frames while paused (like a canvas that doesn't change), next to continuous audio
+	const videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
+	const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
+	const videoWriter = videoGenerator.writable.getWriter();
+	const audioWriter = audioGenerator.writable.getWriter();
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const videoSource = new MediaStreamVideoTrackSource(
+		videoGenerator as unknown as MediaStreamVideoTrack,
+		{ codec: 'vp8', quality: new Quality('low') },
+		{ frameRate: null },
+	);
+	const audioSource = new MediaStreamAudioTrackSource(audioGenerator as unknown as MediaStreamAudioTrack, {
+		codec: 'opus',
+		quality: new Quality('low'),
+	});
+	const errors: unknown[] = [];
+	videoSource.errorPromise.catch(error => errors.push(error));
+	audioSource.errorPromise.catch(error => errors.push(error));
+
+	output.addVideoTrack(videoSource);
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// Record for 0.5 s, pause for 0.8 s, then record for another 0.5 s
+	const canvas = new OffscreenCanvas(64, 48);
+	const context = canvas.getContext('2d')!;
+	const start = performance.now();
+	let videoFrames = 0;
+	let audioChunks = 0;
+
+	while (performance.now() - start < 1800) {
+		const elapsed = performance.now() - start;
+
+		if (elapsed >= 500 && elapsed < 1300 && !videoSource.paused) {
+			videoSource.pause();
+			audioSource.pause();
+		} else if (elapsed >= 1300 && videoSource.paused) {
+			videoSource.resume();
+			audioSource.resume();
+		}
+
+		while (audioChunks * 10 <= elapsed) {
+			await audioWriter.write(new AudioData({
+				format: 'f32-planar',
+				sampleRate: 48000,
+				numberOfChannels: 1,
+				numberOfFrames: 480,
+				timestamp: 1000 * (start + 10 * audioChunks),
+				data: new Float32Array(480),
+			}));
+			audioChunks++;
+		}
+
+		while (videoFrames * 40 <= elapsed) {
+			if (!videoSource.paused) {
+				context.fillStyle = `rgb(${videoFrames * 5}, 0, 0)`;
+				context.fillRect(0, 0, canvas.width, canvas.height);
+				await videoWriter.write(new VideoFrame(canvas, { timestamp: 1000 * (start + 40 * videoFrames) }));
+			}
+			videoFrames++;
+		}
+
+		await new Promise(resolve => setTimeout(resolve, 5));
+	}
+
+	await output.finalize();
+	await videoWriter.close();
+	await audioWriter.close();
+	expect(errors).toEqual([]);
+
+	const input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const videoEnd = await (await input.getPrimaryVideoTrack())!.computeDuration();
+	const audioEnd = await (await input.getPrimaryAudioTrack())!.computeDuration();
+	input.dispose();
+
+	// Both tracks lost the same 0.8 s to the pause
+	expect(audioEnd).toBeCloseTo(1, 0);
+	expect(Math.abs(videoEnd - audioEnd)).toBeLessThan(0.1);
+});
