@@ -14,9 +14,10 @@ import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
 import { Logging, LogLevel } from '../../src/logging.js';
 import { Conversion } from '../../src/conversion.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { countMovedArrayElements } from './array-moves.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -2259,4 +2260,89 @@ test('MPEG-TS uses an intact copy of a damaged PAT or PMT', async () => {
 	});
 	expect(await Promise.all((await input.getTracks()).map(track => track.getCodec()))).toEqual(['mp3']);
 	expect(maxEnd).toBeLessThan(singleBad.byteLength / 2);
+});
+
+test('MPEG-TS packet durations with B-frames do not depend on how the packets were reached', async () => {
+	// The first 40 packets of an HEVC video with B-frames, so that the last frame shown is followed by a gap (the
+	// frames filling it come later in the stream)
+	using mp4 = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video-h265.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('hevc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		await source.add(packet, count === 0 ? { decoderConfig: (await mp4Track.getDecoderConfig())! } : undefined);
+		if (++count === 40) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets: EncodedPacket[] = [];
+	for await (const packet of sink.packets()) {
+		packets.push(packet);
+	}
+
+	// The last frame lasts one frame, however it's reached
+	const lastPacket = packets.reduce((a, b) => b.timestamp > a.timestamp ? b : a);
+	expect(lastPacket.timestamp).toBeCloseTo(1.4);
+	expect(lastPacket.duration).toBeCloseTo(1 / 30);
+	expect((await sink.getPacket(Infinity))!.duration).toBe(lastPacket.duration);
+	expect(await track.computeDuration()).toBeCloseTo(1.4 + 1 / 30);
+});
+
+test('MPEG-TS gives the last frame of variable frame rate video a typical frame duration', async () => {
+	// Frames 17.7, 20.3 and 10.9 ms long at the start, then 29 ms ones (seen in HLS streams, where every segment's
+	// last frame has no successor)
+	using mp4 = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/cursed-vfr.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const mp4Track = await mp4.getPrimaryVideoTrack();
+	assert(mp4Track);
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const timestamps = [0, 0.0177, 0.038, 0.0489];
+	while (timestamps.length < 24) {
+		timestamps.push(timestamps.at(-1)! + 0.029);
+	}
+
+	let i = 0;
+	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
+		const timestamp = timestamps[i]!;
+		const duration = i + 1 < timestamps.length ? timestamps[i + 1]! - timestamp : 0.029;
+		await source.add(
+			packet.clone({ timestamp, duration }),
+			i === 0 ? { decoderConfig: (await mp4Track.getDecoderConfig())! } : undefined,
+		);
+		if (++i === timestamps.length) {
+			break;
+		}
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const lastPacket = await sink.getPacket(Infinity);
+	expect(lastPacket?.duration).toBeCloseTo(0.029);
+	expect(await track.computeDuration()).toBeCloseTo(timestamps.at(-1)! + 0.029);
 });
