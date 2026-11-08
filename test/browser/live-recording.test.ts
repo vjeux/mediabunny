@@ -46,6 +46,19 @@ const runLongTests = !!(import.meta as unknown as { env: Record<string, string |
 const lowVp8 = { codec: 'vp8', quality: new Quality('low') } satisfies VideoEncodingConfig;
 const lowOpus = { codec: 'opus', quality: new Quality('low') } satisfies AudioEncodingConfig;
 
+/**
+ * Checks that video timestamps read back from a WebM file sit on a constant frame rate grid, frame after frame. WebM
+ * stores timestamps in whole milliseconds, rounding each one on its own; with the grid at a half-millisecond offset,
+ * float error decides which way, so a frame may be off by up to a millisecond relative to the first one (frame
+ * durations of 49/51 ms instead of 50 ms). So each timestamp is compared to the first one plus that many frames, within
+ * that millisecond.
+ */
+const expectOnFrameGrid = (timestamps: number[], frameRate: number) => {
+	for (let i = 1; i < timestamps.length; i++) {
+		expect(Math.abs(timestamps[i]! - timestamps[0]! - i / frameRate)).toBeLessThanOrEqual(0.001 + 1e-9);
+	}
+};
+
 const median = (values: number[]) => {
 	const sorted = [...values].sort((a, b) => a - b);
 	return sorted[Math.floor(sorted.length / 2)]!;
@@ -394,9 +407,7 @@ describe.skipIf(!hasMainThreadTrackProcessor)('A/V sync of canvas capture and We
 
 		const { videoTimestamps } = result!.analysis;
 		expect(videoTimestamps.length).toBeGreaterThan(20);
-		for (let i = 1; i < videoTimestamps.length; i++) {
-			expect(videoTimestamps[i]! - videoTimestamps[i - 1]!).toBeCloseTo(1 / 25, 5);
-		}
+		expectOnFrameGrid(videoTimestamps, 25);
 	});
 });
 
@@ -479,11 +490,8 @@ describe.skipIf(!hasTrackGenerator)('Timeline', () => {
 		});
 
 		expect(result.errors).toEqual([]);
-		const deltas = result.videoTimestamps.slice(1).map((timestamp, i) => timestamp - result.videoTimestamps[i]!);
-		expect(deltas.length).toBeGreaterThan(15);
-		for (const delta of deltas) {
-			expect(delta).toBeCloseTo(0.05, 3);
-		}
+		expect(result.videoTimestamps.length).toBeGreaterThan(16);
+		expectOnFrameGrid(result.videoTimestamps, 20);
 	});
 
 	test.each([8000, 16000, 22050, 44100, 48000, 96000])(
