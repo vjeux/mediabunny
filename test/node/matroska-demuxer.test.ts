@@ -2221,3 +2221,76 @@ test('Converting Matroska to MP4 keeps the normal cover as the cover art', async
 	const covers = (await output.getMetadataTags()).images!;
 	expect(new TextDecoder().decode(covers[0]!.data.subarray(4))).toBe('normal');
 });
+
+test('Of several SimpleTags with the same name, the default one wins', async () => {
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const utf8 = (text: string) => [...new TextEncoder().encode(text)];
+	const simpleTag = (name: string, ...children: number[][]) => element(
+		EBMLId.SimpleTag,
+		element(EBMLId.TagName, utf8(name)),
+		...children,
+	);
+	const tagString = (value: string) => element(EBMLId.TagString, utf8(value));
+	const tagLanguage = (language: string) => element(EBMLId.TagLanguage, utf8(language));
+
+	const file = new Uint8Array([
+		...element(EBMLId.EBML, element(EBMLId.DocType, utf8('matroska'))),
+		...element(
+			EBMLId.Segment,
+			element(EBMLId.Tracks, element(
+				EBMLId.TrackEntry,
+				element(EBMLId.TrackNumber, [1]),
+				element(EBMLId.TrackType, [2]),
+				element(EBMLId.CodecID, utf8('A_AC3')),
+			)),
+			element(EBMLId.Tags, element(
+				EBMLId.Tag,
+				element(EBMLId.Targets),
+				// A translation first, as FFmpeg writes `-metadata artist-ger=... -metadata artist=...`
+				simpleTag('ARTIST', tagLanguage('ger'), tagString('Künstler')),
+				simpleTag('ARTIST', tagString('Artist')),
+				// A value flagged as not the default first
+				simpleTag('TITLE', element(EBMLId.TagDefault, [0]), tagString('Non-default')),
+				simpleTag('TITLE', tagString('Title')),
+				// The only value, in another language (given after the value)
+				simpleTag('ALBUM', tagString('Album'), tagLanguage('fre')),
+				// TagLanguageBCP47 takes precedence over TagLanguage
+				simpleTag(
+					'COMMENT',
+					element(EBMLId.TagLanguageBCP47, utf8('de')),
+					tagLanguage('fre'),
+					tagString('Kommentar'),
+				),
+			)),
+		),
+	]);
+
+	using input = new Input({
+		source: new BufferSource(file),
+		formats: ALL_FORMATS,
+	});
+	const tags = await input.getMetadataTags();
+	expect(tags.artist).toBe('Artist');
+	expect(tags.title).toBe('Title');
+	expect(tags.album).toBe('Album');
+	// Translations are also kept under their own names, like FFmpeg does
+	expect(tags.raw).toMatchObject({
+		'ARTIST': 'Artist',
+		'ARTIST-ger': 'Künstler',
+		'TITLE': 'Title',
+		'ALBUM': 'Album',
+		'ALBUM-fre': 'Album',
+		'COMMENT-de': 'Kommentar',
+	});
+	expect(tags.raw!['COMMENT-fre']).toBe(undefined);
+});

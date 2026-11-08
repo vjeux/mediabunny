@@ -540,7 +540,14 @@ export class MatroskaDemuxer extends Demuxer {
 	currentDecodingInstruction: DecodingInstruction | null = null;
 	currentTagTargetIsMovie: boolean = true;
 	/** The SimpleTag being read; SimpleTags can be nested to describe their parent (e.g. ARTIST > SORT_WITH). */
-	currentSimpleTag: { name: string | null; parent: MatroskaDemuxer['currentSimpleTag'] } | null = null;
+	currentSimpleTag: {
+		name: string | null;
+		language: string | null;
+		isDefault: boolean;
+		parent: MatroskaDemuxer['currentSimpleTag'];
+	} | null = null;
+
+	pendingTagValues: { name: string; value: string | Uint8Array; rank: number }[] = [];
 	currentAttachedFile: {
 		fileUid: bigint | null;
 		fileName: string | null;
@@ -2528,7 +2535,16 @@ export class MatroskaDemuxer extends Demuxer {
 					children.skip(childHeader.size);
 				}
 
+				this.pendingTagValues = [];
 				this.readContiguousElements(slice.slice(dataStartPos, size));
+
+				// Of several values with the same name, the first default one in the undetermined language wins,
+				// then the first default one in another language, then the first non-default one (TagDefault 0)
+				const values = this.pendingTagValues.sort((a, b) => b.rank - a.rank); // Stable
+				this.pendingTagValues = [];
+				for (const { name, value } of values) {
+					this.processTagValue(name, value);
+				}
 			}; break;
 
 			case EBMLId.Targets: {
@@ -2557,12 +2573,13 @@ export class MatroskaDemuxer extends Demuxer {
 				if (!this.currentTagTargetIsMovie) break;
 
 				const parent = this.currentSimpleTag;
-				this.currentSimpleTag = { name: null, parent };
+				this.currentSimpleTag = { name: null, language: null, isDefault: true, parent };
 
 				try {
 					// The tag's value and the tags nested in it need its name, but TagName may come after them, so
 					// let's read it first
 					const children = slice.slice(dataStartPos, size);
+					let hasBcp47Language = false;
 					while (children.remainingLength >= MIN_HEADER_SIZE) {
 						const childStartPos = children.filePos;
 						const childHeader = readElementHeader(children);
@@ -2573,7 +2590,20 @@ export class MatroskaDemuxer extends Demuxer {
 						if (childHeader.id === EBMLId.TagName) {
 							children.filePos = childStartPos;
 							this.traverseElement(children);
-							break;
+							continue;
+						} else if (
+							childHeader.id === EBMLId.TagLanguage || childHeader.id === EBMLId.TagLanguageBCP47
+						) {
+							const language = readUnicodeString(children, childHeader.size);
+							if (childHeader.id === EBMLId.TagLanguageBCP47 || !hasBcp47Language) {
+								this.currentSimpleTag.language = language && language !== 'und' ? language : null;
+							}
+							hasBcp47Language ||= childHeader.id === EBMLId.TagLanguageBCP47;
+							continue;
+						} else if (childHeader.id === EBMLId.TagDefault) {
+							this.currentSimpleTag.isDefault = childHeader.size === 0
+								|| readBytes(children, childHeader.size).some(x => x !== 0);
+							continue;
 						}
 
 						children.skip(childHeader.size);
@@ -2610,7 +2640,7 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 
 				const value = id === EBMLId.TagString ? readUnicodeString(slice, size) : readBytes(slice, size);
-				this.processTagValue(name, value);
+				this.addTagValue(name, value);
 			}; break;
 
 			case EBMLId.AttachedFile: {
@@ -2811,6 +2841,18 @@ export class MatroskaDemuxer extends Demuxer {
 		}
 
 		return currentData;
+	}
+
+	addTagValue(name: string, value: string | Uint8Array) {
+		const language = this.currentSimpleTag?.language ?? null;
+		const isDefault = this.currentSimpleTag?.isDefault ?? true;
+		const rank = !isDefault ? 0 : language ? 1 : 2;
+		this.pendingTagValues.push({ name, value, rank });
+
+		if (language) {
+			// Also under its own name for the language, like FFmpeg does (e.g. ARTIST-ger)
+			this.pendingTagValues.push({ name: `${name}-${language}`, value, rank: 2 });
+		}
 	}
 
 	processTagValue(name: string, value: string | Uint8Array) {
