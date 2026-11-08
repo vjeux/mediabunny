@@ -610,25 +610,27 @@ export class Output<
 	}
 
 	/** @internal */
-	_getInitTarget(): Promise<Target> {
+	_getInitTarget() {
+		return this._waitForTarget(this._requestInitTarget());
+	}
+
+	/** @internal */
+	async _requestInitTarget(): Promise<T> {
 		assert(this._initTarget !== null);
 
 		if (this._initTarget instanceof Target) {
-			return this._waitForTarget(this._initTarget);
+			return this._initTarget;
 		}
 
-		const initTarget = this._initTarget;
-		return this._waitForTarget((async () => {
-			const target = await initTarget();
+		const target = await this._initTarget();
 
-			if (this.state === 'canceled') {
-				await target._close();
-			} else {
-				this._rememberTarget(target);
-			}
+		if (this.state === 'canceled') {
+			await target._close();
+		} else {
+			this._rememberTarget(target);
+		}
 
-			return target;
-		})());
+		return target;
 	}
 
 	/** @internal */
