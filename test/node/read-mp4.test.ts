@@ -286,6 +286,32 @@ test('PCM track with stsc not starting at the first chunk', async () => {
 	expect(packetCount).toBe(3);
 });
 
+test('AAC config with channel configuration 0 but no program config element', async () => {
+	// Channel configuration 0 means the layout is in a PCE following the config, but this one has none, so the
+	// channel count has to come from the sample entry (2) instead
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 3; i++) {
+		await source.add(new EncodedPacket(new Uint8Array(20), 'key', i * 1024 / 44100, 1024 / 44100), {
+			decoderConfig: {
+				codec: 'mp4a.40.2',
+				numberOfChannels: 2,
+				sampleRate: 44100,
+				description: new Uint8Array([0x12, 0x00]), // AAC-LC, 44.1 kHz, channel configuration 0
+			},
+		});
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getNumberOfChannels()).toBe(2);
+	expect((await track.getDecoderConfig())!.numberOfChannels).toBe(2);
+});
+
 test('Missing tfdt and tfra entries referencing non-first samples', async () => {
 	// See https://github.com/Vanilagy/mediabunny/issues/578
 	const filePath = path.join(__dirname, '..', 'public/missing-tfdt.mp4');
