@@ -521,6 +521,81 @@ test('btrt boxes copied from input metadata in conversion, fragmented MP4', asyn
 	]);
 });
 
+test('Fragmented MP4 keeps writing fragments when two video tracks\' key frames don\'t line up', async () => {
+	let moofCount = 0;
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'fragmented', onMoof: () => moofCount++ }),
+		target: new BufferTarget(),
+	});
+	const first = new EncodedVideoPacketSource('vp8');
+	const second = new EncodedVideoPacketSource('vp8');
+	output.addVideoTrack(first);
+	output.addVideoTrack(second);
+	await output.start();
+
+	// 10 fps for 20 s with a key frame every 2 s; the second track's key frames are 1 s later (and at 0)
+	const decoderConfig = { codec: 'vp8', codedWidth: 320, codedHeight: 180 };
+	for (let i = 0; i < 200; i++) {
+		const firstType = i % 20 === 0 ? 'key' : 'delta';
+		const secondType = i === 0 || i % 20 === 10 ? 'key' : 'delta';
+		await first.add(new EncodedPacket(new Uint8Array([1, i]), firstType, i / 10, 0.1), { decoderConfig });
+		await second.add(new EncodedPacket(new Uint8Array([2, i]), secondType, i / 10, 0.1), { decoderConfig });
+	}
+	const moofCountBeforeFinalize = moofCount;
+	await output.finalize();
+
+	// Samples per traf, by track. No fragment used to be written before finalize(), which then wrote all samples
+	// into one.
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = toDataView(bytes);
+	const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+	const trafSampleCounts = new Map<number, number[]>();
+	for (let pos = 0; pos < bytes.byteLength; pos += view.getUint32(pos)) {
+		if (type(pos) !== 'moof') {
+			continue;
+		}
+
+		for (let traf = pos + 8; traf < pos + view.getUint32(pos); traf += view.getUint32(traf)) {
+			if (type(traf) !== 'traf') {
+				continue;
+			}
+
+			let trackId = 0;
+			let sampleCount = 0;
+			for (let child = traf + 8; child < traf + view.getUint32(traf); child += view.getUint32(child)) {
+				if (type(child) === 'tfhd') {
+					trackId = view.getUint32(child + 12);
+				} else if (type(child) === 'trun') {
+					sampleCount += view.getUint32(child + 12);
+				}
+			}
+			trafSampleCounts.set(trackId, [...trafSampleCounts.get(trackId) ?? [], sampleCount]);
+		}
+	}
+	// Each track is cut at its own key frames: the first every 2 s, the second at 3 s, 5 s, …
+	expect(moofCountBeforeFinalize).toBe(18);
+	expect([...trafSampleCounts]).toEqual([
+		[1, Array<number>(10).fill(20)],
+		[2, [30, ...Array<number>(8).fill(20), 10]],
+	]);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tracks = await input.getVideoTracks();
+	expect(tracks).toHaveLength(2);
+	for (const [trackIndex, track] of tracks.entries()) {
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		expect(packets).toHaveLength(200);
+		for (let i = 0; i < 200; i++) {
+			expect(packets[i]!.timestamp).toBeCloseTo(i / 10, 5);
+			expect([...packets[i]!.data]).toEqual([trackIndex + 1, i]);
+		}
+	}
+});
+
 test('No btrt boxes, fragmented MP4 without bitrate metadata', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
