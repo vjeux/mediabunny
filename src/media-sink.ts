@@ -460,6 +460,20 @@ abstract class DecoderWrapper<
 }
 
 /**
+ * Gets the key packet before a key packet, from which decoding gets the frames presented before it (the last ones of
+ * the previous GOP). Returns null if there's none.
+ */
+const getPreviousKeyPacket = async (
+	packetSink: EncodedPacketSink,
+	packet: EncodedPacket,
+	options: PacketRetrievalOptions,
+) => {
+	const step = 1 / await packetSink._track.getTimeResolution();
+	const previousPacket = await packetSink.getKeyPacket(packet.timestamp - step, options);
+	return previousPacket && previousPacket.sequenceNumber < packet.sequenceNumber ? previousPacket : null;
+};
+
+/**
  * Base class for decoded media sample sinks.
  * @group Media sinks
  * @public
@@ -584,7 +598,7 @@ export abstract class BaseMediaSampleSink<
 			) ?? await packetSink.getFirstKeyPacket(packetRetrievalOptions);
 
 			let currentPacket: EncodedPacket | null = keyPacket;
-			// What a failed flush decodes again (see below)
+			// What decoding again after a failed flush starts from (see below)
 			let lastKeyPacket: EncodedPacket | null = null;
 			let lastDecodedPacket: EncodedPacket | null = null;
 
@@ -643,8 +657,12 @@ export abstract class BaseMediaSampleSink<
 				if (flushFailed) {
 					// A truncated last frame, as in a stream that was cut short, can make the decoder fail its flush
 					// (Chromium's does), which loses the frames it still held. So, decode the packets since the last
-					// key packet again with a new decoder, without the last packet, so that only its frame is lost.
-					if (terminated || !lastKeyPacket || !lastDecodedPacket || lastDecodedPacket === lastKeyPacket) {
+					// key packet again with a new decoder, without the last packet, so that only its frame is lost. If
+					// the last packet is a key packet itself, the frames lost are the previous GOP's, so start there.
+					const retryStart = lastDecodedPacket && lastDecodedPacket === lastKeyPacket
+						? await getPreviousKeyPacket(packetSink, lastDecodedPacket, packetRetrievalOptions)
+						: lastKeyPacket;
+					if (terminated || !retryStart || !lastDecodedPacket) {
 						throw flushError;
 					}
 
@@ -653,7 +671,7 @@ export abstract class BaseMediaSampleSink<
 					decoder.onDequeue = () => onQueueDequeue();
 					skipSamplesUpTo = lastSampleTimestamp;
 
-					let packet: EncodedPacket | null = lastKeyPacket;
+					let packet: EncodedPacket | null = retryStart;
 					while (packet && packet.sequenceNumber < lastDecodedPacket.sequenceNumber && !terminated) {
 						if (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE) {
 							({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
@@ -911,14 +929,13 @@ export abstract class BaseMediaSampleSink<
 				if (flushFailed) {
 					// A truncated last frame, as in a stream that was cut short, can make the decoder fail its flush
 					// (Chromium's does), which loses the frames it still held. So, decode the packets since the last
-					// key packet again with a new decoder, without the last packet, so that only its frame is lost.
-					// The next batch starts at a key packet of its own anyway.
-					if (
-						terminated
-						|| !lastDecodedKeyPacket
-						|| !lastDecodedPacket
-						|| lastDecodedPacket === lastDecodedKeyPacket
-					) {
+					// key packet again with a new decoder, without the last packet, so that only its frame is lost. If
+					// the last packet is a key packet itself, the frames lost are the previous GOP's, so start there
+					// (also when the batch only has that packet). The next batch starts at a key packet of its own.
+					const retryStart = lastDecodedPacket && lastDecodedPacket === lastDecodedKeyPacket
+						? await getPreviousKeyPacket(packetSink, lastDecodedPacket, retrievalOptions)
+						: lastDecodedKeyPacket;
+					if (terminated || !retryStart || !lastDecodedPacket) {
 						throw flushError;
 					}
 
@@ -927,7 +944,7 @@ export abstract class BaseMediaSampleSink<
 					decoder.onDequeue = () => onQueueDequeue();
 					skipSamplesUpTo = lastSampleTimestamp;
 
-					let packet: EncodedPacket | null = lastDecodedKeyPacket;
+					let packet: EncodedPacket | null = retryStart;
 					while (packet && packet.sequenceNumber < lastDecodedPacket.sequenceNumber && !terminated) {
 						while (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE && !terminated) {
 							({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());

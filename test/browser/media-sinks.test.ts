@@ -12,6 +12,7 @@ import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack } from '../../src/input-track.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -278,24 +279,30 @@ test('Samples at timestamps come out while timestamps are still coming in', asyn
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
 });
 
-test('Video whose last frame was cut short decodes all other frames', async () => {
-	// The first 40 frames of video.mp4 in MPEG-TS, the file cut one TS packet into the last frame, as a recording
-	// that stopped mid-frame leaves it. Chromium's decoder fails its flush on the truncated frame, losing the frames it
-	// still held, so that samples() threw after 37 frames (found by lanes L15 and L80 in real files).
-	using mp4 = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
-	const mp4Track = await mp4.getPrimaryVideoTrack();
-	assert(mp4Track);
-	const decoderConfig = await mp4Track.getDecoderConfig();
+test.for([
+	['a delta frame', '/video.mp4', 40, 'delta'],
+	['a key frame', '/demo.mp4', 26, 'key'],
+] as const)('Video whose last frame, %s, was cut short decodes all other frames', async (
+	[, file, packetCount, cutType],
+) => {
+	// The first frames of a file in MPEG-TS, cut one TS packet into the last frame, as a recording that stopped
+	// mid-frame leaves it. Chromium's decoder fails its flush on the cut frame and loses the frames it still held,
+	// so the sample iterators threw (found by lanes L15 and L80 in real files, and by L46 for a key frame, where the
+	// frames lost are the previous GOP's).
+	using source = new Input({ source: new UrlSource(file), formats: ALL_FORMATS });
+	const sourceTrack = await source.getPrimaryVideoTrack();
+	assert(sourceTrack);
+	const decoderConfig = await sourceTrack.getDecoderConfig();
 	assert(decoderConfig);
 
 	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
-	const source = new EncodedVideoPacketSource('avc');
-	output.addVideoTrack(source);
+	const packetSource = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(packetSource);
 	await output.start();
-	let packetCount = 0;
-	for await (const packet of new EncodedPacketSink(mp4Track).packets()) {
-		await source.add(packet, packetCount === 0 ? { decoderConfig } : undefined);
-		if (++packetCount === 40) {
+	let addedPackets = 0;
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		await packetSource.add(packet, addedPackets === 0 ? { decoderConfig } : undefined);
+		if (++addedPackets === packetCount) {
 			break;
 		}
 	}
@@ -318,13 +325,15 @@ test('Video whose last frame was cut short decodes all other frames', async () =
 	});
 	const track = await input.getPrimaryVideoTrack();
 	assert(track);
-	const packetTimestamps: number[] = [];
+	const packets: EncodedPacket[] = [];
 	for await (const packet of new EncodedPacketSink(track).packets()) {
-		packetTimestamps.push(packet.timestamp);
+		packets.push(packet);
 	}
-	expect(packetTimestamps).toHaveLength(40);
-	const cutTimestamp = packetTimestamps.at(-1)!;
-	const otherTimestamps = packetTimestamps.slice(0, -1).sort((a, b) => a - b);
+	expect(packets).toHaveLength(packetCount);
+	const cutPacket = packets.at(-1)!;
+	expect(cutPacket.type).toBe(cutType);
+	const cutTimestamp = cutPacket.timestamp;
+	const otherTimestamps = packets.slice(0, -1).map(x => x.timestamp).sort((a, b) => a - b);
 
 	// All frames but the cut one, which a decoder can also decode as far as it goes
 	const sink = new VideoSampleSink(track);
@@ -344,4 +353,14 @@ test('Video whose last frame was cut short decodes all other frames', async () =
 		}
 	}
 	expect(index).toBe(queries.length);
+
+	// Starting at the cut frame gives the frame before it (or the cut frame, if decoded)
+	const expected = [cutTimestamp, otherTimestamps.filter(x => x < cutTimestamp).at(-1)];
+	for await (using sample of sink.samplesAtTimestamps([cutTimestamp])) {
+		expect(expected).toContain(sample?.timestamp);
+	}
+	for await (using sample of sink.samples(cutTimestamp)) {
+		expect(expected).toContain(sample.timestamp);
+		break;
+	}
 });
