@@ -763,8 +763,9 @@ export const roundIfAlmostInteger = (value: number) => {
 
 	// The tolerance is relative to the value, with an absolute floor: near zero (a result of 0, or a small one computed
 	// by cancellation, like the end of a packet that starts before zero: -0.025 + 0.026), a float error exceeds any
-	// tolerance relative to the result
-	if (Math.abs(value - rounded) < 1e-6 || Math.abs(value / rounded - 1) < 10 * Number.EPSILON) {
+	// tolerance relative to the result. The floor is in the caller's units, so it's kept tiny: on a track whose
+	// timescale is 1, it's a nanosecond.
+	if (Math.abs(value - rounded) < 1e-9 || Math.abs(value / rounded - 1) < 10 * Number.EPSILON) {
 		return rounded === 0 ? 0 : rounded; // Not -0
 	} else {
 		return value;
