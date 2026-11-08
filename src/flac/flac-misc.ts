@@ -163,3 +163,26 @@ export const calculateCrc8 = (data: Uint8Array) => {
 
 	return crc;
 };
+
+let crc16Table: Uint16Array | null = null;
+
+// https://www.rfc-editor.org/rfc/rfc9639.html#section-9.3
+export const calculateCrc16 = (data: Uint8Array) => {
+	if (!crc16Table) {
+		crc16Table = new Uint16Array(256);
+		for (let n = 0; n < 256; n++) {
+			let crc = n << 8;
+			for (let i = 0; i < 8; i++) {
+				crc = (crc & 0x8000) !== 0 ? (crc << 1) ^ 0x8005 : crc << 1; // x^16 + x^15 + x^2 + x^0
+			}
+			crc16Table[n] = crc & 0xffff;
+		}
+	}
+
+	let crc = 0;
+	for (const byte of data) {
+		crc = ((crc << 8) ^ crc16Table[(crc >> 8) ^ byte]!) & 0xffff;
+	}
+
+	return crc;
+};
