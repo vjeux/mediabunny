@@ -989,7 +989,7 @@ export class Output<
 				const promises = this.tracks.map(x => x.source._flushOrWaitForOngoingClose(true)); // Force close
 				await Promise.all(promises);
 
-				await Promise.all([...this._unfinalizedTargets].map(target => target._close()));
+				await Promise.all([...this._unfinalizedTargets].map(target => target._close().catch(() => {})));
 				this._unfinalizedTargets.clear();
 			} finally {
 				release();

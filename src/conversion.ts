@@ -1418,7 +1418,7 @@ export class Conversion {
 		} catch (error) {
 			if ((this._state as Conversion['_state']) !== 'canceled') {
 				// Make sure to cancel to stop other encoding processes and clean up resources
-				void this.cancel();
+				void this.cancel().catch(() => {});
 			}
 
 			throw error;
