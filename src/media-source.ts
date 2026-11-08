@@ -3382,24 +3382,41 @@ const mediaStreamTrackProcessorIsSupportedInWorker = async () => {
 	}
 
 	if (!mediaStreamTrackProcessorWorker) {
-		initMediaStreamTrackProcessorWorker();
+		try {
+			initMediaStreamTrackProcessorWorker();
+		} catch {
+			// The worker can't be created (some browsers throw when CSP disallows blob: workers)
+			mediaStreamTrackProcessorIsSupportedInWorkerCache = false;
+			return false;
+		}
 	}
 
 	return new Promise<boolean>((resolve) => {
 		assert(mediaStreamTrackProcessorWorker);
+		const worker = mediaStreamTrackProcessorWorker;
+
+		const settle = (supported: boolean) => {
+			mediaStreamTrackProcessorIsSupportedInWorkerCache = supported;
+			worker.removeEventListener('message', listener);
+			worker.removeEventListener('error', errorListener);
+			resolve(supported);
+		};
 
 		const listener = (event: MessageEvent) => {
 			const message = event.data as MediaStreamTrackProcessorWorkerMessage;
 
 			if (message.type === 'support') {
-				mediaStreamTrackProcessorIsSupportedInWorkerCache = message.supported;
-				mediaStreamTrackProcessorWorker!.removeEventListener('message', listener);
-
-				resolve(message.supported);
+				settle(message.supported);
 			}
 		};
+		// A worker that fails to load (for example, when CSP disallows blob: workers) never answers; it fires an error
+		// instead, so don't wait forever
+		const errorListener = () => {
+			settle(false);
+		};
 
-		mediaStreamTrackProcessorWorker.addEventListener('message', listener);
+		worker.addEventListener('message', listener);
+		worker.addEventListener('error', errorListener);
 	});
 };
 

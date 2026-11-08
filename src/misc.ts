@@ -1432,6 +1432,52 @@ let unthrottledTimerWorker: Worker | undefined;
 let nextUnthrottledTimerId = 1;
 const unthrottledTimeoutCallbacks = new Map<number, () => void>();
 const unthrottledIntervalCallbacks = new Map<number, () => void>();
+const unthrottledTimerDelays = new Map<number, number>();
+/**
+ * Set when the timer worker can't run, for example because a Content Security Policy forbids blob: workers (its error
+ * event fires instead of it ever answering). Timers then use the page's own timers, throttled or not.
+ */
+let unthrottledTimerWorkerFailed = false;
+const fallbackTimerHandles = new Map<number, ReturnType<typeof setTimeout>>();
+
+const startFallbackTimer = (timerId: number) => {
+	const delay = unthrottledTimerDelays.get(timerId) ?? 0;
+	const timeoutCallback = unthrottledTimeoutCallbacks.get(timerId);
+	if (timeoutCallback) {
+		fallbackTimerHandles.set(timerId, setTimeout(() => {
+			fallbackTimerHandles.delete(timerId);
+			unthrottledTimeoutCallbacks.delete(timerId);
+			unthrottledTimerDelays.delete(timerId);
+			timeoutCallback();
+		}, delay));
+		return;
+	}
+
+	const intervalCallback = unthrottledIntervalCallbacks.get(timerId);
+	if (intervalCallback) {
+		fallbackTimerHandles.set(timerId, setInterval(intervalCallback, delay));
+	}
+};
+
+const onUnthrottledTimerWorkerFailure = () => {
+	if (unthrottledTimerWorkerFailed) {
+		return;
+	}
+
+	unthrottledTimerWorkerFailed = true;
+	for (const timerId of [...unthrottledTimeoutCallbacks.keys(), ...unthrottledIntervalCallbacks.keys()]) {
+		startFallbackTimer(timerId);
+	}
+};
+
+const clearFallbackTimer = (timerId: number) => {
+	const handle = fallbackTimerHandles.get(timerId);
+	if (handle !== undefined) {
+		clearTimeout(handle);
+		clearInterval(handle);
+		fallbackTimerHandles.delete(timerId);
+	}
+};
 
 const shouldUseNativeTimers = () => {
 	return typeof window === 'undefined';
@@ -1482,14 +1528,25 @@ const unthrottledTimerWorkerMain = () => {
 };
 
 const getUnthrottledTimerWorker = () => {
+	if (unthrottledTimerWorkerFailed) {
+		return null;
+	}
 	if (unthrottledTimerWorker) {
 		return unthrottledTimerWorker;
 	}
 
 	const workerSource = `(${unthrottledTimerWorkerMain.toString()})();`;
 	const workerURL = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
-	unthrottledTimerWorker = new Worker(workerURL);
+	try {
+		unthrottledTimerWorker = new Worker(workerURL);
+	} catch {
+		// Some browsers throw right away when a Content Security Policy forbids blob: workers
+		URL.revokeObjectURL(workerURL);
+		onUnthrottledTimerWorkerFailure();
+		return null;
+	}
 	URL.revokeObjectURL(workerURL);
+	unthrottledTimerWorker.addEventListener('error', onUnthrottledTimerWorkerFailure);
 
 	unthrottledTimerWorker.onmessage = (event: MessageEvent<UnthrottledTimerEvent>) => {
 		const message = event.data;
@@ -1497,6 +1554,7 @@ const getUnthrottledTimerWorker = () => {
 		const timeoutCallback = unthrottledTimeoutCallbacks.get(message.timerId);
 		if (timeoutCallback) {
 			unthrottledTimeoutCallbacks.delete(message.timerId);
+			unthrottledTimerDelays.delete(message.timerId);
 			timeoutCallback();
 			return;
 		}
@@ -1523,12 +1581,18 @@ export const setTimeoutUnthrottled = (
 	unthrottledTimeoutCallbacks.set(timerId, () => {
 		(callback as () => void)();
 	});
+	unthrottledTimerDelays.set(timerId, delay);
 
-	getUnthrottledTimerWorker().postMessage({
-		type: 'set-timeout',
-		timerId,
-		delay,
-	} satisfies UnthrottledTimerMessage);
+	const worker = getUnthrottledTimerWorker();
+	if (worker) {
+		worker.postMessage({
+			type: 'set-timeout',
+			timerId,
+			delay,
+		} satisfies UnthrottledTimerMessage);
+	} else if (!fallbackTimerHandles.has(timerId)) {
+		startFallbackTimer(timerId);
+	}
 
 	return { id: timerId };
 };
@@ -1541,8 +1605,10 @@ export const clearTimeoutUnthrottled = (timer: UnthrottledTimerHandle) => {
 
 	assert(typeof timer.id === 'number');
 	unthrottledTimeoutCallbacks.delete(timer.id);
+	unthrottledTimerDelays.delete(timer.id);
+	clearFallbackTimer(timer.id);
 
-	getUnthrottledTimerWorker().postMessage({
+	getUnthrottledTimerWorker()?.postMessage({
 		type: 'clear-timeout',
 		timerId: timer.id,
 	} satisfies UnthrottledTimerMessage);
@@ -1561,12 +1627,18 @@ export const setIntervalUnthrottled = (
 	unthrottledIntervalCallbacks.set(timerId, () => {
 		(callback as () => void)();
 	});
+	unthrottledTimerDelays.set(timerId, delay);
 
-	getUnthrottledTimerWorker().postMessage({
-		type: 'set-interval',
-		timerId,
-		delay,
-	} satisfies UnthrottledTimerMessage);
+	const worker = getUnthrottledTimerWorker();
+	if (worker) {
+		worker.postMessage({
+			type: 'set-interval',
+			timerId,
+			delay,
+		} satisfies UnthrottledTimerMessage);
+	} else if (!fallbackTimerHandles.has(timerId)) {
+		startFallbackTimer(timerId);
+	}
 
 	return { id: timerId };
 };
@@ -1579,8 +1651,10 @@ export const clearIntervalUnthrottled = (timer: UnthrottledTimerHandle) => {
 
 	assert(typeof timer.id === 'number');
 	unthrottledIntervalCallbacks.delete(timer.id);
+	unthrottledTimerDelays.delete(timer.id);
+	clearFallbackTimer(timer.id);
 
-	getUnthrottledTimerWorker().postMessage({
+	getUnthrottledTimerWorker()?.postMessage({
 		type: 'clear-interval',
 		timerId: timer.id,
 	} satisfies UnthrottledTimerMessage);
