@@ -2065,6 +2065,61 @@ describe('Audio', async () => {
 		});
 	});
 
+	test('Vorbis encodes at bitrates outside libvorbis\'s range for the sample rate and channel count', async () => {
+		// Encodes 2 s of tones and returns the nominal bitrate in the identification header libvorbis wrote
+		const nominalBitrate = async (sampleRate: number, numberOfChannels: number, bitrate: number) => {
+			const encoder = new NodeAvAudioEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = 'vorbis';
+			// @ts-expect-error Readonly
+			encoder.config = { codec: 'vorbis', sampleRate, numberOfChannels, bitrate } satisfies AudioEncoderConfig;
+
+			let description: Uint8Array | null = null;
+			let duration = 0;
+			// @ts-expect-error Readonly
+			encoder.onPacket = (packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) => {
+				description ??= meta?.decoderConfig?.description ? toUint8Array(meta.decoderConfig.description) : null;
+				duration += packet.duration;
+			};
+
+			await encoder.init();
+			const frameCount = 2 * sampleRate;
+			const data = new Float32Array(frameCount * numberOfChannels);
+			for (let channel = 0; channel < numberOfChannels; channel++) {
+				for (let i = 0; i < frameCount; i++) {
+					const frequency = 220 + 110 * channel;
+					data[channel * frameCount + i] = 0.3 * Math.sin(2 * Math.PI * frequency * i / sampleRate);
+				}
+			}
+			using sample = new AudioSample({ data, format: 'f32-planar', sampleRate, numberOfChannels, timestamp: 0 });
+			await encoder.encode(sample);
+			await encoder.flush();
+			await encoder.close();
+			expect(duration).toBeCloseTo(2, 1);
+
+			// The identification header starts with 0x01 "vorbis"; its nominal bitrate is at byte 20
+			assert(description);
+			const headers: Uint8Array = description;
+			const start = headers.findIndex((byte, i) => {
+				return byte === 1 && headers[i + 1] === 0x76 && headers[i + 2] === 0x6f; // 0x01 "vo"
+			});
+			return new DataView(headers.buffer, headers.byteOffset, headers.byteLength).getInt32(start + 20, true);
+		};
+
+		// The quality presets' bitrates for these formats, which libvorbis's bitrate management doesn't take as is:
+		// it takes about 45–500 kbps for 44.1 kHz stereo, up to 240 kbps for 44.1 kHz mono, 84 kbps and up for 48 kHz
+		// 5.1 and up to 42 kbps for 8 kHz mono. They're moved to (within 1 kbps of) the nearest bitrate it takes.
+		expect(await nominalBitrate(44100, 2, 19_400)).toBeGreaterThan(44_000); // Very low
+		expect(await nominalBitrate(44100, 2, 36_400)).toBeGreaterThan(44_000); // Low
+		expect(await nominalBitrate(44100, 1, 247_000)).toBeLessThanOrEqual(240_000); // Very high
+		expect(await nominalBitrate(48000, 6, 69_000)).toBeGreaterThan(69_000); // Medium
+		expect(await nominalBitrate(8000, 1, 64_000)).toBeLessThan(45_000); // Medium
+
+		// Bitrates it takes stay as they are
+		expect(await nominalBitrate(44100, 2, 128_000)).toBe(128_000);
+		expect(await nominalBitrate(8000, 1, 24_000)).toBe(24_000);
+	});
+
 	test('FLAC encode & decode', async () => {
 		await encodeDecodeTest('flac', {}, async (packet, meta, i) => {
 			expect(packet.type).toBe('key');
