@@ -2461,6 +2461,33 @@ describe('Video', async () => {
 		expect([...data]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 	});
 
+	test.each([
+		['vflip', [170, 120, 70, 20]],
+		['hflip', [20, 70, 120, 170]],
+	])('AVFrames from FFmpeg\'s %s filter can be copied out', async (filterDescription, expectedRows) => {
+		// vflip outputs a bottom-up frame (negative line sizes), hflip a regular one. The sample is 4x4 I420 with rows
+		// of luma 20, 70, 120 and 170.
+		const data = new Uint8Array(4 * 4 * 3 / 2).fill(128);
+		for (let y = 0; y < 4; y++) {
+			data.fill(20 + 50 * y, 4 * y, 4 * y + 4);
+		}
+		using sample = new VideoSample(data, { format: 'I420', codedWidth: 4, codedHeight: 4, timestamp: 0 });
+		using inFrame = new NodeAv.Frame();
+		inFrame.alloc();
+		await toAvFrame(sample, inFrame);
+
+		using filter = NodeAv.FilterAPI.create(filterDescription);
+		const [outFrame] = await filter.processAll(inFrame);
+		assert(outFrame);
+		expect(outFrame.linesize[0]! < 0).toBe(filterDescription === 'vflip');
+
+		using result = new VideoSample(new AvFrameVideoSampleResource(outFrame), { timestamp: 0 });
+		const copied = new Uint8Array(result.allocationSize());
+		await result.copyTo(copied);
+		expect([0, 1, 2, 3].map(y => copied[4 * y])).toEqual(expectedRows);
+		expect([...copied.subarray(16)]).toEqual(Array(8).fill(128));
+	});
+
 	describe('VideoSample transformation', () => {
 		// 400x400 image: red everywhere, with a 200x200 blue square filling the bottom-left quadrant.
 		const TEST_IMAGE = (() => {
