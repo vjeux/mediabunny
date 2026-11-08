@@ -265,8 +265,21 @@ export class Mp3Demuxer extends Demuxer {
 				size = (readU8(slice) << 16) | (readU8(slice) << 8) | readU8(slice);
 			} else {
 				const sizeRaw = readU32Be(slice);
-				size = header.majorVersion === 4 ? decodeSynchsafe(sizeRaw) : sizeRaw;
 				flags = readU8(slice) << 8 | readU8(slice);
+				size = sizeRaw;
+
+				// iTunes writes plain sizes into ID3v2.4 tags, so the synchsafe reading only counts if another frame
+				// (or the end of the frames) follows it, or if the plain one doesn't fit either
+				if (header.majorVersion === 4 && (sizeRaw & 0x80808080) === 0) {
+					const synchsafeSize = decodeSynchsafe(sizeRaw);
+					const bodyStart = pos + frameHeaderSize;
+					if (
+						await this.isId3V2FrameBoundary(bodyStart + synchsafeSize, contentEnd)
+						|| !(await this.isId3V2FrameBoundary(bodyStart + sizeRaw, contentEnd))
+					) {
+						size = synchsafeSize;
+					}
+				}
 			}
 
 			const bodyPos = pos + frameHeaderSize;
@@ -316,6 +329,27 @@ export class Mp3Demuxer extends Demuxer {
 
 			return;
 		}
+	}
+
+	/** Whether an ID3v2 frame (or padding) starts at pos, or the frames of a tag ending at contentEnd end there. */
+	async isId3V2FrameBoundary(pos: number, contentEnd: number) {
+		if (pos > contentEnd) {
+			return false;
+		}
+		if (pos + 4 > contentEnd) {
+			return true;
+		}
+
+		let slice = this.reader.requestSlice(pos, 4);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return false;
+		}
+
+		const id = readAscii(slice, 4);
+		return id === '\x00\x00\x00\x00' || /^[0-9A-Z]{4}$/.test(id);
 	}
 
 	async getMimeType() {
