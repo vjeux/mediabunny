@@ -1836,7 +1836,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					.map(loc => packet.data.subarray(loc.offset, loc.offset + loc.length));
 				if (addReorderInfoToAvcSps(nalUnits)) {
 					const newData = concatAvcNalUnits(nalUnits, this.decoderConfig);
-					packet = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
+					colorPacket = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
 				}
 			}
 

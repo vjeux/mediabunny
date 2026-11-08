@@ -317,8 +317,6 @@ test('AAC config with channel configuration 0 but no program config element', as
 const X264_AVCC = new Uint8Array('01640028ffe1001b67640028acd940780227e5c044000003000400000300c83c60c658010006'
 	.concat('68ebe3cb22c0fdf8f800').match(/../g)!.map(x => parseInt(x, 16)));
 
-const u32 = (value: number) => [value >>> 24, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
-
 /** Writes the given length-prefixed H.264 frames into an MP4 at 30 fps, each marked as a key frame there. */
 const writeAvcFrames = async (frames: number[][]) => {
 	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });

@@ -3955,13 +3955,13 @@ type TimedSuppliedPacket = SuppliedPacket & {
 /** Parameter set NAL units by NAL unit type */
 type ParameterSets = Map<number, Uint8Array[]>;
 
-const AVC_PARAMETER_SET_TYPES = [AvcNalUnitType.SPS, AvcNalUnitType.PPS];
-const HEVC_PARAMETER_SET_TYPES = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
-
-/** The NAL unit types of the parameter sets that a decoder needs, in the order they go in. */
+/**
+ * The NAL unit types of the parameter sets that a decoder needs, in the order they go in. Read when called:
+ * enums may not be initialized yet when this module loads (circular imports).
+ */
 const getParameterSetTypes = (codec: 'avc' | 'hevc'): readonly number[] => codec === 'avc'
-	? AVC_PARAMETER_SET_TYPES
-	: HEVC_PARAMETER_SET_TYPES;
+	? [AvcNalUnitType.SPS, AvcNalUnitType.PPS]
+	: [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
 
 const getNalUnitType = (codec: 'avc' | 'hevc', byte: number) => codec === 'avc'
 	? extractNalUnitTypeForAvc(byte)

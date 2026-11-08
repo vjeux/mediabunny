@@ -493,11 +493,15 @@ test('Conversion copies AAC with encoder priming into MPEG-TS with a timestamp o
 	expect(audioStart - videoStart).toBeCloseTo(-1024 / 48000, 6);
 	expect(audioStart).toBeCloseTo(10 - 1024 / 48000, 4);
 
-	// Without an offset, or with one smaller than the priming, the timestamps would go below zero in the file, so the
-	// track isn't copied, as before
+	// Without an offset, or with one smaller than the priming, the timestamps go below zero in the file. A 'preferred'
+	// copy still keeps the track (#653), as 'forced' does, with its first PTS wrapping around
 	for (const options of [{}, { timestampOffset: 0.01 }]) {
-		const { conversion } = await convertDemo(options);
-		expect(conversion.discardedTracks.map(x => `${x.track.type}: ${x.reason}`))
-			.toEqual(['audio: undecodable_source_codec']);
+		const { conversion, output } = await convertDemo(options);
+		expect(conversion.discardedTracks.map(x => `${x.track.type}: ${x.reason}`)).toEqual([]);
+		await conversion.execute();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const audioStart = await (await input.getPrimaryAudioTrack())!.getFirstTimestamp();
+		expect(audioStart).toBeCloseTo((options.timestampOffset ?? 0) - 1024 / 48000, 4);
 	}
 });
