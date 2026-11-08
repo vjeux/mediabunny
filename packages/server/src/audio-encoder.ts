@@ -152,6 +152,14 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			}
 		}
 
+		const channels = this.config.numberOfChannels;
+		if (this.avCodec.name === 'libopus' && channels >= 3 && channels <= 8) {
+			// FFmpeg's default surround path codes 5- and 7-channel audio with a different channel mapping than it
+			// writes into the header, moving the center to a rear channel. Mapping family 1 reorders the channels to
+			// Vorbis order and lets libopus pick the mapping it writes.
+			codecContext.setOption('mapping_family', '1');
+		}
+
 		// libav's DTS and TrueHD encoders are marked experimental, so they refuse to open at the default compliance
 		// level
 		const options = this.codec === 'dts' || this.codec === 'truehd'
