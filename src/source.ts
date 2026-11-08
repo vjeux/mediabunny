@@ -1513,6 +1513,11 @@ export class CustomSource extends Source {
 	_orchestrator: ReadOrchestrator;
 	/** @internal */
 	_readers = new Set<ReadableStreamDefaultReader<Uint8Array>>();
+	/**
+	 * Rejects once the source is disposed, for reads waiting on a getSize call that may never settle.
+	 * @internal
+	 */
+	_disposal = promiseWithResolvers<never>();
 
 	/** Creates a new {@link CustomSource} whose behavior is specified by `options`.  */
 	constructor(options: CustomSourceOptions) {
@@ -1575,7 +1580,8 @@ export class CustomSource extends Source {
 		const result = this._options.getSize();
 
 		if (isThenable(result)) {
-			return result.then((size) => {
+			// getSize may never settle (a HEAD request without a timeout, say), so stop waiting for it once disposed
+			return Promise.race([result, this._disposal.promise]).then((size) => {
 				if (!Number.isInteger(size) || size < 0) {
 					throw new TypeError('options.getSize must return or resolve to a non-negative integer.');
 				}
@@ -1686,6 +1692,8 @@ export class CustomSource extends Source {
 
 	/** @internal */
 	_dispose() {
+		void this._disposal.promise.catch(() => {});
+		this._disposal.reject(new InputDisposedError());
 		this._orchestrator.dispose();
 
 		for (const reader of this._readers) {

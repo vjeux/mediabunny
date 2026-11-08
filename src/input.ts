@@ -128,6 +128,16 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	/** @internal */
 	_sourceRefs: SourceRef[] = [];
 	/** @internal */
+	_rejectOnDisposal: (error: Error) => void = () => {};
+	/**
+	 * Rejects once the input is disposed, for requests waiting on a request handler that may never settle.
+	 * @internal
+	 */
+	_disposal = new Promise<never>((resolve, reject) => {
+		this._rejectOnDisposal = reject;
+	});
+
+	/** @internal */
 	_sourceCache: SourceCacheEntry[] = [];
 	/** @internal */
 	_sourceCachePromises: {
@@ -218,7 +228,16 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		const promise = (async () => {
-			const sourceRef = await this._getSourceUncached(request);
+			// A request handler may never settle (one fetching a signed URL without a timeout, say), so stop waiting
+			// for it once disposed, freeing its source should it arrive after all
+			const uncached = this._getSourceUncached(request);
+			let sourceRef: SourceRef;
+			try {
+				sourceRef = await Promise.race([uncached, this._disposal]);
+			} catch (error) {
+				void uncached.then(ref => ref.free(), () => {});
+				throw error;
+			}
 
 			if (this._disposed) {
 				sourceRef.free();
@@ -537,6 +556,9 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			ref.free();
 		}
 		this._sourceRefs.length = 0;
+
+		void this._disposal.catch(() => {});
+		this._rejectOnDisposal(new InputDisposedError());
 
 		if (this._demuxerPromise) {
 			// The demuxer promise may already be rejected after failed format detection.

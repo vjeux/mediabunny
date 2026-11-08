@@ -59,6 +59,48 @@ test('Implicit source disposal, double input', async () => {
 	expect(source._disposed);
 });
 
+test('Disposing an input rejects reads waiting on a user callback that never settles', async () => {
+	const { BufferSource, CustomPathedSource } = await import('../../src/source.js');
+	const outcome = (promise: Promise<unknown>) => Promise.race([
+		promise.then(
+			() => 'resolved',
+			(error: unknown) => error instanceof InputDisposedError ? 'InputDisposedError' : String(error),
+		),
+		new Promise<string>(resolve => setTimeout(() => resolve('pending after 2 s'), 2000)),
+	]);
+
+	// A getSize that never settles, like a HEAD request without a timeout
+	const customInput = new Input({
+		source: new CustomSource({ getSize: () => new Promise<number>(() => {}), read: () => new Uint8Array(0) }),
+		formats: ALL_FORMATS,
+	});
+	const format = customInput.getFormat();
+	await setImmediate();
+	customInput.dispose();
+	// On main, this stayed pending forever
+	expect(await outcome(format)).toBe('InputDisposedError');
+
+	// A request handler that never settles for a segment, like a resolver fetching a signed URL
+	const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:40\n#EXTINF:38.5,\nsegment.mp3\n#EXT-X-ENDLIST\n';
+	const requestedPaths: string[] = [];
+	const hlsInput = new Input({
+		source: new CustomPathedSource('https://example.com/media.m3u8', ({ path }) => {
+			requestedPaths.push(path);
+			return path.endsWith('.m3u8')
+				? new BufferSource(new TextEncoder().encode(playlist))
+				: new Promise<InstanceType<typeof BufferSource>>(() => {});
+		}),
+		formats: ALL_FORMATS,
+	});
+	const tracks = hlsInput.getTracks();
+	while (!requestedPaths.some(x => x.endsWith('.mp3'))) {
+		await setImmediate();
+	}
+	hlsInput.dispose();
+	// On main, this stayed pending forever
+	expect(await outcome(tracks)).toBe('InputDisposedError');
+});
+
 test.each([
 	{ delayed: false, cancelRejects: false },
 	{ delayed: false, cancelRejects: true },
