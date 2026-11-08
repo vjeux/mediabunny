@@ -854,3 +854,48 @@ test('VideoSampleSource, adds queued behind a process() that never finishes sett
 	]));
 	expect(await Promise.all(settled)).not.toContain('pending');
 });
+
+test('VideoSampleSource, cancel() while finalizing gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 2) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const adds = [0, 1, 2, 3, 4].map(i => videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: i / 30,
+		duration: 1 / 30,
+	})).catch(() => {}));
+	await new Promise(resolve => setTimeout(resolve, 300));
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	// Finalizing waits for the frames added before it, so the stuck one holds it up...
+	const finalized = output.finalize();
+	expect(await stateAfter(finalized, 500)).toBe('pending');
+
+	// ...until the output is canceled, which drops them and lets finalization complete
+	expect(await stateAfter(output.cancel(), 2000)).toBe('fulfilled');
+	expect(await stateAfter(finalized, 1000)).toBe('fulfilled');
+	expect(await stateAfter(Promise.all(adds), 1000)).toBe('fulfilled');
+});
