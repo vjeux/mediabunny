@@ -461,8 +461,9 @@ class VideoEncoderWrapper {
 					}
 				}
 
-				// Clone if the sample is still the user's, to avoid mutating externally-owned data
-				if (videoSample === originalSample) {
+				// Clone if the sample is still the user's, to avoid mutating externally-owned data. A sample we were
+				// asked to close is ours, and cloning it would leave it unclosed.
+				if (videoSample === originalSample && !shouldClose) {
 					videoSample = videoSample.clone();
 					shouldClose = true;
 				}
