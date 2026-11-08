@@ -44,6 +44,8 @@ while (notDone) {
 }
 ```
 
+Misuse that `add` can detect right away, such as invalid arguments or adding data after the output has been finalized or canceled, throws synchronously instead of rejecting the returned promise.
+
 ### Video encoding config
 
 All video sources that handle encoding internally require you to specify a `VideoEncodingConfig`, specifying the codec configuration to use:
@@ -81,6 +83,7 @@ type VideoEncodingConfig = {
 	onEncoderConfig?: (
 		config: VideoEncoderConfig
 	) => unknown;
+	onEncodedSample?: (sample: VideoSample) => unknown;
 };
 ```
 - `codec`: The [video codec](./supported-formats-and-codecs#video-codecs) used for encoding.
@@ -89,7 +92,7 @@ type VideoEncodingConfig = {
 	- `'discard'` (default): Only the samples' color data is kept; the video is opaque.
 	- `'keep'`: The samples' alpha data is also encoded as side data. Make sure to pair this mode with a container format that supports transparency (such as WebM or Matroska).
 - `latencyMode`: The latency mode as specified by the WebCodecs API. Browsers default to `quality`. Media stream-driven video sources will automatically use the `realtime` setting.
-- `keyFrameInterval`: The maximum interval in seconds between two adjacent key frames. Defaults to 2 seconds. More frequent key frames improve seeking behavior but increase file size. When using multiple video tracks, this value should be set to the same value for all tracks.
+- `keyFrameInterval`: The interval in seconds at which key frames are placed: the first frame at or after each multiple of it is encoded as a key frame, so adjacent key frames can be up to one frame further apart than this interval. Defaults to 2 seconds. More frequent key frames improve seeking behavior but increase file size. When using multiple video tracks, this value should be set to the same value for all tracks.
 - `fullCodecString`: Allows you to optionally specify the full codec string used by the video encoder, as specified in the [Mediabunny Codec Registry](/codec-registry/overview). For example, you may set it to `'avc1.42001f'` when using AVC. Keep in mind that the codec string must still match the codec specified in `codec`. If you don't set this field, a codec string will be generated automatically.
 - `hardwareAcceleration`: A hint that configures the hardware acceleration method of this codec. This is best left on `'no-preference'`.
 - `scalabilityMode`: An encoding scalability mode identifier as defined by [WebRTC-SVC](https://w3c.github.io/webrtc-svc/#scalabilitymodes*).
@@ -98,7 +101,7 @@ type VideoEncodingConfig = {
 - `transform`: Optional transformations to apply to the video frames before they are passed to the encoder.
 	- `width`: The width in pixels to resize the frames to. If `height` is not set, it will be deduced automatically based on aspect ratio.
 	- `height`: The height in pixels to resize the frames to. If `width` is not set, it will be deduced automatically based on aspect ratio.
-	- `fit`: The fitting algorithm in case both `width` and `height` are set. To avoid ambiguity, this field must not be set when `sizeChangeBehavior` is `'fill'`, `'contain'` or `'deny'`, since `sizeChangeBehavior` already determines the fitting algorithm.
+	- `fit`: The fitting algorithm in case both `width` and `height` are set. Required in that case, unless `sizeChangeBehavior` is `'fill'`, `'contain'` or `'cover'`, which already determines the fitting algorithm; then, `fit` can be omitted and, if set, must match it.
 		- `'fill'` will stretch the image to fill the entire box, potentially altering aspect ratio.
 		- `'contain'` will contain the entire image within the box while preserving aspect ratio. This may lead to letterboxing.
 		- `'cover'` will scale the image until the entire box is filled, while preserving aspect ratio.
@@ -110,6 +113,7 @@ type VideoEncodingConfig = {
 	- `force`: Forces every video frame through the transformation step even if no transformation properties are defined. This can be used, for example, to bake rotation and flip into the encoded video frames.
 - `onEncodedPacket`: Called for each successfully encoded packet. Useful for determining encoding progress.
 - `onEncoderConfig`: Called when the internal encoder config, as used by the WebCodecs API, is created. You can use this to introspect the full codec string.
+- `onEncodedSample`: Called right before a video sample is passed to the encoder.
 
 ### Audio encoding config
 
@@ -135,10 +139,11 @@ type AudioEncodingConfig = {
 	onEncoderConfig?: (
 		config: AudioEncoderConfig
 	) => unknown;
+	onEncodedSample?: (sample: AudioSample) => unknown;
 };
 ```
-- `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding. Can be omitted for uncompressed PCM codecs.
-- `quality`: The desired quality of the encoded audio; unused for PCM codecs. See [Encoding quality](#encoding-quality).
+- `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding.
+- `quality`: The desired quality of the encoded audio. Required for compressed codecs other than FLAC and TrueHD; can be omitted for those and for PCM codecs, for which it is unused. See [Encoding quality](#encoding-quality).
 - `fullCodecString`: Allows you to optionally specify the full codec string used by the audio encoder, as specified in the [Mediabunny Codec Registry](/codec-registry/overview). For example, you may set it to `'mp4a.40.2'` when using AAC. Keep in mind that the codec string must still match the codec specified in `codec`. If you don't set this field, a codec string will be generated automatically.
 - `transform`: Optional transformations to apply to the audio samples before they are passed to the encoder.
 	- `numberOfChannels`: The desired number of output channels to up/downmix to.
@@ -146,6 +151,7 @@ type AudioEncodingConfig = {
 	- `process`: Allows for custom user-defined processing of audio samples, e.g. for applying audio effects or timestamp modifications. Called for each audio sample after resampling and remixing. Must return an `AudioSample`, an array of them, or `null` for dropping the sample.
 - `onEncodedPacket`: Called for each successfully encoded packet. Useful for determining encoding progress.	
 - `onEncoderConfig`: Called when the internal encoder config, as used by the WebCodecs API, is created. You can use this to introspect the full codec string.
+- `onEncodedSample`: Called right before an audio sample is passed to the encoder.
 
 ### Encoding quality
 
