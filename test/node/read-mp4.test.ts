@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
 	ALL_FORMATS,
+	AudioSampleSink,
 	BufferSource,
 	BufferTarget,
 	EncodedPacket,
@@ -271,4 +272,99 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 	}
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
+});
+
+test('Audio samples flagged as non-sync samples', async () => {
+	// Every sample of an audio codec without delta packets is a key packet, whatever the container says, like in the
+	// Matroska demuxer, Chromium (FrameProcessor), FFmpeg (intra-only codecs) and ExoPlayer (SampleQueue). Some files
+	// flag them as non-sync samples, which left fragmented tracks without key packets.
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const ftyp = box('ftyp', ascii('iso6'), u32(0), ascii('iso6'));
+
+	const audioSampleEntry = (type: string, channels: number, ...children: number[][]) => box(type, zeros(6), u16(1),
+		zeros(8), u16(channels), u16(16), zeros(4), u32(48000 * 0x10000), ...children);
+	const monoPcm = audioSampleEntry('ipcm', 1, box('pcmC', zeros(4), [1, 16]));
+	const aac = (audioSpecificConfig: number[]) => audioSampleEntry('mp4a', 2, box('esds', zeros(4),
+		[3, 23 + audioSpecificConfig.length, 0, 1, 0],
+		[4, 15 + audioSpecificConfig.length, 0x40, 0x15], zeros(11),
+		[5, audioSpecificConfig.length], audioSpecificConfig,
+		[6, 1, 2],
+	));
+	const aacLc = aac([0x11, 0x90]);
+	const xheAac = aac([0xf9, 0x46, 0x40, 0x00]); // Object type 42 (USAC)
+
+	const moov = (sampleEntry: number[], stbl: number[][], ...rest: number[][]) => box('moov',
+		box('mvhd', zeros(12), u32(1000), zeros(4), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(16), zeros(4), [1, 0], zeros(2), matrix, zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(48000), zeros(4), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('smhd', zeros(8)), box('stbl', box('stsd', zeros(4), u32(1), sampleEntry), ...stbl)),
+			),
+		),
+		...rest,
+	);
+
+	// Two fragments of four samples, with the sample flags from the trex box
+	const fragmented = (sampleEntry: number[], frames: number, size: number, sampleFlags: number) => {
+		const emptyTable = [
+			box('stts', zeros(8)),
+			box('stsc', zeros(8)),
+			box('stsz', zeros(12)),
+			box('stco', zeros(8)),
+		];
+		const trex = box('trex', zeros(4), u32(1), u32(1), u32(frames), u32(size), u32(sampleFlags));
+		const fragments = [0, 1].flatMap((index) => {
+			const moof = (dataOffset: number) => box('moof', box('mfhd', zeros(4), u32(index + 1)), box('traf',
+				box('tfhd', [0, 2, 0, 0], u32(1)),
+				box('tfdt', zeros(4), u32(index * 4 * frames)),
+				box('trun', [0, 0, 0, 1], u32(4), u32(dataOffset)),
+			));
+			const moofSize = moof(0).length;
+			return [...moof(moofSize + 8), ...box('mdat', zeros(4 * size).map((_, i) => (i % 2 ? index : 0x10)))];
+		});
+		return [...ftyp, ...moov(sampleEntry, emptyTable, box('mvex', trex)), ...fragments];
+	};
+
+	const read = async (bytes: number[], check: (sink: EncodedPacketSink, input: Input) => Promise<void>) => {
+		using input = new Input({ source: new BufferSource(new Uint8Array(bytes)), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		await check(new EncodedPacketSink(track), input);
+	};
+
+	for (const sampleFlags of [0x01010000, 0x02000000]) { // Non-sync, and sync (the control)
+		await read(fragmented(monoPcm, 480, 960, sampleFlags), async (sink, input) => {
+			expect((await sink.getFirstPacket())?.type).toBe('key');
+			expect((await sink.getKeyPacket(0.045))?.timestamp).toBe(0.04);
+			using sample = await new AudioSampleSink((await input.getPrimaryAudioTrack())!).getSample(0.045);
+			expect(sample?.timestamp).toBe(0.04);
+		});
+	}
+
+	// Without fragments too: only the first sample is in the stss box
+	await read([...ftyp, ...box('mdat', zeros(80)), ...moov(aacLc, [
+		box('stts', zeros(4), u32(1), u32(8), u32(1024)),
+		box('stss', zeros(4), u32(1), u32(1)),
+		box('stsc', zeros(4), u32(1), u32(1), u32(8), u32(1)),
+		box('stsz', zeros(4), u32(10), u32(8)),
+		box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+	])], async (sink) => {
+		expect((await sink.getPacket(0.1))?.type).toBe('key');
+		expect((await sink.getKeyPacket(0.1))?.timestamp).toBe(4096 / 48000);
+	});
+
+	// xHE-AAC frames can depend on the ones before, so their flags are kept, like in Chromium
+	await read(fragmented(xheAac, 1024, 10, 0x01010000), async (sink) => {
+		expect((await sink.getFirstPacket())?.type).toBe('delta');
+	});
 });
