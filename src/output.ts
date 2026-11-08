@@ -598,10 +598,12 @@ export class Output<
 		assert(this._initTarget !== null);
 
 		if (this._initTarget instanceof Target) {
+			this._emit('target', { target: this._initTarget, request: null, isRoot: false });
 			return this._initTarget;
 		}
 
 		const target = await this._initTarget();
+		this._emit('target', { target, request: null, isRoot: false });
 
 		if (this.state === 'canceled') {
 			await target._close();
