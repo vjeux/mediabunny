@@ -971,3 +971,42 @@ test('VideoSampleSource, cancel() while finalizing doesn\'t wait behind a stalle
 	// Canceling can't get the sink going again, but it mustn't get stuck behind it either
 	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
 });
+
+test('VideoSampleSource, cancel() after close() gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				await new Promise(() => {}); // A stuck effect
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const added = videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: 0,
+		duration: 1 / 30,
+	})).catch(() => {});
+	await new Promise(resolve => setTimeout(resolve, 50));
+	videoSource.close(); // Like stopping a recording: waits for what was added
+	await new Promise(resolve => setTimeout(resolve, 100));
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	// Canceling forces the close, which doesn't wait for the stuck call
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	expect(await stateAfter(added, 1000)).toBe('fulfilled');
+});
