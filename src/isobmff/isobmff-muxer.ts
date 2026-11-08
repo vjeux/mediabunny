@@ -1152,7 +1152,7 @@ export class IsobmffMuxer extends Muxer {
 		assert(trackData.lastSample);
 		assert(trackData.lastTimescaleUnits !== null);
 
-		if (nextSample !== undefined && trackData.lastSample.timescaleUnitsToNextSample === 0) {
+		if (nextSample !== undefined) {
 			assert(nextSample.type === 'key');
 
 			// Given the next sample, we can make a guess about the duration of the last sample. This avoids having
@@ -1161,7 +1161,13 @@ export class IsobmffMuxer extends Muxer {
 			// frame (although it can happen).
 			const timescaleUnits = intoTimescale(nextSample.timestamp, trackData.timescale, false);
 			const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
-			trackData.lastSample.timescaleUnitsToNextSample = delta;
+			if (trackData.lastSample.timescaleUnitsToNextSample === 0) {
+				trackData.lastSample.timescaleUnitsToNextSample = delta;
+			} else if (delta >= 0 && delta < trackData.lastSample.timescaleUnitsToNextSample) {
+				// The sample's own duration reaches past the next key frame, which would make it overlap the next
+				// fragment: a fragment's decode time is the sum of all earlier samples' durations
+				trackData.lastSample.timescaleUnitsToNextSample = delta;
+			}
 		}
 	}
 
