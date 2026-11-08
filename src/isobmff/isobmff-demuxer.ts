@@ -123,6 +123,7 @@ import {
 	readU64Be,
 	readU8,
 	readAscii,
+	SliceRangeError,
 } from '../reader';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, RichImageData, TrackDisposition } from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
@@ -556,6 +557,8 @@ export class IsobmffDemuxer extends Demuxer {
 
 	decryptionKeyCache = new Map<string, Promise<Uint8Array>>();
 	boxNestingDepth = 0;
+	/** Positions of boxes whose fields run past the end of their parent, which get skipped */
+	damagedBoxPositions = new Set<number>();
 
 	constructor(input: Input) {
 		super(input);
@@ -617,7 +620,7 @@ export class IsobmffDemuxer extends Demuxer {
 					if (!moovSlice) break;
 
 					this.moovSlice = moovSlice;
-					this.readContiguousBoxes(this.moovSlice);
+					this.parseSkippingDamagedBoxes(moovSlice, slice => this.readContiguousBoxes(slice));
 
 					if (this.movieTimescale === -1) {
 						throw new Error('Invalid moov box: missing mvhd box.');
@@ -707,7 +710,7 @@ export class IsobmffDemuxer extends Demuxer {
 							if (isThenable(mfraSlice)) mfraSlice = await mfraSlice;
 
 							if (mfraSlice) {
-								this.readContiguousBoxes(mfraSlice);
+								this.parseSkippingDamagedBoxes(mfraSlice, slice => this.readContiguousBoxes(slice));
 							}
 						}
 					}
@@ -930,7 +933,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 		this.currentTrack = internalTrack;
 		try {
-			this.traverseBox(stblContainerSlice);
+			this.parseSkippingDamagedBoxes(stblContainerSlice, slice => this.traverseBox(slice));
 		} catch (error) {
 			internalTrack.sampleTable = null;
 			throw error;
@@ -1214,7 +1217,7 @@ export class IsobmffDemuxer extends Demuxer {
 		if (isThenable(entireSlice)) entireSlice = await entireSlice;
 		if (!entireSlice) return null; // The moof box is cut off
 
-		this.traverseBox(entireSlice);
+		this.parseSkippingDamagedBoxes(entireSlice, slice => this.traverseBox(slice));
 
 		const fragment = this.lastReadFragment;
 		assert(fragment && fragment.moofOffset === startPos);
@@ -1429,6 +1432,156 @@ export class IsobmffDemuxer extends Demuxer {
 	}
 
 	traverseBox(slice: FileSlice): boolean {
+		const startPos = slice.filePos;
+		if (this.damagedBoxPositions.size > 0 && this.damagedBoxPositions.has(startPos)) {
+			// Found to be damaged in an earlier attempt (see parseSkippingDamagedBoxes), so skip it
+			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
+			if (size < MIN_BOX_HEADER_SIZE) {
+				return false; // Nothing to skip to (size 0 runs to the end, size 1 is a 64-bit size)
+			}
+
+			slice.filePos = Math.min(startPos + size, slice.end);
+			return true;
+		}
+
+		try {
+			return this.parseBox(slice);
+		} catch (error) {
+			if (!(error instanceof SliceRangeError)) {
+				throw error;
+			}
+
+			slice.filePos = startPos;
+			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
+			const name = size > 0 ? readAscii(slice, 4) : '';
+
+			// Sample tables are read as a whole: a failure discards the partial table (see getSampleTableForTrack)
+			const sampleTableBoxes = ['stbl', 'stts', 'ctts', 'stss', 'stsc', 'stsz', 'stz2', 'stco', 'co64'];
+			if (sampleTableBoxes.includes(name)) {
+				throw error;
+			}
+
+			// The box's fields run past its end and its parent's, so it's damaged (a broken size field, a cut-off
+			// file). Rather than failing the whole file, have the parse redone without it, like FFmpeg skips atoms
+			// it can't read.
+			throw new DamagedBoxError(startPos);
+		}
+	}
+
+	/**
+	 * Runs a parse (of the moov, a fragment, ...) so that boxes whose fields run past the end of their parent are
+	 * skipped: the parse is redone without such a box, from a snapshot of the state before it. That undoes everything
+	 * the damaged box changed, at no cost to intact files.
+	 */
+	parseSkippingDamagedBoxes(slice: FileSlice, parse: (slice: FileSlice) => unknown) {
+		const startPos = slice.filePos;
+		const restoreState = this.snapshotParsingState();
+		const damagedBoxPositions: number[] = [];
+
+		while (true) {
+			try {
+				parse(slice);
+				return;
+			} catch (error) {
+				if (!(error instanceof DamagedBoxError)) {
+					throw error;
+				}
+
+				restoreState();
+				if (damagedBoxPositions.length === MAX_DAMAGED_BOXES_PER_PARSE) {
+					// Each one redoes the parse, so cap them (also keeping crafted files from taking quadratic time)
+					throw new Error('Invalid MP4 file: too many damaged boxes.');
+				}
+
+				damagedBoxPositions.push(error.position);
+				for (const position of damagedBoxPositions) {
+					this.damagedBoxPositions.add(position); // The restore undid earlier additions
+				}
+				slice.filePos = startPos;
+			}
+		}
+	}
+
+	/** Remembers the fields a parse can change (the demuxer's, the current track's and fragment's) for undoing it. */
+	snapshotParsingState() {
+		const track = this.currentTrack;
+		const fragment = this.currentFragment;
+		const objects: object[] = [this];
+		// The metadata tags and the track also have their plain objects (like the raw tags or the track's disposition)
+		// covered, as boxes change some of those in place
+		const withPlainObjects: Record<string, unknown>[] = [this.metadataTags];
+		if (track) {
+			withPlainObjects.push(track);
+			if (track.info) {
+				withPlainObjects.push(track.info);
+			}
+		}
+		for (const object of withPlainObjects) {
+			objects.push(object);
+			for (const key in object) {
+				const value = object[key];
+				if (value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype
+					&& value !== track?.info) {
+					objects.push(value);
+				}
+			}
+		}
+		if (fragment) {
+			objects.push(fragment);
+			const trackData = track && fragment.trackData.get(track.id);
+			if (trackData) {
+				objects.push(trackData);
+			}
+		}
+
+		// Flat list of [object, its keys, its values, then collection and length pairs] per object
+		const snapshots: unknown[][] = [];
+		for (const object of objects as Record<string, unknown>[]) {
+			const keys = Object.keys(object);
+			const values: unknown[] = [];
+			const snapshot: unknown[] = [object, keys, values];
+			for (const key of keys) {
+				const value = object[key];
+				values.push(value);
+				if (Array.isArray(value)) {
+					snapshot.push(value, value.length);
+				} else if (value instanceof Map || value instanceof Set) {
+					snapshot.push(value, value.size);
+				}
+			}
+			snapshots.push(snapshot);
+		}
+
+		return () => {
+			for (const snapshot of snapshots) {
+				const object = snapshot[0] as Record<string, unknown>;
+				const keys = snapshot[1] as string[];
+				const values = snapshot[2] as unknown[];
+				for (const key of Object.keys(object)) {
+					if (!keys.includes(key)) {
+						delete object[key];
+					}
+				}
+				for (let i = 0; i < keys.length; i++) {
+					object[keys[i]!] = values[i];
+				}
+				for (let i = 3; i < snapshot.length; i += 2) {
+					const collection = snapshot[i] as unknown[] | Map<unknown, unknown> | Set<unknown>;
+					const length = snapshot[i + 1] as number;
+					if (Array.isArray(collection)) {
+						collection.length = length;
+					} else {
+						// Entries keep insertion order, so the ones added since come last
+						for (const key of [...collection.keys()].slice(length)) {
+							collection.delete(key);
+						}
+					}
+				}
+			}
+		};
+	}
+
+	parseBox(slice: FileSlice): boolean {
 		const startPos = slice.filePos;
 		const boxInfo = readBoxHeader(slice);
 		if (!boxInfo) {
@@ -4033,6 +4186,18 @@ export class IsobmffDemuxer extends Demuxer {
 
 		slice.filePos = boxEndPos;
 		return true;
+	}
+}
+
+const MAX_DAMAGED_BOXES_PER_PARSE = 16;
+
+/** Reports a box whose fields run past the end of its parent, to have the parse redone without it */
+class DamagedBoxError extends Error {
+	position: number;
+
+	constructor(position: number) {
+		super('Damaged box.');
+		this.position = position;
 	}
 }
 
