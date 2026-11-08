@@ -81,6 +81,7 @@ import {
 } from '../../shared/mp3-misc';
 import { EncodedPacket, PacketType, PLACEHOLDER_DATA } from '../packet';
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
+import { UrlSource } from '../source';
 import {
 	buildMpegTsMimeType,
 	createTimestampWrapInfo,
@@ -523,9 +524,13 @@ export class MpegTsDemuxer extends Demuxer {
 					hasProgramMap = true;
 					programMapSectionPid = section.pid;
 
-					if (this.elementaryStreams.some(x => !x.initialized)) {
-						// PES packets can come before the PMT, like in a capture of a broadcast that starts between two
-						// of its PSI repetitions, so look for each stream's first PES packet from the start of the file
+					// PES packets can come before the PMT, like in a capture of a broadcast that starts between two of
+					// its PSI repetitions, so look for each stream's first PES packet from the start of the file. Not
+					// on sources that only keep what their cache holds, which can't go back there: a
+					// ReadableStreamSource, whose size is unknown, or a UrlSource whose server ignores range requests.
+					const canGoBack = this.reader.fileSizeNonStrict !== null
+						&& !(this.reader.source instanceof UrlSource && this.reader.source._sequentialBacking);
+					if (canGoBack && this.elementaryStreams.some(x => !x.initialized)) {
 						currentPos = this.packetOffset;
 						continue;
 					}
