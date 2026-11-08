@@ -352,6 +352,8 @@ export class IsobmffDemuxer extends Demuxer {
 	isFragmented = false;
 	fragmentTrackDefaults = new Map<number, FragmentTrackDefaults>();
 	psshBoxes: PsshBox[] = [];
+	/** The sizes of the mdat boxes right after moof boxes, keyed by their offset */
+	mdatSizes = new Map<number, number>();
 	currentFragment: Fragment | null = null;
 	isReadingTraf = false;
 	/**
@@ -811,7 +813,9 @@ export class IsobmffDemuxer extends Demuxer {
 		const moofBoxInfo = readBoxHeader(headerSlice);
 		assert(moofBoxInfo?.name === 'moof');
 
-		let entireSlice = this.reader.requestSlice(startPos, moofBoxInfo.totalSize);
+		// With a known file size, the header of the box after the moof box is read along with it, see rememberMdatSize
+		const readSize = moofBoxInfo.totalSize + (this.reader.fileSizeNonStrict !== null ? MAX_BOX_HEADER_SIZE : 0);
+		let entireSlice = this.reader.requestSliceRange(startPos, moofBoxInfo.totalSize, readSize);
 		if (isThenable(entireSlice)) entireSlice = await entireSlice;
 		if (!entireSlice) return null; // The moof box is cut off
 
@@ -824,6 +828,7 @@ export class IsobmffDemuxer extends Demuxer {
 			moofSize: fragment.moofSize,
 			trackIds: new Set(fragment.trackData.keys()),
 		});
+		rememberMdatSize(this, startPos + moofBoxInfo.totalSize, entireSlice);
 
 		for (const [, trackData] of fragment.trackData) {
 			const track = trackData.track;
@@ -3627,6 +3632,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					continue;
 				}
 
+				const mdatSize = demuxer.mdatSizes.get(currentPos);
+				if (mdatSize !== undefined) {
+					currentPos += mdatSize; // Without reading its header, which may be gone from the source by now
+					continue;
+				}
+
 				// Load the header
 				let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 				if (isThenable(slice)) slice = await slice;
@@ -4459,6 +4470,38 @@ const decryptCbcs = (
 	}
 
 	return output;
+};
+
+/**
+ * Finding the next fragment means stepping over the mdat box after a moof box. Its size is remembered when the moof box
+ * is read: once the fragment's samples have been read, a source that only keeps recent data (a stream, or a server
+ * that ignores range requests) may no longer have its header.
+ */
+const rememberMdatSize = (demuxer: IsobmffDemuxer, mdatPos: number, moofSlice: FileSlice) => {
+	const remember = (slice: FileSlice | null) => {
+		const boxInfo = slice && readBoxHeader(slice);
+		if (boxInfo?.name === 'mdat' && boxInfo.totalSize > 0) {
+			demuxer.mdatSizes.set(mdatPos, boxInfo.totalSize);
+		}
+	};
+
+	if (moofSlice.end - mdatPos >= MAX_BOX_HEADER_SIZE) {
+		remember(moofSlice.slice(mdatPos, MAX_BOX_HEADER_SIZE)); // Read along with the moof box
+		return;
+	}
+
+	try {
+		const slice = demuxer.reader.requestSliceRange(mdatPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+		if (isThenable(slice)) {
+			// Not waited for, so that nothing waits for media data that hasn't arrived yet (like in a live stream).
+			// It's there before the samples after it are.
+			slice.then(remember, () => {});
+		} else {
+			remember(slice);
+		}
+	} catch {
+		// The size is only remembered to save a read later, which then happens as before
+	}
 };
 
 const collectCryptRanges = (
