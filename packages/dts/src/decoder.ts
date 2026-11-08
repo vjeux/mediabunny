@@ -47,6 +47,8 @@ class DtsDecoder extends CustomAudioDecoder {
 			numberOfChannels: result.channels,
 			sampleRate: result.sampleRate,
 			timestamp: result.pts / this.config.sampleRate,
+			// Freshly transferred from the worker and used nowhere else, so the sample needn't copy it
+			_doNotCopy: true,
 		});
 		this.onSample(sample);
 	}

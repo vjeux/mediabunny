@@ -45,6 +45,53 @@ test('f32 copyTo identity', () => {
 	testCopyToIdentity('f32', f32Data);
 });
 
+test('AudioSample keeps its own copy of the data it was created from', async () => {
+	// Chunks drained from one reused buffer (e.g. an AudioWorklet ring buffer) into samples that are queued up
+	const buffer = new Float32Array(480);
+	const samples: AudioSample[] = [];
+	for (let i = 0; i < 3; i++) {
+		buffer.fill((i + 1) / 8);
+		samples.push(new AudioSample({
+			data: i === 1 ? buffer.buffer : buffer,
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: i * 0.01,
+		}));
+	}
+	buffer.fill(1);
+
+	using clone = samples[0]!.clone();
+	using trimmed = samples[1]!.trim(0, 240);
+	for (const [sample, expected] of [[clone, 0.125], [trimmed, 0.25]] as const) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32' });
+		expect(values.every(value => value === expected)).toBe(true);
+	}
+
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const source = new AudioSampleSource({ codec: 'pcm-f32' });
+	output.addAudioTrack(source);
+	await output.start();
+	for (const sample of samples) {
+		await source.add(sample);
+		sample.close();
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const levels: number[] = [];
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32' });
+		for (let i = 0; i < values.length; i += 480) {
+			levels.push(values[i]!);
+		}
+		sample.close();
+	}
+	expect(levels).toEqual([0.125, 0.25, 0.375]);
+});
+
 test('pcm-u8 encode-decode roundtrip', async () => {
 	await testEncodeDecodeRoundtrip('pcm-u8', 'u8', u8Data);
 });
