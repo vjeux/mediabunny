@@ -988,8 +988,10 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
-		if (this.demuxer.reader.fileSize === null) {
-			// No file size known, can't do binary search, but fall back to sequential algo instead
+		if (this.demuxer.reader.fileSize === null || this.sequentialScanCache.length > 0) {
+			// No file size known, can't do binary search, but fall back to sequential algo instead. Once that has
+			// started, keep at it: checking for a chained link after the last page can make the size known, but the
+			// source, a stream, may no longer hold the data the binary search would read.
 			return this.getPacketSequential(timestamp, options);
 		}
 

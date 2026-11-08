@@ -340,14 +340,6 @@ test('reads a chain whose third link reuses the first link\'s serial number the 
 	expect(count).toBe(packetCount);
 });
 
-const OGG_CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
-	let crc = n << 24;
-	for (let i = 0; i < 8; i++) {
-		crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
-	}
-	return crc >>> 0;
-});
-
 // Gives every page of the Ogg file the serial number, recomputing the page checksums
 const withSerialNumber = (file: Uint8Array, serialNumber: number) => {
 	const result = file.slice();
@@ -357,12 +349,7 @@ const withSerialNumber = (file: Uint8Array, serialNumber: number) => {
 		const lacingValues = result.subarray(pos + 27, pos + 27 + segmentCount);
 		const size = 27 + segmentCount + lacingValues.reduce((a, b) => a + b, 0);
 		view.setUint32(pos + 14, serialNumber, true);
-		view.setUint32(pos + 22, 0, true);
-		let crc = 0;
-		for (const byte of result.subarray(pos, pos + size)) {
-			crc = ((crc << 8) ^ OGG_CRC_TABLE[(crc >>> 24) ^ byte]!) >>> 0;
-		}
-		view.setUint32(pos + 22, crc, true);
+		view.setUint32(pos + 22, computeOggPageCrc(result.subarray(pos, pos + size)), true);
 		pos += size;
 	}
 	return result;
@@ -387,4 +374,30 @@ test('reads a chain whose longer second link reuses the first link\'s serial num
 	]);
 	expect([duration, otherDuration]).toEqual([iteratedFirst.duration, iteratedFirst.duration]);
 	expect(lastPacket?.timestamp).toBe(iteratedFirst.packets[19]!.timestamp);
+});
+
+test('looks up the last packet of a stream after computing its duration', async () => {
+	// Checking for a chained link after the last page reads to the end of the stream, which makes its size known. A
+	// binary search would then read back where the stream's small cache no longer reaches.
+	const bytes = new Uint8Array(await (await fetch('/vorbis-eos.ogg')).arrayBuffer());
+	let offset = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			if (offset >= bytes.length) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(bytes.slice(offset, offset + 4096));
+			offset += 4096;
+		},
+	});
+
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 32 * 1024 }),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryAudioTrack())!;
+	const duration = await track.computeDuration();
+	const lastPacket = await new EncodedPacketSink(track).getPacket(Infinity);
+	expect(lastPacket!.timestamp + lastPacket!.duration).toBeCloseTo(duration, 9);
 });
