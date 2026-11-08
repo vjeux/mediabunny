@@ -84,6 +84,8 @@ export type HlsSegmentLocation = {
 
 // Way more than any real duration, but small enough to keep all timestamp (and derived sequence number) math finite
 const MAX_DURATION = 1e9; // In seconds
+/** How far, in seconds, a date may lie before the end of the previous segment and still be followed. */
+const MAX_DATE_TIME_OVERLAP = 1;
 
 export class HlsSegmentedInput extends SegmentedInput {
 	rootPath: string;
@@ -143,6 +145,31 @@ export class HlsSegmentedInput extends SegmentedInput {
 	 * Reads and parses the segment info from the playlist file. When called more than one, it updates the existing
 	 * segments by appending the new ones. Existing segments are never removed.
 	 */
+	/**
+	 * Makes sure the reference playlist has been read. Whether a discontinuity follows its program date times is up to
+	 * the reference playlist, so that where the discontinuity lands doesn't depend on which playlist is read first.
+	 */
+	async loadReferencePlaylist() {
+		if (!this.demuxer.hasMasterPlaylist || !this.demuxer.internalTracks) {
+			return;
+		}
+
+		try {
+			const reference = this.demuxer.getReferenceSegmentedInput();
+			if (reference === this) {
+				return;
+			}
+
+			if (reference.currentUpdateSegmentsPromise) {
+				await reference.currentUpdateSegmentsPromise;
+			} else if (reference.lastSegmentUpdateTime === -Infinity) {
+				await reference.runUpdateSegments();
+			}
+		} catch {
+			// Then this playlist decides for itself
+		}
+	}
+
 	async updateSegments() {
 		let lines = this.nextLines;
 		this.nextLines = null;
@@ -174,6 +201,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 		}
 
 		const offsetTimestampsByDateTime = this.input._formatOptions.hls?.offsetTimestampsByDateTime !== false;
+		if (offsetTimestampsByDateTime && lines.some(line => line.startsWith(TAG_PROGRAM_DATE_TIME))) {
+			await this.loadReferencePlaylist();
+		}
 		const variables = new HlsPlaylistVariables(
 			this.rootPath,
 			this.demuxer.hasMasterPlaylist ? this.demuxer.masterPlaylistVariables : null,
@@ -181,6 +211,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 		let headerRead = false;
 		let accumulatedTime = 0;
+		// A date that the accumulated time may snap to, at the next segment (which it's for)
+		let pendingDateTimeSeconds: number | null = null;
 		let accumulatedUnixTime: number | null = null;
 		let nextSegmentDuration: number | null = null;
 		let currentKey: HlsEncryptionInfo | null = null;
@@ -265,6 +297,26 @@ export class HlsSegmentedInput extends SegmentedInput {
 						view.setUint32(12, nextSequenceNumber);
 
 						key = { ...key, iv };
+					}
+
+					if (pendingDateTimeSeconds !== null) {
+						// Snap the accumulated time into Unix space, but not back to before where the timeline already
+						// got: an earlier date (clips out of chronological order, a clock that was reset) would make
+						// the timeline go back in time. Small overlaps are fine; servers may use them to account for
+						// clock drift (RFC 8216bis 6.2.1). The first date of a discontinuity decides for the whole
+						// discontinuity, and for all playlists: their timelines end a bit apart, but they must place
+						// the discontinuity alike. The reference playlist, read first, decides when it can.
+						const decisions = this.demuxer.discontinuitiesFollowingDates;
+						let followsDates = decisions.get(nextDiscontinuityNumber);
+						if (followsDates === undefined) {
+							followsDates = pendingDateTimeSeconds >= accumulatedTime - MAX_DATE_TIME_OVERLAP;
+							decisions.set(nextDiscontinuityNumber, followsDates);
+						}
+
+						if (followsDates) {
+							accumulatedTime = pendingDateTimeSeconds;
+						}
+						pendingDateTimeSeconds = null;
 					}
 
 					const fullPath = joinPaths(this.rootPath, variables.substitute(line));
@@ -524,13 +576,18 @@ export class HlsSegmentedInput extends SegmentedInput {
 							segment.timestamp = segment.unixEpochTimestamp;
 						}
 					}
+
+					if (offsetTimestampsByDateTime) {
+						accumulatedTime = dateTimeSeconds; // Where the moved segments end
+					}
 				}
 
 				lastProgramDateTimeSeconds = dateTimeSeconds;
 				accumulatedUnixTime = dateTimeSeconds;
 
 				if (offsetTimestampsByDateTime) {
-					accumulatedTime = dateTimeSeconds; // Snap the accumulated time into Unix space
+					// Applied at the segment it's for, whose discontinuity can still be declared after this tag
+					pendingDateTimeSeconds = dateTimeSeconds;
 				}
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
