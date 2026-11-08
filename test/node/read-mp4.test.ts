@@ -1258,3 +1258,85 @@ test('Video samples that the track fragment\'s sdtp box marks as dependent are d
 	// Audio samples may depend on others and still be random access points
 	expect(await read({ handler: 'soun', sampleFlags: 0, sdtp })).toEqual(['key', 'key', 'key', 'key']);
 });
+
+test('AAC encoder delay from the iTunSMPB tag when there is no edit list', async () => {
+	// Like iTunes/QuickTime X output: the 2112 priming samples are only declared in iTunSMPB, without an edts box
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	// ES_Descriptor > DecoderConfigDescriptor (AAC) > AudioSpecificConfig, SLConfig
+	const esds = (audioSpecificConfig: number[]) => box(
+		'esds',
+		zeros(4),
+		[3, 23 + audioSpecificConfig.length, 0, 1, 0],
+		[4, 15 + audioSpecificConfig.length, 0x40, 0x15, ...zeros(11)],
+		[5, audioSpecificConfig.length, ...audioSpecificConfig],
+		[6, 1, 2],
+	);
+	const smpb = ' 00000000 00000840 00000338 0000000000015888 00000000 00000000 00000000 00000000';
+	const itunes = box('udta', box('meta', zeros(4), box('hdlr', zeros(8), ascii('mdir'), zeros(13)), box('ilst',
+		box('----', box('mean', zeros(4), ascii('com.apple.iTunes')), box('name', zeros(4), ascii('iTunSMPB')),
+			box('data', u32(1), u32(0), ascii(smpb))),
+	)));
+
+	type Layout = 'lc' | 'explicit-sbr-core-timescale' | 'implicit-sbr-output-rate' | 'lc-22050-timescale-44100';
+	const build = (edts: number[], layout: Layout = 'lc') => {
+		// HE-AAC: the media timescale may follow the core coder at half the output rate (Nero, afconvert) or the output
+		// rate (FFmpeg). With implicit SBR signaling, the AudioSpecificConfig only describes the core coder, and the
+		// sample entry gives the output rate.
+		const timescale = layout === 'explicit-sbr-core-timescale' ? 22050 : 44100;
+		const sampleEntryRate = layout === 'explicit-sbr-core-timescale' || layout === 'lc-22050-timescale-44100'
+			? 22050
+			: 44100;
+		const audioSpecificConfig = {
+			'lc': [0x12, 0x10], // AAC-LC, 44100 Hz, stereo
+			'explicit-sbr-core-timescale': [0x2b, 0x92, 0x08, 0x00], // SBR, 22050 Hz core, 44100 Hz output, stereo
+			'implicit-sbr-output-rate': [0x13, 0x90], // AAC-LC, 22050 Hz, stereo
+			'lc-22050-timescale-44100': [0x13, 0x90],
+		}[layout];
+		const moov = (chunkOffset: number) => box('moov',
+			box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+				edts,
+				box('mdia',
+					box('mdhd', zeros(12), u32(timescale), u32(4096), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', u32(0), u32(1), box('mp4a', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4),
+							u32(sampleEntryRate * 0x10000), esds(audioSpecificConfig))),
+						box('stts', u32(0), u32(1), u32(4), u32(1024)),
+						box('stsc', u32(0), u32(1), u32(1), u32(4), u32(1)),
+						box('stsz', u32(0), u32(10), u32(4)),
+						box('stco', u32(0), u32(1), u32(chunkOffset)),
+					)),
+				),
+			),
+			itunes,
+		);
+		const ftyp = box('ftyp', ascii('M4A '), u32(0), ascii('M4A '));
+		const moovSize = moov(0).length;
+		return new Uint8Array([...ftyp, ...moov(ftyp.length + moovSize + 8), ...box('mdat', zeros(40))]);
+	};
+
+	const firstTimestamp = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		return (await input.getPrimaryAudioTrack())!.getFirstTimestamp();
+	};
+
+	expect(await firstTimestamp(build([]))).toBeCloseTo(-2112 / 44100, 12);
+	// iTunSMPB counts output samples
+	expect(await firstTimestamp(build([], 'explicit-sbr-core-timescale'))).toBeCloseTo(-2112 / 44100, 12);
+	expect(await firstTimestamp(build([], 'implicit-sbr-output-rate'))).toBeCloseTo(-2112 / 44100, 12);
+	// Plain AAC-LC at 22050 Hz, which only its sample entry tells apart from implicit SBR
+	expect(await firstTimestamp(build([], 'lc-22050-timescale-44100'))).toBeCloseTo(-2112 / 22050, 12);
+
+	// An edit list takes precedence over iTunSMPB
+	const edts = box('edts', box('elst', zeros(4), u32(1), u32(4096 - 1024), u32(1024), u32(0x10000)));
+	expect(await firstTimestamp(build(edts))).toBeCloseTo(-1024 / 44100, 12);
+});
