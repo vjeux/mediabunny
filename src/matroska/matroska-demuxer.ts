@@ -528,6 +528,7 @@ const buildLegacyAacAudioSpecificConfig = (
 			coreSampleRate: sampleRate,
 			outputSampleRate: objectType === 5 ? outputSampleRate : sampleRate,
 			outputNumberOfChannels: numberOfChannels,
+			programConfigElement: null,
 		});
 	} catch {
 		return null; // Channel count that can't be signaled without a PCE
