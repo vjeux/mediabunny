@@ -66,7 +66,8 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			codec === 'mp3' && numberOfChannels >= 1 && numberOfChannels <= 2
 			&& MP3_SAMPLE_RATES.includes(sampleRate)
 		) || (
-			codec === 'vorbis' && numberOfChannels >= 1 && numberOfChannels <= 255
+			// NodeAV's resampler only passes on up to 8 planes, silencing any channel past that
+			codec === 'vorbis' && numberOfChannels >= 1 && numberOfChannels <= 8
 			&& sampleRate <= 200000
 		) || (
 			codec === 'flac' && numberOfChannels >= 1 && numberOfChannels <= 8
