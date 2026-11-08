@@ -55,6 +55,15 @@ test('can loop over all samples', async () => {
 	}
 	expect(samples).toBe(213);
 	expect(lastSampleTimestamp).toBe(19.690521541950112);
+
+	// A packet's end, computed as its timestamp plus its duration, is where the next packet starts
+	let previousEnd: number | null = null;
+	for await (const packet of sink.packets()) {
+		if (previousEnd !== null) {
+			expect((await sink.getPacket(previousEnd))?.timestamp).toBe(packet.timestamp);
+		}
+		previousEnd = packet.timestamp + packet.duration;
+	}
 });
 
 test('can do random access', async () => {
