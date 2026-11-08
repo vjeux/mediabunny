@@ -24,6 +24,7 @@ import {
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import {
 	Mp3FrameHeader,
+	MP3_FRAME_HEADER_SIZE,
 	getXingOffset,
 	INFO,
 	XING,
@@ -32,6 +33,7 @@ import {
 	getMp3ChannelCount,
 	MP3_DECODER_DELAY,
 	decodeSynchsafe,
+	readMp3FrameHeader,
 } from '../../shared/mp3-misc';
 import {
 	ID3_V1_TAG_SIZE,
@@ -44,7 +46,11 @@ import {
 	readId3V2Header,
 } from '../id3';
 import { readNextMp3FrameHeader, readFirstMp3FrameHeader } from './mp3-reader';
-import { readAscii, readBytes, Reader, readU32Be, readU8 } from '../reader';
+import { readAscii, readBytes, Reader, readU32Be, readU32Le, readU8 } from '../reader';
+
+const APE_TAG_FOOTER_SIZE = 32;
+/** How far a frame may follow the previous one in damaged audio, to count as more audio */
+const MAX_GAP_IN_AUDIO = 4096;
 
 type Sample = {
 	timestamp: number;
@@ -77,6 +83,8 @@ export class Mp3Demuxer extends Demuxer {
 	nextTimestampInSamples = 0;
 	primingDelay = 0;
 	itunesPriming: number | null = null;
+	audioEndPosPromise: Promise<number | null> | null = null;
+	audioEndPos: number | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -129,16 +137,47 @@ export class Mp3Demuxer extends Demuxer {
 			}
 		}
 
-		// Until a frame has been found, make sure we don't start off with a false sync. A Xing/Info frame confirms the
-		// stream already, so the frames after it are taken as they come.
-		const result = this.firstFrameHeader || this.xingFrameHeader
-			? await readNextMp3FrameHeader(
-				this.reader,
-				this.lastLoadedPos,
-				this.reader.fileSize,
-				this.firstFrameHeader,
-			)
-			: await readFirstMp3FrameHeader(this.reader, this.lastLoadedPos, this.reader.fileSize);
+		let result = this.firstFrameHeader ? await this.readDirectlyFollowingFrame() : null;
+
+		if (!result) {
+			if (this.firstFrameHeader) {
+				// No frame follows the previous one directly. If ID3v2 tags do (like in concatenated files), skip them
+				// instead of searching them for frames, since bytes inside them (like cover art) can look like frames.
+				// This looks right behind the previous frame before searching any further, since sources that can only
+				// be read in order (like a UrlSource whose server ignores range requests) may not keep what a long
+				// search went past.
+				const tagsEnd = await this.skipId3V2Tags(this.lastLoadedPos);
+				if (tagsEnd !== null) {
+					this.lastLoadedPos = tagsEnd;
+				}
+			}
+
+			// Until a frame has been found, make sure we don't start off with a false sync. A Xing/Info frame confirms
+			// the stream already, so the frames after it are taken as they come.
+			result = this.firstFrameHeader || this.xingFrameHeader
+				? await readNextMp3FrameHeader(
+					this.reader,
+					this.lastLoadedPos,
+					this.audioEndPos ?? this.reader.fileSize,
+					this.firstFrameHeader,
+				)
+				: await readFirstMp3FrameHeader(
+					this.reader,
+					this.lastLoadedPos,
+					this.audioEndPos ?? this.reader.fileSize,
+				);
+
+			// Real audio goes on frame after frame, but a lone frame may be bytes inside the APEv2 and ID3v1 tags at
+			// the end of the file. Only then are those looked up, since that reads the end of the file, which sources
+			// that can only be read in order stream to first.
+			if (this.firstFrameHeader && result && !(await this.isFollowedByAudio(result))) {
+				this.audioEndPos = await (this.audioEndPosPromise ??= this.computeAudioEndPos());
+				if (this.audioEndPos !== null && result.startPos >= this.audioEndPos) {
+					result = null;
+				}
+			}
+		}
+
 		if (!result) {
 			this.lastSampleLoaded = true;
 			return;
@@ -230,6 +269,161 @@ export class Mp3Demuxer extends Demuxer {
 		this.nextTimestampInSamples += header.audioSamplesInFrame;
 
 		return;
+	}
+
+	/**
+	 * Whether more audio follows the given frame: another frame right behind it, or one behind a short gap (like a
+	 * damaged frame) that is itself followed by another frame
+	 */
+	async isFollowedByAudio(frame: { header: Mp3FrameHeader; startPos: number }) {
+		if (await this.isFollowedByFrame(frame)) {
+			return true;
+		}
+
+		const nextPos = frame.startPos + frame.header.totalSize;
+		const nextFrame = await readNextMp3FrameHeader(
+			this.reader,
+			nextPos,
+			nextPos + MAX_GAP_IN_AUDIO,
+			this.firstFrameHeader,
+		);
+		return nextFrame !== null && await this.isFollowedByFrame(nextFrame);
+	}
+
+	/** Whether another frame starts right where the given one ends (or a byte before, if it's a byte short). */
+	async isFollowedByFrame(frame: { header: Mp3FrameHeader; startPos: number }) {
+		const nextPos = frame.startPos + frame.header.totalSize;
+		const nextFrame = await readNextMp3FrameHeader(
+			this.reader,
+			nextPos - 1,
+			nextPos + MP3_FRAME_HEADER_SIZE,
+			this.firstFrameHeader,
+		);
+		return nextFrame !== null;
+	}
+
+	/**
+	 * Returns the frame right after the previous one, which ended right after lastLoadedPos (or at it if it was a byte
+	 * short), if it matches the stream like readNextMp3FrameHeader requires
+	 */
+	async readDirectlyFollowingFrame() {
+		const ref = this.firstFrameHeader;
+		assert(ref);
+
+		let slice = this.reader.requestSlice(this.lastLoadedPos, MP3_FRAME_HEADER_SIZE + 1);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return null;
+		}
+
+		for (const startPos of [this.lastLoadedPos, this.lastLoadedPos + 1]) {
+			slice.filePos = startPos;
+			const remainingBytes = this.reader.fileSize !== null ? this.reader.fileSize - startPos : null;
+			const { header } = readMp3FrameHeader(readU32Be(slice), remainingBytes);
+			if (
+				header
+				&& header.sampleRate === ref.sampleRate
+				&& header.mpegVersionId === ref.mpegVersionId
+				&& header.layer === ref.layer
+				&& getMp3ChannelCount(header.channel) === getMp3ChannelCount(ref.channel)
+			) {
+				if (this.reader.fileSize === null) {
+					// Without a known size, a frame cut off by the end of the file only shows when reading all of it
+					let frameSlice = this.reader.requestSlice(startPos, header.totalSize);
+					if (isThenable(frameSlice)) {
+						frameSlice = await frameSlice;
+					}
+					if (!frameSlice) {
+						return null;
+					}
+				}
+
+				return { header, startPos };
+			}
+		}
+
+		return null;
+	}
+
+	/** Skips the ID3v2 tags following the frame that ended at lastLoadedPos, returning where they end. */
+	async skipId3V2Tags(lastLoadedPos: number) {
+		let tagsEnd: number | null = null;
+		// The previous frame ended right after lastLoadedPos, or at it if it was a byte short
+		let positions = [lastLoadedPos + 1, lastLoadedPos];
+
+		while (true) {
+			let foundTag = false;
+
+			for (const pos of positions) {
+				let slice = this.reader.requestSlice(pos, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					continue;
+				}
+
+				const id3V2Header = readId3V2Header(slice);
+				if (id3V2Header) {
+					tagsEnd = slice.filePos + id3V2Header.size;
+					positions = [tagsEnd];
+					foundTag = true;
+					break;
+				}
+			}
+
+			if (!foundTag) {
+				return tagsEnd;
+			}
+		}
+	}
+
+	/**
+	 * Returns where the audio ends, before any APEv2 and ID3v1 tags at the end of the file, so that the bytes inside
+	 * them (like cover art in an APEv2 tag) aren't mistaken for frames.
+	 */
+	async computeAudioEndPos() {
+		if (this.reader.fileSize === null) {
+			return null;
+		}
+
+		let endPos = this.reader.fileSize;
+
+		if (endPos >= ID3_V1_TAG_SIZE) {
+			let slice = this.reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+
+			if (slice && readAscii(slice, 3) === 'TAG') {
+				endPos -= ID3_V1_TAG_SIZE;
+			}
+		}
+
+		// APEv2 tags end with a 32-byte footer and sit in front of any ID3v1 tag
+		if (endPos >= APE_TAG_FOOTER_SIZE) {
+			let slice = this.reader.requestSlice(endPos - APE_TAG_FOOTER_SIZE, APE_TAG_FOOTER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+
+			if (slice && readAscii(slice, 8) === 'APETAGEX') {
+				slice.skip(4); // Version
+				const tagSize = readU32Le(slice); // Includes the footer, but not the header
+				slice.skip(4); // Item count
+				const flags = readU32Le(slice);
+				const hasHeader = (flags & (1 << 31)) !== 0;
+
+				const tagStartPos = endPos - tagSize - (hasHeader ? APE_TAG_FOOTER_SIZE : 0);
+				if (tagStartPos >= 0) {
+					endPos = tagStartPos;
+				}
+			}
+		}
+
+		return endPos;
 	}
 
 	/**
