@@ -632,7 +632,10 @@ class VideoEncoderWrapper {
 					this.recreateWebCodecsEncoders();
 				}
 
-				const keyFrameInterval = this.encodingConfig.keyFrameInterval ?? 2;
+				// A track that can only hold key packets gets nothing but key frames
+				const keyFrameInterval = this.source._connectedTrack?.metadata.hasOnlyKeyPackets
+					? 0
+					: this.encodingConfig.keyFrameInterval ?? 2;
 				// Counted in whole microseconds, the precision of WebCodecs timestamps, since in floating point a
 				// multiple of a fractional interval can come out just short of it (0.6 / 0.2 = 2.9999999999999996)
 				const multipleOfKeyFrameInterval = Math.floor(
