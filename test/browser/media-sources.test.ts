@@ -921,3 +921,37 @@ test('MediaStreamAudioTrackSource drops audio a process() slower than real time 
 	expect(errors).toEqual([]);
 	expect(callsWhileFinalizing).toBeLessThanOrEqual(9);
 });
+
+test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio without a process function', async () => {
+	const capture = installSineCapture();
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, { codec: 'pcm-f32' });
+	audioSource.errorPromise.catch(() => {});
+	output.addAudioTrack(audioSource);
+
+	try {
+		await output.start();
+		await capture.deliver(20);
+		await new Promise(resolve => setTimeout(resolve, 50));
+
+		// Nothing can hold finalization up here, so canceling while it runs doesn't drop any audio
+		const finalized = output.finalize();
+		await output.cancel();
+		await finalized;
+	} finally {
+		await capture.uninstall();
+	}
+
+	expect(output.state).toBe('finalized');
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	let frames = 0;
+	for await (const sample of new AudioSampleSink(track).samples()) {
+		frames += sample.numberOfFrames;
+		sample.close();
+	}
+	expect(frames).toBe(20 * 1024);
+});
