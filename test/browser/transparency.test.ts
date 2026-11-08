@@ -257,6 +257,56 @@ test('Can encode video with alternating transparency', async () => {
 	}
 });
 
+test('Can encode video that turns transparent after opaque frames', async () => {
+	// The track's alpha mode is written before the later frames are known, so the first, opaque frame mustn't decide it
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		alpha: 'keep',
+	});
+	output.addVideoTrack(source);
+
+	await output.start();
+
+	for (let i = 0; i < 8; i++) {
+		using sample = new VideoSample(new Uint8Array(64 * 48 * 4).fill(128), {
+			format: i === 0 ? 'RGBX' : 'RGBA',
+			codedWidth: 64,
+			codedHeight: 48,
+			timestamp: i,
+			duration: 1,
+		});
+		await source.add(sample);
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.canBeTransparent()).toBe(true);
+
+	const withAlpha: boolean[] = [];
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		withAlpha.push(packet.sideData.alpha !== undefined);
+	}
+	expect(withAlpha).toEqual([false, true, true, true, true, true, true, true]);
+
+	const formatsWithAlpha: boolean[] = [];
+	for await (using sample of new VideoSampleSink(videoTrack).samples()) {
+		formatsWithAlpha.push(sample.format!.includes('A'));
+	}
+	expect(formatsWithAlpha).toEqual(withAlpha);
+});
+
 /**
  * Encodes a frame with alpha, decodes it again and reads it back through a canvas: the size, and the pixels in the
  * middle and at the edges (top right, bottom left, bottom right).

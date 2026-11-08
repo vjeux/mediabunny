@@ -945,7 +945,10 @@ export class MatroskaMuxer extends Muxer {
 				height: meta.decoderConfig.codedHeight,
 				aspectRatio,
 				decoderConfig,
-				alphaMode: track.metadata.canBeTransparent || (packet ? !!packet.sideData.alpha : null),
+				// AlphaMode is set in the track header, before later packets (which may have alpha) are known
+				alphaMode: track.metadata.canBeTransparent
+					|| track.source._keepsAlpha
+					|| (packet ? !!packet.sideData.alpha : null),
 				requiresAnnexBTransformation: false,
 			},
 			chunkQueue: new Queue(),

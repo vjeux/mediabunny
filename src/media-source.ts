@@ -202,6 +202,12 @@ export abstract class VideoSource extends MediaSource {
 	 * @internal
 	 */
 	_frameRateHint: number | null = null;
+	/**
+	 * Whether the source encodes the samples' alpha (`alpha: 'keep'`), so the track can turn transparent at any frame,
+	 * even if the first ones are opaque.
+	 * @internal
+	 */
+	_keepsAlpha = false;
 
 	/** Internal constructor. */
 	constructor(codec: VideoCodec) {
@@ -361,7 +367,9 @@ class VideoEncoderWrapper {
 	private writerWaitCount = 0;
 	private closed = false;
 
-	constructor(private source: VideoSource, private encodingConfig: VideoEncodingConfig) {}
+	constructor(private source: VideoSource, private encodingConfig: VideoEncodingConfig) {
+		source._keepsAlpha = encodingConfig.alpha === 'keep';
+	}
 
 	async add(videoSample: VideoSample, shouldClose: boolean, encodeOptions?: VideoEncoderEncodeOptions) {
 		const originalSample = videoSample;
