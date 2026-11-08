@@ -615,6 +615,28 @@ test('null format', async () => {
 	await sample.copyTo(buffer, { format: 'BGRX' });
 });
 
+test('Samples not backed by a canvas fail cleanly when VideoFrame is missing', async () => {
+	const globals = globalThis as { VideoFrame?: unknown };
+	const OriginalVideoFrame = globals.VideoFrame;
+	delete globals.VideoFrame;
+
+	try {
+		using sample = new VideoSample(new Uint8Array(16), {
+			format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0,
+		});
+		const context = new OffscreenCanvas(2, 2).getContext('2d')!;
+		expect(() => sample.draw(context, 0, 0)).toThrow('VideoFrame is not available');
+		expect(() => sample.toVideoFrame()).toThrow('VideoFrame is not available');
+		await expect(sample.transform({ width: 7 })).rejects.toThrow('VideoFrame is not available');
+
+		// Canvas-backed samples don't need it
+		using canvasSample = new VideoSample(new OffscreenCanvas(2, 2), { timestamp: 0 });
+		canvasSample.draw(context, 0, 0);
+	} finally {
+		globals.VideoFrame = OriginalVideoFrame;
+	}
+});
+
 test('encodeOptions', () => {
 	const canvas = new OffscreenCanvas(100, 100);
 	canvas.getContext('2d');
