@@ -596,6 +596,99 @@ test('Fragmented MP4 keeps writing fragments when two video tracks\' key frames 
 	}
 });
 
+test('Fragmented MP4 keeps writing fragments when two TrueHD tracks\' key frames don\'t line up', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/truehd.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getAudioTracks())[0]!;
+	const decoderConfig = (await track.getDecoderConfig())!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push(packet);
+	}
+
+	// TrueHD packets are key frames only at major syncs (every 16th, about 13 ms apart). The second track's come 7 ms
+	// after the first's, as with two TrueHD tracks of a Blu-ray remux, so the tracks are never at a key frame together.
+	// Optionally, there's also a video track that ends after a second.
+	const offset = 0.007;
+	const write = async (withVideo: boolean) => {
+		let moofCount = 0;
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'fragmented', onMoof: () => moofCount++ }),
+			target: new BufferTarget(),
+		});
+		const video = new EncodedVideoPacketSource('vp9');
+		if (withVideo) {
+			output.addVideoTrack(video);
+		}
+		const first = new EncodedAudioPacketSource('truehd');
+		const second = new EncodedAudioPacketSource('truehd');
+		output.addAudioTrack(first);
+		output.addAudioTrack(second);
+		await output.start();
+
+		let i = 0;
+		let j = 0;
+		let k = withVideo ? 0 : 30;
+		while (i < packets.length || j < packets.length) {
+			const nextAudio = Math.min(packets[i]?.timestamp ?? Infinity, (packets[j]?.timestamp ?? Infinity) + offset);
+			if (k < 30 && k / 30 <= nextAudio) {
+				const packet = new EncodedPacket(new Uint8Array(1), k % 15 === 0 ? 'key' : 'delta', k / 30, 1 / 30);
+				await video.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+				if (++k === 30) {
+					video.close();
+				}
+			} else if (
+				i < packets.length
+				&& (j >= packets.length || packets[i]!.timestamp <= packets[j]!.timestamp + offset)
+			) {
+				await first.add(packets[i]!, { decoderConfig });
+				i++;
+			} else {
+				await second.add(packets[j]!.clone({ timestamp: packets[j]!.timestamp + offset }), { decoderConfig });
+				j++;
+			}
+		}
+
+		const moofCountBeforeFinalize = moofCount;
+		await output.finalize();
+		return { moofCountBeforeFinalize, buffer: output.target.buffer! };
+	};
+
+	// A fragment used to wait for both TrueHD tracks to be at a key frame, which never happened: everything was held in
+	// memory and written at finalization (or, with video, everything after the video ended)
+	const { moofCountBeforeFinalize, buffer } = await write(false);
+	expect(moofCountBeforeFinalize).toBeGreaterThanOrEqual(6); // 5 s of audio, fragments of at least 1 s
+	const withVideo = await write(true);
+	expect(withVideo.moofCountBeforeFinalize).toBeGreaterThanOrEqual(6);
+
+	// Both tracks come back whole
+	const checksum = (hash: number, data: Uint8Array) => {
+		for (const byte of data) {
+			hash = Math.imul(hash ^ byte, 16777619);
+		}
+		return hash;
+	};
+	const originalChecksum = packets.reduce((hash, packet) => checksum(hash, packet.data), 2166136261);
+	using result = new Input({ source: new BufferSource(buffer), formats: ALL_FORMATS });
+	const resultTracks = await result.getAudioTracks();
+	expect(resultTracks).toHaveLength(2);
+	for (const [index, resultTrack] of resultTracks.entries()) {
+		let count = 0;
+		let resultChecksum = 2166136261;
+		for await (const packet of new EncodedPacketSink(resultTrack).packets()) {
+			const original = packets[count]!;
+			expect(packet.timestamp).toBeCloseTo(original.timestamp + index * offset, 6);
+			expect(packet.type).toBe(original.type);
+			resultChecksum = checksum(resultChecksum, packet.data);
+			count++;
+		}
+		expect(count).toBe(packets.length);
+		expect(resultChecksum).toBe(originalChecksum);
+	}
+});
+
 test('No btrt boxes, fragmented MP4 without bitrate metadata', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),

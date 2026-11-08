@@ -101,6 +101,10 @@ export type IsobmffTrackData = {
 		samplesPerChunk: number;
 	}[];
 	closed: boolean;
+	/** Whether the track has had delta samples, like TrueHD audio between major syncs (for fragmented files). */
+	hasDeltaSamples: boolean;
+	/** Set when a video key frame ended a fragment without this track, which then ends its chunk at its next key. */
+	endChunkAtNextKey: boolean;
 
 	// 0 means unknown
 	avgBitrate: number;
@@ -530,6 +534,8 @@ export class IsobmffMuxer extends Muxer {
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
 			closed: false,
+			hasDeltaSamples: false,
+			endChunkAtNextKey: false,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 		};
@@ -638,6 +644,8 @@ export class IsobmffMuxer extends Muxer {
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
 			closed: false,
+			hasDeltaSamples: false,
+			endChunkAtNextKey: false,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 		};
@@ -683,6 +691,8 @@ export class IsobmffMuxer extends Muxer {
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
 			closed: false,
+			hasDeltaSamples: false,
+			endChunkAtNextKey: false,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 
@@ -1206,6 +1216,10 @@ export class IsobmffMuxer extends Muxer {
 			const currentChunkDuration = sample.timestamp - trackData.currentChunk.startTimestamp;
 
 			if (this.isFragmented) {
+				if (sample.type === 'delta') {
+					trackData.hasDeltaSamples = true;
+				}
+
 				// We can only finalize this fragment (and begin a new one) if we know that each track will be able to
 				// start the new one with a key frame.
 				const startsWithKeyFrame = (otherTrackData: IsobmffTrackData) => {
@@ -1230,11 +1244,16 @@ export class IsobmffMuxer extends Muxer {
 					beginNewChunk = true;
 					await this.finalizeFragment();
 				} else if (
-					// When the key frames of several video tracks don't line up, the condition above may never hold. A
-					// video key frame then ends a fragment for the tracks that can start the next one with a key frame,
-					// while the others keep their chunk until they can.
+					// When the key frames of several tracks with delta frames (video, or audio like TrueHD) don't line
+					// up, the condition above may never hold. A video key frame (or, once no video is left, any such
+					// track's) then ends a fragment for the tracks that can start the next one with a key frame, while
+					// the others keep their chunk until their next key frame.
 					!keyFrameQueuedEverywhere
-					&& trackData.type === 'video'
+					&& (
+						trackData.type === 'video'
+						|| trackData.endChunkAtNextKey
+						|| (trackData.hasDeltaSamples && !this.trackDatas.some(x => x.type === 'video' && !x.closed))
+					)
 					&& sample.type === 'key'
 					&& currentChunkDuration >= this.minimumFragmentDuration
 					// Another track's sample with this same timestamp may have been written already
@@ -1247,6 +1266,15 @@ export class IsobmffMuxer extends Muxer {
 				) {
 					beginNewChunk = true;
 					await this.finalizeFragment(undefined, this.trackDatas.filter(startsWithKeyFrame));
+
+					if (trackData.type === 'video') {
+						// The tracks left out (those still holding a chunk) end it at their next key frame
+						for (const otherTrackData of this.trackDatas) {
+							if (otherTrackData.currentChunk) {
+								otherTrackData.endChunkAtNextKey = true;
+							}
+						}
+					}
 				}
 			} else {
 				beginNewChunk = currentChunkDuration >= MIN_CHUNK_DURATION; // Chunk is long enough, we need a new one
@@ -1505,6 +1533,7 @@ export class IsobmffMuxer extends Muxer {
 			trackData.finalizedChunks.push(trackData.currentChunk!);
 			this.finalizedChunks.push(trackData.currentChunk!);
 			trackData.currentChunk = null;
+			trackData.endChunkAtNextKey = false;
 		}
 
 		if (flushWriter) {
