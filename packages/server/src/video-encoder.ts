@@ -170,8 +170,11 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		if (this.avCodec.name === 'libsvtav1') {
 			// SVT-AV1's rate control budgets each key frame against its intra period, so key frames requested within a
 			// longer one get far too many bits (a third over the target bitrate). Its period is matched to the
-			// requested interval instead; a requested key frame restarts it, so it adds no key frames of its own.
-			codecContext.gopSize = Math.max(Math.round(this._keyFrameInterval * frameRate), 2);
+			// requested interval instead, plus a frame, so that a frame rate slightly below the real one doesn't end it
+			// before the next request. A requested key frame restarts it, so it adds no key frames of its own, unless
+			// the frame rate is unknown and above the 30 fps assumed then (as with the fixed period of 60 before).
+			const intervalFrameRate = this.config.framerate || 30;
+			codecContext.gopSize = Math.max(Math.ceil(this._keyFrameInterval * intervalFrameRate) + 1, 2);
 		}
 		codecContext.framerate = new NodeAv.Rational(frameRate, 1);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate

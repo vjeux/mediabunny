@@ -556,6 +556,71 @@ describe('Video', async () => {
 		}
 	});
 
+	test('AV1 key frames stay where requested when frames come slightly faster than declared or irregularly', {
+		timeout: 60_000,
+	}, async () => {
+		// Encodes frames at the given timestamps with a declared 30 fps and returns the indices of the key frames,
+		// along with those of the frames the default keyFrameInterval of 2 s requests them for. Indices, since the
+		// declared frame rate snaps the written timestamps to its grid.
+		const keyFrames = async (timestamps: number[]) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'av1', quality: new Quality({ bitrate: 500_000 }) });
+			output.addVideoTrack(source, { frameRate: 30 });
+			await output.start();
+
+			for (let i = 0; i < timestamps.length; i++) {
+				const data = new Uint8Array(160 * 120 * 3 / 2).fill(128);
+				for (let j = 0; j < 160 * 120; j++) {
+					data[j] = (j * 7 + i * 3) & 0xff;
+				}
+				const sample = new VideoSample(data, {
+					format: 'I420',
+					codedWidth: 160,
+					codedHeight: 120,
+					timestamp: timestamps[i]!,
+					duration: (timestamps[i + 1] ?? timestamps[i]! + 1 / 30) - timestamps[i]!,
+				});
+				await source.add(sample);
+				sample.close();
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			const actual: number[] = [];
+			let index = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				if (packet.type === 'key') {
+					actual.push(index);
+				}
+				index++;
+			}
+			expect(index).toBe(timestamps.length);
+			const requested = timestamps.flatMap((timestamp, i) => {
+				return i === 0 || Math.floor(timestamp / 2) > Math.floor(timestamps[i - 1]! / 2) ? [i] : [];
+			});
+
+			return { actual, requested };
+		};
+
+		// 30.4 fps declared as 30: each 2 s interval holds a frame more than SVT-AV1's intra period would at 30 fps
+		const faster = await keyFrames(Array.from({ length: 300 }, (_, i) => i / 30.4));
+		expect(faster.actual).toEqual(faster.requested);
+
+		// About 30 fps, with frame durations varying by up to 20%
+		let seed = 12345;
+		let timestamp = 0;
+		const irregular: number[] = [];
+		for (let i = 0; i < 300; i++) {
+			irregular.push(timestamp);
+			seed = (seed * 48271) % 2147483647;
+			timestamp += (1 + 0.2 * (2 * seed / 2147483647 - 1)) / 30;
+		}
+		const jittered = await keyFrames(irregular);
+		expect(jittered.actual).toEqual(jittered.requested);
+	});
+
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },
