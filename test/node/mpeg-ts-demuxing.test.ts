@@ -1,9 +1,10 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource, UrlSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { ALL_FORMATS, MPEG_TS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
@@ -11,6 +12,10 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { Output } from '../../src/output.js';
+import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -921,4 +926,233 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS uses an intact copy of a damaged PAT or PMT', async () => {
+	// FFmpeg output, which repeats the PAT and PMT (PID 0x1000) several times per second, like broadcasts do
+	const bytes = new Uint8Array(await fs.promises.readFile(path.join(__dirname, '../public/mp3.ts')));
+	const findFirstSection = (pid: number) => {
+		for (let pos = 0; pos < bytes.length; pos += 188) {
+			if (((bytes[pos + 1]! & 0x1f) << 8 | bytes[pos + 2]!) === pid && bytes[pos + 1]! & 0x40) {
+				return pos + 4 + 1 + bytes[pos + 4]!; // Skip the header and pointer_field
+			}
+		}
+
+		throw new Error('Section not found');
+	};
+
+	const readTracks = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		return Promise.all((await input.getTracks()).map(track => track.getCodec()));
+	};
+
+	// A bit error in the first PAT turns its program into the network PID entry
+	const damagedPat = bytes.slice();
+	damagedPat[findFirstSection(0) + 9] = 0x00; // program_number 1 -> 0
+	expect(await readTracks(damagedPat)).toEqual(['mp3']);
+
+	// A bit error in the first PMT changes the stream type
+	const damagedPmt = bytes.slice();
+	damagedPmt[findFirstSection(0x1000) + 12] = 0x13; // stream_type 0x03 (MPEG-1 audio) -> 0x13
+	expect(await readTracks(damagedPmt)).toEqual(['mp3']);
+
+	// A bit error in the first PAT's pointer_field, so its section (and table_id) is looked for in the wrong place
+	const damagedPointerField = bytes.slice();
+	damagedPointerField[findFirstSection(0) - 1]! ^= 0x80; // pointer_field 0 -> 128
+	expect(await readTracks(damagedPointerField)).toEqual(['mp3']);
+
+	// Some muxers write bad CRCs throughout, so without an intact copy, the damaged one is still used
+	const allBad = bytes.slice();
+	for (let pos = 0; pos < allBad.length; pos += 188) {
+		const pid = (allBad[pos + 1]! & 0x1f) << 8 | allBad[pos + 2]!;
+		if ((pid === 0 || pid === 0x1000) && allBad[pos + 1]! & 0x40) {
+			const sectionStart = pos + 4 + 1 + allBad[pos + 4]!;
+			const sectionEnd = sectionStart + 3 + ((allBad[sectionStart + 1]! & 0x0f) << 8 | allBad[sectionStart + 2]!);
+			allBad.fill(0, sectionEnd - 4, sectionEnd); // CRC_32
+		}
+	}
+	expect(await readTracks(allBad)).toEqual(['mp3']);
+
+	// With a single damaged copy of each, the search for an intact one stops after a few seconds of media rather than
+	// reading the whole file
+	const singleBad = allBad.slice();
+	let tableCount = 0;
+	for (let pos = 0; pos < singleBad.length; pos += 188) {
+		const pid = (singleBad[pos + 1]! & 0x1f) << 8 | singleBad[pos + 2]!;
+		if ((pid === 0 || pid === 0x1000) && ++tableCount > 2) {
+			singleBad.set([0x1f, 0xff], pos + 1); // Turn into a null packet
+		}
+	}
+
+	let maxEnd = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => singleBad.byteLength,
+			read: (start, end) => {
+				maxEnd = Math.max(maxEnd, end);
+				return singleBad.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	expect(await Promise.all((await input.getTracks()).map(track => track.getCodec()))).toEqual(['mp3']);
+	expect(maxEnd).toBeLessThan(singleBad.byteLength / 2);
+});
+
+test('MPEG-TS searches for an intact PMT copy only where it can go back to', async () => {
+	// From L04's review. 4 seconds of 64x64 H.264 frames of 60 kB each, written by Mediabunny, which writes the PAT
+	// and PMT once
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		const isKey = i % 25 === 0;
+		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				isKey ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	// Its only PMT gets a bad CRC, and it's read from a stream through a ReadableStreamSource with a 2 MiB cache, then
+	// from a server that ignores range requests through a UrlSource, which knows the size but reads in order too. As
+	// reading goes back to the PMT after a search for an intact copy, such sources search only as far as they can still
+	// come back from.
+	const damaged = bytes.slice();
+	const pmtPos = 188; // After the PAT
+	expect(((damaged[pmtPos + 1]! & 0x1f) << 8) | damaged[pmtPos + 2]!).toBe(0x1000);
+	const sectionStart = pmtPos + 5 + damaged[pmtPos + 4]!;
+	const sectionEnd = sectionStart + 3 + (((damaged[sectionStart + 1]! & 0x0f) << 8) | damaged[sectionStart + 2]!);
+	damaged[sectionEnd - 1]! ^= 0xff; // CRC_32
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= damaged.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(damaged.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	{
+		using input = new Input({
+			source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 21 }),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(packetCount).toBe(100);
+	}
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': damaged.byteLength });
+		response.end(damaged);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using input = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 21,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(packetCount).toBe(100);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+
+	// Within that, they find an intact copy as well as other sources do (from L46's review): mp3.ts, whose first PMT
+	// has a damaged stream type, through the same two sources
+	const mp3Bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/mp3.ts')));
+	for (let pos = 0; pos < mp3Bytes.length; pos += 188) {
+		if ((((mp3Bytes[pos + 1]! & 0x1f) << 8) | mp3Bytes[pos + 2]!) === 0x1000 && mp3Bytes[pos + 1]! & 0x40) {
+			mp3Bytes[pos + 5 + mp3Bytes[pos + 4]! + 12] = 0x13; // stream_type 0x03 (MPEG-1 audio) -> 0x13
+			break;
+		}
+	}
+	const readCodecs = async (source: ReadableStreamSource | UrlSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		return Promise.all((await input.getTracks()).map(track => track.getCodec()));
+	};
+	let mp3Position = 0;
+	const mp3Stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (mp3Position >= mp3Bytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(mp3Bytes.slice(mp3Position, mp3Position + 65536));
+			mp3Position += 65536;
+		},
+	});
+	expect(await readCodecs(new ReadableStreamSource(mp3Stream, { maxCacheSize: 2 ** 21 }))).toEqual(['mp3']);
+	const mp3Server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': mp3Bytes.byteLength });
+		response.end(mp3Bytes);
+	});
+	await new Promise<void>(resolve => mp3Server.listen(0, resolve));
+	try {
+		const address = mp3Server.address();
+		assert(address && typeof address !== 'string');
+		expect(await readCodecs(new UrlSource(`http://localhost:${address.port}/mp3.ts`, {
+			maxCacheSize: 2 ** 21,
+			getRetryDelay: () => null,
+		}))).toEqual(['mp3']);
+	} finally {
+		mp3Server.closeAllConnections();
+		mp3Server.close();
+	}
+
+	// Some data before the PAT that looks like a PMT (a table_id of 2) but has a bad CRC isn't searched for: without a
+	// PAT naming its PID, it may well not be a PMT at all
+	const junk = new Uint8Array(188).fill(0xff);
+	junk.set([0x47, 0x4b, 0x2b, 0x10, 0x00, 0x02, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0xe1, 0x00, 0xf0, 0x00]);
+	junk.set([0xde, 0xad, 0xbe, 0xef], 17); // CRC_32
+	const withJunk = new Uint8Array(junk.length + bytes.length);
+	withJunk.set(junk);
+	withJunk.set(bytes, junk.length);
+	let maxEnd = 0;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => withJunk.byteLength,
+			read: (start, end) => {
+				maxEnd = Math.max(maxEnd, end);
+				return withJunk.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	await input.getTracks();
+	expect(maxEnd).toBeLessThan(2 ** 20);
 });
