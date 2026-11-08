@@ -1666,7 +1666,12 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					currentPage = startPosition.page;
 					currentSegmentIndex = startPosition.segmentIndex;
 
-					if (endPosition.page.headerStartPos !== endPage.headerStartPos) {
+					// A granule position of -1 can't anchor the timestamps, even on a page where packets end (where
+					// RFC 3533 doesn't allow it, but some muxers write it anyway), so let's keep stepping back then
+					if (
+						endPosition.page.headerStartPos !== endPage.headerStartPos
+						&& endPosition.page.granulePosition !== -1
+					) {
 						endPage = endPosition.page;
 						endSegmentIndex = endPosition.segmentIndex;
 						break;
