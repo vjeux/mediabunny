@@ -60,7 +60,8 @@ export class EncodedPacket {
 		 * The encoded data of this packet. For any given codec, this data must adhere to the format specified in the
 		 * Mediabunny Codec Registry. The data is not copied: when the packet is added to an output, the output may read
 		 * it until the packet has been written, so don't modify or reuse the underlying buffer after creating the
-		 * packet.
+		 * packet. Likewise, packets read from an input may share memory with it (a `BufferSource`'s buffer or the read
+		 * cache), so copy their data before modifying it.
 		 */
 		public readonly data: Uint8Array,
 		/** The type of this packet. */
