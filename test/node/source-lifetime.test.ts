@@ -99,6 +99,53 @@ test('Disposing an input rejects reads waiting on a user callback that never set
 	hlsInput.dispose();
 	// On main, this stayed pending forever
 	expect(await outcome(tracks)).toBe('InputDisposedError');
+
+	// The same for the root file, which a CustomPathedSource requests itself (L46)
+	const rootInput = new Input({
+		source: new CustomPathedSource(
+			'https://example.com/media.m3u8',
+			() => new Promise<InstanceType<typeof BufferSource>>(() => {}),
+		),
+		formats: ALL_FORMATS,
+	});
+	const rootFormat = rootInput.getFormat();
+	await setImmediate();
+	rootInput.dispose();
+	// On main, this stayed pending forever
+	expect(await outcome(rootFormat)).toBe('InputDisposedError');
+});
+
+test('Waiting on user callbacks that settle holds on to nothing until disposal', async () => {
+	const { BufferSource, CustomPathedSource } = await import('../../src/source.js');
+	const { EncodedPacketSink } = await import('../../src/media-sink.js');
+
+	// An HLS playlist of 3 segments in memory, read whole. Each request for a segment is waited on until disposal,
+	// which must not keep hold of it once settled, or a long live stream would keep every segment until disposal.
+	const mp3 = await readFile(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3'));
+	const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:40\n'
+		+ [0, 1, 2].map(i => `#EXTINF:38.5,\nsegment${i}.mp3\n`).join('')
+		+ '#EXT-X-ENDLIST\n';
+	const source = new CustomPathedSource('https://example.com/media.m3u8', async ({ path }) => {
+		return new BufferSource(path.endsWith('.m3u8') ? new TextEncoder().encode(playlist) : mp3);
+	});
+	using input = new Input({ source, formats: ALL_FORMATS });
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+		void packet;
+		packetCount++;
+	}
+	expect(packetCount).toBeGreaterThan(3 * 1000);
+	expect(input._disposalSignal.pendingRejecters.size).toBe(0);
+	expect(source._disposalSignal.pendingRejecters.size).toBe(0);
+
+	// The same for a CustomSource's getSize
+	const customSource = new CustomSource({
+		getSize: async () => mp3.length,
+		read: (start, end) => mp3.subarray(start, end),
+	});
+	using customInput = new Input({ source: customSource, formats: ALL_FORMATS });
+	expect(await customInput.getTracks()).toHaveLength(1);
+	expect(customSource._disposalSignal.pendingRejecters.size).toBe(0);
 });
 
 test.each([

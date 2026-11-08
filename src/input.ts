@@ -27,6 +27,7 @@ import {
 	arrayArgmin,
 	arrayCount,
 	assert,
+	DisposalSignal,
 	EventEmitter,
 	polyfillSymbolDispose,
 	removeItem,
@@ -127,16 +128,11 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	_nextSourceCacheAge = 0;
 	/** @internal */
 	_sourceRefs: SourceRef[] = [];
-	/** @internal */
-	_rejectOnDisposal: (error: Error) => void = () => {};
 	/**
-	 * Rejects once the input is disposed, for requests waiting on a request handler that may never settle.
+	 * For requests waiting on a request handler that may never settle, which disposing rejects.
 	 * @internal
 	 */
-	_disposal = new Promise<never>((resolve, reject) => {
-		this._rejectOnDisposal = reject;
-	});
-
+	_disposalSignal = new DisposalSignal();
 	/** @internal */
 	_sourceCache: SourceCacheEntry[] = [];
 	/** @internal */
@@ -233,7 +229,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			const uncached = this._getSourceUncached(request);
 			let sourceRef: SourceRef;
 			try {
-				sourceRef = await Promise.race([uncached, this._disposal]);
+				sourceRef = await this._disposalSignal.wait(uncached);
 			} catch (error) {
 				void uncached.then(ref => ref.free(), () => {});
 				throw error;
@@ -557,8 +553,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 		this._sourceRefs.length = 0;
 
-		void this._disposal.catch(() => {});
-		this._rejectOnDisposal(new InputDisposedError());
+		this._disposalSignal.dispose(new InputDisposedError());
 
 		if (this._demuxerPromise) {
 			// The demuxer promise may already be rejected after failed format detection.
