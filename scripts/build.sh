@@ -50,6 +50,11 @@ api-extractor run -c packages/flac-encoder/api-extractor.json
 api-extractor run -c packages/prores/api-extractor.json
 api-extractor run -c packages/server/api-extractor.json
 
+# The extensions' declarations are CommonJS (their packages aren't "type": "module"), so their ESM entries get ESM copies
+for name in mp3-encoder ac3 dts truehd aac-encoder flac-encoder prores server; do
+	cp packages/$name/dist/mediabunny-$name.d.ts packages/$name/dist/mediabunny-$name.d.mts
+done
+
 # Checks that all symbols are documented
 tsx scripts/check-docblocks.ts \
 	dist/mediabunny.d.ts \
