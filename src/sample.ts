@@ -1351,7 +1351,20 @@ export class VideoSample implements Disposable {
 	}
 
 	/**
-	 * Draws the video sample to a 2D canvas context. Rotation and flip metadata will be taken into account.
+	 * Draws the video sample to a 2D canvas context at its display size. Rotation and flip metadata will be taken into
+	 * account.
+	 *
+	 * @param dx - The x-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 * @param dy - The y-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 */
+	draw(
+		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		dx: number,
+		dy: number,
+	): void;
+	/**
+	 * Draws the video sample to a 2D canvas context, scaled to the given size. Rotation and flip metadata will be taken
+	 * into account.
 	 *
 	 * @param dx - The x-coordinate in the destination canvas at which to place the top-left corner of the source image.
 	 * @param dy - The y-coordinate in the destination canvas at which to place the top-left corner of the source image.
@@ -1362,11 +1375,34 @@ export class VideoSample implements Disposable {
 		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
 		dx: number,
 		dy: number,
-		dWidth?: number,
-		dHeight?: number,
+		dWidth: number,
+		dHeight: number,
 	): void;
 	/**
-	 * Draws the video sample to a 2D canvas context. Rotation and flip metadata will be taken into account.
+	 * Draws a sub-rectangle of the video sample to a 2D canvas context at the sub-rectangle's size. Rotation and flip
+	 * metadata will be taken into account.
+	 *
+	 * @param sx - The x-coordinate of the top left corner of the sub-rectangle of the source image to draw into the
+	 * destination context.
+	 * @param sy - The y-coordinate of the top left corner of the sub-rectangle of the source image to draw into the
+	 * destination context.
+	 * @param sWidth - The width of the sub-rectangle of the source image to draw into the destination context.
+	 * @param sHeight - The height of the sub-rectangle of the source image to draw into the destination context.
+	 * @param dx - The x-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 * @param dy - The y-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 */
+	draw(
+		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		sx: number,
+		sy: number,
+		sWidth: number,
+		sHeight: number,
+		dx: number,
+		dy: number,
+	): void;
+	/**
+	 * Draws a sub-rectangle of the video sample to a 2D canvas context, scaled to the given size. Rotation and flip
+	 * metadata will be taken into account.
 	 *
 	 * @param sx - The x-coordinate of the top left corner of the sub-rectangle of the source image to draw into the
 	 * destination context.
@@ -1387,8 +1423,8 @@ export class VideoSample implements Disposable {
 		sHeight: number,
 		dx: number,
 		dy: number,
-		dWidth?: number,
-		dHeight?: number,
+		dWidth: number,
+		dHeight: number,
 	): void;
 	draw(
 		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
