@@ -3883,3 +3883,69 @@ const u16 = (value: number) => [(value >>> 8) & 0xff, value & 0xff];
 const u8 = (value: number) => [value & 0xff];
 const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
 const zeros = (length: number) => new Uint8Array(length);
+
+test('Fragments without tfdt are placed the same whichever track is looked up first', async () => {
+	// A video and an audio track in fragments without tfdt, where only the video track has tfra entries (like
+	// FFmpeg's samples au30sec.mp4 and MAV_0001.3G2). A video lookup can jump to a late fragment, whose audio samples
+	// can only be placed in time once the audio track's earlier fragments have been read.
+	const output = new Output({
+		format: new Mp4OutputFormat({ fastStart: 'fragmented', minimumFragmentDuration: 1 }),
+		target: new BufferTarget(),
+	});
+	const video = new EncodedVideoPacketSource('vp8');
+	const audio = new EncodedAudioPacketSource('opus');
+	output.addVideoTrack(video);
+	output.addAudioTrack(audio);
+	await output.start();
+	const audioConfig = {
+		codec: 'opus',
+		numberOfChannels: 2,
+		sampleRate: 48000,
+		// OpusHead: version 1, 2 channels, 312 pre-skip, 48 kHz, no gain, family 0
+		description: new Uint8Array([
+			0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0,
+		]),
+	};
+	for (let i = 0; i < 500; i++) {
+		if (i % 5 === 0) {
+			await video.add(new EncodedPacket(new Uint8Array(100), i % 50 === 0 ? 'key' : 'delta', i / 50, 0.1), {
+				decoderConfig: { codec: 'vp8', codedWidth: 64, codedHeight: 64 },
+			});
+		}
+		await audio.add(new EncodedPacket(new Uint8Array(50), 'key', i / 50, 0.02), { decoderConfig: audioConfig });
+	}
+	await output.finalize();
+
+	// Remove the tfdt boxes and the audio track's tfra box by renaming them (which keeps every offset valid)
+	const bytes = new Uint8Array(output.target.buffer!);
+	const tfraCount = { count: 0 };
+	for (let i = 4; i + 4 <= bytes.byteLength; i++) {
+		const name = new TextDecoder().decode(bytes.subarray(i, i + 4));
+		if (name === 'tfdt' || (name === 'tfra' && tfraCount.count++ > 0)) {
+			bytes.set(new TextEncoder().encode('free'), i);
+		}
+	}
+	expect(tfraCount.count).toBe(2);
+
+	const readAudio = async (lookUpVideoFirst: boolean) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const [videoTrack, audioTrack] = [(await input.getVideoTracks())[0]!, (await input.getAudioTracks())[0]!];
+		if (lookUpVideoFirst) {
+			expect(await videoTrack.computeDuration()).toBe(10);
+		}
+
+		const sink = new EncodedPacketSink(audioTrack);
+		const timestamps: number[] = [];
+		for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+			timestamps.push(packet.timestamp);
+		}
+
+		const last = (await sink.getPacket(Infinity))?.timestamp;
+		return { timestamps, last, duration: await audioTrack.computeDuration() };
+	};
+
+	const fresh = await readAudio(false);
+	expect(fresh.timestamps).toEqual(Array.from({ length: 500 }, (_, i) => i / 50));
+	expect(fresh.duration).toBe(10);
+	expect(await readAudio(true)).toEqual(fresh);
+});
