@@ -443,6 +443,49 @@ export class EncodedPacketSink {
 
 const MAX_QUEUE_SIZE = 4;
 
+/**
+ * Creates waits that end early, with null, once terminate() is called. Each wait drops its listener as soon as it
+ * settles, so that a long iteration doesn't keep one per wait until it ends, as racing every wait against one
+ * long-lived promise would (each race leaves a reaction on that promise).
+ */
+const createTerminableWaits = () => {
+	let terminated = false;
+	const listeners = new Set<() => void>();
+
+	const unlessTerminated = <T>(promise: Promise<T>) => {
+		const { promise: result, resolve, reject } = promiseWithResolvers<T | null>();
+		const listener = () => resolve(null);
+		if (terminated) {
+			resolve(null);
+		} else {
+			listeners.add(listener);
+		}
+
+		promise.then(
+			(value) => {
+				listeners.delete(listener);
+				resolve(value);
+			},
+			(error: unknown) => {
+				listeners.delete(listener);
+				reject(error);
+			},
+		);
+
+		return result;
+	};
+
+	const terminate = () => {
+		terminated = true;
+		for (const listener of listeners) {
+			listener();
+		}
+		listeners.clear();
+	};
+
+	return { unlessTerminated, terminate };
+};
+
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
 > {
@@ -501,10 +544,7 @@ export abstract class BaseMediaSampleSink<
 
 		// On a live stream that doesn't go on, waiting for packets never ends, so the pump stops waiting once the
 		// iteration has ended, to free the decoder
-		const { promise: terminatedPromise, resolve: onTerminated } = promiseWithResolvers();
-		const unlessTerminated = <T>(promise: Promise<T>) => {
-			return Promise.race([promise, terminatedPromise.then(() => null)]);
-		};
+		const { unlessTerminated, terminate: onTerminated } = createTerminableWaits();
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -708,10 +748,7 @@ export abstract class BaseMediaSampleSink<
 
 		// On a live stream that doesn't go on, waiting for packets never ends, so the pump stops waiting once the
 		// iteration has ended, to free the decoder
-		const { promise: terminatedPromise, resolve: onTerminated } = promiseWithResolvers();
-		const unlessTerminated = <T>(promise: Promise<T>) => {
-			return Promise.race([promise, terminatedPromise.then(() => null)]);
-		};
+		const { unlessTerminated, terminate: onTerminated } = createTerminableWaits();
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
