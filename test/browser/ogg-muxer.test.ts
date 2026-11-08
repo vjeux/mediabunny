@@ -247,6 +247,38 @@ test('Opus start offset and end trimming survive a demux-mux roundtrip', async (
 	expect(standard.duration).toBe((packetCount * SAMPLES_PER_FRAME - PRE_SKIP) / SAMPLE_RATE);
 });
 
+test('Logical streams come in the order the tracks were added in', async () => {
+	const opusHead = (channels: number) => new Uint8Array([
+		0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, // 'OpusHead'
+		1, channels, 0x38, 1, 0x80, 0xbb, 0, 0, 0, 0, 0, // Version 1, pre-skip 312, 48 kHz, no gain, mapping family 0
+	]);
+
+	const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+	const monoSource = new EncodedAudioPacketSource('opus');
+	const stereoSource = new EncodedAudioPacketSource('opus');
+	output.addAudioTrack(monoSource);
+	output.addAudioTrack(stereoSource);
+	await output.start();
+
+	// The second track's first packet comes first
+	const packet = new Uint8Array([0xf8, 0xff, 0xfe]); // 20 ms of CELT
+	for (const [source, channels] of [[stereoSource, 2], [monoSource, 1]] as const) {
+		const decoderConfig = {
+			codec: 'opus',
+			numberOfChannels: channels,
+			sampleRate: 48000,
+			description: opusHead(channels),
+		};
+		await source.add(new EncodedPacket(packet, 'key', 0, 0.02), { decoderConfig });
+	}
+	await output.finalize();
+	assert(output.target.buffer);
+
+	using input = new Input({ source: new BufferSource(output.target.buffer), formats: ALL_FORMATS });
+	const tracks = await input.getAudioTracks();
+	expect(await Promise.all(tracks.map(track => track.getNumberOfChannels()))).toEqual([1, 2]);
+});
+
 test('Granule positions of full pages', async () => {
 	const SAMPLE_RATE = 48000;
 	const SAMPLES_PER_FRAME = 120; // 2.5 ms at 48 kHz
