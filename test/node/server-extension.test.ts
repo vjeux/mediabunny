@@ -29,7 +29,7 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { FlacOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
+import { FlacOutputFormat, Mp4OutputFormat, OggOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
@@ -2695,6 +2695,39 @@ describe('Audio', async () => {
 				expect(sample.duration).toBe(0.02);
 			}
 		});
+	});
+
+	test.each(['constant', 'variable'] as const)('Opus with bitrateMode \'%s\'', async (bitrateMode) => {
+		const sizes: number[] = [];
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({
+			codec: 'opus',
+			quality: new Quality({ bitrate: 128_000, bitrateMode }),
+			onEncodedPacket: (packet) => {
+				sizes.push(packet.byteLength);
+			},
+		});
+		output.addAudioTrack(source);
+		await output.start();
+
+		// One second of silence, then one second of noise, at 48 kHz stereo
+		const data = new Float32Array(2 * 96000);
+		let seed = 1;
+		for (let i = 96000; i < data.length; i++) {
+			seed = (seed * 1103515245 + 12345) % 2147483648;
+			data[i] = seed / 2147483648 - 0.5;
+		}
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		if (bitrateMode === 'constant') {
+			// Every 20 ms packet gets 128 kbit/s * 20 ms = 320 bytes, like with WebCodecs encoders
+			expect(new Set(sizes)).toEqual(new Set([320]));
+		} else {
+			// Control: the silence takes far less than the noise
+			expect(Math.min(...sizes)).toBeLessThan(Math.max(...sizes) / 10);
+		}
 	});
 
 	test('MP3 encode & decode', async () => {
