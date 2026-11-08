@@ -2629,6 +2629,135 @@ const testSparseTracksInSegments = async (hlsOptions: HlsOutputFormatOptions) =>
 	expect(audioTimestamps).toEqual([2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5]);
 };
 
+const writeHlsWithDates = async (
+	addMedia: (output: Output) => Promise<void>,
+	// Returns the #EXT-X-PROGRAM-DATE-TIME (in Unix seconds) for each segment, or null to leave it undated
+	getDate: (segmentIndex: number, durationsBefore: number[]) => number | null,
+) => {
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1 }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+			return target;
+		}),
+	});
+	await addMedia(output);
+
+	const durations: number[] = [];
+	const playlist = new TextDecoder().decode(targets.get('playlist-1.m3u8')!.buffer!)
+		.replace(/#EXTINF:([\d.]+),/g, (match, duration: string) => {
+			const date = getDate(durations.length, durations);
+			durations.push(Number(duration));
+			return date === null ? match : `#EXT-X-PROGRAM-DATE-TIME:${new Date(1000 * date).toISOString()}\n${match}`;
+		});
+
+	const openInput = (offsetTimestampsByDateTime: boolean, rootPath = 'playlist-1.m3u8', readableSegments = true) => {
+		return new Input({
+			source: new CustomPathedSource(rootPath, ({ path }) => {
+				if (path === 'playlist-1.m3u8') {
+					return new BufferSource(new TextEncoder().encode(playlist));
+				}
+				if (!readableSegments && path !== 'master.m3u8') {
+					throw new Error(`${path} is unavailable`);
+				}
+
+				return new BufferSource(targets.get(path)!.buffer!);
+			}),
+			formats: ALL_FORMATS,
+			formatOptions: { hls: { offsetTimestampsByDateTime } },
+		});
+	};
+
+	return { durations, openInput };
+};
+
+test('Unix times follow each segment\'s own program date time when the dates drift from the media', async () => {
+	// Segments dated from a wall clock while the media follows the encoder's clock: each date lies a bit later than
+	// the previous one plus the segment's duration. A date applies to the first sample of its segment (RFC 8216,
+	// 4.3.2.6), and undated segments are dated from the last date by media time.
+	const start = Date.parse('2026-01-01T00:00:00.000Z') / 1000;
+	const addAudio = async (output: Output) => {
+		const audio = audioSource();
+		output.addAudioTrack(audio);
+		await output.start();
+		for (let i = 0; i * 1024 / 48000 < 8; i++) {
+			await audio.add(new EncodedPacket(aacPacketData, 'key', i * 1024 / 48000, 1024 / 48000), aacMetadata);
+		}
+		await output.finalize();
+	};
+
+	const check = async (datedEvery: number, offsetTimestampsByDateTime: boolean) => {
+		const dates: number[] = [];
+		const { durations, openInput } = await writeHlsWithDates(addAudio, (index, durationsBefore) => {
+			if (index % datedEvery !== 0) {
+				return null;
+			}
+
+			const date = start + durationsBefore.reduce((a, b) => a + b, 0) + 0.25 * index;
+			dates.push(date);
+			return date;
+		});
+
+		using input = openInput(offsetTimestampsByDateTime);
+		const track = (await input.getPrimaryAudioTrack())!;
+		let segmentStart = (await new EncodedPacketSink(track).getFirstPacket())!.timestamp;
+		for (let i = 0; i < durations.length; i++) {
+			// The date in effect, plus the media time since the segment it was given for, plus half a second
+			const dateIndex = Math.floor(i / datedEvery);
+			const sinceDate = durations.slice(dateIndex * datedEvery, i).reduce((a, b) => a + b, 0);
+			const expected = dates[dateIndex]! + sinceDate + 0.5;
+			expect(await track.getUnixTimeForTimestamp(segmentStart + 0.5), `segment ${i}`).toBeCloseTo(expected, 2);
+			segmentStart += durations[i]!;
+		}
+	};
+
+	for (const datedEvery of [1, 2]) {
+		await check(datedEvery, true);
+		await check(datedEvery, false);
+	}
+
+	// When the media can't be read, the playlist's timeline is all there is, as before
+	const { openInput } = await writeHlsWithDates(addAudio, (index, durationsBefore) => {
+		return start + durationsBefore.reduce((a, b) => a + b, 0) + 0.25 * index;
+	});
+	using unreadableInput = openInput(true, 'master.m3u8', false);
+	const unreadableTrack = (await unreadableInput.getPrimaryAudioTrack())!;
+	expect(await unreadableTrack.getUnixTimeForTimestamp(start + 3.5)).toBeCloseTo(start + 3.5, 6);
+});
+
+test('Muxed tracks map a timestamp to the same Unix time', async () => {
+	// The tracks of a segment share its timeline, so its date maps their timestamps alike, even when the audio starts
+	// a bit before the video (encoder priming)
+	const start = Date.parse('2026-01-01T00:00:00.000Z') / 1000;
+	const { openInput } = await writeHlsWithDates(async (output) => {
+		const group = new OutputTrackGroup();
+		const video = videoSource();
+		const audio = audioSource();
+		output.addVideoTrack(video, { group });
+		output.addAudioTrack(audio, { group });
+		await output.start();
+		for (let i = 0; i < 8; i++) {
+			await video.add(new EncodedPacket(avcPacketData, i % 2 === 0 ? 'key' : 'delta', 0.5 * i, 0.5), avcMetadata);
+		}
+		for (let i = -1; i * 1024 / 48000 < 4; i++) {
+			await audio.add(new EncodedPacket(aacPacketData, 'key', i * 1024 / 48000, 1024 / 48000), aacMetadata);
+		}
+		await output.finalize();
+	}, (_, durationsBefore) => start + durationsBefore.reduce((a, b) => a + b, 0));
+
+	using input = openInput(true);
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	const audioTrack = (await input.getPrimaryAudioTrack())!;
+	const firstTimestamp = await videoTrack.getFirstTimestamp();
+	for (const offset of [0.25, 1.25, 2.25, 3.25]) {
+		const timestamp = firstTimestamp + offset;
+		expect(await audioTrack.getUnixTimeForTimestamp(timestamp))
+			.toBeCloseTo((await videoTrack.getUnixTimeForTimestamp(timestamp))!, 6);
+	}
+});
+
 test('Live mode', async () => {
 	const writtenTexts = new Map<string, string>();
 	const writeCounts = new Map<string, number>();
