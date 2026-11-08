@@ -993,8 +993,54 @@ test('MPEG-TS reads the packets in front of a late PAT and PMT', async () => {
 	expect(await readFirstPackets(movePsiBack(5), 30)).toEqual(expected);
 	expect(await readFirstPackets(movePsiBack(bytes.length / 188 - 2), 30)).toEqual(expected);
 
-	// A source that keeps only what its cache holds can't go back to the start once it's found the PMT, so it reads on
-	// from there, as before (found in L15's "sized but not seekable" check). 4 seconds of frames of 60 kB with the
+	// Sources that only keep what their cache holds go back too, when it still holds the start (from L46's review):
+	// the same file through a ReadableStreamSource and a UrlSource whose server ignores range requests, 2 MiB caches
+	const lateBytes = movePsiBack(5);
+	const readFirstPacketsFrom = async (source: ReadableStreamSource | UrlSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const result: Record<number, number[][]> = {};
+		for (const track of await input.getTracks()) {
+			const packets: number[][] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push([Math.round(packet.timestamp * 90000), packet.byteLength]);
+			}
+			result[track.id] = packets;
+		}
+		return result;
+	};
+	let latePosition = 0;
+	const lateStream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (latePosition >= lateBytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(lateBytes.slice(latePosition, latePosition + 65536));
+			latePosition += 65536;
+		},
+	});
+	const lateStreamSource = new ReadableStreamSource(lateStream, { maxCacheSize: 2 ** 21 });
+	expect(await readFirstPacketsFrom(lateStreamSource)).toEqual(expected);
+	const lateServer = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': lateBytes.byteLength });
+		response.end(lateBytes);
+	});
+	await new Promise<void>(resolve => lateServer.listen(0, resolve));
+	try {
+		const address = lateServer.address();
+		assert(address && typeof address !== 'string');
+		expect(await readFirstPacketsFrom(new UrlSource(`http://localhost:${address.port}/late.ts`, {
+			maxCacheSize: 2 ** 21,
+			getRetryDelay: () => null,
+		}))).toEqual(expected);
+	} finally {
+		lateServer.closeAllConnections();
+		lateServer.close();
+	}
+
+	// When its cache doesn't hold the start anymore once the PMT is found, it reads on from there, as before (found in
+	// L15's "sized but not seekable" check). 4 seconds of frames of 60 kB with the
 	// PAT and PMT 3 MB in, from a server that ignores range requests through a UrlSource with a 1 MiB cache.
 	const nalUnit = (nalBytes: number[]) => [0, 0, 0, 1, ...nalBytes];
 	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,

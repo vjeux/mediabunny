@@ -81,7 +81,7 @@ import {
 } from '../../shared/mp3-misc';
 import { EncodedPacket, PacketType, PLACEHOLDER_DATA } from '../packet';
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
-import { UrlSource } from '../source';
+import { ReadableStreamSource, UrlSource } from '../source';
 import {
 	buildMpegTsMimeType,
 	createTimestampWrapInfo,
@@ -232,9 +232,39 @@ export class MpegTsDemuxer extends Demuxer {
 			let hasProgramAssociationTable = false;
 			let hasProgramMap = false;
 			let programMapSectionPid: number | null = null;
+			// When going back for the packets before the PMT: where to read on from and what to restore, should some of
+			// that data be gone after all (a source that only keeps what its cache holds evicts as it reads on)
+			let goingBack: {
+				resumePos: number;
+				streams: Pick<
+					ElementaryStream,
+					'initialized' | 'firstSection' | 'canBeTrustedWithKeyPackets' | 'info'
+				>[];
+				timestampWrapInfo: TimestampWrapInfo | null;
+			} | null = null;
+			const readOnFromPmt = (going: NonNullable<typeof goingBack>) => {
+				this.elementaryStreams.forEach((stream, i) => Object.assign(stream, going.streams[i]));
+				this.timestampWrapInfo = going.timestampWrapInfo;
+				currentPos = going.resumePos;
+				goingBack = null;
+			};
 
 			while (true) {
-				const packetHeader = await this.readPacketHeader(currentPos);
+				if (goingBack && currentPos >= goingBack.resumePos) {
+					goingBack = null; // Back where it was
+				}
+
+				let packetHeader: TsPacketHeader | null;
+				try {
+					packetHeader = await this.readPacketHeader(currentPos);
+				} catch (error) {
+					if (!goingBack) {
+						throw error;
+					}
+
+					readOnFromPmt(goingBack);
+					continue;
+				}
 				if (!packetHeader) {
 					break;
 				}
@@ -257,11 +287,21 @@ export class MpegTsDemuxer extends Demuxer {
 					continue;
 				}
 
-				const section = await this.readSection(
-					currentPos,
-					true,
-					!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
-				);
+				let section: Section | null;
+				try {
+					section = await this.readSection(
+						currentPos,
+						true,
+						!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
+					);
+				} catch (error) {
+					if (!goingBack) {
+						throw error;
+					}
+
+					readOnFromPmt(goingBack);
+					continue;
+				}
 				if (!section) {
 					break;
 				}
@@ -525,12 +565,22 @@ export class MpegTsDemuxer extends Demuxer {
 					programMapSectionPid = section.pid;
 
 					// PES packets can come before the PMT, like in a capture of a broadcast that starts between two of
-					// its PSI repetitions, so look for each stream's first PES packet from the start of the file. Not
-					// on sources that only keep what their cache holds, which can't go back there: a
-					// ReadableStreamSource, whose size is unknown, or a UrlSource whose server ignores range requests.
-					const canGoBack = this.reader.fileSizeNonStrict !== null
-						&& !(this.reader.source instanceof UrlSource && this.reader.source._sequentialBacking);
-					if (canGoBack && this.elementaryStreams.some(x => !x.initialized)) {
+					// its PSI repetitions, so look for each stream's first PES packet from the start of the file, if
+					// it's all still there
+					if (
+						this.elementaryStreams.some(x => !x.initialized)
+						&& await this.canReadAgain(this.packetOffset, currentPos)
+					) {
+						goingBack = {
+							resumePos: currentPos + this.packetStride,
+							streams: this.elementaryStreams.map(x => ({
+								initialized: x.initialized,
+								firstSection: x.firstSection,
+								canBeTrustedWithKeyPackets: x.canBeTrustedWithKeyPackets,
+								info: { ...x.info },
+							})),
+							timestampWrapInfo: this.timestampWrapInfo,
+						};
 						currentPos = this.packetOffset;
 						continue;
 					}
@@ -986,6 +1036,26 @@ export class MpegTsDemuxer extends Demuxer {
 			payload: merged,
 			randomAccessIndicator,
 		};
+	}
+
+	/**
+	 * Checks that the data between the two positions can be read again: a source that only keeps what its cache holds
+	 * (a ReadableStreamSource, or a UrlSource whose server ignores range requests) may have evicted some of it.
+	 */
+	async canReadAgain(startPos: number, endPos: number) {
+		const source = this.reader.source;
+		const isSequential = source instanceof ReadableStreamSource
+			|| (source instanceof UrlSource && source._sequentialBacking);
+		if (!isSequential) {
+			return true;
+		}
+
+		try {
+			await this.reader.requestSlice(startPos, endPos - startPos);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	async readPacketHeader(pos: number): Promise<TsPacketHeader | null> {
