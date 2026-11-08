@@ -1757,7 +1757,7 @@ const validateInitPath = (path: string) => {
 const toPlaylistInfo = (playlist: Playlist): HlsOutputPlaylistInfo => {
 	return {
 		n: playlist.id,
-		tracks: playlist.tracks,
+		tracks: [...playlist.tracks], // Copied, so that callbacks can't change the playlist through it
 		segmentFormat: playlist.segmentFormat,
 	};
 };
