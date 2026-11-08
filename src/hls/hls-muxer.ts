@@ -1286,6 +1286,12 @@ export class HlsMuxer extends Muxer {
 					}
 				}
 
+				if (playlist.singleFile) {
+					// The playlist is about to list this segment's byte range, so its bytes must have been written by
+					// then. Some targets hold data back otherwise, like FilePathTarget until a whole chunk is filled.
+					await playlist.singleFile.target._flushAll();
+				}
+
 				await this.writePlaylist(playlist);
 				await this.tryWriteMasterPlaylist();
 			}
