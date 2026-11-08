@@ -275,6 +275,26 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		});
 	}
 
+	/**
+	 * Removes the source cached for the given request, if there is one, so that the next request opens it anew. Refs
+	 * still held to it stay valid.
+	 * @internal
+	 */
+	_evictSourceCached(request: SourceRequest, cacheGroup = DEFAULT_SOURCE_CACHE_GROUP) {
+		const index = this._sourceCache.findIndex(x =>
+			x.cacheGroup === cacheGroup && sourceRequestsAreEqual(x.request, request),
+		);
+		if (index === -1) {
+			return;
+		}
+
+		const entry = this._sourceCache[index]!;
+		this._sourceCache.splice(index, 1);
+
+		entry.sourceRef.free();
+		removeItem(this._sourceRefs, entry.sourceRef);
+	}
+
 	/** @internal */
 	_getDemuxer() {
 		return this._demuxerPromise ??= (async () => {
