@@ -1046,8 +1046,10 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 
 	// A server that ignores range requests makes a UrlSource read in order too, though it knows the size. Looking up
 	// the end, for the duration, reads past the stream's start before the frame duration is measured there; the last
-	// packet then takes the duration before it (found in L15's "sized but not seekable" check). 4 seconds of frames
-	// of 60 kB, more than one seek chunk, read through a 1 MiB cache.
+	// packet then takes the frame duration measured on the packets at hand (found in L15's "sized but not seekable"
+	// checks: polsat_1080i_hevc.ts, whose last key frame follows a gap of 0.3 s, ended 0.28 s late). 4 seconds of
+	// frames of 60 kB with two B-frames per P-frame, then a key frame after a gap of 9 frames, more than one seek
+	// chunk, read through a 1 MiB cache.
 	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
 	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
 		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
@@ -1056,21 +1058,32 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 	const source = new EncodedVideoPacketSource('avc');
 	output.addVideoTrack(source, { frameRate: 25 });
 	await output.start();
-	for (let i = 0; i < 100; i++) {
-		const isKey = i % 25 === 0;
-		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+	// I0 P3 B1 B2 P6 B4 B5 ... P96 B94 B95, then I105
+	const decodeOrder = [0];
+	for (let anchor = 3; anchor <= 96; anchor += 3) {
+		decodeOrder.push(anchor, anchor - 2, anchor - 1);
+	}
+	decodeOrder.push(105);
+	for (const frame of decodeOrder) {
+		const isKey = frame === 0 || frame === 105;
+		const header = isKey ? 0x65 : frame % 3 === 0 ? 0x41 : 0x01;
+		const slice = nalUnit([header, 0x88, ...new Array<number>(60_000).fill(0x20 + frame % 50)]);
 		await source.add(
 			new EncodedPacket(
 				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
 				isKey ? 'key' : 'delta',
-				i / 25,
+				frame / 25,
 				1 / 25,
 			),
-			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+			frame === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
 		);
 	}
 	await output.finalize();
 	const bytes = new Uint8Array(output.target.buffer!);
+	const sizedInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const sizedDuration = await (await sizedInput.getPrimaryVideoTrack())!.computeDuration();
+	sizedInput.dispose();
+	expect(sizedDuration).toBeCloseTo(106 / 25);
 	const server = http.createServer((request, response) => {
 		response.writeHead(200, { 'Content-Length': bytes.byteLength });
 		response.end(bytes);
@@ -1088,7 +1101,7 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 		});
 		const urlTrack = await urlInput.getPrimaryVideoTrack();
 		assert(urlTrack);
-		expect(await urlTrack.computeDuration()).toBeCloseTo(4);
+		expect(await urlTrack.computeDuration()).toBeCloseTo(sizedDuration);
 	} finally {
 		server.closeAllConnections();
 		server.close();
