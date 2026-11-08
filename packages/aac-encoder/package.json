@@ -39,7 +39,7 @@
     "url": "https://github.com/sponsors/Vanilagy"
   },
   "peerDependencies": {
-    "mediabunny": "^1.0.0"
+    "mediabunny": "^1.56.0"
   },
   "devDependencies": {
     "@types/emscripten": "^1.40.1"
