@@ -732,88 +732,86 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 	return { input, track };
 };
 
-/** A WAV file of a quiet 100 Hz sine, so smooth that consecutive samples differ by at most ~0.004. */
-const makeSineWavBlob = (seconds: number) => {
-	const sampleRate = 48000;
-	const frames = seconds * sampleRate;
-	const view = new DataView(new ArrayBuffer(44 + 2 * frames));
-	const writeString = (offset: number, text: string) => {
-		for (let i = 0; i < text.length; i++) {
-			view.setUint8(offset + i, text.charCodeAt(i));
-		}
+test('MediaStreamAudioTrackSource keeps audio in order when an async process function takes varying time', async () => {
+	// Stands in for MediaStreamTrackProcessor: continuous audio (a smooth 100 Hz sine) in 1024-frame chunks, one every
+	// 21.3 ms with steadily increasing timestamps, like a microphone
+	const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+	const realProcessor = globals.MediaStreamTrackProcessor;
+	let controller!: ReadableStreamDefaultController<AudioData>;
+	const readable = new ReadableStream<AudioData>({
+		start: (c) => {
+			controller = c;
+		},
+	});
+	globals.MediaStreamTrackProcessor = class {
+		readable = readable;
 	};
-	writeString(0, 'RIFF');
-	view.setUint32(4, 36 + 2 * frames, true);
-	writeString(8, 'WAVEfmt ');
-	view.setUint32(16, 16, true);
-	view.setUint16(20, 1, true); // PCM
-	view.setUint16(22, 1, true); // Mono
-	view.setUint32(24, sampleRate, true);
-	view.setUint32(28, 2 * sampleRate, true);
-	view.setUint16(32, 2, true);
-	view.setUint16(34, 16, true);
-	writeString(36, 'data');
-	view.setUint32(40, 2 * frames, true);
-	for (let i = 0; i < frames; i++) {
-		view.setInt16(44 + 2 * i, Math.round(0.3 * 32767 * Math.sin(2 * Math.PI * 100 * i / sampleRate)), true);
-	}
-	return new Blob([view.buffer], { type: 'audio/wav' });
-};
+	const audioContext = new AudioContext();
+	const track = audioContext.createMediaStreamDestination().stream.getAudioTracks()[0]!; // Only identifies the track
 
-test('MediaStreamAudioTrackSource keeps audio in order when an async process function takes varying time', async ({
-	skip,
-}) => {
-	// Muted media may play without a user gesture, and its captureStream() still carries the audio
-	const media = document.createElement('video');
-	if (!('captureStream' in media) || typeof MediaStreamTrackProcessor === 'undefined') {
-		skip('Capturing a media element through MediaStreamTrackProcessor is not supported here');
-	}
-
-	const url = URL.createObjectURL(makeSineWavBlob(3));
-	media.src = url;
-	media.muted = true;
-	document.body.append(media);
-	const errors: unknown[] = [];
-	let output: Output<WavOutputFormat, BufferTarget>;
-	try {
-		await media.play();
-		const track = (media as HTMLVideoElement & { captureStream(): MediaStream })
-			.captureStream()
-			.getAudioTracks()[0]!;
-
-		output = new Output({
-			format: new WavOutputFormat(),
-			target: new BufferTarget(),
-		});
-		let calls = 0;
-		const audioSource = new MediaStreamAudioTrackSource(track, {
-			codec: 'pcm-f32',
-			transform: {
-				// Like an effect whose run time varies: every fourth chunk takes longer than the next two take to
-				// arrive (on average, it keeps up)
-				process: async (sample) => {
-					if (calls++ % 4 === 0) {
-						await new Promise(resolve => setTimeout(resolve, 25));
-					}
-					return sample;
-				},
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const audioSource = new MediaStreamAudioTrackSource(track, {
+		codec: 'pcm-f32',
+		transform: {
+			// Like an effect whose run time varies: every fourth chunk takes longer than the next one takes to arrive
+			// (on average, it keeps up)
+			process: async (sample) => {
+				if (calls++ % 4 === 0) {
+					await new Promise(resolve => setTimeout(resolve, 25));
+				}
+				return sample;
 			},
-		});
-		audioSource.errorPromise.catch(error => errors.push(error));
-		output.addAudioTrack(audioSource);
+		},
+	});
+	const errors: unknown[] = [];
+	audioSource.errorPromise.catch(error => errors.push(error));
+	output.addAudioTrack(audioSource);
+
+	let deliveredFrames = 0;
+	try {
 		await output.start();
-		await new Promise(resolve => setTimeout(resolve, 1500));
+
+		const start = performance.now();
+		for (let i = 0; i < 40; i++) {
+			while (performance.now() - start < 1000 * 1024 * i / 48000) {
+				await new Promise(resolve => setTimeout(resolve, 2));
+			}
+
+			const data = new Float32Array(1024);
+			for (let j = 0; j < 1024; j++) {
+				data[j] = 0.3 * Math.sin(2 * Math.PI * 100 * (1024 * i + j) / 48000);
+			}
+			controller.enqueue(new AudioData({
+				format: 'f32-planar',
+				sampleRate: 48000,
+				numberOfChannels: 1,
+				numberOfFrames: 1024,
+				timestamp: Math.round(1e6 * 1024 * i / 48000),
+				data,
+			}));
+			deliveredFrames += 1024;
+		}
+
+		await new Promise(resolve => setTimeout(resolve, 100)); // Lets the last chunks through process()
 		await output.finalize();
-		track.stop();
 	} finally {
-		media.pause();
-		media.remove();
-		URL.revokeObjectURL(url);
+		try {
+			controller.close();
+		} catch {
+			// The source canceled the stream
+		}
+		globals.MediaStreamTrackProcessor = realProcessor;
+		track.stop();
+		await audioContext.close();
 	}
 
 	expect(errors).toEqual([]);
 
-	// Audio played out of order shows up as jumps in the sine
+	// Audio recorded out of order shows up as jumps in the sine
 	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
 	const samples: number[] = [];
 	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
@@ -822,7 +820,7 @@ test('MediaStreamAudioTrackSource keeps audio in order when an async process fun
 		samples.push(...data);
 		sample.close();
 	}
-	expect(Math.max(...samples)).toBeGreaterThan(0.2); // Real audio was captured
+	expect(samples).toHaveLength(deliveredFrames);
 	const jumps = samples.filter((value, i) => i > 0 && Math.abs(value - samples[i - 1]!) > 0.05);
 	expect(jumps).toHaveLength(0);
 });
