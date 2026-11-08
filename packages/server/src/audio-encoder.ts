@@ -35,6 +35,9 @@ const AC3_SAMPLE_RATES = [32000, 44100, 48000];
 
 const FRAME_SIZE_FALLBACK = 1024; // Just 'cause
 
+// Memoizes NodeAvAudioEncoder.findSupportedVorbisBitrate
+const supportedVorbisBitrates = new Map<string, number | null>();
+
 export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -105,6 +108,27 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	async createCodecContext() {
 		assert(this.codecContext === null);
 
+		let bitrate = resolveBitrate(this.config, this.codec);
+		let { codecContext, ret } = await this.openCodecContext(bitrate);
+
+		if (ret < 0 && this.codec === 'vorbis') {
+			// libvorbis's bitrate management only takes bitrates in a range set by the sample rate and channel count
+			// (its setup templates): about 45–500 kbps for 44.1 kHz stereo, 8–42 kbps for 8 kHz mono. Others are moved
+			// into that range, as encoders may miss their target bitrate.
+			codecContext.freeContext();
+			const supportedBitrate = await this.findSupportedVorbisBitrate(bitrate);
+			if (supportedBitrate !== null) {
+				bitrate = supportedBitrate;
+			}
+			({ codecContext, ret } = await this.openCodecContext(bitrate));
+		}
+		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
+
+		this.codecContext = codecContext;
+	}
+
+	/** Configures a codec context for the given bitrate and tries to open it. */
+	async openCodecContext(bitrate: number) {
 		const codecContext = new NodeAv.CodecContext();
 		codecContext.allocContext3(this.avCodec);
 
@@ -129,7 +153,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		codecContext.codecId = CODEC_TO_CODEC_ID[this.codec]!;
 		codecContext.sampleFormat = sampleFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, this.config.sampleRate);
-		codecContext.bitRate = BigInt(resolveBitrate(this.config, this.codec));
+		codecContext.bitRate = BigInt(bitrate);
 
 		if (this.config.bitrateMode === 'constant') {
 			codecContext.rcMinRate = codecContext.bitRate;
@@ -143,9 +167,52 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			: null;
 
 		const ret = await codecContext.open2(this.avCodec, options);
-		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
+		return { codecContext, ret };
+	}
 
-		this.codecContext = codecContext;
+	/**
+	 * The bitrate closest to the requested one that libvorbis opens with for this sample rate and channel count, or
+	 * null if there is none. Its supported bitrates form a range, so this finds one inside it, then the edge between
+	 * that one and the requested one.
+	 */
+	async findSupportedVorbisBitrate(requestedBitrate: number) {
+		const key = `${this.config.sampleRate}:${this.config.numberOfChannels}:${this.config.bitrateMode}:`
+			+ requestedBitrate;
+		const memoized = supportedVorbisBitrates.get(key);
+		if (memoized !== undefined) {
+			return memoized;
+		}
+
+		const opens = async (bitrate: number) => {
+			const { codecContext, ret } = await this.openCodecContext(bitrate);
+			codecContext.freeContext();
+			return ret >= 0;
+		};
+
+		let result: number | null = null;
+		for (const bitratePerChannel of [16_000, 24_000, 32_000, 48_000, 64_000, 96_000]) {
+			let good = bitratePerChannel * this.config.numberOfChannels;
+			if (!await opens(good)) {
+				continue;
+			}
+
+			// Bisect between the requested bitrate, which doesn't open, and one that does, to within 1 kbps
+			let bad = requestedBitrate;
+			while (Math.abs(good - bad) > 1000) {
+				const middle = Math.round((good + bad) / 2);
+				if (await opens(middle)) {
+					good = middle;
+				} else {
+					bad = middle;
+				}
+			}
+
+			result = good;
+			break;
+		}
+
+		supportedVorbisBitrates.set(key, result);
+		return result;
 	}
 
 	async encode(audioSample: AudioSample): Promise<void> {
