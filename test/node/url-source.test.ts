@@ -17,6 +17,61 @@ import {
 	UrlSource,
 } from '../../src/index.js';
 
+test('UrlSource rejects a retry delay that isn\'t a non-negative finite number', async () => {
+	const waitFor = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+	// Responses whose body breaks off at once (with and without range support), or ends without any data
+	const read = async (retryDelay: unknown, status: 200 | 206, body: 'error' | 'empty') => {
+		let fetches = 0;
+		const fetchFn = (async () => {
+			fetches++;
+			const stream = new ReadableStream<Uint8Array>({
+				pull: (controller) => {
+					if (body === 'error') {
+						controller.error(new Error('Connection reset'));
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(stream, {
+				status,
+				headers: { 'Content-Length': '1000', ...(status === 206 && { 'Content-Range': 'bytes 0-999/1000' }) },
+			});
+		}) as typeof fetch;
+
+		const input = new Input({
+			source: new UrlSource('https://example.com/video.mp4', {
+				fetchFn,
+				getRetryDelay: () => retryDelay as number,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const result = input.getFormat().then(() => 'resolved', (error: Error) => error.message);
+		const settled = await Promise.race([result, waitFor(300).then(() => 'still pending')]);
+		input.dispose();
+		return { fetches, settled };
+	};
+
+	const logs = captureLogs();
+
+	try {
+		for (const [status, body] of [[206, 'error'], [206, 'empty'], [200, 'error']] as const) {
+			for (const retryDelay of [-1, NaN, Infinity, undefined]) {
+				// Such a delay used to make the retries come back to back, hundreds of requests per second
+				expect(await read(retryDelay, status, body), `${retryDelay}, ${status}, ${body}`).toEqual({
+					fetches: 1,
+					settled: 'Retry delay must be a non-negative finite number.',
+				});
+			}
+		}
+
+		// A delay of a second is waited out
+		expect(await read(1, 206, 'error')).toEqual({ fetches: 1, settled: 'still pending' });
+	} finally {
+		logs.stop();
+	}
+});
+
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const videoFilePath = path.join(__dirname, '..', 'public/video.mp4');
 
