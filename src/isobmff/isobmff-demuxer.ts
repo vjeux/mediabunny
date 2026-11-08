@@ -57,6 +57,7 @@ import {
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
+import { fromMatroskaLanguageCode } from '../matroska/ebml';
 import {
 	InputAudioTrackBacking,
 	InputTrackBacking,
@@ -2103,6 +2104,10 @@ export class IsobmffDemuxer extends Demuxer {
 						// Sometimes the bytes are garbage
 						track.languageCode = UNDETERMINED_LANGUAGE;
 					}
+
+					// The code is meant to be the terminology one, but some writers (FFmpeg, when given one) store the
+					// bibliographic one, like "ger" for "deu"
+					track.languageCode = fromMatroskaLanguageCode(track.languageCode);
 				}
 			}; break;
 
