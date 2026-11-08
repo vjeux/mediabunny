@@ -14,7 +14,7 @@ import { EncodedPacket } from '../../src/packet.js';
 
 test('MPEG-TS output format', async () => {
 	const format = new MpegTsOutputFormat();
-	expect(format.mimeType).toBe('video/MP2T');
+	expect(format.mimeType).toBe('video/mp2t');
 	expect(format.fileExtension).toBe('.ts');
 	expect(format.supportsVideoTransformationMetadata).toBe(false);
 	expect(format.getSupportedCodecs()).toEqual(['avc', 'hevc', 'aac', 'mp3', 'ac3', 'eac3', 'dts']);
@@ -46,7 +46,7 @@ test('MPEG-TS muxing with AVC and AAC', async () => {
 	void output.getMimeType().then((mimeType) => {
 		expect(started).toBe(true);
 		expect(finalized).toBe(false);
-		expect(mimeType).toMatch(/^video\/MP2T; codecs="/);
+		expect(mimeType).toMatch(/^video\/mp2t; codecs="/);
 		expect(mimeType).toMatch(/avc1\./);
 		expect(mimeType).toMatch(/mp4a\.40\./);
 
@@ -985,3 +985,14 @@ const readVideoPesTimestamps = (bytes: Uint8Array) => {
 
 	return timestamps;
 };
+
+test('MPEG-TS MIME types are ones that MediaSource accepts', async () => {
+	// MIME types are case-insensitive, but Chromium's MediaSource.isTypeSupported rejects "video/MP2T" while it
+	// accepts "video/mp2t", so the MIME type that getMimeType() suggests passing to MSE has to be the lower-case one
+	using input = new Input({ source: new UrlSource('/0.ts'), formats: ALL_FORMATS });
+	const inputMimeType = await input.getMimeType();
+	expect(inputMimeType).toBe('video/mp2t; codecs="avc1.640020, mp4a.40.2"');
+	expect(MediaSource.isTypeSupported(inputMimeType)).toBe(true);
+	expect(MediaSource.isTypeSupported(MPEG_TS.mimeType)).toBe(true);
+	expect(MediaSource.isTypeSupported(new MpegTsOutputFormat().mimeType)).toBe(true);
+});
