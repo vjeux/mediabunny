@@ -4110,6 +4110,38 @@ export class IsobmffDemuxer extends Demuxer {
 							this.traverseBox(slice);
 						}; break;
 
+						case 'kind': {
+							// A TrackKindBox (ISO/IEC 14496-12 8.10.4), which FFmpeg writes for dispositions
+							if (!this.currentTrack || boxInfo.contentSize < 4) {
+								break;
+							}
+
+							slice.skip(4); // Version + flags
+							const [scheme, value] = textDecoder
+								.decode(readBytes(slice, Math.min(boxInfo.contentSize - 4, slice.remainingLength)))
+								.split('\0');
+							if (scheme !== 'urn:mpeg:dash:role:2011') { // ISO/IEC 23009-1 5.8.5.5
+								break;
+							}
+
+							// The roles that FFmpeg maps to dispositions
+							const disposition = this.currentTrack.disposition;
+							switch (value) {
+								case 'caption': {
+									disposition.hearingImpaired = true;
+								}; break;
+								case 'commentary': {
+									disposition.commentary = true;
+								}; break;
+								case 'description': {
+									disposition.visuallyImpaired = true;
+								}; break;
+								case 'forced-subtitle': {
+									disposition.forced = true;
+								}; break;
+							}
+						}; break;
+
 						case '©nam':
 						case 'name': {
 							if (this.currentTrack) {
