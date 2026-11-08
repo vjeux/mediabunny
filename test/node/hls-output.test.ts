@@ -766,6 +766,82 @@ test('Playlist assignment, video with multiple audio codecs', async () => {
 	expect(decl[2]!.playlist).toBe(decl[3]!.playlist);
 });
 
+test('Renditions whose media lies more than half a day from their playlist time, in fMP4 segments', async () => {
+	// The playlists all start at time 0, so the media of a rendition that starts a day after or before the reference
+	// rendition lies that far from where its playlist puts it. fMP4 timestamps don't wrap, so it must read back where
+	// its timestamps say, not shifted by the 2^33 / 90 kHz period at which MPEG-TS timestamps wrap around, and lookups
+	// must find it there
+	const writeAndOpen = async (addMedia: (output: Output) => Promise<void>) => {
+		const files = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat() }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+				return target;
+			}),
+		});
+		await addMedia(output);
+
+		return new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+			formats: ALL_FORMATS,
+		});
+	};
+	const addAudio = async (source: EncodedAudioPacketSource, start: number, count: number) => {
+		for (let i = 0; i < count; i++) {
+			const timestamp = start + i * 1024 / 48000;
+			await source.add(new EncodedPacket(aacPacketData, 'key', timestamp, 1024 / 48000), aacMetadata);
+		}
+	};
+
+	// An audio rendition starting a day after the other one
+	{
+		using input = await writeAndOpen(async (output) => {
+			const early = audioSource();
+			const late = audioSource();
+			output.addAudioTrack(early, { languageCode: 'eng' });
+			output.addAudioTrack(late, { languageCode: 'fra' });
+			await output.start();
+			await addAudio(early, 0, 100);
+			await addAudio(late, 86400, 10);
+			await output.finalize();
+		});
+		const [earlyTrack, lateTrack] = await input.getAudioTracks();
+		const lateStart = await lateTrack!.getFirstTimestamp();
+		expect(lateStart - await earlyTrack!.getFirstTimestamp()).toBeCloseTo(86400, 3);
+		const latePacket = await new EncodedPacketSink(lateTrack!).getPacket(lateStart + 0.1);
+		expect(latePacket?.timestamp).toBeGreaterThan(lateStart);
+	}
+
+	// Audio renditions starting a day before the video, which is the reference: their media lies before the start of
+	// their playlists
+	{
+		using input = await writeAndOpen(async (output) => {
+			const video = videoSource();
+			const eng = audioSource();
+			const fra = audioSource();
+			output.addVideoTrack(video);
+			output.addAudioTrack(eng, { languageCode: 'eng' });
+			output.addAudioTrack(fra, { languageCode: 'fra' });
+			await output.start();
+			for (let i = 0; i < 4; i++) {
+				const type = i % 2 === 0 ? 'key' : 'delta';
+				await video.add(new EncodedPacket(avcPacketData, type, 86400 + i * 0.5, 0.5), avcMetadata);
+			}
+			await addAudio(eng, 0, 50);
+			await addAudio(fra, 0, 50);
+			await output.finalize();
+		});
+		const videoStart = await (await input.getPrimaryVideoTrack())!.getFirstTimestamp();
+		const audioTrack = (await input.getPrimaryAudioTrack())!;
+		const audioStart = await audioTrack.getFirstTimestamp();
+		expect(audioStart - videoStart).toBeCloseTo(-86400, 3);
+		const packet = await new EncodedPacketSink(audioTrack).getPacket(audioStart + 0.1);
+		expect(packet?.timestamp).toBeCloseTo(audioStart + 4 * 1024 / 48000, 3);
+	}
+});
+
 test('Playlist assignment, audio with multiple video codecs', async () => {
 	const output = new Output({
 		format: new HlsOutputFormat({
