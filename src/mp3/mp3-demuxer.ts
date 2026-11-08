@@ -318,11 +318,13 @@ export class Mp3Demuxer extends Demuxer {
 	 * them (like cover art in an APEv2 tag) aren't mistaken for frames.
 	 */
 	async computeAudioEndPos() {
-		if (this.reader.fileSize === null) {
+		// Reading the end of a file that can only be streamed would discard the data before it
+		const fileSize = this.reader.randomAccessFileSize;
+		if (fileSize === null) {
 			return null;
 		}
 
-		let endPos = this.reader.fileSize;
+		let endPos = fileSize;
 
 		if (endPos >= ID3_V1_TAG_SIZE) {
 			let slice = this.reader.requestSlice(endPos - ID3_V1_TAG_SIZE, 3);
@@ -528,8 +530,9 @@ export class Mp3Demuxer extends Demuxer {
 			// Fall back to an ID3v1 tag at the end of the file when the ID3v2 tags gave us no text fields, like ones
 			// holding nothing but PRIV frames or cover art, like FFmpeg
 			const hasTextFields = Object.keys(this.metadataTags).some(key => key !== 'raw' && key !== 'images');
-			if (!hasTextFields && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
-				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
+			const randomAccessFileSize = this.reader.randomAccessFileSize;
+			if (!hasTextFields && randomAccessFileSize !== null && randomAccessFileSize >= ID3_V1_TAG_SIZE) {
+				let slice = this.reader.requestSlice(randomAccessFileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) slice = await slice;
 				assert(slice);
 

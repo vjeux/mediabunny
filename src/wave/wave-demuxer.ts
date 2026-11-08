@@ -182,7 +182,7 @@ export class WaveDemuxer extends Demuxer {
 					const dataEnd = riffSizeIsUnknown ? this.reader.fileSize : totalFileSize;
 					this.dataSize = Math.max(Math.min(dataChunkSize, (dataEnd ?? Infinity) - this.dataStart), 0);
 
-					if (this.reader.fileSize === null) {
+					if (this.reader.randomAccessFileSize === null) {
 						break; // Stop once we hit the data chunk
 					}
 				} else if (chunkId === 'ds64') {
