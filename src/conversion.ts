@@ -63,7 +63,7 @@ import {
 	VideoSample,
 	VideoSampleResource,
 } from './sample';
-import { MetadataTags, validateMetadataTags } from './metadata';
+import { getRawMetadataTagFields, MetadataTags, validateMetadataTags } from './metadata';
 import { NullTarget } from './target';
 import { PacketOrderValidator } from './muxer';
 import { AudioResampler } from './resample';
@@ -1196,6 +1196,20 @@ export class Conversion {
 					outputTags.raw = Object.fromEntries(
 						Object.entries(outputTags.raw).filter(([key]) => id3Keys.has(key) === outputWritesId3),
 					);
+				}
+			}
+
+			if (rawTagsAreUnchanged && outputTags !== inputTags && outputTags.raw) {
+				// The tags option may have changed or removed fields. The raw tags they were read from would then bring
+				// the old values back (a writer leaves out raw tags only for the fields it writes), so drop those too.
+				const demuxerTags = await (await this.input._getDemuxer()).getMetadataTags();
+				const fieldsByRawKey = demuxerTags.raw && getRawMetadataTagFields(demuxerTags.raw);
+
+				if (fieldsByRawKey) {
+					const isChanged = (field: keyof MetadataTags) => outputTags[field] !== inputTags[field];
+					outputTags.raw = Object.fromEntries(Object.entries(outputTags.raw).filter(
+						([key]) => ![...(fieldsByRawKey.get(key) ?? [])].some(isChanged),
+					));
 				}
 			}
 

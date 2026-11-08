@@ -30,7 +30,7 @@ import {
 } from './misc';
 import { Logging } from './logging';
 import { PacketType } from './packet';
-import { formatMetadataDate, MetadataTags } from './metadata';
+import { formatMetadataDate, MetadataTags, unwatchMetadataTagFields, watchMetadataTagFields } from './metadata';
 import { AC3_SAMPLE_RATES, EAC3_REDUCED_SAMPLE_RATES } from '../shared/ac3-misc';
 import { Bitstream } from '../shared/bitstream';
 import { TRUEHD_MAJOR_SYNC_WORD } from '../shared/truehd-misc';
@@ -3035,6 +3035,7 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 			metadataTags.raw[key] ??= value;
 		}
 
+		watchMetadataTagFields(metadataTags, key);
 		switch (key) {
 			case 'TITLE': {
 				metadataTags.title ??= value;
@@ -3155,6 +3156,8 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 				}
 			}; break;
 		}
+
+		unwatchMetadataTagFields(metadataTags);
 	}
 };
 
