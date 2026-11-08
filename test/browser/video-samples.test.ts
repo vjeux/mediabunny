@@ -581,6 +581,21 @@ test('crop (rect option) for ArrayBuffer-backed data', async () => {
 	}
 });
 
+test('ArrayBuffer-backed samples keep their own copy of the plane layout', async () => {
+	const data = Uint8Array.from({ length: 32 }, (_, i) => i);
+	const layout = [{ offset: 0, stride: 8 }];
+	using sample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0, layout });
+	using clone = sample.clone();
+
+	// Reusing the layout objects for the next frame mustn't change the samples made with them, like for VideoFrame
+	layout[0]!.offset = 16;
+	for (const copy of [sample, clone]) {
+		const bytes = new Uint8Array(16);
+		await copy.copyTo(bytes);
+		expect([...bytes]).toEqual([...data.subarray(0, 16)]);
+	}
+});
+
 test('draw with flip', () => {
 	using sample = makeCoordinateSample({ flip: true });
 	const pixels = drawToPixels(sample, 4, 4);
