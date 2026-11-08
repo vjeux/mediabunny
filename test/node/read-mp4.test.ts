@@ -17,6 +17,7 @@ import {
 	Output,
 	ReadableStreamSource,
 } from '../../src/index.js';
+import { IsobmffDemuxer } from '../../src/isobmff/isobmff-demuxer.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -880,4 +881,99 @@ test('Packet durations from a stream whose earlier fragments are gone from its c
 
 	// The same as from a source that keeps everything
 	expect(await computeDuration(true)).toBe(await computeDuration(false));
+});
+
+test('Packet durations keep what fragments present only for the recently read ones', async () => {
+	// What each fragment presents was kept for the Input's life, about 1.4 KB per fragment read (found by L94). Now
+	// only recently used ones are kept, and one let go of is made again when needed, with the same durations.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), box('avc1', zeros(24), [0, 64, 0, 64], zeros(50))),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+
+	// 400 GOPs decoded as I P B B P B B and presented as I B B P B B P with a variable frame rate, in fragments of two
+	// frames that don't start a GOP
+	const presentationTimestamps: number[] = [];
+	const decodeOrder: number[] = []; // Presented frame index of each decoded frame
+	for (let gop = 0; gop < 400; gop++) {
+		presentationTimestamps.push(...[0, 1, 3, 4, 7, 8, 9].map(x => 11 * gop + x));
+		decodeOrder.push(...[0, 3, 1, 2, 6, 4, 5].map(x => 7 * gop + x));
+	}
+	const decodeTimestamps = presentationTimestamps; // Negative composition offsets instead of a decoding delay
+	const fragments: number[] = [];
+	for (let decoded = 0, i = 0; decoded < decodeOrder.length; decoded += 2, i++) {
+		const samples = decodeOrder.slice(decoded, decoded + 2).map((frame, j) => {
+			const index = decoded + j;
+			const nextDecodeTimestamp = decodeTimestamps[index + 1] ?? decodeTimestamps[index]! + 1;
+			return {
+				duration: nextDecodeTimestamp - decodeTimestamps[index]!,
+				offset: presentationTimestamps[frame]! - decodeTimestamps[index]!,
+				isKeyFrame: frame % 7 === 0,
+			};
+		});
+		const traf = (dataOffset: number) => box('traf',
+			box('tfhd', u32(0x020000), u32(1)),
+			box('tfdt', u32(0), u32(decodeTimestamps[decoded]!)),
+			box('trun', [1, 0, 0x0f, 0x01], u32(samples.length), u32(dataOffset), ...samples.map(sample => [
+				...u32(sample.duration),
+				...u32(1),
+				...u32(sample.isKeyFrame ? 0 : 0x10000),
+				...u32(sample.offset >>> 0),
+			])),
+		);
+		const moofSize = box('moof', box('mfhd', u32(0), u32(i + 1)), traf(0)).length;
+		fragments.push(...box('moof', box('mfhd', u32(0), u32(i + 1)), traf(moofSize + 8)));
+		fragments.push(...box('mdat', zeros(samples.length)));
+	}
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...box('ftyp', ascii('iso6'), u32(0)), ...moov, ...fragments])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+
+	const durations = new Map(presentationTimestamps.map((timestamp, i) => [
+		timestamp / 10,
+		((presentationTimestamps[i + 1] ?? timestamp + 1) - timestamp) / 10,
+	]));
+	let packetCount = 0;
+	for await (const packet of sink.packets()) {
+		expect(packet.duration).toBe(durations.get(packet.timestamp));
+		packetCount++;
+	}
+	expect(packetCount).toBe(2800);
+
+	// The 1,400 fragments read leave a bounded number of presentations behind
+	const demuxer = await input._getDemuxer() as IsobmffDemuxer;
+	const internalTrack = demuxer.idToTrack.get(1)!;
+	expect(internalTrack.fragmentPresentations!.size).toBeLessThan(300);
+	expect(internalTrack.fragmentPresentationOffsets!.length).toBe(internalTrack.fragmentPresentations!.size);
+
+	// The first fragments are read again for their presentations, and give the same durations
+	for (const timestamp of presentationTimestamps.slice(0, 14)) {
+		const packet = await sink.getPacket(timestamp / 10);
+		assert(packet);
+		expect(packet.duration).toBe(durations.get(packet.timestamp));
+	}
 });

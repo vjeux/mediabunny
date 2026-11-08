@@ -159,10 +159,15 @@ type InternalTrack = {
 	editListOffset: number;
 	/** See getMaxReorderedSamples; computed on first use */
 	maxReorderedSamples?: number;
-	/** For tracks that can reorder samples, what each fragment read so far presents, by moof offset */
+	/**
+	 * For tracks that can reorder samples, what fragments read so far present, by moof offset. Only the recently used
+	 * ones are kept, see keepFragmentPresentation.
+	 */
 	fragmentPresentations?: Map<number, FragmentPresentation>;
 	/** The keys of fragmentPresentations, sorted */
 	fragmentPresentationOffsets?: number[];
+	/** How many samples the fragments in fragmentPresentations have */
+	fragmentPresentationSampleCount?: number;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
@@ -907,24 +912,7 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 
 			if (getMaxReorderedSamples(track) > 0 && !track.fragmentPresentations?.has(fragment.moofOffset)) {
-				let minSyncTimestamp = Infinity;
-				for (const sample of trackData.samples) {
-					if (sample.isKeyFrame) {
-						minSyncTimestamp = Math.min(minSyncTimestamp, sample.presentationTimestamp);
-					}
-				}
-
-				track.fragmentPresentations ??= new Map();
-				track.fragmentPresentations.set(fragment.moofOffset, {
-					moofSize: fragment.moofSize,
-					timestamps: trackData.presentationTimestamps.map(x => x.presentationTimestamp),
-					minSyncTimestamp,
-					durations: new Map(),
-				});
-
-				const offsets = track.fragmentPresentationOffsets ??= [];
-				const offsetIndex = binarySearchLessOrEqual(offsets, fragment.moofOffset, x => x) + 1;
-				offsets.splice(offsetIndex, 0, fragment.moofOffset);
+				keepFragmentPresentation(fragment, trackData);
 			}
 
 			// Let's remember that a fragment with a given timestamp is here, speeding up future lookups if no
@@ -3587,10 +3575,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		const trackData = fragment.trackData.get(this.internalTrack.id)!;
 		const sample = trackData.samples[sampleIndex]!;
 		const maxReorderedSamples = getMaxReorderedSamples(this.internalTrack);
-		const presentation = this.internalTrack.fragmentPresentations?.get(fragment.moofOffset);
-		if (maxReorderedSamples === 0 || !presentation) {
+		if (maxReorderedSamples === 0) {
 			return sample.duration; // Presentation order is decode order, so no other fragment can come in between
 		}
+
+		const presentation = useFragmentPresentation(this.internalTrack, fragment.moofOffset)
+			?? keepFragmentPresentation(fragment, trackData); // Again, if it was let go of since
 
 		const knownDuration = presentation.durations.get(sampleIndex);
 		if (knownDuration !== undefined) {
@@ -3681,7 +3671,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					&& presentedAfterSample < maxReorderedSamples
 					&& earlierSampleCount <= MAX_SCANNED_SAMPLES
 				) {
-					let previous = this.getPreviousFragmentPresentation(moofOffset);
+					let previous = this.getPreviousFragmentPresentation(moofOffset, canWait);
 					if (isThenable(previous)) {
 						previous = await previous;
 					}
@@ -3715,11 +3705,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		moofOffset: number;
 		presentation: FragmentPresentation;
 	} | null | undefined> {
-		const { fragmentPresentations } = this.internalTrack;
-		const presentation = fragmentPresentations!.get(moofOffset)!;
+		const presentation = this.internalTrack.fragmentPresentations!.get(moofOffset);
+		if (!presentation) {
+			return undefined; // Let go of since, which the callers take as not known
+		}
 
 		const nextMoofOffset = presentation.nextMoofOffset;
-		const next = nextMoofOffset != null ? fragmentPresentations!.get(nextMoofOffset) : undefined;
+		const next = nextMoofOffset != null ? useFragmentPresentation(this.internalTrack, nextMoofOffset) : undefined;
 		if (next) {
 			return { moofOffset: nextMoofOffset!, presentation: next };
 		}
@@ -3740,36 +3732,41 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				return null;
 			}
 
-			if (!fragmentPresentations!.has(presentation.nextMoofOffset)) {
-				await this.internalTrack.demuxer.readFragment(presentation.nextMoofOffset);
+			const next = useFragmentPresentation(this.internalTrack, presentation.nextMoofOffset)
+				?? await this.readFragmentPresentation(presentation.nextMoofOffset, canWait);
+			if (next === undefined) {
+				return undefined;
 			}
-			const next = fragmentPresentations!.get(presentation.nextMoofOffset);
+
 			return next ? { moofOffset: presentation.nextMoofOffset, presentation: next } : null;
 		})();
 	}
 
 	/**
 	 * The presentation of the fragment holding this track right before the one at the given offset, if any. Returns
-	 * synchronously once known.
+	 * synchronously once known. Without canWait, it only looks at fragments whose presentation is still kept, and
+	 * returns null where it would have to read the file.
 	 */
-	private getPreviousFragmentPresentation(moofOffset: number): MaybePromise<{
+	private getPreviousFragmentPresentation(moofOffset: number, canWait: boolean): MaybePromise<{
 		moofOffset: number;
 		presentation: FragmentPresentation;
 	} | null> {
-		const { fragmentPresentations, fragmentPresentationOffsets } = this.internalTrack;
+		const { fragmentPresentationOffsets } = this.internalTrack;
 
 		const index = binarySearchLessOrEqual(fragmentPresentationOffsets!, moofOffset - 1, x => x);
 		const candidateOffset = fragmentPresentationOffsets![index];
-		const candidate = candidateOffset !== undefined ? fragmentPresentations!.get(candidateOffset) : undefined;
+		const candidate = candidateOffset !== undefined
+			? useFragmentPresentation(this.internalTrack, candidateOffset)
+			: undefined;
 		if (candidate?.nextMoofOffset === moofOffset) {
 			return { moofOffset: candidateOffset!, presentation: candidate };
 		}
 
-		return this.findPreviousFragmentPresentation(moofOffset, candidateOffset ?? null);
+		return this.findPreviousFragmentPresentation(moofOffset, candidateOffset ?? null, canWait);
 	}
 
-	private async findPreviousFragmentPresentation(moofOffset: number, knownOffset: number | null) {
-		const { fragmentPresentations, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
+	private async findPreviousFragmentPresentation(moofOffset: number, knownOffset: number | null, canWait: boolean) {
+		const { fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
 
 		// Boxes can only be walked forward, so start at the closest earlier fragment of this track we know of: one read
 		// before, or one the fragment index (tfra) or the position cache points to. Only without any, at the file
@@ -3787,14 +3784,20 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			return null;
 		}
 
-		if (!fragmentPresentations!.has(currentOffset)) {
-			await this.internalTrack.demuxer.readFragment(currentOffset);
+		const presentation = useFragmentPresentation(this.internalTrack, currentOffset)
+			?? await this.readFragmentPresentation(currentOffset, canWait);
+		if (!presentation) {
+			return null;
 		}
-		let previous = { moofOffset: currentOffset, presentation: fragmentPresentations!.get(currentOffset)! };
+
+		let previous = { moofOffset: currentOffset, presentation };
 		while (true) {
-			let next = this.getNextFragmentPresentation(currentOffset);
+			let next = this.getNextFragmentPresentation(currentOffset, canWait);
 			if (isThenable(next)) {
 				next = await next;
+			}
+			if (next === undefined) {
+				return null; // Not known which fragment comes in between
 			}
 			if (!next || next.moofOffset >= moofOffset) {
 				return previous;
@@ -3803,6 +3806,25 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			previous = next;
 			currentOffset = next.moofOffset;
 		}
+	}
+
+	/**
+	 * The presentation of the fragment at the given offset, read again if it was let go of (see
+	 * keepFragmentPresentation): null if the fragment doesn't hold this track. Without canWait, it returns undefined
+	 * instead of reading the file, which a stream may no longer have.
+	 */
+	private async readFragmentPresentation(moofOffset: number, canWait: boolean) {
+		if (!canWait) {
+			return undefined;
+		}
+
+		const fragment = await this.internalTrack.demuxer.readFragment(moofOffset);
+		const trackData = fragment?.trackData.get(this.internalTrack.id);
+		if (!fragment || !trackData) {
+			return null;
+		}
+
+		return useFragmentPresentation(this.internalTrack, moofOffset) ?? keepFragmentPresentation(fragment, trackData);
 	}
 
 	/**
@@ -4464,6 +4486,64 @@ const getMaxReorderedSamples = (track: InternalTrack) => {
 	}
 
 	return track.maxReorderedSamples = maxReorderedSamples;
+};
+
+/**
+ * How many samples, at most, the fragments whose presentation a track keeps have, beyond its last few fragments:
+ * several times what finding where a sample ends looks at, so that reading through a file keeps everything needed
+ * without memory growing with the file's length. A presentation let go of is made again when needed.
+ */
+const MAX_KEPT_PRESENTATION_SAMPLES = 4 * MAX_SCANNED_SAMPLES;
+const MIN_KEPT_FRAGMENT_PRESENTATIONS = 8;
+
+/** Keeps what a fragment presents for its track, letting go of the least recently used ones beyond the limits */
+const keepFragmentPresentation = (fragment: Fragment, trackData: FragmentTrackData) => {
+	const track = trackData.track;
+	let minSyncTimestamp = Infinity;
+	for (const sample of trackData.samples) {
+		if (sample.isKeyFrame) {
+			minSyncTimestamp = Math.min(minSyncTimestamp, sample.presentationTimestamp);
+		}
+	}
+
+	const presentation: FragmentPresentation = {
+		moofSize: fragment.moofSize,
+		timestamps: trackData.presentationTimestamps.map(x => x.presentationTimestamp),
+		minSyncTimestamp,
+		durations: new Map(),
+	};
+
+	const presentations = track.fragmentPresentations ??= new Map<number, FragmentPresentation>();
+	const offsets = track.fragmentPresentationOffsets ??= [];
+	presentations.set(fragment.moofOffset, presentation);
+	offsets.splice(binarySearchLessOrEqual(offsets, fragment.moofOffset, x => x) + 1, 0, fragment.moofOffset);
+	let sampleCount = (track.fragmentPresentationSampleCount ?? 0) + presentation.timestamps.length;
+
+	// A map iterates in insertion order, and using a presentation moves it to the end (see useFragmentPresentation),
+	// so the first one is the least recently used
+	for (const [moofOffset, { timestamps }] of presentations) {
+		if (presentations.size <= MIN_KEPT_FRAGMENT_PRESENTATIONS || sampleCount <= MAX_KEPT_PRESENTATION_SAMPLES) {
+			break;
+		}
+
+		presentations.delete(moofOffset);
+		offsets.splice(binarySearchExact(offsets, moofOffset, x => x), 1);
+		sampleCount -= timestamps.length;
+	}
+
+	track.fragmentPresentationSampleCount = sampleCount;
+	return presentation;
+};
+
+/** The presentation of a fragment if it's still kept, which then counts as just used (see keepFragmentPresentation) */
+const useFragmentPresentation = (track: InternalTrack, moofOffset: number) => {
+	const presentation = track.fragmentPresentations?.get(moofOffset);
+	if (presentation) {
+		track.fragmentPresentations!.delete(moofOffset);
+		track.fragmentPresentations!.set(moofOffset, presentation);
+	}
+
+	return presentation;
 };
 
 /** The index of the first of the sorted timestamps that is after the given one (or equal to it, if inclusive) */
