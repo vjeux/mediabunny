@@ -1834,6 +1834,16 @@ export class IsobmffDemuxer extends Demuxer {
 				track.info.pcmSampleSize = readU8(slice);
 			}; break;
 
+			case 'srat': {
+				const track = this.currentTrack;
+				if (!track || track.info?.type !== 'audio') {
+					break;
+				}
+
+				slice.skip(4); // Version + flags
+				track.info.sampleRate = readU32Be(slice);
+			}; break;
+
 			case 'dOps': { // Used for Opus audio
 				const track = this.currentTrack;
 				if (!track || track.info?.type !== 'audio') {
