@@ -70,3 +70,33 @@ const makeRampedUrl = () => {
 	const blob = new Blob([data.buffer]);
 	return URL.createObjectURL(blob);
 };
+
+test('UrlSource gives up on blob: URLs that fail instead of retrying forever', async () => {
+	// Reading a blob doesn't touch the network, and the Fetch standard reports a range at or past its end, or a revoked
+	// blob URL, as a network error, so retrying can't help
+	const outcome = (promise: Promise<unknown>) => Promise.race([
+		promise.then(() => 'resolved', (error: unknown) => `rejected: ${String(error)}`),
+		new Promise<string>(resolve => setTimeout(() => resolve('pending after 4 s'), 4000)),
+	]);
+
+	// An empty blob, like a failed recording
+	const emptyUrl = URL.createObjectURL(new Blob([]));
+	using input = new Input({ source: new UrlSource(emptyUrl), formats: ALL_FORMATS });
+	expect(await outcome(input.getFormat())).toMatch(/^rejected: TypeError/);
+	URL.revokeObjectURL(emptyUrl);
+
+	// A blob URL revoked after the first read. Chrome and Firefox fail the next request, while WebKit keeps serving
+	// the blob, so all that matters is that the read settles
+	const revokedUrl = URL.createObjectURL(new Blob([new Uint8Array(3 * 2 ** 20)]));
+	const reader = new Reader(new UrlSource(revokedUrl));
+	expect(await reader.requestSlice(0, 1000)).not.toBeNull();
+	URL.revokeObjectURL(revokedUrl);
+	expect(await outcome(Promise.resolve(reader.requestSlice(2 * 2 ** 20, 1000)))).not.toBe('pending after 4 s');
+
+	// A requested range past the end of a blob
+	const smallUrl = URL.createObjectURL(new Blob([new Uint8Array(500)]));
+	const rangedSource = new UrlSource(smallUrl, { requestInit: { headers: { Range: 'bytes=1000-' } } });
+	const rangedRead = Promise.resolve(new Reader(rangedSource).requestSlice(0, 10));
+	expect(await outcome(rangedRead)).toMatch(/^rejected: TypeError/);
+	URL.revokeObjectURL(smallUrl);
+}, 20_000);
