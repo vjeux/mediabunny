@@ -11,6 +11,9 @@ import {
 	clamp,
 	COLOR_PRIMARIES_MAP,
 	isAllowSharedBufferSource,
+	isUint8Array,
+	arrayBufferFromOtherRealm,
+	uint8ArrayFromOtherRealm,
 	isThenable,
 	MATRIX_COEFFICIENTS_MAP,
 	Rotation,
@@ -403,6 +406,7 @@ export class VideoSample implements Disposable {
 		data: VideoFrame | CanvasImageSource | AllowSharedBufferSource | VideoSampleResource,
 		init?: VideoSampleInit,
 	) {
+		data = arrayBufferFromOtherRealm(data); // instanceof ArrayBuffer rejects ArrayBuffers of other realms
 		if (
 			data instanceof ArrayBuffer
 			|| isSharedArrayBuffer(data)
@@ -1089,7 +1093,7 @@ export class VideoSample implements Disposable {
 
 			if (
 				!Array.isArray(result)
-				|| result.some(x => !(x.data instanceof Uint8Array) || !Number.isInteger(x.stride) || x.stride < 0)
+				|| result.some(x => !isUint8Array(x.data) || !Number.isInteger(x.stride) || x.stride < 0)
 			) {
 				throw new TypeError(
 					'getDataPlanes() must return an array of objects with a Uint8Array "data" property and a'
@@ -3150,6 +3154,11 @@ export class AudioSample implements Disposable {
 				throw new TypeError('Invalid AudioDataInit: must be an object.');
 			}
 
+			const data = arrayBufferFromOtherRealm(init.data); // instanceof rejects ArrayBuffers of other realms
+			if (data !== init.data) {
+				init = { ...init, data };
+			}
+
 			if (!AUDIO_SAMPLE_FORMATS.has(init.format)) {
 				throw new TypeError('Invalid AudioDataInit: invalid format.');
 			}
@@ -3353,7 +3362,7 @@ export class AudioSample implements Disposable {
 		let uint8Data: Uint8Array;
 		if (this._data instanceof AudioSampleResource) {
 			const getDataPlaneValidated = (index: number) => {
-				const result = (this._data as AudioSampleResource).getDataPlane(index);
+				const result = uint8ArrayFromOtherRealm((this._data as AudioSampleResource).getDataPlane(index));
 				if (!(result instanceof Uint8Array)) {
 					throw new TypeError('getDataPlane() must return a Uint8Array.');
 				}

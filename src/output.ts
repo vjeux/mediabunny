@@ -25,6 +25,7 @@ import {
 	TrackDisposition,
 	validateMetadataTags,
 	validateTrackDisposition,
+	localizeMetadataTagBytes,
 } from './metadata';
 import { Muxer } from './muxer';
 import { OutputFormat } from './output-format';
@@ -824,6 +825,7 @@ export class Output<
 	 */
 	setMetadataTags(tags: MetadataTags) {
 		validateMetadataTags(tags);
+		tags = localizeMetadataTagBytes(tags);
 
 		if (this.state !== 'pending') {
 			throw new Error('Cannot set metadata tags after output has been started or canceled.');
