@@ -55,6 +55,9 @@ import {
 	parseHevcSps,
 	iterateNalUnitsInLengthPrefixed,
 	concatNalUnitsInLengthPrefixed,
+	AvcNalUnitType,
+	extractNalUnitTypeForAvc,
+	serializeAvcDecoderConfigurationRecord,
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
@@ -5858,6 +5861,45 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				const firstPacket = await this.getFirstPacket({});
 				this.internalTrack.info.avcCodecInfo
 					= firstPacket && extractAvcDecoderConfigurationRecord(firstPacket.data);
+			} else if (this.internalTrack.info.codec === 'avc') {
+				// 'avc3' tracks may carry their parameter sets in-band only (ISO/IEC 14496-15), but decoders want them
+				// in the description, or else they can only start decoding at a sample that has them. So the ones the
+				// avcC box lacks are taken from the first sample.
+				const record = deserializeAvcDecoderConfigurationRecord(this.internalTrack.info.codecDescription!);
+				if (record && (record.sequenceParameterSets.length === 0 || record.pictureParameterSets.length === 0)) {
+					const firstPacket = await this.getFirstPacket({});
+					const data = firstPacket?.data ?? new Uint8Array(0);
+					const lengthSize = (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
+					const sequenceParameterSets: Uint8Array[] = [];
+					const pictureParameterSets: Uint8Array[] = [];
+
+					for (const { offset, length } of iterateNalUnitsInLengthPrefixed(data, lengthSize)) {
+						const nalUnit = data.subarray(offset, offset + length);
+						const type = extractNalUnitTypeForAvc(nalUnit[0] ?? 0);
+						if (type === AvcNalUnitType.SPS && sequenceParameterSets.length < 31) {
+							sequenceParameterSets.push(nalUnit);
+						} else if (type === AvcNalUnitType.PPS && pictureParameterSets.length < 255) {
+							pictureParameterSets.push(nalUnit);
+						}
+					}
+
+					const completedRecord = {
+						...record,
+						sequenceParameterSets: record.sequenceParameterSets.length > 0
+							? record.sequenceParameterSets
+							: sequenceParameterSets,
+						pictureParameterSets: record.pictureParameterSets.length > 0
+							? record.pictureParameterSets
+							: pictureParameterSets,
+					};
+					if (
+						completedRecord.sequenceParameterSets.length > 0
+						&& completedRecord.pictureParameterSets.length > 0
+					) {
+						this.internalTrack.info.codecDescription
+							= serializeAvcDecoderConfigurationRecord(completedRecord);
+					}
+				}
 			} else if (this.internalTrack.info.codec === 'hevc' && !this.internalTrack.info.codecDescription) {
 				const firstPacket = await this.getFirstPacket({});
 				this.internalTrack.info.hevcCodecInfo
