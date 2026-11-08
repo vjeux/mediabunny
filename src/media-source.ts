@@ -249,6 +249,46 @@ export class EncodedVideoPacketSource extends VideoSource {
 	}
 }
 
+/**
+ * How much memory video frames received while the encoder is being set up may take up when copied (see
+ * `VideoEncoderWrapper.copyFramesDuringSetup`): about 2.7 seconds of 1080p video at 30 FPS.
+ */
+const MAX_SETUP_COPY_BYTES = 2 ** 28;
+
+/**
+ * Copies a VideoFrame-backed sample into memory, in the same pixel format and color space, and closes it. Returns the
+ * sample as it is if it can't be copied.
+ */
+const copyVideoSampleIntoMemory = async (videoSample: VideoSample) => {
+	const frame = videoSample.toVideoFrame();
+	try {
+		const buffer = new ArrayBuffer(frame.allocationSize());
+		const layout = await frame.copyTo(buffer);
+		const copy = new VideoSample(new VideoFrame(buffer, {
+			format: frame.format!,
+			codedWidth: frame.visibleRect!.width,
+			codedHeight: frame.visibleRect!.height,
+			layout,
+			timestamp: frame.timestamp,
+			duration: frame.duration ?? undefined,
+			colorSpace: frame.colorSpace.toJSON(),
+			displayWidth: frame.displayWidth,
+			displayHeight: frame.displayHeight,
+		}), {
+			timestamp: videoSample.timestamp,
+			duration: videoSample.duration,
+			rotation: videoSample.rotation,
+			flip: videoSample.flip,
+		});
+		videoSample.close();
+		return copy;
+	} catch {
+		return videoSample;
+	} finally {
+		frame.close();
+	}
+};
+
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
 	private encoderInitialized = false;
@@ -314,14 +354,33 @@ class VideoEncoderWrapper {
 	private lastMuxerPromise: Promise<void> = Promise.resolve();
 	private closed = false;
 
+	/**
+	 * Whether samples received while the encoder is still being set up get copied into memory (and the originals
+	 * closed). Set by sources whose frames come from a capture device: those hand out frames from a small pool, so
+	 * holding on to them until the encoder is ready stalls the capture, and the recording starts with a frozen picture.
+	 */
+	copyFramesDuringSetup = false;
+	/** Settles once the samples copied so far are ready, in the order they were received. */
+	private setupCopyChain: Promise<unknown> = Promise.resolve();
+	/** How many adds are in the copy chain; until it's drained, later adds wait their turn to stay in order. */
+	private setupCopiesInChain = 0;
+	/** Memory held by copies that haven't been encoded yet. */
+	private setupCopyBytes = 0;
+
 	constructor(private source: VideoSource, private encodingConfig: VideoEncodingConfig) {}
 
 	async add(videoSample: VideoSample, shouldClose: boolean, encodeOptions?: VideoEncoderEncodeOptions) {
 		const originalSample = videoSample;
+		let setupCopyBytes = 0;
 
 		try {
 			this.checkForEncoderError();
 			this.source._ensureValidAdd();
+
+			const copiesDuringSetup = this.copyFramesDuringSetup && shouldClose;
+			if (copiesDuringSetup && (!this.encoderInitialized || this.setupCopiesInChain > 0)) {
+				({ videoSample, bytes: setupCopyBytes } = await this.copyDuringSetup(videoSample));
+			}
 
 			const config = this.encodingConfig;
 			const sizeChangeBehavior = config.sizeChangeBehavior ?? 'deny';
@@ -440,6 +499,38 @@ class VideoEncoderWrapper {
 			if (shouldClose) {
 				videoSample.close();
 			}
+			this.setupCopyBytes -= setupCopyBytes;
+		}
+	}
+
+	/** Copies a sample received while the encoder is being set up into memory (see `copyFramesDuringSetup`). */
+	private async copyDuringSetup(videoSample: VideoSample) {
+		this.setupCopiesInChain++;
+
+		let bytes = 0;
+		let copy: Promise<VideoSample>;
+		if (this.encoderInitialized || videoSample.format === null) {
+			// Nothing to copy (anymore); just stay in order
+			copy = Promise.resolve(videoSample);
+		} else {
+			bytes = videoSample.allocationSize();
+			if (this.setupCopyBytes + bytes > MAX_SETUP_COPY_BYTES) {
+				// Too much held already; this one stays as it is, as without copying
+				bytes = 0;
+				copy = Promise.resolve(videoSample);
+			} else {
+				this.setupCopyBytes += bytes;
+				copy = copyVideoSampleIntoMemory(videoSample);
+			}
+		}
+
+		// Copying is asynchronous, so the samples are chained to come out in the order they came in
+		const ready = this.setupCopyChain.then(() => copy);
+		this.setupCopyChain = ready.catch(() => {});
+		try {
+			return { videoSample: await ready, bytes };
+		} finally {
+			this.setupCopiesInChain--;
 		}
 	}
 
@@ -1668,6 +1759,7 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 
 		this._options = options;
 		this._encoder = new VideoEncoderWrapper(this, encodingConfig);
+		this._encoder.copyFramesDuringSetup = true;
 		this._track = track;
 	}
 

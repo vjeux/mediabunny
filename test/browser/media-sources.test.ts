@@ -2,9 +2,9 @@ import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { Quality } from '../../src/encode.js';
+import { canEncode, Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -731,3 +731,155 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+/**
+ * Stands in for a camera, which hands out its frames from a small pool of buffers: a frame is only captured (every
+ * 33 ms) when one of the `poolSize` buffers is free, that is when every frame referring to it (the frame itself, its
+ * clones, frames created from it) has been closed. Each frame is a different shade of gray. Replaces
+ * MediaStreamTrackProcessor and VideoFrame until `uninstall()` is called.
+ */
+const installPooledCamera = (poolSize: number) => {
+	const globals = globalThis as unknown as { VideoFrame: typeof VideoFrame; MediaStreamTrackProcessor?: unknown };
+	const RealVideoFrame = globals.VideoFrame;
+	const realProcessor = globals.MediaStreamTrackProcessor;
+
+	// The buffer each frame refers to
+	const bufferOf = new WeakMap<object, number>();
+	let openFrames: VideoFrame[] = [];
+	class PooledVideoFrame extends RealVideoFrame {
+		constructor(source: never, init?: never) {
+			super(source, init);
+			const buffer = bufferOf.get(source);
+			if (buffer !== undefined) {
+				bufferOf.set(this, buffer);
+				openFrames.push(this);
+			}
+		}
+
+		override clone(): VideoFrame {
+			return new PooledVideoFrame(this as never);
+		}
+	}
+	const buffersInUse = () => {
+		openFrames = openFrames.filter(frame => frame.format !== null);
+		return new Set(openFrames.map(frame => bufferOf.get(frame))).size;
+	};
+
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const readable = new ReadableStream<VideoFrame>({
+		start: (c) => {
+			controller = c;
+		},
+	});
+	globals.MediaStreamTrackProcessor = class {
+		readable = readable;
+	};
+	globals.VideoFrame = PooledVideoFrame as unknown as typeof VideoFrame;
+
+	const width = 160;
+	const height = 120;
+	let captured = 0;
+	const start = performance.now();
+	const interval = setInterval(() => {
+		if (buffersInUse() >= poolSize) {
+			return; // No free buffer, so no frame
+		}
+
+		const data = new Uint8Array(width * height * 3 / 2).fill(128);
+		data.fill(16 + (captured * 37) % 220, 0, width * height);
+		const frame = new PooledVideoFrame(data as never, {
+			format: 'I420',
+			codedWidth: width,
+			codedHeight: height,
+			timestamp: Math.round(1000 * (performance.now() - start)),
+		} as never);
+		bufferOf.set(frame, captured++);
+		openFrames.push(frame);
+		try {
+			controller.enqueue(frame);
+		} catch {
+			frame.close(); // The source stopped reading
+		}
+	}, 1000 / 30);
+
+	return {
+		uninstall: () => {
+			clearInterval(interval);
+			try {
+				controller.close();
+			} catch {
+				// The source canceled the stream
+			}
+			globals.VideoFrame = RealVideoFrame;
+			globals.MediaStreamTrackProcessor = realProcessor;
+		},
+	};
+};
+
+test.for([{ frameRate: 30 }, { frameRate: null }])(
+	'MediaStreamVideoTrackSource keeps the camera capturing while its encoder is being set up (frameRate: $frameRate)',
+	async ({ frameRate }, { skip }) => {
+		if (typeof VideoEncoder === 'undefined' || !(await canEncode('vp8'))) {
+			skip('VP8 encoding is not supported here');
+		}
+
+		// A cold hardware encoder can take seconds to set up
+		const isConfigSupported = VideoEncoder.isConfigSupported.bind(VideoEncoder);
+		VideoEncoder.isConfigSupported = async (config: VideoEncoderConfig) => {
+			await new Promise(resolve => setTimeout(resolve, 1000));
+			return isConfigSupported(config);
+		};
+		const canvas = document.createElement('canvas');
+		const track = canvas.captureStream().getVideoTracks()[0]!; // Only identifies the track
+		const camera = installPooledCamera(2);
+
+		let output: Output<WebMOutputFormat, BufferTarget>;
+		const errors: unknown[] = [];
+		try {
+			output = new Output({
+				format: new WebMOutputFormat(),
+				target: new BufferTarget(),
+			});
+			const videoSource = new MediaStreamVideoTrackSource(
+				track,
+				{ codec: 'vp8', quality: new Quality('low') },
+				{ frameRate },
+			);
+			videoSource.errorPromise.catch(error => errors.push(error));
+			output.addVideoTrack(videoSource);
+			await output.start();
+			await new Promise(resolve => setTimeout(resolve, 2500));
+			await output.finalize();
+		} finally {
+			camera.uninstall();
+			VideoEncoder.isConfigSupported = isConfigSupported;
+			track.stop();
+		}
+
+		// Every captured frame has its own shade; a stalled capture shows up as a repeated shade or a gap
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const context = new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true })!;
+		let count = 0;
+		let previousShade = -1;
+		let repeats = 0;
+		let longestRepeat = 0;
+		let previousTimestamp = 0;
+		let longestGap = 0;
+		for await (const sample of new VideoSampleSink((await input.getPrimaryVideoTrack())!).samples()) {
+			sample.draw(context, 0, 0, 1, 1);
+			const shade = context.getImageData(0, 0, 1, 1).data[0]!;
+			repeats = Math.abs(shade - previousShade) < 8 ? repeats + 1 : 0;
+			longestRepeat = Math.max(longestRepeat, repeats);
+			longestGap = Math.max(longestGap, sample.timestamp - previousTimestamp);
+			previousShade = shade;
+			previousTimestamp = sample.timestamp;
+			count++;
+			sample.close();
+		}
+
+		expect(errors).toEqual([]);
+		expect(count).toBeGreaterThan(40);
+		expect(longestRepeat).toBeLessThan(5);
+		expect(longestGap).toBeLessThan(0.25);
+	},
+);
