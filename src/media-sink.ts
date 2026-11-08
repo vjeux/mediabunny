@@ -24,6 +24,7 @@ import {
 	determineVideoPacketType,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
+	hasLibfaacSignature,
 	HevcNalUnitType,
 	iterateAvcNalUnits,
 	iterateHevcNalUnits,
@@ -3037,6 +3038,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// A Vorbis decoder outputs nothing for the first packet it gets, which only primes the window overlap. The first
 	// audio comes out of the second packet, so that's the one whose timestamp the output must start at.
 	primingPacketPending: boolean;
+	// The sequence number of a packet the decoder emits nothing for (libfaac's priming, see getDiscardedPacket)
+	discardedPacketSequenceNumber: number | null = null;
 
 	/** The decoder config the decoder currently takes packets with; packets can need another one than the track's. */
 	currentDecoderConfig: AudioDecoderConfig;
@@ -3310,7 +3313,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 			if (this.primingPacketPending) {
 				this.primingPacketPending = false;
-			} else {
+			} else if (packet.sequenceNumber !== this.discardedPacketSequenceNumber) {
+				// The first output comes from the packet after a discarded one
 				this.expectedFirstTimestamp ??= packet.timestamp;
 			}
 
@@ -3564,6 +3568,61 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 }
 
+const discardedPackets = new WeakMap<InputAudioTrack, Promise<number | null>>();
+
+/**
+ * Gets the sequence number of the track's first packet if the platform's decoder emits nothing for it. FFmpeg's AAC
+ * decoder (in Chromium and Firefox) discards the first frame of AAC from libfaac as encoder priming, and Chromium then
+ * stamps the next frame's audio with the first packet's timestamp, unless that's negative. Whether the decoder discards
+ * the frame depends on which one the platform uses, so it's asked of the decoder itself, once per track. The packet is
+ * told by its sequence number, since the next one can share its timestamp.
+ */
+const getDiscardedPacket = (track: InputAudioTrack, decoderConfig: AudioDecoderConfig) => {
+	let result = discardedPackets.get(track);
+	if (!result) {
+		result = (async () => {
+			if (decoderConfig.codec.split('.')[0] !== 'mp4a') {
+				return null;
+			}
+
+			const firstPacket = await new EncodedPacketSink(track).getFirstPacket();
+			if (!firstPacket || firstPacket.sequenceNumber < 0 || !hasLibfaacSignature(firstPacket.data)) {
+				return null;
+			}
+
+			let outputCount = 0;
+			const decoder = new AudioDecoder({
+				output: (data) => {
+					outputCount++;
+					data.close();
+				},
+				error: () => {},
+			});
+
+			try {
+				decoder.configure(decoderConfig);
+				decoder.decode(firstPacket.toEncodedAudioChunk());
+
+				// Nothing is known of a decoder that doesn't finish, as if it kept the frame
+				const finished = await Promise.race([
+					decoder.flush().then(() => true),
+					new Promise<boolean>(resolve => setTimeout(() => resolve(false), 3000)),
+				]);
+				return finished && outputCount === 0 ? firstPacket.sequenceNumber : null;
+			} catch {
+				return null;
+			} finally {
+				if (decoder.state !== 'closed') {
+					decoder.close();
+				}
+			}
+		})();
+		discardedPackets.set(track, result);
+	}
+
+	return result;
+};
+
 /**
  * Sink for retrieving decoded audio samples from an audio track.
  * @group Media sinks
@@ -3612,13 +3671,18 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
 			const backing = this._track._backing;
-			return new AudioDecoderWrapper(
+			const decoder = new AudioDecoderWrapper(
 				onSample,
 				onError,
 				codec,
 				decoderConfig,
 				packet => (backing.getDecoderConfigForPacket?.(packet) ?? null) as AudioDecoderConfig | null,
 			);
+			if (decoder.decoder) {
+				decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, decoderConfig);
+			}
+
+			return decoder;
 		}
 	}
 
