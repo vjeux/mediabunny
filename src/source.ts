@@ -2311,6 +2311,11 @@ export class ReadableStreamSource extends Source {
 				break;
 			}
 
+			if (!(value instanceof Uint8Array)) {
+				// Like for CustomSource's streams. Other typed arrays would be sliced by element instead of by byte.
+				throw new TypeError('The stream of a ReadableStreamSource must yield Uint8Array chunks.');
+			}
+
 			const startIndex = this._currentIndex;
 			const endIndex = this._currentIndex + value.byteLength;
 
