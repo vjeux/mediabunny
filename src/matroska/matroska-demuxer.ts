@@ -136,6 +136,8 @@ type Cluster = {
 type ClusterSummary = {
 	elementEndPos: number;
 	trackIds: Set<number>; // The tracks with blocks in the cluster
+	/** For each track in the cluster, the timestamp of its block presented last */
+	latestTimestamps: Map<number, number>;
 };
 
 type ClusterTrackData = {
@@ -212,6 +214,8 @@ type InternalTrack = {
 		elementStartPos: number;
 		startTimestamp: number;
 		hasKeyFrame: boolean;
+		/** The earliest presented key frame in the cluster */
+		firstKeyFrameTimestamp: number | null;
 	}[];
 	cuePoints: CuePoint[];
 
@@ -270,6 +274,20 @@ const METADATA_ELEMENTS = [
 ] as const;
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
 const MAX_ELEMENT_NESTING_DEPTH = 64;
+// H.264 reorders a frame past at most 16 others (its largest DPB), HEVC a picture past at most 15; a frame can come as
+// two field blocks
+const MAX_REORDER_BLOCKS = 32;
+
+/** Whether a cluster in the position cache holds a key frame presented at or before the given timestamp. */
+const holdsKeyFrameAtOrBefore = (entry: InternalTrack['clusterPositionCache'][number], timestamp: number) => {
+	return entry.firstKeyFrameTimestamp !== null && entry.firstKeyFrameTimestamp <= timestamp;
+};
+
+/** Whether the track's codec may have B-frames, so that its blocks are stored out of presentation order. */
+const trackMayReorder = (track: InternalTrack) => {
+	return track.info?.type === 'video'
+		&& (track.info.codec === 'avc' || track.info.codec === 'hevc' || track.info.codec === null);
+};
 
 export class MatroskaDemuxer extends Demuxer {
 	reader: Reader;
@@ -810,6 +828,7 @@ export class MatroskaDemuxer extends Demuxer {
 					elementStartPos: cluster.elementStartPos,
 					startTimestamp: trackData.startTimestamp,
 					hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
+					firstKeyFrameTimestamp: trackData.firstKeyFrameTimestamp,
 				});
 			}
 		}
@@ -818,6 +837,9 @@ export class MatroskaDemuxer extends Demuxer {
 		segment.clusterSummaries.set(startPos, {
 			elementEndPos: cluster.elementEndPos,
 			trackIds: new Set(cluster.trackData.keys()),
+			latestTimestamps: new Map([...cluster.trackData].map(
+				([trackId, trackData]) => [trackId, last(trackData.presentationTimestamps)!.timestamp],
+			)),
 		});
 
 		return cluster;
@@ -2301,14 +2323,25 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					x => x.timestamp,
 				);
 
-				const blockIndex = index !== -1 ? trackData.presentationTimestamps[index]!.blockIndex : -1;
-				const correctBlockFound = index !== -1 && isSafelyBeforeEnd(trackData, timestampInTimescale);
+				if (index === -1) {
+					return { blockIndex: -1, correctBlockFound: false };
+				}
+
+				const { timestamp: matchTimestamp, blockIndex } = trackData.presentationTimestamps[index]!;
+				// With B-frames, a block presented between the match and the timestamp can still come in a later
+				// cluster, so only an exact match settles the lookup; otherwise, the lookup scans on until no such
+				// block can follow
+				const correctBlockFound = trackMayReorder(this.internalTrack)
+					? matchTimestamp === timestampInTimescale
+					: isSafelyBeforeEnd(trackData, timestampInTimescale);
 
 				return { blockIndex, correctBlockFound };
 			},
 			timestampInTimescale,
 			timestampInTimescale,
 			options,
+			false,
+			true,
 		);
 	}
 
@@ -2508,11 +2541,33 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 		// Whether the match must be a key frame, so that position cache entries without one can be skipped
 		requireKeyFrame = false,
+		// Whether the match is the block presented last at or before latestTimestamp, so that clusters presented
+		// entirely before a known candidate can be skipped
+		matchIsLatestBlock = false,
 	): Promise<EncodedPacket | null> {
 		const { demuxer, segment, cuePoints, clusterPositionCache } = this.internalTrack;
+		const mayReorder = trackMayReorder(this.internalTrack);
 
 		let bestCluster: Cluster | null = null;
 		let bestBlockIndex = -1;
+
+		const getBlockTimestamp = (cluster: Cluster, blockIndex: number) => {
+			return cluster.trackData.get(this.internalTrack.id)!.blocks[blockIndex]!.timestamp;
+		};
+		const considerMatch = (cluster: Cluster, blockIndex: number) => {
+			// Keep the match presented last. Normally, that's simply the one from the latest cluster, but B-frames
+			// can make clusters overlap in presentation time.
+			if (
+				bestCluster
+				&& getBlockTimestamp(cluster, blockIndex) < getBlockTimestamp(bestCluster, bestBlockIndex)
+			) {
+				return;
+			}
+
+			bestCluster = cluster;
+			bestBlockIndex = blockIndex;
+		};
+		const getBestTimestamp = () => bestCluster ? getBlockTimestamp(bestCluster, bestBlockIndex) : -Infinity;
 
 		if (startCluster) {
 			const { blockIndex, correctBlockFound } = getMatchInCluster(startCluster);
@@ -2522,8 +2577,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			}
 
 			if (blockIndex !== -1) {
-				bestCluster = startCluster;
-				bestBlockIndex = blockIndex;
+				considerMatch(startCluster, blockIndex);
 			}
 		}
 
@@ -2532,6 +2586,13 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		let cuePointIndex = binarySearchLessOrEqual(cuePoints, searchTimestamp, x => x.time);
 		// Also check the position cache. Clusters read during the lookup land after this index, so it stays valid.
 		let positionCacheIndex = binarySearchLessOrEqual(clusterPositionCache, searchTimestamp, x => x.startTimestamp);
+
+		// A known cluster starting at or before the upper bound holds a candidate, so the match is presented no earlier
+		// than it. Since a lookup with B-frames starts at a key frame, it can then hop over the known clusters in
+		// between that are presented entirely before the candidate (or the best match so far).
+		const candidateTimestamp = mayReorder && matchIsLatestBlock
+			? clusterPositionCache[positionCacheIndex]?.startTimestamp ?? -Infinity
+			: -Infinity;
 
 		// The position for which we know the correct block will not come after it
 		let stopPos = Infinity;
@@ -2546,6 +2607,13 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				&& (
 					clusterPositionCache[positionCacheIndex]!.elementStartPos >= stopPos
 					|| (requireKeyFrame && !clusterPositionCache[positionCacheIndex]!.hasKeyFrame)
+					// With B-frames, a block presented after a cluster's start can sit in a cluster before it, but not
+					// one presented after a key frame (pictures can't be presented after a key frame and decoded before
+					// it), so the scan has to start at such a key frame
+					|| (
+						mayReorder
+						&& !holdsKeyFrameAtOrBefore(clusterPositionCache[positionCacheIndex]!, searchTimestamp)
+					)
 				)
 			) {
 				positionCacheIndex--;
@@ -2572,6 +2640,11 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			}
 
 			const scanStartPos = currentCluster ? currentCluster.elementStartPos : currentPos;
+			// With B-frames, a block presented before the upper bound can come after (in decode order) blocks presented
+			// after it, even in a later cluster that starts after the upper bound. It can only trail them by so many
+			// blocks, so count the blocks presented after the upper bound since the last one presented before it. (Not
+			// so for key frames, which no block presented after them precedes.)
+			let blocksAfterLatest = 0;
 
 			while (
 				(segment.elementEndPos === null || currentPos <= segment.elementEndPos - MIN_HEADER_SIZE)
@@ -2579,7 +2652,15 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			) {
 				if (currentCluster) {
 					const trackData = currentCluster.trackData.get(this.internalTrack.id);
-					if (trackData && trackData.startTimestamp > latestTimestamp) {
+					for (const block of trackData?.blocks ?? []) {
+						blocksAfterLatest = block.timestamp > latestTimestamp ? blocksAfterLatest + 1 : 0;
+					}
+
+					if (
+						trackData
+						&& trackData.startTimestamp > latestTimestamp
+						&& (!mayReorder || requireKeyFrame || blocksAfterLatest > MAX_REORDER_BLOCKS)
+					) {
 						// We're already past the upper bound, no need to keep searching
 						break;
 					}
@@ -2591,6 +2672,20 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				if (summary && !summary.trackIds.has(this.internalTrack.id)) {
 					// We've read this cluster before and know it has nothing for this track, so let's not read it again
 					currentPos = summary.elementEndPos;
+					continue;
+				}
+
+				const latestInCluster = summary?.latestTimestamps.get(this.internalTrack.id);
+				if (
+					mayReorder
+					&& matchIsLatestBlock
+					&& latestInCluster !== undefined
+					&& (latestInCluster < candidateTimestamp || latestInCluster <= getBestTimestamp())
+				) {
+					// We've read this cluster before and know it can't hold a better match. All of its blocks are
+					// presented before the upper bound.
+					blocksAfterLatest = 0;
+					currentPos = summary!.elementEndPos;
 					continue;
 				}
 
@@ -2639,8 +2734,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 					}
 
 					if (blockIndex !== -1) {
-						bestCluster = currentCluster;
-						bestBlockIndex = blockIndex;
+						considerMatch(currentCluster, blockIndex);
 					}
 				}
 
