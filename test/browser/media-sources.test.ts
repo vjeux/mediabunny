@@ -19,8 +19,13 @@ import { EncodedPacketSink, VideoSampleSink, AudioSampleSink } from '../../src/m
 import { EncodedPacket } from '../../src/packet.js';
 import { assert, Rotation, toDataView } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
-import { CustomAudioEncoder, customAudioEncoders, registerEncoder } from '../../src/custom-coder.js';
-import { AudioCodec } from '../../src/codec.js';
+import {
+	CustomAudioEncoder,
+	CustomVideoEncoder,
+	customAudioEncoders,
+	registerEncoder,
+} from '../../src/custom-coder.js';
+import { AudioCodec, VideoCodec } from '../../src/codec.js';
 
 // First in this file on purpose: the priming of an encoder is only measured for its first use on the page
 test('AudioSampleSource, encoding starts even when measuring the encoder\'s priming hangs', async () => {
@@ -4530,4 +4535,175 @@ test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio wit
 	const track = await input.getPrimaryAudioTrack();
 	expect(track).not.toBeNull();
 	expect(await track!.computeDuration()).toBeGreaterThan(0.9 * 15 * 1024 / 48000);
+});
+
+test('VideoSampleSource, cancel() while finalizing doesn\'t wait behind a stalled target', async () => {
+	// A stream whose sink stops completing writes once finalizing starts, like a hung upload
+	let stalled = false;
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new StreamTarget(new WritableStream({
+			write: () => (stalled ? new Promise<void>(() => {}) : undefined),
+		})),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+	for (let i = 0; i < 3; i++) {
+		await videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: i / 30,
+			duration: 1 / 30,
+		}));
+	}
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	stalled = true;
+	const finalized = output.finalize();
+	expect(await stateAfter(finalized, 300)).toBe('pending'); // The sink holds it up
+
+	// Canceling can't get the sink going again, but it mustn't get stuck behind it either
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+});
+
+test('VideoSampleSource, cancel() after close() gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				await new Promise(() => {}); // A stuck effect
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const added = videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: 0,
+		duration: 1 / 30,
+	})).catch(() => {});
+	await new Promise(resolve => setTimeout(resolve, 50));
+	videoSource.close(); // Like stopping a recording: waits for what was added
+	await new Promise(resolve => setTimeout(resolve, 100));
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	// Canceling forces the close, which doesn't wait for the stuck call
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	expect(await stateAfter(added, 1000)).toBe('fulfilled');
+});
+
+let stuckInitEncoderActive = false;
+/** A custom VP9 encoder whose initialization never finishes (like a codec stuck loading), when active. */
+class StuckInitVideoEncoder extends CustomVideoEncoder {
+	static override supports(codec: VideoCodec) {
+		return stuckInitEncoderActive && codec === 'vp9';
+	}
+
+	init() {
+		return new Promise<void>(() => {});
+	}
+
+	encode() {}
+	flush() {}
+	close() {}
+}
+registerEncoder(StuckInitVideoEncoder);
+
+test('VideoSampleSource, cancel() after close() gets out of an encoder setup that never finishes', async () => {
+	stuckInitEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('low'),
+		});
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: 0,
+			duration: 1 / 30,
+		})).catch(() => {});
+		await new Promise(resolve => setTimeout(resolve, 50));
+		videoSource.close(); // Waits for what was added, which waits for the encoder
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'fulfilled', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		// Canceling forces the close, which doesn't wait for the encoder
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	} finally {
+		stuckInitEncoderActive = false;
+	}
+});
+
+test('VideoSampleSource, cancel() while finalizing gets out of an encoder setup that never finishes', async () => {
+	stuckInitEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('low'),
+		});
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		for (let i = 0; i < 2; i++) {
+			void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+				format: 'RGBA',
+				codedWidth: 160,
+				codedHeight: 120,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			})).catch(() => {});
+		}
+
+		const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'fulfilled', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		// Finalizing waits for the frames added before it, which wait for the encoder, until the output is canceled,
+		// which drops them and lets finalization go on
+		const finalized = output.finalize();
+		await new Promise(resolve => setTimeout(resolve, 50));
+		await output.cancel();
+		expect(await stateAfter(finalized, 1000)).not.toBe('pending');
+	} finally {
+		stuckInitEncoderActive = false;
+	}
 });

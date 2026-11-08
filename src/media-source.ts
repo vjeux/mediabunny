@@ -147,11 +147,14 @@ export abstract class MediaSource {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async _flushAndClose(forceClose: boolean) {}
 	/**
-	 * Called when the output is canceled while finalizing: stops waiting for the samples added before finalizing to
-	 * be processed (a process function that never settles would hold finalization up forever) and drops them.
+	 * Stops waiting for the samples added so far to be processed and drops them, so that a process function call or an
+	 * encoder initialization that never settles can't hold finalization or a graceful close up forever. Called when
+	 * the output is canceled while finalizing, where it only applies with such a call or initialization in flight, and
+	 * with `always` when a graceful close is under way as the output gets canceled.
 	 * @internal
 	 */
-	_cancelPendingAdds() {}
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_cancelPendingAdds(always = false) {}
 
 	/**
 	 * Closes this source. This prevents future samples from being added and signals to the output file that no further
@@ -193,6 +196,12 @@ export abstract class MediaSource {
 	async _flushOrWaitForOngoingClose(forceClose: boolean) {
 		if (forceClose) {
 			this._forceCloseSignal.resolve();
+		}
+		if (forceClose && this._closingPromise) {
+			// A graceful close under way (from close()) waits for the samples added before it, which a process function
+			// call or an encoder initialization that never settles would hold up forever. The output is being canceled,
+			// so stop waiting for them.
+			this._cancelPendingAdds(true);
 		}
 
 		return this._closingPromise ??= (async () => {
@@ -1483,6 +1492,8 @@ class VideoEncoderWrapper {
 			const forceCloseRequested = await Promise.race([
 				this.ensureEncoderPromise.then(() => false, () => false),
 				this.source._forceCloseSignal.promise.then(() => true),
+				// Likewise when cancel() while finalizing stops waiting for the samples this initialization holds up
+				this.pendingAddsCanceledSignal.promise.then(() => true),
 			]);
 			if (forceCloseRequested && !this.encoderInitialized) {
 				return this.flushAndClose(true);
@@ -1498,8 +1509,9 @@ class VideoEncoderWrapper {
 
 				this.checkForEncoderError();
 
-				// Final frame rate padding: fill remaining frames up to the last sample's original end timestamp
-				if (this.frameRateLastSample) {
+				// Final frame rate padding: fill remaining frames up to the last sample's original end timestamp (not
+				// when the queued samples got dropped, as the padding would wait for the encoder all the same)
+				if (this.frameRateLastSample && !this.pendingAddsCanceled) {
 					const frameRate = this.encodingConfig.transform!.frameRate!;
 					const alignedEnd = floorToFrame(this.frameRateLastEndTimestamp!, frameRate);
 					await this.padFrameRate(alignedEnd);
@@ -1564,11 +1576,20 @@ class VideoEncoderWrapper {
 	}
 
 	/**
-	 * Stops waiting for a process function call still in flight, and drops the samples queued behind it. Without one,
-	 * nothing holds them up, so this does nothing and they all still go in.
+	 * Whether the samples added so far are held up by something that may never finish: a process function call or an
+	 * encoder initialization in flight.
 	 */
-	cancelPendingAdds() {
-		if (this.processCallsInFlight === 0) {
+	isHeldUp() {
+		return this.processCallsInFlight > 0 || (this.ensureEncoderPromise !== null && !this.encoderInitialized);
+	}
+
+	/**
+	 * Stops waiting for a process function call or an encoder initialization still in flight, and drops the samples
+	 * queued behind it. Without either, nothing holds them up, so this does nothing and they all still go in, unless
+	 * `always` is set (the output is being canceled).
+	 */
+	cancelPendingAdds(always = false) {
+		if (!always && !this.isHeldUp()) {
 			return;
 		}
 
@@ -2226,8 +2247,8 @@ export class VideoSampleSource extends VideoSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 }
 
@@ -2288,8 +2309,8 @@ export class CanvasSource extends VideoSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 }
 
@@ -2754,8 +2775,8 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 
 	/** @internal */
@@ -3618,6 +3639,8 @@ class AudioEncoderWrapper {
 			const forceCloseRequested = await Promise.race([
 				this.ensureEncoderPromise.then(() => false, () => false),
 				this.source._forceCloseSignal.promise.then(() => true),
+				// Likewise when cancel() while finalizing stops waiting for the samples this initialization holds up
+				this.pendingAddsCanceledSignal.promise.then(() => true),
 			]);
 			if (forceCloseRequested && !this.encoderInitialized) {
 				return this.flushAndClose(true);
