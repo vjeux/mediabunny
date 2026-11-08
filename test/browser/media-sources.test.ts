@@ -1,10 +1,12 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
-import { BufferTarget } from '../../src/target.js';
-import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { BufferTarget, StreamTarget } from '../../src/target.js';
+import { AudioSampleSource, MediaStreamVideoTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
-import { Quality } from '../../src/encode.js';
+import { canEncode, Quality } from '../../src/encode.js';
+import { CustomVideoEncoder, registerEncoder } from '../../src/custom-coder.js';
+import { VideoCodec } from '../../src/codec.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
@@ -731,3 +733,418 @@ const readBackAudioTrack = async (buffer: ArrayBuffer) => {
 
 	return { input, track };
 };
+
+test.for([{ frameRate: 30 }, { frameRate: null }])(
+	'MediaStreamVideoTrackSource encodes frames in order when an async process function takes varying time'
+	+ ' (frameRate: $frameRate)',
+	async ({ frameRate }, { skip }) => {
+		if (typeof VideoEncoder === 'undefined' || !(await canEncode('vp8'))) {
+			skip('VP8 encoding is not supported here');
+		}
+
+		// Stands in for MediaStreamTrackProcessor: a frame every 33 ms, like a camera
+		const globals = globalThis as { MediaStreamTrackProcessor?: unknown };
+		const realProcessor = globals.MediaStreamTrackProcessor;
+		let controller!: ReadableStreamDefaultController<VideoFrame>;
+		const readable = new ReadableStream<VideoFrame>({
+			start: (c) => {
+				controller = c;
+			},
+		});
+		globals.MediaStreamTrackProcessor = class {
+			readable = readable;
+		};
+		const start = performance.now();
+		const interval = setInterval(() => {
+			const frame = new VideoFrame(new Uint8Array(160 * 120 * 3 / 2).fill(128), {
+				format: 'I420',
+				codedWidth: 160,
+				codedHeight: 120,
+				timestamp: Math.round(1000 * (performance.now() - start)),
+			});
+			try {
+				controller.enqueue(frame);
+			} catch {
+				frame.close(); // The source stopped reading
+			}
+		}, 1000 / 30);
+		const canvas = document.createElement('canvas');
+		const track = canvas.captureStream().getVideoTracks()[0]!; // Only identifies the track
+
+		const timestamps: number[] = [];
+		const errors: unknown[] = [];
+		try {
+			const output = new Output({
+				format: new WebMOutputFormat(),
+				target: new BufferTarget(),
+			});
+			let calls = 0;
+			const videoSource = new MediaStreamVideoTrackSource(track, {
+				codec: 'vp8',
+				quality: new Quality('low'),
+				transform: {
+					// Like an effect whose run time varies per frame: every other frame takes 50 ms longer
+					process: async (sample) => {
+						if (calls++ % 2 === 0) {
+							await new Promise(resolve => setTimeout(resolve, 50));
+						}
+						return sample;
+					},
+				},
+				onEncodedPacket: (packet) => {
+					timestamps.push(packet.timestamp);
+				},
+			}, { frameRate });
+			videoSource.errorPromise.catch(error => errors.push(error));
+			output.addVideoTrack(videoSource);
+			await output.start();
+			await new Promise(resolve => setTimeout(resolve, 1500));
+			await output.finalize();
+		} finally {
+			clearInterval(interval);
+			try {
+				controller.close();
+			} catch {
+				// The source canceled the stream
+			}
+			globals.MediaStreamTrackProcessor = realProcessor;
+			track.stop();
+		}
+
+		expect(errors).toEqual([]);
+		expect(timestamps.length).toBeGreaterThan(20);
+		const backwards = timestamps.filter((timestamp, i) => i > 0 && timestamp < timestamps[i - 1]!);
+		expect(backwards).toEqual([]);
+	},
+);
+
+test('VideoSampleSource, adds queued behind a process() that never finishes settle on cancel', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 1) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const adds = [0, 1, 2, 3].map(i => videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: i / 30,
+		duration: 1 / 30,
+	})));
+	await new Promise(resolve => setTimeout(resolve, 300));
+	await output.cancel();
+
+	// The stuck add is up to the process() function, but the ones after it mustn't wait forever once canceled
+	const settled = adds.slice(2).map(add => Promise.race([
+		add.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), 1000)),
+	]));
+	expect(await Promise.all(settled)).not.toContain('pending');
+});
+
+test('VideoSampleSource, cancel() while finalizing gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 2) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const adds = [0, 1, 2, 3, 4].map(i => videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: i / 30,
+		duration: 1 / 30,
+	})).catch(() => {}));
+	await new Promise(resolve => setTimeout(resolve, 300));
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	// Finalizing waits for the frames added before it, so the stuck one holds it up...
+	const finalized = output.finalize();
+	expect(await stateAfter(finalized, 500)).toBe('pending');
+
+	// ...until the output is canceled, which drops them and lets finalization complete
+	expect(await stateAfter(output.cancel(), 2000)).toBe('fulfilled');
+	expect(await stateAfter(finalized, 1000)).toBe('fulfilled');
+	expect(await stateAfter(Promise.all(adds), 1000)).toBe('fulfilled');
+});
+
+test('VideoSampleSource, cancel() while finalizing keeps every frame without a process function', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let packets = 0;
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		onEncodedPacket: () => {
+			packets++;
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	for (let i = 0; i < 6; i++) {
+		void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: i / 30,
+			duration: 1 / 30,
+		})).catch(() => {});
+	}
+
+	// Nothing can hold finalization up here, so canceling while it runs doesn't drop the frames still queued
+	const finalized = output.finalize();
+	await output.cancel();
+	await finalized;
+	expect(output.state).toBe('finalized');
+	expect(packets).toBe(6);
+});
+
+test('VideoSampleSource, cancel() while finalizing doesn\'t wait behind a stalled target', async () => {
+	// A stream whose sink stops completing writes once finalizing starts, like a hung upload
+	let stalled = false;
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new StreamTarget(new WritableStream({
+			write: () => (stalled ? new Promise<void>(() => {}) : undefined),
+		})),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+	for (let i = 0; i < 3; i++) {
+		await videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: i / 30,
+			duration: 1 / 30,
+		}));
+	}
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	stalled = true;
+	const finalized = output.finalize();
+	expect(await stateAfter(finalized, 300)).toBe('pending'); // The sink holds it up
+
+	// Canceling can't get the sink going again, but it mustn't get stuck behind it either
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+});
+
+test('VideoSampleSource, cancel() after close() gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				await new Promise(() => {}); // A stuck effect
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+
+	const added = videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: 0,
+		duration: 1 / 30,
+	})).catch(() => {});
+	await new Promise(resolve => setTimeout(resolve, 50));
+	videoSource.close(); // Like stopping a recording: waits for what was added
+	await new Promise(resolve => setTimeout(resolve, 100));
+
+	const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+		promise.then(() => 'fulfilled', () => 'rejected'),
+		new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+	]);
+
+	// Canceling forces the close, which doesn't wait for the stuck call
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	expect(await stateAfter(added, 1000)).toBe('fulfilled');
+});
+
+let stuckInitEncoderActive = false;
+/** A custom VP9 encoder whose initialization never finishes (like a codec stuck loading), when active. */
+class StuckInitVideoEncoder extends CustomVideoEncoder {
+	static override supports(codec: VideoCodec) {
+		return stuckInitEncoderActive && codec === 'vp9';
+	}
+
+	init() {
+		return new Promise<void>(() => {});
+	}
+
+	encode() {}
+	flush() {}
+	close() {}
+}
+registerEncoder(StuckInitVideoEncoder);
+
+test('VideoSampleSource, cancel() after close() gets out of an encoder setup that never finishes', async () => {
+	stuckInitEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('low'),
+		});
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+			format: 'RGBA',
+			codedWidth: 160,
+			codedHeight: 120,
+			timestamp: 0,
+			duration: 1 / 30,
+		})).catch(() => {});
+		await new Promise(resolve => setTimeout(resolve, 50));
+		videoSource.close(); // Waits for what was added, which waits for the encoder
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'fulfilled', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		// Canceling forces the close, which doesn't wait for the encoder
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	} finally {
+		stuckInitEncoderActive = false;
+	}
+});
+
+test('VideoSampleSource, cancel() while finalizing gets out of an encoder setup that never finishes', async () => {
+	stuckInitEncoderActive = true;
+	try {
+		const output = new Output({
+			format: new WebMOutputFormat(),
+			target: new BufferTarget(),
+		});
+		const videoSource = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('low'),
+		});
+		output.addVideoTrack(videoSource);
+		await output.start();
+
+		for (let i = 0; i < 2; i++) {
+			void videoSource.add(new VideoSample(new Uint8Array(160 * 120 * 4), {
+				format: 'RGBA',
+				codedWidth: 160,
+				codedHeight: 120,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			})).catch(() => {});
+		}
+
+		const stateAfter = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'fulfilled', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		// Finalizing waits for the frames added before it, which wait for the encoder, until the output is canceled,
+		// which drops them and lets finalization go on
+		const finalized = output.finalize();
+		await new Promise(resolve => setTimeout(resolve, 50));
+		await output.cancel();
+		expect(await stateAfter(finalized, 1000)).not.toBe('pending');
+	} finally {
+		stuckInitEncoderActive = false;
+	}
+});
+
+test('VideoSampleSource, finished adds leave no waits behind', async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const videoSource = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('low'),
+		transform: {
+			process: async (sample) => {
+				await new Promise(resolve => setTimeout(resolve, 1));
+				return sample;
+			},
+		},
+	});
+	output.addVideoTrack(videoSource);
+	await output.start();
+	// Each add waits for its turn and for the process function, either of which canceling cuts short
+	const waits = (videoSource as unknown as { _encoder: { releasableWaits: { size: number } } })._encoder
+		.releasableWaits;
+
+	const frame = (i: number) => new VideoSample(new Uint8Array(160 * 120 * 4), {
+		format: 'RGBA',
+		codedWidth: 160,
+		codedHeight: 120,
+		timestamp: i / 30,
+		duration: 1 / 30,
+	});
+	for (let i = 0; i < 60; i++) {
+		await videoSource.add(frame(i));
+	}
+	expect(waits.size).toBe(0);
+
+	// Adds not awaited one by one: at most one wait per add going on (its turn or its process call)
+	const adds = Array.from({ length: 30 }, (_, i) => videoSource.add(frame(60 + i)));
+	expect(waits.size).toBeLessThanOrEqual(30);
+	await Promise.all(adds);
+	expect(waits.size).toBe(0);
+
+	await output.finalize();
+});

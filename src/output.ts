@@ -965,16 +965,27 @@ export class Output<
 	 * Cancels the creation of the output file, releasing internal resources like encoders and preventing further
 	 * samples from being added.
 	 *
-	 * @returns A promise that resolves once all internal resources have been released.
+	 * While the output is finalizing, this instead stops waiting for a `process` function call or an encoder
+	 * initialization still in flight and drops the samples queued behind it, so that one that never settles can't hold
+	 * finalization up forever (without either, nothing is dropped). Finalization then goes on by itself, and the
+	 * returned promise resolves right away.
+	 *
+	 * @returns A promise that resolves once all internal resources have been released, or right away while the output
+	 * is finalizing.
 	 */
 	async cancel() {
 		if (this.state === 'canceled') {
 			return this._cancelPromise ?? undefined;
-		} else if (this.state === 'finalizing' || this.state === 'finalized') {
-			// Don't wanna warn when finalizing since that shows a warning when finalization fails and then cancel
-			// is called
-			if (this.state === 'finalized') {
-				Logging._warn('Output has already been finalized.');
+		} else if (this.state === 'finalized') {
+			Logging._warn('Output has already been finalized.');
+			return;
+		} else if (this.state === 'finalizing') {
+			// Finalization waits for the samples added before it to be processed, which a process function call or an
+			// encoder initialization that never settles would hold up forever. Stop waiting for such a call or
+			// initialization and drop the samples queued behind it, so that finalization can go on. Don't wait for it
+			// here, though: something else, like a target whose sink stopped completing writes, may hold it up as well.
+			for (const track of this.tracks) {
+				track.source._cancelPendingAdds();
 			}
 
 			return;
