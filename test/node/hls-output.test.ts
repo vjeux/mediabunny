@@ -2422,6 +2422,88 @@ test('CMAF segmentation, single file per playlist', async () => {
 	expect(playlistText).toContain('#EXT-X-MAP:URI=');
 });
 
+test('Fragmented MP4 and CMAF segments end where the next segment starts', async () => {
+	// Each traf's decode time, and the decode time where its samples end
+	const readTrafs = (bytes: Uint8Array) => {
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+		const trafs: { decodeTime: number; end: number }[] = [];
+		for (let pos = 0; pos < bytes.byteLength; pos += view.getUint32(pos)) {
+			if (type(pos) !== 'moof') {
+				continue;
+			}
+
+			const traf = pos + 8 + view.getUint32(pos + 8); // After mfhd
+			let decodeTime = 0;
+			let defaultDuration = 0;
+			let duration = 0;
+			for (let child = traf + 8; child < traf + view.getUint32(traf); child += view.getUint32(child)) {
+				const flags = view.getUint32(child + 8) & 0xffffff;
+				if (type(child) === 'tfhd' && flags & 0x08) {
+					defaultDuration = view.getUint32(child + 16 + (flags & 0x01 ? 8 : 0) + (flags & 0x02 ? 4 : 0));
+				} else if (type(child) === 'tfdt') {
+					const isVersion1 = bytes[child + 8] === 1;
+					decodeTime = isVersion1 ? Number(view.getBigUint64(child + 12)) : view.getUint32(child + 12);
+				} else if (type(child) === 'trun') {
+					const sampleCount = view.getUint32(child + 12);
+					let entry = child + 16 + (flags & 0x01 ? 4 : 0) + (flags & 0x04 ? 4 : 0);
+					const entrySize = 4 * [0x100, 0x200, 0x400, 0x800].filter(x => flags & x).length;
+					for (let i = 0; i < sampleCount; i++, entry += entrySize) {
+						duration += flags & 0x100 ? view.getUint32(entry) : defaultDuration;
+					}
+				}
+			}
+			trafs.push({ decodeTime, end: decodeTime + duration });
+		}
+		return trafs;
+	};
+
+	const configurations = [
+		{ segmentFormat: new CmafOutputFormat(), singleFilePerPlaylist: false },
+		{ segmentFormat: new CmafOutputFormat(), singleFilePerPlaylist: true },
+		{ segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }), singleFilePerPlaylist: false },
+	];
+	for (const { segmentFormat, singleFilePerPlaylist } of configurations) {
+		const segments = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat, singleFilePerPlaylist, targetDuration: 2 }),
+			target: new PathedTarget('', (request) => {
+				const target = new BufferTarget();
+				if (request.path.includes('segment')) {
+					target.on('finalized', () => {
+						segments.set(request.path, new Uint8Array(target.buffer!));
+					});
+				}
+				return target;
+			}),
+		});
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source);
+		await output.start();
+
+		// 29.97 fps with timestamps rounded to milliseconds, as in WebM files from FFmpeg, and a key frame every 2 s
+		for (let i = 0; i < 300; i++) {
+			const timestamp = Math.round(i * 1001 / 30) / 1000;
+			const type = i % 60 === 0 ? 'key' : 'delta';
+			const packet = new EncodedPacket(new Uint8Array(1), type, timestamp, 1001 / 30000);
+			await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 320, codedHeight: 180 } });
+		}
+		await output.finalize();
+
+		// Each segment is written by its own muxer, so each one's last sample kept its packet duration, which reached
+		// past the next segment's start. A traf's decode time must be the sum of all earlier sample durations
+		// (ISO/IEC 14496-12), also across segments, which players append one after the other.
+		const segmentNumber = (path: string) => Number(/(\d+)\.[a-z0-9]+$/.exec(path)![1]);
+		const trafs = [...segments]
+			.sort(([a], [b]) => segmentNumber(a) - segmentNumber(b))
+			.flatMap(([, bytes]) => readTrafs(bytes));
+		expect(trafs).toHaveLength(5);
+		for (let i = 1; i < trafs.length; i++) {
+			expect(trafs[i]!.decodeTime).toBe(trafs[i - 1]!.end);
+		}
+	}
+});
+
 test('Sparse tracks in segments, MPEG-TS', async () => {
 	await testSparseTracksInSegments({
 		segmentFormat: new MpegTsOutputFormat(),
