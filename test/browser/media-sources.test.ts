@@ -283,6 +283,87 @@ test('VideoSampleSource, transform.process identity function', async () => {
 	}
 });
 
+test.each(['video', 'audio'] as const)(
+	'Canceling while the first %s sample\'s async process function runs closes the encoder',
+	async (type) => {
+		// Keep track of the encoders that get created
+		const encoders: (VideoEncoder | AudioEncoder)[] = [];
+		const RealVideoEncoder = VideoEncoder;
+		const RealAudioEncoder = AudioEncoder;
+		globalThis.VideoEncoder = class extends RealVideoEncoder {
+			constructor(init: VideoEncoderInit) {
+				super(init);
+				encoders.push(this);
+			}
+		};
+		globalThis.AudioEncoder = class extends RealAudioEncoder {
+			constructor(init: AudioEncoderInit) {
+				super(init);
+				encoders.push(this);
+			}
+		};
+
+		try {
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => release = resolve);
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+
+			let addPromise: Promise<void>;
+			if (type === 'video') {
+				const source = new VideoSampleSource({
+					codec: 'vp9',
+					quality: new Quality('medium'),
+					transform: {
+						process: async (sample) => {
+							await gate;
+							return sample;
+						},
+					},
+				});
+				output.addVideoTrack(source);
+				await output.start();
+
+				using sample = new VideoSample(new Uint8Array(320 * 240 * 4), {
+					format: 'RGBA', codedWidth: 320, codedHeight: 240, timestamp: 0, duration: 1 / 30,
+				});
+				addPromise = source.add(sample);
+			} else {
+				const source = new AudioSampleSource({
+					codec: 'opus',
+					quality: new Quality('medium'),
+					transform: {
+						process: async (sample) => {
+							await gate;
+							return sample;
+						},
+					},
+				});
+				output.addAudioTrack(source);
+				await output.start();
+
+				using sample = new AudioSample({
+					data: new Float32Array(2 * 960),
+					format: 'f32',
+					numberOfChannels: 2,
+					sampleRate: 48000,
+					timestamp: 0,
+				});
+				addPromise = source.add(sample);
+			}
+
+			await new Promise(resolve => setTimeout(resolve, 20));
+			await output.cancel();
+			release();
+			await addPromise.catch(() => {});
+
+			expect(encoders.map(x => x.state)).not.toContain('configured');
+		} finally {
+			globalThis.VideoEncoder = RealVideoEncoder;
+			globalThis.AudioEncoder = RealAudioEncoder;
+		}
+	},
+);
+
 test('VideoSampleSource, transform.process manual resize', async () => {
 	const buffer = await encodeFrames(
 		{
@@ -495,6 +576,101 @@ test('VideoSampleSource, transform.frameRate deduplicates frames in the same slo
 	expect(samples[0]!.timestamp).toBe(0);
 	expect(samples[1]!.timestamp).toBeCloseTo(0.1);
 });
+
+test('VideoSampleSource, canceling while transform.frameRate pads a gap ends the add quietly', async () => {
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const source = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		transform: { frameRate: 30 },
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	const makeSample = (timestamp: number) => new VideoSample(new Uint8Array(640 * 480 * 4), {
+		format: 'RGBA', codedWidth: 640, codedHeight: 480, timestamp, duration: 1 / 30,
+	});
+	using first = makeSample(0);
+	await source.add(first);
+
+	using second = makeSample(2); // A 2 s gap, padded with about 59 repeated frames
+	const addPromise = source.add(second);
+	await output.cancel();
+
+	const error = await addPromise.then(() => null, (error: Error) => error);
+	expect(error === null || error.message === 'Output has been canceled.', String(error)).toBe(true);
+});
+
+test.each([false, true])(
+	'VideoSampleSource, canceling while a frame is transformed leaves no sample open (during the add: %s)',
+	async (cancelDuringAdd) => {
+		// Counts the samples made by clone() and transform() that are never closed, and lets transform() be held back
+		// like a slow one (large frames, a busy GPU)
+		const open = new Set<VideoSample>();
+		const prototype = VideoSample.prototype as unknown as {
+			clone: (this: VideoSample) => VideoSample;
+			close: (this: VideoSample) => void;
+			transform: (this: VideoSample, ...args: unknown[]) => Promise<VideoSample>;
+		};
+		const { clone, close, transform } = prototype;
+		let gate: Promise<void> | null = null;
+		prototype.clone = function () {
+			const sample = clone.call(this);
+			open.add(sample);
+			return sample;
+		};
+		prototype.close = function () {
+			open.delete(this);
+			close.call(this);
+		};
+		prototype.transform = async function (...args) {
+			if (gate) {
+				await gate;
+			}
+			const sample = await transform.apply(this, args);
+			open.add(sample);
+			return sample;
+		};
+
+		try {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({
+				codec: 'avc',
+				quality: new Quality('medium'),
+				transform: { width: 32, height: 32, fit: 'fill', frameRate: 30 },
+			});
+			output.addVideoTrack(source);
+			await output.start();
+
+			const makeSample = (timestamp: number) => new VideoSample(makeCanvas(64, 64), {
+				timestamp,
+				duration: 1 / 30,
+			});
+
+			using first = makeSample(0);
+			await source.add(first);
+
+			using second = makeSample(0.5);
+			let release = () => {};
+			if (cancelDuringAdd) {
+				gate = new Promise<void>(resolve => release = resolve);
+			}
+			const addPromise = source.add(second).catch(() => {});
+			if (cancelDuringAdd) {
+				await output.cancel(); // Completes while the add still awaits the transform
+				release();
+			}
+			await addPromise;
+			if (!cancelDuringAdd) {
+				await output.cancel();
+			}
+
+			expect(open.size).toBe(0);
+		} finally {
+			Object.assign(prototype, { clone, close, transform });
+		}
+	},
+);
 
 test('VideoSampleSource, transform.frameRate final padding fills remaining duration', async () => {
 	const buffer = await encodeFrames(
@@ -969,6 +1145,28 @@ test('AudioSampleSource, normal usage', async () => {
 	expect(await track.getSampleRate()).toBe(48000);
 	expect(await track.computeDuration()).toBe(1);
 	input.dispose();
+});
+
+test('AudioSampleSource, canceling while a gap is filled with silence ends the add quietly', async () => {
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+	output.addAudioTrack(source);
+	await output.start();
+
+	const makeSample = (timestamp: number) => new AudioSample({
+		data: new Float32Array(2 * 960), format: 'f32', numberOfChannels: 2, sampleRate: 48000, timestamp,
+	});
+	for (let i = 0; i < 3; i++) {
+		using sample = makeSample(i * 0.02);
+		await source.add(sample);
+	}
+
+	using gapped = makeSample(1); // About 0.94 s after the end of the previous sample
+	const addPromise = source.add(gapped);
+	await output.cancel();
+
+	const error = await addPromise.then(() => null, (error: Error) => error);
+	expect(error === null || error.message === 'Output has been canceled.', String(error)).toBe(true);
 });
 
 test('AudioSampleSource, remixed to mono', async () => {
