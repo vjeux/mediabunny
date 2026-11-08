@@ -11,7 +11,8 @@ test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
 		// The callback may never settle (an upload URL request without a timeout, a file picker left open), and a
 		// cancel mustn't wait for it
 		const { CmafOutputFormat, Mp4OutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
-		const { PathedTarget } = await import('../../src/target.js');
+		const { PathedTarget, StreamTarget } = await import('../../src/target.js');
+		type StreamTargetChunk = import('../../src/target.js').StreamTargetChunk;
 		const createFormat = () => formatName === 'MP4'
 			? new Mp4OutputFormat()
 			: formatName === 'Matroska'
@@ -22,8 +23,8 @@ test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
 		const usesInitTarget = formatName === 'CMAF';
 
 		for (const settlesLate of [false, true]) {
-			let resolveTarget: ((target: BufferTarget) => void) | null = null;
-			const getTarget = () => new Promise<BufferTarget>((resolve) => {
+			let resolveTarget: ((target: BufferTarget | InstanceType<typeof StreamTarget>) => void) | null = null;
+			const getTarget = () => new Promise<BufferTarget | InstanceType<typeof StreamTarget>>((resolve) => {
 				resolveTarget = resolve;
 			});
 			const output = new Output({
@@ -48,8 +49,12 @@ test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
 			expect(await startResult).toBe('Output has been canceled.');
 
 			if (settlesLate) {
-				// A target that still arrives gets closed
-				const lateTarget = new BufferTarget();
+				// A target that still arrives gets closed, and nothing gets written into it
+				const writes: number[] = [];
+				const writable = new WritableStream<StreamTargetChunk>({
+					write: chunk => void writes.push(chunk.data.byteLength),
+				});
+				const lateTarget = new StreamTarget(writable);
 				let closed = false;
 				const close = lateTarget._close.bind(lateTarget);
 				lateTarget._close = async () => {
@@ -59,6 +64,8 @@ test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
 				resolveTarget!(lateTarget);
 				await new Promise(resolve => setTimeout(resolve, 50));
 				expect(closed).toBe(true);
+				expect(writes).toEqual([]);
+				expect(writable.locked).toBe(false); // The caller's stream stays theirs
 			}
 		}
 	},

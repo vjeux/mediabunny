@@ -604,11 +604,12 @@ export class Output<
 		const target = await this._initTarget();
 
 		if (this.state === 'canceled') {
+			// Arrived after a cancel (which doesn't wait for it), so don't let anything write into it
 			await target._close();
-		} else {
-			this._rememberTarget(target);
+			throw new Error('Output has been canceled.');
 		}
 
+		this._rememberTarget(target);
 		return target;
 	}
 
@@ -663,6 +664,11 @@ export class Output<
 	_getRootWriter(isMonotonic: boolean | ((target: Target) => boolean)) {
 		return this._rootWriterPromise ??= (async () => {
 			const target = await this._getRootTarget();
+			if (this.state === 'canceled') {
+				// Arrived after a cancel (which doesn't wait for it, and has closed it), so don't let anything write
+				// into it
+				throw new Error('Output has been canceled.');
+			}
 
 			const writer = new Writer(target, typeof isMonotonic === 'boolean' ? isMonotonic : isMonotonic(target));
 			writer.start();
