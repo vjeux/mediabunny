@@ -1140,6 +1140,118 @@ test('AudioSampleSource, Opus encoding of 16 kHz audio keeps its timing', async 
 	input.dispose();
 });
 
+/**
+ * Whether the platform's own Opus encoder and decoder keep the timing of audio that needs no resampling: a 20 ms burst
+ * at 0.5 s in 1 s of 48 kHz audio, encoded in one piece and decoded, must come back within 2 ms of its time. WebKitGTK
+ * stamps every encoded chunk with the timestamp of the input it came from, and its decoder delays the audio by the
+ * pre-skip instead of trimming it, so there, encoded timing can't be checked.
+ */
+const nativeOpusKeepsTiming = async () => {
+	const withTimeout = <T>(promise: Promise<T>) => Promise.race([
+		promise,
+		new Promise<null>(resolve => setTimeout(() => resolve(null), 3000)),
+	]);
+
+	const sampleRate = 48000;
+	const config: AudioEncoderConfig = { codec: 'opus', sampleRate, numberOfChannels: 1, bitrate: 64000 };
+	if (typeof AudioEncoder === 'undefined' || typeof AudioDecoder === 'undefined') {
+		return false;
+	}
+	if (!(await withTimeout(AudioEncoder.isConfigSupported(config)))?.supported) {
+		return false;
+	}
+
+	const data = new Float32Array(sampleRate);
+	for (let i = 0; i < sampleRate / 50; i++) {
+		data[sampleRate / 2 + i] = 0.5 * Math.sin(2 * Math.PI * 1000 * i / sampleRate);
+	}
+
+	const chunks: EncodedAudioChunk[] = [];
+	let decoderConfig: AudioDecoderConfig | undefined;
+	let onset: number | null = null;
+	let failed = false;
+	const encoder = new AudioEncoder({
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			decoderConfig ??= meta?.decoderConfig;
+		},
+		error: () => failed = true,
+	});
+	const decoder = new AudioDecoder({
+		output: (output) => {
+			const values = new Float32Array(output.numberOfFrames);
+			output.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+			const index = values.findIndex(x => Math.abs(x) > 0.15);
+			if (index !== -1 && onset === null) {
+				onset = output.timestamp / 1e6 + index / output.sampleRate;
+			}
+			output.close();
+		},
+		error: () => failed = true,
+	});
+
+	try {
+		encoder.configure(config);
+		const audioData = new AudioData({
+			format: 'f32-planar', sampleRate, numberOfChannels: 1, numberOfFrames: sampleRate, timestamp: 0, data,
+		});
+		encoder.encode(audioData);
+		audioData.close();
+		if (await withTimeout(encoder.flush()) === null || !decoderConfig) {
+			return false;
+		}
+
+		decoder.configure(decoderConfig);
+		chunks.forEach(chunk => decoder.decode(chunk));
+		if (await withTimeout(decoder.flush()) === null) {
+			return false;
+		}
+	} catch {
+		return false;
+	} finally {
+		for (const codec of [encoder, decoder]) {
+			if (codec.state !== 'closed') {
+				codec.close();
+			}
+		}
+	}
+
+	return !failed && onset !== null && Math.abs(onset - 0.5) < 0.002;
+};
+
+test('AudioSampleSource, Opus encoding of 22.05 kHz audio keeps its timing', async (context) => {
+	if (!(await nativeOpusKeepsTiming())) {
+		context.skip('The platform\'s own Opus encoding and decoding don\'t keep timing');
+	}
+
+	// 1 s of silence with a 20 ms burst starting at 0.5 s. Chrome's Opus encoder resamples it to 48 kHz internally,
+	// which delays its output.
+	const sampleRate = 22050;
+	const data = new Float32Array(sampleRate);
+	const burstStart = sampleRate / 2;
+	for (let i = 0; i < sampleRate / 50; i++) {
+		data[burstStart + i] = 0.5 * Math.sin(2 * Math.PI * 1000 * i / sampleRate);
+	}
+	const sample = new AudioSample({ data, format: 'f32', sampleRate, numberOfChannels: 1, timestamp: 0 });
+	const buffer = await encodeAudio({ codec: 'opus', quality: new Quality('high') }, sample);
+
+	const { input, track } = await readBackAudioTrack(buffer);
+	let onset: number | null = null;
+	for await (using decoded of new AudioSampleSink(track).samples()) {
+		const values = new Float32Array(decoded.numberOfFrames);
+		decoded.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+		const index = values.findIndex(x => Math.abs(x) > 0.15);
+		if (index !== -1) {
+			onset = decoded.timestamp + index / decoded.sampleRate;
+			break;
+		}
+	}
+	input.dispose();
+
+	assert(onset !== null);
+	expect(onset).toBeCloseTo(0.5, 3);
+});
+
 const makeSineWave = (
 	sampleRate: number,
 	numberOfChannels: number,
