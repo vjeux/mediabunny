@@ -1281,3 +1281,37 @@ test('AudioSampleSource, cancel() while finalizing gets out of an encoder setup 
 		stuckInitAudioEncoderActive = false;
 	}
 });
+
+test('AudioSampleSource, finished adds leave no waits behind', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				await new Promise(resolve => setTimeout(resolve, 1));
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+	// Each add waits for its turn and for the process function, either of which canceling cuts short
+	const waits = (audioSource as unknown as { _encoder: { releasableWaits: { size: number } } })._encoder
+		.releasableWaits;
+
+	for (let i = 0; i < 60; i++) {
+		await audioSource.add(makeConstantSample(i));
+	}
+	expect(waits.size).toBe(0);
+
+	// Adds not awaited one by one: at most one wait per add going on (its turn or its process call)
+	const adds = Array.from({ length: 30 }, (_, i) => audioSource.add(makeConstantSample(60 + i)));
+	expect(waits.size).toBeLessThanOrEqual(30);
+	await Promise.all(adds);
+	expect(waits.size).toBe(0);
+
+	await output.finalize();
+});

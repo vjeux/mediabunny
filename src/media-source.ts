@@ -265,8 +265,53 @@ export class EncodedVideoPacketSource extends VideoSource {
 	}
 }
 
-/** What waiting for a process function's result gives when the output got canceled first. */
-const PROCESS_CANCELED: unique symbol = Symbol('process canceled');
+/** What a wait cut short by `ReleasableWaits.release()` gives. */
+const WAIT_RELEASED: unique symbol = Symbol('wait released');
+
+/**
+ * Waits that can all be cut short at once. Unlike racing each wait against a promise that only settles on release, a
+ * wait leaves nothing behind once it's over: such a race keeps a reaction on that promise until it settles, so with one
+ * per sample, memory would grow for as long as the source is used.
+ */
+class ReleasableWaits {
+	private released = false;
+	private onRelease = new Set<() => void>();
+
+	/** How many waits are going on. */
+	get size() {
+		return this.onRelease.size;
+	}
+
+	/** Cuts short every wait, current and future. */
+	release() {
+		this.released = true;
+		for (const callback of this.onRelease) {
+			callback();
+		}
+		this.onRelease.clear();
+	}
+
+	/** Resolves like `promise`, or with `WAIT_RELEASED` once released, whichever comes first. */
+	wait<T>(promise: PromiseLike<T>) {
+		return new Promise<T | typeof WAIT_RELEASED>((resolve, reject) => {
+			if (this.released) {
+				resolve(WAIT_RELEASED);
+				return;
+			}
+
+			const callback = () => resolve(WAIT_RELEASED);
+			this.onRelease.add(callback);
+			promise.then((value) => {
+				this.onRelease.delete(callback);
+				resolve(value);
+			}, (error: unknown) => {
+				this.onRelease.delete(callback);
+				// eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+				reject(error);
+			});
+		});
+	}
+}
 
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
@@ -2088,10 +2133,10 @@ class AudioEncoderWrapper {
 	/** Resolved when waiting for a process function's result should stop; see `cancelPendingAdds()`. */
 	private pendingAddsCanceledSignal = promiseWithResolvers();
 	/**
-	 * Resolved once the wrapper is closed, so that neither a process function call that never settles nor the adds
-	 * queued behind it are waited for.
+	 * Released once the wrapper is closed or the queued samples get dropped, so that neither a process function call
+	 * that never settles nor the adds queued behind it are waited for.
 	 */
-	private closedSignal = promiseWithResolvers();
+	private releasableWaits = new ReleasableWaits();
 	/** Set when the output is canceled while finalizing; see `cancelPendingAdds()`. */
 	private pendingAddsCanceled = false;
 	/** Settles once the samples added so far have been processed and encoded, one at a time, in order. */
@@ -2118,8 +2163,7 @@ class AudioEncoderWrapper {
 		// function, a later sample would otherwise overtake an earlier one that takes longer (when adds aren't awaited
 		// one by one). They're validated before waiting their turn, so that one added before finalize() isn't rejected
 		// for it.
-		const turn = Promise.race([this.addQueue, this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
-		const added = turn.then(() => this.addInOrder(audioSample, shouldClose));
+		const added = this.releasableWaits.wait(this.addQueue).then(() => this.addInOrder(audioSample, shouldClose));
 		this.addQueue = added.catch(() => {});
 		await added;
 	}
@@ -2204,16 +2248,14 @@ class AudioEncoderWrapper {
 				if (isThenable(processed)) {
 					// Don't wait past the output being canceled (a call that never settles would hold everything up)
 					const pending = processed;
-					const canceled = Promise.race([this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
-					const whenCanceled = canceled.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
 					this.processCallsInFlight++;
 					let result;
 					try {
-						result = await Promise.race([pending, whenCanceled]);
+						result = await this.releasableWaits.wait(pending);
 					} finally {
 						this.processCallsInFlight--;
 					}
-					if (result === PROCESS_CANCELED) {
+					if (result === WAIT_RELEASED) {
 						// Whatever it returns once it does settle is dropped
 						void Promise.resolve(pending).then((late) => {
 							for (const x of Array.isArray(late) ? late : [late]) {
@@ -2743,7 +2785,7 @@ class AudioEncoderWrapper {
 			// This cleanup must also run when flushing threw (e.g. due to an encoder error), otherwise the encoder
 			// would be left dangling
 			this.closed = true;
-			this.closedSignal.resolve();
+			this.releasableWaits.release();
 			this.resampler = null;
 
 			if (this.customEncoder) {
@@ -2779,6 +2821,7 @@ class AudioEncoderWrapper {
 
 		this.pendingAddsCanceled = true;
 		this.pendingAddsCanceledSignal.resolve();
+		this.releasableWaits.release();
 	}
 
 	getQueueSize() {
