@@ -1093,6 +1093,12 @@ export class MatroskaMuxer extends Muxer {
 
 			this.validateTimestamp(trackData.track, cue.timestamp, true);
 
+			if (Math.round(1000 * cue.duration) <= 0) {
+				// Cues that don't end after they start (at Matroska's millisecond resolution) are never shown, but
+				// written without a BlockDuration, a block lasts until the next one. So they're dropped, as in MP4.
+				return;
+			}
+
 			let bodyText = cue.text;
 			const timestampMs = Math.round(cue.timestamp * 1000);
 
