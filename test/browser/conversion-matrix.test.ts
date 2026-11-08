@@ -231,15 +231,15 @@ const buildCells = () => {
 
 const CELLS = buildCells();
 
-// Issues on main that open pull requests fix (one of them on upstream's bug-fix-mania branch). isKnownIssue tolerates
-// each one only while its flag is on: a branch that merges the fix turns the flag off, so the matrix checks it again.
+// Issues on main that open pull requests fix. isKnownIssue tolerates each one only while its flag is on: a branch that
+// merges the fix turns the flag off, so the matrix checks it again.
 const KNOWN_ISSUES: Record<string, boolean> = {
 	'#303+#306': true, // Opus encoding of audio at other rates than 48 kHz comes out late in Chrome (fixed by both)
 	'#75': true, // The encoder fallback changes both the channel count and the sample rate
 	'#304': true, // Trimming the end of MPEG-TS input throws "Assertion failed."
 	'#312': true, // HLS lists tracks without packets in CODECS
 	'#629': true, // Windows' AAC encoder silences the first ~512 samples
-	'bug-fix-mania': true, // The FLAC muxer writes a minimum block size of 0 for a single frame
+	'#635': true, // The FLAC muxer writes a minimum block size of 0 for a single frame
 };
 
 /** Issues known on main, with the PRs that fix them. */
@@ -274,10 +274,10 @@ const isKnownIssue = (cell: Cell, inView: MediaView, run: RunResult, issue: Issu
 	) {
 		return true;
 	}
-	// The FLAC muxer writes a minimum block size of 0 when there's a single frame, which decoders reject (fixed on
+	// The FLAC muxer writes a minimum block size of 0 when there's a single frame, which decoders reject (#635, from
 	// upstream's bug-fix-mania branch)
 	if (
-		KNOWN_ISSUES['bug-fix-mania']
+		KNOWN_ISSUES['#635']
 		&& cell.output === 'flac'
 		&& issue.kind === 'audio-decode'
 		&& cell.id.includes('trim-one-frame')
