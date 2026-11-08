@@ -309,7 +309,7 @@ export const TextEncoder = typeof globalThis.TextEncoder !== 'undefined'
 	};
 
 // Include a polyfill for environments that don't have TextEncoder (like AudioWorkletGlobalScope)
-export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
+const BaseTextDecoder: typeof globalThis.TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 	? globalThis.TextDecoder
 	: class TextDecoder {
 		readonly encoding: 'utf-8' | 'utf-16le' | 'utf-16be';
@@ -430,7 +430,41 @@ export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 
 			return result;
 		}
-	};
+	} as unknown as typeof globalThis.TextDecoder;
+
+/**
+ * Whether the value is a SharedArrayBuffer. Also works where SharedArrayBuffer isn't a global: without cross-origin
+ * isolation, shared WebAssembly memory still is one.
+ */
+export const isSharedArrayBuffer = (value: unknown): value is SharedArrayBuffer => {
+	if (Object.prototype.toString.call(value) !== '[object SharedArrayBuffer]') {
+		return false;
+	}
+
+	try {
+		// The brand can be faked with Symbol.toStringTag, but only real buffers can back a DataView
+		new DataView(value as ArrayBufferLike, 0, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+/**
+ * Browsers' TextDecoder rejects views of shared memory ("must not be shared"), while sources accept shared memory, so
+ * shared bytes get copied before decoding.
+ */
+export const TextDecoder = class TextDecoder extends BaseTextDecoder {
+	override decode(input?: AllowSharedBufferSource, options?: TextDecodeOptions) {
+		if (input !== undefined && isSharedArrayBuffer(ArrayBuffer.isView(input) ? input.buffer : input)) {
+			input = ArrayBuffer.isView(input)
+				? new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice()
+				: new Uint8Array(input).slice();
+		}
+
+		return super.decode(input, options);
+	}
+};
 
 export const textDecoder = /* #__PURE__ */ new TextDecoder();
 export const textEncoder = /* #__PURE__ */ new TextEncoder();
@@ -518,7 +552,7 @@ export const EMPTY_COLOR_SPACE: VideoColorSpaceInit = {
 export const isAllowSharedBufferSource = (x: unknown) => {
 	return (
 		x instanceof ArrayBuffer
-		|| (typeof SharedArrayBuffer !== 'undefined' && x instanceof SharedArrayBuffer)
+		|| isSharedArrayBuffer(x)
 		|| ArrayBuffer.isView(x)
 	);
 };
