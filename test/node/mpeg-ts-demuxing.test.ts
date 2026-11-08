@@ -1056,6 +1056,91 @@ test('MPEG-TS with several programs keeps interleaved PES packets whole when the
 	}
 });
 
+test('MPEG-TS with several programs opens from a stream with a small cache when the choice waits', async () => {
+	// The only PMT in the file has a CA descriptor (over packets that aren't scrambled), so the choice waits for a
+	// better program. Either the PAT lists another program that never shows up, or the PAT only comes 3 MiB in. Read
+	// through a ReadableStreamSource with a 2 MiB cache, the choice must not wait so long that the program's first
+	// packets are gone.
+	const buildFile = (latePat: boolean) => {
+		const packets: Uint8Array[] = [];
+		const counters = new Map<number, number>();
+		const pushPacket = (pid: number, payload: number[]) => {
+			const packet = new Uint8Array(188).fill(0xff);
+			const counter = counters.get(pid) ?? 0;
+			counters.set(pid, (counter + 1) & 0xf);
+			const stuffing = 184 - payload.length;
+			const adaptationFieldControl = stuffing > 0 ? 0x30 : 0x10;
+			packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, adaptationFieldControl | counter]);
+			if (stuffing > 0) {
+				packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+			}
+			packet.set(payload, 4 + stuffing);
+			packets.push(packet);
+		};
+		const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0]; // pointer_field, section, CRC (not checked)
+		const pat = section([0x00, 0xb0, 0x11, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 2, 0xf0, 0x01]);
+		const caDescriptor = [0x09, 0x04, 0x0b, 0x00, 0xff, 0xf0];
+		const pmtBody = [
+			0, 1, 0xc1, 0, 0, 0xe1, 0x01, 0xf0, caDescriptor.length, ...caDescriptor,
+			0x0f, 0xe1, 0x01, 0xf0, 0x00,
+		];
+		const pmt = section([0x02, 0xb0, pmtBody.length + 4, ...pmtBody]);
+		const adtsPes = (pts: number) => [
+			0, 0, 1, 0xc0, 0, 8 + 39, 0x84, 0x80, 5, 0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff,
+			((pts >> 14) & 0xfe) | 1, (pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+			0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc, ...new Array<number>(32).fill(0), // AAC-LC, 48 kHz, stereo
+		];
+
+		if (!latePat) {
+			pushPacket(0x0000, pat);
+		}
+		const frameCount = Math.floor(3 * 2 ** 20 / 188);
+		for (let i = 0; i < frameCount; i++) {
+			if (i % 500 === 0) {
+				pushPacket(0x1000, pmt);
+			}
+			if (latePat && i === frameCount - 100) {
+				pushPacket(0x0000, pat);
+			}
+			pushPacket(0x101, adtsPes(1920 * i));
+		}
+
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+		return { bytes, frameCount };
+	};
+
+	for (const latePat of [false, true]) {
+		const { bytes, frameCount } = buildFile(latePat);
+		let offset = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (offset >= bytes.length) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(bytes.slice(offset, offset + 2 ** 16));
+				offset += 2 ** 16;
+			},
+		});
+
+		using input = new Input({
+			source: new ReadableStreamSource(stream, { maxCacheSize: 2 * 2 ** 20 }),
+			formats: ALL_FORMATS,
+		});
+
+		const tracks = await input.getTracks();
+		expect(tracks.map(track => track.id)).toEqual([0x101]);
+
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
+			expect(packet.timestamp).toBeCloseTo(packetCount * 1920 / 90000, 6);
+			packetCount++;
+		}
+		expect(packetCount).toBe(frameCount);
+	}
+});
+
 test('MPEG-TS first packet key packet forcing', async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({

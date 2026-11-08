@@ -103,11 +103,17 @@ const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 const CA_DESCRIPTOR_TAG = 0x09;
 
 /**
- * How far past the first PMT of a program we can't read anything from we look for another program, as the PMTs of
- * some programs listed in the PAT may never show up. DVB repeats each PMT at least every half second, which this covers
- * at up to 130 Mbit/s.
+ * How far past the first PMT of a program we'd rather not use (its streams have CA descriptors) we look for a better
+ * program, as the PMTs of some programs listed in the PAT may never show up. DVB repeats each PMT at least every half
+ * second, which this covers at up to 130 Mbit/s.
  */
 const MAX_PROGRAM_SEARCH_SIZE = 2 ** 23; // 8 MiB
+/**
+ * The same for sources of unknown size, which may not be able to go back that far to read the program's streams once
+ * it's chosen (a ReadableStreamSource only keeps what its cache holds). This still covers PMTs repeated every 0.1 s at
+ * up to 80 Mbit/s.
+ */
+const MAX_STREAMED_PROGRAM_SEARCH_SIZE = 2 ** 20; // 1 MiB
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
 const HDMV_FORMAT_IDENTIFIER = 0x48444d56;
@@ -249,22 +255,29 @@ export class MpegTsDemuxer extends Demuxer {
 			// is decided by its packets.
 			const seenProgramMapPids = new Set<number>();
 			type FallbackProgram = { pmtPos: number; streams: ElementaryStream[] };
+			// The first program with streams both with and without CA descriptors, the first with streams that all
+			// have one, and the first without any supported stream
 			let partlyScrambledProgram: FallbackProgram | null = null;
-			let unreadableProgram: FallbackProgram | null = null;
+			let scrambledProgram: FallbackProgram | null = null;
+			let emptyProgram: FallbackProgram | null = null;
 
 			// Uses the best fallback program, going back to its PMT to read its streams from there
 			const useFallbackProgram = () => {
-				const program = partlyScrambledProgram ?? unreadableProgram;
+				const program = partlyScrambledProgram ?? scrambledProgram ?? emptyProgram;
 				if (hasProgramMap || !program) {
 					return false;
 				}
 
-				this.elementaryStreams.push(...program.streams);
 				hasProgramMap = true;
-				currentPos = program.pmtPos;
-				// Without a program, sections were read as contiguous, which cuts PES packets short at the first packet
-				// of another PID, so the section ends recorded since can't be trusted
-				this.sectionEndPositions.length = 0;
+
+				if (program.streams.length > 0) {
+					this.elementaryStreams.push(...program.streams);
+					currentPos = program.pmtPos;
+					// Without a program, sections were read as contiguous, which cuts PES packets short at the first
+					// packet of another PID, so the section ends recorded since can't be trusted
+					this.sectionEndPositions.length = 0;
+				}
+
 				return true;
 			};
 
@@ -272,11 +285,15 @@ export class MpegTsDemuxer extends Demuxer {
 				&& [...programMapPids].every(pid => seenProgramMapPids.has(pid));
 
 			while (true) {
+				// A program without supported streams doesn't need to be gone back to, so it can wait for the end
 				const firstFallbackPmtPos = Math.min(
 					partlyScrambledProgram?.pmtPos ?? Infinity,
-					unreadableProgram?.pmtPos ?? Infinity,
+					scrambledProgram?.pmtPos ?? Infinity,
 				);
-				if (currentPos - firstFallbackPmtPos > MAX_PROGRAM_SEARCH_SIZE) {
+				const maxProgramSearchSize = this.reader.fileSizeNonStrict === null
+					? MAX_STREAMED_PROGRAM_SEARCH_SIZE
+					: MAX_PROGRAM_SEARCH_SIZE;
+				if (currentPos - firstFallbackPmtPos > maxProgramSearchSize) {
 					useFallbackProgram();
 				}
 
@@ -602,8 +619,10 @@ export class MpegTsDemuxer extends Demuxer {
 						const program = { pmtPos: currentPos, streams };
 						if (streamsWithoutCa.length > 0) {
 							partlyScrambledProgram ??= program;
+						} else if (streams.length > 0) {
+							scrambledProgram ??= program;
 						} else {
-							unreadableProgram ??= program;
+							emptyProgram ??= program;
 						}
 
 						if (hasSeenAllPrograms()) {
