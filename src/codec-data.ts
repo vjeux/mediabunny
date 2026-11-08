@@ -1846,9 +1846,10 @@ const VP9_COLOR_SPACE_TABLE = {
 	7: { colourPrimaries: 1, transferCharacteristics: 13, matrixCoefficients: 0 }, // CS_RGB (sRGB)
 };
 
-export const extractVp9CodecInfoFromPacket = (
+/** Parses a VP9 key frame's uncompressed header: the codec info and the frame size. */
+const parseVp9KeyFrameHeader = (
 	packet: Uint8Array,
-): Vp9CodecInfo | null => {
+): { codecInfo: Vp9CodecInfo; width: number; height: number } | null => {
 	// eslint-disable-next-line @stylistic/max-len
 	// https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf
 	// http://downloads.webmproject.org/docs/vp9/vp9-bitstream_superframe-and-uncompressed-header_v1.0.pdf
@@ -1959,7 +1960,7 @@ export const extractVp9CodecInfoFromPacket = (
 	const transferCharacteristics = colorSpaceValues?.transferCharacteristics ?? 2;
 	const matrixCoefficients = colorSpaceValues?.matrixCoefficients ?? 2;
 
-	return {
+	const codecInfo: Vp9CodecInfo = {
 		profile,
 		level,
 		bitDepth,
@@ -1969,6 +1970,35 @@ export const extractVp9CodecInfoFromPacket = (
 		transferCharacteristics,
 		matrixCoefficients,
 	};
+
+	return { codecInfo, width, height };
+};
+
+export const extractVp9CodecInfoFromPacket = (packet: Uint8Array): Vp9CodecInfo | null => {
+	return parseVp9KeyFrameHeader(packet)?.codecInfo ?? null;
+};
+
+/** Reads the frame size from a VP9 key frame's uncompressed header. */
+export const extractVp9FrameSizeFromPacket = (packet: Uint8Array) => {
+	const header = parseVp9KeyFrameHeader(packet);
+	return header && { width: header.width, height: header.height };
+};
+
+/** Reads the frame size from a VP8 key frame (RFC 6386, section 9.1). */
+export const extractVp8FrameSizeFromPacket = (packet: Uint8Array) => {
+	const isKeyFrame = packet.length >= 10 && (packet[0]! & 0x01) === 0;
+	if (!isKeyFrame || packet[3] !== 0x9d || packet[4] !== 0x01 || packet[5] !== 0x2a) {
+		return null;
+	}
+
+	// The upper two bits of each dimension are the upscaling mode
+	const width = (packet[6]! | (packet[7]! << 8)) & 0x3fff;
+	const height = (packet[8]! | (packet[9]! << 8)) & 0x3fff;
+	if (width === 0 || height === 0) {
+		return null;
+	}
+
+	return { width, height };
 };
 
 export const vp9CodecInfoHasColorInfo = (info: Vp9CodecInfo) => {
@@ -2065,9 +2095,10 @@ export const iterateAv1PacketObus = function* (packet: Uint8Array) {
  * When AV1 codec information is not provided by the container, we can still try to extract the information by digging
  * into the AV1 bitstream.
  */
-export const extractAv1CodecInfoFromPacket = (
+/** Parses an AV1 sequence header OBU in a packet: the codec info and the maximum frame size. */
+const parseAv1SequenceHeader = (
 	packet: Uint8Array,
-): Av1CodecInfo | null => {
+): { codecInfo: Av1CodecInfo; width: number; height: number } | null => {
 	// https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 
 	for (const { type, data } of iterateAv1PacketObus(packet)) {
@@ -2167,9 +2198,9 @@ export const extractAv1CodecInfoFromPacket = (
 		const frameWidthBitsMinus1 = bitstream.readBits(4);
 		const frameHeightBitsMinus1 = bitstream.readBits(4);
 		const n1 = frameWidthBitsMinus1 + 1;
-		bitstream.skipBits(n1); // max_frame_width_minus_1
+		const maxFrameWidthMinus1 = bitstream.readBits(n1);
 		const n2 = frameHeightBitsMinus1 + 1;
-		bitstream.skipBits(n2); // max_frame_height_minus_1
+		const maxFrameHeightMinus1 = bitstream.readBits(n2);
 
 		// Frame IDs
 		let frameIdNumbersPresentFlag = 0;
@@ -2288,7 +2319,7 @@ export const extractAv1CodecInfoFromPacket = (
 			}
 		}
 
-		return {
+		const codecInfo: Av1CodecInfo = {
 			profile: seqProfile,
 			level: seqLevel,
 			tier: seqTier,
@@ -2302,9 +2333,24 @@ export const extractAv1CodecInfoFromPacket = (
 			transferCharacteristics,
 			matrixCoefficients,
 		};
+
+		return { codecInfo, width: maxFrameWidthMinus1 + 1, height: maxFrameHeightMinus1 + 1 };
 	}
 
 	return null;
+};
+
+export const extractAv1CodecInfoFromPacket = (packet: Uint8Array): Av1CodecInfo | null => {
+	return parseAv1SequenceHeader(packet)?.codecInfo ?? null;
+};
+
+/**
+ * Reads the maximum frame size from an AV1 sequence header OBU in a packet. Frames can be smaller (with
+ * frame_size_override_flag), so it's an upper bound; encoders usually code every frame at this size.
+ */
+export const extractAv1FrameSizeFromPacket = (packet: Uint8Array) => {
+	const header = parseAv1SequenceHeader(packet);
+	return header && { width: header.width, height: header.height };
 };
 
 export const av1CodecInfoHasColorInfo = (info: Av1CodecInfo) => {
