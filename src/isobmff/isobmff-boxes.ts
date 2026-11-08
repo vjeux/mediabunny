@@ -1019,10 +1019,6 @@ export const soundSampleDescription = (
 		const codec = trackData.track.source._codec as PcmAudioCodec;
 		const { sampleSize } = parsePcmCodec(codec);
 		sampleSizeInBits = 8 * sampleSize;
-
-		if (sampleSizeInBits > 16) {
-			version = 1;
-		}
 	} else if (trackData.track.source._codec === 'flac') {
 		// FLAC-in-ISOBMFF requires samplesize to equal the bits per sample in STREAMINFO, which follows the 'fLaC'
 		// marker and the metadata block header in the description. Chromium rejects the track if they differ.
