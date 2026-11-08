@@ -11,6 +11,7 @@ import { AudioCodec } from '../codec';
 import { Demuxer } from '../demuxer';
 import {
 	ID3_V2_HEADER_SIZE,
+	Id3V2Header,
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
@@ -27,7 +28,7 @@ import {
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
-import { readBytes, Reader } from '../reader';
+import { FileSlice, readBytes, Reader } from '../reader';
 import {
 	AdtsFrameHeader,
 	MIN_ADTS_FRAME_HEADER_SIZE,
@@ -51,6 +52,11 @@ export class AdtsDemuxer extends Demuxer {
 	firstFrameHeader: AdtsFrameHeader | null = null;
 	loadedSamples: Sample[] = [];
 	metadataTags: MetadataTags | null = null;
+	/**
+	 * The ID3v2 tags at the start of the file, kept while reading a source of unknown size, which may not keep the
+	 * start of the file (see advanceReader)
+	 */
+	leadingId3V2Tags: { header: Id3V2Header; bytes: Uint8Array }[] | null = null;
 
 	trackBackings: AdtsAudioTrackBacking[] = [];
 
@@ -82,6 +88,12 @@ export class AdtsDemuxer extends Demuxer {
 
 	async advanceReader() {
 		if (this.lastLoadedPos === 0) {
+			if (this.reader.fileSize === null) {
+				// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep what's
+				// behind, so the tags at the start of the file are kept as they're skipped (see getMetadataTags)
+				this.leadingId3V2Tags = [];
+			}
+
 			// Skip all ID3v2 tags at the start of the file
 			while (true) {
 				let slice = this.reader.requestSlice(this.lastLoadedPos, ID3_V2_HEADER_SIZE);
@@ -95,6 +107,19 @@ export class AdtsDemuxer extends Demuxer {
 				const id3V2Header = readId3V2Header(slice);
 				if (!id3V2Header) {
 					break;
+				}
+
+				if (this.leadingId3V2Tags) {
+					let contentSlice = this.reader.requestSlice(slice.filePos, id3V2Header.size);
+					if (isThenable(contentSlice)) {
+						contentSlice = await contentSlice;
+					}
+					if (contentSlice) {
+						this.leadingId3V2Tags.push({
+							header: id3V2Header,
+							bytes: readBytes(contentSlice, id3V2Header.size),
+						});
+					}
 				}
 
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
@@ -166,7 +191,12 @@ export class AdtsDemuxer extends Demuxer {
 			this.metadataTags = {};
 			let currentPos = 0;
 
-			while (true) {
+			for (const tag of this.leadingId3V2Tags ?? []) {
+				parseId3V2Tag(FileSlice.tempFromBytes(tag.bytes), tag.header, this.metadataTags);
+			}
+
+			// Unless they were kept, read the tags from the start of the file
+			while (!this.leadingId3V2Tags) {
 				let headerSlice = this.reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
 				if (isThenable(headerSlice)) headerSlice = await headerSlice;
 				if (!headerSlice) break;

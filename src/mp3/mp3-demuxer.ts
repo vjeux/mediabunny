@@ -35,12 +35,13 @@ import {
 import {
 	ID3_V1_TAG_SIZE,
 	ID3_V2_HEADER_SIZE,
+	Id3V2Header,
 	parseId3V1Tag,
 	parseId3V2Tag,
 	readId3V2Header,
 } from '../id3';
 import { readNextMp3FrameHeader } from './mp3-reader';
-import { readAscii, readBytes, Reader, readU32Be } from '../reader';
+import { FileSlice, readAscii, readBytes, Reader, readU32Be } from '../reader';
 
 type Sample = {
 	timestamp: number;
@@ -59,6 +60,11 @@ export class Mp3Demuxer extends Demuxer {
 	xingFrameHeaderPos: number | null = null;
 	loadedSamples: Sample[] = []; // All samples from the start of the file to lastLoadedPos
 	metadataTags: MetadataTags | null = null;
+	/**
+	 * The ID3v2 tags at the start of the file, kept while reading a source of unknown size, which may not keep the
+	 * start of the file (see advanceReader)
+	 */
+	leadingId3V2Tags: { header: Id3V2Header; bytes: Uint8Array }[] | null = null;
 	xingData: {
 		isVbr: boolean;
 		frameCount: number | null;
@@ -103,6 +109,12 @@ export class Mp3Demuxer extends Demuxer {
 
 	async advanceReader() {
 		if (this.lastLoadedPos === 0) {
+			if (this.reader.fileSize === null) {
+				// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep what's
+				// behind, so the tags at the start of the file are kept as they're skipped (see getMetadataTags)
+				this.leadingId3V2Tags = [];
+			}
+
 			// Let's skip all ID3v2 tags at the start of the file
 			while (true) {
 				let slice = this.reader.requestSlice(this.lastLoadedPos, ID3_V2_HEADER_SIZE);
@@ -116,6 +128,19 @@ export class Mp3Demuxer extends Demuxer {
 				const id3V2Header = readId3V2Header(slice);
 				if (!id3V2Header) {
 					break;
+				}
+
+				if (this.leadingId3V2Tags) {
+					let contentSlice = this.reader.requestSlice(slice.filePos, id3V2Header.size);
+					if (isThenable(contentSlice)) {
+						contentSlice = await contentSlice;
+					}
+					if (contentSlice) {
+						this.leadingId3V2Tags.push({
+							header: id3V2Header,
+							bytes: readBytes(contentSlice, id3V2Header.size),
+						});
+					}
 				}
 
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
@@ -238,7 +263,12 @@ export class Mp3Demuxer extends Demuxer {
 			let currentPos = 0;
 			let id3V2HeaderFound = false;
 
-			while (true) {
+			for (const tag of this.leadingId3V2Tags ?? []) {
+				parseId3V2Tag(FileSlice.tempFromBytes(tag.bytes), tag.header, this.metadataTags);
+			}
+
+			// Unless they were kept, read the tags from the start of the file
+			while (!this.leadingId3V2Tags) {
 				let headerSlice = this.reader.requestSlice(currentPos, ID3_V2_HEADER_SIZE);
 				if (isThenable(headerSlice)) headerSlice = await headerSlice;
 				if (!headerSlice) break;
@@ -259,7 +289,11 @@ export class Mp3Demuxer extends Demuxer {
 				currentPos = headerSlice.filePos + id3V2Header.size;
 			}
 
-			if (!id3V2HeaderFound && this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE) {
+			const keptId3V2Tags = this.leadingId3V2Tags !== null && this.leadingId3V2Tags.length > 0;
+			if (
+				!id3V2HeaderFound && !keptId3V2Tags
+				&& this.reader.fileSize !== null && this.reader.fileSize >= ID3_V1_TAG_SIZE
+			) {
 				// Try reading an ID3v1 tag at the end of the file
 				let slice = this.reader.requestSlice(this.reader.fileSize - ID3_V1_TAG_SIZE, ID3_V1_TAG_SIZE);
 				if (isThenable(slice)) slice = await slice;
