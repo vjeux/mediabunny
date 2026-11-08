@@ -535,7 +535,10 @@ class VideoEncoderWrapper {
 					this.recreateWebCodecsEncoders();
 				}
 
-				const keyFrameInterval = this.encodingConfig.keyFrameInterval ?? 2;
+				// A track that can only hold key packets gets nothing but key frames
+				const keyFrameInterval = this.source._connectedTrack?.metadata.hasOnlyKeyPackets
+					? 0
+					: this.encodingConfig.keyFrameInterval ?? 2;
 				const multipleOfKeyFrameInterval = Math.floor(sampleToEncode.timestamp / keyFrameInterval);
 
 				const mergedEncodeOptions = {

@@ -191,6 +191,33 @@ test('VideoSampleSource, changing dimensions with passThrough, width and height 
 	expect(samples[1]).toMatchObject({ codedWidth: 50, codedHeight: 80 });
 });
 
+test('VideoSampleSource on a track with only key packets encodes every frame as a key frame', async () => {
+	// The way to make an HLS I-frame playlist track; the track can't hold anything but key frames
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	const source = new VideoSampleSource({ codec: 'vp9', quality: new Quality('medium') });
+	output.addVideoTrack(source, { hasOnlyKeyPackets: true });
+	await output.start();
+
+	const canvas = new OffscreenCanvas(160, 120);
+	const context = canvas.getContext('2d')!;
+	for (let i = 0; i < 30; i++) {
+		context.fillRect(0, 0, i * 4, 10);
+		using sample = new VideoSample(canvas, { timestamp: i / 30, duration: 1 / 30 });
+		await source.add(sample);
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	const { EncodedPacketSink } = await import('../../src/media-sink.js');
+	const types: string[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		types.push(packet.type);
+	}
+	expect(types).toEqual(Array<string>(30).fill('key'));
+});
+
 test('VideoSampleSource, encoding rotated video frames', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium') },
