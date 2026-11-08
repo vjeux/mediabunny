@@ -1796,12 +1796,13 @@ export class Conversion {
 			// We need to decode & reencode the video
 
 			const canDecode = await track.canDecode();
-			if (!canDecode && couldCopyWithNegativeTimestamps) {
-				// Transcoding would only have avoided negative timestamps, which the format supports nonetheless
-				await this._processVideoTrack(track, trackOptions, outputTrackId, true);
-				return;
-			}
 			if (!canDecode) {
+				if (couldCopyWithNegativeTimestamps) {
+					// Transcoding would only have avoided negative timestamps, which the format supports nonetheless
+					await this._processVideoTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'undecodable_source_codec',
@@ -1827,11 +1828,12 @@ export class Conversion {
 					: height,
 				quality,
 			});
-			if (!encodableCodec && couldCopyWithNegativeTimestamps) {
-				await this._processVideoTrack(track, trackOptions, outputTrackId, true);
-				return;
-			}
 			if (!encodableCodec) {
+				if (couldCopyWithNegativeTimestamps) {
+					await this._processVideoTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'no_encodable_target_codec',
@@ -2261,12 +2263,13 @@ export class Conversion {
 			// We need to decode & reencode the audio
 
 			const canDecode = await track.canDecode();
-			if (!canDecode && couldCopyWithNegativeTimestamps) {
-				// Transcoding would only have avoided negative timestamps, which the format supports nonetheless
-				await this._processAudioTrack(track, trackOptions, outputTrackId, true);
-				return;
-			}
 			if (!canDecode) {
+				if (couldCopyWithNegativeTimestamps) {
+					// Transcoding would only have avoided negative timestamps, which the format supports nonetheless
+					await this._processAudioTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'undecodable_source_codec',
@@ -2320,11 +2323,12 @@ export class Conversion {
 				outputCodec = encodableCodecs[0] ?? null;
 			}
 
-			if (outputCodec === null && couldCopyWithNegativeTimestamps) {
-				await this._processAudioTrack(track, trackOptions, outputTrackId, true);
-				return;
-			}
 			if (outputCodec === null) {
+				if (couldCopyWithNegativeTimestamps) {
+					await this._processAudioTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'no_encodable_target_codec',

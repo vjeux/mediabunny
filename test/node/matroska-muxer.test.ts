@@ -8,7 +8,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { MkvOutputFormat } from '../../src/output-format.js';
-import { Conversion, ConversionOptions } from '../../src/conversion.js';
+import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -208,7 +208,7 @@ test.each([
 	['ac3.mkv', {}], // AC-3 starting at -5 ms
 	['ac3.mp4', { trim: { start: 1, end: 2 } }], // The AC-3 pre-roll starts before the trim start
 	['video-h265.mp4', { trim: { start: 1, end: 2 } }], // HEVC trimmed between key frames, + AAC
-] as [string, Partial<ConversionOptions>][])(
+] as [string, { trim?: { start: number; end: number } }][])(
 	'Conversion of %s to Matroska copies the tracks that can only be copied with a negative start (%o)',
 	async (fileName, options) => {
 		const convert = async (copyMode: 'preferred' | 'forced') => {
