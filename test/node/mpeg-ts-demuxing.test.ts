@@ -2414,3 +2414,21 @@ test('MPEG-TS packets can be advanced from twice at once', async () => {
 		packet = next;
 	}
 });
+
+test('MPEG-TS with interlaced (field/MBAFF-coded) H.264 reports the full frame height', async () => {
+	// ffmpeg -f lavfi -i testsrc=size=1920x1080:rate=25 -frames:v 2 -c:v libx264 -preset ultrafast -crf 51
+	//   -flags +ildct+ilme -x264opts tff=1 -pix_fmt yuv420p -f mpegts interlaced-1080i-mbaff.ts
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/interlaced-1080i-mbaff.ts')),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	// frame_mbs_only_flag is 0, so the 34 map units are field MB pairs: 68 MB rows, cropped by 8 to 1080
+	expect(await videoTrack.getCodedWidth()).toBe(1920);
+	expect(await videoTrack.getCodedHeight()).toBe(1080);
+	expect(await videoTrack.getDisplayWidth()).toBe(1920);
+	expect(await videoTrack.getDisplayHeight()).toBe(1080);
+});
