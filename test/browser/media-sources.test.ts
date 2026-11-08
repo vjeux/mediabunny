@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, WavOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
-import { BufferTarget } from '../../src/target.js';
+import { BufferTarget, StreamTarget } from '../../src/target.js';
 import { AudioSampleSource, MediaStreamAudioTrackSource, VideoSampleSource } from '../../src/media-source.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { canEncodeAudio, Quality } from '../../src/encode.js';
@@ -965,4 +965,34 @@ test('MediaStreamAudioTrackSource, cancel() while finalizing keeps all audio wit
 	const track = await input.getPrimaryAudioTrack();
 	expect(track).not.toBeNull();
 	expect(await track!.computeDuration()).toBeGreaterThan(0.9 * 15 * 1024 / 48000);
+});
+
+test('MediaStreamAudioTrackSource, cancel() while finalizing doesn\'t wait behind a stalled target', async () => {
+	const capture = installSineCapture();
+	// A stream whose sink stops completing writes once finalizing starts, like a hung upload
+	let stalled = false;
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new StreamTarget(new WritableStream({
+			write: () => (stalled ? new Promise<void>(() => {}) : undefined),
+		})),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, { codec: 'pcm-f32' });
+	audioSource.errorPromise.catch(() => {});
+	output.addAudioTrack(audioSource);
+
+	try {
+		await output.start();
+		await capture.deliver(10);
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		stalled = true;
+		const finalized = output.finalize();
+		expect(await stateAfter(finalized, 300)).toBe('pending'); // The sink holds it up
+
+		// Canceling can't get the sink going again, but it mustn't get stuck behind it either
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	} finally {
+		await capture.uninstall();
+	}
 });
