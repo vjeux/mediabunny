@@ -138,6 +138,62 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 	}
 };
 
+test('Segment Duration ends with the media when audio starts below zero next to video', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const videoSource = new EncodedVideoPacketSource('vp8');
+	output.addVideoTrack(videoSource);
+	const audioSource = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(audioSource);
+
+	await output.start();
+
+	// Video from 0 to 1 s, audio from -0.512 s (written via CodecDelay) to 1.28 s
+	const packets = [
+		...Array.from({ length: 30 }, (_, index) => ({
+			source: videoSource,
+			packet: new EncodedPacket(new Uint8Array(64).fill(index), 'key', index / 30, 1 / 30),
+		})),
+		...Array.from({ length: 56 }, (_, index) => ({
+			source: audioSource,
+			packet: new EncodedPacket(new Uint8Array(64).fill(index), 'key', (index - 16) * 32 / 1000, 32 / 1000),
+		})),
+	].sort((a, b) => a.packet.timestamp - b.packet.timestamp);
+
+	let videoStarted = false;
+	let audioStarted = false;
+	for (const { source, packet } of packets) {
+		if (source === videoSource) {
+			await videoSource.add(packet, videoStarted
+				? undefined
+				: { decoderConfig: { codec: 'vp8', codedWidth: 1280, codedHeight: 720 } });
+			videoStarted = true;
+		} else {
+			const decoderConfig = {
+				codec: 'mp4a.40.2',
+				numberOfChannels: 2,
+				sampleRate: 32000,
+				description: new Uint8Array([0x12, 0x90]),
+			};
+			await audioSource.add(packet, audioStarted ? undefined : { decoderConfig });
+			audioStarted = true;
+		}
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	expect(await input.computeDuration()).toBe(1.28);
+	expect(await input.getDurationFromMetadata()).toBe(1.28);
+});
+
 test('Negative audio start timestamps via CodecDelay', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
