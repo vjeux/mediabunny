@@ -8,7 +8,7 @@ import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { AC3_REGISTRATION_DESCRIPTOR, EAC3_REGISTRATION_DESCRIPTOR } from '../../src/codec-data.js';
+import { AC3_REGISTRATION_DESCRIPTOR, EAC3_REGISTRATION_DESCRIPTOR, parseEac3SyncFrame } from '../../src/codec-data.js';
 import { canEncode, Quality } from '../../src/encode.js';
 import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
 import { AudioSampleSource, EncodedAudioPacketSource } from '../../src/media-source.js';
@@ -130,6 +130,39 @@ test('reads and writes E-AC-3 in MPEG-TS', async () => {
 		}
 	}
 	expect(found).toBe(true);
+});
+
+// An independent E-AC-3 substream signals its service type (bsmod) in the informational metadata, and dec3 carries it
+// over (ETSI TS 102 366 E.1.2.2, F.6.2.8). In the 5.1 file, mixing metadata comes first, which moves it:
+// ffmpeg -f lavfi -i anullsrc=r=48000:cl=stereo -t 0.1 -c:a eac3 -audio_service_type vi eac3-visually-impaired.mkv
+// ffmpeg -f lavfi -i anullsrc=r=48000:cl=5.1 -t 0.1 -c:a eac3 -audio_service_type hi -dmix_mode ltrt \
+//   -ltrt_cmixlev 0.5 -ltrt_surmixlev 0.5 -loro_cmixlev 0.5 -loro_surmixlev 0.5 eac3-5.1-hearing-impaired.mkv
+test.each([
+	['eac3-visually-impaired.mkv', 2],
+	['eac3-5.1-hearing-impaired.mkv', 3],
+	['eac3.ts', 0],
+])('keeps the E-AC-3 bit stream mode in dec3 (%s)', async (fileName, bsmod) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', fileName)),
+		formats: ALL_FORMATS,
+	});
+
+	const firstPacket = (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getFirstPacket())!;
+	expect(parseEac3SyncFrame(firstPacket.data)?.substreams[0]?.bsmod).toBe(bsmod);
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({ input, output, copy: { mode: 'forced' } });
+	await conversion.execute();
+
+	// Like FFmpeg's -c copy: bsmod follows data_rate, num_ind_sub, fscod, bsid and asvc in dec3
+	const bytes = Buffer.from(output.target.buffer!);
+	const dec3 = bytes.indexOf('dec3');
+	expect(dec3).toBeGreaterThan(0);
+	expect((bytes[dec3 + 7]! >> 4) & 0b111).toBe(bsmod);
 });
 
 test('Custom coder registration', async () => {
