@@ -271,6 +271,12 @@ export class VideoSample implements Disposable {
 	 * @internal
 	 */
 	_passedFrame: VideoFrame | null = null;
+	/**
+	 * Whether the browser created the backing VideoFrame from a canvas or image. Browsers store those premultiplied by
+	 * alpha, and so are the color values such a VideoFrame hands out.
+	 * @internal
+	 */
+	_fromImageSource = false;
 
 	/**
 	 * The internal pixel format in which the frame is stored. Will be `null` if it's using an arbitrary internal
@@ -652,7 +658,7 @@ export class VideoSample implements Disposable {
 			}
 
 			if (typeof VideoFrame !== 'undefined') {
-				return new VideoSample(
+				const sample = new VideoSample(
 					new VideoFrame(data, {
 						timestamp: Math.trunc(init.timestamp! * SECOND_TO_MICROSECOND_FACTOR),
 						// Drag 0 to undefined
@@ -668,6 +674,12 @@ export class VideoSample implements Disposable {
 					// The frame is already cropped
 					{ ...init, visibleRect: undefined },
 				);
+				// Frames of a video element come straight from the decoder. ImageBitmaps are left out because their
+				// premultiplication depends on how they were created.
+				sample._fromImageSource = !(typeof HTMLVideoElement !== 'undefined' && data instanceof HTMLVideoElement)
+					&& !(typeof ImageBitmap !== 'undefined' && data instanceof ImageBitmap);
+
+				return sample;
 			}
 
 			let width = 0;
@@ -811,13 +823,16 @@ export class VideoSample implements Disposable {
 				encodeOptions: this.encodeOptions,
 			});
 		} else if (isVideoFrame(this._data)) {
-			return new VideoSample(this._data.clone(), {
+			const sample = new VideoSample(this._data.clone(), {
 				timestamp: this.timestamp,
 				duration: this.duration,
 				rotation: this.rotation,
 				flip: this.flip,
 				encodeOptions: this.encodeOptions,
 			});
+			sample._fromImageSource = this._fromImageSource;
+
+			return sample;
 		} else if (this._data instanceof Uint8Array) {
 			assert(this._layout);
 

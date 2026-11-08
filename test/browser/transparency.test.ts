@@ -541,3 +541,82 @@ test.skipIf(!vp9EncoderKeepsColorSpace)('Encoding planar YUV frames with alpha k
 
 	expect(colorSpace).toMatchObject({ matrix: 'smpte170m', fullRange: true });
 });
+
+test('Encoding semi-transparent canvas content keeps the colors unpremultiplied', async ({ skip }) => {
+	// WebKitGTK's VideoFrame.copyTo() returns YUV planes unconverted when asked for RGBA, so the colors can't be read
+	// back there. This probes the browser itself, not Mediabunny.
+	const probe = new VideoFrame(new Uint8Array([235, 235, 235, 235, 128, 128]), {
+		format: 'I420',
+		codedWidth: 2,
+		codedHeight: 2,
+		timestamp: 0,
+	});
+	const probeRgba = new Uint8Array(16);
+	await probe.copyTo(probeRgba, { format: 'RGBA' }).catch(() => {});
+	probe.close();
+	skip(probeRgba[3] !== 255, 'VideoFrame.copyTo() does not convert YUV to RGBA here');
+
+	const canvas = new OffscreenCanvas(64, 32);
+	const context = canvas.getContext('2d')!;
+	context.fillStyle = 'rgba(255, 64, 0, 0.5)';
+	context.fillRect(0, 0, 32, 32);
+	context.fillStyle = 'rgba(0, 128, 255, 0.25)';
+	context.fillRect(32, 0, 32, 32);
+
+	// Decodes only the color stream, which must hold the straight colors (the alpha stream is applied on top)
+	const readColors = async (buffer: ArrayBuffer) => {
+		using input = new Input({ source: new BufferSource(buffer), formats: ALL_FORMATS });
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		const packet = (await new EncodedPacketSink(videoTrack).getFirstPacket())!;
+		expect(packet.sideData.alpha).toBeDefined();
+
+		const decoderConfig = (await videoTrack.getDecoderConfig())!;
+		const decoded = await new Promise<VideoFrame>((resolve, reject) => {
+			const decoder = new VideoDecoder({ output: resolve, error: reject });
+			decoder.configure(decoderConfig);
+			decoder.decode(packet.toEncodedVideoChunk());
+			void decoder.flush();
+		});
+		const data = new Uint8Array(decoded.allocationSize({ format: 'RGBA' }));
+		await decoded.copyTo(data, { format: 'RGBA' });
+		const width = decoded.visibleRect!.width;
+		const row = Math.floor(decoded.visibleRect!.height / 2);
+		decoded.close();
+
+		const pixelAt = (x: number) => Array.from(data.subarray((row * width + x) * 4, (row * width + x) * 4 + 3));
+		return [pixelAt(width / 4), pixelAt(3 * width / 4)];
+	};
+	// The saturated channel shows it best: premultiplied, it would read 128 and 64 instead of 255
+	const expectStraightColors = ([left, right]: number[][]) => {
+		expect(left![0], left!.join()).toBeGreaterThanOrEqual(240);
+		expect(right![2], right!.join()).toBeGreaterThanOrEqual(240);
+	};
+
+	// Recording the canvas
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new CanvasSource(canvas, { codec: 'vp9', bitrate: 8e6, alpha: 'keep' });
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(0, 1);
+	await output.finalize();
+
+	expectStraightColors(await readColors(output.target.buffer!));
+
+	// Resizing in a conversion, which draws the frames onto a canvas
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const resizedOutput = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const conversion = await Conversion.init({
+		input,
+		output: resizedOutput,
+		video: { width: 32, bitrate: 8e6, alpha: 'keep' },
+	});
+	await conversion.execute();
+
+	expectStraightColors(await readColors(resizedOutput.target.buffer!));
+});
