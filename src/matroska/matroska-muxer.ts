@@ -213,6 +213,8 @@ export class MatroskaMuxer extends Muxer {
 	private tagsElement: EBMLElement | null = null;
 	private attachmentsElement: EBMLElement | null = null;
 	private segmentDuration: EBMLElement | null = null;
+	/** The Segment header as passed to onSegmentHeader, to be passed again once finalize fills in its values. */
+	private segmentHeader: { data: Uint8Array; start: number } | null = null;
 	private cues: EBMLElement | null = null;
 
 	private currentClusterBlocks: ClusterBlock[] = [];
@@ -878,6 +880,7 @@ export class MatroskaMuxer extends Muxer {
 
 		if (this.format._options.onSegmentHeader) {
 			const { data, start } = this.writer.stopTrackingWrites();
+			this.segmentHeader = { data: data.slice(), start };
 			this.format._options.onSegmentHeader(data, start);
 		}
 	}
@@ -1758,24 +1761,48 @@ export class MatroskaMuxer extends Muxer {
 		this.ebmlWriter.writeEBML(this.cues);
 
 		if (!this.format._options.appendOnly) {
+			// The values below are filled into the Segment header, so it's passed again once they're in
+			const patchSegmentHeader = (position: number, write: () => void) => {
+				this.writer.seek(position);
+				if (!this.segmentHeader) {
+					write();
+					return;
+				}
+
+				this.writer.startTrackingWrites();
+				write();
+				const { data, start } = this.writer.stopTrackingWrites();
+				assert(start >= this.segmentHeader.start);
+				assert(start + data.length <= this.segmentHeader.start + this.segmentHeader.data.length);
+				this.segmentHeader.data.set(data, start - this.segmentHeader.start);
+			};
+
 			// Write the Segment size
 			const segmentSize = this.writer.getPos() - this.segmentDataOffset;
-			this.writer.seek(this.ebmlWriter.offsets.get(this.segment!)! + 4);
-			this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
+			patchSegmentHeader(this.ebmlWriter.offsets.get(this.segment!)! + 4, () => {
+				this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
+			});
 
 			// Write the duration of the media to the Segment
 			// Readers take the Duration minus the smallest codec delay of all tracks as the end of the media
 			const minCodecDelayMs = Math.min(...this.trackDatas.map(trackData => this.getCodecDelayMs(trackData)));
 			const duration = this.startTimestamp === Infinity ? 0 : this.endTimestamp + minCodecDelayMs;
 			this.segmentDuration!.data = new EBMLFloat64(duration);
-			this.writer.seek(this.ebmlWriter.offsets.get(this.segmentDuration!)!);
-			this.ebmlWriter.writeEBML(this.segmentDuration);
+			patchSegmentHeader(this.ebmlWriter.offsets.get(this.segmentDuration!)!, () => {
+				this.ebmlWriter.writeEBML(this.segmentDuration);
+			});
 
 			// Fill in SeekHead position data and write it again
 			assert(this.seekHead);
-			this.writer.seek(this.ebmlWriter.offsets.get(this.seekHead)!);
+			const seekHeadPosition = this.ebmlWriter.offsets.get(this.seekHead)!;
 			this.maybeCreateSeekHead(true);
-			this.ebmlWriter.writeEBML(this.seekHead);
+			patchSegmentHeader(seekHeadPosition, () => {
+				this.ebmlWriter.writeEBML(this.seekHead);
+			});
+
+			if (this.segmentHeader) {
+				this.format._options.onSegmentHeader!(this.segmentHeader.data, this.segmentHeader.start);
+			}
 		}
 
 		release();
