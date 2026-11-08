@@ -3131,7 +3131,8 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		// Do a little rounding to catch cases where the result is very close to an integer. If it is, it's likely
 		// that the number was originally an integer divided by the timescale. For stability, it's best
 		// to return the integer in this case.
-		return roundIfAlmostInteger(timestamp * this.internalTrack.segment.timestampFactor)
+		const { timestampFactor } = this.internalTrack.segment;
+		return roundIfAlmostInteger(timestamp * timestampFactor, timestampFactor)
 			+ this.internalTrack.codecDelay;
 	}
 
