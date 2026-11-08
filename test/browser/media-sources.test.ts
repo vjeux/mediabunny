@@ -1154,3 +1154,65 @@ test('AudioBufferSource encodes in order when adds aren\'t awaited and process()
 	const blocks = Array.from({ length: 24 }, (_, i) => samples[480 * i]);
 	expect(blocks).toEqual(Array.from({ length: 24 }, (_, i) => Math.fround(i / 1000)));
 });
+
+test('AudioSampleSource, cancel() after close() gets out of a process() that never finishes', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				await new Promise(() => {}); // A stuck effect
+				return sample;
+			},
+		},
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const added = audioSource.add(makeConstantSample(0)).catch(() => {});
+	await new Promise(resolve => setTimeout(resolve, 50));
+	audioSource.close(); // Like stopping a recording: waits for what was added
+	await new Promise(resolve => setTimeout(resolve, 100));
+
+	// Canceling forces the close, which doesn't wait for the stuck call
+	expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+	expect(await stateAfter(added, 1000)).toBe('fulfilled');
+});
+
+test('MediaStreamAudioTrackSource, cancel() after close() gets out of a process() that never finishes', async () => {
+	const capture = installSineCapture();
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	let calls = 0;
+	const audioSource = new MediaStreamAudioTrackSource(capture.track, {
+		codec: 'pcm-f32',
+		transform: {
+			process: async (sample) => {
+				if (calls++ === 2) {
+					await new Promise(() => {}); // A stuck effect
+				}
+				return sample;
+			},
+		},
+	});
+	audioSource.errorPromise.catch(() => {});
+	output.addAudioTrack(audioSource);
+
+	try {
+		await output.start();
+		await capture.deliver(6);
+		audioSource.close(); // Like stopping a recording: waits for the audio captured so far
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		// Canceling forces the close, which doesn't wait for the stuck call
+		expect(await stateAfter(output.cancel(), 1000)).toBe('fulfilled');
+		expect(capture.chunks.filter(chunk => chunk.format !== null)).toHaveLength(0); // All closed
+	} finally {
+		await capture.uninstall();
+	}
+});
