@@ -3,7 +3,13 @@ import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, promiseWithResolvers, clamp } from '../../src/misc.js';
-import { AudioBufferSink, AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
+import {
+	AudioBufferSink,
+	AudioSampleSink,
+	EncodedPacketSink,
+	VideoSampleSink,
+	CanvasSink,
+} from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat, MpegTsOutputFormat } from '../../src/output-format.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -920,4 +926,13 @@ test('Video whose AVC decoder config changes mid-stream decodes in full after mu
 	using seeked = (await sink.getSample(1.7))!;
 	using expected = (await secondSink.getSample(0.7))!;
 	expect(getPixels(seeked)).toEqual(getPixels(expected));
+});
+
+test('CanvasSink rejects null options like other non-objects', async () => {
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	for (const options of [null, 'fit', 1]) {
+		expect(() => new CanvasSink(track, options as never)).toThrow(new TypeError('options must be an object.'));
+	}
 });
