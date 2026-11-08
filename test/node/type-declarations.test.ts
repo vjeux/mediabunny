@@ -56,7 +56,8 @@ const compileConsumer = (entry: string, lib: string[], extraLibFiles: string[] =
 	});
 
 	return ts.getPreEmitDiagnostics(consumer).map(diagnostic => [
-		diagnostic.file ? path.relative(outDir, diagnostic.file.fileName) : '',
+		// With / as the separator on every platform
+		diagnostic.file ? path.relative(outDir, diagnostic.file.fileName).split(path.sep).join('/') : '',
 		ts.flattenDiagnosticMessageText(diagnostic.messageText, ' '),
 	].join(': '));
 };
