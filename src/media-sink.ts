@@ -2253,16 +2253,62 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 }
 
 let mergerWorkerUrl: string | null = null;
+// Set once the merger workers couldn't run, so that later mergers don't try again
+let mergerWorkersBlocked = false;
 
-/** Utility class that merges together color and alpha information on the CPU in a pool of workers. */
+/**
+ * Utility class that merges together color and alpha information on the CPU in a pool of workers, or on the calling
+ * thread where workers can't run (with a Content Security Policy that forbids blob: workers, for example).
+ */
 export class ColorAlphaMerger {
+	/** The workers that have started */
 	private workers: Worker[] = [];
+	private startingWorkers: Worker[] = [];
 	private nextWorkerIndex = 0;
 	private pendingRequests = new Map<number, ReturnType<typeof promiseWithResolvers<VideoFrame>>>();
 	private nextRequestId = 0;
+	/** Resolves to whether the workers run, once one has started or all have failed to */
+	private workersRunning: Promise<boolean> | null = null;
+	private resolveWorkersRunning: ((running: boolean) => void) | null = null;
+	private mergeLocally: ((request: ColorAlphaMergerWorkerRequest) => void) | null = null;
+	private closed = false;
 
-	merge(color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame> {
-		if (this.workers.length === 0) {
+	/** Merges the color and alpha frames into one, taking ownership of both. */
+	async merge(color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame> {
+		// Frames can only be handed to a worker that runs, as frames transferred to one that never loads are lost. A
+		// closed merger starts no workers.
+		const workersRunning = this.closed ? false : await (this.workersRunning ??= this.startWorkers());
+		if (this.closed) {
+			color.close();
+			alpha.close();
+			throw new Error('Color/alpha merger closed.');
+		}
+
+		const id = this.nextRequestId++;
+		const pending = promiseWithResolvers<VideoFrame>();
+		this.pendingRequests.set(id, pending);
+
+		if (workersRunning) {
+			// Hand the job to the next worker in round-robin fashion
+			const worker = this.workers[this.nextWorkerIndex++ % this.workers.length]!;
+			worker.postMessage({ id, color, alpha }, { transfer: [color, alpha] });
+		} else {
+			this.mergeLocally ??= this.createLocalMerger();
+			this.mergeLocally({ id, color, alpha });
+		}
+
+		return pending.promise;
+	}
+
+	private startWorkers() {
+		const { promise, resolve } = promiseWithResolvers<boolean>();
+		this.resolveWorkersRunning = resolve;
+		if (mergerWorkersBlocked) {
+			resolve(false);
+			return promise;
+		}
+
+		try {
 			if (!mergerWorkerUrl) {
 				const blob = new Blob(
 					[`(${colorAlphaMergerWorkerCode.toString()})()`],
@@ -2271,26 +2317,37 @@ export class ColorAlphaMerger {
 				mergerWorkerUrl = URL.createObjectURL(blob);
 			}
 
-			const poolSize = clamp(navigator.hardwareConcurrency, 1, 4);
+			// hardwareConcurrency can be missing (in some hardened environments), which would make for an empty pool
+			const poolSize = clamp(navigator.hardwareConcurrency || 1, 1, 4);
+			let failedCount = 0;
 			for (let i = 0; i < poolSize; i++) {
 				const worker = new Worker(mergerWorkerUrl);
+				let started = false;
 
 				worker.addEventListener('message', (event: MessageEvent<ColorAlphaMergerWorkerResponse>) => {
 					const data = event.data;
-					const pending = this.pendingRequests.get(data.id);
-					if (!pending) {
-						return;
-					}
-					this.pendingRequests.delete(data.id);
-
-					if ('error' in data) {
-						pending.reject(new Error(data.error));
+					if ('started' in data) {
+						started = true;
+						removeItem(this.startingWorkers, worker);
+						this.workers.push(worker);
+						resolve(true);
 					} else {
-						pending.resolve(data.frame);
+						this.handleResponse(data);
 					}
 				});
 
 				worker.addEventListener('error', (event) => {
+					if (!started) {
+						// It never loaded. Browsers only tell with an error event, without a reason.
+						worker.terminate();
+						removeItem(this.startingWorkers, worker);
+						if (++failedCount === poolSize) {
+							mergerWorkersBlocked = true;
+							resolve(false);
+						}
+						return;
+					}
+
 					const error = new Error(event.message || 'Color/alpha merge worker error.');
 					for (const pending of this.pendingRequests.values()) {
 						pending.reject(error);
@@ -2298,27 +2355,70 @@ export class ColorAlphaMerger {
 					this.pendingRequests.clear();
 				});
 
-				this.workers.push(worker);
+				this.startingWorkers.push(worker);
 			}
+		} catch {
+			// Workers can't be created here at all
+			for (const worker of this.startingWorkers) {
+				worker.terminate();
+			}
+			this.startingWorkers.length = 0;
+			mergerWorkersBlocked = true;
+			resolve(false);
 		}
 
-		const id = this.nextRequestId++;
-		const pending = promiseWithResolvers<VideoFrame>();
-		this.pendingRequests.set(id, pending);
+		return promise;
+	}
 
-		// Hand the job to the next worker in round-robin fashion
-		const worker = this.workers[this.nextWorkerIndex]!;
-		this.nextWorkerIndex = (this.nextWorkerIndex + 1) % this.workers.length;
-		worker.postMessage({ id, color, alpha }, { transfer: [color, alpha] });
+	/** Runs the workers' merge code on the calling thread. */
+	private createLocalMerger() {
+		const local: { listener: ((event: MessageEvent<ColorAlphaMergerWorkerRequest>) => void) | null } = {
+			listener: null,
+		};
+		colorAlphaMergerWorkerCode({
+			addEventListener: (type, listener) => {
+				local.listener = listener;
+			},
+			postMessage: (data) => {
+				if (!('started' in data)) {
+					this.handleResponse(data);
+				}
+			},
+		});
 
-		return pending.promise;
+		const listener = local.listener;
+		assert(listener);
+		return (request: ColorAlphaMergerWorkerRequest) => {
+			listener({ data: request } as MessageEvent<ColorAlphaMergerWorkerRequest>);
+		};
+	}
+
+	private handleResponse(data: ColorAlphaMergerWorkerResult) {
+		const pending = this.pendingRequests.get(data.id);
+		if (!pending) {
+			// Its request is gone (the merger was closed), so nothing owns the frame
+			if ('frame' in data) {
+				data.frame.close();
+			}
+			return;
+		}
+		this.pendingRequests.delete(data.id);
+
+		if ('error' in data) {
+			pending.reject(new Error(data.error));
+		} else {
+			pending.resolve(data.frame);
+		}
 	}
 
 	close() {
-		for (const worker of this.workers) {
+		this.closed = true;
+		for (const worker of [...this.workers, ...this.startingWorkers]) {
 			worker.terminate();
 		}
 		this.workers.length = 0;
+		this.startingWorkers.length = 0;
+		this.resolveWorkersRunning?.(false); // Merges waiting for the workers to start must not wait forever
 
 		const error = new Error('Color/alpha merger closed.');
 		for (const pending of this.pendingRequests.values()) {
@@ -2334,11 +2434,20 @@ type ColorAlphaMergerWorkerRequest = {
 	alpha: VideoFrame;
 };
 
-type ColorAlphaMergerWorkerResponse =
+type ColorAlphaMergerWorkerResult =
 	| { id: number; frame: VideoFrame }
 	| { id: number; error: string };
 
-const colorAlphaMergerWorkerCode = () => {
+/** A result, or the message that the worker has started */
+type ColorAlphaMergerWorkerResponse = ColorAlphaMergerWorkerResult | { started: true };
+
+/** What the merge code talks to: a worker's global scope, or a stand-in for one on the calling thread. */
+type ColorAlphaMergerScope = {
+	addEventListener(type: 'message', listener: (event: MessageEvent<ColorAlphaMergerWorkerRequest>) => void): void;
+	postMessage(message: ColorAlphaMergerWorkerResponse, options?: StructuredSerializeOptions): void;
+};
+
+const colorAlphaMergerWorkerCode = (scope = self as unknown as ColorAlphaMergerScope) => {
 	// These buffers are reused across frames as long as the size matches, since consecutive frames usually share
 	// dimensions
 	let cpuAlphaBuffer: Uint8Array | null = null;
@@ -2346,14 +2455,14 @@ const colorAlphaMergerWorkerCode = () => {
 
 	// Serialize execution internally so concurrent requests don't race on the shared cpu*Buffer state.
 	let chain: Promise<void> = Promise.resolve();
-	self.addEventListener('message', (event: MessageEvent<ColorAlphaMergerWorkerRequest>) => {
+	scope.addEventListener('message', (event: MessageEvent<ColorAlphaMergerWorkerRequest>) => {
 		const { id, color, alpha } = event.data;
 		chain = chain.then(async () => {
 			try {
 				const frame = await merge(color, alpha);
-				self.postMessage({ id, frame }, { transfer: [frame] });
+				scope.postMessage({ id, frame }, { transfer: [frame] });
 			} catch (error) {
-				self.postMessage({ id, error: (error as Error).message });
+				scope.postMessage({ id, error: (error as Error).message });
 			} finally {
 				// We took ownership of the inputs via transfer; close them now that the merge (or its error) is done.
 				color.close();
@@ -2582,6 +2691,8 @@ const colorAlphaMergerWorkerCode = () => {
 			return yPlane;
 		}
 	};
+
+	scope.postMessage({ started: true });
 };
 
 /**
