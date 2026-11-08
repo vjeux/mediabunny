@@ -48,6 +48,11 @@ export class SubtitleParser {
 		let match: RegExpMatchArray | null;
 
 		if (!this.preambleText) {
+			if (text.charCodeAt(0) === 0xFEFF) {
+				// Skip the byte order mark the file may start with
+				text = text.slice(1);
+			}
+
 			if (!preambleStartRegex.test(text)) {
 				throw new Error('WebVTT preamble incorrect.');
 			}
