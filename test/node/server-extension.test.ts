@@ -2072,6 +2072,20 @@ describe('Video', async () => {
 		]);
 	});
 
+	test('AVFrame resource with unknown pixel aspect ratio', () => {
+		const frame = new NodeAv.Frame();
+		frame.alloc();
+		frame.width = 32;
+		frame.height = 16;
+		frame.format = NodeAv.AV_PIX_FMT_YUV420P;
+		frame.allocBuffer();
+		expect(frame.sampleAspectRatio.num).toBe(0);
+
+		using sample = new VideoSample(new AvFrameVideoSampleResource(frame), { timestamp: 0 });
+		expect(sample.squarePixelWidth).toBe(32);
+		expect(sample.squarePixelHeight).toBe(16);
+	});
+
 	test('toAvFrame with RGBA VideoSample', async () => {
 		const width = 16;
 		const height = 8;
