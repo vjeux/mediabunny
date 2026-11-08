@@ -2812,6 +2812,102 @@ test.concurrent('A live reload onto a new init section uses it, also when EXT-X-
 	}
 });
 
+test.concurrent('A live rendition still listing a discontinuity the reference playlist has moved past is readable', async () => {
+	// Two periods of real encoder output with unrelated timestamps (say, content and an ad break), segmented by the
+	// HLS writer: video-only segments for the variant, audio-only ones for the audio rendition
+	using sourceInput = new Input({ source: new FilePathSource('./test/public/edts.mp4'), formats: ALL_FORMATS });
+	const sourceVideo = (await sourceInput.getPrimaryVideoTrack())!;
+	const sourceAudio = (await sourceInput.getPrimaryAudioTrack())!;
+	const writeSegments = async (type: 'video' | 'audio', mediaTimestampBase: number) => {
+		const files = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1.92, mediaTimestampBase }),
+			target: new PathedTarget('master.m3u8', ({ path }) => {
+				const target = new BufferTarget();
+				target.on('finalized', () => files.set(path, new Uint8Array(target.buffer!)));
+				return target;
+			}),
+		});
+		if (type === 'video') {
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+			await output.start();
+			const decoderConfig = (await sourceVideo.getDecoderConfig())!;
+			for await (const packet of new EncodedPacketSink(sourceVideo).packets()) {
+				await source.add(packet, { decoderConfig });
+			}
+		} else {
+			const source = new EncodedAudioPacketSource('aac');
+			output.addAudioTrack(source);
+			await output.start();
+			const decoderConfig = (await sourceAudio.getDecoderConfig())!;
+			for await (const packet of new EncodedPacketSink(sourceAudio).packets()) {
+				await source.add(packet, { decoderConfig });
+			}
+		}
+		await output.finalize();
+
+		const playlist = new TextDecoder().decode(files.get('playlist-1.m3u8')).split('\n');
+		return playlist.flatMap((line, i) => (line.startsWith('#EXTINF:')
+			? [{ duration: Number(line.slice(8, line.indexOf(','))), bytes: files.get(playlist[i + 1]!)! }]
+			: []));
+	};
+	const contentAudio = await writeSegments('audio', 100);
+	const adVideo = await writeSegments('video', 5000);
+	const adAudio = await writeSegments('audio', 5000);
+
+	const files = new Map<string, Uint8Array>();
+	const segmentLines = (prefix: string, segments: { duration: number; bytes: Uint8Array }[], first: number) =>
+		segments.slice(0, 2).flatMap((segment, i) => {
+			files.set(`${prefix}-${first + i}.ts`, segment.bytes);
+			return [`#EXTINF:${segment.duration},`, `${prefix}-${first + i}.ts`];
+		});
+	const live = (sequence: number, discontinuitySequence: number, lines: string[]) => [
+		'#EXTM3U',
+		'#EXT-X-TARGETDURATION:2',
+		`#EXT-X-MEDIA-SEQUENCE:${sequence}`,
+		`#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySequence}`,
+		...lines,
+	].join('\n');
+	const master = '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="en",DEFAULT=YES,URI="audio.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=500000,CODECS="avc1.64001e,mp4a.40.2",AUDIO="a"\nvideo.m3u8\n';
+
+	// The video window has moved past the discontinuity to the ad break, while the audio window (loaded a moment
+	// earlier, or simply longer) still lists the two content segments before it. Both playlists' discontinuity 1
+	// starts at the same instant (RFC 8216, 6.2.4).
+	const videoPlaylist = live(2, 1, segmentLines('v', adVideo, 2));
+	const audioPlaylist = live(0, 0, [...segmentLines('a', contentAudio, 0), '#EXT-X-DISCONTINUITY', ...segmentLines('a', adAudio, 2)]);
+	// Control: the same streams with the audio window aligned to the video one
+	const alignedAudioPlaylist = live(2, 1, segmentLines('a', adAudio, 2));
+
+	const readAudio = async (audioM3u8: string) => {
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => {
+				const text = { 'master.m3u8': master, 'video.m3u8': videoPlaylist, 'audio.m3u8': audioM3u8 }[path];
+				return new BufferSource(text !== undefined ? new TextEncoder().encode(text) : files.get(path)!);
+			}),
+			formats: ALL_FORMATS,
+		});
+		const audioTrack = (await input.getPrimaryAudioTrack())!;
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(audioTrack).packets(undefined, undefined, { skipLiveWait: true })) {
+			timestamps.push(packet.timestamp);
+		}
+		return timestamps;
+	};
+
+	const aligned = await readAudio(alignedAudioPlaylist);
+	const timestamps = await readAudio(audioPlaylist);
+
+	// The ad break's audio lands where it does with aligned windows, and the content's audio right before it
+	const contentDuration = contentAudio[0]!.duration + contentAudio[1]!.duration;
+	const adStart = timestamps.length - aligned.length;
+	expect(timestamps.slice(adStart)).toEqual(aligned);
+	expect(timestamps[0]).toBeCloseTo(aligned[0]! - contentDuration, 3);
+	for (let i = 1; i < timestamps.length; i++) {
+		expect(timestamps[i]).toBeGreaterThan(timestamps[i - 1]!);
+	}
+});
+
 const fetchBytes = async (url: string) => {
 	const response = await fetch(url);
 	return new Uint8Array(await response.arrayBuffer());
