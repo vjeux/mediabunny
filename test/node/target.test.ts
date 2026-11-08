@@ -7,10 +7,11 @@ import { Input } from '../../src/input.js';
 import { FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { AppendOnlyStreamTarget, BufferTarget, StreamTarget } from '../../src/target.js';
+import { AppendOnlyStreamTarget, BufferTarget, StreamTarget, FilePathTarget } from '../../src/target.js';
+import type { FileHandle } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
-import { FilePathTarget } from '../../src/target.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -93,5 +94,46 @@ test('Stream targets validate their constructor arguments', () => {
 		expect(() => new AppendOnlyStreamTarget(writable as never)).toThrow(
 			new TypeError('AppendOnlyStreamTarget requires a WritableStream.'),
 		);
+	}
+});
+
+test('FilePathTarget writes of 2 GiB or more are split into writes Node accepts', async () => {
+	// Node rejects file writes of 2 GiB or more, and Linux transfers at most 0x7ffff000 bytes per call. Written
+	// through a stand-in file handle that behaves like that without touching the data.
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-write-${process.pid}.bin`);
+	const target = new FilePathTarget(filePath, { chunked: false });
+	const writer = target._streamTarget._writable.getWriter();
+	// Once this first write is done, the file is open
+	await writer.write({ type: 'write', data: new Uint8Array(1000), position: 0 });
+
+	try {
+		const realHandle = target._fileHandle!;
+		const calls: { offset: number; length: number; position: number }[] = [];
+		target._fileHandle = {
+			write: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				calls.push({ offset, length, position });
+				return { bytesWritten: Math.min(length, 0x7ffff000), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		const size = 2 ** 31 + 2 ** 20;
+		await writer.write({ type: 'write', data: new Uint8Array(size), position: 1000 });
+
+		// The writes cover the whole chunk, each one picking up where the previous one stopped
+		let pos = 0;
+		for (const call of calls) {
+			expect(call.offset).toBe(pos);
+			expect(call.position).toBe(1000 + pos);
+			pos += Math.min(call.length, 0x7ffff000);
+		}
+		expect(pos).toBe(size);
+
+		await writer.close();
+	} finally {
+		await rm(filePath);
 	}
 });

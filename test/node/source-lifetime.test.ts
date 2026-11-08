@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { Reader } from '../../src/reader.js';
 import fs from 'node:fs';
 import ts from 'typescript';
+import os from 'node:os';
 import { setImmediate } from 'node:timers/promises';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Logging } from '../../src/logging.js';
@@ -327,3 +328,79 @@ test('Declarations of the disposable classes compile without TypeScript\'s esnex
 		.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, ' '));
 	expect(errorsInOwnDeclarations).toEqual([]);
 }, 60_000);
+
+test('FilePathSource reads of 2 GiB or more are split into reads Node accepts', async () => {
+	// Node rejects file reads of 2 GiB or more, and Linux transfers at most 0x7ffff000 bytes per call. A sparse file of
+	// that size, read through a stand-in file handle that behaves like that without touching the buffer.
+	const size = 2 ** 31 + 2 ** 20;
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-read-${process.pid}.bin`);
+	await writeFile(filePath, new Uint8Array(0));
+	await truncate(filePath, size);
+
+	try {
+		const source = new FilePathSource(filePath);
+		expect(await source.getSize()).toBe(size);
+
+		const realHandle = source._fileHandle!;
+		const calls: { offset: number; length: number; position: number }[] = [];
+		source._fileHandle = {
+			read: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				calls.push({ offset, length, position });
+				return { bytesRead: Math.min(length, 0x7ffff000), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		const bytes = await source._customSource._options.read(0, size) as Uint8Array;
+		expect(bytes.byteLength).toBe(size);
+
+		// The reads cover the whole range, each one picking up where the previous one stopped
+		let pos = 0;
+		for (const call of calls) {
+			expect(call.offset).toBe(pos);
+			expect(call.position).toBe(pos);
+			pos += Math.min(call.length, 0x7ffff000);
+		}
+		expect(pos).toBe(size);
+
+		source._dispose();
+	} finally {
+		await rm(filePath);
+	}
+});
+
+test('FilePathSource reads of 2 GiB or more stop with an error where a shrunken file ends', async () => {
+	// The same sparse file, read through a stand-in file handle for which the file now ends after 1.5 GiB
+	const size = 2 ** 31 + 2 ** 20;
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-shrunk-read-${process.pid}.bin`);
+	await writeFile(filePath, new Uint8Array(0));
+	await truncate(filePath, size);
+
+	try {
+		const source = new FilePathSource(filePath);
+		expect(await source.getSize()).toBe(size);
+
+		const realHandle = source._fileHandle!;
+		const shrunkSize = 1.5 * 2 ** 30;
+		source._fileHandle = {
+			read: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				return { bytesRead: Math.max(0, Math.min(length, shrunkSize - position)), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		await expect(source._customSource._options.read(0, size)).rejects.toThrow(
+			`Unexpected end of file at byte ${shrunkSize}`,
+		);
+
+		source._dispose();
+	} finally {
+		await rm(filePath);
+	}
+});
