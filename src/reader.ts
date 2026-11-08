@@ -10,6 +10,21 @@ import { InputDisposedError } from './input';
 import { assert, clamp, getUint24, isThenable, MaybePromise, textDecoder, toDataView } from './misc';
 import { DEFAULT_MAX_READ_POSITION, DEFAULT_MIN_READ_POSITION, Source } from './source';
 
+/**
+ * The most a single read may request. Sizes declared by a file (a box, an element, a chunk) are read in one go, and a
+ * source that can't tell where the file ends holds everything that arrives until such a read is filled. No valid
+ * file needs anything near this: the largest single reads are an MP4's moov box (tens of MB for hours of video), an
+ * ID3v2 tag (at most 256 MiB), a single uncompressed 8K frame (about 265 MB) and HLS playlists.
+ */
+const MAX_SLICE_LENGTH = 2 ** 30; // 1 GiB
+/** How far a source of unknown size is read to find out whether it ends shortly after an over-large read's start */
+const END_PROBE_LENGTH = 2 ** 20; // 1 MiB
+
+const sliceTooLargeError = (start: number, length: number) => new Error(
+	`Refusing to read ${length} bytes at once (at byte ${start}): no valid file needs a single read over 1 GiB, so`
+	+ ' the file is most likely malformed.',
+);
+
 export class Reader {
 	constructor(public source: Source) {}
 
@@ -49,6 +64,32 @@ export class Reader {
 
 		if (this.fileSizeNonStrict !== null && start + length > this.fileSizeNonStrict) {
 			return null;
+		}
+
+		if (length > MAX_SLICE_LENGTH) {
+			if (this.fileSizeNonStrict !== null) {
+				// Throw rather than return null, which would look like the end of the file
+				throw sliceTooLargeError(start, length);
+			}
+
+			// The size isn't known yet. If the file ends shortly after start, this read runs past its end, as a damaged
+			// size in a cut-off file does, and returns null like it would with the size known. Find out with a bounded
+			// read instead of holding everything that arrives until the whole length has come in.
+			const probe = this.source._read(
+				start,
+				start + END_PROBE_LENGTH,
+				DEFAULT_MIN_READ_POSITION,
+				DEFAULT_MAX_READ_POSITION,
+			);
+			const afterProbe = () => {
+				if (this.fileSizeNonStrict !== null && start + length > this.fileSizeNonStrict) {
+					return null;
+				}
+
+				throw sliceTooLargeError(start, length);
+			};
+
+			return isThenable(probe) ? probe.then(afterProbe) : afterProbe();
 		}
 
 		if (length === 0) {
@@ -143,6 +184,9 @@ export class Reader {
 				chunks.push(chunk);
 
 				currentSize += slice.length;
+				if (currentSize > MAX_SLICE_LENGTH) {
+					throw sliceTooLargeError(0, currentSize);
+				}
 			}
 
 			const joined = new Uint8Array(currentSize);
