@@ -331,3 +331,58 @@ test('hev1 video with its parameter sets only in-band', async () => {
 		[34, [pps]],
 	]);
 });
+
+test('Codec string and decoder config of an encrypted hev1 track with an incomplete hvcC need no key', async () => {
+	// hev1 with an hvcC that has no arrays; the only sample is CENC-encrypted and no resolveKeyId is given. Completing
+	// the hvcC from the first sample must not make the metadata calls fail (they work on main). Found by L101.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	// A VPS in the clear, then an IDR slice whose payload is "encrypted" (any bytes do: they are never decrypted here)
+	const vps = [64, 1, 12, 1, 255, 255, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 146, 128, 144];
+	const sample = [...u32(vps.length), ...vps, ...u32(8), 38, 1, ...zeros(6).fill(0x5a)];
+	const hvcC = box('hvcC', [1, 2, 32, 0, 0, 0, 144, 0, 0, 0, 0, 0, 60, 240, 0, 252, 253, 250, 250, 0, 0, 15, 0]);
+	const tenc = box('tenc', zeros(4), [0, 0, 1, 8], zeros(16).fill(0xa1));
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), hvcC, box('sinf', box('frma', ascii('hev1')),
+		box('schm', zeros(4), ascii('cenc'), u32(0x10000)), box('schi', tenc)));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(sample.length)),
+		box('senc', u32(2), u32(1), zeros(8).fill(6), [0, 1], [0, 4 + vps.length + 6], u32(6)),
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', sample),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getCodecParameterString()).toBe('hev1.2.4.L60.90');
+	expect((await track.getDecoderConfig())?.codec).toBe('hev1.2.4.L60.90');
+});

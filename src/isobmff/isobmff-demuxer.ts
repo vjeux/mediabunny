@@ -3763,7 +3763,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				);
 
 				if (record && missingTypes.length > 0) {
-					const firstPacket = await this.getFirstPacket({});
+					const firstPacket = await this.getFirstPacketForCodecInfo(true);
 					const data = firstPacket?.data ?? new Uint8Array(0);
 					const addedArrays = missingTypes.map(nalUnitType => ({
 						arrayCompleteness: 0, // More of them can follow in-band
@@ -3865,6 +3865,23 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 
 			return config;
 		})();
+	}
+
+	/**
+	 * The first packet, from which the codec info of the sample entry is completed or refined. An encrypted track's
+	 * packets can't be read without its key: then, if the sample entry has codec info (hasCodecInfo), null is
+	 * returned, and that info is used as it is, as metadata calls don't need the key.
+	 */
+	private async getFirstPacketForCodecInfo(hasCodecInfo: boolean) {
+		try {
+			return await this.getFirstPacket({});
+		} catch (error) {
+			if (hasCodecInfo && this.internalTrack.encryptionInfo) {
+				return null;
+			}
+
+			throw error;
+		}
 	}
 }
 
