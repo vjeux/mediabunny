@@ -598,6 +598,233 @@ const findBtrtBoxes = (bytes: Uint8Array) => {
 	return boxes;
 };
 
+test('Fragmented MP4 samples end where the next fragment starts with millisecond timestamps', async () => {
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// 29.97 fps with timestamps rounded to milliseconds and exact frame durations, as in WebM files from FFmpeg
+	for (let i = 0; i < 300; i++) {
+		const timestamp = Math.round(i * 1001 / 30) / 1000;
+		const packet = new EncodedPacket(new Uint8Array(16), i % 30 === 0 ? 'key' : 'delta', timestamp, 1001 / 30000);
+		await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+	}
+	await output.finalize();
+
+	// Each traf's decode time and the sum of its sample durations
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = toDataView(bytes);
+	const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+	const fragments: { decodeTime: number; duration: number }[] = [];
+	for (let pos = 0; pos < bytes.byteLength; pos += view.getUint32(pos)) {
+		if (type(pos) !== 'moof') {
+			continue;
+		}
+
+		const traf = pos + 8 + view.getUint32(pos + 8); // After mfhd
+		let decodeTime = 0;
+		let defaultDuration = 0;
+		let duration = 0;
+		for (let child = traf + 8; child < traf + view.getUint32(traf); child += view.getUint32(child)) {
+			const flags = view.getUint32(child + 8) & 0xffffff;
+			if (type(child) === 'tfhd' && flags & 0x08) {
+				defaultDuration = view.getUint32(child + 16 + (flags & 0x01 ? 8 : 0) + (flags & 0x02 ? 4 : 0));
+			} else if (type(child) === 'tfdt') {
+				const isVersion1 = bytes[child + 8] === 1;
+				decodeTime = isVersion1 ? Number(view.getBigUint64(child + 12)) : view.getUint32(child + 12);
+			} else if (type(child) === 'trun') {
+				const sampleCount = view.getUint32(child + 12);
+				let entry = child + 16 + (flags & 0x01 ? 4 : 0) + (flags & 0x04 ? 4 : 0);
+				const entrySize = 4 * [0x100, 0x200, 0x400, 0x800].filter(x => flags & x).length;
+				for (let i = 0; i < sampleCount; i++, entry += entrySize) {
+					duration += flags & 0x100 ? view.getUint32(entry) : defaultDuration;
+				}
+			}
+		}
+		fragments.push({ decodeTime, duration });
+	}
+
+	// ISO/IEC 14496-12: a fragment's decode time is the sum of the durations of all earlier samples. Each fragment's
+	// last sample used to keep its packet duration, ending up to a third of a millisecond after the next fragment's
+	// start, which readers adding up durations accumulate.
+	expect(fragments).toHaveLength(10);
+	for (let i = 1; i < fragments.length; i++) {
+		expect(fragments[i]!.decodeTime).toBe(fragments[i - 1]!.decodeTime + fragments[i - 1]!.duration);
+	}
+});
+
+test('Fragmented MP4 fragments start where the previous one ends, except after real gaps', async () => {
+	type TestPacket = { timestamp: number; type: 'key' | 'delta'; duration: number };
+
+	// Returns the track's timescale and each traf's decode time and end (decode time plus sample durations)
+	const writeFragments = async (packets: TestPacket[], frameRate?: number) => {
+		const format = new Mp4OutputFormat({ fastStart: 'fragmented' });
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp9');
+		output.addVideoTrack(source, { frameRate });
+		await output.start();
+		for (const { timestamp, type, duration } of packets) {
+			const packet = new EncodedPacket(new Uint8Array(16), type, timestamp, duration);
+			await source.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+		}
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = toDataView(bytes);
+		const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+		const children = (start: number, end: number) => {
+			const result: number[] = [];
+			for (let pos = start; pos < end; pos += view.getUint32(pos)) {
+				result.push(pos);
+			}
+			return result;
+		};
+		const child = (box: number, name: string) => {
+			return children(box + 8, box + view.getUint32(box)).find(x => type(x) === name)!;
+		};
+
+		const moov = children(0, bytes.byteLength).find(x => type(x) === 'moov')!;
+		const mdhd = child(child(child(moov, 'trak'), 'mdia'), 'mdhd');
+		const timescale = view.getUint32(mdhd + (bytes[mdhd + 8] === 1 ? 28 : 20));
+
+		const fragments: { decodeTime: number; end: number }[] = [];
+		for (const moof of children(0, bytes.byteLength).filter(x => type(x) === 'moof')) {
+			const traf = child(moof, 'traf');
+			let decodeTime = 0;
+			let defaultDuration = 0;
+			let duration = 0;
+			for (const box of children(traf + 8, traf + view.getUint32(traf))) {
+				const flags = view.getUint32(box + 8) & 0xffffff;
+				if (type(box) === 'tfhd' && flags & 0x08) {
+					defaultDuration = view.getUint32(box + 16 + (flags & 0x01 ? 8 : 0) + (flags & 0x02 ? 4 : 0));
+				} else if (type(box) === 'tfdt') {
+					const isVersion1 = bytes[box + 8] === 1;
+					decodeTime = isVersion1 ? Number(view.getBigUint64(box + 12)) : view.getUint32(box + 12);
+				} else if (type(box) === 'trun') {
+					const sampleCount = view.getUint32(box + 12);
+					let entry = box + 16 + (flags & 0x01 ? 4 : 0) + (flags & 0x04 ? 4 : 0);
+					const entrySize = 4 * [0x100, 0x200, 0x400, 0x800].filter(x => flags & x).length;
+					for (let i = 0; i < sampleCount; i++, entry += entrySize) {
+						duration += flags & 0x100 ? view.getUint32(entry) : defaultDuration;
+					}
+				}
+			}
+			fragments.push({ decodeTime, end: decodeTime + duration });
+		}
+
+		// The holes between fragments, in seconds
+		const holes = fragments.slice(1).map((x, i) => (x.decodeTime - fragments[i]!.end) / timescale);
+		return { timescale, holes };
+	};
+
+	// 60 fps with timestamps rounded to milliseconds, as in WebM files from FFmpeg: frames are 16 or 17 ms apart and
+	// last 16.67 ms each, so a fragment's last sample used to end a third of a millisecond before a key frame 17 ms
+	// away. A fragment's decode time is the sum of all earlier sample durations (ISO/IEC 14496-12), and readers that
+	// add durations up (like mp4box.js) accumulate such holes.
+	const packets: TestPacket[] = [];
+	for (let i = 0; i < 600; i++) {
+		const timestamp = Math.round(i * 1000 / 60) / 1000;
+		packets.push({ timestamp, type: i % 66 === 0 ? 'key' : 'delta', duration: 1 / 60 });
+	}
+	const { holes } = await writeFragments(packets);
+	expect(holes).toEqual(Array<number>(9).fill(0));
+
+	// A real pause before a key frame stays
+	const paused = packets.map((x, i) => i < 330 ? x : { ...x, timestamp: x.timestamp + 0.5 });
+	const { holes: pausedHoles } = await writeFragments(paused);
+	expect(pausedHoles.filter(x => x !== 0)).toHaveLength(1);
+	expect(pausedHoles[4]).toBeGreaterThan(0.45);
+
+	// So does a frame dropped right before a key frame, even when that's a single tick of a frame rate timescale
+	const dropped: TestPacket[] = [];
+	for (let i = 0; i < 90; i++) {
+		if (i !== 59) {
+			dropped.push({ timestamp: i / 30, type: i % 30 === 0 ? 'key' : 'delta', duration: 1 / 30 });
+		}
+	}
+	const { timescale: frameRateTimescale, holes: droppedHoles } = await writeFragments(dropped, 30);
+	expect(frameRateTimescale).toBe(30);
+	expect(droppedHoles).toEqual([0, 1 / 30]);
+
+	// The same 60 fps stream with B-frames (closed GOPs: I, then P B B in decode order), as x264 writes it into MKV
+	const reordered: TestPacket[] = [];
+	for (let start = 0; start + 61 <= 610; start += 61) {
+		const order = [start];
+		for (let i = 0; i < 20; i++) {
+			order.push(start + 3 * i + 3, start + 3 * i + 1, start + 3 * i + 2);
+		}
+		for (const index of order) {
+			const timestamp = Math.round(index * 1000 / 60) / 1000;
+			reordered.push({ timestamp, type: index === start ? 'key' : 'delta', duration: 1 / 60 });
+		}
+	}
+	const { holes: reorderedHoles } = await writeFragments(reordered);
+	expect(reorderedHoles).toEqual(Array<number>(9).fill(0));
+});
+
+test('Fragmented AAC with millisecond timestamps doesn\'t overlap the next fragment', async () => {
+	// 44.1 kHz AAC frames with timestamps rounded to milliseconds, starting at -23 ms (encoder priming), with
+	// durations as Matroska gives them: the gap to the next block. The track then doesn't start on a whole tick.
+	const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'fragmented' }), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	const timestamp = (index: number) => Math.round((index - 1) * 1024 / 44.1) / 1000;
+	for (let i = 0; i < 1300; i++) {
+		const duration = timestamp(i + 1) - timestamp(i);
+		const packet = new EncodedPacket(new Uint8Array(20).fill(i & 0xff), 'key', timestamp(i), duration);
+		await source.add(packet, {
+			decoderConfig: {
+				codec: 'mp4a.40.2',
+				sampleRate: 44100,
+				numberOfChannels: 2,
+				description: new Uint8Array([0x12, 0x10]),
+			},
+		});
+	}
+	await output.finalize();
+
+	// Each traf's decode time and end (decode time plus sample durations)
+	const bytes = new Uint8Array(output.target.buffer!);
+	const view = toDataView(bytes);
+	const type = (pos: number) => String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+	const fragments: { decodeTime: number; end: number }[] = [];
+	for (let pos = 0; pos < bytes.byteLength; pos += view.getUint32(pos)) {
+		if (type(pos) !== 'moof') {
+			continue;
+		}
+
+		const traf = pos + 8 + view.getUint32(pos + 8); // After mfhd
+		let decodeTime = 0;
+		let defaultDuration = 0;
+		let duration = 0;
+		for (let child = traf + 8; child < traf + view.getUint32(traf); child += view.getUint32(child)) {
+			const flags = view.getUint32(child + 8) & 0xffffff;
+			if (type(child) === 'tfhd' && flags & 0x08) {
+				defaultDuration = view.getUint32(child + 16 + (flags & 0x01 ? 8 : 0) + (flags & 0x02 ? 4 : 0));
+			} else if (type(child) === 'tfdt') {
+				const isVersion1 = bytes[child + 8] === 1;
+				decodeTime = isVersion1 ? Number(view.getBigUint64(child + 12)) : view.getUint32(child + 12);
+			} else if (type(child) === 'trun') {
+				const sampleCount = view.getUint32(child + 12);
+				let entry = child + 16 + (flags & 0x01 ? 4 : 0) + (flags & 0x04 ? 4 : 0);
+				const entrySize = 4 * [0x100, 0x200, 0x400, 0x800].filter(x => flags & x).length;
+				for (let i = 0; i < sampleCount; i++, entry += entrySize) {
+					duration += flags & 0x100 ? view.getUint32(entry) : defaultDuration;
+				}
+			}
+		}
+		fragments.push({ decodeTime, end: decodeTime + duration });
+	}
+
+	// The decode times are written relative to the track's start, so they're rounded differently than the durations
+	expect(fragments.length).toBeGreaterThan(20);
+	const joins = fragments.slice(1).map((x, i) => x.decodeTime - fragments[i]!.end);
+	expect(joins.filter(x => x < 0)).toEqual([]);
+	expect(joins.filter(x => x > 0)).toEqual([]);
+});
+
 test('Chunks written in chronological order, no Fast Start', async () => {
 	await testChunkOrder(false);
 });
