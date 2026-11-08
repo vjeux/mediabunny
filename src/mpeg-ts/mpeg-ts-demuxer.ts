@@ -2713,6 +2713,14 @@ class PacketBuffer {
 		this.context = context;
 		this.reorderSize = backing.getReorderSize();
 		assert(this.reorderSize >= 0);
+
+		if (backing.elementaryStream.info.type === 'video') {
+			// Packets without a successor (the last one, say) take the track's frame duration, which is measured at the
+			// start of the stream. Measure it now: by the time it's needed, a sequential source (a stream, a server
+			// that ignores range requests) may have evicted the start from its cache. Errors surface where it's
+			// awaited.
+			void backing.getFrameDuration().catch(() => {});
+		}
 	}
 
 	async readNext(): Promise<{ packet: SuppliedPacket; duration: number } | null> {

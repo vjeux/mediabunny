@@ -1011,3 +1011,35 @@ test('MPEG-TS gives the last frame of variable frame rate video a typical frame 
 	expect(lastPacket?.duration).toBeCloseTo(0.029);
 	expect(await track.computeDuration()).toBeCloseTo(timestamps.at(-1)! + 0.029);
 });
+
+test('MPEG-TS read from a stream larger than the source cache reads to its last packet', async () => {
+	// Found by L91. Like FFmpeg's `-f mpegts pipe:1` output read through a ReadableStreamSource (whose cache holds
+	// 32 MiB by default): the cache only keeps the most recent data. The last packet takes the frame duration measured
+	// at the start of the stream, which must not be read only once the start is long evicted.
+	const data = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/0.ts'))); // 1.9 MB
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= data.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(data.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	using input = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 19 }),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+		expect(packet.duration).toBeGreaterThan(0);
+		packetCount++;
+	}
+	expect(packetCount).toBe(298);
+});
