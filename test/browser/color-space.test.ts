@@ -3,7 +3,7 @@ import { VideoCodec } from '../../src/codec.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
-import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedVideoPacketSource, VideoSampleSource } from '../../src/media-source.js';
 import { assert, colorSpaceIsComplete } from '../../src/misc.js';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
@@ -96,6 +96,28 @@ test('Color space extraction, AV1 in Matroska', async () => {
 	const buffer = await remuxWithoutColorSpace(new MkvOutputFormat(), source);
 
 	await expectCompleteColorSpace(new BufferSource(buffer));
+});
+
+test('Re-encoding decoded frames whose color space the browser reports as partly unspecified', async () => {
+	// The stream only signals the matrix, so WebKitGTK decodes frames with 'unspecified' primaries and transfer, which
+	// its encoder then reports back in the decoder config
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	using sample = await new VideoSampleSink(track).getSample(await track.getFirstTimestamp());
+	assert(sample);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new VideoSampleSource({ codec: 'avc', bitrate: 1e6 });
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(sample);
+	await output.finalize();
+
+	using reencoded = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const reencodedTrack = await reencoded.getPrimaryVideoTrack();
+	assert(reencodedTrack);
+	expect(await reencodedTrack.getCodec()).toBe('avc');
 });
 
 const readPackets = async (path: string) => {
