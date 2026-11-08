@@ -920,6 +920,209 @@ test('Read and write metadata, FLAC', async () => {
 	expect(readTags.raw!['COMPOSER']).toBe('Hans Zimmer');
 });
 
+test('Conversion metadata tags, fields removed by the tags function stay removed', async () => {
+	type Format = Mp4OutputFormat | MkvOutputFormat | WavOutputFormat | FlacOutputFormat;
+	const convert = async (bytes: Uint8Array, format: Format) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			showWarnings: false,
+			// The way the docs remove a field
+			tags: inputTags => ({ ...inputTags, artist: undefined, comment: undefined, images: [] }),
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await result.getMetadataTags();
+	};
+
+	// Same-format conversions copy the raw tags over, which mustn't bring the removed fields back
+	for (const [makeFormat, codec] of [
+		[() => new Mp4OutputFormat(), 'aac'],
+		[() => new MkvOutputFormat(), 'aac'],
+		[() => new WavOutputFormat(), 'pcm-s16'],
+		[() => new WavOutputFormat({ metadataFormat: 'id3' }), 'pcm-s16'],
+	] as const) {
+		const output = new Output({ format: makeFormat(), target: new BufferTarget() });
+		output.setMetadataTags({
+			title: 'Title',
+			artist: 'Artist',
+			comment: 'Comment',
+			images: [{ data: coverArt, mimeType: 'image/jpeg', kind: 'coverFront' }],
+		});
+		const source = new EncodedAudioPacketSource(codec);
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(4096), 'key', 0, 1024 / 44100), {
+			decoderConfig: codec === 'aac'
+				// AAC-LC, 44.1 kHz, stereo
+				? { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, description: new Uint8Array([18, 16]) }
+				: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+		});
+		await output.finalize();
+
+		const tags = await convert(new Uint8Array(output.target.buffer!), makeFormat());
+		expect(tags.title).toBe('Title');
+		expect(tags.artist).toBeUndefined();
+		expect(tags.comment).toBeUndefined();
+		expect(tags.images ?? []).toEqual([]);
+	}
+
+	// FLAC (Vorbis comments)
+	const flac = new Uint8Array(readFileSync(path.join(__dirname, '../public/sample.flac')));
+	const tags = await convert(flac, new FlacOutputFormat());
+	expect(tags.title).toBe('The Happy Meeting');
+	expect(tags.artist).toBeUndefined();
+	expect(tags.raw!['ARTIST']).toBeUndefined();
+	expect(tags.raw!['ALBUM']).toBe('Samples files');
+
+	// Fields that a file carries twice, in two tag blocks or under two keys
+	const removeTitleAndTotal = async (bytes: Uint8Array, format: Format) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const output = new Output({ format, target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			showWarnings: false,
+			tags: inputTags => ({ ...inputTags, title: undefined, tracksTotal: undefined }),
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		return await result.getMetadataTags();
+	};
+
+	// A WAVE file with both RIFF INFO chunks and an ID3 chunk, like DAWs and taggers write
+	const writeWave = async (metadataFormat: 'info' | 'id3') => {
+		const output = new Output({ format: new WavOutputFormat({ metadataFormat }), target: new BufferTarget() });
+		output.setMetadataTags({ title: 'Title', artist: 'Artist' });
+		const source = new EncodedAudioPacketSource('pcm-s16');
+		output.addAudioTrack(source);
+		await output.start();
+		await source.add(new EncodedPacket(new Uint8Array(4096), 'key', 0, 1024 / 44100), {
+			decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+		});
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+	const infoWave = await writeWave('info');
+	const id3Wave = await writeWave('id3');
+	const id3ChunkStart = Buffer.from(id3Wave).indexOf('ID3 ');
+	const id3ChunkSize = 8 + new DataView(id3Wave.buffer).getUint32(id3ChunkStart + 4, true);
+	const bothWave = new Uint8Array([...infoWave, ...id3Wave.subarray(id3ChunkStart, id3ChunkStart + id3ChunkSize)]);
+	new DataView(bothWave.buffer).setUint32(4, bothWave.length - 8, true);
+
+	for (const metadataFormat of ['info', 'id3'] as const) {
+		const tags = await removeTitleAndTotal(bothWave, new WavOutputFormat({ metadataFormat }));
+		expect(tags.title).toBeUndefined();
+		expect(tags.artist).toBe('Artist');
+	}
+
+	// A FLAC file with an ID3v2.4 tag (TIT2 "Old title") in front of its Vorbis comments
+	const id3Tag = [0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 20, 0x54, 0x49, 0x54, 0x32, 0, 0, 0, 10, 0, 0, 3]
+		.concat([...'Old title'].map(x => x.charCodeAt(0)));
+	const id3Flac = await removeTitleAndTotal(new Uint8Array([...id3Tag, ...flac]), new FlacOutputFormat());
+	expect(id3Flac.title).toBeUndefined();
+	expect(id3Flac.album).toBe('Samples files');
+
+	// An ID3v2.3-style date split into the year (TYER) and the day and month (TDAT)
+	const output = new Output({ format: new WavOutputFormat({ metadataFormat: 'id3' }), target: new BufferTarget() });
+	output.setMetadataTags({ title: 'Title', raw: { TYER: '2021', TDAT: '2304' } });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(4096), 'key', 0, 1024 / 44100), {
+		decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 44100 },
+	});
+	await output.finalize();
+
+	// Removing or changing the date drops both frames, whose date would otherwise come back or stay in the file
+	const convertWithDate = async (date: Date | undefined) => {
+		using dateInput = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const dateOutput = new Output({
+			format: new WavOutputFormat({ metadataFormat: 'id3' }),
+			target: new BufferTarget(),
+		});
+		const dateConversion = await Conversion.init({
+			input: dateInput,
+			output: dateOutput,
+			showWarnings: false,
+			tags: inputTags => ({ ...inputTags, date }),
+		});
+		await dateConversion.execute();
+		using dateResult = new Input({ source: new BufferSource(dateOutput.target.buffer!), formats: ALL_FORMATS });
+		return await dateResult.getMetadataTags();
+	};
+	for (const date of [undefined, new Date('1999-06-01T00:00:00Z')]) {
+		const dateTags = await convertWithDate(date);
+		expect(dateTags.title).toBe('Title');
+		expect(dateTags.date).toEqual(date);
+		expect(dateTags.raw!['TYER']).toBeUndefined();
+		expect(dateTags.raw!['TDAT']).toBeUndefined();
+	}
+
+	// Vorbis comments with the track total both in TRACKNUMBER and in TRACKTOTAL
+	using flacInput = new Input({ source: new BufferSource(flac), formats: ALL_FORMATS });
+	const flacOutput = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+	const tagging = await Conversion.init({
+		input: flacInput,
+		output: flacOutput,
+		showWarnings: false,
+		tags: { raw: { TRACKNUMBER: '3/12', TRACKTOTAL: '12' } },
+	});
+	await tagging.execute();
+	const totals = await removeTitleAndTotal(new Uint8Array(flacOutput.target.buffer!), new FlacOutputFormat());
+	expect(totals.trackNumber).toBe(3);
+	expect(totals.tracksTotal).toBeUndefined();
+});
+
+test('Reading tags that fail to parse midway leaves plain data properties', async () => {
+	const accessorFields = (tags: object) => Object.entries(Object.getOwnPropertyDescriptors(tags))
+		.filter(([, descriptor]) => !('value' in descriptor)) // Accessor properties have a getter and setter instead
+		.map(([key]) => key);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+
+	// An ID3v2.4 tag whose TIT2 and TPE1 frames are fine, but whose TALB frame uses the undefined text encoding 4, so
+	// the reader throws in the middle of it
+	const frame = (id: string, body: number[]) => [...ascii(id), 0, 0, 0, body.length, 0, 0, ...body];
+	const frames = [
+		...frame('TIT2', [0, ...ascii('Title')]),
+		...frame('TPE1', [0, ...ascii('Artist')]),
+		...frame('TALB', [4, ...ascii('Bad')]),
+	];
+	const tag = [...ascii('ID3'), 4, 0, 0, 0, 0, 0, frames.length, ...frames];
+	const mp3 = new Uint8Array([...tag, ...readFileSync(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3'))]);
+
+	using mp3Input = new Input({ source: new BufferSource(mp3), formats: ALL_FORMATS });
+	await expect(mp3Input.getMetadataTags()).rejects.toThrow('Unsupported text encoding: 4');
+	const demuxerTags = async (input: Input) => {
+		const demuxer = await input._getDemuxer();
+		return (demuxer as unknown as { metadataTags: MetadataTags }).metadataTags;
+	};
+	const mp3Tags = await demuxerTags(mp3Input);
+	expect(mp3Tags.title).toBe('Title');
+	expect(accessorFields(mp3Tags)).toEqual([]);
+
+	// An MP4 udta whose last item claims a longer string than the file holds
+	const output = new Output({ format: new Mp4OutputFormat({ metadataFormat: 'udta' }), target: new BufferTarget() });
+	output.setMetadataTags({ title: 'Title', artist: 'Artist' });
+	const dummyTrack = createDummyAudioTrack('aac', output);
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+	const mp4 = new Uint8Array(output.target.buffer!);
+	const artistPos = Buffer.from(mp4).lastIndexOf(Buffer.from('\u00a9ART', 'latin1'));
+	mp4.set([0xff, 0xff], artistPos + 4);
+
+	using mp4Input = new Input({ source: new BufferSource(mp4), formats: ALL_FORMATS });
+	await mp4Input.getMetadataTags().catch(() => {});
+	const mp4Tags = await demuxerTags(mp4Input);
+	expect(mp4Tags.title).toBe('Title');
+	expect(accessorFields(mp4Tags)).toEqual([]);
+});
+
 test('Read and write metadata, ADTS', async () => {
 	const originalInput = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/sample3.aac')),
