@@ -57,6 +57,11 @@ const PAT_PID = 0x0000;
 const PMT_PID = 0x1000;
 const FIRST_TRACK_PID = 0x0100;
 
+// Audio that gets a stream_id of its own, rather than private_stream_1 (AC-3, E-AC-3 and DTS)
+const usesAudioStreamId = (track: OutputTrack) => {
+	return track.type === 'audio' && (track.source._codec === 'aac' || track.source._codec === 'mp3');
+};
+
 const VIDEO_STREAM_ID_BASE = 0xE0;
 const AUDIO_STREAM_ID_BASE = 0xC0;
 
@@ -113,9 +118,6 @@ export class MpegTsMuxer extends Muxer {
 	private packetView = toDataView(this.packetBuffer);
 	private allTracksKnown = promiseWithResolvers();
 
-	private videoTrackIndex = 0;
-	private audioTrackIndex = 0;
-
 	private adaptationFieldBuffer = new Uint8Array(184);
 	private payloadBuffer = new Uint8Array(184);
 
@@ -139,6 +141,24 @@ export class MpegTsMuxer extends Muxer {
 		return buildMpegTsMimeType(this.trackDatas.map(x => x.codecString));
 	}
 
+	/**
+	 * Tracks get their PIDs (and their place in the PMT) in the order they were added to the output, like in the other
+	 * formats, not in the order of their first packets, which depends on timing between the sources.
+	 */
+	private getTrackPid(track: OutputTrack) {
+		return FIRST_TRACK_PID + this.output.tracks.indexOf(track);
+	}
+
+	/** Returns the index of the given track among the output's tracks matching the predicate. */
+	private getTrackIndex(track: OutputTrack, predicate: (track: OutputTrack) => boolean) {
+		return this.output.tracks.filter(predicate).indexOf(track);
+	}
+
+	private addTrackData(trackData: MpegTsTrackData) {
+		this.trackDatas.push(trackData);
+		this.trackDatas.sort((a, b) => a.pid - b.pid);
+	}
+
 	private getVideoTrackData(track: OutputVideoTrack, meta?: EncodedVideoChunkMetadata) {
 		const existingTrackData = this.trackDatas.find(x => x.track === track);
 		if (existingTrackData) {
@@ -154,8 +174,8 @@ export class MpegTsMuxer extends Muxer {
 		const streamType = codec === 'avc'
 			? MpegTsStreamType.AVC
 			: MpegTsStreamType.HEVC;
-		const pid = FIRST_TRACK_PID + this.trackDatas.length;
-		const streamId = VIDEO_STREAM_ID_BASE + this.videoTrackIndex++;
+		const pid = this.getTrackPid(track);
+		const streamId = VIDEO_STREAM_ID_BASE + this.getTrackIndex(track, x => x.type === 'video');
 
 		const newTrackData: MpegTsTrackData = {
 			track,
@@ -179,7 +199,7 @@ export class MpegTsMuxer extends Muxer {
 			closed: false,
 		};
 
-		this.trackDatas.push(newTrackData);
+		this.addTrackData(newTrackData);
 
 		if (this.allTracksAreKnown()) {
 			this.allTracksKnown.resolve();
@@ -206,7 +226,7 @@ export class MpegTsMuxer extends Muxer {
 		switch (codec) {
 			case 'aac': {
 				streamType = MpegTsStreamType.AAC;
-				streamId = AUDIO_STREAM_ID_BASE + this.audioTrackIndex++;
+				streamId = AUDIO_STREAM_ID_BASE + this.getTrackIndex(track, usesAudioStreamId);
 			}; break;
 
 			case 'mp3': {
@@ -215,7 +235,7 @@ export class MpegTsMuxer extends Muxer {
 				streamType = meta.decoderConfig.sampleRate < 32000
 					? MpegTsStreamType.MP3_MPEG2
 					: MpegTsStreamType.MP3_MPEG1;
-				streamId = AUDIO_STREAM_ID_BASE + this.audioTrackIndex++;
+				streamId = AUDIO_STREAM_ID_BASE + this.getTrackIndex(track, usesAudioStreamId);
 			}; break;
 
 			case 'ac3': {
@@ -234,7 +254,7 @@ export class MpegTsMuxer extends Muxer {
 			}; break;
 		}
 
-		const pid = FIRST_TRACK_PID + this.trackDatas.length;
+		const pid = this.getTrackPid(track);
 
 		const newTrackData: MpegTsTrackData = {
 			track,
@@ -258,7 +278,7 @@ export class MpegTsMuxer extends Muxer {
 			closed: false,
 		};
 
-		this.trackDatas.push(newTrackData);
+		this.addTrackData(newTrackData);
 
 		if (this.allTracksAreKnown()) {
 			this.allTracksKnown.resolve();
