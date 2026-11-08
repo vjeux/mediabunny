@@ -2644,6 +2644,7 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			sampleRate: this.decoderConfig.sampleRate,
 			numberOfFrames,
 			timestamp: preciseTimestamp,
+			_doNotCopy: true, // Freshly allocated above
 		});
 
 		this.onSample(audioSample);
