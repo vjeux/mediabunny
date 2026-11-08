@@ -4098,6 +4098,66 @@ test('Append-only stream with monotonicity violation', async () => {
 		.rejects.toThrow('AppendOnlyStreamTarget');
 });
 
+test('Tracks of a variant stream take their language and name from the media when the playlist has none', async () => {
+	// A lone audio track is written as the variant stream itself, which can't declare a language or name (only
+	// renditions can), while the CMAF segments carry both
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat() }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+			return target;
+		}),
+	});
+	const audio = audioSource();
+	output.addAudioTrack(audio, { languageCode: 'fra', name: 'Français' });
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		await audio.add(new EncodedPacket(aacPacketData, 'key', i * 1024 / 48000, 1024 / 48000), aacMetadata);
+	}
+	await output.finalize();
+	expect(new TextDecoder().decode(targets.get('master.m3u8')!.buffer!)).not.toContain('LANGUAGE');
+
+	const openInput = (rootPath: string, readable: (path: string) => boolean = () => true) => new Input({
+		source: new CustomPathedSource(rootPath, ({ path }) => {
+			if (!readable(path)) {
+				throw new Error(`${path} is unavailable`);
+			}
+
+			return new BufferSource(targets.get(path)!.buffer!);
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	// Control: the media playlist read directly
+	using mediaPlaylistInput = openInput('playlist-1.m3u8');
+	const directTrack = (await mediaPlaylistInput.getPrimaryAudioTrack())!;
+	expect(await directTrack.getLanguageCode()).toBe('fra');
+	expect(await directTrack.getName()).toBe('Français');
+
+	using masterInput = openInput('master.m3u8');
+	const track = (await masterInput.getPrimaryAudioTrack())!;
+	// The deprecated synchronous getters still work. They don't read media, so they give the playlist's values until
+	// it has been read.
+	const getKnownLanguageAndName = (inputTrack: InputAudioTrack) => {
+		// eslint-disable-next-line @typescript-eslint/no-deprecated -- what's being tested
+		return [inputTrack.languageCode, inputTrack.name];
+	};
+	expect(getKnownLanguageAndName(track)).toEqual(['und', null]);
+	expect(await track.getLanguageCode()).toBe('fra');
+	expect(await track.getName()).toBe('Français');
+	expect(getKnownLanguageAndName(track)).toEqual(['fra', 'Français']);
+
+	// When the media can't be read, these optional values stay what the playlist says instead of failing, and the
+	// metadata that the playlist does give still comes from it
+	using unreadableInput = openInput('master.m3u8', path => path === 'master.m3u8');
+	const unreadableTrack = (await unreadableInput.getPrimaryAudioTrack())!;
+	expect(await unreadableTrack.getLanguageCode()).toBe('und');
+	expect(await unreadableTrack.getName()).toBe(null);
+	expect(await unreadableTrack.getCodecParameterString()).toBe('mp4a.40.2');
+});
+
 test('Relative paths & isRoot', async () => {
 	const output = new Output({
 		format: new HlsOutputFormat({
