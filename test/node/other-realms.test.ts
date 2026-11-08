@@ -6,6 +6,7 @@ import { expect, test } from 'vitest';
 import {
 	ALL_FORMATS,
 	AttachedFile,
+	BlobSource,
 	AudioSample,
 	AudioSampleResource,
 	AudioSampleSource,
@@ -45,6 +46,10 @@ test('Packets and samples take bytes created in another realm', async () => {
 	// Objects that merely claim to be bytes are still rejected
 	const fakeBytes = { [Symbol.toStringTag]: 'Uint8Array', length: 1, 0: 1 } as unknown as Uint8Array;
 	expect(() => new EncodedPacket(fakeBytes, 'key', 0, 1)).toThrow(TypeError);
+	const taggedView = new DataView(new ArrayBuffer(4));
+	Object.defineProperty(taggedView, Symbol.toStringTag, { value: 'Uint8Array' });
+	expect(() => new EncodedPacket(taggedView as unknown as Uint8Array, 'key', 0, 1)).toThrow(TypeError);
+	expect(() => new RichImageData(taggedView as unknown as Uint8Array, 'image/png')).toThrow(TypeError);
 	const fakeBuffer = { [Symbol.toStringTag]: 'ArrayBuffer', byteLength: 8 } as unknown as ArrayBuffer;
 	expect(() => new BufferSource(fakeBuffer)).toThrow(TypeError);
 
@@ -187,6 +192,20 @@ test('Sources take bytes created in another realm', async () => {
 		formats: ALL_FORMATS,
 	});
 	expect(await fromReadStreams.computeDuration()).toBe(duration);
+
+	// A Blob of another implementation, like Node.js's Blob in Jest's jsdom environment, which this realm's Blob
+	// methods don't recognize
+	const blob = new Blob([file]);
+	const otherImplementationBlob = {
+		[Symbol.toStringTag]: 'Blob',
+		size: blob.size,
+		type: blob.type,
+		slice: (start?: number, end?: number) => blob.slice(start, end),
+		arrayBuffer: () => blob.arrayBuffer(),
+		stream: () => blob.stream(),
+	} as unknown as Blob;
+	using fromBlob = new Input({ source: new BlobSource(otherImplementationBlob), formats: ALL_FORMATS });
+	expect(await fromBlob.computeDuration()).toBe(duration);
 });
 
 test('Metadata takes bytes created in another realm, and they get written', async () => {

@@ -9,6 +9,8 @@ test('Blobs and streams created in another realm (an iframe) are taken as source
 
 	// Objects that merely claim to be a Blob or a stream are still rejected
 	expect(() => new BlobSource({ [Symbol.toStringTag]: 'Blob', size: 3 } as unknown as Blob)).toThrow(TypeError);
+	const sliceOnly = { [Symbol.toStringTag]: 'Blob', slice: () => {}, size: 10 } as unknown as Blob;
+	expect(() => new BlobSource(sliceOnly)).toThrow(TypeError);
 	expect(() => new ReadableStreamSource({} as ReadableStream<Uint8Array>)).toThrow(TypeError);
 
 	const iframe = document.createElement('iframe');

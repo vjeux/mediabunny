@@ -239,8 +239,19 @@ export const toDataView = (source: AllowSharedBufferSource): DataView => {
  * jsdom environment), which `instanceof Uint8Array` doesn't recognize.
  */
 export const isUint8Array = (value: unknown): value is Uint8Array => {
-	return value instanceof Uint8Array
-		|| (ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === '[object Uint8Array]');
+	if (value instanceof Uint8Array) {
+		return true;
+	}
+	if (!ArrayBuffer.isView(value)) {
+		return false;
+	}
+
+	// The typed array's internal type name, which an own Symbol.toStringTag can't fake (undefined for a DataView)
+	const typedArrayName: unknown = Object.getOwnPropertyDescriptor(
+		Object.getPrototypeOf(Uint8Array.prototype) as object,
+		Symbol.toStringTag,
+	)!.get!.call(value);
+	return typedArrayName === 'Uint8Array';
 };
 
 /**
@@ -279,15 +290,24 @@ export const arrayBufferFromOtherRealm = <T>(value: T): T | Uint8Array => {
 	return new Uint8Array(value as unknown as ArrayBuffer);
 };
 
-/** Whether the value is a Blob (or File), including one created in another realm. */
+/**
+ * Whether the value is a Blob (or File), including one created in another realm. Those are duck-typed: a Blob of
+ * another implementation (Node.js's Blob in Jest's jsdom environment) fails this realm's brand checks, so it's
+ * recognized by its tag and the members that are used of it.
+ */
 export const isBlob = (value: unknown): value is Blob => {
 	if (typeof Blob !== 'undefined' && value instanceof Blob) {
 		return true;
 	}
 
 	const tag = Object.prototype.toString.call(value);
+	const blob = value as Blob;
 	return (tag === '[object Blob]' || tag === '[object File]')
-		&& typeof (value as Blob).slice === 'function';
+		&& typeof blob.size === 'number'
+		&& typeof blob.type === 'string'
+		&& typeof blob.slice === 'function'
+		&& typeof blob.arrayBuffer === 'function'
+		&& typeof blob.stream === 'function';
 };
 
 /**
