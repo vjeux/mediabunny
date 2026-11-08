@@ -350,7 +350,8 @@ describe('VP9, VP8 and AV1 headers', () => {
 				transferCharacteristics: expectedTransfer,
 				...expectedInfo
 			} = fixture.expected;
-			expect(info, fixture.name).toEqual(expectedInfo);
+			// Other fields, like the frame size, may come along
+			expect(info, fixture.name).toMatchObject(expectedInfo);
 
 			// The color space determines the primaries and transfer only for some values (not for CS_BT_601)
 			const accepted = [[expectedPrimaries, expectedTransfer]];
@@ -384,7 +385,8 @@ describe('VP9, VP8 and AV1 headers', () => {
 	test('AV1 sequence headers written by libaom', () => {
 		for (const fixture of AV1_FIXTURES) {
 			const obu = hexToBytes(fixture.sequenceHeaderObu);
-			expect(extractAv1CodecInfoFromPacket(obu), fixture.name).toEqual(fixture.expected);
+			// Other fields, like the frame size, may come along
+			expect(extractAv1CodecInfoFromPacket(obu), fixture.name).toMatchObject(fixture.expected);
 		}
 
 		const main8Bit = AV1_FIXTURES[0]!.expected;
@@ -397,7 +399,7 @@ describe('VP9, VP8 and AV1 headers', () => {
 			['level 4.0', '0a0b00000042abbfc3732be401', { ...main8Bit, level: 8 }],
 		];
 		for (const [name, hex, expected] of variants) {
-			expect(extractAv1CodecInfoFromPacket(hexToBytes(hex)), name).toEqual(expected);
+			expect(extractAv1CodecInfoFromPacket(hexToBytes(hex)), name).toMatchObject(expected);
 		}
 	});
 
@@ -414,7 +416,7 @@ describe('VP9, VP8 and AV1 headers', () => {
 			[1, sequenceHeader.byteLength - 2],
 			[6, 1],
 		]);
-		expect(extractAv1CodecInfoFromPacket(temporalUnit)).toEqual(AV1_FIXTURES[1]!.expected);
+		expect(extractAv1CodecInfoFromPacket(temporalUnit)).toMatchObject(AV1_FIXTURES[1]!.expected);
 		expect(determineVideoPacketType('av1', { codec: 'av01.0.00M.10' }, temporalUnit)).toBe('key');
 		expect(determineVideoPacketType('av1', { codec: 'av01.0.00M.10' }, interFrame)).toBe('delta');
 		expect(determineVideoPacketType('av1', { codec: 'av01.0.00M.10' }, shownExistingFrame)).toBe(null);
@@ -422,9 +424,9 @@ describe('VP9, VP8 and AV1 headers', () => {
 
 		// With an extension header (temporal and spatial ID) and, as the last OBU, without obu_size
 		const withExtension = new Uint8Array([0x0e, 0x00, ...sequenceHeader.subarray(1)]);
-		expect(extractAv1CodecInfoFromPacket(withExtension)).toEqual(AV1_FIXTURES[1]!.expected);
+		expect(extractAv1CodecInfoFromPacket(withExtension)).toMatchObject(AV1_FIXTURES[1]!.expected);
 		const withoutSize = new Uint8Array([0x08, ...sequenceHeader.subarray(2)]);
-		expect(extractAv1CodecInfoFromPacket(withoutSize)).toEqual(AV1_FIXTURES[1]!.expected);
+		expect(extractAv1CodecInfoFromPacket(withoutSize)).toMatchObject(AV1_FIXTURES[1]!.expected);
 
 		// A reduced still picture header makes every frame a key frame
 		const still = hexToBytes('0a07181debe3da0080');
