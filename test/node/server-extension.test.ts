@@ -2194,6 +2194,90 @@ describe('Video', async () => {
 		});
 	});
 
+	test.each([
+		// ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10 -t 0.3 -pix_fmt gray -c:v libaom-av1 -cpu-used 8 -b:v 100k
+		//   av1-gray-64x48.mp4
+		['av1-gray-64x48.mp4', 'I420'],
+		// ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10 -t 0.3 -c:v libx264rgb -pix_fmt bgr24 h264-rgb-64x48.mp4
+		['h264-rgb-64x48.mp4', 'I444'],
+	] as const)('Decoding %s gives %s samples', async (file, format) => {
+		// Monochrome AV1 decodes to gray and RGB H.264 to planar GBR, which are handed out like Chromium does: as 4:2:0
+		// with neutral chroma, and as 4:4:4 holding the G, B and R planes
+		using input = new Input({ source: new FilePathSource(`./test/public/${file}`), formats: ALL_FORMATS });
+		using sample = (await new VideoSampleSink((await input.getPrimaryVideoTrack())!).getSample(0))!;
+		expect(sample.format).toBe(format);
+
+		const data = new Uint8Array(sample.allocationSize());
+		await sample.copyTo(data);
+		const rgba = new Uint8Array(64 * 48 * 4);
+		await sample.copyTo(rgba, { format: 'RGBA' });
+
+		const planeSize = format === 'I420' ? 32 * 24 : 64 * 48;
+		const firstSamples = [0, 1, 2].map(plane => data[plane === 0 ? 0 : 64 * 48 + (plane - 1) * planeSize]);
+		if (format === 'I420') {
+			expect(firstSamples).toEqual([rgba[0], 128, 128]);
+		} else {
+			expect(sample.colorSpace.matrix).toBe('rgb');
+			expect(firstSamples).toEqual([rgba[1], rgba[2], rgba[0]]); // G, B, R
+		}
+	});
+
+	const makeAvFrame = (format: NodeAv.AVPixelFormat, width: number, height: number, bytes: number[]) => {
+		const frame = new NodeAv.Frame();
+		frame.alloc();
+		frame.format = format;
+		frame.width = width;
+		frame.height = height;
+		frame.sampleAspectRatio = new NodeAv.Rational(1, 1);
+		NodeAv.FFmpegError.throwIfError(frame.fromBuffer(Buffer.from(bytes)), 'fromBuffer');
+		return frame;
+	};
+
+	test('Monochrome AVFrames read as 4:2:0 with neutral chroma', async () => {
+		const luma = Array.from({ length: 24 }, (_, i) => 10 * i);
+		using sample = new VideoSample(
+			new AvFrameVideoSampleResource(makeAvFrame(NodeAv.AV_PIX_FMT_GRAY8, 6, 4, luma)),
+			{ timestamp: 0 },
+		);
+		expect(sample.format).toBe('I420');
+
+		const data = new Uint8Array(sample.allocationSize());
+		await sample.copyTo(data);
+		expect([...data.subarray(0, 24)]).toEqual(luma);
+		expect([...data.subarray(24)]).toEqual(Array(12).fill(128));
+
+		// 10 bits, at an odd size
+		const luma10 = Array.from({ length: 15 }, (_, i) => 40 * i);
+		const bytes10 = luma10.flatMap(value => [value & 0xff, value >> 8]);
+		using sample10 = new VideoSample(
+			new AvFrameVideoSampleResource(makeAvFrame(NodeAv.AV_PIX_FMT_GRAY10LE, 5, 3, bytes10)),
+			{ timestamp: 0 },
+		);
+		expect(sample10.format).toBe('I420P10');
+
+		const data10 = new Uint16Array(sample10.allocationSize() / 2);
+		await sample10.copyTo(data10);
+		expect([...data10.subarray(0, 15)]).toEqual(luma10);
+		expect(data10.length).toBeGreaterThan(15);
+		expect([...data10.subarray(15)]).toEqual(Array(data10.length - 15).fill(512));
+	});
+
+	test('Planar GBR AVFrames read as 4:4:4 in G, B, R plane order', async () => {
+		using sample = new VideoSample(
+			new AvFrameVideoSampleResource(
+				makeAvFrame(NodeAv.AV_PIX_FMT_GBRP, 2, 2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+			),
+			{ timestamp: 0 },
+		);
+		expect(sample.format).toBe('I444');
+		expect(sample.colorSpace.matrix).toBe('rgb');
+		expect(sample.colorSpace.fullRange).toBe(true);
+
+		const data = new Uint8Array(sample.allocationSize());
+		await sample.copyTo(data);
+		expect([...data]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+	});
+
 	describe('VideoSample transformation', () => {
 		// 400x400 image: red everywhere, with a 200x200 blue square filling the bottom-left quadrant.
 		const TEST_IMAGE = (() => {
