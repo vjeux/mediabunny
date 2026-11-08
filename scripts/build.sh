@@ -36,6 +36,9 @@ tsc -p src
 # it ships the individual files to npm (for tree shaking, because it's large)
 npm run fix-build-import-paths
 
+# Classes that only Mediabunny constructs (their constructors are @internal) get private constructors in the declarations
+tsx scripts/declare-private-constructors.ts
+
 # Creates bundles for all packages
 tsx scripts/bundle.ts
 
