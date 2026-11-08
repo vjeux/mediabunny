@@ -2,9 +2,10 @@ import { expect, test } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFile } from 'node:fs/promises';
 import { Input, UnsupportedInputFormatError } from '../../src/input.js';
 import { ALL_FORMATS, MP3, MPEG_TS, ADTS, FLAC, OGG, WAVE } from '../../src/input-format.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, AudioSampleSink } from '../../src/media-sink.js';
 import { BufferSource, CustomPathedSource } from '../../src/source.js';
 import { assert } from '../../src/misc.js';
 
@@ -312,4 +313,57 @@ test('Reads MP3 streams wrapped in RIFF', async () => {
 		packetCount++;
 	}
 	expect(packetCount).toBe(frameCount);
+});
+
+/** Calls next() once per microtask until the first call resolves, like several consumers pulling at once. */
+const pullConcurrently = async <T extends { timestamp: number }>(iterator: AsyncGenerator<T, void, unknown>) => {
+	const calls = [iterator.next()];
+	let firstCallResolved = false;
+	void calls[0]!.then(() => {
+		firstCallResolved = true;
+	});
+
+	while (!firstCallResolved && calls.length < 40) {
+		await Promise.resolve();
+		calls.push(iterator.next());
+	}
+
+	const results = await Promise.all(calls);
+	await iterator.return();
+	return results.map(result => result.done ? null : result.value.timestamp);
+};
+
+const pullSequentially = async <T extends { timestamp: number }>(
+	iterator: AsyncGenerator<T, void, unknown>,
+	count: number,
+) => {
+	const timestamps: (number | null)[] = [];
+	for (let i = 0; i < count; i++) {
+		const result = await iterator.next();
+		timestamps.push(result.done ? null : result.value.timestamp);
+	}
+	await iterator.return();
+	return timestamps;
+};
+
+test('Concurrent next() calls on a packets() iterator get the packets in order', async () => {
+	using input = new Input({
+		source: new BufferSource(await readFile(path.join(__dirname, '../public/video.mp4'))),
+		formats: ALL_FORMATS,
+	});
+	const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+
+	const timestamps = await pullConcurrently(sink.packets());
+	expect(timestamps).toEqual(await pullSequentially(sink.packets(), timestamps.length));
+});
+
+test('Concurrent next() calls on a samples() iterator get the samples in order', async () => {
+	using input = new Input({
+		source: new BufferSource(await readFile(path.join(__dirname, '../public/glitch-hop-is-dead.wav'))),
+		formats: ALL_FORMATS,
+	});
+	const sink = new AudioSampleSink((await input.getPrimaryAudioTrack())!);
+
+	const timestamps = await pullConcurrently(sink.samples());
+	expect(timestamps).toEqual(await pullSequentially(sink.samples(), timestamps.length));
 });
