@@ -2128,13 +2128,15 @@ test('Damaged or hostile sizes don\'t make reads buffer whole streams or allocat
 	await expect(packets.next()).rejects.toThrow(message);
 	expect(moofStream.stats.pulled).toBeLessThan(4 * 2 ** 20);
 
-	// A server stating a huge file size, for an MP4 whose moov claims 4 GiB and a WAVE whose LIST chunk claims about as
-	// much. On main, both allocated a 4 GiB buffer and streamed into it until the server gave up, then failed with
-	// unrelated errors
+	// A server stating a huge file size, for an MP4 whose moov claims 4 GiB and a WAVE with a LIST chunk after its
+	// audio that claims about as much (read with the metadata tags). On main, both allocated a 4 GiB buffer and
+	// streamed into it until the server gave up, then failed with unrelated errors
 	const fmt = [...ascii('fmt '), ...le32(16), 1, 0, 2, 0, ...le32(44100), ...le32(176400), 4, 0, 16, 0];
+	const audio = [...ascii('data'), ...le32(4), 0, 0, 0, 0];
+	const hugeList = [...ascii('LIST'), ...le32(0xfffffff0)];
 	for (const head of [
 		[...ftyp, ...bigBoxHeader('moov', 1)],
-		[...ascii('RIFF'), ...le32(0xffffffff), ...ascii('WAVE'), ...fmt, ...ascii('LIST'), ...le32(0xfffffff0)],
+		[...ascii('RIFF'), ...le32(0xffffffff), ...ascii('WAVE'), ...fmt, ...audio, ...hugeList],
 	]) {
 		const server = await startHostileServer(head);
 		try {
@@ -2143,7 +2145,7 @@ test('Damaged or hostile sizes don\'t make reads buffer whole streams or allocat
 				source: new UrlSource(`http://127.0.0.1:${address.port}/file`, { getRetryDelay: () => null }),
 				formats: ALL_FORMATS,
 			});
-			await expect(input.getTracks()).rejects.toThrow(message);
+			await expect(input.getMetadataTags()).rejects.toThrow(message);
 		} finally {
 			server.closeAllConnections();
 			server.close();

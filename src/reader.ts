@@ -91,9 +91,6 @@ export class Reader {
 			return null;
 		}
 
-		// The limit applies to the length required; the optional rest is capped to it
-		maxLength = Math.min(maxLength, Math.max(minLength, MAX_SLICE_LENGTH));
-
 		if (this.fileSizeNonStrict !== null) {
 			return this.requestSlice(
 				start,
