@@ -715,6 +715,26 @@ export class Id3V2Reader {
 	}
 }
 
+/** Whether the body of a COMM or USLT frame (encoding, language, content descriptor, text) has a content descriptor. */
+const hasId3V2ContentDescriptor = (body: Uint8Array) => {
+	const encoding = body[0];
+	let pos = 4; // Behind the encoding and language
+
+	if (
+		encoding === Id3V2TextEncoding.UTF_16_WITH_BOM
+		|| encoding === Id3V2TextEncoding.UTF_16_BE_NO_BOM
+	) {
+		const hasBom = (body[pos] === 0xff && body[pos + 1] === 0xfe) || (body[pos] === 0xfe && body[pos + 1] === 0xff);
+		if (encoding === Id3V2TextEncoding.UTF_16_WITH_BOM && hasBom) {
+			pos += 2;
+		}
+
+		return pos + 1 < body.length && (body[pos] !== 0 || body[pos + 1] !== 0);
+	}
+
+	return pos < body.length && body[pos] !== 0;
+};
+
 export class Id3V2Writer {
 	writer: Writer;
 	helper = new Uint8Array(8);
@@ -850,7 +870,11 @@ export class Id3V2Writer {
 		if (metadata.raw) {
 			for (const key in metadata.raw) {
 				const value = metadata.raw[key];
-				if (value == null || key.length !== 4 || writtenTags.has(key)) {
+
+				// The comment or lyrics written above only replace the frames without a content descriptor. Those with
+				// one (like iTunes' iTunNORM and iTunSMPB comments) are separate frames, so they're kept.
+				const keepDescribedFramesOnly = (key === 'COMM' || key === 'USLT') && writtenTags.has(key);
+				if (value == null || key.length !== 4 || (writtenTags.has(key) && !keepDescribedFramesOnly)) {
 					continue;
 				}
 
@@ -909,6 +933,10 @@ export class Id3V2Writer {
 					continue;
 				} else {
 					continue;
+				}
+
+				if (keepDescribedFramesOnly) {
+					frames = frames.filter(hasId3V2ContentDescriptor);
 				}
 
 				for (const bytes of frames) {
