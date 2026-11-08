@@ -245,18 +245,6 @@ export const readSignedExpGolomb = (bitstream: Bitstream) => {
 		: (codeNum + 1) / 2;
 };
 
-export const writeBits = (bytes: Uint8Array, start: number, end: number, value: number) => {
-	for (let i = start; i < end; i++) {
-		const byteIndex = Math.floor(i / 8);
-		let byte = bytes[byteIndex]!;
-		const bitIndex = 0b111 - (i & 0b111);
-
-		byte &= ~(1 << bitIndex);
-		byte |= ((value & (1 << (end - i - 1))) >> (end - i - 1)) << bitIndex;
-		bytes[byteIndex] = byte;
-	}
-};
-
 export const toUint8Array = (source: AllowSharedBufferSource): Uint8Array => {
 	if (source.constructor === Uint8Array) { // We want a true Uint8Array, not something that extends it like Buffer
 		return source;
