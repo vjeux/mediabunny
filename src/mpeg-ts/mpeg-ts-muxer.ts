@@ -54,6 +54,10 @@ const AVC_AUD_NAL = new Uint8Array([0x09, 0xF0]);
 
 // More than the deepest reordering AVC and HEVC allow (16 frames), for streams reordering further than they say
 const MAX_REORDER_DEPTH = 64;
+
+// The reorder frame count of each decoder config's stream. An HLS output gives the muxer of every segment the same
+// decoder config, so its SPS is parsed (and an SPS that doesn't parse reported) once per track, not once per segment.
+const reorderFrameCounts = new WeakMap<VideoDecoderConfig, number | null>();
 const HEVC_AUD_NAL = new Uint8Array([0x46, 0x01]);
 
 type MpegTsTrackData = {
@@ -345,7 +349,15 @@ export class MpegTsMuxer extends Muxer {
 				}
 			}
 
-			trackData.reorderFrameCount = this.getReorderFrameCount(trackData, packet.data, codec as 'avc' | 'hevc');
+			const decoderConfig = meta?.decoderConfig;
+			let reorderFrameCount = decoderConfig && reorderFrameCounts.get(decoderConfig);
+			if (reorderFrameCount === undefined) {
+				reorderFrameCount = this.getReorderFrameCount(trackData, packet.data, codec as 'avc' | 'hevc');
+				if (decoderConfig) {
+					reorderFrameCounts.set(decoderConfig, reorderFrameCount);
+				}
+			}
+			trackData.reorderFrameCount = reorderFrameCount;
 		}
 
 		if (trackData.inputIsAnnexB) {
