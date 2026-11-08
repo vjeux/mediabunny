@@ -65,14 +65,14 @@ output.addAudioTrack(audioSourceEng, {
 	disposition: { commentary: true }, // Sets additional flags in the file
 });
 output.addAudioTrack(audioSourceGer, {
-	languageCode: 'ger',
+	languageCode: 'deu',
 });
 
 // This adds multiple subtitle tracks, all for different languages.
 output.addSubtitleTrack(subtitleSourceEng, { languageCode: 'eng' });
-output.addSubtitleTrack(subtitleSourceGer, { languageCode: 'ger' });
+output.addSubtitleTrack(subtitleSourceGer, { languageCode: 'deu' });
 output.addSubtitleTrack(subtitleSourceSpa, { languageCode: 'spa' });
-output.addSubtitleTrack(subtitleSourceFre, { languageCode: 'fre' });
+output.addSubtitleTrack(subtitleSourceFre, { languageCode: 'fra' });
 output.addSubtitleTrack(subtitleSourceIta, { languageCode: 'ita' });
 ```
 
@@ -83,6 +83,10 @@ To precisely achieve common fractional frame rates, make sure to use their exact
 $23.976 \rightarrow 24000/1001$\
 $29.97 \rightarrow 30000/1001$\
 $59.94 \rightarrow 60000/1001$
+:::
+
+::: info
+Which `disposition` flags end up in the file depends on the output format. Matroska and WebM store all of them except `primary`. MP4 stores `default` (as the track's enabled flag, keeping at least one track of each type enabled) and `commentary`, `hearingImpaired`, `visuallyImpaired` and `forced` (as `kind` boxes); MOV only stores `default`. HLS uses `default`, `primary` and `forced`. The other formats store none.
 :::
 
 As an example, let's add two tracks to our output:
@@ -217,7 +221,7 @@ audioStreamTrack.stop(); // Stops capturing the user's microphone
 
 await output.finalize();
 
-const file = output.target.buffer; // => Uint8Array
+const file = output.target.buffer; // => ArrayBuffer
 ```
 
 ---
