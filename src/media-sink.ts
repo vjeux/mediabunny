@@ -1259,6 +1259,12 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	decodeAlphaData(packet: EncodedPacket) {
+		if (this.decoderError) {
+			// The color decoder can report its error right inside decode() (Chromium's sometimes does), and reporting
+			// it flushes the alpha decoder, which would then want a key frame
+			return;
+		}
+
 		if (!packet.sideData.alpha) {
 			// No alpha side data in the packet, most common case
 			this.pushNullAlphaFrame();

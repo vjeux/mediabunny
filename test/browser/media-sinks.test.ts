@@ -406,3 +406,55 @@ test('Video yields the frames waiting in the queue before a decode error', async
 	const decoded = await decodeAllSamples(buffer, 50);
 	expect(decoded.timestamps.slice(0, nativeFrameCount)).toEqual(timestamps.slice(0, nativeFrameCount));
 });
+
+test('Transparent video yields the frames before an error its color decoder reports inside decode()', async () => {
+	// Chromium's decoder sometimes calls its error callback right inside decode(). Reporting the color decoder's error
+	// flushed the alpha decoder, which was then given the same packet's alpha and threw "A key frame is required after
+	// configure() or flush()" before any frame came out. A stand-in color decoder reports the error that way for the
+	// last packet. Like a decoder that fails, it loses the frames it hadn't output yet, so the frames to expect are the
+	// ones it output before.
+	const { buffer, timestamps } = await remuxVp9WithCutLastPacket('/transparency.webm', 30, 'color');
+	const lastTimestamp = timestamps.at(-1)!;
+	const globals = globalThis as { VideoDecoder: typeof VideoDecoder };
+	const OriginalVideoDecoder = globals.VideoDecoder;
+	let decoderCount = 0;
+	const colorOutputTimestamps: number[] = [];
+	globals.VideoDecoder = class extends OriginalVideoDecoder {
+		reportError: ((error: DOMException) => void) | null = null;
+
+		constructor(init: VideoDecoderInit) {
+			const isColorDecoder = decoderCount++ === 0; // The color decoder is created first
+			const colorDecoderInit: VideoDecoderInit = {
+				...init,
+				output: (frame) => {
+					colorOutputTimestamps.push(Math.round(frame.timestamp / 1000) / 1000);
+					init.output(frame);
+				},
+			};
+			super(isColorDecoder ? colorDecoderInit : init);
+			if (isColorDecoder) {
+				this.reportError = init.error;
+			}
+		}
+
+		override decode(chunk: EncodedVideoChunk) {
+			if (this.reportError && Math.abs(chunk.timestamp / 1e6 - lastTimestamp) < 1e-3) {
+				this.close();
+				this.reportError(new DOMException('Decoding error.', 'EncodingError'));
+				return;
+			}
+
+			super.decode(chunk);
+		}
+	};
+
+	try {
+		const decoded = await decodeAllSamples(buffer);
+		expect(decoded.error).toBeInstanceOf(DOMException);
+		expect((decoded.error as DOMException).name).toBe('EncodingError');
+		expect(colorOutputTimestamps.length).toBeGreaterThan(0);
+		expect(decoded.timestamps).toEqual(colorOutputTimestamps);
+	} finally {
+		globals.VideoDecoder = OriginalVideoDecoder;
+	}
+});
