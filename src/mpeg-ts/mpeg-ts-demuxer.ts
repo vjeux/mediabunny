@@ -1971,13 +1971,13 @@ type SuppliedPacket = {
 /** Parameter set NAL units by NAL unit type */
 type ParameterSets = Map<number, Uint8Array[]>;
 
-const AVC_PARAMETER_SET_TYPES = [AvcNalUnitType.SPS, AvcNalUnitType.PPS];
-const HEVC_PARAMETER_SET_TYPES = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
-
-/** The NAL unit types of the parameter sets that a decoder needs, in the order they go in. */
-const getParameterSetTypes = (codec: 'avc' | 'hevc'): readonly number[] => codec === 'avc'
-	? AVC_PARAMETER_SET_TYPES
-	: HEVC_PARAMETER_SET_TYPES;
+/**
+ * The NAL unit types of the parameter sets that a decoder needs, in the order they go in. (The enums are read when
+ * called: codec-data.ts can import this module, through the input formats, before it's done initializing.)
+ */
+const getParameterSetTypes = (codec: 'avc' | 'hevc'): number[] => codec === 'avc'
+	? [AvcNalUnitType.SPS, AvcNalUnitType.PPS]
+	: [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
 
 const getNalUnitType = (codec: 'avc' | 'hevc', byte: number) => codec === 'avc'
 	? extractNalUnitTypeForAvc(byte)
