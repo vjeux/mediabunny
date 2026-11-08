@@ -586,6 +586,8 @@ new HlsOutputFormat({
 
 Mediabunny will then use the first format that can contain all tracks of the segment.
 
+Which tracks share a segment depends on how they're split into playlists. With the default grouping, a single video track and a single audio track end up in the same playlist, so every segment holds both and is written as .ts. Audio only gets its own .aac segments when it has a separate rendition, for example when there are two or more audio tracks.
+
 ### File names
 
 By default, Mediabunny will create the following file names:
