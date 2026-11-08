@@ -39,6 +39,7 @@ import {
 	AC3_FRAME_SIZES,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
+	iterateNalUnitsInAnnexB,
 	parseDtsFrame,
 	parseDtsCoreFrameHeader,
 	parseDtsExssHeader,
@@ -1967,6 +1968,146 @@ type SuppliedPacket = {
 	randomAccessIndicator: number;
 };
 
+/** Parameter set NAL units by NAL unit type */
+type ParameterSets = Map<number, Uint8Array[]>;
+
+/** The NAL unit types of the parameter sets that a decoder needs, in the order they go in. */
+const getParameterSetTypes = (codec: 'avc' | 'hevc'): number[] => codec === 'avc'
+	? [AvcNalUnitType.SPS, AvcNalUnitType.PPS]
+	: [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+
+const getNalUnitType = (codec: 'avc' | 'hevc', byte: number) => codec === 'avc'
+	? extractNalUnitTypeForAvc(byte)
+	: extractNalUnitTypeForHevc(byte);
+
+const isVclNalUnitType = (codec: 'avc' | 'hevc', type: number) => codec === 'avc'
+	? type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR
+	: type <= 31;
+
+/**
+ * Collects the parameter sets in Annex B data, by type. For each type, it keeps those of the last access unit with any
+ * (access units are told apart by their VCL NAL units). When stopping at the first VCL NAL unit, which is enough for
+ * an access unit, only those before it count.
+ */
+const collectParameterSets = (data: Uint8Array, codec: 'avc' | 'hevc', stopAtVclNalUnit: boolean) => {
+	const types = getParameterSetTypes(codec);
+	const parameterSets: ParameterSets = new Map();
+	const typesOfCurrentAccessUnit = new Set<number>();
+
+	for (const location of iterateNalUnitsInAnnexB(data)) {
+		const type = getNalUnitType(codec, data[location.offset]!);
+		if (isVclNalUnitType(codec, type)) {
+			if (stopAtVclNalUnit) {
+				break;
+			}
+
+			typesOfCurrentAccessUnit.clear();
+		} else if (types.includes(type)) {
+			if (!typesOfCurrentAccessUnit.has(type)) {
+				parameterSets.set(type, []);
+				typesOfCurrentAccessUnit.add(type);
+			}
+
+			parameterSets.get(type)!.push(data.slice(location.offset, location.offset + location.length));
+		}
+	}
+
+	return parameterSets;
+};
+
+/** The parameter sets of a video stream's decoder config, which are its first ones. */
+const getDecoderConfigParameterSets = (elementaryStream: ElementaryVideoStream): ParameterSets => {
+	const info = elementaryStream.info;
+	const parameterSets: ParameterSets = new Map();
+
+	if (info.codec === 'avc' && info.avcCodecInfo) {
+		parameterSets.set(AvcNalUnitType.SPS, info.avcCodecInfo.sequenceParameterSets);
+		parameterSets.set(AvcNalUnitType.PPS, info.avcCodecInfo.pictureParameterSets);
+	} else if (info.codec === 'hevc' && info.hevcCodecInfo) {
+		for (const array of info.hevcCodecInfo.arrays) {
+			if (getParameterSetTypes('hevc').includes(array.nalUnitType)) {
+				parameterSets.set(array.nalUnitType, array.nalUnits);
+			}
+		}
+	}
+
+	return parameterSets;
+};
+
+/**
+ * How far back, in bytes, the search for the parameter sets in force at some position goes, before it settles for
+ * those of the decoder config
+ */
+const MAX_PARAMETER_SET_SEARCH_DISTANCE = 2 ** 23;
+
+const parameterSetSearches = new WeakMap<ElementaryStream, Map<number, Promise<ParameterSets>>>();
+
+/**
+ * Finds the parameter sets in force right before the given position in a video stream: for each type, those of the
+ * last PES packet with any. If there are none within MAX_PARAMETER_SET_SEARCH_DISTANCE, or before the track's first
+ * PES packet, the decoder config's, which are the stream's first ones, are taken.
+ */
+const findParameterSetsBefore = (elementaryStream: ElementaryVideoStream, endPos: number) => {
+	let searches = parameterSetSearches.get(elementaryStream);
+	if (!searches) {
+		searches = new Map();
+		parameterSetSearches.set(elementaryStream, searches);
+	}
+
+	let search = searches.get(endPos);
+	if (!search) {
+		search = (async () => {
+			const codec = elementaryStream.info.codec;
+			assert(codec === 'avc' || codec === 'hevc');
+
+			const types = getParameterSetTypes(codec);
+			const demuxer = elementaryStream.demuxer;
+			const parameterSets: ParameterSets = new Map();
+			const minPos = Math.max(
+				elementaryStream.firstSection?.startPos ?? demuxer.packetOffset,
+				endPos - MAX_PARAMETER_SET_SEARCH_DISTANCE,
+			);
+
+			for (let pos = endPos - demuxer.packetStride; pos >= minPos; pos -= demuxer.packetStride) {
+				if (types.every(type => parameterSets.has(type))) {
+					break;
+				}
+
+				const packetHeader = await demuxer.readPacketHeader(pos);
+				if (!packetHeader) {
+					break;
+				}
+				if (packetHeader.pid !== elementaryStream.pid || packetHeader.payloadUnitStartIndicator !== 1) {
+					continue;
+				}
+
+				const section = await demuxer.readSection(pos, true);
+				const pesPacket = section && readPesPacket(demuxer, section, false);
+				if (!pesPacket) {
+					continue;
+				}
+
+				for (const [type, nalUnits] of collectParameterSets(pesPacket.data, codec, false)) {
+					if (!parameterSets.has(type)) {
+						parameterSets.set(type, nalUnits);
+					}
+				}
+			}
+
+			for (const [type, nalUnits] of getDecoderConfigParameterSets(elementaryStream)) {
+				if (!parameterSets.has(type)) {
+					parameterSets.set(type, nalUnits);
+				}
+			}
+
+			return parameterSets;
+		})();
+		searches.set(endPos, search);
+	}
+
+	return search;
+};
+
 /** Stateful context used to extract exact encoded packets from the underlying data stream. */
 class PacketReadingContext {
 	elementaryStream: ElementaryStream;
@@ -1983,6 +2124,8 @@ class PacketReadingContext {
 	nextPts: number | null = null;
 
 	suppliedPacket: SuppliedPacket | null = null;
+	/** The parameter sets in force, as far as this context knows them (see addMissingParameterSets) */
+	parameterSets: ParameterSets | null = null;
 
 	constructor(elementaryStream: ElementaryStream, startingPesPacket: TimestampedPesPacket) {
 		this.elementaryStream = elementaryStream;
@@ -2141,7 +2284,83 @@ class PacketReadingContext {
 		this.currentPesPacketIndex++;
 	}
 
+	/** Marks the next packet as the supplied packet, if there is one. */
 	async markNextPacket() {
+		await this.findNextPacket();
+
+		const packet = this.suppliedPacket;
+		const info = this.elementaryStream.info;
+		if (packet && info.type === 'video' && info.decoderConfig && (info.codec === 'avc' || info.codec === 'hevc')) {
+			await this.addMissingParameterSets(packet, info.codec);
+		}
+	}
+
+	/**
+	 * A decoder that starts at a key packet needs the parameter sets, which in Annex B come in-band, along with the
+	 * frames. Some streams only send them with some of their key frames, and the other key frames rely on those sent
+	 * before. A key packet without any parameter sets gets those in force before it inserted, the last of each type in
+	 * the stream, as FFmpeg's h264_mp4toannexb does. Reading along, a context keeps track of them; one that starts
+	 * further into the track looks back for them (see findParameterSetsBefore).
+	 */
+	async addMissingParameterSets(packet: SuppliedPacket, codec: 'avc' | 'hevc') {
+		const elementaryStream = this.elementaryStream as ElementaryVideoStream;
+		this.parameterSets ??= this.startingPesPacket.sectionStartPos === elementaryStream.firstSection?.startPos
+			? getDecoderConfigParameterSets(elementaryStream)
+			: new Map();
+
+		const parameterSetsOfPacket = collectParameterSets(packet.data, codec, true);
+		for (const [type, nalUnits] of parameterSetsOfPacket) {
+			this.parameterSets.set(type, nalUnits);
+		}
+
+		if (packet.randomAccessIndicator !== 1 || parameterSetsOfPacket.size > 0) {
+			return;
+		}
+
+		const types = getParameterSetTypes(codec);
+		if (types.some(type => !this.parameterSets!.has(type))) {
+			const earlierParameterSets = await findParameterSetsBefore(
+				elementaryStream,
+				this.startingPesPacket.sectionStartPos,
+			);
+			for (const [type, nalUnits] of earlierParameterSets) {
+				if (!this.parameterSets.has(type)) {
+					this.parameterSets.set(type, nalUnits);
+				}
+			}
+		}
+
+		const nalUnits = types.flatMap(type => this.parameterSets!.get(type) ?? []);
+		if (nalUnits.length === 0) {
+			return;
+		}
+
+		// They go right after the access unit delimiter, if there's one
+		let insertPos = 0;
+		const firstNalUnit = iterateNalUnitsInAnnexB(packet.data).next();
+		if (!firstNalUnit.done) {
+			const type = getNalUnitType(codec, packet.data[firstNalUnit.value.offset]!);
+			if (type === (codec === 'avc' ? AvcNalUnitType.AUD : HevcNalUnitType.AUD_NUT)) {
+				insertPos = firstNalUnit.value.offset + firstNalUnit.value.length;
+			}
+		}
+
+		const START_CODE = [0, 0, 0, 1];
+		const insertedLength = nalUnits.reduce((sum, nalUnit) => sum + START_CODE.length + nalUnit.length, 0);
+		const data = new Uint8Array(packet.data.length + insertedLength);
+		data.set(packet.data.subarray(0, insertPos), 0);
+		let pos = insertPos;
+		for (const nalUnit of nalUnits) {
+			data.set(START_CODE, pos);
+			data.set(nalUnit, pos + START_CODE.length);
+			pos += START_CODE.length + nalUnit.length;
+		}
+		data.set(packet.data.subarray(insertPos), pos);
+
+		packet.data = data;
+	}
+
+	async findNextPacket() {
 		assert(!this.suppliedPacket);
 
 		const elementaryStream = this.elementaryStream;
