@@ -349,6 +349,8 @@ type Section = {
 	holes: readonly number[];
 	/** Whether the first TS packet arrived with errors, which makes the payload garbage from the start. */
 	firstPacketHasErrors: boolean;
+	/** Whether the end of the file cut the section off */
+	cutAtEnd: boolean;
 };
 
 // Stream types for metadata rather than media (H.222.0 Table 2-34), like the ID3 timed metadata (0x15) that many HLS
@@ -867,6 +869,8 @@ export class MpegTsDemuxer extends Demuxer {
 	 * known end without reaching the next packet that tells.
 	 */
 	sectionEndsBeforeMissingPackets = new Set<number>();
+	/** Start positions of the sections that the end of the file cut off */
+	cutSectionStarts = new Set<number>();
 	/**
 	 * Per PID, the stretches of the file known to have no TS packets of it (only long ones, or ones running to the end
 	 * of the file), sorted and disjoint, so that searches skip them instead of walking them again
@@ -1865,6 +1869,12 @@ export class MpegTsDemuxer extends Demuxer {
 					this.addGap(firstPacket.pid, endPos, Infinity);
 				}
 
+				if (full && firstPacket && !sectionLooksComplete(chunks, chunksByteLength, lastPacketWithPayload)) {
+					// The file ends before the section does. Since reading the section again stops at its known end,
+					// remember that.
+					this.cutSectionStarts.add(startPos);
+				}
+
 				break;
 			}
 
@@ -2018,6 +2028,7 @@ export class MpegTsDemuxer extends Demuxer {
 			randomAccessIndicator,
 			holes: holes ?? NO_HOLES,
 			firstPacketHasErrors: firstPacket.transportErrorIndicator === 1,
+			cutAtEnd: this.cutSectionStarts.has(startPos),
 		};
 	}
 
@@ -2493,6 +2504,8 @@ type PesPacket = PesPacketHeader & {
 	data: Uint8Array<ArrayBufferLike>;
 	/** Where in the data some is missing, ascending */
 	holes: readonly number[];
+	/** Whether the end of the file cut the PES packet off */
+	cutAtEnd: boolean;
 };
 
 const readPesPacketHeader = (demuxer: MpegTsDemuxer, section: Section): PesPacketHeader | null => {
@@ -2609,6 +2622,7 @@ const readPesPacket = (demuxer: MpegTsDemuxer, section: Section): PesPacket | nu
 		...header,
 		data,
 		holes,
+		cutAtEnd: section.cutAtEnd,
 	};
 };
 
@@ -4227,8 +4241,18 @@ class PacketReadingContext {
 				}
 			}
 
-			// End of stream - emit whatever's left as the final packet, unless it holds no picture
-			if (frameStartFound) {
+			// End of stream - emit whatever's left as the final packet, unless it holds no picture or the file ends
+			// inside it (a cut frame fails decoding, with WebCodecs at the final flush, which ends the whole run). A
+			// first field whose second one didn't follow ends before the cut. While the stream is being set up, its
+			// parameter sets are what counts, which a cut frame still has.
+			if (
+				frameStartFound
+				&& (
+					pendingBoundaryPos !== null
+					|| !last(this.pesPackets)?.cutAtEnd
+					|| !elementaryStream.info.decoderConfig
+				)
+			) {
 				assert(packetStartPos !== null);
 
 				const packetLength = (pendingBoundaryPos ?? this.endPos) - packetStartPos;
