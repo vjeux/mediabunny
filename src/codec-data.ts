@@ -3500,6 +3500,96 @@ export interface Eac3FrameInfo {
 }
 
 /**
+ * Reads the bit stream mode from the informational metadata of an independent substream's BSI, continuing right after
+ * bsid. It's 0 when the BSI has no informational metadata. Section E.1.2.2
+ */
+const readEac3Bsmod = (bitstream: Bitstream, strmtyp: number, numblkscod: number, acmod: number, lfeon: number) => {
+	bitstream.skipBits(5); // dialnorm
+	if (bitstream.readBits(1)) { // compre
+		bitstream.skipBits(8); // compr
+	}
+
+	if (acmod === 0) {
+		bitstream.skipBits(5); // dialnorm2
+		if (bitstream.readBits(1)) { // compr2e
+			bitstream.skipBits(8); // compr2
+		}
+	}
+
+	// (chanmape only exists in dependent substreams)
+
+	if (bitstream.readBits(1)) { // mixmdate
+		if (acmod > 2) {
+			bitstream.skipBits(2); // dmixmod
+		}
+
+		if ((acmod & 1) && acmod > 2) {
+			bitstream.skipBits(6); // ltrtcmixlev, lorocmixlev
+		}
+
+		if (acmod & 4) {
+			bitstream.skipBits(6); // ltrtsurmixlev, lorosurmixlev
+		}
+
+		if (lfeon && bitstream.readBits(1)) { // lfemixlevcode
+			bitstream.skipBits(5); // lfemixlevcod
+		}
+
+		if (strmtyp === 0) {
+			if (bitstream.readBits(1)) { // pgmscle
+				bitstream.skipBits(6); // pgmscl
+			}
+
+			if (acmod === 0 && bitstream.readBits(1)) { // pgmscl2e
+				bitstream.skipBits(6); // pgmscl2
+			}
+
+			if (bitstream.readBits(1)) { // extpgmscle
+				bitstream.skipBits(6); // extpgmscl
+			}
+
+			const mixdef = bitstream.readBits(2);
+			if (mixdef === 1) {
+				bitstream.skipBits(5); // premixcmpsel, drcsrc, premixcmpscl
+			} else if (mixdef === 2) {
+				bitstream.skipBits(12); // mixdata
+			} else if (mixdef === 3) {
+				const mixdeflen = bitstream.readBits(5);
+				bitstream.skipBits(8 * (mixdeflen + 2)); // The mixing data and its fill bits
+			}
+
+			if (acmod < 2) {
+				if (bitstream.readBits(1)) { // paninfoe
+					bitstream.skipBits(14); // panmean, paninfo
+				}
+
+				if (acmod === 0 && bitstream.readBits(1)) { // paninfo2e
+					bitstream.skipBits(14); // panmean2, paninfo2
+				}
+			}
+
+			if (bitstream.readBits(1)) { // frmmixcfginfoe
+				if (numblkscod === 0) {
+					bitstream.skipBits(5); // blkmixcfginfo[0]
+				} else {
+					for (let i = 0; i < EAC3_NUMBLKS_TABLE[numblkscod]!; i++) {
+						if (bitstream.readBits(1)) { // blkmixcfginfoe
+							bitstream.skipBits(5); // blkmixcfginfo[i]
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (bitstream.readBits(1)) { // infomdate
+		return bitstream.readBits(3); // bsmod
+	}
+
+	return 0;
+};
+
+/**
  * Parse an E-AC-3 syncframe to extract BSI fields.
  * Section E.1.2
  */
@@ -3557,9 +3647,10 @@ export const parseEac3SyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
 	}
 	const dataRate = Math.round(((frmsiz + 1) * fs) / (numblks * 16));
 
+	const bsmod = readEac3Bsmod(bitstream, strmtyp, numblkscod, acmod, lfeon);
+
 	// These fields require parsing beyond the first frame.
 	// Defaults are correct for almost all content.
-	const bsmod = 0;
 	const numDepSub = 0;
 	const chanLoc = 0;
 
