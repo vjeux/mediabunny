@@ -42,6 +42,7 @@ import {
 import {
 	assert,
 	assertNever,
+	AsyncMutex,
 	ceilToMultipleOfTwo,
 	clamp,
 	isIso639Dash2LanguageCode,
@@ -638,6 +639,19 @@ const FALLBACK_SAMPLE_RATE = 48000;
 const PACKET_STATS_PACKET_COUNT = 256;
 
 /**
+ * Serializes adding tracks to an output across conversions initialized concurrently on it (composable conversions),
+ * so that each sees the tracks added by the others when checking the output's track capacity.
+ */
+const outputTrackAdditionMutexes = new WeakMap<Output, AsyncMutex>();
+
+/**
+ * How many conversions were initialized on each output, not counting those that ended up adding nothing to it. An
+ * output that a conversion is being initialized on isn't fresh anymore, even while that conversion hasn't added its
+ * tracks yet.
+ */
+const outputConversionCounts = new WeakMap<Output, number>();
+
+/**
  * An input track that was discarded (excluded) from a {@link Conversion} alongside the discard reason.
  * @group Conversion
  * @public
@@ -818,7 +832,17 @@ export class Conversion {
 	/** Initializes a new conversion process without starting the conversion. */
 	static async init(options: ConversionOptions) {
 		const conversion = new Conversion(options);
-		await conversion._init();
+
+		try {
+			await conversion._init();
+		} finally {
+			if (conversion._outputTrackIds.length === 0) {
+				// The conversion added nothing to the output, so it doesn't count as using it
+				const count = outputConversionCounts.get(conversion.output);
+				assert(count !== undefined);
+				outputConversionCounts.set(conversion.output, count - 1);
+			}
+		}
 
 		return conversion;
 	}
@@ -881,6 +905,8 @@ export class Conversion {
 				options.output.tracks.length > 0
 				|| Object.keys(options.output._metadataTags).length > 0
 				|| options.output.state !== 'pending'
+				// Another conversion that is still initializing has no tracks on it yet
+				|| (outputConversionCounts.get(options.output) ?? 0) > 0
 			) {
 				throw new TypeError('options.output must be fresh: no tracks or metadata tags added and not started.');
 			}
@@ -958,6 +984,8 @@ export class Conversion {
 		this._composable = composable;
 		this.input = options.input;
 		this.output = options.output;
+
+		outputConversionCounts.set(options.output, (outputConversionCounts.get(options.output) ?? 0) + 1);
 	}
 
 	/** @internal */
@@ -1100,45 +1128,56 @@ export class Conversion {
 		this._endTimestamp = Math.max(this._options.trim?.end ?? Infinity, this._startTimestamp);
 		this._timestampOffset = -this._startTimestamp; // Initial value, may get refined later by track processing
 
-		// Run these sequentially so that output tracks have a deterministic order
-		for (let i = 0; i < filteredTracks.length; i++) {
-			const track = filteredTracks[i]!;
-			const options = filteredTrackOptions[i]!;
+		let trackAdditionMutex = outputTrackAdditionMutexes.get(this.output);
+		if (!trackAdditionMutex) {
+			trackAdditionMutex = new AsyncMutex();
+			outputTrackAdditionMutexes.set(this.output, trackAdditionMutex);
+		}
+		const releaseTrackAddition = await trackAdditionMutex.acquire();
 
-			for (const option of options) {
-				if (this.output.tracks.length === outputTrackCounts.total.max) {
-					this.discardedTracks.push({
-						track,
-						reason: 'max_track_count_reached',
-						trackOptions: option,
-					});
-					continue;
-				}
+		try {
+			// Run these sequentially so that output tracks have a deterministic order
+			for (let i = 0; i < filteredTracks.length; i++) {
+				const track = filteredTracks[i]!;
+				const options = filteredTrackOptions[i]!;
 
-				const addedCountOfType = this.output.tracks.reduce(
-					(count, t) => count + (t.type === track.type ? 1 : 0),
-					0,
-				);
+				for (const option of options) {
+					if (this.output.tracks.length === outputTrackCounts.total.max) {
+						this.discardedTracks.push({
+							track,
+							reason: 'max_track_count_reached',
+							trackOptions: option,
+						});
+						continue;
+					}
 
-				if (addedCountOfType === outputTrackCounts[track.type].max) {
-					this.discardedTracks.push({
-						track,
-						reason: 'max_track_count_of_type_reached',
-						trackOptions: option,
-					});
-					continue;
-				}
+					const addedCountOfType = this.output.tracks.reduce(
+						(count, t) => count + (t.type === track.type ? 1 : 0),
+						0,
+					);
 
-				const outputTrackId = this._nextOutputTrackId++;
+					if (addedCountOfType === outputTrackCounts[track.type].max) {
+						this.discardedTracks.push({
+							track,
+							reason: 'max_track_count_of_type_reached',
+							trackOptions: option,
+						});
+						continue;
+					}
 
-				if (track.isVideoTrack()) {
-					await this._processVideoTrack(track, option as ConversionVideoOptions, outputTrackId);
-				} else if (track.isAudioTrack()) {
-					await this._processAudioTrack(track, option as ConversionAudioOptions, outputTrackId);
-				} else {
-					assert(false);
+					const outputTrackId = this._nextOutputTrackId++;
+
+					if (track.isVideoTrack()) {
+						await this._processVideoTrack(track, option as ConversionVideoOptions, outputTrackId);
+					} else if (track.isAudioTrack()) {
+						await this._processAudioTrack(track, option as ConversionAudioOptions, outputTrackId);
+					} else {
+						assert(false);
+					}
 				}
 			}
+		} finally {
+			releaseTrackAddition();
 		}
 
 		// When no track groups are set by the user, then the output track pairability should be *identical* to the
