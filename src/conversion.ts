@@ -2703,6 +2703,12 @@ export class Conversion {
 			}
 		}
 
+		// Formats without timestamped media data can't make up the file for a track that receives no packets (when the
+		// trim range misses its media), so tell them upfront what the copied packets look like
+		const declaredDecoderConfig = !needsTranscode && !this.output.format.supportsTimestampedMediaData
+			? await track.getDecoderConfig()
+			: null;
+
 		this.output.addAudioTrack(audioSource, {
 			// TODO: This condition can be removed when all demuxers properly homogenize to BCP47 in v2
 			languageCode: isIso639Dash2LanguageCode(audioTrackLanguageCode)
@@ -2714,6 +2720,7 @@ export class Conversion {
 			bitrate: bitrate ?? undefined,
 			averageBitrate: averageBitrate ?? undefined,
 			maximumPacketCount,
+			decoderConfig: declaredDecoderConfig ?? undefined,
 		});
 
 		this.utilizedTracks.push(track);
