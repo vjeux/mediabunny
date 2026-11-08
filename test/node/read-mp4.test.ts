@@ -3111,3 +3111,38 @@ test('Macintosh language codes in the mdhd box of QuickTime files', async () => 
 	expect(await readLanguage('qt  ', 0x7fff)).toBe('und'); // Unspecified
 	expect(await readLanguage('isom', 0)).toBe('und');
 });
+
+test('A pasp box wins over the SPS whether it comes before or after the codec configuration', async () => {
+	// The fixtures' SPS signals a pixel aspect ratio, which a 2:1 pasp box inserted into the sample entry overrides
+	const readSquarePixelSize = async (fileName: string, paspFirst: boolean) => {
+		const file = readFileSync(path.join(__dirname, '../public', fileName));
+		const moovStart = file.indexOf('moov') - 4;
+		assert(moovStart + file.readUInt32BE(moovStart) === file.length); // So no chunk offsets move
+
+		const configStart = Math.max(file.indexOf('avcC'), file.indexOf('hvcC')) - 4;
+		const insertionPos = paspFirst ? configStart : configStart + file.readUInt32BE(configStart);
+		const pasp = Buffer.from([0, 0, 0, 16, ...Buffer.from('pasp'), 0, 0, 0, 2, 0, 0, 0, 1]);
+		const bytes = Buffer.concat([file.subarray(0, insertionPos), pasp, file.subarray(insertionPos)]);
+
+		// The boxes enclosing the sample entry grow by the inserted box
+		let boxStart = moovStart;
+		for (const name of ['moov', 'trak', 'mdia', 'minf', 'stbl', 'stsd']) {
+			boxStart = bytes.indexOf(name, boxStart) - 4;
+			bytes.writeUInt32BE(bytes.readUInt32BE(boxStart) + 16, boxStart);
+		}
+		const sampleEntryStart = boxStart + 16;
+		bytes.writeUInt32BE(bytes.readUInt32BE(sampleEntryStart) + 16, sampleEntryStart);
+		const width = bytes.readUInt16BE(sampleEntryStart + 32);
+		const height = bytes.readUInt16BE(sampleEntryStart + 34);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return [await track.getSquarePixelWidth() / width, await track.getSquarePixelHeight() / height];
+	};
+
+	for (const fileName of ['sps-only-sar-h264.mp4', 'sps-only-sar-hevc.mp4']) {
+		expect(await readSquarePixelSize(fileName, false)).toEqual([2, 1]);
+		expect(await readSquarePixelSize(fileName, true)).toEqual([2, 1]);
+	}
+});
