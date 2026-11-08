@@ -412,6 +412,34 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	}
 }
 
+/**
+ * By sample rate, for 1–6 channels, the bitrates below which the AC-3 and E-AC-3 encoders, which open anyway, fail the
+ * bit allocation of frames that are hard to fit. Measured as what the hardest of nine full-scale test signals needs
+ * (white noise, square waves, a sawtooth, a sweep, many tones, noise bursts and a tone near Nyquist).
+ */
+const AC3_MIN_BITRATES: Record<number, number[]> = {
+	32000: [0, 0, 0, 40_000, 48_000, 56_000],
+	44100: [0, 0, 40_000, 56_000, 64_000, 80_000],
+	48000: [0, 40_000, 48_000, 56_000, 80_000, 80_000],
+};
+const EAC3_MIN_BITRATES: Record<number, number[]> = {
+	32000: [16_000, 24_000, 32_000, 48_000, 56_000, 56_000],
+	44100: [20_000, 32_000, 48_000, 56_000, 64_000, 64_000],
+	48000: [24_000, 40_000, 48_000, 56_000, 72_000, 72_000],
+};
+
 const resolveBitrate = (config: AudioEncoderConfig, codec: AudioCodec) => {
-	return config.bitrate ?? new Quality('medium')._toAudioBitrate(codec) ?? 0;
+	const bitrate = config.bitrate ?? new Quality('medium')._toAudioBitrate(codec) ?? 0;
+
+	// Bitrates outside the encoders' range are moved into it, as encoders may miss their target bitrate. libopus takes
+	// 500 bps to 256 kbps per channel.
+	if (codec === 'opus') {
+		return Math.min(Math.max(bitrate, 500), 256_000 * config.numberOfChannels);
+	} else if (codec === 'ac3') {
+		return Math.max(bitrate, AC3_MIN_BITRATES[config.sampleRate]?.[config.numberOfChannels - 1] ?? 0);
+	} else if (codec === 'eac3') {
+		return Math.max(bitrate, EAC3_MIN_BITRATES[config.sampleRate]?.[config.numberOfChannels - 1] ?? 0);
+	}
+
+	return bitrate;
 };
