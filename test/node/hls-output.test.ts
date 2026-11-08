@@ -2512,6 +2512,76 @@ test('I-frame stream, pairing warning', async () => {
 	warnSpy.mockRestore();
 });
 
+test('I-frame stream next to a regular video track with other metadata', async () => {
+	// Found by L17's round-trip fuzzing. The differing names used to put both (unpaired) video tracks into one
+	// VIDEO rendition group, led by whichever track came first: with the I-frame track first, only an I-frame stream
+	// was written and the regular track was unreachable; with the regular track first, the I-frames became a VIDEO
+	// rendition
+	const keyFrame = new Uint8Array([
+		0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x06, 0x26, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04,
+		0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x48, 0x99, 0x20,
+		0, 0, 0, 1, 0x68, 0xcb, 0x83, 0xcb, 0x20,
+		0, 0, 0, 1, 0x65, 0x88, 0x84, 0x10, 0x20, 0x40, 0x80, 0x01,
+	]);
+	const deltaFrame = new Uint8Array([0, 0, 0, 1, 0x41, 0x9a, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40]);
+	const config = { decoderConfig: { codec: 'avc1.42c00a', codedWidth: 96, codedHeight: 64 } };
+
+	for (const iFrameTrackFirst of [true, false]) {
+		const files = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat(), targetDuration: 1 }),
+			target: new PathedTarget('master.m3u8', ({ path }) => {
+				const target = new BufferTarget();
+				files.set(path, target);
+				return target;
+			}),
+		});
+		const regular = new EncodedVideoPacketSource('avc');
+		const iFrames = new EncodedVideoPacketSource('avc');
+		if (iFrameTrackFirst) {
+			output.addVideoTrack(iFrames, { hasOnlyKeyPackets: true, name: 'Trick play' });
+			output.addVideoTrack(regular, { name: 'Main' });
+		} else {
+			output.addVideoTrack(regular, { name: 'Main' });
+			output.addVideoTrack(iFrames, { hasOnlyKeyPackets: true, name: 'Trick play' });
+		}
+		await output.start();
+		for (let i = 0; i < 48; i++) {
+			const isKey = i % 12 === 0;
+			const meta = i === 0 ? config : undefined;
+			const packet = new EncodedPacket(isKey ? keyFrame : deltaFrame, isKey ? 'key' : 'delta', i / 24, 1 / 24);
+			await regular.add(packet, meta);
+			if (isKey) {
+				await iFrames.add(new EncodedPacket(keyFrame, 'key', i / 24, 0.5), meta);
+			}
+		}
+		await output.finalize();
+
+		// One variant stream for the regular track and an I-frame stream of its own for the key-packets-only track,
+		// neither of them a VIDEO rendition
+		const master = new TextDecoder().decode(files.get('master.m3u8')!.buffer!);
+		expect((master.match(/#EXT-X-STREAM-INF:/g) ?? []).length).toBe(1);
+		expect((master.match(/#EXT-X-I-FRAME-STREAM-INF:/g) ?? []).length).toBe(1);
+		expect(master).not.toContain('TYPE=VIDEO');
+
+		using input = new Input({
+			source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!.buffer!)),
+			formats: ALL_FORMATS,
+		});
+		const tracks = await input.getVideoTracks();
+		const keyOnly = await Promise.all(tracks.map(x => x.hasOnlyKeyPackets()));
+		expect([...keyOnly].sort()).toEqual([false, true]);
+		expect(await (await input.getPrimaryVideoTrack())!.hasOnlyKeyPackets()).toBe(false);
+
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(tracks[keyOnly.indexOf(false)]!).packets()) {
+			expect(packet.type).toBe(count % 12 === 0 ? 'key' : 'delta');
+			count++;
+		}
+		expect(count).toBe(48);
+	}
+});
+
 test('CMAF segmentation', async () => {
 	let playlistText: string | null = null;
 	const targets = new Map<string, BufferTarget>();
