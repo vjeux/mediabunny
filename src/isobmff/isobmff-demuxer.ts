@@ -4729,6 +4729,21 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 		assert(track.trackBacking);
 
+		if (!track.demuxer.isFragmented && track.durationInMediaTimescale > 0) {
+			// The mdhd box gives the length of the media (ISO/IEC 14496-12). With an edit list though, FFmpeg 4.4 and
+			// 5.0 (movenc's calc_pts_duration) write the track's end time there, which counts the start of a late
+			// track twice. So the duration doesn't go past the end of the last sample.
+			const lastPacket = await track.trackBacking.getPacket(Infinity, { metadataOnly: true });
+			if (lastPacket) {
+				const firstPacket = await track.trackBacking.getFirstPacket({ metadataOnly: true });
+				const end = lastPacket.timestamp + lastPacket.duration;
+				return Math.min(
+					(firstPacket?.timestamp ?? 0) + track.durationInMediaTimescale / track.timescale,
+					Math.round(end * track.timescale) / track.timescale, // Rounded like computeDuration()
+				);
+			}
+		}
+
 		const firstPacket = await track.trackBacking.getFirstPacket({ metadataOnly: true });
 		return (firstPacket?.timestamp ?? 0) + durationInMediaTimescale / track.timescale;
 	}
