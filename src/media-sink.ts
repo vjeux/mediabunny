@@ -956,6 +956,29 @@ export abstract class BaseMediaSampleSink<
 	}
 }
 
+/**
+ * Adds reorder info (bitstream_restriction) to every SPS among the given AVC NAL units that has B-frame reordering but
+ * lacks that info. Returns true if it replaced any SPS.
+ */
+const addReorderInfoToAvcSps = (nalUnits: Uint8Array[]) => {
+	let replaced = false;
+
+	for (let i = 0; i < nalUnits.length; i++) {
+		const nalUnit = nalUnits[i]!;
+		if (extractNalUnitTypeForAvc(nalUnit[0]!) !== AvcNalUnitType.SPS) {
+			continue;
+		}
+
+		const sps = parseAvcSps(nalUnit);
+		if (sps && sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+			nalUnits[i] = addAvcBitstreamRestriction(sps);
+			replaced = true;
+		}
+	}
+
+	return replaced;
+};
+
 class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	decoder: VideoDecoder | null = null;
 
@@ -1035,7 +1058,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				}
 			};
 
-			if (isChromium()) {
+			if (isChromium() || isFirefox()) {
 				if (codec === 'avc' && this.decoderConfig.description) {
 					const record = deserializeAvcDecoderConfigurationRecord(
 						toUint8Array(this.decoderConfig.description),
@@ -1043,7 +1066,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					if (record && record.sequenceParameterSets.length > 0) {
 						const sps = parseAvcSps(record.sequenceParameterSets[0]!);
 						if (sps) {
-							if (sps.frameMbsOnlyFlag === 0) {
+							if (sps.frameMbsOnlyFlag === 0 && isChromium()) {
 								// Chromium has/had a bug with playing interlaced AVC
 								// (https://issues.chromium.org/issues/456919096) which can be worked around by
 								// requesting that software decoding be used. So, here we peek into the AVC description,
@@ -1055,7 +1078,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 							}
 
 							if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
-								// Modify the SPS to fix potential loss of B frames
+								// Modify the SPS to fix potential loss of B frames (Firefox loses the last frame)
 								record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
 								this.decoderConfig = {
 									...this.decoderConfig,
@@ -1066,7 +1089,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					}
 				}
 
-				if (!colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
+				if (isChromium() && !colorSpaceIsComplete(this.decoderConfig.colorSpace)) {
 					// Found via https://github.com/remotion-dev/remotion/issues/10841.
 					// If the color space is incomplete (which is often that it's just partially filled), Chromium has
 					// some nasty logic where it doesn't pass that information along to the GPU at all. The result is
@@ -1203,6 +1226,14 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					if (sanitizedData) {
 						packet = new EncodedPacket(sanitizedData, packet.type, packet.timestamp, packet.duration);
 					}
+				}
+			} else if (isFirefox() && this.codec === 'avc' && packet.type === 'key') {
+				// Same SPS fixup, but Firefox re-reads every in-band SPS, so all of them need it, not just the first
+				const nalUnits = [...iterateAvcNalUnits(packet.data, this.decoderConfig)]
+					.map(loc => packet.data.subarray(loc.offset, loc.offset + loc.length));
+				if (addReorderInfoToAvcSps(nalUnits)) {
+					const newData = concatAvcNalUnits(nalUnits, this.decoderConfig);
+					packet = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
 				}
 			}
 
