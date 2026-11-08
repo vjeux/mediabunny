@@ -807,7 +807,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			return true;
 		}
 
-		return packet.endPage.granulePosition - page.granulePosition - durations.sum >= -toleranceInSamples;
+		// The granule positions of pages that end a packet increase, so an equal or smaller one can't confirm a gap
+		return packet.endPage.granulePosition > page.granulePosition
+			&& packet.endPage.granulePosition - page.granulePosition - durations.sum >= -toleranceInSamples;
 	}
 
 	/** Whether pages of the bitstream are missing between the two given pages, as their sequence numbers show. */
