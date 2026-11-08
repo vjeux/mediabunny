@@ -2526,6 +2526,31 @@ test('Ogg: A single bogus granule position in a stream', async () => {
 	expect(await readTimestamps(bogusVorbisFile)).toEqual(await readTimestamps(vorbisFile));
 });
 
+test('Ogg: The same bogus granule position on two consecutive pages', async () => {
+	// Twenty pages of one 20 ms Opus packet each (as FFmpeg writes with -page_duration 20000), the 10th and 11th with
+	// the same bogus granule position. Equal granule positions on two pages that each end a packet can't be a gap.
+	const pages = [
+		oggPacketsPage({ headerType: 2 }, [opusHead()]),
+		oggPacketsPage({ sequence: 1 }, [opusTags([])]),
+	];
+	for (let i = 0; i < 20; i++) {
+		pages.push(oggPacketsPage({
+			headerType: i === 19 ? 4 : 0,
+			granule: i === 9 || i === 10 ? 2 ** 40 : 312 + 960 * (i + 1),
+			sequence: 2 + i,
+		}, [OPUS_PACKET]));
+	}
+
+	using input = new Input({ source: new BufferSource(concatList(pages)), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		timestamps.push(packet.timestamp);
+	}
+
+	expect(timestamps.map(x => Math.round(x * 48000))).toEqual(Array.from({ length: 20 }, (_, i) => 960 * i));
+});
+
 const opusPages = (options: { pageCount?: number; lastEos?: boolean } = {}) => {
 	const pageCount = options.pageCount ?? 10;
 	const pages = [oggPacketsPage({ headerType: 2 }, [opusHead()]), oggPacketsPage({ sequence: 1 }, [opusTags([])])];
