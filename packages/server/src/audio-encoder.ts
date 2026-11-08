@@ -115,14 +115,17 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			// libvorbis's bitrate management only takes bitrates in a range set by the sample rate and channel count
 			// (its setup templates): about 45–500 kbps for 44.1 kHz stereo, 8–42 kbps for 8 kHz mono. Others are moved
 			// into that range, as encoders may miss their target bitrate.
-			codecContext.freeContext();
 			const supportedBitrate = await this.findSupportedVorbisBitrate(bitrate);
 			if (supportedBitrate !== null) {
+				codecContext.freeContext();
 				bitrate = supportedBitrate;
+				({ codecContext, ret } = await this.openCodecContext(bitrate));
 			}
-			({ codecContext, ret } = await this.openCodecContext(bitrate));
 		}
-		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
+		if (ret < 0) {
+			codecContext.freeContext();
+			NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
+		}
 
 		this.codecContext = codecContext;
 	}
