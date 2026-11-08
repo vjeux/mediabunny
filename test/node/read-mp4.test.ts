@@ -2908,3 +2908,65 @@ test('A metadata atom overrunning its item neither breaks the file nor leaks int
 	new DataView(mov.buffer).setUint16(find(mov, '\xa9nam') + 4, 0xffff);
 	expect((await read(mov)).title).toBe('Title');
 });
+
+test('Negative sample deltas stored in stts', async () => {
+	// Some writers store negative deltas as unsigned 32-bit values to correct the timestamps (samples.ffmpeg.org
+	// mov/mp4-negative-stts-problem.mp4, whose AAC entries these are). Like FFmpeg, such a sample gets a delta of 1 and
+	// the following ones are shortened until the timestamps have caught up.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	const esds = box('esds', zeros(4), [3, 25, 0, 1, 0], [4, 17, 0x40, 0x15, ...zeros(11)], [5, 2, 0x12, 0x10],
+		[6, 1, 2]);
+	const mp4a = box('mp4a', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4), u32(44100 * 0x10000), esds);
+	const timing = [[3, 1023], [1, -866], [2, 1023], [1, 2362], [2, 1023]];
+
+	const moov = (chunkOffset: number) => box('moov',
+		box('mvhd', zeros(12), u32(44100), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, zeros(8)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(44100), u32(9 * 1023), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), mp4a),
+					box('stts', u32(0), u32(timing.length), ...timing.map(([count, delta]) => [
+						...u32(count!),
+						...u32(delta! >>> 0),
+					])),
+					box('stsc', u32(0), u32(1), u32(1), u32(9), u32(1)),
+					box('stsz', u32(0), u32(4), u32(9)),
+					box('stco', u32(0), u32(1), u32(chunkOffset)),
+				)),
+			),
+		),
+	);
+	const ftyp = box('ftyp', ascii('isom'), u32(0), ascii('isom'));
+	const moovSize = moov(0).length;
+
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...ftyp,
+			...moov(ftyp.length + moovSize + 8),
+			...box('mdat', zeros(36)),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packets: number[][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([Math.round(packet.timestamp * 44100), Math.round(packet.duration * 44100)]);
+	}
+	// The timestamps and durations ffprobe reports for such entries
+	expect(packets).toEqual([
+		[0, 1023], [1023, 1023], [2046, 1023], [3069, 1], [3070, 590], [3660, 590], [4250, 2361], [6611, 1023],
+		[7634, 1023],
+	]);
+});
