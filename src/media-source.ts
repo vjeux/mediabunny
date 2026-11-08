@@ -3353,7 +3353,9 @@ const detectAudioEncoderPrimingShift = (
 			output: (audioData) => {
 				decodedSampleRate = audioData.sampleRate;
 				const values = new Float32Array(audioData.numberOfFrames);
-				audioData.copyTo(values, { planeIndex: 0, format });
+				if (values.length > 0) { // Firefox's Vorbis decoder starts with an empty one, which can't be copied
+					audioData.copyTo(values, { planeIndex: 0, format });
+				}
 				audioData.close();
 
 				for (let i = 0; i < values.length; i++) {
