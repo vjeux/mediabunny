@@ -1491,17 +1491,36 @@ describe('Chromium media/formats/mp4/track_run_iterator_unittest.cc', () => {
 	});
 
 	test('TrackExtendsDefaultsTest: trex defaults apply when tfhd and trun give none', async () => {
-		const bytes = buildFragmentedMp4({
+		const audio = buildFragmentedMp4({
 			type: 'audio',
 			sampleEntry: aacEntry,
 			timescale: 48000,
 			trex: { duration: 50, size: 3, flags: UN },
 			fragments: [{ baseDecodeTime: 0, samples: ascending.map(() => ({})) }],
 		});
-		// Chromium also reports the non-sync audio samples as non-key
-		expect((await readPackets(bytes, 48000)).slice(0, 2)).toEqual([
-			[0, 50, 3, false],
-			[50, 50, 3, false],
+		// TrackRunIterator reports these non-sync AAC samples as non-key, but Chromium's FrameProcessor then marks
+		// every audio frame as a key frame (except xHE-AAC and DTS:X P2), since metadata may not say so. Mediabunny may
+		// do either, so only the timing, the sizes and consistent key flags are checked here, and the default flags on
+		// video below.
+		const audioPackets = await readPackets(audio, 48000);
+		expect(audioPackets.slice(0, 2).map(packet => packet.slice(0, 3))).toEqual([
+			[0, 50, 3],
+			[50, 50, 3],
+		]);
+		expect(new Set(audioPackets.map(packet => packet[3])).size).toBe(1);
+
+		// The same defaults on a video track, where the key flags follow Chromium's rules (see FirstSampleFlagTest)
+		const video = buildFragmentedMp4({
+			type: 'video',
+			sampleEntry: avcEntry,
+			timescale: 25,
+			trex: { duration: 1, size: 3, flags: UN },
+			fragments: [{ baseDecodeTime: 0, firstSampleFlags: US, samples: ascending.map(() => ({})) }],
+		});
+		expect((await readPackets(video, 25)).slice(0, 3)).toEqual([
+			[0, 1, 3, true],
+			[1, 1, 3, false],
+			[2, 1, 3, false],
 		]);
 	});
 
