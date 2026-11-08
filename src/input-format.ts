@@ -35,7 +35,7 @@ import { findTsPacketLayout, TS_PACKET_LAYOUT_PROBE_SIZE, TS_PACKET_SIZE } from 
 import { HlsDemuxer } from './hls/hls-demuxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
 import { PathedSource } from './source';
-import { isThenable, MaybePromise } from './misc';
+import { isThenable, MaybePromise, toDataView } from './misc';
 
 /**
  * Base class representing an input media file format.
@@ -363,6 +363,52 @@ const skipZeroBytes = async (reader: Reader, pos: number, maxLength: number) => 
 	return pos;
 };
 
+const ISOBMFF_LEADING_BOX_TYPES = ['ftyp', 'styp', 'moov', 'mdat', 'moof', 'sidx', 'free', 'skip', 'wide', 'pnot'];
+
+// How many MPEG-TS packets must start with a sync byte (fewer if the file is shorter), so that MP3 data that just
+// happens to hold 0x47 at a couple of packet starts isn't taken for MPEG-TS
+const MPEG_TS_SIGNATURE_PACKET_COUNT = 5;
+const MPEG_TS_SIGNATURE_LENGTH = 4 + MPEG_TS_SIGNATURE_PACKET_COUNT * (TS_PACKET_SIZE + 16);
+
+const startsWithMpegTsPackets = (bytes: Uint8Array, offset: number, packetSize: number) => {
+	let packetCount = 0;
+	for (
+		let pos = offset;
+		pos < bytes.length && packetCount < MPEG_TS_SIGNATURE_PACKET_COUNT;
+		pos += packetSize, packetCount++
+	) {
+		if (bytes[pos] !== 0x47) {
+			return false;
+		}
+	}
+
+	return packetCount >= 2;
+};
+
+/**
+ * Whether the bytes start like an ISOBMFF/QuickTime, Matroska, Ogg, FLAC or MPEG-TS file. RIFF files aren't included:
+ * some hold a plain MP3 stream (RIFF MP3, MP3 in WAVE), which reads fine as MP3.
+ */
+const startsWithOtherContainerSignature = (bytes: Uint8Array) => {
+	const view = toDataView(bytes);
+	const ascii = (start: number, length: number) => String.fromCharCode(...bytes.subarray(start, start + length));
+
+	if (bytes.length >= 8 && view.getUint32(0) >= 8 && ISOBMFF_LEADING_BOX_TYPES.includes(ascii(4, 4))) {
+		return true;
+	}
+	if (bytes.length >= 4 && view.getUint32(0) === EBMLId.EBML) {
+		return true;
+	}
+	if (['OggS', 'fLaC'].includes(ascii(0, 4))) {
+		return true;
+	}
+
+	// The packet layouts MPEG-TS detection checks: plain, with FEC, and with 4-byte timestamps (M2TS)
+	return startsWithMpegTsPackets(bytes, 0, TS_PACKET_SIZE)
+		|| startsWithMpegTsPackets(bytes, 0, TS_PACKET_SIZE + 16)
+		|| startsWithMpegTsPackets(bytes, 4, TS_PACKET_SIZE + 4);
+};
+
 /**
  * MP3 file format.
  *
@@ -387,6 +433,16 @@ export class Mp3InputFormat extends InputFormat {
 			}
 
 			currentPos = slice.filePos + id3V2Header.size;
+		}
+
+		// Frame syncs are easily found in the data of other containers (in their sample tables, say), so a file that
+		// starts like one of them isn't taken for MP3, even when that format isn't among the input's formats
+		let signatureSlice = input._reader.requestSliceRange(currentPos, 0, MPEG_TS_SIGNATURE_LENGTH);
+		if (isThenable(signatureSlice)) {
+			signatureSlice = await signatureSlice;
+		}
+		if (signatureSlice && startsWithOtherContainerSignature(readBytes(signatureSlice, signatureSlice.length))) {
+			return false;
 		}
 
 		// MPEG program streams (like VOB files) hold runs of MPEG audio frames in their packets, which the search below
