@@ -204,6 +204,67 @@ test('can get metadata-only packets', async () => {
 	expect(packet.duration).toBe(0.09287981859410431);
 });
 
+test('reads past the join of concatenated FLAC streams', async () => {
+	// `ffmpeg -f concat -c copy` joins FLAC files frame by frame, so the frame numbers start over at the join
+	const crc8 = (bytes: number[]) => bytes.reduce((crc, byte) => {
+		crc ^= byte;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+		}
+		return crc;
+	}, 0);
+	const crc16 = (bytes: number[]) => bytes.reduce((crc, byte) => {
+		crc ^= byte << 8;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x8000 ? ((crc << 1) ^ 0x8005) & 0xffff : (crc << 1) & 0xffff;
+		}
+		return crc;
+	}, 0);
+
+	// Mono 16-bit 44.1 kHz frames with 576 samples, the block size stored as an uncommon 16-bit value
+	const frameHeader = (frameNumber: number) => {
+		const header = [0xff, 0xf8, 0x79, 0x08, frameNumber, 0x02, 0x3f];
+		return [...header, crc8(header)];
+	};
+	const frame = (frameNumber: number, verbatim: boolean) => {
+		const subframe = verbatim
+			// The samples contain a valid frame header (frame 0), which must not be mistaken for the join
+			? [0x02, ...frameHeader(0), ...new Array<number>(576 * 2 - 8).fill(0x11)]
+			: [0x00, 0x12, frameNumber];
+		const bytes = [...frameHeader(frameNumber), ...subframe];
+		const crc = crc16(bytes);
+		return [...bytes, crc >> 8, crc & 0xff];
+	};
+	const frames = [
+		frame(0, false), frame(1, false), frame(2, true), frame(3, false), // First file
+		frame(0, false), frame(1, true), frame(2, false), // Second file
+	];
+
+	const streamInfo = new Uint8Array(34);
+	const view = new DataView(streamInfo.buffer);
+	view.setUint16(0, 576);
+	view.setUint16(2, 576);
+	view.setUint32(10, (44100 << 12) | (0 << 9) | (15 << 4)); // 44.1 kHz, mono, 16 bits per sample
+	view.setUint32(14, 576 * 4); // FFmpeg keeps the first file's STREAMINFO
+
+	const file = new Uint8Array([
+		0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34, ...streamInfo,
+		...frames.flat(),
+	]);
+
+	using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packets: [number, number][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push([Math.round(packet.timestamp * 44100), packet.byteLength]);
+	}
+
+	expect(packets).toEqual(frames.map((frame, i) => [576 * i, frame.length]));
+	expect(await track.computeDuration()).toBe(576 * 7 / 44100);
+});
+
 test('can get metadata', async () => {
 	const filePath = path.join(__dirname, '..', 'public/sample.flac');
 	using input = new Input({

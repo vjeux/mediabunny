@@ -31,6 +31,7 @@ import {
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
 import {
 	calculateCrc8,
+	calculateCrc16,
 	readBlockSize,
 	getBlockSizeOrUncommon,
 	readCodedNumber,
@@ -437,6 +438,27 @@ export class FlacDemuxer extends Demuxer {
 				const nextFrameHeader = this.readFlacFrameHeader(slice);
 
 				if (!nextFrameHeader) {
+					slice.filePos = positionBeforeReading;
+					continue;
+				}
+
+				// Where FLAC streams were joined (e.g. by FFmpeg's concat demuxer), the numbering starts over. Accept
+				// such a boundary if the frame before it ends with a valid CRC-16, which a sync code that's part of
+				// the frame data practically never produces.
+				if (nextFrameHeader.num <= frameHeader.num) {
+					slice.filePos = startPos;
+					const frameBytes = readBytes(slice, lengthIfNextFlacFrameHeaderIsLegit);
+
+					if (calculateCrc16(frameBytes) === 0) {
+						return {
+							num: frameHeader.num,
+							blockSize: frameHeader.blockSize,
+							sampleRate: frameHeader.sampleRate,
+							size: lengthIfNextFlacFrameHeaderIsLegit,
+							isLastFrame: false,
+						};
+					}
+
 					slice.filePos = positionBeforeReading;
 					continue;
 				}
