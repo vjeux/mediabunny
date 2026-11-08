@@ -520,6 +520,17 @@ test('UrlSource reads files larger than its cache in order from a server without
 		expect(reader.randomAccessFileSize).toBe(file.length);
 		const tail = await reader.requestSlice(file.length - 1000, 1000);
 		expect(tail && readBytes(tail, 1000)).toEqual(file.subarray(file.length - 1000));
+
+		// So the WAVE's LIST chunk after the audio, skipped when the file was opened, is read for the tags once the
+		// packets have been read
+		using input = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/media`, { maxCacheSize: 2 ** 16 }),
+			formats: ALL_FORMATS,
+		});
+		for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+			void packet;
+		}
+		expect((await input.getMetadataTags()).title).toBe('Title');
 	} finally {
 		logs.stop();
 		server.close();
