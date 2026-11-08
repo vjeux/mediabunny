@@ -810,3 +810,74 @@ test('MediaStreamAudioTrackSource, timestamp jitter adds no silence, real gaps s
 	expect(Math.abs(silentRuns[0]! - 2880)).toBeLessThanOrEqual(10);
 	expect(frames).toBe(writtenFrames + silentRuns[0]!);
 });
+
+test('MediaStreamAudioTrackSource, capture timestamps stepping back lose no audio', async ({ skip }) => {
+	if (typeof MediaStreamTrackGenerator === 'undefined') {
+		skip('Needs MediaStreamTrackGenerator (Chromium)');
+	}
+
+	const audioGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
+	const audioWriter = audioGenerator.writable.getWriter();
+
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new MediaStreamAudioTrackSource(audioGenerator as unknown as MediaStreamAudioTrack, {
+		codec: 'pcm-f32',
+	});
+	const errors: unknown[] = [];
+	audioSource.errorPromise.catch(error => errors.push(error));
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// Continuous audio in 10 ms chunks, but the first chunk is stamped 64 ms ahead of where the ones after it put it,
+	// as Chrome sometimes does for the first chunk of a media element's capture
+	const start = performance.now();
+	let writtenFrames = 0;
+	for (let i = 0; i < 30; i++) {
+		while (performance.now() - start < 10 * i) {
+			await new Promise(resolve => setTimeout(resolve, 2));
+		}
+
+		const data = new Float32Array(480);
+		for (let j = 0; j < 480; j++) {
+			data[j] = 0.5 + 0.25 * Math.sin(2 * Math.PI * 440 * (480 * i + j) / 48000);
+		}
+		await audioWriter.write(new AudioData({
+			format: 'f32-planar',
+			sampleRate: 48000,
+			numberOfChannels: 1,
+			numberOfFrames: 480,
+			timestamp: Math.round(1000 * (start + 10 * i + (i === 0 ? 64 : 0))),
+			data,
+		}));
+		writtenFrames += 480;
+	}
+
+	await new Promise(resolve => setTimeout(resolve, 50));
+	await output.finalize();
+	await audioWriter.close();
+	expect(errors).toEqual([]);
+
+	// All of the audio is there, in one piece
+	const { input, track } = await readBackAudioTrack(output.target.buffer!);
+	let frames = 0;
+	let previous: number | null = null;
+	let largestStep = 0;
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		const data = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+		for (const value of data) {
+			if (previous !== null) {
+				largestStep = Math.max(largestStep, Math.abs(value - previous));
+			}
+			previous = value;
+		}
+		frames += sample.numberOfFrames;
+	}
+	input.dispose();
+
+	expect(frames).toBe(writtenFrames);
+	expect(largestStep).toBeLessThan(0.05);
+});
