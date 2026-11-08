@@ -939,7 +939,16 @@ export class UrlSource extends PathedSource {
 
 		this._url = url;
 		this._options = options;
-		this._getRetryDelay = options.getRetryDelay ?? DEFAULT_RETRY_DELAY;
+		const getRetryDelay = options.getRetryDelay ?? DEFAULT_RETRY_DELAY;
+		this._getRetryDelay = (previousAttempts, error, url) => {
+			const delay = getRetryDelay(previousAttempts, error, url);
+			// Any other value would make the retries come back to back, as fast as the requests go
+			if (delay !== null && (!Number.isFinite(delay) || delay < 0)) {
+				throw new TypeError('Retry delay must be a non-negative finite number.');
+			}
+
+			return delay;
+		};
 
 		// A user-supplied Range header is interpreted as a byte offset (and optional length) into the resource. We
 		// pull it out of the request and remember it for subsequent requests.
