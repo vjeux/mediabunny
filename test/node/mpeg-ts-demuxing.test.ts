@@ -3872,3 +3872,216 @@ test('MPEG-TS drops the rest of the GOP after a video frame that lost a TS packe
 	expect((await sink.getKeyPacket(12 / 25))?.timestamp).toBe(8 / 25);
 	expect((await sink.getNextPacket(packet))?.data).toEqual(clean[16]!.data);
 });
+
+test('MPEG-TS reads AAC declared as private data without descriptors, as FFmpeg\'s m2ts mode writes it', async () => {
+	// Made with FFmpeg 8.0.3, which writes the AAC as stream_type 0x06 without any descriptor in .m2ts files:
+	// ffmpeg -f lavfi -i testsrc2=size=160x120:rate=25:duration=1
+	//   -f lavfi -i sine=frequency=440:sample_rate=48000:duration=1
+	//   -c:v libx264 -preset ultrafast -c:a aac -b:a 32k aac-private-data.m2ts
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/aac-private-data.m2ts')),
+		formats: ALL_FORMATS,
+	});
+
+	expect(await input.getVideoTracks()).toHaveLength(1);
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('aac');
+	expect(await track.getSampleRate()).toBe(48000);
+	expect(await track.getNumberOfChannels()).toBe(1);
+
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		expect(packet.byteLength).toBeGreaterThan(0);
+		count++;
+	}
+	expect(count).toBe(48); // As ffprobe counts
+});
+
+test('MPEG-TS tells the audio codec of a private data stream without descriptors from its payload', async () => {
+	// 30 AAC frames (48 kHz stereo) with stub payloads
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < 30; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(100).fill(0x11), 'key', i * 1024 / 48000, 1024 / 48000),
+			i === 0
+				? {
+						decoderConfig: {
+							codec: 'mp4a.40.2',
+							numberOfChannels: 2,
+							sampleRate: 48000,
+							description: new Uint8Array([0x11, 0x90]),
+						},
+					}
+				: undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const crc32 = (data: Uint8Array) => {
+		let crc = 0xffffffff;
+		for (const byte of data) {
+			crc ^= byte << 24;
+			for (let k = 0; k < 8; k++) {
+				crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
+			}
+		}
+		return crc >>> 0;
+	};
+
+	// Turns the PMT's stream_type for the AAC (0x0f) into private data (0x06), like FFmpeg's m2ts mode writes it
+	const declareAsPrivateData = (data: Uint8Array) => {
+		const copy = data.slice();
+		for (let pos = 0; pos < copy.length; pos += 188) {
+			const section = copy.subarray(pos + 5 + copy[pos + 4]!); // After the pointer field
+			if (!(copy[pos + 1]! & 0x40) || section[0] !== 0x02) {
+				continue;
+			}
+
+			const sectionLength = ((section[1]! & 0x0f) << 8) | section[2]!;
+			const programInfoLength = ((section[10]! & 0x0f) << 8) | section[11]!;
+			const streamTypePos = 12 + programInfoLength;
+			expect(section[streamTypePos]).toBe(0x0f);
+			section[streamTypePos] = 0x06;
+			const crcPos = 3 + sectionLength - 4;
+			new DataView(section.buffer, section.byteOffset).setUint32(crcPos, crc32(section.subarray(0, crcPos)));
+		}
+		return copy;
+	};
+
+	const readAudio = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		if (!track) {
+			return { codec: null, count: 0 };
+		}
+
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			count += packet.byteLength > 0 ? 1 : 0;
+		}
+		return { codec: await track.getCodec(), count };
+	};
+
+	expect(await readAudio(bytes)).toEqual({ codec: 'aac', count: 30 });
+	const privateData = declareAsPrivateData(bytes);
+	expect(await readAudio(privateData)).toEqual({ codec: 'aac', count: 30 });
+
+	// A payload that isn't audio we know leaves the stream out, as before
+	for (let pos = 0; pos < privateData.length; pos += 188) {
+		const pesStart = pos + 4 + (privateData[pos + 3]! & 0x20 ? 1 + privateData[pos + 4]! : 0);
+		if (privateData[pos + 1]! & 0x40 && privateData[pesStart + 3] === 0xc0) {
+			privateData[pesStart + 9 + privateData[pesStart + 8]!] = 0x00; // The first frame's sync word
+			break;
+		}
+	}
+	expect(await readAudio(privateData)).toEqual({ codec: null, count: 0 });
+});
+
+test('MPEG-TS gives up on private data streams without descriptors that hold no audio', async () => {
+	// From L46's review. mp3.ts (one MP3 stream) with extra stream_type 0x06 entries in its PMT, without descriptors
+	const crc32 = (data: Uint8Array) => {
+		let crc = 0xffffffff;
+		for (const byte of data) {
+			crc ^= byte << 24;
+			for (let k = 0; k < 8; k++) {
+				crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
+			}
+		}
+		return crc >>> 0;
+	};
+	const withPrivateStreams = (extraPids: number[], extraPackets: Uint8Array[], nullPacketCount: number) => {
+		const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/mp3.ts')));
+		const pidAt = (pos: number) => ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+		const packets: Uint8Array[] = [];
+		let pmtPid = -1;
+		let patched = false;
+		for (let pos = 0; pos + 188 <= bytes.length; pos += 188) {
+			const packet = bytes.slice(pos, pos + 188);
+			const sectionStart = 5 + packet[4]!;
+			if (pidAt(pos) === 0 && pmtPid === -1) {
+				pmtPid = ((packet[sectionStart + 10]! & 0x1f) << 8) | packet[sectionStart + 11]!;
+			} else if (pidAt(pos) === pmtPid && packet[1]! & 0x40 && !patched) {
+				const sectionLength = ((packet[sectionStart + 1]! & 0x0f) << 8) | packet[sectionStart + 2]!;
+				const body = [...packet.subarray(sectionStart + 3, sectionStart + 3 + sectionLength - 4)];
+				for (const pid of extraPids) {
+					body.push(0x06, 0xe0 | (pid >> 8), pid & 0xff, 0xf0, 0x00);
+				}
+				const newLength = body.length + 4;
+				const section = [packet[sectionStart]!, 0xb0 | (newLength >> 8), newLength & 0xff, ...body];
+				const crc = crc32(new Uint8Array(section));
+				section.push(crc >>> 24, (crc >> 16) & 0xff, (crc >> 8) & 0xff, crc & 0xff);
+				packet.fill(0xff, sectionStart);
+				packet.set(section, sectionStart);
+				patched = true;
+				packets.push(packet, ...extraPackets);
+				continue;
+			}
+			packets.push(packet);
+		}
+
+		const nullPacket = new Uint8Array(188).fill(0xff);
+		nullPacket.set([0x47, 0x1f, 0xff, 0x10]);
+		for (let i = 0; i < nullPacketCount; i++) {
+			packets.push(nullPacket);
+		}
+
+		const file = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => file.set(packet, 188 * i));
+		return file;
+	};
+	const open = (file: Uint8Array) => {
+		const counter = { bytes: 0 };
+		const input = new Input({
+			source: new CustomSource({
+				getSize: () => file.byteLength,
+				read: (start, end) => {
+					counter.bytes += end - start;
+					return file.subarray(start, end);
+				},
+			}),
+			formats: ALL_FORMATS,
+		});
+		return { input, counter };
+	};
+
+	// A stream that never carries a PES packet doesn't make the metadata scan read the whole file (16 MiB of null
+	// packets after the content)
+	const withEmptyStream = open(withPrivateStreams([0x1ff0], [], 16 * 2 ** 20 / 188));
+	expect(await withEmptyStream.input.getTracks()).toHaveLength(1);
+	expect(withEmptyStream.counter.bytes).toBeLessThan(8 * 2 ** 20); // 4 MiB past the MP3 stream's setup
+	withEmptyStream.input.dispose();
+
+	// A stream whose first PES packet merely starts with an ADTS-like header, followed by random data, stays out
+	let seed = 1;
+	const random = () => (seed = (seed * 1103515245 + 12345) >>> 0) >>> 24;
+	const fakePesPacket = (counter: number, isStart: boolean) => {
+		const packet = new Uint8Array(188);
+		packet.set([0x47, (isStart ? 0x40 : 0) | 0x1f, 0xf1, 0x10 | counter]);
+		let pos = 4;
+		if (isStart) {
+			const pesHeader = [0, 0, 1, 0xc0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1];
+			packet.set([...pesHeader, 0xff, 0xf1, 0x4c, 0x80, 0x2e, 0x7f, 0xfc], 4); // Then an ADTS header
+			pos = 25;
+		}
+		for (; pos < 188; pos++) {
+			packet[pos] = random();
+		}
+		return packet;
+	};
+	const withFakeAudio = open(withPrivateStreams(
+		[0x1ff1],
+		[fakePesPacket(0, true), fakePesPacket(1, false), fakePesPacket(2, true), fakePesPacket(3, false)],
+		0,
+	));
+	const tracks = await withFakeAudio.input.getTracks();
+	expect(tracks).toHaveLength(1);
+	for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
+		expect(packet.byteLength).toBeGreaterThan(0);
+	}
+	withFakeAudio.input.dispose();
+});

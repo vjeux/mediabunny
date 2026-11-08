@@ -36,6 +36,7 @@ import {
 	EAC3_NUMBLKS_TABLE,
 	getEac3ChannelCount,
 	getEac3SampleRate,
+	parseEac3SyncFrame,
 	HevcDecoderConfigurationRecord,
 	HevcNalUnitType,
 	parseAc3SyncFrame,
@@ -149,6 +150,101 @@ const BLU_RAY_STREAM_TYPES = new Map<number, MpegTsStreamType>([
 	[MpegTsStreamType.BLU_RAY_DTS_EXPRESS_SECONDARY, MpegTsStreamType.DTS],
 ]);
 
+/**
+ * How much further than the streams that say what they hold we look for the first PES packet of a private data stream
+ * that doesn't: its audio would have shown up by then, and it may well hold none at all.
+ */
+const MAX_PRIVATE_DATA_PROBE_DISTANCE = 2 ** 22; // 4 MiB
+
+// Descriptors that make a private data stream something other than audio: VBI data, VBI teletext, teletext, DVB
+// subtitling, data broadcast ID, application signalling and ARIB data component
+const NON_AUDIO_PRIVATE_DATA_DESCRIPTOR_TAGS = new Set<number>([0x45, 0x46, 0x56, 0x59, 0x66, 0x6f, 0xfd]);
+
+/**
+ * The codec, size and sample rate (or its code) of the audio frame whose header starts the bytes, for telling the codec
+ * of a stream that doesn't say what it is. Only headers that the code reading the stream's first frame accepts count.
+ */
+const probeAudioFrame = (bytes: Uint8Array): { codec: AudioCodec; frameSize: number; rate: number } | null => {
+	if (bytes.byteLength < MAX_ADTS_FRAME_HEADER_SIZE) {
+		return null;
+	}
+
+	if (bytes[0] === 0x0b && bytes[1] === 0x77) {
+		// AC-3 and E-AC-3 tell themselves apart by their bsid
+		const bsid = bytes[5]! >> 3;
+		if (bsid <= 8) {
+			const fscod = bytes[4]! >> 6;
+			const frmsizecod = bytes[4]! & 0x3f;
+			if (fscod === 3 || frmsizecod > 37 || !parseAc3SyncFrame(bytes)) {
+				return null;
+			}
+
+			return { codec: 'ac3', frameSize: AC3_FRAME_SIZES[3 * frmsizecod + fscod]!, rate: fscod };
+		} else if (bsid >= 11 && bsid <= 16) {
+			const frameInfo = parseEac3SyncFrame(bytes);
+			const sampleRate = frameInfo && getEac3SampleRate(frameInfo);
+			if (!sampleRate) {
+				return null;
+			}
+
+			const frmsiz = ((bytes[2]! & 0x07) << 8) | bytes[3]!;
+			return { codec: 'eac3', frameSize: (frmsiz + 1) * 2, rate: sampleRate };
+		}
+
+		return null;
+	}
+
+	if (bytes[0] === 0x7f && bytes[1] === 0xfe && bytes[2] === 0x80 && bytes[3] === 0x01) {
+		const frameInfo = parseDtsFrame(bytes);
+		return frameInfo && { codec: 'dts', frameSize: frameInfo.frameSize, rate: frameInfo.sampleRate };
+	}
+
+	if (bytes[0] === 0xff && (bytes[1]! & 0xf6) === 0xf0) {
+		// ADTS: a sample rate, a channel configuration, a frame length that holds the header, and one raw data block
+		const samplingFrequencyIndex = (bytes[2]! >> 2) & 0x0f;
+		const channelConfiguration = ((bytes[2]! & 0x01) << 2) | (bytes[3]! >> 6);
+		const frameLength = ((bytes[3]! & 0x03) << 11) | (bytes[4]! << 3) | (bytes[5]! >> 5);
+		const headerSize = bytes[1]! & 0x01 ? MAX_ADTS_FRAME_HEADER_SIZE - 2 : MAX_ADTS_FRAME_HEADER_SIZE;
+		const rawDataBlockCount = (bytes[6]! & 0x03) + 1;
+		if (
+			samplingFrequencyIndex >= aacFrequencyTable.length
+			|| channelConfiguration === 0
+			|| frameLength < headerSize
+			|| rawDataBlockCount !== 1
+		) {
+			return null;
+		}
+
+		return { codec: 'aac', frameSize: frameLength, rate: samplingFrequencyIndex };
+	}
+
+	if (bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0) {
+		const header = readMp3FrameHeader(readU32Be(FileSlice.tempFromBytes(bytes)), bytes.byteLength).header;
+		return header && { codec: 'mp3', frameSize: header.totalSize, rate: header.sampleRate };
+	}
+
+	return null;
+};
+
+/**
+ * Works out the codec of an audio stream that doesn't say what it is (a private data stream without descriptors, as
+ * FFmpeg's m2ts mode writes AAC) from its first PES packet. Like FFmpeg's probes, one header isn't enough: the next
+ * frame's header must follow with the same codec and sample rate, unless the frame fills the PES packet exactly.
+ */
+const getAudioCodecFromPayload = (data: Uint8Array): AudioCodec | null => {
+	const frame = probeAudioFrame(data);
+	if (!frame || frame.frameSize <= 0 || frame.frameSize > data.byteLength) {
+		return null;
+	}
+
+	if (frame.frameSize === data.byteLength) {
+		return frame.codec;
+	}
+
+	const nextFrame = probeAudioFrame(data.subarray(frame.frameSize));
+	return nextFrame && nextFrame.codec === frame.codec && nextFrame.rate === frame.rate ? frame.codec : null;
+};
+
 type ElementaryStream = {
 	demuxer: MpegTsDemuxer;
 	pid: number;
@@ -163,6 +259,8 @@ type ElementaryStream = {
 	languageCode: string;
 	/** audio_type from the ISO 639 language descriptor. */
 	audioType: number;
+	/** For private data streams that don't say what they hold: the first PES packet tells the audio codec. */
+	codecFromPayload: boolean;
 	info: {
 		type: 'video';
 		codec: VideoCodec;
@@ -864,8 +962,15 @@ export class MpegTsDemuxer extends Demuxer {
 			let firstTableNotInEffectPos: number | null = null;
 			let takesTablesNotInEffect = false;
 			let programMapSectionPid: number | null = null;
+			// Where to stop looking for the private data streams that don't say what they hold
+			let privateDataProbeEndPos: number | null = null;
 
 			while (true) {
+				if (privateDataProbeEndPos !== null && currentPos >= privateDataProbeEndPos) {
+					// The private data streams that don't say what they hold didn't show up as audio we know
+					break;
+				}
+
 				const packetHeader = await this.readPacketHeader(currentPos);
 
 				if (
@@ -1089,6 +1194,7 @@ export class MpegTsDemuxer extends Demuxer {
 						let hasDtsDescriptor = false;
 						let languageCode = UNDETERMINED_LANGUAGE;
 						let audioType = 0;
+						let hasOtherDescriptor = false;
 						while (bitstream.pos < esInfoEndPos) {
 							const descriptorTag = bitstream.readBits(8);
 							const descriptorLength = bitstream.readBits(8);
@@ -1105,9 +1211,14 @@ export class MpegTsDemuxer extends Demuxer {
 								// which we work out from the bitstream anyway. A private data stream may also be named
 								// AC-3 or E-AC-3 this way instead of with a DVB descriptor (FFmpeg reads both).
 								const formatIdentifier = bitstream.readBits(32);
-								hasDtsDescriptor ||= (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
-								hasAc3Descriptor ||= formatIdentifier === AC3_FORMAT_IDENTIFIER;
-								hasEac3Descriptor ||= formatIdentifier === EAC3_FORMAT_IDENTIFIER;
+								const isDts = (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
+								const isAc3 = formatIdentifier === AC3_FORMAT_IDENTIFIER;
+								const isEac3 = formatIdentifier === EAC3_FORMAT_IDENTIFIER;
+								hasDtsDescriptor ||= isDts;
+								hasAc3Descriptor ||= isAc3;
+								hasEac3Descriptor ||= isEac3;
+								// Says what the stream is, which isn't something we know
+								hasOtherDescriptor ||= !isDts && !isAc3 && !isEac3;
 							} else if (descriptorTag === ISO_639_LANGUAGE_DESCRIPTOR_TAG && descriptorLength >= 4) {
 								// Dual-mono audio may list a second language, but the first one is what describes the
 								// stream as a whole. Some muxers write it in upper case.
@@ -1121,12 +1232,15 @@ export class MpegTsDemuxer extends Demuxer {
 								}
 
 								audioType = bitstream.readBits(8);
+							} else if (NON_AUDIO_PRIVATE_DATA_DESCRIPTOR_TAGS.has(descriptorTag)) {
+								hasOtherDescriptor = true;
 							}
 
 							bitstream.pos = descriptorEndPos;
 						}
 
 						let info: ElementaryStream['info'] | null = null;
+						let codecFromPayload = false;
 
 						// Blu-ray has its own stream types for E-AC-3 and the DTS extensions
 						const effectiveStreamType = (isBluRayProgram && BLU_RAY_STREAM_TYPES.get(streamType))
@@ -1225,6 +1339,20 @@ export class MpegTsDemuxer extends Demuxer {
 										numberOfChannels: -1,
 										sampleRate: -1,
 									};
+								} else if (!hasOtherDescriptor) {
+									// Nothing says what the stream holds, as FFmpeg's m2ts mode writes AAC (and older
+									// FFmpeg versions wrote DTS), so let the first PES packet tell. The codec is a
+									// placeholder until then.
+									codecFromPayload = true;
+									info = {
+										type: 'audio',
+										codec: 'aac',
+										decoderConfig: null,
+										aacCodecInfo: null,
+										dtsFormat: null,
+										numberOfChannels: -1,
+										sampleRate: -1,
+									};
 								}
 							}; break;
 
@@ -1252,6 +1380,7 @@ export class MpegTsDemuxer extends Demuxer {
 								canBeTrustedWithKeyPackets: false,
 								languageCode,
 								audioType,
+								codecFromPayload,
 								info,
 								referencePesPackets: [],
 								droppedRanges: [],
@@ -1289,6 +1418,18 @@ export class MpegTsDemuxer extends Demuxer {
 									`Couldn't read first PES packet for Elementary Stream with PID`
 									+ ` ${elementaryStream.pid}`,
 								);
+							}
+
+							if (elementaryStream.codecFromPayload) {
+								const codec = getAudioCodecFromPayload(pesPacket.data);
+								if (!codec || elementaryStream.info.type !== 'audio') {
+									// Not audio we know, so don't surface the stream, like any we don't support
+									this.elementaryStreams.splice(this.elementaryStreams.indexOf(elementaryStream), 1);
+									break outer;
+								}
+
+								elementaryStream.info.codec = codec;
+								elementaryStream.codecFromPayload = false;
 							}
 
 							elementaryStream.firstSection = section;
@@ -1625,6 +1766,10 @@ export class MpegTsDemuxer extends Demuxer {
 							unreadableStreamErrors.push(error);
 						}
 					}
+				}
+
+				if (hasProgramMap && this.elementaryStreams.every(x => x.initialized || x.codecFromPayload)) {
+					privateDataProbeEndPos ??= currentPos + MAX_PRIVATE_DATA_PROBE_DISTANCE;
 				}
 
 				const isDone = hasProgramMap && this.elementaryStreams.every(x => x.initialized);
@@ -1969,9 +2114,13 @@ export class MpegTsDemuxer extends Demuxer {
 
 	/** Warns that declared streams which haven't shown up `where` are left out, since they may start later on. */
 	warnAboutMissingStreams(where: string) {
+		// Private data streams without descriptors may well hold no audio at all, so they aren't missed
 		const streams = this.elementaryStreams
-			.filter(x => !x.initialized)
+			.filter(x => !x.initialized && !x.codecFromPayload)
 			.map(x => `PID ${x.pid} (stream_type 0x${x.streamType.toString(16).padStart(2, '0')})`);
+		if (streams.length === 0) {
+			return;
+		}
 
 		Logging._warn(
 			`MPEG-TS: these streams are declared but didn't show up ${where}, so they're left out (if they start later`
