@@ -1,6 +1,7 @@
 import { createCipheriv } from 'node:crypto';
 import { expect, test } from 'vitest';
 import fs from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -5792,3 +5793,47 @@ test('Compressed movie box that declares a huge size', async () => {
 		globalThis.DecompressionStream = OriginalDecompressionStream;
 	}
 }, 60_000);
+
+test('Fragmented MP4 whose fragments are larger than the source\'s cache', async () => {
+	// A source that only keeps recent data (a ReadableStreamSource, 32 MiB by default, or a UrlSource on a server that
+	// ignores range requests, 64 MiB) can't go back to the header of the mdat box after a moof box once the fragment's
+	// samples have been read. Finding the next fragment stepped over that box by reading its header again, so reading
+	// failed after the first fragment larger than the cache. A fragment holds everything between two key frames in
+	// Mediabunny's own fragmented output and FFmpeg's frag_keyframe, so long GOPs make such fragments (found by L91).
+	const readPacketTimestamps = async (fileName: string, maxCacheSize?: number) => {
+		const data = new Uint8Array(await readFile(path.join(__dirname, '..', 'public', fileName)));
+		let position = 0;
+		const source = maxCacheSize === undefined
+			? new BufferSource(data)
+			: new ReadableStreamSource(new ReadableStream<Uint8Array>({
+				pull: (controller) => {
+					if (position >= data.length) {
+						controller.close();
+						return;
+					}
+
+					controller.enqueue(data.slice(position, position + 2 ** 14));
+					position += 2 ** 14;
+				},
+			}), { maxCacheSize });
+
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+		return timestamps;
+	};
+
+	// One fragment of 649 kB
+	const allOfOneFragment = await readPacketTimestamps('rotate-buck-bunny.mp4');
+	expect(allOfOneFragment).toHaveLength(45);
+	expect(await readPacketTimestamps('rotate-buck-bunny.mp4', 2 ** 16)).toEqual(allOfOneFragment);
+
+	// 40 fragments of up to 26 kB
+	const allOfManyFragments = await readPacketTimestamps('fragments-without-keyframes.mp4');
+	expect(allOfManyFragments).toHaveLength(120);
+	expect(await readPacketTimestamps('fragments-without-keyframes.mp4', 2 ** 14)).toEqual(allOfManyFragments);
+});
