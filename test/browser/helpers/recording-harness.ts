@@ -28,7 +28,26 @@ export const createRunningAudioContext = async (options: AudioContextOptions = {
 		return null;
 	}
 
+	// Even then, the output may only report its timing a while later (Chrome on Windows); getContextTimeAt() falls back
+	// to currentTime if it never does
+	const outputWaitStart = performance.now();
+	const hasOutputTiming = () => (audioContext.getOutputTimestamp().performanceTime ?? 0) > 0;
+	while (!hasOutputTiming() && performance.now() - outputWaitStart < 1000) {
+		await sleep(10);
+	}
+
 	return audioContext;
+};
+
+/** The context time of the audio that `audioContext` outputs at the given performance.now() time, in milliseconds. */
+export const getContextTimeAt = (audioContext: AudioContext, performanceTimeMs: number) => {
+	const { contextTime, performanceTime } = audioContext.getOutputTimestamp();
+	if (contextTime !== undefined && performanceTime !== undefined && performanceTime > 0) {
+		return contextTime + (performanceTimeMs - performanceTime) / 1000;
+	}
+
+	// The output hasn't reported its timing; currentTime is off by no more than a render quantum and the output latency
+	return audioContext.currentTime + (performanceTimeMs - performance.now()) / 1000;
 };
 
 export type MarkerSourceOptions = {
@@ -93,9 +112,9 @@ export const createMarkerSource = async (options: MarkerSourceOptions = {}) => {
 			const start = performance.now() + delayMs;
 
 			// Schedule the beeps at the moments the flashes start
-			const { contextTime, performanceTime } = audioContext.getOutputTimestamp();
+			const startContextTime = getContextTimeAt(audioContext, start);
 			for (let time = 0; time < durationMs; time += periodMs) {
-				const beepTime = contextTime! + (start + time - performanceTime!) / 1000;
+				const beepTime = startContextTime + time / 1000;
 				gain.gain.setValueAtTime(0.5, beepTime);
 				gain.gain.setValueAtTime(0, beepTime + markerMs / 1000);
 			}

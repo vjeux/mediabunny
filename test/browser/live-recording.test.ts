@@ -367,6 +367,8 @@ describe.skipIf(!hasMainThreadTrackProcessor)('A/V sync of canvas capture and We
 		}
 
 		expect(result!.errors).toEqual([]);
+		// The marker source itself must have produced its beeps and flashes, or there's nothing to compare
+		expect(result!.inputOffsets.length, 'beep/flash pairs entering the tracks').toBeGreaterThanOrEqual(5);
 		expect(result!.outputOffsets.length).toBeGreaterThanOrEqual(5);
 
 		// Within a recording, the offset moves by at most a frame (the video is sampled at 30 FPS)
@@ -1051,6 +1053,7 @@ describe.skipIf(!runLongTests || !hasTrackGenerator)('Long recordings', () => {
 		}
 
 		expect(result!.errors).toEqual([]);
+		expect(result!.inputOffsets.length, 'beep/flash pairs entering the tracks').toBeGreaterThanOrEqual(58);
 		expect(result!.outputOffsets.length).toBeGreaterThanOrEqual(58);
 		const start = median(result!.outputOffsets.slice(0, 5));
 		const end = median(result!.outputOffsets.slice(-5));
