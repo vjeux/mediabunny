@@ -782,7 +782,7 @@ export class MpegTsInputFormat extends InputFormat {
 	}
 
 	get mimeType() {
-		return 'video/MP2T';
+		return 'video/mp2t';
 	}
 
 	get supportsTimestampedMediaData() {
