@@ -592,6 +592,60 @@ describe('Video', async () => {
 		expect(keyFrameTimestamps).toEqual(interval === 10 ? [0] : [0, 1, 2]);
 	});
 
+	// Encodes 4 s of 128x96 at 30 fps at 300 kbps, whose odd seconds are noise, and returns the bits of each second
+	const encodeBitsPerSecond = async (codec: VideoCodec, bitrateMode: 'variable' | 'constant') => {
+		const bitsPerSecond = [0, 0, 0, 0];
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({
+			codec,
+			quality: new Quality({ bitrate: 300_000, bitrateMode }),
+			onEncodedPacket: (packet) => {
+				bitsPerSecond[Math.floor(Math.round(packet.timestamp * 30) / 30)]! += 8 * packet.byteLength;
+			},
+		});
+		output.addVideoTrack(source, { frameRate: 30 });
+		await output.start();
+
+		let seed = 1;
+		for (let i = 0; i < 120; i++) {
+			const data = new Uint8Array(128 * 96 * 4);
+			const noisy = Math.floor(i / 30) % 2 === 1;
+			for (let j = 0; j < data.length; j++) {
+				seed = (seed * 1103515245 + 12345) % 2147483648;
+				data[j] = j % 4 === 3 ? 255 : noisy ? seed >> 23 : 64 + (i % 4);
+			}
+
+			const sample = new VideoSample(data, {
+				format: 'RGBA',
+				codedWidth: 128,
+				codedHeight: 96,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+			sample.close();
+		}
+		await output.finalize();
+
+		return bitsPerSecond;
+	};
+
+	test.each(['avc', 'hevc', 'vp9'] as VideoCodec[])('%s with bitrateMode \'constant\' caps it', async (codec) => {
+		const variable = await encodeBitsPerSecond(codec, 'variable');
+		const constant = await encodeBitsPerSecond(codec, 'constant');
+
+		// The noise blows far past the target in variable mode, while constant mode reins it in (libvpx already did)
+		expect(constant[1]).toBeLessThan(0.6 * variable[1]!);
+	});
+
+	test('AV1 with bitrateMode \'constant\'', async () => {
+		const constant = await encodeBitsPerSecond('av1', 'constant');
+
+		// The noisy seconds stay close to the 300 kbps target
+		expect(constant[1]).toBeGreaterThan(0);
+		expect(constant[1]).toBeLessThan(600_000);
+	});
+
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },
