@@ -13,6 +13,7 @@ import {
 	isIso639Dash2LanguageCode,
 	isThenable,
 	MaybePromise,
+	promiseWithResolvers,
 	Rotation,
 	toArray,
 	TransformationMatrix,
@@ -461,6 +462,8 @@ export class Output<
 	_startPromise: Promise<void> | null = null;
 	/** @internal */
 	_cancelPromise: Promise<void> | null = null;
+	/** @internal Resolved once the output is canceled. */
+	_canceledSignal = promiseWithResolvers();
 	/** @internal */
 	_finalizePromise: Promise<void> | null = null;
 	/** @internal */
@@ -942,7 +945,15 @@ export class Output<
 			const releasePromise = this._mutex.acquire();
 
 			try {
-				await this._muxer.start();
+				// The muxer may have to wait for its target (an async PathedTarget or initTarget callback, which might
+				// never settle). A cancel must not wait behind that: it ends the start, and a target that still arrives
+				// afterwards gets closed (see _getRootTarget)
+				const muxerStartPromise = this._muxer.start();
+				muxerStartPromise.catch(() => {}); // It may fail on a target closed in the meantime
+				await Promise.race([muxerStartPromise, this._canceledSignal.promise]);
+				if ((this.state as Output['state']) === 'canceled') {
+					throw new Error('Output has been canceled.');
+				}
 
 				const promises = this.tracks.map(track => track.source._start());
 				await Promise.all(promises);
@@ -982,6 +993,7 @@ export class Output<
 
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
+			this._canceledSignal.resolve();
 
 			const release = await this._mutex.acquire();
 
