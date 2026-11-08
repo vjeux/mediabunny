@@ -334,9 +334,13 @@ export class WebMInputFormat extends MatroskaInputFormat {
  */
 const skipZeroBytes = async (reader: Reader, pos: number, maxLength: number) => {
 	const end = pos + maxLength;
+	// Start small: a source of unknown size (such as a live stream) only resolves a slice once all of it has come in,
+	// and there's usually no zero to skip. Grow the slices while zeros keep coming, up to 64 KiB.
+	let chunkSize = 16;
 
 	while (pos < end) {
-		let slice = reader.requestSliceRange(pos, 1, Math.min(2 ** 16, end - pos));
+		let slice = reader.requestSliceRange(pos, 1, Math.min(chunkSize, end - pos));
+		chunkSize = Math.min(2 * chunkSize, 2 ** 16);
 		if (isThenable(slice)) {
 			slice = await slice;
 		}
