@@ -1032,7 +1032,8 @@ export class MpegTsDemuxer extends Demuxer {
 			// (conditional access, which usually means scrambled packets) or no supported streams are only fallen back
 			// to if no better one shows up: first one with streams without a CA descriptor, else the first one. CA
 			// descriptors are often left in recordings that aren't scrambled, though, so whether a stream is scrambled
-			// is decided by its packets.
+			// is decided by its packets, which we watch while waiting: a program whose packets turn out clear is taken
+			// right away.
 			const seenProgramMapPids = new Set<number>();
 			type FallbackProgram = { pmtPos: number; pmtPid: number; streams: ElementaryStream[] };
 			// The first program with streams both with and without CA descriptors, the first with streams that all
@@ -1040,26 +1041,42 @@ export class MpegTsDemuxer extends Demuxer {
 			let partlyScrambledProgram: FallbackProgram | null = null;
 			let scrambledProgram: FallbackProgram | null = null;
 			let emptyProgram: FallbackProgram | null = null;
+			// Whether the TS packet holding the first PES packet of a stream of one of these programs was scrambled
+			const firstPesPacketScrambling = new Map<number, boolean>();
 
-			// Uses the best fallback program, reading its streams from the start of the file (their PES packets can
-			// come before the PMT)
+			// Uses the given program. Without a program, sections were read as contiguous, which cuts PES packets
+			// short at the first packet of another PID, so the section ends recorded since can't be trusted.
+			const useProgram = (program: FallbackProgram, goBack: boolean) => {
+				this.elementaryStreams.push(...program.streams);
+				hasProgramMap = true;
+				programMapSectionPid = program.pmtPid;
+				this.sectionEndPositions.clear();
+
+				if (goBack) {
+					// Read its streams' first PES packets from the start of the file (they can come before the PMT)
+					currentPos = this.packetOffset;
+				}
+			};
+
+			// Uses the best fallback program, once no better one is to be expected
 			const useFallbackProgram = () => {
 				const program = partlyScrambledProgram ?? scrambledProgram ?? emptyProgram;
 				if (hasProgramMap || !program) {
 					return false;
 				}
 
-				hasProgramMap = true;
-				programMapSectionPid = program.pmtPid;
-
-				if (program.streams.length > 0) {
-					this.elementaryStreams.push(...program.streams);
-					currentPos = this.packetOffset;
-					// Without a program, sections were read as contiguous, which cuts PES packets short at the first
-					// packet of another PID, so the section ends recorded since can't be trusted
-					this.sectionEndPositions.clear();
+				const scrambling = program.streams.map(stream => firstPesPacketScrambling.get(stream.pid));
+				if (scrambling.length > 0 && scrambling.every(scrambled => scrambled === true)) {
+					// Every stream showed up scrambled, so there's nothing to go back for
+					throw new Error(
+						'The streams of this transport stream are scrambled (conditional access), so they can\'t be'
+						+ ' read.',
+					);
 				}
 
+				// Only the streams that showed up clear need going back to. The others are read from here on, the
+				// scrambled ones to be left out when they show up again.
+				useProgram(program, scrambling.includes(false));
 				return true;
 			};
 
@@ -1110,6 +1127,24 @@ export class MpegTsDemuxer extends Demuxer {
 					// Not the start of a section
 					currentPos += this.packetStride;
 					continue;
+				}
+
+				if (!hasProgramMap && !firstPesPacketScrambling.has(packetHeader.pid)) {
+					const program = [partlyScrambledProgram, scrambledProgram]
+						.find(x => x?.streams.some(stream => stream.pid === packetHeader.pid));
+					if (program) {
+						const isScrambled = packetHeader.transportScramblingControl !== 0;
+						firstPesPacketScrambling.set(packetHeader.pid, isScrambled);
+
+						const isUnscrambledProgram = program.streams
+							.every(stream => firstPesPacketScrambling.get(stream.pid) !== true);
+						if (!isScrambled && isUnscrambledProgram) {
+							// The program's packets are clear despite its CA descriptors, so there's no need to wait
+							// for a better program (nor to go far back for this one's packets)
+							useProgram(program, true);
+							continue;
+						}
+					}
 				}
 
 				if (
