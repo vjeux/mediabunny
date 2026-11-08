@@ -126,7 +126,14 @@ import {
 	readAscii,
 	SliceRangeError,
 } from '../reader';
-import { DEFAULT_TRACK_DISPOSITION, MetadataTags, RichImageData, TrackDisposition } from '../metadata';
+import {
+	DEFAULT_TRACK_DISPOSITION,
+	MetadataTags,
+	RichImageData,
+	TrackDisposition,
+	unwatchMetadataTagFields,
+	watchMetadataTagFields,
+} from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
@@ -1472,6 +1479,19 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 		} finally {
 			this.boxNestingDepth--;
+		}
+	}
+
+	/**
+	 * Iterates over the metadata items of a udta or ilst box. An item that fails to parse mustn't leave the fields
+	 * watched, and a loop that throws ends this iterator, which runs the finally.
+	 */
+	// eslint-disable-next-line @stylistic/generator-star-spacing
+	*iterateMetadataItems(slice: FileSlice) {
+		try {
+			yield* this.iterateContiguousBoxes(slice);
+		} finally {
+			unwatchMetadataTagFields(this.metadataTags);
 		}
 	}
 
@@ -3910,7 +3930,7 @@ export class IsobmffDemuxer extends Demuxer {
 				// https://mp4workshop.com/about
 
 			case 'udta': { // Contains either movie metadata or track metadata
-				const iterator = this.iterateContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
+				const iterator = this.iterateMetadataItems(slice.slice(contentStartPos, boxInfo.contentSize));
 
 				for (const { boxInfo, slice } of iterator) {
 					if (
@@ -3922,6 +3942,7 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 
 					if (boxInfo.name !== 'meta' && !this.currentTrack) {
+						watchMetadataTagFields(this.metadataTags, boxInfo.name);
 						const startPos = slice.filePos;
 						this.metadataTags.raw ??= {};
 
@@ -4002,6 +4023,8 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 					}
+
+					unwatchMetadataTagFields(this.metadataTags);
 				}
 			}; break;
 
@@ -4053,7 +4076,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				const iterator = this.iterateContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
+				const iterator = this.iterateMetadataItems(slice.slice(contentStartPos, boxInfo.contentSize));
 
 				for (const { boxInfo, slice } of iterator) {
 					const itemEndPos = slice.filePos + boxInfo.contentSize;
@@ -4090,6 +4113,7 @@ export class IsobmffDemuxer extends Demuxer {
 						data = readDataBox(slice);
 					}
 
+					watchMetadataTagFields(this.metadataTags, metadataKey);
 					this.metadataTags.raw ??= {};
 					this.metadataTags.raw[metadataKey] ??= data;
 
@@ -4282,6 +4306,8 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 					}
+
+					unwatchMetadataTagFields(this.metadataTags);
 				}
 			}; break;
 		}
