@@ -2737,7 +2737,9 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 						fallBackToPlainEntry(error);
 						continue;
 					}
-					if (!slice) break;
+					if (!slice) {
+						break;
+					}
 
 					const elementHeader = readElementHeader(slice);
 
