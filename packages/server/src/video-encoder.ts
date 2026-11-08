@@ -112,6 +112,28 @@ const canProduceCodecString = (codec: VideoCodec, codecString: string) => {
 	return true;
 };
 
+/**
+ * Whether a hardware encoder can give what a codec string asks for beyond the codec itself. NVENC is the only one we
+ * know how to ask for a lower AVC profile or a 10-bit HEVC or AV1 stream (from P010 frames); AVC High 10 it only has
+ * on recent GPUs. The software encoder is used otherwise.
+ */
+const hardwareCanHonorCodecString = (hardwareCodec: NodeAv.Codec, codec: VideoCodec, codecString: string) => {
+	const requirements = parseCodecStringRequirements(codec, codecString);
+	const isNvenc = !!hardwareCodec.name?.endsWith('_nvenc');
+
+	if (requirements.bitDepth > 8) {
+		return isNvenc
+			&& codec !== 'avc'
+			&& requirements.bitDepth === 10
+			&& !!hardwareCodec.pixelFormats?.includes(NodeAv.AV_PIX_FMT_P010LE);
+	}
+	if (requirements.avcProfile !== null) {
+		return isNvenc;
+	}
+
+	return true;
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
@@ -178,6 +200,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				// NVENC is the only hardware encoder we know how to drive in constant-quantizer mode
 				hardwareCodec = null;
 			}
+			if (hardwareCodec && !hardwareCanHonorCodecString(hardwareCodec, this.codec, this.config.codec)) {
+				hardwareCodec = null;
+			}
 
 			codec = hardwareCodec ?? getSoftwareCodec();
 		}
@@ -217,8 +242,11 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		}
 
 		const requirements = parseCodecStringRequirements(this.codec, this.config.codec);
+		// Hardware encoders like NVENC take 10-bit frames as P010 instead
 		const requestedPixelFormat = requirements.bitDepth === 10
-			? NodeAv.AV_PIX_FMT_YUV420P10LE
+			? this.avCodec.pixelFormats?.includes(NodeAv.AV_PIX_FMT_YUV420P10LE) === false
+				? NodeAv.AV_PIX_FMT_P010LE
+				: NodeAv.AV_PIX_FMT_YUV420P10LE
 			: requirements.bitDepth === 12
 				? NodeAv.AV_PIX_FMT_YUV420P12LE
 				: null;
@@ -258,6 +286,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 		if (this.avCodec.name === 'libx264' && requirements.avcProfile !== null) {
 			codecContext.profile = requirements.avcProfile;
+		} else if (this.avCodec.name === 'h264_nvenc' && requirements.avcProfile !== null) {
+			codecContext.setOption(
+				'profile',
+				requirements.avcProfile === NodeAv.AV_PROFILE_H264_BASELINE ? 'baseline' : 'main',
+			);
+		} else if (this.avCodec.name === 'hevc_nvenc' && requirements.bitDepth === 10) {
+			codecContext.setOption('profile', 'main10');
 		}
 
 		const isRealtime = this.config.latencyMode === 'realtime';
