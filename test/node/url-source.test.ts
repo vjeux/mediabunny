@@ -60,35 +60,47 @@ test('UrlSource works against a server without range request support', async () 
 
 test('UrlSource reads a relative URL from a server without range request support outside a window', async () => {
 	// In a worker, there's no window to resolve a relative URL against, while fetch resolves it against the worker's
-	// location. Here, the fetch function does that.
-	const server = await startRangelessServer();
-	const logs = captureLogs();
-
-	try {
-		using input = new Input({
-			source: new UrlSource('video.mp4', {
-				fetchFn: (url, init) => fetch(new URL(url as string, server.url), init),
-			}),
-			formats: ALL_FORMATS,
-		});
-
-		// On main, building the URL for the warning about the missing range request support threw "Invalid URL"
-		const track = await input.getPrimaryVideoTrack();
-		if (!track) throw new Error('No video track found');
-
-		let packetCount = 0;
-		for await (const packet of new EncodedPacketSink(track).packets()) {
-			void packet;
-			packetCount++;
+	// location. Here, the fetch function does that, and either returns the response as is, or rebuilds it (as caching
+	// layers and header-rewriting wrappers do), which leaves it without a url; a worker's location is stood in for.
+	for (const rebuilt of [false, true]) {
+		const server = await startRangelessServer();
+		const logs = captureLogs();
+		const globals = globalThis as unknown as { location?: URL };
+		if (rebuilt) {
+			globals.location = new URL(server.url);
 		}
 
-		expect(packetCount).toBe(125);
-		expect(logs.warnings.filter(
-			x => x.includes(`HTTP server (origin ${new URL(server.url).origin}) did not respond to a range request`),
-		)).toHaveLength(1);
-	} finally {
-		logs.stop();
-		server.close();
+		try {
+			using input = new Input({
+				source: new UrlSource('video.mp4', {
+					fetchFn: async (url, init) => {
+						const response = await fetch(new URL(url as string, server.url), init);
+						return rebuilt ? new Response(response.body, response) : response;
+					},
+				}),
+				formats: ALL_FORMATS,
+			});
+
+			// On main, building the URL for the warning about the missing range request support threw "Invalid URL"
+			const track = await input.getPrimaryVideoTrack();
+			if (!track) {
+				throw new Error('No video track found');
+			}
+
+			let packetCount = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				void packet;
+				packetCount++;
+			}
+
+			expect(packetCount).toBe(125);
+			const warning = `HTTP server (origin ${new URL(server.url).origin}) did not respond to a range request`;
+			expect(logs.warnings.filter(x => x.includes(warning))).toHaveLength(1);
+		} finally {
+			delete globals.location;
+			logs.stop();
+			server.close();
+		}
 	}
 });
 
