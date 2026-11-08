@@ -1005,7 +1005,7 @@ export type IsobmffInputFormatOptions = {
 		keyId: string;
 		/**
 		 * Protection System Specific Header (pssh) boxes that apply to this key ID. Can be used to obtain a
-		 * description key from a DRM license server.
+		 * decryption key from a DRM license server.
 		 */
 		psshBoxes: PsshBox[];
 	}) => MaybePromise<Uint8Array | string>;
