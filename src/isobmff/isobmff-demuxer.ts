@@ -2812,6 +2812,10 @@ export class IsobmffDemuxer extends Demuxer {
 					track.info.codec = 'mp3';
 				} else if (objectTypeIndication === 0xdd) {
 					track.info.codec = 'vorbis'; // "nonstandard, gpac uses it" - FFmpeg
+				} else if (objectTypeIndication === 0xa5) {
+					track.info.codec = 'ac3'; // Registered at MP4RA, like the ones below; FFmpeg and Chromium read them
+				} else if (objectTypeIndication === 0xa6) {
+					track.info.codec = 'eac3';
 				} else if (objectTypeIndication === 0xa9) {
 					track.info.codec = 'dts';
 				} else {
