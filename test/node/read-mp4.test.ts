@@ -4980,3 +4980,53 @@ test('AC-3 and E-AC-3 declared by an esds box', async () => {
 	expect(await read(0xa6)).toEqual(['eac3', 6, 48000, 100]);
 	expect(await read(0xa9)).toEqual(['dts', 6, 48000, 100]);
 });
+
+test('Track names stored as C strings', async () => {
+	// Some writers end a track's udta name with a NUL, like Firefox's test file gizmo-frag.mp4 ("Stereo\0"). Like
+	// FFmpeg, the name ends at the first NUL.
+	const u16 = (value: number) => [(value >> 8) & 0xff, value & 0xff];
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	const readName = async (nameBytes: number[]) => {
+		const ipcm = box('ipcm', zeros(6), u16(1), zeros(8), u16(1), u16(16), zeros(4), u32(48000 * 0x10000),
+			box('pcmC', zeros(4), [1, 16]));
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(48000), u32(5), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(5), zeros(16), matrix, zeros(8)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(48000), u32(5), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), ipcm),
+						box('stts', zeros(4), u32(1), u32(5), u32(1)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(5), u32(1)),
+						box('stsz', zeros(4), u32(2), u32(5)),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+				box('udta', box('name', nameBytes)),
+			),
+		);
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...box('mdat', zeros(10)), ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		return track.getName();
+	};
+
+	expect(await readName(ascii('Stereo'))).toBe('Stereo');
+	expect(await readName([...ascii('Stereo'), 0])).toBe('Stereo');
+	expect(await readName([...ascii('Stereo'), 0, 0, ...ascii('junk')])).toBe('Stereo');
+});
