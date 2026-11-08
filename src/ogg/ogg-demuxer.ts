@@ -432,12 +432,21 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	sequentialScanCache: EncodedPacketMetadata[] = [];
 	sequentialScanMutex = new AsyncMutex();
 	firstTimestampInSamplesPromise: Promise<number> | null = null;
+	/**
+	 * Whether the file size was unknown when the track was read, as with a ReadableStreamSource. Such a source is read
+	 * in order and can't read back what has left its cache, which a binary search would do, so packets are always
+	 * looked up by reading on, even once reaching the end of the stream has made its size known.
+	 */
+	sourceWasUnsized: boolean;
+	/** The track's last packet, once reading on has reached it. */
+	lastPacketMetadata: EncodedPacketMetadata | null = null;
 
 	constructor(public bitstream: LogicalBitstream, public demuxer: OggDemuxer) {
 		// Opus always uses a fixed sample rate for its internal calculations, even if the actual rate is different
 		this.internalSampleRate = bitstream.codecInfo.codec === 'opus'
 			? OPUS_SAMPLE_RATE
 			: bitstream.sampleRate;
+		this.sourceWasUnsized = demuxer.reader.fileSizeNonStrict === null;
 	}
 
 	getType() {
@@ -672,6 +681,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 
 		const packetPosition = await this.demuxer.findNextPacketStart(prevMetadata.packet);
 		if (!packetPosition) {
+			// This is the track's last packet. Let's remember it, so that looking it up again (as computeDuration()
+			// does) doesn't need to read on from the start of a stream, which the source may no longer hold.
+			this.lastPacketMetadata ??= prevMetadata;
 			return null;
 		}
 
@@ -693,8 +705,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
-		if (this.demuxer.reader.fileSize === null) {
-			// No file size known, can't do binary search, but fall back to sequential algo instead
+		if (this.sourceWasUnsized || this.demuxer.reader.fileSize === null) {
+			// No file size known (or not from the start), can't do binary search, but fall back to sequential algo
+			// instead
 			return this.getPacketSequential(timestamp, options);
 		}
 
@@ -1024,6 +1037,18 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		try {
 			const timestampInSamples = roundIfAlmostInteger(timestamp * this.internalSampleRate);
 			timestamp = timestampInSamples / this.internalSampleRate;
+
+			if (this.lastPacketMetadata && timestampInSamples >= this.lastPacketMetadata.timestampInSamples) {
+				// It's the last packet, which reading on has already reached
+				return this.createEncodedPacketFromOggPacket(
+					this.lastPacketMetadata.packet,
+					{
+						timestampInSamples: this.lastPacketMetadata.timestampInSamples,
+						vorbisLastBlocksize: this.lastPacketMetadata.vorbisLastBlockSize,
+					},
+					options,
+				);
+			}
 
 			const index = binarySearchLessOrEqual(
 				this.sequentialScanCache,
