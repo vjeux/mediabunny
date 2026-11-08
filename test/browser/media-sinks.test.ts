@@ -2,7 +2,7 @@ import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, CustomPathedSource, UrlSource, CustomSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { assert, promiseWithResolvers, clamp } from '../../src/misc.js';
+import { assert, promiseWithResolvers, clamp, isChromium } from '../../src/misc.js';
 import {
 	AudioBufferSink,
 	AudioSampleSink,
@@ -11,8 +11,9 @@ import {
 	CanvasSink,
 } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat, MpegTsOutputFormat, OutputFormat } from '../../src/output-format.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { Mp4OutputFormat, MpegTsOutputFormat, OutputFormat, WebMOutputFormat } from '../../src/output-format.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, CanvasSource } from '../../src/media-source.js';
+import { canEncodeVideo } from '../../src/encode.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions, VideoSample } from '../../src/sample.js';
@@ -1929,5 +1930,72 @@ test.for([
 		assert(sample);
 		expect(sample.timestamp).toBe(timestamp);
 		expectSameAudio(getAudioSignature(sample), signature);
+	}
+});
+
+test.for(['vp9', 'av1'] as const)('Chromium decodes %s of odd dimensions in software, unless asked otherwise', async (
+	codec,
+	{ skip },
+) => {
+	// Chromium's hardware decoders fail on VP9 and AV1 of odd dimensions with a decoding error, though
+	// isConfigSupported() says they decode them (found by lane L14, with Windows' D3D11 decoders)
+	skip(!isChromium(), 'the workaround is for Chromium');
+	skip(!(await canEncodeVideo(codec, { width: 641, height: 479 })), 'there is no encoder for this codec here');
+
+	const encode = async (width: number, height: number) => {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const canvas = new OffscreenCanvas(width, height);
+		const context = canvas.getContext('2d');
+		assert(context);
+		const source = new CanvasSource(canvas, { codec, bitrate: 1e6 });
+		output.addVideoTrack(source);
+		await output.start();
+		for (let i = 0; i < 2; i++) {
+			context.fillStyle = i === 0 ? 'red' : 'blue';
+			context.fillRect(0, 0, width, height);
+			await source.add(i / 30, 1 / 30);
+		}
+		await output.finalize();
+
+		return new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	};
+
+	const hardwareAccelerations: (string | undefined)[] = [];
+	// eslint-disable-next-line @typescript-eslint/unbound-method
+	const configure = VideoDecoder.prototype.configure;
+	VideoDecoder.prototype.configure = function (this: VideoDecoder, config) {
+		hardwareAccelerations.push(config.hardwareAcceleration);
+		return configure.call(this, config);
+	};
+
+	try {
+		using odd = await encode(641, 479);
+		const oddTrack = await odd.getPrimaryVideoTrack();
+		assert(oddTrack);
+		for (const hardwareAcceleration of [undefined, 'no-preference'] as const) {
+			hardwareAccelerations.length = 0;
+			using sample = await new VideoSampleSink(oddTrack, { hardwareAcceleration }).getSample(0);
+			expect(sample?.displayWidth).toBe(641);
+			expect(hardwareAccelerations, String(hardwareAcceleration)).toEqual(['prefer-software']);
+		}
+
+		// An explicit choice is kept, though hardware decoding may not be available here
+		hardwareAccelerations.length = 0;
+		await new VideoSampleSink(oddTrack, { hardwareAcceleration: 'prefer-hardware' }).getSample(0).then(
+			sample => sample?.close(),
+			() => {},
+		);
+		expect(hardwareAccelerations).not.toContain('prefer-software');
+
+		// Even dimensions keep the default
+		using even = await encode(640, 480);
+		const evenTrack = await even.getPrimaryVideoTrack();
+		assert(evenTrack);
+		hardwareAccelerations.length = 0;
+		using sample = await new VideoSampleSink(evenTrack).getSample(0);
+		expect(sample?.displayWidth).toBe(640);
+		expect(hardwareAccelerations).toEqual([undefined]);
+	} finally {
+		VideoDecoder.prototype.configure = configure;
 	}
 });
