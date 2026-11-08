@@ -3183,6 +3183,187 @@ test('Sparse tracks in segments, fragmented MP4', async () => {
 	});
 });
 
+test('A discontinuity dated earlier than the timeline so far doesn\'t send the timeline back in time', async () => {
+	// Two clips of one dated recording, the later clip first (a highlights playlist, or an encoder that came back with
+	// a reset clock). With timestamps offset by date time, the second clip's date would put its media an hour before
+	// the first clip's.
+	const targets = new Map<string, BufferTarget>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1 }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			targets.set(request.path, target);
+			return target;
+		}),
+	});
+	const audio = audioSource();
+	output.addAudioTrack(audio);
+	await output.start();
+	const frameCount = 188;
+	for (let i = 0; i < frameCount; i++) {
+		await audio.add(new EncodedPacket(aacPacketData, 'key', i * 1024 / 48000, 1024 / 48000), aacMetadata);
+	}
+	await output.finalize();
+
+	// Whichever order the tags of the second clip's first segment come in
+	for (const dateFirst of [false, true]) {
+		await checkReversedClips(targets, frameCount, dateFirst);
+	}
+});
+
+const checkReversedClips = async (targets: Map<string, BufferTarget>, frameCount: number, dateFirst: boolean) => {
+	let segmentIndex = 0;
+	const playlist = new TextDecoder().decode(targets.get('playlist-1.m3u8')!.buffer!).replace(/#EXTINF/g, (match) => {
+		const index = segmentIndex++;
+		if (index === 0) {
+			return `#EXT-X-PROGRAM-DATE-TIME:2026-01-01T11:00:00.000Z\n${match}`;
+		} else if (index === 2) {
+			const tags = ['#EXT-X-DISCONTINUITY', '#EXT-X-PROGRAM-DATE-TIME:2026-01-01T10:00:00.000Z'];
+			return `${(dateFirst ? tags.reverse() : tags).join('\n')}\n${match}`;
+		}
+
+		return match;
+	});
+	using input = new Input({
+		source: new CustomPathedSource('playlist-1.m3u8', ({ path }) => new BufferSource(
+			path === 'playlist-1.m3u8' ? new TextEncoder().encode(playlist) : targets.get(path)!.buffer!,
+		)),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	const sink = new EncodedPacketSink(track);
+	const timestamps: number[] = [];
+	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+		timestamps.push(packet.timestamp);
+	}
+	expect(timestamps).toHaveLength(frameCount);
+	for (let i = 1; i < timestamps.length; i++) {
+		expect(timestamps[i]!).toBeGreaterThan(timestamps[i - 1]!);
+	}
+
+	const start = Date.parse('2026-01-01T11:00:00.000Z') / 1000;
+	expect(timestamps[0]).toBe(start);
+	expect((await sink.getPacket(start + 3))!.timestamp).toBeCloseTo(start + 3, 1);
+	expect(await track.getDurationFromMetadata()).toBeCloseTo(start + frameCount * 1024 / 48000, 1);
+
+	// The second clip's own date still gives its Unix times
+	const secondClipStart = timestamps.find(x => x >= start + 2 - 1e-6)!;
+	const unixTime = await track.getUnixTimeForTimestamp(secondClipStart);
+	expect(unixTime! - Date.parse('2026-01-01T10:00:00.000Z') / 1000).toBeCloseTo(secondClipStart - (start + 2), 1);
+};
+
+test('Renditions dated alike take the same decision for a discontinuity dated earlier', async () => {
+	// A date about a second before the end of the timeline so far: the renditions' timelines end a bit apart (audio
+	// segments end on audio frames), but they must not place the discontinuity differently
+	const write = async (kind: 'video' | 'audio') => {
+		const targets = new Map<string, BufferTarget>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1 }),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const target = new BufferTarget();
+				targets.set(request.path, target);
+				return target;
+			}),
+		});
+		if (kind === 'video') {
+			const video = videoSource();
+			output.addVideoTrack(video);
+			await output.start();
+			for (let i = 0; i < 100; i++) {
+				await video.add(new EncodedPacket(avcPacketData, 'key', i / 25, 1 / 25), avcMetadata);
+			}
+		} else {
+			const audio = audioSource();
+			output.addAudioTrack(audio);
+			await output.start();
+			for (let i = 0; i < 188; i++) {
+				await audio.add(new EncodedPacket(aacPacketData, 'key', i * 1024 / 48000, 1024 / 48000), aacMetadata);
+			}
+		}
+		await output.finalize();
+
+		return targets;
+	};
+	const video = await write('video');
+	const audio = await write('audio');
+
+	const playlistOf = (targets: Map<string, BufferTarget>) => {
+		return new TextDecoder().decode(targets.get('playlist-1.m3u8')!.buffer!);
+	};
+	const timelineEnd = (playlist: string, segmentCount: number) => {
+		return [...playlist.matchAll(/#EXTINF:([\d.]+)/g)]
+			.slice(0, segmentCount)
+			.reduce((sum, match) => sum + Number(match[1]), 0);
+	};
+	const videoEnd = timelineEnd(playlistOf(video), 2);
+	const audioEnd = timelineEnd(playlistOf(audio), 2);
+	expect(videoEnd).not.toBe(audioEnd);
+	const date = Math.min(videoEnd, audioEnd) - 1 + Math.abs(audioEnd - videoEnd) / 2; // Between the two thresholds
+
+	const toIsoString = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1000).toISOString();
+	const addDates = (playlist: string) => {
+		let index = 0;
+		return playlist.replace(/#EXTINF/g, (match) => {
+			const i = index++;
+			if (i === 0) {
+				return `#EXT-X-PROGRAM-DATE-TIME:${toIsoString(0)}\n${match}`;
+			} else if (i === 2) {
+				return `#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:${toIsoString(date)}\n${match}`;
+			}
+
+			return match;
+		});
+	};
+	const files = new Map<string, Uint8Array>([
+		['master.m3u8', new TextEncoder().encode([
+			'#EXTM3U',
+			'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,URI="audio/playlist-1.m3u8"',
+			'#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.4d401e,mp4a.40.2",AUDIO="audio"',
+			'video/playlist-1.m3u8',
+		].join('\n'))],
+		['video/playlist-1.m3u8', new TextEncoder().encode(addDates(playlistOf(video)))],
+		['audio/playlist-1.m3u8', new TextEncoder().encode(addDates(playlistOf(audio)))],
+	]);
+	for (const [prefix, targets] of [['video', video], ['audio', audio]] as const) {
+		for (const [path, target] of targets) {
+			if (!path.endsWith('.m3u8')) {
+				files.set(`${prefix}/${path}`, new Uint8Array(target.buffer!));
+			}
+		}
+	}
+
+	const openInput = () => new Input({
+		source: new CustomPathedSource('master.m3u8', ({ path }) => new BufferSource(files.get(path)!)),
+		formats: ALL_FORMATS,
+	});
+
+	using input = openInput();
+	const audioTrack = (await input.getPrimaryAudioTrack())!;
+	const metadataDuration = (await audioTrack.getDurationFromMetadata())!;
+	expect(Math.abs(metadataDuration - await audioTrack.computeDuration())).toBeLessThan(0.1);
+
+	// Nor does where the discontinuity lands depend on which track is read first
+	const getSecondClipStart = async (firstTrackType: 'video' | 'audio') => {
+		using orderInput = openInput();
+		const firstTrack = (await orderInput.getTracks()).find(track => track.type === firstTrackType)!;
+		const firstSink = new EncodedPacketSink(firstTrack);
+		for await (const packet of firstSink.packets(undefined, undefined, { metadataOnly: true })) {
+			void packet;
+		}
+
+		const videoTrack = (await orderInput.getPrimaryVideoTrack())!;
+		const timestamps: number[] = [];
+		const sink = new EncodedPacketSink(videoTrack);
+		for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+			timestamps.push(packet.timestamp);
+		}
+
+		return timestamps[50]!; // The second clip's first frame
+	};
+	expect(await getSecondClipStart('audio')).toBeCloseTo(await getSecondClipStart('video'), 3);
+});
+
 test('Sparse tracks in segments, fragmented MP4 + single file', async () => {
 	await testSparseTracksInSegments({
 		segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }),
