@@ -731,6 +731,10 @@ export class AdtsInputFormat extends InputFormat {
 
 		// Packed audio, like HLS segments, may carry timed ID3v2 tags between frames
 		currentPos = await skipId3V2Tags(currentPos + firstHeader.frameLength);
+		if (currentPos === input._reader.fileSize) {
+			// The file holds exactly this one frame, so surely this is ADTS
+			return true;
+		}
 
 		slice = input._reader.requestSliceRange(
 			currentPos,
