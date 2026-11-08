@@ -229,6 +229,52 @@ test('VideoSampleSource, flip is baked in via transform', async () => {
 	input.dispose();
 });
 
+test('VideoSampleSource with alpha encodes where workers can\'t be constructed', async () => {
+	// Like under Trusted Types (require-trusted-types-for 'script'), where Chromium throws right away; the color/alpha
+	// splitter then runs on this thread, and later encoders don't try a worker again
+	const RealWorker = Worker;
+	let attempts = 0;
+	globalThis.Worker = class {
+		constructor() {
+			attempts++;
+			throw new TypeError(
+				'Failed to construct \'Worker\': This document requires \'TrustedScriptURL\' assignment.',
+			);
+		}
+	} as unknown as typeof Worker;
+
+	try {
+		for (let i = 0; i < 2; i++) {
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+			let alphaPacketCount = 0;
+			const source = new VideoSampleSource({
+				codec: 'vp9',
+				quality: new Quality('high'),
+				alpha: 'keep',
+				onEncodedPacket: (packet) => {
+					alphaPacketCount += packet.sideData.alpha ? 1 : 0;
+				},
+			});
+			output.addVideoTrack(source);
+			await output.start();
+
+			const canvas = new OffscreenCanvas(64, 64);
+			canvas.getContext('2d')!.fillRect(0, 0, 32, 64); // Left half opaque, right half transparent
+			for (let j = 0; j < 3; j++) {
+				using sample = new VideoSample(canvas, { timestamp: j / 30, duration: 1 / 30 });
+				await source.add(sample);
+			}
+			await output.finalize();
+
+			expect(alphaPacketCount).toBe(3);
+		}
+
+		expect(attempts).toBe(1);
+	} finally {
+		globalThis.Worker = RealWorker;
+	}
+});
+
 test('VideoSampleSource, encoding flipped video frames with forced transform', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { force: true } },
