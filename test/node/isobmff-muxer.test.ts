@@ -66,6 +66,45 @@ test('ISOBMFF muxer internally converts ADTS to AAC', async () => {
 	expect(count).toBe(4557);
 });
 
+test('MP3 below 32 kHz is declared as MPEG-2 audio in the esds', async () => {
+	// Layer III frame headers: MPEG-1 at 44.1 kHz (128 kbit/s) and MPEG-2 at 22.05 kHz (64 kbit/s), both stereo
+	const formats = [
+		{ sampleRate: 44100, header: [0xff, 0xfb, 0x90, 0x00], frameSize: 417, frameLength: 1152, expected: 0x6b },
+		{ sampleRate: 22050, header: [0xff, 0xf3, 0x80, 0x00], frameSize: 208, frameLength: 576, expected: 0x69 },
+	];
+
+	for (const { sampleRate, header, frameSize, frameLength, expected } of formats) {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('mp3');
+		output.addAudioTrack(source);
+		await output.start();
+
+		for (let i = 0; i < 4; i++) {
+			const data = new Uint8Array(frameSize);
+			data.set(header);
+			const duration = frameLength / sampleRate;
+			await source.add(new EncodedPacket(data, 'key', i * duration, duration), {
+				decoderConfig: { codec: 'mp3', sampleRate, numberOfChannels: 2 },
+			});
+		}
+		await output.finalize();
+
+		// The ES_Descriptor and DecoderConfigDescriptor headers are 2 bytes each here (sizes below 128)
+		const bytes = new Uint8Array(output.target.buffer!);
+		const esds = bytes.findIndex((_, i) => String.fromCharCode(...bytes.subarray(i, i + 4)) === 'esds');
+		expect(bytes[esds + 8]).toBe(0x03); // ES_Descriptor
+		expect(bytes[esds + 13]).toBe(0x04); // DecoderConfigDescriptor
+		// ISO/IEC 11172-3 (0x6B) for MPEG-1 audio, ISO/IEC 13818-3 (0x69) for the lower rates, as FFmpeg writes them
+		expect(bytes[esds + 15]).toBe(expected);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		expect(await track.getCodec()).toBe('mp3');
+		expect(await track.getSampleRate()).toBe(sampleRate);
+	}
+});
+
 test('Fragmented fMP4 with video+audio preserves B-frame CTS', async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
