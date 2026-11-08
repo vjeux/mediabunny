@@ -2129,8 +2129,8 @@ test('Damaged or hostile sizes don\'t make reads buffer whole streams or allocat
 	expect(moofStream.stats.pulled).toBeLessThan(4 * 2 ** 20);
 
 	// A server stating a huge file size, for an MP4 whose moov claims 4 GiB and a WAVE whose LIST chunk claims about as
-	// much. On main, both streamed until the server gave up, reading the MP4 allocated a 4 GiB buffer, and both then
-	// failed with unrelated errors
+	// much. On main, both allocated a 4 GiB buffer and streamed into it until the server gave up, then failed with
+	// unrelated errors
 	const fmt = [...ascii('fmt '), ...le32(16), 1, 0, 2, 0, ...le32(44100), ...le32(176400), 4, 0, 16, 0];
 	for (const head of [
 		[...ftyp, ...bigBoxHeader('moov', 1)],
