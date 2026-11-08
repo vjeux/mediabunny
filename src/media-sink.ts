@@ -517,6 +517,9 @@ const isInvisibleVp8Frame = (codec: VideoCodec, data: Uint8Array) => {
  */
 const TIMESTAMP_EPSILON = 1e-10;
 
+// Decoded video frames are timed with their packets' timestamps, so these compare equal up to rounding
+const FRAME_TIMESTAMP_EPSILON = 1e-6;
+
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
 > {
@@ -531,6 +534,73 @@ abstract class DecoderWrapper<
 	abstract decode(packet: EncodedPacket): void;
 	abstract flush(): Promise<void>;
 	abstract close(): void;
+}
+
+/**
+ * Gets the key packet before a key packet, from which decoding gets the frames presented before it (the last ones of
+ * the previous GOP). Returns null if there's none.
+ */
+const getPreviousKeyPacket = async (
+	packetSink: EncodedPacketSink,
+	packet: EncodedPacket,
+	options: PacketRetrievalOptions,
+) => {
+	const step = 1 / await packetSink._track.getTimeResolution();
+	const previousPacket = await packetSink.getKeyPacket(packet.timestamp - step, options);
+	return previousPacket && previousPacket.sequenceNumber < packet.sequenceNumber ? previousPacket : null;
+};
+
+/**
+ * The packets a decoder was given, in decoding order, for decoding again after its flush failed (see the sample
+ * iterators). Decoding again can only recover the frames the decoder held back at the end, so it starts at a key packet
+ * before which the decoder gave back every frame: if an earlier frame failed, that frame is decoded again, and fails
+ * again, instead of the frames after it getting lost unnoticed.
+ */
+class DecodedPackets {
+	first: EncodedPacket | null = null;
+	last: EncodedPacket | null = null;
+	/** The highest timestamp among the packets before the last one */
+	maxTimestampBeforeLast = -Infinity;
+	/** The latest key packets, each with the highest timestamp among the packets before it */
+	keyPackets: { packet: EncodedPacket; maxTimestampBefore: number }[] = [];
+
+	add(packet: EncodedPacket) {
+		this.first ??= packet;
+		if (this.last) {
+			this.maxTimestampBeforeLast = Math.max(this.maxTimestampBeforeLast, this.last.timestamp);
+		}
+		if (packet.type === 'key') {
+			this.keyPackets.push({ packet, maxTimestampBefore: this.maxTimestampBeforeLast });
+			if (this.keyPackets.length > 32) {
+				this.keyPackets.shift();
+			}
+		}
+		this.last = packet;
+	}
+
+	/**
+	 * Gets the key packet to decode again from: the latest one before the last packet before which the decoder gave
+	 * back every frame (up to the given timestamp). If decoding started at the last packet, a key packet, that's the
+	 * key packet before it. Returns null if there's none.
+	 */
+	async getRetryStart(
+		lastSampleTimestamp: number,
+		getPreviousKeyPacket: (packet: EncodedPacket) => Promise<EncodedPacket | null>,
+	) {
+		const last = this.last;
+		if (!last) {
+			return null;
+		}
+
+		for (let i = this.keyPackets.length - 1; i >= 0; i--) {
+			const { packet, maxTimestampBefore } = this.keyPackets[i]!;
+			if (packet !== last && maxTimestampBefore <= lastSampleTimestamp + FRAME_TIMESTAMP_EPSILON) {
+				return packet;
+			}
+		}
+
+		return this.first === last && last.type === 'key' ? getPreviousKeyPacket(last) : null;
+	}
 }
 
 /**
@@ -619,8 +689,20 @@ export abstract class BaseMediaSampleSink<
 		(async () => {
 			tolerance = Math.max(await this._getTimestampTolerance(), TIMESTAMP_EPSILON);
 
-			decoder = await this._createDecoder((sample) => {
+			// While the decoder flushes at the end, its errors are held back, as decoding again can recover from them
+			let heldBackErrors: unknown[] | null = null;
+			// When decoding again, the samples up to this timestamp have been emitted already
+			let skipSamplesUpTo = -Infinity;
+			let lastSampleTimestamp = -Infinity;
+
+			const onSample = (sample: MediaSample) => {
 				onQueueDequeue();
+				if (sample.timestamp <= skipSamplesUpTo) {
+					sample.close();
+					return;
+				}
+
+				lastSampleTimestamp = sample.timestamp;
 				if (sample.timestamp >= endTimestamp - TIMESTAMP_EPSILON) {
 					ended = true;
 				}
@@ -654,13 +736,18 @@ export abstract class BaseMediaSampleSink<
 					onQueueNotEmpty();
 					({ promise: queueNotEmpty, resolve: onQueueNotEmpty } = promiseWithResolvers());
 				}
-			}, (error) => {
-				if (!hasOutOfBandError) {
+			};
+			const onError = (error: unknown) => {
+				if (heldBackErrors) {
+					heldBackErrors.push(error);
+				} else if (!hasOutOfBandError) {
 					outOfBandError = error;
 					hasOutOfBandError = true;
 					onQueueNotEmpty();
 				}
-			});
+			};
+
+			decoder = await this._createDecoder(onSample, onError);
 			decoder.onDequeue = () => onQueueDequeue();
 
 			const packetSink = this._createPacketSink();
@@ -681,6 +768,8 @@ export abstract class BaseMediaSampleSink<
 			}
 
 			let currentPacket: EncodedPacket | null = keyPacket;
+			// For decoding again after a failed flush (see below)
+			const decodedPackets = new DecodedPackets();
 
 			// B-frames make it exceedingly difficult to properly define an upper bound for packet iteration if an end
 			// timestamp is set, so we just don't do it. The case that makes it especially tricky is when the frames
@@ -701,6 +790,7 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				decoder.decode(currentPacket);
+				decodedPackets.add(currentPacket);
 
 				const packetResult = await unlessTerminated(packets.next());
 				if (!packetResult || packetResult.done) {
@@ -713,7 +803,73 @@ export abstract class BaseMediaSampleSink<
 			await packets.return();
 
 			if (!terminated && !this._track.input._disposed) {
-				await decoder.flush();
+				const errors: unknown[] = heldBackErrors = [];
+				let flushError: unknown = null;
+				let flushFailed = false;
+				try {
+					await decoder.flush();
+				} catch (error) {
+					flushError = error;
+					flushFailed = true;
+				}
+
+				heldBackErrors = null;
+				for (const error of errors) {
+					if (!flushFailed || error !== flushError) {
+						onError(error);
+					}
+				}
+
+				if (flushFailed) {
+					// A truncated last frame, as in a stream that was cut short, can make a video decoder fail its
+					// flush (Chromium's does), which loses the frames it still held. So, decode the packets since the
+					// last key packet again with a new decoder, without the last packet, so that only its frame is
+					// lost. If the last packet is a key packet itself, the frames lost are the previous GOP's, so start
+					// there. Audio decoders hold back no frames, so there's nothing to recover.
+					const lastPacket = decodedPackets.last;
+					const retryStart = this._track.isVideoTrack() && !terminated
+						? await decodedPackets.getRetryStart(
+							lastSampleTimestamp,
+							packet => getPreviousKeyPacket(packetSink, packet, packetRetrievalOptions),
+						)
+						: null;
+					if (!retryStart || !lastPacket) {
+						throw flushError;
+					}
+					const sampleTimestampBefore = lastSampleTimestamp;
+
+					decoder.close();
+					decoder = await this._createDecoder(onSample, onError);
+					decoder.onDequeue = () => onQueueDequeue();
+					skipSamplesUpTo = lastSampleTimestamp;
+
+					let packet: EncodedPacket | null = retryStart;
+					let maxTimestamp = decodedPackets.maxTimestampBeforeLast;
+					while (packet && packet.sequenceNumber < lastPacket.sequenceNumber && !terminated) {
+						if (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE) {
+							({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
+							await queueDequeue;
+							continue;
+						}
+
+						decoder.decode(packet);
+						maxTimestamp = Math.max(maxTimestamp, packet.timestamp);
+						packet = await packetSink.getNextPacket(packet, packetRetrievalOptions);
+					}
+
+					if (!terminated) {
+						await decoder.flush();
+
+						// Decoding again must have given back frames, or already had every frame but the last packet's.
+						// Otherwise, it failed unnoticed, as decoders can drop frames they fail on without an error.
+						if (
+							lastSampleTimestamp === sampleTimestampBefore
+							&& lastSampleTimestamp < maxTimestamp - FRAME_TIMESTAMP_EPSILON
+						) {
+							throw flushError;
+						}
+					}
+				}
 			}
 
 			if (!firstSampleQueued && lastSample) {
@@ -867,13 +1023,21 @@ export abstract class BaseMediaSampleSink<
 		(async () => {
 			tolerance = Math.max(await this._getTimestampTolerance(), TIMESTAMP_EPSILON);
 
-			decoder = await this._createDecoder((sample) => {
+			// While the decoder flushes, its errors are held back, as decoding again can recover from them
+			let heldBackErrors: unknown[] | null = null;
+			// When decoding again, the samples up to this timestamp have been emitted already
+			let skipSamplesUpTo = -Infinity;
+			let lastSampleTimestamp = -Infinity;
+
+			const onSample = (sample: MediaSample) => {
 				onQueueDequeue();
 
-				if (terminated) {
+				if (terminated || sample.timestamp <= skipSamplesUpTo) {
 					sample.close();
 					return;
 				}
+
+				lastSampleTimestamp = sample.timestamp;
 
 				// Every query timestamp this sample starts after (by more than the tolerance, or at least a little
 				// epsilon) is answered by the sample before it
@@ -888,13 +1052,18 @@ export abstract class BaseMediaSampleSink<
 
 				emitHeldSample(heldSampleUses);
 				heldSample = sample;
-			}, (error) => {
-				if (!hasOutOfBandError) {
+			};
+			const onError = (error: unknown) => {
+				if (heldBackErrors) {
+					heldBackErrors.push(error);
+				} else if (!hasOutOfBandError) {
 					outOfBandError = error;
 					hasOutOfBandError = true;
 					onQueueNotEmpty();
 				}
-			});
+			};
+
+			decoder = await this._createDecoder(onSample, onError);
 			decoder.onDequeue = () => onQueueDequeue();
 
 			const packetSink = this._createPacketSink();
@@ -904,6 +1073,8 @@ export abstract class BaseMediaSampleSink<
 			let lastTimestamp = -Infinity;
 			let lastKeyPacket: EncodedPacket | null = null;
 			let lastDecodedPacket: EncodedPacket | null = null;
+			// The current batch's packets, for decoding again after a failed flush (see flushDecoder)
+			let decodedPackets = new DecodedPackets();
 
 			// The end sequence number (inclusive) of the current batch of packets. The batch starts at the last key
 			// frame and goes until this sequence number.
@@ -918,6 +1089,8 @@ export abstract class BaseMediaSampleSink<
 				if (!currentPacket) {
 					currentPacket = lastKeyPacket;
 					decoder.decode(currentPacket);
+					decodedPackets = new DecodedPackets();
+					decodedPackets.add(currentPacket);
 				}
 
 				while (currentPacket.sequenceNumber < maxSequenceNumber) {
@@ -941,6 +1114,7 @@ export abstract class BaseMediaSampleSink<
 					}
 
 					decoder.decode(nextPacket);
+					decodedPackets.add(nextPacket);
 					currentPacket = nextPacket;
 				}
 
@@ -984,7 +1158,81 @@ export abstract class BaseMediaSampleSink<
 					await decodePackets();
 				}
 
-				await decoder.flush();
+				const errors: unknown[] = heldBackErrors = [];
+				let flushError: unknown = null;
+				let flushFailed = false;
+				try {
+					await decoder.flush();
+				} catch (error) {
+					flushError = error;
+					flushFailed = true;
+				}
+
+				heldBackErrors = null;
+				for (const error of errors) {
+					if (!flushFailed || error !== flushError) {
+						onError(error);
+					}
+				}
+
+				if (flushFailed) {
+					// A truncated last frame, as in a stream that was cut short, can make a video decoder fail its
+					// flush (Chromium's does), which loses the frames it still held. So, decode the packets since the
+					// last key packet again with a new decoder, without the last packet, so that only its frame is
+					// lost. If the last packet is a key packet itself, the frames lost are the previous GOP's, so start
+					// there (also when the batch only has that packet). The next batch starts at a key packet of its
+					// own. Audio decoders hold back no frames, so there's nothing to recover.
+					const lastPacket = decodedPackets.last;
+					const retryStart = this._track.isVideoTrack() && !terminated
+						? await decodedPackets.getRetryStart(
+							lastSampleTimestamp,
+							packet => getPreviousKeyPacket(packetSink, packet, retrievalOptions),
+						)
+						: null;
+					if (!retryStart || !lastPacket) {
+						throw flushError;
+					}
+					const sampleTimestampBefore = lastSampleTimestamp;
+
+					decoder.close();
+					decoder = await this._createDecoder(onSample, onError);
+					decoder.onDequeue = () => onQueueDequeue();
+					skipSamplesUpTo = lastSampleTimestamp;
+
+					let packet: EncodedPacket | null = retryStart;
+					let maxTimestamp = decodedPackets.maxTimestampBeforeLast;
+					while (packet && packet.sequenceNumber < lastPacket.sequenceNumber && !terminated) {
+						while (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE && !terminated) {
+							({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
+							await queueDequeue;
+						}
+
+						if (terminated) {
+							break;
+						}
+
+						decoder.decode(packet);
+						maxTimestamp = Math.max(maxTimestamp, packet.timestamp);
+						packet = await packetSink.getNextPacket(packet, retrievalOptions);
+					}
+
+					if (!terminated) {
+						await decoder.flush();
+
+						// Decoding again must have given back frames, or already had every frame but the last packet's.
+						// Otherwise, it failed unnoticed, as decoders can drop frames they fail on without an error.
+						if (
+							lastSampleTimestamp === sampleTimestampBefore
+							&& lastSampleTimestamp < maxTimestamp - FRAME_TIMESTAMP_EPSILON
+						) {
+							throw flushError;
+						}
+					}
+					skipSamplesUpTo = -Infinity;
+				}
+
+				// The next batch can go back in time
+				lastSampleTimestamp = -Infinity;
 
 				// No sample starts after the remaining query timestamps, so the last one answers all of them
 				emitHeldSample(timestampsOfInterest.length);
