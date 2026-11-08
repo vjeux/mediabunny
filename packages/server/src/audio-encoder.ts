@@ -58,8 +58,9 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			codec === 'aac' && numberOfChannels >= 1 && numberOfChannels <= 48
 			&& AAC_SAMPLE_RATES.includes(sampleRate)
 		) || (
+			// Other rates are resampled to 48 kHz, as WebCodecs encoders do
 			codec === 'opus' && numberOfChannels >= 1 && numberOfChannels <= 255
-			&& OPUS_SAMPLE_RATES.includes(sampleRate)
+			&& sampleRate >= 8000 && sampleRate <= 192000
 		) || (
 			codec === 'mp3' && numberOfChannels >= 1 && numberOfChannels <= 2
 			&& MP3_SAMPLE_RATES.includes(sampleRate)
@@ -128,7 +129,12 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			sampleFormat = this.avCodec.sampleFormats[0]!;
 		}
 
-		codecContext.sampleRate = this.config.sampleRate;
+		// libopus only takes a few rates, and others are resampled to 48 kHz
+		const encoderSampleRate = this.codec === 'opus' && !OPUS_SAMPLE_RATES.includes(this.config.sampleRate)
+			? 48000
+			: this.config.sampleRate;
+
+		codecContext.sampleRate = encoderSampleRate;
 		if (this.codec === 'dts') {
 			codecContext.channelLayout = getDtsChannelLayout(this.config.numberOfChannels);
 		} else if (this.codec === 'truehd') {
@@ -139,7 +145,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		codecContext.codecType = NodeAv.AVMEDIA_TYPE_AUDIO;
 		codecContext.codecId = CODEC_TO_CODEC_ID[this.codec]!;
 		codecContext.sampleFormat = sampleFormat;
-		codecContext.timeBase = new NodeAv.Rational(1, this.config.sampleRate);
+		codecContext.timeBase = new NodeAv.Rational(1, encoderSampleRate);
 		codecContext.bitRate = BigInt(resolveBitrate(this.config, this.codec));
 
 		if (this.config.bitrateMode === 'constant') {
@@ -247,7 +253,8 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 				this.dstFrame.duration = BigInt(this.dstFrame.nbSamples);
 				this.dstFrame.allocBuffer();
 
-				this.nextResamplerPts = this.frame.pts;
+				// In the encoder's sample rate, which can differ from the input's
+				this.nextResamplerPts = BigInt(Math.round(audioSample.timestamp * this.codecContext.sampleRate));
 			}
 
 			const inputBuffers = this.frame.data;
