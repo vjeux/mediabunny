@@ -794,7 +794,9 @@ export class Conversion {
 	 * 0 and 1, indicating the completion of the conversion. Note that a progress of 1 doesn't necessarily mean the
 	 * conversion is complete; the conversion is complete once `execute()` resolves.
 	 *
-	 * As second argument, this callback receives the input time in seconds that has been processed.
+	 * As second argument, this callback receives how much media time, in seconds, has been processed so far, measured
+	 * from the start of the conversion (the trim start, if set). For example, it runs from 0 to 2 when converting with
+	 * `trim: { start: 2, end: 4 }`.
 	 *
 	 * In order for progress to be computed, this property must be set before `execute` is called.
 	 */
