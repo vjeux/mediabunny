@@ -17,7 +17,7 @@ import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { Input } from '../../src/input.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
-import { BufferSource, FilePathSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, CustomSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AttachedFile, MetadataTags, RichImageData } from '../../src/metadata.js';
 import { VERSIONED_NAME } from '../../src/version.js';
@@ -1923,6 +1923,62 @@ test('Default creation time, ISOBMFF', async () => {
 
 	// The format only stores whole seconds
 	expect(readTags.creationTime).toEqual(new Date('2024-02-29T13:37:42Z'));
+});
+
+test('Read the ID3 tags of a WAV file only for the metadata tags, not to get its track', async () => {
+	// One second of 8 kHz mono 16-bit PCM, then an 'id3 ' chunk (as DJ software and taggers write it) holding an
+	// ID3v2.3 tag with a title and an 8 MiB picture
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const imageSize = 8 * 2 ** 20;
+	const titleFrame = [...ascii('TIT2'), 0, 0, 0, 6, 0, 0, 0, ...ascii('Title')];
+	const apicBody = new Uint8Array(1 + 10 + 1 + 1 + imageSize);
+	apicBody.set([0, ...ascii('image/png'), 0, 3, 0, 0x89, 0x50, 0x4e, 0x47]);
+	const id3Size = titleFrame.length + 10 + apicBody.length;
+	const id3 = new Uint8Array(10 + id3Size);
+	id3.set([...ascii('ID3'), 3, 0, 0, ...[21, 14, 7, 0].map(shift => (id3Size >> shift) & 0x7f)]);
+	id3.set(titleFrame, 10);
+	const apicSize = [24, 16, 8, 0].map(shift => (apicBody.length >>> shift) & 0xff); // Plain in ID3v2.3
+	id3.set([...ascii('APIC'), ...apicSize, 0, 0], 10 + titleFrame.length);
+	id3.set(apicBody, 20 + titleFrame.length);
+
+	const pcmSize = 16000;
+	const bytes = new Uint8Array(12 + 24 + 8 + pcmSize + 8 + id3.length);
+	const view = new DataView(bytes.buffer);
+	bytes.set(ascii('RIFF'), 0);
+	view.setUint32(4, bytes.length - 8, true);
+	bytes.set(ascii('WAVEfmt '), 8);
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true); // PCM
+	view.setUint16(22, 1, true); // Mono
+	view.setUint32(24, 8000, true);
+	view.setUint32(28, 16000, true);
+	view.setUint16(32, 2, true);
+	view.setUint16(34, 16, true);
+	bytes.set(ascii('data'), 36);
+	view.setUint32(40, pcmSize, true);
+	bytes.set(ascii('id3 '), 44 + pcmSize);
+	view.setUint32(48 + pcmSize, id3.length, true);
+	bytes.set(id3, 52 + pcmSize);
+
+	let bytesRead = 0;
+	using input = new Input({
+		formats: ALL_FORMATS,
+		source: new CustomSource({
+			getSize: () => bytes.byteLength,
+			read: (start, end) => {
+				bytesRead += end - start;
+				return bytes.subarray(start, end);
+			},
+		}),
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	expect(await track!.getSampleRate()).toBe(8000);
+	expect(bytesRead).toBeLessThan(2 ** 20);
+
+	const tags = await input.getMetadataTags();
+	expect(tags.title).toBe('Title');
+	expect(tags.images![0]!.data.byteLength).toBe(imageSize);
 });
 
 test('Default creation time, Matroska', async () => {
