@@ -1,8 +1,9 @@
-import { test } from 'vitest';
+import { expect, test } from 'vitest';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { TextSubtitleSource } from '../../src/media-source.js';
+import { SubtitleCue, SubtitleParser } from '../../src/subtitles.js';
 
 test('ISOBMFF muxing', async () => {
 	const output = new Output({
@@ -54,4 +55,29 @@ Tell me, is the lord of the universe in?
 `);
 
 	await output.finalize();
+});
+
+test('A WebVTT file can consist of just its header', () => {
+	const cues: SubtitleCue[] = [];
+	const configs: (string | undefined)[] = [];
+	const parse = (text: string) => {
+		const parser = new SubtitleParser({
+			codec: 'webvtt',
+			output: (cue, meta) => {
+				cues.push(cue);
+				configs.push(meta.config?.description);
+			},
+		});
+		parser.parse(text);
+		return parser;
+	};
+
+	expect(() => parse('WEBVTT')).not.toThrow();
+	expect(() => parse('WEBVTT - Title\nKind: captions\n')).not.toThrow();
+	expect(cues).toEqual([]);
+
+	// Such a header can be the first chunk, with the cues following in later chunks
+	parse('WEBVTT\n').parse('\n00:00.000 --> 00:01.000\nHi\n');
+	expect(cues.map(cue => cue.text)).toEqual(['Hi']);
+	expect(configs).toEqual(['WEBVTT']);
 });
