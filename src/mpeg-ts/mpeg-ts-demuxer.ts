@@ -138,9 +138,10 @@ const CA_DESCRIPTOR_TAG = 0x09;
  */
 const MAX_PROGRAM_SEARCH_SIZE = 2 ** 23; // 8 MiB
 /**
- * The same for sources of unknown size, which may not be able to go back that far to read the program's streams once
- * it's chosen (a ReadableStreamSource only keeps what its cache holds). This still covers PMTs repeated every 0.1 s at
- * up to 80 Mbit/s.
+ * The same for sources of unknown size, and once one of the programs waiting turns out readable (its packets aren't
+ * scrambled): reading may not be able to go back further to read the program's streams once it's chosen, as with a
+ * ReadableStreamSource, or a UrlSource whose server ignores range requests (which can't be told apart from a seekable
+ * source). This still covers PMTs repeated every 0.1 s at up to 80 Mbit/s.
  */
 const MAX_STREAMED_PROGRAM_SEARCH_SIZE = 2 ** 20; // 1 MiB
 
@@ -1032,8 +1033,8 @@ export class MpegTsDemuxer extends Demuxer {
 			// (conditional access, which usually means scrambled packets) or no supported streams are only fallen back
 			// to if no better one shows up: first one with streams without a CA descriptor, else the first one. CA
 			// descriptors are often left in recordings that aren't scrambled, though, so whether a stream is scrambled
-			// is decided by its packets, which we watch while waiting: a program whose packets turn out clear is taken
-			// right away.
+			// is decided by its packets, which we watch while waiting: once a program turns out readable, a short wait
+			// for a better one is enough.
 			const seenProgramMapPids = new Set<number>();
 			type FallbackProgram = { pmtPos: number; pmtPid: number; streams: ElementaryStream[] };
 			// The first program with streams both with and without CA descriptors, the first with streams that all
@@ -1043,6 +1044,7 @@ export class MpegTsDemuxer extends Demuxer {
 			let emptyProgram: FallbackProgram | null = null;
 			// Whether the TS packet holding the first PES packet of a stream of one of these programs was scrambled
 			const firstPesPacketScrambling = new Map<number, boolean>();
+			let hasReadableFallbackProgram = false;
 
 			// Uses the given program. Without a program, sections were read as contiguous, which cuts PES packets
 			// short at the first packet of another PID, so the section ends recorded since can't be trusted.
@@ -1094,7 +1096,7 @@ export class MpegTsDemuxer extends Demuxer {
 					partlyScrambledProgram?.pmtPos ?? Infinity,
 					scrambledProgram?.pmtPos ?? Infinity,
 				);
-				const maxProgramSearchSize = this.reader.fileSizeNonStrict === null
+				const maxProgramSearchSize = this.reader.fileSizeNonStrict === null || hasReadableFallbackProgram
 					? MAX_STREAMED_PROGRAM_SEARCH_SIZE
 					: MAX_PROGRAM_SEARCH_SIZE;
 				if (currentPos - firstFallbackPmtPos > maxProgramSearchSize) {
@@ -1130,20 +1132,13 @@ export class MpegTsDemuxer extends Demuxer {
 				}
 
 				if (!hasProgramMap && !firstPesPacketScrambling.has(packetHeader.pid)) {
-					const program = [partlyScrambledProgram, scrambledProgram]
-						.find(x => x?.streams.some(stream => stream.pid === packetHeader.pid));
-					if (program) {
+					const isFallbackStream = [partlyScrambledProgram, scrambledProgram]
+						.some(x => x?.streams.some(stream => stream.pid === packetHeader.pid));
+					if (isFallbackStream) {
 						const isScrambled = packetHeader.transportScramblingControl !== 0;
 						firstPesPacketScrambling.set(packetHeader.pid, isScrambled);
-
-						const isUnscrambledProgram = program.streams
-							.every(stream => firstPesPacketScrambling.get(stream.pid) !== true);
-						if (!isScrambled && isUnscrambledProgram) {
-							// The program's packets are clear despite its CA descriptors, so there's no need to wait
-							// for a better program (nor to go far back for this one's packets)
-							useProgram(program, true);
-							continue;
-						}
+						// Its program can be read, whatever its CA descriptors say
+						hasReadableFallbackProgram ||= !isScrambled;
 					}
 				}
 
