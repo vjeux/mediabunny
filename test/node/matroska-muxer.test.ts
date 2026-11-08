@@ -209,3 +209,38 @@ const containsBytes = (haystack: Uint8Array, needle: number[]) => {
 
 	return false;
 };
+
+test('A B-frame stream written to Matroska keeps the duration of the frame presented last', async () => {
+	// Decode order I0 P3 B1 B2 P6 B4 B5 P9 B7 B8 (x264-style B-frames), 40 ms per frame
+	const presentationIndices = [0, 3, 1, 2, 6, 4, 5, 9, 7, 8];
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	const decoderConfig = {
+		codec: 'avc1.64001f',
+		codedWidth: 16,
+		codedHeight: 16,
+		description: new Uint8Array([1, 0x64, 0, 0x1f, 0xff, 0xe0, 0xf0]),
+	};
+	for (const [i, index] of presentationIndices.entries()) {
+		const type = i === 0 ? 'key' : 'delta';
+		const packet = new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), type, index * 0.04, 0.04);
+		await source.add(packet, i === 0 ? { decoderConfig } : undefined);
+	}
+	source.close();
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// The block that ends the cluster in presentation order (P9) carries the BlockDuration, not the one stored last
+	const durations: number[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		durations.push(Math.round(packet.duration * 1000));
+	}
+	expect(durations).toEqual(new Array<number>(10).fill(40));
+	expect(await track.computeDuration()).toBe(0.4);
+});
