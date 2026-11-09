@@ -91,6 +91,7 @@ export class HlsDemuxer extends Demuxer {
 	hasMasterPlaylist = true;
 	masterPlaylistVariables: HlsPlaylistVariables | null = null;
 	mediaOffsets = new Map<number, Promise<number>>();
+	timelineSegmentedInputPromise: Promise<HlsSegmentedInput> | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -692,7 +693,7 @@ export class HlsDemuxer extends Demuxer {
 			// defines global timestamps. For the reference track, the first packet of any discontinuity lands exactly
 			// on the timestamp of the discontinuity's first segment. This ensures that time starts at 0 (unless
 			// PDT is used) and that discontinuities don't mess with overall timestamp continuity.
-			const referenceSegmentedInput = this.getReferenceSegmentedInput();
+			const referenceSegmentedInput = await this.getTimelineSegmentedInput();
 
 			const referenceFirstSegment = await referenceSegmentedInput.getFirstSegment();
 			let segment = referenceFirstSegment;
@@ -809,6 +810,53 @@ export class HlsDemuxer extends Demuxer {
 		assert(index !== -1);
 
 		return this.getSegmentedInputForPath(pool[index]!.fullPath);
+	}
+
+	/**
+	 * The playlist whose segments define the timeline of all tracks: the reference playlist, unless it has no segments
+	 * (such as an empty track's), in which case the next one in the same order of preference that has segments. Chosen
+	 * once, so that it stays the same.
+	 */
+	getTimelineSegmentedInput() {
+		if (this.timelineSegmentedInputPromise) {
+			return this.timelineSegmentedInputPromise;
+		}
+
+		const promise = (async () => {
+			const reference = this.getReferenceSegmentedInput();
+			if (!this.hasMasterPlaylist || await reference.getFirstSegment()) {
+				return reference;
+			}
+
+			assert(this.internalTracks);
+			const byBitrate = (tracks: InternalTrack[]) => {
+				return [...tracks].sort((a, b) => (a.peakBitrate ?? Infinity) - (b.peakBitrate ?? Infinity));
+			};
+			const regularTracks = this.internalTracks.filter(x => !x.hasOnlyKeyPackets);
+			const orderedTracks = [
+				...byBitrate(regularTracks.filter(x => x.info.type === 'video')),
+				...byBitrate(regularTracks.filter(x => x.info.type !== 'video')),
+				...byBitrate(this.internalTracks.filter(x => x.hasOnlyKeyPackets)),
+			];
+
+			for (const track of orderedTracks) {
+				const segmentedInput = this.getSegmentedInputForPath(track.fullPath);
+				if (segmentedInput !== reference && await segmentedInput.getFirstSegment()) {
+					return segmentedInput;
+				}
+			}
+
+			return reference;
+		})();
+		this.timelineSegmentedInputPromise = promise;
+		// A failed playlist load can be retried
+		promise.catch(() => {
+			if (this.timelineSegmentedInputPromise === promise) {
+				this.timelineSegmentedInputPromise = null;
+			}
+		});
+
+		return promise;
 	}
 
 	getSegmentedInputForPath(path: string) {
