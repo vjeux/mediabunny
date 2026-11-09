@@ -1097,10 +1097,41 @@ export class MpegTsDemuxer extends Demuxer {
 			const hasSeenAllPrograms = () => hasProgramAssociationTable
 				&& [...programMapPids].every(pid => seenProgramMapPids.has(pid));
 
+			// When going back for the packets before the PMT: where to read on from and what to restore, should some of
+			// that data be gone after all (a source that only keeps what its cache holds evicts as it reads on)
+			let goingBack: {
+				resumePos: number;
+				streams: {
+					stream: ElementaryStream;
+					state: Pick<
+						ElementaryStream,
+						'initialized' | 'firstSection' | 'canBeTrustedWithKeyPackets' | 'info' | 'codecFromPayload'
+					>;
+				}[];
+				timestampWrapInfo: TimestampWrapInfo | null;
+			} | null = null;
+			const readOnFromPmt = (going: NonNullable<typeof goingBack>) => {
+				this.elementaryStreams.length = 0;
+				for (const { stream, state } of going.streams) {
+					this.elementaryStreams.push(Object.assign(stream, state));
+				}
+				this.timestampWrapInfo = going.timestampWrapInfo;
+				currentPos = going.resumePos;
+				goingBack = null;
+				readsOnFromPmt = true;
+			};
+			// Set when reading on from the PMT after all, which the cache may not hold anymore either (reading a
+			// stream's first frame can read far ahead)
+			let readsOnFromPmt = false;
+
 			while (true) {
 				if (privateDataProbeEndPos !== null && currentPos >= privateDataProbeEndPos) {
 					// The private data streams that don't say what they hold didn't show up as audio we know
 					break;
+				}
+
+				if (goingBack && currentPos >= goingBack.resumePos) {
+					goingBack = null; // Back where it was
 				}
 
 				// A program without supported streams doesn't need to be gone back to, so it can wait for the end
@@ -1115,7 +1146,25 @@ export class MpegTsDemuxer extends Demuxer {
 					useFallbackProgram();
 				}
 
-				const packetHeader = await this.readPacketHeader(currentPos);
+				let packetHeader: TsPacketHeader | null;
+				try {
+					packetHeader = await this.readPacketHeader(currentPos);
+				} catch (error) {
+					if (goingBack) {
+						readOnFromPmt(goingBack);
+						continue;
+					}
+
+					if (readsOnFromPmt) {
+						// Then read on from where the cache holds data again
+						readsOnFromPmt = false;
+						currentPos = await this.findReadablePos(currentPos);
+						continue;
+					}
+
+					throw error;
+				}
+				readsOnFromPmt = false;
 
 				if (
 					!hasProgramMap
@@ -1209,11 +1258,37 @@ export class MpegTsDemuxer extends Demuxer {
 					continue;
 				}
 
-				const section = await this.readSection(
-					currentPos,
-					true,
-					!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
-				);
+				if (
+					goingBack
+					&& getReadBackDistance(this.reader) !== Infinity
+					&& !await this.pesPacketEndsBefore(
+						currentPos,
+						packetHeader.pid,
+						currentPos + 1.5 * getReadBackDistance(this.reader),
+					)
+				) {
+					// Reading this PES packet in full would read so far ahead that a source that only keeps what its
+					// cache holds would lose the rest of the way back to the PMT (within three quarters of the cache
+					// is safe), so its stream starts after the PMT
+					currentPos += this.packetStride;
+					continue;
+				}
+
+				let section: Section | null;
+				try {
+					section = await this.readSection(
+						currentPos,
+						true,
+						!hasProgramMap, // Expect contiguous sections as long as we don't have the PMT
+					);
+				} catch (error) {
+					if (!goingBack) {
+						throw error;
+					}
+
+					readOnFromPmt(goingBack);
+					continue;
+				}
 				if (!section) {
 					if (useFallbackProgram() || await adoptInitProgramMap()) {
 						continue;
@@ -1588,10 +1663,27 @@ export class MpegTsDemuxer extends Demuxer {
 						hasProgramMap = true;
 						programMapSectionPid = section.pid;
 
-						if (this.elementaryStreams.some(x => !x.initialized)) {
-							// PES packets can come before the PMT, like in a capture of a broadcast that starts between
-							// two of its PSI repetitions, so look for each stream's first PES packet from the start of
-							// the file
+						// PES packets can come before the PMT, like in a capture of a broadcast that starts between
+						// two of its PSI repetitions, so look for each stream's first PES packet from the start of
+						// the file, if it's all still there
+						if (
+							this.elementaryStreams.some(x => !x.initialized)
+							&& await this.canReadAgain(this.packetOffset, currentPos)
+						) {
+							goingBack = {
+								resumePos: currentPos + this.packetStride,
+								streams: this.elementaryStreams.map(stream => ({
+									stream,
+									state: {
+										initialized: stream.initialized,
+										firstSection: stream.firstSection,
+										canBeTrustedWithKeyPackets: stream.canBeTrustedWithKeyPackets,
+										info: { ...stream.info },
+										codecFromPayload: stream.codecFromPayload,
+									},
+								})),
+								timestampWrapInfo: this.timestampWrapInfo,
+							};
 							currentPos = this.packetOffset;
 							continue;
 						}
@@ -2295,6 +2387,48 @@ export class MpegTsDemuxer extends Demuxer {
 			firstPacketHasErrors: firstPacket.transportErrorIndicator === 1,
 			cutAtEnd: this.cutSectionStarts.has(startPos),
 		};
+	}
+
+	/** Returns the first position from the given one on, in steps of TS packets, whose data can still be read. */
+	async findReadablePos(pos: number) {
+		const step = 64 * this.packetStride;
+		while (!await this.canReadAgain(pos, pos + 1)) {
+			pos += step;
+		}
+
+		return pos;
+	}
+
+	/**
+	 * Checks that the PES packet starting at the given position ends, as another one of its PID starts, before the end
+	 * position, from the TS packet headers.
+	 */
+	async pesPacketEndsBefore(pos: number, pid: number, endPos: number) {
+		for (let currentPos = pos + this.packetStride; currentPos < endPos; currentPos += this.packetStride) {
+			const packetHeader = await this.readPacketHeader(currentPos);
+			if (!packetHeader || (packetHeader.pid === pid && packetHeader.payloadUnitStartIndicator === 1)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Checks that the data between the two positions can be read again: a source that only keeps what its cache holds
+	 * (a ReadableStreamSource, or a UrlSource whose server ignores range requests) may have evicted some of it.
+	 */
+	async canReadAgain(startPos: number, endPos: number) {
+		if (getReadBackDistance(this.reader) === Infinity) {
+			return true;
+		}
+
+		try {
+			await this.reader.requestSlice(startPos, endPos - startPos);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
