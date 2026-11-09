@@ -2109,6 +2109,68 @@ test('Single-file mode', async () => {
 	expect(onSegment).toHaveBeenCalledTimes(1);
 });
 
+test('MPEG-TS segments continue the continuity counters of the previous segment', async () => {
+	// Players read a playlist's segments as one transport stream, so their counters must go on from one segment to the
+	// next (H.222.0 2.4.3.3; Apple's HLS authoring spec 7.2: "continuity counters [...] MUST be sequential"), like
+	// FFmpeg writes them, in separate segment files (found by L74) as well as in single-file mode
+	for (const singleFilePerPlaylist of [false, true]) {
+		const files = new Map<string, Uint8Array>();
+		const output = new Output({
+			format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), singleFilePerPlaylist }),
+			target: new PathedTarget('', (request) => {
+				const target = new BufferTarget();
+				target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+				return target;
+			}),
+		});
+
+		const video = videoSource();
+		output.addVideoTrack(video);
+		await output.start();
+
+		for (let i = 0; i < 12; i++) {
+			await video.add(new EncodedPacket(avcPacketData, i % 4 === 0 ? 'key' : 'delta', i / 2, 0), avcMetadata);
+		}
+		await output.finalize();
+
+		// The segments in playlist order
+		const segmentPaths = [...files.keys()].filter(path => path.endsWith('.ts')).sort((a, b) => {
+			return Number(a.match(/(\d+)\.ts$/)![1]) - Number(b.match(/(\d+)\.ts$/)![1]);
+		});
+		expect(segmentPaths).toHaveLength(singleFilePerPlaylist ? 1 : 3);
+		const segments = segmentPaths.map(path => files.get(path)!);
+		const stream = new Uint8Array(segments.reduce((sum, segment) => sum + segment.length, 0));
+		let offset = 0;
+		for (const segment of segments) {
+			stream.set(segment, offset);
+			offset += segment.length;
+		}
+
+		const lastCounters = new Map<number, number>();
+		let tableCount = 0;
+		for (let pos = 0; pos < stream.length; pos += 188) {
+			const pid = ((stream[pos + 1]! & 0x1f) << 8) | stream[pos + 2]!;
+			if (pid === 0) {
+				tableCount++;
+			}
+
+			if (!(stream[pos + 3]! & 0x10)) {
+				continue; // No payload, so the counter doesn't go on
+			}
+
+			const counter = stream[pos + 3]! & 0xf;
+			const lastCounter = lastCounters.get(pid);
+			if (lastCounter !== undefined) {
+				expect({ pid, counter }).toEqual({ pid, counter: (lastCounter + 1) % 16 });
+			}
+
+			lastCounters.set(pid, counter);
+		}
+
+		expect(tableCount).toBe(3); // A PAT in each segment
+	}
+});
+
 test('Single-file mode with fragmented MP4 produces proper standalone segment file', async () => {
 	let playlistText: string | null = null;
 	let segmentBuffer: ArrayBuffer | null = null;
