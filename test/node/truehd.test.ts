@@ -421,3 +421,38 @@ test('TrueHD in Matroska is looked up exactly, as its access units are shorter t
 		}
 	}
 });
+
+test('TrueHD in Matroska from FFmpeg decodes without gaps after a seek', async () => {
+	// FFmpeg rounds the timestamps of the access units (0.83 ms each) to the millisecond, so after a seek, the decoded
+	// timeline and a packet's rounded timestamp can differ by a whole access unit. The decoder took that as a gap and
+	// jumped ahead, so lookups after it returned the access unit before (found by the lane L98 review). The file is
+	// silence, made with ffmpeg -f lavfi -i anullsrc=r=48000:cl=stereo -t 2 -strict -2 -c:a truehd truehd-silence.mkv
+	registerTrueHdDecoder();
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'truehd-silence.mkv')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const duration = await track.computeDuration();
+	const sink = new AudioSampleSink(track);
+
+	for (const start of [1.013, 1.3333]) {
+		let end: number | null = null;
+		for await (using sample of sink.samples(start, start + 0.4)) {
+			if (end !== null) {
+				expect(sample.timestamp, `samples(${start})`).toBeCloseTo(end, 6);
+			}
+			end = sample.timestamp + sample.duration;
+		}
+	}
+
+	const covers = (sample: AudioSample | null, timestamp: number) => sample !== null
+		&& sample.timestamp - timestamp <= 1e-9
+		&& sample.timestamp + sample.duration > timestamp;
+	const timestamps = Array.from({ length: 40 }, (_, i) => duration * (i + 0.37) / 40);
+	for (const timestamp of timestamps) {
+		using sample = await sink.getSample(timestamp);
+		expect(covers(sample, timestamp), `getSample(${timestamp})`).toBe(true);
+	}
+});

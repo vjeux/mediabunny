@@ -2354,6 +2354,11 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
 	timestampOffset = 0;
+	/**
+	 * How far a decoded sample's timestamp can be from its packet's: a container tick where packet timestamps are
+	 * rounded to one (a millisecond in Matroska). Differences within it are rounding, not gaps.
+	 */
+	timestampTolerance = 0;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
@@ -2379,7 +2384,9 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 			if (
 				this.currentTimestamp === null
-				|| Math.abs(sampleTimestamp - this.currentTimestamp) >= sample.duration
+				// A sample shorter than a tick (TrueHD's, in Matroska) would see rounding as a gap
+				|| Math.abs(sampleTimestamp - this.currentTimestamp)
+				>= Math.max(sample.duration, this.timestampTolerance)
 			) {
 				// We need to sync with the sample timestamp again
 				this.currentTimestamp = sampleTimestamp;
@@ -2733,7 +2740,10 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			const timestampTolerance = await this._getTimestampTolerance();
+			const decoder = new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
+			decoder.timestampTolerance = timestampTolerance;
+			return decoder;
 		}
 	}
 
