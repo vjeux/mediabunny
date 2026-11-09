@@ -1103,6 +1103,11 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	}
 
 	decode(packet: EncodedPacket) {
+		if (packet.byteLength === 0) {
+			// Empty packets hold no frame (MP4 allows zero-size samples), and decoders error out on them
+			return;
+		}
+
 		if (this.codec === 'hevc' && this.currentPacketIndex > 0 && !this.raslSkipped) {
 			if (this.hasHevcRaslPicture(packet.data)) {
 				return; // Drop
@@ -2551,6 +2556,11 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	}
 
 	decode(packet: EncodedPacket) {
+		if (packet.byteLength === 0) {
+			// Empty packets hold no audio (MP4 allows zero-size samples), and decoders error out on them
+			return;
+		}
+
 		if (this.customDecoder) {
 			this.customDecoderQueueSize++;
 			void this.customDecoderCallSerializer
@@ -2761,6 +2771,10 @@ class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		const numberOfFrames = Math.floor(
 			packet.byteLength / this.decoderConfig.numberOfChannels / this.inputSampleSize,
 		);
+		if (numberOfFrames === 0) {
+			// Empty packets (MP4 allows zero-size samples) hold no audio, and samples can't have zero frames
+			return;
+		}
 
 		const outputBufferSize = numberOfFrames * this.decoderConfig.numberOfChannels * this.outputSampleSize;
 		const outputBuffer = new ArrayBuffer(outputBufferSize);
