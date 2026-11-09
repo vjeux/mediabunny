@@ -2411,6 +2411,46 @@ test('setMetadataTags keeps the tags as they were when set', async () => {
 	expect(readTags.date).toEqual(new Date(Date.UTC(2024, 0, 1)));
 });
 
+test('Creation time that a Date can\'t hold, ISOBMFF', async () => {
+	// A broken muxer's 64-bit creation time made an Invalid Date, which threw wherever it was used, such as when the
+	// tags were copied to an output (found by L96)
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({ creationTime: new Date('3000-01-01T00:00:00Z') }); // Needs a version 1 mvhd box
+
+	const dummyTrack = createDummyAudioTrack('opus', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	let mvhdTypeOffset = 0;
+	while (String.fromCharCode(...bytes.subarray(mvhdTypeOffset, mvhdTypeOffset + 4)) !== 'mvhd') {
+		mvhdTypeOffset++;
+	}
+	expect(bytes[mvhdTypeOffset + 4]).toBe(1); // The version
+	bytes.fill(0xff, mvhdTypeOffset + 8, mvhdTypeOffset + 16); // The creation time
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+
+	expect(readTags.creationTime).toBeUndefined(); // As if it wasn't set
+
+	const copyOutput = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	copyOutput.setMetadataTags(readTags);
+});
+
 test('Creation time override, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
