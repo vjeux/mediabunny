@@ -8,7 +8,7 @@
 
 import { AUDIO_CODECS, AudioCodec, inferCodecFromCodecString, MediaCodec, VIDEO_CODECS, VideoCodec } from '../codec';
 import { Demuxer, DurationMetadataRequestOptions } from '../demuxer';
-import { Input } from '../input';
+import { Input, InputDisposedError } from '../input';
 import {
 	InputAudioTrackBacking,
 	InputTrackBacking,
@@ -780,6 +780,11 @@ export class HlsDemuxer extends Demuxer {
 	}
 
 	getReferenceSegmentedInput() {
+		// dispose() drops the segmented inputs
+		if (this.input._disposed) {
+			throw new InputDisposedError();
+		}
+
 		if (!this.hasMasterPlaylist) {
 			return this.segmentedInputs[0]!;
 		}
@@ -798,6 +803,11 @@ export class HlsDemuxer extends Demuxer {
 	}
 
 	getSegmentedInputForPath(path: string) {
+		// dispose() drops the segmented inputs; don't create new ones
+		if (this.input._disposed) {
+			throw new InputDisposedError();
+		}
+
 		let segmentedInput = this.segmentedInputs.find(x => x.path === path);
 		if (segmentedInput) {
 			return segmentedInput;
