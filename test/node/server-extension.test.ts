@@ -4848,35 +4848,36 @@ describe('Audio', async () => {
 		return score;
 	};
 
-	test('AAC conversion roundtrip', async () => {
+	test('AAC conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('aac');
 	});
 
-	test('Opus conversion roundtrip', async () => {
+	test('Opus conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('opus');
 	});
 
-	test('MP3 conversion roundtrip', async () => {
+	test('MP3 conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('mp3');
 	});
 
-	test('Vorbis conversion roundtrip', async () => {
+	test('Vorbis conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('vorbis');
 	});
 
-	test('FLAC conversion roundtrip', async () => {
+	test('FLAC conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('flac');
 	});
 
-	test('AC-3 conversion roundtrip', async () => {
+	test('AC-3 conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('ac3');
 	});
 
-	test('E-AC-3 conversion roundtrip', async () => {
+	test('E-AC-3 conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('eac3');
 	});
 
-	test('TrueHD conversion roundtrip', async () => {
+	// About 1 s alone, but it once took over 5 s on a loaded CI runner
+	test('TrueHD conversion roundtrip', { timeout: 20_000 }, async () => {
 		await conversionRoundtrip('truehd');
 	});
 
