@@ -15,7 +15,7 @@ import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
 import { WavOutputFormat } from '../output-format';
 import { assert, assertNever, isIso88591Compatible, keyValueIterator } from '../misc';
-import { MetadataTags, metadataTagsAreEmpty } from '../metadata';
+import { formatMetadataDate, MetadataTags, metadataTagsAreEmpty } from '../metadata';
 import { Id3V2Writer } from '../id3';
 import { Logging } from '../logging';
 
@@ -270,7 +270,11 @@ export class WaveMuxer extends Muxer {
 				}; break;
 
 				case 'date': {
-					writeInfoTag('ICRD', value.toISOString().slice(0, 10));
+					const dateString = formatMetadataDate(value);
+					if (dateString !== null) {
+						writeInfoTag('ICRD', dateString);
+					}
+					// Marked as written even when left out, so that a raw tag can't bring the date back
 					writtenTags.add('ICRD');
 				}; break;
 
