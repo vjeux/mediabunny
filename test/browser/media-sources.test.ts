@@ -498,6 +498,64 @@ test('VideoSampleSource, encoding flipped video frames with forced transform', a
 	input.dispose();
 });
 
+test('MediaStreamVideoTrackSource records via <video> where workers can\'t be constructed', async () => {
+	// Like under Trusted Types (require-trusted-types-for 'script'), where Chromium throws right away. Browsers without
+	// MediaStreamTrackProcessor on the main thread (Safari for video, Firefox) check for it in a worker, then fall back
+	// to a <video> element ticked by a timer that also runs in a worker
+	const { MediaStreamVideoTrackSource } = await import('../../src/media-source.js');
+	const { EncodedPacketSink } = await import('../../src/media-sink.js');
+	const RealWorker = Worker;
+	globalThis.Worker = class {
+		constructor() {
+			throw new TypeError(
+				'Failed to construct \'Worker\': This document requires \'TrustedScriptURL\' assignment.',
+			);
+		}
+	} as unknown as typeof Worker;
+	const globals = globalThis as Record<string, unknown>;
+	const processor = globals['MediaStreamTrackProcessor'];
+	delete globals['MediaStreamTrackProcessor'];
+
+	const canvas = document.createElement('canvas');
+	canvas.width = 64;
+	canvas.height = 64;
+	const context = canvas.getContext('2d')!;
+	let frame = 0;
+	const interval = setInterval(() => {
+		context.fillStyle = `rgb(${(frame++ * 10) % 256}, 0, 0)`;
+		context.fillRect(0, 0, 64, 64);
+	}, 16);
+	const track = canvas.captureStream(30).getVideoTracks()[0]!;
+
+	try {
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new MediaStreamVideoTrackSource(
+			track,
+			{ codec: 'vp9', quality: new Quality('medium') },
+			{ frameRate: 30 },
+		);
+		source.errorPromise.catch(() => {});
+		output.addVideoTrack(source);
+		await output.start();
+		await new Promise(resolve => setTimeout(resolve, 1000));
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+			packetCount += packet ? 1 : 0;
+		}
+		expect(packetCount).toBeGreaterThan(20);
+	} finally {
+		globalThis.Worker = RealWorker;
+		globals['MediaStreamTrackProcessor'] = processor;
+		clearInterval(interval);
+		track.stop();
+	}
+});
+
 test('VideoSampleSource, encoding rotated video frames with forced transform', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { force: true } },
