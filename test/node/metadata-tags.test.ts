@@ -2117,6 +2117,75 @@ test('Creation time override, ISOBMFF', async () => {
 	expect(nullReadTags.creationTime).toBeUndefined();
 });
 
+test('Metadata blocks too big for FLAC', async () => {
+	// A FLAC metadata block gives its length in 24 bits, which a bigger one used to overflow, so that nothing could
+	// read the file. It must throw instead.
+	const writeFlac = async (tags: Parameters<Output['setMetadataTags']>[0]) => {
+		const output = new Output({
+			format: new FlacOutputFormat(),
+			target: new BufferTarget(),
+		});
+		output.setMetadataTags(tags);
+		const dummyTrack = createDummyAudioTrack('flac', output);
+
+		await output.start();
+		await dummyTrack.addPacket();
+		await output.finalize();
+	};
+
+	await expect(writeFlac({ title: 'a'.repeat(2 ** 24) })).rejects.toThrow('Metadata tags are too big for FLAC');
+	await expect(writeFlac({
+		images: [{ data: new Uint8Array(2 ** 24), kind: 'coverFront', mimeType: 'image/jpeg' }],
+	})).rejects.toThrow('Picture is too big for FLAC');
+});
+
+test('Picture descriptions with non-ASCII characters, FLAC', async () => {
+	const output = new Output({
+		format: new FlacOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const descriptions = ['Pochette – Café', '封面画像'];
+	output.setMetadataTags({
+		images: descriptions.map(description => ({
+			data: coverArt,
+			kind: 'coverFront',
+			mimeType: 'image/jpeg',
+			description,
+		})),
+	});
+
+	const dummyTrack = createDummyAudioTrack('flac', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.images!.map(image => image.description)).toEqual(descriptions);
+	expect(readTags.images!.map(image => image.data)).toEqual([coverArt, coverArt]);
+
+	// The PICTURE block gives the description's length in bytes (RFC 9639, section 8.8), and the width, height,
+	// color depth and number of colors after it are written as unknown
+	const view = new DataView(bytes.buffer);
+	const pictureFields: number[][] = [];
+	for (let pos = 4, isLast = false; !isLast; pos += 4 + view.getUint32(pos) % 2 ** 24) {
+		isLast = (bytes[pos]! & 0x80) !== 0;
+		if ((bytes[pos]! & 0x7f) === 6) {
+			const descriptionPos = pos + 12 + view.getUint32(pos + 8);
+			const fieldsPos = descriptionPos + 4 + view.getUint32(descriptionPos);
+			pictureFields.push([0, 4, 8, 12].map(offset => view.getUint32(fieldsPos + offset)));
+		}
+	}
+	expect(pictureFields).toEqual([[0, 0, 0, 0], [0, 0, 0, 0]]);
+});
+
 test('Creation time override, Matroska', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
