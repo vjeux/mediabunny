@@ -428,7 +428,7 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 				const bpmText = reader.readId3V2EncodingAndText(frameEndPos);
 				const bpm = Number.parseInt(bpmText, 10);
 
-				if (Number.isInteger(bpm)) {
+				if (Number.isInteger(bpm) && bpm > 0) {
 					tags.beatsPerMinute ??= bpm;
 				}
 			}; break;
