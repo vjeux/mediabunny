@@ -2,6 +2,16 @@ import { expect, test } from 'vitest';
 import { joinPaths } from '../../src/misc.js';
 
 test('joinPaths', () => {
+	// data: and blob: URIs are absolute (an HLS key given inline, say), and only paths starting with a scheme followed
+	// by "//" are absolute among the others. On main, the first two were joined onto the base path, and the third one
+	// was taken as absolute.
+	const base = 'https://example.com/a/p.m3u8';
+	expect(joinPaths(base, 'data:text/plain;base64,AAA=')).toBe('data:text/plain;base64,AAA=');
+	expect(joinPaths(base, 'blob:null/0f1e2d3c')).toBe('blob:null/0f1e2d3c');
+	expect(joinPaths(base, 'dir/x://y.ts').startsWith('https://example.com/a/dir/')).toBe(true);
+	expect(joinPaths(base, 'blob:https://example.com/0f1e')).toBe('blob:https://example.com/0f1e');
+	expect(joinPaths(base, 'HTTPS://other.example/x.ts')).toBe('HTTPS://other.example/x.ts');
+
 	// Simple relative paths
 	expect(joinPaths('path/to/entry.m3u8', 'other.m3u8')).toBe('path/to/other.m3u8');
 	expect(joinPaths('entry.m3u8', 'other.m3u8')).toBe('other.m3u8');
