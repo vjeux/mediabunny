@@ -153,6 +153,41 @@ test('Decode with the extension', async () => {
 	expect(sampleCount).toBe(packetCount);
 });
 
+// DTS 96/24 from FFmpeg's FATE suite: ffmpeg -i dts/dcadec-suite/x96_51_24_96_1509.dtshd -c copy -f mpegts
+// dts-x96-96khz.ts (and -c copy -fflags +bitexact dts-x96-96khz.mkv). MPEG-TS reports the 48 kHz rate of the core,
+// Matroska the 96 kHz the decoder outputs.
+test.each([
+	['dts-x96-96khz.ts', 48000],
+	['dts-x96-96khz.mkv', 96000],
+])('Decode DTS 96/24 from %s with timestamps that follow the packets', async (file, trackSampleRate) => {
+	registerDtsDecoder();
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', file)),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getSampleRate()).toBe(trackSampleRate);
+
+	const firstPacket = await new EncodedPacketSink(track).getFirstPacket();
+	assert(firstPacket);
+
+	let sampleCount = 0;
+	let nextTimestamp = firstPacket.timestamp;
+
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		expect(sample.sampleRate).toBe(96000);
+		expect(sample.timestamp).toBeCloseTo(nextTimestamp, 6);
+
+		nextTimestamp += sample.duration;
+		sampleCount++;
+	}
+
+	expect(sampleCount).toBe(6);
+});
+
 test('Encode with the extension', async () => {
 	registerDtsEncoder();
 
