@@ -717,8 +717,24 @@ export class BlobSource extends Source {
 }
 
 const URL_SOURCE_MIN_LOAD_AMOUNT = 0.5 * 2 ** 20; // 0.5 MiB
+/**
+ * How many times the default retry policy retries a request answered with an HTTP status that may be transient (with
+ * its backoff, that's 15.5 seconds of waiting in total).
+ */
+const DEFAULT_MAX_HTTP_ERROR_RETRIES = 5;
+
 const DEFAULT_RETRY_DELAY
 	= ((previousAttempts, error, src) => {
+		// A status like 503 often goes away when retried, but some servers answer one for good
+		if (
+			error instanceof Error
+			&& 'status' in error
+			&& typeof error.status === 'number'
+			&& previousAttempts > DEFAULT_MAX_HTTP_ERROR_RETRIES
+		) {
+			return null;
+		}
+
 		// Check if this could be a CORS error. If so, we cannot recover from it and
 		// should not attempt to retry.
 		// CORS errors are intentionally not opaque, so we need to rely on heuristics.
@@ -794,7 +810,11 @@ export type UrlSourceOptions = {
 	 * with the number of previous, unsuccessful attempts, as well as with the error with which the previous request
 	 * failed. If the function returns `null`, no more retries will be made.
 	 *
-	 * By default, it uses an exponential backoff algorithm that never gives up unless
+	 * A request fails when `fetch()` rejects, or when it's answered with an HTTP status that may be transient (408,
+	 * 429, 500, 502, 503 or 504), in which case the error has a `status` property holding that status.
+	 *
+	 * By default, it uses an exponential backoff algorithm that gives up on such a status after 5 retries, and
+	 * otherwise never gives up unless
 	 * a CORS error is suspected (`fetch()` did reject, `navigator.onLine` is true and origin is different).
 	 * The default can't tell a CORS failure from a network error when a URL of the same origin redirects to another
 	 * origin whose server doesn't allow it, so it keeps retrying such a request; if your URLs may redirect like that,
