@@ -2473,7 +2473,7 @@ class AudioEncoderWrapper {
 				const primingShift = primingShiftInSamples / encoderConfig.sampleRate;
 				let opusPreSkip = 0; // In seconds
 				const restampingPrimingShift = audioEncoderRestampingPrimingShifts.get(encoderConfig.codec);
-				let aacFrameSize = 1024; // In samples
+				let aacFrameDuration = 1024 / encoderConfig.sampleRate; // In seconds
 				let nextTimestamp: number | null = null; // In seconds
 
 				const stack = new Error('Encoding error').stack;
@@ -2491,8 +2491,9 @@ class AudioEncoderWrapper {
 							const isAac = this.encodingConfig.codec === 'aac';
 							if (restampingPrimingShift !== undefined && isAac && meta.decoderConfig.description) {
 								const description = toUint8Array(meta.decoderConfig.description);
-								const { objectType } = parseAacAudioSpecificConfig(description);
-								aacFrameSize = objectType === 5 || objectType === 29 ? 2048 : 1024; // SBR doubles it
+								// The core sample rate accounts for SBR doubling the duration at the output sample rate
+								const { frameLength, coreSampleRate } = parseAacAudioSpecificConfig(description);
+								aacFrameDuration = frameLength / coreSampleRate;
 							}
 						}
 
@@ -2518,7 +2519,7 @@ class AudioEncoderWrapper {
 							const duration = roundToDivisor(
 								codec === 'opus'
 									? parseOpusTocByte(packet.data).durationInSamples / OPUS_SAMPLE_RATE
-									: aacFrameSize / encoderConfig.sampleRate,
+									: aacFrameDuration,
 								encoderConfig.sampleRate,
 							);
 							const packetTimestamp = nextTimestamp ?? roundToDivisor(
@@ -2756,6 +2757,7 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 		let decodedFrames = 0;
 		let codecError = null as DOMException | null;
 		let repeatsTimestamps = false;
+		let encodedDuration = 0; // In seconds, known when the timestamps repeat
 
 		const encoder = new AudioEncoder({
 			output: (chunk, meta) => {
@@ -2819,8 +2821,32 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 			assert(decoderConfig);
 			fixAudioDecoderConfig(codec, encoderConfig, decoderConfig);
 
+			let chunksToDecode = chunks;
+			if (repeatsTimestamps && (codec === 'opus' || codec === 'aac')) {
+				// The chunk timestamps mean little then, and WebKit's decoder plays audio that starts at a negative
+				// timestamp backwards, so the chunks are decoded with timestamps from zero that follow their durations
+				const aacConfig = codec === 'aac' && decoderConfig.description
+					? parseAacAudioSpecificConfig(toUint8Array(decoderConfig.description))
+					: null;
+				chunksToDecode = chunks.map((chunk) => {
+					const data = new Uint8Array(chunk.byteLength);
+					chunk.copyTo(data);
+					const duration = aacConfig
+						? aacConfig.frameLength / aacConfig.coreSampleRate
+						: parseOpusTocByte(data).durationInSamples / OPUS_SAMPLE_RATE;
+					const restampedChunk = new EncodedAudioChunk({
+						type: chunk.type,
+						timestamp: Math.round(1e6 * encodedDuration),
+						duration: Math.round(1e6 * duration),
+						data,
+					});
+					encodedDuration += duration;
+					return restampedChunk;
+				});
+			}
+
 			decoder.configure(decoderConfig);
-			for (const chunk of chunks) {
+			for (const chunk of chunksToDecode) {
 				decoder.decode(chunk);
 			}
 
@@ -2839,7 +2865,18 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 		assert(peakIndex !== null);
 
 		if (repeatsTimestamps) {
-			audioEncoderRestampingPrimingShifts.set(codecString, peakIndex - impulseIndex);
+			let restampingPrimingShift = peakIndex - impulseIndex;
+
+			// Opus decoders normally drop the pre-skip, which the packet timestamps then account for. Some (WPE's)
+			// keep it, returning every encoded frame, in which case the measured shift includes it.
+			if (codec === 'opus' && decoderConfig?.description) {
+				const { preSkip } = parseOpusIdentificationHeader(toUint8Array(decoderConfig.description));
+				if (decodedFrames > encodedDuration * OPUS_SAMPLE_RATE - preSkip / 2) {
+					restampingPrimingShift -= preSkip;
+				}
+			}
+
+			audioEncoderRestampingPrimingShifts.set(codecString, restampingPrimingShift);
 		}
 
 		const firstChunkTimestampInSamples = Math.round(chunks[0]!.timestamp / 1e6 * sampleRate);
