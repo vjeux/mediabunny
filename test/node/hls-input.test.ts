@@ -358,6 +358,53 @@ test.concurrent('AES and discontinuities', { timeout: 15_000 }, async () => {
 	expect(packetCount).toBe(125);
 });
 
+test('HLS AES-128 key given as a data: URI', async () => {
+	// An inline key (hls.js supports them) is an absolute URI, so it must not be joined onto the playlist's URL. On
+	// main, fetching it failed every segment: "Error fetching http://127.0.0.1:…/data:text/plain;base64,…: 404".
+	const { createCipheriv } = await import('node:crypto');
+	const { createServer } = await import('node:http');
+
+	// An ADTS segment of 10 AAC-LC frames (44.1 kHz stereo), encrypted with the key that the playlist inlines
+	const key = Buffer.alloc(16, 0x5a);
+	const frames: number[] = [];
+	for (let i = 0; i < 10; i++) {
+		const length = 7 + 20;
+		frames.push(0xff, 0xf1, 0x50, 0x80 | (length >> 11), (length >> 3) & 0xff, ((length & 7) << 5) | 0x1f, 0xfc,
+			...new Array<number>(20).fill(i));
+	}
+	const cipher = createCipheriv('aes-128-cbc', key, Buffer.alloc(16)); // The IV is the media sequence number, 0
+	const segment = Buffer.concat([cipher.update(Buffer.from(frames)), cipher.final()]);
+	const playlist = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+		+ `#EXT-X-KEY:METHOD=AES-128,URI="data:text/plain;base64,${key.toString('base64')}"\n`
+		+ '#EXTINF:0.24,\nsegment.aac\n#EXT-X-ENDLIST\n';
+	const server = createServer((request, response) => {
+		const body = request.url === '/playlist.m3u8'
+			? Buffer.from(playlist)
+			: request.url === '/segment.aac' ? segment : null;
+		response.writeHead(body ? 200 : 404, body ? { 'content-length': body.length } : {});
+		response.end(body);
+	});
+	await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+	try {
+		const { port } = server.address() as { port: number };
+		using input = new Input({
+			source: new UrlSource(`http://127.0.0.1:${port}/playlist.m3u8`),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			void packet;
+			count++;
+		}
+		expect(count).toBe(10);
+	} finally {
+		server.close();
+	}
+});
+
 test.concurrent('Range requests', { timeout: 15_000 }, async () => {
 	using input = new Input({
 		source: new UrlSource('https://playertest.longtailvideo.com/adaptive/issue666/playlists/cisq0gim60007xzvi505emlxx.m3u8'),

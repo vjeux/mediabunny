@@ -1650,8 +1650,8 @@ const joinWindowsPaths = (basePath: FilePath, relativePath: FilePath) => {
 };
 
 export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
-	// If relativePath is a full URL with protocol, return it as-is
-	if (relativePath.includes('://')) {
+	// A path that starts with a scheme followed by "//" is absolute already, as are data: and blob: URIs
+	if (/^(?:[a-z][a-z0-9+.-]*:\/\/|(?:data|blob):)/i.test(relativePath)) {
 		return relativePath;
 	}
 
