@@ -455,13 +455,35 @@ export class MatroskaMuxer extends Muxer {
 				!== trackData.info.aspectRatio.den * trackData.info.width
 			);
 
+		let displayElements: EBMLElement[] = [];
+		if (hasNonSquarePixelAspectRatio) {
+			const aspectRatio = trackData.info.aspectRatio!;
+
+			if (this.format instanceof WebMOutputFormat) {
+				// WebM only allows pixels as the DisplayUnit, and WebKit and Gecko take the display dimensions as the
+				// video's pixel size. So, like FFmpeg, we scale the width and keep the height. (A width of 0 isn't
+				// allowed, which extreme aspect ratios would otherwise round to.)
+				displayElements = [
+					{
+						id: EBMLId.DisplayWidth,
+						data: Math.max(Math.round(trackData.info.height * aspectRatio.num / aspectRatio.den), 1),
+					},
+					{ id: EBMLId.DisplayHeight, data: trackData.info.height },
+				];
+			} else {
+				displayElements = [
+					{ id: EBMLId.DisplayWidth, data: aspectRatio.num },
+					{ id: EBMLId.DisplayHeight, data: aspectRatio.den },
+					{ id: EBMLId.DisplayUnit, data: 3 }, // 3 = display aspect ratio
+				];
+			}
+		}
+
 		const colorSpace = trackData.info.decoderConfig.colorSpace;
 		const videoElement: EBMLElement = { id: EBMLId.Video, data: [
 			{ id: EBMLId.PixelWidth, data: trackData.info.width },
 			{ id: EBMLId.PixelHeight, data: trackData.info.height },
-			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayWidth, data: trackData.info.aspectRatio!.num } : null),
-			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayHeight, data: trackData.info.aspectRatio!.den } : null),
-			(hasNonSquarePixelAspectRatio ? { id: EBMLId.DisplayUnit, data: 3 } : null), // 3 = display aspect ratio
+			...displayElements,
 			trackData.info.alphaMode ? { id: EBMLId.AlphaMode, data: 1 } : null,
 			(colorSpaceIsEmpty(colorSpace)
 				? null
