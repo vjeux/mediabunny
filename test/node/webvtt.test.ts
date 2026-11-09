@@ -47,6 +47,59 @@ test('WebVTT cue timings may omit the spaces around the arrow', () => {
 	expect(config).toBe('WEBVTT');
 });
 
+test('A WebVTT timing line ends the previous cue even without a blank line before it', () => {
+	const cues: SubtitleCue[] = [];
+	const parser = new SubtitleParser({ codec: 'webvtt', output: cue => cues.push(cue) });
+	parser.parse('WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n00:02.000 --> 00:03.000\nThere\n');
+
+	expect(cues.map(cue => [cue.timestamp, cue.duration, cue.text])).toEqual([[0, 1, 'Hi'], [2, 1, 'There']]);
+
+	// Many such cues are parsed in linear time (looking for each cue's blank line up to the end of the text made 20,000
+	// cues take about 3 seconds)
+	const timestamp = (seconds: number) => [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
+		.map(value => String(value).padStart(2, '0'))
+		.join(':') + '.000';
+	let manyCues = 'WEBVTT\n\n';
+	for (let i = 0; i < 50_000; i++) {
+		manyCues += `${timestamp(i)} --> ${timestamp(i + 1)}\nCue ${i}\n`;
+	}
+	let manyCueCount = 0;
+	const manyCuesParser = new SubtitleParser({ codec: 'webvtt', output: () => manyCueCount++ });
+	const startTime = performance.now();
+	manyCuesParser.parse(manyCues);
+	expect(performance.now() - startTime).toBeLessThan(2000);
+	expect(manyCueCount).toBe(50_000);
+});
+
+test('A WebVTT cue whose timing line ends the text has empty text', () => {
+	const parse = (...chunks: string[]) => {
+		const cues: SubtitleCue[] = [];
+		const parser = new SubtitleParser({
+			codec: 'webvtt',
+			output: (cue) => {
+				cues.push(cue);
+				if (cues.length > 10) {
+					throw new Error('The parser keeps emitting cues.'); // Instead of hanging the test
+				}
+			},
+		});
+		chunks.forEach(chunk => parser.parse(chunk));
+		return cues.map(cue => [cue.timestamp, cue.duration, cue.text, cue.settings]);
+	};
+
+	expect(parse('WEBVTT\n\n00:00.000 --> 00:01.000')).toEqual([[0, 1, '', '']]);
+	expect(parse('WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n00:02.000 --> 00:03.000 align:start')).toEqual([
+		[0, 1, 'Hi', ''],
+		[2, 1, '', 'align:start'],
+	]);
+	expect(parse('WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n\n00:01.000 --> 00:02.000')).toEqual([
+		[0, 1, 'Hi', ''],
+		[1, 1, '', ''],
+	]);
+	// A chunk passed to TextSubtitleSource.add may end right after a timing line too
+	expect(parse('WEBVTT\n\n', '00:00.000 --> 00:01.000')).toEqual([[0, 1, '', '']]);
+});
+
 test('Matroska muxing', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
