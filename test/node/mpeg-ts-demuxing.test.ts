@@ -4514,9 +4514,10 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 	expect(withEmptyStream.counter.bytes).toBeLessThan(8 * 2 ** 20); // 4 MiB past the MP3 stream's setup
 	withEmptyStream.input.dispose();
 
-	// Nor does it make a sequential source that keeps only what its cache holds (a ReadableStreamSource) read so far
-	// ahead that the other streams' start is gone (found in L15's streamed check): such sources look 1 MiB ahead. 6 MB
-	// of H.264 frames of 60 kB, written by Mediabunny, with such a stream added, read through a 2 MiB cache.
+	// Nor does it make a source that keeps only what its cache holds read so far ahead that the other streams' start is
+	// gone (found in L15's streamed checks): such sources don't look further. 6 MB of H.264 frames of 60 kB, written by
+	// Mediabunny, with such a stream added, read through a 2 MiB cache, from a ReadableStreamSource, then from a server
+	// that ignores range requests through a UrlSource, which knows the size but reads in order too.
 	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
 	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
 		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
@@ -4565,6 +4566,34 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 			packetCount++;
 		}
 		expect(packetCount).toBe(100);
+	}
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': streamedFile.byteLength });
+		response.end(streamedFile);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		using urlInput = new Input({
+			source: new UrlSource(`http://localhost:${address.port}/video.ts`, {
+				maxCacheSize: 2 ** 21,
+				getRetryDelay: () => null,
+			}),
+			formats: ALL_FORMATS,
+		});
+		const urlTracks = await urlInput.getTracks();
+		expect(urlTracks.map(track => track.type)).toEqual(['video']);
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(urlTracks[0]!).packets()) {
+			expect(packet.byteLength).toBeGreaterThan(60_000);
+			packetCount++;
+		}
+		expect(packetCount).toBe(100);
+	} finally {
+		server.closeAllConnections();
+		server.close();
 	}
 
 	// A stream whose first PES packet merely starts with an ADTS-like header, followed by random data, stays out
@@ -5576,6 +5605,60 @@ test('MPEG-TS lookups don\'t read the start of the track again', async () => {
 		assert(videoTrack && audioTrack);
 		expect(await videoTrack.computeDuration()).toBeCloseTo(180 / 25);
 		expect(await audioTrack.computeDuration()).toBeCloseTo(audioFrame * audioFrameDuration);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('MPEG-TS reads a small file the same from sources that can\'t go back as from a buffer', async () => {
+	// From L46's review. A file that fits in the cache of a source that only keeps what its cache holds (a
+	// ReadableStreamSource, or a UrlSource whose server ignores range requests) can still be looked through and gone
+	// back in, so the AAC that FFmpeg's m2ts mode writes as private data without descriptors is found there too
+	const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/aac-private-data.m2ts'))); // 0.4 MB
+	const readTracks = async (source: BufferSource | ReadableStreamSource | UrlSource) => {
+		using input = new Input({ source, formats: ALL_FORMATS });
+		const result: string[] = [];
+		for (const track of await input.getTracks()) {
+			let count = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				count += packet.byteLength > 0 ? 1 : 0;
+			}
+			result.push(`${track.type} ${await track.getCodec()} ${count}`);
+		}
+		return result;
+	};
+
+	const expected = await readTracks(new BufferSource(bytes));
+	expect(expected.map(x => x.split(' ')[0])).toEqual(['video', 'audio']);
+
+	let position = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull: (controller) => {
+			if (position >= bytes.length) {
+				controller.close();
+				return;
+			}
+
+			controller.enqueue(bytes.slice(position, position + 65536));
+			position += 65536;
+		},
+	});
+	expect(await readTracks(new ReadableStreamSource(stream, { maxCacheSize: 2 ** 21 }))).toEqual(expected);
+
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Length': bytes.byteLength });
+		response.end(bytes);
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const source = new UrlSource(`http://localhost:${address.port}/video.ts`, {
+			maxCacheSize: 2 ** 21,
+			getRetryDelay: () => null,
+		});
+		expect(await readTracks(source)).toEqual(expected);
 	} finally {
 		server.closeAllConnections();
 		server.close();
