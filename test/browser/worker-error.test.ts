@@ -12,6 +12,11 @@ import { registerDtsEncoder } from '@mediabunny/dts';
 import { registerTrueHdEncoder } from '@mediabunny/truehd';
 import { registerFlacEncoder } from '@mediabunny/flac-encoder';
 import { registerMp3Encoder } from '@mediabunny/mp3-encoder';
+import { registerProresDecoder } from '@mediabunny/prores';
+import { Input } from '../../src/input.js';
+import { ALL_FORMATS } from '../../src/input-format.js';
+import { VideoSampleSink } from '../../src/media-sink.js';
+import { UrlSource } from '../../src/source.js';
 
 beforeAll(() => {
 	const meta = document.createElement('meta');
@@ -59,3 +64,24 @@ for (const { codec, register, bitrate } of cases) {
 		await output.cancel();
 	});
 }
+
+test('ProRes decoding without blob: workers', { timeout: 20_000 }, async () => {
+	// The ProRes decoder runs its WebAssembly in workers started from blob: URLs, which this page's CSP forbids, so it
+	// has to decode on the calling thread instead of waiting for its workers forever
+	registerProresDecoder();
+
+	// ffmpeg -f lavfi -i testsrc2=s=64x32:r=10:d=0.2 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le \
+	//   -fflags +bitexact -flags:v +bitexact prores-422hq-64x32.mov
+	using input = new Input({
+		source: new UrlSource('/prores-422hq-64x32.mov'),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+
+	let count = 0;
+	for await (using sample of new VideoSampleSink(track).samples()) {
+		expect(sample.displayWidth).toBe(64);
+		count++;
+	}
+	expect(count).toBe(2);
+});
