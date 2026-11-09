@@ -28,8 +28,10 @@ type SubtitleParserOptions = {
 	output: (cue: SubtitleCue, metadata: SubtitleMetadata) => unknown;
 };
 
-const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
-const preambleStartRegex = /^WEBVTT(.|\n)*?\n{2}/;
+// Line feeds are WebVTT's only line terminators once carriage returns are normalized, so lines may contain U+2028 and
+// U+2029, which the . of regexes doesn't match
+const cueBlockHeaderRegex = /(?:([^\n]+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
+const preambleStartRegex = /^WEBVTT[\s\S]*?\n{2}/;
 export const inlineTimestampRegex = /<(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})>/g;
 
 export class SubtitleParser {
