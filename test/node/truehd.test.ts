@@ -382,3 +382,42 @@ const createSineWave = () => {
 
 	return data;
 };
+
+test('TrueHD in Matroska is looked up exactly, as its access units are shorter than a millisecond', async () => {
+	// Matroska rounds timestamps to a millisecond, which decoded audio was allowed to start after a looked-up
+	// timestamp. A TrueHD access unit lasts 0.83 ms, so lookups returned the next one for almost every timestamp, and
+	// ranges started with an access unit that ends before their start (found by the lane L98 review).
+	registerTrueHdDecoder();
+	using input = new Input({ source: new FilePathSource(TRUEHD_FILE), formats: ALL_FORMATS });
+	using mkv = await convert(input, new MkvOutputFormat());
+	const track = await mkv.getPrimaryAudioTrack();
+	assert(track);
+	const duration = await track.computeDuration();
+	const sink = new AudioSampleSink(track);
+
+	const covers = (sample: AudioSample | null, timestamp: number) => sample !== null
+		&& sample.timestamp - timestamp <= 1e-9
+		&& sample.timestamp + sample.duration > timestamp;
+
+	const timestamps = Array.from({ length: 40 }, (_, i) => duration * (i + 0.37) / 40);
+	for (const timestamp of timestamps) {
+		using sample = await sink.getSample(timestamp);
+		expect(covers(sample, timestamp), `getSample(${timestamp})`).toBe(true);
+	}
+
+	let index = 0;
+	for await (using sample of sink.samplesAtTimestamps(timestamps)) {
+		const timestamp = timestamps[index++]!;
+		expect(covers(sample, timestamp), `samplesAtTimestamps, ${timestamp}`).toBe(true);
+	}
+	expect(index).toBe(timestamps.length);
+
+	// Range starts on and off the millisecond grid of the packet timestamps
+	const onGrid = timestamps.map(x => Math.round(x * 1000) / 1000);
+	for (const start of [0.374, ...timestamps.filter((_, i) => i % 4 === 0), ...onGrid]) {
+		for await (using sample of sink.samples(start, start + 0.05)) {
+			expect(covers(sample, start), `samples(${start})`).toBe(true);
+			break;
+		}
+	}
+});
