@@ -347,7 +347,7 @@ Some [output formats](./output-formats) have *append-only* writing modes in whic
 
 #### Chunked mode
 
-By default, data will be emitted by the `StreamTarget` as soon as it is available. In some formats, these may lead to hundreds of write events per second. If you want to reduce the frequency of writes, `StreamTarget` offers an alternative "chunked mode" in which data will first be accumulated into large chunks of a given size in memory, and then only be emitted once a chunk is completely full.
+By default, data will be emitted by the `StreamTarget` as soon as it is available. In some formats, these may lead to hundreds of write events per second. If you want to reduce the frequency of writes, `StreamTarget` offers an alternative "chunked mode" in which data will first be accumulated into large chunks of a given size in memory, and then only be emitted once a chunk is completely full. The exception is when the output needs its data written out before it goes on, like a live HLS playlist listing byte ranges of a single segment file: then partial chunks are emitted too.
 
 ```ts
 new StreamTarget(writable, {

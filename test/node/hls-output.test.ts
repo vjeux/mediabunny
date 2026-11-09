@@ -4487,6 +4487,62 @@ segment-1-5.ts
 	expect(poppedSegments[1]!.info.n).toBe(2);
 });
 
+test('Live mode, singleFilePerPlaylist with a target that holds data back', async () => {
+	// Each live playlist lists byte ranges of the segments file, so those bytes must have been written by then, even
+	// with a target that holds data back until a whole chunk is filled (like FilePathTarget does by default)
+	for (const segmentFormat of [new MpegTsOutputFormat(), new CmafOutputFormat()]) {
+		const writtenUntil = new Map<string, number>();
+		const playlistChecks: string[] = [];
+
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat,
+				live: true,
+				singleFilePerPlaylist: true,
+				onPlaylist: (content) => {
+					const lines = content.split('\n');
+					for (let i = 0; i < lines.length - 1; i++) {
+						const match = /^#EXT-X-(?:BYTERANGE:|MAP:URI="(.+)",BYTERANGE=")(\d+)@(\d+)/.exec(lines[i]!);
+						if (!match) {
+							continue;
+						}
+
+						const path = match[1] ?? lines[i + 1]!;
+						const end = Number(match[3]) + Number(match[2]);
+						playlistChecks.push(`${path} up to ${end}: ${(writtenUntil.get(path) ?? 0) >= end}`);
+					}
+				},
+			}),
+			target: new PathedTarget('master.m3u8', (request) => {
+				const writable = new WritableStream<StreamTargetChunk>({
+					write: async (chunk) => {
+						await new Promise(resolve => setTimeout(resolve, 5)); // Slow, like a disk or a network
+
+						const end = chunk.position + chunk.data.byteLength;
+						writtenUntil.set(request.path, Math.max(writtenUntil.get(request.path) ?? 0, end));
+					},
+				});
+
+				return new StreamTarget(writable, { chunked: true });
+			}),
+		});
+
+		const source = videoSource();
+		output.addVideoTrack(source);
+
+		await output.start();
+
+		for (let i = 0; i < 16; i++) {
+			await source.add(new EncodedPacket(avcPacketData, i % 4 === 0 ? 'key' : 'delta', i / 2, 0.5), avcMetadata);
+		}
+
+		await output.finalize();
+
+		expect(playlistChecks.length).toBeGreaterThan(4);
+		expect(playlistChecks.filter(x => x.endsWith('false'))).toEqual([]);
+	}
+});
+
 test('Live mode, maxLiveSegmentCount with singleFilePerPlaylist', async () => {
 	const onSegmentPopped = vi.fn();
 	let lastPlaylistText = '';
