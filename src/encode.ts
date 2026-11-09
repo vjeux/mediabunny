@@ -722,48 +722,51 @@ export class Quality {
 			throw new TypeError('options.bitrateMode, when provided, must be \'constant\' or \'variable\'.');
 		}
 
-		if ('quality' in options) {
+		// As everywhere else, options set to undefined count as not provided
+		const fields = options as Partial<QualitativeQualityOptions & QuantitativeQualityOptions>;
+
+		if (fields.quality !== undefined) {
 			if (
-				typeof options.quality === 'string'
-					? !(options.quality in QUALITY_LEVELS)
-					: (typeof options.quality !== 'number' || Number.isNaN(options.quality))
+				typeof fields.quality === 'string'
+					? !(fields.quality in QUALITY_LEVELS)
+					: (typeof fields.quality !== 'number' || Number.isNaN(fields.quality))
 			) {
 				throw new TypeError(
 					'options.quality must be a number, or one of \'very-low\', \'low\', \'medium\', \'high\''
 					+ ' or \'very-high\'.',
 				);
 			}
-			if (options.preferBitrate !== undefined && typeof options.preferBitrate !== 'boolean') {
+			if (fields.preferBitrate !== undefined && typeof fields.preferBitrate !== 'boolean') {
 				throw new TypeError('options.preferBitrate, when provided, must be a boolean.');
 			}
-			if ('bitrate' in options || 'quantizer' in options) {
+			if (fields.bitrate !== undefined || fields.quantizer !== undefined) {
 				throw new TypeError('options.quality cannot be combined with options.bitrate or options.quantizer.');
 			}
 
-			this._quality = typeof options.quality === 'string'
-				? QUALITY_LEVELS[options.quality]
-				: options.quality;
-			this._preferBitrate = options.preferBitrate ?? false;
+			this._quality = typeof fields.quality === 'string'
+				? QUALITY_LEVELS[fields.quality]
+				: fields.quality;
+			this._preferBitrate = fields.preferBitrate ?? false;
 			this._bitrate = undefined;
 			this._quantizer = undefined;
 		} else {
-			if (options.bitrate !== undefined && (!Number.isInteger(options.bitrate) || options.bitrate <= 0)) {
+			if (fields.bitrate !== undefined && (!Number.isInteger(fields.bitrate) || fields.bitrate <= 0)) {
 				throw new TypeError('options.bitrate, when provided, must be a positive integer.');
 			}
-			if (options.quantizer !== undefined && (!Number.isInteger(options.quantizer) || options.quantizer < 0)) {
+			if (fields.quantizer !== undefined && (!Number.isInteger(fields.quantizer) || fields.quantizer < 0)) {
 				throw new TypeError('options.quantizer, when provided, must be a non-negative integer.');
 			}
-			if (options.bitrate === undefined && options.quantizer === undefined) {
+			if (fields.bitrate === undefined && fields.quantizer === undefined) {
 				throw new TypeError('At least one of options.bitrate or options.quantizer must be set.');
 			}
-			if ('preferBitrate' in options) {
+			if (fields.preferBitrate !== undefined) {
 				throw new TypeError('options.preferBitrate can only be combined with options.quality.');
 			}
 
 			this._quality = undefined;
 			this._preferBitrate = false;
-			this._bitrate = options.bitrate;
-			this._quantizer = options.quantizer;
+			this._bitrate = fields.bitrate;
+			this._quantizer = fields.quantizer;
 		}
 
 		this._bitrateMode = options.bitrateMode;
