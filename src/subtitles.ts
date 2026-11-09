@@ -28,13 +28,31 @@ type SubtitleParserOptions = {
 	output: (cue: SubtitleCue, metadata: SubtitleMetadata) => unknown;
 };
 
-// An identifier is the line before a timing line, so it's only looked for at the start of a line (multiline ^).
-// Otherwise, every position of a long line of text before a cue would start an identifier reaching to the end of that
-// line, which makes the search quadratic.
+// Line feeds are WebVTT's only line terminators once carriage returns are normalized, so lines may contain U+2028 and
+// U+2029, which the . of regexes doesn't match. An identifier is the whole line before a timing line, so it's only
+// looked for after a line feed or at the start of the text; execCueBlockHeader takes that line feed back out of the
+// match. Started anywhere in a long line instead, the search would reach to the end of that line every time, which is
+// quadratic. (A lookbehind can't be used, as Safari before 16.4 can't parse one, and the ^ of the m flag also matches
+// after U+2028 and U+2029.)
 // The hours of a timestamp may have any number of digits, even just one (W3C WebVTT, "collect a WebVTT timestamp")
-const cueBlockHeaderRegex = /(?:^(.+?)\n)?((?:\d+:)?\d{2}:\d{2}.\d{3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}.\d{3})/gm;
-const preambleStartRegex = /^WEBVTT(.|\n)*?\n{2}/;
+const cueBlockHeaderRegex
+	= /(?:(?:^|\n)([^\n]+?)\n)?((?:\d+:)?\d{2}:\d{2}.\d{3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}.\d{3})/g;
+const preambleStartRegex = /^WEBVTT[\s\S]*?\n{2}/;
 export const inlineTimestampRegex = /<(?:(\d+):)?(\d{2}):(\d{2}).(\d{3})>/g;
+
+/**
+ * Finds the next cue block header (an optional identifier line, then a timing line) from the regex's lastIndex on. The
+ * match starts at the identifier, without the line feed before it.
+ */
+const execCueBlockHeader = (text: string) => {
+	const match = cueBlockHeaderRegex.exec(text);
+	if (match?.[0].startsWith('\n')) {
+		match.index++;
+		match[0] = match[0].slice(1);
+	}
+
+	return match;
+};
 
 export class SubtitleParser {
 	private options: SubtitleParserOptions;
@@ -67,8 +85,8 @@ export class SubtitleParser {
 
 			// The header holds at least the WEBVTT line, so that line can't be the identifier of a cue that directly
 			// follows it (W3C WebVTT parser: a line containing "-->" ends the header)
-			cueBlockHeaderRegex.lastIndex = text.indexOf('\n') + 1;
-			match = cueBlockHeaderRegex.exec(text);
+			cueBlockHeaderRegex.lastIndex = text.indexOf('\n');
+			match = execCueBlockHeader(text);
 			const preamble = text.slice(0, match?.index ?? text.length).trimEnd();
 
 			if (!preamble) {
@@ -88,7 +106,7 @@ export class SubtitleParser {
 		}
 
 		const cues: SubtitleCue[] = [];
-		while ((match = cueBlockHeaderRegex.exec(text))) {
+		while ((match = execCueBlockHeader(text))) {
 			const notes = text.slice(0, match.index);
 			const cueIdentifier = match[1];
 			const matchEnd = match.index! + match[0].length;
