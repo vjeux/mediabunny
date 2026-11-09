@@ -1856,3 +1856,77 @@ test('A SeekPreRoll longer than the codec\'s pre-roll is honored', async () => {
 	assert(aacTrack);
 	expect(await aacTrack.getPreRollDuration()).toBe(1024 / 44100);
 });
+
+test('EBML lacing with frame size differences of any width', async () => {
+	// The size differences are signed VINTs of up to 8 bytes
+
+	const element = (id: number, ...parts: number[][]) => {
+		const data = parts.flat();
+		const idBytes: number[] = [];
+		for (let value = id; value > 0; value = Math.floor(value / 256)) {
+			idBytes.unshift(value & 0xff);
+		}
+
+		const size = [0x10, (data.length >>> 16) & 0xff, (data.length >>> 8) & 0xff, data.length & 0xff]; // 4-byte VINT
+		return [...idBytes, ...size, ...data];
+	};
+
+	const ascii = (text: string) => [...text].map(x => x.charCodeAt(0));
+	const float64 = (value: number) => {
+		const bytes = new Uint8Array(8);
+		new DataView(bytes.buffer).setFloat64(0, value);
+		return [...bytes];
+	};
+
+	const readFrameSizes = async (sizeDifference: number[]) => {
+		// Three frames: frame count minus one, the first size (320 as a 2-byte VINT), one difference, 960 bytes in all
+		const lace = [2, 0x41, 0x40, ...sizeDifference];
+		const file = new Uint8Array([
+			...element(EBMLId.EBML, element(EBMLId.DocType, ascii('matroska'))),
+			...element(
+				EBMLId.Segment,
+				element(EBMLId.Info, element(EBMLId.TimestampScale, [0x0f, 0x42, 0x40])),
+				element(EBMLId.Tracks, element(
+					EBMLId.TrackEntry,
+					element(EBMLId.TrackNumber, [1]),
+					element(EBMLId.TrackType, [2]),
+					element(EBMLId.CodecID, ascii('A_PCM/INT/LIT')),
+					element(EBMLId.DefaultDuration, [0x01, 0x31, 0x2d, 0x00]), // 20 ms
+					element(
+						EBMLId.Audio,
+						element(EBMLId.SamplingFrequency, float64(8000)),
+						element(EBMLId.Channels, [1]),
+						element(EBMLId.BitDepth, [16]),
+					),
+				)),
+				element(
+					EBMLId.Cluster,
+					element(EBMLId.Timestamp, [0]),
+					// Track 1, timestamp 0, key frame with EBML lacing
+					element(EBMLId.SimpleBlock, [0x81, 0, 0, 0x86], lace, new Array<number>(960).fill(0)),
+				),
+			),
+		]);
+
+		using input = new Input({
+			source: new BufferSource(file),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const sizes: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			sizes.push(packet.data.byteLength);
+		}
+		return sizes;
+	};
+
+	// Frames of 320, 322 and (implied) 318 bytes: a difference of +2
+	expect(await readFrameSizes([0xc1])).toEqual([320, 322, 318]); // 65, minus the bias of 2^6 - 1
+	expect(await readFrameSizes([0x0c, 0, 0, 0, 1])).toEqual([320, 322, 318]); // 2^34 + 1, bias 2^34 - 1
+	expect(await readFrameSizes([0x01, 0x80, 0, 0, 0, 0, 0, 1])).toEqual([320, 322, 318]); // 2^55 + 1, bias 2^55 - 1
+	// And -2
+	expect(await readFrameSizes([0xbd])).toEqual([320, 318, 322]);
+	expect(await readFrameSizes([0x01, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd])).toEqual([320, 318, 322]);
+});
