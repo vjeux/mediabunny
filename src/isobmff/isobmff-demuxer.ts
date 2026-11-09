@@ -2788,11 +2788,12 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.currentFragmentState || !this.currentFragment?.trackData.has(track.id)) {
+				if (!track.currentFragmentState) {
 					break;
 				}
 
-				// The IV sizes can depend on the samples' sample groups, which may come later in the traf
+				// Read once the traf's other boxes are: its samples come from track runs, and their IV sizes can
+				// depend on their sample groups, which may both come after senc (the box order is only recommended)
 				track.currentFragmentState.sencSlice = slice.slice(contentStartPos, boxInfo.contentSize);
 			}; break;
 
