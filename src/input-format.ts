@@ -23,7 +23,7 @@ import {
 import { MatroskaDemuxer } from './matroska/matroska-demuxer';
 import { Mp3Demuxer } from './mp3/mp3-demuxer';
 import { ID3_V2_HEADER_SIZE, readId3V2Header } from './id3';
-import { readFirstMp3FrameHeader } from './mp3/mp3-reader';
+import { findWaveDataChunk, readFirstMp3FrameHeader } from './mp3/mp3-reader';
 import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from './adts/adts-reader';
@@ -455,6 +455,12 @@ export class Mp3InputFormat extends InputFormat {
 			return false;
 		}
 
+		// MP3 in WAVE: the frames are in the data chunk, which can start further in (behind a JUNK or bext chunk)
+		const dataChunk = await findWaveDataChunk(input._reader, currentPos);
+		if (dataChunk) {
+			currentPos = dataChunk.start;
+		}
+
 		// Skip a run of zero bytes before the first frame, as found in files whose ID3v2 tag was stripped by zeroing it
 		// out in place. Zeros can't form a frame header; FFmpeg's mp3_read_probe skips them the same way.
 		currentPos = await skipZeroBytes(input._reader, currentPos, 2 ** 20);
@@ -483,6 +489,43 @@ export class Mp3InputFormat extends InputFormat {
 }
 
 /**
+ * Format tags of MPEG audio in WAVE ("RIFF MP3", as written by Windows' ACM codecs or FFmpeg): layers I and II, and
+ * layer III. The data chunk of such a file holds a plain MPEG audio stream.
+ */
+const WAVE_MPEG_AUDIO_FORMAT_TAGS = [0x0050, 0x0055];
+
+/** Reads the format tag in the "fmt " chunk of a WAVE file, or returns null if no such chunk precedes the data. */
+const readWaveFormatTag = async (input: Input, littleEndian: boolean) => {
+	let pos = 12;
+
+	// Few chunks come before the data, so looking at a bounded number of them is enough
+	for (let i = 0; i < 64; i++) {
+		let slice = input._reader.requestSlice(pos, 10);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (!slice) {
+			return null;
+		}
+
+		const chunkId = readAscii(slice, 4);
+		const bytes = readBytes(slice, 6);
+		const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		const chunkSize = view.getUint32(0, littleEndian);
+
+		if (chunkId === 'fmt ') {
+			return view.getUint16(4, littleEndian);
+		} else if (chunkId === 'data') {
+			return null;
+		}
+
+		pos += 8 + chunkSize + (chunkSize & 1);
+	}
+
+	return null;
+};
+
+/**
  * WAVE file format, based on RIFF.
  *
  * Do not instantiate this class; use the {@link WAVE} singleton instead.
@@ -505,7 +548,14 @@ export class WaveInputFormat extends InputFormat {
 		slice.skip(4);
 
 		const format = readAscii(slice, 4);
-		return format === 'WAVE';
+		if (format !== 'WAVE') {
+			return false;
+		}
+
+		// MPEG audio in WAVE is left to the MP3 format, which reads the plain MPEG audio stream in the data chunk; the
+		// WAVE demuxer doesn't support it
+		const formatTag = await readWaveFormatTag(input, riffType !== 'RIFX');
+		return formatTag === null || !WAVE_MPEG_AUDIO_FORMAT_TAGS.includes(formatTag);
 	}
 
 	/** @internal */
