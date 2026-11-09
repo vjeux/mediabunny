@@ -1959,8 +1959,11 @@ const generateMetadataPairs = (tags: MetadataTags, isMdta: boolean) => {
 			}; break;
 
 			case 'images': {
+				// iTunes artwork has no picture type. Front covers are written if there are any, else the other images
+				// rather than none (FFmpeg, for example, tags the covers it writes as type "other", read as 'unknown')
+				const hasFrontCover = value.some(image => image.kind === 'coverFront');
 				for (const image of value) {
-					if (image.kind !== 'coverFront') {
+					if (hasFrontCover && image.kind !== 'coverFront') {
 						continue;
 					}
 
