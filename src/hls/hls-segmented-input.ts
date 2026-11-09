@@ -95,6 +95,14 @@ export type HlsSegmentLocation = {
 // Way more than any real duration, but small enough to keep all timestamp (and derived sequence number) math finite
 const MAX_DURATION = 1e9; // In seconds
 
+/** Whether two EXT-X-MAP tags declare the same unencrypted init section. */
+const isSameInitSegment = (a: HlsSegment, b: HlsSegment | null) => b !== null
+	&& a.location.path === b.location.path
+	&& a.location.offset === b.location.offset
+	&& a.location.length === b.location.length
+	&& a.encryption === null
+	&& b.encryption === null;
+
 export class HlsSegmentedInput extends SegmentedInput {
 	rootPath: string;
 	demuxer: HlsDemuxer;
@@ -270,7 +278,11 @@ export class HlsSegmentedInput extends SegmentedInput {
 					// continue the segment list from there. Set some data to continue where we left off.
 					accumulatedTime = prevLastSegment.timestamp + prevLastSegment.duration;
 					currentFirstSegment = prevLastSegment.firstSegment;
-					currentInitSegment = prevLastSegment.initSegment;
+					// An EXT-X-MAP read in this pass, even one before EXT-X-MEDIA-SEQUENCE, applies to the new
+					// segments. When it's the init section we already know, keep that one so that its input is reused.
+					if (!currentInitSegment || isSameInitSegment(currentInitSegment, prevLastSegment.initSegment)) {
+						currentInitSegment = prevLastSegment.initSegment;
+					}
 					lastProgramDateTimeSeconds = prevLastSegment.lastProgramDateTimeSeconds;
 					accumulatedUnixTime = prevLastSegment.unixEpochTimestamp !== null
 						? prevLastSegment.unixEpochTimestamp + prevLastSegment.duration
@@ -418,39 +430,37 @@ export class HlsSegmentedInput extends SegmentedInput {
 					throw new Error('Invalid #EXT-X-MAP tag; BYTERANGE attribute must have a specified offset.');
 				}
 
-				if (!prevLastSegment) {
-					const fullPath = joinPaths(this.rootPath, uri);
-					const location: HlsSegmentLocation = {
-						path: fullPath,
-						offset: parsedByteRange?.offset ?? 0,
-						length: parsedByteRange?.length ?? null,
-					};
+				// Read even among segments we already know, since a map before EXT-X-MEDIA-SEQUENCE also applies to the
+				// new segments that follow (RFC 8216, 4.3.2.5)
+				const fullPath = joinPaths(this.rootPath, uri);
+				const location: HlsSegmentLocation = {
+					path: fullPath,
+					offset: parsedByteRange?.offset ?? 0,
+					length: parsedByteRange?.length ?? null,
+				};
 
-					const currentKey = getCurrentKey();
-					if (currentKey?.method === 'AES-128' && !currentKey.iv) {
-						// Required by the spec
-						throw new Error('IV attribute must be set on #EXT-X-KEY tag preceding the #EXT-X-MAP tag.');
-					}
-
-					const segment: HlsSegment = {
-						index: -1,
-						timestamp: accumulatedTime,
-						unixEpochTimestamp: accumulatedUnixTime,
-						discontinuityNumber: nextDiscontinuityNumber,
-						firstSegment: null,
-						sequenceNumber: null,
-						location,
-						duration: 0,
-						encryption: currentKey,
-						initSegment: null,
-						lastProgramDateTimeSeconds,
-					};
-
-					// Accumulated time and sequence number are not updated in this case
-					currentInitSegment = segment;
-				} else {
-					// We're still seeing segments we already know about
+				const currentKey = getCurrentKey();
+				if (currentKey?.method === 'AES-128' && !currentKey.iv) {
+					// Required by the spec
+					throw new Error('IV attribute must be set on #EXT-X-KEY tag preceding the #EXT-X-MAP tag.');
 				}
+
+				const segment: HlsSegment = {
+					index: -1,
+					timestamp: accumulatedTime,
+					unixEpochTimestamp: accumulatedUnixTime,
+					discontinuityNumber: nextDiscontinuityNumber,
+					firstSegment: null,
+					sequenceNumber: null,
+					location,
+					duration: 0,
+					encryption: currentKey,
+					initSegment: null,
+					lastProgramDateTimeSeconds,
+				};
+
+				// Accumulated time and sequence number are not updated in this case
+				currentInitSegment = segment;
 
 				nextSegmentDuration = null;
 
