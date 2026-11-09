@@ -1388,22 +1388,28 @@ export class HlsMuxer extends Muxer {
 				const minPlaylistDuration = 3 * Math.ceil(this.targetSegmentDuration);
 				let playlistDuration = playlist.writtenSegments.reduce((sum, segment) => sum + segment.duration, 0);
 
+				const poppedSegments: PlaylistSegment[] = [];
 				while (
 					playlist.writtenSegments.length > this.maxLiveSegmentCount
 					&& playlistDuration - playlist.writtenSegments[0]!.duration >= minPlaylistDuration
 				) {
 					const popped = playlist.writtenSegments.shift()!;
 					playlistDuration -= popped.duration;
+					poppedSegments.push(popped);
 					playlist.mediaSequence++;
-
-					if (!this.singleFilePerPlaylist) {
-						assert(popped.info);
-						this.format._options.onSegmentPopped?.(popped.path, popped.info);
-					}
 				}
 
 				await this.writePlaylist(playlist);
 				await this.tryWriteMasterPlaylist();
+
+				// Popped segments are reported only once a playlist without them has been written, since their files
+				// may get deleted in response
+				if (!this.singleFilePerPlaylist) {
+					for (const popped of poppedSegments) {
+						assert(popped.info);
+						this.format._options.onSegmentPopped?.(popped.path, popped.info);
+					}
+				}
 			}
 		}
 	}
