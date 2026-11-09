@@ -98,3 +98,12 @@ export const psshBoxesAreEqual = (a: PsshBox, b: PsshBox) => (
 	a.systemId === b.systemId
 	&& uint8ArraysAreEqual(a.data, b.data)
 );
+
+/** Throws for a video size that MP4/MOV can't store: the sample entry holds it in 16-bit fields (as FFmpeg checks). */
+export const validateIsobmffVideoSize = (width: number, height: number) => {
+	if (width > 0xffff || height > 0xffff) {
+		throw new Error(
+			`Video of ${width}x${height} pixels can't be stored in MP4/MOV, which holds at most 65535x65535.`,
+		);
+	}
+};
