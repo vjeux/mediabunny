@@ -457,7 +457,9 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 						? 'image/png'
 						: imageFormat === 'JPG'
 							? 'image/jpeg'
-							: 'image/*';
+							: imageFormat === '-->'
+								? imageFormat
+								: 'image/*';
 				} else {
 					mimeType = reader.readId3V2Text(encoding, frameEndPos);
 				}
@@ -466,8 +468,10 @@ const parseId3V2Frames = (slice: FileSlice, header: Id3V2Header, tags: MetadataT
 				const pictureType = reader.readU8();
 				const description = reader.readId3V2Text(encoding, frameEndPos).trimEnd(); // Trim ending spaces
 
+				// A MIME type of "-->" means that the data is a link to the picture, not the picture (ID3v2.3,
+				// section 4.15), so that one is only kept in the raw tags
 				const imageDataSize = frameEndPos - reader.pos;
-				if (imageDataSize >= 0) {
+				if (imageDataSize >= 0 && mimeType !== '-->') {
 					const imageData = reader.readBytes(imageDataSize);
 
 					if (!tags.images) tags.images = [];
