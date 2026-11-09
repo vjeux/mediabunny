@@ -25,7 +25,7 @@ import {
 	ReadableStreamSource,
 } from '../../src/index.js';
 import { IsobmffDemuxer } from '../../src/isobmff/isobmff-demuxer.js';
-import { iterateNalUnitsInLengthPrefixed } from '../../src/codec-data.js';
+import { iterateNalUnitsInLengthPrefixed, deserializeHevcDecoderConfigurationRecord } from '../../src/codec-data.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -6223,4 +6223,117 @@ test('Fragmented MP4 whose fragments are larger than the source\'s cache', async
 	const allOfManyFragments = await readPacketTimestamps('fragments-without-keyframes.mp4');
 	expect(allOfManyFragments).toHaveLength(120);
 	expect(await readPacketTimestamps('fragments-without-keyframes.mp4', 2 ** 14)).toEqual(allOfManyFragments);
+});
+
+test('hev1 video with its parameter sets only in-band', async () => {
+	// An hvcC box without parameter set arrays, as 'hev1' allows (ISO/IEC 14496-15) and GPAC writes with
+	// xps_inband=all: the parameter sets of x265's HDR10 output (BT.2020, PQ) come in-band only, with the first
+	// sample. They used to stay out of the description, so the color space was empty (found by L99).
+	const vps = [64, 1, 12, 1, 255, 255, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 146, 128, 144];
+	const sps = [
+		66, 1, 1, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 160, 10, 8, 15, 19, 101, 146, 164, 147, 43, 195, 154,
+		132, 136, 4, 130, 0, 0, 3, 0, 2, 0, 0, 3, 0, 60, 16,
+	];
+	const pps = [68, 1, 193, 114, 180, 98, 64];
+	const slice = [38, 1, 175, 0, 0]; // An IDR slice header, enough for reading
+	const lengthPrefixed = (...nalUnits: number[][]) => {
+		return nalUnits.flatMap(nalUnit => [0, 0, 0, nalUnit.length, ...nalUnit]);
+	};
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('hevc');
+	output.addVideoTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(lengthPrefixed(vps, sps, pps, slice)), 'key', 0, 1 / 30), {
+		decoderConfig: {
+			codec: 'hev1.2.4.L60.90',
+			codedWidth: 320,
+			codedHeight: 240,
+			// The record's fields, with no arrays
+			description: new Uint8Array([
+				1, 2, 32, 0, 0, 0, 144, 0, 0, 0, 0, 0, 60, 240, 0, 252, 253, 250, 250, 0, 0, 15, 0,
+			]),
+		},
+	});
+	await source.add(new EncodedPacket(new Uint8Array(lengthPrefixed([2, 1, 208, 0])), 'delta', 1 / 30, 1 / 30));
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	expect(await track.getColorSpace()).toEqual({
+		primaries: 'bt2020',
+		transfer: 'pq',
+		matrix: 'bt2020-ncl',
+		fullRange: false,
+	});
+	expect(await track.hasHighDynamicRange()).toBe(true);
+
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig?.description);
+	const record = deserializeHevcDecoderConfigurationRecord(toUint8Array(decoderConfig.description));
+	expect(record?.arrays.map(x => [x.nalUnitType, x.nalUnits.map(nalUnit => [...nalUnit])])).toEqual([
+		[32, [vps]],
+		[33, [sps]],
+		[34, [pps]],
+	]);
+});
+
+test('Codec string and decoder config of an encrypted hev1 track with an incomplete hvcC need no key', async () => {
+	// hev1 with an hvcC that has no arrays; the only sample is CENC-encrypted and no resolveKeyId is given. Completing
+	// the hvcC from the first sample must not make the metadata calls fail (they work on main). Found by L101.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	// A VPS in the clear, then an IDR slice whose payload is "encrypted" (any bytes do: they are never decrypted here)
+	const vps = [64, 1, 12, 1, 255, 255, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 146, 128, 144];
+	const sample = [...u32(vps.length), ...vps, ...u32(8), 38, 1, ...zeros(6).fill(0x5a)];
+	const hvcC = box('hvcC', [1, 2, 32, 0, 0, 0, 144, 0, 0, 0, 0, 0, 60, 240, 0, 252, 253, 250, 250, 0, 0, 15, 0]);
+	const tenc = box('tenc', zeros(4), [0, 0, 1, 8], zeros(16).fill(0xa1));
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), hvcC, box('sinf', box('frma', ascii('hev1')),
+		box('schm', zeros(4), ascii('cenc'), u32(0x10000)), box('schi', tenc)));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(sample.length)),
+		box('senc', u32(2), u32(1), zeros(8).fill(6), [0, 1], [0, 4 + vps.length + 6], u32(6)),
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', sample),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getCodecParameterString()).toBe('hev1.2.4.L60.90');
+	expect((await track.getDecoderConfig())?.codec).toBe('hev1.2.4.L60.90');
 });
