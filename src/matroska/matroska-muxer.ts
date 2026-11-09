@@ -1506,9 +1506,16 @@ export class MatroskaMuxer extends Muxer {
 		const clusterOffsetFromSegment = this.ebmlWriter.offsets.get(cluster)! - this.segmentDataOffset;
 		const clusterDataOffset = this.ebmlWriter.dataOffsets.get(cluster)!;
 
-		// Group tracks by their first key packet's timestamp and create a CuePoint for each unique timestamp
+		// Cue points go to each track's first key packet in the cluster, except for subtitle tracks: each of their
+		// blocks SHOULD get one, with its duration, so that a subtitle still shown at a seek target can be found
+		const cueBlocks = [
+			...[...firstKeyBlockPerTrack.values()].filter(block => block.trackData.type !== 'subtitle'),
+			...[...blockElements.keys()].filter(block => block.trackData.type === 'subtitle'),
+		];
+
+		// Group them by timestamp and create a CuePoint for each unique timestamp
 		const groupedByTimestamp = new Map<number, ClusterBlock[]>();
-		for (const block of firstKeyBlockPerTrack.values()) {
+		for (const block of cueBlocks) {
 			if (!groupedByTimestamp.has(block.msTimestamp)) {
 				groupedByTimestamp.set(block.msTimestamp, []);
 			}
@@ -1522,14 +1529,18 @@ export class MatroskaMuxer extends Muxer {
 			assert(this.cues);
 			(this.cues.data as EBML[]).push({ id: EBMLId.CuePoint, data: [
 				{ id: EBMLId.CueTime, data: Math.max(0, msTimestamp) }, // CueTime is unsigned
-				// Create CueTrackPositions for each track whose first key packet is at this timestamp
+				// Create CueTrackPositions for each block at this timestamp
 				...blocks.map((block) => {
 					const blockOffset = this.ebmlWriter.offsets.get(blockElements.get(block)!)!;
+					const msDuration = secondsToMs(block.chunk.duration);
 
 					return { id: EBMLId.CueTrackPositions, data: [
 						{ id: EBMLId.CueTrack, data: block.trackData.track.id },
 						{ id: EBMLId.CueClusterPosition, data: clusterOffsetFromSegment },
 						{ id: EBMLId.CueRelativePosition, data: blockOffset - clusterDataOffset },
+						block.trackData.type === 'subtitle' && msDuration > 0
+							? { id: EBMLId.CueDuration, data: msDuration }
+							: null,
 					] };
 				}),
 			] });
