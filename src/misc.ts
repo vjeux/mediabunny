@@ -2198,17 +2198,23 @@ export class EventEmitter<TEvents extends Record<string, unknown>> {
 			return;
 		}
 
-		for (const entry of listeners) {
+		// Iterate over a snapshot so that listeners added during this emit only receive the next one
+		for (const entry of [...listeners]) {
+			if (!listeners.has(entry)) {
+				continue;
+			}
+
+			// Remove before calling, so that a re-entrant emit can't call it a second time
+			if (entry.once) {
+				listeners.delete(entry);
+			}
+
 			try {
 				(entry.fn as (data: unknown) => void)(data);
 			} catch (error) {
 				// Deliberately not routed through Logging here: Logging emits via an EventEmitter, so a throwing
 				// log listener would recurse straight back into this handler.
 				console.error(error);
-			}
-
-			if (entry.once) {
-				listeners.delete(entry);
 			}
 		}
 	}
