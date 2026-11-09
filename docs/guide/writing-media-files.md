@@ -242,7 +242,7 @@ writer.
 After calling `cancel`, adding more media data to the output results in an error.
 :::
 
-Calling `cancel` while the output is finalizing doesn't cancel the file: finalization waits for the samples added before it to be processed by a `process` function, and `cancel` stops waiting for a call still in flight and drops the samples queued behind it, so that a call that never settles can't hold finalization up forever. Without such a call, nothing is dropped. It resolves once finalization has completed.
+Calling `cancel` while the output is finalizing doesn't cancel the file: finalization waits for the samples added before it to be processed by a `process` function, and `cancel` stops waiting for a call still in flight and drops the samples queued behind it, so that a call that never settles can't hold finalization up forever. Without such a call, nothing is dropped. It resolves right away; finalization then goes on by itself.
 
 In our example, we would do this:
 ```ts	
