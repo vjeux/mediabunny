@@ -1205,12 +1205,11 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				}
 			}
 
-			if (this.inputTimestampShift !== 0) {
-				packet = packet.clone({ timestamp: packet.timestamp + this.inputTimestampShift });
-			}
-
-			this.decoder.decode(packet.toEncodedVideoChunk());
-			this.decodeAlphaData(packet);
+			const decoderPacket = this.inputTimestampShift === 0
+				? packet
+				: packet.clone({ timestamp: packet.timestamp + this.inputTimestampShift });
+			this.decoder.decode(decoderPacket.toEncodedVideoChunk());
+			this.decodeAlphaData(decoderPacket);
 		}
 
 		this.currentPacketIndex++;
@@ -2496,11 +2495,10 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 				this.expectedFirstPacketData = packet.data;
 			}
 
-			if (this.inputTimestampShift !== 0) {
-				packet = packet.clone({ timestamp: packet.timestamp + this.inputTimestampShift });
-			}
-
-			this.decoder.decode(packet.toEncodedAudioChunk());
+			const decoderPacket = this.inputTimestampShift === 0
+				? packet
+				: packet.clone({ timestamp: packet.timestamp + this.inputTimestampShift });
+			this.decoder.decode(decoderPacket.toEncodedAudioChunk());
 		}
 	}
 
