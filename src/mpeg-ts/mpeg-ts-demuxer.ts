@@ -3266,20 +3266,15 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				return false; // We've hit the track's first PES packet, there's nothing more to rewind
 			};
 
-			for (let i = 0; i < reorderSize + 1; i++) {
-				if (!await rewindByOnePesPacket()) {
-					break;
-				}
-			}
-
-			// Inside a stretch of dropped video packets, the packet we're looking for comes before it
-			while (true) {
+			// Inside a stretch of dropped video packets, the packet we're looking for comes before it, and so does the
+			// window to rewind by, since the packets in the stretch don't count
+			const rewindOutOfDroppedRange = async () => {
 				const startPos = windowStart.sectionStartPos;
 				const droppedRange = this.elementaryStream.droppedRanges.find(
 					x => x.start <= startPos && startPos < x.end,
 				);
 				if (!droppedRange) {
-					break;
+					return false;
 				}
 
 				while (windowStart.sectionStartPos > droppedRange.start) {
@@ -3288,13 +3283,21 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 					}
 				}
 
-				const rewoundFrom = windowStart.sectionStartPos;
+				return true;
+			};
+			const rewindByWindow = async () => {
 				for (let i = 0; i < reorderSize + 1; i++) {
 					if (!await rewindByOnePesPacket()) {
 						break;
 					}
 				}
+			};
 
+			await rewindOutOfDroppedRange();
+			await rewindByWindow();
+			while (await rewindOutOfDroppedRange()) {
+				const rewoundFrom = windowStart.sectionStartPos;
+				await rewindByWindow();
 				if (windowStart.sectionStartPos === rewoundFrom) {
 					break; // The start of the track
 				}
@@ -4735,10 +4738,16 @@ class PacketReadingContext {
 		const hole = this.holes.length > 0
 			? this.holes.find(x => x > packetStartPos && x <= packetEndPos)
 			: undefined;
-		if (hole !== undefined) {
-			if (this.elementaryStream.info.type === 'audio') {
-				this.seekTo(hole);
-			} else if (this.dropsRestOfGop()) {
+		if (hole !== undefined && this.elementaryStream.info.type === 'audio') {
+			this.seekTo(hole);
+			this.skipPacket();
+			return;
+		}
+
+		if (hole !== undefined && this.elementaryStream.info.decoderConfig) {
+			// A video frame that lost data. (While the stream is being set up, it's kept: setup only reads its
+			// parameter sets, which come first, and key frames can't be told yet to drop up to the next one.)
+			if (this.dropsRestOfGop()) {
 				this.extendDroppedRange(sequenceNumber);
 			}
 
