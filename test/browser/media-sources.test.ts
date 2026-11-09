@@ -571,6 +571,43 @@ test('VideoSampleSource, encoding rotated video frames with forced transform', a
 	}
 });
 
+test('VideoSampleSource with sizeChangeBehavior contain keeps 10-bit and HDR frames out of the canvas', async () => {
+	// 8-bit SDR frames all go through the canvas, so that resized frames match the others' color space; the 8-bit
+	// sRGB canvas would degrade the rest
+	for (const [format, transfer, throughCanvas] of [
+		['I420', 'bt709', true],
+		['I420P10', 'bt709', false],
+		['I420', 'pq', false],
+	] as const) {
+		const encodedFormats: (string | null)[] = [];
+		const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({
+			codec: 'vp9',
+			quality: new Quality('medium'),
+			sizeChangeBehavior: 'contain',
+			onEncodedSample: sample => encodedFormats.push(sample.format),
+		});
+		output.addVideoTrack(source);
+		await output.start();
+
+		for (let i = 0; i < 3; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 1.5 * (format === 'I420P10' ? 2 : 1)), {
+				format,
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+				colorSpace: { primaries: 'bt709', transfer: transfer as VideoTransferCharacteristics, matrix: 'bt709' },
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		expect(encodedFormats.every(x => x === format), `${format}/${transfer}: ${encodedFormats.join(',')}`)
+			.toBe(!throughCanvas);
+	}
+});
+
 test('VideoSampleSource, transform.process identity function', async () => {
 	const buffer = await encodeFrames(
 		{ codec: 'vp8', quality: new Quality('medium'), transform: { process: sample => sample } },
