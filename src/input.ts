@@ -29,6 +29,7 @@ import {
 	arrayArgmin,
 	arrayCount,
 	assert,
+	DisposalSignal,
 	EventEmitter,
 	polyfillSymbolDispose,
 	removeItem,
@@ -138,6 +139,11 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	_nextSourceCacheAge = 0;
 	/** @internal */
 	_sourceRefs: SourceRef[] = [];
+	/**
+	 * For requests waiting on a request handler that may never settle, which disposing rejects.
+	 * @internal
+	 */
+	_disposalSignal = new DisposalSignal();
 	/** @internal */
 	_sourceCache: SourceCacheEntry[] = [];
 	/** @internal */
@@ -232,7 +238,16 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		const promise = (async () => {
-			const sourceRef = await this._getSourceUncached(request);
+			// A request handler may never settle (one fetching a signed URL without a timeout, say), so stop waiting
+			// for it once disposed, freeing its source should it arrive after all
+			const uncached = this._getSourceUncached(request);
+			let sourceRef: SourceRef;
+			try {
+				sourceRef = await this._disposalSignal.wait(uncached);
+			} catch (error) {
+				void uncached.then(ref => ref.free(), () => {});
+				throw error;
+			}
 
 			if (this._disposed) {
 				sourceRef.free();
@@ -605,6 +620,8 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			ref.free();
 		}
 		this._sourceRefs.length = 0;
+
+		this._disposalSignal.dispose(new InputDisposedError());
 
 		if (this._demuxerPromise) {
 			// The demuxer promise may already be rejected after failed format detection.
