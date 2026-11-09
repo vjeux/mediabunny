@@ -682,8 +682,9 @@ export abstract class BaseMediaSampleSink<
 	/** @internal */
 	abstract _getPreRollDuration(): Promise<number>;
 	/**
-	 * How far apart, in seconds, a decoded sample's timestamp and its packet's timestamp can be. Timestamps within
-	 * this tolerance count as equal when looking up samples.
+	 * How far apart, in seconds, a decoded sample's timestamp and its packet's timestamp can be. A sample starting
+	 * within this tolerance after a looked-up timestamp counts as starting at it, if the sample lasts at least twice
+	 * the tolerance (otherwise, the tolerance could reach the next sample).
 	 * @internal
 	 */
 	abstract _getTimestampTolerance(): Promise<number>;
@@ -712,6 +713,13 @@ export abstract class BaseMediaSampleSink<
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
 		let tolerance = 0;
+		// Decoding sessions time samples from different packets, whose rounded timestamps can move a sample by up to
+		// the tolerance. For a sample shorter than twice that, this can't tell it from its neighbors, so lookups stay
+		// exact there. The comparison allows for rounding, so that a sample of exactly two ticks keeps the tolerance
+		// despite its epsilon.
+		const toleranceFor = (sample: MediaSample) => sample.duration + 1e-9 >= 2 * tolerance
+			? tolerance
+			: TIMESTAMP_EPSILON;
 
 		// On a live stream that doesn't go on, waiting for packets never ends, so the pump stops waiting once the
 		// iteration has ended, to free the decoder
@@ -762,7 +770,7 @@ export abstract class BaseMediaSampleSink<
 				}
 
 				if (lastSample) {
-					if (sample.timestamp > startTimestamp + tolerance) {
+					if (sample.timestamp > startTimestamp + toleranceFor(sample)) {
 						// We don't know ahead of time what the first first is. This is because the first first is the
 						// last first whose timestamp is less than or equal to the start timestamp. Therefore we need to
 						// wait for the first first after the start timestamp, and then we'll know that the previous
@@ -774,7 +782,7 @@ export abstract class BaseMediaSampleSink<
 					}
 				}
 
-				if (sample.timestamp >= startTimestamp - tolerance) {
+				if (sample.timestamp >= startTimestamp) {
 					sampleQueue.push(sample);
 					firstSampleQueued = true;
 				}
@@ -803,7 +811,7 @@ export abstract class BaseMediaSampleSink<
 			const preRollDuration = await this._getPreRollDuration();
 
 			const startPacket = await unlessTerminated(
-				packetSink.getPacket(startTimestamp + tolerance, packetRetrievalOptions),
+				packetSink.getPacket(startTimestamp, packetRetrievalOptions),
 			);
 			let keyPacket: EncodedPacket | null = null;
 			if (!terminated) {
@@ -1028,6 +1036,13 @@ export abstract class BaseMediaSampleSink<
 		let terminated = false;
 		let decoder: DecoderWrapper<MediaSample> | null = null;
 		let tolerance = 0;
+		// Decoding sessions time samples from different packets, whose rounded timestamps can move a sample by up to
+		// the tolerance. For a sample shorter than twice that, this can't tell it from its neighbors, so lookups stay
+		// exact there. The comparison allows for rounding, so that a sample of exactly two ticks keeps the tolerance
+		// despite its epsilon.
+		const toleranceFor = (sample: MediaSample) => sample.duration + 1e-9 >= 2 * tolerance
+			? tolerance
+			: TIMESTAMP_EPSILON;
 
 		// On a live stream that doesn't go on, waiting for packets never ends, so the pump stops waiting once the
 		// iteration has ended, to free the decoder
@@ -1093,12 +1108,12 @@ export abstract class BaseMediaSampleSink<
 
 				lastSampleTimestamp = sample.timestamp;
 
-				// Every query timestamp this sample starts after (by more than the tolerance, or at least a little
+				// Every query timestamp this sample starts after (by more than its tolerance, or at least a little
 				// epsilon) is answered by the sample before it
 				let heldSampleUses = 0;
 				while (
 					timestampsOfInterest.length > 0
-					&& sample.timestamp - timestampsOfInterest[0]! > Math.max(tolerance, 1e-10)
+					&& sample.timestamp - timestampsOfInterest[0]! > Math.max(toleranceFor(sample), 1e-10)
 				) {
 					heldSampleUses++;
 					timestampsOfInterest.shift();
@@ -1313,12 +1328,16 @@ export abstract class BaseMediaSampleSink<
 					break;
 				}
 
-				// Also decode a sample that starts within the tolerance after the timestamp, since it's the answer
+				// Decoding goes up to a packet that may start within the tolerance after the timestamp, but starts from
+				// the packet at the timestamp itself, so that the sample covering it is decoded too
 				const targetPacket = await unlessTerminated(
 					packetSink.getPacket(timestamp + tolerance, retrievalOptions),
 				);
-				let keyPacket = targetPacket && await unlessTerminated(packetSink.getKeyPacket(
-					targetPacket.timestamp - preRollDuration,
+				const startPacket = tolerance > TIMESTAMP_EPSILON
+					? (await unlessTerminated(packetSink.getPacket(timestamp, retrievalOptions))) ?? targetPacket
+					: targetPacket;
+				let keyPacket = startPacket && await unlessTerminated(packetSink.getKeyPacket(
+					startPacket.timestamp - preRollDuration,
 					retrievalOptions,
 				));
 				if (targetPacket && !keyPacket && !terminated) {
@@ -3653,6 +3672,11 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	pendingPackets: EncodedPacket[] = [];
 	closed = false;
 	inputTimestampShift: number | null = null; // See getInputTimestampShift
+	/**
+	 * How far a decoded sample's timestamp can be from its packet's: a container tick where packet timestamps are
+	 * rounded to one (a millisecond in Matroska). Differences within it are rounding, not gaps.
+	 */
+	timestampTolerance = 0;
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
@@ -3756,7 +3780,8 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 					+ sample.duration;
 			} else if (
 				this.currentTimestamp === null
-				|| sampleTimestamp - this.currentTimestamp >= sample.duration
+				// A sample shorter than a tick (TrueHD's, in Matroska) would see rounding as a gap
+				|| sampleTimestamp - this.currentTimestamp >= Math.max(sample.duration, this.timestampTolerance)
 			) {
 				// We need to sync with the sample timestamp again. Only forward (a gap), never back, which would play
 				// audio twice: decoders that stamp each output with its chunk's timestamp, as the spec says, stamp the
@@ -4324,6 +4349,7 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 				? { ...decoderConfig, codec: nativeCodecString }
 				: decoderConfig;
 
+			const timestampTolerance = await this._getTimestampTolerance();
 			const backing = this._track._backing;
 			const decoder = new AudioDecoderWrapper(
 				onSample,
@@ -4332,6 +4358,7 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 				nativeDecoderConfig,
 				packet => (backing.getDecoderConfigForPacket?.(packet) ?? null) as AudioDecoderConfig | null,
 			);
+			decoder.timestampTolerance = timestampTolerance;
 			if (decoder.decoder) {
 				try {
 					decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, nativeDecoderConfig);
@@ -4396,7 +4423,8 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 	 * sample.
 	 *
 	 * Decoded audio is timed by its sample count, so in containers that round packet timestamps to a coarser
-	 * resolution (a millisecond in Matroska, for example), timestamps are compared within one such tick.
+	 * resolution (a millisecond in Matroska, for example), a sample starting within one such tick after the timestamp
+	 * counts as starting at it, if the sample lasts at least two ticks.
 	 *
 	 * @param timestamp - The timestamp used for retrieval, in seconds.
 	 * @param options - Options used for the underlying packet retrieval.
