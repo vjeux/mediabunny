@@ -1238,7 +1238,8 @@ export type MpegTsOutputFormatOptions = {
 	 * otherwise be negative (caused by audio priming samples or B-frames) positive in the final file, since negative
 	 * timestamps trip up some players. A recommended value is 10 seconds.
 	 *
-	 * Defaults to 0. When writing HLS, prefer {@link HlsOutputFormatOptions.mediaTimestampBase} instead.
+	 * Defaults to 0. Ignored, with a warning, for MPEG-TS segments written for HLS, whose media starts at
+	 * {@link HlsOutputFormatOptions.mediaTimestampBase} like that of the other segment formats.
 	 */
 	timestampOffset?: number;
 
