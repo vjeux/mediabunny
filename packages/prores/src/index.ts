@@ -138,11 +138,14 @@ class ProresDecoder extends CustomVideoDecoder {
 			this.trimCodedHeightToVisibleHeight(result);
 		}
 
+		// Like with WebCodecs, the decoder config (which carries container-level metadata) overrides in-band values
+		const configColorSpace = this.config.colorSpace;
 		const colorSpaceInit = {
-			primaries: result.colorPrimariesString as VideoColorPrimaries | undefined,
-			matrix: result.colorMatrixString as VideoMatrixCoefficients | undefined,
-			transfer: result.colorTransferString as VideoTransferCharacteristics | undefined,
-			fullRange: result.colorRangeFull,
+			primaries: configColorSpace?.primaries ?? result.colorPrimariesString as VideoColorPrimaries | undefined,
+			matrix: configColorSpace?.matrix ?? result.colorMatrixString as VideoMatrixCoefficients | undefined,
+			transfer: configColorSpace?.transfer
+				?? result.colorTransferString as VideoTransferCharacteristics | undefined,
+			fullRange: configColorSpace?.fullRange ?? result.colorRangeFull,
 		};
 
 		let pixelAspectRatio = result.pixelAspectRatio;
