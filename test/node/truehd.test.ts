@@ -53,6 +53,27 @@ test('Matroska muxing and demuxing', async () => {
 	expectPacketsToMatch(newPackets, packets, 1 / 1000);
 });
 
+test('Matroska to MP4 copy gives every access unit its own timestamp', async () => {
+	// A TrueHD access unit lasts 1/1200 s, less than a Matroska tick (1 ms), so in Matroska every sixth or so shares
+	// the timestamp of the one before it. An MP4 must not inherit those duplicate timestamps.
+	using input = new Input({
+		source: new FilePathSource(TRUEHD_FILE),
+		formats: ALL_FORMATS,
+	});
+	const packets = await expectTrueHdTrack(input);
+	const countNonIncreasing = (list: EncodedPacket[]) => list
+		.filter((packet, i) => i > 0 && packet.timestamp <= list[i - 1]!.timestamp)
+		.length;
+
+	using matroskaInput = await convert(input, new MkvOutputFormat());
+	expect(countNonIncreasing(await expectTrueHdTrack(matroskaInput))).toBeGreaterThan(0);
+
+	using mp4Input = await convert(matroskaInput, new Mp4OutputFormat());
+	const mp4Packets = await expectTrueHdTrack(mp4Input);
+	expect(countNonIncreasing(mp4Packets)).toBe(0);
+	expectPacketsToMatch(mp4Packets, packets, 1 / 1000); // Within a Matroska tick of the original timestamps
+});
+
 test('Custom coder registration', async () => {
 	using input = new Input({
 		source: new FilePathSource(TRUEHD_FILE),

@@ -2388,6 +2388,15 @@ export class Conversion {
 				let droppingGop = false;
 				let warnedAboutDroppedPackets = false;
 
+				// A TrueHD access unit lasts 1/1200 s (1/1102.5 s at 44.1 kHz-family rates), less than a Matroska
+				// tick (1 ms), so there every sixth or so shares the timestamp of the one before it. Place such a
+				// unit right after the previous one, so that no two units share a timestamp; any other packet keeps
+				// its own.
+				const trueHdUnitDuration = sourceCodec === 'truehd'
+					? 1 / ((await track.getSampleRate()) % 48000 === 0 ? 1200 : 1102.5)
+					: null;
+				let previousOutputTimestamp: number | null = null;
+
 				// eslint-disable-next-line curly
 				if (copyStartPacket) for await (const packet of this._trackIterator(
 					pump,
@@ -2420,8 +2429,19 @@ export class Conversion {
 						continue;
 					}
 
+					let outputTimestamp = packetTimestamp;
+					let outputDuration = packet.duration;
+					if (
+						trueHdUnitDuration !== null
+						&& previousOutputTimestamp !== null
+						&& outputTimestamp <= previousOutputTimestamp
+					) {
+						outputTimestamp = previousOutputTimestamp + trueHdUnitDuration;
+						outputDuration = trueHdUnitDuration;
+					}
+
 					// If packets violate the ordering rule (and would throw in the muxer), drop 'em
-					if (!packetOrderValidator.digest(packetTimestamp, packet.type)) {
+					if (!packetOrderValidator.digest(outputTimestamp, packet.type)) {
 						droppingGop = packet.type === 'key';
 
 						if (!warnedAboutDroppedPackets) {
@@ -2435,9 +2455,10 @@ export class Conversion {
 					}
 
 					const modifiedPacket = packet.clone({
-						timestamp: packetTimestamp,
-						duration: packet.duration,
+						timestamp: outputTimestamp,
+						duration: outputDuration,
 					});
+					previousOutputTimestamp = outputTimestamp;
 
 					this._updateProgress(outputTrackId, modifiedPacket.timestamp + modifiedPacket.duration);
 					await source.add(modifiedPacket, meta);
