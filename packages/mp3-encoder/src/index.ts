@@ -95,7 +95,10 @@ class Mp3Encoder extends CustomAudioEncoder {
 			data: {
 				numberOfChannels: this.config.numberOfChannels,
 				sampleRate: this.config.sampleRate,
-				bitrate: this.config.bitrate,
+				// LAME takes the bitrate in kbps, rounded down, where 0 makes it pick its default (128 kbps for
+				// 44.1 kHz stereo). From 1 kbps on, it takes the nearest bitrate it supports, so lower ones get its
+				// minimum.
+				bitrate: Math.max(this.config.bitrate, 1000),
 			},
 		});
 
