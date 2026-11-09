@@ -62,6 +62,40 @@ test('Pixel aspect ratio from SPS without pasp box', async () => {
 	}
 });
 
+test('Pixel aspect ratio from a pasp box alone reaches the decoded samples', async () => {
+	// The H.264 stream signals no aspect ratio, only the pasp box says 2:1. Made with FFmpeg: libx264 from a SAR 0/1
+	// source, then -c copy -aspect 32:9
+	const decodeFirstSample = async () => {
+		using input = new Input({ source: new UrlSource('/pasp-only-sar2.mp4'), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		expect([await track.getSquarePixelWidth(), await track.getSquarePixelHeight()]).toEqual([640, 180]);
+
+		using sample = await new VideoSampleSink(track).getSample(0);
+		assert(sample);
+		return [sample.codedWidth, sample.codedHeight, sample.displayWidth, sample.displayHeight];
+	};
+
+	expect(await decodeFirstSample()).toEqual([320, 180, 640, 180]);
+
+	// WebKit's VideoDecoder doesn't apply displayAspectWidth/displayAspectHeight (WebCore never passes them on to the
+	// platform decoder), which this simulates in other browsers
+	const NativeVideoDecoder = VideoDecoder;
+	globalThis.VideoDecoder = class extends NativeVideoDecoder {
+		override configure(config: VideoDecoderConfig) {
+			const { displayAspectWidth, displayAspectHeight, ...rest } = config;
+			void displayAspectWidth;
+			void displayAspectHeight;
+			super.configure(rest);
+		}
+	};
+	try {
+		expect(await decodeFirstSample()).toEqual([320, 180, 640, 180]);
+	} finally {
+		globalThis.VideoDecoder = NativeVideoDecoder;
+	}
+});
+
 test('Pixel aspect ratio copy conversion', async () => {
 	using input = new Input({
 		source: new UrlSource(SOURCE_PATH),
