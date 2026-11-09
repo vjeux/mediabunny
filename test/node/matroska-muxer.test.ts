@@ -543,3 +543,26 @@ test('Movie-level tags are written without a TargetType string', async () => {
 	const tags = await input.getMetadataTags();
 	expect([tags.title, tags.artist]).toEqual(['Title', 'Artist']);
 });
+
+test('AV1 blocks are stored without temporal delimiter OBUs', async () => {
+	const target = new BufferTarget();
+	const output = new Output({ target, format: new MkvOutputFormat() });
+	const source = new EncodedVideoPacketSource('av1');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// Temporal unit as WebCodecs encoders emit it: OBU_TEMPORAL_DELIMITER followed by an OBU_FRAME
+	const frame = [0x32, 0x03, 0xaa, 0xbb, 0xcc];
+	await source.add(new EncodedPacket(new Uint8Array([0x12, 0x00, ...frame]), 'key', 0, 1), {
+		decoderConfig: { codec: 'av01.0.04M.08', codedWidth: 320, codedHeight: 240 },
+	});
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// The Matroska AV1 mapping says temporal delimiters SHOULD NOT be stored; FFmpeg's matroskaenc strips them too
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	expect(packet?.data).toEqual(new Uint8Array(frame));
+});
