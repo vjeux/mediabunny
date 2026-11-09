@@ -86,6 +86,57 @@ test('AAC encoding', async () => {
 	expect(await track.computeDuration()).toBeCloseTo(2, 1);
 });
 
+test.each([
+	[48000, 2, 128],
+	[44100, 1, 128],
+	[96000, 2, 1500],
+	[48000, 6, 4500],
+])('AAC encoding at %i Hz, %i channels and %i bps, too low to reach', async (sampleRate, channels, bitrate) => {
+	// Like a bitrate given in kbps instead of bps. The encoder can't get frames that small, which made it loop forever
+	// or give frames near the maximum size, so it encodes at its lowest bitrate instead.
+	registerAacEncoder();
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const audioSource = new AudioSampleSource({ codec: 'aac', quality: new Quality({ bitrate }) });
+	output.addAudioTrack(audioSource);
+
+	// One second of a sweep from 200 Hz up, different in each channel
+	const data = new Float32Array(sampleRate * channels);
+	for (let i = 0; i < sampleRate; i++) {
+		for (let ch = 0; ch < channels; ch++) {
+			const t = i / sampleRate;
+			data[i * channels + ch] = 0.4 * Math.sin(2 * Math.PI * (200 + 4000 * t) * t * (1 + 0.1 * ch));
+		}
+	}
+
+	const encode = async () => {
+		await output.start();
+		const sample = new AudioSample({
+			data,
+			format: 'f32',
+			numberOfChannels: channels,
+			sampleRate,
+			timestamp: 0,
+		});
+		await audioSource.add(sample);
+		sample.close();
+		await output.finalize();
+		return 'encoded';
+	};
+	const timeout = new Promise<string>(resolve => setTimeout(() => resolve('hang'), 10_000));
+	const result = await Promise.race([encode(), timeout]);
+	if (result === 'hang') {
+		await output.cancel();
+	}
+	expect(result).toBe('encoded');
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const { averageBitrate } = await track.computePacketStats();
+	expect(averageBitrate / channels).toBeLessThan(40_000);
+}, 20_000);
+
 test('AAC with huge timestamps', async () => {
 	registerAacEncoder();
 
