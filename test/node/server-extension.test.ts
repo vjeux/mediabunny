@@ -1,4 +1,5 @@
-import { beforeAll, describe, expect, test } from 'vitest';
+import { beforeAll, describe, expect, test, vi } from 'vitest';
+import fs from 'node:fs';
 import { registerMediabunnyServer } from '@mediabunny/server';
 import { Input } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
@@ -6,7 +7,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert, last, toUint8Array } from '../../src/misc.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { NodeAvVideoDecoder } from '../../packages/server/src/video-decoder.js';
-import { NodeAvVideoEncoder } from '../../packages/server/src/video-encoder.js';
+import { getAlphaPixelFormat, NodeAvVideoEncoder } from '../../packages/server/src/video-encoder.js';
 import { NodeAvAudioDecoder } from '../../packages/server/src/audio-decoder.js';
 import { NodeAvAudioEncoder } from '../../packages/server/src/audio-encoder.js';
 import { AudioSample, VideoSample, VideoSampleColorSpace } from '../../src/sample.js';
@@ -28,15 +29,25 @@ import {
 	iterateNalUnitsInLengthPrefixed,
 } from '../../src/codec-data.js';
 import { Output } from '../../src/output.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import {
+	FlacOutputFormat,
+	Mp4OutputFormat,
+	OggOutputFormat,
+	MkvOutputFormat,
+	WebMOutputFormat,
+} from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { VideoSampleSource } from '../../src/media-source.js';
-import { buildQuantizerEncodeOptions, Quality } from '../../src/encode.js';
+import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { buildQuantizerEncodeOptions, Quality, canEncodeVideo, canEncodeAudio } from '../../src/encode.js';
 import { AvFrameVideoSampleResource } from '../../packages/server/src/video-sample.js';
+import { AdtsOutputFormat, MpegTsOutputFormat } from '../../src/index.js';
 import { AvFrameAudioSampleResource } from '../../packages/server/src/audio-sample.js';
-import { toAvFrame } from '../../packages/server/src/index.js';
+import { _serverOptions, toAvFrame } from '../../packages/server/src/index.js';
+import { getCodecThreadCount } from '../../packages/server/src/misc.js';
 import * as NodeAv from 'node-av';
+import os from 'node:os';
+import { createHash } from 'node:crypto';
 
 beforeAll(() => {
 	registerMediabunnyServer();
@@ -232,6 +243,56 @@ describe('Video', async () => {
 		await encoder.close();
 	});
 
+	test('Realtime encoding emits a packet for every frame without holding frames back', async () => {
+		// Encodes 30 frames one by one and returns how many went in without a packet coming out yet
+		const getEncoderLag = async (codec: VideoCodec, latencyMode: 'quality' | 'realtime') => {
+			const encoder = new NodeAvVideoEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = codec;
+			// @ts-expect-error Readonly
+			encoder.config = {
+				codec: buildVideoCodecString(codec, 320, 240, 500_000, false),
+				width: 320,
+				height: 240,
+				bitrate: 500_000,
+				latencyMode,
+			} satisfies VideoEncoderConfig;
+
+			let packetCount = 0;
+			// @ts-expect-error Readonly
+			encoder.onPacket = () => {
+				packetCount++;
+			};
+
+			await encoder.init();
+			const frameCount = 30;
+			for (let i = 0; i < frameCount; i++) {
+				const data = new Uint8Array(320 * 240 * 3 / 2).fill(128);
+				data.fill(i * 8, 0, 320 * 240);
+				const sample = new VideoSample(data, {
+					format: 'I420',
+					codedWidth: 320,
+					codedHeight: 240,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await encoder.encode(sample, {});
+				sample.close();
+			}
+			const lag = frameCount - packetCount;
+
+			await encoder.flush();
+			await encoder.close();
+			return lag;
+		};
+
+		for (const codec of ['avc', 'hevc', 'vp8', 'vp9', 'av1'] as const) {
+			expect({ codec, lag: await getEncoderLag(codec, 'realtime') }).toEqual({ codec, lag: 0 });
+		}
+		// Quality mode keeps its lookahead
+		expect(await getEncoderLag('vp9', 'quality')).toBeGreaterThan(0);
+	});
+
 	test('AVC encode and decode, length-prefixed', async () => {
 		await encodeDecodeTest('avc', {}, async (packet, meta, i) => {
 			expect(packet.duration).toBe(1 / 30);
@@ -268,6 +329,36 @@ describe('Video', async () => {
 		});
 	});
 
+	test('Scalability modes other than a single layer are declined', async () => {
+		const size = { width: 128, height: 96 };
+		for (const codec of ['avc', 'hevc', 'vp8', 'vp9', 'av1'] as const) {
+			// The encoders make a single layer, whatever temporal or spatial layers were asked for
+			for (const scalabilityMode of ['L1T2', 'L1T3', 'L2T2', 'S2T1', 'foo']) {
+				const canEncode = await canEncodeVideo(codec, { ...size, scalabilityMode });
+				expect({ codec, scalabilityMode, canEncode }).toEqual({ codec, scalabilityMode, canEncode: false });
+			}
+
+			expect(await canEncodeVideo(codec, { ...size, scalabilityMode: 'L1T1' })).toBe(true);
+			expect(await canEncodeVideo(codec, size)).toBe(true);
+		}
+
+		// So encoding with one fails instead of silently giving a single layer
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'avc', quality: new Quality('medium'), scalabilityMode: 'L1T3' });
+		output.addVideoTrack(source);
+		await output.start();
+		const sample = new VideoSample(new Uint8Array(128 * 96 * 3 / 2).fill(128), {
+			format: 'I420',
+			codedWidth: 128,
+			codedHeight: 96,
+			timestamp: 0,
+			duration: 1 / 30,
+		});
+		await expect(source.add(sample)).rejects.toThrow();
+		sample.close();
+		await output.cancel();
+	});
+
 	test('AVC encode and decode, Annex B', async () => {
 		await encodeDecodeTest('avc', { avc: { format: 'annexb' } }, async (packet, meta, i) => {
 			expect(packet.duration).toBe(1 / 30);
@@ -299,6 +390,53 @@ describe('Video', async () => {
 
 			expect(buf[0]).toBeGreaterThan(250); // Quasi-white
 		});
+	});
+
+	test('canEncodeVideo agrees with what the encoders open, at the edges of their frame sizes', async () => {
+		// Encodes one mid-gray frame, returning whether that worked
+		const encodesFrame = async (codec: VideoCodec, width: number, height: number) => {
+			const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec, quality: new Quality('medium') });
+			output.addVideoTrack(source);
+			try {
+				await output.start();
+				const sample = new VideoSample(new Uint8Array(width * height * 3 / 2).fill(128), {
+					format: 'I420',
+					codedWidth: width,
+					codedHeight: height,
+					timestamp: 0,
+					duration: 1 / 30,
+				});
+				try {
+					await source.add(sample);
+				} finally {
+					sample.close();
+				}
+				await output.finalize();
+				return true;
+			} catch {
+				await output.cancel();
+				return false;
+			}
+		};
+
+		const cases: [codec: VideoCodec, width: number, height: number, encodable: boolean][] = [
+			// libx265 needs at least 16 pixels in each dimension, and at most 4216 in the other one under 32
+			['hevc', 16, 8, false], ['hevc', 8, 16, false], ['hevc', 16, 16, true],
+			['hevc', 4218, 16, false], ['hevc', 16, 4218, false], ['hevc', 4216, 16, true], ['hevc', 4218, 32, true],
+			// VP8 frame headers have 14 bits for each dimension (RFC 6386, section 9.1)
+			['vp8', 16384, 64, false], ['vp8', 64, 16384, false], ['vp8', 16382, 64, true],
+			// libx264 takes up to 16384 pixels in each dimension
+			['avc', 64, 16386, false], ['avc', 16386, 64, false], ['avc', 64, 16384, true],
+			// SVT-AV1 takes frames up to 16384x8704
+			['av1', 16386, 64, false], ['av1', 64, 8706, false], ['av1', 16384, 64, true], ['av1', 64, 8704, true],
+		];
+		for (const [codec, width, height, encodable] of cases) {
+			const canEncode = await canEncodeVideo(codec, { width, height });
+			const encoded = await encodesFrame(codec, width, height);
+			expect({ codec, width, height, canEncode, encoded })
+				.toEqual({ codec, width, height, canEncode: encodable, encoded: encodable });
+		}
 	});
 
 	test('HEVC encode and decode, length-prefixed', async () => {
@@ -370,6 +508,139 @@ describe('Video', async () => {
 
 			expect(buf[0]).toBe(255); // White
 		});
+	});
+
+	test('Encoding honors the profile and bit depth asked for in fullCodecString, or declines it', async () => {
+		// Encodes five mid-gray 320x240 frames (big enough for hardware encoders to take) and returns the codec string
+		// of the written track
+		const writtenCodecString = async (codec: VideoCodec, fullCodecString: string | undefined, bitDepth: number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const quality = new Quality({ bitrate: 500_000 });
+			const source = new VideoSampleSource({ codec, quality, fullCodecString });
+			output.addVideoTrack(source);
+
+			try {
+				await output.start();
+				for (let i = 0; i < 5; i++) {
+					const sampleCount = 320 * 240 * 3 / 2;
+					const data = bitDepth === 8
+						? new Uint8Array(sampleCount).fill(128)
+						: new Uint8Array(new Uint16Array(sampleCount).fill(128 << (bitDepth - 8)).buffer);
+					const sample = new VideoSample(data, {
+						format: bitDepth === 8 ? 'I420' : bitDepth === 10 ? 'I420P10' : 'I420P12',
+						codedWidth: 320,
+						codedHeight: 240,
+						timestamp: i / 30,
+						duration: 1 / 30,
+					});
+					try {
+						await source.add(sample);
+					} finally {
+						sample.close();
+					}
+				}
+				await output.finalize();
+			} catch (error) {
+				await output.cancel();
+				throw error;
+			}
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			return await track.getCodecParameterString();
+		};
+
+		const honored: [codec: VideoCodec, fullCodecString: string, bitDepth: number, written: RegExp][] = [
+			// AVC Baseline, Main and High 10 (libx264 picks High by itself)
+			['avc', 'avc1.42001f', 8, /^avc1\.42/],
+			['avc', 'avc1.4d001f', 8, /^avc1\.4d/],
+			['avc', 'avc1.6e001f', 10, /^avc1\.6e/],
+			// HEVC Main 10, and the bit depth fields of VP9 and AV1
+			['hevc', 'hvc1.2.4.L93.B0', 10, /^(hev1|hvc1)\.2\./],
+			['vp9', 'vp09.02.10.10', 10, /^vp09\.02\.\d\d\.10/],
+			['vp9', 'vp09.02.10.12', 12, /^vp09\.02\.\d\d\.12/],
+			['av1', 'av01.0.04M.10', 10, /^av01\.0\.\d\d[MH]\.10/],
+		];
+		// Builds whose software encoder lacks a bit depth (node-av's libx265 for Windows is 8-bit only) decline it, as
+		// hardware encoders fall back to the software one
+		const softwareCodecIds: Partial<Record<VideoCodec, NodeAv.AVCodecID>> = {
+			avc: NodeAv.AV_CODEC_ID_H264,
+			hevc: NodeAv.AV_CODEC_ID_HEVC,
+			vp9: NodeAv.AV_CODEC_ID_VP9,
+			av1: NodeAv.AV_CODEC_ID_AV1,
+		};
+		const softwareHasBitDepth = (codec: VideoCodec, bitDepth: number) => {
+			const format = bitDepth === 10 ? NodeAv.AV_PIX_FMT_YUV420P10LE : NodeAv.AV_PIX_FMT_YUV420P12LE;
+			const softwareCodec = NodeAv.Codec.findEncoder(softwareCodecIds[codec]!);
+			return bitDepth === 8 || !!softwareCodec?.pixelFormats?.includes(format);
+		};
+
+		for (const [codec, fullCodecString, bitDepth, written] of honored) {
+			const encodable = softwareHasBitDepth(codec, bitDepth);
+			const canEncode = await canEncodeVideo(codec, { width: 320, height: 240, fullCodecString });
+			expect({ fullCodecString, canEncode }).toEqual({ fullCodecString, canEncode: encodable });
+			if (encodable) {
+				expect(await writtenCodecString(codec, fullCodecString, bitDepth)).toMatch(written);
+			} else {
+				await expect(writtenCodecString(codec, fullCodecString, bitDepth)).rejects.toThrow();
+			}
+		}
+
+		// What these encoders can't produce is declined, as browsers do, rather than encoded as something else
+		const declined: [codec: VideoCodec, fullCodecString: string][] = [
+			['avc', 'avc1.7a0028'], // High 4:2:2
+			['avc', 'avc1.f40028'], // High 4:4:4 Predictive
+			['avc', 'avc1.58001f'], // Extended
+			['hevc', 'hvc1.4.10.L93.B0'], // Range extensions
+			['vp9', 'vp09.01.10.08'], // Profile 1 (4:2:2, 4:4:0 or 4:4:4)
+			['vp9', 'vp09.00.10.10'], // Profile 0 is 8-bit only
+			['av1', 'av01.1.04M.08'], // High (4:4:4)
+			['av1', 'av01.0.04M.12'], // 12 bits needs the Professional profile
+		];
+		for (const [codec, fullCodecString] of declined) {
+			const canEncode = await canEncodeVideo(codec, { width: 320, height: 240, fullCodecString });
+			expect({ fullCodecString, canEncode }).toEqual({ fullCodecString, canEncode: false });
+			await expect(writtenCodecString(codec, fullCodecString, 8)).rejects.toThrow();
+		}
+
+		// Without a codec string, the encoders' defaults stay: High, Main, and 8 bits even from 10-bit frames
+		expect(await writtenCodecString('avc', undefined, 8)).toMatch(/^avc1\.64/);
+		expect(await writtenCodecString('hevc', undefined, 10)).toMatch(/^(hev1|hvc1)\.1\./);
+		expect(await writtenCodecString('vp9', undefined, 10)).toMatch(/^vp09\.00\.\d\d\.08/);
+		expect(await writtenCodecString('av1', undefined, 10)).toMatch(/^av01\.0\.\d\d[MH]\.08/);
+	});
+
+	test('Codec strings asking for a bit depth the software encoder lacks are declined', async () => {
+		// node-av's libx265 for Windows is 8-bit only; simulate that by hiding its 10-bit format
+		const findEncoder = NodeAv.Codec.findEncoder.bind(NodeAv.Codec);
+		const spy = vi.spyOn(NodeAv.Codec, 'findEncoder').mockImplementation((id) => {
+			const codec = findEncoder(id);
+			if (!codec || id !== NodeAv.AV_CODEC_ID_HEVC) {
+				return codec;
+			}
+
+			return new Proxy(codec, {
+				get: (target, property) => {
+					if (property === 'pixelFormats') {
+						return [NodeAv.AV_PIX_FMT_YUV420P];
+					}
+					const value = Reflect.get(target, property) as unknown;
+					return typeof value === 'function' ? (value as () => unknown).bind(target) : value;
+				},
+			});
+		});
+
+		try {
+			// A frame size no other test uses, so that canEncodeVideo isn't answered from its memo
+			const config = { width: 80, height: 48, fullCodecString: 'hvc1.2.4.L93.B0' };
+			expect(await canEncodeVideo('hevc', config)).toBe(false);
+			expect(await canEncodeVideo('hevc', { ...config, hardwareAcceleration: 'prefer-software' })).toBe(false);
+			// 8-bit Main is still fine
+			expect(await canEncodeVideo('hevc', { ...config, fullCodecString: 'hvc1.1.6.L93.B0' })).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	test('VP8 encode and decode', async () => {
@@ -450,6 +721,42 @@ describe('Video', async () => {
 		}, true);
 	});
 
+	test('VP9 encode, the level allows the frame width and height', async () => {
+		const vp9Level = async (width: number, height: number) => {
+			let codecString: string | null = null;
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({
+				codec: 'vp9',
+				quality: new Quality('medium'),
+				onEncodedPacket: (packet, meta) => {
+					codecString ??= meta?.decoderConfig?.codec ?? null;
+				},
+			});
+			output.addVideoTrack(source, { frameRate: 30 });
+			await output.start();
+
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(128), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+			sample.close();
+			await output.finalize();
+
+			assert(codecString);
+			return Number((codecString as string).split('.')[2]);
+		};
+
+		// https://www.webmproject.org/vp9/levels/: level 1.1 allows 73728 pixels but at most 768 px of width or height,
+		// level 3 allows 2048 px, and levels 4 and 4.1 allow 4160 px
+		expect(await vp9Level(4096, 16)).toBe(40);
+		expect(await vp9Level(16, 2048)).toBe(30);
+		expect(await vp9Level(1280, 720)).toBe(31);
+	});
+
 	test('AV1 encode and decode', async () => {
 		await encodeDecodeTest('av1', {}, async (packet, meta, i) => {
 			expect(packet.duration).toBe(1 / 30);
@@ -474,6 +781,366 @@ describe('Video', async () => {
 		});
 	});
 
+	test('Hardware encoder that fails to open falls back to software', async () => {
+		// CUDA contexts list av1_nvenc even on NVIDIA GPUs without AV1 encoding (RTX 30 and older), where, like on
+		// machines without an NVIDIA GPU, it fails to open
+		const hardwareCodec = NodeAv.Codec.findEncoderByName(NodeAv.FF_ENCODER_AV1_NVENC);
+		assert(hardwareCodec);
+		const hardwareContext = Object.assign(
+			Object.create(NodeAv.HardwareContext.prototype) as NodeAv.HardwareContext,
+			{ getEncoderCodec: () => hardwareCodec, getDecoderCodec: () => null },
+		);
+
+		_serverOptions.hardwareContext = () => hardwareContext;
+		try {
+			await encodeDecodeTest('av1', {}, async () => {}, async () => {});
+		} finally {
+			delete _serverOptions.hardwareContext;
+		}
+	});
+
+	test.each(['avc', 'av1'] as VideoCodec[])('%s encode with alpha kept but no alpha format', async (codec) => {
+		// libx264 and libsvtav1 can't encode alpha, so the stream stays plain 8-bit 4:2:0 instead of switching to
+		// whichever format comes closest to a YUVA source
+		await encodeDecodeTest(codec, { alpha: 'keep' }, async (packet, meta, i) => {
+			if (i === 0 && codec === 'avc') {
+				// Not High 4:4:4 Predictive, which most hardware decoders can't play
+				expect(meta.decoderConfig!.codec.startsWith('avc1.f4')).toBe(false);
+			}
+		}, async (sample) => {
+			expect(sample.format).toBe('I420');
+		}, true);
+	});
+
+	test('Pixel format for alpha: \'keep\'', () => {
+		// prores_videotoolbox (macOS) only takes alpha packed, as ayuv64le or bgra
+		expect(getAlphaPixelFormat('prores', [
+			NodeAv.AV_PIX_FMT_VIDEOTOOLBOX,
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_NV12,
+			NodeAv.AV_PIX_FMT_AYUV64LE,
+			NodeAv.AV_PIX_FMT_UYVY422,
+			NodeAv.AV_PIX_FMT_P010LE,
+			NodeAv.AV_PIX_FMT_BGRA,
+		])).toBe(NodeAv.AV_PIX_FMT_AYUV64LE);
+
+		// h264_nvenc takes RGBA input, but AVC can't carry alpha
+		expect(getAlphaPixelFormat('avc', [
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_NV12,
+			NodeAv.AV_PIX_FMT_P010LE,
+			NodeAv.AV_PIX_FMT_YUV444P,
+			NodeAv.AV_PIX_FMT_YUV444P16LE,
+			NodeAv.AV_PIX_FMT_BGR0,
+			NodeAv.AV_PIX_FMT_BGRA,
+			NodeAv.AV_PIX_FMT_RGBA,
+		])).toBeNull();
+
+		// libvpx-vp9, prores_ks and libsvtav1
+		expect(getAlphaPixelFormat('vp9', [
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_YUVA420P,
+			NodeAv.AV_PIX_FMT_YUV444P,
+			NodeAv.AV_PIX_FMT_YUVA444P,
+			NodeAv.AV_PIX_FMT_GBRAP,
+		])).toBe(NodeAv.AV_PIX_FMT_YUVA420P);
+		expect(getAlphaPixelFormat('prores', [
+			NodeAv.AV_PIX_FMT_YUV422P10LE,
+			NodeAv.AV_PIX_FMT_YUV444P10LE,
+			NodeAv.AV_PIX_FMT_YUVA444P10LE,
+		])).toBe(NodeAv.AV_PIX_FMT_YUVA444P10LE);
+		expect(getAlphaPixelFormat('av1', [
+			NodeAv.AV_PIX_FMT_YUV420P,
+			NodeAv.AV_PIX_FMT_YUV420P10LE,
+		])).toBeNull();
+	});
+
+	test.each([
+		['avc', 10],
+		['avc', 1],
+		['vp9', 10],
+		['vp9', 1],
+		['hevc', 10],
+		['hevc', 1],
+		['av1', 10],
+		['av1', 1],
+	] as [VideoCodec, number][])('%s key frames only at a keyFrameInterval of %i s', async (codec, interval) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec, quality: new Quality('low'), keyFrameInterval: interval });
+		output.addVideoTrack(source, { frameRate: 30 });
+		await output.start();
+
+		// 3 s at 30 fps of a slowly changing gray
+		for (let i = 0; i < 90; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 1.5).fill(100 + i), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+		const keyFrameTimestamps: number[] = [];
+		for await (const packet of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+			if (packet.type === 'key') {
+				keyFrameTimestamps.push(Math.round(packet.timestamp * 30) / 30);
+			}
+		}
+
+		// The encoder adds no key frames of its own, as with WebCodecs encoders
+		expect(keyFrameTimestamps).toEqual(interval === 10 ? [0] : [0, 1, 2]);
+	});
+
+	test('AV1 encoding stays near its target bitrate at any keyFrameInterval', { timeout: 60_000 }, async () => {
+		// Converts the 5 s test video to 640x360 AV1 at 30 fps and 500 kbps
+		const convertToAv1 = async (keyFrameInterval: number | undefined) => {
+			using input = new Input({ source: new FilePathSource('./test/public/video.mp4'), formats: ALL_FORMATS });
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: {
+					codec: 'av1',
+					width: 640,
+					frameRate: 30,
+					quality: new Quality({ bitrate: 500_000 }),
+					keyFrameInterval,
+				},
+				audio: { discard: true },
+			});
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await result.getPrimaryVideoTrack();
+			assert(track);
+			const keyFrameTimestamps: number[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				if (packet.type === 'key') {
+					keyFrameTimestamps.push(Math.round(packet.timestamp * 30) / 30);
+				}
+			}
+
+			return { bitrate: (await track.computePacketStats()).averageBitrate, keyFrameTimestamps };
+		};
+
+		// SVT-AV1 budgets each key frame against its intra period, which therefore has to match the requested interval
+		const cases = [[undefined, [0, 2, 4]], [1, [0, 1, 2, 3, 4]]] as const;
+		for (const [keyFrameInterval, keyFrameTimestamps] of cases) {
+			const { bitrate, keyFrameTimestamps: actual } = await convertToAv1(keyFrameInterval);
+			expect({ keyFrameInterval, keyFrameTimestamps: actual }).toEqual({ keyFrameInterval, keyFrameTimestamps });
+			expect(bitrate, `keyFrameInterval ${keyFrameInterval}`).toBeLessThan(1.25 * 500_000);
+		}
+	});
+
+	test('AV1 key frames stay where requested when frames come slightly faster than declared or irregularly', {
+		timeout: 60_000,
+	}, async () => {
+		// Encodes frames at the given timestamps with a declared 30 fps and returns the indices of the key frames,
+		// along with those of the frames the default keyFrameInterval of 2 s requests them for. Indices, since the
+		// declared frame rate snaps the written timestamps to its grid.
+		const keyFrames = async (timestamps: number[]) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'av1', quality: new Quality({ bitrate: 500_000 }) });
+			output.addVideoTrack(source, { frameRate: 30 });
+			await output.start();
+
+			for (let i = 0; i < timestamps.length; i++) {
+				const data = new Uint8Array(160 * 120 * 3 / 2).fill(128);
+				for (let j = 0; j < 160 * 120; j++) {
+					data[j] = (j * 7 + i * 3) & 0xff;
+				}
+				const sample = new VideoSample(data, {
+					format: 'I420',
+					codedWidth: 160,
+					codedHeight: 120,
+					timestamp: timestamps[i]!,
+					duration: (timestamps[i + 1] ?? timestamps[i]! + 1 / 30) - timestamps[i]!,
+				});
+				await source.add(sample);
+				sample.close();
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			const actual: number[] = [];
+			let index = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				if (packet.type === 'key') {
+					actual.push(index);
+				}
+				index++;
+			}
+			expect(index).toBe(timestamps.length);
+			const requested = timestamps.flatMap((timestamp, i) => {
+				return i === 0 || Math.floor(timestamp / 2) > Math.floor(timestamps[i - 1]! / 2) ? [i] : [];
+			});
+
+			return { actual, requested };
+		};
+
+		// 30.4 fps declared as 30: each 2 s interval holds a frame more than SVT-AV1's intra period would at 30 fps
+		const faster = await keyFrames(Array.from({ length: 300 }, (_, i) => i / 30.4));
+		expect(faster.actual).toEqual(faster.requested);
+
+		// About 30 fps, with frame durations varying by up to 20%
+		let seed = 12345;
+		let timestamp = 0;
+		const irregular: number[] = [];
+		for (let i = 0; i < 300; i++) {
+			irregular.push(timestamp);
+			seed = (seed * 48271) % 2147483647;
+			timestamp += (1 + 0.2 * (2 * seed / 2147483647 - 1)) / 30;
+		}
+		const jittered = await keyFrames(irregular);
+		expect(jittered.actual).toEqual(jittered.requested);
+	});
+
+	// Encodes 4 s of 128x96 at 30 fps at 300 kbps, whose odd seconds are noise, and returns the bits of each second
+	const encodeBitsPerSecond = async (codec: VideoCodec, bitrateMode: 'variable' | 'constant') => {
+		const bitsPerSecond = [0, 0, 0, 0];
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({
+			codec,
+			quality: new Quality({ bitrate: 300_000, bitrateMode }),
+			onEncodedPacket: (packet) => {
+				bitsPerSecond[Math.floor(Math.round(packet.timestamp * 30) / 30)]! += 8 * packet.byteLength;
+			},
+		});
+		output.addVideoTrack(source, { frameRate: 30 });
+		await output.start();
+
+		let seed = 1;
+		for (let i = 0; i < 120; i++) {
+			const data = new Uint8Array(128 * 96 * 4);
+			const noisy = Math.floor(i / 30) % 2 === 1;
+			for (let j = 0; j < data.length; j++) {
+				seed = (seed * 1103515245 + 12345) % 2147483648;
+				data[j] = j % 4 === 3 ? 255 : noisy ? seed >> 23 : 64 + (i % 4);
+			}
+
+			const sample = new VideoSample(data, {
+				format: 'RGBA',
+				codedWidth: 128,
+				codedHeight: 96,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+			sample.close();
+		}
+		await output.finalize();
+
+		return bitsPerSecond;
+	};
+
+	test.each(['avc', 'hevc', 'vp9'] as VideoCodec[])('%s with bitrateMode \'constant\' caps it', async (codec) => {
+		const variable = await encodeBitsPerSecond(codec, 'variable');
+		const constant = await encodeBitsPerSecond(codec, 'constant');
+
+		// The noise blows far past the target in variable mode, while constant mode reins it in (libvpx already did)
+		expect(constant[1]).toBeLessThan(0.6 * variable[1]!);
+	});
+
+	test('AV1 with bitrateMode \'constant\'', async () => {
+		const constant = await encodeBitsPerSecond('av1', 'constant');
+
+		// The noisy seconds stay close to the 300 kbps target
+		expect(constant[1]).toBeGreaterThan(0);
+		expect(constant[1]).toBeLessThan(600_000);
+	});
+
+	test('AV1 support stops at the sizes libsvtav1 can encode', async () => {
+		// With a target bitrate, libsvtav1 can't open below 64 pixels in either dimension
+		expect(await canEncodeVideo('av1', { width: 64, height: 64, bitrate: 1e6 })).toBe(true);
+		expect(await canEncodeVideo('av1', { width: 63, height: 64, bitrate: 1e6 })).toBe(false);
+		expect(await canEncodeVideo('av1', { width: 1920, height: 32, bitrate: 1e6 })).toBe(false);
+
+		// A quality is encoded in constant-quantizer mode, where libsvtav1's flush hangs forever for frames up to 24
+		// pixels wide, and for frames up to 24 pixels high and wider than 64 pixels
+		const quality = new Quality('medium');
+		for (const [width, height] of [[25, 4], [25, 1080], [64, 4], [64, 24], [65, 25], [1920, 25]]) {
+			expect(await canEncodeVideo('av1', { width, height, bitrate: quality })).toBe(true);
+		}
+		for (const [width, height] of [[24, 1080], [16, 16], [65, 24], [1920, 16]]) {
+			expect(await canEncodeVideo('av1', { width, height, bitrate: quality })).toBe(false);
+		}
+
+		const encoder = new NodeAvVideoEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'av1';
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: buildVideoCodecString('av1', 16, 16, 1e6, false),
+			width: 16,
+			height: 16,
+			bitrateMode: 'quantizer',
+		} satisfies VideoEncoderConfig;
+		await expect(encoder.init()).rejects.toThrow('isn\'t supported in constant-quantizer mode');
+	});
+
+	test.each([[64, 16], [26, 16], [66, 25]])('AV1 with a quality at %ix%i still encodes', async (width, height) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'av1', quality: new Quality('medium') });
+		output.addVideoTrack(source);
+		await output.start();
+
+		for (let i = 0; i < 10; i++) {
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(60 + i * 10), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+			sample.close();
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		expect(await (await input.getPrimaryVideoTrack())!.getCodec()).toBe('av1');
+	});
+
+	test('AV1 encoding of a tiny video fails instead of hanging', { timeout: 15_000 }, async () => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'av1', quality: new Quality('medium') });
+		output.addVideoTrack(source);
+		await output.start();
+
+		const encode = async () => {
+			for (let i = 0; i < 3; i++) {
+				const sample = new VideoSample(new Uint8Array(16 * 16 * 4).fill(128), {
+					format: 'RGBX',
+					codedWidth: 16,
+					codedHeight: 16,
+					timestamp: i / 10,
+					duration: 0.1,
+				});
+				await source.add(sample);
+				sample.close();
+			}
+			await output.finalize();
+		};
+
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
+		const hang = new Promise<never>((_, reject) => {
+			timeoutId = setTimeout(() => reject(new Error('The AV1 encode hung.')), 5000);
+		});
+
+		try {
+			await expect(Promise.race([encode(), hang])).rejects.not.toThrow('The AV1 encode hung.');
+		} finally {
+			clearTimeout(timeoutId);
+		}
+	});
+
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },
@@ -491,6 +1158,14 @@ describe('Video', async () => {
 				.toBeGreaterThan(highQuantizerPackets.reduce((sum, packet) => sum + packet.data.byteLength, 0));
 		});
 
+		test(`${name} encode at the ends of the quantizer range`, { timeout: 20_000 }, async () => {
+			// The Mediabunny Codec Registry ranges: 0-51 for AVC and HEVC, 0-255 for VP9 and AV1
+			const max = codec === 'avc' || codec === 'hevc' ? 51 : 255;
+			for (const quantizer of [0, max - 1, max]) {
+				expect(await quantizerEncodeTest(codec, () => quantizer)).toHaveLength(10);
+			}
+		});
+
 		test(`${name} mid-stream quantizer change`, { timeout: 20_000 }, async () => {
 			const packets = await quantizerEncodeTest(codec, i => i < 5 ? low : high);
 
@@ -501,6 +1176,86 @@ describe('Video', async () => {
 				.toBeGreaterThan(packets.slice(5).reduce((sum, packet) => sum + packet.data.byteLength, 0));
 		});
 	}
+
+	test('Frames after a mid-stream quantizer change decode as well as with a constant quantizer', {
+		timeout: 60_000,
+	}, async () => {
+		const width = 128;
+		const height = 96;
+
+		// A moving, textured luma pattern
+		const lumaPlane = (frameIndex: number) => {
+			const plane = new Uint8Array(width * height);
+			for (let y = 0; y < height; y++) {
+				for (let x = 0; x < width; x++) {
+					const value = 128 + 50 * Math.sin(x * 0.21 + frameIndex * 0.4)
+						+ 40 * Math.cos(y * 0.17 - frameIndex * 0.3) + ((x * 13 + y * 7 + frameIndex * 5) % 11) - 5;
+					plane[y * width + x] = Math.max(0, Math.min(255, Math.round(value)));
+				}
+			}
+			return plane;
+		};
+
+		// Encodes 12 frames through VideoSampleSource into MP4, decodes them back and returns the mean absolute luma
+		// error of each frame
+		const lumaErrors = async (codec: VideoCodec, getQuantizer: (frameIndex: number) => number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({
+				codec,
+				quality: new Quality({ quantizer: getQuantizer(0) }),
+				hardwareAcceleration: 'prefer-software',
+			});
+			output.addVideoTrack(source, { frameRate: 30 });
+			await output.start();
+
+			for (let i = 0; i < 12; i++) {
+				const data = new Uint8Array(width * height * 3 / 2).fill(128);
+				data.set(lumaPlane(i));
+				const sample = new VideoSample(data, {
+					format: 'I420',
+					codedWidth: width,
+					codedHeight: height,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await source.add(sample, buildQuantizerEncodeOptions(codec, getQuantizer(i)));
+				sample.close();
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			const errors: number[] = [];
+			for await (using sample of new VideoSampleSink(track).samples()) {
+				const decoded = new Uint8Array(sample.allocationSize({ format: 'I420' }));
+				await sample.copyTo(decoded, { format: 'I420' });
+				const original = lumaPlane(errors.length);
+				let sum = 0;
+				for (let i = 0; i < width * height; i++) {
+					sum += Math.abs(decoded[i]! - original[i]!);
+				}
+				errors.push(sum / (width * height));
+			}
+			expect(errors).toHaveLength(12);
+
+			return errors;
+		};
+
+		const cases = [
+			{ codec: 'avc', high: 36, low: 16 },
+			{ codec: 'hevc', high: 36, low: 16 },
+			{ codec: 'vp9', high: 144, low: 64 },
+			{ codec: 'av1', high: 144, low: 64 },
+		] as const;
+		for (const { codec, high, low } of cases) {
+			// The change re-creates the encoder, and its frames must decode with the new quantizer, not the old one
+			const afterChange = (await lumaErrors(codec, i => i < 6 ? high : low)).slice(6);
+			const constant = (await lumaErrors(codec, () => low)).slice(6);
+			expect(Math.max(...afterChange), codec).toBeLessThanOrEqual(2 * Math.max(...constant) + 0.5);
+		}
+	});
 
 	test('ProRes encode', async () => {
 		// ProRes can't be decoded by node-av's wrapper here, so this is encode-only.
@@ -560,6 +1315,115 @@ describe('Video', async () => {
 		await encoder.close();
 	});
 
+	test('ProRes keeps the last chroma column of odd-width frames', async () => {
+		// Encodes a green frame with a red last column as ProRes, decodes the packet with FFmpeg's ProRes decoder, and
+		// returns the decoded width and the Cr of the middle row's last chroma sample, on an 8-bit scale
+		const encodeAndReadLastCr = async (width: number, alpha: 'keep' | 'discard') => {
+			const height = 16;
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'prores', quality: new Quality('medium'), alpha });
+			output.addVideoTrack(source);
+			await output.start();
+
+			const data = new Uint8Array(width * height * 4);
+			for (let i = 0; i < width * height; i++) {
+				data.set(i % width === width - 1 ? [255, 0, 0, 200] : [20, 120, 60, 200], 4 * i);
+			}
+			const sample = new VideoSample(data, {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			await source.add(sample);
+			sample.close();
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+			const encodedPacket = await new EncodedPacketSink(track).getFirstPacket();
+			assert(encodedPacket);
+
+			const decoderCodec = NodeAv.Codec.findDecoder(NodeAv.AV_CODEC_ID_PRORES);
+			assert(decoderCodec);
+			const decoder = new NodeAv.CodecContext();
+			decoder.allocContext3(decoderCodec);
+			NodeAv.FFmpegError.throwIfError(await decoder.open2(decoderCodec), 'open2');
+			const packet = new NodeAv.Packet();
+			packet.alloc();
+			packet.data = Buffer.from(encodedPacket.data);
+			NodeAv.FFmpegError.throwIfError(await decoder.sendPacket(packet), 'sendPacket');
+			const frame = new NodeAv.Frame();
+			frame.alloc();
+			NodeAv.FFmpegError.throwIfError(await decoder.receiveFrame(frame), 'receiveFrame');
+
+			// 16-bit samples holding 10 or 12 bits, a chroma column per pixel for 4:4:4, one per two pixels for 4:2:2
+			const formatName = NodeAv.avGetPixFmtName(frame.format as NodeAv.AVPixelFormat) ?? '';
+			const chromaWidth = formatName.includes('422') ? Math.ceil(width / 2) : width;
+			const row = frame.data![2]!.subarray((height / 2) * frame.linesize[2]!);
+			const lastCr = row.readUInt16LE(2 * (chromaWidth - 1)) >> (formatName.includes('12') ? 4 : 2);
+			const decodedWidth = frame.width;
+
+			frame.free();
+			packet.free();
+			decoder.freeContext();
+			return { decodedWidth, lastCr };
+		};
+
+		// prores_ks only encodes floor(width / 2) chroma columns of 4:2:2 frames, so the last one of an odd width came
+		// out zeroed (widths of 16n + 1, a green line along the right edge) or copied from the one before
+		for (const [width, alpha] of [[33, 'discard'], [35, 'discard'], [33, 'keep']] as const) {
+			const { decodedWidth, lastCr } = await encodeAndReadLastCr(width, alpha);
+			expect({ width, alpha, decodedWidth, redEdgeKept: lastCr > 220 })
+				.toEqual({ width, alpha, decodedWidth: width, redEdgeKept: true });
+		}
+	});
+
+	test('Odd-width conversions to ProRes keeping alpha keep working', async () => {
+		// A semi-transparent 641x16 ProRes 4444 source, written through the server itself
+		const width = 641;
+		const height = 16;
+		const sourceOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const videoSource = new VideoSampleSource({
+			codec: 'prores',
+			fullCodecString: 'ap4h',
+			quality: new Quality('medium'),
+			alpha: 'keep',
+		});
+		sourceOutput.addVideoTrack(videoSource);
+		await sourceOutput.start();
+		for (let i = 0; i < 3; i++) {
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(128), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await videoSource.add(sample);
+			sample.close();
+		}
+		await sourceOutput.finalize();
+
+		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec: 'prores', alpha: 'keep', forceTranscode: true },
+		});
+		expect(conversion.discardedTracks).toEqual([]);
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getCodedWidth()).toBe(width);
+		expect(await track.canBeTransparent()).toBe(true);
+	});
+
 	test('ProRes Proxy encode', async () => {
 		const encoder = new NodeAvVideoEncoder();
 		// @ts-expect-error Readonly
@@ -615,6 +1479,43 @@ describe('Video', async () => {
 		expect(packets).toHaveLength(10);
 		expect(packets.map(x => x.timestamp)).toEqual(sampleTimestamps);
 
+		await encoder.close();
+	});
+
+	test('ProRes encoding runs on several threads', async () => {
+		// libavcodec defaults to a single thread, with which prores_ks took 19 s to encode 5 s of 1080p
+		const encoder = new NodeAvVideoEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'prores';
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: 'apch',
+			width: 1920,
+			height: 1080,
+			bitrate: 1e6,
+		} satisfies VideoEncoderConfig;
+		// @ts-expect-error Readonly
+		encoder.onPacket = () => {};
+
+		await encoder.init();
+
+		using sample = new VideoSample(new Uint8Array(1920 * 1080 * 4), {
+			format: 'RGBX',
+			codedWidth: 1920,
+			codedHeight: 1080,
+			timestamp: 0,
+			duration: 1 / 30,
+		});
+		await encoder.encode(sample, {});
+
+		assert(encoder.codecContext);
+		// Slice threads, unlike frame threads, give the exact same bytes as a single thread
+		expect(encoder.codecContext.threadType).toBe(NodeAv.FF_THREAD_SLICE);
+		if (os.availableParallelism() > 1) {
+			expect(encoder.codecContext.threadCount).toBeGreaterThan(1);
+		}
+
+		await encoder.flush();
 		await encoder.close();
 	});
 
@@ -682,6 +1583,62 @@ describe('Video', async () => {
 		expect(maxAlpha).toBeLessThan(4095);
 		expect(Math.abs(minAlpha - 4095 / 2)).toBeLessThan(32);
 		expect(Math.abs(maxAlpha - 4095 / 2)).toBeLessThan(32);
+	});
+
+	test('Odd-sized AVC and HEVC are unencodable with a clear error, like in browsers', async () => {
+		const encode = async (codec: VideoCodec, width: number, height: number) => {
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec, quality: new Quality('medium') });
+			output.addVideoTrack(source);
+			await output.start();
+
+			const sample = new VideoSample(new Uint8Array(width * height * 4).fill(128), {
+				format: 'RGBA',
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			try {
+				await source.add(sample);
+			} finally {
+				sample.close();
+			}
+			await output.finalize();
+		};
+
+		// libx264 and libx265 encode 4:2:0, which needs even dimensions
+		for (const codec of ['avc', 'hevc'] as const) {
+			expect({ codec, canEncode: await canEncodeVideo(codec, { width: 321, height: 241 }) })
+				.toEqual({ codec, canEncode: false });
+			await expect(encode(codec, 321, 241)).rejects.toThrow('both width and height must be even numbers');
+			expect(await canEncodeVideo(codec, { width: 322, height: 242 })).toBe(true);
+		}
+
+		expect(await canEncodeVideo('vp9', { width: 321, height: 241 })).toBe(true);
+		await encode('vp9', 321, 241);
+	});
+
+	test('Converting to AVC with an odd-sized crop still rounds to even dimensions', async () => {
+		using input = new Input({ source: new FilePathSource('test/public/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			trim: { end: 0.2 },
+			audio: { discard: true },
+			video: { codec: 'avc', crop: { left: 3, top: 3, width: 641, height: 361 } },
+		});
+
+		// The frames are resized to 642x362 for AVC, so the odd crop size mustn't rule AVC out
+		expect(conversion.discardedTracks.filter(x => x.track.type === 'video').map(x => x.reason)).toEqual([]);
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getCodec()).toBe('avc');
+		expect([await track.getCodedWidth(), await track.getCodedHeight()]).toEqual([642, 362]);
 	});
 
 	test('Non-square pixels encode and decode #1', async () => {
@@ -878,12 +1835,79 @@ describe('Video', async () => {
 		await conversionRoundtrip('vp9');
 	});
 
+	test('AV1 encodes at target bitrates above SVT-AV1\'s 100 Mbps', async () => {
+		const encoder = new NodeAvVideoEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'av1';
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: buildVideoCodecString('av1', 64, 64, 200_000_000, false),
+			width: 64,
+			height: 64,
+			bitrate: 200_000_000,
+		} satisfies VideoEncoderConfig;
+
+		let packetCount = 0;
+		// @ts-expect-error Readonly
+		encoder.onPacket = () => {
+			packetCount++;
+		};
+
+		await encoder.init();
+		for (let i = 0; i < 3; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 3 / 2).fill(128), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+			});
+			await encoder.encode(sample, {});
+		}
+		await encoder.flush();
+		await encoder.close();
+
+		expect(packetCount).toBe(3);
+	});
+
 	test('AV1 conversion roundtrip', { timeout: 20_000 }, async () => {
 		await conversionRoundtrip('av1');
 	});
 
+	test('AV1 conversion of 300 fps footage', { timeout: 30_000 }, async () => {
+		// One second of 300 fps AVC, as slow-motion recordings are
+		const sourceOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const videoSource = new VideoSampleSource({ codec: 'avc', quality: new Quality('low') });
+		sourceOutput.addVideoTrack(videoSource);
+		await sourceOutput.start();
+		for (let i = 0; i < 300; i++) {
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 3 / 2).fill(i % 256), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 300,
+				duration: 1 / 300,
+			});
+			await videoSource.add(sample);
+		}
+		await sourceOutput.finalize();
+
+		// The encoder is told the source's frame rate, which SVT-AV1 takes only up to 240 fps
+		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video: { codec: 'av1' } });
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getCodec()).toBe('av1');
+		expect((await track.computePacketStats()).packetCount).toBe(300);
+	});
+
 	test('ProRes conversion roundtrip', { timeout: 30_000 }, async () => {
-		await conversionRoundtrip('prores');
+		// Encoding the whole clip as ProRes takes 30 CPU-seconds, which can exceed the timeout under parallel load
+		await conversionRoundtrip('prores', 1);
 	});
 
 	const conversionRoundtrip = async (codec: VideoCodec, duration?: number) => {
@@ -951,6 +1975,48 @@ describe('Video', async () => {
 
 		expect(sampleCount).toBe(packetTimestamps.length);
 	};
+
+	test('Decoded samples carry the color space of the decoder config', async () => {
+		// 16x16 gray, one frame, VP9 profile 2 tagged BT.2020/PQ. The VP9 bitstream itself can only signal the matrix,
+		// so the primaries and transfer are only in the WebM Colour element:
+		// ffmpeg -f lavfi -i "color=gray:s=16x16:r=10:d=0.1" -c:v libvpx-vp9 -pix_fmt yuv420p10le -profile:v 2
+		//   -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv vp9-pq-16x16.webm
+		using input = new Input({
+			source: new FilePathSource('./test/public/vp9-pq-16x16.webm'),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const expected = { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false };
+		expect((await track.getDecoderConfig())!.colorSpace).toEqual(expected);
+
+		// Like in WebCodecs, the config's color space applies to the decoded samples
+		using sample = (await new VideoSampleSink(track).getSample(0))!;
+		expect(sample.colorSpace.toJSON()).toEqual(expected);
+	});
+
+	test('Decoded H.264 samples take the container\'s color space where the bitstream has none', async () => {
+		// 16x16 orange-red, one frame of H.264 whose VUI signals no color, with BT.601 color in the MP4 colr box:
+		// ffmpeg -f lavfi -i "color=c=0xC83020:s=16x16:r=10:d=0.1" -c:v libx264 -pix_fmt yuv420p untagged.mp4
+		// ffmpeg -i untagged.mp4 -c copy -color_primaries smpte170m -color_trc smpte170m -colorspace smpte170m
+		//   -color_range tv -movflags +write_colr h264-untagged-colr-bt601.mp4
+		using input = new Input({
+			source: new FilePathSource('./test/public/h264-untagged-colr-bt601.mp4'),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const expected = { primaries: 'smpte170m', transfer: 'smpte170m', matrix: 'smpte170m', fullRange: false };
+		expect((await track.getDecoderConfig())!.colorSpace).toEqual(expected);
+
+		using sample = (await new VideoSampleSink(track).getSample(0))!;
+		expect(sample.colorSpace.toJSON()).toEqual(expected);
+
+		// Converted to RGB with the BT.601 matrix, as Chromium does
+		const rgba = new Uint8Array(16 * 16 * 4);
+		await sample.copyTo(rgba, { format: 'RGBA' });
+		expect(Math.abs(rgba[0]! - 200)).toBeLessThanOrEqual(3);
+		expect(Math.abs(rgba[1]! - 48)).toBeLessThanOrEqual(3);
+		expect(Math.abs(rgba[2]! - 32)).toBeLessThanOrEqual(3);
+	});
 
 	test('Color space, RGB to BT.709 encode', async () => {
 		const width = 320;
@@ -1405,6 +2471,20 @@ describe('Video', async () => {
 		]);
 	});
 
+	test('AVFrame resource with unknown pixel aspect ratio', () => {
+		const frame = new NodeAv.Frame();
+		frame.alloc();
+		frame.width = 32;
+		frame.height = 16;
+		frame.format = NodeAv.AV_PIX_FMT_YUV420P;
+		frame.allocBuffer();
+		expect(frame.sampleAspectRatio.num).toBe(0);
+
+		using sample = new VideoSample(new AvFrameVideoSampleResource(frame), { timestamp: 0 });
+		expect(sample.squarePixelWidth).toBe(32);
+		expect(sample.squarePixelHeight).toBe(16);
+	});
+
 	test('toAvFrame with RGBA VideoSample', async () => {
 		const width = 16;
 		const height = 8;
@@ -1473,59 +2553,82 @@ describe('Video', async () => {
 
 		await encoder.init();
 
-		// Encode a single white frame to get one packet (and the decoder config) to drive the loop with
-		const data = new Uint8Array(1920 * 1080 * 4).fill(0xff); // White
-		using bootstrapSample = new VideoSample(data, {
-			format: 'RGBX',
-			codedWidth: 1920,
-			codedHeight: 1080,
-			timestamp: 0,
-			duration: 1 / 30,
-		});
-		await encoder.encode(bootstrapSample, {});
-		await encoder.flush();
-		assert(decoderConfig);
-		assert(pendingPackets.length > 0);
+		// The native coders must be closed even when the test fails, as nothing else stops them
+		try {
+			// Encode a single white frame to get one packet (and the decoder config) to drive the loop with
+			const data = new Uint8Array(1920 * 1080 * 4).fill(0xff); // White
+			using bootstrapSample = new VideoSample(data, {
+				format: 'RGBX',
+				codedWidth: 1920,
+				codedHeight: 1080,
+				timestamp: 0,
+				duration: 1 / 30,
+			});
+			await encoder.encode(bootstrapSample, {});
+			await encoder.flush();
+			assert(decoderConfig);
+			assert(pendingPackets.length > 0);
 
-		const sourcePacket = pendingPackets[0]!;
-		pendingPackets.length = 0;
-
-		const decoder = new NodeAvVideoDecoder();
-		// @ts-expect-error Readonly
-		decoder.codec = 'avc';
-		// @ts-expect-error Readonly
-		decoder.config = decoderConfig;
-		// @ts-expect-error Readonly
-		decoder.onSample = (sample: VideoSample) => {
-			decodedFrames.push(sample);
-		};
-		await decoder.init();
-
-		const iterations = 300;
-		let baselineRss = 0;
-
-		for (let i = 1; i <= iterations; i++) {
-			await decoder.decode(sourcePacket.clone({ timestamp: i / 30 }));
-
-			for (const frame of decodedFrames) {
-				await encoder.encode(frame, {});
-				frame.close();
-			}
-			decodedFrames.length = 0;
+			const sourcePacket = pendingPackets[0]!;
 			pendingPackets.length = 0;
 
-			if (i === 100) { // Should have stabilized by then
-				baselineRss = process.memoryUsage().rss;
+			const decoder = new NodeAvVideoDecoder();
+			// @ts-expect-error Readonly
+			decoder.codec = 'avc';
+			// @ts-expect-error Readonly
+			decoder.config = decoderConfig;
+			// @ts-expect-error Readonly
+			decoder.onSample = (sample: VideoSample) => {
+				decodedFrames.push(sample);
+			};
+			await decoder.init();
+
+			try {
+				let frameCount = 0;
+				let packetCount = 0;
+
+				// Decodes the packet again and re-encodes the result
+				const roundTripFrame = async () => {
+					frameCount++;
+					await decoder.decode(sourcePacket.clone({ timestamp: frameCount / 30 }));
+
+					for (const frame of decodedFrames) {
+						await encoder.encode(frame, {});
+						frame.close();
+					}
+					decodedFrames.length = 0;
+					packetCount += pendingPackets.length;
+					pendingPackets.length = 0;
+				};
+
+				// The encoder holds frames in its lookahead and in its frame threads, whose count grows with the CPU
+				// count, so memory keeps growing until well after the first packet comes out (at frame 50 to 81 on 2
+				// to 192 cores). Only measure from there, but within a bounded number of frames.
+				while (packetCount < 150) {
+					if (frameCount === 500) {
+						throw new Error(`The encoder output only ${packetCount} packets for ${frameCount} frames.`);
+					}
+
+					await roundTripFrame();
+				}
+
+				const baselineRss = process.memoryUsage().rss;
+
+				for (let i = 0; i < 200; i++) {
+					await roundTripFrame();
+				}
+
+				const growth = process.memoryUsage().rss - baselineRss;
+				expect(growth).toBeLessThan(10 * 1024 * 1024);
+			} finally {
+				await decoder.close();
 			}
+		} finally {
+			for (const frame of decodedFrames) {
+				frame.close();
+			}
+			await encoder.close();
 		}
-
-		const finalRss = process.memoryUsage().rss;
-		const growth = finalRss - baselineRss;
-
-		expect(growth).toBeLessThan(10 * 1024 * 1024);
-
-		await encoder.close();
-		await decoder.close();
 	});
 
 	test('No B-frames are skipped when decoding AVC', async () => {
@@ -1548,6 +2651,504 @@ describe('Video', async () => {
 		}
 
 		expect(count).toBe(48);
+	});
+
+	describe('Threading', () => {
+		// libavcodec opens codecs on a single thread unless told otherwise, which is what these compare against
+		const withSingleThreadedCodecs = async <T>(fn: () => Promise<T>) => {
+			const prototype = NodeAv.CodecContext.prototype;
+			const descriptor = Object.getOwnPropertyDescriptor(prototype, 'open2');
+			assert(descriptor);
+			const open2 = descriptor.value as typeof prototype.open2;
+
+			Object.defineProperty(prototype, 'open2', {
+				...descriptor,
+				value: function (this: NodeAv.CodecContext, ...args: Parameters<typeof prototype.open2>) {
+					this.threadCount = 1;
+					return open2.apply(this, args);
+				},
+			});
+
+			try {
+				return await fn();
+			} finally {
+				Object.defineProperty(prototype, 'open2', descriptor);
+			}
+		};
+
+		test('Codecs run on a number of threads that scales with the resolution', () => {
+			// Each thread holds frames of its own, so like in Chromium, more threads are only used for more pixels
+			const cores = os.availableParallelism();
+			expect(getCodecThreadCount(640, 360)).toBe(Math.min(2, cores));
+			expect(getCodecThreadCount(1920, 1080)).toBe(Math.min(3, cores));
+			expect(getCodecThreadCount(undefined, undefined)).toBe(Math.min(3, cores));
+			expect(getCodecThreadCount(2560, 1440)).toBe(Math.min(5, cores));
+			expect(getCodecThreadCount(3840, 2160)).toBe(Math.min(8, cores));
+			expect(getCodecThreadCount(7680, 4320)).toBe(Math.min(8, cores));
+		});
+
+		const fingerprint = (data: Uint8Array) => createHash('sha256').update(data).digest('hex');
+
+		const readPackets = async (path: string, count: number) => {
+			using input = new Input({
+				source: new FilePathSource(path),
+				formats: ALL_FORMATS,
+			});
+
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			const packets: EncodedPacket[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push(packet);
+				if (packets.length === count) {
+					break;
+				}
+			}
+
+			const codec = await track.getCodec();
+			const decoderConfig = await track.getDecoderConfig();
+			assert(codec && decoderConfig);
+
+			return { codec, decoderConfig, packets };
+		};
+
+		const encodePackets = async (codec: VideoCodec, width: number, height: number) => {
+			const encoder = new NodeAvVideoEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = codec;
+			// @ts-expect-error Readonly
+			encoder.config = {
+				codec: buildVideoCodecString(codec, width, height, 2e6, false),
+				width,
+				height,
+				bitrate: 2e6,
+			} satisfies VideoEncoderConfig;
+
+			const packets: EncodedPacket[] = [];
+			let decoderConfig: VideoDecoderConfig | undefined;
+			// @ts-expect-error Readonly
+			encoder.onPacket = (packet: EncodedPacket, meta: EncodedVideoChunkMetadata) => {
+				packets.push(packet);
+				decoderConfig ??= meta.decoderConfig;
+			};
+
+			await encoder.init();
+
+			let threadCount = 0;
+			const data = new Uint8Array(width * height * 4);
+			for (let i = 0; i < 20; i++) {
+				// A moving gradient, so that every frame has something to encode
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						const offset = 4 * (y * width + x);
+						data[offset] = (x + 4 * i) & 0xff;
+						data[offset + 1] = (y + 2 * i) & 0xff;
+						data[offset + 2] = (x ^ y) & 0xff;
+					}
+				}
+
+				using sample = new VideoSample(data, {
+					format: 'RGBX',
+					codedWidth: width,
+					codedHeight: height,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await encoder.encode(sample, {});
+
+				assert(encoder.codecContext);
+				threadCount = encoder.codecContext.threadCount;
+			}
+
+			await encoder.flush();
+			await encoder.close();
+
+			assert(decoderConfig);
+			return { packets, decoderConfig, threadCount };
+		};
+
+		const decodePackets = async (
+			codec: VideoCodec,
+			decoderConfig: VideoDecoderConfig,
+			packets: EncodedPacket[],
+		) => {
+			const decoder = new NodeAvVideoDecoder();
+			// @ts-expect-error Readonly
+			decoder.codec = codec;
+			// @ts-expect-error Readonly
+			decoder.config = decoderConfig;
+
+			const samples: VideoSample[] = [];
+			// @ts-expect-error Readonly
+			decoder.onSample = (sample: VideoSample) => {
+				samples.push(sample);
+			};
+
+			await decoder.init();
+
+			// How many frames have come out after each packet
+			const framesOut: number[] = [];
+			for (const packet of packets) {
+				await decoder.decode(packet);
+				framesOut.push(samples.length);
+			}
+
+			await decoder.flush();
+
+			assert(decoder.codecContext);
+			const threadCount = decoder.codecContext.threadCount;
+			await decoder.close();
+
+			const frames: string[] = [];
+			for (using sample of samples) {
+				const data = new Uint8Array(sample.allocationSize());
+				await sample.copyTo(data);
+				frames.push(`${sample.timestamp}: ${fingerprint(data)}`);
+			}
+
+			return { frames, framesOut, threadCount };
+		};
+
+		test('Decoders run on several threads and give the same frames as on one', { timeout: 30_000 }, async () => {
+			const inputs = [
+				await readPackets('./test/public/video.mp4', 30), // H.264
+				await readPackets('./test/public/video-h265.mp4', 30), // HEVC
+				await readPackets('./test/public/demo.webm', 30), // VP9
+				await readPackets('./test/public/transparency.webm', 10), // VP9 with alpha, decoded by libvpx
+				{ codec: 'vp8' as const, ...await encodePackets('vp8', 640, 360) },
+				{ codec: 'av1' as const, ...await encodePackets('av1', 640, 360) }, // Decoded by dav1d
+			];
+
+			for (const { codec, decoderConfig, packets } of inputs) {
+				const threaded = await decodePackets(codec, decoderConfig, packets);
+				const singleThreaded = await withSingleThreadedCodecs(
+					() => decodePackets(codec, decoderConfig, packets),
+				);
+
+				expect(singleThreaded.threadCount).toBe(1);
+				if (os.availableParallelism() > 1) {
+					expect(threaded.threadCount, codec).toBeGreaterThan(1);
+				}
+
+				expect(threaded.frames, codec).toHaveLength(packets.length);
+				expect(threaded.frames, codec).toEqual(singleThreaded.frames);
+			}
+		});
+
+		test('Decoders asked to minimize latency output frames as early as on one thread', async () => {
+			// Frame threading holds back frames until more packets come in, so it must be off here
+			const inputs = [
+				await readPackets('./test/public/video.mp4', 20), // H.264
+				await readPackets('./test/public/demo.webm', 20), // VP9
+				{ codec: 'av1' as const, ...await encodePackets('av1', 640, 360) }, // dav1d, which threads by itself
+			];
+
+			for (const { codec, decoderConfig, packets } of inputs) {
+				const lowLatency = await decodePackets(codec, { ...decoderConfig, optimizeForLatency: true }, packets);
+				const singleThreaded = await withSingleThreadedCodecs(
+					() => decodePackets(codec, decoderConfig, packets),
+				);
+
+				expect(lowLatency.framesOut, codec).toEqual(singleThreaded.framesOut);
+				expect(lowLatency.frames, codec).toEqual(singleThreaded.frames);
+			}
+		});
+
+		test('VP9 encoding runs on several threads and gives the same packets as on one', async () => {
+			const threaded = await encodePackets('vp9', 1280, 720);
+			const singleThreaded = await withSingleThreadedCodecs(() => encodePackets('vp9', 1280, 720));
+
+			expect(singleThreaded.threadCount).toBe(1);
+			if (os.availableParallelism() > 1) {
+				expect(threaded.threadCount).toBeGreaterThan(1);
+			}
+
+			const describePackets = (packets: EncodedPacket[]) => packets.map(
+				packet => `${packet.timestamp} ${packet.type}: ${fingerprint(packet.data)}`,
+			);
+			expect(describePackets(threaded.packets)).toEqual(describePackets(singleThreaded.packets));
+		});
+	});
+
+	test.each([
+		// ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10 -t 0.3 -pix_fmt gray -c:v libaom-av1 -cpu-used 8 -b:v 100k
+		//   av1-gray-64x48.mp4
+		['av1-gray-64x48.mp4', 'I420'],
+		// ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10 -t 0.3 -c:v libx264rgb -pix_fmt bgr24 h264-rgb-64x48.mp4
+		['h264-rgb-64x48.mp4', 'I444'],
+	] as const)('Decoding %s gives %s samples', async (file, format) => {
+		// Monochrome AV1 decodes to gray and RGB H.264 to planar GBR, which are handed out like Chromium does: as 4:2:0
+		// with neutral chroma, and as 4:4:4 holding the G, B and R planes
+		using input = new Input({ source: new FilePathSource(`./test/public/${file}`), formats: ALL_FORMATS });
+		using sample = (await new VideoSampleSink((await input.getPrimaryVideoTrack())!).getSample(0))!;
+		expect(sample.format).toBe(format);
+
+		const data = new Uint8Array(sample.allocationSize());
+		await sample.copyTo(data);
+		const rgba = new Uint8Array(64 * 48 * 4);
+		await sample.copyTo(rgba, { format: 'RGBA' });
+
+		const planeSize = format === 'I420' ? 32 * 24 : 64 * 48;
+		const firstSamples = [0, 1, 2].map(plane => data[plane === 0 ? 0 : 64 * 48 + (plane - 1) * planeSize]);
+		if (format === 'I420') {
+			expect(firstSamples).toEqual([rgba[0], 128, 128]);
+		} else {
+			expect(sample.colorSpace.matrix).toBe('rgb');
+			expect(firstSamples).toEqual([rgba[1], rgba[2], rgba[0]]); // G, B, R
+		}
+	});
+
+	const makeAvFrame = (format: NodeAv.AVPixelFormat, width: number, height: number, bytes: number[]) => {
+		const frame = new NodeAv.Frame();
+		frame.alloc();
+		frame.format = format;
+		frame.width = width;
+		frame.height = height;
+		frame.sampleAspectRatio = new NodeAv.Rational(1, 1);
+		NodeAv.FFmpegError.throwIfError(frame.fromBuffer(Buffer.from(bytes)), 'fromBuffer');
+		return frame;
+	};
+
+	test('Monochrome AVFrames read as 4:2:0 with neutral chroma', async () => {
+		const luma = Array.from({ length: 24 }, (_, i) => 10 * i);
+		using sample = new VideoSample(
+			new AvFrameVideoSampleResource(makeAvFrame(NodeAv.AV_PIX_FMT_GRAY8, 6, 4, luma)),
+			{ timestamp: 0 },
+		);
+		expect(sample.format).toBe('I420');
+
+		const data = new Uint8Array(sample.allocationSize());
+		await sample.copyTo(data);
+		expect([...data.subarray(0, 24)]).toEqual(luma);
+		expect([...data.subarray(24)]).toEqual(Array(12).fill(128));
+
+		// 10 bits, at an odd size
+		const luma10 = Array.from({ length: 15 }, (_, i) => 40 * i);
+		const bytes10 = luma10.flatMap(value => [value & 0xff, value >> 8]);
+		using sample10 = new VideoSample(
+			new AvFrameVideoSampleResource(makeAvFrame(NodeAv.AV_PIX_FMT_GRAY10LE, 5, 3, bytes10)),
+			{ timestamp: 0 },
+		);
+		expect(sample10.format).toBe('I420P10');
+
+		const data10 = new Uint16Array(sample10.allocationSize() / 2);
+		await sample10.copyTo(data10);
+		expect([...data10.subarray(0, 15)]).toEqual(luma10);
+		expect(data10.length).toBeGreaterThan(15);
+		expect([...data10.subarray(15)]).toEqual(Array(data10.length - 15).fill(512));
+	});
+
+	test('Planar GBR AVFrames read as 4:4:4 in G, B, R plane order', async () => {
+		using sample = new VideoSample(
+			new AvFrameVideoSampleResource(
+				makeAvFrame(NodeAv.AV_PIX_FMT_GBRP, 2, 2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+			),
+			{ timestamp: 0 },
+		);
+		expect(sample.format).toBe('I444');
+		expect(sample.colorSpace.matrix).toBe('rgb');
+		expect(sample.colorSpace.fullRange).toBe(true);
+
+		const data = new Uint8Array(sample.allocationSize());
+		await sample.copyTo(data);
+		expect([...data]).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+	});
+
+	test.each([
+		['vflip', [170, 120, 70, 20]],
+		['hflip', [20, 70, 120, 170]],
+	])('AVFrames from FFmpeg\'s %s filter can be copied out', async (filterDescription, expectedRows) => {
+		// vflip outputs a bottom-up frame (negative line sizes), hflip a regular one. The sample is 4x4 I420 with rows
+		// of luma 20, 70, 120 and 170.
+		const data = new Uint8Array(4 * 4 * 3 / 2).fill(128);
+		for (let y = 0; y < 4; y++) {
+			data.fill(20 + 50 * y, 4 * y, 4 * y + 4);
+		}
+		using sample = new VideoSample(data, { format: 'I420', codedWidth: 4, codedHeight: 4, timestamp: 0 });
+		using inFrame = new NodeAv.Frame();
+		inFrame.alloc();
+		await toAvFrame(sample, inFrame);
+
+		using filter = NodeAv.FilterAPI.create(filterDescription);
+		const [outFrame] = await filter.processAll(inFrame);
+		assert(outFrame);
+		expect(outFrame.linesize[0]! < 0).toBe(filterDescription === 'vflip');
+
+		using result = new VideoSample(new AvFrameVideoSampleResource(outFrame), { timestamp: 0 });
+		const copied = new Uint8Array(result.allocationSize());
+		await result.copyTo(copied);
+		expect([0, 1, 2, 3].map(y => copied[4 * y])).toEqual(expectedRows);
+		expect([...copied.subarray(16)]).toEqual(Array(8).fill(128));
+	});
+
+	describe('VP9 alpha that starts after the first packet', () => {
+		// Encodes 64x64 VP9 frames whose right half is transparent, with a key frame every 10 frames, and returns the
+		// packets and decoder config
+		const encodeVp9 = async (frameCount: number, alpha: 'keep' | 'discard') => {
+			const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+			const source = new VideoSampleSource({ codec: 'vp9', bitrate: 1e6, alpha, keyFrameInterval: 1 / 3 });
+			output.addVideoTrack(source);
+			await output.start();
+			for (let i = 0; i < frameCount; i++) {
+				const data = new Uint8Array(64 * 64 * 4);
+				for (let j = 0; j < 64 * 64; j++) {
+					data.set([200, 50, 50, j % 64 >= 32 ? 0 : 255], j * 4);
+				}
+				using sample = new VideoSample(data, {
+					format: 'RGBA',
+					codedWidth: 64,
+					codedHeight: 64,
+					timestamp: i / 30,
+					duration: 1 / 30,
+				});
+				await source.add(sample);
+			}
+			await output.finalize();
+
+			using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = (await input.getPrimaryVideoTrack())!;
+			const packets: EncodedPacket[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push(packet);
+			}
+			return { packets, decoderConfig: (await track.getDecoderConfig())! };
+		};
+
+		// Decodes the packets with the server's decoder, and returns the format of each frame that comes out, with the
+		// alpha in the middle of its opaque left half and its transparent right half
+		const decodeVp9 = async (packets: EncodedPacket[], decoderConfig: VideoDecoderConfig) => {
+			const decoder = new NodeAvVideoDecoder();
+			// @ts-expect-error Readonly
+			decoder.codec = 'vp9';
+			// @ts-expect-error Readonly
+			decoder.config = decoderConfig;
+			const samples: VideoSample[] = [];
+			// @ts-expect-error Readonly
+			decoder.onSample = (sample: VideoSample) => {
+				samples.push(sample);
+			};
+			await decoder.init();
+			for (const packet of packets) {
+				await decoder.decode(packet);
+			}
+			await decoder.flush();
+			await decoder.close();
+
+			const frames: { format: string | null; alpha: number[] | null }[] = [];
+			for (const sample of samples) {
+				const data = new Uint8Array(sample.allocationSize());
+				await sample.copyTo(data);
+				const alphaPlane = data.subarray(64 * 64 + 2 * 32 * 32);
+				frames.push({
+					format: sample.format,
+					alpha: sample.format === 'I420A' ? [alphaPlane[32 * 64 + 16]!, alphaPlane[32 * 64 + 48]!] : null,
+				});
+				sample.close();
+			}
+			return frames;
+		};
+
+		// Gives packets the alpha data of another encode's packets, from the given packet on, the way Mediabunny writes
+		// alpha: 'keep' when only some frames are transparent
+		const addAlpha = (packets: EncodedPacket[], alphaPackets: EncodedPacket[], start: number) => {
+			return packets.map((packet, i) => i < start || i >= start + alphaPackets.length
+				? packet
+				: packet.clone({ sideData: { alpha: alphaPackets[i - start]!.sideData.alpha } }),
+			);
+		};
+
+		const opaque = (count: number) => Array.from({ length: count }, () => ({ format: 'I420', alpha: null }));
+		const transparent = (count: number) => {
+			return Array.from({ length: count }, () => ({ format: 'I420A', alpha: [255, 0] }));
+		};
+
+		test('VP9 alpha that starts on a delta frame is decoded from there', async () => {
+			const color = await encodeVp9(10, 'discard');
+			const alpha = await encodeVp9(5, 'keep');
+			const packets = addAlpha(color.packets, alpha.packets, 5);
+			expect(packets[5]!.type).toBe('delta');
+
+			expect(await decodeVp9(packets, color.decoderConfig)).toEqual([...opaque(5), ...transparent(5)]);
+		});
+
+		test('VP9 alpha that starts and stops mid-stream is decoded, and so are the frames after it', async () => {
+			// A fade from opaque to transparent and back
+			const color = await encodeVp9(20, 'discard');
+			const alpha = await encodeVp9(8, 'keep');
+			const packets = addAlpha(color.packets, alpha.packets, 5);
+
+			expect(await decodeVp9(packets, color.decoderConfig)).toEqual([
+				...opaque(5),
+				...transparent(8),
+				...opaque(7),
+			]);
+		});
+
+		test('VP9 alpha that starts on a delta frame of its own is decoded from its next key frame', async () => {
+			// The alpha data of frames 3-19 of an encode, so the first alpha frame refers to frames that are missing.
+			// Its frames stay opaque until the alpha's next key frame, at frame 10, like in Chromium.
+			const color = await encodeVp9(20, 'discard');
+			const alpha = await encodeVp9(20, 'keep');
+			const packets = addAlpha(color.packets, alpha.packets.slice(3), 3);
+
+			expect(await decodeVp9(packets, color.decoderConfig)).toEqual([...opaque(10), ...transparent(10)]);
+		});
+
+		test('VP9 alpha from the first packet on is decoded (control)', async () => {
+			const { packets, decoderConfig } = await encodeVp9(10, 'keep');
+			expect(await decodeVp9(packets, decoderConfig)).toEqual(transparent(10));
+		});
+	});
+
+	test.each(['avc', 'vp9', 'av1'] as const)('%s encodes frames in the stream\'s color space', async (codec) => {
+		// Six frames of one color, Y/U/V 80/200/90, the first three tagged BT.709 limited range and the last three
+		// BT.601 (smpte170m) full range. The stream's color space comes from the first frame, so the others must be
+		// converted to it rather than encoded as they are.
+		const bt709Limited = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false } as const;
+		const bt601Full = {
+			primaries: 'smpte170m',
+			transfer: 'smpte170m',
+			matrix: 'smpte170m',
+			fullRange: true,
+		} as const;
+		// What Y/U/V 80/200/90 is in RGB with either (H.273)
+		const expectedRgb = [[5, 78, 226], [27, 82, 208]];
+
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec, bitrate: 2e6 });
+		output.addVideoTrack(source);
+		await output.start();
+		for (let i = 0; i < 6; i++) {
+			const data = new Uint8Array(64 * 64 * 3 / 2);
+			data.fill(80, 0, 64 * 64);
+			data.fill(200, 64 * 64, 64 * 64 * 5 / 4);
+			data.fill(90, 64 * 64 * 5 / 4);
+			using sample = new VideoSample(data, {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: i / 30,
+				duration: 1 / 30,
+				colorSpace: i < 3 ? bt709Limited : bt601Full,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		let i = 0;
+		for await (using sample of new VideoSampleSink((await input.getPrimaryVideoTrack())!).samples()) {
+			const rgba = new Uint8Array(64 * 64 * 4);
+			await sample.copyTo(rgba, { format: 'RGBA' });
+			const center = (32 * 64 + 32) * 4;
+			const expected = expectedRgb[i < 3 ? 0 : 1]!;
+			for (let c = 0; c < 3; c++) {
+				expect(Math.abs(rgba[center + c]! - expected[c]!), `frame ${i}`).toBeLessThanOrEqual(4);
+			}
+			i++;
+		}
+		expect(i).toBe(6);
 	});
 
 	describe('VideoSample transformation', () => {
@@ -1611,6 +3212,25 @@ describe('Video', async () => {
 			expectColor(getColorAt(rgba, 200, 150, 50), [255, 0, 0]); // top-right
 			expectColor(getColorAt(rgba, 200, 50, 150), [0, 0, 255]); // bottom-left (blue)
 			expectColor(getColorAt(rgba, 200, 150, 150), [255, 0, 0]); // bottom-right
+		});
+
+		test('Transform keeps the color space', async () => {
+			const colorSpace: VideoColorSpaceInit = {
+				primaries: 'bt2020' as VideoColorPrimaries,
+				transfer: 'pq' as VideoTransferCharacteristics,
+				matrix: 'bt2020-ncl' as VideoMatrixCoefficients,
+				fullRange: true,
+			};
+			using sample = new VideoSample(new Uint8Array(64 * 64 * 3 / 2).fill(0x80), {
+				format: 'I420',
+				codedWidth: 64,
+				codedHeight: 64,
+				timestamp: 0,
+				colorSpace,
+			});
+			using result = await sample.transform({ width: 32 });
+
+			expect(result.colorSpace.toJSON()).toEqual(colorSpace);
 		});
 
 		test('Rotate 90 deg clockwise', async () => {
@@ -1761,6 +3381,233 @@ describe('Video', async () => {
 			expectColor(getColorAt(rgba, 400, 350, 150), [255, 0, 0]); // bottom-right (red)
 		});
 
+		test('alpha: \'discard\' paints transparent pixels onto black', async () => {
+			// 4x2 RGBA: the left half is fully transparent red, the right half opaque green
+			const data = new Uint8Array(4 * 2 * 4);
+			for (let i = 0; i < 8; i++) {
+				data.set((i % 4) < 2 ? [255, 0, 0, 0] : [0, 255, 0, 255], i * 4);
+			}
+			using sample = new VideoSample(data, { format: 'RGBA', codedWidth: 4, codedHeight: 2, timestamp: 0 });
+
+			const readPixels = async (sample: VideoSample) => {
+				const bytes = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
+				await sample.copyTo(bytes, { format: 'RGBA' });
+				return bytes;
+			};
+
+			// Control: 'keep' leaves the transparent pixels transparent
+			using kept = await sample.transform({ alpha: 'keep' });
+			expect((await readPixels(kept))[3]).toBe(0);
+
+			// Like the canvas transformer, 'discard' paints the frame onto black, making every pixel opaque
+			using discarded = await sample.transform({ alpha: 'discard' });
+			expect(discarded.format).toBe('RGBA');
+			const pixels = await readPixels(discarded);
+			expect([...pixels.subarray(0, 4)]).toEqual([0, 0, 0, 255]);
+			expect([...pixels.subarray(8, 12)]).toEqual([0, 255, 0, 255]);
+
+			// The letterbox bars of 'contain' are opaque black as well
+			using letterboxed = await sample.transform({ width: 4, height: 4, fit: 'contain', alpha: 'discard' });
+			expect([...(await readPixels(letterboxed)).subarray(0, 4)]).toEqual([0, 0, 0, 255]);
+		});
+
+		test.each([
+			['I420A', 8],
+			['I420AP10', 10],
+			['I444AP12', 12],
+		] as const)('alpha: \'discard\' on %s', async (format, bitDepth) => {
+			// 16x16, white, transparent on the left half
+			const width = 16;
+			const height = 16;
+			const chromaSize = format.startsWith('I420') ? (width / 2) * (height / 2) : width * height;
+			const max = 2 ** bitDepth - 1;
+			const values = bitDepth === 8
+				? new Uint8Array(width * height * 2 + chromaSize * 2)
+				: new Uint16Array(width * height * 2 + chromaSize * 2);
+			values.fill(Math.round(235 / 255 * max), 0, width * height); // Y
+			values.fill(Math.round(128 / 255 * max), width * height, width * height + chromaSize * 2); // U, V
+			const alpha = values.subarray(width * height + chromaSize * 2);
+			for (let y = 0; y < height; y++) {
+				alpha.fill(0, y * width, y * width + width / 2);
+				alpha.fill(max, y * width + width / 2, (y + 1) * width);
+			}
+			using sample = new VideoSample(new Uint8Array(values.buffer), {
+				format,
+				codedWidth: width,
+				codedHeight: height,
+				timestamp: 0,
+			});
+
+			// The format (and bit depth) stays, with every pixel opaque
+			using discarded = await sample.transform({ width: 32, height: 32, fit: 'fill', alpha: 'discard' });
+			expect(discarded.format).toBe(format);
+
+			const rgba = new Uint8Array(32 * 32 * 4);
+			await discarded.copyTo(rgba, { format: 'RGBA' });
+			expectColor(getColorAt(rgba, 32, 4, 16), [0, 0, 0]);
+			expectColor(getColorAt(rgba, 32, 27, 16), [255, 255, 255]);
+			expect(rgba.filter((_, i) => i % 4 === 3).every(value => value === 255)).toBe(true);
+		});
+
+		// 32x24 I420 or NV12, whose luma ramps by 3 per column and 4 per row, so a crop that's off by one pixel is off
+		// by at least 3. The chroma is neutral unless given.
+		const rampLumaAt = (x: number, y: number) => 40 + 3 * x + 4 * y;
+		const makeRampSample = (format: 'I420' | 'NV12' = 'I420', u = 128, v = 128) => {
+			const data = new Uint8Array(32 * 24 * 3 / 2);
+			for (let y = 0; y < 24; y++) {
+				for (let x = 0; x < 32; x++) {
+					data[y * 32 + x] = rampLumaAt(x, y);
+				}
+			}
+
+			// NV12 interleaves U and V, I420 has a U plane and then a V plane
+			const chroma = data.subarray(32 * 24);
+			for (let i = 0; i < chroma.length / 2; i++) {
+				chroma[format === 'NV12' ? 2 * i : i] = u;
+				chroma[format === 'NV12' ? 2 * i + 1 : chroma.length / 2 + i] = v;
+			}
+
+			return new VideoSample(data, { format, codedWidth: 32, codedHeight: 24, timestamp: 0 });
+		};
+
+		// The largest difference between the result's luma and the ramp's, starting at the given offset
+		const getMaxRampLumaError = async (result: VideoSample, left: number, top: number) => {
+			const data = new Uint8Array(result.allocationSize());
+			await result.copyTo(data);
+
+			let maxError = 0;
+			for (let y = 0; y < result.codedHeight; y++) {
+				for (let x = 0; x < result.codedWidth; x++) {
+					const error = Math.abs(data[y * result.codedWidth + x]! - rampLumaAt(x + left, y + top));
+					maxError = Math.max(maxError, error);
+				}
+			}
+
+			return maxError;
+		};
+
+		test.each([
+			{ format: 'I420', left: 1, top: 3, width: 21, height: 15 },
+			{ format: 'I420', left: 2, top: 4, width: 20, height: 14 },
+			// Up to the right edge
+			{ format: 'I420', left: 3, top: 5, width: 29, height: 19 },
+			{ format: 'NV12', left: 3, top: 5, width: 29, height: 19 },
+			{ format: 'NV12', left: 5, top: 0, width: 27, height: 15 },
+			{ format: 'NV12', left: 1, top: 1, width: 31, height: 23 },
+		] as const)('Crop of $format to $width x $height at $left, $top keeps the exact region', async (crop) => {
+			// FFmpeg's crop filter rounds the offsets and size down to the chroma subsampling unless asked not to
+			for (let run = 0; run < 3; run++) {
+				using sample = makeRampSample(crop.format);
+				using result = await sample.transform({ crop });
+
+				expect(result.codedWidth).toBe(crop.width);
+				expect(result.codedHeight).toBe(crop.height);
+				expect(await getMaxRampLumaError(result, crop.left, crop.top)).toBeLessThanOrEqual(2);
+			}
+		});
+
+		test('Crop of NV12 at an odd offset up to the right edge, then resized, stays smooth', async () => {
+			for (let run = 0; run < 3; run++) {
+				using sample = makeRampSample('NV12');
+				using result = await sample.transform({
+					crop: { left: 3, top: 5, width: 29, height: 19 },
+					width: 58,
+					height: 38,
+					fit: 'fill',
+				});
+
+				const data = new Uint8Array(result.allocationSize());
+				await result.copyTo(data);
+				for (let y = 1; y < 37; y++) {
+					for (let x = 1; x < 58; x++) {
+						expect(Math.abs(data[y * 58 + x]! - data[y * 58 + x - 1]!)).toBeLessThanOrEqual(4);
+					}
+				}
+			}
+		});
+
+		test('Cover of I420 at an odd offset keeps the centered region', async () => {
+			// 32x24 covering 32x18 crops 3 rows off the top and bottom
+			using sample = makeRampSample();
+			using result = await sample.transform({ width: 32, height: 18, fit: 'cover' });
+
+			expect(result.codedHeight).toBe(18);
+			expect(await getMaxRampLumaError(result, 0, 3)).toBeLessThanOrEqual(1);
+		});
+
+		test('Crop at an odd offset keeps the chroma of NV12 and 10-bit I420', async () => {
+			// FFmpeg's exact crop moves the chroma by the wrong number of bytes when a chroma sample takes two, which
+			// swaps U and V in NV12 and misaligns 10-bit samples
+			const crop = { left: 3, top: 5, width: 29, height: 19 };
+
+			using nv12 = makeRampSample('NV12', 112, 144);
+			using nv12Result = await nv12.transform({ crop });
+			const nv12Data = new Uint8Array(nv12Result.allocationSize());
+			await nv12Result.copyTo(nv12Data);
+			const nv12Chroma = nv12Data.subarray(29 * 19);
+			for (let i = 0; i < nv12Chroma.length; i += 2) {
+				expect(Math.abs(nv12Chroma[i]! - 112)).toBeLessThanOrEqual(8);
+				expect(Math.abs(nv12Chroma[i + 1]! - 144)).toBeLessThanOrEqual(8);
+			}
+
+			const words = new Uint16Array(32 * 24 * 3 / 2);
+			for (let y = 0; y < 24; y++) {
+				for (let x = 0; x < 32; x++) {
+					words[y * 32 + x] = 4 * rampLumaAt(x, y);
+				}
+			}
+			words.subarray(32 * 24, 32 * 24 + 16 * 12).fill(448);
+			words.subarray(32 * 24 + 16 * 12).fill(576);
+			using i420P10 = new VideoSample(new Uint8Array(words.buffer), {
+				format: 'I420P10',
+				codedWidth: 32,
+				codedHeight: 24,
+				timestamp: 0,
+			});
+			using i420P10Result = await i420P10.transform({ crop });
+			const i420P10Data = new Uint16Array(i420P10Result.allocationSize() / 2);
+			await i420P10Result.copyTo(i420P10Data);
+
+			const lumaErrors = [...i420P10Data.subarray(0, 29 * 19)]
+				.map((value, i) => Math.abs(value - 4 * rampLumaAt(i % 29 + crop.left, Math.floor(i / 29) + crop.top)));
+			expect(Math.max(...lumaErrors)).toBeLessThanOrEqual(16);
+
+			const chroma = i420P10Data.subarray(29 * 19);
+			const u = chroma.subarray(0, chroma.length / 2);
+			const v = chroma.subarray(chroma.length / 2);
+			expect(Math.max(...u.map(value => Math.abs(value - 448)))).toBeLessThanOrEqual(32);
+			expect(Math.max(...v.map(value => Math.abs(value - 576)))).toBeLessThanOrEqual(32);
+		});
+
+		test.each(['AVFrame', 'buffer'])('Closing a %s-backed sample while it is transformed', async (backing) => {
+			// Like in the browser, where the transform reads the sample before returning
+			let sample: VideoSample;
+			if (backing === 'AVFrame') {
+				const frame = new NodeAv.Frame();
+				frame.alloc();
+				frame.format = NodeAv.AV_PIX_FMT_YUV420P;
+				frame.width = 16;
+				frame.height = 16;
+				frame.sampleAspectRatio = new NodeAv.Rational(1, 1);
+				NodeAv.FFmpegError.throwIfError(frame.fromBuffer(Buffer.alloc(16 * 16 * 3 / 2, 100)), 'fromBuffer');
+				sample = new VideoSample(new AvFrameVideoSampleResource(frame), { timestamp: 0 });
+			} else {
+				sample = new VideoSample(new Uint8Array(16 * 16 * 3 / 2).fill(100), {
+					format: 'I420',
+					codedWidth: 16,
+					codedHeight: 16,
+					timestamp: 0,
+				});
+			}
+
+			const transformed = sample.transform({ width: 8 });
+			sample.close();
+
+			using result = await transformed;
+			expect(result.codedWidth).toBe(8);
+			await result.copyTo(new Uint8Array(result.allocationSize()));
+		});
+
 		test('VideoSample transformation via Conversion API', async () => {
 			using input = new Input({
 				source: new FilePathSource('./test/public/video.mp4'),
@@ -1783,7 +3630,52 @@ describe('Video', async () => {
 			});
 			await conversion.execute();
 		});
+
+		test('Transform leaves AVFrame-backed source intact', async () => {
+			using input = new Input({
+				source: new FilePathSource('./test/public/video.mp4'),
+				formats: ALL_FORMATS,
+			});
+			const track = await input.getPrimaryVideoTrack();
+			assert(track);
+
+			using sample = await new VideoSampleSink(track).getSample(0);
+			assert(sample);
+			expect(sample._data).toBeInstanceOf(AvFrameVideoSampleResource);
+
+			using first = await sample.transform({ width: 320 });
+			using second = await sample.transform({ width: 160 });
+			expect(first.codedWidth).toBe(320);
+			expect(second.codedWidth).toBe(160);
+
+			const buffer = new Uint8Array(sample.allocationSize());
+			await sample.copyTo(buffer);
+			expect(sample.codedWidth).toBe(1920);
+		});
 	});
+});
+
+test('Hardware detection runs with FFmpeg logging silenced', async () => {
+	// Probing logs an FFmpeg error for every hardware API that isn't there, which would reach stderr whatever
+	// Mediabunny's log level. A fresh module instance, so the hardware context hasn't been detected and cached yet.
+	vi.resetModules();
+	const { getHardwareContext } = await import('../../packages/server/src/misc.js');
+
+	const levelBefore = NodeAv.Log.getLevel();
+	const levelsDuringDetection: number[] = [];
+	const spy = vi.spyOn(NodeAv.HardwareContext, 'auto').mockImplementation(() => {
+		levelsDuringDetection.push(NodeAv.Log.getLevel());
+		return null;
+	});
+
+	try {
+		getHardwareContext();
+	} finally {
+		spy.mockRestore();
+	}
+
+	expect(levelsDuringDetection).toEqual([NodeAv.AV_LOG_QUIET]);
+	expect(NodeAv.Log.getLevel()).toBe(levelBefore);
 });
 
 describe('Audio', async () => {
@@ -1799,6 +3691,62 @@ describe('Audio', async () => {
 		ac3: 256,
 		eac3: 256,
 	};
+
+	test('Decoding a packet that holds several frames', async () => {
+		using input = new Input({
+			source: new FilePathSource('./test/public/eac3.mp4'),
+			formats: ALL_FORMATS,
+		});
+
+		const audioTrack = await input.getPrimaryAudioTrack();
+		assert(audioTrack);
+
+		// Like FFmpeg's E-AC-3 MP4 samples at high bitrates, which hold several syncframes each
+		const sink = new EncodedPacketSink(audioTrack);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of sink.packets()) {
+			packets.push(packet);
+			if (packets.length === 3) {
+				break;
+			}
+		}
+
+		const combinedData = new Uint8Array(packets.reduce((sum, packet) => sum + packet.data.byteLength, 0));
+		let offset = 0;
+		for (const packet of packets) {
+			combinedData.set(packet.data, offset);
+			offset += packet.data.byteLength;
+		}
+		const combined = new EncodedPacket(
+			combinedData,
+			'key',
+			packets[0]!.timestamp,
+			packets.reduce((sum, packet) => sum + packet.duration, 0),
+		);
+
+		const decoder = new NodeAvAudioDecoder();
+		// @ts-expect-error Readonly
+		decoder.codec = await audioTrack.getCodec();
+		// @ts-expect-error Readonly
+		decoder.config = await audioTrack.getDecoderConfig();
+
+		const timestamps: number[] = [];
+		// @ts-expect-error Readonly
+		decoder.onSample = (sample: AudioSample) => {
+			timestamps.push(sample.timestamp);
+			sample.close();
+		};
+
+		await decoder.init();
+		await decoder.decode(combined);
+		await decoder.flush();
+		await decoder.close();
+
+		expect(timestamps).toHaveLength(3);
+		for (let i = 0; i < 3; i++) {
+			expect(timestamps[i]).toBeCloseTo(packets[i]!.timestamp, 6);
+		}
+	});
 
 	test('Decoder lifecycle', async () => {
 		using input = new Input({
@@ -1883,10 +3831,16 @@ describe('Audio', async () => {
 		} satisfies AudioEncoderConfig;
 
 		let packetCount = 0;
+		let lastPacket: EncodedPacket | null = null;
 
 		// @ts-expect-error Readonly
 		encoder.onPacket = (packet: EncodedPacket, meta: EncodedAudioChunkMetadata) => {
-			expect(packet.duration).toBe(1024 / 48000);
+			if (lastPacket) {
+				// Every packet but the last holds a full frame
+				expect(lastPacket.duration).toBe(1024 / 48000);
+			}
+			lastPacket = packet;
+
 			expect(packet.type).toBe('key');
 
 			if (packetCount === 0) {
@@ -1918,8 +3872,10 @@ describe('Audio', async () => {
 
 		const minPacketCount = 2 * 48000 / 1024;
 		expect(packetCount).toBeGreaterThan(minPacketCount);
+		expect(lastPacket!.timestamp + lastPacket!.duration).toBeCloseTo(2, 10);
 
 		packetCount = 0;
+		lastPacket = null;
 
 		using sample2 = new AudioSample({
 			data,
@@ -1933,8 +3889,48 @@ describe('Audio', async () => {
 		await encoder.flush();
 
 		expect(packetCount).toBeGreaterThan(minPacketCount);
+		expect(lastPacket!.timestamp + lastPacket!.duration).toBeCloseTo(2, 10);
 
 		await encoder.close();
+	});
+
+	test('AAC encoding of samples that hold NaN or infinite values', async () => {
+		const encoder = new NodeAvAudioEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = 'aac';
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: buildAudioCodecString('aac', 2, 48000),
+			numberOfChannels: 2,
+			sampleRate: 48000,
+			bitrate: 128000,
+		} satisfies AudioEncoderConfig;
+
+		let packetCount = 0;
+		// @ts-expect-error Readonly
+		encoder.onPacket = () => {
+			packetCount++;
+		};
+
+		await encoder.init();
+
+		const data = createF32SineWave(48000, 2, 1);
+		data[1000] = NaN; // Like a glitch in a float WAV file or an unstable audio effect
+		data[30000] = Infinity;
+		data[30001] = -Infinity;
+		using sample = new AudioSample({
+			data,
+			format: 'f32',
+			timestamp: 0,
+			numberOfChannels: 2,
+			sampleRate: 48000,
+		});
+
+		await encoder.encode(sample);
+		await encoder.flush();
+		await encoder.close();
+
+		expect(packetCount).toBe(Math.ceil(48000 / 1024) + 1);
 	});
 
 	const createF32SineWave = (sampleRate: number, channels: number, durationSeconds: number) => {
@@ -1955,9 +3951,12 @@ describe('Audio', async () => {
 		await encodeDecodeTest('aac', {
 			// @ts-expect-error Fucky type
 			aac: { format: 'aac' },
-		}, async (packet, meta, i) => {
+		}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(1024 / 48000);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(1024 / 48000);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -1977,9 +3976,12 @@ describe('Audio', async () => {
 		await encodeDecodeTest('aac', {
 			// @ts-expect-error Fucky type
 			aac: { format: 'adts' },
-		}, async (packet, meta, i) => {
+		}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(1024 / 48000);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(1024 / 48000);
+			}
 			expect(packet.data[0]).toBe(0xff);
 
 			if (i === 0) {
@@ -1994,6 +3996,41 @@ describe('Audio', async () => {
 			expect(sample.numberOfChannels).toBe(2);
 			expect(sample.sampleRate).toBe(48000);
 		});
+	});
+
+	test.each([
+		[22050, 2],
+		[16000, 1],
+		[24000, 6],
+		[48000, 2],
+	])('AAC codec string at %i Hz, %i channel(s), matches the encoder\'s output', async (sampleRate, channels) => {
+		let decoderConfig: AudioDecoderConfig | undefined;
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({
+			codec: 'aac',
+			quality: new Quality('medium'),
+			onEncodedPacket: (_, meta) => {
+				decoderConfig ??= meta?.decoderConfig;
+			},
+		});
+		output.addAudioTrack(source);
+		await output.start();
+
+		using sample = new AudioSample({
+			data: new Float32Array(sampleRate * channels / 2),
+			format: 'f32',
+			numberOfChannels: channels,
+			sampleRate,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		await output.finalize();
+
+		// FFmpeg's encoder makes AAC-LC (object type 2) at every rate, so no HE-AAC codec string ('mp4a.40.5' or
+		// 'mp4a.40.29') at low ones. The object type is the first 5 bits of the AudioSpecificConfig.
+		const description = toUint8Array(decoderConfig!.description!);
+		expect(description[0]! >> 3).toBe(2);
+		expect(decoderConfig!.codec).toBe('mp4a.40.2');
 	});
 
 	test('Opus encode & decode', async () => {
@@ -2023,6 +4060,285 @@ describe('Audio', async () => {
 				expect(sample.duration).toBe(0.02);
 			}
 		});
+	});
+
+	test.each(['constant', 'variable'] as const)('Opus with bitrateMode \'%s\'', async (bitrateMode) => {
+		const sizes: number[] = [];
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({
+			codec: 'opus',
+			quality: new Quality({ bitrate: 128_000, bitrateMode }),
+			onEncodedPacket: (packet) => {
+				sizes.push(packet.byteLength);
+			},
+		});
+		output.addAudioTrack(source);
+		await output.start();
+
+		// One second of silence, then one second of noise, at 48 kHz stereo
+		const data = new Float32Array(2 * 96000);
+		let seed = 1;
+		for (let i = 96000; i < data.length; i++) {
+			seed = (seed * 1103515245 + 12345) % 2147483648;
+			data[i] = seed / 2147483648 - 0.5;
+		}
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		if (bitrateMode === 'constant') {
+			// Every 20 ms packet gets 128 kbit/s * 20 ms = 320 bytes, like with WebCodecs encoders
+			expect(new Set(sizes)).toEqual(new Set([320]));
+		} else {
+			// Control: the silence takes far less than the noise
+			expect(Math.min(...sizes)).toBeLessThan(Math.max(...sizes) / 10);
+		}
+	});
+
+	test.each([3, 4, 5, 6, 7, 8])('Opus keeps the order of %i channels', async (numberOfChannels) => {
+		const frequencies = [300, 500, 700, 900, 1100, 1300, 1500, 1700];
+
+		// Goertzel: the power of one frequency in the signal
+		const power = (samples: Float32Array, frequency: number) => {
+			const k = 2 * Math.cos(2 * Math.PI * frequency / 48000);
+			let s1 = 0;
+			let s2 = 0;
+			for (const value of samples) {
+				const s = value + k * s1 - s2;
+				s2 = s1;
+				s1 = s;
+			}
+			return s1 * s1 + s2 * s2 - k * s1 * s2;
+		};
+
+		// A distinct tone per channel
+		const data = new Float32Array(48000 * numberOfChannels);
+		for (let c = 0; c < numberOfChannels; c++) {
+			for (let i = 0; i < 48000; i++) {
+				data[c * 48000 + i] = 0.3 * Math.sin(2 * Math.PI * frequencies[c]! * i / 48000);
+			}
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('very-high') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({
+			data,
+			format: 'f32-planar',
+			numberOfChannels,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		using decoded = (await new AudioSampleSink((await input.getPrimaryAudioTrack())!).getSample(0.5))!;
+
+		// The loudest tone of each decoded channel
+		const order: number[] = [];
+		for (let c = 0; c < numberOfChannels; c++) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: c, format: 'f32-planar' });
+			const powers = frequencies.map(frequency => power(channel, frequency));
+			order.push(powers.indexOf(Math.max(...powers)));
+		}
+
+		// Channel 3 of 6 to 8 is the LFE, which Opus low-passes, so it's left out
+		const hasLfe = numberOfChannels >= 6;
+		const expected = [...Array(numberOfChannels).keys()].filter(c => !hasLfe || c !== 3);
+		expect(order.filter((_, c) => !hasLfe || c !== 3)).toEqual(expected);
+	});
+
+	test.each([44100, 22050, 96000])('Opus encoding of %i Hz audio', async (sampleRate) => {
+		// Like WebCodecs encoders, rates libopus doesn't take are resampled to 48 kHz
+		expect(await canEncodeAudio('opus', { sampleRate, numberOfChannels: 2 })).toBe(true);
+
+		// One second of stereo silence with a 10 ms tone burst at 0.25 s
+		const data = new Float32Array(2 * sampleRate);
+		const burstStart = Math.round(0.25 * sampleRate);
+		for (let i = burstStart; i < burstStart + Math.round(0.01 * sampleRate); i++) {
+			data[2 * i] = data[2 * i + 1] = 0.8 * Math.sin(2 * Math.PI * 1000 * (i - burstStart) / sampleRate);
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getSampleRate()).toBe(48000);
+
+		// The burst is still at 0.25 s
+		let burstTimestamp: number | null = null;
+		for await (using decoded of new AudioSampleSink(track).samples()) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
+			const index = channel.findIndex(value => Math.abs(value) > 0.2);
+			if (index !== -1) {
+				burstTimestamp ??= decoded.timestamp + index / decoded.sampleRate;
+			}
+		}
+		expect(burstTimestamp).toBeCloseTo(0.25, 3);
+	});
+
+	test.each([
+		['opus', ['s16', 'f32']],
+		['opus', ['f32-planar', 's16', 'f32']],
+		['flac', ['s16', 'f32-planar', 's16']],
+	] as const)('%s encoding takes samples whose format changes (%j)', async (codec, formats) => {
+		// Like WebCodecs encoders, only the sample rate and channel count have to stay the same from one sample to the
+		// next. 0.1 s of a quarter-scale stereo sine per format, all of whose values are exact in 16 bits.
+		const frames = 4800;
+		const values = Int16Array.from(
+			{ length: frames * formats.length },
+			(_, i) => Math.round(8192 * Math.sin(i / 20)),
+		);
+
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec, quality: new Quality('high') });
+		output.addAudioTrack(source);
+		await output.start();
+
+		for (let i = 0; i < formats.length; i++) {
+			const format = formats[i]!;
+			const chunk = [...values.subarray(i * frames, (i + 1) * frames)];
+			let data: Int16Array | Float32Array;
+			if (format === 's16') {
+				data = new Int16Array(chunk.flatMap(value => [value, value]));
+			} else if (format === 'f32') {
+				data = new Float32Array(chunk.flatMap(value => [value / 32768, value / 32768]));
+			} else {
+				data = new Float32Array([...chunk, ...chunk].map(value => value / 32768));
+			}
+
+			using sample = new AudioSample({
+				data,
+				format,
+				numberOfChannels: 2,
+				sampleRate: 48000,
+				timestamp: i * 0.1,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		if (codec === 'flac') {
+			// Lossless, so every sample comes back (followed by the padding of the last block)
+			const decoded: number[] = [];
+			for await (using sample of new AudioSampleSink(track).samples()) {
+				const channel = new Int16Array(sample.numberOfFrames);
+				sample.copyTo(channel, { planeIndex: 0, format: 's16-planar' });
+				decoded.push(...channel);
+			}
+			expect(decoded.slice(0, values.length)).toEqual([...values]);
+		} else {
+			expect(await track.computeDuration()).toBeCloseTo(0.1 * formats.length, 2);
+		}
+	});
+
+	test.each([
+		[44100, 1024],
+		[22050, 960],
+		[44100, 4410],
+	])('Opus encoding of %i Hz audio fed in %i-frame samples keeps its timing', async (sampleRate, chunkFrames) => {
+		// 10 s of stereo silence with a 1 ms tone burst at every second, fed in samples of the given size (1024 is an
+		// AAC decoder's), which the encoder resamples to 48 kHz
+		const duration = 10;
+		const data = new Float32Array(2 * duration * sampleRate);
+		for (let second = 0; second < duration; second++) {
+			const start = second * sampleRate;
+			for (let i = 0; i < Math.round(0.001 * sampleRate); i++) {
+				data[2 * (start + i)] = data[2 * (start + i) + 1] = 0.8 * Math.sin(2 * Math.PI * 1000 * i / sampleRate);
+			}
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('medium') });
+		output.addAudioTrack(source);
+		await output.start();
+		for (let start = 0; start < duration * sampleRate; start += chunkFrames) {
+			const frames = Math.min(chunkFrames, duration * sampleRate - start);
+			using sample = new AudioSample({
+				data: data.subarray(2 * start, 2 * (start + frames)),
+				format: 'f32',
+				numberOfChannels: 2,
+				sampleRate,
+				timestamp: start / sampleRate,
+			});
+			await source.add(sample);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		// Each burst is still at its second, and the audio still ends where the input does (give or take a frame)
+		const burstTimestamps: number[] = [];
+		let wasLoud = false;
+		let end = 0;
+		for await (using decoded of new AudioSampleSink(track).samples()) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
+			for (let i = 0; i < channel.length; i++) {
+				const isLoud = Math.abs(channel[i]!) > 0.2;
+				const timestamp = decoded.timestamp + i / decoded.sampleRate;
+				if (isLoud && !wasLoud && (burstTimestamps.length === 0 || timestamp > last(burstTimestamps)! + 0.5)) {
+					burstTimestamps.push(timestamp);
+				}
+				wasLoud = isLoud;
+			}
+			end = decoded.timestamp + decoded.duration;
+		}
+
+		expect(burstTimestamps).toHaveLength(duration);
+		for (let second = 0; second < duration; second++) {
+			expect(Math.abs(burstTimestamps[second]! - second)).toBeLessThan(0.002);
+		}
+		expect(end).toBeGreaterThan(duration - 0.001);
+		expect(end).toBeLessThan(duration + 0.03);
+	});
+
+	test.each([44100, 22050, 96000])('Opus encoding of %i Hz audio keeps its last samples', async (sampleRate) => {
+		// 1 s and 37 samples of stereo silence ending in a 5 ms tone that peaks on the last sample. The resampler
+		// holds back the input's last samples for its filter, and they must still come out at the end.
+		const frameCount = sampleRate + 37;
+		const data = new Float32Array(2 * frameCount);
+		for (let i = frameCount - Math.round(0.005 * sampleRate); i < frameCount; i++) {
+			data[2 * i] = data[2 * i + 1] = 0.8 * Math.cos(2 * Math.PI * 1000 * (frameCount - 1 - i) / sampleRate);
+		}
+
+		const output = new Output({ format: new OggOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'opus', quality: new Quality('high') });
+		output.addAudioTrack(source);
+		await output.start();
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		let lastLoudTimestamp = -1;
+		for await (using decoded of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+			const channel = new Float32Array(decoded.numberOfFrames);
+			decoded.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
+			for (let i = 0; i < channel.length; i++) {
+				if (Math.abs(channel[i]!) > 0.2) {
+					lastLoudTimestamp = decoded.timestamp + i / decoded.sampleRate;
+				}
+			}
+		}
+
+		// The tone lasts until the input's end, give or take a few samples
+		expect(lastLoudTimestamp).toBeGreaterThan(frameCount / sampleRate - 0.0001);
+		expect(lastLoudTimestamp).toBeLessThan(frameCount / sampleRate + 0.0005);
 	});
 
 	test('MP3 encode & decode', async () => {
@@ -2065,10 +4381,68 @@ describe('Audio', async () => {
 		});
 	});
 
+	test('Vorbis encodes at bitrates outside libvorbis\'s range for the sample rate and channel count', async () => {
+		// Encodes 2 s of tones and returns the nominal bitrate in the identification header libvorbis wrote
+		const nominalBitrate = async (sampleRate: number, numberOfChannels: number, bitrate: number) => {
+			const encoder = new NodeAvAudioEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = 'vorbis';
+			// @ts-expect-error Readonly
+			encoder.config = { codec: 'vorbis', sampleRate, numberOfChannels, bitrate } satisfies AudioEncoderConfig;
+
+			let description: Uint8Array | null = null;
+			let duration = 0;
+			// @ts-expect-error Readonly
+			encoder.onPacket = (packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) => {
+				description ??= meta?.decoderConfig?.description ? toUint8Array(meta.decoderConfig.description) : null;
+				duration += packet.duration;
+			};
+
+			await encoder.init();
+			const frameCount = 2 * sampleRate;
+			const data = new Float32Array(frameCount * numberOfChannels);
+			for (let channel = 0; channel < numberOfChannels; channel++) {
+				for (let i = 0; i < frameCount; i++) {
+					const frequency = 220 + 110 * channel;
+					data[channel * frameCount + i] = 0.3 * Math.sin(2 * Math.PI * frequency * i / sampleRate);
+				}
+			}
+			using sample = new AudioSample({ data, format: 'f32-planar', sampleRate, numberOfChannels, timestamp: 0 });
+			await encoder.encode(sample);
+			await encoder.flush();
+			await encoder.close();
+			expect(duration).toBeCloseTo(2, 1);
+
+			// The identification header starts with 0x01 "vorbis"; its nominal bitrate is at byte 20
+			assert(description);
+			const headers: Uint8Array = description;
+			const start = headers.findIndex((byte, i) => {
+				return byte === 1 && headers[i + 1] === 0x76 && headers[i + 2] === 0x6f; // 0x01 "vo"
+			});
+			return new DataView(headers.buffer, headers.byteOffset, headers.byteLength).getInt32(start + 20, true);
+		};
+
+		// The quality presets' bitrates for these formats, which libvorbis's bitrate management doesn't take as is:
+		// it takes about 45–500 kbps for 44.1 kHz stereo, up to 240 kbps for 44.1 kHz mono, 84 kbps and up for 48 kHz
+		// 5.1 and up to 42 kbps for 8 kHz mono. They're moved to (within 1 kbps of) the nearest bitrate it takes.
+		expect(await nominalBitrate(44100, 2, 19_400)).toBeGreaterThan(44_000); // Very low
+		expect(await nominalBitrate(44100, 2, 36_400)).toBeGreaterThan(44_000); // Low
+		expect(await nominalBitrate(44100, 1, 247_000)).toBeLessThanOrEqual(240_000); // Very high
+		expect(await nominalBitrate(48000, 6, 69_000)).toBeGreaterThan(69_000); // Medium
+		expect(await nominalBitrate(8000, 1, 64_000)).toBeLessThan(45_000); // Medium
+
+		// Bitrates it takes stay as they are
+		expect(await nominalBitrate(44100, 2, 128_000)).toBe(128_000);
+		expect(await nominalBitrate(8000, 1, 24_000)).toBe(24_000);
+	});
+
 	test('FLAC encode & decode', async () => {
-		await encodeDecodeTest('flac', {}, async (packet, meta, i) => {
+		await encodeDecodeTest('flac', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(0.096);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(0.096);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2081,17 +4455,72 @@ describe('Audio', async () => {
 					0x66, 0x4c, 0x61, 0x43,
 				]);
 			}
-		}, async (sample) => {
+		}, async (sample, i, n) => {
 			expect(sample.numberOfChannels).toBe(2);
 			expect(sample.sampleRate).toBe(48000);
-			expect(sample.duration).toBe(0.096);
+
+			if (i < n - 1) {
+				expect(sample.duration).toBe(0.096);
+			}
 		});
 	});
 
+	// Encodes `values` (one channel) to FLAC and returns its bit depth and the decoded values, as s32
+	const flacRoundTrip = async (data: Int16Array | Int32Array | Float32Array, sampleFormat?: 's32') => {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'flac', transform: { sampleFormat } });
+		output.addAudioTrack(source);
+		await output.start();
+
+		const format = data instanceof Int16Array ? 's16' : data instanceof Int32Array ? 's32' : 'f32';
+		using sample = new AudioSample({ data, format, numberOfChannels: 1, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		// The STREAMINFO block (after 'fLaC' and its 4-byte header) holds the bits per sample minus 1 in 5 bits
+		const streamInfo = toUint8Array((await track.getDecoderConfig())!.description!).subarray(8);
+		const bitsPerSample = (((streamInfo[12]! & 0x01) << 4) | (streamInfo[13]! >> 4)) + 1;
+
+		const decoded: number[] = [];
+		for await (using decodedSample of new AudioSampleSink(track).samples()) {
+			const values = new Int32Array(decodedSample.numberOfFrames);
+			decodedSample.copyTo(values, { planeIndex: 0, format: 's32' });
+			decoded.push(...values);
+		}
+
+		// Only the input's length: the encoder may pad the last block
+		return { bitsPerSample, decoded: decoded.slice(0, data.length) };
+	};
+
+	test('FLAC encoding keeps 24-bit input lossless', async () => {
+		// 24-bit values in a 32-bit container
+		const values = Int32Array.from({ length: 4800 }, (_, i) => (Math.round(Math.sin(i / 7) * 3e6) + (i % 5)) * 256);
+
+		const fromS32 = await flacRoundTrip(values);
+		expect(fromS32.bitsPerSample).toBe(24);
+		expect(fromS32.decoded).toEqual([...values]);
+
+		// transform.sampleFormat controls the bit depth
+		const fromF32 = await flacRoundTrip(Float32Array.from(values, x => x / 2 ** 31), 's32');
+		expect(fromF32.bitsPerSample).toBe(24);
+		expect(fromF32.decoded).toEqual([...values]);
+
+		// 16-bit input stays 16-bit
+		const values16 = Int16Array.from({ length: 4800 }, (_, i) => Math.round(Math.sin(i / 7) * 12000) + (i % 5));
+		const fromS16 = await flacRoundTrip(values16);
+		expect(fromS16.bitsPerSample).toBe(16);
+		expect(fromS16.decoded).toEqual(Array.from(values16, x => x * 65536));
+	});
+
 	test('AC-3 encode & decode', async () => {
-		await encodeDecodeTest('ac3', {}, async (packet, meta, i) => {
+		await encodeDecodeTest('ac3', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(0.032);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(0.032);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2108,9 +4537,12 @@ describe('Audio', async () => {
 	});
 
 	test('E-AC-3 encode & decode', async () => {
-		await encodeDecodeTest('eac3', {}, async (packet, meta, i) => {
+		await encodeDecodeTest('eac3', {}, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBe(0.032);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBe(0.032);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2126,10 +4558,82 @@ describe('Audio', async () => {
 		});
 	});
 
+	test('Opus, AC-3 and E-AC-3 encode at bitrates outside their encoders\' range', async () => {
+		// Hard content to fit: loud white noise, and full-scale square waves (one frequency per channel)
+		const signals = {
+			noise: (channel: number, i: number) => {
+				return (Math.sin(i * 12.9898 + channel * 78.233) * 43758.5453 % 1) * 0.8;
+			},
+			square: (channel: number, i: number, sampleRate: number) => {
+				return Math.sin(2 * Math.PI * (1000 + 137 * channel) * i / sampleRate) >= 0 ? 1 : -1;
+			},
+		};
+
+		// Encodes 1 s and returns the average bitrate of the packets but the last, whose duration can be cut to the
+		// samples it holds
+		const encodedBitrate = async (
+			codec: AudioCodec,
+			sampleRate: number,
+			numberOfChannels: number,
+			bitrate: number,
+			signal: keyof typeof signals = 'noise',
+		) => {
+			const encoder = new NodeAvAudioEncoder();
+			// @ts-expect-error Readonly
+			encoder.codec = codec;
+			// @ts-expect-error Readonly
+			encoder.config = { codec, sampleRate, numberOfChannels, bitrate } satisfies AudioEncoderConfig;
+
+			const packets: EncodedPacket[] = [];
+			// @ts-expect-error Readonly
+			encoder.onPacket = (packet: EncodedPacket) => {
+				packets.push(packet);
+			};
+
+			await encoder.init();
+			const data = new Float32Array(sampleRate * numberOfChannels);
+			for (let channel = 0; channel < numberOfChannels; channel++) {
+				for (let i = 0; i < sampleRate; i++) {
+					data[channel * sampleRate + i] = signals[signal](channel, i, sampleRate);
+				}
+			}
+			using sample = new AudioSample({ data, format: 'f32-planar', sampleRate, numberOfChannels, timestamp: 0 });
+			await encoder.encode(sample);
+			await encoder.flush();
+			await encoder.close();
+
+			const measured = packets.slice(0, -1);
+			const duration = measured.reduce((sum, packet) => sum + packet.duration, 0);
+			expect(duration).toBeGreaterThan(0.9);
+			return measured.reduce((sum, packet) => sum + packet.byteLength, 0) * 8 / duration;
+		};
+
+		// libopus takes 500 bps to 256 kbps per channel
+		expect(await encodedBitrate('opus', 48000, 1, 320_000)).toBeLessThan(270_000);
+		expect(await encodedBitrate('opus', 48000, 2, 1_000_000)).toBeLessThan(530_000);
+		expect(await encodedBitrate('opus', 48000, 1, 400)).toBeGreaterThan(0);
+		// The AC-3 and E-AC-3 encoders fail the bit allocation of such content below some bitrate
+		expect(await encodedBitrate('ac3', 48000, 6, 32_000)).toBeGreaterThan(32_000);
+		expect(await encodedBitrate('ac3', 48000, 6, 64_000, 'square')).toBeGreaterThan(64_000);
+		expect(await encodedBitrate('ac3', 48000, 2, 32_000, 'square')).toBeGreaterThan(32_000);
+		expect(await encodedBitrate('ac3', 32000, 4, 32_000, 'square')).toBeGreaterThan(32_000);
+		expect(await encodedBitrate('eac3', 48000, 2, 16_000)).toBeGreaterThan(16_000);
+		expect(await encodedBitrate('eac3', 48000, 6, 56_000, 'square')).toBeGreaterThan(56_000);
+		expect(await encodedBitrate('eac3', 44100, 4, 8_000, 'square')).toBeGreaterThan(8_000);
+
+		// Bitrates in the range stay as they are. Lower sample rates need less.
+		expect(await encodedBitrate('opus', 48000, 2, 128_000)).toBeLessThan(140_000);
+		expect(await encodedBitrate('ac3', 48000, 2, 192_000)).toBeCloseTo(192_000, -3);
+		expect(await encodedBitrate('ac3', 32000, 2, 32_000, 'square')).toBeCloseTo(32_000, -3);
+	});
+
 	test('DTS encode & decode', async () => {
-		await encodeDecodeTest('dts', { bitrate: DTS_BITRATE }, async (packet, meta, i) => {
+		await encodeDecodeTest('dts', { bitrate: DTS_BITRATE }, async (packet, meta, i, n) => {
 			expect(packet.type).toBe('key');
-			expect(packet.duration).toBeCloseTo(512 / 48000);
+
+			if (i < n - 1) {
+				expect(packet.duration).toBeCloseTo(512 / 48000);
+			}
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
@@ -2163,6 +4667,90 @@ describe('Audio', async () => {
 			expect(sample.sampleRate).toBe(48000);
 			expect(sample.duration).toBeCloseTo(40 / 48000);
 		});
+	});
+
+	test.each([
+		'aac', 'opus', 'mp3', 'vorbis', 'flac', 'ac3', 'eac3', 'dts', 'truehd',
+	] as AudioCodec[])('%s encoding ends where the input ends', async (codec) => {
+		const sampleRate = 48000;
+		const frameCount = 48485; // Not a whole number of frames for any of these codecs
+
+		const encoder = new NodeAvAudioEncoder();
+		// @ts-expect-error Readonly
+		encoder.codec = codec;
+		// @ts-expect-error Readonly
+		encoder.config = {
+			codec: buildAudioCodecString(codec, 2, sampleRate),
+			numberOfChannels: 2,
+			sampleRate,
+			bitrate: codec === 'dts' ? DTS_BITRATE : 128000,
+		} satisfies AudioEncoderConfig;
+
+		const packets: EncodedPacket[] = [];
+		// @ts-expect-error Readonly
+		encoder.onPacket = (packet: EncodedPacket) => {
+			packets.push(packet);
+		};
+
+		await encoder.init();
+
+		using sample = new AudioSample({
+			data: createF32SineWave(sampleRate, 2, 2).subarray(0, 2 * frameCount),
+			format: 'f32',
+			timestamp: 0,
+			numberOfChannels: 2,
+			sampleRate,
+		});
+		await encoder.encode(sample);
+		await encoder.flush();
+		await encoder.close();
+
+		// The silence that fills up the last frame isn't part of the audio
+		const lastPacket = last(packets)!;
+		expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(frameCount / sampleRate, 10);
+	});
+
+	test('FLAC encoding is lossless', async () => {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(source);
+		await output.start();
+
+		// 10000 frames isn't a multiple of the encoder's 4608-frame block size
+		const data = Int16Array.from({ length: 10000 }, (_, i) => Math.round(8000 * Math.sin(i / 7)));
+		using sample = new AudioSample({ data, format: 's16', numberOfChannels: 1, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		const decoded: number[] = [];
+		for await (using decodedSample of new AudioSampleSink(track).samples()) {
+			const values = new Int16Array(decodedSample.numberOfFrames);
+			decodedSample.copyTo(values, { planeIndex: 0, format: 's16' });
+			decoded.push(...values);
+		}
+
+		expect(await input.computeDuration()).toBe(10000 / 48000);
+		expect(decoded).toEqual([...data]);
+	});
+
+	test.each([1, 15, 16])('FLAC encoding of %i samples has a valid maximum block size', async (frameCount) => {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new AudioSampleSource({ codec: 'flac' });
+		output.addAudioTrack(source);
+		await output.start();
+
+		const data = new Float32Array(2 * frameCount).fill(0.5);
+		using sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate: 48000, timestamp: 0 });
+		await source.add(sample);
+		await output.finalize();
+
+		// STREAMINFO follows 'fLaC' and its block header. Blocks of fewer than 16 samples aren't allowed (RFC 9639,
+		// section 8.2), and FFmpeg rejects a stream whose maximum block size is below that.
+		const bytes = new Uint8Array(output.target.buffer!);
+		const maximumBlockSize = (bytes[10]! << 8) | bytes[11]!;
+		expect(maximumBlockSize).toBeGreaterThanOrEqual(16);
 	});
 
 	for (const codec of NON_PCM_AUDIO_CODECS) {
@@ -2255,6 +4843,9 @@ describe('Audio', async () => {
 		await encoder.encode(inputSample);
 
 		await encoder.flush();
+
+		// Any silence filling up the last frame isn't part of the audio
+		expect(last(packets)!.timestamp + last(packets)!.duration).toBeCloseTo(startTimestamp + 2, 6);
 
 		for (let i = 0; i < packets.length; i++) {
 			await onPacket(packets[i]!, metas[i]!, i, packets.length);
@@ -2353,36 +4944,84 @@ describe('Audio', async () => {
 		return score;
 	};
 
-	test('AAC conversion roundtrip', async () => {
+	test('AAC conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('aac');
 	});
 
-	test('Opus conversion roundtrip', async () => {
+	test('Opus conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('opus');
 	});
 
-	test('MP3 conversion roundtrip', async () => {
+	test('MP3 conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('mp3');
 	});
 
-	test('Vorbis conversion roundtrip', async () => {
+	test('Vorbis conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('vorbis');
 	});
 
-	test('FLAC conversion roundtrip', async () => {
+	test('FLAC conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('flac');
 	});
 
-	test('AC-3 conversion roundtrip', async () => {
+	test('AC-3 conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('ac3');
 	});
 
-	test('E-AC-3 conversion roundtrip', async () => {
+	test('E-AC-3 conversion roundtrip', { timeout: 10_000 }, async () => {
 		await conversionRoundtrip('eac3');
 	});
 
-	test('TrueHD conversion roundtrip', async () => {
+	// About 1 s alone, but it once took over 5 s on a loaded CI runner
+	test('TrueHD conversion roundtrip', { timeout: 20_000 }, async () => {
 		await conversionRoundtrip('truehd');
+	});
+
+	test('7.1 AAC can\'t be written to ADTS or MPEG-TS', async () => {
+		// FFmpeg's encoder signals 7.1 with channel configuration 12, which doesn't fit the 3-bit field of ADTS
+		// headers. It used to be cut to 4, so the headers said 4.0 while the data held 8 channels, and the files didn't
+		// decode.
+		expect(NodeAvAudioEncoder.supports('aac', {
+			codec: 'mp4a.40.2',
+			numberOfChannels: 8,
+			sampleRate: 48000,
+			// @ts-expect-error Fucky type
+			aac: { format: 'adts' },
+		})).toBe(false);
+		expect(NodeAvAudioEncoder.supports('aac', { codec: 'mp4a.40.2', numberOfChannels: 8, sampleRate: 48000 }))
+			.toBe(true);
+
+		const encode = async (format: AdtsOutputFormat | MpegTsOutputFormat, numberOfChannels: number) => {
+			const output = new Output({ format, target: new BufferTarget() });
+			const source = new AudioSampleSource({ codec: 'aac', bitrate: 512e3 });
+			output.addAudioTrack(source);
+			await output.start();
+
+			// 1 s of a different tone on each channel
+			const data = new Float32Array(numberOfChannels * 48000);
+			for (let i = 0; i < data.length; i++) {
+				const frequency = 300 + 150 * (i % numberOfChannels);
+				data[i] = 0.2 * Math.sin(2 * Math.PI * frequency * Math.floor(i / numberOfChannels) / 48000);
+			}
+			using sample = new AudioSample({ data, format: 'f32', numberOfChannels, sampleRate: 48000, timestamp: 0 });
+			await source.add(sample);
+			await output.finalize();
+
+			return output.target.buffer!;
+		};
+
+		for (const createFormat of [() => new AdtsOutputFormat(), () => new MpegTsOutputFormat()]) {
+			await expect(encode(createFormat(), 8)).rejects.toThrow('channel configuration 12');
+
+			// 5.1 still works
+			using input = new Input({
+				source: new BufferSource(await encode(createFormat(), 6)),
+				formats: ALL_FORMATS,
+			});
+			const track = await input.getPrimaryAudioTrack();
+			assert(track);
+			expect(await track.getNumberOfChannels()).toBe(6);
+		}
 	});
 
 	const conversionRoundtrip = async (codec: AudioCodec) => {
@@ -2438,6 +5077,16 @@ describe('Audio', async () => {
 		expect(sampleCount).toBeGreaterThan(0);
 	};
 
+	test('Vorbis is not claimed past eight channels', () => {
+		// Encoding would succeed, but with every channel past the eighth silent
+		expect(NodeAvAudioEncoder.supports('vorbis', {
+			codec: 'vorbis',
+			numberOfChannels: 10,
+			sampleRate: 48000,
+			bitrate: 640000,
+		})).toBe(false);
+	});
+
 	test('Custom AudioSample resource', async () => {
 		using input = new Input({
 			source: new FilePathSource('./test/public/trim-buck-bunny-ffmpeg.ts'),
@@ -2472,6 +5121,37 @@ describe('Audio', async () => {
 		sample.copyTo(buf, { planeIndex: 5 });
 		sample.copyTo(buf, { format: 'f32', planeIndex: 0 });
 	});
+
+	test('AvFrameAudioSampleResource with more than 8 planar channels', () => {
+		const frame = createPlanarAudioFrame(10, 64);
+		const planes = frame.extendedData;
+		assert(planes);
+		planes.forEach((plane, i) => plane.fill(i));
+
+		using sample = new AudioSample(new AvFrameAudioSampleResource(frame));
+		const lastPlane = new Uint8Array(sample.allocationSize({ planeIndex: 9 }));
+		sample.copyTo(lastPlane, { planeIndex: 9 });
+
+		expect([...new Set(lastPlane)]).toEqual([9]);
+	});
+
+	const createPlanarAudioFrame = (numberOfChannels: number, numberOfFrames: number) => {
+		const frame = new NodeAv.Frame();
+		frame.alloc();
+		frame.format = NodeAv.AV_SAMPLE_FMT_FLTP;
+		frame.nbSamples = numberOfFrames;
+		frame.sampleRate = 44100;
+		frame.channelLayout = {
+			nbChannels: numberOfChannels,
+			order: NodeAv.AV_CHANNEL_ORDER_UNSPEC,
+			mask: 0n,
+		};
+
+		const ret = frame.allocBuffer();
+		NodeAv.FFmpegError.throwIfError(ret, 'allocBuffer');
+
+		return frame;
+	};
 
 	test('toAvFrame with f32 AudioSample', async () => {
 		const sampleRate = 48000;
@@ -2540,5 +5220,42 @@ describe('Audio', async () => {
 		const u8 = toUint8Array(frame.data[0]!);
 		const plane = new Float32Array(u8.buffer, u8.byteOffset, largeData.length);
 		expect(plane[plane.length - 1]).toBe(0.25);
+	});
+
+	test('toAvFrame with more than 8 planar channels', async () => {
+		const numberOfChannels = 10;
+		const planeSize = 64 * Float32Array.BYTES_PER_ELEMENT;
+		const data = new Uint8Array(numberOfChannels * planeSize);
+		for (let i = 0; i < numberOfChannels; i++) {
+			data.fill(i, i * planeSize, (i + 1) * planeSize);
+		}
+
+		using sample = new AudioSample({
+			data,
+			format: 'f32-planar',
+			numberOfChannels,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+
+		using frame = new NodeAv.Frame();
+		frame.alloc();
+		await toAvFrame(sample, frame);
+
+		const planes = frame.extendedData;
+		assert(planes);
+		expect(planes.map(plane => [...new Set(plane)])).toEqual([[0], [1], [2], [3], [4], [5], [6], [7], [8], [9]]);
+	});
+});
+
+describe('Packaging', () => {
+	// The bundles are built by `npm run pre-test`
+	test('Bundles load @mediabunny/prores instead of inlining a copy of it', () => {
+		for (const file of ['mediabunny-server.cjs', 'mediabunny-server.mjs']) {
+			const code = fs.readFileSync(`./packages/server/dist/bundles/${file}`, 'utf8');
+			expect(code).toMatch(/(require\(|from )"@mediabunny\/prores"/);
+			// turbores only has an "import" export, so a require() of it throws ERR_PACKAGE_PATH_NOT_EXPORTED
+			expect(code).not.toContain('turbores');
+		}
 	});
 });

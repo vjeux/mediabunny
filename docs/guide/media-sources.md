@@ -44,6 +44,8 @@ while (notDone) {
 }
 ```
 
+Misuse that `add` can detect right away, such as invalid arguments or adding data after the output has been finalized or canceled, throws synchronously instead of rejecting the returned promise.
+
 ### Video encoding config
 
 All video sources that handle encoding internally require you to specify a `VideoEncodingConfig`, specifying the codec configuration to use:
@@ -81,6 +83,7 @@ type VideoEncodingConfig = {
 	onEncoderConfig?: (
 		config: VideoEncoderConfig
 	) => unknown;
+	onEncodedSample?: (sample: VideoSample) => unknown;
 };
 ```
 - `codec`: The [video codec](./supported-formats-and-codecs#video-codecs) used for encoding.
@@ -89,7 +92,7 @@ type VideoEncodingConfig = {
 	- `'discard'` (default): Only the samples' color data is kept; the video is opaque.
 	- `'keep'`: The samples' alpha data is also encoded as side data. Make sure to pair this mode with a container format that supports transparency (such as WebM or Matroska).
 - `latencyMode`: The latency mode as specified by the WebCodecs API. Browsers default to `quality`. Media stream-driven video sources will automatically use the `realtime` setting.
-- `keyFrameInterval`: The maximum interval in seconds between two adjacent key frames. Defaults to 2 seconds. More frequent key frames improve seeking behavior but increase file size. When using multiple video tracks, this value should be set to the same value for all tracks.
+- `keyFrameInterval`: The interval in seconds at which key frames are placed: the first frame at or after each multiple of it is encoded as a key frame, so adjacent key frames can be up to one frame further apart than this interval. Defaults to 2 seconds. More frequent key frames improve seeking behavior but increase file size. When using multiple video tracks, this value should be set to the same value for all tracks.
 - `fullCodecString`: Allows you to optionally specify the full codec string used by the video encoder, as specified in the [Mediabunny Codec Registry](/codec-registry/overview). For example, you may set it to `'avc1.42001f'` when using AVC. Keep in mind that the codec string must still match the codec specified in `codec`. If you don't set this field, a codec string will be generated automatically.
 - `hardwareAcceleration`: A hint that configures the hardware acceleration method of this codec. This is best left on `'no-preference'`.
 - `scalabilityMode`: An encoding scalability mode identifier as defined by [WebRTC-SVC](https://w3c.github.io/webrtc-svc/#scalabilitymodes*).
@@ -98,7 +101,7 @@ type VideoEncodingConfig = {
 - `transform`: Optional transformations to apply to the video frames before they are passed to the encoder.
 	- `width`: The width in pixels to resize the frames to. If `height` is not set, it will be deduced automatically based on aspect ratio.
 	- `height`: The height in pixels to resize the frames to. If `width` is not set, it will be deduced automatically based on aspect ratio.
-	- `fit`: The fitting algorithm in case both `width` and `height` are set. To avoid ambiguity, this field must not be set when `sizeChangeBehavior` is `'fill'`, `'contain'` or `'deny'`, since `sizeChangeBehavior` already determines the fitting algorithm.
+	- `fit`: The fitting algorithm in case both `width` and `height` are set. Required in that case, unless `sizeChangeBehavior` is `'fill'`, `'contain'` or `'cover'`, which already determines the fitting algorithm; then, `fit` can be omitted and, if set, must match it.
 		- `'fill'` will stretch the image to fill the entire box, potentially altering aspect ratio.
 		- `'contain'` will contain the entire image within the box while preserving aspect ratio. This may lead to letterboxing.
 		- `'cover'` will scale the image until the entire box is filled, while preserving aspect ratio.
@@ -106,10 +109,11 @@ type VideoEncodingConfig = {
 	- `flip`: Whether to flip the frames horizontally (about the vertical axis), in addition to each frame's own flip. The flip is applied after rotation but before cropping and resizing.
 	- `crop`: Specifies the rectangular region of the frames to crop to. The crop region will automatically be clamped to the dimensions of the frame. Cropping is performed after rotation and flip but before resizing.
 	- `frameRate`: The frame rate in hertz to normalize the video frame stream to.
-	- `process`: Allows for custom user-defined processing of video frames, e.g. for applying overlays, color transformations, or timestamp modifications. Will be called for each video frame after transformations and frame rate corrections. Must return a `VideoSample` or a `CanvasImageSource`, an array of them, or `null` for dropping the frame. When non-timestamped data is returned, the timestamp and duration from the input sample will be used.
+	- `process`: Allows for custom user-defined processing of video frames, e.g. for applying overlays, color transformations, or timestamp modifications. Will be called for each video frame after transformations and frame rate corrections, one frame at a time and in order: the next frame waits until the returned promise settles. So don't wait for an `add()` on the same source inside it, as that add waits for it in turn. Finalizing the output also waits for the calls of the frames added before it, so a promise that never settles keeps it from finishing until the output is canceled. Must return a `VideoSample` or a `CanvasImageSource`, an array of them, or `null` for dropping the frame. When non-timestamped data is returned, the timestamp and duration from the input sample will be used.
 	- `force`: Forces every video frame through the transformation step even if no transformation properties are defined. This can be used, for example, to bake rotation and flip into the encoded video frames.
 - `onEncodedPacket`: Called for each successfully encoded packet. Useful for determining encoding progress.
 - `onEncoderConfig`: Called when the internal encoder config, as used by the WebCodecs API, is created. You can use this to introspect the full codec string.
+- `onEncodedSample`: Called right before a video sample is passed to the encoder.
 
 ### Audio encoding config
 
@@ -135,17 +139,19 @@ type AudioEncodingConfig = {
 	onEncoderConfig?: (
 		config: AudioEncoderConfig
 	) => unknown;
+	onEncodedSample?: (sample: AudioSample) => unknown;
 };
 ```
-- `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding. Can be omitted for uncompressed PCM codecs.
-- `quality`: The desired quality of the encoded audio; unused for PCM codecs. See [Encoding quality](#encoding-quality).
+- `codec`: The [audio codec](./supported-formats-and-codecs#audio-codecs) used for encoding.
+- `quality`: The desired quality of the encoded audio. Required for compressed codecs other than FLAC and TrueHD; can be omitted for those and for PCM codecs, for which it is unused. See [Encoding quality](#encoding-quality).
 - `fullCodecString`: Allows you to optionally specify the full codec string used by the audio encoder, as specified in the [Mediabunny Codec Registry](/codec-registry/overview). For example, you may set it to `'mp4a.40.2'` when using AAC. Keep in mind that the codec string must still match the codec specified in `codec`. If you don't set this field, a codec string will be generated automatically.
 - `transform`: Optional transformations to apply to the audio samples before they are passed to the encoder.
 	- `numberOfChannels`: The desired number of output channels to up/downmix to.
 	- `sampleRate`: The desired output sample rate in hertz to resample to.
-	- `process`: Allows for custom user-defined processing of audio samples, e.g. for applying audio effects or timestamp modifications. Called for each audio sample after resampling and remixing. Must return an `AudioSample`, an array of them, or `null` for dropping the sample.
+	- `process`: Allows for custom user-defined processing of audio samples, e.g. for applying audio effects or timestamp modifications. Called for each audio sample after resampling and remixing. For a `MediaStreamAudioTrackSource`, it's called one sample at a time and in order, and finalizing the output waits for the calls of the samples captured before it, so a promise that never settles keeps it from finishing until the output is canceled. Must return an `AudioSample`, an array of them, or `null` for dropping the sample.
 - `onEncodedPacket`: Called for each successfully encoded packet. Useful for determining encoding progress.	
 - `onEncoderConfig`: Called when the internal encoder config, as used by the WebCodecs API, is created. You can use this to introspect the full codec string.
+- `onEncodedSample`: Called right before an audio sample is passed to the encoder.
 
 ### Encoding quality
 
@@ -153,7 +159,7 @@ Mediabunny provides the [`Quality`](../api/Quality) class as a way to describe t
 
 #### Qualitative quality
 
-Qualitative qualities are defined abstractly will automatically map to an underlying bitrate or quantizer based on codec and media parameters (such as video dimensions).
+Qualitative qualities are defined abstractly will automatically map to an underlying bitrate or quantizer based on codec and media parameters (such as video dimensions and, above 30 fps, frame rate).
 
 ```ts
 import { Quality } from 'mediabunny';
@@ -259,11 +265,15 @@ const videoTrack = stream.getVideoTracks()[0];
 const videoTrackSource = new MediaStreamVideoTrackSource(videoTrack, {
 	codec: 'vp9',
 	quality: new Quality({ bitrate: 1e7 }),
+	// A shared tab or window changes size when the user resizes it
+	sizeChangeBehavior: 'contain',
 });
 
 // Make sure to allow any internal errors to properly bubble up
 videoTrackSource.errorPromise.catch((error) => ...);
 ```
+
+A shared tab or window changes its frame size whenever it's resized during the recording. By default (`sizeChangeBehavior: 'deny'`), the first such change is an error that stops the capture; with `'contain'`, later frames are fitted into the first frame's size instead. See [Video encoding config](#video-encoding-config) for the other options.
 
 This source requires no additional method calls; data will automatically be captured and piped to the output file as soon as `start()` is called on the `Output`. Make sure to `stop()` on `videoTrack` after finalizing the `Output` if you don't need the user's media anymore.
 
@@ -301,6 +311,8 @@ await packetSource.add(packet2);
 
 > [!IMPORTANT]
 > You must add the packets in decode order.
+
+The output keeps a reference to each packet's `data` until it has written the packet, which can be long after `add` resolved; it doesn't copy it. So don't modify or reuse a packet's buffer after adding it: if your encoder hands out views into memory it overwrites (a reused buffer, or a WebAssembly heap), copy the data first, for example with `data.slice()`.
 
 You will need to provide additional metadata alongside your first call to `add` to give the `Output` more information about the shape and form of the video data. This metadata must be in the form of the WebCodecs API's `EncodedVideoChunkMetadata`. It might look like this:
 ```ts
@@ -464,6 +476,8 @@ const packetSource = new EncodedAudioPacketSource('aac');
 
 await packetSource.add(packet);
 ```
+
+As with video, don't modify or reuse a packet's buffer after adding it; see [`EncodedVideoPacketSource`](#encodedvideopacketsource).
 
 You will need to provide additional metadata alongside your first call to `add` to give the `Output` more information about the shape and form of the audio data. This metadata must be in the form of the WebCodecs API's `EncodedAudioChunkMetadata`. It might look like this:
 ```ts

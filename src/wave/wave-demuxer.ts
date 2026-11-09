@@ -11,8 +11,20 @@ import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { PacketRetrievalOptions } from '../media-sink';
-import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
-import { assert, isThenable, UNDETERMINED_LANGUAGE } from '../misc';
+import {
+	DEFAULT_TRACK_DISPOSITION,
+	MetadataTags,
+	unwatchMetadataTagFields,
+	watchMetadataTagFields,
+} from '../metadata';
+import {
+	assert,
+	isThenable,
+	roundIfAlmostInteger,
+	UNDETERMINED_LANGUAGE,
+	createUtcDate,
+	floorToMultiple,
+} from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16, readU32, readU64 } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
@@ -25,23 +37,52 @@ export enum WaveFormat {
 	EXTENSIBLE = 0xFFFE,
 }
 
+// The sub-format GUIDs that hold a WAVE format tag in their first field, by their remaining 12 bytes (in the binary
+// layout): the KSDATAFORMAT_SUBTYPE_* GUIDs, the Ambisonic B-format ones, and those of a known broken writer. Same as
+// FFmpeg's (riffdec.c).
+const FORMAT_TAG_SUB_FORMAT_BASES = [
+	[0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+	[0x21, 0x07, 0xd3, 0x11, 0x86, 0x44, 0xc8, 0xc1, 0xca, 0x00, 0x00, 0x00],
+	[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa],
+];
+
+/** Formats a GUID given in its binary layout (first three fields little-endian). */
+const formatGuid = (bytes: Uint8Array) => {
+	const hex = (start: number, end: number, littleEndian: boolean) => {
+		const part = [...bytes.subarray(start, end)];
+		return (littleEndian ? part.reverse() : part).map(byte => byte.toString(16).padStart(2, '0')).join('');
+	};
+
+	return `{${hex(0, 4, true)}-${hex(4, 6, true)}-${hex(6, 8, true)}-${hex(8, 10, false)}-${hex(10, 16, false)}}`;
+};
+
 export class WaveDemuxer extends Demuxer {
 	reader: Reader;
 
 	metadataPromise: Promise<void> | null = null;
+	/** Where the chunk walk stopped at the data chunk, as the chunks after it couldn't be read yet */
+	chunksAfterData: { pos: number; end: number | null; littleEndian: boolean } | null = null;
+	chunksAfterDataPromise: Promise<void> | null = null;
 	dataStart = -1;
 	dataSize = -1;
+	dataSizeCapped = false;
 	audioInfo: {
 		format: number;
 		numberOfChannels: number;
 		sampleRate: number;
 		sampleSizeInBytes: number;
 		blockSizeInBytes: number;
+		littleEndian: boolean;
 	} | null = null;
 
+	/** Keys of the raw metadata tags read from RIFF INFO chunks; the others come from an ID3v2 chunk */
+	infoRawMetadataTagKeys = new Set<string>();
 	trackBackings: WaveAudioTrackBacking[] = [];
-	lastKnownPacketIndex = 0;
 	metadataTags: MetadataTags = {};
+	/** Rethrown by getMetadataTags(), so that a broken tag can't make the audio unreadable */
+	id3Error: Error | null = null;
+	metadataChunks: WaveMetadataChunk[] = [];
+	metadataChunksPromise: Promise<void> | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -51,7 +92,31 @@ export class WaveDemuxer extends Demuxer {
 
 	async readMetadata() {
 		return this.metadataPromise ??= (async () => {
-			let slice = this.reader.requestSlice(0, 12);
+			// Some taggers put ID3v2 tags in front of the RIFF header, where they don't belong. Like FFmpeg, read past
+			// them, and take their tags after the ones inside the RIFF structure.
+			let riffStart = 0;
+			const prependedId3Tags: { pos: number; size: number }[] = [];
+
+			while (true) {
+				let slice = this.reader.requestSlice(riffStart, ID3_V2_HEADER_SIZE);
+				if (isThenable(slice)) {
+					slice = await slice;
+				}
+				if (!slice) {
+					break;
+				}
+
+				const id3V2Header = readId3V2Header(slice);
+				if (!id3V2Header) {
+					break;
+				}
+
+				const size = ID3_V2_HEADER_SIZE + id3V2Header.size;
+				prependedId3Tags.push({ pos: riffStart, size });
+				riffStart += size;
+			}
+
+			let slice = this.reader.requestSlice(riffStart, 12);
 			if (isThenable(slice)) slice = await slice;
 			assert(slice);
 
@@ -62,9 +127,15 @@ export class WaveDemuxer extends Demuxer {
 
 			const outerChunkSize = readU32(slice, littleEndian);
 
+			// Sizes that don't fit into 32 bits are left at 0xFFFFFFFF by FFmpeg (as are all sizes it can't seek back
+			// to, like when writing to a pipe). Like FFmpeg, we take such a data chunk to extend to the end of the
+			// file. Chunks are still only looked for within the stated RIFF size.
+			const isUnknownSize = (size: number) => size === 0xffffffff && this.reader.fileSize !== null;
+			const riffSizeIsUnknown = !isRf64 && isUnknownSize(outerChunkSize);
+
 			let totalFileSize = isRf64
 				? this.reader.fileSize
-				: Math.min(outerChunkSize + 8, this.reader.fileSize ?? Infinity);
+				: Math.min(riffStart + outerChunkSize + 8, this.reader.fileSize ?? Infinity);
 			const format = readAscii(slice, 4);
 
 			if (format !== 'WAVE') {
@@ -74,6 +145,9 @@ export class WaveDemuxer extends Demuxer {
 			let chunksRead = 0;
 			let dataChunkSize: number | null = null;
 			let currentPos = slice.filePos;
+			// The sizes of chunks other than "data" that don't fit into 32 bits, from the table in the "ds64" chunk, by
+			// chunk ID in the order they come in
+			const largeChunkSizes = new Map<string, number[]>();
 
 			while (totalFileSize === null || currentPos < totalFileSize) {
 				let slice = this.reader.requestSlice(currentPos, 8);
@@ -81,23 +155,52 @@ export class WaveDemuxer extends Demuxer {
 				if (!slice) break;
 
 				const chunkId = readAscii(slice, 4);
-				const chunkSize = readU32(slice, littleEndian);
+				let chunkSize = readU32(slice, littleEndian);
 				const startPos = slice.filePos;
 
 				if (isRf64 && chunksRead === 0 && chunkId !== 'ds64') {
 					throw new Error('Invalid RF64 file: First chunk must be "ds64".');
 				}
 
+				if (this.dataStart !== -1 && !/^[\x20-\x7e]{4}$/.test(chunkId)) {
+					// Chunk IDs are four printable ASCII characters, so after the audio this isn't a chunk header but
+					// zeros or garbage, as at the end of a damaged file. Walking it 8 bytes at a time could take
+					// forever, so the chunks end here. (Before the data chunk, zeros between chunks are walked like
+					// FFmpeg does.)
+					break;
+				}
+
+				if (isRf64 && chunkSize === 0xffffffff && chunkId !== 'data') {
+					// The chunk's real size is in the "ds64" chunk's table (EBU Tech 3306, Annex A.2)
+					chunkSize = largeChunkSizes.get(chunkId)?.shift() ?? chunkSize;
+				}
+
 				if (chunkId === 'fmt ') {
-					await this.parseFmtChunk(startPos, chunkSize, littleEndian);
+					// Only the first format chunk counts, like in FFmpeg and when reading a stream, which stops at the
+					// data chunk
+					if (!this.audioInfo) {
+						await this.parseFmtChunk(startPos, chunkSize, littleEndian);
+					}
 				} else if (chunkId === 'data') {
+					if (!isRf64 && isUnknownSize(chunkSize)) {
+						chunkSize = this.reader.fileSize! - startPos;
+					}
+
 					dataChunkSize ??= chunkSize;
 
 					this.dataStart = slice.filePos;
-					this.dataSize = Math.max(Math.min(dataChunkSize, (totalFileSize ?? Infinity) - this.dataStart), 0);
+					const dataEnd = riffSizeIsUnknown ? this.reader.fileSize : totalFileSize;
+					this.dataSize = Math.max(Math.min(dataChunkSize, (dataEnd ?? Infinity) - this.dataStart), 0);
 
-					if (this.reader.fileSize === null) {
-						break; // Stop once we hit the data chunk
+					if (this.reader.randomAccessFileSize === null) {
+						// Stop once we hit the data chunk; the chunks after it are looked at once they can be read
+						// (see getMetadataTags)
+						this.chunksAfterData = {
+							pos: startPos + chunkSize + (chunkSize & 1),
+							end: totalFileSize,
+							littleEndian,
+						};
+						break;
 					}
 				} else if (chunkId === 'ds64') {
 					// File and data chunk sizes are defined in here instead
@@ -113,15 +216,48 @@ export class WaveDemuxer extends Demuxer {
 					const riffChunkSize = readU64(ds64Slice, littleEndian);
 					dataChunkSize = readU64(ds64Slice, littleEndian);
 
-					totalFileSize = Math.min(riffChunkSize + 8, this.reader.fileSize ?? Infinity);
-				} else if (chunkId === 'LIST') {
-					await this.parseListChunk(startPos, chunkSize, littleEndian);
-				} else if (chunkId === 'ID3 ' || chunkId === 'id3 ') {
-					await this.parseId3Chunk(startPos, chunkSize);
+					if (chunkSize >= 28) {
+						ds64Slice.skip(8); // Sample count
+						const tableLength = readU32(ds64Slice, littleEndian);
+
+						// Only the entries that the chunk actually holds
+						const entryCount = Math.min(tableLength, Math.floor((chunkSize - 28) / 12));
+						for (let i = 0; i < entryCount; i++) {
+							const id = readAscii(ds64Slice, 4);
+							const size = readU64(ds64Slice, littleEndian);
+
+							const sizes = largeChunkSizes.get(id) ?? [];
+							sizes.push(size);
+							largeChunkSizes.set(id, sizes);
+						}
+					}
+
+					totalFileSize = Math.min(riffStart + riffChunkSize + 8, this.reader.fileSize ?? Infinity);
+				} else if (chunkId === 'LIST' || chunkId === 'ID3 ' || chunkId === 'id3 ') {
+					const metadataChunk = { id: chunkId, pos: startPos, size: chunkSize, littleEndian };
+
+					if (this.reader.randomAccessFileSize === null) {
+						// Sources of unknown size, like a ReadableStreamSource, are read in order and may not keep
+						// what's behind, so their metadata chunks are read right away
+						await this.parseMetadataChunk(metadataChunk);
+					} else {
+						// Metadata chunks can hold large pictures and only the metadata tags need them, so they're read
+						// later (see getMetadataTags), not to get the track
+						this.metadataChunks.push(metadataChunk);
+					}
 				}
 
 				currentPos = startPos + chunkSize + (chunkSize & 1); // Handle padding
 				chunksRead++;
+			}
+
+			for (const tag of prependedId3Tags) {
+				const metadataChunk = { id: 'ID3 ', pos: tag.pos, size: tag.size, littleEndian };
+				if (this.reader.randomAccessFileSize === null) {
+					await this.parseMetadataChunk(metadataChunk);
+				} else {
+					this.metadataChunks.push(metadataChunk);
+				}
 			}
 
 			if (!this.audioInfo) {
@@ -133,6 +269,7 @@ export class WaveDemuxer extends Demuxer {
 
 			const blockSize = this.audioInfo.blockSizeInBytes;
 			this.dataSize = Math.floor(this.dataSize / blockSize) * blockSize;
+			this.maybeCapDataSize();
 
 			this.trackBackings.push(new WaveAudioTrackBacking(this));
 		})();
@@ -150,7 +287,7 @@ export class WaveDemuxer extends Demuxer {
 		let formatTag = readU16(slice, littleEndian);
 		const numChannels = readU16(slice, littleEndian);
 		const sampleRate = readU32(slice, littleEndian);
-		slice.skip(4); // Bytes per second
+		const bytesPerSecond = readU32(slice, littleEndian);
 		const blockAlign = readU16(slice, littleEndian);
 
 		if (numChannels === 0 || sampleRate === 0 || blockAlign === 0) {
@@ -176,8 +313,22 @@ export class WaveDemuxer extends Demuxer {
 				slice.skip(2 + 4);
 				const subFormat = readBytes(slice, 16);
 
-				// Get actual format from subFormat GUID
-				formatTag = subFormat[0]! | (subFormat[1]! << 8);
+				// Get the actual format tag from the sub-format GUID. Other GUIDs denote other (vendor) formats, whose
+				// data mustn't be taken for PCM just because their first bytes happen to look like its tag.
+				const holdsFormatTag = FORMAT_TAG_SUB_FORMAT_BASES.some(
+					base => base.every((byte, i) => subFormat[4 + i] === byte),
+				);
+				if (!holdsFormatTag) {
+					throw new Error(
+						`Unsupported WAVE codec (sub-format GUID ${formatGuid(subFormat)}). Only integer/float PCM,`
+						+ ` A-law, and μ-law are supported.`,
+					);
+				}
+
+				// The whole first field, like FFmpeg: a GUID whose first field merely ends in a known tag isn't that
+				// format either
+				formatTag = (subFormat[0]! | (subFormat[1]! << 8) | (subFormat[2]! << 16) | (subFormat[3]! << 24))
+					>>> 0;
 			}
 		}
 
@@ -207,13 +358,32 @@ export class WaveDemuxer extends Demuxer {
 			);
 		}
 
+		const sampleSizeInBytes = Math.ceil(bitsPerSample / 8);
+
+		// Some writers get the block align wrong, so the frames' size goes by the bit depth (like FFmpeg computes the
+		// duration). A larger block align is only believed when the byte rate agrees with it, as for 24-bit samples
+		// in 4-byte containers (written by Adobe Audition, say).
+		const minBlockSize = numChannels * sampleSizeInBytes;
+		const blockSizeInBytes = blockAlign >= minBlockSize && bytesPerSecond === sampleRate * blockAlign
+			? blockAlign
+			: minBlockSize;
+
 		this.audioInfo = {
 			format: formatTag,
 			numberOfChannels: numChannels,
 			sampleRate,
-			sampleSizeInBytes: Math.ceil(bitsPerSample / 8),
-			blockSizeInBytes: blockAlign,
+			sampleSizeInBytes,
+			blockSizeInBytes,
+			littleEndian,
 		};
+	}
+
+	private async parseMetadataChunk(chunk: WaveMetadataChunk) {
+		if (chunk.id === 'LIST') {
+			await this.parseListChunk(chunk.pos, chunk.size, chunk.littleEndian);
+		} else {
+			await this.parseId3Chunk(chunk.pos, chunk.size);
+		}
 	}
 
 	private async parseListChunk(startPos: number, size: number, littleEndian: boolean) {
@@ -229,11 +399,25 @@ export class WaveDemuxer extends Demuxer {
 		}
 
 		let currentPos = slice.filePos;
+		let skippedPadByte = false;
 		while (currentPos <= startPos + size - 8) {
 			slice.filePos = currentPos;
 
-			const chunkName = readAscii(slice, 4);
-			const chunkSize = readU32(slice, littleEndian);
+			let chunkName = readAscii(slice, 4);
+			let chunkSize = readU32(slice, littleEndian);
+			if (chunkSize > slice.remainingLength && skippedPadByte) {
+				// Some writers leave out the pad byte after odd-sized sub-chunks, so like FFmpeg, see if this sub-chunk
+				// starts a byte earlier
+				slice.filePos = currentPos - 1;
+				chunkName = readAscii(slice, 4);
+				chunkSize = readU32(slice, littleEndian);
+				if (!/^[\x20-\x7e]{4}$/.test(chunkName)) {
+					// No sub-chunk starts there either (their IDs are ASCII), so the list is corrupt from here on
+					break;
+				}
+
+				currentPos--;
+			}
 			if (chunkSize > slice.remainingLength) {
 				break; // The sub-chunk doesn't fit into the LIST chunk
 			}
@@ -245,8 +429,10 @@ export class WaveDemuxer extends Demuxer {
 				value += String.fromCharCode(bytes[i]!);
 			}
 
+			watchMetadataTagFields(this.metadataTags, chunkName);
 			this.metadataTags.raw ??= {};
 			this.metadataTags.raw[chunkName] = value;
+			this.infoRawMetadataTagKeys.add(chunkName);
 
 			switch (chunkName) {
 				case 'INAM':
@@ -291,8 +477,9 @@ export class WaveDemuxer extends Demuxer {
 
 				case 'YEAR': {
 					const year = Number.parseInt(value, 10);
-					if (Number.isInteger(year) && year > 0) {
-						this.metadataTags.date ??= new Date(year, 0, 1);
+					const date = createUtcDate(year);
+					if (year > 0 && !Number.isNaN(date.getTime())) {
+						this.metadataTags.date ??= date;
 					}
 				}; break;
 
@@ -307,6 +494,9 @@ export class WaveDemuxer extends Demuxer {
 					this.metadataTags.comment ??= value;
 				}; break;
 			}
+
+			unwatchMetadataTagFields(this.metadataTags);
+			skippedPadByte = (chunkSize & 1) === 1;
 
 			currentPos += 8 + chunkSize + (chunkSize & 1); // Handle padding
 		}
@@ -329,7 +519,12 @@ export class WaveDemuxer extends Demuxer {
 
 			if (id3V2Header.size > 0) {
 				const contentSlice = slice.slice(startPos + ID3_V2_HEADER_SIZE, id3V2Header.size);
-				parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+
+				try {
+					parseId3V2Tag(contentSlice, id3V2Header, this.metadataTags);
+				} catch (error) {
+					this.id3Error ??= error as Error;
+				}
 			}
 		}
 	}
@@ -343,31 +538,59 @@ export class WaveDemuxer extends Demuxer {
 		if (this.audioInfo.format === WaveFormat.ALAW) {
 			return 'alaw';
 		}
+
+		// RIFX stores the samples big-endian, just like the rest of the file
+		const littleEndian = this.audioInfo.littleEndian;
+
 		if (this.audioInfo.format === WaveFormat.PCM) {
-			// All formats are little-endian
 			if (this.audioInfo.sampleSizeInBytes === 1) {
 				return 'pcm-u8';
 			} else if (this.audioInfo.sampleSizeInBytes === 2) {
-				return 'pcm-s16';
+				return littleEndian ? 'pcm-s16' : 'pcm-s16be';
 			} else if (this.audioInfo.sampleSizeInBytes === 3) {
-				return 'pcm-s24';
+				return littleEndian ? 'pcm-s24' : 'pcm-s24be';
 			} else if (this.audioInfo.sampleSizeInBytes === 4) {
-				return 'pcm-s32';
+				return littleEndian ? 'pcm-s32' : 'pcm-s32be';
 			}
 		}
 		if (this.audioInfo.format === WaveFormat.IEEE_FLOAT) {
 			if (this.audioInfo.sampleSizeInBytes === 4) {
-				return 'pcm-f32';
+				return littleEndian ? 'pcm-f32' : 'pcm-f32be';
 			} else if (this.audioInfo.sampleSizeInBytes === 8) {
-				return 'pcm-f64';
+				return littleEndian ? 'pcm-f64' : 'pcm-f64be';
 			}
 		}
 
 		assert(false);
 	}
 
+	maybeCapDataSize() {
+		assert(this.audioInfo);
+
+		if (this.dataSizeCapped) {
+			return;
+		}
+
+		// With unsized sources, we may only get to know the file size after the init logic, so this may only happen
+		// later on
+		const fileSize = this.reader.fileSize;
+		if (fileSize !== null) {
+			this.dataSize = Math.min(
+				this.dataSize,
+				floorToMultiple(fileSize - this.dataStart, this.audioInfo.blockSizeInBytes),
+			);
+			this.dataSizeCapped = true;
+		}
+	}
+
 	async getMimeType() {
 		return 'audio/wav';
+	}
+
+	override async getId3RawMetadataTagKeys() {
+		await this.readMetadata();
+		const keys = Object.keys(this.metadataTags.raw ?? {});
+		return new Set(keys.filter(key => !this.infoRawMetadataTagKeys.has(key)));
 	}
 
 	async getTrackBackings() {
@@ -376,8 +599,60 @@ export class WaveDemuxer extends Demuxer {
 	}
 
 	async getMetadataTags() {
+		await this.readChunksAfterData();
 		await this.readMetadata();
+
+		await (this.metadataChunksPromise ??= (async () => {
+			// In file order, as the first value read for a field wins
+			for (const chunk of this.metadataChunks) {
+				await this.parseMetadataChunk(chunk);
+			}
+		})());
+
+		if (this.id3Error) {
+			throw this.id3Error;
+		}
+
 		return this.metadataTags;
+	}
+
+	/** If the chunk walk stopped at the data chunk, reads the chunks after it for the tags once they can be read */
+	async readChunksAfterData() {
+		await this.readMetadata();
+
+		if (this.chunksAfterData && this.reader.randomAccessFileSize !== null) {
+			// The chunks after the data, skipped when the file was opened, can be read by now (as once reads have
+			// nearly reached the end of a file that can only be streamed)
+			const { pos, end, littleEndian } = this.chunksAfterData;
+			this.chunksAfterData = null;
+
+			this.chunksAfterDataPromise = (async () => {
+				let currentPos = pos;
+				while (end === null || currentPos < end) {
+					let slice = this.reader.requestSlice(currentPos, 8);
+					if (isThenable(slice)) {
+						slice = await slice;
+					}
+					if (!slice) {
+						break;
+					}
+
+					const chunkId = readAscii(slice, 4);
+					const chunkSize = readU32(slice, littleEndian);
+					const startPos = slice.filePos;
+
+					if (chunkId === 'LIST') {
+						await this.parseListChunk(startPos, chunkSize, littleEndian);
+					} else if (chunkId === 'ID3 ' || chunkId === 'id3 ') {
+						await this.parseId3Chunk(startPos, chunkSize);
+					}
+
+					currentPos = startPos + chunkSize + (chunkSize & 1); // Handle padding
+				}
+			})();
+		}
+
+		await this.chunksAfterDataPromise;
 	}
 }
 
@@ -487,17 +762,19 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		assert(packetIndex >= 0);
 
 		assert(this.demuxer.audioInfo);
-		const startOffset = packetIndex * PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes;
+		const blockSize = this.demuxer.audioInfo.blockSizeInBytes;
+
+		this.demuxer.maybeCapDataSize();
+		const fileSize = this.demuxer.reader.fileSize;
+
+		const startOffset = packetIndex * PACKET_SIZE_IN_FRAMES * blockSize;
 		if (startOffset >= this.demuxer.dataSize) {
 			return null;
 		}
 
-		const sizeInBytes = Math.min(
-			PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes,
-			this.demuxer.dataSize - startOffset,
-		);
+		const sizeInBytes = Math.min(PACKET_SIZE_IN_FRAMES * blockSize, this.demuxer.dataSize - startOffset);
 
-		if (this.demuxer.reader.fileSize === null) {
+		if (fileSize === null) {
 			// If the file size is unknown, we weren't able to cap the dataSize in the init logic and we instead have to
 			// rely on the headers telling us how large the file is. But, these might be wrong, so let's check if the
 			// requested slice actually exists.
@@ -506,7 +783,9 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 			if (isThenable(slice)) slice = await slice;
 
 			if (!slice) {
-				return null;
+				// It doesn't, but the failed read has told us the file size, so let's try again with a capped dataSize
+				assert(this.demuxer.reader.fileSize !== null);
+				return this.getPacketAtIndex(packetIndex, options);
 			}
 		}
 
@@ -522,12 +801,7 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		}
 
 		const timestamp = packetIndex * PACKET_SIZE_IN_FRAMES / this.demuxer.audioInfo.sampleRate;
-		const duration = sizeInBytes / this.demuxer.audioInfo.blockSizeInBytes / this.demuxer.audioInfo.sampleRate;
-
-		this.demuxer.lastKnownPacketIndex = Math.max(
-			packetIndex,
-			this.demuxer.lastKnownPacketIndex,
-		);
+		const duration = sizeInBytes / blockSize / this.demuxer.audioInfo.sampleRate;
 
 		return new EncodedPacket(
 			data,
@@ -543,11 +817,12 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		return this.getPacketAtIndex(0, options);
 	}
 
-	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
+	async getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
 		assert(this.demuxer.audioInfo);
 
 		const packetIndex = Math.floor(Math.min(
-			timestamp * this.demuxer.audioInfo.sampleRate / PACKET_SIZE_IN_FRAMES,
+			// Rounded, since a packet's own timestamp can come out a hair below its first frame
+			roundIfAlmostInteger(timestamp * this.demuxer.audioInfo.sampleRate) / PACKET_SIZE_IN_FRAMES,
 			(this.demuxer.dataSize - 1) / (PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes),
 		));
 		if (packetIndex < 0) {
@@ -559,25 +834,9 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 			return packet;
 		}
 
-		if (packetIndex === 0) {
-			return null; // Empty data chunk
-		}
-
-		assert(this.demuxer.reader.fileSize === null);
-
-		// The file is shorter than we thought, meaning the packet we were looking for doesn't exist. So, let's find
-		// the last packet by doing a sequential scan, instead.
-		let currentPacket = await this.getPacketAtIndex(this.demuxer.lastKnownPacketIndex, options);
-		while (currentPacket) {
-			const nextPacket = await this.getNextPacket(currentPacket, options);
-			if (!nextPacket) {
-				break;
-			}
-
-			currentPacket = nextPacket;
-		}
-
-		return currentPacket;
+		// The file is shorter than we thought, meaning the packet we were looking for doesn't exist. But by now, the
+		// dataSize has been capped to the actual data, so let's try again.
+		return this.getPacket(timestamp, options);
 	}
 
 	getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions) {
@@ -595,3 +854,11 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		return this.getNextPacket(packet, options);
 	}
 }
+
+/** A LIST or ID3 chunk, which is only read for the metadata tags. */
+type WaveMetadataChunk = {
+	id: string;
+	pos: number;
+	size: number;
+	littleEndian: boolean;
+};

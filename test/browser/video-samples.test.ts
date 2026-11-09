@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
-import { VideoSample } from '../../src/sample.js';
+import { VideoSample, registerVideoSampleTransformer } from '../../src/sample.js';
 import { VideoSampleSource } from '../../src/media-source.js';
+import { copyToConvertsYuvToRgba } from './helpers/platform-probes.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -74,7 +75,48 @@ test('allocationSize', async () => {
 	}
 });
 
-test('copyTo and plane layouts', async () => {
+test('Copying into the sample\'s own pixel format, for VideoFrame- and ArrayBuffer-backed data', async () => {
+	for (const format of ['I420', 'NV12', 'I420A', 'I444', 'RGBA'] as const) {
+		const planeSize = { I420: 1.5, NV12: 1.5, I420A: 2.5, I444: 3, RGBA: 4 }[format];
+		const data = new Uint8Array(4 * 2 * planeSize).map((_, i) => (i * 37 + 11) % 256);
+		const init = { format, codedWidth: 4, codedHeight: 2, timestamp: 0 };
+		let frame: VideoFrame;
+		try {
+			frame = new VideoFrame(data, init);
+		} catch {
+			continue; // Not every browser's VideoFrame has every format (Firefox has no 4:4:4)
+		}
+		using rawSample = new VideoSample(data, init);
+		using frameSample = new VideoSample(frame);
+
+		const crop = { x: 2, y: 0, width: 2, height: 2 };
+		const optionSets: VideoFrameCopyToOptions[] = [
+			{ format },
+			{ format, colorSpace: 'srgb' },
+			{ format, rect: crop },
+			// Dictionary members may be inherited
+			Object.assign(Object.create({ rect: crop }) as VideoFrameCopyToOptions, { format }),
+			new (class {
+				format = format;
+				get rect() {
+					return crop;
+				}
+			})(),
+		];
+		for (const options of optionSets) {
+			const label = `${format} ${JSON.stringify(options)} rect ${JSON.stringify(options.rect)}`;
+			const expected = new Uint8Array(rawSample.allocationSize(options));
+			const expectedLayout = await rawSample.copyTo(expected, options);
+
+			expect(frameSample.allocationSize(options), label).toBe(expected.length);
+			const actual = new Uint8Array(expected.length);
+			expect(await frameSample.copyTo(actual, options), label).toEqual(expectedLayout);
+			expect(actual, label).toEqual(expected);
+		}
+	}
+});
+
+test('copyTo and plane layouts', async ({ skip }) => {
 	const buffer = new ArrayBuffer(1e7);
 
 	{
@@ -194,12 +236,103 @@ test('copyTo and plane layouts', async () => {
 			stride: 1280 / 2,
 		}]);
 
+		// Converted by the platform's VideoFrame.copyTo()
+		skip(
+			!await copyToConvertsYuvToRgba(),
+			'the platform\'s VideoFrame.copyTo() doesn\'t convert YUV to RGBA (native probe)',
+		);
 		const rgbLayout = await sample.copyTo(buffer, { format: 'RGBA' });
 
 		expect(rgbLayout).toEqual([{
 			offset: 0,
 			stride: 4 * 1280,
 		}]);
+	}
+});
+
+test('copyTo with odd dimensions keeps the last chroma column', async () => {
+	// Same case as WPT's webcodecs/videoFrame-odd-size.any.js: a 3-wide I420 frame has 2-wide chroma planes
+	const buf = new Uint8Array([
+		1, 2, 3, 4, 5, 6, 7, 8, 9, // Y
+		10, 11, 12, 13, // U
+		14, 15, 16, 17, // V
+	]);
+	using sample = new VideoSample(buf, { format: 'I420', codedWidth: 3, codedHeight: 3, timestamp: 0 });
+
+	expect(sample.allocationSize()).toBe(buf.byteLength);
+	const data = new Uint8Array(buf.byteLength);
+	const layout = await sample.copyTo(data);
+	expect(layout).toEqual([{ offset: 0, stride: 3 }, { offset: 9, stride: 2 }, { offset: 13, stride: 2 }]);
+	expect([...data]).toEqual([...buf]);
+
+	// Planes padded like a decoder's (e.g. the AVFrames @mediabunny/server's samples copy from) come out tightly
+	// packed, with ceil(width / 2) chroma columns. 322x242 is an even-width control.
+	const planeGeometry = { // Width divisor, height divisor, bytes per sample
+		I420: [[1, 1, 1], [2, 2, 1], [2, 2, 1]],
+		I420A: [[1, 1, 1], [2, 2, 1], [2, 2, 1], [1, 1, 1]],
+		I422: [[1, 1, 1], [2, 1, 1], [2, 1, 1]],
+		NV12: [[1, 1, 1], [2, 2, 2]],
+		I420P10: [[1, 1, 2], [2, 2, 2], [2, 2, 2]],
+	} as const;
+	for (const format of Object.keys(planeGeometry) as (keyof typeof planeGeometry)[]) {
+		for (const [width, height] of [[1, 1], [17, 15], [321, 241], [322, 242]] as const) {
+			const planes = planeGeometry[format].map(([widthDivisor, heightDivisor, sampleBytes]) => ({
+				rowBytes: Math.ceil(width / widthDivisor) * sampleBytes,
+				rows: Math.ceil(height / heightDivisor),
+			}));
+
+			let offset = 16;
+			const paddedLayout = planes.map(({ rowBytes, rows }) => {
+				const plane = { offset, stride: Math.ceil(rowBytes / 32) * 32 + 32 };
+				offset += plane.stride * rows + 16;
+				return plane;
+			});
+			const source = new Uint8Array(offset).fill(0xee);
+			const expected: number[] = [];
+			planes.forEach(({ rowBytes, rows }, i) => {
+				for (let row = 0; row < rows; row++) {
+					for (let x = 0; x < rowBytes; x++) {
+						const value = (i * 61 + row * 7 + x * 3) % 239;
+						source[paddedLayout[i]!.offset + row * paddedLayout[i]!.stride + x] = value;
+						expected.push(value);
+					}
+				}
+			});
+
+			const label = `${format} ${width}x${height}`;
+			using padded = new VideoSample(source, {
+				format, codedWidth: width, codedHeight: height, timestamp: 0, layout: paddedLayout,
+			});
+			expect(padded.allocationSize(), label).toBe(expected.length);
+			const copy = new Uint8Array(expected.length);
+			const copyLayout = await padded.copyTo(copy);
+			expect(copyLayout.map(plane => plane.stride), label).toEqual(planes.map(plane => plane.rowBytes));
+			expect([...copy], label).toEqual(expected);
+		}
+	}
+
+	// Same as what VideoFrame does with the same data, including for cropped rects
+	const cases = [
+		['I420', 5, 3], ['I422', 5, 3], ['NV12', 5, 3], ['I420', 321, 241],
+	] as const;
+	for (const [format, codedWidth, codedHeight] of cases) {
+		const init = { format, codedWidth, codedHeight, timestamp: 0 };
+		const probe = new VideoFrame(new Uint8Array(codedWidth * codedHeight * 3), init);
+		const pixels = Uint8Array.from({ length: probe.allocationSize() }, (_, i) => i % 251);
+		probe.close();
+
+		using reference = new VideoSample(new VideoFrame(pixels, init));
+		using bufferSample = new VideoSample(pixels, init);
+
+		for (const options of [{}, { rect: { x: 2, y: 0, width: 3, height: 1 } }]) {
+			const expected = new Uint8Array(reference.allocationSize(options));
+			const expectedLayout = await reference.copyTo(expected, options);
+
+			expect(bufferSample.allocationSize(options)).toBe(expected.byteLength);
+			const actual = new Uint8Array(expected.byteLength);
+			expect(await bufferSample.copyTo(actual, options)).toEqual(expectedLayout);
+			expect([...actual]).toEqual([...expected]);
+		}
 	}
 });
 
@@ -342,6 +475,126 @@ test('RGB conversion for ArrayBuffer-backed data', async () => {
 	}
 });
 
+test('RGB conversion for ArrayBuffer-backed data converts into the target color space', async () => {
+	// Not every browser's VideoFrame converts color spaces correctly here (Firefox ignores the color space of a Display
+	// P3 frame, WebKitGTK copies RGB planes verbatim). Mediabunny then copies the pixels as they are, only reordering
+	// the channels, like it always did.
+	const nativeOrange = async (primaries: string, options: VideoFrameCopyToOptions) => {
+		const frame = new VideoFrame(new Uint8Array([200, 100, 50, 255]), {
+			format: 'RGBA',
+			codedWidth: 1,
+			codedHeight: 1,
+			timestamp: 0,
+			colorSpace: {
+				primaries: primaries as VideoColorPrimaries, transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true,
+			},
+		});
+		const bytes = new Uint8Array(4);
+		await frame.copyTo(bytes, options);
+		frame.close();
+		return bytes;
+	};
+	const toDisplayP3 = await nativeOrange('bt709', { format: 'BGRA', colorSpace: 'display-p3' });
+	const toSrgb = await nativeOrange('smpte432', { format: 'RGBA', colorSpace: 'srgb' });
+	const browserConverts = toDisplayP3[2]! > toDisplayP3[0]! && toDisplayP3[0] !== 50 && toSrgb[0] !== 200;
+	const asIs = (bytes: Uint8Array, format: string) => {
+		const result = [...bytes];
+		if (format.startsWith('BGR')) {
+			for (let i = 0; i < result.length; i += 4) {
+				[result[i], result[i + 2]] = [result[i + 2]!, result[i]!];
+			}
+		}
+		return result;
+	};
+
+	const data = new Uint8Array([200, 100, 50, 255, 0, 255, 0, 255]);
+	const displayP3 = {
+		primaries: 'smpte432' as VideoColorPrimaries,
+		transfer: 'iec61966-2-1' as VideoTransferCharacteristics,
+		matrix: 'rgb' as VideoMatrixCoefficients,
+		fullRange: true,
+	};
+
+	// Same results as VideoFrame, for sRGB and Display P3 data
+	for (const colorSpace of [undefined, displayP3]) {
+		const init = { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0, colorSpace } as const;
+		using sample = new VideoSample(data, init);
+		const frame = new VideoFrame(data, init);
+		const optionSets: VideoFrameCopyToOptions[] = [
+			{ format: 'RGBA' },
+			{ format: 'BGRA', colorSpace: 'srgb' },
+			{ format: 'RGBA', colorSpace: 'display-p3' },
+			{ format: 'BGRX', colorSpace: 'display-p3' },
+		];
+		for (const options of optionSets) {
+			const actual = new Uint8Array(8);
+			await sample.copyTo(actual, options);
+			if (browserConverts) {
+				const expected = new Uint8Array(8);
+				await frame.copyTo(expected, options);
+				expect([...actual], JSON.stringify({ colorSpace, options })).toEqual([...expected]);
+			} else {
+				expect([...actual], JSON.stringify({ colorSpace, options })).toEqual(asIs(data, options.format!));
+			}
+		}
+		frame.close();
+	}
+
+	if (!browserConverts) {
+		return;
+	}
+
+	// A visible rect that doesn't start at the origin: R, G, B, orange cropped to G, B
+	const pixels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 128, 0, 255]);
+	const croppedInit = { format: 'RGBA', codedWidth: 4, codedHeight: 1, timestamp: 0 } as const;
+	using cropped = new VideoSample(pixels, { ...croppedInit, visibleRect: { left: 1, top: 0, width: 2, height: 1 } });
+	const croppedFrame = new VideoFrame(pixels, { ...croppedInit, visibleRect: { x: 1, y: 0, width: 2, height: 1 } });
+	const croppedOptionSets: VideoFrameCopyToOptions[] = [
+		{ format: 'RGBA', colorSpace: 'display-p3' },
+		{ format: 'BGRA', colorSpace: 'display-p3', rect: { x: 1, y: 0, width: 1, height: 1 } },
+	];
+	for (const options of croppedOptionSets) {
+		const expected = new Uint8Array(croppedFrame.allocationSize(options));
+		await croppedFrame.copyTo(expected, options);
+		const actual = new Uint8Array(cropped.allocationSize(options));
+		await cropped.copyTo(actual, options);
+		expect([...actual], JSON.stringify(options)).toEqual([...expected]);
+	}
+	croppedFrame.close();
+
+	// E.g. sRGB orange as Display P3 (this point is only reached where the browser's VideoFrame converts, see above)
+	using srgbSample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 1, timestamp: 0 });
+	const p3Bytes = new Uint8Array(8);
+	await srgbSample.copyTo(p3Bytes, { format: 'RGBA', colorSpace: 'display-p3' });
+	[187, 105, 62].forEach((value, i) => expect(Math.abs(p3Bytes[i]! - value)).toBeLessThanOrEqual(2));
+});
+
+test('Closing a sample right after calling copyTo() still copies it, also when converting color spaces', async () => {
+	const displayP3 = {
+		primaries: 'smpte432' as VideoColorPrimaries,
+		transfer: 'iec61966-2-1' as VideoTransferCharacteristics,
+		matrix: 'rgb' as VideoMatrixCoefficients,
+		fullRange: true,
+	};
+
+	for (const colorSpace of [displayP3, undefined]) {
+		const sample = new VideoSample(new Uint8Array([200, 100, 50, 255]), {
+			format: 'RGBA',
+			codedWidth: 1,
+			codedHeight: 1,
+			timestamp: 0,
+			colorSpace,
+		});
+
+		// As with VideoFrame, the copy reads the pixels as they are when copyTo() is called
+		const bytes = new Uint8Array(4);
+		const promise = sample.copyTo(bytes, { format: 'RGBA' });
+		sample.close();
+		await expect(promise).resolves.toBeDefined();
+		expect(bytes[3]).toBe(255);
+	}
+});
+
 test('crop (rect option) for ArrayBuffer-backed data', async () => {
 	// 4x4 RGBA image where each pixel's R/G channels encode (x, y)
 	const width = 4;
@@ -420,6 +673,21 @@ test('crop (rect option) for ArrayBuffer-backed data', async () => {
 	}
 });
 
+test('ArrayBuffer-backed samples keep their own copy of the plane layout', async () => {
+	const data = Uint8Array.from({ length: 32 }, (_, i) => i);
+	const layout = [{ offset: 0, stride: 8 }];
+	using sample = new VideoSample(data, { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0, layout });
+	using clone = sample.clone();
+
+	// Reusing the layout objects for the next frame mustn't change the samples made with them, like for VideoFrame
+	layout[0]!.offset = 16;
+	for (const copy of [sample, clone]) {
+		const bytes = new Uint8Array(16);
+		await copy.copyTo(bytes);
+		expect([...bytes]).toEqual([...data.subarray(0, 16)]);
+	}
+});
+
 test('draw with flip', () => {
 	using sample = makeCoordinateSample({ flip: true });
 	const pixels = drawToPixels(sample, 4, 4);
@@ -429,6 +697,29 @@ test('draw with flip', () => {
 	expect(pixelAt(pixels, 4, 0, 3)).toEqual([3, 3]);
 });
 
+test('ArrayBuffer-backed samples reject a visible rect outside the coded size', () => {
+	const init = { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 } as const;
+	const outside = [
+		{ left: 2, top: 0, width: 2, height: 2 },
+		{ left: 0, top: 1, width: 2, height: 2 },
+		{ left: 1, top: 0, width: 2, height: 1 },
+	];
+	for (const visibleRect of outside) {
+		const { left: x, top: y, width, height } = visibleRect;
+		expect(() => new VideoFrame(new Uint8Array(16), { ...init, visibleRect: { x, y, width, height } }))
+			.toThrow(TypeError);
+		expect(() => new VideoSample(new Uint8Array(16), { ...init, visibleRect }), JSON.stringify(visibleRect))
+			.toThrow(TypeError);
+	}
+
+	// One inside the coded size is fine, and so is cloning a sample with it
+	using sample = new VideoSample(new Uint8Array(16), {
+		...init, visibleRect: { left: 1, top: 1, width: 1, height: 1 },
+	});
+	using clone = sample.clone();
+	expect(clone.visibleRect).toEqual({ left: 1, top: 1, width: 1, height: 1 });
+});
+
 test('draw with rotation then flip', () => {
 	using sample = makeCoordinateSample({ rotation: 90, flip: true });
 	const pixels = drawToPixels(sample, 4, 4);
@@ -436,6 +727,24 @@ test('draw with rotation then flip', () => {
 	expect(pixelAt(pixels, 4, 0, 0)).toEqual([0, 0]);
 	expect(pixelAt(pixels, 4, 3, 0)).toEqual([0, 3]);
 	expect(pixelAt(pixels, 4, 0, 3)).toEqual([3, 0]);
+});
+
+test('ArrayBuffer-backed samples accept the SharedArrayBuffer of shared WebAssembly memory', async () => {
+	// Without cross-origin isolation (as in this test page), SharedArrayBuffer isn't a global, but shared WebAssembly
+	// memory, e.g. the heap of a threaded WebAssembly decoder, still is one
+	const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+	const pixels = Uint8Array.from({ length: 16 }, (_, i) => i + 1);
+	new Uint8Array(memory.buffer).set(pixels);
+
+	using sample = new VideoSample(memory.buffer, { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 });
+	const bytes = new Uint8Array(16);
+	await sample.copyTo(bytes);
+	expect(bytes).toEqual(pixels);
+
+	// Merely tagging an object as a SharedArrayBuffer doesn't make it one
+	const fake = { [Symbol.toStringTag]: 'SharedArrayBuffer', byteLength: 16 };
+	expect(() => new VideoSample(fake as never, { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 }))
+		.toThrow('Invalid data type');
 });
 
 test('drawWithFit with rotation, flip and crop', () => {
@@ -454,6 +763,36 @@ test('drawWithFit with rotation, flip and crop', () => {
 	expect(pixelAt(pixels, 1, 0, 3)).toEqual([3, 3]);
 });
 
+test('transform never produces empty or infinite sizes', async () => {
+	const descriptions: string[] = [];
+	registerVideoSampleTransformer((sample, description) => {
+		if (sample.timestamp === 4242) {
+			descriptions.push(`${description.width}x${description.height}`);
+		}
+		return null;
+	});
+
+	// Extreme aspect ratios round to at least one pixel, or one multiple of roundDimensionsTo
+	using strip = new VideoSample(new Uint8Array(1000 * 4), {
+		format: 'RGBA', codedWidth: 1000, codedHeight: 1, timestamp: 4242,
+	});
+	using thin = await strip.transform({ width: 2 });
+	expect([thin.displayWidth, thin.displayHeight]).toEqual([2, 1]);
+	using rounded = await strip.transform({ width: 16, roundDimensionsTo: 4 });
+	expect([rounded.displayWidth, rounded.displayHeight]).toEqual([16, 4]);
+	expect(descriptions).toEqual(['2x1', '16x4']);
+
+	// A crop that selects nothing is rejected
+	using sample = makeCoordinateSample({});
+	const outside = { left: 10, top: 0, width: 2, height: 2 };
+	await expect(sample.transform({ crop: outside })).rejects.toThrow('lies outside the 4x4 frame');
+	await expect(sample.transform({ crop: outside, width: 2 })).rejects.toThrow('lies outside the 4x4 frame');
+	const context = new OffscreenCanvas(2, 2).getContext('2d')!;
+	expect(() => sample.drawWithFit(context, { fit: 'fill', crop: outside })).toThrow('lies outside the 4x4 frame');
+	await expect(sample.transform({ crop: { left: 0, top: 0, width: 0, height: 2 }, height: 2 }))
+		.rejects.toThrow('options.crop.width must be a positive integer');
+});
+
 test('transform with flip metadata and additional rotation', async () => {
 	using sample = makeCoordinateSample({ flip: true });
 	using result = await sample.transform({ rotate: 90 });
@@ -465,6 +804,56 @@ test('transform with flip metadata and additional rotation', async () => {
 	expect(pixelAt(pixels, 4, 3, 3)).toEqual([0, 0]);
 	expect(pixelAt(pixels, 4, 0, 3)).toEqual([0, 3]);
 	expect(pixelAt(pixels, 4, 3, 0)).toEqual([3, 0]);
+});
+
+// Firefox's VideoFrame has no rotation or flip (it bakes an image's orientation into the pixels)
+test.runIf('rotation' in VideoFrame.prototype)('VideoFrame rotation and flip become sample metadata', async () => {
+	// A JPEG with EXIF orientation 6 (how phones store portrait photos): stored as 8x4, displayed as 4x8
+	const canvas = new OffscreenCanvas(8, 4);
+	const ctx = canvas.getContext('2d')!;
+	ctx.fillStyle = 'red';
+	ctx.fillRect(0, 0, 8, 4);
+	ctx.fillStyle = 'blue';
+	ctx.fillRect(0, 0, 4, 2);
+	const jpeg = new Uint8Array(await (await canvas.convertToBlob({ type: 'image/jpeg', quality: 1 })).arrayBuffer());
+	// APP1 segment holding a big-endian TIFF with a single IFD entry: Orientation (0x0112) = 6
+	const exif = [
+		0x45, 0x78, 0x69, 0x66, 0, 0, 0x4d, 0x4d, 0, 0x2a, 0, 0, 0, 8,
+		0, 1, 1, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
+	];
+	const app1 = new Uint8Array([0xff, 0xe1, 0, exif.length + 2, ...exif]);
+	const image = new Image();
+	image.src = URL.createObjectURL(new Blob([jpeg.subarray(0, 2), app1, jpeg.subarray(2)]));
+	await image.decode();
+	URL.revokeObjectURL(image.src);
+	expect([image.naturalWidth, image.naturalHeight]).toEqual([4, 8]);
+
+	using sample = new VideoSample(image, { timestamp: 0 });
+	expect(sample.rotation).toBe(90);
+	expect(sample.flip).toBe(false);
+	expect([sample.squarePixelWidth, sample.squarePixelHeight]).toEqual([8, 4]);
+	expect([sample.displayWidth, sample.displayHeight]).toEqual([4, 8]);
+	expect(sample.pixelAspectRatio).toEqual({ num: 1, den: 1 });
+
+	// Drawing it must look like drawing the image itself, so the rotation isn't applied twice
+	const expected = new OffscreenCanvas(4, 8).getContext('2d', { willReadFrequently: true })!;
+	expected.drawImage(image, 0, 0);
+	const actual = new OffscreenCanvas(4, 8).getContext('2d', { willReadFrequently: true })!;
+	sample.draw(actual, 0, 0);
+	expect([...actual.getImageData(0, 0, 4, 8).data]).toEqual([...expected.getImageData(0, 0, 4, 8).data]);
+
+	// A frame's flip is composed with the init's rotation and flip, like the VideoFrame constructor does
+	const frame = new VideoFrame(new Uint8Array(4 * 2 * 4), {
+		format: 'RGBX', codedWidth: 4, codedHeight: 2, timestamp: 0, rotation: 90, flip: true,
+	} as VideoFrameBufferInit);
+	const flipped = new VideoSample(frame, { rotation: 90, flip: true });
+	expect([flipped.rotation, flipped.flip]).toEqual([0, false]);
+	expect([flipped.displayWidth, flipped.displayHeight]).toEqual([4, 2]);
+
+	// The passed frame stays usable until the sample is closed
+	expect(frame.format).toBe('RGBX');
+	flipped.close();
+	expect(frame.format).toBe(null);
 });
 
 /** 4x4 RGBA sample where each pixel's R/G channels encode its (x, y) position. */
@@ -533,6 +922,28 @@ test('null format', async () => {
 	await sample.copyTo(buffer, { format: 'RGBX' });
 	await sample.copyTo(buffer, { format: 'BGRA' });
 	await sample.copyTo(buffer, { format: 'BGRX' });
+});
+
+test('Samples not backed by a canvas fail cleanly when VideoFrame is missing', async () => {
+	const globals = globalThis as { VideoFrame?: unknown };
+	const OriginalVideoFrame = globals.VideoFrame;
+	delete globals.VideoFrame;
+
+	try {
+		using sample = new VideoSample(new Uint8Array(16), {
+			format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0,
+		});
+		const context = new OffscreenCanvas(2, 2).getContext('2d')!;
+		expect(() => sample.draw(context, 0, 0)).toThrow('VideoFrame is not available');
+		expect(() => sample.toVideoFrame()).toThrow('VideoFrame is not available');
+		await expect(sample.transform({ width: 7 })).rejects.toThrow('VideoFrame is not available');
+
+		// Canvas-backed samples don't need it
+		using canvasSample = new VideoSample(new OffscreenCanvas(2, 2), { timestamp: 0 });
+		canvasSample.draw(context, 0, 0);
+	} finally {
+		globals.VideoFrame = OriginalVideoFrame;
+	}
 });
 
 test('encodeOptions', () => {
@@ -615,6 +1026,30 @@ const encodeAndAssertPacketTypes = async (
 	await output.finalize();
 };
 
+test('Registered transformers defer on undefined and must return VideoSamples', async () => {
+	// A plain-JS transformer that only handles one size, falling off the end otherwise (like the docs' stub)
+	registerVideoSampleTransformer(((sample: VideoSample, description: { width: number }) => {
+		if (description.width === 1000) {
+			return sample.clone();
+		}
+	}) as never);
+	// One that returns something other than a VideoSample, for one marker timestamp
+	registerVideoSampleTransformer(((sample: VideoSample) => {
+		return sample.timestamp === 5151 ? {} : null;
+	}) as never);
+
+	const canvas = new OffscreenCanvas(4, 4);
+	canvas.getContext('2d')!.fillRect(0, 0, 4, 4);
+	using sample = new VideoSample(canvas, { timestamp: 0 });
+	using transformed = await sample.transform({ width: 2, height: 2, fit: 'fill' });
+	expect(transformed).toBeInstanceOf(VideoSample);
+	expect([transformed.displayWidth, transformed.displayHeight]).toEqual([2, 2]);
+
+	using marked = new VideoSample(canvas, { timestamp: 5151 });
+	await expect(marked.transform({ width: 2, height: 2, fit: 'fill' }))
+		.rejects.toThrow('registerVideoSampleTransformer');
+});
+
 test('Treat non-standard VideoFrame color space values as unknown', () => {
 	const frame = new VideoFrame(new Uint8Array(16), { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 });
 
@@ -627,4 +1062,173 @@ test('Treat non-standard VideoFrame color space values as unknown', () => {
 	expect(sample.colorSpace.transfer).toBe(null);
 	expect(sample.colorSpace.matrix).toBe('smpte170m');
 	expect(sample.colorSpace.fullRange).toBe(true);
+});
+
+test('init visibleRect and display size refine a wrapped VideoFrame', () => {
+	using source = makeCoordinateSample({});
+
+	// Pixels are only checked where the browser's own VideoFrame draws a visible rect correctly (WebKitGTK draws it
+	// from the frame's origin)
+	const uncropped = source.toVideoFrame();
+	const nativeCrop = new VideoFrame(uncropped, { visibleRect: { x: 2, y: 0, width: 2, height: 4 } });
+	const probe = new OffscreenCanvas(2, 4).getContext('2d', { willReadFrequently: true })!;
+	probe.drawImage(nativeCrop, 0, 0);
+	const browserDrawsCrops = pixelAt(probe.getImageData(0, 0, 2, 4).data, 2, 0, 0)[0] === 2;
+	nativeCrop.close();
+	uncropped.close();
+
+	const frame = source.toVideoFrame();
+	const cropped = new VideoSample(frame, { visibleRect: { left: 2, top: 0, width: 2, height: 4 } });
+	expect(cropped.visibleRect).toEqual({ left: 2, top: 0, width: 2, height: 4 });
+	expect([cropped.displayWidth, cropped.displayHeight]).toEqual([2, 4]);
+	if (browserDrawsCrops) {
+		const pixels = drawToPixels(cropped, 2, 4);
+		expect(pixelAt(pixels, 2, 0, 0)).toEqual([2, 0]);
+		expect(pixelAt(pixels, 2, 1, 3)).toEqual([3, 3]);
+	}
+
+	// The passed frame stays usable until the sample is closed
+	expect(frame.format).toBe('RGBA');
+	cropped.close();
+	expect(frame.format).toBe(null);
+
+	using stretched = new VideoSample(source.toVideoFrame(), { displayWidth: 8, displayHeight: 4 });
+	expect([stretched.displayWidth, stretched.displayHeight]).toEqual([8, 4]);
+	expect(stretched.pixelAspectRatio).toEqual({ num: 2, den: 1 });
+
+	// Like for ArrayBuffer-backed samples, the display size is the one after rotation
+	using rotated = new VideoSample(source.toVideoFrame(), { rotation: 90, displayWidth: 4, displayHeight: 8 });
+	expect([rotated.squarePixelWidth, rotated.squarePixelHeight]).toEqual([8, 4]);
+
+	// Image sources get cropped only once
+	const canvas = new OffscreenCanvas(4, 4);
+	source.draw(canvas.getContext('2d')!, 0, 0);
+	using fromCanvas = new VideoSample(canvas, {
+		timestamp: 0,
+		visibleRect: { left: 2, top: 2, width: 2, height: 2 },
+		displayWidth: 4,
+		displayHeight: 2,
+	});
+	expect([fromCanvas.codedWidth, fromCanvas.codedHeight]).toEqual([2, 2]);
+	expect([fromCanvas.displayWidth, fromCanvas.displayHeight]).toEqual([4, 2]);
+	if (browserDrawsCrops) {
+		expect(pixelAt(drawToPixels(fromCanvas, 4, 2), 4, 0, 0)).toEqual([2, 2]);
+	}
+});
+
+// Firefox's VideoFrame has no rotation
+const frameHasRotation = 'rotation' in VideoFrame.prototype;
+
+test.runIf(frameHasRotation)('init display size and crop of a VideoFrame with its own rotation', () => {
+	// Like Chrome's frames of EXIF-rotated images or rotated videos
+	const makeRotatedFrame = () => {
+		const canvas = new OffscreenCanvas(8, 4);
+		canvas.getContext('2d')!.fillRect(0, 0, 8, 4);
+		return new VideoFrame(canvas, { timestamp: 0, rotation: 90 } as VideoFrameInit);
+	};
+
+	// The display size in init is the one after all rotation, the frame's own included
+	for (const rotation of [0, 90] as const) {
+		using sample = new VideoSample(makeRotatedFrame(), { rotation, displayWidth: 16, displayHeight: 8 });
+		expect([sample.displayWidth, sample.displayHeight], `init rotation ${rotation}`).toEqual([16, 8]);
+	}
+
+	// The caller's frame is closed together with the sample
+	const inits = [{ visibleRect: { left: 0, top: 0, width: 4, height: 4 } }, { displayWidth: 16, displayHeight: 8 }];
+	for (const init of inits) {
+		const frame = makeRotatedFrame();
+		new VideoSample(frame, init).close();
+		expect(frame.format, JSON.stringify(init)).toBe(null);
+	}
+});
+
+test('toVideoFrame() keeps the pixels of padded and odd-sized YUV data', async () => {
+	// Firefox's VideoFrame constructor ignores `layout` and refuses odd-sized I420 frames. Read back through a canvas,
+	// as not every browser's copyTo() converts to RGBA (WebKitGTK's doesn't).
+	const readRgba = (frame: VideoFrame) => {
+		const context = new OffscreenCanvas(frame.displayWidth, frame.displayHeight).getContext('2d')!;
+		context.drawImage(frame, 0, 0);
+		frame.close();
+		return context.getImageData(0, 0, context.canvas.width, context.canvas.height).data;
+	};
+
+	// Reference color from tightly packed data
+	const reference = readRgba(new VideoFrame(new Uint8Array([100, 100, 100, 100, 90, 200]), {
+		format: 'I420', codedWidth: 2, codedHeight: 2, timestamp: 0,
+	}));
+
+	for (const [width, height] of [[4, 2], [5, 3]] as const) {
+		// Rows padded with zeros, which must not show up in the frame
+		const yStride = width + 3;
+		const uvStride = Math.ceil(width / 2) + 2;
+		const uvRows = Math.ceil(height / 2);
+		const data = new Uint8Array(yStride * height + 2 * uvStride * uvRows);
+		for (let row = 0; row < height; row++) {
+			data.fill(100, row * yStride, row * yStride + width);
+		}
+		for (let row = 0; row < uvRows; row++) {
+			const uStart = yStride * height + row * uvStride;
+			data.fill(90, uStart, uStart + Math.ceil(width / 2));
+			const vStart = yStride * height + (uvRows + row) * uvStride;
+			data.fill(200, vStart, vStart + Math.ceil(width / 2));
+		}
+
+		using sample = new VideoSample(data, {
+			format: 'I420',
+			codedWidth: width,
+			codedHeight: height,
+			timestamp: 0,
+			layout: [
+				{ offset: 0, stride: yStride },
+				{ offset: yStride * height, stride: uvStride },
+				{ offset: yStride * height + uvStride * uvRows, stride: uvStride },
+			],
+		});
+
+		const frame = sample.toVideoFrame();
+		expect([frame.displayWidth, frame.displayHeight]).toEqual([width, height]);
+		const rgba = readRgba(frame);
+		expect(rgba.length).toBe(width * height * 4);
+		for (let i = 0; i < rgba.length; i += 4) {
+			const pixel = [...rgba.subarray(i, i + 4)];
+			expect(pixel, `${width}x${height} pixel ${i / 4}`).toEqual([...reference.subarray(0, 4)]);
+		}
+	}
+});
+
+test('draw takes the drawImage call shapes, with destination sizes in pairs', () => {
+	const canvas = new OffscreenCanvas(8, 8);
+	const context = canvas.getContext('2d')!;
+	using sample = new VideoSample(new Uint8Array(4 * 4 * 4).fill(255), {
+		format: 'RGBA',
+		codedWidth: 4,
+		codedHeight: 4,
+		timestamp: 0,
+	});
+
+	const drawnPixels = (draw: () => void) => {
+		context.clearRect(0, 0, 8, 8);
+		draw();
+		const data = context.getImageData(0, 0, 8, 8).data;
+		let count = 0;
+		for (let i = 3; i < data.length; i += 4) {
+			count += data[i]! > 0 ? 1 : 0;
+		}
+		return count;
+	};
+
+	expect(drawnPixels(() => sample.draw(context, 0, 0))).toBe(16);
+	expect(drawnPixels(() => sample.draw(context, 0, 0, 8, 8))).toBe(64);
+	expect(drawnPixels(() => sample.draw(context, 0, 0, 2, 2, 0, 0))).toBe(4);
+	expect(drawnPixels(() => sample.draw(context, 0, 0, 2, 2, 0, 0, 6, 6))).toBe(36);
+
+	// A destination width without a height has no meaning, so it doesn't type-check, and it throws
+	expect(() => {
+		// @ts-expect-error dWidth needs dHeight
+		sample.draw(context, 0, 0, 5);
+	}).toThrow(new TypeError('dHeight must be a non-negative number.'));
+	expect(() => {
+		// @ts-expect-error dWidth needs dHeight
+		sample.draw(context, 0, 0, 2, 2, 0, 0, 5);
+	}).toThrow(new TypeError('dHeight must be a non-negative number.'));
 });

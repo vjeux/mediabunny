@@ -9,21 +9,30 @@
 import type { FileHandle } from 'node:fs/promises';
 import {
 	assert,
+	binarySearchExact,
 	binarySearchLessOrEqual,
 	clamp,
 	closedIntervalsOverlap,
+	DisposalSignal,
 	FilePath,
 	isNumber,
+	isFirefox,
 	isThenable,
 	isWebKit,
+	MAX_FILE_IO_SIZE,
 	MaybePromise,
 	mergeRequestInit,
 	normalizeHeaders,
+	isSharedArrayBuffer,
 	polyfillSymbolDispose,
 	promiseWithResolvers,
 	retriedFetch,
 	toDataView,
 	toUint8Array,
+	arrayBufferFromOtherRealm,
+	isBlob,
+	isReadableStream,
+	isUint8Array,
 	wait,
 	EventEmitter,
 } from './misc';
@@ -62,13 +71,6 @@ export type SourceEvents = {
 	};
 };
 
-let sourceFinalizationRegistry: FinalizationRegistry<() => unknown> | null = null;
-if (typeof FinalizationRegistry !== 'undefined') {
-	sourceFinalizationRegistry = new FinalizationRegistry((cleanup) => {
-		cleanup();
-	});
-}
-
 /**
  * The source base class, representing a resource from which bytes can be read.
  * @group Input sources
@@ -95,6 +97,23 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 * @internal
 	 */
 	_usedForHls = false;
+
+	/**
+	 * Whether this source may evict data it has read, being unable to read it again (it reads a stream sequentially
+	 * and only keeps a bounded part of it). Reading the whole input ahead of time then evicts its start.
+	 * @internal
+	 */
+	get _evictsReadData() {
+		return false;
+	}
+
+	/**
+	 * For a source that evicts data it has read: reads ahead as far as it can without evicting anything, so that a
+	 * stream that fits into it no longer counts as evicting.
+	 * @internal
+	 */
+	async _readAheadWithinCache() {}
+
 	/**
 	 * FinalizationRegistry for rogue refs to this source that didn't get freed. It lives on the Source itself so that
 	 * in case the Source transitively points back to itself and forms a cycle (for example through a custom
@@ -189,6 +208,15 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 		// eslint-disable-next-line @typescript-eslint/no-deprecated
 		this.onread?.(start, end);
 		this._emit('read', { start, end });
+	}
+
+	/**
+	 * Whether data anywhere in the file can be read without discarding the data before it. False for sources that can
+	 * only be streamed from the start and whose cache can't hold the entire file.
+	 * @internal
+	 */
+	_supportsRandomAccess(): boolean {
+		return true;
 	}
 
 	/**
@@ -361,13 +389,43 @@ export const sourceRequestsAreEqual = (a: SourceRequest, b: SourceRequest) => {
  * @group Input sources
  */
 export class CustomPathedSource extends PathedSource {
+	/**
+	 * For reads waiting on the root request, whose handler may never settle, which disposing rejects.
+	 * @internal
+	 */
+	_disposalSignal = new DisposalSignal();
 	/** @internal */
 	_root: SourceRef | null = null;
 	/** @internal */
 	_rootRequest: Promise<SourceRef> | null = null;
+	/** @internal */
+	_pendingReadCount = 0;
+	/** @internal */
+	_releaseRootWhenIdle = false;
+	/** @internal */
+	_releasedRootFileSize: number | null | undefined = undefined;
 
 	/** @internal */
 	override _read(
+		start: number,
+		end: number,
+		minReadPosition: number,
+		maxReadPosition: number,
+	): MaybePromise<ReadResult | null> {
+		const result = this._readFromRoot(start, end, minReadPosition, maxReadPosition);
+		if (!isThenable(result)) {
+			return result;
+		}
+
+		this._pendingReadCount++;
+		return result.finally(() => {
+			this._pendingReadCount--;
+			this._maybeReleaseRoot();
+		});
+	}
+
+	/** @internal */
+	_readFromRoot(
 		start: number,
 		end: number,
 		minReadPosition: number,
@@ -397,7 +455,8 @@ export class CustomPathedSource extends PathedSource {
 			}
 
 			if (this._rootRequest) {
-				return this._rootRequest.then(ref => ref.source._read(start, end, minReadPosition, maxReadPosition));
+				return this._disposalSignal.wait(this._rootRequest)
+					.then(ref => ref.source._read(start, end, minReadPosition, maxReadPosition));
 			}
 		}
 
@@ -410,7 +469,38 @@ export class CustomPathedSource extends PathedSource {
 			return this._root.source._getFileSize();
 		}
 
-		return undefined;
+		return this._releasedRootFileSize;
+	}
+
+	/**
+	 * Frees the root source once no read is pending; the next read requests it again. This lets an input that's
+	 * unlikely to be read again release the root's file handles and caches without waiting for garbage collection.
+	 * @internal
+	 */
+	_releaseRoot() {
+		if (!this._root && !this._rootRequest) {
+			return;
+		}
+
+		this._releaseRootWhenIdle = true;
+		this._maybeReleaseRoot();
+	}
+
+	/** @internal */
+	_maybeReleaseRoot() {
+		if (!this._releaseRootWhenIdle || this._pendingReadCount > 0 || !this._root || this._disposed) {
+			return;
+		}
+
+		this._releasedRootFileSize = this._root.source._getFileSize();
+		this._root.free();
+		this._root = null;
+		this._releaseRootWhenIdle = false;
+	}
+
+	/** @internal */
+	override _supportsRandomAccess(): boolean {
+		return this._root ? this._root.source._supportsRandomAccess() : true;
 	}
 
 	/** @internal */
@@ -422,6 +512,8 @@ export class CustomPathedSource extends PathedSource {
 				.then(ref => ref.free())
 				.catch(() => {});
 		}
+
+		this._disposalSignal.dispose(new InputDisposedError());
 	}
 }
 
@@ -443,9 +535,13 @@ export class BufferSource extends Source {
 	 * or `ArrayBufferView`.
 	 */
 	constructor(buffer: AllowSharedBufferSource) {
+		// An ArrayBuffer created in another realm (an iframe, a Node.js vm context, Jest's jsdom environment) is
+		// genuine, but instanceof rejects it, so it's taken through a view of this realm (views of any realm work as
+		// they are)
+		buffer = arrayBufferFromOtherRealm(buffer);
 		if (
 			!(buffer instanceof ArrayBuffer)
-			&& !(typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer)
+			&& !isSharedArrayBuffer(buffer)
 			&& !ArrayBuffer.isView(buffer)
 		) {
 			throw new TypeError('buffer must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView.');
@@ -496,7 +592,10 @@ export type BlobSourceOptions = {
 	 */
 	useStreamReader?: boolean;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -530,7 +629,7 @@ export class BlobSource extends Source {
 	 * [`Blob`](https://developer.mozilla.org/en-US/docs/Web/API/Blob).
 	 */
 	constructor(blob: Blob, options: BlobSourceOptions = {}) {
-		if (!(blob instanceof Blob)) {
+		if (!isBlob(blob)) {
 			throw new TypeError('blob must be a Blob.');
 		}
 		if (!options || typeof options !== 'object') {
@@ -662,8 +761,24 @@ export class BlobSource extends Source {
 }
 
 const URL_SOURCE_MIN_LOAD_AMOUNT = 0.5 * 2 ** 20; // 0.5 MiB
+/**
+ * How many times the default retry policy retries a request answered with an HTTP status that may be transient (with
+ * its backoff, that's 15.5 seconds of waiting in total).
+ */
+const DEFAULT_MAX_HTTP_ERROR_RETRIES = 5;
+
 const DEFAULT_RETRY_DELAY
 	= ((previousAttempts, error, src) => {
+		// A status like 503 often goes away when retried, but some servers answer one for good
+		if (
+			error instanceof Error
+			&& 'status' in error
+			&& typeof error.status === 'number'
+			&& previousAttempts > DEFAULT_MAX_HTTP_ERROR_RETRIES
+		) {
+			return null;
+		}
+
 		// Check if this could be a CORS error. If so, we cannot recover from it and
 		// should not attempt to retry.
 		// CORS errors are intentionally not opaque, so we need to rely on heuristics.
@@ -672,25 +787,28 @@ const DEFAULT_RETRY_DELAY
 				error.message.includes('Failed to fetch') // Chrome
 				|| error.message.includes('Load failed') // Safari
 				|| error.message.includes('NetworkError when attempting to fetch resource') // Firefox
-			)
-			&& typeof window !== 'undefined'; // CORS only happens in browser environments
+			);
 
 		if (couldBeCorsError) {
+			let ownOrigin: string | null = null;
 			let originOfSrc: string | null = null;
 			// Checking if the origin is different, because only then a CORS error could originate
 			try {
-				if (typeof window !== 'undefined' && typeof window.location !== 'undefined') {
-					originOfSrc = new URL(src instanceof Request ? src.url : src, window.location.href).origin;
+				// CORS only happens in browser environments, which have a location in windows and workers alike
+				// (elsewhere, reading it may even throw, like in Deno without --location)
+				if (typeof location !== 'undefined') {
+					ownOrigin = location.origin;
+					originOfSrc = new URL(src instanceof Request ? src.url : src, location.href).origin;
 				}
 			} catch {
-				// URL parse failed
+				// No location, or the URL parse failed
 			}
 
 			// If user is offline, it is probably not a CORS error.
 			const isOnline
 			= typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
 
-			if (isOnline && originOfSrc !== null && originOfSrc !== window.location.origin) {
+			if (isOnline && originOfSrc !== null && originOfSrc !== ownOrigin) {
 				Logging._warn(
 					`Request will not be retried because a CORS error was suspected due to different origins. You can`
 					+ ` modify this behavior by providing your own function for the 'getRetryDelay' option.`,
@@ -699,10 +817,29 @@ const DEFAULT_RETRY_DELAY
 			}
 		}
 
+		// blob:, data: and file: URLs are read without touching the network, so retrying can't fix a failure. (The
+		// Fetch standard reports a range at or past the end of a blob, or a revoked blob URL, as a network error.)
+		const href = typeof src === 'string' ? src : src instanceof URL ? src.href : src.url;
+		if (/^\s*(?:blob|data|file):/i.test(href)) {
+			return null;
+		}
+
 		return Math.min(2 ** (previousAttempts - 2), 16);
 	}) satisfies UrlSourceOptions['getRetryDelay'];
 
 const warnedOrigins = new Set<string>();
+
+/**
+ * Whether the body of a response has a content coding, in which case its Content-Range and Content-Length count
+ * encoded bytes. "identity" isn't one: RFC 9110 reserves it as a synonym for "no encoding".
+ */
+const hasContentCoding = (response: Response) => {
+	const value = response.headers.get('Content-Encoding');
+	return value !== null && value.split(',').some((coding) => {
+		const normalized = coding.trim().toLowerCase();
+		return normalized !== '' && normalized !== 'identity';
+	});
+};
 
 /**
  * Options for {@link UrlSource}.
@@ -723,9 +860,18 @@ export type UrlSourceOptions = {
 	 * A function that returns the delay (in seconds) before retrying a failed request. The function is called
 	 * with the number of previous, unsuccessful attempts, as well as with the error with which the previous request
 	 * failed. If the function returns `null`, no more retries will be made.
+	 * Requests for `blob:`, `data:` and `file:` URLs are never retried by default: they don't touch the network, so
+	 * retrying can't fix their failures.
 	 *
-	 * By default, it uses an exponential backoff algorithm that never gives up unless
+	 * A request fails when `fetch()` rejects, or when it's answered with an HTTP status that may be transient (408,
+	 * 429, 500, 502, 503 or 504), in which case the error has a `status` property holding that status.
+	 *
+	 * By default, it uses an exponential backoff algorithm that gives up on such a status after 5 retries, and
+	 * otherwise never gives up unless
 	 * a CORS error is suspected (`fetch()` did reject, `navigator.onLine` is true and origin is different).
+	 * The default can't tell a CORS failure from a network error when a URL of the same origin redirects to another
+	 * origin whose server doesn't allow it, so it keeps retrying such a request; if your URLs may redirect like that,
+	 * pass a function that gives up at some point.
 	 */
 	getRetryDelay?: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
 
@@ -741,7 +887,10 @@ export type UrlSourceOptions = {
 	 */
 	fetchFn?: typeof fetch;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -757,6 +906,11 @@ export class UrlSource extends PathedSource {
 	_url: string | URL | Request;
 	/** @internal */
 	_getRetryDelay: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
+	/**
+	 * Whether a response for this URL got through. After that, CORS can't be why a request fails.
+	 * @internal
+	 */
+	_responseReceived = false;
 	/** @internal */
 	_options: UrlSourceOptions;
 	/** @internal */
@@ -774,6 +928,12 @@ export class UrlSource extends PathedSource {
 	 */
 	_fileSizeDetermined = false;
 	/**
+	 * Whether the server has honored a range request for this resource, after which a 200 for one doesn't mean it
+	 * ignores range requests.
+	 * @internal
+	 */
+	_rangeRequestsHonored = false;
+	/**
 	 * When the server doesn't support range requests, we abandon the orchestrator and instead defer to an internal
 	 * ReadableStreamSource wrapping the response body, which pulls new data only when reads demand it.
 	 * @internal
@@ -783,6 +943,23 @@ export class UrlSource extends PathedSource {
 	_abortControllers = new Map<ReadWorker, AbortController>();
 	/** @internal */
 	_sequentialAbortController: AbortController | null = null;
+	/**
+	 * The length of the resource as stated by the first response that stated it, which later responses mustn't fall
+	 * below.
+	 * @internal
+	 */
+	_resourceLength: number | null = null;
+
+	/** @internal */
+	override get _evictsReadData() {
+		// Only when streaming the resource, because the server doesn't honor range requests
+		return this._sequentialBacking?._evictsReadData ?? false;
+	}
+
+	/** @internal */
+	override async _readAheadWithinCache() {
+		await this._sequentialBacking?._readAheadWithinCache();
+	}
 
 	/**
 	 * Creates a new {@link UrlSource} backed by the resource at the specified URL.
@@ -840,7 +1017,16 @@ export class UrlSource extends PathedSource {
 
 		this._url = url;
 		this._options = options;
-		this._getRetryDelay = options.getRetryDelay ?? DEFAULT_RETRY_DELAY;
+		const getRetryDelay = options.getRetryDelay ?? DEFAULT_RETRY_DELAY;
+		this._getRetryDelay = (previousAttempts, error, url) => {
+			const delay = getRetryDelay(previousAttempts, error, url);
+			// Any other value would make the retries come back to back, as fast as the requests go
+			if (delay !== null && (!Number.isFinite(delay) || delay < 0)) {
+				throw new TypeError('Retry delay must be a non-negative finite number.');
+			}
+
+			return delay;
+		};
 
 		// A user-supplied Range header is interpreted as a byte offset (and optional length) into the resource. We
 		// pull it out of the request and remember it for subsequent requests.
@@ -872,10 +1058,22 @@ export class UrlSource extends PathedSource {
 
 		if (rangeHeaderValue !== null) {
 			const parsed = parseByteRangeHeader(rangeHeaderValue);
-			if (parsed) {
-				this._offset = parsed.offset;
-				this._length = parsed.length;
+			if (!parsed) {
+				// Silently reading the whole resource instead would ignore what the caller asked for
+				throw new TypeError(
+					`Unsupported Range header '${rangeHeaderValue}': only 'bytes=<start>-' and 'bytes=<start>-<end>'`
+					+ ` (with end >= start) can be mapped onto the resource.`,
+				);
 			}
+
+			this._offset = parsed.offset;
+			this._length = parsed.length;
+		}
+
+		if (typeof Request !== 'undefined' && options.fetchFn === undefined && !(this._url instanceof Request)) {
+			// fetch() rejects a request it can't make (an unparsable URL, an invalid header value) with the same
+			// TypeError every time, which no retry fixes; constructing the request here throws that error right away
+			void new Request(this._url, this._requestInit);
 		}
 
 		// Most files in the real-world have a single sequential access pattern, but having two in parallel can
@@ -895,7 +1093,9 @@ export class UrlSource extends PathedSource {
 	/** @internal */
 	_getFileSize(): number | null | undefined {
 		if (!this._fileSizeDetermined) {
-			return this._length !== null ? this._length : undefined;
+			// The resource may end before the end of the Range window (RFC 9110 reads such a last-pos as "up to the
+			// end"), so the window's length only becomes the size once a response confirms the resource's
+			return undefined;
 		}
 
 		const baseSize = this._sequentialBacking
@@ -906,6 +1106,26 @@ export class UrlSource extends PathedSource {
 		}
 
 		return clamp(baseSize - this._offset, 0, this._length ?? Infinity);
+	}
+
+	/** @internal */
+	override _supportsRandomAccess(): boolean {
+		if (!this._sequentialBacking) {
+			return true;
+		}
+
+		// Without range requests, the resource can only be streamed from its start, and data further than the cache
+		// size behind the furthest read gets evicted. So data near the end can only be read without losing data that
+		// reads have yet to get to if all of it fits into the cache, or once the stream has nearly reached the end:
+		// reading the end then only evicts data the reads have passed, keeping at least half the cache before it.
+		const size = this._getFileSize();
+		if (typeof size !== 'number') {
+			return false;
+		}
+
+		const backing = this._sequentialBacking;
+		const end = this._offset + size;
+		return size <= backing._maxCacheSize || end - backing._currentIndex <= backing._maxCacheSize / 2;
 	}
 
 	/** @internal */
@@ -945,9 +1165,45 @@ export class UrlSource extends PathedSource {
 		}
 	}
 
+	/**
+	 * The delay before resuming a response body that failed partway: from the user's getRetryDelay if there's one,
+	 * else from the default policy without its CORS heuristic.
+	 * @internal
+	 */
+	_getResumeDelay(previousAttempts: number, error: unknown) {
+		if (this._options.getRetryDelay) {
+			return this._getRetryDelay(previousAttempts, error, this._url);
+		}
+
+		// blob:, data: and file: URLs are read without touching the network, so retrying can't fix a failure
+		const url = this._url;
+		const href = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+		if (/^\s*(?:blob|data|file):/i.test(href)) {
+			return null;
+		}
+
+		// The response got through CORS before its body failed, so the CORS heuristic doesn't apply (and would misfire
+		// in WebKit, which reports every response body error as "Load failed", like a CORS failure). It only looks at
+		// TypeErrors (what fetch() and failed bodies throw), so not passing those skips it, while other errors (such as
+		// an HTTP status) still reach the default.
+		return DEFAULT_RETRY_DELAY(previousAttempts, error instanceof TypeError ? null : error, this._url);
+	}
+
+	/**
+	 * The delay before retrying a failed fetch(). Once a response for this URL got through CORS, a failed fetch() is a
+	 * network failure (a reset connection, a network change), so it's treated like a failed response body.
+	 * @internal
+	 */
+	_getFetchRetryDelay(previousAttempts: number, error: unknown) {
+		return this._responseReceived
+			? this._getResumeDelay(previousAttempts, error)
+			: this._getRetryDelay(previousAttempts, error, this._url);
+	}
+
 	/** @internal */
 	private async _runWorker(worker: ReadWorker) {
-		let consecutiveEmptyResponses = 0;
+		// Responses in a row that failed or ended without getting us any further, for getRetryDelay
+		let consecutiveFailedResponses = 0;
 
 		// The outer loop is for resuming a request if it dies mid-response
 		while (true) {
@@ -960,7 +1216,7 @@ export class UrlSource extends PathedSource {
 			const abortController = new AbortController();
 			this._abortControllers.set(worker, abortController);
 
-			const response = await retriedFetch(
+			const fetchFromCurrentPos = (cache?: RequestCache) => retriedFetch(
 				this._options.fetchFn ?? fetch,
 				this._url,
 				mergeRequestInit(this._requestInit, {
@@ -969,15 +1225,54 @@ export class UrlSource extends PathedSource {
 						Range: `bytes=${worker.currentPos}-`,
 					},
 					signal: abortController.signal,
+					...(cache && { cache }),
 				}),
-				this._getRetryDelay,
+				(previousAttempts, error) => this._getFetchRetryDelay(previousAttempts, error),
 				() => abortController.signal.aborted,
 			);
 
+			let response = await fetchFromCurrentPos();
+
+			if (response.ok) {
+				// It got through CORS. Recorded as soon as it arrives, before anything may request the URL again.
+				this._responseReceived = true;
+			}
+
+			const firefoxCachedStart = worker.currentPos === 0 && isFirefox();
+			if (response.status === 200 && (firefoxCachedStart || this._rangeRequestsHonored) && !this._usedForHls) {
+				// Firefox answers bytes=0- with a 200 from its HTTP cache when it holds the entire resource, so this
+				// doesn't mean the server ignores range requests. Neither does a 200 once the server has honored a
+				// range request: when a browser completes a range request from its HTTP cache with If-Range and the
+				// validator no longer matches (an ETag that differs per backend, say), the server rightly answers
+				// with a 200 and the whole resource. Ask the server itself. HLS segments are read sequentially anyway,
+				// so they keep the cached response.
+				void response.body?.cancel().catch(() => {});
+				response = await fetchFromCurrentPos('no-store');
+			}
+
+			if (response.status === 206) {
+				this._rangeRequestsHonored = true;
+			}
+
 			if (!response.ok) {
+				if (
+					response.status === 416
+					&& this._orchestrator.fileSize === null
+					&& worker.currentPos === this._orchestrator.suppliedEnd
+				) {
+					// No response has stated the size (Content-Range "bytes a-b/*", or hidden by CORS), the data
+					// received ends right here, and the server says there's nothing here: so the resource ends here
+					void response.body?.cancel().catch(() => {});
+					this._fileSizeDetermined = true;
+					this._orchestrator.onWorkerFinished(worker);
+					return;
+				}
+
 				// eslint-disable-next-line @typescript-eslint/no-base-to-string
 				throw new Error(`Error fetching ${String(this._url)}: ${response.status} ${response.statusText}`);
 			}
+
+			this._checkResourceLength(response);
 
 			if (response.redirected) {
 				// Modify our own root path so that future subrequests get made relative to the redirected URL
@@ -990,7 +1285,7 @@ export class UrlSource extends PathedSource {
 				// Content-Range/Length fields are meaningless if Content-Encoding is present: they count encoded
 				// bytes, while the reader addresses decoded ones. This holds for 206 responses too - some CDNs do
 				// answer range requests with a content coding, stating the compressed total (stupid!)
-				&& !response.headers.has('Content-Encoding')
+				&& !hasContentCoding(response)
 				// CORS requests may have Content-Encoding but they hide it from us
 				&& (response.status === 206 || response.type === 'basic')
 			) {
@@ -1011,7 +1306,10 @@ export class UrlSource extends PathedSource {
 					// less data than was requested. In practice, it seems most servers don't do this though, and the
 					// Content-Length header actually contains the length until the end of the file.
 					// A non-206 response always spans the entire resource, no matter what range we asked for.
-					const basePos = response.status === 206 ? worker.currentPos : 0;
+					// A 206 body starts where its Content-Range says, which may lie before the requested position
+					const basePos = response.status === 206
+						? (parseContentRange(response.headers.get('Content-Range'))?.start ?? worker.currentPos)
+						: 0;
 					this._orchestrator.supplyFileSize(basePos + Number(contentLength));
 				}
 			}
@@ -1034,9 +1332,16 @@ export class UrlSource extends PathedSource {
 				}
 
 				if (!this._usedForHls) {
+					let base: string | undefined;
+					try {
+						base = typeof location !== 'undefined' ? location.href : undefined; // Defined in workers too
+					} catch {
+						// Reading it may even throw, like in Deno without --location
+					}
+
 					const url = new URL(
-						this._url instanceof Request ? this._url.url : this._url,
-						typeof window !== 'undefined' ? window.location.href : undefined,
+						response.url || (this._url instanceof Request ? this._url.url : this._url),
+						base,
 					);
 
 					if (
@@ -1063,6 +1368,26 @@ export class UrlSource extends PathedSource {
 				return;
 			}
 
+			// A 206 response states which range it encloses (RFC 9110, Section 15.3.7.1), which may begin before the
+			// requested position; Chromium's media loader handles such responses the same way. Content-Range counts
+			// encoded bytes when Content-Encoding is present, so it can't be used then.
+			let bytesToSkip = 0;
+			const enclosedRange = hasContentCoding(response)
+				? null
+				: parseContentRange(response.headers.get('Content-Range'));
+			if (enclosedRange) {
+				if (enclosedRange.start > worker.currentPos || enclosedRange.end < worker.currentPos) {
+					void response.body.cancel().catch(() => {});
+					throw new Error(
+						// eslint-disable-next-line @typescript-eslint/no-base-to-string
+						`Error fetching ${String(this._url)}: requested bytes from ${worker.currentPos}, but the server`
+						+ ` sent bytes ${enclosedRange.start}-${enclosedRange.end}.`,
+					);
+				}
+
+				bytesToSkip = worker.currentPos - enclosedRange.start;
+			}
+
 			const reader = response.body.getReader();
 			const responseStartPos = worker.currentPos;
 
@@ -1084,10 +1409,15 @@ export class UrlSource extends PathedSource {
 						throw error;
 					}
 
-					const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
+					if (worker.currentPos > responseStartPos) {
+						consecutiveFailedResponses = 0; // This response still got us further before it failed
+					}
+					consecutiveFailedResponses++;
+
+					const retryDelayInSeconds = this._getResumeDelay(consecutiveFailedResponses, error);
 					if (retryDelayInSeconds !== null) {
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
-						await wait(1000 * retryDelayInSeconds);
+						await wait(1000 * retryDelayInSeconds, abortController.signal);
 
 						break;
 					} else {
@@ -1115,20 +1445,20 @@ export class UrlSource extends PathedSource {
 
 						if (worker.currentPos > responseStartPos) {
 							// Response still moved us forward; keep going immediately
-							consecutiveEmptyResponses = 0;
+							consecutiveFailedResponses = 0;
 							break;
 						}
 
 						// The response didn't get us any further, so back off instead of hammering the server
-						consecutiveEmptyResponses++;
+						consecutiveFailedResponses++;
 						const error = new Error('Range response ended without delivering any data.');
-						const retryDelayInSeconds = this._getRetryDelay(consecutiveEmptyResponses, error, this._url);
+						const retryDelayInSeconds = this._getRetryDelay(consecutiveFailedResponses, error, this._url);
 						if (retryDelayInSeconds === null) {
 							throw error;
 						}
 
 						Logging._error('Retrying range request that ended without delivering any data.');
-						await wait(1000 * retryDelayInSeconds);
+						await wait(1000 * retryDelayInSeconds, abortController.signal);
 
 						break;
 					} else {
@@ -1138,14 +1468,62 @@ export class UrlSource extends PathedSource {
 					}
 				}
 
-				this._dispatchRead(worker.currentPos, worker.currentPos + value.length);
-				this._orchestrator.supplyWorkerData(worker, value);
+				let chunk = value;
+				if (bytesToSkip > 0) {
+					const skipped = Math.min(bytesToSkip, chunk.length);
+					bytesToSkip -= skipped;
+					chunk = chunk.subarray(skipped);
+
+					if (chunk.length === 0) {
+						continue;
+					}
+				}
+
+				this._dispatchRead(worker.currentPos, worker.currentPos + chunk.length);
+				this._orchestrator.supplyWorkerData(worker, chunk);
 			}
 		}
 
 		// The previous UrlSource had logic for circumventing https://issues.chromium.org/issues/436025873; I haven't
 		// been able to observe this bug with the new UrlSource (maybe because we're using response streaming), so the
 		// logic for that has vanished for now. Leaving a comment here if this becomes relevant again.
+	}
+
+	/**
+	 * Throws if a response states a smaller length for the resource than the first response did: the resource got
+	 * replaced in the meantime, bytes read before may be gone, and the new bytes can't be combined with them (RFC 9110,
+	 * Section 13.1.5). A larger length is taken as a file that is still being written, which keeps being read within
+	 * the length first stated.
+	 * @internal
+	 */
+	private _checkResourceLength(response: Response) {
+		let length: number | null = null;
+
+		// Lengths count encoded bytes when Content-Encoding is present (and CORS responses may hide that header)
+		if (!hasContentCoding(response)) {
+			if (response.status === 206) {
+				const match = /\/(\d+)\s*$/.exec(response.headers.get('Content-Range') ?? '');
+				length = match ? Number(match[1]) : null; // A complete length of '*' is unknown
+			} else if (response.status === 200 && response.type === 'basic') {
+				const contentLength = response.headers.get('Content-Length')?.trim() ?? '';
+				length = /^\d+$/.test(contentLength) ? Number(contentLength) : null;
+			}
+		}
+
+		if (length === null) {
+			return;
+		}
+
+		if (this._resourceLength === null) {
+			this._resourceLength = length;
+		} else if (length < this._resourceLength) {
+			void response.body?.cancel().catch(() => {});
+			throw new Error(
+				// eslint-disable-next-line @typescript-eslint/no-base-to-string
+				`Error fetching ${String(this._url)}: the resource changed while it was being read; it was`
+				+ ` ${this._resourceLength} bytes long, now it is ${length}.`,
+			);
+		}
 	}
 
 	/** @internal */
@@ -1160,6 +1538,8 @@ export class UrlSource extends PathedSource {
 		let currentReader = body.getReader();
 		let streamPosition = 0;
 		let skipRemaining = 0;
+		// Responses in a row that failed before delivering new data, for getRetryDelay
+		let consecutiveFailedResponses = 0;
 
 		const wrappedStream = new ReadableStream<Uint8Array>({
 			pull: async (controller) => {
@@ -1173,13 +1553,14 @@ export class UrlSource extends PathedSource {
 							throw error;
 						}
 
-						const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
+						consecutiveFailedResponses++;
+						const retryDelayInSeconds = this._getResumeDelay(consecutiveFailedResponses, error);
 						if (retryDelayInSeconds === null) {
 							throw error;
 						}
 
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
-						await wait(1000 * retryDelayInSeconds);
+						await wait(1000 * retryDelayInSeconds, this._sequentialAbortController?.signal);
 
 						this._sequentialAbortController = new AbortController();
 						if (this._disposed) {
@@ -1196,17 +1577,27 @@ export class UrlSource extends PathedSource {
 								},
 								signal: this._sequentialAbortController.signal,
 							}),
-							this._getRetryDelay,
+							(previousAttempts, error) => this._getFetchRetryDelay(previousAttempts, error),
 							() => this._disposed,
 						);
 
 						if (!newResponse.ok) {
+							if (newResponse.status === 416 && this._sequentialBacking?._endIndex === null) {
+								// Everything before streamPosition has been delivered, and the server says there's
+								// nothing after it: this is the end of a resource whose size no response stated
+								void newResponse.body?.cancel().catch(() => {});
+								controller.close();
+								return;
+							}
+
 							throw new Error(
 								// eslint-disable-next-line @typescript-eslint/no-base-to-string
 								`Error fetching ${String(this._url)}:`
 								+ ` ${newResponse.status} ${newResponse.statusText}`,
 							);
 						}
+
+						this._checkResourceLength(newResponse);
 
 						if (!newResponse.body) {
 							throw new Error(
@@ -1217,8 +1608,25 @@ export class UrlSource extends PathedSource {
 
 						currentReader = newResponse.body.getReader();
 						// If the server still doesn't do ranges, the new response starts at byte 0 again and
-						// we need to skip over everything we already delivered. Cursed!
-						skipRemaining = newResponse.status === 206 ? 0 : streamPosition;
+						// we need to skip over everything we already delivered. Cursed! A 206 response states
+						// where its range starts, which may lie before the requested position.
+						if (newResponse.status === 206) {
+							const enclosedRange = hasContentCoding(newResponse)
+								? null
+								: parseContentRange(newResponse.headers.get('Content-Range'));
+							const rangeStart = enclosedRange?.start ?? streamPosition;
+							if (rangeStart > streamPosition) {
+								throw new Error(
+									// eslint-disable-next-line @typescript-eslint/no-base-to-string
+									`Error fetching ${String(this._url)}: requested bytes from ${streamPosition}, but`
+									+ ` the server sent bytes from ${rangeStart}.`,
+								);
+							}
+
+							skipRemaining = streamPosition - rangeStart;
+						} else {
+							skipRemaining = streamPosition;
+						}
 
 						continue;
 					}
@@ -1241,6 +1649,7 @@ export class UrlSource extends PathedSource {
 					}
 
 					streamPosition += chunk.length;
+					consecutiveFailedResponses = 0;
 					controller.enqueue(chunk);
 
 					return;
@@ -1330,7 +1739,8 @@ export class UrlSource extends PathedSource {
 	}
 }
 
-const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/;
+// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+const BYTE_RANGE_REGEX = /^bytes=(\d+)-(\d*)$/i;
 const parseByteRangeHeader = (value: string) => {
 	const match = BYTE_RANGE_REGEX.exec(value.trim());
 	if (!match) {
@@ -1350,6 +1760,23 @@ const parseByteRangeHeader = (value: string) => {
 	};
 };
 
+// Range unit names are case-insensitive (RFC 9110, Section 14.1)
+const CONTENT_RANGE_REGEX = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/i;
+const parseContentRange = (value: string | null) => {
+	const match = value !== null ? CONTENT_RANGE_REGEX.exec(value.trim()) : null;
+	if (!match) {
+		return null;
+	}
+
+	const start = Number(match[1]);
+	const end = Number(match[2]);
+	if (end < start) {
+		return null;
+	}
+
+	return { start, end };
+};
+
 /**
  * Options for {@link FilePathSource}.
  * @group Input sources
@@ -1359,12 +1786,24 @@ export type FilePathSourceOptions = {
 	/** The maximum number of bytes the cache is allowed to hold in memory. Defaults to 8 MiB. */
 	maxCacheSize?: number;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
+let filePathSourceFinalizationRegistry: FinalizationRegistry<FileHandle> | null = null;
+if (typeof FinalizationRegistry !== 'undefined') {
+	filePathSourceFinalizationRegistry = new FinalizationRegistry((fileHandle) => {
+		// If it's not closed, Node prints annoying warnings
+		void fileHandle.close();
+	});
+}
+
 /**
- * A source backed by a path to a file. Intended for server-side usage in Node, Bun, or Deno.
+ * A source backed by a path to a file. Intended for server-side usage in Node, Bun, or Deno. The path must lead to a
+ * regular file; to read from a pipe or a device, use a {@link ReadableStreamSource}.
  *
  * Make sure to call `.dispose()` on the corresponding {@link Input} when done to explicitly free the internal file
  * handle acquired by this source.
@@ -1403,13 +1842,25 @@ export class FilePathSource extends PathedSource {
 		// Let's back this source with a CustomSource, makes the implementation very simple
 		this._customSource = new CustomSource({
 			getSize: async () => {
-				const fileHandle = await node.fs.open(filePath, 'r');
-				this._fileHandle = fileHandle;
+				// Opening a named pipe waits for a writer, and pipes and devices state no size, so they'd read as
+				// empty files
+				const pathStats = await node.fs.stat(filePath);
+				if (!pathStats.isFile()) {
+					throw new TypeError(
+						`FilePathSource needs a regular file, but "${filePath}" isn't one (a named pipe, a device or a`
+						+ ' directory, say). To read from a pipe or a device, use a ReadableStreamSource, for example'
+						+ ' with Readable.toWeb(fs.createReadStream(path)).',
+					);
+				}
 
-				sourceFinalizationRegistry?.register(this, () => {
-					// If it's not closed, Node prints annoying warnings
+				const fileHandle = await node.fs.open(filePath, 'r');
+				if (this._disposed) {
 					void fileHandle.close();
-				}, this);
+					throw new InputDisposedError();
+				}
+
+				this._fileHandle = fileHandle;
+				filePathSourceFinalizationRegistry?.register(this, fileHandle, this);
 
 				const stats = await fileHandle.stat();
 				return stats.size;
@@ -1418,7 +1869,27 @@ export class FilePathSource extends PathedSource {
 				assert(this._fileHandle);
 
 				const buffer = new Uint8Array(end - start);
-				await this._fileHandle.read(buffer, 0, end - start, start);
+				let bytesFilled = 0;
+
+				// A single read may deliver fewer bytes than asked for (FUSE and network file systems do this), and
+				// reaching the end early means the file shrank after its size was read
+				while (bytesFilled < buffer.length) {
+					const { bytesRead } = await this._fileHandle.read(
+						buffer,
+						bytesFilled,
+						// Node rejects reads of 2 GiB or more, and Linux reads at most 0x7ffff000 bytes at once
+						Math.min(buffer.length - bytesFilled, MAX_FILE_IO_SIZE),
+						start + bytesFilled,
+					);
+					if (bytesRead === 0) {
+						throw new Error(
+							`Unexpected end of file at byte ${start + bytesFilled} of ${filePath}; the file got shorter`
+							+ ` while being read.`,
+						);
+					}
+
+					bytesFilled += bytesRead;
+				}
 
 				return buffer;
 			},
@@ -1445,12 +1916,13 @@ export class FilePathSource extends PathedSource {
 
 	/** @internal */
 	_dispose() {
+		this._customSource._disposed = true;
 		this._customSource._dispose();
 
 		if (this._fileHandle) {
 			void this._fileHandle.close();
 			this._fileHandle = null;
-			sourceFinalizationRegistry?.unregister(this);
+			filePathSourceFinalizationRegistry?.unregister(this);
 		}
 	}
 }
@@ -1471,7 +1943,7 @@ export type CustomSourceOptions = {
 	 * Called when data is requested. Must return or resolve to the bytes from the specified byte range, or a stream
 	 * that yields these bytes.
 	 *
-	 * You are guaranteed that `0 <= start < end < fileSize`.
+	 * You are guaranteed that `0 <= start < end <= fileSize`.
 	 */
 	read: (start: number, end: number) => MaybePromise<Uint8Array | ReadableStream<Uint8Array>>;
 
@@ -1496,7 +1968,10 @@ export type CustomSourceOptions = {
 	 */
 	prefetchProfile?: 'none' | 'fileSystem' | 'network';
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -1513,6 +1988,11 @@ export class CustomSource extends Source {
 	_orchestrator: ReadOrchestrator;
 	/** @internal */
 	_readers = new Set<ReadableStreamDefaultReader<Uint8Array>>();
+	/**
+	 * For reads waiting on a getSize call that may never settle, which disposing rejects.
+	 * @internal
+	 */
+	_disposalSignal = new DisposalSignal();
 
 	/** Creates a new {@link CustomSource} whose behavior is specified by `options`.  */
 	constructor(options: CustomSourceOptions) {
@@ -1537,7 +2017,10 @@ export class CustomSource extends Source {
 		) {
 			throw new TypeError('options.maxCacheSize, when provided, must be a non-negative number.');
 		}
-		if (options.prefetchProfile && !['none', 'fileSystem', 'network'].includes(options.prefetchProfile)) {
+		if (
+			options.prefetchProfile !== undefined
+			&& !['none', 'fileSystem', 'network'].includes(options.prefetchProfile)
+		) {
 			throw new TypeError(
 				'options.prefetchProfile, when provided, must be one of \'none\', \'fileSystem\' or \'network\'.',
 			);
@@ -1575,7 +2058,8 @@ export class CustomSource extends Source {
 		const result = this._options.getSize();
 
 		if (isThenable(result)) {
-			return result.then((size) => {
+			// getSize may never settle (a HEAD request without a timeout, say), so stop waiting for it once disposed
+			return this._disposalSignal.wait(result).then((size) => {
 				if (!Number.isInteger(size) || size < 0) {
 					throw new TypeError('options.getSize must return or resolve to a non-negative integer.');
 				}
@@ -1615,14 +2099,14 @@ export class CustomSource extends Source {
 			if (isThenable(data)) data = await data;
 
 			if (worker.aborted) {
-				if (data instanceof ReadableStream) {
+				if (isReadableStream(data)) {
 					await data.cancel().catch(() => {});
 				}
 				break;
 			}
 
-			if (data instanceof Uint8Array) {
-				data = toUint8Array(data); // Normalize things like Node.js Buffer to Uint8Array
+			if (isUint8Array(data)) {
+				data = toUint8Array(data); // Normalize things like Node.js Buffer, or a Uint8Array of another realm
 
 				if (data.length !== originalTargetPos - worker.currentPos) {
 					// Yes, we're that strict
@@ -1635,7 +2119,7 @@ export class CustomSource extends Source {
 
 				this._dispatchRead(worker.currentPos, worker.currentPos + data.length);
 				this._orchestrator.supplyWorkerData(worker, data);
-			} else if (data instanceof ReadableStream) {
+			} else if (isReadableStream(data)) {
 				const reader = data.getReader();
 				this._readers.add(reader);
 
@@ -1657,7 +2141,7 @@ export class CustomSource extends Source {
 							break;
 						}
 
-						if (!(value instanceof Uint8Array)) {
+						if (!isUint8Array(value)) {
 							throw new TypeError(
 								'ReadableStream returned by options.read must yield Uint8Array chunks.',
 							);
@@ -1686,6 +2170,7 @@ export class CustomSource extends Source {
 
 	/** @internal */
 	_dispose() {
+		this._disposalSignal.dispose(new InputDisposedError());
 		this._orchestrator.dispose();
 
 		for (const reader of this._readers) {
@@ -1694,7 +2179,18 @@ export class CustomSource extends Source {
 		}
 
 		this._readers.clear();
-		this._options.dispose?.();
+
+		// The user's callback must not be able to abort the disposal of everything else (the other sources of the
+		// input, its demuxer), and there is nobody to surface its errors to, so we log them
+		const logError = (error: unknown) => Logging._error('Error in CustomSource dispose callback:', error);
+		try {
+			const result = this._options.dispose?.();
+			if (isThenable(result)) {
+				result.then(null, logError);
+			}
+		} catch (error) {
+			logError(error);
+		}
 	}
 }
 
@@ -1731,6 +2227,19 @@ type SlicePart = {
 };
 
 /**
+ * Reports an error from a read nobody is waiting for, such as one prefetching data ahead of the reads. Throwing it
+ * would make it an unhandled rejection, which terminates a Node.js process. A read that needs the data requests it
+ * again, and gets any error itself.
+ */
+const reportUnawaitedError = (error: unknown, handleUnhandledError: ((error: unknown) => unknown) | undefined) => {
+	if (handleUnhandledError) {
+		handleUnhandledError(error);
+	} else {
+		Logging._error('A background read failed; the data will be requested again when a read needs it.', error);
+	}
+};
+
+/**
  * Options for {@link ReadableStreamSource}.
  * @group Input sources
  * @public
@@ -1739,7 +2248,10 @@ export type ReadableStreamSourceOptions = {
 	/** The maximum number of bytes the cache is allowed to hold in memory. Defaults to 32 MiB. */
 	maxCacheSize?: number;
 
-	/** Handles errors that occur while no read is pending. By default, these become unhandled rejections. */
+	/**
+	 * Handles errors that occur while no read is pending, such as when prefetching. By default, these are logged; the
+	 * data is requested again once a read needs it.
+	 */
 	handleUnhandledError?: (error: unknown) => unknown;
 };
 
@@ -1764,6 +2276,12 @@ export class ReadableStreamSource extends Source {
 	_reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	/** @internal */
 	_cache: CacheEntry[] = [];
+	/**
+	 * Entries before this index have been evicted. They're dropped from the array in bulk, since shift() is O(n) for
+	 * large arrays and small stream chunks make for many entries.
+	 * @internal
+	 */
+	_cacheStart = 0;
 	/** @internal */
 	_maxCacheSize: number;
 	/** @internal */
@@ -1787,9 +2305,32 @@ export class ReadableStreamSource extends Source {
 	_cacheMissErrorMessage = 'Attempted to read data from an already-evicted part of the cache. With'
 		+ ' ReadableStreamSource, you must access the data more sequentially or increase the size of its cache.';
 
+	/** @internal */
+	override get _evictsReadData() {
+		// Unless the whole stream is known to fit into the cache
+		return this._maxCacheSize !== Infinity && (this._endIndex === null || this._endIndex > this._maxCacheSize);
+	}
+
+	/** @internal */
+	override async _readAheadWithinCache() {
+		if (
+			!this._evictsReadData
+			|| this._maxCacheSize < 1
+			// Already pulled (or requested) past the cache's size, so the stream doesn't fit
+			|| this._currentIndex >= this._maxCacheSize
+			|| this._maxRequestedIndex > this._maxCacheSize
+		) {
+			return;
+		}
+
+		// Reading up to the cache's size from the start evicts nothing. The stream either ends before that (and its
+		// size is then known) or is larger than the cache
+		await this._read(this._maxCacheSize - 1, this._maxCacheSize);
+	}
+
 	/** Creates a new {@link ReadableStreamSource} backed by the specified `ReadableStream<Uint8Array>`. */
 	constructor(stream: ReadableStream<Uint8Array>, options: ReadableStreamSourceOptions = {}) {
-		if (!(stream instanceof ReadableStream)) {
+		if (!isReadableStream(stream)) {
 			throw new TypeError('stream must be a ReadableStream.');
 		}
 		if (!options || typeof options !== 'object') {
@@ -1825,7 +2366,10 @@ export class ReadableStreamSource extends Source {
 
 		this._maxRequestedIndex = Math.max(this._maxRequestedIndex, end);
 
-		const cacheStartIndex = binarySearchLessOrEqual(this._cache, start, x => x.start);
+		let cacheStartIndex = binarySearchLessOrEqual(this._cache, start, x => x.start);
+		if (cacheStartIndex < this._cacheStart) {
+			cacheStartIndex = -1; // Evicted
+		}
 		const cacheStartEntry = cacheStartIndex !== -1 ? this._cache[cacheStartIndex]! : null;
 
 		if (cacheStartEntry && cacheStartEntry.start <= start && end <= cacheStartEntry.end) {
@@ -1900,10 +2444,8 @@ export class ReadableStreamSource extends Source {
 					if (this._pendingSlices.length > 0) {
 						this._pendingSlices.forEach(x => x.reject(error)); // Make sure to propagate any errors
 						this._pendingSlices.length = 0;
-					} else if (this._handleUnhandledError) {
-						this._handleUnhandledError(error);
 					} else {
-						throw error; // So it doesn't get swallowed
+						reportUnawaitedError(error, this._handleUnhandledError);
 					}
 				});
 		}
@@ -1932,6 +2474,11 @@ export class ReadableStreamSource extends Source {
 				this._endIndex = this._currentIndex; // We know how long the file is now!
 
 				break;
+			}
+
+			if (!(value instanceof Uint8Array)) {
+				// Like for CustomSource's streams. Other typed arrays would be sliced by element instead of by byte.
+				throw new TypeError('The stream of a ReadableStreamSource must yield Uint8Array chunks.');
 			}
 
 			const startIndex = this._currentIndex;
@@ -1972,15 +2519,26 @@ export class ReadableStreamSource extends Source {
 			// Do cache eviction, based on the distance from the last-requested index. It's important that we do it like
 			// this and not based on how far we've pulled the stream, because if the stream supplies data faster than it
 			// is being requested, we'd unnecessarily evict data that we still might need.
-			while (this._cache.length > 0) {
-				const firstEntry = this._cache[0]!;
-				const distance = this._maxRequestedIndex - firstEntry.end;
+			// A request can also reach past the end of the stream, though, so never measure from further than what has
+			// been pulled: otherwise, every chunk would be evicted as it arrives, and the cache would end up empty.
+			const evictionReference = Math.min(this._maxRequestedIndex, endIndex);
+			while (this._cacheStart < this._cache.length) {
+				const firstEntry = this._cache[this._cacheStart]!;
+				const distance = evictionReference - firstEntry.end;
 
 				if (distance <= this._maxCacheSize) {
 					break;
 				}
 
-				this._cache.shift();
+				// Release the data right away; the entry itself stays in the array (for now) to keep it sorted
+				firstEntry.bytes = EMPTY_BYTES;
+				firstEntry.view = EMPTY_VIEW;
+				this._cacheStart++;
+			}
+
+			if (this._cacheStart > 0 && this._cacheStart >= this._cache.length / 2) {
+				this._cache.splice(0, this._cacheStart);
+				this._cacheStart = 0;
 			}
 
 			this._currentIndex += value.byteLength;
@@ -1997,9 +2555,13 @@ export class ReadableStreamSource extends Source {
 
 		this._pendingSlices.length = 0;
 		this._cache.length = 0;
+		this._cacheStart = 0;
 		void this._reader?.cancel().catch(() => {});
 	}
 }
+
+const EMPTY_BYTES = new Uint8Array(0);
+const EMPTY_VIEW = toDataView(EMPTY_BYTES);
 
 const assembleSlice = (start: number, end: number, parts: SlicePart[]): ReadResult => {
 	const bytes = new Uint8Array(end - start);
@@ -2014,25 +2576,43 @@ const assembleSlice = (start: number, end: number, parts: SlicePart[]): ReadResu
 	};
 };
 
-type PrefetchProfile = (start: number, end: number, workers: ReadWorker[]) => {
+/**
+ * Returns the range to load for a read of [start, end). The data loaded around the read has to fit into the cache
+ * (`maxCacheSize`); otherwise, it's evicted before it's read and then requested again.
+ */
+type PrefetchProfile = (start: number, end: number, workers: ReadWorker[], maxCacheSize: number) => {
 	start: number;
 	end: number;
 };
 
+/** The largest power of 2 not above `x`, or 0 if `x` is below 1. */
+const floorToPowerOf2 = (x: number) => x < 1 ? 0 : 2 ** Math.floor(Math.log2(x));
+
 const PREFETCH_PROFILES = {
 	none: (start, end) => ({ start, end }),
-	fileSystem: (start, end) => {
-		const padding = 2 ** 16;
+	fileSystem: (start, end, workers, maxCacheSize) => {
+		const padding = Math.min(2 ** 16, floorToPowerOf2(maxCacheSize / 4));
+		if (padding === 0) {
+			return { start, end };
+		}
 
 		start = Math.floor((start - padding) / padding) * padding;
 		end = Math.ceil((end + padding) / padding) * padding;
 
 		return { start, end };
 	},
-	network: (start, end, workers) => {
+	network: (start, end, workers, maxCacheSize) => {
+		// What's loaded ahead of the read has to fit into the cache next to what's being read
+		const maxLoadAhead = floorToPowerOf2(maxCacheSize / 2);
+		if (maxLoadAhead === 0) {
+			return { start, end };
+		}
+
 		// Add a slight bit of start padding because backwards reading is painful
-		const paddingStart = 2 ** 16;
-		start = Math.max(0, Math.floor((start - paddingStart) / paddingStart) * paddingStart);
+		const paddingStart = Math.min(2 ** 16, floorToPowerOf2(maxLoadAhead / 2));
+		if (paddingStart > 0) {
+			start = Math.max(0, Math.floor((start - paddingStart) / paddingStart) * paddingStart);
+		}
 
 		// Remote resources have extreme latency (relatively speaking), so the benefit from intelligent
 		// prefetching is great. The network prefetch strategy is as follows: When we notice
@@ -2042,7 +2622,7 @@ const PREFETCH_PROFILES = {
 		// is small. Or, we're repeatedly doing a sequential access pattern (common in media files), in which
 		// case we can become more and more confident to prefetch more and more data.
 		for (const worker of workers) {
-			const maxExtensionAmount = 8 * 2 ** 20; // 8 MiB
+			const maxExtensionAmount = Math.min(8 * 2 ** 20 /* 8 MiB */, maxLoadAhead);
 
 			// When the read region cross the threshold point, we trigger a prefetch. This point is typically
 			// in the middle of the worker's read region, or a fixed offset from the end if the region has grown
@@ -2068,7 +2648,7 @@ const PREFETCH_PROFILES = {
 			}
 		}
 
-		end = Math.max(end, start + URL_SOURCE_MIN_LOAD_AMOUNT);
+		end = Math.max(end, start + Math.min(URL_SOURCE_MIN_LOAD_AMOUNT, maxLoadAhead));
 
 		return {
 			start,
@@ -2098,6 +2678,19 @@ type CacheEntry = {
 	age: number;
 };
 
+type OrchestratorCacheEntry = {
+	start: number;
+	end: number;
+	bytes: Uint8Array;
+	view: DataView;
+	/** The neighbors in the order of last use, so that the least recently used entry is found in O(1). */
+	lruOlder: OrchestratorCacheEntry | null;
+	lruNewer: OrchestratorCacheEntry | null;
+};
+
+const EVICTED_BYTES = new Uint8Array(0);
+const EVICTED_VIEW = toDataView(EVICTED_BYTES);
+
 type ReadWorker = {
 	startPos: number;
 	currentPos: number;
@@ -2120,9 +2713,19 @@ type ReadWorker = {
  */
 class ReadOrchestrator {
 	fileSize: number | null = null;
+	/** Where the data supplied by the workers ends, as far as it goes */
+	suppliedEnd = 0;
 	nextAge = 0; // Used for multiple things
 	workers: ReadWorker[] = [];
-	cache: CacheEntry[] = [];
+	cache: OrchestratorCacheEntry[] = [];
+	/**
+	 * Entries before this index have been evicted. When reading forward, the evicted entry is the first one, and
+	 * removing it from the array right away would be O(n); they're dropped in bulk instead.
+	 */
+	cacheStart = 0;
+	/** The ends of a list of the cache entries ordered by last use. */
+	lruOldestEntry: OrchestratorCacheEntry | null = null;
+	lruNewestEntry: OrchestratorCacheEntry | null = null;
 	currentCacheSize = 0;
 	disposed = false;
 	queuedReads: {
@@ -2149,19 +2752,24 @@ class ReadOrchestrator {
 	): MaybePromise<ReadResult | null> {
 		assert(!this.disposed);
 
-		const prefetchRange = this.options.prefetchProfile(innerStart, innerEnd, this.workers);
+		const prefetchRange = this.options.prefetchProfile(
+			innerStart,
+			innerEnd,
+			this.workers,
+			this.options.maxCacheSize,
+		);
 		const outerStart = Math.max(prefetchRange.start, minReadPosition);
 		const outerEnd = Math.min(prefetchRange.end, this.fileSize ?? Infinity, maxReadPosition);
 		assert(outerStart <= innerStart && innerEnd <= outerEnd);
 
 		let result: MaybePromise<ReadResult | null> | null = null;
 
-		const innerCacheStartIndex = binarySearchLessOrEqual(this.cache, innerStart, x => x.start);
+		const innerCacheStartIndex = this.findCacheEntryIndex(innerStart);
 		const innerStartEntry = innerCacheStartIndex !== -1 ? this.cache[innerCacheStartIndex] : null;
 
 		// See if the read request can be satisfied by a single cache entry
 		if (innerStartEntry && innerStartEntry.start <= innerStart && innerEnd <= innerStartEntry.end) {
-			innerStartEntry.age = this.nextAge++;
+			this.markCacheEntryUsed(innerStartEntry);
 
 			result = {
 				bytes: innerStartEntry.bytes,
@@ -2171,7 +2779,7 @@ class ReadOrchestrator {
 			// Can't return yet though, still need to check if the prefetch range might lie outside the cached area
 		}
 
-		const outerCacheStartIndex = binarySearchLessOrEqual(this.cache, outerStart, x => x.start);
+		const outerCacheStartIndex = this.findCacheEntryIndex(outerStart);
 
 		const bytes = result ? null : new Uint8Array(innerEnd - innerStart);
 		let contiguousBytesWriteEnd = 0; // Used to track if the cache is able to completely cover the bytes
@@ -2218,7 +2826,7 @@ class ReadOrchestrator {
 						}
 					}
 				}
-				entry.age = this.nextAge++;
+				this.markCacheEntryUsed(entry);
 			}
 
 			if (lastEnd < outerEnd) {
@@ -2353,11 +2961,7 @@ class ReadOrchestrator {
 				}
 
 				// Nobody's awaiting this result but an errored read is still notable
-				if (this.options.handleUnhandledError) {
-					this.options.handleUnhandledError(error);
-				} else {
-					throw error;
-				}
+				reportUnawaitedError(error, this.options.handleUnhandledError);
 			});
 		}
 
@@ -2475,11 +3079,7 @@ class ReadOrchestrator {
 					worker.pendingSlices.forEach(x => x.reject(error)); // Make sure to propagate any errors
 					worker.pendingSlices.length = 0;
 				} else if (!worker.aborted && !this.disposed) {
-					if (this.options.handleUnhandledError) {
-						this.options.handleUnhandledError(error);
-					} else {
-						throw error; // So it doesn't get swallowed
-					}
+					reportUnawaitedError(error, this.options.handleUnhandledError);
 				}
 			})
 			.finally(() => {
@@ -2529,9 +3129,11 @@ class ReadOrchestrator {
 			end,
 			bytes,
 			view: toDataView(bytes),
-			age: this.nextAge++,
+			lruOlder: null,
+			lruNewer: null,
 		});
 		worker.currentPos += bytes.length;
+		this.suppliedEnd = Math.max(this.suppliedEnd, worker.currentPos);
 
 		if (worker.currentPos > worker.targetPos) {
 			// In case it overshoots
@@ -2677,14 +3279,19 @@ class ReadOrchestrator {
 		}
 	}
 
-	insertIntoCache(entry: CacheEntry) {
+	insertIntoCache(entry: OrchestratorCacheEntry) {
 		if (this.options.maxCacheSize === 0) {
 			return; // No caching
 		}
 
 		let insertionIndex = binarySearchLessOrEqual(this.cache, entry.start, x => x.start) + 1;
+		if (insertionIndex < this.cacheStart) {
+			// The entry goes before evicted ones, so drop those first to keep the array sorted
+			this.dropEvictedCacheEntries();
+			insertionIndex = 0;
+		}
 
-		if (insertionIndex > 0) {
+		if (insertionIndex > this.cacheStart) {
 			const previous = this.cache[insertionIndex - 1]!;
 			if (previous.end >= entry.end) {
 				// Previous entry swallows the one to be inserted; we don't need to do anything
@@ -2708,10 +3315,12 @@ class ReadOrchestrator {
 				entry = previous;
 			} else {
 				this.cache.splice(insertionIndex, 0, entry);
+				this.appendToLruList(entry);
 				this.currentCacheSize += entry.bytes.length;
 			}
 		} else {
 			this.cache.splice(insertionIndex, 0, entry);
+			this.appendToLruList(entry);
 			this.currentCacheSize += entry.bytes.length;
 		}
 
@@ -2725,6 +3334,7 @@ class ReadOrchestrator {
 			if (entry.end >= next.end) {
 				// The inserted entry completely swallows the next entry
 				this.cache.splice(i, 1);
+				this.removeFromLruList(next);
 				this.currentCacheSize -= next.bytes.length;
 				i--;
 				continue;
@@ -2741,32 +3351,90 @@ class ReadOrchestrator {
 			entry.view = toDataView(joined);
 			entry.end = next.end;
 			this.cache.splice(i, 1);
+			this.removeFromLruList(next);
 
 			break; // After the join case, we're done: the next entry cannot possibly overlap with the inserted one.
 		}
 
 		// LRU eviction of cache entries
 		while (this.currentCacheSize > this.options.maxCacheSize) {
-			let oldestIndex = 0;
-			let oldestEntry = this.cache[0]!;
-
-			for (let i = 1; i < this.cache.length; i++) {
-				const entry = this.cache[i]!;
-
-				if (entry.age < oldestEntry.age) {
-					oldestIndex = i;
-					oldestEntry = entry;
-				}
-			}
+			const oldestEntry = this.lruOldestEntry;
+			assert(oldestEntry);
 
 			if (this.currentCacheSize - oldestEntry.bytes.length <= this.options.maxCacheSize) {
 				// Don't evict if it would shrink the cache below the max size
 				break;
 			}
 
-			this.cache.splice(oldestIndex, 1);
+			if (this.cache[this.cacheStart] === oldestEntry) {
+				this.cacheStart++;
+			} else {
+				let oldestIndex = binarySearchExact(this.cache, oldestEntry.start, x => x.start);
+				while (this.cache[oldestIndex] !== oldestEntry) {
+					oldestIndex++; // Empty or evicted entries can share a start with it
+				}
+				assert(oldestIndex < this.cache.length);
+
+				this.cache.splice(oldestIndex, 1);
+			}
+
+			this.removeFromLruList(oldestEntry);
 			this.currentCacheSize -= oldestEntry.bytes.length;
+			oldestEntry.bytes = EVICTED_BYTES;
+			oldestEntry.view = EVICTED_VIEW;
 		}
+
+		if (this.cacheStart > 0 && this.cacheStart >= this.cache.length / 2) {
+			this.dropEvictedCacheEntries();
+		}
+	}
+
+	/** Returns the index of the last cache entry starting at or before the position, or -1 if there is none. */
+	findCacheEntryIndex(position: number) {
+		const index = binarySearchLessOrEqual(this.cache, position, x => x.start);
+		return index < this.cacheStart ? -1 : index;
+	}
+
+	dropEvictedCacheEntries() {
+		this.cache.splice(0, this.cacheStart);
+		this.cacheStart = 0;
+	}
+
+	/** Makes the entry the most recently used one. */
+	markCacheEntryUsed(entry: OrchestratorCacheEntry) {
+		if (entry !== this.lruNewestEntry) {
+			this.removeFromLruList(entry);
+			this.appendToLruList(entry);
+		}
+	}
+
+	appendToLruList(entry: OrchestratorCacheEntry) {
+		entry.lruOlder = this.lruNewestEntry;
+		entry.lruNewer = null;
+
+		if (this.lruNewestEntry) {
+			this.lruNewestEntry.lruNewer = entry;
+		} else {
+			this.lruOldestEntry = entry;
+		}
+		this.lruNewestEntry = entry;
+	}
+
+	removeFromLruList(entry: OrchestratorCacheEntry) {
+		if (entry.lruOlder) {
+			entry.lruOlder.lruNewer = entry.lruNewer;
+		} else {
+			this.lruOldestEntry = entry.lruNewer;
+		}
+
+		if (entry.lruNewer) {
+			entry.lruNewer.lruOlder = entry.lruOlder;
+		} else {
+			this.lruNewestEntry = entry.lruOlder;
+		}
+
+		entry.lruOlder = null;
+		entry.lruNewer = null;
 	}
 
 	dispose() {
@@ -2792,6 +3460,9 @@ class ReadOrchestrator {
 
 		this.workers.length = 0;
 		this.cache.length = 0;
+		this.cacheStart = 0;
+		this.lruOldestEntry = null;
+		this.lruNewestEntry = null;
 		this.queuedReads.length = 0;
 		this.disposed = true;
 	}
@@ -2863,6 +3534,11 @@ export class RangedSource extends Source {
 		}
 
 		return clamp(baseSize - this._offset, 0, this._length ?? Infinity);
+	}
+
+	/** @internal */
+	override _supportsRandomAccess(): boolean {
+		return this._baseSource._supportsRandomAccess();
 	}
 
 	/** @internal */

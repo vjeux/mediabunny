@@ -1,6 +1,14 @@
 import { expect, test } from 'vitest';
 import { AudioResampler } from '../../src/resample.js';
 import { AudioSample } from '../../src/sample.js';
+import { AudioSampleSource } from '../../src/media-source.js';
+import { AudioEncodingConfig } from '../../src/encode.js';
+import { Output } from '../../src/output.js';
+import { MkvOutputFormat } from '../../src/output-format.js';
+import { BufferTarget } from '../../src/target.js';
+import { Input } from '../../src/input.js';
+import { BufferSource } from '../../src/source.js';
+import { ALL_FORMATS } from '../../src/input-format.js';
 
 test('Output buffer boundary with fractional chunk endpoint', async () => {
 	const output: number[] = [];
@@ -66,4 +74,98 @@ test('Exact output frame count across chunks', async () => {
 	await resampler.finalize();
 
 	expect(outputFrames).toBe(343 * 1152 * 48000 / 22050);
+});
+
+test('Resampling keeps the passband and filters out what the target rate cannot represent', async () => {
+	const resample = async (frequency: number, sourceRate: number, targetRate: number) => {
+		const output: number[] = [];
+		const resampler = new AudioResampler({
+			targetSampleRate: targetRate,
+			targetNumberOfChannels: 1,
+			onSample: async (sample) => {
+				const data = new Float32Array(sample.numberOfFrames);
+				sample.copyTo(data, { planeIndex: 0, format: 'f32' });
+				output.push(...data);
+				sample.close();
+			},
+		});
+
+		for (let start = 0; start < sourceRate / 2; start += 1024) {
+			const data = new Float32Array(1024);
+			for (let i = 0; i < data.length; i++) {
+				data[i] = 0.5 * Math.sin(2 * Math.PI * frequency * (start + i) / sourceRate);
+			}
+
+			const sample = new AudioSample({
+				format: 'f32',
+				sampleRate: sourceRate,
+				numberOfChannels: 1,
+				timestamp: start / sourceRate,
+				data,
+			});
+			await resampler.add(sample);
+			sample.close();
+		}
+		await resampler.finalize();
+
+		return output;
+	};
+
+	// Amplitude of a frequency component, relative to the input's, using a Hann-windowed DFT
+	const relativeAmplitude = (data: number[], rate: number, frequency: number) => {
+		let re = 0;
+		let im = 0;
+		let windowSum = 0;
+		for (let i = 0; i < data.length; i++) {
+			const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (data.length - 1));
+			re += data[i]! * window * Math.cos(2 * Math.PI * frequency * i / rate);
+			im -= data[i]! * window * Math.sin(2 * Math.PI * frequency * i / rate);
+			windowSum += window;
+		}
+		return 2 * Math.hypot(re, im) / windowSum / 0.5;
+	};
+
+	// A 10 kHz tone passes 48 kHz -> 44.1 kHz unchanged (linear interpolation dampens it by 1.3 dB)
+	const passband = relativeAmplitude(await resample(10_000, 48_000, 44_100), 44_100, 10_000);
+	expect(passband).toBeGreaterThan(0.99);
+	expect(passband).toBeLessThan(1.01);
+
+	// A 12 kHz tone can't be represented at 16 kHz and must be filtered out instead of folding back to 4 kHz (FFmpeg
+	// and Chrome's decodeAudioData both suppress it by more than 75 dB)
+	const alias = relativeAmplitude(await resample(12_000, 48_000, 16_000), 16_000, 4_000);
+	expect(alias).toBeLessThan(0.001);
+});
+
+test('Audio sources built from one reused config keep their own transform', async () => {
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const config: AudioEncodingConfig = { codec: 'pcm-s16', transform: { sampleRate: 48000, numberOfChannels: 1 } };
+	const sources: AudioSampleSource[] = [];
+	for (const [sampleRate, numberOfChannels] of [[48000, 1], [16000, 2]] as const) {
+		config.transform!.sampleRate = sampleRate;
+		config.transform!.numberOfChannels = numberOfChannels;
+		const source = new AudioSampleSource(config);
+		output.addAudioTrack(source);
+		sources.push(source);
+	}
+	config.codec = 'pcm-f32'; // Too late to matter, and must not desync the encoder from its track
+
+	await output.start();
+	for (const source of sources) {
+		const sample = new AudioSample({
+			data: new Float32Array(4800),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: 0,
+		});
+		await source.add(sample);
+		sample.close();
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const tracks = await input.getAudioTracks();
+	expect(await Promise.all(tracks.map(track => track.getSampleRate()))).toEqual([48000, 16000]);
+	expect(await Promise.all(tracks.map(track => track.getNumberOfChannels()))).toEqual([1, 2]);
+	expect(await Promise.all(tracks.map(track => track.getCodec()))).toEqual(['pcm-s16', 'pcm-s16']);
 });

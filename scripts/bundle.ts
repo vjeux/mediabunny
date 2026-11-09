@@ -12,6 +12,8 @@ const createVariants = async (
 	specificUmdConfig: esbuild.BuildOptions = {},
 	specificEsmConfig: esbuild.BuildOptions = {},
 	nodeUmdVariant = false,
+	cjsVariant = false,
+	scriptVariants = false,
 ) => {
 	const baseConfig: esbuild.BuildOptions = {
 		entryPoints: [entryPoint],
@@ -86,6 +88,32 @@ const createVariants = async (
 		variants.push(nodeVariant);
 	}
 
+	if (cjsVariant) {
+		// The build for require(). Its require('mediabunny') loads the same CommonJS build of Mediabunny that the app
+		// gets, whereas the ESM build would import Mediabunny's ESM build, a second copy the extension registers with.
+		const cjsVariantContext = await esbuild.context({
+			...esmConfig,
+			...specificEsmConfig,
+			format: 'cjs',
+			outfile: `${outfileBase}.cjs`,
+		});
+		variants.push(cjsVariantContext);
+	}
+
+	if (scriptVariants) {
+		// The UMD build again, as .js for script tags: CDNs and servers send .cjs files as application/node or
+		// application/octet-stream, which browsers refuse to run in workers (importScripts), and as script tags when
+		// the response has `X-Content-Type-Options: nosniff` (jsDelivr does both)
+		for (const minify of [false, true]) {
+			variants.push(await esbuild.context({
+				...umdConfig,
+				...specificUmdConfig,
+				outfile: `${outfileBase}${minify ? '.min' : ''}.js`,
+				minify,
+			}));
+		}
+	}
+
 	return variants;
 };
 
@@ -96,6 +124,8 @@ const mediabunnyVariants = await createVariants(
 	'cjs',
 	undefined,
 	undefined,
+	true,
+	false, // The .cjs build stays UMD, so cjsVariant (from #315) is off
 	true,
 );
 
@@ -128,6 +158,8 @@ const mp3EncoderVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const ac3Variants = await createVariants(
@@ -159,6 +191,8 @@ const ac3Variants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const dtsVariants = await createVariants(
@@ -190,6 +224,8 @@ const dtsVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const trueHdVariants = await createVariants(
@@ -221,6 +257,8 @@ const trueHdVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const aacEncoderVariants = await createVariants(
@@ -252,6 +290,8 @@ const aacEncoderVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const flacEncoderVariants = await createVariants(
@@ -283,6 +323,8 @@ const flacEncoderVariants = await createVariants(
 			}),
 		],
 	},
+	false,
+	true,
 );
 
 const proresVariants = await createVariants(
@@ -301,6 +343,8 @@ const proresVariants = await createVariants(
 		external: ['mediabunny'],
 		platform: 'node', // To retain the Node imports
 	},
+	false,
+	true,
 );
 
 const serverVariants = await createVariants(
@@ -311,12 +355,13 @@ const serverVariants = await createVariants(
 	{
 		platform: 'node',
 		packages: 'external',
-		external: ['mediabunny'],
+		// Listed explicitly because the tsconfig paths would otherwise resolve them to their sources and inline them
+		external: ['mediabunny', '@mediabunny/prores'],
 	},
 	{
 		platform: 'node',
 		packages: 'external',
-		external: ['mediabunny'],
+		external: ['mediabunny', '@mediabunny/prores'],
 	},
 );
 

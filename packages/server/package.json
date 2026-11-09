@@ -7,9 +7,14 @@
   "module": "./dist/bundles/mediabunny-server.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
-    "types": "./dist/modules/src/index.d.ts",
-    "import": "./dist/bundles/mediabunny-server.mjs",
-    "require": "./dist/bundles/mediabunny-server.cjs"
+    "import": {
+      "types": "./dist/mediabunny-server.d.mts",
+      "default": "./dist/bundles/mediabunny-server.mjs"
+    },
+    "require": {
+      "types": "./dist/modules/src/index.d.ts",
+      "default": "./dist/bundles/mediabunny-server.cjs"
+    }
   },
   "files": [
     "README.md",
@@ -38,7 +43,7 @@
     "@mediabunny/prores": "^1.65.2"
   },
   "peerDependencies": {
-    "mediabunny": "^1.45.0"
+    "mediabunny": "^1.56.0"
   },
   "keywords": [
     "server",

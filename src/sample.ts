@@ -11,6 +11,9 @@ import {
 	clamp,
 	COLOR_PRIMARIES_MAP,
 	isAllowSharedBufferSource,
+	isUint8Array,
+	arrayBufferFromOtherRealm,
+	uint8ArrayFromOtherRealm,
 	isThenable,
 	MATRIX_COEFFICIENTS_MAP,
 	Rotation,
@@ -20,6 +23,7 @@ import {
 	SetRequired,
 	TRANSFER_CHARACTERISTICS_MAP,
 	isFirefox,
+	isChromium,
 	polyfillSymbolDispose,
 	assertNever,
 	isWebKit,
@@ -28,10 +32,12 @@ import {
 	Rectangle,
 	validateRectangle,
 	composeRotationAndFlip,
+	normalizeRotation,
 	roundToMultiple,
 	arrayArgmin,
 	MaybePromise,
 	DeepReadonly,
+	missingWebCodecsClassMessage,
 } from './misc';
 import { Logging } from './logging';
 
@@ -40,6 +46,7 @@ polyfillSymbolDispose();
 type FinalizationRegistryValue = {
 	type: 'video';
 	data: VideoFrame | OffscreenCanvas | Uint8Array | VideoSampleResource;
+	passedFrame: VideoFrame | null;
 } | {
 	type: 'audio';
 	data: AudioData | Uint8Array | AudioSampleResource;
@@ -67,6 +74,7 @@ if (typeof FinalizationRegistry !== 'undefined') {
 
 			if (typeof VideoFrame !== 'undefined' && value.data instanceof VideoFrame) {
 				value.data.close(); // Prevent the browser error since we're logging our own
+				value.passedFrame?.close();
 			}
 		} else {
 			if (now - lastAudioGcErrorLog >= 1000) {
@@ -84,6 +92,24 @@ if (typeof FinalizationRegistry !== 'undefined') {
 		}
 	});
 }
+
+/**
+ * Whether the value is a SharedArrayBuffer. Also works where SharedArrayBuffer isn't a global: without cross-origin
+ * isolation, shared WebAssembly memory still is one.
+ */
+const isSharedArrayBuffer = (value: unknown): value is SharedArrayBuffer => {
+	if (Object.prototype.toString.call(value) !== '[object SharedArrayBuffer]') {
+		return false;
+	}
+
+	try {
+		// The brand can be faked with Symbol.toStringTag, but only real buffers can back a DataView
+		new DataView(value as ArrayBufferLike, 0, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
 
 /**
  * Abstract base class for custom video sample resources. Implement this class to provide custom backing
@@ -260,6 +286,18 @@ export class VideoSample implements Disposable {
 	_layout!: PlaneLayout[] | null;
 	/** @internal */
 	_closed: boolean = false;
+	/**
+	 * The VideoFrame passed to the constructor when the sample holds a wrapper of it instead; closed together with the
+	 * sample.
+	 * @internal
+	 */
+	_passedFrame: VideoFrame | null = null;
+	/**
+	 * Whether the browser created the backing VideoFrame from a canvas or image. Browsers store those premultiplied by
+	 * alpha, and so are the color values such a VideoFrame hands out.
+	 * @internal
+	 */
+	_fromImageSource = false;
 
 	/**
 	 * The internal pixel format in which the frame is stored. Will be `null` if it's using an arbitrary internal
@@ -368,9 +406,10 @@ export class VideoSample implements Disposable {
 		data: VideoFrame | CanvasImageSource | AllowSharedBufferSource | VideoSampleResource,
 		init?: VideoSampleInit,
 	) {
+		data = arrayBufferFromOtherRealm(data); // instanceof ArrayBuffer rejects ArrayBuffers of other realms
 		if (
 			data instanceof ArrayBuffer
-			|| (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)
+			|| isSharedArrayBuffer(data)
 			|| ArrayBuffer.isView(data)
 		) {
 			if (!init || typeof init !== 'object') {
@@ -416,6 +455,12 @@ export class VideoSample implements Disposable {
 			}
 			if (init.visibleRect !== undefined) {
 				validateRectangle(init.visibleRect, 'init.visibleRect');
+				if (
+					init.visibleRect.left + init.visibleRect.width > init.codedWidth!
+					|| init.visibleRect.top + init.visibleRect.height > init.codedHeight!
+				) {
+					throw new TypeError('init.visibleRect must lie within the coded size.');
+				}
 			}
 			if (
 				init.displayWidth !== undefined
@@ -442,6 +487,7 @@ export class VideoSample implements Disposable {
 			this.duration = init.duration ?? 0;
 
 			const layout = init.layout ?? createDefaultPlaneLayout(init.format, init.codedWidth!, init.codedHeight!);
+			validatePlaneLayout(init.format, init.codedWidth!, init.codedHeight!, layout, data.byteLength);
 
 			let colorSpaceInit = init.colorSpace ?? null;
 			if (colorSpaceInit === null) {
@@ -490,7 +536,8 @@ export class VideoSample implements Disposable {
 			this._data = init._doNotCopy
 				? toUint8Array(data)
 				: toUint8Array(data).slice(); // Copy it
-			this._layout = layout;
+			// Own copy of the layout, so later changes to the caller's objects can't move the planes (like the data)
+			this._layout = layout.map(({ offset, stride }) => ({ offset, stride }));
 			this.colorSpace = new VideoSampleColorSpace(colorSpaceInit);
 		} else if (typeof VideoFrame !== 'undefined' && data instanceof VideoFrame) {
 			if (init?.rotation !== undefined && ![0, 90, 180, 270].includes(init.rotation)) {
@@ -508,6 +555,72 @@ export class VideoSample implements Disposable {
 			if (init?.visibleRect !== undefined) {
 				validateRectangle(init.visibleRect, 'init.visibleRect');
 			}
+			if (
+				init?.displayWidth !== undefined
+				&& (!Number.isInteger(init.displayWidth) || init.displayWidth <= 0)
+			) {
+				throw new TypeError('init.displayWidth, when provided, must be a positive integer.');
+			}
+			if (
+				init?.displayHeight !== undefined
+				&& (!Number.isInteger(init.displayHeight) || init.displayHeight <= 0)
+			) {
+				throw new TypeError('init.displayHeight, when provided, must be a positive integer.');
+			}
+			if ((init?.displayWidth !== undefined) !== (init?.displayHeight !== undefined)) {
+				throw new TypeError(
+					'init.displayWidth and init.displayHeight must be either both provided or both omitted.',
+				);
+			}
+
+			if (init?.visibleRect !== undefined || init?.displayWidth !== undefined) {
+				// Crop and/or rescale the frame, like the VideoFrame constructor does. The display size in init is the
+				// one after all rotation, the frame's own included, while VideoFrame takes the one before its rotation
+				// (init's rotation isn't passed on to the frame), so undo it.
+				const frameRotation = (data as VideoFrame & { rotation?: number }).rotation ?? 0;
+				const quarterTurn = (frameRotation + (init.rotation ?? 0)) % 180 !== 0;
+				const refinedFrame = new VideoFrame(data, {
+					visibleRect: init.visibleRect && {
+						x: init.visibleRect.left,
+						y: init.visibleRect.top,
+						width: init.visibleRect.width,
+						height: init.visibleRect.height,
+					},
+					displayWidth: quarterTurn ? init.displayHeight : init.displayWidth,
+					displayHeight: quarterTurn ? init.displayWidth : init.displayHeight,
+				});
+				// Keep the caller's frame open for as long as the sample, as if the sample held it directly. A frame
+				// of our own that gets replaced is closed.
+				if (this._passedFrame === null) {
+					this._passedFrame = data;
+				} else {
+					data.close();
+				}
+				data = refinedFrame;
+			}
+
+			// Browsers put an image's orientation into the frame's rotation and flip when it isn't baked into the
+			// pixels, e.g. for JPEGs with an EXIF orientation. VideoSample keeps orientation in its own metadata, so
+			// move it there and strip it from the frame (else drawing the frame would apply it a second time).
+			const frameRotation = normalizeRotation((data as OrientedVideoFrame).rotation ?? 0);
+			const frameFlip = (data as OrientedVideoFrame).flip ?? false;
+			if (frameRotation !== 0 || frameFlip) {
+				const unorientedFrame = new VideoFrame(data, {
+					// Undoes the orientation, as per the "Add Rotations" algorithm of the WebCodecs spec
+					rotation: frameFlip ? frameRotation : (360 - frameRotation) % 360,
+					flip: frameFlip,
+					displayWidth: frameRotation % 180 === 0 ? data.displayWidth : data.displayHeight,
+					displayHeight: frameRotation % 180 === 0 ? data.displayHeight : data.displayWidth,
+				} as VideoFrameInit);
+				// Keep the caller's frame open for as long as the sample, as if the sample held it directly. A frame
+				// of our own that gets replaced is closed.
+				if (this._passedFrame === null) {
+					this._passedFrame = data;
+				} else {
+					data.close();
+				}
+				data = unorientedFrame;
+			}
 
 			this._data = data;
 			this._layout = null;
@@ -519,12 +632,18 @@ export class VideoSample implements Disposable {
 				width: data.visibleRect?.width ?? data.codedWidth,
 				height: data.visibleRect?.height ?? data.codedHeight,
 			};
-			// The VideoFrame's rotation and flip are ignored here. They're still new fields, and I'm not sure of any
-			// application where the browser makes use of them. If a case gets found, I'll add it.
-			this.rotation = init?.rotation ?? 0;
-			this.flip = init?.flip ?? false;
 
-			// Assuming no innate VideoFrame rotation here
+			// Like the VideoFrame constructor, the init's rotation and flip are applied on top of the frame's
+			const orientation = composeRotationAndFlip(
+				frameRotation,
+				frameFlip,
+				init?.rotation ?? 0,
+				init?.flip ?? false,
+			);
+			this.rotation = orientation.rotation;
+			this.flip = orientation.flip;
+
+			// The frame has no rotation at this point
 			this.squarePixelWidth = data.displayWidth;
 			this.squarePixelHeight = data.displayHeight;
 
@@ -568,7 +687,7 @@ export class VideoSample implements Disposable {
 			}
 
 			if (typeof VideoFrame !== 'undefined') {
-				return new VideoSample(
+				const sample = new VideoSample(
 					new VideoFrame(data, {
 						timestamp: Math.trunc(init.timestamp! * SECOND_TO_MICROSECOND_FACTOR),
 						// Drag 0 to undefined
@@ -581,8 +700,15 @@ export class VideoSample implements Disposable {
 							height: init.visibleRect.height,
 						},
 					}),
-					init,
+					// The frame is already cropped
+					{ ...init, visibleRect: undefined },
 				);
+				// Frames of a video element come straight from the decoder. ImageBitmaps are left out because their
+				// premultiplication depends on how they were created.
+				sample._fromImageSource = !(typeof HTMLVideoElement !== 'undefined' && data instanceof HTMLVideoElement)
+					&& !(typeof ImageBitmap !== 'undefined' && data instanceof ImageBitmap);
+
+				return sample;
 			}
 
 			let width = 0;
@@ -702,7 +828,11 @@ export class VideoSample implements Disposable {
 			num: this.squarePixelWidth * this.codedHeight,
 			den: this.squarePixelHeight * this.codedWidth,
 		});
-		finalizationRegistry?.register(this, { type: 'video', data: this._data }, this);
+		finalizationRegistry?.register(this, {
+			type: 'video',
+			data: this._data,
+			passedFrame: this._passedFrame,
+		}, this);
 	}
 
 	/** Clones this video sample. */
@@ -722,21 +852,26 @@ export class VideoSample implements Disposable {
 				encodeOptions: this.encodeOptions,
 			});
 		} else if (isVideoFrame(this._data)) {
-			return new VideoSample(this._data.clone(), {
+			const sample = new VideoSample(this._data.clone(), {
 				timestamp: this.timestamp,
 				duration: this.duration,
 				rotation: this.rotation,
 				flip: this.flip,
 				encodeOptions: this.encodeOptions,
 			});
+			sample._fromImageSource = this._fromImageSource;
+
+			return sample;
 		} else if (this._data instanceof Uint8Array) {
 			assert(this._layout);
 
 			return new VideoSample(this._data, {
 				format: this.format!,
 				layout: this._layout,
-				codedWidth: this.codedWidth,
-				codedHeight: this.codedHeight,
+				// The smallest coded size containing the visible rect (codedWidth/Height are the visible size); the
+				// layout has the actual strides
+				codedWidth: this.visibleRect.left + this.visibleRect.width,
+				codedHeight: this.visibleRect.top + this.visibleRect.height,
 				timestamp: this.timestamp,
 				duration: this.duration,
 				colorSpace: this.colorSpace,
@@ -786,6 +921,7 @@ export class VideoSample implements Disposable {
 			}
 		} else if (isVideoFrame(this._data)) {
 			this._data.close();
+			this._passedFrame?.close();
 		} else {
 			this._data = null; // GC that shit
 		}
@@ -811,7 +947,7 @@ export class VideoSample implements Disposable {
 
 		if (isVideoFrame(this._data)) {
 			// Call the native method purely for performance
-			return this._data.allocationSize(options);
+			return this._data.allocationSize(toNativeCopyToOptions(this._data, options));
 		}
 
 		const combinedLayout = ParseVideoFrameCopyToOptions(this, options);
@@ -823,6 +959,19 @@ export class VideoSample implements Disposable {
 	 * @returns The byte layout of the planes of the copied data.
 	 */
 	async copyTo(destination: AllowSharedBufferSource, options: VideoFrameCopyToOptions = {}): Promise<PlaneLayout[]> {
+		return this._copyTo(destination, options, true);
+	}
+
+	/**
+	 * `convertColorSpace` is false for samples returned by toRgbSample(), whose pixels are in the requested color
+	 * space already.
+	 * @internal
+	 */
+	async _copyTo(
+		destination: AllowSharedBufferSource,
+		options: VideoFrameCopyToOptions,
+		convertColorSpace: boolean,
+	): Promise<PlaneLayout[]> {
 		if (!isAllowSharedBufferSource(destination)) {
 			throw new TypeError('destination must be an ArrayBuffer or an ArrayBuffer view.');
 		}
@@ -836,9 +985,45 @@ export class VideoSample implements Disposable {
 		}
 
 		assert(this._data !== null);
+		// Like VideoFrame.copyTo(), the copy reads the pixels as they are when it's called, even if the sample is
+		// closed before the copy (which may wait for the conversion probe) finishes
+		const data = this._data;
+		const layout = this._layout;
 
-		if (isVideoFrame(this._data)) {
-			return this._data.copyTo(destination, options);
+		if (isVideoFrame(data)) {
+			return data.copyTo(destination, toNativeCopyToOptions(data, options));
+		}
+
+		// Copying into an RGB format converts the pixels into options.colorSpace (sRGB by default). We can't convert
+		// between color spaces ourselves, so let VideoFrame do it when the sample's RGB data is in another one, if this
+		// platform's VideoFrame can; otherwise, the pixels are copied as they are below. Custom resources are left
+		// alone, since they convert colors in toRgbSample().
+		if (
+			convertColorSpace
+			&& data instanceof Uint8Array
+			&& options.format
+			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
+			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(this.format!)
+			&& !isInPredefinedColorSpace(this.colorSpace, options.colorSpace ?? 'srgb')
+			&& await canConvertRgbColorSpaces()
+		) {
+			// Wrap exactly the visible rect: the smallest coded size containing it, with the strides of the layout
+			// (toVideoFrame() would reset a visible rect that doesn't start at the origin)
+			const visible = this.visibleRect;
+			const tempFrame = new VideoFrame(data, {
+				format: this.format as VideoPixelFormat,
+				codedWidth: visible.left + visible.width,
+				codedHeight: visible.top + visible.height,
+				layout: layout!,
+				visibleRect: { x: visible.left, y: visible.top, width: visible.width, height: visible.height },
+				timestamp: this.microsecondTimestamp,
+				colorSpace: this.colorSpace,
+			});
+			try {
+				return await tempFrame.copyTo(destination, options);
+			} finally {
+				tempFrame.close();
+			}
 		}
 
 		// Detect non-RGB to RGB conversion
@@ -848,8 +1033,8 @@ export class VideoSample implements Disposable {
 			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
 		) {
 			// RGB conversion for custom VideoSampleResource
-			if (this._data instanceof VideoSampleResource) {
-				using rgbSample = await this._data.toRgbSample(
+			if (data instanceof VideoSampleResource) {
+				using rgbSample = await data.toRgbSample(
 					{
 						timestamp: this.timestamp,
 						duration: this.duration,
@@ -869,7 +1054,8 @@ export class VideoSample implements Disposable {
 				}
 				// Note that we DON'T force the RGB format to be exactly what was requested; any RGB format will do
 
-				return await rgbSample.copyTo(destination, options); // 'await' is intentional here cuz of using
+				// 'await' is intentional here cuz of using
+				return await rgbSample._copyTo(destination, options, false);
 			} else {
 				if (typeof VideoFrame === 'undefined') {
 					throw new Error(
@@ -901,13 +1087,13 @@ export class VideoSample implements Disposable {
 		const planeConfigs = getPlaneConfigs(this.format);
 		let dataPlanes: VideoDataPlane[];
 
-		if (this._data instanceof VideoSampleResource) {
-			let result = this._data.getDataPlanes();
+		if (data instanceof VideoSampleResource) {
+			let result = data.getDataPlanes();
 			if (isThenable(result)) result = await result;
 
 			if (
 				!Array.isArray(result)
-				|| result.some(x => !(x.data instanceof Uint8Array) || !Number.isInteger(x.stride) || x.stride < 0)
+				|| result.some(x => !isUint8Array(x.data) || !Number.isInteger(x.stride) || x.stride < 0)
 			) {
 				throw new TypeError(
 					'getDataPlanes() must return an array of objects with a Uint8Array "data" property and a'
@@ -916,15 +1102,15 @@ export class VideoSample implements Disposable {
 			}
 
 			dataPlanes = result;
-		} else if (this._data instanceof Uint8Array) {
-			assert(this._layout);
-			assert(this._layout.length === planeConfigs.length);
+		} else if (data instanceof Uint8Array) {
+			assert(layout);
+			assert(layout.length === planeConfigs.length);
 
-			dataPlanes = this._layout.map((planeLayout, i) => {
+			dataPlanes = layout.map((planeLayout, i) => {
 				const height = Math.ceil(this.codedHeight / planeConfigs[i]!.heightDivisor);
 
 				return {
-					data: (this._data as Uint8Array).subarray(
+					data: data.subarray(
 						planeLayout.offset,
 						planeLayout.offset + planeLayout.stride * height,
 					),
@@ -932,7 +1118,7 @@ export class VideoSample implements Disposable {
 				};
 			});
 		} else {
-			const canvas = this._data;
+			const canvas = data;
 			const context = canvas.getContext('2d');
 			assert(context); // We already got it earlier so it's definitely available
 
@@ -1050,6 +1236,13 @@ export class VideoSample implements Disposable {
 		if (this._closed) {
 			throw new Error('VideoSample is closed.');
 		}
+		if (typeof VideoFrame === 'undefined') {
+			// Drawing and transforming samples that aren't backed by a canvas go through here too
+			throw new Error(
+				'This VideoSample needs to be converted to a VideoFrame (e.g. to draw or transform it), but VideoFrame'
+				+ ' is not available in this environment.',
+			);
+		}
 
 		assert(this._data !== null);
 
@@ -1066,6 +1259,13 @@ export class VideoSample implements Disposable {
 					'Cannot convert a VideoSampleResource-backed VideoSample to VideoFrame if getDataPlanes() returns'
 					+ ' a promise.',
 				);
+			}
+
+			if (!isChromium()) {
+				const repacked = repackPlanes(this.format, this.codedWidth, this.codedHeight, planes, null);
+				assert(repacked);
+
+				return this._repackedToVideoFrame(repacked);
 			}
 
 			// We can't use allocationSize since that method assumes a tight packing
@@ -1105,6 +1305,20 @@ export class VideoSample implements Disposable {
 		} else if (this._data instanceof Uint8Array) {
 			assert(this._layout);
 
+			if (!isChromium()) {
+				const data = this._data;
+				const repacked = repackPlanes(
+					this.format!,
+					this.codedWidth,
+					this.codedHeight,
+					this._layout.map(({ offset, stride }) => ({ data: data.subarray(offset), stride })),
+					this._layout,
+				);
+				if (repacked) {
+					return this._repackedToVideoFrame(repacked);
+				}
+			}
+
 			return new VideoFrame(this._data, {
 				format: this.format! as VideoPixelFormat,
 				codedWidth: this.codedWidth, // This is technically wrong! codedWidth is a lie technically. But, since
@@ -1125,8 +1339,36 @@ export class VideoSample implements Disposable {
 		}
 	}
 
+	/** @internal */
+	_repackedToVideoFrame(repacked: { data: Uint8Array; codedWidth: number; codedHeight: number }) {
+		return new VideoFrame(repacked.data, {
+			format: this.format! as VideoPixelFormat,
+			codedWidth: repacked.codedWidth,
+			codedHeight: repacked.codedHeight,
+			visibleRect: { x: 0, y: 0, width: this.codedWidth, height: this.codedHeight },
+			timestamp: this.microsecondTimestamp,
+			duration: this.microsecondDuration || undefined,
+			colorSpace: this.colorSpace,
+			displayWidth: this.squarePixelWidth, // Not display* since we're not passing rotation
+			displayHeight: this.squarePixelHeight,
+		});
+	}
+
 	/**
-	 * Draws the video sample to a 2D canvas context. Rotation and flip metadata will be taken into account.
+	 * Draws the video sample to a 2D canvas context at its display size. Rotation and flip metadata will be taken into
+	 * account.
+	 *
+	 * @param dx - The x-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 * @param dy - The y-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 */
+	draw(
+		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		dx: number,
+		dy: number,
+	): void;
+	/**
+	 * Draws the video sample to a 2D canvas context, scaled to the given size. Rotation and flip metadata will be taken
+	 * into account.
 	 *
 	 * @param dx - The x-coordinate in the destination canvas at which to place the top-left corner of the source image.
 	 * @param dy - The y-coordinate in the destination canvas at which to place the top-left corner of the source image.
@@ -1137,11 +1379,34 @@ export class VideoSample implements Disposable {
 		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
 		dx: number,
 		dy: number,
-		dWidth?: number,
-		dHeight?: number,
+		dWidth: number,
+		dHeight: number,
 	): void;
 	/**
-	 * Draws the video sample to a 2D canvas context. Rotation and flip metadata will be taken into account.
+	 * Draws a sub-rectangle of the video sample to a 2D canvas context at the sub-rectangle's size. Rotation and flip
+	 * metadata will be taken into account.
+	 *
+	 * @param sx - The x-coordinate of the top left corner of the sub-rectangle of the source image to draw into the
+	 * destination context.
+	 * @param sy - The y-coordinate of the top left corner of the sub-rectangle of the source image to draw into the
+	 * destination context.
+	 * @param sWidth - The width of the sub-rectangle of the source image to draw into the destination context.
+	 * @param sHeight - The height of the sub-rectangle of the source image to draw into the destination context.
+	 * @param dx - The x-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 * @param dy - The y-coordinate in the destination canvas at which to place the top-left corner of the source image.
+	 */
+	draw(
+		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		sx: number,
+		sy: number,
+		sWidth: number,
+		sHeight: number,
+		dx: number,
+		dy: number,
+	): void;
+	/**
+	 * Draws a sub-rectangle of the video sample to a 2D canvas context, scaled to the given size. Rotation and flip
+	 * metadata will be taken into account.
 	 *
 	 * @param sx - The x-coordinate of the top left corner of the sub-rectangle of the source image to draw into the
 	 * destination context.
@@ -1162,8 +1427,8 @@ export class VideoSample implements Disposable {
 		sHeight: number,
 		dx: number,
 		dy: number,
-		dWidth?: number,
-		dHeight?: number,
+		dWidth: number,
+		dHeight: number,
 	): void;
 	draw(
 		context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
@@ -1250,7 +1515,7 @@ export class VideoSample implements Disposable {
 
 		({ sx, sy, sWidth, sHeight } = this._unmapSourceRegion(sx, sy, sWidth, sHeight, this.rotation, this.flip));
 
-		const source = this.toCanvasImageSource();
+		const source = this._toCanvasImageSourceForRegion(sx, sy, sWidth, sHeight);
 
 		context.save();
 
@@ -1403,7 +1668,8 @@ export class VideoSample implements Disposable {
 
 		// Important that we don't use .draw() here since that would take rotation and flip into account, but we wanna
 		// handle them ourselves here
-		context.drawImage(this.toCanvasImageSource(), sx, sy, sWidth, sHeight, dx, dy, newWidth, newHeight);
+		const source = this._toCanvasImageSourceForRegion(sx, sy, sWidth, sHeight);
+		context.drawImage(source, sx, sy, sWidth, sHeight, dx, dy, newWidth, newHeight);
 
 		context.restore();
 	}
@@ -1536,8 +1802,9 @@ export class VideoSample implements Disposable {
 	 * Converts this video sample to a
 	 * [`CanvasImageSource`](https://udn.realityripple.com/docs/Web/API/CanvasImageSource) for drawing to a canvas.
 	 *
-	 * You must use the value returned by this method immediately, as any VideoFrame created internally may
-	 * automatically be closed in the next microtask.
+	 * The returned value belongs to the sample, so don't close it. It may be a VideoFrame created internally, which is
+	 * automatically closed in the next microtask (so use it immediately), or the sample's own VideoFrame, which
+	 * closing would invalidate.
 	 */
 	toCanvasImageSource() {
 		if (this._closed) {
@@ -1555,6 +1822,31 @@ export class VideoSample implements Disposable {
 		} else {
 			return this._data;
 		}
+	}
+
+	/**
+	 * Like toCanvasImageSource(), but for drawing only the given region of the sample. WebKit ignores the source
+	 * rectangle when drawing a VideoFrame and always draws the whole frame, so there, the frame is first drawn onto a
+	 * canvas, which respects it.
+	 * @internal
+	 */
+	_toCanvasImageSourceForRegion(sx: number, sy: number, sWidth: number, sHeight: number) {
+		const source = this.toCanvasImageSource();
+		const width = this.squarePixelWidth;
+		const height = this.squarePixelHeight;
+		if (
+			!isWebKit()
+			|| !isVideoFrame(source)
+			|| (sx === 0 && sy === 0 && sWidth === width && sHeight === height)
+		) {
+			return source;
+		}
+
+		const { canvas, context } = getWebKitFrameCanvas(width, height);
+		context.clearRect(0, 0, width, height);
+		context.drawImage(source, 0, 0, width, height);
+
+		return canvas;
 	}
 
 	/**
@@ -1642,8 +1934,10 @@ export class VideoSample implements Disposable {
 			targetHeight = cropHeight;
 		}
 
-		targetWidth = roundToMultiple(targetWidth, options.roundDimensionsTo ?? 1);
-		targetHeight = roundToMultiple(targetHeight, options.roundDimensionsTo ?? 1);
+		// Extreme aspect ratios must not round a dimension down to zero
+		const multiple = options.roundDimensionsTo ?? 1;
+		targetWidth = Math.max(multiple, roundToMultiple(targetWidth, multiple));
+		targetHeight = Math.max(multiple, roundToMultiple(targetHeight, multiple));
 
 		const description: VideoSampleTransformationDescription = {
 			width: targetWidth,
@@ -1665,7 +1959,15 @@ export class VideoSample implements Disposable {
 			let result = transformer(this, description);
 			if (isThenable(result)) result = await result;
 
-			if (result !== null) {
+			// Plain JavaScript transformers that don't handle the sample may return nothing, which defers too
+			if (result != null) {
+				if (!(result instanceof VideoSample)) {
+					throw new TypeError(
+						'Transformers registered with registerVideoSampleTransformer() must return a VideoSample,'
+						+ ' or null to defer.',
+					);
+				}
+
 				return result;
 			}
 		}
@@ -1861,11 +2163,44 @@ export const registerVideoSampleTransformer = (
 		description: VideoSampleTransformationDescription,
 	) => MaybePromise<VideoSample | null>,
 ) => {
+	if (typeof transformer !== 'function') {
+		throw new TypeError('transformer must be a function.');
+	}
+
 	if (registeredVideoSampleTransformers.includes(transformer)) {
 		return; // Already in there
 	}
 
 	registeredVideoSampleTransformers.push(transformer);
+};
+
+let webKitFrameCanvas: {
+	canvas: HTMLCanvasElement | OffscreenCanvas;
+	context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+} | null = null;
+
+/** The canvas that VideoFrames are drawn onto on WebKit before drawing a region of them. */
+const getWebKitFrameCanvas = (width: number, height: number) => {
+	if (!webKitFrameCanvas) {
+		let canvas: HTMLCanvasElement | OffscreenCanvas;
+		if (typeof OffscreenCanvas !== 'undefined') {
+			canvas = new OffscreenCanvas(width, height);
+		} else {
+			canvas = document.createElement('canvas');
+		}
+
+		const context = canvas.getContext('2d') as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
+		assert(context);
+		webKitFrameCanvas = { canvas, context };
+	}
+
+	const { canvas } = webKitFrameCanvas;
+	if (canvas.width !== width || canvas.height !== height) {
+		canvas.width = width;
+		canvas.height = height;
+	}
+
+	return webKitFrameCanvas;
 };
 
 const TRANSFORMATION_CANVAS_CACHE_MAX_SIZE = 3;
@@ -1994,6 +2329,93 @@ const isVideoFrame = (x: unknown): x is VideoFrame => {
 	return typeof VideoFrame !== 'undefined' && x instanceof VideoFrame;
 };
 
+/** VideoFrame's orientation fields, which aren't in TypeScript's DOM types yet. */
+type OrientedVideoFrame = VideoFrame & {
+	rotation?: number;
+	flip?: boolean;
+};
+
+/**
+ * Whether RGB data in the given color space is already in the given predefined color space. Like Chrome, this treats
+ * unspecified members and the BT.709 transfer function as sRGB.
+ */
+const isInPredefinedColorSpace = (colorSpace: VideoSampleColorSpace, target: PredefinedColorSpace) => {
+	const primaries = colorSpace.primaries as string | null;
+	const transfer = colorSpace.transfer as string | null;
+	if (target === 'display-p3') {
+		return primaries === 'smpte432' && transfer === 'iec61966-2-1';
+	}
+
+	return (primaries === null || primaries === 'bt709')
+		&& (transfer === null || transfer === 'iec61966-2-1' || transfer === 'bt709');
+};
+
+let rgbColorSpaceConversionSupport: Promise<boolean> | null = null;
+
+/**
+ * Whether this platform's VideoFrame converts RGB pixels between color spaces and channel orders in copyTo(), as the
+ * spec requires. Not all do: Firefox ignores the color space of a Display P3 frame, WebKitGTK copies RGB planes
+ * verbatim.
+ */
+const canConvertRgbColorSpaces = () => {
+	return rgbColorSpaceConversionSupport ??= (async () => {
+		if (typeof VideoFrame === 'undefined') {
+			return false;
+		}
+
+		const copyOrange = async (primaries: string, options: VideoFrameCopyToOptions) => {
+			const frame = new VideoFrame(new Uint8Array([200, 100, 50, 255]), {
+				format: 'RGBA',
+				codedWidth: 1,
+				codedHeight: 1,
+				timestamp: 0,
+				colorSpace: {
+					primaries: primaries as VideoColorPrimaries,
+					transfer: 'iec61966-2-1',
+					matrix: 'rgb',
+					fullRange: true,
+				},
+			});
+			const bytes = new Uint8Array(4);
+			try {
+				await frame.copyTo(bytes, options);
+			} finally {
+				frame.close();
+			}
+			return bytes;
+		};
+
+		try {
+			// sRGB orange copied as Display P3 BGRA must change color and have red and blue swapped, and Display P3
+			// orange copied as sRGB must change color
+			const toDisplayP3 = await copyOrange('bt709', { format: 'BGRA', colorSpace: 'display-p3' });
+			const toSrgb = await copyOrange('smpte432', { format: 'RGBA', colorSpace: 'srgb' });
+			return toDisplayP3[2]! > toDisplayP3[0]!
+				&& (toDisplayP3[0] !== 50 || toDisplayP3[2] !== 200)
+				&& (toSrgb[0] !== 200 || toSrgb[2] !== 50);
+		} catch {
+			return false;
+		}
+	})();
+};
+
+/**
+ * VideoFrame only accepts RGB formats in its copy options, while our own copy routine also accepts the frame's own
+ * format. Copying into it is a plain copy, so drop the format (and the color space, which only applies to RGB).
+ */
+const toNativeCopyToOptions = (frame: VideoFrame, options: VideoFrameCopyToOptions): VideoFrameCopyToOptions => {
+	if (
+		options.format !== undefined
+		&& options.format === frame.format
+		&& !['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
+	) {
+		// Picked one by one, since dictionary members may be inherited (e.g. getters), which a spread would drop
+		return { rect: options.rect, layout: options.layout };
+	}
+
+	return options;
+};
+
 /**
  * Specifies the rectangular cropping region.
  * @group Miscellaneous
@@ -2016,8 +2438,12 @@ export const clampCropRectangle = (crop: CropRectangle, outerWidth: number, oute
 	const width = Math.min(crop.width, outerWidth - left);
 	const height = Math.min(crop.height, outerHeight - top);
 
-	assert(width >= 0);
-	assert(height >= 0);
+	if (width === 0 || height === 0) {
+		throw new TypeError(
+			`The crop rectangle (left ${crop.left}, top ${crop.top}, ${crop.width}x${crop.height}) lies outside the`
+			+ ` ${outerWidth}x${outerHeight} frame.`,
+		);
+	}
 
 	return { left, top, width, height };
 };
@@ -2032,11 +2458,11 @@ export const validateCropRectangle = (crop: CropRectangle, prefix: string) => {
 	if (!Number.isInteger(crop.top) || crop.top < 0) {
 		throw new TypeError(prefix + 'crop.top must be a non-negative integer.');
 	}
-	if (!Number.isInteger(crop.width) || crop.width < 0) {
-		throw new TypeError(prefix + 'crop.width must be a non-negative integer.');
+	if (!Number.isInteger(crop.width) || crop.width <= 0) {
+		throw new TypeError(prefix + 'crop.width must be a positive integer.');
 	}
-	if (!Number.isInteger(crop.height) || crop.height < 0) {
-		throw new TypeError(prefix + 'crop.height must be a non-negative integer.');
+	if (!Number.isInteger(crop.height) || crop.height <= 0) {
+		throw new TypeError(prefix + 'crop.height must be a positive integer.');
 	}
 };
 
@@ -2086,6 +2512,45 @@ const validateVideoFrameCopyToOptions = (options: VideoFrameCopyToOptions) => {
 	}
 };
 
+/**
+ * Checks raw frame data against its plane layout like VideoFrame's constructor does (see Chromium's VideoFrameLayout):
+ * each row must fit in its stride, planes must not overlap, and the data must hold every plane.
+ */
+const validatePlaneLayout = (
+	format: VideoSamplePixelFormat,
+	codedWidth: number,
+	codedHeight: number,
+	layout: PlaneLayout[],
+	byteLength: number,
+) => {
+	const planes = getPlaneConfigs(format);
+	if (layout.length !== planes.length) {
+		throw new TypeError(`init.layout must have ${planes.length} entries for format ${format}.`);
+	}
+
+	const planeEnds: number[] = [];
+	for (let i = 0; i < planes.length; i++) {
+		const { offset, stride } = layout[i]!;
+		const minStride = Math.ceil(codedWidth / planes[i]!.widthDivisor) * planes[i]!.sampleBytes;
+		if (stride < minStride) {
+			throw new TypeError(`init.layout[${i}].stride must be at least ${minStride}, got ${stride}.`);
+		}
+
+		const end = offset + stride * Math.ceil(codedHeight / planes[i]!.heightDivisor);
+		for (let j = 0; j < i; j++) {
+			if (offset < planeEnds[j]! && layout[j]!.offset < end) {
+				throw new TypeError(`Planes ${j} and ${i} of init.layout overlap.`);
+			}
+		}
+		planeEnds.push(end);
+	}
+
+	const requiredSize = Math.max(...planeEnds);
+	if (byteLength < requiredSize) {
+		throw new TypeError(`data is too small: ${requiredSize} bytes are required, got ${byteLength}.`);
+	}
+};
+
 /** Implements logic from WebCodecs § 9.4.6 "Compute Layout and Allocation Size" */
 const createDefaultPlaneLayout = (
 	format: VideoSamplePixelFormat,
@@ -2115,6 +2580,61 @@ const createDefaultPlaneLayout = (
 	}
 
 	return layouts;
+};
+
+/**
+ * Outside Chromium, the VideoFrame constructor can't be trusted with `layout`: Firefox and WebKitGTK read the buffer as
+ * tightly packed planes of the coded size. Firefox also only accepts even coded sizes for chroma-subsampled formats
+ * (https://bugzilla.mozilla.org/show_bug.cgi?id=1899811). Repacks the top-left width x height region of the planes into
+ * that shape, repeating the edge into any padding. Returns null if the given layout already has that shape.
+ */
+const repackPlanes = (
+	format: VideoSamplePixelFormat,
+	width: number,
+	height: number,
+	planes: VideoDataPlane[],
+	layout: PlaneLayout[] | null,
+) => {
+	const configs = getPlaneConfigs(format);
+	const subX = Math.max(...configs.map(x => x.widthDivisor));
+	const subY = Math.max(...configs.map(x => x.heightDivisor));
+	const codedWidth = Math.ceil(width / subX) * subX;
+	const codedHeight = Math.ceil(height / subY) * subY;
+	const packedLayout = createDefaultPlaneLayout(format, codedWidth, codedHeight);
+
+	if (
+		layout
+		&& codedWidth === width
+		&& codedHeight === height
+		&& layout.every((x, i) => x.offset === packedLayout[i]!.offset && x.stride === packedLayout[i]!.stride)
+	) {
+		return null;
+	}
+
+	const lastPlane = packedLayout.length - 1;
+	const size = packedLayout[lastPlane]!.offset
+		+ packedLayout[lastPlane]!.stride * (codedHeight / configs[lastPlane]!.heightDivisor);
+	const data = new Uint8Array(size);
+
+	for (let i = 0; i < configs.length; i++) {
+		const { sampleBytes, widthDivisor, heightDivisor } = configs[i]!;
+		const { offset, stride } = packedLayout[i]!;
+		const plane = planes[i]!;
+		const rowBytes = Math.ceil(width / widthDivisor) * sampleBytes;
+		const rows = Math.ceil(height / heightDivisor);
+
+		for (let row = 0; row < codedHeight / heightDivisor; row++) {
+			const sourceStart = Math.min(row, rows - 1) * plane.stride;
+			const rowStart = offset + row * stride;
+			data.set(plane.data.subarray(sourceStart, sourceStart + rowBytes), rowStart);
+
+			for (let x = rowBytes; x < stride; x += sampleBytes) {
+				data.copyWithin(rowStart + x, rowStart + rowBytes - sampleBytes, rowStart + rowBytes);
+			}
+		}
+	}
+
+	return { data, codedWidth, codedHeight };
 };
 
 type PlaneConfig = {
@@ -2383,7 +2903,7 @@ const ComputeLayoutAndAllocationSize = (
 		// Set computedLayout’s sourceLeftBytes...
 		computedLayout.sourceLeftBytes = Math.floor(Math.trunc(parsedRect.x || 0) / sampleWidth) * sampleBytes;
 		// Set computedLayout’s sourceWidthBytes...
-		computedLayout.sourceWidthBytes = Math.floor(Math.trunc(parsedRect.width || 0) / sampleWidth) * sampleBytes;
+		computedLayout.sourceWidthBytes = Math.ceil(Math.trunc(parsedRect.width || 0) / sampleWidth) * sampleBytes;
 
 		// If layout is not undefined:
 		if (layout !== undefined) {
@@ -2508,6 +3028,9 @@ export type AudioSampleInit = {
 	sampleRate: number;
 	/** The presentation timestamp of the sample in seconds. */
 	timestamp: number;
+
+	/** @internal */
+	_doNotCopy?: boolean;
 };
 
 /**
@@ -2632,6 +3155,11 @@ export class AudioSample implements Disposable {
 				throw new TypeError('Invalid AudioDataInit: must be an object.');
 			}
 
+			const data = arrayBufferFromOtherRealm(init.data); // instanceof rejects ArrayBuffers of other realms
+			if (data !== init.data) {
+				init = { ...init, data };
+			}
+
 			if (!AUDIO_SAMPLE_FORMATS.has(init.format)) {
 				throw new TypeError('Invalid AudioDataInit: invalid format.');
 			}
@@ -2645,8 +3173,17 @@ export class AudioSample implements Disposable {
 				throw new TypeError('init.timestamp must be a number.');
 			}
 
+			let dataBuffer: Uint8Array;
+			if (init.data instanceof ArrayBuffer) {
+				dataBuffer = new Uint8Array(init.data);
+			} else if (ArrayBuffer.isView(init.data)) {
+				dataBuffer = new Uint8Array(init.data.buffer, init.data.byteOffset, init.data.byteLength);
+			} else {
+				throw new TypeError('Invalid AudioDataInit: data is not a BufferSource.');
+			}
+
 			const numberOfFrames
-				= init.data.byteLength / (getBytesPerSample(init.format) * init.numberOfChannels);
+				= dataBuffer.byteLength / (getBytesPerSample(init.format) * init.numberOfChannels);
 			if (!Number.isInteger(numberOfFrames)) {
 				throw new TypeError('Invalid AudioDataInit: data size is not a multiple of frame size.');
 			}
@@ -2658,22 +3195,14 @@ export class AudioSample implements Disposable {
 			this.timestamp = init.timestamp;
 			this.duration = numberOfFrames / init.sampleRate;
 
-			let dataBuffer: Uint8Array;
-			if (init.data instanceof ArrayBuffer) {
-				dataBuffer = new Uint8Array(init.data);
-			} else if (ArrayBuffer.isView(init.data)) {
-				dataBuffer = new Uint8Array(init.data.buffer, init.data.byteOffset, init.data.byteLength);
-			} else {
-				throw new TypeError('Invalid AudioDataInit: data is not a BufferSource.');
-			}
-
 			const expectedSize
                 = this.numberOfFrames * this.numberOfChannels * getBytesPerSample(this.format);
 			if (dataBuffer.byteLength < expectedSize) {
 				throw new TypeError('Invalid AudioDataInit: insufficient data size.');
 			}
 
-			this._data = dataBuffer;
+			// Like VideoSample and AudioData, keep a copy, so changes to the caller's memory don't affect the sample
+			this._data = init._doNotCopy ? dataBuffer : dataBuffer.slice();
 		}
 
 		finalizationRegistry?.register(this, { type: 'audio', data: this._data }, this);
@@ -2834,7 +3363,7 @@ export class AudioSample implements Disposable {
 		let uint8Data: Uint8Array;
 		if (this._data instanceof AudioSampleResource) {
 			const getDataPlaneValidated = (index: number) => {
-				const result = (this._data as AudioSampleResource).getDataPlane(index);
+				const result = uint8ArrayFromOtherRealm((this._data as AudioSampleResource).getDataPlane(index));
 				if (!(result instanceof Uint8Array)) {
 					throw new TypeError('getDataPlane() must return a Uint8Array.');
 				}
@@ -2960,6 +3489,8 @@ export class AudioSample implements Disposable {
 				numberOfChannels: this.numberOfChannels,
 				timestamp: this.timestamp,
 				data: this._data,
+				// The data never changes, so the clone can share it
+				_doNotCopy: true,
 			});
 		}
 	}
@@ -3029,6 +3560,7 @@ export class AudioSample implements Disposable {
 			sampleRate: this.sampleRate,
 			numberOfChannels: this.numberOfChannels,
 			timestamp: this.timestamp + startFrame / this.sampleRate,
+			_doNotCopy: true,
 		});
 	}
 
@@ -3064,6 +3596,9 @@ export class AudioSample implements Disposable {
 	toAudioData() {
 		if (this._closed) {
 			throw new Error('AudioSample is closed.');
+		}
+		if (typeof AudioData === 'undefined') {
+			throw new Error(missingWebCodecsClassMessage('AudioData'));
 		}
 
 		if (this._data instanceof AudioSampleResource) {
@@ -3129,6 +3664,9 @@ export class AudioSample implements Disposable {
 		if (this._closed) {
 			throw new Error('AudioSample is closed.');
 		}
+		if (typeof AudioBuffer === 'undefined') {
+			throw new Error('AudioBuffer is not available in this environment.');
+		}
 
 		const audioBuffer = new AudioBuffer({
 			numberOfChannels: this.numberOfChannels,
@@ -3163,7 +3701,7 @@ export class AudioSample implements Disposable {
 
 	/** @internal */
 	static* _fromAudioBuffer(audioBuffer: AudioBuffer, timestamp: number) {
-		if (!(audioBuffer instanceof AudioBuffer)) {
+		if (typeof AudioBuffer === 'undefined' || !(audioBuffer instanceof AudioBuffer)) {
 			throw new TypeError('audioBuffer must be an AudioBuffer.');
 		}
 
@@ -3197,6 +3735,7 @@ export class AudioSample implements Disposable {
 				numberOfChannels,
 				timestamp: timestamp + currentRelativeFrame / sampleRate,
 				data: chunkData,
+				_doNotCopy: true,
 			});
 
 			currentRelativeFrame += framesToCopy;
@@ -3205,11 +3744,12 @@ export class AudioSample implements Disposable {
 	}
 
 	/**
-	 * Creates AudioSamples from an AudioBuffer, starting at the given timestamp in seconds. Typically creates exactly
-	 * one sample, but may create multiple if the AudioBuffer is exceedingly large.
+	 * Creates AudioSamples from an AudioBuffer, starting at the given timestamp in seconds. Each sample holds at most
+	 * 240,000 values (5 seconds of mono or 2.5 seconds of stereo 48 kHz audio), so longer buffers yield multiple
+	 * samples.
 	 */
 	static fromAudioBuffer(audioBuffer: AudioBuffer, timestamp: number) {
-		if (!(audioBuffer instanceof AudioBuffer)) {
+		if (typeof AudioBuffer === 'undefined' || !(audioBuffer instanceof AudioBuffer)) {
 			throw new TypeError('audioBuffer must be an AudioBuffer.');
 		}
 
@@ -3245,6 +3785,7 @@ export class AudioSample implements Disposable {
 				numberOfChannels,
 				timestamp: timestamp + currentRelativeFrame / sampleRate,
 				data: chunkData,
+				_doNotCopy: true,
 			});
 
 			result.push(audioSample);
@@ -3465,5 +4006,6 @@ export const audioSampleToInterleavedFormat = (sample: AudioSample, format: 'u8'
 		sampleRate: sample.sampleRate,
 		timestamp: sample.timestamp,
 		duration: sample.duration,
+		_doNotCopy: true,
 	});
 };

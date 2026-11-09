@@ -35,7 +35,14 @@ export abstract class Muxer {
 	abstract finalize(): Promise<void>;
 
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
-	onTrackClose(track: OutputTrack) {}
+	async onTrackClose(track: OutputTrack) {}
+
+	/**
+	 * Called before finalization when this muxer writes a segment of a larger stream (as for HLS), with the timestamps
+	 * at which each track's next segment starts.
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	setNextSegmentTimestamps(timestamps: Map<OutputTrack, number>) {}
 
 	private trackPacketOrderValidators = new WeakMap<OutputTrack, PacketOrderValidator>();
 

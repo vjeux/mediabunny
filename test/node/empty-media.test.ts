@@ -1,4 +1,6 @@
 import { expect, test } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
@@ -17,9 +19,10 @@ import {
 } from '../../src/output-format.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { Bitstream } from '../../shared/bitstream.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { BufferTarget, PathedTarget } from '../../src/target.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
+import { Conversion } from '../../src/conversion.js';
 
 type EmptyMediaVariant =
 	| { type: 'mp4'; fastStart: false | 'in-memory' | 'reserve' | 'fragmented' }
@@ -558,6 +561,63 @@ test('Empty ADTS with declared decoder config', async () => {
 	await expect(output.finalize()).rejects.toThrow('Cannot finalize an empty ADTS file');
 });
 
+test.each([
+	['fragmented MP4', () => new Mp4OutputFormat({ fastStart: 'fragmented' })],
+	['Matroska', () => new MkvOutputFormat()],
+	['CMAF', () => new CmafOutputFormat()],
+] as const)('getMimeType() rejects once a %s output is canceled before its codecs are known', async (
+	_,
+	createFormat,
+) => {
+	// Like MSE code waiting for the MIME type of a recording that gets canceled before its first frames: the codec
+	// strings will never be known then
+	const unhandledRejections: unknown[] = [];
+	const onUnhandledRejection = (reason: unknown) => void unhandledRejections.push(reason);
+	process.on('unhandledRejection', onUnhandledRejection);
+
+	try {
+		const createOutput = () => {
+			const output = new Output({
+				format: createFormat(),
+				target: new BufferTarget(),
+				initTarget: createFormat() instanceof CmafOutputFormat ? new BufferTarget() : undefined,
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+			return { output, source };
+		};
+
+		const { output } = createOutput();
+		await output.start();
+		const pending = output.getMimeType();
+		await output.cancel();
+		await expect(pending).rejects.toThrow('Output has been canceled.');
+		await expect(output.getMimeType()).rejects.toThrow('Output has been canceled.'); // Later calls too
+
+		// Canceled once the MIME type is known, or without anyone asking for it: nothing rejects
+		const known = createOutput();
+		await known.output.start();
+		await known.source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1 / 30), {
+			decoderConfig: {
+				codec: 'avc1.42001f',
+				codedWidth: 64,
+				codedHeight: 64,
+				description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+			},
+		});
+		expect(await known.output.getMimeType()).toContain('avc1.42001f');
+		await known.output.cancel();
+		const unasked = createOutput();
+		await unasked.output.start();
+		await unasked.output.cancel();
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(unhandledRejections).toEqual([]);
+	} finally {
+		process.off('unhandledRejection', onUnhandledRejection);
+	}
+});
+
 test('Empty FLAC', async () => {
 	const output = new Output({
 		format: new FlacOutputFormat(),
@@ -619,6 +679,35 @@ test('Empty FLAC with declared decoder config', async () => {
 	expect(await audioTrack.getSampleRate()).toBe(44100);
 	expect(await audioTrack.getNumberOfChannels()).toBe(1);
 	expect((await audioTrack.computePacketStats()).packetCount).toBe(0);
+});
+
+test('FLAC packets too short for a frame header', async () => {
+	// A STREAMINFO metadata block for a 44100 Hz mono, 16-bit stream
+	const description = new Uint8Array(4 + 4 + 34);
+	description.set([0x66, 0x4c, 0x61, 0x43]); // 'fLaC'
+	description[4] = 0x80; // Last metadata block, type STREAMINFO
+	description[7] = 34; // Block size
+	const streamInfo = new Bitstream(description.subarray(8));
+	streamInfo.writeBits(16, 4096); // Minimum block size
+	streamInfo.writeBits(16, 4096); // Maximum block size
+	streamInfo.skipBits(48); // Minimum and maximum frame size
+	streamInfo.writeBits(20, 44100); // Sample rate
+	streamInfo.writeBits(3, 0); // Channels - 1
+	streamInfo.writeBits(5, 15); // Bits per sample - 1
+	const decoderConfig = { codec: 'flac', sampleRate: 44100, numberOfChannels: 1, description };
+
+	// A frame header for 4096 samples cut short, and one whose coded number takes 7 bytes but has only 2
+	const header = [0xff, 0xf8, 0xc9, 0x08, 0x00, 0x00];
+	const longCodedNumber = [0xff, 0xf8, 0xc9, 0x08, 0xfe, 0x00];
+	for (const bytes of [[], header.slice(0, 3), header.slice(0, 4), longCodedNumber]) {
+		const output = new Output({ format: new FlacOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource('flac');
+		output.addAudioTrack(source);
+		await output.start();
+
+		const packet = new EncodedPacket(new Uint8Array(bytes), 'key', 0, 4096 / 44100);
+		await expect(source.add(packet, { decoderConfig })).rejects.toThrow('Invalid FLAC frame: Too short.');
+	}
 });
 
 test('Empty MPEG-TS', async () => {
@@ -698,6 +787,29 @@ test('Empty HLS', async () => {
 	// HLS only ever writes segments for packets it has actually seen, so all we get is the master playlist (which is
 	// the root target) and one empty media playlist
 	expect([...files.keys()].sort()).toEqual(['', 'playlist-1.m3u8']);
+});
+
+test.each([
+	['glitch-hop-is-dead.wav', () => new WavOutputFormat()],
+	['sample.flac', () => new FlacOutputFormat()],
+	['Toothsome-Meme.VBRv2.mp3', () => new Mp3OutputFormat()],
+] as const)('A copy of %s whose trim range misses its media gives an empty file', async (fileName, createFormat) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(fileURLToPath(new URL('.', import.meta.url)), '../public', fileName)),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: createFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({
+		input,
+		output,
+		trim: { start: await input.computeDuration() + 1 },
+		showWarnings: false,
+	});
+	expect(conversion.isValid).toBe(true);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect(await result.computeDuration()).toBe(0);
 });
 
 const createFormat = (variant: EmptyMediaVariant) => {

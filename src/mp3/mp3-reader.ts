@@ -6,9 +6,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { MP3_FRAME_HEADER_SIZE, getMp3ChannelCount, Mp3FrameHeader, readMp3FrameHeader } from '../../shared/mp3-misc';
+import {
+	getMp3ChannelCount,
+	getXingOffset,
+	INFO,
+	MP3_FRAME_HEADER_SIZE,
+	Mp3FrameHeader,
+	readMp3FrameHeader,
+	XING,
+} from '../../shared/mp3-misc';
+import { ID3_V1_TAG_SIZE } from '../id3';
 import { isThenable } from '../misc';
-import { Reader, readU32Be } from '../reader';
+import { readAscii, Reader, readU32, readU32Be } from '../reader';
 
 export const readNextMp3FrameHeader = async (
 	reader: Reader,
@@ -19,13 +28,17 @@ export const readNextMp3FrameHeader = async (
 	header: Mp3FrameHeader;
 	startPos: number;
 } | null> => {
-	const CHUNK_SIZE = 2 ** 16; // So we don't need to grab thousands of slices
+	// The header is usually right at startPos, so start small and only grow the chunks when we need to search for it;
+	// large chunks are there so we don't need to grab thousands of slices
+	const MAX_CHUNK_SIZE = 2 ** 16;
+	let chunkSize = 2 ** 8;
 	let currentPos = startPos;
 
 	while (until === null || currentPos < until) {
 		const maxLength = until !== null
-			? Math.min(CHUNK_SIZE, until - currentPos)
-			: CHUNK_SIZE;
+			? Math.min(chunkSize, until - currentPos)
+			: chunkSize;
+		chunkSize = Math.min(2 * chunkSize, MAX_CHUNK_SIZE);
 
 		let slice = reader.requestSliceRange(currentPos, MP3_FRAME_HEADER_SIZE, maxLength);
 		if (isThenable(slice)) slice = await slice;
@@ -47,15 +60,217 @@ export const readNextMp3FrameHeader = async (
 					result.header.sampleRate === ref.sampleRate
 					&& result.header.mpegVersionId === ref.mpegVersionId
 					&& result.header.layer === ref.layer
-					&& getMp3ChannelCount(result.header.channel) === getMp3ChannelCount(ref.channel)
 				))
+				&& (
+					// The channel mode may switch between mono and stereo from one frame to the next (or between
+					// concatenated files), which decoders handle just fine. But for a frame we had to skip data to
+					// find, another channel count hints at a false sync, unless the frame checks out.
+					!ref
+					|| getMp3ChannelCount(result.header.channel) === getMp3ChannelCount(ref.channel)
+					|| currentPos - startPos <= 1
+					|| await isConfirmedMp3Frame(reader, currentPos, result.header)
+				)
 			) {
+				if (reader.fileSize === null) {
+					// Unsized sources learn their size only once a read goes past their end, which the small slices
+					// above may not do, so make sure the frame isn't cut off by the end of the file before taking it
+					let frameSlice = reader.requestSlice(currentPos, result.header.totalSize);
+					if (isThenable(frameSlice)) {
+						frameSlice = await frameSlice;
+					}
+
+					if (!frameSlice) {
+						if (reader.fileSize === null) {
+							return null;
+						}
+
+						// Now that the file size is known, look at this position again
+						slice.filePos = posBeforeRead;
+						continue;
+					}
+				}
+
 				return { header: result.header, startPos: currentPos };
 			}
 
 			slice.filePos = posBeforeRead + result.bytesAdvanced;
 			currentPos = slice.filePos;
 		}
+	}
+
+	return null;
+};
+
+/** Whether the frame at pos holds a Xing/Info tag, or a frame header with the same parameters follows it. */
+const isConfirmedMp3Frame = async (reader: Reader, pos: number, header: Mp3FrameHeader) => {
+	let slice = reader.requestSlice(pos + getXingOffset(header.mpegVersionId, header.channel), 4);
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
+	if (slice) {
+		const word = readU32Be(slice);
+		if (word === XING || word === INFO) {
+			return true;
+		}
+	}
+
+	slice = reader.requestSlice(pos + header.totalSize, MP3_FRAME_HEADER_SIZE);
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
+	if (!slice) {
+		return false;
+	}
+
+	const nextHeader = readMp3FrameHeader(readU32Be(slice), null).header;
+	return !!nextHeader
+		&& nextHeader.sampleRate === header.sampleRate
+		&& nextHeader.mpegVersionId === header.mpegVersionId
+		&& nextHeader.layer === header.layer
+		&& getMp3ChannelCount(nextHeader.channel) === getMp3ChannelCount(header.channel);
+};
+
+/** Whether a run of frames ending at the given position ends with the file, or with an ID3v1 tag that ends it. */
+const endsWithFile = async (reader: Reader, pos: number) => {
+	if (pos === reader.fileSize) {
+		return true;
+	}
+
+	if (pos + ID3_V1_TAG_SIZE !== reader.fileSize) {
+		return false;
+	}
+
+	let slice = reader.requestSlice(pos, 3);
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
+
+	return !!slice && readAscii(slice, 3) === 'TAG';
+};
+
+/**
+ * Finds the first MP3 frame from startPos on. Unlike readNextMp3FrameHeader, this skips false syncs, like the ones in
+ * the middle of a frame when the data starts mid-stream: a frame header only counts if its frame holds a Xing/Info
+ * tag, or if frame headers with the same MPEG version, layer and sample rate follow it.
+ */
+export const readFirstMp3FrameHeader = async (
+	reader: Reader,
+	startPos: number,
+	until: number | null,
+) => {
+	let currentPos = startPos;
+	// Once we've skipped over something, demand a longer run of frames (like FFmpeg's probe does) that also spans more
+	// than two MPEG-TS packets, so we don't mistake the MP3 frames inside another container (like the small frames
+	// of low-bitrate audio within a single 184-byte TS payload) for an MP3 file
+	let requiredFollowingFrames = 1;
+	let requiredRunLength = 0;
+
+	while (true) {
+		const result = await readNextMp3FrameHeader(reader, currentPos, until);
+		if (!result) {
+			return null;
+		}
+
+		const firstHeader = result.header;
+
+		let slice = reader.requestSlice(
+			result.startPos + getXingOffset(firstHeader.mpegVersionId, firstHeader.channel),
+			4,
+		);
+		if (isThenable(slice)) {
+			slice = await slice;
+		}
+		if (slice) {
+			const word = readU32Be(slice);
+			if (word === XING || word === INFO) {
+				return result;
+			}
+		}
+
+		let nextPos = result.startPos + firstHeader.totalSize;
+		let followingFrames = 0;
+		const runIsLongEnough = () => followingFrames >= requiredFollowingFrames
+			&& nextPos - result.startPos >= requiredRunLength;
+
+		while (!runIsLongEnough() && nextPos !== reader.fileSize) {
+			slice = reader.requestSlice(nextPos, MP3_FRAME_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				break;
+			}
+
+			const header = readMp3FrameHeader(readU32Be(slice), null).header;
+			if (
+				!header
+				|| header.mpegVersionId !== firstHeader.mpegVersionId
+				|| header.layer !== firstHeader.layer
+				|| header.sampleRate !== firstHeader.sampleRate
+				// The channel mode may change from one frame to the next, so it doesn't need to match
+			) {
+				break;
+			}
+
+			followingFrames++;
+			nextPos += header.totalSize;
+		}
+
+		// A first frame whose run ends with the file is fine too (like a file with a single frame), also when only an
+		// ID3v1 tag follows it
+		if (runIsLongEnough() || (requiredRunLength === 0 && await endsWithFile(reader, nextPos))) {
+			return result;
+		}
+
+		currentPos = result.startPos + 1;
+		requiredFollowingFrames = 3;
+		requiredRunLength = 2 * 204 + 1; // Longest TS packets (with FEC)
+	}
+};
+
+/**
+ * For MP3 in a WAVE file ("RIFF MP3"), finds the data chunk holding the frames, since the chunks around it aren't
+ * audio. Returns null if the bytes at pos don't start a WAVE file.
+ */
+export const findWaveDataChunk = async (reader: Reader, pos: number) => {
+	let slice = reader.requestSlice(pos, 12);
+	if (isThenable(slice)) {
+		slice = await slice;
+	}
+	if (!slice) {
+		return null;
+	}
+
+	const riffType = readAscii(slice, 4);
+	slice.skip(4);
+	if ((riffType !== 'RIFF' && riffType !== 'RIFX' && riffType !== 'RF64') || readAscii(slice, 4) !== 'WAVE') {
+		return null;
+	}
+
+	const littleEndian = riffType !== 'RIFX';
+	let chunkPos = pos + 12;
+
+	// Few chunks come before the data, so looking at a bounded number of them is enough
+	for (let i = 0; i < 64; i++) {
+		let chunkSlice = reader.requestSlice(chunkPos, 8);
+		if (isThenable(chunkSlice)) {
+			chunkSlice = await chunkSlice;
+		}
+		if (!chunkSlice) {
+			return null;
+		}
+
+		const chunkId = readAscii(chunkSlice, 4);
+		const chunkSize = readU32(chunkSlice, littleEndian);
+		if (chunkId === 'data') {
+			const start = chunkPos + 8;
+			// RF64 keeps the real size elsewhere, and FFmpeg leaves sizes it can't fill in at 0xFFFFFFFF, so these run
+			// to the end of the file
+			const end = riffType === 'RF64' || chunkSize === 0xffffffff ? null : start + chunkSize;
+			return { start, end };
+		}
+
+		chunkPos += 8 + chunkSize + (chunkSize & 1);
 	}
 
 	return null;

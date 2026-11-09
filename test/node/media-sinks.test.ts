@@ -1,0 +1,301 @@
+import { expect, test, vi } from 'vitest';
+import { ALL_FORMATS } from '../../src/input-format.js';
+import { Input } from '../../src/input.js';
+import { EncodedPacketSink, AudioSampleSink } from '../../src/media-sink.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
+import { countMovedArrayElements } from './array-moves.js';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { EncodedVideoPacketSource, EncodedAudioPacketSource } from '../../src/media-source.js';
+import { MkvOutputFormat } from '../../src/output-format.js';
+import { Output } from '../../src/output.js';
+import { EncodedPacket } from '../../src/packet.js';
+import { BufferTarget } from '../../src/target.js';
+import { mapAsyncGenerator } from '../../src/misc.js';
+import { createHook } from 'node:async_hooks';
+
+// 200k minimal ADTS frames (77 min at 44.1 kHz)
+const createAdtsFile = (frameCount: number) => {
+	const frame = [0xff, 0xf1, 0x50, 0x80, 0x01, 0x1f, 0xfc, 0x00];
+	const file = new Uint8Array(frame.length * frameCount);
+	for (let i = 0; i < frameCount; i++) {
+		file.set(frame, i * frame.length);
+	}
+
+	return file;
+};
+
+test('packets() keeps a constant cost per packet for consumers dequeuing over 100k packets per second', async () => {
+	const count = 200_000;
+
+	// The iterator remembers when each packet was dequeued during the last second. With a clock advancing 10 µs per
+	// call, that's 100k packets, which used to be evicted one by one with Array.prototype.shift(), copying the array.
+	let now = 0;
+	vi.spyOn(performance, 'now').mockImplementation(() => now += 0.01);
+
+	using input = new Input({ source: new BufferSource(createAdtsFile(count)), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	expect(track).not.toBeNull();
+
+	const sink = new EncodedPacketSink(track!);
+	let packetCount = 0;
+	const movedElements = await countMovedArrayElements(async () => {
+		for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+			void packet;
+			packetCount++;
+		}
+	});
+
+	expect(packetCount).toBe(count);
+	// Linear: each entry is moved at most about once (main moved ~1e10)
+	expect(movedElements).toBeLessThan(2 * count);
+});
+
+test('packets() keeps a constant cost per packet when its queue runs far ahead', async () => {
+	const count = 200_000;
+
+	// With a frozen clock, all packets dequeued so far count as the last second's, which is how many the iterator
+	// queues ahead
+	vi.spyOn(performance, 'now').mockReturnValue(0);
+
+	using input = new Input({ source: new BufferSource(createAdtsFile(count)), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	expect(track).not.toBeNull();
+	const packets = new EncodedPacketSink(track!).packets(undefined, undefined, { metadataOnly: true });
+
+	let packetCount = 0;
+	const movedElements = await countMovedArrayElements(async () => {
+		for (; packetCount < count / 2; packetCount++) {
+			await packets.next();
+		}
+
+		// A consumer that awaits something (like a muxer waiting on its writer) lets the iterator fill its queue, whose
+		// packets were taken off with Array.prototype.shift(), copying the whole queue each time
+		await new Promise(resolve => setTimeout(resolve, 200));
+
+		while (!(await packets.next()).done) {
+			packetCount++;
+		}
+	});
+
+	expect(packetCount).toBe(count);
+	// Linear: each entry is moved at most about once (main moved ~5e9)
+	expect(movedElements).toBeLessThan(2 * count);
+});
+
+test('packets() reads at most 1024 packets ahead of a fast consumer', async () => {
+	const count = 200_000;
+
+	// With a frozen clock, all packets dequeued so far count as the last second's
+	vi.spyOn(performance, 'now').mockReturnValue(0);
+
+	using input = new Input({ source: new BufferSource(createAdtsFile(count)), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	expect(track).not.toBeNull();
+	const sink = new EncodedPacketSink(track!);
+
+	let fetchedCount = 0;
+	const getFirstPacket = sink.getFirstPacket.bind(sink);
+	const getNextPacket = sink.getNextPacket.bind(sink);
+	sink.getFirstPacket = async (options) => {
+		fetchedCount++;
+		return getFirstPacket(options);
+	};
+	sink.getNextPacket = async (packet, options) => {
+		fetchedCount++;
+		return getNextPacket(packet, options);
+	};
+
+	const packets = sink.packets(undefined, undefined, { metadataOnly: true });
+	for (let i = 0; i < count / 2; i++) {
+		await packets.next();
+	}
+
+	// Let the iterator read ahead as far as it wants while the consumer pauses. The queue used to grow to a second's
+	// worth of dequeued packets, which is tens of thousands for a fast consumer
+	await new Promise(resolve => setTimeout(resolve, 200));
+	const readAheadCount = fetchedCount - count / 2;
+	await packets.return();
+
+	// The queue, plus the packet the pump is holding
+	expect(readAheadCount).toBeLessThanOrEqual(1024 + 2);
+});
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+test('throw() on the packets() iterator ends the iteration', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	const iterator = new EncodedPacketSink(track!).packets();
+
+	expect((await iterator.next()).done).toBe(false);
+	await expect(iterator.throw(new Error('Stop'))).rejects.toThrow('Stop');
+
+	// Like for a generator function, the iterator is done after the throw
+	expect(await iterator.next()).toEqual({ value: undefined, done: true });
+});
+
+test('packets() caps how much packet data it reads ahead', async () => {
+	const packetSize = 2 ** 19;
+
+	// 160 frames of 512 KiB, like high-bitrate (lossless, ProRes) video: once as frame data and once as alpha side data
+	for (const withAlpha of [false, true]) {
+		const target = new BufferTarget();
+		const output = new Output({ format: new MkvOutputFormat(), target });
+		const videoSource = new EncodedVideoPacketSource('vp8');
+		output.addVideoTrack(videoSource);
+		await output.start();
+		for (let i = 0; i < 160; i++) {
+			const data = new Uint8Array(withAlpha ? 16 : packetSize);
+			const sideData = withAlpha ? { alpha: new Uint8Array(packetSize) } : {};
+			await videoSource.add(new EncodedPacket(data, 'key', i / 30, 1 / 30, undefined, undefined, sideData), {
+				decoderConfig: { codec: 'vp8', codedWidth: 1920, codedHeight: 1080 },
+			});
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		expect(track).not.toBeNull();
+		const sink = new EncodedPacketSink(track!);
+
+		// Count the bytes of every packet the iterator fetches
+		let fetchedBytes = 0;
+		const countBytes = (packet: EncodedPacket | null) => {
+			fetchedBytes += (packet?.data.byteLength ?? 0) + (packet?.sideData.alpha?.byteLength ?? 0);
+			return packet;
+		};
+		const getFirstPacket = sink.getFirstPacket.bind(sink);
+		const getNextPacket = sink.getNextPacket.bind(sink);
+		sink.getFirstPacket = async options => countBytes(await getFirstPacket(options));
+		sink.getNextPacket = async (packet, options) => countBytes(await getNextPacket(packet, options));
+
+		// A frozen clock makes the queue limit "everything dequeued so far", as if all of it happened within one second
+		vi.spyOn(performance, 'now').mockReturnValue(0);
+
+		const packets = sink.packets();
+		let consumedBytes = 0;
+		for (let i = 0; i < 80; i++) {
+			const { value } = await packets.next();
+			consumedBytes += value!.data.byteLength + (value!.sideData.alpha?.byteLength ?? 0);
+		}
+
+		// Let the iterator read ahead as far as it wants while the consumer pauses
+		await new Promise(resolve => setTimeout(resolve, 100));
+		const readAheadBytes = fetchedBytes - consumedBytes;
+		await packets.return();
+
+		// Up to 80 packets (40 MiB) used to be queued
+		expect(readAheadBytes).toBeLessThan(2 ** 25 + 4 * packetSize);
+	}
+});
+
+const readOneValueThenDispose = async (iterator: AsyncGenerator<unknown, void, unknown>) => {
+	// AsyncGenerator is AsyncDisposable in TypeScript's esnext lib, which this project doesn't use
+	await using disposable = iterator as AsyncGenerator<unknown, void, unknown> & AsyncDisposable;
+	const result = await disposable.next();
+	expect(result.done).toBe(false);
+	(result.value as { close?: () => void }).close?.();
+};
+
+test('Sink iterators end when disposed with await using, like native async generators', async () => {
+	using input = new Input({
+		source: new FilePathSource('./test/public/glitch-hop-is-dead.wav'),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryAudioTrack())!;
+	const sampleSink = new AudioSampleSink(track);
+
+	const iterators: AsyncGenerator<unknown, void, unknown>[] = [
+		new EncodedPacketSink(track).packets(),
+		sampleSink.samples(),
+		sampleSink.samplesAtTimestamps([0, 0.5, 1]),
+		// What CanvasSink and AudioBufferSink return
+		mapAsyncGenerator(new EncodedPacketSink(track).packets(), packet => packet.timestamp),
+	];
+
+	for (const iterator of iterators) {
+		await readOneValueThenDispose(iterator);
+		expect(await iterator.next()).toEqual({ value: undefined, done: true });
+	}
+});
+
+/** Matroska with many tiny PCM packets, which decode without WebCodecs. */
+const createManyPacketFile = async (packetCount: number) => {
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+	for (let i = 0; i < packetCount; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(4), 'key', i / 1000, 1 / 1000),
+			i === 0 ? { decoderConfig: { codec: 'pcm-s16', numberOfChannels: 1, sampleRate: 2000 } } : undefined,
+		);
+	}
+	await output.finalize();
+
+	return output.target.buffer!;
+};
+
+/** Tracks the promises created from now on that are still pending. */
+const trackPendingPromises = () => {
+	const pending = new Set<number>();
+	const hook = createHook({
+		init: (asyncId, type) => {
+			if (type === 'PROMISE') {
+				pending.add(asyncId);
+			}
+		},
+		promiseResolve: (asyncId) => {
+			pending.delete(asyncId);
+		},
+	});
+	hook.enable();
+
+	return {
+		stop: () => {
+			hook.disable();
+			return pending.size;
+		},
+	};
+};
+
+test.for(['samples()', 'samplesAtTimestamps()'] as const)(
+	'%s keeps nothing pending per sample while it iterates',
+	async (method) => {
+		// Each packet wait was raced against a promise that only settles when the iteration ends, which left one
+		// pending promise (with its closures) per wait, about a kilobyte per sample (found by the lane L94 review)
+		using input = new Input({ source: new BufferSource(await createManyPacketFile(3000)), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		expect(track).not.toBe(null);
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track!).packets()) {
+			timestamps.push(packet.timestamp);
+		}
+
+		const sink = new AudioSampleSink(track!);
+		const iterator = method === 'samples()' ? sink.samples() : sink.samplesAtTimestamps(timestamps);
+		let count = 0;
+		let tracker: ReturnType<typeof trackPendingPromises> | null = null;
+		let pendingCount = -1;
+		for await (const sample of iterator) {
+			sample?.close();
+			count++;
+			if (count === 500) {
+				tracker = trackPendingPromises();
+			} else if (count === 2500) {
+				pendingCount = tracker!.stop(); // Before the iteration ends, which settles what it waits on
+				break;
+			}
+		}
+
+		expect(count).toBe(2500);
+		// A few reads are in flight at any time; 2000 samples left 2000 or more pending
+		expect(pendingCount).toBeGreaterThanOrEqual(0);
+		expect(pendingCount).toBeLessThan(50);
+	},
+);

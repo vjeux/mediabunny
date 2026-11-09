@@ -8,12 +8,13 @@ import { BufferTarget, StreamTarget, StreamTargetChunk } from '../../src/target.
 import { CanvasSource, EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { assert } from '../../src/misc.js';
 import { Conversion } from '../../src/conversion.js';
 
 test('MPEG-TS output format', async () => {
 	const format = new MpegTsOutputFormat();
-	expect(format.mimeType).toBe('video/MP2T');
+	expect(format.mimeType).toBe('video/mp2t');
 	expect(format.fileExtension).toBe('.ts');
 	expect(format.supportsVideoTransformationMetadata).toBe(false);
 	expect(format.getSupportedCodecs()).toEqual(['avc', 'hevc', 'aac', 'mp3', 'ac3', 'eac3', 'dts']);
@@ -45,7 +46,7 @@ test('MPEG-TS muxing with AVC and AAC', async () => {
 	void output.getMimeType().then((mimeType) => {
 		expect(started).toBe(true);
 		expect(finalized).toBe(false);
-		expect(mimeType).toMatch(/^video\/MP2T; codecs="/);
+		expect(mimeType).toMatch(/^video\/mp2t; codecs="/);
 		expect(mimeType).toMatch(/avc1\./);
 		expect(mimeType).toMatch(/mp4a\.40\./);
 
@@ -342,6 +343,31 @@ test('MPEG-TS muxing with HEVC and MP3', async () => {
 	expect(audioDuration).toBeCloseTo(5, 1);
 });
 
+test('Unrepresentable AAC channel configuration', async () => {
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// What FFmpeg's encoder writes for 7.1: channel configuration 12, too large for the 3-bit ADTS field
+	const addPacket = () => source.add(
+		new EncodedPacket(new Uint8Array(16), 'key', 0, 1024 / 48000),
+		{
+			decoderConfig: {
+				codec: 'mp4a.40.2',
+				numberOfChannels: 8,
+				sampleRate: 48000,
+				description: new Uint8Array([0x11, 0xe0, 0x56, 0xe5, 0x00]),
+			},
+		},
+	);
+	await expect(addPacket()).rejects.toThrow('channel configuration 12');
+});
+
 test('MPEG-TS muxing with no data', async () => {
 	const output = new Output({
 		format: new MpegTsOutputFormat(),
@@ -605,6 +631,53 @@ test('MPEG-TS muxing with two audio tracks', async () => {
 	expect(audioTracks[1]!.id).toBe(0x101);
 });
 
+test('MPEG-TS muxing writes track languages and audio types into the PMT', async () => {
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const sources = [new EncodedAudioPacketSource('aac'), new EncodedAudioPacketSource('aac')];
+	output.addAudioTrack(sources[0]!, { languageCode: 'fra', disposition: { hearingImpaired: true } });
+	output.addAudioTrack(sources[1]!); // No language
+
+	await output.start();
+
+	// ADTS frames (AAC-LC, 48 kHz, stereo) with an empty raw data block
+	const frame = new Uint8Array([0xff, 0xf1, 0x4c, 0x80, 0x01, 0x3f, 0xfc, 0x00, 0x00]);
+	for (const source of sources) {
+		for (let i = 0; i < 3; i++) {
+			await source.add(new EncodedPacket(frame, 'key', i * 1024 / 48000, 1024 / 48000), {
+				decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000 },
+			});
+		}
+	}
+
+	await output.finalize();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const pmtPacket = bytes.subarray(188, 2 * 188); // PAT first, then the PMT
+	expect(((pmtPacket[1]! & 0x1f) << 8) | pmtPacket[2]!).toBe(0x1000);
+
+	// Skip the header, any adaptation field and the pointer_field
+	const adaptationFieldLength = pmtPacket[3]! & 0x20 ? 1 + pmtPacket[4]! : 0;
+	const payload = pmtPacket.subarray(4 + adaptationFieldLength);
+	const section = payload.subarray(1 + payload[0]!);
+	const sectionLength = ((section[1]! & 0x0f) << 8) | section[2]!;
+	const esInfo = new Map<number, number[]>();
+	let pos = 12 + (((section[10]! & 0x0f) << 8) | section[11]!);
+	while (pos < 3 + sectionLength - 4) {
+		const pid = ((section[pos + 1]! & 0x1f) << 8) | section[pos + 2]!;
+		const length = ((section[pos + 3]! & 0x0f) << 8) | section[pos + 4]!;
+		esInfo.set(pid, [...section.subarray(pos + 5, pos + 5 + length)]);
+		pos += 5 + length;
+	}
+
+	// ISO_639_language_descriptor: 'fra', audio_type 0x02 (hearing impaired)
+	expect(esInfo.get(0x100)).toEqual([0x0a, 0x04, 0x66, 0x72, 0x61, 0x02]);
+	expect(esInfo.get(0x101)).toEqual([]);
+});
+
 test('MPEG-TS transmux (Annex B and ADTS passthrough)', async () => {
 	using input = new Input({
 		source: new UrlSource('/0.ts'),
@@ -739,6 +812,19 @@ test('MPEG-TS muxing with StreamTarget', async () => {
 	expect(videoPacketCount).toBe(frameCount);
 });
 
+test('Conversion of MP4 (H.264 + AAC with priming) to MPEG-TS keeps the audio', async () => {
+	// The AAC copy starts before zero, which MPEG-TS supports but discourages. Where the audio can't be transcoded
+	// instead (no AAC encoder, as in Chromium on Linux), it must still be copied rather than discarded
+	using input = new Input({ source: new UrlSource('/edts.mp4'), formats: ALL_FORMATS });
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, showWarnings: false });
+	expect(conversion.discardedTracks.map(x => x.reason)).toEqual([]);
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	expect((await result.getTracks()).map(track => track.type).sort()).toEqual(['audio', 'video']);
+});
+
 test('MPEG-TS muxing with negative start timestamps', async () => {
 	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1);
 });
@@ -787,10 +873,11 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 	}
 
 	const expectedPackets = timestamps.map(timestamp => ({ timestamp, duration }));
+	// Sorted, since encoders with B-frames (like Firefox's H.264 encoder) emit them in decode order
 	expect(outputPackets.map(packet => ({
 		timestamp: packet.timestamp,
 		duration: packet.duration,
-	}))).toEqual(expectedPackets);
+	})).sort((a, b) => a.timestamp - b.timestamp)).toEqual(expectedPackets);
 
 	for (const expectedPacket of expectedPackets) {
 		const outputPacket = await sink.getPacket(expectedPacket.timestamp);
@@ -802,3 +889,167 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 		}).toEqual(expectedPacket);
 	}
 };
+
+test('MPEG-TS muxing with B-frames keeps DTS at or before PTS', async () => {
+	// Decode timestamps were the sorted presentation timestamps as is, so every B-frame was decoded after it was due
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+
+	// Two GOPs in decode order, presentation times given in frames
+	const frames = [0, 3, 1, 2, 6, 4, 5, 7, 10, 8, 9];
+	for (let i = 0; i < frames.length; i++) {
+		const isKey = i === 0 || i === 7;
+		const data = new Uint8Array([0, 0, 0, 1, isKey ? 0x65 : 0x41, 0x88]);
+		await source.add(new EncodedPacket(data, isKey ? 'key' : 'delta', frames[i]! / 30, 1 / 30), {
+			decoderConfig: { codec: 'avc1.42001f', codedWidth: 16, codedHeight: 16 },
+		});
+	}
+
+	await output.finalize();
+
+	const timestamps = readVideoPesTimestamps(new Uint8Array(output.target.buffer!));
+	expect(timestamps.map(x => x.pts)).toEqual(frames.map(x => 3000 * x));
+	expect(timestamps.map(x => x.dts)).toEqual([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(x => 3000 * x));
+});
+
+test('MPEG-TS muxing keeps DTS increasing when a later GOP reorders deeper', async () => {
+	// A GOP without B-frames, then one with a B-pyramid (x264 can pick no B-frames at first). Without an SPS saying
+	// how deeply the stream reorders, the second GOP's DTS are kept after the first one's. With one (x264's, from
+	// video.mp4: 2 frames), DTS are that far behind PTS from the start, like in FFmpeg. Also with x264's SPS: frames
+	// with irregular timing, and a lone frame (whose DTS needn't go before its PTS, as no GOP follows).
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	const x264DecoderConfig = await videoTrack.getDecoderConfig();
+	assert(x264DecoderConfig);
+
+	const noSpsDecoderConfig = { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 };
+	const pyramid = [0, 1, 2, 3, 4, 8, 6, 5, 7, 9].map(x => x / 30);
+	// x264's SPS, for Annex B packets carrying it in-band
+	const avcC = new Uint8Array(x264DecoderConfig.description as ArrayBuffer);
+	const x264Sps = [...avcC.subarray(8, 8 + ((avcC[6]! << 8) | avcC[7]!))];
+	// One decoder config object, reused for a stream with x264's SPS in-band and then for one without it: the second
+	// one doesn't take the first one's reordering (from L46's review)
+	const sharedDecoderConfig = { codec: 'avc1.64001f', codedWidth: 16, codedHeight: 16 };
+	const cases: { decoderConfig: VideoDecoderConfig; timestamps: number[]; dts: number[]; inBandSps?: boolean }[] = [
+		{
+			decoderConfig: noSpsDecoderConfig,
+			timestamps: pyramid,
+			dts: [0, 3000, 6000, 9000, 9001, 9002, 12000, 15000, 18000, 21000],
+		},
+		{
+			decoderConfig: x264DecoderConfig,
+			timestamps: pyramid,
+			dts: [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(x => 3000 * x),
+		},
+		{ decoderConfig: x264DecoderConfig, timestamps: [0, 10.03, 1 / 120], dts: [-750, 0, 750] },
+		{ decoderConfig: x264DecoderConfig, timestamps: [0], dts: [0] },
+		{
+			decoderConfig: sharedDecoderConfig,
+			timestamps: pyramid,
+			dts: [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(x => 3000 * x),
+			inBandSps: true,
+		},
+		{
+			decoderConfig: sharedDecoderConfig,
+			timestamps: pyramid,
+			dts: [0, 3000, 6000, 9000, 9001, 9002, 12000, 15000, 18000, 21000],
+		},
+	];
+
+	for (const { decoderConfig, timestamps, dts, inBandSps } of cases) {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+
+		for (let i = 0; i < timestamps.length; i++) {
+			const isKey = i === 0 || (timestamps === pyramid && (i === 4 || i === 9));
+			// Length-prefixed NAL units with x264's decoder config
+			const startCode = decoderConfig === x264DecoderConfig ? [0, 0, 0, 2] : [0, 0, 0, 1];
+			const sps = inBandSps && isKey ? [0, 0, 0, 1, ...x264Sps] : [];
+			const data = new Uint8Array([...sps, ...startCode, isKey ? 0x65 : 0x41, 0x88]);
+			await source.add(new EncodedPacket(data, isKey ? 'key' : 'delta', timestamps[i]!, 1 / 30), {
+				decoderConfig,
+			});
+		}
+
+		await output.finalize();
+
+		const pesTimestamps = readVideoPesTimestamps(new Uint8Array(output.target.buffer!));
+		expect(pesTimestamps.map(x => x.pts)).toEqual(timestamps.map(x => Math.round(90_000 * x)));
+		expect(pesTimestamps.map(x => x.dts)).toEqual(dts);
+	}
+});
+
+test('MPEG-TS muxing gives the same DTS when remuxing its own output', async () => {
+	// DTS are worked out on the timestamps as written, in whole 90 kHz ticks, so the file remuxes into the same bytes.
+	// video.mp4's first 60 frames (x264 with B-frames), slowed down to 47.65 fps so frame times aren't whole ticks.
+	const remux = async (input: Input, timeScale: number) => {
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const decoderConfig = await track.getDecoderConfig();
+		assert(decoderConfig);
+
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+
+		let count = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			const timestamp = packet.timestamp * timeScale;
+			await source.add(packet.clone({ timestamp, duration: packet.duration * timeScale }), { decoderConfig });
+			if (++count === 60) {
+				break;
+			}
+		}
+
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	using input = new Input({ source: new UrlSource('/video.mp4'), formats: ALL_FORMATS });
+	const firstPass = await remux(input, 30 / 47.65);
+	using reread = new Input({ source: new BufferSource(firstPass), formats: ALL_FORMATS });
+	const secondPass = await remux(reread, 1);
+
+	expect(readVideoPesTimestamps(secondPass)).toEqual(readVideoPesTimestamps(firstPass));
+	expect(secondPass).toEqual(firstPass);
+});
+
+/** Returns the PTS and DTS of the video PES packets (on PID 0x100), with negative ones as such. */
+const readVideoPesTimestamps = (bytes: Uint8Array) => {
+	const readTimestamp = (pos: number) => {
+		const value = ((bytes[pos]! >> 1) & 0x07) * 2 ** 30 + (bytes[pos + 1]! << 22) + ((bytes[pos + 2]! >> 1) << 15)
+			+ (bytes[pos + 3]! << 7) + (bytes[pos + 4]! >> 1);
+		return value >= 2 ** 32 ? value - 2 ** 33 : value; // Negative ones are written modulo 2^33
+	};
+
+	const timestamps: { pts: number; dts: number }[] = [];
+	for (let pos = 0; pos < bytes.length; pos += 188) {
+		if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100 && bytes[pos + 1]! & 0x40) {
+			const headerPos = pos + 4 + (bytes[pos + 3]! & 0x20 ? 1 + bytes[pos + 4]! : 0);
+			timestamps.push({ pts: readTimestamp(headerPos + 9), dts: readTimestamp(headerPos + 14) });
+		}
+	}
+
+	return timestamps;
+};
+
+test('MPEG-TS MIME types are ones that MediaSource accepts', async () => {
+	// MIME types are case-insensitive, but Chromium's MediaSource.isTypeSupported rejects "video/MP2T" while it
+	// accepts "video/mp2t", so the MIME type that getMimeType() suggests passing to MSE has to be the lower-case one
+	using input = new Input({ source: new UrlSource('/0.ts'), formats: ALL_FORMATS });
+	const inputMimeType = await input.getMimeType();
+	expect(inputMimeType).toBe('video/mp2t; codecs="avc1.640020, mp4a.40.2"');
+	expect(MediaSource.isTypeSupported(inputMimeType)).toBe(true);
+	expect(MediaSource.isTypeSupported(MPEG_TS.mimeType)).toBe(true);
+	expect(MediaSource.isTypeSupported(new MpegTsOutputFormat().mimeType)).toBe(true);
+});

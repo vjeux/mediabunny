@@ -10,6 +10,21 @@ import { InputDisposedError } from './input';
 import { assert, clamp, getUint24, isThenable, MaybePromise, textDecoder, toDataView } from './misc';
 import { DEFAULT_MAX_READ_POSITION, DEFAULT_MIN_READ_POSITION, Source } from './source';
 
+/**
+ * The most a single read may request. Sizes declared by a file (a box, an element, a chunk) are read in one go, and a
+ * source that can't tell where the file ends holds everything that arrives until such a read is filled. No valid
+ * file needs anything near this: the largest single reads are an MP4's moov box (tens of MB for hours of video), an
+ * ID3v2 tag (at most 256 MiB), a single uncompressed 8K frame (about 265 MB) and HLS playlists.
+ */
+const MAX_SLICE_LENGTH = 2 ** 30; // 1 GiB
+/** How far a source of unknown size is read to find out whether it ends shortly after an over-large read's start */
+const END_PROBE_LENGTH = 2 ** 20; // 1 MiB
+
+const sliceTooLargeError = (start: number, length: number) => new Error(
+	`Refusing to read ${length} bytes at once (at byte ${start}): no valid file needs a single read over 1 GiB, so`
+	+ ' the file is most likely malformed.',
+);
+
 export class Reader {
 	constructor(public source: Source) {}
 
@@ -26,17 +41,56 @@ export class Reader {
 		return this.source._getFileSize() ?? null;
 	}
 
+	/**
+	 * The file size, or null if the source is unsized or can't currently read near the end of the file without
+	 * discarding data before it that reads have yet to get to (such as a UrlSource whose server ignores range
+	 * requests, for a file larger than its cache, until reads have nearly reached the end). Use this instead of
+	 * fileSize to decide whether to make optional reads near the end of the file.
+	 */
+	get randomAccessFileSize(): number | null {
+		const fileSize = this.fileSize;
+		return fileSize !== null && this.source._supportsRandomAccess() ? fileSize : null;
+	}
+
 	requestSlice(start: number, length: number): MaybePromise<FileSlice | null> {
 		if (this.source._disposed) {
 			throw new InputDisposedError();
 		}
 
-		if (start < 0) {
+		if (!(start >= 0 && start + length <= Number.MAX_SAFE_INTEGER)) {
+			// Also NaN (from a damaged file's tables), and past 2^53, where positions lose precision (from a huge size
+			// field); no file is that large. Without a file size to compare against, such reads would never settle.
 			return null;
 		}
 
 		if (this.fileSizeNonStrict !== null && start + length > this.fileSizeNonStrict) {
 			return null;
+		}
+
+		if (length > MAX_SLICE_LENGTH) {
+			if (this.fileSizeNonStrict !== null) {
+				// Throw rather than return null, which would look like the end of the file
+				throw sliceTooLargeError(start, length);
+			}
+
+			// The size isn't known yet. If the file ends shortly after start, this read runs past its end, as a damaged
+			// size in a cut-off file does, and returns null like it would with the size known. Find out with a bounded
+			// read instead of holding everything that arrives until the whole length has come in.
+			const probe = this.source._read(
+				start,
+				start + END_PROBE_LENGTH,
+				DEFAULT_MIN_READ_POSITION,
+				DEFAULT_MAX_READ_POSITION,
+			);
+			const afterProbe = () => {
+				if (this.fileSizeNonStrict !== null && start + length > this.fileSizeNonStrict) {
+					return null;
+				}
+
+				throw sliceTooLargeError(start, length);
+			};
+
+			return isThenable(probe) ? probe.then(afterProbe) : afterProbe();
 		}
 
 		if (length === 0) {
@@ -69,7 +123,7 @@ export class Reader {
 			throw new InputDisposedError();
 		}
 
-		if (start < 0) {
+		if (!(start >= 0 && start + maxLength <= Number.MAX_SAFE_INTEGER)) {
 			return null;
 		}
 
@@ -131,6 +185,9 @@ export class Reader {
 				chunks.push(chunk);
 
 				currentSize += slice.length;
+				if (currentSize > MAX_SLICE_LENGTH) {
+					throw sliceTooLargeError(0, currentSize);
+				}
 			}
 
 			const joined = new Uint8Array(currentSize);
@@ -144,6 +201,9 @@ export class Reader {
 		})();
 	}
 }
+
+/** Thrown for reads outside of a slice, which means that the file's structures claim more bytes than they hold. */
+export class SliceRangeError extends RangeError {}
 
 export class FileSlice {
 	/** The current position in the backing buffer. Do not modify directly, prefer `.skip()` instead. */
@@ -198,7 +258,7 @@ export class FileSlice {
 	/** Creates a new subslice of this slice whose byte range must be contained within this slice. */
 	slice(filePos: number, length = this.end - filePos) {
 		if (filePos < this.start || filePos + length > this.end) {
-			throw new RangeError('Slicing outside of original slice.');
+			throw new SliceRangeError('Slicing outside of original slice.');
 		}
 
 		return new FileSlice(
@@ -213,7 +273,7 @@ export class FileSlice {
 
 const checkIsInRange = (slice: FileSlice, bytesToRead: number) => {
 	if (bytesToRead < 0 || slice.filePos < slice.start || slice.filePos + bytesToRead > slice.end) {
-		throw new RangeError(
+		throw new SliceRangeError(
 			`Tried reading [${slice.filePos}, ${slice.filePos + bytesToRead}), but slice is`
 			+ ` [${slice.start}, ${slice.end}). This is likely an internal error, please report it alongside the file`
 			+ ` that caused it.`,

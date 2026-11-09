@@ -25,6 +25,20 @@ if ((globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL]) {
 }
 (globalThis as Record<symbol, unknown>)[PRORES_LOADED_SYMBOL] = true;
 
+/**
+ * TurboRes starts one worker per core unless told otherwise, but its throughput stops growing at around 16 workers.
+ * Beyond that, workers only cost: with shared memory (Node, cross-origin isolated pages) they burn CPU and even slow
+ * decoding down, and without it every worker gets its own WASM memory, of which Chromium only reserves address space
+ * for about a hundred per page, after which starting more workers fails and decoding hangs.
+ */
+const MAX_WORKERS = 16;
+
+/**
+ * TurboRes decoders share their workers, but decoders that are created at the same time each start a full set of them,
+ * so they're created one after another.
+ */
+let lastDecoderCreation: Promise<unknown> = Promise.resolve();
+
 class ProresDecoder extends CustomVideoDecoder {
 	private decoder: Decoder | null = null;
 	private framePool: Frame[] = [];
@@ -68,11 +82,21 @@ class ProresDecoder extends CustomVideoDecoder {
 			ProresDecoder._supportedVideoFrameFormats ??= ProresDecoder._determineSupportedVideoFrameFormats();
 		}
 
-		const decoder = await Decoder.create({
+		// Node 20 and older have no navigator, in which case TurboRes asks the OS for the core count itself
+		const hardwareConcurrency = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : undefined;
+
+		// Without workers, TurboRes decodes on this thread, which blocks it, but works
+		const useWorkers = await canRunWasmInWorkers();
+
+		const creation = lastDecoderCreation.then(() => Decoder.create({
 			proresFourCc: this.config.codec as ProresFourCc,
 			useSharedMemory: Decoder.canUseSharedMemory(),
+			concurrency: !useWorkers ? 0 : hardwareConcurrency ? Math.min(hardwareConcurrency, MAX_WORKERS) : undefined,
 			allowedOutputFormats: ProresDecoder._supportedVideoFrameFormats ?? undefined,
-		});
+		}));
+		lastDecoderCreation = creation.catch(() => {});
+
+		const decoder = await creation;
 		if (decoder instanceof Error) {
 			throw decoder;
 		}
@@ -114,24 +138,31 @@ class ProresDecoder extends CustomVideoDecoder {
 			this.trimCodedHeightToVisibleHeight(result);
 		}
 
+		// Like with WebCodecs, the decoder config (which carries container-level metadata) overrides in-band values
+		const configColorSpace = this.config.colorSpace;
 		const colorSpaceInit = {
-			primaries: result.colorPrimariesString as VideoColorPrimaries | undefined,
-			matrix: result.colorMatrixString as VideoMatrixCoefficients | undefined,
-			transfer: result.colorTransferString as VideoTransferCharacteristics | undefined,
-			fullRange: result.colorRangeFull,
+			primaries: configColorSpace?.primaries ?? result.colorPrimariesString as VideoColorPrimaries | undefined,
+			matrix: configColorSpace?.matrix ?? result.colorMatrixString as VideoMatrixCoefficients | undefined,
+			transfer: configColorSpace?.transfer
+				?? result.colorTransferString as VideoTransferCharacteristics | undefined,
+			fullRange: configColorSpace?.fullRange ?? result.colorRangeFull,
 		};
+
+		let pixelAspectRatio = result.pixelAspectRatio;
+		if (this.config.displayAspectWidth !== undefined && this.config.displayAspectHeight !== undefined) {
+			pixelAspectRatio = {
+				num: this.config.displayAspectWidth * result.visibleHeight,
+				den: this.config.displayAspectHeight * result.visibleWidth,
+			};
+		}
 
 		let displayWidth = result.visibleWidth;
 		let displayHeight = result.visibleHeight;
 
-		if (result.pixelAspectRatio.num > result.pixelAspectRatio.den) {
-			displayWidth = Math.round(
-				result.visibleWidth * result.pixelAspectRatio.num / result.pixelAspectRatio.den,
-			);
+		if (pixelAspectRatio.num > pixelAspectRatio.den) {
+			displayWidth = Math.round(result.visibleWidth * pixelAspectRatio.num / pixelAspectRatio.den);
 		} else {
-			displayHeight = Math.round(
-				result.visibleHeight * result.pixelAspectRatio.den / result.pixelAspectRatio.num,
-			);
+			displayHeight = Math.round(result.visibleHeight * pixelAspectRatio.den / pixelAspectRatio.num);
 		}
 
 		let sample: VideoSample;
@@ -211,6 +242,17 @@ class ProresDecoder extends CustomVideoDecoder {
 			bytesPerSample * (lumaVisiblePixels + chromaVisiblePixels),
 		);
 
+		if (result.pixelFormat.includes('A')) {
+			// A
+			result.frameData.set(
+				result.frameData.subarray(
+					bytesPerSample * (lumaCodedPixels + 2 * chromaCodedPixels),
+					bytesPerSample * (2 * lumaCodedPixels + 2 * chromaCodedPixels),
+				),
+				bytesPerSample * (lumaVisiblePixels + 2 * chromaVisiblePixels),
+			);
+		}
+
 		result.codedHeight = result.visibleHeight;
 	}
 
@@ -232,6 +274,41 @@ class ProresDecoder extends CustomVideoDecoder {
 		}
 	}
 }
+
+let workersCanRunWasm: Promise<boolean> | null = null;
+
+/**
+ * Whether the page can start a module worker from a blob: URL and compile WebAssembly in it, which is how TurboRes runs
+ * its decoding threads. A Content Security Policy can forbid either, and then TurboRes waits for its workers forever.
+ * Checked once per page; true where TurboRes uses worker_threads instead (Node and Bun, like its own check).
+ */
+const canRunWasmInWorkers = () => {
+	return workersCanRunWasm ??= new Promise<boolean>((resolve) => {
+		if (typeof Worker === 'undefined' || 'Bun' in globalThis || typeof URL.createObjectURL !== 'function') {
+			resolve(true);
+			return;
+		}
+
+		// Instantiates the smallest WebAssembly module there is: its magic number and version
+		const source = 'WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]))'
+			+ '.then(() => postMessage(true), () => postMessage(false));';
+		const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+		let worker: Worker | null = null;
+		const finish = (result: boolean) => {
+			worker?.terminate();
+			URL.revokeObjectURL(url);
+			resolve(result);
+		};
+
+		try {
+			worker = new Worker(url, { type: 'module' }); // Like TurboRes's workers (and Deno only has module workers)
+			worker.addEventListener('message', event => finish(event.data === true));
+			worker.addEventListener('error', () => finish(false));
+		} catch {
+			finish(false);
+		}
+	});
+};
 
 let registered = false;
 

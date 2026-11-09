@@ -3,13 +3,18 @@
   "author": "Vanilagy",
   "version": "1.65.2",
   "description": "AC-3 and E-AC-3 (Dolby Digital) decoder and encoder extension for Mediabunny, based on libavcodec.",
-  "main": "./dist/bundles/mediabunny-ac3.mjs",
+  "main": "./dist/bundles/mediabunny-ac3.cjs",
   "module": "./dist/bundles/mediabunny-ac3.mjs",
   "types": "./dist/modules/src/index.d.ts",
   "exports": {
-    "types": "./dist/modules/src/index.d.ts",
-    "import": "./dist/bundles/mediabunny-ac3.mjs",
-    "require": "./dist/bundles/mediabunny-ac3.mjs"
+    "import": {
+      "types": "./dist/mediabunny-ac3.d.mts",
+      "default": "./dist/bundles/mediabunny-ac3.mjs"
+    },
+    "require": {
+      "types": "./dist/modules/src/index.d.ts",
+      "default": "./dist/bundles/mediabunny-ac3.cjs"
+    }
   },
   "files": [
     "README.md",
@@ -39,7 +44,7 @@
     "url": "https://github.com/sponsors/Vanilagy"
   },
   "peerDependencies": {
-    "mediabunny": "^1.0.0"
+    "mediabunny": "^1.56.0"
   },
   "devDependencies": {
     "@types/emscripten": "^1.40.1"

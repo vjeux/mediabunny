@@ -85,6 +85,77 @@ test('MP3 encoding', async () => {
 	expect(await track.computeDuration()).toBeCloseTo(2, 0);
 });
 
+test('MP3 encoding ends where the input ends', async () => {
+	registerMp3Encoder();
+
+	const sampleRate = 44100;
+	const channels = 2;
+	const data = createSineWave(sampleRate, channels, 1);
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const audioSource = new AudioSampleSource({ codec: 'mp3', quality: new Quality({ bitrate: 128_000 }) });
+	output.addAudioTrack(audioSource);
+
+	await output.start();
+	const sample = new AudioSample({
+		data,
+		format: 'f32',
+		numberOfChannels: channels,
+		sampleRate,
+		timestamp: 0,
+	});
+	await audioSource.add(sample);
+	sample.close();
+	audioSource.close();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	const lastPacket = (await new EncodedPacketSink(track).getPacket(Infinity))!;
+
+	// LAME fills its last frames with silence, which isn't part of the audio
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(1, 6);
+});
+
+test.each([
+	[44100, 128],
+	[48000, 999],
+	[16000, 128],
+])('MP3 encoding at %i Hz and %i bps, below the encoder\'s minimum', async (sampleRate, bitrate) => {
+	// Like a bitrate given in kbps instead of bps. It must come out at the encoder's minimum, not its default.
+	registerMp3Encoder();
+
+	const output = new Output({ format: new Mp3OutputFormat(), target: new BufferTarget() });
+	const audioSource = new AudioSampleSource({ codec: 'mp3', quality: new Quality({ bitrate }) });
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	const sample = new AudioSample({
+		data: createSineWave(sampleRate, 2, 1),
+		format: 'f32',
+		numberOfChannels: 2,
+		sampleRate,
+		timestamp: 0,
+	});
+	await audioSource.add(sample);
+	sample.close();
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const { averageBitrate } = await track.computePacketStats();
+	expect(averageBitrate).toBeLessThan(40_000); // LAME's minimum is 32 kbps at 32-48 kHz, 8 kbps below
+});
+
 test('MP3 with huge timestamps', async () => {
 	registerMp3Encoder();
 

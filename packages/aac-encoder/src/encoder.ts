@@ -28,6 +28,14 @@ const AAC_SAMPLE_RATES = [
 	24000, 22050, 16000, 12000, 11025, 8000, 7350,
 ];
 
+/**
+ * FFmpeg's AAC encoder needs at least 18 bits per channel for each frame of 1024 samples: with fewer, its rate control
+ * can't get a frame that small, and it either loops forever or ends up near the maximum frame size. Lower bitrates
+ * (like one given in kbps instead of bps) are raised to this, with some margin. The encoder can't go that low anyway:
+ * its output for such bitrates is around 20 kbps per channel.
+ */
+const MIN_BITS_PER_CHANNEL_PER_FRAME = 24;
+
 class AacEncoder extends CustomAudioEncoder {
 	private worker: Worker | null = null;
 	private workerError: Error | null = null;
@@ -108,7 +116,9 @@ class AacEncoder extends CustomAudioEncoder {
 			data: {
 				numberOfChannels: this.config.numberOfChannels,
 				sampleRate: this.config.sampleRate,
-				bitrate: this.config.bitrate,
+				bitrate: Math.max(this.config.bitrate, Math.ceil(
+					MIN_BITS_PER_CHANNEL_PER_FRAME * this.config.numberOfChannels * this.config.sampleRate / 1024,
+				)),
 			},
 		});
 
@@ -157,6 +167,15 @@ class AacEncoder extends CustomAudioEncoder {
 		const audioBytes = new Uint8Array(totalBytes);
 		audioSample.copyTo(audioBytes, { format: 'f32', planeIndex: 0 });
 		const incomingData = new Float32Array(audioBytes.buffer);
+
+		// FFmpeg's encoder rejects a whole frame if it holds a NaN or infinite sample, so map those like the conversion
+		// to integer samples does: NaN to silence, infinities to full scale
+		for (let i = 0; i < incomingData.length; i++) {
+			const value = incomingData[i]!;
+			if (!Number.isFinite(value)) {
+				incomingData[i] = Number.isNaN(value) ? 0 : Math.sign(value);
+			}
+		}
 
 		const requiredSamples = (this.pendingFrames + incomingFrames) * channels;
 		if (requiredSamples > this.pendingBuffer.length) {

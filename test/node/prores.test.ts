@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import { registerProresDecoder } from '@mediabunny/prores';
 import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, MovOutputFormat } from '../../src/output-format.js';
@@ -9,6 +9,8 @@ import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
 import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert } from '../../src/misc.js';
+import { customVideoDecoders } from '../../src/custom-coder.js';
+import { VideoSample } from '../../src/sample.js';
 
 const SAMPLE_URL = 'https://pub-1ee78aacb848486482b20a72b55b3121.r2.dev/turbores-sample.mov';
 
@@ -131,6 +133,54 @@ test('Custom coder registration', { timeout: 20_000 }, async () => {
 	expect(await videoTrack.canDecode()).toBe(true);
 });
 
+test('ProRes samples take the pixel aspect ratio from the container', async () => {
+	// prores_ks, like Apple's encoders, writes the pixel aspect ratio (here 4:3) only into the pasp box, with
+	// aspect_ratio_information 0 (unknown) in the frame header. Made with (FFmpeg 7.0.2):
+	// ffmpeg -f lavfi -i testsrc2=s=64x32:r=10:d=0.2 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le -vf setsar=4/3 \
+	//   -fflags +bitexact -flags:v +bitexact prores-422hq-64x32-sar4x3.mov
+	registerProresDecoder();
+
+	using input = new Input({
+		source: new FilePathSource('./test/public/prores-422hq-64x32-sar4x3.mov'),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(85);
+	expect(await videoTrack.getDisplayHeight()).toBe(32);
+
+	using sample = await new VideoSampleSink(videoTrack).getSample(0);
+	assert(sample);
+
+	expect(sample.codedWidth).toBe(64);
+	expect(sample.displayWidth).toBe(85);
+	expect(sample.displayHeight).toBe(32);
+});
+
+test('Color space signaled only by the container', async () => {
+	registerProresDecoder();
+
+	using input = new Input({
+		source: new FilePathSource('./test/public/prores-container-metadata.mov'),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	const expectedColorSpace = {
+		primaries: 'bt2020',
+		transfer: 'hlg',
+		matrix: 'bt2020-ncl',
+		fullRange: false,
+	};
+	expect(await videoTrack.getColorSpace()).toEqual(expectedColorSpace);
+
+	const sink = new VideoSampleSink(videoTrack);
+	using sample = (await sink.getSample(await videoTrack.getFirstTimestamp()))!;
+
+	// The ProRes frame headers say "unspecified", so this can only come from the colr box
+	expect(sample.colorSpace.toJSON()).toEqual(expectedColorSpace);
+});
+
 test('ProRes decoding', { timeout: 20_000 }, async () => {
 	registerProresDecoder();
 
@@ -167,4 +217,60 @@ test('ProRes decoding', { timeout: 20_000 }, async () => {
 	const pixels = new Uint8Array(allocationSize);
 	await sample.copyTo(pixels);
 	expect(pixels.some(byte => byte !== 0)).toBe(true);
+});
+
+test('ProRes decoding uses at most 16 worker threads on machines with many cores', async () => {
+	registerProresDecoder();
+
+	// Like a 96-core/192-thread server. TurboRes starts one worker per core by default, but more than 16 of them only
+	// burn CPU.
+	Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 192, configurable: true });
+
+	try {
+		// ffmpeg -f lavfi -i testsrc2=s=64x32:r=10:d=0.2 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le
+		//   -fflags +bitexact -flags:v +bitexact prores-422hq-64x32.mov
+		using input = new Input({
+			source: new FilePathSource('./test/public/prores-422hq-64x32.mov'),
+			formats: ALL_FORMATS,
+		});
+		const videoTrack = (await input.getPrimaryVideoTrack())!;
+		const decoderConfig = (await videoTrack.getDecoderConfig())!;
+
+		const ProresDecoder = customVideoDecoders.find(x => x.supports('prores', decoderConfig));
+		assert(ProresDecoder);
+
+		// @ts-expect-error Abstract class, but the registered one is concrete
+		const decoder = new ProresDecoder() as InstanceType<typeof ProresDecoder>;
+		// @ts-expect-error Readonly
+		decoder.codec = 'prores';
+		// @ts-expect-error Readonly
+		decoder.config = decoderConfig;
+		const samples: VideoSample[] = [];
+		// @ts-expect-error Readonly
+		decoder.onSample = (sample: VideoSample) => {
+			samples.push(sample);
+		};
+		await decoder.init();
+
+		try {
+			for await (const packet of new EncodedPacketSink(videoTrack).packets()) {
+				await decoder.decode(packet);
+			}
+			await decoder.flush();
+
+			expect(samples.length).toBeGreaterThan(0);
+			expect(samples[0]!.codedWidth).toBe(64);
+
+			const turboresDecoder = (decoder as unknown as { decoder: { concurrency: number } }).decoder;
+			expect(turboresDecoder.concurrency).toBe(16);
+		} finally {
+			for (const sample of samples) {
+				sample.close();
+			}
+			await decoder.close();
+		}
+	} finally {
+		// Back to the real value from the prototype
+		delete (navigator as { hardwareConcurrency?: number }).hardwareConcurrency;
+	}
 });

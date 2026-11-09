@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { decoderKeepsFrameSizeOfNonSquarePixels } from './helpers/platform-probes.js';
 import { Conversion } from '../../src/conversion.js';
 import { ALL_FORMATS, MATROSKA, MP4, MPEG_TS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
@@ -11,7 +12,7 @@ import { BufferTarget } from '../../src/target.js';
 
 const SOURCE_PATH = '/sar_2x1.mp4';
 
-test('Pixel aspect ratio reading', async () => {
+test('Pixel aspect ratio reading', async ({ skip }) => {
 	using input = new Input({
 		source: new UrlSource(SOURCE_PATH),
 		formats: ALL_FORMATS,
@@ -29,6 +30,10 @@ test('Pixel aspect ratio reading', async () => {
 	assert(decoderConfig);
 	expect(decoderConfig.displayAspectWidth).toBe(await videoTrack.getSquarePixelWidth());
 	expect(decoderConfig.displayAspectHeight).toBe(await videoTrack.getSquarePixelHeight());
+	skip(
+		!await decoderKeepsFrameSizeOfNonSquarePixels(),
+		'the platform\'s video decoder rescales frames with non-square pixels (native probe)',
+	);
 
 	const sink = new VideoSampleSink(videoTrack);
 	using sample = (await sink.getSample(await videoTrack.getFirstTimestamp()))!;
@@ -59,6 +64,40 @@ test('Pixel aspect ratio from SPS without pasp box', async () => {
 		expect(await track.getSquarePixelHeight()).toBe(114);
 		expect(await track.getDisplayWidth()).toBe(64);
 		expect(await track.getDisplayHeight()).toBe(114);
+	}
+});
+
+test('Pixel aspect ratio from a pasp box alone reaches the decoded samples', async () => {
+	// The H.264 stream signals no aspect ratio, only the pasp box says 2:1. Made with FFmpeg: libx264 from a SAR 0/1
+	// source, then -c copy -aspect 32:9
+	const decodeFirstSample = async () => {
+		using input = new Input({ source: new UrlSource('/pasp-only-sar2.mp4'), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		expect([await track.getSquarePixelWidth(), await track.getSquarePixelHeight()]).toEqual([640, 180]);
+
+		using sample = await new VideoSampleSink(track).getSample(0);
+		assert(sample);
+		return [sample.codedWidth, sample.codedHeight, sample.displayWidth, sample.displayHeight];
+	};
+
+	expect(await decodeFirstSample()).toEqual([320, 180, 640, 180]);
+
+	// WebKit's VideoDecoder doesn't apply displayAspectWidth/displayAspectHeight (WebCore never passes them on to the
+	// platform decoder), which this simulates in other browsers
+	const NativeVideoDecoder = VideoDecoder;
+	globalThis.VideoDecoder = class extends NativeVideoDecoder {
+		override configure(config: VideoDecoderConfig) {
+			const { displayAspectWidth, displayAspectHeight, ...rest } = config;
+			void displayAspectWidth;
+			void displayAspectHeight;
+			super.configure(rest);
+		}
+	};
+	try {
+		expect(await decodeFirstSample()).toEqual([320, 180, 640, 180]);
+	} finally {
+		globalThis.VideoDecoder = NativeVideoDecoder;
 	}
 });
 

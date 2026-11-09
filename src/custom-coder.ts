@@ -89,10 +89,18 @@ export abstract class CustomVideoEncoder {
 	readonly codec!: VideoCodec;
 	/** Config for the encoder. */
 	readonly config!: VideoEncoderConfig;
-	/** The callback to call when an EncodedPacket is available. */
+	/**
+	 * The callback to call when an EncodedPacket is available. The packet's data is not copied, so don't modify or
+	 * reuse its buffer afterwards (copy views into a reused buffer or a WebAssembly heap first).
+	 */
 	readonly onPacket!: (packet: EncodedPacket, meta?: EncodedVideoChunkMetadata) => unknown;
 	/** The callback to call to surface out-of-band errors that can't be surfaced through the main methods. */
 	readonly onError!: (error: unknown) => undefined;
+	/**
+	 * The interval in seconds at which key frames are requested through the encode options, 0 for every frame.
+	 * @internal
+	 */
+	_keyFrameInterval = 2;
 
 	/** Returns true if and only if the encoder can encode the given codec configuration. */
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -121,7 +129,10 @@ export abstract class CustomAudioEncoder {
 	readonly codec!: AudioCodec;
 	/** Config for the encoder. */
 	readonly config!: AudioEncoderConfig;
-	/** The callback to call when an EncodedPacket is available. */
+	/**
+	 * The callback to call when an EncodedPacket is available. The packet's data is not copied, so don't modify or
+	 * reuse its buffer afterwards (copy views into a reused buffer or a WebAssembly heap first).
+	 */
 	readonly onPacket!: (packet: EncodedPacket, meta?: EncodedAudioChunkMetadata) => unknown;
 	/** The callback to call to surface out-of-band errors that can't be surfaced through the main methods. */
 	readonly onError!: (error: unknown) => undefined;
@@ -154,7 +165,7 @@ export const customAudioEncoders: typeof CustomAudioEncoder[] = [];
  * @public
  */
 export const registerDecoder = (decoder: typeof CustomVideoDecoder | typeof CustomAudioDecoder) => {
-	if (decoder.prototype instanceof CustomVideoDecoder) {
+	if (decoder?.prototype instanceof CustomVideoDecoder) {
 		const casted = decoder as typeof CustomVideoDecoder;
 
 		if (customVideoDecoders.includes(casted)) {
@@ -164,7 +175,7 @@ export const registerDecoder = (decoder: typeof CustomVideoDecoder | typeof Cust
 
 		customVideoDecoders.push(casted);
 		canDecodeVideoMemo.clear();
-	} else if (decoder.prototype instanceof CustomAudioDecoder) {
+	} else if (decoder?.prototype instanceof CustomAudioDecoder) {
 		const casted = decoder as typeof CustomAudioDecoder;
 
 		if (customAudioDecoders.includes(casted)) {
@@ -186,7 +197,7 @@ export const registerDecoder = (decoder: typeof CustomVideoDecoder | typeof Cust
  * @public
  */
 export const registerEncoder = (encoder: typeof CustomVideoEncoder | typeof CustomAudioEncoder) => {
-	if (encoder.prototype instanceof CustomVideoEncoder) {
+	if (encoder?.prototype instanceof CustomVideoEncoder) {
 		const casted = encoder as typeof CustomVideoEncoder;
 
 		if (customVideoEncoders.includes(casted)) {
@@ -196,7 +207,7 @@ export const registerEncoder = (encoder: typeof CustomVideoEncoder | typeof Cust
 
 		customVideoEncoders.push(casted);
 		canEncodeVideoMemo.clear();
-	} else if (encoder.prototype instanceof CustomAudioEncoder) {
+	} else if (encoder?.prototype instanceof CustomAudioEncoder) {
 		const casted = encoder as typeof CustomAudioEncoder;
 
 		if (customAudioEncoders.includes(casted)) {

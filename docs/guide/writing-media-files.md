@@ -65,14 +65,14 @@ output.addAudioTrack(audioSourceEng, {
 	disposition: { commentary: true }, // Sets additional flags in the file
 });
 output.addAudioTrack(audioSourceGer, {
-	languageCode: 'ger',
+	languageCode: 'deu',
 });
 
 // This adds multiple subtitle tracks, all for different languages.
 output.addSubtitleTrack(subtitleSourceEng, { languageCode: 'eng' });
-output.addSubtitleTrack(subtitleSourceGer, { languageCode: 'ger' });
+output.addSubtitleTrack(subtitleSourceGer, { languageCode: 'deu' });
 output.addSubtitleTrack(subtitleSourceSpa, { languageCode: 'spa' });
-output.addSubtitleTrack(subtitleSourceFre, { languageCode: 'fre' });
+output.addSubtitleTrack(subtitleSourceFre, { languageCode: 'fra' });
 output.addSubtitleTrack(subtitleSourceIta, { languageCode: 'ita' });
 ```
 
@@ -83,6 +83,10 @@ To precisely achieve common fractional frame rates, make sure to use their exact
 $23.976 \rightarrow 24000/1001$\
 $29.97 \rightarrow 30000/1001$\
 $59.94 \rightarrow 60000/1001$
+:::
+
+::: info
+Which `disposition` flags end up in the file depends on the output format. Matroska and WebM store all of them except `primary`. MP4 stores `default` (as the track's enabled flag, keeping at least one track of each type enabled) and `commentary`, `hearingImpaired`, `visuallyImpaired` and `forced` (as `kind` boxes); MOV only stores `default`. HLS uses `default`, `primary` and `forced`. The other formats store none.
 :::
 
 As an example, let's add two tracks to our output:
@@ -217,7 +221,7 @@ audioStreamTrack.stop(); // Stops capturing the user's microphone
 
 await output.finalize();
 
-const file = output.target.buffer; // => Uint8Array
+const file = output.target.buffer; // => ArrayBuffer
 ```
 
 ---
@@ -237,6 +241,8 @@ writer.
 ::: warning
 After calling `cancel`, adding more media data to the output results in an error.
 :::
+
+Calling `cancel` while the output is finalizing doesn't cancel the file: finalization waits for the samples added before it to be processed by a `process` function, and `cancel` stops waiting for such a call (or an encoder initialization) still in flight and drops the samples queued behind it, so that one that never settles can't hold finalization up forever. Without either, nothing is dropped. It resolves right away; finalization then goes on by itself.
 
 In our example, we would do this:
 ```ts	
@@ -347,7 +353,7 @@ Some [output formats](./output-formats) have *append-only* writing modes in whic
 
 #### Chunked mode
 
-By default, data will be emitted by the `StreamTarget` as soon as it is available. In some formats, these may lead to hundreds of write events per second. If you want to reduce the frequency of writes, `StreamTarget` offers an alternative "chunked mode" in which data will first be accumulated into large chunks of a given size in memory, and then only be emitted once a chunk is completely full.
+By default, data will be emitted by the `StreamTarget` as soon as it is available. In some formats, these may lead to hundreds of write events per second. If you want to reduce the frequency of writes, `StreamTarget` offers an alternative "chunked mode" in which data will first be accumulated into large chunks of a given size in memory, and then only be emitted once a chunk is completely full. The exception is when the output needs its data written out before it goes on, like a live HLS playlist listing byte ranges of a single segment file: then partial chunks are emitted too.
 
 ```ts
 new StreamTarget(writable, {

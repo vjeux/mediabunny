@@ -18,6 +18,7 @@ import {
 import * as NodeAv from 'node-av';
 import {
 	CODEC_TO_CODEC_ID,
+	getCodecThreadCount,
 	getHardwareEncoderCodec,
 	isRgbPixelFormat,
 	unmapColorPrimaries,
@@ -40,7 +41,7 @@ import {
 	serializeHevcDecoderConfigurationRecord,
 } from '../../../src/codec-data';
 import { extractVideoCodecString, ProresFourCc } from '../../../src/codec';
-import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
+import { assert, binarySearchLessOrEqual, simplifyRational, toDataView, toUint8Array } from '../../../src/misc';
 
 const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	apco: NodeAv.AV_PROFILE_PRORES_PROXY,
@@ -51,16 +52,171 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
 };
 
+// Codecs whose bitstream can carry alpha: VP8 and VP9 (as a second stream), HEVC (as an extra layer) and ProRes 4444
+const ALPHA_CAPABLE_CODECS: VideoCodec[] = ['vp8', 'vp9', 'hevc', 'prores'];
+
+/**
+ * The pixel format to encode with when keeping alpha, or null for the default one. Codecs that can't carry alpha
+ * (AVC, AV1) never get an alpha format: it would drop the alpha anyway, only changing the stream's format (to 4:4:4
+ * 10-bit for libx264) or the input format (to RGBA for NVENC).
+ */
+export const getAlphaPixelFormat = (codec: VideoCodec, pixelFormats: NodeAv.AVPixelFormat[]) => {
+	if (!ALPHA_CAPABLE_CODECS.includes(codec)) {
+		return null;
+	}
+
+	// Going by FFmpeg's names for them, planar (yuva420p, gbrap10le) and packed: prores_videotoolbox only takes alpha
+	// as ayuv64le or bgra
+	const alphaFormats = pixelFormats.filter(
+		format => /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|ayuv|vuya)/.test(NodeAv.avGetPixFmtName(format) ?? ''),
+	);
+
+	if (alphaFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
+		return NodeAv.AV_PIX_FMT_YUVA420P;
+	} else if (alphaFormats.length === 0) {
+		return null;
+	}
+
+	// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a high-quality YUVA source
+	return NodeAv.avcodecFindBestPixFmtOfList(alphaFormats, NodeAv.AV_PIX_FMT_YUVA444P12LE);
+};
+
+/**
+ * Whether libsvtav1 can encode frames of this size. With a target bitrate, it refuses to open below 64 pixels in either
+ * dimension ("Adaptive quantization can not be turned OFF when RC ON"). In constant-quantizer mode, its flush hangs
+ * forever for frames up to 24 pixels wide, and for frames up to 24 pixels high that are wider than 64 pixels
+ * (measured; SVT-AV1 documents no such limit).
+ */
+const av1SizeIsSupported = (config: VideoEncoderConfig) => {
+	const { width, height } = config;
+
+	if (config.bitrateMode === 'quantizer') {
+		return width > 24 && (height > 24 || width <= 64);
+	}
+
+	return width >= 64 && height >= 64;
+};
+
+/**
+ * What a codec string asks for beyond the codec itself: a profile below High for AVC, and the bit depth (AVC High 10,
+ * HEVC Main 10, and the bit depth fields of VP9 and AV1). The encoders would otherwise apply their own defaults (the
+ * High profile for libx264, 8 bits everywhere) whatever was requested.
+ */
+const parseCodecStringRequirements = (codec: VideoCodec, codecString: string) => {
+	const parts = codecString.split('.');
+	let avcProfileIdc: number | null = null;
+	let avcProfile: NodeAv.AVProfile | null = null;
+	let bitDepth = 8;
+
+	if (codec === 'avc') {
+		const profileIdc = parseInt(parts[1]?.slice(0, 2) ?? '', 16);
+		avcProfileIdc = profileIdc;
+		// libx264 picks High (or above, like for lossless) by itself, so only the lower profiles need asking for
+		if (profileIdc === 66) {
+			avcProfile = NodeAv.AV_PROFILE_H264_BASELINE;
+		} else if (profileIdc === 77) {
+			avcProfile = NodeAv.AV_PROFILE_H264_MAIN;
+		} else if (profileIdc === 110) {
+			bitDepth = 10;
+		}
+	} else if (codec === 'hevc') {
+		// The general_profile_idc, after the optional profile space letter
+		bitDepth = Number(parts[1]?.replace(/^[ABC]/, '')) === 2 ? 10 : 8;
+	} else if (codec === 'vp9' || codec === 'av1') {
+		const fieldValue = Number(parts[3]);
+		bitDepth = fieldValue === 10 || fieldValue === 12 ? fieldValue : 8;
+	}
+
+	return { avcProfileIdc, avcProfile, bitDepth };
+};
+
+/**
+ * Whether the encoders here can produce what a codec string asks for. They encode 4:2:0 only: AVC in the Baseline,
+ * Main, High and High 10 profiles, HEVC in Main and Main 10, VP9 in profiles 0 (8-bit) and 2 (10 and 12-bit), and AV1
+ * in the Main profile at 8 or 10 bits. Anything else would come out as something other than what was asked for, so
+ * it's declined, as browsers do.
+ */
+const isProducibleCodecString = (codec: VideoCodec, codecString: string) => {
+	const parts = codecString.split('.');
+
+	if (codec === 'avc') {
+		return [66, 77, 100, 110].includes(parseInt(parts[1]?.slice(0, 2) ?? '', 16));
+	} else if (codec === 'hevc') {
+		// Profile space 0 (no letter), Main or Main 10
+		return parts[1] === '1' || parts[1] === '2';
+	} else if (codec === 'vp9') {
+		const profile = Number(parts[1]);
+		const bitDepth = Number(parts[3]);
+		// The optional chroma subsampling field: 0 and 1 are 4:2:0
+		const isYuv420 = parts[4] === undefined || Number(parts[4]) <= 1;
+		return isYuv420 && (profile === 0 ? bitDepth === 8 : profile === 2 && (bitDepth === 10 || bitDepth === 12));
+	} else if (codec === 'av1') {
+		const bitDepth = Number(parts[3]);
+		// The optional monochrome and chroma subsampling fields: 4:2:0 is 0 and 11x
+		const isYuv420 = (parts[4] === undefined || Number(parts[4]) === 0) && (parts[5] ?? '11').startsWith('11');
+		return parts[1] === '0' && (bitDepth === 8 || bitDepth === 10) && isYuv420;
+	}
+
+	return true;
+};
+
+/**
+ * Whether a codec string is producible (see isProducibleCodecString) and the software encoder has its bit depth.
+ */
+const canProduceCodecString = (codec: VideoCodec, codecString: string) => {
+	if (!isProducibleCodecString(codec, codecString)) {
+		return false;
+	}
+
+	// Hardware encoders fall back to the software encoder (for frames they can't take, say), so it has to have the bit
+	// depth. Some builds don't: node-av's libx265 for Windows is 8-bit only.
+	const { bitDepth } = parseCodecStringRequirements(codec, codecString);
+	if (bitDepth > 8) {
+		const softwareCodec = NodeAv.Codec.findEncoder(CODEC_TO_CODEC_ID[codec]!);
+		const format = bitDepth === 10 ? NodeAv.AV_PIX_FMT_YUV420P10LE : NodeAv.AV_PIX_FMT_YUV420P12LE;
+		return !!softwareCodec?.pixelFormats?.includes(format);
+	}
+
+	return true;
+};
+
+/**
+ * Whether a hardware encoder can give what a codec string asks for beyond the codec itself. NVENC is the only one we
+ * know how to ask for a lower AVC profile or a 10-bit HEVC or AV1 stream (from P010 frames); AVC High 10 it only has
+ * on recent GPUs. The software encoder is used otherwise.
+ */
+const hardwareCanHonorCodecString = (hardwareCodec: NodeAv.Codec, codec: VideoCodec, codecString: string) => {
+	const requirements = parseCodecStringRequirements(codec, codecString);
+	const isNvenc = !!hardwareCodec.name?.endsWith('_nvenc');
+
+	if (requirements.bitDepth > 8) {
+		return isNvenc
+			&& codec !== 'avc'
+			&& requirements.bitDepth === 10
+			&& !!hardwareCodec.pixelFormats?.includes(NodeAv.AV_PIX_FMT_P010LE);
+	}
+	if (requirements.avcProfile !== null) {
+		return isNvenc;
+	}
+
+	return true;
+};
+
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
 	codecContext: NodeAv.CodecContext | null = null;
 	scaler: NodeAv.SoftwareScaleContext | null = null;
 	dstFrame: NodeAv.Frame | null = null;
+	/** Whether frames are encoded one column wider than the output, see `createCodecContext` */
+	encodesExtraColumn = false;
+	paddedFrame: NodeAv.Frame | null = null;
 	avCodec!: NodeAv.Codec;
 	lastBuffer: Buffer | null = null;
 	packetEmitted = false;
 	quantizer: number | null = null;
+	/** The software encoder to switch to should the chosen hardware encoder fail to open. */
+	softwareFallbackCodec: NodeAv.Codec | null = null;
 
 	// Bookkeeping to restore the original timing information
 	preciseTimings: {
@@ -72,17 +228,64 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
+		if (codec === 'av1' && !av1SizeIsSupported(config)) {
+			return false;
+		}
+
+		if ((codec === 'avc' || codec === 'hevc') && (config.width % 2 === 1 || config.height % 2 === 1)) {
+			// AVC and HEVC are encoded as 4:2:0, which libx264, libx265 and hardware encoders need even dimensions for
+			return false;
+		}
+
+		const { width, height } = config;
+		if (codec === 'hevc' && (width < 16 || height < 16)) {
+			// libx265 refuses to open for frames under 16 pixels in either dimension
+			return false;
+		}
+		if (codec === 'hevc' && Math.min(width, height) < 32 && Math.max(width, height) > 4216) {
+			// Under 32 pixels, libx265 uses 16-pixel CTUs, which HEVC levels 5 and up don't allow, and past 4216 pixels
+			// (padded to whole 8-pixel blocks, more than level 4's 4222), the other dimension needs level 5
+			return false;
+		}
+		if (codec === 'vp8' && (width > 16383 || height > 16383)) {
+			// VP8 frame headers store the dimensions in 14 bits (RFC 6386, section 9.1)
+			return false;
+		}
+		if (codec === 'avc' && (width > 16384 || height > 16384)) {
+			// libx264 refuses to open past 16384 pixels in either dimension
+			return false;
+		}
+		if (codec === 'av1' && (width > 16384 || height > 8704)) {
+			// SVT-AV1's maximum frame size
+			return false;
+		}
+
+		if (config.scalabilityMode !== undefined && config.scalabilityMode !== 'L1T1') {
+			// The encoders here make a single layer, so other scalability modes are declined, as browsers decline the
+			// ones they can't make
+			return false;
+		}
+
 		if (config.bitrateMode === 'quantizer') {
-			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
+			return (codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1')
+				&& canProduceCodecString(codec, config.codec);
 		}
 
 		return (
 			codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
 			|| codec === 'prores'
-		);
+		) && canProduceCodecString(codec, config.codec);
 	}
 
 	async init(): Promise<void> {
+		if (this.codec === 'av1' && !av1SizeIsSupported(this.config)) {
+			// Fail right away instead of failing to open, or hanging, later
+			throw new Error(
+				`AV1 encoding of ${this.config.width}x${this.config.height} video isn't supported`
+				+ (this.config.bitrateMode === 'quantizer' ? ' in constant-quantizer mode.' : ' with a bitrate.'),
+			);
+		}
+
 		this.frame = new NodeAv.Frame();
 		this.frame.alloc();
 		this.frame.timeBase = new NodeAv.Rational(1, 1e6);
@@ -116,8 +319,17 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				// NVENC is the only hardware encoder we know how to drive in constant-quantizer mode
 				hardwareCodec = null;
 			}
+			if (hardwareCodec && !hardwareCanHonorCodecString(hardwareCodec, this.codec, this.config.codec)) {
+				hardwareCodec = null;
+			}
 
 			codec = hardwareCodec ?? getSoftwareCodec();
+
+			if (hardwareCodec) {
+				// A listed hardware encoder can still fail to open, like av1_nvenc on NVIDIA GPUs without AV1 encoding
+				// or once all of the GPU's encoder sessions are taken, so keep a software encoder at hand
+				this.softwareFallbackCodec = getSoftwareCodec();
+			}
 		}
 
 		if (!codec) {
@@ -141,17 +353,25 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 
 			if (this.config.alpha === 'keep') {
-				if (this.avCodec.pixelFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
-					pixelFormat = NodeAv.AV_PIX_FMT_YUVA420P;
-				} else {
-					// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a
-					// high-quality YUVA source
-					pixelFormat = NodeAv.avcodecFindBestPixFmtOfList(
-						this.avCodec.pixelFormats,
-						NodeAv.AV_PIX_FMT_YUVA444P12LE,
-					);
-				}
+				pixelFormat = getAlphaPixelFormat(this.codec, this.avCodec.pixelFormats) ?? pixelFormat;
 			}
+		}
+
+		const requirements = parseCodecStringRequirements(this.codec, this.config.codec);
+		// Hardware encoders like NVENC take 10-bit frames as P010 instead
+		const requestedPixelFormat = requirements.bitDepth === 10
+			? this.avCodec.pixelFormats?.includes(NodeAv.AV_PIX_FMT_YUV420P10LE) === false
+				? NodeAv.AV_PIX_FMT_P010LE
+				: NodeAv.AV_PIX_FMT_YUV420P10LE
+			: requirements.bitDepth === 12
+				? NodeAv.AV_PIX_FMT_YUV420P12LE
+				: null;
+		if (
+			requestedPixelFormat !== null
+			&& pixelFormat === NodeAv.AV_PIX_FMT_YUV420P
+			&& this.avCodec.pixelFormats?.includes(requestedPixelFormat)
+		) {
+			pixelFormat = requestedPixelFormat;
 		}
 
 		const pixelAspectRatio = simplifyRational({
@@ -159,12 +379,36 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			den: (this.config.displayHeight ?? this.config.height) * this.config.width,
 		});
 
-		codecContext.width = this.config.width;
+		// prores_ks only encodes floor(width / 2) chroma columns of 4:2:2 frames, so the last one of an odd-width frame
+		// would be lost (zeroed or smeared). Such frames are encoded a column wider, with the last column repeated, and
+		// the frame headers then get the actual width back: both widths give the same macroblocks.
+		this.encodesExtraColumn = this.codec === 'prores'
+			&& this.config.width % 2 === 1
+			&& !!NodeAv.avGetPixFmtName(pixelFormat)?.startsWith('yuv422');
+
+		codecContext.width = this.config.width + (this.encodesExtraColumn ? 1 : 0);
 		codecContext.height = this.config.height;
 		codecContext.pixelFormat = pixelFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, 1e6);
-		codecContext.gopSize = 60;
-		codecContext.framerate = new NodeAv.Rational(Math.round(this.config.framerate ?? 0) || 30, 1);
+		const frameRate = Math.round(this.config.framerate ?? 0) || 30;
+		// Mediabunny requests every key frame itself (keyFrameInterval), so the encoder must not insert its own on a
+		// schedule of its own
+		codecContext.gopSize = 100_000;
+		if (this.avCodec.name === 'libsvtav1') {
+			// SVT-AV1's rate control budgets each key frame against its intra period, so key frames requested within a
+			// longer one get far too many bits (a third over the target bitrate). Its period is matched to the
+			// requested interval instead, plus a frame, so that a frame rate slightly below the real one doesn't end it
+			// before the next request. A requested key frame restarts it, so it adds no key frames of its own, unless
+			// the frame rate is unknown and above the 30 fps assumed then (as with the fixed period of 60 before).
+			const intervalFrameRate = this.config.framerate || 30;
+			codecContext.gopSize = Math.max(Math.ceil(this._keyFrameInterval * intervalFrameRate) + 1, 2);
+		}
+		// SVT-AV1 refuses frame rates above 240 fps. The frame rate only informs rate control here (the timestamps come
+		// from the frames), so faster footage, like slow-motion recordings, is encoded as if at 240 fps
+		codecContext.framerate = new NodeAv.Rational(
+			this.avCodec.name === 'libsvtav1' ? Math.min(frameRate, 240) : frameRate,
+			1,
+		);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate
 		// control mode
 		codecContext.bitRate = this.config.bitrateMode === 'quantizer'
@@ -173,11 +417,35 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					this.config.bitrate ?? new Quality('medium')
 						._toVideoBitrate(this.codec, this.config.width, this.config.height),
 				);
+		if (this.avCodec.name === 'libsvtav1' && codecContext.bitRate > 100_000_000n) {
+			// SVT-AV1 refuses target bitrates above 100 Mbps, and encoders may miss their target bitrate
+			codecContext.bitRate = 100_000_000n;
+		}
 		codecContext.sampleAspectRatio = new NodeAv.Rational(pixelAspectRatio.num, pixelAspectRatio.den);
 
 		if (this.config.bitrateMode === 'constant') {
-			codecContext.rcMinRate = codecContext.bitRate;
-			codecContext.rcMaxRate = codecContext.bitRate;
+			if (this.avCodec.name === 'libsvtav1') {
+				// SVT-AV1 only does CBR with its low-delay prediction structure, and refuses a maximum bitrate
+				// outside of CRF mode, which FFmpeg would pass on from rcMaxRate
+				codecContext.setOption('svtav1-params', 'rc=2:pred-struct=1');
+			} else {
+				codecContext.rcMinRate = codecContext.bitRate;
+				codecContext.rcMaxRate = codecContext.bitRate;
+				// libx264 and libx265 ignore the maximum rate without a buffer size: one second's worth
+				codecContext.rcBufferSize = Number(codecContext.bitRate);
+			}
+		}
+
+		if (this.avCodec.name === 'libx264' && requirements.avcProfile !== null) {
+			codecContext.profile = requirements.avcProfile;
+		} else if (this.avCodec.name === 'h264_nvenc' && requirements.avcProfileIdc !== null) {
+			// NVENC defaults to Main, even for High (the default codec string)
+			const profile = { 66: 'baseline', 77: 'main', 100: 'high' }[requirements.avcProfileIdc];
+			if (profile) {
+				codecContext.setOption('profile', profile);
+			}
+		} else if (this.avCodec.name === 'hevc_nvenc' && requirements.bitDepth === 10) {
+			codecContext.setOption('profile', 'main10');
 		}
 
 		const isRealtime = this.config.latencyMode === 'realtime';
@@ -202,10 +470,15 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				codecContext.setOption('cpu-used', '8');
 			}
 		} else if (this.avCodec.name === 'libvpx-vp9') {
+			// libvpx encodes VP9 tile columns in parallel, which gives the exact same bytes as a single thread. (Unlike
+			// VP8 and libx265, whose output changes with the thread count, so they're left as they are.)
+			codecContext.threadCount = getCodecThreadCount(this.config.width, this.config.height);
 			codecContext.setOption('deadline', 'realtime');
 
 			if (isRealtime) {
 				codecContext.setOption('cpu-used', '8');
+				// libvpx otherwise holds back 25 frames to look for alternate reference frames
+				codecContext.setOption('lag-in-frames', '0');
 			} else {
 				codecContext.setOption('cpu-used', '5');
 			}
@@ -216,12 +489,27 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			if (isRealtime) {
 				codecContext.setOption('preset', '12');
+				// The default random access prediction structure holds back dozens of frames, the low-delay one none.
+				// It can't do variable bitrate, so bitrates are kept constant.
+				codecContext.setOption(
+					'svtav1-params',
+					this.config.bitrateMode === 'quantizer' ? 'pred-struct=1' : 'pred-struct=1:rc=2',
+				);
 			}
 		} else if (this.avCodec.name === 'h264_nvenc') {
 			// When we force a key frame, we want a true IDR frame, not just an I frame
 			codecContext.setOption('forced-idr', '1');
 		} else if (this.avCodec.name === 'hevc_nvenc') {
 			codecContext.setOption('forced-idr', '1');
+		}
+
+		if (isRealtime && this.avCodec.name?.endsWith('_nvenc')) {
+			// NVENC otherwise uses B-frames and holds frames back for its output queue and lookahead
+			codecContext.setOption('tune', 'ull');
+			codecContext.setOption('zerolatency', '1');
+			codecContext.setOption('delay', '0');
+			codecContext.setOption('rc-lookahead', '0');
+			codecContext.maxBFrames = 0;
 		}
 
 		if (this.config.bitrateMode === 'quantizer') {
@@ -235,7 +523,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				|| this.avCodec.name === 'libvpx-vp9'
 			) {
 				// Mediabunny uses the quantizer index (0-255), while these encoders expect the 0-63 quantizer scale
-				mapped = Math.round(this.quantizer / 4);
+				// (254 and 255 would round up to 64)
+				mapped = Math.min(Math.round(this.quantizer / 4), 63);
 			} else {
 				// Everything else lines up with Mediabunny directly
 				mapped = this.quantizer;
@@ -258,6 +547,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				throw new Error(`Encoder '${this.avCodec.name}' cannot be used for quantizer-based encoding.`);
 			}
 
+			if (this.avCodec.name === 'libx264') {
+				// A quantizer change re-creates the encoder, whose stream must then still fit the decoder config's
+				// parameter sets, as its own get stripped from the packets. x264 otherwise writes the quantizer into
+				// the PPS (as pic_init_qp), so the frames after a change would decode with the old one.
+				codecContext.setOption('x264-params', 'stitchable=1');
+			}
+
 			// Also pin the quantizer range so crf-based encoders (libvpx, libaom) hold the quantizer truly constant
 			codecContext.qMin = mapped;
 			codecContext.qMax = mapped;
@@ -269,6 +565,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			assert(profile !== undefined);
 
 			codecContext.setOption('profile', String(profile));
+		}
+
+		if (this.avCodec.name === 'prores_ks') {
+			// Unlike the FFmpeg CLI, libavcodec defaults to a single thread, which makes prores_ks the slowest encoder
+			// here by far. Slice threading (one thread per core, up to 16) produces the exact same bytes, without the
+			// delay and the extra frames in memory that frame threading would bring.
+			codecContext.threadCount = 0;
+			codecContext.threadType = NodeAv.FF_THREAD_SLICE;
 		}
 
 		let primaries = this.frame.colorPrimaries;
@@ -312,6 +616,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.colorRange = range;
 
 		const ret = await codecContext.open2();
+		if (ret < 0 && this.softwareFallbackCodec) {
+			codecContext.freeContext();
+			this.avCodec = this.softwareFallbackCodec;
+			this.softwareFallbackCodec = null;
+
+			await this.createCodecContext();
+			return;
+		}
 		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
 
 		this.codecContext = codecContext;
@@ -375,10 +687,25 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 		let frameToEncode = this.frame;
 
+		// The stream's color space comes from the first frame, and containers carry one per track, so a later frame
+		// with another matrix or range is converted to it. An unspecified matrix leaves nothing to convert to, while an
+		// unspecified range is encoded as limited.
+		const isFullRange = (range: NodeAv.AVColorRange) => range === NodeAv.AVCOL_RANGE_JPEG;
+		const colorSpaceDiffers
+			= (
+				this.frame.colorSpace !== NodeAv.AVCOL_SPC_UNSPECIFIED
+				&& this.codecContext.colorSpace !== NodeAv.AVCOL_SPC_UNSPECIFIED
+				&& this.frame.colorSpace !== this.codecContext.colorSpace
+			) || (
+				this.frame.colorRange !== NodeAv.AVCOL_RANGE_UNSPECIFIED
+				&& isFullRange(this.frame.colorRange) !== isFullRange(this.codecContext.colorRange)
+			);
+
 		const requiresScaler
 			= this.codecContext.pixelFormat !== this.frame.format
-				|| this.codecContext.width !== this.frame.width
-				|| this.codecContext.height !== this.frame.height;
+				|| this.config.width !== this.frame.width
+				|| this.codecContext.height !== this.frame.height
+				|| colorSpaceDiffers;
 
 		if (requiresScaler) {
 			if (!this.scaler) {
@@ -391,7 +718,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			if (!this.dstFrame) {
 				this.dstFrame = new NodeAv.Frame();
 				this.dstFrame.alloc();
-				this.dstFrame.width = this.codecContext.width;
+				this.dstFrame.width = this.config.width;
 				this.dstFrame.height = this.codecContext.height;
 				this.dstFrame.format = this.codecContext.pixelFormat;
 				this.dstFrame.allocBuffer();
@@ -413,6 +740,10 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			NodeAv.FFmpegError.throwIfError(ret, 'Scale frame');
 
 			frameToEncode = this.dstFrame;
+		}
+
+		if (this.encodesExtraColumn) {
+			frameToEncode = this.padWithExtraColumn(frameToEncode);
 		}
 
 		frameToEncode.pts = BigInt(videoSample.microsecondTimestamp);
@@ -481,6 +812,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			return;
 		}
 		let packetData = toUint8Array(this.packet.data);
+
+		if (this.encodesExtraColumn) {
+			// The frame header's width follows the frame size, the 'icpf' tag, the header size, version and creator
+			const view = toDataView(packetData);
+			assert(view.getUint32(4) === 0x69637066 && view.getUint16(16) === this.config.width + 1);
+			view.setUint16(16, this.config.width);
+		}
 
 		let timestamp = Number(this.packet.pts) / 1e6;
 		let duration = Number(this.packet.duration) / 1e6;
@@ -704,9 +1042,9 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			// Create the decoder config
 			metadata.decoderConfig = {
 				codec: decoderConfigCodecString,
-				codedWidth: this.codecContext.width,
+				codedWidth: this.config.width,
 				codedHeight: this.codecContext.height,
-				displayAspectWidth: this.config.displayWidth ?? this.codecContext.width,
+				displayAspectWidth: this.config.displayWidth ?? this.config.width,
 				displayAspectHeight: this.config.displayHeight ?? this.codecContext.height,
 				description: decoderConfigDescription ?? undefined,
 				colorSpace: {
@@ -752,11 +1090,55 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		this.packetEmitted = false;
 	}
 
+	/** Copies a 4:2:2 frame of odd width into one a column wider, whose chroma columns it already fills. */
+	padWithExtraColumn(frame: NodeAv.Frame) {
+		assert(this.codecContext);
+
+		if (!this.paddedFrame) {
+			this.paddedFrame = new NodeAv.Frame();
+			this.paddedFrame.alloc();
+			this.paddedFrame.width = this.codecContext.width;
+			this.paddedFrame.height = this.codecContext.height;
+			this.paddedFrame.format = this.codecContext.pixelFormat;
+			this.paddedFrame.allocBuffer();
+		}
+
+		NodeAv.FFmpegError.throwIfError(this.paddedFrame.makeWritable(), 'Make frame writable');
+		NodeAv.FFmpegError.throwIfError(this.paddedFrame.copyProps(frame), 'Copy frame properties');
+
+		const src = frame.data;
+		const dst = this.paddedFrame.data;
+		assert(src && dst);
+
+		// The 4:2:2 formats prores_ks takes have 16-bit samples
+		const lumaRowBytes = 2 * frame.width;
+		const chromaRowBytes = 2 * Math.ceil(frame.width / 2);
+
+		for (let plane = 0; plane < 3; plane++) {
+			const rowBytes = plane === 0 ? lumaRowBytes : chromaRowBytes;
+			const srcStride = frame.linesize[plane]!;
+			const dstStride = this.paddedFrame.linesize[plane]!;
+
+			for (let y = 0; y < frame.height; y++) {
+				const dstStart = y * dstStride;
+				src[plane]!.copy(dst[plane]!, dstStart, y * srcStride, y * srcStride + rowBytes);
+
+				if (plane === 0) {
+					// Repeat the last luma sample
+					dst[0]!.copy(dst[0]!, dstStart + rowBytes, dstStart + rowBytes - 2, dstStart + rowBytes);
+				}
+			}
+		}
+
+		return this.paddedFrame;
+	}
+
 	close(): MaybePromise<void> {
 		this.codecContext?.freeContext();
 		this.frame.free();
 		this.packet.free();
 		this.scaler?.freeContext();
 		this.dstFrame?.free();
+		this.paddedFrame?.free();
 	}
 }

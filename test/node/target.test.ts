@@ -1,17 +1,405 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
+import { EncodedAudioPacketSource, EncodedPacket, WavOutputFormat } from '../../src/index.js';
 import { Input } from '../../src/input.js';
 import { FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
-import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import {
+	AppendOnlyStreamTarget,
+	BufferTarget,
+	StreamTarget,
+	FilePathTarget,
+	StreamTargetChunk,
+	Target,
+} from '../../src/target.js';
+import type { FileHandle } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
+import { Mp4OutputFormat, CmafOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 const samplePath = path.join(__dirname, '../public/video.mp4');
+
+const startPcmOutput = async (target: Target) => {
+	const output = new Output({ format: new WavOutputFormat(), target });
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add(new EncodedPacket(new Uint8Array(960).fill(7), 'key', 0, 0.01), {
+		decoderConfig: { codec: 'pcm-s16', sampleRate: 48000, numberOfChannels: 1 },
+	});
+	return output;
+};
+
+const writePcmFile = async (target: Target) => {
+	const output = await startPcmOutput(target);
+	await output.finalize();
+};
+
+test('A slice of a target writes a file into a section of it', async () => {
+	const reference = new BufferTarget();
+	await writePcmFile(reference);
+	const file = new Uint8Array(reference.buffer!);
+
+	const bufferTarget = new BufferTarget();
+	await writePcmFile(bufferTarget.slice(100));
+	expect(bufferTarget.buffer).not.toBeNull();
+	expect(new Uint8Array(bufferTarget.buffer!)).toEqual(new Uint8Array([...new Uint8Array(100), ...file]));
+
+	// The stream receives the file at the offset (StreamTarget fills the gap before it) and gets closed in the end
+	const chunks: StreamTargetChunk[] = [];
+	let closed = false;
+	const streamTarget = new StreamTarget(new WritableStream<StreamTargetChunk>({
+		write: (chunk) => {
+			chunks.push(chunk);
+		},
+		close: () => {
+			closed = true;
+		},
+	}));
+	await writePcmFile(streamTarget.slice(100));
+	expect(closed).toBe(true);
+	const streamed = new Uint8Array(100 + file.length);
+	for (const chunk of chunks) {
+		streamed.set(chunk.data, chunk.position);
+	}
+	expect(streamed).toEqual(new Uint8Array([...new Uint8Array(100), ...file]));
+});
+
+test('Slices of a target used at the same time finalize it once the last one is done', async () => {
+	const reference = new BufferTarget();
+	await writePcmFile(reference);
+	const file = new Uint8Array(reference.buffer!);
+
+	const target = new BufferTarget();
+	const first = await startPcmOutput(target.slice(0));
+	const second = await startPcmOutput(target.slice(file.length));
+	await first.finalize();
+	expect(target.buffer).toBeNull();
+	await second.finalize();
+	expect(new Uint8Array(target.buffer!)).toEqual(new Uint8Array([...file, ...file]));
+
+	// Once finalized, the target takes no further slices
+	await expect(writePcmFile(target.slice(0))).rejects.toThrow(
+		'Cannot use a slice of a target that has already been finalized or closed.',
+	);
+});
+
+test('Canceling the output of a slice closes the sliced target', async () => {
+	let closed = false;
+	const streamTarget = new StreamTarget(new WritableStream<StreamTargetChunk>({
+		close: () => {
+			closed = true;
+		},
+	}));
+	const output = await startPcmOutput(streamTarget.slice(0));
+	await output.cancel();
+	expect(closed).toBe(true);
+});
+
+test.each(['MP4', 'Matroska', 'MPEG-TS', 'CMAF'] as const)(
+	'Canceling an output whose target callback is still pending at start (%s)',
+	async (formatName) => {
+		// The callback may never settle (an upload URL request without a timeout, a file picker left open), and a
+		// cancel mustn't wait for it
+		const { CmafOutputFormat, MkvOutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
+		const { PathedTarget, StreamTarget } = await import('../../src/target.js');
+		const { EncodedVideoPacketSource } = await import('../../src/media-source.js');
+		type StreamTargetChunk = import('../../src/target.js').StreamTargetChunk;
+		const createFormat = () => formatName === 'MP4'
+			? new Mp4OutputFormat()
+			: formatName === 'Matroska'
+				? new MkvOutputFormat()
+				: formatName === 'MPEG-TS'
+					? new MpegTsOutputFormat()
+					: new CmafOutputFormat();
+		const usesInitTarget = formatName === 'CMAF';
+
+		for (const settlesLate of [false, true]) {
+			let resolveTarget: ((target: BufferTarget | InstanceType<typeof StreamTarget>) => void) | null = null;
+			const getTarget = () => new Promise<BufferTarget | InstanceType<typeof StreamTarget>>((resolve) => {
+				resolveTarget = resolve;
+			});
+			const output = new Output({
+				format: createFormat(),
+				target: usesInitTarget
+					? new PathedTarget('stream.mp4', () => new BufferTarget())
+					: new PathedTarget('file', getTarget),
+				initTarget: usesInitTarget ? getTarget : undefined,
+			});
+			output.addVideoTrack(new EncodedVideoPacketSource('avc'));
+
+			const start = output.start();
+			const startResult = start.then(() => 'started', (error: Error) => error.message);
+			await new Promise(resolve => setTimeout(resolve, 50));
+			expect(resolveTarget).not.toBeNull(); // The start waits for the target
+
+			const cancelResult = await Promise.race([
+				output.cancel().then(() => 'canceled'),
+				new Promise(resolve => setTimeout(() => resolve('pending'), 2000)),
+			]);
+			expect(cancelResult).toBe('canceled');
+			expect(await startResult).toBe('started'); // As when the cancel comes after the start
+			expect(output.state).toBe('canceled');
+
+			if (settlesLate) {
+				// A target that still arrives gets closed, and nothing gets written into it
+				const writes: number[] = [];
+				const writable = new WritableStream<StreamTargetChunk>({
+					write: chunk => void writes.push(chunk.data.byteLength),
+				});
+				const lateTarget = new StreamTarget(writable);
+				let closed = false;
+				const close = lateTarget._close.bind(lateTarget);
+				lateTarget._close = async () => {
+					closed = true;
+					await close();
+				};
+				resolveTarget!(lateTarget);
+				await new Promise(resolve => setTimeout(resolve, 50));
+				expect(closed).toBe(true);
+				expect(writes).toEqual([]);
+				expect(writable.locked).toBe(false); // The caller's stream stays theirs
+			}
+		}
+	},
+);
+
+test.each(['synchronous', 'never settling'] as const)(
+	'Canceling right after an unawaited start() rejects nothing (%s target)',
+	async (targetKind) => {
+		const { PathedTarget } = await import('../../src/target.js');
+		const { EncodedVideoPacketSource } = await import('../../src/media-source.js');
+		const { EncodedPacket } = await import('../../src/packet.js');
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => void unhandledRejections.push(reason);
+		process.on('unhandledRejection', onUnhandledRejection);
+
+		try {
+			const output = new Output({
+				format: new Mp4OutputFormat(),
+				target: targetKind === 'synchronous'
+					? new BufferTarget()
+					: new PathedTarget('file.mp4', () => new Promise<BufferTarget>(() => {})),
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+
+			void output.start();
+			await output.cancel();
+			await new Promise(resolve => setTimeout(resolve, 50));
+
+			expect(unhandledRejections).toEqual([]);
+			expect(output.state).toBe('canceled');
+			// As on main after a cancel
+			await expect((async () => source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1)))())
+				.rejects.toThrow('Output has been canceled.');
+		} finally {
+			process.off('unhandledRejection', onUnhandledRejection);
+		}
+	},
+);
+
+test.each([
+	['MP4', null],
+	['Matroska', null],
+	['MPEG-TS', null],
+	['WAVE', 'glitch-hop-is-dead.wav'],
+	['ADTS', 'sample3.aac'],
+	['Ogg', 'preroll-test.opus'],
+	['FLAC', 'sample.flac'],
+	['MP3', 'Toothsome-Meme.VBRv2.mp3'],
+] as const)(
+	'An add issued while the start is still running settles when the start is canceled or its target fails (%s)',
+	async (formatName, audioFile) => {
+		// The muxer holds its mutex while it waits for its target at start, and adds wait for that mutex
+		const formats = await import('../../src/output-format.js');
+		const { PathedTarget } = await import('../../src/target.js');
+		const { EncodedAudioPacketSource, EncodedVideoPacketSource } = await import('../../src/media-source.js');
+		const { EncodedPacketSink } = await import('../../src/media-sink.js');
+		const { EncodedPacket } = await import('../../src/packet.js');
+		const createFormat = {
+			'MP4': () => new formats.Mp4OutputFormat(),
+			'Matroska': () => new formats.MkvOutputFormat(),
+			'MPEG-TS': () => new formats.MpegTsOutputFormat(),
+			'WAVE': () => new formats.WavOutputFormat(),
+			'ADTS': () => new formats.AdtsOutputFormat(),
+			'Ogg': () => new formats.OggOutputFormat(),
+			'FLAC': () => new formats.FlacOutputFormat(),
+			'MP3': () => new formats.Mp3OutputFormat(),
+		}[formatName];
+
+		// A video track gets an AVC packet, an audio track the first packet of a file in a codec the format holds
+		let addTrack: (output: Output) => () => Promise<void>;
+		if (audioFile === null) {
+			addTrack = (output) => {
+				const source = new EncodedVideoPacketSource('avc');
+				output.addVideoTrack(source);
+				return () => source.add(new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', 0, 1 / 30), {
+					decoderConfig: {
+						codec: 'avc1.42001f',
+						codedWidth: 64,
+						codedHeight: 64,
+						description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+					},
+				});
+			};
+		} else {
+			using input = new Input({
+				source: new FilePathSource(path.join(__dirname, '../public', audioFile)),
+				formats: ALL_FORMATS,
+			});
+			const track = (await input.getPrimaryAudioTrack())!;
+			const codec = (await track.getCodec())!;
+			const decoderConfig = (await track.getDecoderConfig())!;
+			const packet = (await new EncodedPacketSink(track).getFirstPacket())!;
+			addTrack = (output) => {
+				const source = new EncodedAudioPacketSource(codec);
+				output.addAudioTrack(source);
+				return () => source.add(packet, { decoderConfig });
+			};
+		}
+
+		const settlesWithin = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'resolved', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		const scenarios = ['canceled same tick', 'canceled while the target is pending', 'target fails'] as const;
+		for (const scenario of scenarios) {
+			const output = new Output({
+				format: createFormat(),
+				target: scenario === 'canceled same tick'
+					? new BufferTarget()
+					: new PathedTarget('file', () => new Promise<BufferTarget>((_, reject) => {
+						if (scenario === 'target fails') {
+							setTimeout(() => reject(new Error('No target')), 20);
+						}
+					})),
+			});
+			const addPacket = addTrack(output);
+
+			const start = output.start();
+			const add = addPacket();
+
+			if (scenario === 'target fails') {
+				await expect(start).rejects.toThrow('No target');
+				expect(await settlesWithin(add, 1000), scenario).not.toBe('pending');
+				expect(await settlesWithin(output.finalize(), 1000), scenario).toBe('rejected');
+				continue;
+			}
+
+			if (scenario === 'canceled while the target is pending') {
+				await new Promise(resolve => setTimeout(resolve, 20));
+			}
+			const cancel = output.cancel();
+			expect(await settlesWithin(add, 1000), scenario).toBe('resolved'); // As when the start had finished
+			expect(await settlesWithin(start, 1000), scenario).toBe('resolved');
+			expect(await settlesWithin(cancel, 1000), scenario).toBe('resolved');
+		}
+	},
+);
+
+test.each(['MPEG-TS', 'CMAF'] as const)(
+	'Adds waiting behind an HLS target request that never settles settle once the output is canceled (%s segments)',
+	async (segmentFormatName) => {
+		// The HLS muxer asks for segment and playlist targets as it goes, while holding its mutex
+		const formats = await import('../../src/output-format.js');
+		const { PathedTarget } = await import('../../src/target.js');
+		const { EncodedVideoPacketSource } = await import('../../src/media-source.js');
+		const { EncodedPacket } = await import('../../src/packet.js');
+		const settlesWithin = (promise: Promise<unknown>, ms: number) => Promise.race([
+			promise.then(() => 'resolved', () => 'rejected'),
+			new Promise(resolve => setTimeout(() => resolve('pending'), ms)),
+		]);
+
+		for (const stuckRequest of [2, 3]) {
+			let requests = 0;
+			const output = new Output({
+				format: new formats.HlsOutputFormat({
+					segmentFormat: segmentFormatName === 'MPEG-TS'
+						? new formats.MpegTsOutputFormat()
+						: new formats.CmafOutputFormat(),
+					targetDuration: 1,
+				}),
+				// Like a request for a segment's upload URL that never gets an answer
+				target: new PathedTarget('', () => ++requests === stuckRequest
+					? new Promise<BufferTarget>(() => {})
+					: new BufferTarget()),
+			});
+			const source = new EncodedVideoPacketSource('avc');
+			output.addVideoTrack(source);
+			await output.start();
+
+			const decoderConfig = {
+				codec: 'avc1.42001f',
+				codedWidth: 64,
+				codedHeight: 64,
+				description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+			};
+			const adds = Array.from({ length: 40 }, (_, i) => source.add(
+				new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', i * 0.1, 0.1),
+				i === 0 ? { decoderConfig } : undefined,
+			));
+			await new Promise(resolve => setTimeout(resolve, 100));
+			expect(requests, `request ${stuckRequest}`).toBeGreaterThanOrEqual(stuckRequest);
+
+			await output.cancel();
+			const results = await Promise.all(adds.map(add => settlesWithin(add, 1000)));
+			expect(results.filter(result => result === 'pending'), `request ${stuckRequest}`).toEqual([]);
+		}
+	},
+);
+
+test('HLS target requests leave nothing waiting on the output\'s cancel once their target has come', async () => {
+	// A live output can make thousands of requests (one per segment) without ever being canceled
+	const { HlsOutputFormat, MpegTsOutputFormat } = await import('../../src/output-format.js');
+	const { PathedTarget } = await import('../../src/target.js');
+	const { EncodedVideoPacketSource } = await import('../../src/media-source.js');
+	const { EncodedPacket } = await import('../../src/packet.js');
+
+	let requests = 0;
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 1 }),
+		target: new PathedTarget('', () => {
+			requests++;
+			return new BufferTarget();
+		}),
+	});
+
+	// Counts the reactions registered on the output's cancel signal
+	let cancelReactions = 0;
+	const canceledPromise = output._canceled.promise;
+	const then = canceledPromise.then.bind(canceledPromise);
+	canceledPromise.then = ((...args: Parameters<typeof then>) => {
+		cancelReactions++;
+		return then(...args);
+	}) as typeof canceledPromise.then;
+
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source);
+	await output.start();
+	const decoderConfig = {
+		codec: 'avc1.42001f',
+		codedWidth: 64,
+		codedHeight: 64,
+		description: new Uint8Array([0x01, 0x42, 0x00, 0x1f, 0xff, 0xe1, 0x00, 0x00, 0x01, 0x00, 0x00]),
+	};
+	for (let i = 0; i < 60; i++) {
+		const packet = new EncodedPacket(new Uint8Array([0, 0, 0, 1, 0x65]), 'key', i * 0.5, 0.5);
+		await source.add(packet, i === 0 ? { decoderConfig } : undefined);
+	}
+	await output.finalize();
+
+	expect(requests).toBeGreaterThan(25);
+	expect(cancelReactions).toBeLessThanOrEqual(2);
+	expect(output._targetWaits?.size ?? 0).toBe(0);
+});
 
 test('BufferTarget onFinalize callback', async () => {
 	let received: ArrayBuffer | null = null;
@@ -42,6 +430,75 @@ test('BufferTarget onFinalize callback', async () => {
 	expect(output.target.buffer!.byteLength).toBeGreaterThan(0);
 });
 
+test('FilePathTarget leaves the file alone until there is something to write', async () => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mediabunny-'));
+	const filePath = path.join(directory, 'existing.mp4');
+	await fs.writeFile(filePath, new Uint8Array(100));
+
+	// Rejected options, then a target that's never used
+	expect(() => new FilePathTarget(filePath, { chunkSize: 100 })).toThrow(TypeError);
+	new FilePathTarget(filePath);
+	await new Promise(resolve => setTimeout(resolve, 50));
+	expect((await fs.stat(filePath)).size).toBe(100);
+
+	// Writing still replaces the file
+	using input = new Input({ source: new FilePathSource(samplePath), formats: ALL_FORMATS });
+	const output = new Output({ format: new Mp4OutputFormat(), target: new FilePathTarget(filePath) });
+	const conversion = await Conversion.init({ input, output });
+	await conversion.execute();
+
+	using written = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+	expect(await written.computeDuration()).toBeCloseTo(await input.computeDuration(), 1);
+
+	await fs.rm(directory, { recursive: true });
+});
+
+test.each(['copy', 'transcode'] as const)(
+	'A Conversion whose StreamTarget fails to write rejects without unhandled rejections (%s)',
+	async (kind) => {
+		// Like streaming the output to an HTTP response whose client disconnects. The conversion then cancels its
+		// output, whose closing of the errored stream used to reject unhandled, which kills a Node process
+		const { StreamTarget } = await import('../../src/target.js');
+		const { WavOutputFormat } = await import('../../src/output-format.js');
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => void unhandledRejections.push(reason);
+		process.on('unhandledRejection', onUnhandledRejection);
+
+		try {
+			using input = new Input({
+				source: new FilePathSource(kind === 'copy'
+					? samplePath
+					: path.join(__dirname, '../public/glitch-hop-is-dead.wav')),
+				formats: ALL_FORMATS,
+			});
+			let bytesWritten = 0;
+			const output = new Output({
+				format: kind === 'copy' ? new Mp4OutputFormat() : new WavOutputFormat(),
+				target: new StreamTarget(new WritableStream({
+					write: (chunk: { data: Uint8Array }) => {
+						bytesWritten += chunk.data.byteLength;
+						if (bytesWritten > 2 ** 16) {
+							throw new Error('Client disconnected');
+						}
+					},
+				}), { chunked: true, chunkSize: 2 ** 14 }),
+			});
+			const conversion = await Conversion.init({
+				input,
+				output,
+				audio: kind === 'transcode' ? { sampleRate: 16000 } : undefined, // Resampling, so a PCM transcode
+				showWarnings: false,
+			});
+
+			await expect(conversion.execute()).rejects.toThrow('Client disconnected');
+			await new Promise(resolve => setTimeout(resolve, 100)); // Lets the cancel finish
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off('unhandledRejection', onUnhandledRejection);
+		}
+	},
+);
+
 test('BufferTarget internal buffer transfer on finalize', async () => {
 	const target = new BufferTarget();
 	target._write(new Uint8Array([1, 2, 3, 4, 5]), 0);
@@ -56,4 +513,110 @@ test('BufferTarget internal buffer transfer on finalize', async () => {
 
 	expect(target.buffer).toHaveProperty('resizable', false);
 	expect([...new Uint8Array(target.buffer!)]).toEqual([1, 2, 3, 6, 7]);
+});
+
+test('Stream targets validate their constructor arguments', () => {
+	expect(() => new StreamTarget(new WritableStream(), null as never)).toThrow(
+		new TypeError('StreamTarget options, when provided, must be an object.'),
+	);
+
+	for (const writable of [undefined, null, {}, new ReadableStream()]) {
+		expect(() => new AppendOnlyStreamTarget(writable as never)).toThrow(
+			new TypeError('AppendOnlyStreamTarget requires a WritableStream.'),
+		);
+	}
+});
+
+test('FilePathTarget writes of 2 GiB or more are split into writes Node accepts', async () => {
+	// Node rejects file writes of 2 GiB or more, and Linux transfers at most 0x7ffff000 bytes per call. Written
+	// through a stand-in file handle that behaves like that without touching the data.
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-write-${process.pid}.bin`);
+	const target = new FilePathTarget(filePath, { chunked: false });
+	const writer = target._streamTarget._writable.getWriter();
+	// Once this first write is done, the file is open
+	await writer.write({ type: 'write', data: new Uint8Array(1000), position: 0 });
+
+	try {
+		const realHandle = target._fileHandle!;
+		const calls: { offset: number; length: number; position: number }[] = [];
+		target._fileHandle = {
+			write: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				calls.push({ offset, length, position });
+				return { bytesWritten: Math.min(length, 0x7ffff000), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		const size = 2 ** 31 + 2 ** 20;
+		await writer.write({ type: 'write', data: new Uint8Array(size), position: 1000 });
+
+		// The writes cover the whole chunk, each one picking up where the previous one stopped
+		let pos = 0;
+		for (const call of calls) {
+			expect(call.offset).toBe(pos);
+			expect(call.position).toBe(1000 + pos);
+			pos += Math.min(call.length, 0x7ffff000);
+		}
+		expect(pos).toBe(size);
+
+		await writer.close();
+	} finally {
+		await rm(filePath);
+	}
+});
+
+test('StreamTarget in chunked mode handles a write spanning many chunks', async () => {
+	const writes: StreamTargetChunk[] = [];
+	const target = new StreamTarget(new WritableStream<StreamTargetChunk>({
+		write: (chunk) => {
+			writes.push({ ...chunk, data: chunk.data.slice() });
+		},
+	}), { chunked: true, chunkSize: 1024 });
+
+	// Like the media data of an in-memory fast start MP4, written in one go: 32 MiB, so 32768 chunks
+	const data = new Uint8Array(2 ** 25);
+	for (let i = 0; i < data.length; i += 4096) {
+		data[i] = (i / 4096) & 0xff;
+	}
+
+	target._start();
+	target._write(data, 0);
+	await target._flush();
+	await target._finalize();
+
+	const result = new Uint8Array(data.length);
+	for (const write of writes) {
+		expect(write.data.byteLength).toBeLessThanOrEqual(1024);
+		result.set(write.data, write.position);
+	}
+	expect(result.every((byte, i) => byte === data[i])).toBe(true);
+});
+
+test.each(['a target', 'a function'])('Output emits a target event for the CMAF init target, given as %s', async (
+	kind,
+) => {
+	const initTarget = new BufferTarget();
+	const output = new Output({
+		format: new CmafOutputFormat(),
+		target: new BufferTarget(),
+		initTarget: kind === 'a target' ? initTarget : () => initTarget,
+	});
+
+	const events: { target: Target; isRoot: boolean }[] = [];
+	output.on('target', ({ target, isRoot }) => events.push({ target, isRoot }));
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+	const description = new Uint8Array([0x11, 0x88]);
+	await source.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 0.02), {
+		decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: 1, sampleRate: 48000, description },
+	});
+	await output.finalize();
+
+	expect(initTarget.buffer).not.toBeNull(); // The init segment was written to it
+	expect(events.filter(x => x.target === initTarget)).toEqual([{ target: initTarget, isRoot: false }]);
 });

@@ -8,14 +8,16 @@ import { Output } from '../../src/output.js';
 import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { AC3_REGISTRATION_DESCRIPTOR, EAC3_REGISTRATION_DESCRIPTOR } from '../../src/codec-data.js';
+import { AC3_REGISTRATION_DESCRIPTOR, EAC3_REGISTRATION_DESCRIPTOR, parseEac3SyncFrame } from '../../src/codec-data.js';
 import { canEncode, Quality } from '../../src/encode.js';
 import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
-import { AudioSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { AudioSample } from '../../src/sample.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { registerAc3Decoder, registerAc3Encoder } from '@mediabunny/ac3';
 import { assert } from '../../src/misc.js';
+import { canEncodeAudio } from '../../src/encode.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -129,6 +131,39 @@ test('reads and writes E-AC-3 in MPEG-TS', async () => {
 		}
 	}
 	expect(found).toBe(true);
+});
+
+// An independent E-AC-3 substream signals its service type (bsmod) in the informational metadata, and dec3 carries it
+// over (ETSI TS 102 366 E.1.2.2, F.6.2.8). In the 5.1 file, mixing metadata comes first, which moves it:
+// ffmpeg -f lavfi -i anullsrc=r=48000:cl=stereo -t 0.1 -c:a eac3 -audio_service_type vi eac3-visually-impaired.mkv
+// ffmpeg -f lavfi -i anullsrc=r=48000:cl=5.1 -t 0.1 -c:a eac3 -audio_service_type hi -dmix_mode ltrt \
+//   -ltrt_cmixlev 0.5 -ltrt_surmixlev 0.5 -loro_cmixlev 0.5 -loro_surmixlev 0.5 eac3-5.1-hearing-impaired.mkv
+test.each([
+	['eac3-visually-impaired.mkv', 2],
+	['eac3-5.1-hearing-impaired.mkv', 3],
+	['eac3.ts', 0],
+])('keeps the E-AC-3 bit stream mode in dec3 (%s)', async (fileName, bsmod) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', fileName)),
+		formats: ALL_FORMATS,
+	});
+
+	const firstPacket = (await new EncodedPacketSink((await input.getPrimaryAudioTrack())!).getFirstPacket())!;
+	expect(parseEac3SyncFrame(firstPacket.data)?.substreams[0]?.bsmod).toBe(bsmod);
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({ input, output, copy: { mode: 'forced' } });
+	await conversion.execute();
+
+	// Like FFmpeg's -c copy: bsmod follows data_rate, num_ind_sub, fscod, bsid and asvc in dec3
+	const bytes = Buffer.from(output.target.buffer!);
+	const dec3 = bytes.indexOf('dec3');
+	expect(dec3).toBeGreaterThan(0);
+	expect((bytes[dec3 + 7]! >> 4) & 0b111).toBe(bsmod);
 });
 
 test('Custom coder registration', async () => {
@@ -288,6 +323,47 @@ test('AC-3 encoding', async () => {
 	expect(await track.computeDuration()).toBeCloseTo(2, 1);
 });
 
+test('AC-3 and E-AC-3 encode a NaN or infinite sample like silence or full scale', async () => {
+	registerAc3Encoder();
+
+	const encode = async (codec: 'ac3' | 'eac3', data: Float32Array) => {
+		const packets: Uint8Array[] = [];
+		const output = new Output({
+			format: new Mp4OutputFormat(),
+			target: new BufferTarget(),
+		});
+		const audioSource = new AudioSampleSource({
+			codec,
+			quality: new Quality({ bitrate: 192000 }),
+			onEncodedPacket: packet => packets.push(packet.data),
+		});
+		output.addAudioTrack(audioSource);
+
+		await output.start();
+		const sample = new AudioSample({ data, format: 'f32', numberOfChannels: 2, sampleRate: 48000, timestamp: 0 });
+		await audioSource.add(sample);
+		sample.close();
+		await output.finalize();
+
+		return packets;
+	};
+
+	// FFmpeg's MDCT turns a non-finite sample into silence for the blocks around it, so it has to be encoded like the
+	// conversion to integer samples maps it: NaN to silence, infinities to full scale
+	for (const codec of ['ac3', 'eac3'] as const) {
+		for (const [value, replacement] of [[NaN, 0], [Infinity, 1], [-Infinity, -1]] as const) {
+			const withValue = createSineWave(48000, 2, 1);
+			withValue[20000] = value;
+			const withReplacement = createSineWave(48000, 2, 1);
+			withReplacement[20000] = replacement;
+
+			const packets = await encode(codec, withValue);
+			expect(packets.length).toBeGreaterThan(0);
+			expect(packets, `${codec}, ${value}`).toEqual(await encode(codec, withReplacement));
+		}
+	}
+});
+
 test('E-AC-3 encoding', async () => {
 	registerAc3Encoder();
 
@@ -338,6 +414,46 @@ test('E-AC-3 encoding', async () => {
 	expect(packetCount).toBeGreaterThan(0);
 
 	expect(await track.computeDuration()).toBeCloseTo(2, 1);
+});
+
+test.each(['ac3', 'eac3'] as const)('%s encoding ends where the input ends', async (codec) => {
+	registerAc3Encoder();
+
+	const sampleRate = 48000;
+	const channels = 2;
+	const data = createSineWave(sampleRate, channels, 1); // Not a whole number of 1536-sample frames
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const audioSource = new AudioSampleSource({ codec, quality: new Quality({ bitrate: 192000 }) });
+	output.addAudioTrack(audioSource);
+
+	await output.start();
+	const sample = new AudioSample({
+		data,
+		format: 'f32',
+		numberOfChannels: channels,
+		sampleRate,
+		timestamp: 0,
+	});
+	await audioSource.add(sample);
+	sample.close();
+	audioSource.close();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	const lastPacket = (await new EncodedPacketSink(track).getPacket(Infinity))!;
+
+	// The silence that fills the last frame isn't part of the audio
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(1, 6);
 });
 
 test('AC-3 with huge timestamps', async () => {
@@ -392,6 +508,163 @@ test('AC-3 with huge timestamps', async () => {
 	expect(firstSample.timestamp).toBe(timestamp - primingDelay);
 });
 
+// Real content for the AC-3 encoder's bitrate limits: a sine tone per channel (440, 550, 660... Hz), and 1 s of music,
+// with the extra channels getting the stereo channels again, offset in time
+const createSineTones = (sampleRate: number, channels: number) => {
+	const data = new Float32Array(sampleRate * channels);
+	for (let i = 0; i < sampleRate; i++) {
+		for (let ch = 0; ch < channels; ch++) {
+			data[i * channels + ch] = 0.5 * Math.sin(2 * Math.PI * (440 + 110 * ch) * i / sampleRate);
+		}
+	}
+	return data;
+};
+
+let stereoMusic: Float32Array | null = null;
+const createMusic = async (sampleRate: number, channels: number) => {
+	if (!stereoMusic) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '..', 'public/glitch-hop-is-dead.wav')),
+			formats: ALL_FORMATS,
+		});
+		const chunks: Float32Array[] = [];
+		for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples(3, 4)) {
+			const chunk = new Float32Array(sample.allocationSize({ format: 'f32', planeIndex: 0 }) / 4);
+			sample.copyTo(chunk, { format: 'f32', planeIndex: 0 });
+			chunks.push(chunk);
+			sample.close();
+		}
+		stereoMusic = new Float32Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
+		chunks.reduce((offset, chunk) => (stereoMusic!.set(chunk, offset), offset + chunk.length), 0);
+	}
+
+	// Resampled from 44.1 kHz with linear interpolation
+	const sourceFrames = stereoMusic.length / 2;
+	const frames = Math.floor(sourceFrames * sampleRate / 44100);
+	const data = new Float32Array(frames * channels);
+	for (let i = 0; i < frames; i++) {
+		for (let ch = 0; ch < channels; ch++) {
+			const position = ((i + 997 * Math.floor(ch / 2)) % frames) * 44100 / sampleRate;
+			const index = Math.min(Math.floor(position), sourceFrames - 2);
+			const fraction = position - index;
+			const a = stereoMusic[2 * index + (ch % 2)]!;
+			const b = stereoMusic[2 * (index + 1) + (ch % 2)]!;
+			data[i * channels + ch] = a + (b - a) * fraction;
+		}
+	}
+	return data;
+};
+
+const encodeAc3 = async (
+	codec: 'ac3' | 'eac3',
+	data: Float32Array,
+	sampleRate: number,
+	channels: number,
+	bitrate: number,
+) => {
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const audioSource = new AudioSampleSource({ codec, quality: new Quality({ bitrate }) });
+	output.addAudioTrack(audioSource);
+
+	const sample = new AudioSample({ data, format: 'f32', numberOfChannels: channels, sampleRate, timestamp: 0 });
+	try {
+		await output.start();
+		await audioSource.add(sample);
+		await output.finalize();
+	} catch (error) {
+		await output.cancel();
+		throw error;
+	} finally {
+		sample.close();
+	}
+
+	return output.target.buffer!;
+};
+
+test('AC-3 and E-AC-3 encode real content at the lowest bitrate they claim', { timeout: 60_000 }, async () => {
+	registerAc3Encoder();
+
+	// Below some bitrate, FFmpeg's bit allocation fails the encode, so the encoder must not claim it
+	const failures: string[] = [];
+	for (const codec of ['ac3', 'eac3'] as const) {
+		for (const sampleRate of [32000, 44100, 48000]) {
+			for (let channels = 1; channels <= 6; channels++) {
+				let lowestBitrate = 24000;
+				while (!(await canEncodeAudio(codec, {
+					numberOfChannels: channels,
+					sampleRate,
+					quality: new Quality({ bitrate: lowestBitrate }),
+				}))) {
+					lowestBitrate += 4000;
+				}
+
+				const label = `${codec}, ${sampleRate} Hz, ${channels} ch, ${lowestBitrate} bps`;
+				for (const [name, data] of [
+					['sine tones', createSineTones(sampleRate, channels)],
+					['music', await createMusic(sampleRate, channels)],
+				] as const) {
+					try {
+						await encodeAc3(codec, data, sampleRate, channels, lowestBitrate);
+					} catch (error) {
+						failures.push(`${label}, ${name}: ${String(error)}`);
+					}
+				}
+			}
+		}
+	}
+
+	expect(failures).toEqual([]);
+
+	// FFmpeg's encoders top out at 5.1 and can't do E-AC-3's reduced sample rates
+	const quality = new Quality({ bitrate: 448000 });
+	for (const codec of ['ac3', 'eac3'] as const) {
+		for (const channels of [7, 8]) {
+			expect(await canEncodeAudio(codec, { numberOfChannels: channels, sampleRate: 48000, quality })).toBe(false);
+		}
+	}
+	for (const sampleRate of [16000, 22050, 24000]) {
+		expect(await canEncodeAudio('eac3', { numberOfChannels: 2, sampleRate, quality })).toBe(false);
+	}
+});
+
+// The hardest signals for FFmpeg's bit allocation: full-scale square and sawtooth waves, slightly detuned per channel
+const HARSH_SIGNALS: Record<string, (t: number) => number> = {
+	square220: t => (220 * t) % 1 < 0.5 ? 1 : -1,
+	square550: t => (550 * t) % 1 < 0.5 ? 1 : -1,
+	saw330: t => 2 * ((330 * t) % 1) - 1,
+	sine440: t => 0.5 * Math.sin(2 * Math.PI * 440 * t),
+};
+
+test.each([
+	['ac3', 48000, 2, 48000], // A valid AC-3 bitrate, so it isn't rounded
+	['ac3', 48000, 3, 48000],
+	['eac3', 48000, 2, 48000],
+	['eac3', 48000, 6, 88000],
+	['ac3', 32000, 4, 64000],
+	['eac3', 32000, 5, 80000],
+] as const)('%s at %d Hz, %d channels and %d bps stays encodable', async (codec, sampleRate, channels, rate) => {
+	registerAc3Encoder();
+
+	// These encode even the hardest signals
+	const options = { numberOfChannels: channels, sampleRate, quality: new Quality({ bitrate: rate }) };
+	expect(await canEncodeAudio(codec, options)).toBe(true);
+
+	for (const [name, signal] of Object.entries(HARSH_SIGNALS)) {
+		const data = new Float32Array(sampleRate / 2 * channels);
+		for (let i = 0; i < sampleRate / 2; i++) {
+			for (let ch = 0; ch < channels; ch++) {
+				data[i * channels + ch] = signal(i * (1 + 0.01 * ch) / sampleRate);
+			}
+		}
+
+		const buffer = await encodeAc3(codec, data, sampleRate, channels, rate);
+		expect(buffer.byteLength, name).toBeGreaterThan(1000);
+	}
+});
+
 test('E-AC-3 with huge timestamps', async () => {
 	registerAc3Decoder();
 	registerAc3Encoder();
@@ -442,4 +715,95 @@ test('E-AC-3 with huge timestamps', async () => {
 	assert(firstSample);
 
 	expect(firstSample.timestamp).toBe(timestamp - primingDelay);
+});
+
+// ETSI TS 102 366 F.2: an E-AC-3 sample in ISOBMFF holds six audio blocks (1536 samples, the stts delta), so
+// syncframes with fewer blocks are combined, as FFmpeg's MP4 muxer does. FFmpeg's encoder uses 3-block syncframes here:
+// ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=0.1 -ac 2 -c:a eac3 -b:a 1536k \
+//   eac3-three-block-frames.mkv
+test('writes E-AC-3 syncframes with fewer than six blocks as 1536-sample MP4 samples', async () => {
+	using originalInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/eac3-three-block-frames.mkv')),
+		formats: ALL_FORMATS,
+	});
+
+	const originalPackets: Uint8Array[] = [];
+	for await (const packet of new EncodedPacketSink((await originalInput.getPrimaryAudioTrack())!).packets()) {
+		originalPackets.push(packet.data);
+	}
+	expect(originalPackets.length).toBe(7);
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({ input: originalInput, output, copy: { mode: 'forced' } });
+	await conversion.execute();
+
+	using newInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const newPackets = [];
+	for await (const packet of new EncodedPacketSink((await newInput.getPrimaryAudioTrack())!).packets()) {
+		newPackets.push(packet);
+	}
+
+	// Pairs of 3-block syncframes, then the leftover one
+	expect(newPackets.map(x => x.data.byteLength)).toEqual([6144, 6144, 6144, 3072]);
+	expect(newPackets.slice(0, 3).map(x => Math.round(x.duration * 48000))).toEqual([1536, 1536, 1536]);
+	expect([...newPackets[0]!.data]).toEqual([...originalPackets[0]!, ...originalPackets[1]!]);
+	expect([...newPackets[3]!.data]).toEqual([...originalPackets[6]!]);
+
+	// Every syncframe of a sample is decoded
+	registerAc3Decoder();
+	const timestamps: number[] = [];
+	for await (using sample of new AudioSampleSink((await newInput.getPrimaryAudioTrack())!).samples()) {
+		expect(sample.numberOfFrames).toBe(768);
+		timestamps.push(Math.round(sample.timestamp * 48000));
+	}
+
+	expect(timestamps).toEqual([-240, 528, 1296, 2064, 2832, 3600, 4368]);
+});
+
+test('combines E-AC-3 syncframes into one MP4 sample only across contiguous timestamps', async () => {
+	using originalInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/eac3-three-block-frames.mkv')),
+		formats: ALL_FORMATS,
+	});
+
+	const originalTrack = (await originalInput.getPrimaryAudioTrack())!;
+	const decoderConfig = (await originalTrack.getDecoderConfig())!;
+	const packetSink = new EncodedPacketSink(originalTrack);
+	const first = (await packetSink.getFirstPacket())!;
+	const second = (await packetSink.getNextPacket(first))!;
+
+	const output = new Output({
+		format: new Mp4OutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedAudioPacketSource('eac3');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// Two 3-block syncframes with a gap of almost a second between them
+	await source.add(new EncodedPacket(first.data, 'key', 0, 768 / 48000), { decoderConfig });
+	await source.add(new EncodedPacket(second.data, 'key', 1, 768 / 48000));
+	await output.finalize();
+
+	using newInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const newTrack = (await newInput.getPrimaryAudioTrack())!;
+
+	const packets = [];
+	for await (const packet of new EncodedPacketSink(newTrack).packets()) {
+		packets.push([packet.timestamp, packet.data.byteLength]);
+	}
+
+	expect(packets).toEqual([[0, 3072], [1, 3072]]);
+	expect(await newTrack.computeDuration()).toBeCloseTo(1 + 768 / 48000);
 });

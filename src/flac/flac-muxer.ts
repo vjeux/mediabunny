@@ -7,9 +7,10 @@
  */
 
 import { validateAudioChunkMetadata } from '../codec';
-import { createVorbisComments, FlacBlockType } from '../codec-data';
+import { createVorbisComments, FlacBlockType, getRawPictureLinks } from '../codec-data';
 import {
 	assert,
+	base64ToBytes,
 	textEncoder,
 	toDataView,
 	toUint8Array,
@@ -25,19 +26,60 @@ import {
 	readBlockSize,
 	getBlockSizeOrUncommon,
 	readCodedNumber,
+	calculateCrc8,
+	calculateCrc16,
+	encodeCodedNumber,
 } from './flac-misc';
 import { Bitstream } from '../../shared/bitstream';
 
 const FLAC_HEADER = /* #__PURE__ */ new Uint8Array([0x66, 0x4c, 0x61, 0x43]); // 'fLaC'
 const STREAMINFO_SIZE = 38;
 const STREAMINFO_BLOCK_SIZE = 34;
+const MAX_METADATA_BLOCK_SIZE = 2 ** 24 - 1;
+
+/**
+ * Returns the frame with its coded number (the frame or sample number) replaced by the given one, recomputing the
+ * header and frame checksums, or the frame itself if the number is unchanged.
+ */
+const renumberFrame = (frame: Uint8Array, codedNumberEnd: number, oldNumber: number, newNumber: number) => {
+	if (newNumber === oldNumber) {
+		return frame;
+	}
+
+	// The header continues with an uncommon block size and sample rate, if any, and ends with its CRC-8
+	const blockSizeBits = frame[2]! >> 4;
+	const sampleRateBits = frame[2]! & 0x0f;
+	const headerEnd = codedNumberEnd
+		+ (blockSizeBits === 6 ? 1 : blockSizeBits === 7 ? 2 : 0)
+		+ (sampleRateBits === 12 ? 1 : sampleRateBits === 13 || sampleRateBits === 14 ? 2 : 0);
+
+	const codedNumber = encodeCodedNumber(newNumber);
+	const result = new Uint8Array(frame.length - (codedNumberEnd - 4) + codedNumber.length);
+	result.set(frame.subarray(0, 4));
+	result.set(codedNumber, 4);
+	result.set(frame.subarray(codedNumberEnd, headerEnd), 4 + codedNumber.length);
+
+	const newHeaderEnd = headerEnd - codedNumberEnd + 4 + codedNumber.length;
+	result[newHeaderEnd] = calculateCrc8(result.subarray(0, newHeaderEnd));
+	result.set(frame.subarray(headerEnd + 1, frame.length - 2), newHeaderEnd + 1);
+
+	const crc16 = calculateCrc16(result.subarray(0, result.length - 2));
+	result[result.length - 2] = crc16 >> 8;
+	result[result.length - 1] = crc16 & 0xff;
+
+	return result;
+};
 
 export class FlacMuxer extends Muxer {
 	private writer!: Writer;
 	private metadataWritten = false;
 
 	private blockSizes: number[] = [];
+	/** In append-only mode, the fixed block size that STREAMINFO declares, if it declares one. */
+	private declaredFixedBlockSize: number | null = null;
 	private frameSizes: number[] = [];
+	private writtenFrameCount = 0;
+	private writtenSampleCount = 0;
 
 	private sampleRate: number | null = null;
 	private channels: number | null = null;
@@ -78,24 +120,31 @@ export class FlacMuxer extends Muxer {
 		const descriptionBitstream = new Bitstream(
 			toUint8Array(decoderConfig.description),
 		);
-		// skip 'fLaC' + block size + frame size + sample rate + number of channels
+		// skip 'fLaC' + the metadata block header, then read the block sizes
 		// See demuxer for the exact structure
-		descriptionBitstream.skipBits(103 + 64);
+		descriptionBitstream.skipBits(64);
+		const minimumBlockSize = descriptionBitstream.readBits(16);
+		const maximumBlockSize = descriptionBitstream.readBits(16);
+		// skip frame size + sample rate + number of channels
+		descriptionBitstream.skipBits(24 + 24 + 20 + 3);
 		this.bitsPerSample = descriptionBitstream.readBits(5) + 1;
 
 		if (this.format._options.appendOnly) {
+			// https://www.rfc-editor.org/rfc/rfc9639.html#name-streaminfo
+			// A stream with a fixed block size states it as both the minimum and maximum block size: decoders such as
+			// libFLAC take a stream whose minimum and maximum differ as one with a variable block size, can't place
+			// frames numbered by frame (instead of sample) in it, and fail to seek. Only for a variable block size may
+			// the sizes be looser than the actual ones, so for those, we use the full valid range (16-65535): "This is
+			// because the encoder has to write these fields before receiving any input audio data and cannot know
+			// beforehand what block sizes it will use." Like the rest of the header, the block size comes from the
+			// decoder config.
+			const isFixedBlockSize = minimumBlockSize === maximumBlockSize && minimumBlockSize >= 16;
+			this.declaredFixedBlockSize = isFixedBlockSize ? minimumBlockSize : null;
+
 			// Write STREAMINFO immediately since we can't seek back later.
 			this.writeHeader({
-				// https://www.rfc-editor.org/rfc/rfc9639.html#name-streaminfo
-				// Per RFC 9639, min/max block sizes can be looser than
-				// actual values, so we use the full valid range (16–65535).
-				// "The actual max block size MAY be smaller than what's
-				// listed, and the actual min (excluding last block) MAY be
-				// larger. This is because the encoder has to write these
-				// fields before receiving any input audio data and cannot
-				// know beforehand what block sizes it will use."
-				minimumBlockSize: 16,
-				maximumBlockSize: 65535,
+				minimumBlockSize: isFixedBlockSize ? minimumBlockSize : 16,
+				maximumBlockSize: isFixedBlockSize ? maximumBlockSize : 65535,
 				// https://www.rfc-editor.org/rfc/rfc9639.html#name-streaminfo
 				// "A value of 0 signifies that the value is not known."
 				minimumFrameSize: 0,
@@ -178,11 +227,20 @@ export class FlacMuxer extends Muxer {
 		// 4 bytes: picture data length
 		// z bytes: picture data
 		// Total: 20 + x + y + z
+		const mimeTypeBytes = textEncoder.encode(picture.mimeType);
+		const descriptionBytes = textEncoder.encode(picture.description ?? '');
 		const headerSize
 			= 32
-				+ picture.mimeType.length
-				+ (picture.description?.length ?? 0)
+				+ mimeTypeBytes.length
+				+ descriptionBytes.length
 				+ picture.data.length;
+
+		if (headerSize > MAX_METADATA_BLOCK_SIZE) {
+			throw new Error(
+				`Picture is too big for FLAC: its metadata block would take ${headerSize} bytes, but FLAC metadata`
+				+ ` blocks can take at most ${MAX_METADATA_BLOCK_SIZE} bytes.`,
+			);
+		}
 
 		const header = new Uint8Array(headerSize);
 
@@ -193,14 +251,14 @@ export class FlacMuxer extends Muxer {
 			picture.kind === 'coverFront' ? 3 : picture.kind === 'coverBack' ? 4 : 0,
 		);
 		offset += 4;
-		dataView.setUint32(offset, picture.mimeType.length);
+		dataView.setUint32(offset, mimeTypeBytes.length);
 		offset += 4;
-		header.set(textEncoder.encode(picture.mimeType), 8);
-		offset += picture.mimeType.length;
-		dataView.setUint32(offset, picture.description?.length ?? 0);
+		header.set(mimeTypeBytes, offset);
+		offset += mimeTypeBytes.length;
+		dataView.setUint32(offset, descriptionBytes.length);
 		offset += 4;
-		header.set(textEncoder.encode(picture.description ?? ''), offset);
-		offset += picture.description?.length ?? 0;
+		header.set(descriptionBytes, offset);
+		offset += descriptionBytes.length;
 		offset += 4 + 4 + 4 + 4; // setting width, height, color depth, number of indexed colors to 0
 		dataView.setUint32(offset, picture.data.length);
 		offset += 4;
@@ -230,11 +288,42 @@ export class FlacMuxer extends Muxer {
 			this.writePictureBlock(picture);
 		}
 
+		// Picture links (media type "-->") aren't among the images, but among the raw tags as METADATA_BLOCK_PICTURE
+		// comments, which hold PICTURE blocks. So let's write them as such, and not into the Vorbis comment block.
+		const links = getRawPictureLinks(this.output._metadataTags);
+		for (const link of links) {
+			const block = base64ToBytes(link);
+			const headerBitstream = new Bitstream(new Uint8Array(4));
+			headerBitstream.writeBits(1, 0); // Last metadata block -> false, will be continued by vorbis comment
+			headerBitstream.writeBits(7, FlacBlockType.PICTURE); // Type -> Picture
+			headerBitstream.writeBits(24, block.length);
+			this.writer.write(headerBitstream.bytes);
+			this.writer.write(block);
+		}
+
+		const tags = { ...this.output._metadataTags };
+		const rawPictures = tags.raw?.['METADATA_BLOCK_PICTURE'];
+		if (links.length > 0 && rawPictures !== undefined) {
+			const otherRawPictures = (Array.isArray(rawPictures) ? rawPictures as unknown[] : [rawPictures])
+				.filter(x => !links.includes(x as string));
+			tags.raw = { ...tags.raw, METADATA_BLOCK_PICTURE: otherRawPictures as string[] };
+			if (otherRawPictures.length === 0) {
+				delete tags.raw['METADATA_BLOCK_PICTURE'];
+			}
+		}
+
 		const vorbisComment = createVorbisComments(
 			new Uint8Array(0),
-			this.output._metadataTags,
+			tags,
 			false,
 		);
+
+		if (vorbisComment.length > MAX_METADATA_BLOCK_SIZE) {
+			throw new Error(
+				`Metadata tags are too big for FLAC: their Vorbis comment block would take ${vorbisComment.length}`
+				+ ` bytes, but FLAC metadata blocks can take at most ${MAX_METADATA_BLOCK_SIZE} bytes.`,
+			);
+		}
 
 		const headerBitstream = new Bitstream(new Uint8Array(4));
 		headerBitstream.writeBits(1, 1); // Last metadata block -> true
@@ -282,6 +371,20 @@ export class FlacMuxer extends Muxer {
 				this.writeVorbisCommentAndPictureBlock();
 			}
 
+			// The frame header fields read below take 4 bytes, then the coded frame or sample number as many bytes
+			// as its first byte has leading 1 bits (at least 1), then an uncommon block size 1 or 2 bytes (RFC 9639,
+			// section 9.1). A packet too short for them isn't a FLAC frame.
+			const packetData = packet.data;
+			let codedNumberLength = 0;
+			while (codedNumberLength < 8 && ((packetData[4] ?? 0) << codedNumberLength) & 0x80) {
+				codedNumberLength++;
+			}
+			const blockSizeBits = (packetData[2] ?? 0) >> 4;
+			const uncommonBlockSizeLength = blockSizeBits === 0b0110 ? 1 : blockSizeBits === 0b0111 ? 2 : 0;
+			if (packetData.length < 4 + Math.max(codedNumberLength, 1) + uncommonBlockSizeLength) {
+				throw new Error('Invalid FLAC frame: Too short.');
+			}
+
 			const slice = FileSlice.tempFromBytes(packet.data);
 			slice.skip(2);
 			const bytes = readBytes(slice, 2);
@@ -291,19 +394,45 @@ export class FlacMuxer extends Muxer {
 				throw new Error('Invalid FLAC frame: Invalid block size.');
 			}
 
-			readCodedNumber(slice); // num
+			const codedNumber = readCodedNumber(slice);
+			const codedNumberEnd = slice.filePos;
 			const blockSize = readBlockSize(slice, blockSizeOrUncommon);
+
+			// A frame's coded number must be the number of frames before it in the stream, or of samples with a
+			// variable block size (RFC 9639, section 9.1.5), which readers such as FFmpeg take timestamps from. Frames
+			// copied from elsewhere in a stream (as when trimming its start) carry their original numbers, so let's
+			// renumber them.
+			const hasVariableBlockSize = (packet.data[1]! & 0x01) === 1;
+			const data = renumberFrame(
+				packet.data,
+				codedNumberEnd,
+				codedNumber,
+				hasVariableBlockSize ? this.writtenSampleCount : this.writtenFrameCount,
+			);
+			this.writtenFrameCount++;
+			this.writtenSampleCount += blockSize;
 
 			if (!this.format._options.appendOnly) {
 				this.blockSizes.push(blockSize);
-				this.frameSizes.push(packet.data.length);
+				this.frameSizes.push(data.length);
+			}
+
+			if (this.declaredFixedBlockSize !== null && blockSize > this.declaredFixedBlockSize) {
+				// Decoders such as FFmpeg's drop frames larger than STREAMINFO's maximum block size, which was already
+				// written, so let's fail instead of writing audio that would be lost. A shorter frame (as where streams
+				// are joined) is decoded fine.
+				throw new Error(
+					`Cannot write a FLAC frame of ${blockSize} samples in append-only mode, as the STREAMINFO already`
+					+ ` written declares a fixed block size of ${this.declaredFixedBlockSize} samples, taken from the`
+					+ ' decoder config. To join streams with different block sizes, disable appendOnly.',
+				);
 			}
 
 			const startPos = this.writer.getPos();
-			this.writer.write(packet.data);
+			this.writer.write(data);
 
 			if (this.format._options.onFrame) {
-				this.format._options.onFrame(packet.data, startPos);
+				this.format._options.onFrame(data, startPos);
 			}
 
 			await this.writer.flush();
@@ -360,6 +489,11 @@ export class FlacMuxer extends Muxer {
 				maximumBlockSize = 65535;
 				minimumFrameSize = 0;
 				maximumFrameSize = 0;
+			} else if (this.blockSizes.length === 1) {
+				// The only block is also the last one, so it's a fixed block size stream. Being the last block, it may
+				// be shorter than 16 samples, which STREAMINFO's block sizes must never go below
+				maximumBlockSize = Math.max(maximumBlockSize, 16);
+				minimumBlockSize = maximumBlockSize;
 			}
 
 			assert(this.channels !== null);

@@ -35,34 +35,53 @@ const AC3_SAMPLE_RATES = [32000, 44100, 48000];
 
 const FRAME_SIZE_FALLBACK = 1024; // Just 'cause
 
+// Memoizes NodeAvAudioEncoder.findSupportedVorbisBitrate
+const supportedVorbisBitrates = new Map<string, number | null>();
+
 export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	frame!: NodeAv.Frame;
 	packet!: NodeAv.Packet;
 	codecContext: NodeAv.CodecContext | null = null;
 	resampler: NodeAv.SoftwareResampleContext | null = null;
+	/** What came out of the resampler, until it adds up to a frame for the encoder. */
+	resampledFifo: NodeAv.AudioFifo | null = null;
+	resampledFrame: NodeAv.Frame | null = null;
+	resamplerInputSampleRate: number | null = null;
+	/** The samples that went into the resampler, at the input's rate. */
+	resampledInputCount = 0;
+	/** The samples kept from the resampler, at the encoder's rate. */
+	resampledOutputCount = 0;
 	dstFrame: NodeAv.Frame | null = null;
 	avCodec!: NodeAv.Codec;
 
 	inputParametersKey: string | null = null;
-	resamplerInputSampleRate: number | null = null;
+	inputSampleFormat: AudioSampleFormat | null = null;
 	nextResamplerPts: bigint | null = null;
+	inputEndPts: bigint | null = null;
+	flacBitsPerSample: 16 | 24 = 16;
 	packetEmitted = false;
 	adtsHeaderTemplate: AdtsHeaderTemplate | null = null;
 
 	static override supports(codec: AudioCodec, config: AudioEncoderConfig): boolean {
 		const { numberOfChannels, sampleRate } = config;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
+		const isAdts = (config as any).aac?.format === 'adts';
 
 		return (
 			codec === 'aac' && numberOfChannels >= 1 && numberOfChannels <= 48
 			&& AAC_SAMPLE_RATES.includes(sampleRate)
+			// FFmpeg's encoder signals 7.1 with channel configuration 12, too large for the ADTS header's 3 bits
+			&& !(isAdts && numberOfChannels === 8)
 		) || (
+			// Other rates are resampled to 48 kHz, as WebCodecs encoders do
 			codec === 'opus' && numberOfChannels >= 1 && numberOfChannels <= 255
-			&& OPUS_SAMPLE_RATES.includes(sampleRate)
+			&& sampleRate >= 8000 && sampleRate <= 192000
 		) || (
 			codec === 'mp3' && numberOfChannels >= 1 && numberOfChannels <= 2
 			&& MP3_SAMPLE_RATES.includes(sampleRate)
 		) || (
-			codec === 'vorbis' && numberOfChannels >= 1 && numberOfChannels <= 255
+			// NodeAV's resampler only passes on up to 8 planes, silencing any channel past that
+			codec === 'vorbis' && numberOfChannels >= 1 && numberOfChannels <= 8
 			&& sampleRate <= 200000
 		) || (
 			codec === 'flac' && numberOfChannels >= 1 && numberOfChannels <= 8
@@ -99,12 +118,39 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 		this.avCodec = codec;
 
-		await this.createCodecContext();
+		if (this.codec !== 'flac') {
+			// FLAC's bit depth follows the first sample, so its context is created then
+			await this.createCodecContext();
+		}
 	}
 
 	async createCodecContext() {
 		assert(this.codecContext === null);
 
+		let bitrate = resolveBitrate(this.config, this.codec);
+		let { codecContext, ret } = await this.openCodecContext(bitrate);
+
+		if (ret < 0 && this.codec === 'vorbis') {
+			// libvorbis's bitrate management only takes bitrates in a range set by the sample rate and channel count
+			// (its setup templates): about 45–500 kbps for 44.1 kHz stereo, 8–42 kbps for 8 kHz mono. Others are moved
+			// into that range, as encoders may miss their target bitrate.
+			const supportedBitrate = await this.findSupportedVorbisBitrate(bitrate);
+			if (supportedBitrate !== null) {
+				codecContext.freeContext();
+				bitrate = supportedBitrate;
+				({ codecContext, ret } = await this.openCodecContext(bitrate));
+			}
+		}
+		if (ret < 0) {
+			codecContext.freeContext();
+			NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
+		}
+
+		this.codecContext = codecContext;
+	}
+
+	/** Configures a codec context for the given bitrate and tries to open it. */
+	async openCodecContext(bitrate: number) {
 		const codecContext = new NodeAv.CodecContext();
 		codecContext.allocContext3(this.avCodec);
 
@@ -112,12 +158,23 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		if (this.codec === 'truehd') {
 			// The first listed format is 16-bit, which would needlessly truncate what's supposed to be lossless
 			sampleFormat = NodeAv.AV_SAMPLE_FMT_S32P;
+		} else if (this.codec === 'flac') {
+			// Like @mediabunny/flac-encoder: 16-bit for 8- and 16-bit input, 24-bit otherwise
+			sampleFormat = this.flacBitsPerSample === 24 ? NodeAv.AV_SAMPLE_FMT_S32 : NodeAv.AV_SAMPLE_FMT_S16;
+			if (this.flacBitsPerSample === 24) {
+				codecContext.bitsPerRawSample = 24;
+			}
 		} else if (this.avCodec.sampleFormats && !this.avCodec.sampleFormats.includes(NodeAv.AV_SAMPLE_FMT_FLTP)) {
 			// Use a format that's supported
 			sampleFormat = this.avCodec.sampleFormats[0]!;
 		}
 
-		codecContext.sampleRate = this.config.sampleRate;
+		// libopus only takes a few rates, and others are resampled to 48 kHz
+		const encoderSampleRate = this.codec === 'opus' && !OPUS_SAMPLE_RATES.includes(this.config.sampleRate)
+			? 48000
+			: this.config.sampleRate;
+
+		codecContext.sampleRate = encoderSampleRate;
 		if (this.codec === 'dts') {
 			codecContext.channelLayout = getDtsChannelLayout(this.config.numberOfChannels);
 		} else if (this.codec === 'truehd') {
@@ -128,12 +185,25 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		codecContext.codecType = NodeAv.AVMEDIA_TYPE_AUDIO;
 		codecContext.codecId = CODEC_TO_CODEC_ID[this.codec]!;
 		codecContext.sampleFormat = sampleFormat;
-		codecContext.timeBase = new NodeAv.Rational(1, this.config.sampleRate);
-		codecContext.bitRate = BigInt(resolveBitrate(this.config, this.codec));
+		codecContext.timeBase = new NodeAv.Rational(1, encoderSampleRate);
+		codecContext.bitRate = BigInt(bitrate);
 
 		if (this.config.bitrateMode === 'constant') {
 			codecContext.rcMinRate = codecContext.bitRate;
 			codecContext.rcMaxRate = codecContext.bitRate;
+
+			if (this.avCodec.name === 'libopus') {
+				// libopus doesn't look at the rate limits, only at its own VBR switch
+				codecContext.setOption('vbr', 'off');
+			}
+		}
+
+		const channels = this.config.numberOfChannels;
+		if (this.avCodec.name === 'libopus' && channels >= 3 && channels <= 8) {
+			// FFmpeg's default surround path codes 5- and 7-channel audio with a different channel mapping than it
+			// writes into the header, moving the center to a rear channel. Mapping family 1 reorders the channels to
+			// Vorbis order and lets libopus pick the mapping it writes.
+			codecContext.setOption('mapping_family', '1');
 		}
 
 		// libav's DTS and TrueHD encoders are marked experimental, so they refuse to open at the default compliance
@@ -143,25 +213,81 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			: null;
 
 		const ret = await codecContext.open2(this.avCodec, options);
-		NodeAv.FFmpegError.throwIfError(ret, 'Open codec context');
+		return { codecContext, ret };
+	}
 
-		this.codecContext = codecContext;
+	/**
+	 * The bitrate closest to the requested one that libvorbis opens with for this sample rate and channel count, or
+	 * null if there is none. Its supported bitrates form a range, so this finds one inside it, then the edge between
+	 * that one and the requested one.
+	 */
+	async findSupportedVorbisBitrate(requestedBitrate: number) {
+		const key = `${this.config.sampleRate}:${this.config.numberOfChannels}:${this.config.bitrateMode}:`
+			+ requestedBitrate;
+		const memoized = supportedVorbisBitrates.get(key);
+		if (memoized !== undefined) {
+			return memoized;
+		}
+
+		const opens = async (bitrate: number) => {
+			const { codecContext, ret } = await this.openCodecContext(bitrate);
+			codecContext.freeContext();
+			return ret >= 0;
+		};
+
+		let result: number | null = null;
+		for (const bitratePerChannel of [16_000, 24_000, 32_000, 48_000, 64_000, 96_000]) {
+			let good = bitratePerChannel * this.config.numberOfChannels;
+			if (!await opens(good)) {
+				continue;
+			}
+
+			// Bisect between the requested bitrate, which doesn't open, and one that does, to within 1 kbps
+			let bad = requestedBitrate;
+			while (Math.abs(good - bad) > 1000) {
+				const middle = Math.round((good + bad) / 2);
+				if (await opens(middle)) {
+					good = middle;
+				} else {
+					bad = middle;
+				}
+			}
+
+			result = good;
+			break;
+		}
+
+		supportedVorbisBitrates.set(key, result);
+		return result;
 	}
 
 	async encode(audioSample: AudioSample): Promise<void> {
 		if (this.codecContext === null) {
+			if (this.codec === 'flac') {
+				const format = audioSample.format;
+				this.flacBitsPerSample = format.startsWith('u8') || format.startsWith('s16') ? 16 : 24;
+			}
+
 			await this.createCodecContext();
 			assert(this.codecContext);
 		}
 
-		if (audioSample._data instanceof AvFrameAudioSampleResource) {
+		// The resampler is set up for the first sample's format, so later samples are converted to it. Unlike the
+		// sample rate and channel count, the format may change from one sample to the next.
+		const sampleFormat = this.inputSampleFormat ?? audioSample.format;
+		if (audioSample._data instanceof AvFrameAudioSampleResource && audioSample.format === sampleFormat) {
 			// Release any buffers still referenced from the previous encode before reffing the new frame, otherwise
 			// av_frame_ref leaks them
 			// https://github.com/Vanilagy/mediabunny/issues/392
 			this.frame.unref();
 			this.frame.ref(audioSample._data.frame);
 		} else {
-			copyAudioSampleToAvFrame(audioSample, this.frame);
+			copyAudioSampleToAvFrame(audioSample, this.frame, sampleFormat);
+		}
+		this.inputSampleFormat = sampleFormat;
+
+		if (this.codec === 'aac') {
+			replaceNonFiniteSamples(this.frame);
 		}
 
 		this.frame.pts = BigInt(Math.round(audioSample.timestamp * this.config.sampleRate));
@@ -214,14 +340,22 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 				this.dstFrame.duration = BigInt(this.dstFrame.nbSamples);
 				this.dstFrame.allocBuffer();
 
-				this.nextResamplerPts = this.frame.pts;
+				this.resampledFifo = new NodeAv.AudioFifo();
+				this.resampledFifo.alloc(
+					this.codecContext.sampleFormat,
+					this.codecContext.channels,
+					this.dstFrame.nbSamples,
+				);
+
+				// In the encoder's sample rate, which can differ from the input's
+				this.nextResamplerPts = BigInt(Math.round(audioSample.timestamp * this.codecContext.sampleRate));
 			}
 
 			const inputBuffers = this.frame.data;
 			if (!inputBuffers) {
 				throw new DOMException('Frame has no data', 'EncodingError');
 			}
-			await this.resampler.convert(null, 0, inputBuffers, this.frame.nbSamples);
+			await this.resample(inputBuffers, this.frame.nbSamples);
 
 			await this.pullResampledFrames();
 		} else {
@@ -229,21 +363,60 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		}
 	}
 
-	async pullResampledFrames() {
+	/**
+	 * Runs samples through the resampler and adds what comes out of it to the FIFO. When converting between sample
+	 * rates, the resampler holds samples back for its filter, so it can output fewer samples than it said it could,
+	 * which is why this goes by what it returns. With no input, it outputs what it can without more input. At most
+	 * `maxKeepCount` of the output samples are kept.
+	 */
+	async resample(input: Buffer[] | null, sampleCount: number, maxKeepCount = Infinity) {
 		assert(this.codecContext);
 		assert(this.resampler);
+		assert(this.resampledFifo);
+
+		const capacity = this.resampler.getOutSamples(sampleCount);
+		NodeAv.FFmpegError.throwIfError(capacity, 'getOutSamples');
+		if (capacity === 0) {
+			return;
+		}
+
+		if (!this.resampledFrame || this.resampledFrame.nbSamples < capacity) {
+			this.resampledFrame?.free();
+			this.resampledFrame = new NodeAv.Frame();
+			this.resampledFrame.alloc();
+			this.resampledFrame.channelLayout = this.codecContext.channelLayout;
+			this.resampledFrame.sampleRate = this.codecContext.sampleRate;
+			this.resampledFrame.format = this.codecContext.sampleFormat;
+			this.resampledFrame.nbSamples = capacity;
+			this.resampledFrame.allocBuffer();
+		}
+		assert(this.resampledFrame.data);
+
+		const convertedCount = await this.resampler.convert(this.resampledFrame.data, capacity, input, sampleCount);
+		NodeAv.FFmpegError.throwIfError(convertedCount, 'Resample');
+
+		if (input) {
+			this.resampledInputCount += sampleCount;
+		}
+
+		const keptCount = Math.min(convertedCount, maxKeepCount);
+		if (keptCount > 0) {
+			await this.resampledFifo.write(this.resampledFrame.data, keptCount);
+			this.resampledOutputCount += keptCount;
+		}
+	}
+
+	/** Sends the resampled samples to the encoder, a frame at a time, for as long as there are enough for one. */
+	async pullResampledFrames() {
+		assert(this.resampledFifo);
 		assert(this.dstFrame);
 		assert(this.nextResamplerPts !== null);
 
-		const frameSize = this.codecContext.frameSize || FRAME_SIZE_FALLBACK;
+		const frameSize = this.dstFrame.nbSamples;
 
-		while (true) {
-			const available = this.resampler.getOutSamples(0);
-			if (available < frameSize) {
-				break;
-			}
-
-			await this.resampler.convert(this.dstFrame.data, frameSize, null, 0);
+		while (this.resampledFifo.size >= frameSize) {
+			assert(this.dstFrame.data);
+			await this.resampledFifo.read(this.dstFrame.data, frameSize);
 
 			this.dstFrame.pts = this.nextResamplerPts;
 
@@ -276,8 +449,19 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			return;
 		}
 
+		let durationInSamples = Number(this.packet.duration);
+		if (this.inputEndPts !== null) {
+			// Leave out the silence that filled up the last frame
+			const samplesInInput = Number(this.inputEndPts - this.packet.pts);
+			if (samplesInInput <= 0) {
+				return;
+			}
+
+			durationInSamples = Math.min(durationInSamples, samplesInInput);
+		}
+
 		const timestamp = Number(this.packet.pts) / this.codecContext.sampleRate;
-		const duration = Number(this.packet.duration) / this.codecContext.sampleRate;
+		const duration = durationInSamples / this.codecContext.sampleRate;
 
 		let data: Uint8Array = this.packet.data;
 
@@ -285,7 +469,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		if (this.packetEmitted) {
 			metadata = {};
 		} else {
-			const codecString = this.config.codec;
+			let codecString = this.config.codec;
 			let description = this.codecContext.extraData
 				? toUint8Array(this.codecContext.extraData)
 				: undefined;
@@ -294,6 +478,10 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 				if (!description) {
 					throw new Error('Extradata expected for AAC.');
 				}
+
+				// The configured codec string guesses HE-AAC at low sample rates, but FFmpeg's encoder only makes
+				// AAC-LC, so take the object type from what it actually produced
+				codecString = `mp4a.40.${parseAacAudioSpecificConfig(description).objectType}`;
 
 				// eslint-disable-next-line @stylistic/max-len
 				// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
@@ -369,20 +557,67 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 		outer:
 		if (this.resampler) {
-			assert(this.resamplerInputSampleRate !== null);
+			assert(this.resampledFifo);
+			assert(this.dstFrame);
+			assert(this.nextResamplerPts !== null);
 
-			const currentOutSamples = this.resampler.getOutSamples(0);
-			if (currentOutSamples === 0) {
+			// When converting between sample rates, the resampler holds back the input's last samples for its filter
+			// until more input comes. Push them out with silence, keeping exactly as many samples as the input amounts
+			// to at the encoder's rate.
+			assert(this.resamplerInputSampleRate !== null);
+			const expectedCount = Math.round(
+				this.resampledInputCount * this.codecContext.sampleRate / this.resamplerInputSampleRate,
+			);
+			for (let i = 0; i < 16 && this.resampledOutputCount < expectedCount; i++) {
+				NodeAv.FFmpegError.throwIfError(this.resampler.injectSilence(256), 'injectSilence');
+				await this.resample(null, 0, expectedCount - this.resampledOutputCount);
+			}
+			await this.pullResampledFrames();
+
+			const remainingCount = this.resampledFifo.size;
+			if (remainingCount === 0) {
 				break outer; // Clean cut-off point
 			}
 
-			const frameSize = this.codecContext.frameSize || FRAME_SIZE_FALLBACK;
-			assert(currentOutSamples < frameSize); // Because if it's more, it would've already been retrieved
+			// Silence filling up the last frame would become part of the decoded audio, so the encoder gets a
+			// shorter last frame instead. Unless the whole track is one frame of fewer than 16 samples: FLAC doesn't
+			// allow blocks that short (RFC 9639, section 8.2), and FFmpeg rejects such a stream.
+			const isLossless = this.codec === 'flac' || this.codec === 'truehd';
+			if (
+				isLossless
+				&& this.avCodec.capabilities & NodeAv.AV_CODEC_CAP_SMALL_LAST_FRAME
+				&& (this.packetEmitted || remainingCount >= 16)
+			) {
+				assert(this.dstFrame.data);
+				await this.resampledFifo.read(this.dstFrame.data, remainingCount);
 
-			const inputSamplesNeeded = Math.ceil(
-				((frameSize - currentOutSamples) / this.codecContext.sampleRate) * this.resamplerInputSampleRate,
-			);
-			this.resampler.injectSilence(inputSamplesNeeded);
+				this.dstFrame.nbSamples = remainingCount;
+				this.dstFrame.duration = BigInt(remainingCount);
+				this.dstFrame.pts = this.nextResamplerPts;
+
+				await this.sendFrameAndReceivePackets(this.dstFrame);
+				this.nextResamplerPts += BigInt(remainingCount);
+
+				break outer;
+			}
+
+			// The silence that fills up the last frame isn't part of the audio, so the packets must end where the
+			// input does. Except when no packet has come out yet: such a short track could end up as one shortened
+			// packet, whose audio FFmpeg misplaces in MP4.
+			if (this.packetEmitted) {
+				this.inputEndPts = this.nextResamplerPts + BigInt(remainingCount);
+			}
+
+			// Fill up the last frame with silence: zero bytes, in every sample format these encoders take
+			const sampleFormat = this.codecContext.sampleFormat;
+			const isPlanar = NodeAv.avSampleFmtIsPlanar(sampleFormat);
+			const silenceCount = this.dstFrame.nbSamples - remainingCount;
+			const planeSize = silenceCount * NodeAv.avGetBytesPerSample(sampleFormat)
+				* (isPlanar ? 1 : this.codecContext.channels);
+			const silence = Array.from({ length: isPlanar ? this.codecContext.channels : 1 }, () => {
+				return Buffer.alloc(planeSize);
+			});
+			await this.resampledFifo.write(silence, silenceCount);
 
 			await this.pullResampledFrames();
 		}
@@ -391,13 +626,21 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 		this.codecContext.freeContext();
 		this.codecContext = null;
+		this.inputEndPts = null;
 		this.packetEmitted = false;
 		this.adtsHeaderTemplate = null;
 
 		this.resampler?.free();
 		this.resampler = null;
-		this.inputParametersKey = null;
+		this.resampledFifo?.free();
+		this.resampledFifo = null;
+		this.resampledFrame?.free();
+		this.resampledFrame = null;
 		this.resamplerInputSampleRate = null;
+		this.resampledInputCount = 0;
+		this.resampledOutputCount = 0;
+		this.inputParametersKey = null;
+		this.inputSampleFormat = null;
 		this.nextResamplerPts = null;
 		this.dstFrame?.free();
 		this.dstFrame = null;
@@ -409,9 +652,76 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		this.packet.free();
 		this.dstFrame?.free();
 		this.resampler?.free();
+		this.resampledFifo?.free();
+		this.resampledFrame?.free();
 	}
 }
 
+/**
+ * libav's AAC encoder rejects a whole frame if it holds a NaN or infinite sample, so this maps those like the
+ * conversion to integer samples does: NaN to silence, infinities to full scale.
+ */
+const replaceNonFiniteSamples = (frame: NodeAv.Frame) => {
+	const planar = frame.format === NodeAv.AV_SAMPLE_FMT_FLTP;
+	if (!planar && frame.format !== NodeAv.AV_SAMPLE_FMT_FLT) {
+		return;
+	}
+
+	const valuesPerPlane = planar ? frame.nbSamples : frame.nbSamples * frame.channels;
+	const forEachValue = (callback: (view: DataView, offset: number, value: number) => void) => {
+		for (const plane of frame.data ?? []) {
+			const view = new DataView(plane.buffer, plane.byteOffset, plane.byteLength);
+			for (let i = 0; i < valuesPerPlane; i++) {
+				callback(view, 4 * i, view.getFloat32(4 * i, true));
+			}
+		}
+	};
+
+	let found = false;
+	forEachValue((view, offset, value) => {
+		found ||= !Number.isFinite(value);
+	});
+	if (!found) {
+		return;
+	}
+
+	// The data may be shared with the decoded frame it was reffed from
+	NodeAv.FFmpegError.throwIfError(frame.makeWritable(), 'makeWritable');
+	forEachValue((view, offset, value) => {
+		if (!Number.isFinite(value)) {
+			view.setFloat32(offset, Number.isNaN(value) ? 0 : Math.sign(value), true);
+		}
+	});
+};
+
+/**
+ * By sample rate, for 1–6 channels, the bitrates below which the AC-3 and E-AC-3 encoders, which open anyway, fail the
+ * bit allocation of frames that are hard to fit. Measured as what the hardest of nine full-scale test signals needs
+ * (white noise, square waves, a sawtooth, a sweep, many tones, noise bursts and a tone near Nyquist).
+ */
+const AC3_MIN_BITRATES: Record<number, number[]> = {
+	32000: [0, 0, 0, 40_000, 48_000, 56_000],
+	44100: [0, 0, 40_000, 56_000, 64_000, 80_000],
+	48000: [0, 40_000, 48_000, 56_000, 80_000, 80_000],
+};
+const EAC3_MIN_BITRATES: Record<number, number[]> = {
+	32000: [16_000, 24_000, 32_000, 48_000, 56_000, 56_000],
+	44100: [20_000, 32_000, 48_000, 56_000, 64_000, 64_000],
+	48000: [24_000, 40_000, 48_000, 56_000, 72_000, 72_000],
+};
+
 const resolveBitrate = (config: AudioEncoderConfig, codec: AudioCodec) => {
-	return config.bitrate ?? new Quality('medium')._toAudioBitrate(codec) ?? 0;
+	const bitrate = config.bitrate ?? new Quality('medium')._toAudioBitrate(codec) ?? 0;
+
+	// Bitrates outside the encoders' range are moved into it, as encoders may miss their target bitrate. libopus takes
+	// 500 bps to 256 kbps per channel.
+	if (codec === 'opus') {
+		return Math.min(Math.max(bitrate, 500), 256_000 * config.numberOfChannels);
+	} else if (codec === 'ac3') {
+		return Math.max(bitrate, AC3_MIN_BITRATES[config.sampleRate]?.[config.numberOfChannels - 1] ?? 0);
+	} else if (codec === 'eac3') {
+		return Math.max(bitrate, EAC3_MIN_BITRATES[config.sampleRate]?.[config.numberOfChannels - 1] ?? 0);
+	}
+
+	return bitrate;
 };

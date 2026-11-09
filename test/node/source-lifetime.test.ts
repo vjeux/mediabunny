@@ -1,14 +1,54 @@
 import { expect, test, vi } from 'vitest';
-import { CustomSource, FilePathSource } from '../../src/source.js';
+import { CustomPathedSource, CustomSource, FilePathSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Input, InputDisposedError } from '../../src/input.js';
+import { Input, InputDisposedError, UnsupportedInputFormatError } from '../../src/input.js';
 import { ALL_FORMATS, MP4 } from '../../src/input-format.js';
-import { promiseWithResolvers } from '../../src/misc.js';
-import { readFile } from 'node:fs/promises';
+import { promiseWithResolvers, assert } from '../../src/misc.js';
+import { FileHandle, open, readFile, rm, truncate, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { Reader } from '../../src/reader.js';
+import fs from 'node:fs';
+import ts from 'typescript';
+import os from 'node:os';
+import { AudioSampleSink, EncodedPacketSink } from '../../src/media-sink.js';
+import { AudioSample } from '../../src/sample.js';
+import { CustomAudioDecoder, registerDecoder } from '../../src/custom-coder.js';
+import { AudioCodec } from '../../src/codec.js';
+import { EncodedPacket } from '../../src/packet.js';
 import { setImmediate } from 'node:timers/promises';
+import { Logging } from '../../src/logging.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+// Linux lists the open files of the process
+test.skipIf(process.platform !== 'linux')('FilePathSource disposed while opening its file closes it', async () => {
+	const fs = await import('node:fs');
+	const filePath = path.join(__dirname, '../public/video.mp4');
+	const openFileCount = () => fs.readdirSync('/proc/self/fd').length;
+	const before = openFileCount();
+
+	const outcomes = new Set<string>();
+	for (let i = 0; i < 50; i++) {
+		const input = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+		const format = input.getFormat().then(
+			() => 'read',
+			(error: unknown) => error instanceof InputDisposedError ? 'InputDisposedError' : String(error),
+		);
+		input.dispose(); // While its file is still opening
+		outcomes.add(await format);
+	}
+
+	// Each pending read rejects with InputDisposedError. On main, they failed with "Assertion failed."
+	expect([...outcomes]).toEqual(['InputDisposedError']);
+
+	// And each file gets closed again. On main, each one stayed open.
+	const deadline = Date.now() + 2000;
+	while (openFileCount() > before && Date.now() < deadline) {
+		await new Promise(resolve => setTimeout(resolve, 20));
+	}
+	expect(openFileCount()).toBeLessThanOrEqual(before);
+});
 
 test('Direct source disposal', async () => {
 	const filePath = path.join(__dirname, '../public/video.mp4');
@@ -19,6 +59,13 @@ test('Direct source disposal', async () => {
 	const ref = source.ref();
 	ref.free();
 	expect(source._disposed);
+});
+
+test('Input takes a readonly list of formats', async () => {
+	// Input never changes the list, so a readonly one (from `as const` or a frozen shared config) type-checks and works
+	const formats = Object.freeze([...ALL_FORMATS]);
+	using input = new Input({ source: new FilePathSource(path.join(__dirname, '../public/video.mp4')), formats });
+	expect(await input.getFormat()).toBe(MP4);
 });
 
 test('Implicit source disposal', async () => {
@@ -34,6 +81,20 @@ test('Implicit source disposal', async () => {
 	expect(!source._disposed);
 	input.dispose();
 	expect(source._disposed);
+});
+
+test('Input rejects a freed SourceRef, like a disposed Source', () => {
+	const source = new CustomSource({ getSize: () => 16, read: () => new Uint8Array(16) });
+	const ref = source.ref();
+	ref.free();
+
+	expect(() => new Input({ source, formats: ALL_FORMATS })).toThrow(
+		new TypeError('options.source must not be a disposed Source.'),
+	);
+	// Accepting it would make every read fail, and disposing the input free the ref a second time
+	expect(() => new Input({ source: ref, formats: ALL_FORMATS })).toThrow(
+		new TypeError('options.source must not be a freed SourceRef.'),
+	);
 });
 
 test('Implicit source disposal, double input', async () => {
@@ -57,6 +118,95 @@ test('Implicit source disposal, double input', async () => {
 	expect(!source._disposed);
 	input2.dispose();
 	expect(source._disposed);
+});
+
+test('Disposing an input rejects reads waiting on a user callback that never settles', async () => {
+	const { BufferSource, CustomPathedSource } = await import('../../src/source.js');
+	const outcome = (promise: Promise<unknown>) => Promise.race([
+		promise.then(
+			() => 'resolved',
+			(error: unknown) => error instanceof InputDisposedError ? 'InputDisposedError' : String(error),
+		),
+		new Promise<string>(resolve => setTimeout(() => resolve('pending after 2 s'), 2000)),
+	]);
+
+	// A getSize that never settles, like a HEAD request without a timeout
+	const customInput = new Input({
+		source: new CustomSource({ getSize: () => new Promise<number>(() => {}), read: () => new Uint8Array(0) }),
+		formats: ALL_FORMATS,
+	});
+	const format = customInput.getFormat();
+	await setImmediate();
+	customInput.dispose();
+	// On main, this stayed pending forever
+	expect(await outcome(format)).toBe('InputDisposedError');
+
+	// A request handler that never settles for a segment, like a resolver fetching a signed URL
+	const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:40\n#EXTINF:38.5,\nsegment.mp3\n#EXT-X-ENDLIST\n';
+	const requestedPaths: string[] = [];
+	const hlsInput = new Input({
+		source: new CustomPathedSource('https://example.com/media.m3u8', ({ path }) => {
+			requestedPaths.push(path);
+			return path.endsWith('.m3u8')
+				? new BufferSource(new TextEncoder().encode(playlist))
+				: new Promise<InstanceType<typeof BufferSource>>(() => {});
+		}),
+		formats: ALL_FORMATS,
+	});
+	const tracks = hlsInput.getTracks();
+	while (!requestedPaths.some(x => x.endsWith('.mp3'))) {
+		await setImmediate();
+	}
+	hlsInput.dispose();
+	// On main, this stayed pending forever
+	expect(await outcome(tracks)).toBe('InputDisposedError');
+
+	// The same for the root file, which a CustomPathedSource requests itself (L46)
+	const rootInput = new Input({
+		source: new CustomPathedSource(
+			'https://example.com/media.m3u8',
+			() => new Promise<InstanceType<typeof BufferSource>>(() => {}),
+		),
+		formats: ALL_FORMATS,
+	});
+	const rootFormat = rootInput.getFormat();
+	await setImmediate();
+	rootInput.dispose();
+	// On main, this stayed pending forever
+	expect(await outcome(rootFormat)).toBe('InputDisposedError');
+});
+
+test('Waiting on user callbacks that settle holds on to nothing until disposal', async () => {
+	const { BufferSource, CustomPathedSource } = await import('../../src/source.js');
+	const { EncodedPacketSink } = await import('../../src/media-sink.js');
+
+	// An HLS playlist of 3 segments in memory, read whole. Each request for a segment is waited on until disposal,
+	// which must not keep hold of it once settled, or a long live stream would keep every segment until disposal.
+	const mp3 = await readFile(path.join(__dirname, '../public/Toothsome-Meme.VBRv2.mp3'));
+	const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:40\n'
+		+ [0, 1, 2].map(i => `#EXTINF:38.5,\nsegment${i}.mp3\n`).join('')
+		+ '#EXT-X-ENDLIST\n';
+	const source = new CustomPathedSource('https://example.com/media.m3u8', async ({ path }) => {
+		return new BufferSource(path.endsWith('.m3u8') ? new TextEncoder().encode(playlist) : mp3);
+	});
+	using input = new Input({ source, formats: ALL_FORMATS });
+	let packetCount = 0;
+	for await (const packet of new EncodedPacketSink((await input.getPrimaryAudioTrack())!).packets()) {
+		void packet;
+		packetCount++;
+	}
+	expect(packetCount).toBeGreaterThan(3 * 1000);
+	expect(input._disposalSignal.pendingRejecters.size).toBe(0);
+	expect(source._disposalSignal.pendingRejecters.size).toBe(0);
+
+	// The same for a CustomSource's getSize
+	const customSource = new CustomSource({
+		getSize: async () => mp3.length,
+		read: (start, end) => mp3.subarray(start, end),
+	});
+	using customInput = new Input({ source: customSource, formats: ALL_FORMATS });
+	expect(await customInput.getTracks()).toHaveLength(1);
+	expect(customSource._disposalSignal.pendingRejecters.size).toBe(0);
 });
 
 test.each([
@@ -110,6 +260,62 @@ test.each([
 	}
 });
 
+test('Format detection is tried again after a failed read', async () => {
+	const videoBytes = new Uint8Array(await readFile(path.join(__dirname, '../public/video.mp4')));
+	// The first read fails, like a request hitting a 503 or a dropped connection
+	let failed = false;
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => videoBytes.length,
+			read: (start, end) => {
+				if (!failed) {
+					failed = true;
+					throw new Error('Transient failure');
+				}
+
+				return videoBytes.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	await expect(input.getFormat()).rejects.toThrow('Transient failure');
+	expect(await input.getFormat()).toBe(MP4);
+
+	// An unsupported format doesn't get better though, so it's not tried again
+	let reads = 0;
+	using unsupported = new Input({
+		source: new CustomSource({
+			getSize: () => 4,
+			read: () => {
+				reads++;
+				return new Uint8Array(4);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	await expect(unsupported.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
+	const readsAfterDetection = reads;
+	await expect(unsupported.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
+	expect(reads).toBe(readsAfterDetection);
+
+	// Neither does a disposed input: one disposed during detection keeps saying so
+	const disposed = new Input({
+		source: new CustomSource({
+			getSize: () => videoBytes.length,
+			read: async (start, end) => {
+				await new Promise(resolve => setTimeout(resolve, 50));
+				return videoBytes.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+	const detection = disposed.getFormat();
+	disposed.dispose();
+	await expect(detection).rejects.toThrow(InputDisposedError);
+	await expect(disposed.getFormat()).rejects.toThrow(InputDisposedError);
+	await expect(disposed.getTracks()).rejects.toThrow(InputDisposedError);
+});
+
 test('CustomSource releases stream readers after successful reads', async () => {
 	const bytes = await readFile(path.join(__dirname, '../public/video.mp4'));
 	const streams: ReadableStream<Uint8Array>[] = [];
@@ -134,6 +340,46 @@ test('CustomSource releases stream readers after successful reads', async () => 
 	expect(streams.every(stream => !stream.locked)).toBe(true);
 });
 
+// Named pipes don't live in the file system on Windows
+test.skipIf(process.platform === 'win32')('FilePathSource refuses a named pipe instead of hanging', async () => {
+	const { execFileSync } = await import('node:child_process');
+	const fs = await import('node:fs');
+	const os = await import('node:os');
+	const fifoPath = path.join(os.tmpdir(), `mediabunny-fifo-${process.pid}-${Date.now()}`);
+	execFileSync('mkfifo', [fifoPath]);
+
+	// The bound only detects a hang (on main, opening a pipe nothing writes to waited forever); refusing is immediate
+	const getFormatOutcome = async () => {
+		using input = new Input({ source: new FilePathSource(fifoPath), formats: ALL_FORMATS });
+		return await Promise.race([
+			input.getFormat().then(format => format.name, (error: unknown) => String(error)),
+			new Promise<string>(resolve => setTimeout(() => resolve('pending after 20 s'), 20_000)),
+		]);
+	};
+	const error = /^TypeError: FilePathSource needs a regular file/;
+
+	try {
+		// Nothing writes to the pipe yet. On main, opening it waited for a writer, so this never settled.
+		expect(await getFormatOutcome()).toMatch(error);
+
+		// A valid MP3 written into the pipe. On main, the pipe stated a size of 0, so this was "unsupported format".
+		// Nothing here may block: both ends are opened without waiting (the reading end first, so that the writing end
+		// can open), and what's written fits into a pipe of one page, as pipes get once the user holds very many.
+		const mp3 = await readFile(path.join(__dirname, '..', 'public', 'Toothsome-Meme.VBRv2.mp3'));
+		const readFd = fs.openSync(fifoPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		const writeFd = fs.openSync(fifoPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+		try {
+			fs.writeSync(writeFd, mp3.subarray(0, 4096));
+			expect(await getFormatOutcome()).toMatch(error);
+		} finally {
+			fs.closeSync(writeFd);
+			fs.closeSync(readFd);
+		}
+	} finally {
+		fs.unlinkSync(fifoPath);
+	}
+}, 60_000);
+
 test('CustomSource releases stream readers after read errors', async () => {
 	const error = new Error('Read failed');
 	const stream = new ReadableStream<Uint8Array>({
@@ -145,4 +391,354 @@ test('CustomSource releases stream readers after read errors', async () => {
 	});
 	await expect(input.getFormat()).rejects.toBe(error);
 	expect(stream.locked).toBe(false);
+});
+
+test('FilePathSource rejects reads past the end of a file that got shorter', async () => {
+	const filePath = path.join(tmpdir(), `mediabunny-shrinking-${process.pid}.bin`);
+	await writeFile(filePath, new Uint8Array(100_000).fill(1));
+
+	try {
+		using ref = new FilePathSource(filePath, { maxCacheSize: 0 }).ref();
+		const reader = new Reader(ref.source);
+		expect(await reader.requestSlice(0, 10)).not.toBeNull(); // Learns the size: 100,000 bytes
+
+		await truncate(filePath, 50_000);
+		await expect(async () => reader.requestSlice(49_000, 2000)).rejects.toThrow(
+			'Unexpected end of file at byte 50000',
+		);
+	} finally {
+		await rm(filePath, { force: true });
+	}
+});
+
+test('FilePathSource fills reads that the file system answers in parts', async () => {
+	const filePath = path.join(tmpdir(), `mediabunny-partial-${process.pid}.bin`);
+	const data = new Uint8Array(100_000).map((_, i) => i % 251);
+	await writeFile(filePath, data);
+
+	// Like FUSE or network file systems may, deliver at most 1000 bytes per read call
+	const handle = await open(filePath, 'r');
+	const fileHandlePrototype = Object.getPrototypeOf(handle) as FileHandle;
+	await handle.close();
+	const originalRead = Object.getOwnPropertyDescriptor(fileHandlePrototype, 'read')!.value as (
+		...args: unknown[]
+	) => Promise<unknown>;
+	vi.spyOn(fileHandlePrototype, 'read').mockImplementation(function (
+		this: FileHandle,
+		buffer: Uint8Array,
+		offset: number,
+		length: number,
+		position: number,
+	) {
+		return originalRead.call(this, buffer, offset, Math.min(length, 1000), position);
+	} as never);
+
+	try {
+		using ref = new FilePathSource(filePath).ref();
+		const slice = await new Reader(ref.source).requestSlice(10_000, 50_000);
+		const bytes = slice!.bytes.subarray(slice!.bufferPos, slice!.bufferPos + 50_000);
+		expect(Buffer.compare(bytes, data.subarray(10_000, 60_000))).toBe(0);
+	} finally {
+		await rm(filePath, { force: true });
+	}
+});
+
+test('CustomSource rejects falsy prefetchProfile values it cannot use', async () => {
+	for (const prefetchProfile of ['', false, 0, null]) {
+		expect(() => new CustomSource({
+			getSize: () => 1024,
+			read: (start, end) => new Uint8Array(end - start),
+			prefetchProfile: prefetchProfile as never,
+		})).toThrow(new TypeError(
+			'options.prefetchProfile, when provided, must be one of \'none\', \'fileSystem\' or \'network\'.',
+		));
+	}
+});
+
+test('A throwing CustomSource dispose callback does not stop the rest of the input from disposing', async () => {
+	// Minimal ADTS frames (AAC-LC, 44.1 kHz, stereo) with zeroed payloads
+	const adtsFrames = (count: number) => {
+		const frameLength = 7 + 10;
+		const bytes = new Uint8Array(count * frameLength);
+		for (let i = 0; i < count; i++) {
+			const header = [0xff, 0xf1, 0x50, 0x80, frameLength >> 3, ((frameLength & 7) << 5) | 0x1f, 0xfc];
+			bytes.set(header, i * frameLength);
+		}
+		return bytes;
+	};
+
+	const files = new Map<string, Uint8Array>([
+		['index.m3u8', new TextEncoder().encode([
+			'#EXTM3U',
+			'#EXT-X-TARGETDURATION:1',
+			'#EXT-X-PLAYLIST-TYPE:VOD',
+			'#EXTINF:0.1,',
+			'a.aac',
+			'#EXTINF:0.1,',
+			'b.aac',
+			'#EXT-X-ENDLIST',
+		].join('\n'))],
+		['a.aac', adtsFrames(4)],
+		['b.aac', adtsFrames(4)],
+	]);
+
+	const disposed: string[] = [];
+	const loggedErrors: unknown[] = [];
+	vi.spyOn(console, 'error').mockImplementation(() => {});
+	const unsubscribe = Logging.on('error', args => loggedErrors.push(args[1]));
+
+	const input = new Input({
+		formats: ALL_FORMATS,
+		source: new CustomPathedSource('index.m3u8', ({ path }) => {
+			const name = path.split('/').pop()!;
+			const bytes = files.get(name)!;
+			return new CustomSource({
+				getSize: () => bytes.length,
+				read: (start, end) => bytes.subarray(start, end),
+				dispose: () => {
+					disposed.push(name);
+					if (name === 'index.m3u8') {
+						throw new Error('Dispose failed');
+					}
+				},
+			});
+		}),
+	});
+
+	try {
+		const track = await input.getPrimaryAudioTrack();
+		let packetCount = 0;
+		for await (const packet of new EncodedPacketSink(track!).packets()) {
+			void packet;
+			packetCount++;
+		}
+		expect(packetCount).toBe(8); // Both segments were read
+
+		input.dispose();
+		await setImmediate(); // The demuxer, and with it the segment inputs, gets disposed asynchronously
+
+		expect(disposed.sort()).toEqual(['a.aac', 'b.aac', 'index.m3u8']);
+		expect(loggedErrors).toEqual([new Error('Dispose failed')]);
+	} finally {
+		unsubscribe();
+	}
+});
+
+test('Declarations of the disposable classes compile without TypeScript\'s esnext lib', () => {
+	// Emits the declaration files the package ships and type-checks a consumer against them with skipLibCheck off and
+	// the ES2022 lib, which has no Disposable or Symbol.dispose
+	const outDir = path.join(__dirname, '../../node_modules/.cache/mediabunny-disposable-declarations-test');
+	fs.rmSync(outDir, { recursive: true, force: true });
+	const config = ts.getParsedCommandLineOfConfigFile(path.join(__dirname, '../../src/tsconfig.json'), {}, {
+		...ts.sys,
+		onUnRecoverableConfigFileDiagnostic: () => {},
+	})!;
+	ts.createProgram({
+		rootNames: [path.join(__dirname, '../../src/index.ts')],
+		options: {
+			...config.options, outDir, noCheck: true, emitDeclarationOnly: true, composite: false, incremental: false,
+		},
+	}).emit();
+
+	const consumerFile = path.join(outDir, 'consumer.ts');
+	fs.writeFileSync(consumerFile, [
+		`import { Input, SourceRef, VideoSample, AudioSample } from './src/index.js';`,
+		'export const used = [Input, SourceRef, VideoSample, AudioSample];',
+	].join('\n'));
+	const consumer = ts.createProgram({
+		rootNames: [consumerFile],
+		options: {
+			target: ts.ScriptTarget.ES2022,
+			module: ts.ModuleKind.ESNext,
+			moduleResolution: ts.ModuleResolutionKind.Bundler,
+			lib: ['lib.es2022.d.ts', 'lib.dom.d.ts'],
+			types: [],
+			strict: true,
+			skipLibCheck: false,
+			noEmit: true,
+		},
+	});
+	const errorsInOwnDeclarations = ts.getPreEmitDiagnostics(consumer)
+		.filter((diagnostic) => {
+			// TypeScript's file names use / on every platform
+			const file = diagnostic.file && path.relative(outDir, diagnostic.file.fileName).split(path.sep).join('/');
+			return file?.startsWith('src/');
+		})
+		.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, ' '));
+	expect(errorsInOwnDeclarations).toEqual([]);
+}, 60_000);
+
+test('FilePathSource reads of 2 GiB or more are split into reads Node accepts', async () => {
+	// Node rejects file reads of 2 GiB or more, and Linux transfers at most 0x7ffff000 bytes per call. A sparse file of
+	// that size, read through a stand-in file handle that behaves like that without touching the buffer.
+	const size = 2 ** 31 + 2 ** 20;
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-read-${process.pid}.bin`);
+	await writeFile(filePath, new Uint8Array(0));
+	await truncate(filePath, size);
+
+	try {
+		const source = new FilePathSource(filePath);
+		expect(await source.getSize()).toBe(size);
+
+		const realHandle = source._fileHandle!;
+		const calls: { offset: number; length: number; position: number }[] = [];
+		source._fileHandle = {
+			read: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				calls.push({ offset, length, position });
+				return { bytesRead: Math.min(length, 0x7ffff000), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		const bytes = await source._customSource._options.read(0, size) as Uint8Array;
+		expect(bytes.byteLength).toBe(size);
+
+		// The reads cover the whole range, each one picking up where the previous one stopped
+		let pos = 0;
+		for (const call of calls) {
+			expect(call.offset).toBe(pos);
+			expect(call.position).toBe(pos);
+			pos += Math.min(call.length, 0x7ffff000);
+		}
+		expect(pos).toBe(size);
+
+		source._dispose();
+	} finally {
+		await rm(filePath);
+	}
+});
+
+test('FilePathSource reads of 2 GiB or more stop with an error where a shrunken file ends', async () => {
+	// The same sparse file, read through a stand-in file handle for which the file now ends after 1.5 GiB
+	const size = 2 ** 31 + 2 ** 20;
+	const filePath = path.join(os.tmpdir(), `mediabunny-large-shrunk-read-${process.pid}.bin`);
+	await writeFile(filePath, new Uint8Array(0));
+	await truncate(filePath, size);
+
+	try {
+		const source = new FilePathSource(filePath);
+		expect(await source.getSize()).toBe(size);
+
+		const realHandle = source._fileHandle!;
+		const shrunkSize = 1.5 * 2 ** 30;
+		source._fileHandle = {
+			read: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+				if (length > 2 ** 31 - 1) {
+					throw new RangeError(`The value of "length" is out of range. Received ${length}`);
+				}
+				return { bytesRead: Math.max(0, Math.min(length, shrunkSize - position)), buffer };
+			},
+			close: () => realHandle.close(),
+		} as unknown as FileHandle;
+
+		await expect(source._customSource._options.read(0, size)).rejects.toThrow(
+			`Unexpected end of file at byte ${shrunkSize}`,
+		);
+
+		source._dispose();
+	} finally {
+		await rm(filePath);
+	}
+});
+
+// A stand-in AAC decoder, active only while a test enables it, that keeps track of what it emits and whether it's
+// closed
+let countingDecoderActive = false;
+const countingDecoderSamples: AudioSample[] = [];
+let countingDecoderCloseCount = 0;
+
+class CountingAacDecoder extends CustomAudioDecoder {
+	static override supports(codec: AudioCodec) {
+		return codec === 'aac' && countingDecoderActive;
+	}
+
+	init() {}
+
+	decode(packet: EncodedPacket) {
+		const sample = new AudioSample({
+			data: new Float32Array(1024),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: packet.timestamp,
+		});
+		countingDecoderSamples.push(sample);
+		this.onSample(sample);
+	}
+
+	flush() {}
+
+	close() {
+		countingDecoderCloseCount++;
+	}
+}
+registerDecoder(CountingAacDecoder);
+
+test.each([
+	['samples()', (sink: AudioSampleSink) => sink.samples()],
+	['samplesAtTimestamps()', (sink: AudioSampleSink) => sink.samplesAtTimestamps([0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4])],
+] as const)('Disposing the input closes the decoder and samples of an open %s iterator', async (_, iterate) => {
+	countingDecoderActive = true;
+	countingDecoderSamples.length = 0;
+	countingDecoderCloseCount = 0;
+
+	try {
+		const input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const iterator = iterate(new AudioSampleSink(track));
+		const first = await iterator.next();
+		first.value?.close();
+
+		// The sink decodes ahead until its queue is full, then waits for the consumer, which stops here and just
+		// disposes the input (a player being torn down, for example), found by lane L57
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(countingDecoderSamples.length).toBeGreaterThan(1);
+		input.dispose();
+		await new Promise(resolve => setTimeout(resolve, 50));
+
+		expect(countingDecoderCloseCount).toBe(1);
+		expect(countingDecoderSamples.filter(sample => !sample._closed)).toHaveLength(0);
+		await expect(iterator.next()).rejects.toThrow(InputDisposedError);
+	} finally {
+		countingDecoderActive = false;
+	}
+});
+
+test('Finished and returned iterators stop listening for the input being disposed', async () => {
+	countingDecoderActive = true;
+
+	try {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packetSink = new EncodedPacketSink(track);
+		for await (const packet of packetSink.packets(undefined, undefined, { metadataOnly: true })) {
+			expect(packet.isMetadataOnly).toBe(true);
+		}
+
+		const packets = packetSink.packets();
+		await packets.next();
+		await packets.return();
+
+		const samples = new AudioSampleSink(track).samples();
+		(await samples.next()).value?.close();
+		await samples.return();
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(input._disposeCallbacks.size).toBe(0);
+	} finally {
+		countingDecoderActive = false;
+	}
 });

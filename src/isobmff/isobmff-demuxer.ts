@@ -7,9 +7,10 @@
  */
 
 import { TrackType } from '../output';
-import { parseAacAudioSpecificConfig } from '../../shared/aac-misc';
+import { buildAacAudioSpecificConfig, parseAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
 	AacCodecInfo,
+	AUDIO_CODECS_WITH_DELTA_PACKETS,
 	AudioCodec,
 	DTS_FOURCCS,
 	DtsFourCc,
@@ -24,6 +25,7 @@ import {
 	PRORES_FOURCCS,
 	ProresFourCc,
 	VideoCodec,
+	VP9_LEVEL_TABLE,
 } from '../codec';
 import {
 	Av1CodecInfo,
@@ -48,12 +50,21 @@ import {
 	extractHevcDecoderConfigurationRecord,
 	deserializeAvcDecoderConfigurationRecord,
 	deserializeHevcDecoderConfigurationRecord,
+	extractNalUnitTypeForHevc,
+	iterateHevcNalUnits,
+	serializeHevcDecoderConfigurationRecord,
 	HevcNalUnitType,
 	parseAvcSps,
 	parseHevcSps,
+	iterateNalUnitsInLengthPrefixed,
+	concatNalUnitsInLengthPrefixed,
+	AvcNalUnitType,
+	extractNalUnitTypeForAvc,
+	serializeAvcDecoderConfigurationRecord,
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
+import { fromMatroskaLanguageCode } from '../matroska/ebml';
 import {
 	InputAudioTrackBacking,
 	InputTrackBacking,
@@ -66,12 +77,12 @@ import {
 	binarySearchLessOrEqual,
 	bytesToHexString,
 	COLOR_PRIMARIES_MAP_INVERSE,
-	findLastIndex,
 	IDENTITY_MATRIX,
 	isIso639Dash2LanguageCode,
 	isThenable,
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
+	missingWebCodecsClassMessage,
 	multiplyMatrices,
 	Rational,
 	textDecoder,
@@ -84,6 +95,10 @@ import {
 	HEX_STRING_REGEX,
 	EMPTY_COLOR_SPACE,
 	colorSpaceIsComplete,
+	MaybePromise,
+	uint8ArraysAreEqual,
+	getDisplayAspect,
+	simplifyRational,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import {
@@ -98,6 +113,7 @@ import {
 	MIN_BOX_HEADER_SIZE,
 	readBoxHeader,
 	readDataBox,
+	readFreeformMetadataItem,
 	readFixed_16_16,
 	readFixed_2_30,
 	readEsDescriptor,
@@ -117,14 +133,38 @@ import {
 	readU64Be,
 	readU8,
 	readAscii,
+	SliceRangeError,
 } from '../reader';
-import { DEFAULT_TRACK_DISPOSITION, MetadataTags, RichImageData, TrackDisposition } from '../metadata';
+import {
+	DEFAULT_TRACK_DISPOSITION,
+	MetadataTags,
+	RichImageData,
+	TrackDisposition,
+	unwatchMetadataTagFields,
+	watchMetadataTagFields,
+} from '../metadata';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
 import { Logging } from '../logging';
+import { ID3_V1_GENRES } from '../id3';
 
 const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
+
+/**
+ * QuickTime's Macintosh language codes 0 to 94 as ISO 639-2/T codes, empty where a language has none of its own (the
+ * languages of FFmpeg's mov_mdhd_language_map, with terminology codes for the bibliographic ones it lists).
+ */
+const MACINTOSH_LANGUAGE_CODES = [
+	'eng', 'fra', 'deu', 'ita', 'nld', 'swe', 'spa', 'dan', 'por', 'nor', 'heb', 'jpn', 'ara', 'fin', 'ell', 'isl',
+	'mlt', 'tur', 'hrv', 'zho', 'urd', 'hin', 'tha', 'kor', 'lit', 'pol', 'hun', 'est', 'lav', 'smi', 'fao', 'fas',
+	'rus', 'zho', '', 'gle', 'sqi', 'ron', 'ces', 'slk', 'slv', 'yid', 'srp', 'mkd', 'bul', 'ukr', 'bel', 'uzb',
+	'kaz', 'aze', 'aze', 'hye', 'kat', 'ron', 'kir', 'tgk', 'tuk', 'mon', '', 'pus', 'kur', 'kas', 'snd', 'bod',
+	'nep', 'san', 'mar', 'ben', 'asm', 'guj', 'pan', 'ori', 'mal', 'kan', 'tam', 'tel', 'sin', 'mya', 'khm', 'lao',
+	'vie', 'ind', 'tgl', 'msa', 'msa', 'amh', 'tir', 'orm', 'som', 'swa', 'kin', 'run', 'nya', 'mlg', 'epo',
+];
+/** Macintosh language codes 128 to 138, likewise */
+const MACINTOSH_LANGUAGE_CODES_FROM_128 = ['cym', 'eus', 'cat', 'lat', 'que', 'grn', 'aym', 'tat', 'uig', 'dzo', 'jav'];
 
 type InternalTrack = {
 	id: number;
@@ -135,12 +175,27 @@ type InternalTrack = {
 	durationInMovieTimescale: number;
 	durationInMediaTimescale: number;
 	matrix: TransformationMatrix;
+	/** The integer parts of the tkhd box's width and height, the visual presentation size before the matrix */
+	presentationWidth: number;
+	presentationHeight: number;
+	/** Whether a pasp box gave the pixel aspect ratio */
+	hasPaspBox: boolean;
 	internalCodecId: string | null;
 	name: string | null;
 	languageCode: string;
 	sampleTableByteOffset: number | null; // null when the track's sample table is another file (ominous ik 👀)
 	sampleTable: SampleTable | null;
+	/** The encryption info of each sample description (stsd entry), which can each have their own key ID */
+	encryptionInfos: (TrackEncryptionInfo | null)[];
 	fragmentLookupTable: FragmentLookupTableEntry[];
+	/**
+	 * Where each read fragment with samples of this track ends in decode time, sorted by moof offset. Unlike the
+	 * position cache, it holds every fragment, also those presented before the fragment preceding them.
+	 */
+	fragmentDecodeEnds: {
+		moofOffset: number;
+		endDecodeTimestamp: number;
+	}[];
 	currentFragmentState: FragmentTrackState | null;
 	/**
 	 * List of all encountered fragment offsets alongside their timestamps. This list never gets truncated, but memory
@@ -149,18 +204,63 @@ type InternalTrack = {
 	fragmentPositionCache: {
 		moofOffset: number;
 		startTimestamp: number;
-		endTimestamp: number;
+		endDecodeTimestamp: number;
 		hasKeyFrame: boolean;
 	}[];
+	/**
+	 * Lets fragment scans skip the fragments without this track (before its start, in a gap in it, or after its end)
+	 * instead of walking them again. When a scan went past such fragments, this maps where it came from (the end of a
+	 * moof box with samples of this track, or 0 for the start of the file) to the offset of the next moof box with
+	 * samples of this track, or to Infinity if there was none before the end of the file.
+	 */
+	nextFragmentOffsets: Map<number, number>;
+	/**
+	 * The moof offsets of the fragments read so far whose samples of this track aren't placed in time and remembered
+	 * in `fragmentPositionCache` yet (see placeFragmentTrackData)
+	 */
+	unplacedFragmentOffsets: number[];
 	/** The segment durations of all edit list entries leading up to the main one (from which the offset is taken.) */
 	editListPreviousSegmentDurations: number;
 	/** The media time offset of the main edit list entry (with media time !== -1) */
 	editListOffset: number;
+	/** See getMaxReorderedSamples; computed on first use */
+	maxReorderedSamples?: number;
+	/**
+	 * For tracks that can reorder samples, what fragments read so far present, by moof offset. Only the recently used
+	 * ones are kept, see keepFragmentPresentation.
+	 */
+	fragmentPresentations?: Map<number, FragmentPresentation>;
+	/** The keys of fragmentPresentations, sorted */
+	fragmentPresentationOffsets?: number[];
+	/** How many samples the fragments in fragmentPresentations have */
+	fragmentPresentationSampleCount?: number;
+	hasEditList: boolean;
+	/** For AAC, the decoded sample rate when it differs from info.sampleRate (implicit SBR; see the esds box) */
+	aacOutputSampleRate?: number;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
+	/** The codec info read from each sample description, of which the one the samples refer to is used. */
+	sampleDescriptionStates: SampleDescriptionState[];
+	/** The sample description index of the first chunk in the sample table, if there is one. */
+	firstChunkSampleDescriptionIndex: number | null;
+	/** The entries of the track's 'seig' sample group description, which fragments can refer to. */
+	encryptionGroups: SampleGroupEncryption[];
+	/** The entry of the track's 'seig' sample group description that applies to samples without a mapping. */
+	defaultEncryptionGroup: SampleGroupEncryption | null;
+	/** The 'seig' sample-to-group runs of a non-fragmented track's sample table, with their first sample index */
+	encryptionGroupRuns: { startIndex: number; sampleCount: number; groupDescriptionIndex: number }[];
+	/** The avcC or hvcC record of each sample description (by index), if it has one. */
+	sampleDescriptionRecords: (Uint8Array | null)[];
+	/** Parameter sets to send in band, computed on first use; see getInBandParameterSets. */
+	inBandParameterSets?: InBandParameterSets | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
+	/**
+	 * Whether each sample description (stsd entry) is an encrypted one. A track may also have clear ones, which
+	 * clear lead samples use (Shaka Packager, for example).
+	 */
+	encryptedSampleDescriptions: boolean[];
 	/** In bits per second, from the btrt box if present. */
 	maxBitrate: number | null;
 	avgBitrate: number | null;
@@ -173,10 +273,15 @@ type InternalTrack = {
 		height: number;
 		squarePixelWidth: number;
 		squarePixelHeight: number;
+		/** Whether the current sample entry has a pasp box, whose pixel aspect ratio wins over the bitstream's */
+		hasPixelAspectRatioBox: boolean;
+		/** Exact, unlike the square pixel size */
+		pixelAspectRatio: Rational;
 		codec: VideoCodec | null;
 		codecDescription: Uint8Array | null;
 		colorSpace: VideoColorSpaceInit;
 		avcType: 1 | 3 | null;
+		hevcType: 'hvc1' | 'hev1' | null;
 		avcCodecInfo: AvcDecoderConfigurationRecord | null;
 		hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 		vp9CodecInfo: Vp9CodecInfo | null;
@@ -195,6 +300,8 @@ type InternalTrack = {
 		dtsFormat: DtsFourCc | null;
 		pcmLittleEndian: boolean;
 		pcmSampleSize: number | null;
+		/** The compressed packet layout from a QuickTime sound sample description version 1, if there is one. */
+		soundPacketLayout: { samplesPerPacket: number; bytesPerFrame: number } | null;
 	};
 });
 
@@ -248,14 +355,28 @@ type FragmentLookupTableEntry = {
 	sampleNumber: number; // 1-indexed
 };
 
+type SampleDescriptionState = Pick<InternalTrack, 'info' | 'internalCodecId' | 'maxBitrate' | 'avgBitrate'>;
+
 type FragmentTrackState = {
 	baseDataOffset: number;
 	sampleDescriptionIndex: number | null;
 	defaultSampleDuration: number | null;
 	defaultSampleSize: number | null;
 	defaultSampleFlags: number | null;
+	/** For video, the sample_depends_on of each sample's flags, which the sdtp box can tell where it's 0 (unknown) */
+	sampleDependsOn: number[];
+	/** The traf's sdtp box entries, one per sample */
+	sampleDependencies: Uint8Array | null;
 	startTimestamp: number | null;
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
+	/** The traf's own 'seig' sample group entries */
+	encryptionGroups: SampleGroupEncryption[];
+	/** The traf's own 'seig' entry for samples without a mapping */
+	defaultEncryptionGroup: SampleGroupEncryption | null;
+	/** The traf's 'seig' sample-to-group runs */
+	encryptionGroupRuns: { sampleCount: number; groupDescriptionIndex: number }[] | null;
+	/** The senc box, read once the samples' groups are known */
+	sencSlice: FileSlice | null;
 };
 
 type FragmentTrackData = {
@@ -275,7 +396,12 @@ type FragmentTrackData = {
 	}[];
 	startTimestampIsFinal: boolean;
 	trunSampleCounts: number[];
+	/** Whether runs of PCM samples were merged into bigger samples, so that sample numbers past 1 don't match */
+	samplesAreGrouped: boolean;
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
+	/** Whether the samples use an encrypted sample description */
+	isEncrypted: boolean;
+	sampleDescriptionIndex: number;
 };
 
 type FragmentTrackSample = {
@@ -283,6 +409,7 @@ type FragmentTrackSample = {
 	duration: number;
 	byteOffset: number;
 	byteSize: number;
+	encryptionGroup: SampleGroupEncryption | null;
 	isKeyFrame: boolean;
 	encryption: SampleEncryptionInfo | null;
 };
@@ -291,9 +418,24 @@ type Fragment = {
 	moofOffset: number;
 	moofSize: number;
 	implicitBaseDataOffset: number;
+	/** Where the data of a skipped traf lies, so the implicit base data offset can move past it. */
+	skippedTraf: { baseDataOffset: number; dataEnd: number | null; defaultSampleSize: number | null } | null;
 	trackData: Map<InternalTrack['id'], FragmentTrackData>;
 	psshBoxes: PsshBox[];
 	sampleCount: number;
+};
+
+/** What a fragment presents of a track; see getFragmentSampleDuration */
+type FragmentPresentation = {
+	moofSize: number;
+	/** The presentation timestamps of the track's samples, sorted */
+	timestamps: number[];
+	/** The earliest presentation timestamp of a sync sample, or Infinity */
+	minSyncTimestamp: number;
+	/** The offset of the next moof box holding the track, once known (null for none) */
+	nextMoofOffset?: number | null;
+	/** Durations computed so far, by sample index */
+	durations: Map<number, number>;
 };
 
 type FragmentSummary = {
@@ -319,6 +461,16 @@ type SampleEncryptionInfo = {
 	}[] | null;
 };
 
+/** A CENC sample group entry ('seig'), overriding the tenc defaults for its samples (e.g. for key rotation). */
+type SampleGroupEncryption = {
+	isProtected: boolean;
+	perSampleIvSize: number;
+	kid: string;
+	constantIv: Uint8Array | null;
+	cryptByteBlock: number;
+	skipByteBlock: number;
+};
+
 /**
  * Holds parsed saiz+saio state. The encryption info itself lives at a file offset and is fetched lazily.
  * For fragmented files this state is per-traf; for non-fragmented files it's per-track (on stbl).
@@ -328,11 +480,122 @@ type SampleEncryptionAuxInfo = {
 	sampleSizes: Uint8Array | null;
 	sampleCount: number;
 	offset: number | null; // Absolute file offset of the first sample's aux info
+	offsets: number[]; // Every absolute offset of the saio box: one per track run or chunk if there are several
 	resolved: SampleEncryptionInfo[] | null;
 };
 
 // Anything beyond this is malicious
 const MAX_BOX_NESTING_DEPTH = 64;
+/** The size up to which runs of PCM samples of one frame each are merged into one sample, in fragments */
+const MAX_GROUPED_PCM_SAMPLE_SIZE = 2 ** 16;
+
+/**
+ * Caps the entry count read from a box at the number of entries that fit into the rest of the box, so that a corrupt
+ * count doesn't make us read past the box. FFmpeg's mov demuxer likewise stops at the end of the atom.
+ */
+const capEntryCount = (entryCount: number, slice: FileSlice, boxEndPos: number, entrySize: number) => {
+	const availableBytes = Math.min(boxEndPos, slice.end) - slice.filePos;
+	return Math.min(entryCount, Math.max(Math.floor(availableBytes / entrySize), 0));
+};
+
+/**
+ * Vorbis in MP4 is nonstandard. gpac's esds holds the three Vorbis headers each prefixed with a 16-bit length, while
+ * decoders (like WebCodecs, and FFmpeg's own layout) expect Xiph lacing. Like FFmpeg's avpriv_split_xiph_headers,
+ * recognize that layout by the size of the identification header and convert it. Returns null for anything else.
+ */
+const xiphLaceLengthPrefixedVorbisHeaders = (bytes: Uint8Array) => {
+	const VORBIS_IDENTIFICATION_HEADER_SIZE = 30;
+
+	const headers: Uint8Array[] = [];
+	let pos = 0;
+	for (let i = 0; i < 3; i++) {
+		if (pos + 2 > bytes.length) {
+			return null;
+		}
+
+		const length = (bytes[pos]! << 8) | bytes[pos + 1]!;
+		if (pos + 2 + length > bytes.length) {
+			return null;
+		}
+
+		headers.push(bytes.subarray(pos + 2, pos + 2 + length));
+		pos += 2 + length;
+	}
+
+	const identificationHeader = headers[0]!;
+	if (identificationHeader.length !== VORBIS_IDENTIFICATION_HEADER_SIZE || identificationHeader[0] !== 1) {
+		return null;
+	}
+
+	const view = toDataView(identificationHeader);
+	const numberOfChannels = view.getUint8(11);
+	const sampleRate = view.getUint32(12, true);
+	if (numberOfChannels === 0 || sampleRate === 0) {
+		return null;
+	}
+
+	// The segment table holds the sizes of the first two headers; the third one takes up the rest
+	const segmentTable: number[] = [];
+	for (const header of headers.slice(0, 2)) {
+		for (let remaining = header.length; ; remaining -= 255) {
+			segmentTable.push(Math.min(remaining, 255));
+			if (remaining < 255) {
+				break;
+			}
+		}
+	}
+
+	const laced = new Uint8Array(1 + segmentTable.length + pos - 6);
+	laced[0] = 2; // Number of headers minus one
+	laced.set(segmentTable, 1);
+	let writePos = 1 + segmentTable.length;
+	for (const header of headers) {
+		laced.set(header, writePos);
+		writePos += header.length;
+	}
+
+	return { description: laced, numberOfChannels, sampleRate };
+};
+
+/**
+ * The fewest content bytes that the fixed fields of these boxes take up. Boxes that are smaller (for example, empty)
+ * are skipped. Variable-length contents are checked where they're read.
+ */
+const MIN_BOX_CONTENT_SIZES: Partial<Record<string, number>> = {
+	meta: 4,
+	mehd: 8,
+	trex: 24,
+	tfhd: 8,
+	tfdt: 8,
+	trun: 8,
+	elst: 8,
+	stts: 8,
+	ctts: 8,
+	stss: 8,
+	stsc: 8,
+	stco: 8,
+	co64: 8,
+	stsz: 12,
+	stz2: 12,
+	frma: 4,
+	colr: 4,
+	pasp: 8,
+	btrt: 12,
+	vpcC: 10,
+	esds: 6,
+	dOps: 11,
+	dfLa: 8,
+	dac3: 3,
+	dmlp: 4,
+	pcmC: 6,
+	enda: 2,
+};
+
+/**
+ * Sample durations above this are taken to be negative values stored as unsigned ones (like FFmpeg's
+ * max_stts_delta default).
+ */
+const MAX_SAMPLE_DELTA = 0xffffffff - 48000 * 10;
 
 export class IsobmffDemuxer extends Demuxer {
 	reader: Reader;
@@ -343,15 +606,23 @@ export class IsobmffDemuxer extends Demuxer {
 	idToTrack = new Map<number, InternalTrack>();
 	metadataPromise: Promise<void> | null = null;
 	movieTimescale = -1;
+	/** Whether the file ends inside the moov box (or the moov box's size goes past the end of the file) */
+	moovIsCutOff = false;
 	movieDurationInTimescale = -1;
+	/** From the mehd box: the duration of a fragmented movie including its fragments, in the movie timescale */
+	fragmentedMovieDurationInTimescale = -1;
 	movieMatrix = IDENTITY_MATRIX;
 	isQuickTime = false;
 	metadataTags: MetadataTags = {};
+	/** The encoder delay from the iTunSMPB tag, in samples. */
+	iTunesPriming: number | null = null;
 	currentMetadataKeys: Map<number, string> | null = null;
 
 	isFragmented = false;
 	fragmentTrackDefaults = new Map<number, FragmentTrackDefaults>();
 	psshBoxes: PsshBox[] = [];
+	/** The sizes of the mdat boxes right after moof boxes, keyed by their offset */
+	mdatSizes = new Map<number, number>();
 	currentFragment: Fragment | null = null;
 	isReadingTraf = false;
 	/**
@@ -360,9 +631,13 @@ export class IsobmffDemuxer extends Demuxer {
 	 */
 	lastReadFragment: Fragment | null = null;
 	fragmentSummaries = new Map<number, FragmentSummary>(); // Keyed by moof offset
+	/** Lookups have gone past every top-level box before this file position, so its fragments have all been read */
+	fragmentsWalkedUpTo = 0;
 
 	decryptionKeyCache = new Map<string, Promise<Uint8Array>>();
 	boxNestingDepth = 0;
+	/** Positions of boxes whose fields run past the end of their parent, which get skipped */
+	damagedBoxPositions = new Set<number>();
 
 	constructor(input: Input) {
 		super(input);
@@ -408,9 +683,22 @@ export class IsobmffDemuxer extends Demuxer {
 				if (!slice) break;
 
 				const startPos = currentPos;
-				const boxInfo = readBoxHeader(slice);
+				let boxInfo = readBoxHeader(slice);
 				if (!boxInfo) {
-					break;
+					// A size of 0 means that the box extends to the end of the file, which the last top-level box may
+					// do (ISO/IEC 14496-12 4.2; FFmpeg and Chromium read it so). Only a moov box there matters here.
+					slice.filePos = startPos;
+					if (readU32Be(slice) !== 0 || readAscii(slice, 4) !== 'moov') {
+						break;
+					}
+
+					const fileSize = await this.readUntilFileSizeIsKnown(startPos);
+					if (fileSize === null) {
+						break;
+					}
+
+					const totalSize = fileSize - startPos;
+					boxInfo = { name: 'moov', totalSize, headerSize: 8, contentSize: totalSize - 8 };
 				}
 
 				if ((boxInfo.name === 'ftyp' || boxInfo.name === 'styp') && slice.remainingLength >= 4) {
@@ -418,13 +706,29 @@ export class IsobmffDemuxer extends Demuxer {
 					this.isQuickTime = majorBrand === 'qt  ';
 				} else if (boxInfo.name === 'moov') {
 					// Found moov, load it
-
 					let moovSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
 					if (isThenable(moovSlice)) moovSlice = await moovSlice;
+					if (!moovSlice) {
+						// The file is cut off inside the box (an interrupted download, say) or its size goes past the
+						// end of the file. Take what's there: the boxes before that point are complete. (The box is
+						// asked for whole first, so that a read too large to make fails as such.)
+						moovSlice = this.reader.requestSliceRange(slice.filePos, 0, boxInfo.contentSize);
+						if (isThenable(moovSlice)) {
+							moovSlice = await moovSlice;
+						}
+					}
 					if (!moovSlice) break;
 
+					this.moovIsCutOff = moovSlice.length < boxInfo.contentSize;
 					this.moovSlice = moovSlice;
-					this.readContiguousBoxes(this.moovSlice);
+					this.parseSkippingDamagedBoxes(moovSlice, slice => this.readContiguousBoxes(slice));
+
+					const compressedMovieBox = this.movieTimescale === -1 ? readCompressedMovieBox(moovSlice) : null;
+					if (compressedMovieBox) {
+						// Read the movie box that the compressed one holds instead
+						this.moovSlice = await decompressMovieBox(compressedMovieBox);
+						this.readContiguousBoxes(this.moovSlice);
+					}
 
 					if (this.movieTimescale === -1) {
 						throw new Error('Invalid moov box: missing mvhd box.');
@@ -436,11 +740,27 @@ export class IsobmffDemuxer extends Demuxer {
 						const previousSegmentDurationsInSeconds
 							= track.editListPreviousSegmentDurations / this.movieTimescale;
 						track.editListOffset -= Math.round(previousSegmentDurationsInSeconds * track.timescale);
+
+						if (
+							this.iTunesPriming !== null
+							&& !track.hasEditList
+							&& track.info?.type === 'audio'
+							&& track.info.codec === 'aac'
+						) {
+							// Without an edit list, iTunes-style files only declare the encoder delay in iTunSMPB,
+							// which FFmpeg applies just like an edit list's media time. It counts output samples, which
+							// for HE-AAC are at twice the rate of the core coder that the media timescale may follow.
+							const outputSampleRate = track.aacOutputSampleRate
+								?? (track.info.sampleRate > 0 ? track.info.sampleRate : track.timescale);
+							track.editListOffset = Math.round(this.iTunesPriming * track.timescale / outputSampleRate);
+						}
 					}
 
+					await this.applyReferencedSampleDescriptions(startPos + boxInfo.totalSize);
+
 					lookForMfraBox = this.isFragmented
-						&& this.reader.fileSize !== null
-						&& this.reader.fileSize > startPos + boxInfo.totalSize; // There's more after the moov box
+						&& this.reader.randomAccessFileSize !== null // Not if the file can only be streamed
+						&& this.reader.randomAccessFileSize > startPos + boxInfo.totalSize; // More after the moov box
 					foundMovieBoxes = true;
 
 					break;
@@ -498,7 +818,7 @@ export class IsobmffDemuxer extends Demuxer {
 							if (isThenable(mfraSlice)) mfraSlice = await mfraSlice;
 
 							if (mfraSlice) {
-								this.readContiguousBoxes(mfraSlice);
+								this.parseSkippingDamagedBoxes(mfraSlice, slice => this.readContiguousBoxes(slice));
 							}
 						}
 					}
@@ -521,6 +841,121 @@ export class IsobmffDemuxer extends Demuxer {
 		})();
 	}
 
+	/**
+	 * For tracks with several sample descriptions, takes the codec info from the one the first samples refer to:
+	 * through the sample table's first chunk, or for fragmented files through the first fragment's tfhd or trex. FFmpeg
+	 * switches between descriptions per sample, and Chromium picks the one trex refers to. Without either, the last
+	 * description is kept.
+	 */
+	private async applyReferencedSampleDescriptions(moovEndPos: number) {
+		const tracks = this.tracks.filter(track => track.sampleDescriptionStates.length > 1);
+		if (tracks.length === 0) {
+			return;
+		}
+
+		let firstFragmentIndices: Map<number, number> | null = null;
+		if (this.isFragmented && tracks.some(track => track.firstChunkSampleDescriptionIndex === null)) {
+			firstFragmentIndices = await this.readFirstFragmentSampleDescriptionIndices(moovEndPos);
+		}
+
+		for (const track of tracks) {
+			const candidates = [
+				track.firstChunkSampleDescriptionIndex,
+				...(this.isFragmented
+					? [
+							firstFragmentIndices?.get(track.id),
+							this.fragmentTrackDefaults.get(track.id)?.defaultSampleDescriptionIndex,
+						]
+					: []),
+			];
+			const index = candidates.find(x => x != null && x >= 1 && x <= track.sampleDescriptionStates.length);
+
+			if (index != null) {
+				Object.assign(track, track.sampleDescriptionStates[index - 1]!);
+			}
+		}
+	}
+
+	/** Reads which sample description each track fragment of the first moof box refers to, by track ID. */
+	private async readFirstFragmentSampleDescriptionIndices(pos: number) {
+		const indices = new Map<number, number>();
+
+		// Any number of boxes (like sidx, styp, emsg or free) may come before the first moof box. Every box moves the
+		// position forward by at least its header, so this ends at the first moof box or the end of the file.
+		while (true) {
+			let slice = this.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice) {
+				break;
+			}
+
+			const boxInfo = readBoxHeader(slice);
+			if (!boxInfo || boxInfo.totalSize === 0) {
+				break;
+			}
+
+			if (boxInfo.name === 'moof') {
+				let moofSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
+				if (isThenable(moofSlice)) {
+					moofSlice = await moofSlice;
+				}
+				if (!moofSlice) {
+					break;
+				}
+
+				for (const { boxInfo: trafInfo, slice: trafSlice } of this.iterateContiguousBoxes(moofSlice)) {
+					if (trafInfo.name !== 'traf') {
+						continue;
+					}
+
+					const trafContentSlice = trafSlice.slice(trafSlice.filePos, trafInfo.contentSize);
+					const children = this.iterateContiguousBoxes(trafContentSlice);
+					for (const { boxInfo: childInfo, slice: childSlice } of children) {
+						if (childInfo.name !== 'tfhd') {
+							continue;
+						}
+
+						childSlice.skip(1); // Version
+						const flags = readU24Be(childSlice);
+						const trackId = readU32Be(childSlice);
+						const hasBaseDataOffset = Boolean(flags & 0x000001);
+						if (flags & 0x000002 && childInfo.contentSize >= (hasBaseDataOffset ? 20 : 12)) {
+							childSlice.skip(hasBaseDataOffset ? 8 : 0);
+							indices.set(trackId, readU32Be(childSlice));
+						}
+
+						break;
+					}
+				}
+
+				break;
+			}
+
+			pos += boxInfo.totalSize;
+		}
+
+		return indices;
+	}
+
+	/** The file size, reading on from the given position until the end of the file if the source doesn't know it. */
+	private async readUntilFileSizeIsKnown(pos: number) {
+		while (this.reader.fileSizeNonStrict === null) {
+			let slice = this.reader.requestSliceRange(pos, 0, 2 ** 16);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			if (!slice || slice.length === 0) {
+				break;
+			}
+
+			pos += slice.length;
+		}
+
+		return this.reader.fileSizeNonStrict;
+	}
+
 	private async copyMetadataFromInitInput(initInput: Input) {
 		const initDemuxer = (await initInput._getDemuxer()) as IsobmffDemuxer;
 		if (initDemuxer.constructor !== IsobmffDemuxer) {
@@ -531,6 +966,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 		this.movieTimescale = initDemuxer.movieTimescale;
 		this.movieDurationInTimescale = initDemuxer.movieDurationInTimescale;
+		this.fragmentedMovieDurationInTimescale = initDemuxer.fragmentedMovieDurationInTimescale;
 		this.movieMatrix = initDemuxer.movieMatrix;
 		this.metadataTags = initDemuxer.metadataTags;
 		this.isFragmented = true;
@@ -548,19 +984,34 @@ export class IsobmffDemuxer extends Demuxer {
 				durationInMediaTimescale: foreignTrack.durationInMediaTimescale,
 				durationInMovieTimescale: foreignTrack.durationInMovieTimescale,
 				matrix: foreignTrack.matrix,
+				presentationWidth: foreignTrack.presentationWidth,
+				presentationHeight: foreignTrack.presentationHeight,
+				hasPaspBox: foreignTrack.hasPaspBox,
 				internalCodecId: foreignTrack.internalCodecId,
 				name: foreignTrack.name,
 				languageCode: foreignTrack.languageCode,
 				sampleTableByteOffset: null,
 				sampleTable: null,
+				encryptionInfos: foreignTrack.encryptionInfos,
 				fragmentLookupTable: [],
+				fragmentDecodeEnds: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
+				nextFragmentOffsets: new Map(),
+				unplacedFragmentOffsets: [],
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
+				hasEditList: foreignTrack.hasEditList,
 				encryptionInfo: foreignTrack.encryptionInfo,
+				sampleDescriptionStates: [],
+				firstChunkSampleDescriptionIndex: null,
+				encryptionGroups: foreignTrack.encryptionGroups,
+				defaultEncryptionGroup: foreignTrack.defaultEncryptionGroup,
+				encryptionGroupRuns: foreignTrack.encryptionGroupRuns,
+				sampleDescriptionRecords: foreignTrack.sampleDescriptionRecords,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
+				encryptedSampleDescriptions: foreignTrack.encryptedSampleDescriptions,
 				maxBitrate: foreignTrack.maxBitrate,
 				avgBitrate: foreignTrack.avgBitrate,
 				info: foreignTrack.info,
@@ -615,7 +1066,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 		this.currentTrack = internalTrack;
 		try {
-			this.traverseBox(stblContainerSlice);
+			this.parseSkippingDamagedBoxes(stblContainerSlice, slice => this.traverseBox(slice));
 		} catch (error) {
 			internalTrack.sampleTable = null;
 			throw error;
@@ -643,6 +1094,10 @@ export class IsobmffDemuxer extends Demuxer {
 
 		capEntryCounts(sampleTable.sampleTimingEntries, sampleTable.sampleCount);
 		capEntryCounts(sampleTable.sampleCompositionTimeOffsets, sampleTable.sampleCount);
+
+		if (hasOnlyKeySamples(internalTrack)) {
+			sampleTable.keySampleIndices = null; // Whatever the stss box says
+		}
 
 		const isPcmCodec = internalTrack.info?.type === 'audio'
 			&& internalTrack.info.codec
@@ -731,6 +1186,105 @@ export class IsobmffDemuxer extends Demuxer {
 			sampleTable.sampleTimingEntries = newSampleTimingEntries;
 			sampleTable.sampleSizes = newSampleSizes;
 			sampleTable.sampleCount = newSampleSizes.length;
+		} else if (
+			internalTrack.info?.type === 'audio'
+			&& internalTrack.info.soundPacketLayout
+			&& sampleTable.sampleCompositionTimeOffsets.length === 0
+			&& sampleTable.sampleTimingEntries.length > 0
+			&& sampleTable.sampleTimingEntries.every(x => x.delta === 1)
+			&& sampleTable.sampleSizes.length === 1
+		) {
+			// Old QuickTime files store some compressed audio (like MP3) the way they store PCM: the sample table
+			// counts decoded samples, each one byte "large", and the sound sample description tells how many decoded
+			// samples and bytes make up one compressed packet. Like FFmpeg, turn every packet into a sample.
+			let { samplesPerPacket, bytesPerFrame } = internalTrack.info.soundPacketLayout;
+
+			if (internalTrack.info.codec === 'mp3') {
+				// Packets can hold several MP3 frames, which are of the same size in such constant-bitrate files.
+				// Layer II frames always hold 1152 samples, Layer III ones 576 at the MPEG-2 and 2.5 sample rates.
+				const isLayer2 = internalTrack.internalCodecId === '.mp2';
+				const frameSamples = isLayer2 || internalTrack.info.sampleRate >= 32000 ? 1152 : 576;
+				const framesPerPacket = samplesPerPacket / frameSamples;
+				if (Number.isInteger(framesPerPacket) && framesPerPacket > 1 && bytesPerFrame % framesPerPacket === 0) {
+					samplesPerPacket = frameSamples;
+					bytesPerFrame /= framesPerPacket;
+				}
+			}
+
+			// Chunks must hold whole packets; FFmpeg rejects them otherwise too
+			if (sampleTable.sampleToChunk.every(x => x.samplesPerChunk % samplesPerPacket === 0)) {
+				const newSampleTimingEntries: SampleTimingEntry[] = [];
+				let newSampleCount = 0;
+
+				for (let i = 0; i < sampleTable.sampleToChunk.length; i++) {
+					const chunkEntry = sampleTable.sampleToChunk[i]!;
+					const nextEntry = sampleTable.sampleToChunk[i + 1];
+					const chunkCount = Math.min(
+						nextEntry ? nextEntry.startChunkIndex : Infinity,
+						sampleTable.chunkOffsets.length,
+					) - chunkEntry.startChunkIndex;
+					const packetsPerChunk = chunkEntry.samplesPerChunk / samplesPerPacket;
+					const newStartSampleIndex = newSampleCount;
+
+					for (let j = 0; j < chunkCount; j++) {
+						const startSampleIndex = chunkEntry.startSampleIndex + j * chunkEntry.samplesPerChunk;
+						if (startSampleIndex >= sampleTable.sampleCount) {
+							break;
+						}
+
+						const timingEntry = sampleTable.sampleTimingEntries[binarySearchLessOrEqual(
+							sampleTable.sampleTimingEntries,
+							startSampleIndex,
+							x => x.startIndex,
+						)]!;
+						const startTimestamp = timingEntry.startDecodeTimestamp
+							+ (startSampleIndex - timingEntry.startIndex) * timingEntry.delta;
+
+						const lastTimingEntry = last(newSampleTimingEntries);
+						if (
+							lastTimingEntry
+							&& lastTimingEntry.startDecodeTimestamp + lastTimingEntry.count * samplesPerPacket
+							=== startTimestamp
+						) {
+							lastTimingEntry.count += packetsPerChunk;
+						} else {
+							newSampleTimingEntries.push({
+								startIndex: newSampleCount,
+								startDecodeTimestamp: startTimestamp,
+								count: packetsPerChunk,
+								delta: samplesPerPacket,
+							});
+						}
+
+						newSampleCount += packetsPerChunk;
+					}
+
+					chunkEntry.startSampleIndex = newStartSampleIndex;
+					chunkEntry.samplesPerChunk = packetsPerChunk;
+				}
+
+				sampleTable.sampleTimingEntries = newSampleTimingEntries;
+				sampleTable.sampleSizes = [bytesPerFrame];
+				sampleTable.sampleCount = newSampleCount;
+				sampleTable.keySampleIndices = null;
+			}
+		}
+
+		// A file cut off in its media data (an interrupted download, say) still describes the samples it lost. Like
+		// reading the packets one after the other, the track ends before the first sample whose data isn't there.
+		const fileSize = this.reader.fileSizeNonStrict;
+		if (fileSize !== null) {
+			const sampleCount = countSamplesWithData(sampleTable, fileSize);
+			if (sampleCount < sampleTable.sampleCount) {
+				sampleTable.sampleCount = sampleCount;
+				capEntryCounts(sampleTable.sampleTimingEntries, sampleCount);
+				capEntryCounts(sampleTable.sampleCompositionTimeOffsets, sampleCount);
+
+				const keySampleIndices = sampleTable.keySampleIndices;
+				while (keySampleIndices && keySampleIndices.length > 0 && last(keySampleIndices)! >= sampleCount) {
+					keySampleIndices.pop();
+				}
+			}
 		}
 
 		if (sampleTable.sampleCompositionTimeOffsets.length > 0) {
@@ -799,8 +1353,11 @@ export class IsobmffDemuxer extends Demuxer {
 		return sampleTable;
 	}
 
-	async readFragment(startPos: number): Promise<Fragment | null> {
+	/** Reads the fragment at the given position for a lookup of the given track, which reads its fragments in order */
+	async readFragment(startPos: number, track: InternalTrack): Promise<Fragment | null> {
 		if (this.lastReadFragment?.moofOffset === startPos) {
+			// It may have been read for another track, which can leave this track's samples unplaced (see below)
+			this.placeFragment(this.lastReadFragment, track);
 			return this.lastReadFragment;
 		}
 
@@ -811,11 +1368,13 @@ export class IsobmffDemuxer extends Demuxer {
 		const moofBoxInfo = readBoxHeader(headerSlice);
 		assert(moofBoxInfo?.name === 'moof');
 
-		let entireSlice = this.reader.requestSlice(startPos, moofBoxInfo.totalSize);
+		// With a known file size, the header of the box after the moof box is read along with it, see rememberMdatSize
+		const readSize = moofBoxInfo.totalSize + (this.reader.fileSizeNonStrict !== null ? MAX_BOX_HEADER_SIZE : 0);
+		let entireSlice = this.reader.requestSliceRange(startPos, moofBoxInfo.totalSize, readSize);
 		if (isThenable(entireSlice)) entireSlice = await entireSlice;
 		if (!entireSlice) return null; // The moof box is cut off
 
-		this.traverseBox(entireSlice);
+		this.parseSkippingDamagedBoxes(entireSlice, slice => this.traverseBox(slice));
 
 		const fragment = this.lastReadFragment;
 		assert(fragment && fragment.moofOffset === startPos);
@@ -824,92 +1383,17 @@ export class IsobmffDemuxer extends Demuxer {
 			moofSize: fragment.moofSize,
 			trackIds: new Set(fragment.trackData.keys()),
 		});
+		rememberMdatSize(this, startPos + moofBoxInfo.totalSize, entireSlice);
 
 		for (const [, trackData] of fragment.trackData) {
-			const track = trackData.track;
-			const { fragmentPositionCache } = track;
-
-			if (!trackData.startTimestampIsFinal) {
-				// It may be that some tracks don't define the base decode time, i.e. when the fragment begins. This
-				// we'll need to figure out the start timestamp another way. We'll compute the timestamp by accessing
-				// the lookup entries and fragment cache, which works out nicely with the lookup algorithm: If these
-				// exist, then the lookup will automatically start at the furthest possible point. If they don't, the
-				// lookup starts sequentially from the start, incrementally summing up all fragment durations. It's sort
-				// of implicit, but it ends up working nicely.
-
-				// The table is sorted by timestamp, which for any sane file means it's also sorted by offset
-				const lookupEntryIndex = binarySearchExact(
-					track.fragmentLookupTable,
-					fragment.moofOffset,
-					x => x.moofOffset,
-				);
-				const lookupEntry = track.fragmentLookupTable[lookupEntryIndex];
-				const lookupEntryIsValid = lookupEntry
-					&& trackData.trunSampleCounts.length >= lookupEntry.trunNumber
-					&& trackData.trunSampleCounts[lookupEntry.trunNumber - 1]! >= lookupEntry.sampleNumber;
-
-				if (lookupEntryIsValid) {
-					// We ignore traf number here, since we've already matched based on track ID
-
-					let sampleIndex = 0;
-					for (let i = 1; i < lookupEntry.trunNumber; i++) {
-						sampleIndex += trackData.trunSampleCounts[i - 1]!;
-					}
-
-					sampleIndex += lookupEntry.sampleNumber - 1;
-					const sample = trackData.samples[sampleIndex];
-					assert(sample); // Must hold due to the above range checks
-
-					// The timestamp in the lookup entry describes the timestamp of the referenced sample
-					const timestampOffset = lookupEntry.timestamp - sample.presentationTimestamp;
-					offsetFragmentTrackDataByTimestamp(trackData, timestampOffset);
-				} else {
-					const lastCacheIndex = binarySearchLessOrEqual(
-						fragmentPositionCache,
-						fragment.moofOffset - 1,
-						x => x.moofOffset,
-					);
-					if (lastCacheIndex !== -1) {
-						// Let's use the end timestamp of the previous fragment in the cache
-						const lastCache = fragmentPositionCache[lastCacheIndex]!;
-						offsetFragmentTrackDataByTimestamp(trackData, lastCache.endTimestamp);
-					} else {
-						// We're the first fragment I guess, "offset by 0"
-					}
-				}
-
-				trackData.startTimestampIsFinal = true;
-			}
-
-			// Let's remember that a fragment with a given timestamp is here, speeding up future lookups if no
-			// lookup table exists
-			const insertionIndex = binarySearchLessOrEqual(
-				fragmentPositionCache,
-				trackData.startTimestamp,
-				x => x.startTimestamp,
-			);
-			const previousEntry = fragmentPositionCache[insertionIndex];
-			const nextEntry = fragmentPositionCache[insertionIndex + 1];
-
-			// Only remember it if the timestamp order matches the moof offset order
-			if (
-				(!previousEntry || previousEntry.moofOffset < fragment.moofOffset)
-				&& (!nextEntry || nextEntry.moofOffset > fragment.moofOffset)
-			) {
-				fragmentPositionCache.splice(insertionIndex + 1, 0, {
-					moofOffset: fragment.moofOffset,
-					startTimestamp: trackData.startTimestamp,
-					endTimestamp: trackData.endTimestamp,
-					hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
-				});
-			}
-
 			// If senc wasn't parsed but saiz+saio were, fetch the aux info now and stamp each sample with it
-			if (trackData.encryptionAuxInfo && track.encryptionInfo) {
+			if (trackData.encryptionAuxInfo && trackData.track.encryptionInfo) {
 				const entries = await resolveEncryptionAuxInfo(
 					this.reader,
-					track.encryptionInfo,
+					trackData.track.encryptionInfo,
 					trackData.encryptionAuxInfo,
+					trackData.trunSampleCounts,
+					i => trackData.samples[i]?.encryptionGroup ?? null,
 				);
 
 				for (let i = 0; i < Math.min(trackData.samples.length, entries.length); i++) {
@@ -919,7 +1403,204 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 		}
 
+		this.placeFragment(fragment, track);
 		return fragment;
+	}
+
+	/** Reads a '----' ilst item, made of mean, name and data boxes. */
+	readFreeformMetadataItem(slice: FileSlice, endPos: number) {
+		let name: string | null = null;
+		let value: string | null = null;
+
+		while (endPos - slice.filePos >= MIN_BOX_HEADER_SIZE) {
+			const startPos = slice.filePos;
+			const boxInfo = readBoxHeader(slice);
+			if (!boxInfo || startPos + boxInfo.totalSize > endPos) {
+				break;
+			}
+
+			if (boxInfo.name === 'name' && boxInfo.contentSize >= 4) {
+				slice.skip(4); // Version + flags
+				name = textDecoder.decode(readBytes(slice, boxInfo.contentSize - 4));
+			} else if (boxInfo.name === 'data') {
+				slice.filePos = startPos;
+				const data = readDataBox(slice);
+				if (typeof data === 'string') {
+					value = data;
+				}
+			}
+
+			slice.filePos = startPos + boxInfo.totalSize;
+		}
+
+		if (name === 'iTunSMPB' && value !== null) {
+			// Hex fields: reserved, encoder delay, end padding, sample count (FFmpeg's ff_itunes_parse_smpb)
+			const match = /^\s*[0-9a-fA-F]{1,16}\s+([0-9a-fA-F]{1,16})\s+[0-9a-fA-F]{1,16}\s+[0-9a-fA-F]{1,16}\b/
+				.exec(value);
+			const priming = match ? Number.parseInt(match[1]!, 16) : 0;
+
+			if (priming > 0 && priming < 16384) { // The plausible range used by FFmpeg
+				this.iTunesPriming ??= priming;
+			}
+		}
+	}
+
+	/** Places the samples of a fragment read for a lookup of the given track and moves `fragmentsWalkedUpTo` past it */
+	private placeFragment(fragment: Fragment, track: InternalTrack) {
+		for (const [, trackData] of fragment.trackData) {
+			// A lookup for the track reads its fragments in order. For the other tracks, this fragment may come after
+			// fragments of theirs that weren't read yet.
+			this.placeFragmentTrackData(fragment, trackData, trackData.track === track);
+		}
+
+		this.passTopLevelBox(fragment.moofOffset, fragment.moofOffset + fragment.moofSize);
+	}
+
+	/** Moves `fragmentsWalkedUpTo` past a top-level box that a lookup went past */
+	passTopLevelBox(start: number, end: number) {
+		if (this.fragmentsWalkedUpTo >= start && this.fragmentsWalkedUpTo < end) {
+			this.fragmentsWalkedUpTo = end;
+		}
+	}
+
+	/**
+	 * Settles the start timestamp of a track's samples in a fragment if it isn't final yet, and remembers where the
+	 * fragment is. When a fragment doesn't say when its samples begin, that's where the track's previous fragment
+	 * ended. That's only known once all of the track's fragments before it have been placed: when a lookup for the
+	 * track reads them in order, or when lookups have gone past every top-level box before the fragment and none of
+	 * the track's samples there is unplaced. Otherwise, the samples stay unplaced (unless a lookup entry places them)
+	 * until then.
+	 */
+	placeFragmentTrackData(fragment: Fragment, trackData: FragmentTrackData, readInOrder: boolean) {
+		const track = trackData.track;
+		const { fragmentPositionCache } = track;
+		// If so, the track's last remembered fragment before this one is the one right before it
+		const previousFragmentsArePlaced = readInOrder || (
+			this.fragmentsWalkedUpTo >= fragment.moofOffset
+			&& (track.unplacedFragmentOffsets[0] ?? Infinity) > fragment.moofOffset
+		);
+
+		if (!trackData.startTimestampIsFinal) {
+			// It may be that some tracks don't define the base decode time, i.e. when the fragment begins. This
+			// we'll need to figure out the start timestamp another way. We'll compute the timestamp by accessing
+			// the lookup entries and fragment cache, which works out nicely with the lookup algorithm: If these
+			// exist, then the lookup will automatically start at the furthest possible point. If they don't, the
+			// lookup starts sequentially from the start, incrementally summing up all fragment durations. It's sort
+			// of implicit, but it ends up working nicely.
+
+			// The table is sorted by timestamp, which for any sane file means it's also sorted by offset
+			const lookupEntryIndex = binarySearchExact(
+				track.fragmentLookupTable,
+				fragment.moofOffset,
+				x => x.moofOffset,
+			);
+			const lookupEntry = track.fragmentLookupTable[lookupEntryIndex];
+			const lookupEntryIsValid = lookupEntry
+				&& trackData.trunSampleCounts.length >= lookupEntry.trunNumber
+				&& trackData.trunSampleCounts[lookupEntry.trunNumber - 1]! >= lookupEntry.sampleNumber
+				&& (lookupEntry.sampleNumber === 1 || !trackData.samplesAreGrouped);
+			const placedIndex = binarySearchExact(track.fragmentDecodeEnds, fragment.moofOffset, x => x.moofOffset);
+
+			if (lookupEntryIsValid) {
+				// We ignore traf number here, since we've already matched based on track ID
+
+				let sampleIndex = 0;
+				for (let i = 1; i < lookupEntry.trunNumber; i++) {
+					sampleIndex += trackData.trunSampleCounts[i - 1]!;
+				}
+
+				sampleIndex += lookupEntry.sampleNumber - 1;
+				const sample = trackData.samples[sampleIndex];
+				assert(sample); // Must hold due to the above range checks
+
+				// The timestamp in the lookup entry describes the timestamp of the referenced sample
+				const timestampOffset = lookupEntry.timestamp - sample.presentationTimestamp;
+				offsetFragmentTrackDataByTimestamp(trackData, timestampOffset);
+			} else if (placedIndex !== -1) {
+				// We've placed it before
+				offsetFragmentTrackDataByTimestamp(
+					trackData,
+					track.fragmentDecodeEnds[placedIndex]!.endDecodeTimestamp - trackData.currentTimestamp,
+				);
+			} else if (previousFragmentsArePlaced) {
+				const previousIndex = binarySearchLessOrEqual(
+					track.fragmentDecodeEnds,
+					fragment.moofOffset - 1,
+					x => x.moofOffset,
+				);
+				if (previousIndex !== -1) {
+					// Let's continue decoding where the previous fragment left off
+					offsetFragmentTrackDataByTimestamp(
+						trackData,
+						track.fragmentDecodeEnds[previousIndex]!.endDecodeTimestamp,
+					);
+				} else {
+					// We're the first fragment, so we continue where the samples in the moov box end (which is at
+					// 0 if there are none)
+					let lastTimingEntry: SampleTimingEntry | undefined;
+					try {
+						lastTimingEntry = last(this.getSampleTableForTrack(track).sampleTimingEntries);
+					} catch {
+						// A sample table that can't be read (a damaged file) leaves the fragment at 0, as before
+					}
+					if (lastTimingEntry) {
+						const { startDecodeTimestamp, count, delta } = lastTimingEntry;
+						offsetFragmentTrackDataByTimestamp(trackData, startDecodeTimestamp + count * delta);
+					}
+				}
+			} else {
+				// The track's previous fragment may not have been read yet
+				insertSorted(track.unplacedFragmentOffsets, fragment.moofOffset);
+				return;
+			}
+
+			trackData.startTimestampIsFinal = true;
+		}
+
+		if (getMaxReorderedSamples(track) > 0 && !track.fragmentPresentations?.has(fragment.moofOffset)) {
+			keepFragmentPresentation(fragment, trackData);
+		}
+
+		// Let's remember that a fragment with a given timestamp is here, speeding up future lookups if no
+		// lookup table exists
+		const insertionIndex = binarySearchLessOrEqual(
+			fragmentPositionCache,
+			trackData.startTimestamp,
+			x => x.startTimestamp,
+		);
+		const previousEntry = fragmentPositionCache[insertionIndex];
+		const nextEntry = fragmentPositionCache[insertionIndex + 1];
+
+		// Only remember it if the timestamp order matches the moof offset order
+		if (
+			(!previousEntry || previousEntry.moofOffset < fragment.moofOffset)
+			&& (!nextEntry || nextEntry.moofOffset > fragment.moofOffset)
+		) {
+			fragmentPositionCache.splice(insertionIndex + 1, 0, {
+				moofOffset: fragment.moofOffset,
+				startTimestamp: trackData.startTimestamp,
+				endDecodeTimestamp: trackData.currentTimestamp,
+				hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
+			});
+		}
+
+		// Fragments without tfdt continue from here
+		const decodeEndIndex = binarySearchLessOrEqual(
+			track.fragmentDecodeEnds,
+			fragment.moofOffset,
+			x => x.moofOffset,
+		);
+		if (track.fragmentDecodeEnds[decodeEndIndex]?.moofOffset !== fragment.moofOffset) {
+			track.fragmentDecodeEnds.splice(decodeEndIndex + 1, 0, {
+				moofOffset: fragment.moofOffset,
+				endDecodeTimestamp: trackData.currentTimestamp,
+			});
+		}
+
+		const unplacedIndex = binarySearchExact(track.unplacedFragmentOffsets, fragment.moofOffset, x => x);
+		if (unplacedIndex !== -1) {
+			track.unplacedFragmentOffsets.splice(unplacedIndex, 1);
+		}
 	}
 
 	readContiguousBoxes(slice: FileSlice) {
@@ -932,6 +1613,20 @@ export class IsobmffDemuxer extends Demuxer {
 
 		try {
 			while (slice.filePos - startIndex <= slice.length - MIN_BOX_HEADER_SIZE) {
+				const fileSize = this.reader.fileSizeNonStrict;
+				if (this.moovIsCutOff && fileSize !== null) {
+					const startPos = slice.filePos;
+					const boxInfo = readBoxHeader(slice);
+					slice.filePos = startPos;
+
+					if (boxInfo && startPos + boxInfo.totalSize > fileSize) {
+						// The file is cut off inside this box, so its content is incomplete. Like FFmpeg, keep the
+						// boxes before it. (Within a complete moov box, a box past the end of the file only claims
+						// too much.)
+						break;
+					}
+				}
+
 				const foundBox = this.traverseBox(slice);
 
 				if (!foundBox) {
@@ -940,6 +1635,19 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 		} finally {
 			this.boxNestingDepth--;
+		}
+	}
+
+	/**
+	 * Iterates over the metadata items of a udta or ilst box. An item that fails to parse mustn't leave the fields
+	 * watched, and a loop that throws ends this iterator, which runs the finally.
+	 */
+	// eslint-disable-next-line @stylistic/generator-star-spacing
+	*iterateMetadataItems(slice: FileSlice) {
+		try {
+			yield* this.iterateContiguousBoxes(slice);
+		} finally {
+			unwatchMetadataTagFields(this.metadataTags);
 		}
 	}
 
@@ -954,12 +1662,171 @@ export class IsobmffDemuxer extends Demuxer {
 				break;
 			}
 
-			yield { boxInfo, slice };
-			slice.filePos = startPos + boxInfo.totalSize;
+			// Like FFmpeg, cut a box that claims to extend past its parent down to the parent's end, and hand out a
+			// slice bounded to the box so that reading its contents can't run into the boxes after it
+			const totalSize = Math.min(boxInfo.totalSize, slice.end - startPos);
+			const boxSlice = slice.slice(startPos, totalSize);
+			boxSlice.filePos = startPos + boxInfo.headerSize;
+
+			yield {
+				boxInfo: { ...boxInfo, totalSize, contentSize: Math.max(totalSize - boxInfo.headerSize, 0) },
+				slice: boxSlice,
+			};
+			slice.filePos = startPos + totalSize;
 		}
 	}
 
 	traverseBox(slice: FileSlice): boolean {
+		const startPos = slice.filePos;
+		if (this.damagedBoxPositions.size > 0 && this.damagedBoxPositions.has(startPos)) {
+			// Found to be damaged in an earlier attempt (see parseSkippingDamagedBoxes), so skip it
+			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
+			if (size < MIN_BOX_HEADER_SIZE) {
+				return false; // Nothing to skip to (size 0 runs to the end, size 1 is a 64-bit size)
+			}
+
+			slice.filePos = Math.min(startPos + size, slice.end);
+			return true;
+		}
+
+		try {
+			return this.parseBox(slice);
+		} catch (error) {
+			if (!(error instanceof SliceRangeError)) {
+				throw error;
+			}
+
+			slice.filePos = startPos;
+			const size = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readU32Be(slice) : 0;
+			const name = size > 0 ? readAscii(slice, 4) : '';
+
+			// Sample tables are read as a whole: a failure discards the partial table (see getSampleTableForTrack)
+			const sampleTableBoxes = ['stbl', 'stts', 'ctts', 'stss', 'stsc', 'stsz', 'stz2', 'stco', 'co64'];
+			if (sampleTableBoxes.includes(name)) {
+				throw error;
+			}
+
+			// The box's fields run past its end and its parent's, so it's damaged (a broken size field, a cut-off
+			// file). Rather than failing the whole file, have the parse redone without it, like FFmpeg skips atoms
+			// it can't read.
+			throw new DamagedBoxError(startPos);
+		}
+	}
+
+	/**
+	 * Runs a parse (of the moov, a fragment, ...) so that boxes whose fields run past the end of their parent are
+	 * skipped: the parse is redone without such a box, from a snapshot of the state before it. That undoes everything
+	 * the damaged box changed, at no cost to intact files.
+	 */
+	parseSkippingDamagedBoxes(slice: FileSlice, parse: (slice: FileSlice) => unknown) {
+		const startPos = slice.filePos;
+		const restoreState = this.snapshotParsingState();
+		const damagedBoxPositions: number[] = [];
+
+		while (true) {
+			try {
+				parse(slice);
+				return;
+			} catch (error) {
+				if (!(error instanceof DamagedBoxError)) {
+					throw error;
+				}
+
+				restoreState();
+				if (damagedBoxPositions.length === MAX_DAMAGED_BOXES_PER_PARSE) {
+					// Each one redoes the parse, so cap them (also keeping crafted files from taking quadratic time)
+					throw new Error('Invalid MP4 file: too many damaged boxes.');
+				}
+
+				damagedBoxPositions.push(error.position);
+				for (const position of damagedBoxPositions) {
+					this.damagedBoxPositions.add(position); // The restore undid earlier additions
+				}
+				slice.filePos = startPos;
+			}
+		}
+	}
+
+	/** Remembers the fields a parse can change (the demuxer's, the current track's and fragment's) for undoing it. */
+	snapshotParsingState() {
+		const track = this.currentTrack;
+		const fragment = this.currentFragment;
+		const objects: object[] = [this];
+		// The metadata tags and the track also have their plain objects (like the raw tags or the track's disposition)
+		// covered, as boxes change some of those in place
+		const withPlainObjects: Record<string, unknown>[] = [this.metadataTags];
+		if (track) {
+			withPlainObjects.push(track);
+			if (track.info) {
+				withPlainObjects.push(track.info);
+			}
+		}
+		for (const object of withPlainObjects) {
+			objects.push(object);
+			for (const key in object) {
+				const value = object[key];
+				if (value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype
+					&& value !== track?.info) {
+					objects.push(value);
+				}
+			}
+		}
+		if (fragment) {
+			objects.push(fragment);
+			const trackData = track && fragment.trackData.get(track.id);
+			if (trackData) {
+				objects.push(trackData);
+			}
+		}
+
+		// Flat list of [object, its keys, its values, then collection and length pairs] per object
+		const snapshots: unknown[][] = [];
+		for (const object of objects as Record<string, unknown>[]) {
+			const keys = Object.keys(object);
+			const values: unknown[] = [];
+			const snapshot: unknown[] = [object, keys, values];
+			for (const key of keys) {
+				const value = object[key];
+				values.push(value);
+				if (Array.isArray(value)) {
+					snapshot.push(value, value.length);
+				} else if (value instanceof Map || value instanceof Set) {
+					snapshot.push(value, value.size);
+				}
+			}
+			snapshots.push(snapshot);
+		}
+
+		return () => {
+			for (const snapshot of snapshots) {
+				const object = snapshot[0] as Record<string, unknown>;
+				const keys = snapshot[1] as string[];
+				const values = snapshot[2] as unknown[];
+				for (const key of Object.keys(object)) {
+					if (!keys.includes(key)) {
+						delete object[key];
+					}
+				}
+				for (let i = 0; i < keys.length; i++) {
+					object[keys[i]!] = values[i];
+				}
+				for (let i = 3; i < snapshot.length; i += 2) {
+					const collection = snapshot[i] as unknown[] | Map<unknown, unknown> | Set<unknown>;
+					const length = snapshot[i + 1] as number;
+					if (Array.isArray(collection)) {
+						collection.length = length;
+					} else {
+						// Entries keep insertion order, so the ones added since come last
+						for (const key of [...collection.keys()].slice(length)) {
+							collection.delete(key);
+						}
+					}
+				}
+			}
+		};
+	}
+
+	parseBox(slice: FileSlice): boolean {
 		const startPos = slice.filePos;
 		const boxInfo = readBoxHeader(slice);
 		if (!boxInfo) {
@@ -967,10 +1834,47 @@ export class IsobmffDemuxer extends Demuxer {
 		}
 
 		const contentStartPos = slice.filePos;
+
+		if (startPos + boxInfo.totalSize > slice.end) {
+			// Like FFmpeg (mov_read_default), cut a box that claims to extend past its parent down to the parent's end
+			boxInfo.totalSize = slice.end - startPos;
+			boxInfo.contentSize = Math.max(slice.end - contentStartPos, 0);
+		}
+
 		const boxEndPos = startPos + boxInfo.totalSize;
 
+		if (boxInfo.contentSize < (MIN_BOX_CONTENT_SIZES[boxInfo.name] ?? 0)) {
+			// Too small for its fixed fields (e.g. empty); skip it rather than reading past it, like FFmpeg
+			slice.filePos = boxEndPos;
+			return true;
+		}
+
 		switch (boxInfo.name) {
-			case 'mdia':
+			case 'mdia': {
+				const mdiaSlice = slice.slice(contentStartPos, boxInfo.contentSize);
+
+				// The handler type decides how the sample descriptions in minf are read, but ISO/IEC 14496-12 doesn't
+				// require hdlr to come before minf (some MPEG-4 Systems encoders put it last), so read it first
+				while (mdiaSlice.remainingLength >= MIN_BOX_HEADER_SIZE) {
+					const childStartPos = mdiaSlice.filePos;
+					const childInfo = readBoxHeader(mdiaSlice);
+					if (!childInfo) {
+						break;
+					}
+
+					if (childInfo.name === 'hdlr') {
+						mdiaSlice.filePos = childStartPos;
+						this.traverseBox(mdiaSlice);
+						break;
+					}
+
+					mdiaSlice.filePos = childStartPos + childInfo.totalSize;
+				}
+
+				mdiaSlice.filePos = contentStartPos;
+				this.readContiguousBoxes(mdiaSlice);
+			}; break;
+
 			case 'minf':
 			case 'dinf':
 			case 'mfra':
@@ -981,6 +1885,7 @@ export class IsobmffDemuxer extends Demuxer {
 			}; break;
 
 			case 'mvhd': {
+				const isFirstMovieHeader = this.movieTimescale === -1;
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
@@ -998,7 +1903,12 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (creationTime !== 0) {
-					this.metadataTags.creationTime = new Date(1000 * (creationTime - TIMESTAMP_OFFSET));
+					const date = new Date(1000 * (creationTime - TIMESTAMP_OFFSET));
+					if (!Number.isNaN(date.getTime())) {
+						this.metadataTags.creationTime = date;
+					} else {
+						// Further from 1970 than a Date can hold (275,760 years), so it's garbage
+					}
 				} else {
 					// Assume this means the creation time isn't set (I doubt the file was created in 1904)
 				}
@@ -1009,6 +1919,14 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4 + 2 + 2 + 2 * 4); // Rate, volume, reserved
 				this.movieMatrix = readMatrix(slice);
+
+				if (isFirstMovieHeader) {
+					// The children of moov may come in any order (QuickTime File Format), so tracks may precede the
+					// mvhd box. Their matrices were composed with the identity matrix the movie matrix starts as.
+					for (const track of this.tracks) {
+						track.matrix = multiplyMatrices(track.matrix, this.movieMatrix);
+					}
+				}
 			}; break;
 
 			case 'trak': {
@@ -1029,19 +1947,34 @@ export class IsobmffDemuxer extends Demuxer {
 					durationInMovieTimescale: -1,
 					durationInMediaTimescale: -1,
 					matrix: IDENTITY_MATRIX,
+					presentationWidth: 0,
+					presentationHeight: 0,
+					hasPaspBox: false,
 					internalCodecId: null,
 					name: null,
 					languageCode: UNDETERMINED_LANGUAGE,
 					sampleTableByteOffset: -1,
 					sampleTable: null,
+					encryptionInfos: [],
 					fragmentLookupTable: [],
+					fragmentDecodeEnds: [],
 					currentFragmentState: null,
 					fragmentPositionCache: [],
+					nextFragmentOffsets: new Map(),
+					unplacedFragmentOffsets: [],
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
+					hasEditList: false,
 					encryptionInfo: null,
+					sampleDescriptionStates: [],
+					firstChunkSampleDescriptionIndex: null,
+					encryptionGroups: [],
+					defaultEncryptionGroup: null,
+					encryptionGroupRuns: [],
+					sampleDescriptionRecords: [],
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
+					encryptedSampleDescriptions: [],
 					maxBitrate: null,
 					avgBitrate: null,
 				} satisfies InternalTrack as InternalTrack;
@@ -1056,6 +1989,8 @@ export class IsobmffDemuxer extends Demuxer {
 					&& track.sampleTableByteOffset !== -1
 				) {
 					if (track.info.type === 'video' && track.info.width !== -1) {
+						applyDisplayMatrixAspectRatio(track);
+						applyPresentationSizeAspectRatio(track);
 						const videoTrack = track as InternalVideoTrack;
 						track.trackBacking = new IsobmffVideoTrackBacking(videoTrack);
 						this.tracks.push(track);
@@ -1102,6 +2037,9 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(2 * 4 + 2 + 2 + 2 + 2);
 				const trackMatrix = readMatrix(slice);
+				// Like FFmpeg, only the integer parts of the size: they're 0 in tkhd boxes whose fields are shifted
+				track.presentationWidth = Math.floor(readU32Be(slice) / 0x10000);
+				track.presentationHeight = Math.floor(readU32Be(slice) / 0x10000);
 
 				// The track matrix maps into movie space, and the movie matrix then maps into the final output space
 				track.matrix = multiplyMatrices(trackMatrix, this.movieMatrix);
@@ -1116,10 +2054,11 @@ export class IsobmffDemuxer extends Demuxer {
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
+				track.hasEditList = true;
 				let relevantEntryFound = false;
 				let previousSegmentDurations = 0;
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, version === 1 ? 20 : 12);
 				for (let i = 0; i < entryCount; i++) {
 					const segmentDuration = version === 1
 						? readU64Be(slice)
@@ -1177,7 +2116,16 @@ export class IsobmffDemuxer extends Demuxer {
 
 				let language = readU16Be(slice);
 
-				if (language > 0) {
+				if (language < 0x400) {
+					// Not a packed ISO 639-2/T code (whose first letter makes it at least 0x400), but in QuickTime
+					// files, one of the Macintosh language codes, 0 being English
+					if (this.isQuickTime) {
+						const languageCode = language < 128
+							? MACINTOSH_LANGUAGE_CODES[language]
+							: MACINTOSH_LANGUAGE_CODES_FROM_128[language - 128];
+						track.languageCode = languageCode || UNDETERMINED_LANGUAGE;
+					}
+				} else {
 					track.languageCode = '';
 
 					for (let i = 0; i < 3; i++) {
@@ -1189,6 +2137,10 @@ export class IsobmffDemuxer extends Demuxer {
 						// Sometimes the bytes are garbage
 						track.languageCode = UNDETERMINED_LANGUAGE;
 					}
+
+					// The code is meant to be the terminology one, but some writers (FFmpeg, when given one) store the
+					// bibliographic one, like "ger" for "deu"
+					track.languageCode = fromMatroskaLanguageCode(track.languageCode);
 				}
 			}; break;
 
@@ -1201,17 +2153,21 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(8); // Version + flags + pre-defined
 				const handlerType = readAscii(slice, 4);
 
+				// The media handler is read ahead of the other boxes in mdia, so it may have been read already
 				if (handlerType === 'vide') {
-					track.info = {
+					track.info ??= {
 						type: 'video',
 						width: -1,
 						height: -1,
 						squarePixelWidth: -1,
 						squarePixelHeight: -1,
+						hasPixelAspectRatioBox: false,
+						pixelAspectRatio: { num: 1, den: 1 },
 						codec: null,
 						codecDescription: null,
 						colorSpace: { ...EMPTY_COLOR_SPACE },
 						avcType: null,
+						hevcType: null,
 						avcCodecInfo: null,
 						hevcCodecInfo: null,
 						vp9CodecInfo: null,
@@ -1220,7 +2176,7 @@ export class IsobmffDemuxer extends Demuxer {
 						proresFormat: null,
 					};
 				} else if (handlerType === 'soun') {
-					track.info = {
+					track.info ??= {
 						type: 'audio',
 						numberOfChannels: -1,
 						sampleRate: -1,
@@ -1230,14 +2186,15 @@ export class IsobmffDemuxer extends Demuxer {
 						dtsFormat: null,
 						pcmLittleEndian: false,
 						pcmSampleSize: null,
+						soundPacketLayout: null,
 					};
 				}
 			}; break;
 
 			case 'stbl': {
 				const track = this.currentTrack;
-				if (!track) {
-					break;
+				if (!track || this.currentFragment) {
+					break; // Sample tables don't belong in fragments
 				}
 
 				track.sampleTableByteOffset = startPos;
@@ -1267,8 +2224,14 @@ export class IsobmffDemuxer extends Demuxer {
 						break;
 					}
 
+					// Each sample description can have its own encryption info (sinf), with its own key ID. The
+					// track's is the last one's, as before.
+					const previousEncryptionInfo = track.encryptionInfo;
+					track.encryptionInfo = null;
+
 					track.internalCodecId = sampleBoxInfo.name;
 					const lowercaseBoxName = sampleBoxInfo.name.toLowerCase();
+					track.encryptedSampleDescriptions.push(lowercaseBoxName === 'encv' || lowercaseBoxName === 'enca');
 
 					if (track.info.type === 'video') {
 						slice.skip(6 * 1 + 2 + 2 + 2 + 3 * 4);
@@ -1277,16 +2240,22 @@ export class IsobmffDemuxer extends Demuxer {
 						track.info.height = readU16Be(slice);
 						track.info.squarePixelWidth = track.info.width;
 						track.info.squarePixelHeight = track.info.height;
+						track.info.hasPixelAspectRatioBox = false;
+						track.info.pixelAspectRatio = { num: 1, den: 1 };
 
 						slice.skip(4 + 4 + 4 + 2 + 32 + 2 + 2);
 
 						track.frmaCodecString = null;
+						const descriptionBefore = track.info.codecDescription;
 						this.readContiguousBoxes(
 							slice.slice(
 								slice.filePos,
 								(sampleBoxStartPos + sampleBoxInfo.totalSize) - slice.filePos,
 							),
 						);
+						track.sampleDescriptionRecords[i] = track.info.codecDescription !== descriptionBefore
+							? track.info.codecDescription
+							: null;
 
 						const codecName = lowercaseBoxName === 'encv'
 							? track.frmaCodecString
@@ -1298,6 +2267,7 @@ export class IsobmffDemuxer extends Demuxer {
 							track.info.avcType = codecName === 'avc1' ? 1 : 3;
 						} else if (codecName === 'hvc1' || codecName === 'hev1') {
 							track.info.codec = 'hevc';
+							track.info.hevcType = codecName;
 						} else if (codecName === 'vp08') {
 							track.info.codec = 'vp8';
 						} else if (codecName === 'vp09') {
@@ -1330,9 +2300,14 @@ export class IsobmffDemuxer extends Demuxer {
 						if (stsdVersion === 0 && version > 0) {
 							// Additional QuickTime fields
 							if (version === 1) {
-								slice.skip(4);
-								sampleSize = 8 * readU32Be(slice);
-								slice.skip(2 * 4);
+								const samplesPerPacket = readU32Be(slice);
+								sampleSize = 8 * readU32Be(slice); // Bytes per packet (per channel)
+								const bytesPerFrame = readU32Be(slice); // Bytes per packet (all channels)
+								slice.skip(4); // Bytes per sample
+
+								track.info.soundPacketLayout = samplesPerPacket > 0 && bytesPerFrame > 0
+									? { samplesPerPacket, bytesPerFrame }
+									: null;
 							} else if (version === 2) {
 								slice.skip(4);
 								sampleRate = readF64Be(slice);
@@ -1348,7 +2323,8 @@ export class IsobmffDemuxer extends Demuxer {
 						}
 
 						track.info.numberOfChannels = channelCount;
-						track.info.sampleRate = sampleRate;
+						// A sample rate that doesn't fit is written as 0, making the media timescale our best guess
+						track.info.sampleRate = sampleRate || track.timescale;
 
 						track.frmaCodecString = null;
 						this.readContiguousBoxes(
@@ -1366,6 +2342,11 @@ export class IsobmffDemuxer extends Demuxer {
 						// developer.apple.com/documentation/quicktime-file-format/sound_sample_descriptions/
 						if (codecName === 'mp4a') {
 							// The codec is set by the esds box
+						} else if (codecName === '.mp3' || codecName === 'ms\u0000u' || codecName === '.mp2') {
+							// QuickTime's MP3 sample entries (kFullMPEGLay3Format and the older kMPEGLayer3Format),
+							// and its MPEG-1/2 Layer II one, which FFmpeg writes for MP2. Like MPEG-1 audio in an esds
+							// box, all of them are 'mp3'.
+							track.info.codec = 'mp3';
 						} else if (codecName === 'opus') {
 							track.info.codec = 'opus';
 							track.info.sampleRate = OPUS_SAMPLE_RATE; // Always the same
@@ -1385,10 +2366,15 @@ export class IsobmffDemuxer extends Demuxer {
 						} else if (codecName === 'mlpa') {
 							track.info.codec = 'truehd';
 						} else if (codecName === 'twos') {
+							// Like FFmpeg, also accept 24 and 32-bit samples, which QuickTime would label in24/in32
 							if (sampleSize === 8) {
 								track.info.codec = 'pcm-s8';
 							} else if (sampleSize === 16) {
 								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s16' : 'pcm-s16be';
+							} else if (sampleSize === 24) {
+								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s24' : 'pcm-s24be';
+							} else if (sampleSize === 32) {
+								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s32' : 'pcm-s32be';
 							} else {
 								Logging._warn(`Unsupported sample size ${sampleSize} for codec 'twos'.`);
 								track.info.codec = null;
@@ -1398,12 +2384,22 @@ export class IsobmffDemuxer extends Demuxer {
 								track.info.codec = 'pcm-s8';
 							} else if (sampleSize === 16) {
 								track.info.codec = 'pcm-s16';
+							} else if (sampleSize === 24) {
+								track.info.codec = 'pcm-s24';
+							} else if (sampleSize === 32) {
+								track.info.codec = 'pcm-s32';
 							} else {
 								Logging._warn(`Unsupported sample size ${sampleSize} for codec 'sowt'.`);
 								track.info.codec = null;
 							}
 						} else if (codecName === 'raw ') {
-							track.info.codec = 'pcm-u8';
+							// QuickTime defines 'raw ' as 8-bit, but like FFmpeg, read 16-bit samples as signed and
+							// big-endian, unless an enda box says otherwise
+							if (sampleSize === 16) {
+								track.info.codec = track.info.pcmLittleEndian ? 'pcm-s16' : 'pcm-s16be';
+							} else {
+								track.info.codec = 'pcm-u8';
+							}
 						} else if (codecName === 'in24') {
 							track.info.codec = track.info.pcmLittleEndian ? 'pcm-s24' : 'pcm-s24be';
 						} else if (codecName === 'in32') {
@@ -1470,6 +2466,8 @@ export class IsobmffDemuxer extends Demuxer {
 								if (isFloat) {
 									if (sampleSize === 32) {
 										track.info.codec = isBigEndian ? 'pcm-f32be' : 'pcm-f32';
+									} else if (sampleSize === 64) {
+										track.info.codec = isBigEndian ? 'pcm-f64be' : 'pcm-f64';
 									}
 								} else {
 									if (sFlags & (1 << (bytesPerSample - 1))) {
@@ -1498,9 +2496,27 @@ export class IsobmffDemuxer extends Demuxer {
 						} else {
 							Logging._warn(`Unsupported audio codec (sample entry type '${sampleBoxInfo.name}').`);
 						}
+
+						if (track.info.numberOfChannels === 0 && track.info.codec !== null) {
+							Logging._warn('Invalid audio sample entry: channel count must not be 0.');
+							track.info.codec = null;
+						}
 					}
 
+					track.encryptionInfos.push(track.encryptionInfo);
+					track.encryptionInfo ??= previousEncryptionInfo;
+
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
+
+					// Every description is read for what applies to the whole track (like the encryption info of a
+					// clear lead's copy), but the codec info comes from the one the samples use; see
+					// applyReferencedSampleDescriptions
+					track.sampleDescriptionStates.push({
+						info: { ...track.info },
+						internalCodecId: track.internalCodecId,
+						maxBitrate: track.maxBitrate,
+						avgBitrate: track.avgBitrate,
+					});
 				}
 			}; break;
 
@@ -1597,6 +2613,7 @@ export class IsobmffDemuxer extends Demuxer {
 					?.sequenceParameterSets[0];
 				const spsInfo = sps && parseAvcSps(sps);
 				if (spsInfo) {
+					applySpsDimensions(track, spsInfo.displayWidth, spsInfo.displayHeight);
 					applySpsPixelAspectRatio(track, spsInfo.pixelAspectRatio);
 				}
 			}; break;
@@ -1618,6 +2635,7 @@ export class IsobmffDemuxer extends Demuxer {
 					?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
 				const spsInfo = sps && parseHevcSps(sps);
 				if (spsInfo) {
+					applySpsDimensions(track, spsInfo.displayWidth, spsInfo.displayHeight);
 					applySpsPixelAspectRatio(track, spsInfo.pixelAspectRatio);
 				}
 			}; break;
@@ -1628,10 +2646,25 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				slice.skip(4); // Version + flags
+				const version = readU8(slice);
+				if (version !== 1) {
+					// Version 0 comes from an early draft of the spec with a different layout. Like FFmpeg, ignore it;
+					// the codec info then comes from the first key frame instead.
+					break;
+				}
+
+				slice.skip(3); // Flags
 
 				const profile = readU8(slice);
-				const level = readU8(slice);
+				let level = readU8(slice);
+				if (level === 0) {
+					// Not a VP9 level, but Chrome's MediaRecorder writes it into MP4 recordings, and browsers reject
+					// codec strings containing it. Derive the level from the dimensions, like when vpcC is missing.
+					const pictureSize = track.info.width * track.info.height;
+					const levelInfo = VP9_LEVEL_TABLE.find(x => pictureSize <= x.maxPictureSize);
+					level = (levelInfo ?? last(VP9_LEVEL_TABLE)!).level;
+				}
+
 				const thirdByte = readU8(slice);
 				const bitDepth = thirdByte >> 4;
 				const chromaSubsampling = (thirdByte >> 1) & 0b111;
@@ -1655,6 +2688,12 @@ export class IsobmffDemuxer extends Demuxer {
 			case 'av1C': {
 				const track = this.currentTrack;
 				if (!track || track.info?.type !== 'video') {
+					break;
+				}
+
+				if (boxInfo.contentSize < 4) {
+					// FFmpeg writes an empty av1C box when the encoder has no extradata yet (fragmented output), so
+					// let's get the info from the sequence header in the first packet instead
 					break;
 				}
 
@@ -1708,13 +2747,30 @@ export class IsobmffDemuxer extends Demuxer {
 				if (colourType !== 'nclx' && colourType !== 'nclc') {
 					break;
 				}
+				if (boxInfo.contentSize < 10) {
+					break;
+				}
+
+				const { colorSpace } = track.info;
+				if (
+					colorSpace.primaries !== undefined
+					|| colorSpace.transfer !== undefined
+					|| colorSpace.matrix !== undefined
+					|| colorSpace.fullRange !== undefined
+				) {
+					// An earlier colr box already set the color space. Boxes are ordered from the most accurate to
+					// the least (ISO/IEC 14496-12), and Chromium also reads the first one.
+					break;
+				}
 
 				const colourPrimaries = readU16Be(slice);
 				const transferCharacteristics = readU16Be(slice);
 				const matrixCoefficients = readU16Be(slice);
 
+				// Some files have nclx boxes without the full range byte (ExoPlayer has a sample of them); like
+				// FFmpeg, the rest is still used
 				let fullRange: boolean | undefined = undefined;
-				if (colourType === 'nclx') {
+				if (colourType === 'nclx' && boxInfo.contentSize >= 11) {
 					fullRange = Boolean(readU8(slice) & 0x80);
 				}
 
@@ -1734,12 +2790,18 @@ export class IsobmffDemuxer extends Demuxer {
 
 				const num = readU32Be(slice);
 				const den = readU32Be(slice);
+				if (num > 0 && den > 0) {
+					track.hasPaspBox = true;
+				}
 
 				// https://github.com/Vanilagy/mediabunny/issues/362
 				if (num > 0 && den > 0) {
-					// The ratio may already be set by the SPS, but the pasp box wins
+					// The ratio may already be set by the SPS, but the pasp box wins (also over an SPS that comes after
+					// it)
 					track.info.squarePixelWidth = track.info.width;
 					track.info.squarePixelHeight = track.info.height;
+					track.info.hasPixelAspectRatioBox = true;
+					track.info.pixelAspectRatio = simplifyRational({ num, den });
 
 					if (num > den) {
 						track.info.squarePixelWidth = Math.round(track.info.width * num / den);
@@ -1775,7 +2837,7 @@ export class IsobmffDemuxer extends Demuxer {
 
 				slice.skip(4); // Version + flags
 
-				const { objectTypeIndication, decoderSpecificInfo } = readEsDescriptor(slice);
+				const { objectTypeIndication, decoderSpecificInfo: esDecoderSpecificInfo } = readEsDescriptor(slice);
 				if (objectTypeIndication === 0x40 || objectTypeIndication === 0x67) {
 					track.info.codec = 'aac';
 					track.info.aacCodecInfo = {
@@ -1786,12 +2848,35 @@ export class IsobmffDemuxer extends Demuxer {
 					track.info.codec = 'mp3';
 				} else if (objectTypeIndication === 0xdd) {
 					track.info.codec = 'vorbis'; // "nonstandard, gpac uses it" - FFmpeg
+				} else if (objectTypeIndication === 0xa5) {
+					track.info.codec = 'ac3'; // Registered at MP4RA, like the ones below; FFmpeg and Chromium read them
+				} else if (objectTypeIndication === 0xa6) {
+					track.info.codec = 'eac3';
 				} else if (objectTypeIndication === 0xa9) {
 					track.info.codec = 'dts';
 				} else {
 					Logging._warn(
 						`Unsupported audio codec (objectTypeIndication ${objectTypeIndication}) - discarding track.`,
 					);
+				}
+
+				// An AudioSpecificConfig takes at least 2 bytes, so a shorter one is treated like a missing one
+				const isCutShort = track.info.codec === 'aac' && (esDecoderSpecificInfo?.length ?? 2) < 2;
+				const decoderSpecificInfo = isCutShort ? null : esDecoderSpecificInfo;
+
+				if (!decoderSpecificInfo && track.info.codec === 'aac') {
+					// Some writers leave out the AudioSpecificConfig. Like FFmpeg, assume AAC-LC with the sample
+					// entry's sample rate and channel count.
+					try {
+						track.info.codecDescription = buildAacAudioSpecificConfig({
+							objectType: 2,
+							outputSampleRate: track.info.sampleRate,
+							outputNumberOfChannels: track.info.numberOfChannels,
+							programConfigElement: null,
+						});
+					} catch {
+						// Channel count not expressible in an AudioSpecificConfig
+					}
 				}
 
 				if (decoderSpecificInfo) {
@@ -1804,7 +2889,30 @@ export class IsobmffDemuxer extends Demuxer {
 							track.info.numberOfChannels = audioSpecificConfig.outputNumberOfChannels;
 						}
 						if (audioSpecificConfig.outputSampleRate !== null) {
+							const sampleEntryRate = track.info.sampleRate;
+							const coreRate = audioSpecificConfig.coreSampleRate;
 							track.info.sampleRate = audioSpecificConfig.outputSampleRate;
+
+							// With implicit SBR signaling, the AudioSpecificConfig only describes the AAC-LC core coder
+							// (at up to 24 kHz), and the decoder doubles the rate once it finds SBR data in the stream.
+							// Writers like FFmpeg then give the output rate in the sample entry. (Not the media
+							// timescale, which may be a multiple of the rate of plain AAC-LC too.)
+							if (
+								audioSpecificConfig.objectType === 2
+								&& audioSpecificConfig.outputSampleRate === coreRate
+								&& coreRate <= 24000
+								&& sampleEntryRate === 2 * coreRate
+							) {
+								track.aacOutputSampleRate = 2 * coreRate;
+							}
+						}
+					} else if (track.info.codec === 'vorbis') {
+						const converted = xiphLaceLengthPrefixedVorbisHeaders(decoderSpecificInfo);
+						if (converted) {
+							track.info.codecDescription = converted.description;
+							// The identification header has the actual values
+							track.info.numberOfChannels = converted.numberOfChannels;
+							track.info.sampleRate = converted.sampleRate;
 						}
 					}
 				}
@@ -1834,6 +2942,16 @@ export class IsobmffDemuxer extends Demuxer {
 				track.info.pcmSampleSize = readU8(slice);
 			}; break;
 
+			case 'srat': {
+				const track = this.currentTrack;
+				if (!track || track.info?.type !== 'audio') {
+					break;
+				}
+
+				slice.skip(4); // Version + flags
+				track.info.sampleRate = readU32Be(slice);
+			}; break;
+
 			case 'dOps': { // Used for Opus audio
 				const track = this.currentTrack;
 				if (!track || track.info?.type !== 'audio') {
@@ -1848,6 +2966,10 @@ export class IsobmffDemuxer extends Demuxer {
 				const inputSampleRate = readU32Be(slice);
 				const outputGain = readI16Be(slice);
 				const channelMappingFamily = readU8(slice);
+
+				if (channelMappingFamily !== 0 && boxInfo.contentSize < 11 + 2 + outputChannelCount) {
+					break; // The channel mapping table is cut off
+				}
 
 				let channelMappingTable: Uint8Array;
 				if (channelMappingFamily !== 0) {
@@ -2031,20 +3153,39 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
 				slice.skip(4); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 8);
 
 				let currentIndex = 0;
 				let currentTimestamp = 0;
+				// Where the timestamps would be if the deltas were applied as written, including negative ones
+				let correctedTimestamp = 0;
 
 				for (let i = 0; i < entryCount; i++) {
 					const sampleCount = readU32Be(slice);
-					const sampleDelta = readU32Be(slice);
+					let sampleDelta = readU32Be(slice);
+
+					// The deltas are unsigned, but some writers store negative ones to correct the timestamps. Like
+					// FFmpeg (mov_read_stts), treat huge deltas as such corrections: the samples get a delta of 1,
+					// and the following samples are shortened until the timestamps have caught up.
+					if (sampleDelta > MAX_SAMPLE_DELTA) {
+						const signedDelta = sampleDelta | 0;
+						correctedTimestamp += (signedDelta < 0 ? signedDelta : 1) * sampleCount;
+						sampleDelta = 1;
+					} else {
+						correctedTimestamp += sampleDelta * sampleCount;
+					}
+
+					const excess = currentTimestamp + sampleDelta * sampleCount - correctedTimestamp;
+					if (excess > 0) {
+						const drift = Math.floor(excess / Math.max(sampleCount, 1));
+						sampleDelta -= Math.min(drift, sampleDelta - 1);
+					}
 
 					track.sampleTable.sampleTimingEntries.push({
 						startIndex: currentIndex,
@@ -2064,13 +3205,13 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
 				slice.skip(1 + 3); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 8);
 
 				let sampleIndex = 0;
 				for (let i = 0; i < entryCount; i++) {
@@ -2096,16 +3237,18 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
 				slice.skip(4); // Version + flags
 
 				const sampleSize = readU32Be(slice);
-				const sampleCount = readU32Be(slice);
+				let sampleCount = readU32Be(slice);
 
 				if (sampleSize === 0) {
+					sampleCount = capEntryCount(sampleCount, slice, boxEndPos, 4);
+
 					for (let i = 0; i < sampleCount; i++) {
 						const sampleSize = readU32Be(slice);
 						track.sampleTable.sampleSizes.push(sampleSize);
@@ -2123,7 +3266,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
@@ -2131,11 +3274,13 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(3); // Reserved
 
 				const fieldSize = readU8(slice); // in bits
-				const sampleCount = readU32Be(slice);
+				let sampleCount = readU32Be(slice);
 
 				if (fieldSize !== 4 && fieldSize !== 8 && fieldSize !== 16) {
 					throw new Error(`Invalid stz2 box: unsupported field size ${fieldSize}.`);
 				}
+
+				sampleCount = capEntryCount(sampleCount, slice, boxEndPos, fieldSize / 8);
 
 				const bytes = readBytes(slice, Math.ceil(sampleCount * fieldSize / 8));
 				const bitstream = new Bitstream(bytes);
@@ -2154,18 +3299,25 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
 				slice.skip(4); // Version + flags
 
+				// Sample numbers start at 1, but some writers count from 0. Like FFmpeg, take a table whose first entry
+				// is 0 as counting from 0.
+				let firstSampleNumber = 1;
 				track.sampleTable.keySampleIndices = [];
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 4);
 				for (let i = 0; i < entryCount; i++) {
-					const sampleIndex = readU32Be(slice) - 1; // Convert to 0-indexed
-					track.sampleTable.keySampleIndices.push(sampleIndex);
+					const sampleNumber = readU32Be(slice);
+					if (i === 0 && sampleNumber === 0) {
+						firstSampleNumber = 0;
+					}
+
+					track.sampleTable.keySampleIndices.push(sampleNumber - firstSampleNumber); // Convert to 0-indexed
 				}
 
 				// We binary search this list, so it must be sorted
@@ -2185,16 +3337,25 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (!track.sampleTable) {
+					// While reading the moov box, only note which sample description the first chunk uses
+					slice.skip(4); // Version + flags
+					if (readU32Be(slice) > 0 && boxInfo.contentSize >= 20) {
+						slice.skip(8); // First chunk + samples per chunk
+						track.firstChunkSampleDescriptionIndex = readU32Be(slice);
+					}
+
 					break;
 				}
 
 				slice.skip(4);
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 12);
 				let skippedEntryCount = 0;
 
 				for (let i = 0; i < entryCount; i++) {
-					const startChunkIndex = readU32Be(slice) - 1; // Convert to 0-indexed
+					// Convert to 0-indexed. Chunk numbers start at 1, so like FFmpeg, raise an entry's first chunk to
+					// at least its own number: a table numbered from 0 still maps all chunks, none starting at -1
+					const startChunkIndex = Math.max(readU32Be(slice) - 1, i);
 					const samplesPerChunk = readU32Be(slice);
 					const sampleDescriptionIndex = readU32Be(slice);
 
@@ -2220,6 +3381,15 @@ export class IsobmffDemuxer extends Demuxer {
 					);
 				}
 
+				// Some writers end the table with entries of zero samples per chunk. Like FFmpeg, drop them, so that
+				// their chunks keep the samples per chunk of the entry before.
+				while (
+					track.sampleTable.sampleToChunk.length > 1
+					&& last(track.sampleTable.sampleToChunk)!.samplesPerChunk === 0
+				) {
+					track.sampleTable.sampleToChunk.pop();
+				}
+
 				let startSampleIndex = 0;
 				for (let i = 0; i < track.sampleTable.sampleToChunk.length; i++) {
 					track.sampleTable.sampleToChunk[i]!.startSampleIndex = startSampleIndex;
@@ -2239,13 +3409,13 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
 				slice.skip(4); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 4);
 
 				for (let i = 0; i < entryCount; i++) {
 					const chunkOffset = readU32Be(slice);
@@ -2259,13 +3429,13 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
 				slice.skip(4); // Version + flags
 
-				const entryCount = readU32Be(slice);
+				const entryCount = capEntryCount(readU32Be(slice), slice, boxEndPos, 8);
 
 				for (let i = 0; i < entryCount; i++) {
 					const chunkOffset = readU64Be(slice);
@@ -2282,8 +3452,11 @@ export class IsobmffDemuxer extends Demuxer {
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
-				const fragmentDuration = version === 1 ? readU64Be(slice) : readU32Be(slice);
-				this.movieDurationInTimescale = fragmentDuration;
+				if (version === 1 && boxInfo.contentSize < 12) {
+					break;
+				}
+
+				this.fragmentedMovieDurationInTimescale = version === 1 ? readU64Be(slice) : readU32Be(slice);
 			}; break;
 
 			case 'trex': {
@@ -2360,6 +3533,7 @@ export class IsobmffDemuxer extends Demuxer {
 					moofOffset: startPos,
 					moofSize: boxInfo.totalSize,
 					implicitBaseDataOffset: startPos,
+					skippedTraf: null,
 					trackData: new Map(),
 					psshBoxes: [],
 					sampleCount: 0,
@@ -2380,6 +3554,7 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				this.isReadingTraf = true;
+				this.currentFragment.skippedTraf = null;
 				try {
 					this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 				} finally {
@@ -2392,12 +3567,30 @@ export class IsobmffDemuxer extends Demuxer {
 					const trackData = this.currentFragment.trackData.get(this.currentTrack.id);
 					cond:
 					if (trackData) {
+						// Like for sample tables, the fragment ends before the first sample whose data is cut off
+						const fileSize = this.reader.fileSizeNonStrict;
+						const sampleCount = fileSize === null
+							? -1
+							: trackData.samples.findIndex(sample => sample.byteOffset + sample.byteSize > fileSize);
+						if (sampleCount !== -1) {
+							trackData.samples.length = sampleCount;
+
+							let remainingSampleCount = sampleCount;
+							trackData.trunSampleCounts = trackData.trunSampleCounts.map((count) => {
+								const keptCount = Math.min(count, remainingSampleCount);
+								remainingSampleCount -= keptCount;
+								return keptCount;
+							});
+						}
+
 						if (trackData.samples.length === 0) {
 							// Don't associate the fragment with the track if it has no samples, this simplifies
 							// other code
 							this.currentFragment.trackData.delete(this.currentTrack.id);
 							break cond;
 						}
+
+						applySampleDependencies(this.currentTrack, trackData);
 
 						trackData.presentationTimestamps = trackData.samples
 							.map((x, i) => ({ presentationTimestamp: x.presentationTimestamp, sampleIndex: i }))
@@ -2432,6 +3625,17 @@ export class IsobmffDemuxer extends Demuxer {
 						if (currentFragmentState.startTimestamp !== null) {
 							offsetFragmentTrackDataByTimestamp(trackData, currentFragmentState.startTimestamp);
 							trackData.startTimestampIsFinal = true;
+						}
+
+						if (
+							currentFragmentState.encryptionGroupRuns
+							|| currentFragmentState.defaultEncryptionGroup
+							|| this.currentTrack.defaultEncryptionGroup
+						) {
+							assignEncryptionGroups(this.currentTrack, currentFragmentState, trackData);
+						}
+						if (currentFragmentState.sencSlice) {
+							readSampleEncryptionBox(currentFragmentState.sencSlice, this.currentTrack, trackData);
 						}
 
 						// Transfer the buffered saiz+saio state onto the track data, so readFragment can resolve it
@@ -2478,50 +3682,76 @@ export class IsobmffDemuxer extends Demuxer {
 				const defaultBaseIsMoof = Boolean(flags & 0x020000);
 
 				const trackId = readU32Be(slice);
-				const track = this.idToTrack.get(trackId);
-				if (!track) {
-					// We don't care about this track
-					break;
-				}
-
-				if (this.currentFragment.trackData.has(trackId)) {
-					Logging._warn(`Multiple traf boxes for track ${trackId} in the same moof box; skipping.`);
-					break;
-				}
-
 				const defaults = this.fragmentTrackDefaults.get(trackId);
-
-				this.currentTrack = track;
-				track.currentFragmentState = {
+				const fragmentState: FragmentTrackState = {
 					baseDataOffset: this.currentFragment.implicitBaseDataOffset,
 					sampleDescriptionIndex: defaults?.defaultSampleDescriptionIndex ?? null,
 					defaultSampleDuration: defaults?.defaultSampleDuration ?? null,
 					defaultSampleSize: defaults?.defaultSampleSize ?? null,
 					defaultSampleFlags: defaults?.defaultSampleFlags ?? null,
+					sampleDependsOn: [],
+					sampleDependencies: null,
 					startTimestamp: null,
 					encryptionAuxInfo: null,
+					encryptionGroups: [],
+					defaultEncryptionGroup: null,
+					encryptionGroupRuns: null,
+					sencSlice: null,
 				};
 
 				if (baseDataOffsetPresent) {
-					track.currentFragmentState.baseDataOffset = readU64Be(slice);
+					fragmentState.baseDataOffset = readU64Be(slice);
 				} else if (defaultBaseIsMoof) {
-					track.currentFragmentState.baseDataOffset = this.currentFragment.moofOffset;
+					fragmentState.baseDataOffset = this.currentFragment.moofOffset;
 				}
 				if (sampleDescriptionIndexPresent) {
-					track.currentFragmentState.sampleDescriptionIndex = readU32Be(slice);
+					fragmentState.sampleDescriptionIndex = readU32Be(slice);
 				}
 				if (defaultSampleDurationPresent) {
-					track.currentFragmentState.defaultSampleDuration = readU32Be(slice);
+					fragmentState.defaultSampleDuration = readU32Be(slice);
 				}
 				if (defaultSampleSizePresent) {
-					track.currentFragmentState.defaultSampleSize = readU32Be(slice);
+					fragmentState.defaultSampleSize = readU32Be(slice);
 				}
 				if (defaultSampleFlagsPresent) {
-					track.currentFragmentState.defaultSampleFlags = readU32Be(slice);
+					fragmentState.defaultSampleFlags = readU32Be(slice);
 				}
 				if (durationIsEmpty) {
-					track.currentFragmentState.defaultSampleDuration = 0;
+					fragmentState.defaultSampleDuration = 0;
 				}
+
+				const track = this.idToTrack.get(trackId);
+				const isDuplicate = this.currentFragment.trackData.has(trackId);
+				if (isDuplicate) {
+					Logging._warn(`Multiple traf boxes for track ${trackId} in the same moof box; skipping.`);
+				}
+
+				if (!track || isDuplicate) {
+					// We don't care about this traf, but a later traf's data may start where this one's ends
+					this.currentFragment.skippedTraf = {
+						baseDataOffset: fragmentState.baseDataOffset,
+						dataEnd: null,
+						defaultSampleSize: fragmentState.defaultSampleSize,
+					};
+					break;
+				}
+
+				this.currentTrack = track;
+				track.currentFragmentState = fragmentState;
+			}; break;
+
+			case 'sdtp': {
+				// Only the track fragment's one is read, for the dependencies of samples whose flags don't tell them
+				const fragmentState = this.currentTrack?.currentFragmentState;
+				if (!fragmentState || !this.currentFragment || boxInfo.contentSize < 4) {
+					break;
+				}
+
+				slice.skip(4); // Version + flags
+				fragmentState.sampleDependencies = readBytes(
+					slice,
+					Math.min(boxInfo.contentSize - 4, slice.remainingLength),
+				);
 			}; break;
 
 			case 'tfdt': {
@@ -2533,12 +3763,57 @@ export class IsobmffDemuxer extends Demuxer {
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
+				if (version !== 0 && boxInfo.contentSize < 12) {
+					break;
+				}
+
 				const baseMediaDecodeTime = version === 0 ? readU32Be(slice) : readU64Be(slice);
 				track.currentFragmentState.startTimestamp = baseMediaDecodeTime;
 			}; break;
 
 			case 'trun': {
 				const track = this.currentTrack;
+				const skippedTraf = this.currentFragment?.skippedTraf;
+				if (!track?.currentFragmentState && skippedTraf) {
+					// Only find out where the run's data ends, for the implicit base data offset of later trafs
+					slice.skip(1); // Version
+					const flags = readU24Be(slice);
+					const sampleCount = readU32Be(slice);
+					const dataOffset = flags & 0x000001 ? readI32Be(slice) : null;
+					if (flags & 0x000004) {
+						slice.skip(4); // First sample flags
+					}
+
+					const sampleSizePresent = Boolean(flags & 0x000200);
+					const entrySize = 4 * [0x000100, 0x000200, 0x000400, 0x000800].filter(x => flags & x).length;
+					let dataSize: number;
+
+					if (sampleSizePresent) {
+						dataSize = 0;
+						const entryCount = Math.min(sampleCount, Math.floor((boxEndPos - slice.filePos) / entrySize));
+						const sizeOffset = flags & 0x000100 ? 4 : 0;
+
+						for (let i = 0; i < entryCount; i++) {
+							const entryStartPos = slice.filePos;
+							slice.skip(sizeOffset);
+							dataSize += readU32Be(slice);
+							slice.filePos = entryStartPos + entrySize;
+						}
+					} else if (skippedTraf.defaultSampleSize !== null) {
+						dataSize = sampleCount * skippedTraf.defaultSampleSize;
+					} else {
+						break;
+					}
+
+					const dataStart = dataOffset !== null
+						? skippedTraf.baseDataOffset + dataOffset
+						: skippedTraf.dataEnd ?? skippedTraf.baseDataOffset;
+					skippedTraf.dataEnd = dataStart + dataSize;
+					this.currentFragment!.implicitBaseDataOffset = skippedTraf.dataEnd;
+
+					break;
+				}
+
 				if (!track?.currentFragmentState || !this.currentFragment) {
 					break;
 				}
@@ -2552,7 +3827,7 @@ export class IsobmffDemuxer extends Demuxer {
 				const sampleFlagsPresent = Boolean(flags & 0x000400);
 				const sampleCompositionTimeOffsetsPresent = Boolean(flags & 0x000800);
 
-				const sampleCount = readU32Be(slice);
+				let sampleCount = readU32Be(slice);
 
 				const { defaultSampleDuration, defaultSampleSize, defaultSampleFlags } = track.currentFragmentState;
 				if (
@@ -2566,12 +3841,6 @@ export class IsobmffDemuxer extends Demuxer {
 					throw new Error('Invalid trun box: sample values are missing and there are no defaults.');
 				}
 
-				this.currentFragment.sampleCount += sampleCount;
-				if (this.currentFragment.sampleCount > 2 ** 20) {
-					// Safety measure
-					throw new Error('Too many (> 2^20) samples in fragment.');
-				}
-
 				let dataOffset: number | null = null;
 				if (dataOffsetPresent) {
 					dataOffset = readI32Be(slice);
@@ -2579,6 +3848,41 @@ export class IsobmffDemuxer extends Demuxer {
 				let firstSampleFlags: number | null = null;
 				if (firstSampleFlagsPresent) {
 					firstSampleFlags = readU32Be(slice);
+				}
+
+				const entrySize = 4 * [
+					sampleDurationPresent,
+					sampleSizePresent,
+					sampleFlagsPresent,
+					sampleCompositionTimeOffsetsPresent,
+				].filter(Boolean).length;
+				if (entrySize > 0) {
+					sampleCount = capEntryCount(sampleCount, slice, boxEndPos, entrySize);
+				}
+
+				// PCM is often stored with one sample per frame (GPAC and Bento4 do so in fragments), which makes tens
+				// of thousands of samples per second. Like the PCM transform of sample tables, runs of such samples
+				// become bigger samples (never across track runs). Without per-sample values, they all have the default
+				// size, so they can be stepped through a group at a time.
+				const pcmFrameSize = track.info?.type === 'audio'
+					&& track.info.codec !== null
+					&& (PCM_AUDIO_CODECS as readonly string[]).includes(track.info.codec)
+					&& !sampleCompositionTimeOffsetsPresent
+					&& !track.encryptionInfo
+					? parsePcmCodec(track.info.codec as PcmAudioCodec).sampleSize * track.info.numberOfChannels
+					: 0;
+				const samplesPerStep = pcmFrameSize > 0
+					&& !sampleDurationPresent
+					&& !sampleSizePresent
+					&& !sampleFlagsPresent
+					&& defaultSampleSize === pcmFrameSize
+					? Math.floor(MAX_GROUPED_PCM_SAMPLE_SIZE / pcmFrameSize)
+					: 1;
+
+				this.currentFragment.sampleCount += Math.ceil(sampleCount / samplesPerStep);
+				if (this.currentFragment.sampleCount > 2 ** 20) {
+					// Safety measure
+					throw new Error('Too many (> 2^20) samples in fragment.');
 				}
 
 				let trackData: FragmentTrackData;
@@ -2604,26 +3908,39 @@ export class IsobmffDemuxer extends Demuxer {
 						presentationTimestamps: [],
 						startTimestampIsFinal: false,
 						trunSampleCounts: [],
+						samplesAreGrouped: false,
 						encryptionAuxInfo: null,
+						isEncrypted: sampleDescriptionIsEncrypted(
+							track,
+							track.currentFragmentState.sampleDescriptionIndex ?? 1,
+						),
+						sampleDescriptionIndex: track.currentFragmentState.sampleDescriptionIndex ?? 1,
 					};
 					this.currentFragment.trackData.set(track.id, trackData);
 				}
 
+				const trunStartSampleCount = trackData.samples.length;
 				trackData.trunSampleCounts.push(sampleCount);
+				const allSamplesAreKeySamples = hasOnlyKeySamples(track);
 
-				for (let i = 0; i < sampleCount; i++) {
+				for (let i = 0; i < sampleCount; i += samplesPerStep) {
+					const stepSampleCount = Math.min(samplesPerStep, sampleCount - i);
+
 					let sampleDuration: number;
 					if (sampleDurationPresent) {
 						sampleDuration = readU32Be(slice);
 					} else {
-						sampleDuration = defaultSampleDuration!;
+						sampleDuration = defaultSampleDuration! * stepSampleCount;
+					}
+					if (sampleDuration > MAX_SAMPLE_DELTA) {
+						sampleDuration = 1; // Most likely a negative duration; FFmpeg clips these the same way
 					}
 
 					let sampleSize: number;
 					if (sampleSizePresent) {
 						sampleSize = readU32Be(slice);
 					} else {
-						sampleSize = defaultSampleSize!;
+						sampleSize = defaultSampleSize! * stepSampleCount;
 					}
 
 					let sampleFlags: number;
@@ -2644,19 +3961,52 @@ export class IsobmffDemuxer extends Demuxer {
 						sampleCompositionTimeOffset = readI32Be(slice);
 					}
 
-					const isKeyFrame = !(sampleFlags & 0x00010000);
+					// Some muxers mark every video frame as a sync sample and only signal the dependency on other
+					// samples, which FFmpeg (mov_read_trun) and Chromium (PopulateSampleInfo) then don't treat as key
+					// frames. Audio samples may depend on others and still be random access points.
+					const isKeyFrame = !(sampleFlags & 0x00010000)
+						&& !(track.info?.type === 'video' && ((sampleFlags >>> 24) & 0b11) === 1);
+					if (track.info?.type === 'video') {
+						track.currentFragmentState.sampleDependsOn.push((sampleFlags >>> 24) & 0b11);
+					}
+
+					const previousSample = trackData.samples.length > trunStartSampleCount
+						? last(trackData.samples)!
+						: null;
+					if (
+						pcmFrameSize > 0
+						&& sampleSize === pcmFrameSize
+						&& previousSample
+						&& previousSample.byteOffset + previousSample.byteSize === trackData.currentOffset
+						&& previousSample.byteSize + sampleSize <= MAX_GROUPED_PCM_SAMPLE_SIZE
+						// A key frame doesn't go into a sample that isn't one
+						&& (previousSample.isKeyFrame || !isKeyFrame)
+					) {
+						previousSample.duration += sampleDuration;
+						previousSample.byteSize += sampleSize;
+						trackData.currentOffset += sampleSize;
+						trackData.currentTimestamp += sampleDuration;
+						continue;
+					}
 
 					trackData.samples.push({
 						presentationTimestamp: trackData.currentTimestamp + sampleCompositionTimeOffset,
 						duration: sampleDuration,
 						byteOffset: trackData.currentOffset,
 						byteSize: sampleSize,
-						isKeyFrame,
+						isKeyFrame: isKeyFrame || allSamplesAreKeySamples,
 						encryption: null,
+						encryptionGroup: null,
 					});
 
 					trackData.currentOffset += sampleSize;
 					trackData.currentTimestamp += sampleDuration;
+				}
+
+				const trunSampleCount = trackData.samples.length - trunStartSampleCount;
+				if (trunSampleCount < sampleCount) {
+					trackData.trunSampleCounts[trackData.trunSampleCounts.length - 1] = trunSampleCount;
+					trackData.samplesAreGrouped = true;
 				}
 
 				this.currentFragment.implicitBaseDataOffset = trackData.currentOffset;
@@ -2717,19 +4067,28 @@ export class IsobmffDemuxer extends Demuxer {
 				if (entryCount === 0) {
 					break;
 				}
-				if (entryCount > 1) {
-					Logging._warn('Multiple saio entries are not supported; using the first offset only.');
+
+				// One offset, or one per track run (in a traf) or chunk (ISO/IEC 14496-12 8.7.9)
+				const offsets: number[] = [];
+				const offsetSize = version === 0 ? 4 : 8;
+				for (let i = 0; i < entryCount && boxEndPos - slice.filePos >= offsetSize; i++) {
+					let offset = version === 0 ? readU32Be(slice) : Number(readU64Be(slice));
+
+					// Per ISO/IEC 23001-7: when saio is inside a moof, offsets are relative to the start of the moof.
+					if (this.currentFragment) {
+						offset += this.currentFragment.moofOffset;
+					}
+
+					offsets.push(offset);
 				}
 
-				let offset = version === 0 ? readU32Be(slice) : Number(readU64Be(slice));
-
-				// Per ISO/IEC 23001-7: when saio is inside a moof, offsets are relative to the start of the moof box.
-				if (this.currentFragment) {
-					offset += this.currentFragment.moofOffset;
+				if (offsets.length === 0) {
+					break;
 				}
 
 				const aux = getOrCreateEncryptionAuxInfo(track);
-				aux.offset = offset;
+				aux.offset = offsets[0]!;
+				aux.offsets = offsets;
 			}; break;
 
 			case 'senc': {
@@ -2740,47 +4099,131 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				const trackData = this.currentFragment?.trackData.get(track.id);
-				if (!trackData) {
+				if (!this.currentFragment) {
+					// ISO/IEC 23001-7 also allows senc in the sample table of a non-fragmented file, where FFmpeg
+					// writes it. Like FFmpeg, prefer it over saiz/saio, whose offset older FFmpeg versions got wrong.
+					getOrCreateEncryptionAuxInfo(track).resolved = readSampleEncryptionEntries(
+						slice,
+						boxEndPos,
+						track.encryptionInfo,
+						Infinity,
+					);
 					break;
 				}
 
-				slice.skip(1); // Version
-				const flags = readU24Be(slice);
-				const useSubsamples = Boolean(flags & 0x000002);
-
-				const sampleCount = readU32Be(slice);
-				const ivSize = track.encryptionInfo.defaultPerSampleIvSize;
-				if (ivSize === null) {
-					throw new Error('Invalid file: encrypted track is missing its tenc box.');
+				if (!track.currentFragmentState) {
+					break;
 				}
 
-				for (let i = 0; i < Math.min(sampleCount, trackData.samples.length); i++) {
-					// Normalize the IV to 16 bytes so downstream code can assume a full-length buffer. For CTR with
-					// an 8-byte per-sample IV the lower 8 bytes are zero (that's the CENC spec's block counter start);
-					// for CBC/cbcs the IV is always 16 bytes by spec.
-					const iv = new Uint8Array(16);
-					if (ivSize > 0) {
-						iv.set(readBytes(slice, ivSize), 0);
-					} else if (track.encryptionInfo.defaultConstantIv) {
-						iv.set(track.encryptionInfo.defaultConstantIv, 0);
-					} else {
-						throw new Error('Invalid file: encrypted sample has no IV.');
-					}
+				// Read once the traf's other boxes are: its samples come from track runs, and their IV sizes can
+				// depend on their sample groups, which may both come after senc (the box order is only recommended)
+				track.currentFragmentState.sencSlice = slice.slice(contentStartPos, boxInfo.contentSize);
+			}; break;
 
-					let subsamples: SampleEncryptionInfo['subsamples'] = null;
-					if (useSubsamples) {
-						const subsampleCount = readU16Be(slice);
-						subsamples = [];
-						for (let j = 0; j < subsampleCount; j++) {
-							const clearLen = readU16Be(slice);
-							const protectedLen = readU32Be(slice);
-							subsamples.push({ clearLen, protectedLen });
+			case 'sgpd': {
+				// Sample group description; only CENC sample groups ('seig') are of interest
+				const track = this.currentTrack;
+				if (!track?.encryptionInfo) {
+					break;
+				}
+
+				const version = readU8(slice);
+				slice.skip(3); // Flags
+				if (readAscii(slice, 4) !== 'seig') {
+					break;
+				}
+
+				// ISO/IEC 14496-12 8.9.3: the default length exists since version 1, the default entry since version 2
+				const defaultLength = version >= 1 ? readU32Be(slice) : 0;
+				const defaultGroupDescriptionIndex = version >= 2 ? readU32Be(slice) : 0;
+				const hasLengthFields = version >= 1 && defaultLength === 0;
+
+				const entryCount = readU32Be(slice);
+				const entries: SampleGroupEncryption[] = [];
+				for (let i = 0; i < entryCount && boxEndPos - slice.filePos >= (hasLengthFields ? 24 : 20); i++) {
+					const length = hasLengthFields ? readU32Be(slice) : defaultLength;
+					const entryStartPos = slice.filePos;
+
+					slice.skip(1); // Reserved
+					const pattern = readU8(slice);
+					const isProtected = readU8(slice) !== 0;
+					const perSampleIvSize = readU8(slice);
+					if (perSampleIvSize > 16) {
+						throw new Error('Invalid sgpd box: IV size must not exceed 16 bytes.');
+					}
+					const kid = [...readBytes(slice, 16)].map(x => x.toString(16).padStart(2, '0')).join('');
+					let constantIv: Uint8Array | null = null;
+					if (isProtected && perSampleIvSize === 0) {
+						if (boxEndPos - slice.filePos < 1) {
+							break;
 						}
+						const constantIvSize = Math.min(readU8(slice), 16, boxEndPos - slice.filePos);
+						constantIv = new Uint8Array(16);
+						constantIv.set(readBytes(slice, constantIvSize));
 					}
 
-					const sample = trackData.samples[i]!;
-					sample.encryption = { iv, subsamples };
+					entries.push({
+						isProtected,
+						perSampleIvSize,
+						kid,
+						constantIv,
+						cryptByteBlock: pattern >> 4,
+						skipByteBlock: pattern & 0xf,
+					});
+
+					if (length > 0) {
+						slice.filePos = entryStartPos + length;
+					}
+				}
+
+				// The default entry is an index into this box's entries (traf-local ones may use the sbgp convention)
+				const defaultIndex = defaultGroupDescriptionIndex > 0x10000
+					? defaultGroupDescriptionIndex - 0x10000
+					: defaultGroupDescriptionIndex;
+				const defaultGroup = defaultIndex > 0 ? entries[defaultIndex - 1] ?? null : null;
+
+				if (track.currentFragmentState) {
+					track.currentFragmentState.encryptionGroups = entries;
+					track.currentFragmentState.defaultEncryptionGroup = defaultGroup;
+				} else if (!this.currentFragment) {
+					track.encryptionGroups = entries;
+					track.defaultEncryptionGroup = defaultGroup;
+				}
+			}; break;
+
+			case 'sbgp': {
+				// Sample to group; only CENC sample groups ('seig') are of interest
+				const track = this.currentTrack;
+				const fragmentState = track?.currentFragmentState;
+				if (!track || (!fragmentState && this.currentFragment)) {
+					break;
+				}
+
+				const version = readU8(slice);
+				slice.skip(3); // Flags
+				if (readAscii(slice, 4) !== 'seig') {
+					break;
+				}
+				if (version === 1) {
+					slice.skip(4); // Grouping type parameter
+				}
+
+				const entryCount = readU32Be(slice);
+				const runs: { sampleCount: number; groupDescriptionIndex: number }[] = [];
+				for (let i = 0; i < entryCount && boxEndPos - slice.filePos >= 8; i++) {
+					runs.push({ sampleCount: readU32Be(slice), groupDescriptionIndex: readU32Be(slice) });
+				}
+
+				if (fragmentState) {
+					fragmentState.encryptionGroupRuns = runs;
+				} else {
+					// In a sample table
+					let startIndex = 0;
+					track.encryptionGroupRuns = runs.map((run) => {
+						const result = { startIndex, ...run };
+						startIndex += run.sampleCount;
+						return result;
+					});
 				}
 			}; break;
 
@@ -2789,10 +4232,19 @@ export class IsobmffDemuxer extends Demuxer {
 				// https://mp4workshop.com/about
 
 			case 'udta': { // Contains either movie metadata or track metadata
-				const iterator = this.iterateContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
+				const iterator = this.iterateMetadataItems(slice.slice(contentStartPos, boxInfo.contentSize));
 
 				for (const { boxInfo, slice } of iterator) {
+					if (
+						!this.currentTrack
+						&& (boxInfo.name[0] === '©' || boxInfo.name === 'name')
+						&& boxInfo.contentSize < 4
+					) {
+						continue; // Too small for the length and language code of a text atom
+					}
+
 					if (boxInfo.name !== 'meta' && !this.currentTrack) {
+						watchMetadataTagFields(this.metadataTags, boxInfo.name);
 						const startPos = slice.filePos;
 						this.metadataTags.raw ??= {};
 
@@ -2813,10 +4265,52 @@ export class IsobmffDemuxer extends Demuxer {
 							this.traverseBox(slice);
 						}; break;
 
+						case 'kind': {
+							// A TrackKindBox (ISO/IEC 14496-12 8.10.4), which FFmpeg writes for dispositions
+							if (!this.currentTrack || boxInfo.contentSize < 4) {
+								break;
+							}
+
+							slice.skip(4); // Version + flags
+							const [scheme, value] = textDecoder
+								.decode(readBytes(slice, Math.min(boxInfo.contentSize - 4, slice.remainingLength)))
+								.split('\0');
+							if (scheme !== 'urn:mpeg:dash:role:2011') { // ISO/IEC 23009-1 5.8.5.5
+								break;
+							}
+
+							// The roles that FFmpeg maps to dispositions
+							const disposition = this.currentTrack.disposition;
+							switch (value) {
+								case 'caption': {
+									disposition.hearingImpaired = true;
+								}; break;
+								case 'commentary': {
+									disposition.commentary = true;
+								}; break;
+								case 'description': {
+									disposition.visuallyImpaired = true;
+								}; break;
+								case 'forced-subtitle': {
+									disposition.forced = true;
+								}; break;
+							}
+						}; break;
+
 						case '©nam':
 						case 'name': {
 							if (this.currentTrack) {
-								this.currentTrack.name = textDecoder.decode(readBytes(slice, boxInfo.contentSize));
+								let bytes = readBytes(slice, boxInfo.contentSize);
+								if (boxInfo.name === 'name') {
+									// Some writers end the string with a NUL, like a C string. Like FFmpeg, read it up
+									// to the first NUL.
+									const end = bytes.indexOf(0);
+									if (end !== -1) {
+										bytes = bytes.subarray(0, end);
+									}
+								}
+
+								this.currentTrack.name = textDecoder.decode(bytes);
 							} else {
 								this.metadataTags.title ??= readMetadataStringShort(slice);
 							}
@@ -2873,6 +4367,8 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 					}
+
+					unwatchMetadataTagFields(this.metadataTags);
 				}
 			}; break;
 
@@ -2924,9 +4420,10 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				const iterator = this.iterateContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
+				const iterator = this.iterateMetadataItems(slice.slice(contentStartPos, boxInfo.contentSize));
 
 				for (const { boxInfo, slice } of iterator) {
+					const itemEndPos = slice.filePos + boxInfo.contentSize;
 					let metadataKey = boxInfo.name;
 
 					// Interpret the box name as a u32be
@@ -2940,8 +4437,27 @@ export class IsobmffDemuxer extends Demuxer {
 						metadataKey = this.currentMetadataKeys.get(nameAsNumber)!;
 					}
 
-					const data = readDataBox(slice);
+					let data: ReturnType<typeof readDataBox>;
+					if (metadataKey === '----') {
+						// An iTunSMPB item holds the AAC encoder delay
+						const startPos = slice.filePos;
+						this.readFreeformMetadataItem(slice, startPos + boxInfo.contentSize);
+						slice.filePos = startPos;
 
+						// All freeform items share this name, so key them by their domain and name instead, like TagLib
+						// and Mutagen do (e.g. '----:com.apple.iTunes:iTunSMPB')
+						const freeform = readFreeformMetadataItem(slice, boxInfo.contentSize);
+						if (!freeform) {
+							continue;
+						}
+
+						metadataKey = `----:${freeform.mean}:${freeform.name}`;
+						data = freeform.data;
+					} else {
+						data = readDataBox(slice);
+					}
+
+					watchMetadataTagFields(this.metadataTags, metadataKey);
 					this.metadataTags.raw ??= {};
 					this.metadataTags.raw[metadataKey] ??= data;
 
@@ -2998,11 +4514,22 @@ export class IsobmffDemuxer extends Demuxer {
 						}; break;
 
 						case '©gen':
-						case 'gnre':
 						case 'com.apple.quicktime.genre':
 						case 'genre': {
 							if (typeof data === 'string') {
 								this.metadataTags.genre ??= data;
+							}
+						}; break;
+
+						case 'gnre': {
+							// Holds a 16-bit ID3v1 genre number plus one, though some writers put text there
+							if (typeof data === 'string') {
+								this.metadataTags.genre ??= data;
+							} else if (data instanceof Uint8Array && data.length >= 2) {
+								const genre = ID3_V1_GENRES[toDataView(data).getUint16(0, false) - 1];
+								if (genre !== undefined) {
+									this.metadataTags.genre ??= genre;
+								}
 							}
 						}; break;
 
@@ -3036,20 +4563,30 @@ export class IsobmffDemuxer extends Demuxer {
 
 						case 'covr':
 						case 'com.apple.quicktime.artwork': {
-							if (data instanceof RichImageData) {
-								this.metadataTags.images ??= [];
-								this.metadataTags.images.push({
-									data: data.data,
-									kind: 'coverFront',
-									mimeType: data.mimeType,
-								});
-							} else if (data instanceof Uint8Array) {
-								this.metadataTags.images ??= [];
-								this.metadataTags.images.push({
-									data,
-									kind: 'coverFront',
-									mimeType: 'image/*',
-								});
+							// The item holds one data box per image
+							let image = data;
+							while (image) {
+								if (image instanceof RichImageData) {
+									this.metadataTags.images ??= [];
+									this.metadataTags.images.push({
+										data: image.data,
+										kind: 'coverFront',
+										mimeType: image.mimeType,
+									});
+								} else if (image instanceof Uint8Array) {
+									this.metadataTags.images ??= [];
+									this.metadataTags.images.push({
+										data: image,
+										kind: 'coverFront',
+										mimeType: 'image/*',
+									});
+								}
+
+								if (itemEndPos - slice.filePos < MIN_BOX_HEADER_SIZE) {
+									break;
+								}
+
+								image = readDataBox(slice);
 							}
 						}; break;
 
@@ -3086,7 +4623,19 @@ export class IsobmffDemuxer extends Demuxer {
 
 						case 'disc':
 						case 'disk': {
-							if (data instanceof Uint8Array && data.length >= 6) {
+							if (typeof data === 'string') {
+								// mdta keys hold it as a string, like the track number
+								const parts = data.split('/');
+								const discNum = Number.parseInt(parts[0]!, 10);
+								const discsTotal = parts[1] && Number.parseInt(parts[1], 10);
+
+								if (Number.isInteger(discNum) && discNum > 0) {
+									this.metadataTags.discNumber ??= discNum;
+								}
+								if (discsTotal && Number.isInteger(discsTotal) && discsTotal > 0) {
+									this.metadataTags.discsTotal ??= discsTotal;
+								}
+							} else if (data instanceof Uint8Array && data.length >= 6) {
 								const view = toDataView(data);
 
 								const discNumber = view.getUint16(2, false);
@@ -3101,12 +4650,26 @@ export class IsobmffDemuxer extends Demuxer {
 							}
 						}; break;
 					}
+
+					unwatchMetadataTagFields(this.metadataTags);
 				}
 			}; break;
 		}
 
 		slice.filePos = boxEndPos;
 		return true;
+	}
+}
+
+const MAX_DAMAGED_BOXES_PER_PARSE = 16;
+
+/** Reports a box whose fields run past the end of its parent, to have the parse redone without it */
+class DamagedBoxError extends Error {
+	position: number;
+
+	constructor(position: number) {
+		super('Damaged box.');
+		this.position = position;
 	}
 }
 
@@ -3190,16 +4753,77 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 	async getDurationFromMetadata() {
 		const track = this.internalTrack;
-		if (track.durationInMediaTimescale <= 0) {
+		const { demuxer } = track;
+
+		if (demuxer.isFragmented) {
+			// The mdhd box only describes the samples in the moov box, while the mehd box gives the movie's duration
+			// including its fragments (ISO/IEC 14496-12 8.8.2)
+			if (demuxer.fragmentedMovieDurationInTimescale > 0) {
+				return demuxer.fragmentedMovieDurationInTimescale / demuxer.movieTimescale;
+			}
+
+			let hasSamplesInMoov: boolean | null = null;
+			try {
+				hasSamplesInMoov = !sampleTableIsEmpty(demuxer.getSampleTableForTrack(track));
+			} catch {
+				// A sample table that can't be read (a damaged file) leaves it to the mdhd box, as before
+			}
+
+			if (hasSamplesInMoov === false) {
+				// All of the samples are in fragments, so the mdhd box has nothing to describe; Chromium's muxer even
+				// writes milliseconds there. Like Chromium, fall back to the mvhd box's duration.
+				return demuxer.movieDurationInTimescale > 0
+					? demuxer.movieDurationInTimescale / demuxer.movieTimescale
+					: null;
+			}
+		}
+
+		let durationInMediaTimescale = track.durationInMediaTimescale;
+		if (durationInMediaTimescale <= 0) {
 			// The duration is often zero for fragmented files for example; return `null` to signal that the duration
-			// must be computed instead.
+			// must be computed instead. A regular track has its samples' durations in its sample table though, which
+			// all lasting 0 is also what makes the duration 0 (like a still frame next to other media).
+			let lastTimingEntry: SampleTimingEntry | undefined;
+			try {
+				const sampleTable = track.demuxer.isFragmented ? null : track.demuxer.getSampleTableForTrack(track);
+				lastTimingEntry = sampleTable && !sampleTableIsEmpty(sampleTable)
+					? last(sampleTable.sampleTimingEntries)
+					: undefined;
+			} catch {
+				// A sample table that can't be read (a damaged file) leaves the duration unknown, as it was before
+			}
+			if (!lastTimingEntry) {
+				return null;
+			}
+
+			durationInMediaTimescale = lastTimingEntry.startDecodeTimestamp
+				+ lastTimingEntry.count * lastTimingEntry.delta;
+		}
+
+		if (track.demuxer.isFragmented && track.demuxer.getSampleTableForTrack(track).sampleCount > 0) {
+			// The duration only covers the samples in the moov box and not the fragments that follow
 			return null;
 		}
 
 		assert(track.trackBacking);
 
+		if (!track.demuxer.isFragmented && track.durationInMediaTimescale > 0) {
+			// The mdhd box gives the length of the media (ISO/IEC 14496-12). With an edit list though, FFmpeg 4.4 and
+			// 5.0 (movenc's calc_pts_duration) write the track's end time there, which counts the start of a late
+			// track twice. So the duration doesn't go past the end of the last sample.
+			const lastPacket = await track.trackBacking.getPacket(Infinity, { metadataOnly: true });
+			if (lastPacket) {
+				const firstPacket = await track.trackBacking.getFirstPacket({ metadataOnly: true });
+				const end = lastPacket.timestamp + lastPacket.duration;
+				return Math.min(
+					(firstPacket?.timestamp ?? 0) + track.durationInMediaTimescale / track.timescale,
+					Math.round(end * track.timescale) / track.timescale, // Rounded like computeDuration()
+				);
+			}
+		}
+
 		const firstPacket = await track.trackBacking.getFirstPacket({ metadataOnly: true });
-		return (firstPacket?.timestamp ?? 0) + track.durationInMediaTimescale / track.timescale;
+		return (firstPacket?.timestamp ?? 0) + durationInMediaTimescale / track.timescale;
 	}
 
 	async getLiveRefreshInterval() {
@@ -3213,33 +4837,15 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			return regularPacket;
 		}
 
-		return this.performFragmentedLookup(
-			null,
-			(fragment) => {
-				const trackData = fragment.trackData.get(this.internalTrack.id);
-				if (trackData) {
-					return {
-						sampleIndex: 0,
-						correctSampleFound: true,
-					};
-				}
-
-				return {
-					sampleIndex: -1,
-					correctSampleFound: false,
-				};
-			},
-			-Infinity, // Use -Infinity as a search timestamp to avoid using the lookup entries
-			Infinity,
-			options,
-		);
+		return this.fetchFirstFragmentedPacket(false, options);
 	}
 
 	private mapTimestampIntoTimescale(timestamp: number) {
 		// Do a little rounding to catch cases where the result is very close to an integer. If it is, it's likely
 		// that the number was originally an integer divided by the timescale. For stability, it's best
 		// to return the integer in this case.
-		return roundIfAlmostInteger(timestamp * this.internalTrack.timescale) + this.internalTrack.editListOffset;
+		const { timescale } = this.internalTrack;
+		return roundIfAlmostInteger(timestamp * timescale, timescale) + this.internalTrack.editListOffset;
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
@@ -3249,12 +4855,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		const sampleIndex = getSampleIndexForTimestamp(sampleTable, timestampInTimescale);
 		const regularPacket = await this.fetchPacketForSampleIndex(sampleIndex, options);
 
-		if (!sampleTableIsEmpty(sampleTable) || !this.internalTrack.demuxer.isFragmented) {
-			// Prefer the non-fragmented packet
+		if (!this.internalTrack.demuxer.isFragmented) {
 			return regularPacket;
 		}
 
-		return this.performFragmentedLookup(
+		const fragmentedPacket = await this.performFragmentedLookup(
 			null,
 			(fragment) => {
 				const trackData = fragment.trackData.get(this.internalTrack.id);
@@ -3276,7 +4881,16 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestampInTimescale,
 			timestampInTimescale,
 			options,
+			false,
+			true,
 		);
+
+		if (!regularPacket || !fragmentedPacket) {
+			return regularPacket ?? fragmentedPacket;
+		}
+
+		// The closer one wins
+		return regularPacket.timestamp > fragmentedPacket.timestamp ? regularPacket : fragmentedPacket;
 	}
 
 	async getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions) {
@@ -3284,7 +4898,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 		if (regularSampleIndex !== undefined) {
 			// Prefer the non-fragmented packet
-			return this.fetchPacketForSampleIndex(regularSampleIndex + 1, options);
+			const regularPacket = await this.fetchPacketForSampleIndex(regularSampleIndex + 1, options);
+			if (regularPacket || !this.internalTrack.demuxer.isFragmented) {
+				return regularPacket;
+			}
+
+			// The fragments come after the non-fragmented samples
+			return this.fetchFirstFragmentedPacket(false, options);
 		}
 
 		const locationInFragment = this.packetToFragmentLocation.get(packet);
@@ -3332,12 +4952,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		const sampleIndex = getKeyframeSampleIndexForTimestamp(sampleTable, timestampInTimescale);
 		const regularPacket = await this.fetchPacketForSampleIndex(sampleIndex, options);
 
-		if (!sampleTableIsEmpty(sampleTable) || !this.internalTrack.demuxer.isFragmented) {
-			// Prefer the non-fragmented packet
+		if (!this.internalTrack.demuxer.isFragmented) {
 			return regularPacket;
 		}
 
-		return this.performFragmentedLookup(
+		const fragmentedPacket = await this.performFragmentedLookup(
 			null,
 			(fragment) => {
 				const trackData = fragment.trackData.get(this.internalTrack.id);
@@ -3345,10 +4964,21 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					return { sampleIndex: -1, correctSampleFound: false };
 				}
 
-				const index = findLastIndex(trackData.presentationTimestamps, (x) => {
-					const sample = trackData.samples[x.sampleIndex]!;
-					return sample.isKeyFrame && x.presentationTimestamp <= timestampInTimescale;
-				});
+				// The timestamps are sorted, so find the last one at or before the timestamp and walk back to a key
+				// frame from there, instead of scanning all of the fragment's samples on every lookup
+				let index = binarySearchLessOrEqual(
+					trackData.presentationTimestamps,
+					timestampInTimescale,
+					x => x.presentationTimestamp,
+				);
+				while (index !== -1) {
+					const sample = trackData.samples[trackData.presentationTimestamps[index]!.sampleIndex]!;
+					if (sample.isKeyFrame) {
+						break;
+					}
+
+					index--;
+				}
 
 				const sampleIndex = index !== -1 ? trackData.presentationTimestamps[index]!.sampleIndex : -1;
 				const correctSampleFound = index !== -1 && timestampInTimescale < trackData.endTimestamp;
@@ -3360,6 +4990,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			options,
 			true,
 		);
+
+		if (!regularPacket || !fragmentedPacket) {
+			return regularPacket ?? fragmentedPacket;
+		}
+
+		// The closer one wins
+		return regularPacket.timestamp > fragmentedPacket.timestamp ? regularPacket : fragmentedPacket;
 	}
 
 	async getNextKeyPacket(packet: EncodedPacket, options: PacketRetrievalOptions) {
@@ -3368,7 +5005,13 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			// Prefer the non-fragmented packet
 			const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
 			const nextKeyFrameSampleIndex = getNextKeyframeIndexForSample(sampleTable, regularSampleIndex);
-			return this.fetchPacketForSampleIndex(nextKeyFrameSampleIndex, options);
+			const regularPacket = await this.fetchPacketForSampleIndex(nextKeyFrameSampleIndex, options);
+			if (regularPacket || !this.internalTrack.demuxer.isFragmented) {
+				return regularPacket;
+			}
+
+			// The fragments come after the non-fragmented samples
+			return this.fetchFirstFragmentedPacket(true, options);
 		}
 
 		const locationInFragment = this.packetToFragmentLocation.get(packet);
@@ -3415,6 +5058,24 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		);
 	}
 
+	private fetchFirstFragmentedPacket(keyPacketsOnly: boolean, options: PacketRetrievalOptions) {
+		return this.performFragmentedLookup(
+			null,
+			(fragment) => {
+				const trackData = fragment.trackData.get(this.internalTrack.id);
+				const sampleIndex = trackData?.samples.findIndex(x => !keyPacketsOnly || x.isKeyFrame) ?? -1;
+
+				return {
+					sampleIndex,
+					correctSampleFound: sampleIndex !== -1,
+				};
+			},
+			-Infinity, // Use -Infinity as a search timestamp to avoid using the lookup entries
+			Infinity,
+			options,
+		);
+	}
+
 	private async fetchPacketForSampleIndex(sampleIndex: number, options: PacketRetrievalOptions) {
 		if (sampleIndex === -1) {
 			return null;
@@ -3430,6 +5091,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		if (options.metadataOnly) {
 			data = PLACEHOLDER_DATA;
 		} else {
+			assertProtectionSchemeIsSupported(this.internalTrack);
+
 			let slice = this.internalTrack.demuxer.reader.requestSlice(
 				sampleInfo.sampleOffset,
 				sampleInfo.sampleSize,
@@ -3441,14 +5104,28 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			data = readBytes(slice, sampleInfo.sampleSize);
 
-			if (this.internalTrack.encryptionInfo) {
+			const trackEncryptionInfo = this.internalTrack.encryptionInfo;
+			if (
+				trackEncryptionInfo
+				&& sampleDescriptionIsEncrypted(this.internalTrack, sampleInfo.sampleDescriptionIndex)
+			) {
+				// Like in fragments, a sample's 'seig' sample group entry overrides tenc's parameters
+				const group = getSampleTableEncryptionGroup(this.internalTrack, sampleIndex);
+				const descriptionEncryptionInfo
+					= getSampleDescriptionEncryptionInfo(this.internalTrack, sampleInfo.sampleDescriptionIndex)!;
+				const encryptionInfo = group
+					? applySampleGroupEncryption(descriptionEncryptionInfo, group)
+					: descriptionEncryptionInfo;
 				let sampleEncryption: SampleEncryptionInfo | null = null;
 
-				if (this.internalTrack.encryptionAuxInfo) {
+				const auxInfo = this.internalTrack.encryptionAuxInfo;
+				if (auxInfo) {
 					const entries = await resolveEncryptionAuxInfo(
 						this.internalTrack.demuxer.reader,
-						this.internalTrack.encryptionInfo,
-						this.internalTrack.encryptionAuxInfo,
+						trackEncryptionInfo,
+						auxInfo,
+						auxInfo.offsets.length > 1 && !auxInfo.resolved ? getChunkSampleCounts(sampleTable) : null,
+						i => getSampleTableEncryptionGroup(this.internalTrack, i),
 					);
 
 					if (sampleIndex < entries.length) {
@@ -3456,11 +5133,39 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					}
 				}
 
-				sampleEncryption ??= getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
-				if (sampleEncryption) {
-					data = await decryptSample(this.internalTrack, sampleEncryption, data, null);
+				sampleEncryption ??= getDefaultSampleEncryption(encryptionInfo);
+				if (sampleEncryption && encryptionInfo.defaultIsProtected !== false) {
+					data = await decryptSample(this.internalTrack, sampleEncryption, data, null, encryptionInfo);
+				} else if (!sampleEncryption) {
+					assertUnprotectedSample(
+						this.internalTrack,
+						encryptionInfo,
+						sampleDescriptionIsEncrypted(this.internalTrack, sampleInfo.sampleDescriptionIndex),
+					);
 				}
 			}
+		}
+
+		let sizingData: Uint8Array | null = null;
+		const sampleDescriptionIndex = sampleInfo.sampleDescriptionIndex;
+		if (options.metadataOnly && inBandParameterSetsNeedData(this.internalTrack, sampleDescriptionIndex)) {
+			let slice = this.internalTrack.demuxer.reader.requestSlice(sampleInfo.sampleOffset, sampleInfo.sampleSize);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			sizingData = slice && readBytes(slice, sampleInfo.sampleSize);
+		}
+
+		const withParameterSets = applyInBandParameterSets(
+			this.internalTrack,
+			options.metadataOnly ? sizingData : data,
+			sampleInfo.sampleSize,
+			sampleInfo.sampleDescriptionIndex,
+			sampleInfo.isKeyFrame,
+			!!options.metadataOnly,
+		);
+		if (withParameterSets.data) {
+			data = withParameterSets.data;
 		}
 
 		const timestamp = (sampleInfo.presentationTimestamp - this.internalTrack.editListOffset)
@@ -3472,7 +5177,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestamp,
 			duration,
 			sampleIndex,
-			sampleInfo.sampleSize,
+			withParameterSets.byteLength,
 		);
 
 		this.packetToSampleIndex.set(packet, sampleIndex);
@@ -3493,6 +5198,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		if (options.metadataOnly) {
 			data = PLACEHOLDER_DATA;
 		} else {
+			assertProtectionSchemeIsSupported(this.internalTrack);
+
 			let slice = this.internalTrack.demuxer.reader.requestSlice(
 				fragmentSample.byteOffset,
 				fragmentSample.byteSize,
@@ -3504,30 +5211,388 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			data = readBytes(slice, fragmentSample.byteSize);
 
-			if (this.internalTrack.encryptionInfo) {
-				const sampleEncryption = fragmentSample.encryption
-					?? getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
-				if (sampleEncryption) {
-					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment);
+			if (this.internalTrack.encryptionInfo && trackData.isEncrypted) {
+				const group = fragmentSample.encryptionGroup;
+				const descriptionEncryptionInfo
+					= getSampleDescriptionEncryptionInfo(this.internalTrack, trackData.sampleDescriptionIndex)!;
+				const encryptionInfo = group
+					? applySampleGroupEncryption(descriptionEncryptionInfo, group)
+					: descriptionEncryptionInfo;
+				const sampleEncryption = fragmentSample.encryption ?? getDefaultSampleEncryption(encryptionInfo);
+
+				if (sampleEncryption && encryptionInfo.defaultIsProtected !== false) {
+					data = await decryptSample(this.internalTrack, sampleEncryption, data, fragment, encryptionInfo);
+				} else if (!sampleEncryption) {
+					assertUnprotectedSample(this.internalTrack, encryptionInfo, trackData.isEncrypted);
 				}
 			}
 		}
 
+		let sizingData: Uint8Array | null = null;
+		const sampleDescriptionIndex = trackData.sampleDescriptionIndex;
+		if (options.metadataOnly && inBandParameterSetsNeedData(this.internalTrack, sampleDescriptionIndex)) {
+			let slice = this.internalTrack.demuxer.reader.requestSlice(
+				fragmentSample.byteOffset,
+				fragmentSample.byteSize,
+			);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			sizingData = slice && readBytes(slice, fragmentSample.byteSize);
+		}
+
+		const withParameterSets = applyInBandParameterSets(
+			this.internalTrack,
+			options.metadataOnly ? sizingData : data,
+			fragmentSample.byteSize,
+			trackData.sampleDescriptionIndex,
+			fragmentSample.isKeyFrame,
+			!!options.metadataOnly,
+		);
+		if (withParameterSets.data) {
+			data = withParameterSets.data;
+		}
+
 		const timestamp = (fragmentSample.presentationTimestamp - this.internalTrack.editListOffset)
 			/ this.internalTrack.timescale;
-		const duration = fragmentSample.duration / this.internalTrack.timescale;
+		const duration = await this.getFragmentSampleDuration(fragment, sampleIndex) / this.internalTrack.timescale;
+
+		// Sequence numbers count up from the moof's offset, and the next fragment's moof starts after this one ends. If
+		// the fragment has more samples than its moof has bytes (possible when their sizes and durations are defaults),
+		// squeeze them into that range so that they still come before the next fragment's samples.
+		const sampleCount = trackData.samples.length;
+		const sequenceNumber = sampleCount <= fragment.moofSize
+			? fragment.moofOffset + sampleIndex
+			: fragment.moofOffset + sampleIndex * fragment.moofSize / sampleCount;
+
 		const packet = new EncodedPacket(
 			data,
 			fragmentSample.isKeyFrame ? 'key' : 'delta',
 			timestamp,
 			duration,
-			fragment.moofOffset + sampleIndex,
-			fragmentSample.byteSize,
+			sequenceNumber,
+			withParameterSets.byteLength,
 		);
 
 		this.packetToFragmentLocation.set(packet, { fragment, sampleIndex });
 
 		return packet;
+	}
+
+	/**
+	 * A fragment's sample lasts until the next sample in presentation order, which, with B-frames in fragments that
+	 * don't start a GOP, can sit in a fragment decoded before or after this one. Unless the fragment itself proves that
+	 * no other one holds it, the adjacent fragments are looked at until the stream guarantees that no further one can:
+	 * no sample is presented before more than maxReorderedSamples samples decoded before it, and no sample decoded
+	 * before a sync sample is presented after it. The scans are bounded so that broken files stay cheap.
+	 */
+	private async getFragmentSampleDuration(fragment: Fragment, sampleIndex: number) {
+		const trackData = fragment.trackData.get(this.internalTrack.id)!;
+		const sample = trackData.samples[sampleIndex]!;
+		const maxReorderedSamples = getMaxReorderedSamples(this.internalTrack);
+		if (maxReorderedSamples === 0) {
+			return sample.duration; // Presentation order is decode order, so no other fragment can come in between
+		}
+
+		const presentation = useFragmentPresentation(this.internalTrack, fragment.moofOffset)
+			?? keepFragmentPresentation(fragment, trackData); // Again, if it was let go of since
+
+		const knownDuration = presentation.durations.get(sampleIndex);
+		if (knownDuration !== undefined) {
+			return knownDuration;
+		}
+
+		const timestamp = sample.presentationTimestamp;
+		// Samples presented at the same time are ordered by decoding, as in non-fragmented files, so a sample decoded
+		// after this one at the same timestamp ends it: later in this fragment, or in a later fragment
+		const lastAtTimestamp = searchTimestamps(presentation.timestamps, timestamp, false) - 1;
+		let nextTimestamp = trackData.presentationTimestamps[lastAtTimestamp]!.sampleIndex !== sampleIndex
+			? timestamp
+			: getNextTimestamp(presentation.timestamps, timestamp);
+		let presentedAfterNext = countTimestampsFrom(presentation.timestamps, nextTimestamp);
+
+		if (
+			nextTimestamp > timestamp
+			&& (presentedAfterNext <= maxReorderedSamples || presentation.minSyncTimestamp > timestamp)
+		) {
+			// Later fragments can't hold a sample presented before nextTimestamp once more than maxReorderedSamples
+			// samples decoded before them are presented at or after it
+			const laterPresentations = [presentation];
+			let latestTimestamp = presentation.timestamps.at(-1) ?? -Infinity;
+			// A source of unknown size may be a live stream whose next fragment hasn't arrived yet, which must not hold
+			// back the packets that have, or a stream whose cache can't hold the rest of this fragment. Then only
+			// fragments read before are looked at.
+			const canWait = this.internalTrack.demuxer.reader.fileSizeNonStrict !== null;
+			let laterSampleCount = 0;
+			let moofOffset = fragment.moofOffset;
+			while (
+				nextTimestamp > timestamp
+				&& presentedAfterNext <= maxReorderedSamples
+				&& laterSampleCount <= MAX_SCANNED_SAMPLES
+				// No conforming stream presents that many samples decoded after a sample before it
+				&& (nextTimestamp !== Infinity || laterSampleCount <= MAX_REORDERED_SAMPLES)
+			) {
+				let next = this.getNextFragmentPresentation(moofOffset, canWait);
+				if (isThenable(next)) {
+					next = await next;
+				}
+				if (next === undefined) {
+					// The next fragment hasn't been read yet. Rather than reading it, the sample keeps the duration its
+					// own fragment gives it, as before. That isn't remembered, so that once the fragment has been read,
+					// the duration is taken from the presentation order.
+					return sample.duration;
+				}
+				// A sync sample is presented after every sample decoded before it, so one presented earlier means that
+				// the fragments overlap (cut or edited content), which nothing reorders across
+				if (!next || next.presentation.minSyncTimestamp <= latestTimestamp) {
+					break;
+				}
+
+				moofOffset = next.moofOffset;
+				laterPresentations.push(next.presentation);
+				latestTimestamp = Math.max(latestTimestamp, next.presentation.timestamps.at(-1) ?? -Infinity);
+				laterSampleCount += next.presentation.timestamps.length;
+
+				// A later fragment's sample at the same timestamp is decoded after this one, so it counts too
+				const candidate = next.presentation.timestamps[
+					searchTimestamps(next.presentation.timestamps, timestamp, true)
+				] ?? Infinity;
+				if (candidate < nextTimestamp) {
+					nextTimestamp = candidate;
+					presentedAfterNext = 0;
+					for (const { timestamps } of laterPresentations) {
+						presentedAfterNext += countTimestampsFrom(timestamps, nextTimestamp);
+					}
+				} else {
+					presentedAfterNext += countTimestampsFrom(next.presentation.timestamps, nextTimestamp);
+				}
+			}
+
+			// Earlier fragments can't hold one once a sync sample presented at or before the sample has been seen,
+			// or all of the at most maxReorderedSamples samples decoded before it and presented after it
+			let syncTimestamp = presentation.minSyncTimestamp;
+			if (syncTimestamp > timestamp && nextTimestamp > timestamp) {
+				let presentedAfterSample = 0;
+				for (let i = 0; i < sampleIndex; i++) {
+					if (trackData.samples[i]!.presentationTimestamp > timestamp) {
+						presentedAfterSample++;
+					}
+				}
+
+				let earlierSampleCount = 0;
+				moofOffset = fragment.moofOffset;
+				while (
+					syncTimestamp > timestamp
+					&& presentedAfterSample < maxReorderedSamples
+					&& earlierSampleCount <= MAX_SCANNED_SAMPLES
+				) {
+					let previous = this.getPreviousFragmentPresentation(moofOffset, canWait);
+					if (isThenable(previous)) {
+						previous = await previous;
+					}
+					// Same for an earlier fragment presenting a sample after a later sync sample
+					if (!previous || (previous.presentation.timestamps.at(-1) ?? -Infinity) >= syncTimestamp) {
+						break;
+					}
+
+					const { timestamps } = previous.presentation;
+					moofOffset = previous.moofOffset;
+					nextTimestamp = Math.min(nextTimestamp, getNextTimestamp(timestamps, timestamp));
+					syncTimestamp = Math.min(syncTimestamp, previous.presentation.minSyncTimestamp);
+					presentedAfterSample += countTimestampsAfter(timestamps, timestamp);
+					earlierSampleCount += timestamps.length;
+				}
+			}
+		}
+
+		// Without any later sample, the sample keeps its own duration
+		const duration = nextTimestamp === Infinity ? sample.duration : nextTimestamp - timestamp;
+		presentation.durations.set(sampleIndex, duration);
+
+		return duration;
+	}
+
+	/**
+	 * The presentation of the next fragment holding this track after the one at the given offset, if any. Returns
+	 * synchronously once known. Without canWait, it returns undefined instead of reading the file, see findTrackMoof.
+	 */
+	private getNextFragmentPresentation(moofOffset: number, canWait = true): MaybePromise<{
+		moofOffset: number;
+		presentation: FragmentPresentation;
+	} | null | undefined> {
+		const presentation = this.internalTrack.fragmentPresentations!.get(moofOffset);
+		if (!presentation) {
+			return undefined; // Let go of since, which the callers take as not known
+		}
+
+		const nextMoofOffset = presentation.nextMoofOffset;
+		const next = nextMoofOffset != null ? useFragmentPresentation(this.internalTrack, nextMoofOffset) : undefined;
+		if (next) {
+			return { moofOffset: nextMoofOffset!, presentation: next };
+		}
+		if (nextMoofOffset === null) {
+			return null;
+		}
+
+		return (async () => {
+			if (presentation.nextMoofOffset === undefined) {
+				const nextMoofOffset = await this.findTrackMoof(moofOffset + presentation.moofSize, canWait);
+				if (nextMoofOffset === undefined) {
+					return undefined; // Not there yet
+				}
+
+				presentation.nextMoofOffset = nextMoofOffset;
+			}
+			if (presentation.nextMoofOffset === null) {
+				return null;
+			}
+
+			const next = useFragmentPresentation(this.internalTrack, presentation.nextMoofOffset)
+				?? await this.readFragmentPresentation(presentation.nextMoofOffset, canWait);
+			if (next === undefined) {
+				return undefined;
+			}
+
+			return next ? { moofOffset: presentation.nextMoofOffset, presentation: next } : null;
+		})();
+	}
+
+	/**
+	 * The presentation of the fragment holding this track right before the one at the given offset, if any. Returns
+	 * synchronously once known. Without canWait, it only looks at fragments whose presentation is still kept, and
+	 * returns null where it would have to read the file.
+	 */
+	private getPreviousFragmentPresentation(moofOffset: number, canWait: boolean): MaybePromise<{
+		moofOffset: number;
+		presentation: FragmentPresentation;
+	} | null> {
+		const { fragmentPresentationOffsets } = this.internalTrack;
+
+		const index = binarySearchLessOrEqual(fragmentPresentationOffsets!, moofOffset - 1, x => x);
+		const candidateOffset = fragmentPresentationOffsets![index];
+		const candidate = candidateOffset !== undefined
+			? useFragmentPresentation(this.internalTrack, candidateOffset)
+			: undefined;
+		if (candidate?.nextMoofOffset === moofOffset) {
+			return { moofOffset: candidateOffset!, presentation: candidate };
+		}
+
+		return this.findPreviousFragmentPresentation(moofOffset, candidateOffset ?? null, canWait);
+	}
+
+	private async findPreviousFragmentPresentation(moofOffset: number, knownOffset: number | null, canWait: boolean) {
+		const { fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
+
+		// Boxes can only be walked forward, so start at the closest earlier fragment of this track we know of: one read
+		// before, or one the fragment index (tfra) or the position cache points to. Only without any, at the file
+		// start.
+		const lookupEntry = fragmentLookupTable[
+			binarySearchLessOrEqual(fragmentLookupTable, moofOffset - 1, x => x.moofOffset)
+		];
+		const cacheEntry = fragmentPositionCache[
+			binarySearchLessOrEqual(fragmentPositionCache, moofOffset - 1, x => x.moofOffset)
+		];
+		const candidates = [knownOffset, lookupEntry?.moofOffset, cacheEntry?.moofOffset]
+			.filter((x): x is number => x != null && x < moofOffset);
+		let currentOffset = candidates.length > 0 ? Math.max(...candidates) : await this.findTrackMoof(0);
+		if (currentOffset == null || currentOffset >= moofOffset) {
+			return null;
+		}
+
+		const presentation = useFragmentPresentation(this.internalTrack, currentOffset)
+			?? await this.readFragmentPresentation(currentOffset, canWait);
+		if (!presentation) {
+			return null;
+		}
+
+		let previous = { moofOffset: currentOffset, presentation };
+		while (true) {
+			let next = this.getNextFragmentPresentation(currentOffset, canWait);
+			if (isThenable(next)) {
+				next = await next;
+			}
+			if (next === undefined) {
+				return null; // Not known which fragment comes in between
+			}
+			if (!next || next.moofOffset >= moofOffset) {
+				return previous;
+			}
+
+			previous = next;
+			currentOffset = next.moofOffset;
+		}
+	}
+
+	/**
+	 * The presentation of the fragment at the given offset, read again if it was let go of (see
+	 * keepFragmentPresentation): null if the fragment doesn't hold this track. Without canWait, it returns undefined
+	 * instead of reading the file, which a stream may no longer have.
+	 */
+	private async readFragmentPresentation(moofOffset: number, canWait: boolean) {
+		if (!canWait) {
+			return undefined;
+		}
+
+		const fragment = await this.internalTrack.demuxer.readFragment(moofOffset, this.internalTrack);
+		const trackData = fragment?.trackData.get(this.internalTrack.id);
+		if (!fragment || !trackData) {
+			return null;
+		}
+
+		return useFragmentPresentation(this.internalTrack, moofOffset) ?? keepFragmentPresentation(fragment, trackData);
+	}
+
+	/**
+	 * The offset of the first moof box holding this track at or after the given position, if any. Without canWait, it
+	 * only goes through boxes read before, and returns undefined where it would have to read the file.
+	 */
+	private async findTrackMoof(pos: number, canWait = true): Promise<number | null | undefined> {
+		const { demuxer } = this.internalTrack;
+
+		while (true) {
+			const summary = demuxer.fragmentSummaries.get(pos);
+			if (summary) {
+				if (summary.trackIds.has(this.internalTrack.id)) {
+					return pos;
+				}
+
+				pos += summary.moofSize;
+				continue;
+			}
+
+			const mdatSize = demuxer.mdatSizes.get(pos);
+			if (mdatSize !== undefined) {
+				pos += mdatSize; // Without reading its header, which may be gone from the source by now
+				continue;
+			}
+
+			if (!canWait) {
+				// Even a read that isn't waited for makes a stream fetch data, which can push data still to be read
+				// out of its cache
+				return undefined;
+			}
+
+			let slice = demuxer.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+			if (isThenable(slice)) {
+				slice = await slice;
+			}
+			const boxInfo = slice && readBoxHeader(slice);
+			if (!boxInfo) {
+				return null;
+			}
+
+			if (boxInfo.name === 'moof') {
+				const fragment = await demuxer.readFragment(pos, this.internalTrack);
+				if (!fragment) {
+					return null;
+				}
+				if (fragment.trackData.has(this.internalTrack.id)) {
+					return pos;
+				}
+			}
+
+			pos += boxInfo.totalSize;
+		}
 	}
 
 	/** Looks for a packet in the fragments while trying to load as few fragments as possible to retrieve it. */
@@ -3543,11 +5608,56 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 		// Whether the match must be a key frame, so that position cache entries without one can be skipped
 		requireKeyFrame = false,
+		// Whether the best match is the one with the latest presentation timestamp across all fragments. Fragments may
+		// interleave in presentation order (B-frames in fragments that don't start a GOP), so then the match found in
+		// one fragment is only final once no fragment before or after it can hold a later presentation timestamp.
+		matchByPresentationTimestamp = false,
 	): Promise<EncodedPacket | null> {
-		const { demuxer, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
+		const { demuxer, fragmentLookupTable, fragmentPositionCache, nextFragmentOffsets } = this.internalTrack;
 
 		let bestFragment: Fragment | null = null;
 		let bestSampleIndex = -1;
+
+		const getPresentationTimestamp = (fragment: Fragment, sampleIndex: number) => {
+			return fragment.trackData.get(this.internalTrack.id)!.samples[sampleIndex]!.presentationTimestamp;
+		};
+		const isBetterMatch = (fragment: Fragment, sampleIndex: number) => {
+			if (!bestFragment || !matchByPresentationTimestamp) {
+				return true;
+			}
+
+			const timestamp = getPresentationTimestamp(fragment, sampleIndex);
+			const bestTimestamp = getPresentationTimestamp(bestFragment, bestSampleIndex);
+			return timestamp > bestTimestamp
+				|| (timestamp === bestTimestamp && fragment.moofOffset > bestFragment.moofOffset);
+		};
+
+		// When matching by presentation timestamp, only what the scanned samples prove about the others ends the
+		// search, not where the fragments' timestamps happen to lie: a sample presented at or before latestTimestamp
+		// can't be decoded after more than maxReorderedSamples samples presented after it, so the forward scan can
+		// stop once it has seen more of those. And no sample decoded before a sync sample is presented after it, so
+		// the scan needn't go back further than a sync sample presented at or before latestTimestamp.
+		const maxReorderedSamples = matchByPresentationTimestamp ? getMaxReorderedSamples(this.internalTrack) : 0;
+		let samplesPresentedAfter = 0;
+		let syncSampleFound = false;
+		const scanSamples = (fragment: Fragment) => {
+			const trackData = fragment.trackData.get(this.internalTrack.id);
+			if (!trackData) {
+				return;
+			}
+
+			// The fragment's samples in presentation order
+			const { presentationTimestamps, samples } = trackData;
+			const index = binarySearchLessOrEqual(
+				presentationTimestamps,
+				latestTimestamp,
+				x => x.presentationTimestamp,
+			);
+			samplesPresentedAfter += presentationTimestamps.length - (index + 1);
+			for (let i = 0; i <= index && !syncSampleFound; i++) {
+				syncSampleFound = samples[presentationTimestamps[i]!.sampleIndex]!.isKeyFrame;
+			}
+		};
 
 		if (startFragment) {
 			const { sampleIndex, correctSampleFound } = getMatchInFragment(startFragment);
@@ -3600,6 +5710,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				if (lookupEntryPosition === null || startFragment.moofOffset >= lookupEntryPosition) {
 					currentPos = startFragment.moofOffset + startFragment.moofSize;
 					currentFragment = startFragment;
+					if (matchByPresentationTimestamp) {
+						scanSamples(startFragment);
+					}
 				} else {
 					// Use the lookup entry
 					currentPos = lookupEntryPosition;
@@ -3607,62 +5720,127 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 
 			const scanStartPos = currentFragment ? currentFragment.moofOffset : currentPos;
+			// The end of the last moof box with samples of this track that this scan went past, and the number of moof
+			// boxes without samples of this track it went past since
+			let lastTrackFragmentEnd: number | null = null;
+			let fragmentsWithoutTrack = 0;
+			if (!currentFragment && currentPos === 0) {
+				// The start of the file works like the end of a fragment of this track
+				lastTrackFragmentEnd = 0;
+				currentPos = nextFragmentOffsets.get(0) ?? 0;
+			}
+			const reachedEnd = () => {
+				if (lastTrackFragmentEnd !== null && fragmentsWithoutTrack > 0) {
+					nextFragmentOffsets.set(lastTrackFragmentEnd, Infinity);
+				}
+			};
 
 			while (currentPos < stopPos) {
 				if (currentFragment) {
 					const trackData = currentFragment.trackData.get(this.internalTrack.id);
-					if (trackData && trackData.startTimestamp > latestTimestamp) {
+					if (trackData) {
+						if (lastTrackFragmentEnd !== null && fragmentsWithoutTrack > 0) {
+							nextFragmentOffsets.set(lastTrackFragmentEnd, currentFragment.moofOffset);
+						}
+						// Here, currentPos is the end of the fragment's moof box
+						lastTrackFragmentEnd = currentPos;
+						fragmentsWithoutTrack = 0;
+					} else {
+						fragmentsWithoutTrack++;
+					}
+
+					const pastUpperBound = matchByPresentationTimestamp
+						// Only the first scan goes forward; scans further back must reach the fragments scanned before
+						? stopPos === Infinity && samplesPresentedAfter > maxReorderedSamples
+						: trackData && trackData.startTimestamp > latestTimestamp;
+					if (pastUpperBound) {
 						// We're already past the upper bound, no need to keep searching
 						break;
 					}
 
 					currentFragment = null; // So we don't process it again next iteration
+
+					const nextFragmentOffset = trackData && nextFragmentOffsets.get(currentPos);
+					if (nextFragmentOffset !== undefined) {
+						// A previous scan went from here to the next fragment of this track (or to the end of the
+						// file), so we can skip the fragments in between
+						currentPos = nextFragmentOffset;
+						continue;
+					}
 				}
 
 				const summary = demuxer.fragmentSummaries.get(currentPos);
 				if (summary && !summary.trackIds.has(this.internalTrack.id)) {
 					// We've read this fragment before and know it has nothing for this track, so let's not read it
 					// again
+					demuxer.passTopLevelBox(currentPos, currentPos + summary.moofSize);
 					currentPos += summary.moofSize;
+					fragmentsWithoutTrack++;
+					continue;
+				}
+
+				const mdatSize = demuxer.mdatSizes.get(currentPos);
+				if (mdatSize !== undefined) {
+					demuxer.passTopLevelBox(currentPos, currentPos + mdatSize);
+					currentPos += mdatSize; // Without reading its header, which may be gone from the source by now
 					continue;
 				}
 
 				// Load the header
 				let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 				if (isThenable(slice)) slice = await slice;
-				if (!slice) break;
+				if (!slice) {
+					reachedEnd();
+					break;
+				}
 
 				const boxStartPos = currentPos;
 				const boxInfo = readBoxHeader(slice);
 				if (!boxInfo) {
+					reachedEnd();
 					break;
 				}
 
 				if (boxInfo.name === 'moof') {
-					currentFragment = await demuxer.readFragment(boxStartPos);
+					currentFragment = await demuxer.readFragment(boxStartPos, this.internalTrack);
 					if (!currentFragment) {
+						reachedEnd();
 						break;
 					}
 
+					if (matchByPresentationTimestamp) {
+						scanSamples(currentFragment);
+					}
+
 					const { sampleIndex, correctSampleFound } = getMatchInFragment(currentFragment);
-					if (correctSampleFound) {
+					if (correctSampleFound && !matchByPresentationTimestamp) {
 						return this.fetchPacketInFragment(currentFragment, sampleIndex, options);
 					}
-					if (sampleIndex !== -1) {
+					if (sampleIndex !== -1 && isBetterMatch(currentFragment, sampleIndex)) {
 						bestFragment = currentFragment;
 						bestSampleIndex = sampleIndex;
 					}
+				} else {
+					demuxer.passTopLevelBox(boxStartPos, boxStartPos + boxInfo.totalSize);
 				}
 
 				currentPos = boxStartPos + boxInfo.totalSize;
 			}
 
-			if (lookupEntryPosition === null || (bestFragment && bestFragment.moofOffset >= lookupEntryPosition)) {
+			if (
+				lookupEntryPosition === null
+				|| (
+					bestFragment
+					&& bestFragment.moofOffset >= lookupEntryPosition
+					&& (!matchByPresentationTimestamp || syncSampleFound)
+				)
+			) {
 				break;
 			}
 
-			// We found a lookup entry but no fragment from there on that satisfied the match. In this case, let's
-			// search again from the lookup entry preceding the fragments we just scanned.
+			// We found a lookup entry but no fragment from there on that satisfied the match (or, when matching by
+			// presentation timestamp, an earlier fragment may still hold a better one). In this case, let's search
+			// again from the lookup entry preceding the fragments we just scanned.
 			stopPos = scanStartPos; // So we don't read the same fragments again
 			startFragment = null;
 		}
@@ -3708,6 +5886,10 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 		return this.internalTrack.info.squarePixelHeight;
 	}
 
+	getPixelAspectRatio() {
+		return this.internalTrack.info.pixelAspectRatio;
+	}
+
 	getTransformationMatrix(): TransformationMatrix {
 		return [...this.internalTrack.matrix];
 	}
@@ -3733,6 +5915,40 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 		);
 	}
 
+	getHasOnlyKeyPackets() {
+		const { demuxer } = this.internalTrack;
+		if (demuxer.isFragmented) {
+			// Fragments flag their samples themselves, and the metadata doesn't say anything about them
+			return null;
+		}
+
+		let sampleTable: SampleTable;
+		try {
+			sampleTable = demuxer.getSampleTableForTrack(this.internalTrack);
+		} catch {
+			return null; // A sample table that can't be read (a damaged file) says nothing either
+		}
+		if (sampleTable.sampleCount === 0) {
+			return null;
+		}
+
+		const { keySampleIndices, sampleCount } = sampleTable;
+		if (!keySampleIndices) {
+			return true; // Without an stss box, every sample is a sync sample (ISO/IEC 14496-12 8.6.2.1)
+		}
+
+		// Whether the stss box lists every sample. Invalid entries can leave the list unsorted (see the stss box), so
+		// count the distinct valid ones.
+		const listedSampleIndices = new Set<number>();
+		for (const sampleIndex of keySampleIndices) {
+			if (sampleIndex >= 0 && sampleIndex < sampleCount) {
+				listedSampleIndices.add(sampleIndex);
+			}
+		}
+
+		return listedSampleIndices.size === sampleCount;
+	}
+
 	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
 		if (!this.internalTrack.info.codec) {
 			return null;
@@ -3743,10 +5959,94 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				const firstPacket = await this.getFirstPacket({});
 				this.internalTrack.info.avcCodecInfo
 					= firstPacket && extractAvcDecoderConfigurationRecord(firstPacket.data);
+			} else if (this.internalTrack.info.codec === 'avc') {
+				// 'avc3' tracks may carry their parameter sets in-band only (ISO/IEC 14496-15), but decoders want them
+				// in the description, or else they can only start decoding at a sample that has them. So the ones the
+				// avcC box lacks are taken from the first sample.
+				const record = deserializeAvcDecoderConfigurationRecord(this.internalTrack.info.codecDescription!);
+				if (record && (record.sequenceParameterSets.length === 0 || record.pictureParameterSets.length === 0)) {
+					const firstPacket = await this.getFirstPacketForCodecInfo(true);
+					const data = firstPacket?.data ?? new Uint8Array(0);
+					const lengthSize = (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
+					const sequenceParameterSets: Uint8Array[] = [];
+					const pictureParameterSets: Uint8Array[] = [];
+
+					for (const { offset, length } of iterateNalUnitsInLengthPrefixed(data, lengthSize)) {
+						const nalUnit = data.subarray(offset, offset + length);
+						const type = extractNalUnitTypeForAvc(nalUnit[0] ?? 0);
+						if (type === AvcNalUnitType.SPS && sequenceParameterSets.length < 31) {
+							sequenceParameterSets.push(nalUnit);
+						} else if (type === AvcNalUnitType.PPS && pictureParameterSets.length < 255) {
+							pictureParameterSets.push(nalUnit);
+						}
+					}
+
+					const completedRecord = {
+						...record,
+						sequenceParameterSets: record.sequenceParameterSets.length > 0
+							? record.sequenceParameterSets
+							: sequenceParameterSets,
+						pictureParameterSets: record.pictureParameterSets.length > 0
+							? record.pictureParameterSets
+							: pictureParameterSets,
+					};
+					if (
+						completedRecord.sequenceParameterSets.length > 0
+						&& completedRecord.pictureParameterSets.length > 0
+					) {
+						this.internalTrack.info.codecDescription
+							= serializeAvcDecoderConfigurationRecord(completedRecord);
+					}
+				}
 			} else if (this.internalTrack.info.codec === 'hevc' && !this.internalTrack.info.codecDescription) {
 				const firstPacket = await this.getFirstPacket({});
 				this.internalTrack.info.hevcCodecInfo
 					= firstPacket && extractHevcDecoderConfigurationRecord(firstPacket.data);
+			} else if (this.internalTrack.info.codec === 'hevc') {
+				// 'hev1' tracks may carry their parameter sets in-band only, with none in the hvcC box (ISO/IEC
+				// 14496-15), but decoders want them in the description, or else they can only start decoding at a
+				// sample that has them, and the color space comes from the SPS. So the kinds the hvcC box lacks are
+				// taken from the first sample.
+				const description = this.internalTrack.info.codecDescription!;
+				const record = deserializeHevcDecoderConfigurationRecord(description);
+				const parameterSetTypes = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+				const missingTypes = parameterSetTypes.filter(
+					type => !record?.arrays.some(x => x.nalUnitType === type && x.nalUnits.length > 0),
+				);
+
+				if (record && missingTypes.length > 0) {
+					const firstPacket = await this.getFirstPacketForCodecInfo(true);
+					const data = firstPacket?.data ?? new Uint8Array(0);
+					const addedArrays = missingTypes.map(nalUnitType => ({
+						arrayCompleteness: 0, // More of them can follow in-band
+						nalUnitType: nalUnitType as number,
+						nalUnits: [] as Uint8Array[],
+					}));
+
+					for (const { offset, length } of iterateHevcNalUnits(data, { codec: 'hev1', description })) {
+						const nalUnit = data.subarray(offset, offset + length);
+						const type = extractNalUnitTypeForHevc(nalUnit[0] ?? 0);
+						const array = addedArrays.find(x => x.nalUnitType === type);
+						if (array && array.nalUnits.length < 0xffff) {
+							array.nalUnits.push(nalUnit);
+						}
+					}
+
+					if (addedArrays.every(x => x.nalUnits.length > 0)) {
+						// The parameter sets first, in the usual order, then the rest (such as SEI) as they were
+						const rank = (type: number) => {
+							const index = parameterSetTypes.indexOf(type);
+							return index === -1 ? parameterSetTypes.length : index;
+						};
+						const arrays = [
+							...record.arrays.filter(x => !missingTypes.includes(x.nalUnitType)),
+							...addedArrays,
+						].sort((a, b) => rank(a.nalUnitType) - rank(b.nalUnitType));
+
+						this.internalTrack.info.codecDescription
+							= serializeHevcDecoderConfigurationRecord({ ...record, arrays });
+					}
+				}
 			} else if (
 				this.internalTrack.info.codec === 'vp9'
 				&& (
@@ -3755,7 +6055,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 					|| !vp9CodecInfoHasColorInfo(this.internalTrack.info.vp9CodecInfo)
 				)
 			) {
-				const firstPacket = await this.getFirstPacket({});
+				const firstPacket = await this.getFirstPacketForCodecInfo(!!this.internalTrack.info.vp9CodecInfo);
 				const packetInfo = firstPacket && extractVp9CodecInfoFromPacket(firstPacket.data);
 
 				if (packetInfo) {
@@ -3777,7 +6077,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 					)
 				)
 			) {
-				const firstPacket = await this.getFirstPacket({});
+				const firstPacket = await this.getFirstPacketForCodecInfo(!!this.internalTrack.info.av1CodecInfo);
 				const packetInfo = firstPacket && extractAv1CodecInfoFromPacket(firstPacket.data);
 
 				if (packetInfo) {
@@ -3803,20 +6103,38 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				codec: extractVideoCodecString(this.internalTrack.info),
 				codedWidth: this.internalTrack.info.width,
 				codedHeight: this.internalTrack.info.height,
-				description: this.internalTrack.info.codecDescription ?? undefined,
+				description: getInBandParameterSets(this.internalTrack)?.description
+					?? this.internalTrack.info.codecDescription
+					?? undefined,
 				colorSpace: this.internalTrack.info.colorSpace,
 			};
 
-			if (
-				this.internalTrack.info.width !== this.internalTrack.info.squarePixelWidth
-				|| this.internalTrack.info.height !== this.internalTrack.info.squarePixelHeight
-			) {
-				config.displayAspectWidth = this.internalTrack.info.squarePixelWidth;
-				config.displayAspectHeight = this.internalTrack.info.squarePixelHeight;
+			const { width, height, pixelAspectRatio } = this.internalTrack.info;
+			const displayAspect = getDisplayAspect(width, height, pixelAspectRatio);
+			if (displayAspect) {
+				config.displayAspectWidth = displayAspect.displayAspectWidth;
+				config.displayAspectHeight = displayAspect.displayAspectHeight;
 			}
 
 			return config;
 		})();
+	}
+
+	/**
+	 * The first packet, from which the codec info of the sample entry is completed or refined. An encrypted track's
+	 * packets can't be read without its key: then, if the sample entry has codec info (hasCodecInfo), null is
+	 * returned, and that info is used as it is, as metadata calls don't need the key.
+	 */
+	private async getFirstPacketForCodecInfo(hasCodecInfo: boolean) {
+		try {
+			return await this.getFirstPacket({});
+		} catch (error) {
+			if (hasCodecInfo && this.internalTrack.encryptionInfo) {
+				return null;
+			}
+
+			throw error;
+		}
 	}
 }
 
@@ -3866,6 +6184,86 @@ class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudio
 	}
 }
 
+/**
+ * Without a pasp box or a pixel aspect ratio in the bitstream, a display matrix that scales the axes unevenly
+ * (QuickTime's "scrunch") gives the pixel aspect ratio, as FFmpeg (mov_read_tkhd) takes it, before the tkhd
+ * presentation size. The scale then moves out of the matrix, so that the square pixel size and the matrix don't both
+ * apply it.
+ */
+const applyDisplayMatrixAspectRatio = (track: InternalTrack) => {
+	const info = track.info;
+	const [a, b, , c, d] = track.matrix;
+	if (
+		info?.type !== 'video'
+		|| track.hasPaspBox
+		|| info.squarePixelWidth !== info.width
+		|| info.squarePixelHeight !== info.height
+		|| !(info.width > 0 && info.height > 0)
+		// Only for matrices that don't rotate the frame: with a quarter turn, FFmpeg's ratio (of the matrix's column
+		// lengths) is the inverse of the one the matrix gives the frame
+		|| b !== 0
+		|| c !== 0
+	) {
+		return;
+	}
+
+	const horizontalScale = Math.abs(a);
+	const verticalScale = Math.abs(d);
+	if (
+		!(horizontalScale > 0 && verticalScale > 0 && horizontalScale < 256 && verticalScale < 256)
+		|| Math.abs(horizontalScale / verticalScale - 1) <= 0.01
+	) {
+		return;
+	}
+
+	// The scales are multiples of 2^-32 (16.16 fixed-point numbers, or products of two)
+	applySpsPixelAspectRatio(track, {
+		num: Math.round(horizontalScale * 2 ** 32),
+		den: Math.round(verticalScale * 2 ** 32),
+	});
+
+	// Keep the uniform part of the scale, like for matrices that scale both axes the same
+	const matrix: TransformationMatrix = [...track.matrix];
+	const smaller = Math.min(horizontalScale, verticalScale);
+	const larger = Math.max(horizontalScale, verticalScale);
+	const row = horizontalScale > verticalScale ? 0 : 3;
+	for (let i = row; i < row + 3; i++) {
+		matrix[i] = matrix[i]! * smaller / larger;
+	}
+	track.matrix = matrix;
+};
+
+/**
+ * Without a pasp box or a pixel aspect ratio in the bitstream, a tkhd presentation size of another shape than the coded
+ * frame gives the pixel aspect ratio, as FFmpeg (mov_read_trak) and Chromium (MP4StreamParser) take it.
+ */
+const applyPresentationSizeAspectRatio = (track: InternalTrack) => {
+	const info = track.info;
+	if (
+		info?.type !== 'video'
+		|| track.hasPaspBox
+		|| info.squarePixelWidth !== info.width
+		|| info.squarePixelHeight !== info.height
+		|| !(track.presentationWidth > 0 && track.presentationHeight > 0)
+		|| !(info.width > 0 && info.height > 0)
+	) {
+		return;
+	}
+
+	// FFmpeg's ratio. Shapes within 1% of the frame's are left alone, as rounding or a clean aperture can explain
+	// them.
+	const pixelAspectRatio = {
+		num: info.height * track.presentationWidth,
+		den: info.width * track.presentationHeight,
+	};
+	if (Math.abs(pixelAspectRatio.num / pixelAspectRatio.den - 1) < 0.01) {
+		return;
+	}
+
+	// Applied like a ratio from the bitstream, which only widens or heightens the frame
+	applySpsPixelAspectRatio(track, pixelAspectRatio);
+};
+
 const getSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: number) => {
 	if (sampleTable.sortedCompositionTimeOffsets) {
 		return performPresentationTimeLookup(sampleTable, timescaleUnits, false);
@@ -3892,6 +6290,25 @@ const getSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: nu
 	}
 };
 
+/**
+ * Whether every sample of the track is a key sample, whatever the container says: true for audio codecs without delta
+ * packets, like in the Matroska demuxer. Some files flag such samples as non-sync samples.
+ */
+const hasOnlyKeySamples = (track: InternalTrack) => {
+	const info = track.info;
+	if (info?.type !== 'audio' || !info.codec || AUDIO_CODECS_WITH_DELTA_PACKETS.includes(info.codec)) {
+		return false;
+	}
+
+	if (info.codec === 'aac' && info.codecDescription) {
+		// xHE-AAC (USAC) frames can depend on the ones before; only its independent frames are sync samples (Chromium
+		// makes the same exception)
+		return parseAacAudioSpecificConfig(info.codecDescription).objectType !== 42;
+	}
+
+	return true;
+};
+
 const getKeyframeSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: number) => {
 	if (!sampleTable.keySampleIndices) {
 		// Every sample is a keyframe
@@ -3908,6 +6325,147 @@ const getKeyframeSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleU
 	}
 };
 
+type InBandParameterSets = {
+	/**
+	 * The NAL unit length size of every packet: the largest among the sample descriptions, since narrowing could
+	 * truncate NAL unit lengths
+	 */
+	lengthSize: 1 | 2 | 3 | 4;
+	/** The decoder config's avcC/hvcC record, with that length size */
+	description: Uint8Array;
+	bySampleDescription: Map<number, { parameterSets: Uint8Array; lengthSize: 1 | 2 | 3 | 4 }>;
+};
+
+/**
+ * The decoder config of an AVC or HEVC track has the parameter sets of one sample description only, but FFmpeg starts
+ * a new sample description when they change mid-stream. Like Chromium, which inserts the parameter sets of the sample's
+ * own description into every key frame, we then send each description's parameter sets in band.
+ */
+const getInBandParameterSets = (track: InternalTrack) => {
+	if (track.inBandParameterSets !== undefined) {
+		return track.inBandParameterSets;
+	}
+
+	track.inBandParameterSets = null;
+	const info = track.info;
+	if (info?.type !== 'video' || (info.codec !== 'avc' && info.codec !== 'hevc') || !info.codecDescription) {
+		return null;
+	}
+
+	const configDescription = info.codecDescription;
+	const records = track.sampleDescriptionRecords;
+	if (!records.some(record => record && !uint8ArraysAreEqual(record, configDescription))) {
+		return null; // All descriptions share the decoder config's parameter sets
+	}
+
+	const parseRecord = (record: Uint8Array) => {
+		if (info.codec === 'avc') {
+			const avcRecord = deserializeAvcDecoderConfigurationRecord(record);
+			return avcRecord && {
+				nalUnits: [...avcRecord.sequenceParameterSets, ...avcRecord.pictureParameterSets],
+				lengthSize: (avcRecord.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			};
+		} else {
+			const hevcRecord = deserializeHevcDecoderConfigurationRecord(record);
+			const parameterSetTypes: number[] = [
+				HevcNalUnitType.VPS_NUT,
+				HevcNalUnitType.SPS_NUT,
+				HevcNalUnitType.PPS_NUT,
+			];
+			return hevcRecord && {
+				nalUnits: hevcRecord.arrays
+					.filter(x => parameterSetTypes.includes(x.nalUnitType))
+					.flatMap(x => x.nalUnits),
+				lengthSize: (hevcRecord.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			};
+		}
+	};
+
+	const config = parseRecord(configDescription);
+	if (!config) {
+		return null;
+	}
+
+	const parsedRecords = records.map(record => record && parseRecord(record));
+	const lengthSize = Math.max(
+		config.lengthSize,
+		...parsedRecords.map(parsed => parsed?.lengthSize ?? 1),
+	) as 1 | 2 | 3 | 4;
+
+	let description = configDescription;
+	if (lengthSize !== config.lengthSize) {
+		// lengthSizeMinusOne is in the low two bits of byte 4 of avcC and of byte 21 of hvcC
+		description = configDescription.slice();
+		const lengthSizePos = info.codec === 'avc' ? 4 : 21;
+		description[lengthSizePos] = (description[lengthSizePos]! & 0xfc) | (lengthSize - 1);
+	}
+
+	const bySampleDescription: InBandParameterSets['bySampleDescription'] = new Map();
+	parsedRecords.forEach((parsed, i) => {
+		if (parsed) {
+			bySampleDescription.set(i + 1, {
+				parameterSets: concatNalUnitsInLengthPrefixed(parsed.nalUnits, lengthSize),
+				lengthSize: parsed.lengthSize,
+			});
+		}
+	});
+
+	return track.inBandParameterSets = { lengthSize, description, bySampleDescription };
+};
+
+/**
+ * Whether a sample's NAL unit length prefixes get widened to the packets' size, which makes the packet's size depend on
+ * its NAL units: then even a metadata-only packet needs the sample's data to know its size.
+ */
+const inBandParameterSetsNeedData = (track: InternalTrack, sampleDescriptionIndex: number) => {
+	const inBand = getInBandParameterSets(track);
+	const description = inBand?.bySampleDescription.get(sampleDescriptionIndex);
+	return !!inBand && !!description && description.lengthSize !== inBand.lengthSize;
+};
+
+/**
+ * Prepends a key sample's own parameter sets when the track's sample descriptions differ in them, widening NAL unit
+ * length prefixes to the packets' size if needed. For metadata-only packets, only computes the size (from the
+ * data when inBandParameterSetsNeedData says so) and returns no data.
+ */
+const applyInBandParameterSets = (
+	track: InternalTrack,
+	data: Uint8Array | null,
+	byteLength: number,
+	sampleDescriptionIndex: number,
+	isKeyFrame: boolean,
+	metadataOnly: boolean,
+) => {
+	const inBand = getInBandParameterSets(track);
+	const description = inBand?.bySampleDescription.get(sampleDescriptionIndex);
+	if (!inBand || !description) {
+		return { data: metadataOnly ? null : data, byteLength };
+	}
+
+	if (data && description.lengthSize !== inBand.lengthSize) {
+		const bytes = data;
+		const nalUnits = [...iterateNalUnitsInLengthPrefixed(bytes, description.lengthSize)]
+			.map(location => bytes.subarray(location.offset, location.offset + location.length));
+		data = concatNalUnitsInLengthPrefixed(nalUnits, inBand.lengthSize);
+	}
+
+	if (data) {
+		byteLength = data.byteLength;
+	}
+
+	if (isKeyFrame) {
+		byteLength += description.parameterSets.byteLength;
+		if (data && !metadataOnly) {
+			const result = new Uint8Array(byteLength);
+			result.set(description.parameterSets, 0);
+			result.set(data, description.parameterSets.byteLength);
+			data = result;
+		}
+	}
+
+	return { data: metadataOnly ? null : data, byteLength };
+};
+
 type SampleInfo = {
 	presentationTimestamp: number;
 	duration: number;
@@ -3915,6 +6473,7 @@ type SampleInfo = {
 	sampleSize: number;
 	chunkOffset: number;
 	isKeyFrame: boolean;
+	sampleDescriptionIndex: number;
 };
 
 const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInfo | null => {
@@ -3976,7 +6535,13 @@ const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInf
 		isKeyFrame: sampleTable.keySampleIndices
 			? binarySearchExact(sampleTable.keySampleIndices, sampleIndex, x => x) !== -1
 			: true,
+		sampleDescriptionIndex: chunkEntry.sampleDescriptionIndex,
 	};
+};
+
+/** `index` is 1-based. The encryption info of that sample description, or else the track's. */
+const getSampleDescriptionEncryptionInfo = (track: InternalTrack, index: number) => {
+	return track.encryptionInfos[index - 1] ?? track.encryptionInfo;
 };
 
 const performPresentationTimeLookup = (
@@ -4053,6 +6618,141 @@ const getNextPresentationTimestamp = (sampleTable: SampleTable, sampleIndex: num
 	return nextTimestamp;
 };
 
+type CompressedMovieBox = {
+	uncompressedSize: number;
+	data: Uint8Array;
+};
+
+/**
+ * QuickTime can store the movie box compressed (its "Compress movie header" option): the movie box then holds a cmov
+ * box with the compression algorithm (dcom) and the compressed movie box (cmvd). Returns those, or null if the movie
+ * box isn't compressed.
+ */
+const readCompressedMovieBox = (moovSlice: FileSlice): CompressedMovieBox | null => {
+	const slice = moovSlice.slice(moovSlice.start); // From the start, whatever was read from the movie box before
+	const cmovInfo = slice.remainingLength >= MIN_BOX_HEADER_SIZE ? readBoxHeader(slice) : null;
+	if (cmovInfo?.name !== 'cmov' || cmovInfo.contentSize > slice.remainingLength) {
+		return null;
+	}
+
+	const cmovSlice = slice.slice(slice.filePos, cmovInfo.contentSize);
+	let algorithm: string | null = null;
+	let compressedMovieBox: CompressedMovieBox | null = null;
+
+	while (cmovSlice.remainingLength >= MIN_BOX_HEADER_SIZE) {
+		const boxStartPos = cmovSlice.filePos;
+		const boxInfo = readBoxHeader(cmovSlice);
+		if (!boxInfo || boxInfo.contentSize > cmovSlice.remainingLength) {
+			break;
+		}
+
+		if (boxInfo.name === 'dcom' && boxInfo.contentSize >= 4) {
+			algorithm = readAscii(cmovSlice, 4);
+		} else if (boxInfo.name === 'cmvd' && boxInfo.contentSize >= 4) {
+			const uncompressedSize = readU32Be(cmovSlice);
+			compressedMovieBox = { uncompressedSize, data: readBytes(cmovSlice, boxInfo.contentSize - 4) };
+		}
+
+		cmovSlice.filePos = boxStartPos + boxInfo.totalSize;
+	}
+
+	if (algorithm !== 'zlib') {
+		throw new Error(`Unsupported compression algorithm '${algorithm}' for the compressed movie box.`);
+	}
+	if (!compressedMovieBox) {
+		throw new Error('Invalid compressed movie box: missing cmvd box.');
+	}
+
+	return compressedMovieBox;
+};
+
+/**
+ * The most a compressed movie box may decompress to. Real ones are a few megabytes at most, and the size the cmvd box
+ * declares can't bound the data on its own: a file of 1 MB can declare 4 GiB.
+ */
+const MAX_DECOMPRESSED_MOVIE_BOX_SIZE = 2 ** 26;
+
+/** Returns a slice over the contents of the movie box that a compressed movie box holds. */
+const decompressMovieBox = async ({ uncompressedSize, data }: CompressedMovieBox) => {
+	if (typeof DecompressionStream === 'undefined') {
+		throw new Error('Reading a compressed movie box requires DecompressionStream, which isn\'t available here.');
+	}
+
+	const stream = new DecompressionStream('deflate'); // The zlib format
+	const writer = stream.writable.getWriter();
+	writer.write(data as Uint8Array<ArrayBuffer>).then(() => writer.close()).catch(() => {}); // Reading reports errors
+	const reader = stream.readable.getReader();
+
+	const chunks: Uint8Array[] = [];
+	let decompressedSize = 0;
+	const joinChunks = (length: number) => {
+		const bytes = new Uint8Array(length);
+		let offset = 0;
+		for (const chunk of chunks) {
+			const part = chunk.subarray(0, length - offset);
+			bytes.set(part, offset);
+			offset += part.length;
+		}
+
+		return bytes;
+	};
+	const fail = (message: string) => {
+		reader.cancel().catch(() => {});
+		return new Error(message);
+	};
+
+	// The data must start with a movie box no bigger than the declared size and the limit, and decompression stops at
+	// its end. That way, data that isn't a movie box fails with its first bytes, and no file can make this decompress
+	// more than the limit.
+	let movieBoxSize: number | null = null;
+	while (movieBoxSize === null || decompressedSize < movieBoxSize) {
+		let result: ReadableStreamReadResult<Uint8Array>;
+		try {
+			result = await reader.read();
+		} catch (error) {
+			const detail = error instanceof Error && error.message ? ` (${error.message})` : '';
+			throw new Error(`Invalid compressed movie box: its data couldn't be decompressed${detail}.`);
+		}
+		if (result.done) {
+			break;
+		}
+
+		chunks.push(result.value);
+		decompressedSize += result.value.length;
+
+		if (movieBoxSize === null) {
+			const head = joinChunks(Math.min(decompressedSize, MAX_BOX_HEADER_SIZE));
+			const headerIsComplete = head.length === MAX_BOX_HEADER_SIZE
+				|| (head.length >= MIN_BOX_HEADER_SIZE && toDataView(head).getUint32(0) !== 1); // 1: a 64-bit size
+			if (!headerIsComplete) {
+				continue;
+			}
+
+			const boxInfo = readBoxHeader(FileSlice.tempFromBytes(head));
+			if (boxInfo?.name !== 'moov') {
+				throw fail('Invalid compressed movie box: it doesn\'t hold a movie box.');
+			}
+			if (boxInfo.totalSize > uncompressedSize) {
+				throw fail('Invalid compressed movie box: its data decompresses to more than its declared size.');
+			}
+			if (boxInfo.totalSize > MAX_DECOMPRESSED_MOVIE_BOX_SIZE) {
+				throw fail('Unsupported compressed movie box: it decompresses to more than 64 MiB.');
+			}
+
+			movieBoxSize = boxInfo.totalSize;
+		}
+	}
+
+	reader.cancel().catch(() => {}); // Whatever follows the movie box isn't needed
+	if (movieBoxSize === null || decompressedSize < movieBoxSize) {
+		throw new Error('Invalid compressed movie box: it doesn\'t hold a movie box.');
+	}
+
+	const decompressedSlice = FileSlice.tempFromBytes(joinChunks(movieBoxSize));
+	const moovInfo = readBoxHeader(decompressedSlice)!;
+	return decompressedSlice.slice(decompressedSlice.filePos, moovInfo.contentSize);
+};
+
 const findFirstSampleInEntry = (
 	sampleTable: SampleTable,
 	entry: SampleCompositionTimeOffsetEntry,
@@ -4077,6 +6777,21 @@ const findFirstSampleInEntry = (
 	return low;
 };
 
+/** The number of samples in each chunk */
+const getChunkSampleCounts = (sampleTable: SampleTable) => {
+	const counts: number[] = [];
+	for (let i = 0; i < sampleTable.sampleToChunk.length; i++) {
+		const entry = sampleTable.sampleToChunk[i]!;
+		const nextEntry = sampleTable.sampleToChunk[i + 1];
+		const endChunkIndex = Math.min(nextEntry?.startChunkIndex ?? Infinity, sampleTable.chunkOffsets.length);
+		for (let j = entry.startChunkIndex; j < endChunkIndex; j++) {
+			counts.push(entry.samplesPerChunk);
+		}
+	}
+
+	return counts;
+};
+
 const getDecodeTimestamp = (sampleTable: SampleTable, sampleIndex: number) => {
 	const timingEntryIndex = binarySearchLessOrEqual(sampleTable.sampleTimingEntries, sampleIndex, x => x.startIndex);
 	const timingEntry = sampleTable.sampleTimingEntries[timingEntryIndex]!;
@@ -4093,7 +6808,142 @@ const getNextKeyframeIndexForSample = (sampleTable: SampleTable, sampleIndex: nu
 	return sampleTable.keySampleIndices[index + 1] ?? -1;
 };
 
+/**
+ * No sample is presented before more than this many samples that precede it in decoding order: AVC, HEVC and VVC can't
+ * reorder more frames than their decoded picture buffer holds (16 frames, 32 fields), and other codecs reorder less.
+ */
+const MAX_REORDERED_SAMPLES = 32;
+
+/** How many samples of other fragments are looked at, at most, to find where a fragment's sample ends */
+const MAX_SCANNED_SAMPLES = 4 * (MAX_REORDERED_SAMPLES + 1);
+
+/** The most samples that can precede any sample of the track in decoding order and follow it in presentation order. */
+const getMaxReorderedSamples = (track: InternalTrack) => {
+	if (track.maxReorderedSamples !== undefined) {
+		return track.maxReorderedSamples;
+	}
+
+	const info = track.info;
+	let maxReorderedSamples = MAX_REORDERED_SAMPLES;
+	if (info?.type === 'audio') {
+		maxReorderedSamples = 0;
+	} else if (info?.type === 'video') {
+		if (info.codec === 'vp8' || info.codec === 'vp9' || info.codec === 'av1') {
+			// Their ISOBMFF bindings store one displayed frame per sample, in presentation order
+			maxReorderedSamples = 0;
+		} else if (info.codec === 'avc' && info.codecDescription) {
+			const sps = deserializeAvcDecoderConfigurationRecord(info.codecDescription)?.sequenceParameterSets[0];
+			const spsInfo = sps && parseAvcSps(sps);
+			if (spsInfo) {
+				// num_reorder_frames counts frames, whose two fields can be separate samples
+				maxReorderedSamples = spsInfo.frameMbsOnlyFlag
+					? spsInfo.numReorderFrames
+					: 2 * spsInfo.numReorderFrames + 1;
+			}
+		} else if (info.codec === 'hevc' && info.codecDescription) {
+			const sps = deserializeHevcDecoderConfigurationRecord(info.codecDescription)
+				?.arrays.find(x => x.nalUnitType === HevcNalUnitType.SPS_NUT)?.nalUnits[0];
+			const spsInfo = sps && parseHevcSps(sps);
+			if (spsInfo) {
+				maxReorderedSamples = spsInfo.maxDecFrameBuffering; // At least sps_max_num_reorder_pics
+			}
+		}
+	}
+
+	return track.maxReorderedSamples = maxReorderedSamples;
+};
+
+/**
+ * How many samples, at most, the fragments whose presentation a track keeps have, beyond its last few fragments:
+ * several times what finding where a sample ends looks at, so that reading through a file keeps everything needed
+ * without memory growing with the file's length. A presentation let go of is made again when needed.
+ */
+const MAX_KEPT_PRESENTATION_SAMPLES = 4 * MAX_SCANNED_SAMPLES;
+const MIN_KEPT_FRAGMENT_PRESENTATIONS = 8;
+
+/** Keeps what a fragment presents for its track, letting go of the least recently used ones beyond the limits */
+const keepFragmentPresentation = (fragment: Fragment, trackData: FragmentTrackData) => {
+	const track = trackData.track;
+	let minSyncTimestamp = Infinity;
+	for (const sample of trackData.samples) {
+		if (sample.isKeyFrame) {
+			minSyncTimestamp = Math.min(minSyncTimestamp, sample.presentationTimestamp);
+		}
+	}
+
+	const presentation: FragmentPresentation = {
+		moofSize: fragment.moofSize,
+		timestamps: trackData.presentationTimestamps.map(x => x.presentationTimestamp),
+		minSyncTimestamp,
+		durations: new Map(),
+	};
+
+	const presentations = track.fragmentPresentations ??= new Map<number, FragmentPresentation>();
+	const offsets = track.fragmentPresentationOffsets ??= [];
+	presentations.set(fragment.moofOffset, presentation);
+	offsets.splice(binarySearchLessOrEqual(offsets, fragment.moofOffset, x => x) + 1, 0, fragment.moofOffset);
+	let sampleCount = (track.fragmentPresentationSampleCount ?? 0) + presentation.timestamps.length;
+
+	// A map iterates in insertion order, and using a presentation moves it to the end (see useFragmentPresentation),
+	// so the first one is the least recently used
+	for (const [moofOffset, { timestamps }] of presentations) {
+		if (presentations.size <= MIN_KEPT_FRAGMENT_PRESENTATIONS || sampleCount <= MAX_KEPT_PRESENTATION_SAMPLES) {
+			break;
+		}
+
+		presentations.delete(moofOffset);
+		offsets.splice(binarySearchExact(offsets, moofOffset, x => x), 1);
+		sampleCount -= timestamps.length;
+	}
+
+	track.fragmentPresentationSampleCount = sampleCount;
+	return presentation;
+};
+
+/** The presentation of a fragment if it's still kept, which then counts as just used (see keepFragmentPresentation) */
+const useFragmentPresentation = (track: InternalTrack, moofOffset: number) => {
+	const presentation = track.fragmentPresentations?.get(moofOffset);
+	if (presentation) {
+		track.fragmentPresentations!.delete(moofOffset);
+		track.fragmentPresentations!.set(moofOffset, presentation);
+	}
+
+	return presentation;
+};
+
+/** The index of the first of the sorted timestamps that is after the given one (or equal to it, if inclusive) */
+const searchTimestamps = (timestamps: number[], timestamp: number, inclusive: boolean) => {
+	let low = 0;
+	let high = timestamps.length;
+	while (low < high) {
+		const middle = (low + high) >> 1;
+		if (inclusive ? timestamps[middle]! < timestamp : timestamps[middle]! <= timestamp) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+
+	return low;
+};
+
+/** The earliest of the sorted timestamps after the given one, or Infinity */
+const getNextTimestamp = (timestamps: number[], timestamp: number) => {
+	return timestamps[searchTimestamps(timestamps, timestamp, false)] ?? Infinity;
+};
+
+/** How many of the sorted timestamps are at or after the given one */
+const countTimestampsFrom = (timestamps: number[], timestamp: number) => {
+	return timestamps.length - searchTimestamps(timestamps, timestamp, true);
+};
+
+/** How many of the sorted timestamps are after the given one */
+const countTimestampsAfter = (timestamps: number[], timestamp: number) => {
+	return timestamps.length - searchTimestamps(timestamps, timestamp, false);
+};
+
 const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timestamp: number) => {
+	trackData.currentTimestamp += timestamp;
 	trackData.startTimestamp += timestamp;
 	trackData.endTimestamp += timestamp;
 
@@ -4102,6 +6952,25 @@ const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timest
 	}
 	for (const entry of trackData.presentationTimestamps) {
 		entry.presentationTimestamp += timestamp;
+	}
+};
+
+/**
+ * Takes the dependencies of video samples whose sample flags leave them unknown from the traf's sdtp box, like
+ * Chromium (TrackRunIterator), as some files mark every video frame as a sync sample.
+ */
+const applySampleDependencies = (track: InternalTrack, trackData: FragmentTrackData) => {
+	const state = track.currentFragmentState;
+	if (!state?.sampleDependencies || track.info?.type !== 'video') {
+		return;
+	}
+
+	const { sampleDependsOn, sampleDependencies } = state;
+	for (let i = 0; i < trackData.samples.length && i < sampleDependencies.length; i++) {
+		// sample_depends_on 1: the sample depends on others
+		if (sampleDependsOn[i] === 0 && ((sampleDependencies[i]! >> 4) & 0b11) === 1) {
+			trackData.samples[i]!.isKeyFrame = false;
+		}
 	}
 };
 
@@ -4119,9 +6988,25 @@ const readMatrix = (slice: FileSlice): TransformationMatrix => {
 	];
 };
 
+/**
+ * Takes the dimensions from the SPS when the sample entry leaves them at 0, as some writers do. FFmpeg also uses the
+ * dimensions of the parameter sets.
+ */
+const applySpsDimensions = (track: InternalTrack, width: number, height: number) => {
+	const info = track.info!;
+	if (info.type !== 'video' || (info.width > 0 && info.height > 0) || !(width > 0 && height > 0)) {
+		return;
+	}
+
+	info.width = width;
+	info.height = height;
+	info.squarePixelWidth = width;
+	info.squarePixelHeight = height;
+};
+
 const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Rational) => {
 	const info = track.info!;
-	if (info.type !== 'video') {
+	if (info.type !== 'video' || info.hasPixelAspectRatioBox) {
 		return;
 	}
 
@@ -4130,6 +7015,7 @@ const applySpsPixelAspectRatio = (track: InternalTrack, pixelAspectRatio: Ration
 		return;
 	}
 
+	info.pixelAspectRatio = simplifyRational({ num, den });
 	if (num > den) {
 		info.squarePixelWidth = Math.round(info.width * num / den);
 		info.squarePixelHeight = info.height;
@@ -4143,6 +7029,45 @@ const sampleTableIsEmpty = (sampleTable: SampleTable) => {
 	return sampleTable.sampleSizes.length === 0;
 };
 
+/** Counts the samples before the first one whose data goes past the end of the file. */
+const countSamplesWithData = (sampleTable: SampleTable, fileSize: number) => {
+	const { sampleToChunk, chunkOffsets, sampleSizes, sampleCount } = sampleTable;
+	const getSampleSize = (sampleIndex: number) => sampleSizes[Math.min(sampleIndex, sampleSizes.length - 1)]!;
+
+	for (let i = 0; i < sampleToChunk.length; i++) {
+		const chunkEntry = sampleToChunk[i]!;
+		const chunkCount = Math.min(sampleToChunk[i + 1]?.startChunkIndex ?? Infinity, chunkOffsets.length)
+			- chunkEntry.startChunkIndex;
+
+		for (let j = 0; j < chunkCount; j++) {
+			const startSampleIndex = chunkEntry.startSampleIndex + j * chunkEntry.samplesPerChunk;
+			const endSampleIndex = Math.min(startSampleIndex + chunkEntry.samplesPerChunk, sampleCount);
+			let offset = chunkOffsets[chunkEntry.startChunkIndex + j]!;
+
+			for (let sampleIndex = startSampleIndex; sampleIndex < endSampleIndex; sampleIndex++) {
+				offset += getSampleSize(sampleIndex);
+				if (offset > fileSize) {
+					return sampleIndex;
+				}
+			}
+
+			if (endSampleIndex >= sampleCount) {
+				return sampleCount;
+			}
+		}
+	}
+
+	return sampleCount;
+};
+
+/** Inserts a number into a sorted array, unless it's already there */
+const insertSorted = (array: number[], value: number) => {
+	const index = binarySearchLessOrEqual(array, value, x => x);
+	if (array[index] !== value) {
+		array.splice(index + 1, 0, value);
+	}
+};
+
 const capEntryCounts = (entries: { startIndex: number; count: number }[], sampleCount: number) => {
 	while (entries.length > 0 && last(entries)!.startIndex >= sampleCount) {
 		entries.pop();
@@ -4154,6 +7079,11 @@ const capEntryCounts = (entries: { startIndex: number; count: number }[], sample
 	}
 };
 
+/** `index` is 1-based. Descriptions of a track that we couldn't classify count as encrypted. */
+const sampleDescriptionIsEncrypted = (track: InternalTrack, index: number) => {
+	return track.encryptionInfo !== null && track.encryptedSampleDescriptions[index - 1] !== false;
+};
+
 const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
 	if (track.currentFragmentState) {
 		return track.currentFragmentState.encryptionAuxInfo ??= {
@@ -4161,6 +7091,7 @@ const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
 			sampleSizes: null,
 			sampleCount: 0,
 			offset: null,
+			offsets: [],
 			resolved: null,
 		};
 	} else {
@@ -4169,18 +7100,115 @@ const getOrCreateEncryptionAuxInfo = (track: InternalTrack) => {
 			sampleSizes: null,
 			sampleCount: 0,
 			offset: null,
+			offsets: [],
 			resolved: null,
 		};
 	}
+};
+
+/** Reads up to `maxCount` entries of a senc box, stopping early if the box is truncated. */
+const readSampleEncryptionEntries = (
+	slice: FileSlice,
+	boxEndPos: number,
+	encryptionInfo: TrackEncryptionInfo,
+	maxCount: number,
+) => {
+	slice.skip(1); // Version
+	const flags = readU24Be(slice);
+	const useSubsamples = Boolean(flags & 0x000002);
+
+	const sampleCount = readU32Be(slice);
+	const ivSize = encryptionInfo.defaultPerSampleIvSize;
+	if (ivSize === null) {
+		throw new Error('Invalid file: encrypted track is missing its tenc box.');
+	}
+
+	const entries: SampleEncryptionInfo[] = [];
+	for (let i = 0; i < Math.min(sampleCount, maxCount); i++) {
+		if (boxEndPos - slice.filePos < ivSize + (useSubsamples ? 2 : 0)) {
+			break;
+		}
+
+		// Normalize the IV to 16 bytes so downstream code can assume a full-length buffer. For CTR with
+		// an 8-byte per-sample IV the lower 8 bytes are zero (that's the CENC spec's block counter start);
+		// for CBC/cbcs the IV is always 16 bytes by spec.
+		const iv = new Uint8Array(16);
+		if (ivSize > 0) {
+			iv.set(readBytes(slice, ivSize), 0);
+		} else if (encryptionInfo.defaultConstantIv) {
+			iv.set(encryptionInfo.defaultConstantIv, 0);
+		} else {
+			throw new Error('Invalid file: encrypted sample has no IV.');
+		}
+
+		let subsamples: SampleEncryptionInfo['subsamples'] = null;
+		if (useSubsamples) {
+			const subsampleCount = readU16Be(slice);
+			if (boxEndPos - slice.filePos < 6 * subsampleCount) {
+				break;
+			}
+
+			subsamples = [];
+			for (let j = 0; j < subsampleCount; j++) {
+				const clearLen = readU16Be(slice);
+				const protectedLen = readU32Be(slice);
+				subsamples.push({ clearLen, protectedLen });
+			}
+		}
+
+		entries.push({ iv, subsamples });
+	}
+
+	return entries;
 };
 
 const resolveEncryptionAuxInfo = async (
 	reader: Reader,
 	encryptionInfo: TrackEncryptionInfo,
 	aux: SampleEncryptionAuxInfo,
-) => {
+	runSampleCounts: number[] | null, // Of the track runs or chunks, which saio can give one offset each
+	// The 'seig' sample group entry of each sample, which overrides tenc's IV size and constant IV
+	getEncryptionGroup: (sampleIndex: number) => SampleGroupEncryption | null = () => null,
+): Promise<SampleEncryptionInfo[]> => {
 	if (aux.resolved) {
 		return aux.resolved;
+	}
+
+	if (aux.offsets.length > 1) {
+		if (runSampleCounts?.length === aux.offsets.length) {
+			// Each run's entries are at its own offset (like Chromium's TrackRunIterator does it)
+			const entries: SampleEncryptionInfo[] = [];
+			let sampleStart = 0;
+			for (let i = 0; i < runSampleCounts.length && sampleStart < aux.sampleCount; i++) {
+				const sampleCount = Math.min(runSampleCounts[i]!, aux.sampleCount - sampleStart);
+				if (sampleCount === 0) {
+					continue;
+				}
+
+				const runStart = sampleStart;
+				const runEntries = await resolveEncryptionAuxInfo(reader, encryptionInfo, {
+					defaultSampleInfoSize: aux.defaultSampleInfoSize,
+					sampleSizes: aux.sampleSizes && aux.sampleSizes.subarray(sampleStart, sampleStart + sampleCount),
+					sampleCount,
+					offset: aux.offsets[i]!,
+					offsets: [aux.offsets[i]!],
+					resolved: null,
+				}, null, j => getEncryptionGroup(runStart + j));
+				for (const entry of runEntries) {
+					entries.push(entry);
+				}
+
+				sampleStart += sampleCount;
+			}
+
+			aux.resolved = entries;
+			return entries;
+		}
+
+		Logging._warn(
+			'Multiple saio entries that don\'t match the track runs or chunks are not supported; using the first'
+			+ ' offset only.',
+		);
 	}
 
 	if (aux.offset === null || aux.sampleCount === 0) {
@@ -4203,32 +7231,43 @@ const resolveEncryptionAuxInfo = async (
 		throw new Error('Failed to read auxiliary encryption info.');
 	}
 
-	const ivSize = encryptionInfo.defaultPerSampleIvSize;
-	if (ivSize === null) {
-		throw new Error('Invalid file: encrypted track is missing its tenc box.');
-	}
-
 	// Each aux entry has the same byte layout as a senc entry: IV (of size ivSize, or the constant IV from tenc
 	// when ivSize is 0), then optionally subsample count + [clearLen, protectedLen] pairs. Subsamples are present
-	// iff the entry is larger than the IV.
+	// iff the entry is larger than the IV. Like in senc, a sample's 'seig' group overrides tenc's IV parameters.
 	const entries: SampleEncryptionInfo[] = [];
 	for (let i = 0; i < aux.sampleCount; i++) {
 		const entrySize = aux.defaultSampleInfoSize > 0
 			? aux.defaultSampleInfoSize
 			: aux.sampleSizes![i]!;
+		const entryEndPos = slice.filePos + entrySize;
+
+		const group = getEncryptionGroup(i);
+		const ivSize = group ? group.perSampleIvSize : encryptionInfo.defaultPerSampleIvSize;
+		const constantIv = group ? group.constantIv : encryptionInfo.defaultConstantIv;
+		if (ivSize === null) {
+			throw new Error('Invalid file: encrypted track is missing its tenc box.');
+		}
+		if (entrySize < ivSize || entrySize === ivSize + 1) {
+			throw new Error('Invalid file: sample auxiliary information doesn\'t match its size in saiz.');
+		}
 
 		const iv = new Uint8Array(16);
 		if (ivSize > 0) {
 			iv.set(readBytes(slice, ivSize), 0);
-		} else if (encryptionInfo.defaultConstantIv) {
-			iv.set(encryptionInfo.defaultConstantIv, 0);
-		} else {
+		} else if (constantIv) {
+			iv.set(constantIv, 0);
+		} else if (group ? group.isProtected : encryptionInfo.defaultIsProtected !== false) {
+			// A sample in no group takes tenc's protection, and an unprotected one has no IV
 			throw new Error('Invalid file: encrypted sample has no IV.');
 		}
 
 		let subsamples: { clearLen: number; protectedLen: number }[] | null = null;
 		if (entrySize > ivSize) {
 			const subsampleCount = readU16Be(slice);
+			if (entryEndPos - slice.filePos < 6 * subsampleCount) {
+				throw new Error('Invalid file: sample auxiliary information doesn\'t match its size in saiz.');
+			}
+
 			subsamples = [];
 			for (let j = 0; j < subsampleCount; j++) {
 				const clearLen = readU16Be(slice);
@@ -4238,10 +7277,111 @@ const resolveEncryptionAuxInfo = async (
 		}
 
 		entries.push({ iv, subsamples });
+		slice.filePos = entryEndPos;
 	}
 
 	aux.resolved = entries;
 	return entries;
+};
+
+/** The track's encryption parameters, as overridden by a 'seig' sample group entry */
+const applySampleGroupEncryption = (
+	encryptionInfo: TrackEncryptionInfo,
+	group: SampleGroupEncryption,
+): TrackEncryptionInfo => ({
+	...encryptionInfo,
+	defaultKid: group.kid,
+	defaultIsProtected: group.isProtected,
+	defaultPerSampleIvSize: group.perSampleIvSize,
+	defaultConstantIv: group.constantIv,
+	defaultCryptByteBlock: group.cryptByteBlock,
+	defaultSkipByteBlock: group.skipByteBlock,
+});
+
+/** The 'seig' sample group entry of a sample of a non-fragmented track (ISO/IEC 23001-7, 6), if any */
+const getSampleTableEncryptionGroup = (track: InternalTrack, sampleIndex: number) => {
+	const runIndex = binarySearchLessOrEqual(track.encryptionGroupRuns, sampleIndex, x => x.startIndex);
+	const run = runIndex === -1 ? null : track.encryptionGroupRuns[runIndex]!;
+	if (!run || sampleIndex >= run.startIndex + run.sampleCount) {
+		// Samples that no run covers get the default entry of a version 2 sample group description
+		return track.defaultEncryptionGroup;
+	}
+
+	// Index 0 means no group
+	return run.groupDescriptionIndex > 0 ? track.encryptionGroups[run.groupDescriptionIndex - 1] ?? null : null;
+};
+
+/** Maps a traf's samples to their 'seig' sample group entries (ISO/IEC 23001-7, 6). */
+const assignEncryptionGroups = (track: InternalTrack, state: FragmentTrackState, trackData: FragmentTrackData) => {
+	// Samples that no sbgp entry covers get the default entry of a version 2 sample group description, the traf's
+	// before the track's (ISO/IEC 14496-12 8.9.2.1). Samples mapped to index 0 explicitly belong to no group.
+	const defaultGroup = state.defaultEncryptionGroup ?? track.defaultEncryptionGroup;
+	for (const sample of trackData.samples) {
+		sample.encryptionGroup = defaultGroup;
+	}
+
+	let sampleIndex = 0;
+	for (const run of state.encryptionGroupRuns ?? []) {
+		// Indices above 0x10000 refer to the traf's own sample group description, the others to the track's
+		const index = run.groupDescriptionIndex;
+		const group = index > 0x10000
+			? state.encryptionGroups[index - 0x10001] ?? null
+			: index > 0
+				? track.encryptionGroups[index - 1] ?? null
+				: null;
+
+		const end = Math.min(sampleIndex + run.sampleCount, trackData.samples.length);
+		for (; sampleIndex < end; sampleIndex++) {
+			trackData.samples[sampleIndex]!.encryptionGroup = group;
+		}
+	}
+};
+
+/** Reads the per-sample IVs and subsamples of a traf's senc box. */
+const readSampleEncryptionBox = (slice: FileSlice, track: InternalTrack, trackData: FragmentTrackData) => {
+	assert(track.encryptionInfo);
+
+	slice.skip(1); // Version
+	const flags = readU24Be(slice);
+	const useSubsamples = Boolean(flags & 0x000002);
+
+	const sampleCount = readU32Be(slice);
+
+	for (let i = 0; i < Math.min(sampleCount, trackData.samples.length); i++) {
+		const sample = trackData.samples[i]!;
+		const group = sample.encryptionGroup;
+		const ivSize = group ? group.perSampleIvSize : track.encryptionInfo.defaultPerSampleIvSize;
+		const constantIv = group ? group.constantIv : track.encryptionInfo.defaultConstantIv;
+		if (ivSize === null) {
+			throw new Error('Invalid file: encrypted track is missing its tenc box.');
+		}
+
+		// Normalize the IV to 16 bytes so downstream code can assume a full-length buffer. For CTR with
+		// an 8-byte per-sample IV the lower 8 bytes are zero (that's the CENC spec's block counter start);
+		// for CBC/cbcs the IV is always 16 bytes by spec.
+		const iv = new Uint8Array(16);
+		if (ivSize > 0) {
+			iv.set(readBytes(slice, ivSize), 0);
+		} else if (constantIv) {
+			iv.set(constantIv, 0);
+		} else if (group ? group.isProtected : track.encryptionInfo.defaultIsProtected !== false) {
+			// A sample in no group takes tenc's protection, and an unprotected one has no IV
+			throw new Error('Invalid file: encrypted sample has no IV.');
+		}
+
+		let subsamples: SampleEncryptionInfo['subsamples'] = null;
+		if (useSubsamples) {
+			const subsampleCount = readU16Be(slice);
+			subsamples = [];
+			for (let j = 0; j < subsampleCount; j++) {
+				const clearLen = readU16Be(slice);
+				const protectedLen = readU32Be(slice);
+				subsamples.push({ clearLen, protectedLen });
+			}
+		}
+
+		sample.encryption = { iv, subsamples };
+	}
 };
 
 const getDefaultSampleEncryption = (encryptionInfo: TrackEncryptionInfo): SampleEncryptionInfo | null => {
@@ -4255,14 +7395,31 @@ const getDefaultSampleEncryption = (encryptionInfo: TrackEncryptionInfo): Sample
 	};
 };
 
+/**
+ * Throws for a track whose samples are all encrypted (encv/enca) but not with a scheme we can decrypt, or without a
+ * scheme at all, rather than letting the ciphertext pass as media data. Tracks that also have clear sample
+ * descriptions (clear lead) are left alone.
+ */
+const assertProtectionSchemeIsSupported = (track: InternalTrack) => {
+	if (
+		track.encryptionInfo === null
+		&& track.encryptedSampleDescriptions.length > 0
+		&& !track.encryptedSampleDescriptions.includes(false)
+	) {
+		throw new Error(
+			'Encrypted media samples use an unsupported protection scheme; only cenc, cens and cbcs can be decrypted.',
+		);
+	}
+};
+
 const decryptSample = async (
 	track: InternalTrack,
 	sampleEncryption: SampleEncryptionInfo,
 	data: Uint8Array,
 	fragment: Fragment | null,
+	encryptionInfo = track.encryptionInfo,
 ): Promise<Uint8Array> => {
-	assert(track.encryptionInfo);
-	const encryptionInfo = track.encryptionInfo;
+	assert(encryptionInfo);
 	if (encryptionInfo.defaultKid === null) {
 		throw new Error('Invalid file: encrypted track is missing its tenc box.');
 	}
@@ -4282,20 +7439,18 @@ const decryptSample = async (
 		}
 
 		const promise = (async () => {
-			let psshBoxes = track.demuxer.psshBoxes;
-			if (fragment) {
-				psshBoxes = [
-					...psshBoxes,
-					...fragment.psshBoxes,
-				].filter(x => x.keyIds === null || x.keyIds.includes(keyId));
+			// The boxes that apply to this key ID, from the moov box and the fragment
+			const psshBoxes = [
+				...track.demuxer.psshBoxes,
+				...(fragment?.psshBoxes ?? []),
+			].filter(x => x.keyIds === null || x.keyIds.includes(keyId));
 
-				// Filter out duplicates
-				for (let i = 0; i < psshBoxes.length - 1; i++) {
-					for (let j = i + 1; j < psshBoxes.length; j++) {
-						if (psshBoxesAreEqual(psshBoxes[i]!, psshBoxes[j]!)) {
-							psshBoxes.splice(j, 1);
-							j--;
-						}
+			// Filter out duplicates
+			for (let i = 0; i < psshBoxes.length - 1; i++) {
+				for (let j = i + 1; j < psshBoxes.length; j++) {
+					if (psshBoxesAreEqual(psshBoxes[i]!, psshBoxes[j]!)) {
+						psshBoxes.splice(j, 1);
+						j--;
 					}
 				}
 			}
@@ -4318,13 +7473,45 @@ const decryptSample = async (
 		})();
 
 		track.demuxer.decryptionKeyCache.set(keyId, promise);
+		// A failed resolution (an unreachable license server, for example) is tried again by the next sample
+		promise.catch(() => {
+			if (track.demuxer.decryptionKeyCache.get(keyId) === promise) {
+				track.demuxer.decryptionKeyCache.delete(keyId);
+			}
+		});
 		keyBytes = await promise;
 	}
 
-	if (encryptionInfo.scheme === 'cenc' || encryptionInfo.scheme === 'cens') {
+	if (encryptionInfo.scheme === 'cenc') {
+		// 'cenc' has no pattern encryption (ISO/IEC 23001-7, 10.1), whatever a version 1 tenc box declares: its
+		// protected bytes are all encrypted, which Chromium goes by too
+		const withoutPattern = { ...encryptionInfo, defaultCryptByteBlock: 0, defaultSkipByteBlock: 0 };
+		return decryptCtr(keyBytes, withoutPattern, sampleEncryption, data);
+	} else if (encryptionInfo.scheme === 'cens') {
 		return decryptCtr(keyBytes, encryptionInfo, sampleEncryption, data);
 	} else {
 		return decryptCbcs(keyBytes, encryptionInfo, sampleEncryption, data);
+	}
+};
+
+/**
+ * For a sample of an encrypted track without encryption info (no senc, saiz/saio or constant IV), throws if it's
+ * protected, since its IV is lost, rather than letting the ciphertext pass as media data. Samples of a clear sample
+ * description (clear lead), or that tenc or sample groups can make unprotected, are left alone.
+ */
+const assertUnprotectedSample = (
+	track: InternalTrack,
+	encryptionInfo: TrackEncryptionInfo,
+	usesEncryptedSampleDescription: boolean,
+) => {
+	if (
+		usesEncryptedSampleDescription
+		&& encryptionInfo.defaultIsProtected !== false
+	) {
+		throw new Error(
+			'Encrypted media samples have no encryption info (senc box, or saiz and saio boxes), so they can\'t be'
+			+ ' decrypted.',
+		);
 	}
 };
 
@@ -4336,6 +7523,13 @@ const decryptCtr = async (
 ) => {
 	const counter = new Uint8Array(16);
 	counter.set(sampleEncryption.iv, 0);
+
+	if (typeof crypto === 'undefined' || !crypto.subtle) {
+		// Unlike for cbcs, AES-CTR comes from the Web Crypto API, which insecure contexts (http:// pages) don't have
+		throw new Error(missingWebCodecsClassMessage(
+			'The Web Crypto API (crypto.subtle), which decrypting \'cenc\' and \'cens\' samples needs,',
+		));
+	}
 
 	const cryptoKey = await crypto.subtle.importKey(
 		'raw',
@@ -4355,8 +7549,8 @@ const decryptCtr = async (
 		return new Uint8Array(plaintext);
 	};
 
-	if (!sampleEncryption.subsamples) {
-		// Whole sample is protected, no pattern
+	if (!sampleEncryption.subsamples || sampleEncryption.subsamples.length === 0) {
+		// Whole sample is protected, no pattern. Like FFmpeg, also for an entry that lists no subsamples.
 		return cryptApply(data);
 	}
 
@@ -4412,8 +7606,9 @@ const decryptCbcs = (
 	const skipByteBlock = encryptionInfo.defaultSkipByteBlock;
 	assert(cryptByteBlock !== null && skipByteBlock !== null);
 
-	if (!sampleEncryption.subsamples) {
-		// Whole-sample encryption: straightforward CBC over floor(size / 16) blocks, any trailing bytes stay clear
+	if (!sampleEncryption.subsamples || sampleEncryption.subsamples.length === 0) {
+		// Whole-sample encryption: straightforward CBC over floor(size / 16) blocks, any trailing bytes stay clear.
+		// Like FFmpeg, also for an entry that lists no subsamples.
 		const output = new Uint8Array(data);
 		const numBlocks = Math.floor(data.length / 16);
 
@@ -4427,15 +7622,18 @@ const decryptCbcs = (
 		return output;
 	}
 
-	if (cryptByteBlock === 0 && skipByteBlock === 0) {
-		throw new Error('cbcs with subsamples requires pattern encryption.');
-	}
-
 	const output = new Uint8Array(data);
 
 	// Pattern decryption: IV is reset at the start of each subsample. Within a subsample, the CBC chain continues
 	// across skipped blocks (the IV after a crypt group carries over to the next crypt group's first block).
-	const cryptRanges = collectCryptRanges(sampleEncryption.subsamples, cryptByteBlock, skipByteBlock, data.length);
+	// The pattern 0:0 encrypts every complete block, like 1:0 (as in Chromium and Shaka Packager)
+	const encryptsAllBlocks = cryptByteBlock === 0 && skipByteBlock === 0;
+	const cryptRanges = collectCryptRanges(
+		sampleEncryption.subsamples,
+		encryptsAllBlocks ? 1 : cryptByteBlock,
+		encryptsAllBlocks ? 0 : skipByteBlock,
+		data.length,
+	);
 	const ivView = new DataView(sampleEncryption.iv.buffer, sampleEncryption.iv.byteOffset, 16);
 
 	for (const range of cryptRanges) {
@@ -4459,6 +7657,38 @@ const decryptCbcs = (
 	}
 
 	return output;
+};
+
+/**
+ * Finding the next fragment means stepping over the mdat box after a moof box. Its size is remembered when the moof box
+ * is read: once the fragment's samples have been read, a source that only keeps recent data (a stream, or a server
+ * that ignores range requests) may no longer have its header.
+ */
+const rememberMdatSize = (demuxer: IsobmffDemuxer, mdatPos: number, moofSlice: FileSlice) => {
+	const remember = (slice: FileSlice | null) => {
+		const boxInfo = slice && readBoxHeader(slice);
+		if (boxInfo?.name === 'mdat' && boxInfo.totalSize > 0) {
+			demuxer.mdatSizes.set(mdatPos, boxInfo.totalSize);
+		}
+	};
+
+	if (moofSlice.end - mdatPos >= MAX_BOX_HEADER_SIZE) {
+		remember(moofSlice.slice(mdatPos, MAX_BOX_HEADER_SIZE)); // Read along with the moof box
+		return;
+	}
+
+	try {
+		const slice = demuxer.reader.requestSliceRange(mdatPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+		if (isThenable(slice)) {
+			// Not waited for, so that nothing waits for media data that hasn't arrived yet (like in a live stream).
+			// It's there before the samples after it are.
+			slice.then(remember, () => {});
+		} else {
+			remember(slice);
+		}
+	} catch {
+		// The size is only remembered to save a read later, which then happens as before
+	}
 };
 
 const collectCryptRanges = (
@@ -4489,11 +7719,13 @@ const collectCryptRanges = (
 			let remaining = subsample.protectedLen;
 			let pos = cursor;
 			while (remaining > 0) {
-				if (remaining < 16 * cryptByteBlock) {
-					break; // Partial final crypt group stays clear
+				// The last pattern may end inside the crypt blocks: its complete 16-byte blocks are still encrypted
+				// and only a trailing partial block stays clear (ISO/IEC 23001-7 10.4.2, like Chromium and Shaka)
+				const cryptBytes = Math.min(16 * cryptByteBlock, 16 * Math.floor(remaining / 16));
+				if (cryptBytes === 0) {
+					break;
 				}
 
-				const cryptBytes = 16 * cryptByteBlock;
 				perSubsample.push({ offset: pos, length: cryptBytes });
 				pos += cryptBytes;
 				remaining -= cryptBytes;

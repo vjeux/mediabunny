@@ -1,17 +1,23 @@
 import { expect, test } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Input } from '../../src/input.js';
-import { BufferSource } from '../../src/source.js';
+import { BufferSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
 import { WavOutputFormat } from '../../src/output-format.js';
-import { AudioSampleSource, PCM_ENCODER_PACKET_SIZE } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource, PCM_ENCODER_PACKET_SIZE } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
 import { AudioSample } from '../../src/sample.js';
-import { PcmAudioCodec } from '../../src/codec.js';
+import { AudioCodec, PcmAudioCodec } from '../../src/codec.js';
+import { CustomAudioDecoder, registerDecoder } from '../../src/custom-coder.js';
 import { toUint8Array, uint8ArraysAreEqual } from '../../src/misc.js';
 import { fromAlaw, fromUlaw, toAlaw, toUlaw } from '../../src/pcm.js';
+import { Conversion, ConversionAudioOptions } from '../../src/conversion.js';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 // All of these span the full value range of their format
 const u8Data = Uint8Array.from({ length: 256 }, (_, i) => i);
@@ -37,6 +43,53 @@ test('s32 copyTo identity', () => {
 
 test('f32 copyTo identity', () => {
 	testCopyToIdentity('f32', f32Data);
+});
+
+test('AudioSample keeps its own copy of the data it was created from', async () => {
+	// Chunks drained from one reused buffer (e.g. an AudioWorklet ring buffer) into samples that are queued up
+	const buffer = new Float32Array(480);
+	const samples: AudioSample[] = [];
+	for (let i = 0; i < 3; i++) {
+		buffer.fill((i + 1) / 8);
+		samples.push(new AudioSample({
+			data: i === 1 ? buffer.buffer : buffer,
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 48000,
+			timestamp: i * 0.01,
+		}));
+	}
+	buffer.fill(1);
+
+	using clone = samples[0]!.clone();
+	using trimmed = samples[1]!.trim(0, 240);
+	for (const [sample, expected] of [[clone, 0.125], [trimmed, 0.25]] as const) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32' });
+		expect(values.every(value => value === expected)).toBe(true);
+	}
+
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const source = new AudioSampleSource({ codec: 'pcm-f32' });
+	output.addAudioTrack(source);
+	await output.start();
+	for (const sample of samples) {
+		await source.add(sample);
+		sample.close();
+	}
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const levels: number[] = [];
+	for await (const sample of new AudioSampleSink((await input.getPrimaryAudioTrack())!).samples()) {
+		const values = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(values, { planeIndex: 0, format: 'f32' });
+		for (let i = 0; i < values.length; i += 480) {
+			levels.push(values[i]!);
+		}
+		sample.close();
+	}
+	expect(levels).toEqual([0.125, 0.25, 0.375]);
 });
 
 test('pcm-u8 encode-decode roundtrip', async () => {
@@ -104,6 +157,41 @@ test('Encoded PCM packets have a fixed size', async () => {
 		offset += packet.data.byteLength / 2;
 	}
 	expect(encoded).toEqual(data);
+});
+
+test('Long gaps between encoded audio samples are filled with silence in pieces of at most 16 MiB', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const frameCounts: number[] = [];
+	const audioSource = new AudioSampleSource({
+		codec: 'pcm-s16',
+		onEncodedSample: sample => frameCounts.push(sample.numberOfFrames),
+	});
+	output.addAudioTrack(audioSource);
+	await output.start();
+
+	// One second of audio, a ten-minute gap (19.2 MB of f32 silence), then another second
+	for (const timestamp of [0, 601]) {
+		using sample = new AudioSample({
+			data: new Float32Array(8000).fill(0.5),
+			format: 'f32',
+			numberOfChannels: 1,
+			sampleRate: 8000,
+			timestamp,
+		});
+		await audioSource.add(sample);
+	}
+	await output.finalize();
+
+	// The whole gap used to be one sample, which at 48 kHz stereo exceeds what an AudioData can hold after 90 minutes
+	expect(frameCounts).toEqual([8000, 2 ** 22, 4_800_000 - 2 ** 22, 8000]);
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.computeDuration()).toBe(602);
 });
 
 const testCopyToIdentity = (format: SampleFormat, data: SampleData) => {
@@ -282,3 +370,158 @@ const expectG711FileRoundtrip = async (codec: 'ulaw' | 'alaw', decodeCodeword: (
 	expect(frameOffset).toBe(data.length);
 	expect(decoded).toEqual(data);
 };
+
+test('RF64 sample count goes by the data, not the packet durations', async () => {
+	const output = new Output({
+		format: new WavOutputFormat({ large: true }),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedAudioPacketSource('pcm-s16');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// 1000 stereo frames per packet at 48 kHz, with durations rounded to milliseconds, as in a Matroska file
+	for (let i = 0; i < 3; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(4000), 'key', i * 0.021, 0.021),
+			{ decoderConfig: { codec: 'pcm-s16', numberOfChannels: 2, sampleRate: 48000 } },
+		);
+	}
+	await output.finalize();
+
+	const view = new DataView(output.target.buffer!);
+	expect(String.fromCharCode(...new Uint8Array(output.target.buffer!, 12, 4))).toBe('ds64');
+	expect(view.getBigUint64(28, true)).toBe(12000n); // Data size
+	expect(view.getBigUint64(36, true)).toBe(3000n); // Sample count
+});
+
+test('WAVE writes the format chunk of non-PCM formats as a WAVEFORMATEX with cbSize', async () => {
+	// Microsoft's WAVEFORMATEX, which formats other than PCM use, ends with cbSize, the size of the extra format
+	// information. It must be 0 if there is none, and is only ignored for PCM.
+	const codecs: [PcmAudioCodec, number][] = [
+		// Codec, expected fmt chunk size
+		['pcm-s16', 16],
+		['pcm-u8', 16],
+		['pcm-f32', 18],
+		['pcm-f64', 18],
+		['alaw', 18],
+		['ulaw', 18],
+	];
+
+	for (const [codec, fmtSize] of codecs) {
+		const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+		const source = new EncodedAudioPacketSource(codec);
+		output.addAudioTrack(source);
+		await output.start();
+
+		const data = Uint8Array.from({ length: 2 * 8 * 100 }, (_, i) => i * 7);
+		await source.add(
+			new EncodedPacket(data, 'key', 0, 0.01),
+			{ decoderConfig: { codec, numberOfChannels: 2, sampleRate: 48000 } },
+		);
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const view = new DataView(bytes.buffer);
+		const chunks = new Map<string, Uint8Array>();
+		for (let pos = 12; pos + 8 <= bytes.length;) {
+			const size = view.getUint32(pos + 4, true);
+			chunks.set(String.fromCharCode(...bytes.subarray(pos, pos + 4)), bytes.subarray(pos + 8, pos + 8 + size));
+			pos += 8 + size + (size & 1);
+		}
+
+		const fmt = chunks.get('fmt ')!;
+		expect(fmt.length, codec).toBe(fmtSize);
+		if (fmtSize === 18) {
+			expect(new DataView(fmt.buffer, fmt.byteOffset).getUint16(16, true), codec).toBe(0);
+		}
+		expect(chunks.get('data'), codec).toEqual(data);
+
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getCodec(), codec).toBe(codec);
+	}
+});
+
+test('A registered custom decoder takes precedence over the built-in PCM decoder', async () => {
+	let active = false; // Keeps the decoder out of the other tests
+	let decodeCalls = 0;
+
+	class CustomPcmDecoder extends CustomAudioDecoder {
+		static override supports(codec: AudioCodec) {
+			return active && codec === 'pcm-s16';
+		}
+
+		override init() {}
+
+		override decode(packet: EncodedPacket) {
+			decodeCalls++;
+			const numberOfFrames = Math.round(packet.duration * this.config.sampleRate);
+			this.onSample(new AudioSample({
+				data: new Float32Array(numberOfFrames * this.config.numberOfChannels).fill(0.5),
+				format: 'f32',
+				numberOfChannels: this.config.numberOfChannels,
+				sampleRate: this.config.sampleRate,
+				timestamp: packet.timestamp,
+			}));
+		}
+
+		override flush() {}
+		override close() {}
+	}
+
+	registerDecoder(CustomPcmDecoder);
+	active = true;
+
+	try {
+		const filePath = path.join(__dirname, '..', 'public/glitch-hop-is-dead.wav'); // 16-bit PCM
+		using input = new Input({ source: new FilePathSource(filePath), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+		expect(await track.getCodec()).toBe('pcm-s16');
+
+		using sample = (await new AudioSampleSink(track).getSample(1))!;
+		const data = new Float32Array(sample.allocationSize({ format: 'f32', planeIndex: 0 }) / 4);
+		sample.copyTo(data, { format: 'f32', planeIndex: 0 });
+
+		expect(decodeCalls).toBeGreaterThan(0);
+		expect(data[0]).toBe(0.5);
+	} finally {
+		active = false;
+	}
+});
+
+const convertToWave = async (audio: ConversionAudioOptions) => {
+	using input = new Input({
+		source: new FilePathSource(
+			path.join(fileURLToPath(new URL('.', import.meta.url)), '../public/glitch-hop-is-dead.wav'),
+		),
+		formats: ALL_FORMATS,
+	});
+	const output = new Output({ format: new WavOutputFormat(), target: new BufferTarget() });
+	const conversion = await Conversion.init({ input, output, audio, trim: { end: 1 }, showWarnings: false });
+	await conversion.execute();
+
+	using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await result.getPrimaryAudioTrack())!;
+	using sample = (await new AudioSampleSink(track).getSample(0.5))!;
+	const data = new Float32Array(sample.numberOfFrames);
+	sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+
+	return { codec: await track.getCodec(), data };
+};
+
+test.each([
+	['s32', 'pcm-s32'],
+	['f32', 'pcm-f32'],
+	['u8', 'pcm-u8'],
+] as const)('Conversion into WAVE with sampleFormat %s writes %s', async (sampleFormat, expectedCodec) => {
+	const result = await convertToWave({ sampleFormat });
+	expect(result.codec).toBe(expectedCodec);
+
+	const reference = await convertToWave({ forceTranscode: true });
+	expect(reference.codec).toBe('pcm-s16'); // The default without a sample format
+	if (sampleFormat !== 'u8') {
+		// The 16-bit source survives these exactly
+		expect(result.data).toEqual(reference.data);
+	}
+});

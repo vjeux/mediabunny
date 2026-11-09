@@ -13,15 +13,24 @@ import {
 	isIso639Dash2LanguageCode,
 	isThenable,
 	MaybePromise,
+	promiseWithResolvers,
 	Rotation,
 	toArray,
+	toUint8Array,
 	TransformationMatrix,
 } from './misc';
-import { MetadataTags, TrackDisposition, validateMetadataTags, validateTrackDisposition } from './metadata';
+import {
+	cloneMetadataTags,
+	MetadataTags,
+	TrackDisposition,
+	validateMetadataTags,
+	validateTrackDisposition,
+	localizeMetadataTagBytes,
+} from './metadata';
 import { Muxer } from './muxer';
 import { OutputFormat } from './output-format';
 import { AudioSource, MediaSource, SubtitleSource, VideoSource } from './media-source';
-import { PathedTarget, Target, TargetRequest } from './target';
+import { NullTarget, PathedTarget, Target, TargetRequest } from './target';
 import { Writer } from './writer';
 import { Logging } from './logging';
 import { EncodedPacket } from './packet';
@@ -230,7 +239,8 @@ export type BaseTrackMetadata = {
 	 * - For video codecs, you can assume one packet per frame.
 	 * - For audio codecs, there is one packet for each "audio chunk", the duration of which depends on the codec. For
 	 * simplicity, you can assume each packet is roughly 10 ms or 512 samples long, whichever is shorter.
-	 * - For subtitles, assume each cue and each gap in the subtitles adds a packet.
+	 * - For subtitles, a new packet can begin at every cue start and end time (overlapping cues get split, and gaps
+	 * fill their own packets), so assume up to two packets per cue.
 	 *
 	 * If you're not fully sure, make sure to add a buffer of around 33% to make sure you stay below the maximum.
 	 */
@@ -335,6 +345,37 @@ export type AudioTrackMetadata = BaseTrackMetadata & {
  */
 export type SubtitleTrackMetadata = BaseTrackMetadata & {};
 
+/**
+ * Copies track metadata along with its nested values, so that the track keeps what was passed when it was added:
+ * callers often reuse one object for several tracks, and changes made afterwards mustn't bypass the validation.
+ */
+const copyTrackMetadata = <T extends VideoTrackMetadata | AudioTrackMetadata | SubtitleTrackMetadata>(
+	metadata: T,
+): T => {
+	const copy = { ...metadata };
+	if (metadata.disposition) {
+		copy.disposition = { ...metadata.disposition };
+	}
+	if (Array.isArray(metadata.group)) {
+		copy.group = [...metadata.group];
+	}
+	if ('transformationMatrix' in metadata && metadata.transformationMatrix) {
+		(copy as VideoTrackMetadata).transformationMatrix = [...metadata.transformationMatrix] as TransformationMatrix;
+	}
+	if ('decoderConfig' in metadata && metadata.decoderConfig) {
+		const decoderConfig: VideoDecoderConfig | AudioDecoderConfig = { ...metadata.decoderConfig };
+		if (decoderConfig.description) {
+			decoderConfig.description = toUint8Array(decoderConfig.description).slice();
+		}
+		if ('colorSpace' in decoderConfig && decoderConfig.colorSpace) {
+			decoderConfig.colorSpace = { ...decoderConfig.colorSpace };
+		}
+		(copy as VideoTrackMetadata | AudioTrackMetadata).decoderConfig = decoderConfig;
+	}
+
+	return copy;
+};
+
 const validateBaseTrackMetadata = (metadata: BaseTrackMetadata) => {
 	if (!metadata || typeof metadata !== 'object') {
 		throw new TypeError('metadata must be an object.');
@@ -362,6 +403,9 @@ const validateBaseTrackMetadata = (metadata: BaseTrackMetadata) => {
 		&& (!Number.isFinite(metadata.averageBitrate) || metadata.averageBitrate < 0)
 	) {
 		throw new TypeError('metadata.averageBitrate, when provided, must be a non-negative number.');
+	}
+	if (metadata.isRelativeToUnixEpoch !== undefined && typeof metadata.isRelativeToUnixEpoch !== 'boolean') {
+		throw new TypeError('metadata.isRelativeToUnixEpoch, when provided, must be a boolean.');
 	}
 	if (
 		metadata.group !== undefined
@@ -421,6 +465,20 @@ export type OutputEvents = {
 	};
 };
 
+/** Discards everything and fails to finalize: what the muxer writes to when its target couldn't be had. */
+class UnavailableTarget extends NullTarget {
+	_error: unknown;
+
+	constructor(error: unknown) {
+		super();
+		this._error = error;
+	}
+
+	override async _finalize() {
+		throw this._error;
+	}
+}
+
 /**
  * Main class orchestrating the creation of new media files.
  * @group Output files
@@ -455,12 +513,18 @@ export class Output<
 	_muxer: Muxer;
 	/** @internal */
 	_unfinalizedTargets = new Set<Target>();
+	/** @internal Set when a target that the muxer needed at start couldn't be had (see _waitForTarget). */
+	_targetFailure: { error: unknown } | null = null;
+	/** @internal Ends the wait for each target request in progress once the output is canceled. */
+	_targetWaits: Set<() => void> | null = null;
 	/** @internal */
 	_rootWriterPromise: Promise<Writer> | null = null;
 	/** @internal */
 	_startPromise: Promise<void> | null = null;
 	/** @internal */
 	_cancelPromise: Promise<void> | null = null;
+	/** @internal */
+	_canceled = promiseWithResolvers();
 	/** @internal */
 	_finalizePromise: Promise<void> | null = null;
 	/** @internal */
@@ -478,6 +542,13 @@ export class Output<
 	 * @internal
 	 */
 	_firstMediaStreamTimestamp: number | null = null;
+	/**
+	 * How the capture timestamps of a MediaStreamTrack map to output timestamps, by timestamp base and track. Every
+	 * source of the same track (e.g. one per rendition) uses the same mapping, so that it gives the same media the same
+	 * timestamp.
+	 * @internal
+	 */
+	_mediaStreamTimestampOffsets = new Map<string, number>();
 
 	/**
 	 * The target to which the root file will be written. Throws when using {@link PathedTarget} with an async callback;
@@ -527,7 +598,7 @@ export class Output<
 			&& !(options.initTarget instanceof Target)
 			&& typeof options.initTarget !== 'function'
 		) {
-			throw new Error(
+			throw new TypeError(
 				'options.initTarget, when provided, must be a Target or a function that returns or resolves to'
 				+ ' a Target.',
 			);
@@ -568,8 +639,23 @@ export class Output<
 		}
 	}
 
+	/**
+	 * Gets the target for a request the muxer makes as it runs (HLS segments and playlists), which it waits for while
+	 * holding its mutex. Once the output is canceled, the muxer gets a target discarding everything instead, rather
+	 * than waiting for one that may never come, so that the adds and the finalization waiting on it can finish. A
+	 * request that fails still fails as before.
+	 * @internal
+	 */
+	_getTarget(request: TargetRequest): Promise<Target> {
+		if (this.state === 'canceled') {
+			return Promise.resolve(new NullTarget());
+		}
+
+		return this._targetUnlessCanceled(this._requestTarget(request));
+	}
+
 	/** @internal */
-	async _getTarget(request: TargetRequest) {
+	async _requestTarget(request: TargetRequest) {
 		assert(this._target instanceof PathedTarget);
 
 		const target = await this._getTargetValidated(request);
@@ -591,14 +677,21 @@ export class Output<
 	}
 
 	/** @internal */
-	async _getInitTarget(): Promise<T> {
+	_getInitTarget() {
+		return this._waitForTarget(this._requestInitTarget());
+	}
+
+	/** @internal */
+	async _requestInitTarget(): Promise<T> {
 		assert(this._initTarget !== null);
 
 		if (this._initTarget instanceof Target) {
+			this._emit('target', { target: this._initTarget, request: null, isRoot: false });
 			return this._initTarget;
 		}
 
 		const target = await this._initTarget();
+		this._emit('target', { target, request: null, isRoot: false });
 
 		if (this.state === 'canceled') {
 			await target._close();
@@ -659,12 +752,61 @@ export class Output<
 	/** @internal */
 	_getRootWriter(isMonotonic: boolean | ((target: Target) => boolean)) {
 		return this._rootWriterPromise ??= (async () => {
-			const target = await this._getRootTarget();
+			const target = await this._waitForTarget(this._getRootTarget());
 
 			const writer = new Writer(target, typeof isMonotonic === 'boolean' ? isMonotonic : isMonotonic(target));
 			writer.start();
 			return writer;
 		})();
+	}
+
+	/**
+	 * Waits for a target that the muxer is about to write to as it starts, while holding its mutex. A cancel doesn't
+	 * wait for the target (which may never come), and a target may fail to come. In both cases, the muxer gets a target
+	 * discarding everything instead: its start then finishes and releases the mutex, rather than leaving the adds and
+	 * the finalization waiting on it forever. A target arriving after a cancel is closed and never written to, and one
+	 * that couldn't be had makes start() reject with its error, and the finalization too.
+	 * @internal
+	 */
+	async _waitForTarget(target: MaybePromise<Target>): Promise<Target> {
+		try {
+			return await this._targetUnlessCanceled(target);
+		} catch (error) {
+			this._targetFailure ??= { error };
+			return new UnavailableTarget(error);
+		}
+	}
+
+	/** Resolves with the target, or with one discarding everything if the output is canceled before it comes. */
+	async _targetUnlessCanceled(target: MaybePromise<Target>): Promise<Target> {
+		if (this.state === 'canceled') {
+			// A target still to come gets closed as it arrives (see _requestTarget)
+			void Promise.resolve(target).catch(() => {});
+			return new NullTarget();
+		}
+
+		if (!this._targetWaits) {
+			// A single reaction to the cancel, rather than one per request: those would pile up for as long as the
+			// output lives (one per HLS segment)
+			const targetWaits = this._targetWaits = new Set();
+			void this._canceled.promise.then(() => {
+				for (const endWait of targetWaits) {
+					endWait();
+				}
+				targetWaits.clear();
+			});
+		}
+
+		const canceled = promiseWithResolvers<null>();
+		const endWait = () => canceled.resolve(null);
+		this._targetWaits.add(endWait);
+
+		try {
+			const result = await Promise.race([target, canceled.promise]);
+			return result && (this.state as Output['state']) !== 'canceled' ? result : new NullTarget();
+		} finally {
+			this._targetWaits.delete(endWait);
+		}
 	}
 
 	/** Adds a video track to the output with the given source. Can only be called before the output is started. */
@@ -715,7 +857,7 @@ export class Output<
 			}
 		}
 
-		const metadataCopy = { ...metadata };
+		const metadataCopy = copyTrackMetadata(metadata);
 		metadataCopy.group ??= this.defaultTrackGroup;
 
 		return this._addTrack(new OutputVideoTrack(
@@ -741,7 +883,7 @@ export class Output<
 			}
 		}
 
-		const metadataCopy = { ...metadata };
+		const metadataCopy = copyTrackMetadata(metadata);
 		metadataCopy.group ??= this.defaultTrackGroup;
 
 		return this._addTrack(new OutputAudioTrack(
@@ -756,7 +898,7 @@ export class Output<
 		}
 		validateBaseTrackMetadata(metadata);
 
-		const metadataCopy = { ...metadata };
+		const metadataCopy = copyTrackMetadata(metadata);
 		metadataCopy.group ??= this.defaultTrackGroup;
 
 		return this._addTrack(new OutputSubtitleTrack(
@@ -772,12 +914,14 @@ export class Output<
 	 */
 	setMetadataTags(tags: MetadataTags) {
 		validateMetadataTags(tags);
+		tags = localizeMetadataTagBytes(tags);
 
 		if (this.state !== 'pending') {
 			throw new Error('Cannot set metadata tags after output has been started or canceled.');
 		}
 
-		this._metadataTags = tags;
+		// Copied, so that changing the object afterwards neither changes what's written nor skips the validation
+		this._metadataTags = cloneMetadataTags(tags);
 	}
 
 	/** @internal */
@@ -858,6 +1002,8 @@ export class Output<
 				);
 			}
 		}
+
+		this.format._validateTrack(track);
 
 		this.tracks.push(track);
 		track.source._connectedTrack = track;
@@ -941,13 +1087,37 @@ export class Output<
 			// We want to call muxer.start immediately, so we avoid using an await here
 			const releasePromise = this._mutex.acquire();
 
+			let startFailed = false;
+			let startError: unknown = null;
+
 			try {
-				await this._muxer.start();
+				// The muxer may have to wait for its target (an async PathedTarget or initTarget callback, which might
+				// never settle). A cancel must not wait behind that: it ends the start (which resolves, as when the
+				// cancel comes after the start), and a target that still arrives afterwards gets closed and isn't
+				// written to (see _getRootTarget and _getRootWriter)
+				const muxerStartPromise = this._muxer.start();
+				muxerStartPromise.catch(() => {}); // It fails on a target arriving after the cancel
+				await Promise.race([muxerStartPromise, this._canceled.promise]);
+				if ((this.state as Output['state']) === 'canceled') {
+					return;
+				}
+				if (this._targetFailure) {
+					throw this._targetFailure.error;
+				}
 
 				const promises = this.tracks.map(track => track.source._start());
 				await Promise.all(promises);
+			} catch (error) {
+				startFailed = true;
+				startError = error;
 			} finally {
 				(await releasePromise)();
+			}
+
+			if (startFailed) {
+				// The muxer is in an undefined state now, so don't let anything use the output anymore
+				await this.cancel().catch(() => {});
+				throw startError;
 			}
 		})();
 	}
@@ -955,26 +1125,58 @@ export class Output<
 	/**
 	 * Resolves with the full MIME type of the output file, including track codecs.
 	 *
-	 * The returned promise will resolve only once the precise codec strings of all tracks are known.
+	 * The returned promise will resolve only once the precise codec strings of all tracks are known. If the output is
+	 * canceled before that, the promise rejects.
 	 */
 	getMimeType() {
-		return this._muxer.getMimeType();
+		return Promise.race([
+			this._muxer.getMimeType(),
+			// Codec strings still unknown once the output is canceled will never be known
+			this._canceled.promise.then(() => {
+				throw new Error('Output has been canceled.');
+			}),
+		]);
 	}
 
 	/**
 	 * Cancels the creation of the output file, releasing internal resources like encoders and preventing further
 	 * samples from being added.
 	 *
-	 * @returns A promise that resolves once all internal resources have been released.
+	 * When writing to a {@link StreamTarget}, this waits for its `WritableStream` to close, unless the stream's sink
+	 * has stalled on a write: once 5 seconds pass without any of the pending writes completing, this resolves, and the
+	 * stream closes in the background if the sink ever catches up.
+	 *
+	 * While the output is finalizing, this instead stops waiting for a `process` function call or an encoder
+	 * initialization still in flight and drops the samples queued behind it, so that one that never settles can't hold
+	 * finalization up forever (without either, nothing is dropped). Finalization then goes on by itself, and the
+	 * returned promise resolves right away.
+	 *
+	 * While the output is finalizing, this returns right away, and finalization goes on. Should the sink of a
+	 * {@link StreamTarget} then complete none of its pending writes for 5 seconds, finalization is given up on:
+	 * {@link Output.finalize} rejects, the output becomes canceled, and the stream closes in the background if the sink
+	 * ever catches up.
+	 *
+	 * @returns A promise that resolves once all internal resources have been released, or right away while the output
+	 * is finalizing.
 	 */
 	async cancel() {
 		if (this.state === 'canceled') {
 			return this._cancelPromise ?? undefined;
-		} else if (this.state === 'finalizing' || this.state === 'finalized') {
-			// Don't wanna warn when finalizing since that shows a warning when finalization fails and then cancel
-			// is called
-			if (this.state === 'finalized') {
-				Logging._warn('Output has already been finalized.');
+		} else if (this.state === 'finalized') {
+			Logging._warn('Output has already been finalized.');
+			return;
+		} else if (this.state === 'finalizing') {
+			// Finalization waits for the samples added before it to be processed, which a process function call or an
+			// encoder initialization that never settles would hold up forever. Stop waiting for such a call or
+			// initialization and drop the samples queued behind it, so that finalization can go on. Don't wait for it
+			// here, though: something else, like a target whose sink stopped completing writes, may hold it up as well.
+			for (const track of this.tracks) {
+				track.source._cancelPendingAdds();
+			}
+
+			// Finalization can get stuck on a StreamTarget whose sink stopped completing writes; give up on it then
+			for (const target of this._unfinalizedTargets) {
+				target._cancelFinalization();
 			}
 
 			return;
@@ -982,14 +1184,22 @@ export class Output<
 
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
+			this._canceled.resolve();
+
+			// Closing a source, or a pending add, can be stuck on a StreamTarget whose sink stopped completing writes;
+			// the target gives up on its stream then
+			for (const target of this._unfinalizedTargets) {
+				target._cancelFinalization();
+			}
 
 			const release = await this._mutex.acquire();
 
 			try {
-				const promises = this.tracks.map(x => x.source._flushOrWaitForOngoingClose(true)); // Force close
+				// Force close. Errors don't matter anymore at this point, we just want everything released.
+				const promises = this.tracks.map(x => x.source._flushOrWaitForOngoingClose(true).catch(() => {}));
 				await Promise.all(promises);
 
-				await Promise.all([...this._unfinalizedTargets].map(target => target._close()));
+				await Promise.all([...this._unfinalizedTargets].map(target => target._close().catch(() => {})));
 				this._unfinalizedTargets.clear();
 			} finally {
 				release();

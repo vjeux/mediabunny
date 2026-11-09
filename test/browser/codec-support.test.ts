@@ -1,0 +1,275 @@
+import { describe, expect, test } from 'vitest';
+import { buildVideoCodecString, extractVideoCodecString, VideoCodec } from '../../src/codec.js';
+import { extractAv1CodecInfoFromPacket, extractVp9CodecInfoFromPacket, parseAvcSps } from '../../src/codec-data.js';
+import { canDecodeAudio, canDecodeVideo } from '../../src/decode.js';
+import { canEncodeAudio, canEncodeVideo, Quality } from '../../src/encode.js';
+import { EncodedPacket } from '../../src/packet.js';
+import {
+	AV1_FIXTURES,
+	AVC_SPS_FIXTURES,
+	FLAC_DESCRIPTION,
+	hexToBytes,
+	VORBIS_DESCRIPTION,
+	VP9_FIXTURES,
+} from '../node/helpers/codecs-fixtures.js';
+
+type VideoTrackInfo = Parameters<typeof extractVideoCodecString>[0];
+
+const videoTrackInfo = (info: Partial<VideoTrackInfo>): VideoTrackInfo => ({
+	width: 176,
+	height: 144,
+	codec: null,
+	codecDescription: null,
+	colorSpace: null,
+	avcType: null,
+	avcCodecInfo: null,
+	hevcCodecInfo: null,
+	vp9CodecInfo: null,
+	av1CodecInfo: null,
+	proresFormat: null,
+	...info,
+});
+
+const isDecodable = async (codec: string, width = 176, height = 144) => {
+	const support = await VideoDecoder.isConfigSupported({ codec, codedWidth: width, codedHeight: height });
+	return support.supported;
+};
+
+/** Whether the browser really encodes a 100 ms tone with the config, and decodes it back audibly */
+const encodesAudibleTone = async (config: AudioEncoderConfig) => {
+	const { numberOfChannels, sampleRate } = config;
+	const numberOfFrames = sampleRate / 10;
+	const data = new Float32Array(numberOfFrames * numberOfChannels);
+	for (let i = 0; i < numberOfFrames; i++) {
+		data.fill(0.5 * Math.sin(2 * Math.PI * 440 * i / sampleRate), i * numberOfChannels, (i + 1) * numberOfChannels);
+	}
+
+	const chunks: EncodedAudioChunk[] = [];
+	let decoderConfig: AudioDecoderConfig | undefined;
+	let failed = false;
+	let peak = 0;
+
+	const encoder = new AudioEncoder({
+		output: (chunk, meta) => {
+			chunks.push(chunk);
+			decoderConfig ??= meta?.decoderConfig;
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+	const decoder = new AudioDecoder({
+		output: (audioData) => {
+			const values = new Float32Array(audioData.numberOfFrames);
+			audioData.copyTo(values, { planeIndex: 0, format: 'f32-planar' });
+			audioData.close();
+			for (const value of values) {
+				peak = Math.max(peak, Math.abs(value));
+			}
+		},
+		error: () => {
+			failed = true;
+		},
+	});
+
+	try {
+		encoder.configure(config);
+		const audioData = new AudioData({
+			format: 'f32',
+			numberOfChannels,
+			sampleRate,
+			numberOfFrames,
+			timestamp: 0,
+			data,
+		});
+		encoder.encode(audioData);
+		audioData.close();
+		await encoder.flush();
+		if (failed || !decoderConfig) {
+			return false;
+		}
+
+		decoder.configure(decoderConfig);
+		for (const chunk of chunks) {
+			decoder.decode(chunk);
+		}
+		await decoder.flush();
+	} catch {
+		return false;
+	} finally {
+		if (encoder.state !== 'closed') {
+			encoder.close();
+		}
+		if (decoder.state !== 'closed') {
+			decoder.close();
+		}
+	}
+
+	return !failed && peak > 0.1;
+};
+
+describe('Codec strings in the browser', () => {
+	test('Strings derived from real streams are accepted', async () => {
+		// How strictly browsers parse codec strings varies (WebKitGTK, for one, accepts a wrong AV1 tier letter or a
+		// missing VP9 bit depth), so these checks only assert acceptance. Mediabunny's own rejection of malformed
+		// strings is tested in Node (codec-strings.test.ts).
+
+		for (const fixture of AV1_FIXTURES) {
+			const av1CodecInfo = extractAv1CodecInfoFromPacket(hexToBytes(fixture.sequenceHeaderObu))!;
+			const codecString = extractVideoCodecString(videoTrackInfo({ codec: 'av1', av1CodecInfo }));
+			// Only where the browser decodes the fixture's profile and bit depth at all (WebKitGTK decodes neither
+			// AV1's High and Professional profiles nor VP9 profiles 1 to 3), as the fixture states them
+			const { profile, bitDepth } = fixture.expected;
+			const bits = String(bitDepth).padStart(2, '0');
+			if (!await isDecodable(`av01.${profile}.00M.${bits}`)) {
+				continue;
+			}
+
+			expect(await isDecodable(codecString), `${fixture.name}: ${codecString}`).toBe(true);
+		}
+
+		for (const fixture of VP9_FIXTURES) {
+			const vp9CodecInfo = extractVp9CodecInfoFromPacket(hexToBytes(fixture.keyFrameStart))!;
+			const codecString = extractVideoCodecString(videoTrackInfo({ codec: 'vp9', vp9CodecInfo }));
+			const { profile, bitDepth } = fixture.expected;
+			const [paddedProfile, bits] = [profile, bitDepth].map(x => String(x).padStart(2, '0'));
+			if (!await isDecodable(`vp09.${paddedProfile}.10.${bits}`)) {
+				continue; // As above
+			}
+
+			expect(await isDecodable(codecString), `${fixture.name}: ${codecString}`).toBe(true);
+		}
+
+		// The H.264 profiles every WebCodecs implementation decodes
+		for (const fixture of AVC_SPS_FIXTURES.filter(x => [66, 77, 100].includes(x.expected.profileIdc))) {
+			const sps = parseAvcSps(hexToBytes(fixture.sps))!;
+			const codecString = extractVideoCodecString(videoTrackInfo({
+				codec: 'avc',
+				avcType: 1,
+				codecDescription: new Uint8Array([1, sps.profileIdc, sps.constraintFlags, sps.levelIdc]),
+			}));
+			const { displayWidth, displayHeight } = fixture.expected;
+			expect(await isDecodable(codecString, displayWidth, displayHeight), `${fixture.name}: ${codecString}`)
+				.toBe(true);
+		}
+	});
+
+	test('Strings built for encoding are accepted', async () => {
+		const sizes = [[176, 144], [640, 480], [1280, 720], [1920, 1080], [3840, 2160]] as const;
+
+		for (const codec of ['avc', 'vp8', 'vp9', 'av1'] as VideoCodec[]) {
+			for (const [width, height] of sizes) {
+				for (const bitrate of [100_000, 5_000_000, 50_000_000]) {
+					const codecString = buildVideoCodecString(codec, width, height, bitrate, false);
+					expect(await isDecodable(codecString, width, height), codecString).toBe(true);
+				}
+			}
+		}
+	});
+
+	test('Support queries agree with WebCodecs', async () => {
+		// The browser's own answer for a fixed, valid 1280x720 config of each codec decides what the queries must say
+		const fixedCodecStrings: [VideoCodec, string][] = [
+			['avc', 'avc1.64001f'],
+			['vp8', 'vp8'],
+			['vp9', 'vp09.00.31.08'],
+			['av1', 'av01.0.05M.08'],
+		];
+		for (const [codec, codecString] of fixedCodecStrings) {
+			expect(await canDecodeVideo(codec), codec).toBe(await isDecodable(codecString, 1280, 720));
+		}
+
+		// Vorbis and FLAC need a description, which the queries make up. What the browser says for a real one decides
+		// what they must answer.
+		const realDescriptions = [['vorbis', VORBIS_DESCRIPTION], ['flac', FLAC_DESCRIPTION]] as const;
+		for (const [codec, description] of realDescriptions) {
+			const support = await AudioDecoder.isConfigSupported({
+				codec,
+				numberOfChannels: 2,
+				sampleRate: 48000,
+				description,
+			});
+			expect(await canDecodeAudio(codec), codec).toBe(!!support.supported);
+		}
+
+		// Where the browser encodes AVC at all, the query says so, but not for odd dimensions, which AVC encoders need
+		// to be even
+		const avcEncoderSupport = await VideoEncoder.isConfigSupported({
+			codec: 'avc1.64001f',
+			width: 1280,
+			height: 720,
+			bitrate: 1_000_000,
+		});
+		if (avcEncoderSupport.supported) {
+			expect(await canEncodeVideo('avc', { width: 1280, height: 720 })).toBe(true);
+			expect(await canEncodeVideo('avc', { width: 1281, height: 720 })).toBe(false);
+		}
+
+		// Many Opus encoders only take up to two channels, and the query has to say so rather than fail later. It
+		// mustn't claim more than the browser does, but it may claim less: some browsers report configs as supported
+		// that their encoder then fails on (WebKitGTK and Firefox with multichannel Opus), which the query may find out
+		// by trying. Then, a real round trip has to fail too.
+		for (const numberOfChannels of [2, 6]) {
+			const config = { codec: 'opus', numberOfChannels, sampleRate: 48000 };
+			const nativelySupported = !!(await AudioEncoder.isConfigSupported(config)).supported;
+			const queried = await canEncodeAudio('opus', { numberOfChannels, quality: new Quality('medium') });
+
+			if (queried) {
+				expect(nativelySupported, `${numberOfChannels} channels`).toBe(true);
+			} else if (nativelySupported) {
+				expect(await encodesAudibleTone(config), `${numberOfChannels} channels`).toBe(false);
+			}
+		}
+	});
+});
+
+describe('EncodedPacket and WebCodecs chunks', () => {
+	test('Video chunks', () => {
+		const data = new Uint8Array([1, 2, 3, 4]);
+		const alpha = new Uint8Array([5, 6]);
+		const packet = new EncodedPacket(data, 'key', 1001 / 30000, 1001 / 30000, -1, undefined, { alpha });
+
+		const chunk = packet.toEncodedVideoChunk();
+		expect(chunk.type).toBe('key');
+		expect(chunk.timestamp).toBe(33366);
+		expect(chunk.duration).toBe(33366);
+		expect(chunk.byteLength).toBe(4);
+		const copy = new Uint8Array(4);
+		chunk.copyTo(copy);
+		expect([...copy]).toEqual([1, 2, 3, 4]);
+
+		const alphaChunk = packet.alphaToEncodedVideoChunk('delta');
+		expect(alphaChunk.type).toBe('delta');
+		expect(alphaChunk.byteLength).toBe(2);
+		expect(alphaChunk.timestamp).toBe(33366);
+
+		// And back
+		const restored = EncodedPacket.fromEncodedChunk(chunk, { alpha });
+		expect([...restored.data]).toEqual([1, 2, 3, 4]);
+		expect(restored.data).not.toBe(data);
+		expect(restored.type).toBe('key');
+		expect(restored.microsecondTimestamp).toBe(33366);
+		expect(restored.microsecondDuration).toBe(33366);
+		expect(restored.sideData.alphaByteLength).toBe(2);
+	});
+
+	test('Audio chunks', () => {
+		// Negative timestamps (encoder priming) are fine
+		const packet = new EncodedPacket(new Uint8Array(10), 'key', -1024 / 48000, 1024 / 48000);
+		const chunk = packet.toEncodedAudioChunk();
+		expect(chunk.timestamp).toBe(-21333);
+		expect(chunk.duration).toBe(21333);
+		expect(chunk.byteLength).toBe(10);
+
+		const restored = EncodedPacket.fromEncodedChunk(chunk);
+		expect(restored.timestamp).toBe(-0.021333);
+		expect(restored.duration).toBe(0.021333);
+		expect(restored.microsecondTimestamp).toBe(-21333);
+
+		// A chunk without duration
+		const noDuration = new EncodedVideoChunk({ type: 'delta', timestamp: 40000, data: new Uint8Array(1) });
+		expect(EncodedPacket.fromEncodedChunk(noDuration).duration).toBe(0);
+
+		expect(() => EncodedPacket.fromEncodedChunk({} as EncodedVideoChunk)).toThrow(TypeError);
+	});
+});

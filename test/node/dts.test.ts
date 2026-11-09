@@ -12,7 +12,7 @@ import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { assert, uint8ArraysAreEqual } from '../../src/misc.js';
 import { AudioSampleSink } from '../../src/media-sink.js';
-import { AudioSampleSource } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { AudioSample } from '../../src/sample.js';
 import { canEncode, Quality } from '../../src/encode.js';
 import { registerDtsDecoder, registerDtsEncoder } from '@mediabunny/dts';
@@ -153,6 +153,154 @@ test('Decode with the extension', async () => {
 	expect(sampleCount).toBe(packetCount);
 });
 
+// DTS 96/24 from FFmpeg's FATE suite: ffmpeg -i dts/dcadec-suite/x96_51_24_96_1509.dtshd -c copy -f mpegts
+// dts-x96-96khz.ts (and -c copy -fflags +bitexact dts-x96-96khz.mkv). MPEG-TS reports the 48 kHz rate of the core,
+// Matroska the 96 kHz the decoder outputs.
+test.each([
+	['dts-x96-96khz.ts', 48000],
+	['dts-x96-96khz.mkv', 96000],
+])('Decode DTS 96/24 from %s with timestamps that follow the packets', async (file, trackSampleRate) => {
+	registerDtsDecoder();
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', file)),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getSampleRate()).toBe(trackSampleRate);
+
+	const firstPacket = await new EncodedPacketSink(track).getFirstPacket();
+	assert(firstPacket);
+
+	let sampleCount = 0;
+	let nextTimestamp = firstPacket.timestamp;
+
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		expect(sample.sampleRate).toBe(96000);
+		expect(sample.timestamp).toBeCloseTo(nextTimestamp, 6);
+
+		nextTimestamp += sample.duration;
+		sampleCount++;
+	}
+
+	expect(sampleCount).toBe(6);
+});
+
+// DTS:X from FFmpeg's FATE suite: ffmpeg -i dts/dtsx_7.1.4_24bit.dts -c copy -fflags +bitexact dtsx-7.1.4.mkv. The
+// decoder outputs 12 channels (7.1.4), more than AVFrame.data has room for.
+test('Decode the four height channels of DTS:X', async () => {
+	registerDtsDecoder();
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'dtsx-7.1.4.mkv')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	let numberOfChannels = 0;
+	const peaks: number[] = [];
+
+	for await (using sample of new AudioSampleSink(track).samples()) {
+		numberOfChannels = sample.numberOfChannels;
+		for (let i = 0; i < numberOfChannels; i++) {
+			const plane = new Float32Array(sample.numberOfFrames);
+			sample.copyTo(plane, { format: 'f32-planar', planeIndex: i });
+			for (const value of plane) {
+				peaks[i] = Math.max(peaks[i] ?? 0, Math.abs(value));
+			}
+		}
+	}
+
+	expect(numberOfChannels).toBe(12);
+	// The bed, whose loudest channel is the center at 0.064
+	expect(Math.max(...peaks.slice(0, 8))).toBeLessThan(0.07);
+	// The heights, which are quiet too (they came out as full-scale noise when read from past the end of data)
+	expect(Math.max(...peaks.slice(8))).toBeLessThan(0.01);
+});
+
+// The DTS core's ADPCM predictors carry state across frames, so random access needs enough pre-roll. Made with
+// FFmpeg 8.0:
+// ffmpeg -f lavfi -i "anoisesrc=color=pink:amplitude=0.25:sample_rate=48000:duration=0.6:seed=5"
+//   -f lavfi -i "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*330*t):s=48000:d=0.6"
+//   -filter_complex "[0]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=0.7*c0[n];[n][1]amix=inputs=2:normalize=0"
+//   -c:a dca -strict -2 -dca_adpcm 1 -b:a 384k dts-adpcm.mp4
+test('Random access into DTS decodes the same audio as decoding from the start', async () => {
+	registerDtsDecoder();
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'dts-adpcm.mp4')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const getPlanes = (sample: AudioSample) => Array.from({ length: sample.numberOfChannels }, (_, i) => {
+		const plane = new Float32Array(sample.numberOfFrames);
+		sample.copyTo(plane, { format: 'f32-planar', planeIndex: i });
+		return plane;
+	});
+
+	const sink = new AudioSampleSink(track);
+	const sequential: { timestamp: number; planes: Float32Array[] }[] = [];
+	for await (using sample of sink.samples()) {
+		sequential.push({ timestamp: sample.timestamp, planes: getPlanes(sample) });
+	}
+	expect(sequential.length).toBeGreaterThan(50);
+
+	for (const [i, { timestamp, planes }] of sequential.entries()) {
+		using sample = await sink.getSample(timestamp);
+		assert(sample);
+		expect(sample.timestamp).toBe(timestamp);
+
+		let maxDifference = 0;
+		getPlanes(sample).forEach((plane, channel) => plane.forEach((value, j) => {
+			maxDifference = Math.max(maxDifference, Math.abs(value - planes[channel]![j]!));
+		}));
+		expect(maxDifference, `frame ${i}`).toBeLessThan(1e-3); // -60 dBFS
+	}
+});
+
+test('DTS pre-roll spans the same core frames in a track signaled at 96 kHz', async () => {
+	// DTS 96/24 and DTS-HD streams extend a 48 kHz core, while MP4 and Matroska signal the extended rate
+	using sourceInput = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public', 'dts-adpcm.mp4')),
+		formats: ALL_FORMATS,
+	});
+
+	const sourceTrack = await sourceInput.getPrimaryAudioTrack();
+	assert(sourceTrack);
+	const decoderConfig = await sourceTrack.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('dts');
+	output.addAudioTrack(source);
+	await output.start();
+
+	let meta: EncodedAudioChunkMetadata | undefined = { decoderConfig: { ...decoderConfig, sampleRate: 96000 } };
+	for await (const packet of new EncodedPacketSink(sourceTrack).packets()) {
+		await source.add(packet, meta);
+		meta = undefined;
+	}
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	expect(await track.getSampleRate()).toBe(96000);
+	expect(await track.getPreRollDuration()).toBe(await sourceTrack.getPreRollDuration());
+});
+
 test('Encode with the extension', async () => {
 	registerDtsEncoder();
 
@@ -255,6 +403,26 @@ test('Encode with huge timestamps', async () => {
 	assert(firstSample);
 
 	expect(firstSample.timestamp).toBe(timestamp);
+});
+
+test('Encoding ends where the input ends', async () => {
+	registerDtsEncoder();
+
+	// The input isn't a whole number of 512-sample frames, and the silence that fills the last one isn't part of the
+	// audio
+	const output = await encodeSineWaveToMp4(0, new Mp4OutputFormat());
+
+	using input = new Input({
+		source: new BufferSource(output),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const lastPacket = await new EncodedPacketSink(track).getPacket(Infinity);
+	assert(lastPacket);
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(ENCODE_DURATION, 6);
 });
 
 const expectStreamShape = async (input: Input) => {

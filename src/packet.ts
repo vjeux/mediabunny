@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { SECOND_TO_MICROSECOND_FACTOR } from './misc';
+import { isUint8Array, SECOND_TO_MICROSECOND_FACTOR, uint8ArrayFromOtherRealm } from './misc';
 
 export const PLACEHOLDER_DATA = /* #__PURE__ */ new Uint8Array(0);
 
@@ -58,7 +58,10 @@ export class EncodedPacket {
 	constructor(
 		/**
 		 * The encoded data of this packet. For any given codec, this data must adhere to the format specified in the
-		 * Mediabunny Codec Registry.
+		 * Mediabunny Codec Registry. The data is not copied: when the packet is added to an output, the output may read
+		 * it until the packet has been written, so don't modify or reuse the underlying buffer after creating the
+		 * packet. Likewise, packets read from an input may share memory with it (a `BufferSource`'s buffer or the read
+		 * cache), so copy their data before modifying it.
 		 */
 		public readonly data: Uint8Array,
 		/** The type of this packet. */
@@ -80,18 +83,27 @@ export class EncodedPacket {
 		byteLength?: number,
 		sideData?: EncodedPacketSideData,
 	) {
+		// Uint8Arrays created in another realm (an iframe, a Node.js vm context, Jest's jsdom environment) become
+		// ones of this realm over the same memory: they're genuine, but instanceof checks reject them
+		data = uint8ArrayFromOtherRealm(data);
+		this.data = data;
+		const alpha = uint8ArrayFromOtherRealm(sideData?.alpha);
+		if (alpha !== sideData?.alpha) {
+			sideData = { ...sideData, alpha };
+		}
+
 		if (data === PLACEHOLDER_DATA && byteLength === undefined) {
 			throw new Error(
 				'Internal error: byteLength must be explicitly provided when constructing metadata-only packets.',
 			);
 		}
 
-		if (byteLength === undefined) {
-			byteLength = data.byteLength;
-		}
-
 		if (!(data instanceof Uint8Array)) {
 			throw new TypeError('data must be a Uint8Array.');
+		}
+
+		if (byteLength === undefined) {
+			byteLength = data.byteLength;
 		}
 		if (type !== 'key' && type !== 'delta') {
 			throw new TypeError('type must be either "key" or "delta".');
@@ -219,7 +231,10 @@ export class EncodedPacket {
 		chunk: EncodedVideoChunk | EncodedAudioChunk,
 		sideData?: EncodedPacketSideData,
 	): EncodedPacket {
-		if (!(chunk instanceof EncodedVideoChunk || chunk instanceof EncodedAudioChunk)) {
+		if (
+			!(typeof EncodedVideoChunk !== 'undefined' && chunk instanceof EncodedVideoChunk)
+			&& !(typeof EncodedAudioChunk !== 'undefined' && chunk instanceof EncodedAudioChunk)
+		) {
 			throw new TypeError('chunk must be an EncodedVideoChunk or EncodedAudioChunk.');
 		}
 
@@ -255,7 +270,7 @@ export class EncodedPacket {
 		if (options !== undefined && (typeof options !== 'object' || options === null)) {
 			throw new TypeError('options, when provided, must be an object.');
 		}
-		if (options?.data !== undefined && !(options.data instanceof Uint8Array)) {
+		if (options?.data !== undefined && !isUint8Array(options.data)) {
 			throw new TypeError('options.data, when provided, must be a Uint8Array.');
 		}
 		if (options?.type !== undefined && options.type !== 'key' && options.type !== 'delta') {

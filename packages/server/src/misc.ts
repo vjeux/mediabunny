@@ -8,6 +8,7 @@
 
 import { VideoSamplePixelFormat, MediaCodec } from 'mediabunny';
 import * as NodeAv from 'node-av';
+import os from 'node:os';
 import { _serverOptions } from './index';
 
 export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = {
@@ -29,6 +30,17 @@ export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = 
 	truehd: NodeAv.AV_CODEC_ID_TRUEHD,
 };
 
+/**
+ * The number of threads to run a codec on. libavcodec uses a single thread unless told otherwise (it's the FFmpeg CLI
+ * that defaults to automatic threading). Each thread holds frames of its own, so like Chromium's FFmpeg decoder, this
+ * scales with the resolution: 3 threads for 1080p, at least 2, and at most 8 (reached at 4K) or one per core.
+ */
+export const getCodecThreadCount = (width: number | undefined, height: number | undefined) => {
+	const cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+	const forResolution = Math.max(2, Math.floor((width || 1920) * (height || 1080) * 3 / (1920 * 1080)));
+	return Math.max(1, Math.min(forResolution, 8, cores));
+};
+
 let cachedHardwareContext: NodeAv.HardwareContext | null | undefined = undefined;
 export const getHardwareContext = (): NodeAv.HardwareContext | null => {
 	if (_serverOptions.hardwareContext !== undefined && typeof _serverOptions.hardwareContext !== 'function') {
@@ -37,7 +49,15 @@ export const getHardwareContext = (): NodeAv.HardwareContext | null => {
 	}
 
 	if (cachedHardwareContext === undefined) {
-		cachedHardwareContext = NodeAv.HardwareContext.auto();
+		// Probing logs an FFmpeg error for every hardware API that isn't there (CUDA, VAAPI, Vulkan, OpenCL and AMF on
+		// a typical GPU-less server), so keep FFmpeg quiet while it runs
+		const logLevel = NodeAv.Log.getLevel();
+		NodeAv.Log.setLevel(NodeAv.AV_LOG_QUIET);
+		try {
+			cachedHardwareContext = NodeAv.HardwareContext.auto();
+		} finally {
+			NodeAv.Log.setLevel(logLevel);
+		}
 	}
 	return cachedHardwareContext;
 };
@@ -192,6 +212,12 @@ export const toPixelFormat = (ffmpegPixelFormat: NodeAv.AVPixelFormat): VideoSam
 		case NodeAv.AV_PIX_FMT_YUVA444P12LE: return 'I444AP12';
 
 		case NodeAv.AV_PIX_FMT_NV12: return 'NV12';
+
+		// What 4:4:4 streams with an identity matrix (H.264 and VP9 RGB, AV1 identity) decode to. Their planes (G, B,
+		// R) are the stream's Y, U and V planes, so like Chromium, they're handed out as 4:4:4 with the 'rgb' matrix.
+		case NodeAv.AV_PIX_FMT_GBRP: return 'I444';
+		case NodeAv.AV_PIX_FMT_GBRP10LE: return 'I444P10';
+		case NodeAv.AV_PIX_FMT_GBRP12LE: return 'I444P12';
 
 		case NodeAv.AV_PIX_FMT_RGBA: return 'RGBA';
 		case NodeAv.AV_PIX_FMT_RGB0: return 'RGBX';

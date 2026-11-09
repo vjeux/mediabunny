@@ -25,11 +25,12 @@ import {
 	isChromium,
 	popcount,
 	setUint24,
+	uint8ArraysAreEqual,
 	writeExpGolomb,
 } from './misc';
 import { Logging } from './logging';
 import { PacketType } from './packet';
-import { MetadataTags } from './metadata';
+import { formatMetadataDate, MetadataTags, unwatchMetadataTagFields, watchMetadataTagFields } from './metadata';
 import { AC3_SAMPLE_RATES, EAC3_REDUCED_SAMPLE_RATES } from '../shared/ac3-misc';
 import { Bitstream } from '../shared/bitstream';
 import { TRUEHD_MAJOR_SYNC_WORD } from '../shared/truehd-misc';
@@ -167,11 +168,56 @@ export const iterateAvcNalUnits = (packetData: Uint8Array, decoderConfig: VideoD
 	}
 };
 
+/**
+ * Like {@link iterateAvcNalUnits}, but also yields the NAL units that follow a start code inside a length-prefixed NAL
+ * unit. Some writers leave start codes in place: Samsung's slow motion recordings put each frame's SVC prefix NAL unit,
+ * a start code and the slice under a single length, and Android 8's MPEG4Writer only turned the start codes within a
+ * frame's first 64 bytes into lengths. Emulation prevention keeps start codes out of NAL units, so each begins a new
+ * one.
+ */
+const iterateAvcNalUnitsIncludingEmbedded = function* (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+): Generator<NalUnitLocation> {
+	for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
+		if (!decoderConfig.description) {
+			// Annex B, where every start code already begins a NAL unit
+			yield loc;
+			continue;
+		}
+
+		const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
+		let foundStartCode = false;
+
+		for (const embeddedLoc of iterateNalUnitsInAnnexB(nalUnit)) {
+			if (!foundStartCode) {
+				foundStartCode = true;
+
+				// The NAL unit before the first start code. Zero bytes right before a start code are never part of a
+				// NAL unit (they belong to a 4-byte start code or are trailing zeros).
+				let length = embeddedLoc.offset - 3;
+				while (length > 0 && nalUnit[length - 1] === 0) {
+					length--;
+				}
+				if (length > 0) {
+					yield { offset: loc.offset, length };
+				}
+			}
+
+			yield { offset: loc.offset + embeddedLoc.offset, length: embeddedLoc.length };
+		}
+
+		if (!foundStartCode) {
+			yield loc;
+		}
+	}
+};
+
 export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
 
-const removeEmulationPreventionBytes = (data: Uint8Array) => {
+export const removeEmulationPreventionBytes = (data: Uint8Array) => {
 	const result = new Uint8Array(data.length); // The result can only be shorter
 	const len = data.length;
 	let resultLength = 0;
@@ -290,12 +336,52 @@ export const concatAvcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDe
 	}
 };
 
+/**
+ * Finds the SPS that the first slice of a picture refers to (through the pic_parameter_set_id of its slice header and
+ * the seq_parameter_set_id of that PPS), among the parameter sets preceding the slice. Returns its index in `spsUnits`,
+ * or null if it can't be told.
+ */
+const findActiveAvcSpsIndex = (spsUnits: Uint8Array[], ppsUnits: Uint8Array[], firstSlice: Uint8Array) => {
+	try {
+		const readIds = (nalUnit: Uint8Array, skippedBits: number, count: number) => {
+			const bitstream = new Bitstream(removeEmulationPreventionBytes(nalUnit));
+			bitstream.skipBits(8 + skippedBits); // The NAL unit header and fixed-length fields
+			return Array.from({ length: count }, () => readExpGolomb(bitstream));
+		};
+
+		const ppsId = readIds(firstSlice, 0, 3)[2]!; // After first_mb_in_slice and slice_type
+
+		// A later parameter set with the same ID replaces an earlier one
+		let spsId: number | null = null;
+		for (const pps of ppsUnits) {
+			const [id, referencedSpsId] = readIds(pps, 0, 2);
+			if (id === ppsId) {
+				spsId = referencedSpsId!;
+			}
+		}
+
+		let index: number | null = null;
+		for (let i = 0; i < spsUnits.length; i++) {
+			if (readIds(spsUnits[i]!, 24, 1)[0] === spsId) { // After profile_idc, the constraint flags and level_idc
+				index = i;
+			}
+		}
+
+		return index;
+	} catch {
+		return null;
+	}
+};
+
 /** Builds an AvcDecoderConfigurationRecord from an AVC packet in Annex B format. */
 export const extractAvcDecoderConfigurationRecord = (packetData: Uint8Array): AvcDecoderConfigurationRecord | null => {
 	try {
 		const spsUnits: Uint8Array[] = [];
 		const ppsUnits: Uint8Array[] = [];
 		const spsExtUnits: Uint8Array[] = [];
+		let firstSlice: Uint8Array | null = null;
+		let spsCountBeforeSlice = 0;
+		let ppsCountBeforeSlice = 0;
 
 		for (const loc of iterateNalUnitsInAnnexB(packetData)) {
 			const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
@@ -308,6 +394,17 @@ export const extractAvcDecoderConfigurationRecord = (packetData: Uint8Array): Av
 				ppsUnits.push(nalUnit);
 			} else if (type === AvcNalUnitType.SPS_EXT && spsExtUnits.length < 255) {
 				spsExtUnits.push(nalUnit);
+			} else if (
+				firstSlice === null
+				&& (
+					type === AvcNalUnitType.NON_IDR_SLICE
+					|| type === AvcNalUnitType.SLICE_DPA
+					|| type === AvcNalUnitType.IDR
+				)
+			) {
+				firstSlice = nalUnit;
+				spsCountBeforeSlice = spsUnits.length;
+				ppsCountBeforeSlice = ppsUnits.length;
 			}
 		}
 
@@ -317,6 +414,17 @@ export const extractAvcDecoderConfigurationRecord = (packetData: Uint8Array): Av
 
 		if (ppsUnits.length === 0) {
 			return null;
+		}
+
+		// The SPS the picture uses comes first, so that its profile and level describe the record, and so that users of
+		// the first SPS (like the MPEG-TS demuxer, for the dimensions) get it. Other SPS stay in the record.
+		const activeSpsIndex = firstSlice && findActiveAvcSpsIndex(
+			spsUnits.slice(0, spsCountBeforeSlice),
+			ppsUnits.slice(0, ppsCountBeforeSlice),
+			firstSlice,
+		);
+		if (activeSpsIndex) {
+			spsUnits.unshift(...spsUnits.splice(activeSpsIndex, 1));
 		}
 
 		// Let's get the first SPS for profile and level information
@@ -518,6 +626,10 @@ export type AvcSpsInfo = {
 	constraintFlags: number;
 	levelIdc: number;
 	frameMbsOnlyFlag: number;
+	separateColourPlaneFlag: number;
+	log2MaxFrameNumMinus4: number;
+	picOrderCntType: number;
+	log2MaxPicOrderCntLsbMinus4: number;
 	chromaFormatIdc: number;
 	bitDepthLumaMinus8: number;
 	bitDepthChromaMinus8: number;
@@ -535,6 +647,20 @@ export type AvcSpsInfo = {
 	vuiParametersFlagBitOffset: number;
 	bitstreamRestrictionFlagBitOffset: number | null;
 	bitstreamRestrictionFlag: number | null;
+	timingInfo: VuiTimingInfo | null;
+};
+
+/** The clock of the VUI: a tick is `numUnitsInTick / timeScale` seconds. */
+export type VuiTimingInfo = {
+	numUnitsInTick: number;
+	timeScale: number;
+};
+
+const readVuiTimingInfo = (bitstream: Bitstream): VuiTimingInfo => {
+	// Both are 32 bits, which readBits can't do without overflowing
+	const numUnitsInTick = bitstream.readBits(16) * 2 ** 16 + bitstream.readBits(16);
+	const timeScale = bitstream.readBits(16) * 2 ** 16 + bitstream.readBits(16);
+	return { numUnitsInTick, timeScale };
 };
 
 const AVC_HEVC_ASPECT_RATIO_IDC_TABLE: Partial<Record<number, Rational>> = {
@@ -624,11 +750,12 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			}
 		}
 
-		readExpGolomb(bitstream); // log2_max_frame_num_minus4
+		const log2MaxFrameNumMinus4 = readExpGolomb(bitstream);
 
 		const picOrderCntType = readExpGolomb(bitstream);
+		let log2MaxPicOrderCntLsbMinus4 = 0;
 		if (picOrderCntType === 0) {
-			readExpGolomb(bitstream); // log2_max_pic_order_cnt_lsb_minus4
+			log2MaxPicOrderCntLsbMinus4 = readExpGolomb(bitstream);
 		} else if (picOrderCntType === 1) {
 			bitstream.skipBits(1); // delta_pic_order_always_zero_flag
 			readSignedExpGolomb(bitstream); // offset_for_non_ref_pic
@@ -644,15 +771,16 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 
 		const picWidthInMbsMinus1 = readExpGolomb(bitstream);
 		const picHeightInMapUnitsMinus1 = readExpGolomb(bitstream);
-		const codedWidth = 16 * (picWidthInMbsMinus1 + 1);
-		const codedHeight = 16 * (picHeightInMapUnitsMinus1 + 1);
-		let displayWidth = codedWidth;
-		let displayHeight = codedHeight;
 
 		const frameMbsOnlyFlag = bitstream.readBits(1);
 		if (!frameMbsOnlyFlag) {
 			bitstream.skipBits(1); // mb_adaptive_frame_field_flag
 		}
+
+		const codedWidth = 16 * (picWidthInMbsMinus1 + 1);
+		const codedHeight = 16 * (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1);
+		let displayWidth = codedWidth;
+		let displayHeight = codedHeight;
 
 		bitstream.skipBits(1); // direct_8x8_inference_flag
 		const frameCroppingFlag = bitstream.readBits(1);
@@ -699,6 +827,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 		let maxDecFrameBuffering: number | null = null;
 		let bitstreamRestrictionFlagBitOffset: number | null = null;
 		let bitstreamRestrictionFlag: number | null = null;
+		let timingInfo: VuiTimingInfo | null = null;
 
 		const vuiParametersFlagBitOffset = bitstream.pos;
 		const vuiParametersPresentFlag = bitstream.readBits(1);
@@ -745,8 +874,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 
 			const timingInfoPresentFlag = bitstream.readBits(1);
 			if (timingInfoPresentFlag) {
-				bitstream.skipBits(32); // num_units_in_tick
-				bitstream.skipBits(32); // time_scale
+				timingInfo = readVuiTimingInfo(bitstream);
 				bitstream.skipBits(1); // fixed_frame_rate_flag
 			}
 
@@ -824,6 +952,10 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			constraintFlags,
 			levelIdc,
 			frameMbsOnlyFlag,
+			separateColourPlaneFlag,
+			log2MaxFrameNumMinus4,
+			picOrderCntType,
+			log2MaxPicOrderCntLsbMinus4,
 			chromaFormatIdc,
 			bitDepthLumaMinus8,
 			bitDepthChromaMinus8,
@@ -841,6 +973,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			vuiParametersFlagBitOffset,
 			bitstreamRestrictionFlagBitOffset,
 			bitstreamRestrictionFlag,
+			timingInfo,
 		};
 	} catch (error) {
 		Logging._error('Error parsing AVC SPS:', error);
@@ -963,6 +1096,7 @@ export type HevcSpsInfo = {
 	bitDepthLumaMinus8: number;
 	bitDepthChromaMinus8: number;
 	minSpatialSegmentationIdc: number;
+	timingInfo: VuiTimingInfo | null;
 };
 
 export const concatHevcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDecoderConfig) => {
@@ -994,6 +1128,45 @@ export const iterateHevcNalUnits = (packetData: Uint8Array, decoderConfig: Video
 
 export const extractNalUnitTypeForHevc = (byte: number) => {
 	return (byte >> 1) & 0x3F;
+};
+
+/**
+ * Yields the given length-prefixed NAL units, splitting each at the start codes inside it. Some writers leave start
+ * codes in place: Android 8's MPEG4Writer only turned those within a frame's first 64 bytes into lengths, so when the
+ * NAL units before a frame's slice take up more (a long SEI, in-band parameter sets), the slice follows a start code
+ * inside an earlier NAL unit's length. Emulation prevention keeps start codes out of NAL units, so each one begins a
+ * new NAL unit.
+ */
+const splitNalUnitsAtStartCodes = function* (
+	packetData: Uint8Array,
+	lengthPrefixedNalUnits: Iterable<NalUnitLocation>,
+): Generator<NalUnitLocation> {
+	for (const loc of lengthPrefixedNalUnits) {
+		const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
+		let foundStartCode = false;
+
+		for (const embeddedLoc of iterateNalUnitsInAnnexB(nalUnit)) {
+			if (!foundStartCode) {
+				foundStartCode = true;
+
+				// The NAL unit before the first start code. Zero bytes right before a start code are never part of a
+				// NAL unit (they belong to a 4-byte start code or are trailing zeros).
+				let length = embeddedLoc.offset - 3;
+				while (length > 0 && nalUnit[length - 1] === 0) {
+					length--;
+				}
+				if (length > 0) {
+					yield { offset: loc.offset, length };
+				}
+			}
+
+			yield { offset: loc.offset + embeddedLoc.offset, length: embeddedLoc.length };
+		}
+
+		if (!foundStartCode) {
+			yield loc;
+		}
+	}
 };
 
 /** Parses an HEVC SPS (Sequence Parameter Set) to extract video information. */
@@ -1113,9 +1286,11 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 		let fullRangeFlag = 0;
 		let minSpatialSegmentationIdc = 0;
 		let pixelAspectRatio: Rational = { num: 1, den: 1 };
+		let timingInfo: VuiTimingInfo | null = null;
 
 		if (bitstream.readBits(1)) { // vui_parameters_present_flag
 			const vui = parseHevcVui(bitstream, spsMaxSubLayersMinus1);
+			timingInfo = vui.timingInfo;
 			pixelAspectRatio = vui.pixelAspectRatio;
 			colourPrimaries = vui.colourPrimaries;
 			transferCharacteristics = vui.transferCharacteristics;
@@ -1147,9 +1322,54 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 			bitDepthLumaMinus8,
 			bitDepthChromaMinus8,
 			minSpatialSegmentationIdc,
+			timingInfo,
 		};
 	} catch (error) {
 		Logging._error('Error parsing HEVC SPS:', error);
+		return null;
+	}
+};
+
+/**
+ * Finds the SPS that the first slice segment of a picture refers to (through the slice_pic_parameter_set_id of its
+ * header and the pps_seq_parameter_set_id of that PPS), among the parameter sets preceding it. Returns its index in
+ * `spsUnits`, or null if it can't be told.
+ */
+const findActiveHevcSpsIndex = (spsUnits: Uint8Array[], ppsUnits: Uint8Array[], firstSlice: Uint8Array) => {
+	try {
+		const slice = new Bitstream(removeEmulationPreventionBytes(firstSlice));
+		const sliceType = extractNalUnitTypeForHevc(firstSlice[0]!);
+		slice.skipBits(16); // NAL unit header
+		slice.skipBits(1); // first_slice_segment_in_pic_flag
+		if (sliceType >= HevcNalUnitType.BLA_W_LP && sliceType <= HevcNalUnitType.RSV_IRAP_VCL23) {
+			slice.skipBits(1); // no_output_of_prior_pics_flag
+		}
+		const ppsId = readExpGolomb(slice); // slice_pic_parameter_set_id
+
+		// A later parameter set with the same ID replaces an earlier one
+		let spsId: number | null = null;
+		for (const pps of ppsUnits) {
+			const bitstream = new Bitstream(removeEmulationPreventionBytes(pps));
+			bitstream.skipBits(16); // NAL unit header
+			if (readExpGolomb(bitstream) === ppsId) { // pps_pic_parameter_set_id
+				spsId = readExpGolomb(bitstream); // pps_seq_parameter_set_id
+			}
+		}
+
+		let index: number | null = null;
+		for (let i = 0; i < spsUnits.length; i++) {
+			const bitstream = new Bitstream(removeEmulationPreventionBytes(spsUnits[i]!));
+			bitstream.skipBits(16 + 4); // NAL unit header, sps_video_parameter_set_id
+			const maxSubLayersMinus1 = bitstream.readBits(3);
+			bitstream.skipBits(1); // sps_temporal_id_nesting_flag
+			parseProfileTierLevel(bitstream, maxSubLayersMinus1);
+			if (readExpGolomb(bitstream) === spsId) { // sps_seq_parameter_set_id
+				index = i;
+			}
+		}
+
+		return index;
+	} catch {
 		return null;
 	}
 };
@@ -1161,6 +1381,9 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 		const spsUnits: Uint8Array[] = [];
 		const ppsUnits: Uint8Array[] = [];
 		const seiUnits: Uint8Array[] = [];
+		let firstSlice: Uint8Array | null = null;
+		let spsCountBeforeSlice = 0;
+		let ppsCountBeforeSlice = 0;
 
 		// The counts are capped at what the record can hold
 		const MAX_NAL_UNITS_PER_ARRAY = 0xffff;
@@ -1169,7 +1392,11 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 			const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
 			const type = extractNalUnitTypeForHevc(nalUnit[0]!);
 
-			if (type === HevcNalUnitType.VPS_NUT && vpsUnits.length < MAX_NAL_UNITS_PER_ARRAY) {
+			if (firstSlice === null && type < HevcNalUnitType.VPS_NUT) { // The first VCL NAL unit
+				firstSlice = nalUnit;
+				spsCountBeforeSlice = spsUnits.length;
+				ppsCountBeforeSlice = ppsUnits.length;
+			} else if (type === HevcNalUnitType.VPS_NUT && vpsUnits.length < MAX_NAL_UNITS_PER_ARRAY) {
 				vpsUnits.push(nalUnit);
 			} else if (type === HevcNalUnitType.SPS_NUT && spsUnits.length < MAX_NAL_UNITS_PER_ARRAY) {
 				spsUnits.push(nalUnit);
@@ -1184,6 +1411,17 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 		}
 
 		if (spsUnits.length === 0 || ppsUnits.length === 0) return null;
+
+		// The SPS the picture uses comes first, so that it describes the record, and so that users of the first SPS
+		// (like the MPEG-TS demuxer, for the dimensions) get it. Other SPS stay in the record.
+		const activeSpsIndex = firstSlice && findActiveHevcSpsIndex(
+			spsUnits.slice(0, spsCountBeforeSlice),
+			ppsUnits.slice(0, ppsCountBeforeSlice),
+			firstSlice,
+		);
+		if (activeSpsIndex) {
+			spsUnits.unshift(...spsUnits.splice(activeSpsIndex, 1));
+		}
 
 		const spsInfo = parseHevcSps(spsUnits[0]!);
 		if (!spsInfo) return null;
@@ -1421,6 +1659,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 	let fullRangeFlag = 0;
 	let minSpatialSegmentationIdc = 0;
 	let pixelAspectRatio: Rational = { num: 1, den: 1 };
+	let timingInfo: VuiTimingInfo | null = null;
 
 	if (bitstream.readBits(1)) { // aspect_ratio_info_present_flag
 		const aspect_ratio_idc = bitstream.readBits(8);
@@ -1462,8 +1701,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 		readExpGolomb(bitstream); // def_disp_win_bottom_offset
 	}
 	if (bitstream.readBits(1)) { // vui_timing_info_present_flag
-		bitstream.readBits(32); // vui_num_units_in_tick
-		bitstream.readBits(32); // vui_time_scale
+		timingInfo = readVuiTimingInfo(bitstream);
 		if (bitstream.readBits(1)) { // vui_poc_proportional_to_timing_flag
 			readExpGolomb(bitstream); // vui_num_ticks_poc_diff_one_minus1
 		}
@@ -1489,6 +1727,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 		matrixCoefficients,
 		fullRangeFlag,
 		minSpatialSegmentationIdc,
+		timingInfo,
 	};
 };
 
@@ -1728,6 +1967,137 @@ export const deserializeHevcDecoderConfigurationRecord = (data: Uint8Array): Hev
 	}
 };
 
+/** Returns the NAL unit length size and the parameter set NAL units of an AVC or HEVC decoder configuration record. */
+const extractParameterSetsFromDescription = (codec: 'avc' | 'hevc', description: Uint8Array) => {
+	if (codec === 'avc') {
+		const record = deserializeAvcDecoderConfigurationRecord(description);
+		if (!record) {
+			return null;
+		}
+
+		return {
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			nalUnits: [
+				...record.sequenceParameterSets,
+				...(record.sequenceParameterSetExt ?? []),
+				...record.pictureParameterSets,
+			],
+		};
+	} else {
+		const record = deserializeHevcDecoderConfigurationRecord(description);
+		if (!record) {
+			return null;
+		}
+
+		const nalUnits: Uint8Array[] = [];
+		for (const type of [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT]) {
+			for (const array of record.arrays) {
+				if (array.nalUnitType === type) {
+					nalUnits.push(...array.nalUnits);
+				}
+			}
+		}
+
+		return {
+			lengthSize: (record.lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4,
+			nalUnits,
+		};
+	}
+};
+
+/**
+ * Carries mid-stream AVC/HEVC decoder configuration changes in-band, for containers that hold only one decoder
+ * configuration per track (the ISOBMFF sample entry, Matroska's CodecPrivate). Encoders emit a new configuration
+ * when their parameter sets change, for example when Chromium's VideoEncoder falls back from a hardware to a software
+ * encoder mid-stream; the new parameter sets are then only in the new description, not in the packets. Once a
+ * packet arrives with a description that differs from the stored one, every key packet from then on gets the current
+ * parameter sets in front of its first slice (unless it carries them itself), so decoders pick up the change, also
+ * when they start at a later key packet. Length prefixes are rewritten if the new description uses another size; a
+ * NAL unit too large for the track's length size throws instead.
+ */
+export class InBandParameterSetWriter {
+	private readonly storedLengthSize: 1 | 2 | 3 | 4;
+	private lastDescriptionSource: AllowSharedBufferSource | null = null;
+	private currentDescription: Uint8Array;
+	private currentLengthSize: 1 | 2 | 3 | 4;
+	/** Null until the description changes for the first time. */
+	private parameterSets: Uint8Array[] | null = null;
+
+	constructor(private readonly codec: 'avc' | 'hevc', description: Uint8Array) {
+		const parsed = extractParameterSetsFromDescription(codec, description);
+		this.storedLengthSize = parsed?.lengthSize ?? 4;
+		this.currentDescription = description;
+		this.currentLengthSize = this.storedLengthSize;
+	}
+
+	/** Returns the data of the packet as it must be stored. */
+	process(packetData: Uint8Array, type: PacketType, description: AllowSharedBufferSource | undefined) {
+		let changed = false;
+
+		if (description && description !== this.lastDescriptionSource) {
+			this.lastDescriptionSource = description;
+
+			const bytes = toUint8Array(description);
+			if (!uint8ArraysAreEqual(bytes, this.currentDescription)) {
+				const parsed = extractParameterSetsFromDescription(this.codec, bytes);
+				if (parsed) {
+					this.currentDescription = bytes.slice();
+					this.currentLengthSize = parsed.lengthSize;
+					this.parameterSets = parsed.nalUnits.map(x => x.slice());
+					changed = true;
+				}
+			}
+		}
+
+		if (!this.parameterSets) {
+			return packetData;
+		}
+
+		const insertParameterSets = type === 'key' || changed;
+		if (!insertParameterSets && this.currentLengthSize === this.storedLengthSize) {
+			return packetData;
+		}
+
+		const getType = (nalUnit: Uint8Array) => this.codec === 'avc'
+			? extractNalUnitTypeForAvc(nalUnit[0]!)
+			: extractNalUnitTypeForHevc(nalUnit[0]!);
+		const isVcl = (nalUnitType: number) => this.codec === 'avc'
+			? nalUnitType >= AvcNalUnitType.NON_IDR_SLICE && nalUnitType <= AvcNalUnitType.IDR
+			: nalUnitType < 32;
+
+		const nalUnits: Uint8Array[] = [];
+		for (const loc of iterateNalUnitsInLengthPrefixed(packetData, this.currentLengthSize)) {
+			nalUnits.push(packetData.subarray(loc.offset, loc.offset + loc.length));
+		}
+
+		if (insertParameterSets) {
+			const presentTypes = new Set(nalUnits.filter(x => x.length > 0).map(getType));
+			const missing = this.parameterSets.filter(x => x.length > 0 && !presentTypes.has(getType(x)));
+
+			let insertionIndex = nalUnits.findIndex(x => x.length > 0 && isVcl(getType(x)));
+			if (insertionIndex === -1) {
+				insertionIndex = nalUnits.length;
+			}
+
+			nalUnits.splice(insertionIndex, 0, ...missing);
+		}
+
+		const maxNalUnitLength = 2 ** (8 * this.storedLengthSize) - 1;
+		for (const nalUnit of nalUnits) {
+			if (nalUnit.byteLength > maxNalUnitLength) {
+				// Writing it would truncate its length field and corrupt the rest of the sample
+				throw new Error(
+					`A ${nalUnit.byteLength}-byte NAL unit doesn't fit the ${this.storedLengthSize}-byte NAL unit`
+					+ ' length fields of the track\'s first decoder configuration, which the container uses for the'
+					+ ' whole track. Use 4-byte NAL unit lengths when the decoder configuration can change.',
+				);
+			}
+		}
+
+		return concatNalUnitsInLengthPrefixed(nalUnits, this.storedLengthSize);
+	}
+}
+
 enum HevcNaluOrderState {
 	audAllowed,
 	beforeFirstVcl,
@@ -1838,7 +2208,9 @@ export type Vp9CodecInfo = {
 
 // The color spaces from section 7.2.2 of the VP9 spec The matrix column is taken from FFmpeg's libavcodec/vp9.c
 const VP9_COLOR_SPACE_TABLE = {
-	1: { colourPrimaries: 5, transferCharacteristics: 6, matrixCoefficients: 5 }, // CS_BT_601
+	// CS_BT_601 says nothing about the primaries and transfer, as BT.601 has both 625-line (BT.470BG) and 525-line
+	// (SMPTE 170M) systems. FFmpeg leaves them unspecified too; assuming BT.470BG makes Chromium convert the gamut.
+	1: { colourPrimaries: 2, transferCharacteristics: 2, matrixCoefficients: 5 }, // CS_BT_601
 	2: { colourPrimaries: 1, transferCharacteristics: 1, matrixCoefficients: 1 }, // CS_BT_709
 	3: { colourPrimaries: 6, transferCharacteristics: 6, matrixCoefficients: 6 }, // CS_SMPTE_170
 	4: { colourPrimaries: 7, transferCharacteristics: 7, matrixCoefficients: 7 }, // CS_SMPTE_240
@@ -1846,9 +2218,10 @@ const VP9_COLOR_SPACE_TABLE = {
 	7: { colourPrimaries: 1, transferCharacteristics: 13, matrixCoefficients: 0 }, // CS_RGB (sRGB)
 };
 
-export const extractVp9CodecInfoFromPacket = (
+/** Parses a VP9 key frame's uncompressed header: the codec info and the frame size. */
+const parseVp9KeyFrameHeader = (
 	packet: Uint8Array,
-): Vp9CodecInfo | null => {
+): { codecInfo: Vp9CodecInfo; width: number; height: number } | null => {
 	// eslint-disable-next-line @stylistic/max-len
 	// https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf
 	// http://downloads.webmproject.org/docs/vp9/vp9-bitstream_superframe-and-uncompressed-header_v1.0.pdf
@@ -1944,11 +2317,11 @@ export const extractVp9CodecInfoFromPacket = (
 	const width = widthMinusOne + 1;
 	const height = heightMinusOne + 1;
 
-	// Calculate level based on dimensions
+	// Calculate level based on dimensions: each level limits both the picture size and the width and height
 	const pictureSize = width * height;
 	let level = last(VP9_LEVEL_TABLE)!.level; // Default to highest level
 	for (const entry of VP9_LEVEL_TABLE) {
-		if (pictureSize <= entry.maxPictureSize) {
+		if (pictureSize <= entry.maxPictureSize && Math.max(width, height) <= entry.maxDimension) {
 			level = entry.level;
 			break;
 		}
@@ -1959,7 +2332,7 @@ export const extractVp9CodecInfoFromPacket = (
 	const transferCharacteristics = colorSpaceValues?.transferCharacteristics ?? 2;
 	const matrixCoefficients = colorSpaceValues?.matrixCoefficients ?? 2;
 
-	return {
+	const codecInfo: Vp9CodecInfo = {
 		profile,
 		level,
 		bitDepth,
@@ -1969,6 +2342,35 @@ export const extractVp9CodecInfoFromPacket = (
 		transferCharacteristics,
 		matrixCoefficients,
 	};
+
+	return { codecInfo, width, height };
+};
+
+export const extractVp9CodecInfoFromPacket = (packet: Uint8Array): Vp9CodecInfo | null => {
+	return parseVp9KeyFrameHeader(packet)?.codecInfo ?? null;
+};
+
+/** Reads the frame size from a VP9 key frame's uncompressed header. */
+export const extractVp9FrameSizeFromPacket = (packet: Uint8Array) => {
+	const header = parseVp9KeyFrameHeader(packet);
+	return header && { width: header.width, height: header.height };
+};
+
+/** Reads the frame size from a VP8 key frame (RFC 6386, section 9.1). */
+export const extractVp8FrameSizeFromPacket = (packet: Uint8Array) => {
+	const isKeyFrame = packet.length >= 10 && (packet[0]! & 0x01) === 0;
+	if (!isKeyFrame || packet[3] !== 0x9d || packet[4] !== 0x01 || packet[5] !== 0x2a) {
+		return null;
+	}
+
+	// The upper two bits of each dimension are the upscaling mode
+	const width = (packet[6]! | (packet[7]! << 8)) & 0x3fff;
+	const height = (packet[8]! | (packet[9]! << 8)) & 0x3fff;
+	if (width === 0 || height === 0) {
+		return null;
+	}
+
+	return { width, height };
 };
 
 export const vp9CodecInfoHasColorInfo = (info: Vp9CodecInfo) => {
@@ -2062,12 +2464,76 @@ export const iterateAv1PacketObus = function* (packet: Uint8Array) {
 };
 
 /**
+ * Removes the OBUs that AV1-ISOBMFF (section 2.4) and the Matroska AV1 mapping say samples should not contain (temporal
+ * delimiters, redundant frame headers, padding) or must not contain (tile lists), like FFmpeg's ff_av1_filter_obus.
+ * Returns the packet unchanged if there is nothing to remove or if it can't be parsed.
+ */
+export const filterAv1SampleObus = (packet: Uint8Array) => {
+	const kept: Uint8Array[] = [];
+	let removedAny = false;
+	let pos = 0;
+
+	while (pos < packet.length) {
+		const header = packet[pos]!;
+		const obuType = (header >> 3) & 0b1111;
+		const obuExtension = (header >> 2) & 1;
+		const obuHasSizeField = (header >> 1) & 1;
+
+		let payloadStart = pos + 1 + obuExtension;
+		let payloadSize = 0;
+		if (obuHasSizeField) {
+			for (let i = 0; ; i++) {
+				if (payloadStart >= packet.length || i === 8) {
+					return packet; // Malformed size field
+				}
+
+				const byte = packet[payloadStart++]!;
+				payloadSize += (byte & 0x7f) * 2 ** (7 * i);
+				if (!(byte & 0x80)) {
+					break;
+				}
+			}
+		} else {
+			payloadSize = packet.length - payloadStart;
+		}
+
+		const end = payloadStart + payloadSize;
+		if (end > packet.length) {
+			return packet; // Truncated OBU
+		}
+
+		// 2 = OBU_TEMPORAL_DELIMITER, 7 = OBU_REDUNDANT_FRAME_HEADER, 8 = OBU_TILE_LIST, 15 = OBU_PADDING
+		if (obuType === 2 || obuType === 7 || obuType === 8 || obuType === 15) {
+			removedAny = true;
+		} else {
+			kept.push(packet.subarray(pos, end));
+		}
+
+		pos = end;
+	}
+
+	if (!removedAny || kept.length === 0) {
+		return packet;
+	}
+
+	const result = new Uint8Array(kept.reduce((total, obu) => total + obu.byteLength, 0));
+	let offset = 0;
+	for (const obu of kept) {
+		result.set(obu, offset);
+		offset += obu.byteLength;
+	}
+
+	return result;
+};
+
+/**
  * When AV1 codec information is not provided by the container, we can still try to extract the information by digging
  * into the AV1 bitstream.
  */
-export const extractAv1CodecInfoFromPacket = (
+/** Parses an AV1 sequence header OBU in a packet: the codec info and the maximum frame size. */
+const parseAv1SequenceHeader = (
 	packet: Uint8Array,
-): Av1CodecInfo | null => {
+): { codecInfo: Av1CodecInfo; width: number; height: number } | null => {
 	// https://aomediacodec.github.io/av1-spec/av1-spec.pdf
 
 	for (const { type, data } of iterateAv1PacketObus(packet)) {
@@ -2167,9 +2633,9 @@ export const extractAv1CodecInfoFromPacket = (
 		const frameWidthBitsMinus1 = bitstream.readBits(4);
 		const frameHeightBitsMinus1 = bitstream.readBits(4);
 		const n1 = frameWidthBitsMinus1 + 1;
-		bitstream.skipBits(n1); // max_frame_width_minus_1
+		const maxFrameWidthMinus1 = bitstream.readBits(n1);
 		const n2 = frameHeightBitsMinus1 + 1;
-		bitstream.skipBits(n2); // max_frame_height_minus_1
+		const maxFrameHeightMinus1 = bitstream.readBits(n2);
 
 		// Frame IDs
 		let frameIdNumbersPresentFlag = 0;
@@ -2288,7 +2754,7 @@ export const extractAv1CodecInfoFromPacket = (
 			}
 		}
 
-		return {
+		const codecInfo: Av1CodecInfo = {
 			profile: seqProfile,
 			level: seqLevel,
 			tier: seqTier,
@@ -2302,9 +2768,24 @@ export const extractAv1CodecInfoFromPacket = (
 			transferCharacteristics,
 			matrixCoefficients,
 		};
+
+		return { codecInfo, width: maxFrameWidthMinus1 + 1, height: maxFrameHeightMinus1 + 1 };
 	}
 
 	return null;
+};
+
+export const extractAv1CodecInfoFromPacket = (packet: Uint8Array): Av1CodecInfo | null => {
+	return parseAv1SequenceHeader(packet)?.codecInfo ?? null;
+};
+
+/**
+ * Reads the maximum frame size from an AV1 sequence header OBU in a packet. Frames can be smaller (with
+ * frame_size_override_flag), so it's an upper bound; encoders usually code every frame at this size.
+ */
+export const extractAv1FrameSizeFromPacket = (packet: Uint8Array) => {
+	const header = parseAv1SequenceHeader(packet);
+	return header && { width: header.width, height: header.height };
 };
 
 export const av1CodecInfoHasColorInfo = (info: Av1CodecInfo) => {
@@ -2376,7 +2857,7 @@ export const parseOpusIdentificationHeader = (bytes: Uint8Array) => {
 };
 
 // From https://datatracker.ietf.org/doc/html/rfc6716, in 48 kHz samples
-const OPUS_FRAME_DURATION_TABLE = [
+export const OPUS_FRAME_DURATION_TABLE = [
 	480, 960, 1920, 2880,
 	480, 960, 1920, 2880,
 	480, 960, 1920, 2880,
@@ -2505,7 +2986,34 @@ export const determineVideoPacketType = (
 ): PacketType | null => {
 	switch (codec) {
 		case 'avc': {
-			for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
+			let hasSps = false;
+
+			// Only a frame whose length-prefixed NAL units cover it exactly, but without any slice among them, hides
+			// its slices behind start codes. Elsewhere, a start code that a writer failed to escape (say, in an SEI
+			// payload before the slice), or one in the bytes that a broken length runs into, mustn't decide the type.
+			let lookBehindStartCodes = false;
+			if (decoderConfig.description) {
+				let hasLengthPrefixedSlice = false;
+				let end = 0;
+
+				for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
+					const type = extractNalUnitTypeForAvc(packetData[loc.offset]!);
+					if (type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR) {
+						hasLengthPrefixedSlice = true;
+						break;
+					}
+
+					end = loc.offset + loc.length;
+				}
+
+				lookBehindStartCodes = !hasLengthPrefixedSlice && end === packetData.byteLength;
+			}
+
+			const nalUnits = lookBehindStartCodes
+				? iterateAvcNalUnitsIncludingEmbedded(packetData, decoderConfig)
+				: iterateAvcNalUnits(packetData, decoderConfig);
+
+			for (const loc of nalUnits) {
 				const nalTypeByte = packetData[loc.offset]!;
 				const type = extractNalUnitTypeForAvc(nalTypeByte);
 
@@ -2517,10 +3025,13 @@ export const determineVideoPacketType = (
 					return 'key';
 				}
 
+				hasSps ||= type === AvcNalUnitType.SPS;
+
 				// In addition to IDR, Recovery Point SEI also counts as a valid H.264 keyframe by current consensus.
 				// See https://github.com/w3c/webcodecs/issues/650 for the relevant discussion. WebKit and Firefox have
-				// always supported them, but Chromium hasn't.
-				if (type === AvcNalUnitType.SEI && !isChromium()) {
+				// always supported them, but Chromium hasn't. Decoding can only start there if the parameter sets are
+				// known though, which in Annex B means the packet must carry them (an IDR always gets them inserted).
+				if (type === AvcNalUnitType.SEI && !isChromium() && (decoderConfig.description || hasSps)) {
 					const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
 					const bytes = removeEmulationPreventionBytes(nalUnit);
 					let pos = 1; // Skip NALU header
@@ -2581,7 +3092,32 @@ export const determineVideoPacketType = (
 		};
 
 		case 'hevc': {
-			for (const loc of iterateHevcNalUnits(packetData, decoderConfig)) {
+			// Only a frame whose length-prefixed NAL units cover it exactly, but without any VCL NAL unit among them,
+			// hides its slices behind start codes. Elsewhere, a start code that a writer failed to escape (say, in an
+			// SEI payload before the slice), or one in the bytes that a broken length runs into, mustn't decide the
+			// type.
+			let lookBehindStartCodes = false;
+			if (decoderConfig.description) {
+				let hasLengthPrefixedVclNalUnit = false;
+				let end = 0;
+
+				for (const loc of iterateHevcNalUnits(packetData, decoderConfig)) {
+					if (extractNalUnitTypeForHevc(packetData[loc.offset]!) <= 31) {
+						hasLengthPrefixedVclNalUnit = true;
+						break;
+					}
+
+					end = loc.offset + loc.length;
+				}
+
+				lookBehindStartCodes = !hasLengthPrefixedVclNalUnit && end === packetData.byteLength;
+			}
+
+			const nalUnits = lookBehindStartCodes
+				? splitNalUnitsAtStartCodes(packetData, iterateHevcNalUnits(packetData, decoderConfig))
+				: iterateHevcNalUnits(packetData, decoderConfig);
+
+			for (const loc of nalUnits) {
 				const type = extractNalUnitTypeForHevc(packetData[loc.offset]!);
 				if (type < HevcNalUnitType.BLA_W_LP) {
 					return 'delta';
@@ -2716,6 +3252,19 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 	const listLength = commentView.getUint32(commentPos, true);
 	commentPos += 4;
 
+	// The tags may already hold the comments of another logical stream of the file, which usually carries the same
+	// ones (each Ogg stream has its own comment header). Comments already there, pictures included, are only added
+	// again where this header holds them more often.
+	const previousValues = new Map<string, string[]>();
+	for (const key in metadataTags.raw) {
+		const value = metadataTags.raw[key];
+		if (typeof value === 'string') {
+			previousValues.set(key, [value]);
+		} else if (Array.isArray(value) && value.every(x => typeof x === 'string')) {
+			previousValues.set(key, [...value]);
+		}
+	}
+
 	// Loop over all metadata tags
 	for (let i = 0; i < listLength; i++) {
 		if (commentPos + 4 > bytes.length) {
@@ -2737,6 +3286,12 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 
 		const key = string.slice(0, separatorIndex).toUpperCase();
 		const value = string.slice(separatorIndex + 1);
+		const previousValuesOfKey = previousValues.get(key);
+		const previousIndex = previousValuesOfKey?.indexOf(value) ?? -1;
+		if (previousIndex !== -1) {
+			previousValuesOfKey!.splice(previousIndex, 1); // Already read from another logical stream
+			continue;
+		}
 
 		metadataTags.raw ??= {};
 		if (Array.isArray(metadataTags.raw[key])) {
@@ -2747,6 +3302,7 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 			metadataTags.raw[key] ??= value;
 		}
 
+		watchMetadataTagFields(metadataTags, key);
 		switch (key) {
 			case 'TITLE': {
 				metadataTags.title ??= value;
@@ -2854,6 +3410,10 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 						mediaTypeLength + descriptionLength + 32 + dataLength,
 					);
 
+					if (mediaType === '-->') {
+						break; // The data is a link to the picture, not the picture; it's only kept in the raw tags
+					}
+
 					metadataTags.images ??= [];
 					metadataTags.images.push({
 						data,
@@ -2867,7 +3427,31 @@ export const readVorbisComments = (bytes: Uint8Array, metadataTags: MetadataTags
 				}
 			}; break;
 		}
+
+		unwatchMetadataTagFields(metadataTags);
 	}
+};
+
+/**
+ * Returns the METADATA_BLOCK_PICTURE values among the raw tags that hold a link to a picture (media type "-->")
+ * instead of a picture. These aren't among the images, so they're written from the raw tags.
+ */
+export const getRawPictureLinks = (tags: MetadataTags) => {
+	const value = tags.raw?.['METADATA_BLOCK_PICTURE'];
+	const values = Array.isArray(value) ? value as unknown[] : [value];
+
+	return values.filter((value): value is string => {
+		if (typeof value !== 'string') {
+			return false;
+		}
+
+		try {
+			const bytes = base64ToBytes(value);
+			return toDataView(bytes).getUint32(4, false) === 3 && textDecoder.decode(bytes.subarray(8, 11)) === '-->';
+		} catch {
+			return false;
+		}
+	});
 };
 
 export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags, writeImages: boolean) => {
@@ -2887,7 +3471,14 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	commentHeaderParts.push(currentBuffer);
 
 	const writtenTags: string[] = [];
+	// Keys left out on purpose, which a raw tag may not fill in
+	const omittedTags: string[] = [];
 	const addCommentTag = (key: string, value: string) => {
+		if (isWritingNormalizedTags && key !== 'METADATA_BLOCK_PICTURE') {
+			addNormalizedCommentTag(key, value);
+			return;
+		}
+
 		const joined = `${key}=${value}`;
 		const encoded = textEncoder.encode(joined);
 
@@ -2899,6 +3490,44 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 
 		commentHeaderParts.push(currentBuffer);
 		writtenTags.push(key);
+		commentCount++;
+	};
+
+	let commentCount = 0;
+	let isWritingNormalizedTags = true;
+
+	// Marks the raw tags of a field as written (so that they're skipped), whatever the case of their key: field names
+	// are case-insensitive
+	const coverRawTags = (fieldName: string) => {
+		for (const key in tags.raw) {
+			if (key.toUpperCase() === fieldName) {
+				writtenTags.push(key);
+			}
+		}
+	};
+	// A field may repeat (as for several artists). Read from a file, the normalized tag holds its first value and the
+	// raw tags hold all of them, so if the normalized tag still holds that first value, let's write them all.
+	const addNormalizedCommentTag = (key: string, value: string) => {
+		const rawValues: string[] = [];
+		for (const rawKey in tags.raw) {
+			const rawValue = tags.raw[rawKey];
+			if (rawKey === 'vendor' || rawKey.toUpperCase() !== key) {
+				continue;
+			}
+
+			if (typeof rawValue === 'string') {
+				rawValues.push(rawValue);
+			} else if (Array.isArray(rawValue) && rawValue.every(x => typeof x === 'string')) {
+				rawValues.push(...rawValue);
+			}
+		}
+
+		coverRawTags(key);
+		isWritingNormalizedTags = false;
+		for (const valueToWrite of rawValues[0] === value ? rawValues : [value]) {
+			addCommentTag(key, valueToWrite);
+		}
+		isWritingNormalizedTags = true;
 	};
 
 	for (const { key, value } of keyValueIterator(tags)) {
@@ -2928,7 +3557,12 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 			}; break;
 
 			case 'date': {
-				addCommentTag('DATE', value.toISOString().slice(0, 10));
+				const dateString = formatMetadataDate(value);
+				if (dateString !== null) {
+					addCommentTag('DATE', dateString);
+				} else {
+					omittedTags.push('DATE');
+				}
 			}; break;
 
 			case 'comment': {
@@ -3004,6 +3638,12 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 					const encoded = bytesToBase64(buffer);
 					addCommentTag('METADATA_BLOCK_PICTURE', encoded);
 				}
+
+				// The raw METADATA_BLOCK_PICTURE tags are left out once the images are written, but picture links
+				// aren't among those
+				for (const link of getRawPictureLinks(tags)) {
+					addCommentTag('METADATA_BLOCK_PICTURE', link);
+				}
 			}; break;
 
 			case 'raw': {
@@ -3018,10 +3658,17 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 		}
 	}
 
+	isWritingNormalizedTags = false;
+
 	if (tags.raw) {
 		for (const key in tags.raw) {
 			const value = tags.raw[key] ?? tags.raw[key.toLowerCase()];
-			if (key === 'vendor' || value == null || writtenTags.includes(key)) {
+			if (
+				key === 'vendor'
+				|| value == null
+				|| writtenTags.includes(key)
+				|| omittedTags.includes(key.toUpperCase()) // Field names are case-insensitive
+			) {
 				continue;
 			}
 
@@ -3040,7 +3687,7 @@ export const createVorbisComments = (headerBytes: Uint8Array, tags: MetadataTags
 	}
 
 	const listLengthBuffer = new Uint8Array(4);
-	toDataView(listLengthBuffer).setUint32(0, writtenTags.length, true);
+	toDataView(listLengthBuffer).setUint32(0, commentCount, true);
 	commentHeaderParts.splice(2, 0, listLengthBuffer); // Insert after the header and vendor section
 
 	// Merge all comment header parts into a single buffer
@@ -3137,6 +3784,9 @@ export const parseAc3SyncFrame = (data: Uint8Array): Ac3FrameInfo | null => {
 	return { fscod, bsid, bsmod, acmod, lfeon, bitRateCode };
 };
 
+/** AC-3 bit rates in kbit/s, indexed by frmsizecod / 2 (Table 4.13). */
+const AC3_BIT_RATES = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640];
+
 /**
  * AC-3 frame sizes in bytes, indexed by [3 * frmsizecod + fscod].
  * fscod: 0=48kHz, 1=44.1kHz, 2=32kHz
@@ -3201,6 +3851,50 @@ export const EAC3_REGISTRATION_DESCRIPTOR = new Uint8Array([0x05, 0x04, 0x45, 0x
 export const EAC3_NUMBLKS_TABLE = [1, 2, 3, 6];
 
 /**
+ * Returns how many audio blocks of independent substream 0 a packet of AC-3/E-AC-3 syncframes holds, or null if the
+ * packet isn't made of whole syncframes. Sections 4.3 and E.1.2.
+ */
+export const countEac3AudioBlocks = (data: Uint8Array) => {
+	let blocks = 0;
+	let pos = 0;
+
+	while (pos + 6 <= data.length) {
+		if (data[pos] !== 0x0B || data[pos + 1] !== 0x77) {
+			return null;
+		}
+
+		const bsid = data[pos + 5]! >> 3;
+		let frameSize: number;
+
+		if (bsid <= 10) {
+			// An AC-3 syncframe (e.g. the core of an E-AC-3 stream) always holds six blocks
+			const fscod = data[pos + 4]! >> 6;
+			const frmsizecod = data[pos + 4]! & 0x3f;
+			if (fscod === 3 || frmsizecod > 37) {
+				return null;
+			}
+
+			frameSize = AC3_FRAME_SIZES[3 * frmsizecod + fscod]!;
+			blocks += 6;
+		} else {
+			const strmtyp = data[pos + 2]! >> 6;
+			const substreamid = (data[pos + 2]! >> 3) & 0x7;
+			const fscod = data[pos + 4]! >> 6;
+			const numblkscod = fscod === 3 ? 3 : (data[pos + 4]! >> 4) & 0x3;
+
+			frameSize = 2 * ((((data[pos + 2]! & 0x7) << 8) | data[pos + 3]!) + 1);
+			if (strmtyp !== 1 && substreamid === 0) {
+				blocks += EAC3_NUMBLKS_TABLE[numblkscod]!;
+			}
+		}
+
+		pos += frameSize;
+	}
+
+	return pos === data.length ? blocks : null;
+};
+
+/**
  * E-AC-3 independent substream info.
  * Each independent substream represents a separate audio program.
  */
@@ -3232,6 +3926,96 @@ export interface Eac3FrameInfo {
 	/** Independent substreams */
 	substreams: Eac3SubstreamInfo[];
 }
+
+/**
+ * Reads the bit stream mode from the informational metadata of an independent substream's BSI, continuing right after
+ * bsid. It's 0 when the BSI has no informational metadata. Section E.1.2.2
+ */
+const readEac3Bsmod = (bitstream: Bitstream, strmtyp: number, numblkscod: number, acmod: number, lfeon: number) => {
+	bitstream.skipBits(5); // dialnorm
+	if (bitstream.readBits(1)) { // compre
+		bitstream.skipBits(8); // compr
+	}
+
+	if (acmod === 0) {
+		bitstream.skipBits(5); // dialnorm2
+		if (bitstream.readBits(1)) { // compr2e
+			bitstream.skipBits(8); // compr2
+		}
+	}
+
+	// (chanmape only exists in dependent substreams)
+
+	if (bitstream.readBits(1)) { // mixmdate
+		if (acmod > 2) {
+			bitstream.skipBits(2); // dmixmod
+		}
+
+		if ((acmod & 1) && acmod > 2) {
+			bitstream.skipBits(6); // ltrtcmixlev, lorocmixlev
+		}
+
+		if (acmod & 4) {
+			bitstream.skipBits(6); // ltrtsurmixlev, lorosurmixlev
+		}
+
+		if (lfeon && bitstream.readBits(1)) { // lfemixlevcode
+			bitstream.skipBits(5); // lfemixlevcod
+		}
+
+		if (strmtyp === 0) {
+			if (bitstream.readBits(1)) { // pgmscle
+				bitstream.skipBits(6); // pgmscl
+			}
+
+			if (acmod === 0 && bitstream.readBits(1)) { // pgmscl2e
+				bitstream.skipBits(6); // pgmscl2
+			}
+
+			if (bitstream.readBits(1)) { // extpgmscle
+				bitstream.skipBits(6); // extpgmscl
+			}
+
+			const mixdef = bitstream.readBits(2);
+			if (mixdef === 1) {
+				bitstream.skipBits(5); // premixcmpsel, drcsrc, premixcmpscl
+			} else if (mixdef === 2) {
+				bitstream.skipBits(12); // mixdata
+			} else if (mixdef === 3) {
+				const mixdeflen = bitstream.readBits(5);
+				bitstream.skipBits(8 * (mixdeflen + 2)); // The mixing data and its fill bits
+			}
+
+			if (acmod < 2) {
+				if (bitstream.readBits(1)) { // paninfoe
+					bitstream.skipBits(14); // panmean, paninfo
+				}
+
+				if (acmod === 0 && bitstream.readBits(1)) { // paninfo2e
+					bitstream.skipBits(14); // panmean2, paninfo2
+				}
+			}
+
+			if (bitstream.readBits(1)) { // frmmixcfginfoe
+				if (numblkscod === 0) {
+					bitstream.skipBits(5); // blkmixcfginfo[0]
+				} else {
+					for (let i = 0; i < EAC3_NUMBLKS_TABLE[numblkscod]!; i++) {
+						if (bitstream.readBits(1)) { // blkmixcfginfoe
+							bitstream.skipBits(5); // blkmixcfginfo[i]
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (bitstream.readBits(1)) { // infomdate
+		return bitstream.readBits(3); // bsmod
+	}
+
+	return 0;
+};
 
 /**
  * Parse an E-AC-3 syncframe to extract BSI fields.
@@ -3291,9 +4075,10 @@ export const parseEac3SyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
 	}
 	const dataRate = Math.round(((frmsiz + 1) * fs) / (numblks * 16));
 
+	const bsmod = readEac3Bsmod(bitstream, strmtyp, numblkscod, acmod, lfeon);
+
 	// These fields require parsing beyond the first frame.
 	// Defaults are correct for almost all content.
-	const bsmod = 0;
 	const numDepSub = 0;
 	const chanLoc = 0;
 
@@ -3312,6 +4097,100 @@ export const parseEac3SyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
 		dataRate,
 		substreams: [substream],
 	};
+};
+
+/**
+ * Like parseEac3SyncFrame, but also accepts an AC-3 frame (bsid up to 10) as the first independent substream, as
+ * Blu-ray's Dolby Digital Plus streams carry it, the E-AC-3 data extending it following in dependent substreams. It's
+ * then described like an E-AC-3 one, as FFmpeg's MP4 muxer does in dec3.
+ */
+export const parseEac3OrAc3CoreSyncFrame = (data: Uint8Array): Eac3FrameInfo | null => {
+	if (data.length < 6 || data[0] !== 0x0B || data[1] !== 0x77 || data[5]! >> 3 > 10) {
+		return parseEac3SyncFrame(data);
+	}
+
+	const frameInfo = parseAc3SyncFrame(data);
+	if (!frameInfo) {
+		return null;
+	}
+
+	const frameSize = AC3_FRAME_SIZES[3 * (data[4]! & 0x3f) + frameInfo.fscod];
+	const { numDepSub, chanLoc, dependentSize } = frameSize !== undefined
+		? readEac3DependentSubstreams(data, frameSize)
+		: { numDepSub: 0, chanLoc: 0, dependentSize: 0 };
+
+	// data_rate is the rate of the whole bitstream, the dependent substreams' frames (spanning the core's 1536
+	// samples) included
+	const dependentDataRate = dependentSize * 8 * AC3_SAMPLE_RATES[frameInfo.fscod]! / AC3_SAMPLES_PER_FRAME / 1000;
+
+	return {
+		dataRate: AC3_BIT_RATES[frameInfo.bitRateCode]! + Math.round(dependentDataRate),
+		substreams: [{
+			fscod: frameInfo.fscod,
+			fscod2: 0,
+			bsid: frameInfo.bsid,
+			bsmod: frameInfo.bsmod,
+			acmod: frameInfo.acmod,
+			lfeon: frameInfo.lfeon,
+			numDepSub,
+			chanLoc,
+		}],
+	};
+};
+
+/**
+ * Counts the dependent substream frames that directly follow an independent substream's frame (ending at `offset`)
+ * within the same access unit, and collects the channel locations they add, in dec3's `chan_loc` bits, and their
+ * size. Taken from upstream's bug-fix-mania branch, where parseEac3SyncFrame does the same for E-AC-3 frames.
+ */
+const readEac3DependentSubstreams = (data: Uint8Array, offset: number) => {
+	const bitstream = new Bitstream(data);
+	const startOffset = offset;
+	let numDepSub = 0;
+	let chanLoc = 0;
+
+	while (offset + 2 <= data.length) {
+		bitstream.seekToByte(offset);
+		if (bitstream.readBits(16) !== 0x0b77 || bitstream.readBits(2) !== 1) { // syncword, strmtyp
+			break;
+		}
+
+		bitstream.skipBits(3); // substreamid
+		const dependentFrmsiz = bitstream.readBits(11);
+		bitstream.skipBits(2 + 2); // fscod, fscod2 or numblkscod
+		const dependentAcmod = bitstream.readBits(3);
+		bitstream.skipBits(1 + 5 + 5); // lfeon, bsid, dialnorm
+
+		if (bitstream.readBits(1)) { // compre
+			bitstream.skipBits(8); // compr
+		}
+		if (dependentAcmod === 0) {
+			bitstream.skipBits(5); // dialnorm2
+			if (bitstream.readBits(1)) { // compr2e
+				bitstream.skipBits(8); // compr2
+			}
+		}
+
+		if (bitstream.readBits(1)) { // chanmape
+			const chanmap = bitstream.readBits(16);
+
+			// chanmap numbers its locations from the most significant bit, chan_loc from the least significant one.
+			// chan_loc covers the Lc/Rc pair through Cvh, then skips the Lts/Rts pair to end with LFE2.
+			for (let i = 0; i < 8; i++) {
+				if (chanmap & (1 << (10 - i))) {
+					chanLoc |= 1 << i;
+				}
+			}
+			if (chanmap & 0b10) {
+				chanLoc |= 1 << 8;
+			}
+		}
+
+		numDepSub++;
+		offset += 2 * (dependentFrmsiz + 1);
+	}
+
+	return { numDepSub, chanLoc, dependentSize: offset - startOffset };
 };
 
 /**
@@ -3404,8 +4283,9 @@ export const getEac3ChannelCount = (config: Eac3FrameInfo): number => {
 	if (sub.numDepSub > 0) {
 		const CHAN_LOC_COUNTS = [2, 2, 1, 1, 2, 2, 2, 1, 1];
 
+		// chan_loc numbers its locations from the least significant bit (as upstream's bug-fix-mania branch fixed)
 		for (let bit = 0; bit < 9; bit++) {
-			if (sub.chanLoc & (1 << (8 - bit))) {
+			if (sub.chanLoc & (1 << bit)) {
 				channels += CHAN_LOC_COUNTS[bit]!;
 			}
 		}
@@ -3904,4 +4784,44 @@ export const buildDtsSpecificBox = (frameInfo: DtsFrameInfo) => {
 /** Count the channels in a DTS speaker layout mask, where some bits stand for a pair of speakers. */
 const getDtsChannelCount = (channelLayout: number) => {
 	return popcount(channelLayout) + popcount(channelLayout & DTS_CHANNEL_LAYOUT_PAIR_MASK);
+};
+
+/**
+ * Tells whether an AAC frame (raw, or with its ADTS header) starts with the fill element in which libfaac names itself
+ * (in the first frame it encodes). FFmpeg's AAC decoder, which Chromium and Firefox use, discards the first frame of
+ * such AAC as encoder priming. It's read as FFmpeg reads it: an EXT_FILL extension payload, then 13 bits, then
+ * "libfaac <major>.<minor>".
+ */
+export const hasLibfaacSignature = (frame: Uint8Array) => {
+	if (frame.length >= 7 && frame[0] === 0xff && (frame[1]! & 0xf0) === 0xf0) {
+		// An ADTS header, with a CRC unless protection_absent is set
+		frame = frame.subarray((frame[1]! & 1) ? 7 : 9);
+	}
+
+	const bitstream = new Bitstream(frame);
+	if (bitstream.getBitsLeft() < 32 || bitstream.readBits(3) !== 6) { // ID_FIL
+		return false;
+	}
+
+	let count = bitstream.readBits(4);
+	if (count === 15) {
+		count += bitstream.readBits(8) - 1;
+	}
+
+	if (count * 8 < 4 + 13 + 7 * 8 || count * 8 > bitstream.getBitsLeft() || bitstream.readBits(4) !== 0) { // EXT_FILL
+		return false;
+	}
+
+	bitstream.skipBits(13);
+	let text = '';
+	for (let i = 0; i < count - 3; i++) {
+		const byte = bitstream.readBits(8);
+		if (byte === 0) {
+			break;
+		}
+
+		text += String.fromCharCode(byte);
+	}
+
+	return /^libfaac\s*[+-]?\d+\.\s*[+-]?\d+/.test(text);
 };

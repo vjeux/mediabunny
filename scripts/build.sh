@@ -36,6 +36,9 @@ tsc -p src
 # it ships the individual files to npm (for tree shaking, because it's large)
 npm run fix-build-import-paths
 
+# Classes that only Mediabunny constructs (their constructors are @internal) get private constructors in the declarations
+tsx scripts/declare-private-constructors.ts
+
 # Creates bundles for all packages
 tsx scripts/bundle.ts
 
@@ -49,6 +52,11 @@ api-extractor run -c packages/aac-encoder/api-extractor.json
 api-extractor run -c packages/flac-encoder/api-extractor.json
 api-extractor run -c packages/prores/api-extractor.json
 api-extractor run -c packages/server/api-extractor.json
+
+# The extensions' declarations are CommonJS (their packages aren't "type": "module"), so their ESM entries get ESM copies
+for name in mp3-encoder ac3 dts truehd aac-encoder flac-encoder prores server; do
+	cp packages/$name/dist/mediabunny-$name.d.ts packages/$name/dist/mediabunny-$name.d.mts
+done
 
 # Checks that all symbols are documented
 tsx scripts/check-docblocks.ts \
@@ -64,6 +72,9 @@ tsx scripts/check-docblocks.ts \
 
 # Checks that API docs are generatable
 npm run docs:generate -- --dry
+
+# API Extractor leaves `declare global` blocks out of the rollup, so add them for the global namespace declarations
+tsx scripts/add-global-declarations.ts dist/modules dist/mediabunny.d.ts
 
 # Appends stuff to the declaration files to register the global variables these libraries expose
 echo 'export as namespace Mediabunny;' >> dist/mediabunny.d.ts

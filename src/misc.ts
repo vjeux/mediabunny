@@ -81,7 +81,12 @@ export const centeredTransformationMatrix = (linear: TransformationMatrix, width
  * horizontally", and snapping to the nearest multiple of 90 degrees.
  */
 export const extractRotationFromMatrix = (matrix: TransformationMatrix) => {
-	const [a, b] = matrix;
+	const [a, b, , c, d] = matrix;
+	if (a * d - b * c === 0) {
+		// A singular matrix (like a track matrix shifted by one entry) maps the frame onto a line or a point, so it
+		// holds no rotation. FFmpeg (av_display_rotation_get) and Chromium (VideoTransformation) apply none either.
+		return 0;
+	}
 
 	// (1, 0) projects onto (a, b), so that's all we need. The rotation is applied before flipping though, so we
 	// first need to undo the flip to isolate the rotation.
@@ -160,6 +165,49 @@ export const last = <T>(arr: T[]) => {
 	return arr && arr[arr.length - 1];
 };
 
+/**
+ * A first-in, first-out queue. Taking an item off the front is amortized O(1), unlike with
+ * `Array.prototype.shift()`, which copies the whole array once the array is large.
+ */
+export class Queue<T> {
+	private items: (T | undefined)[] = [];
+	private head = 0;
+
+	get length() {
+		return this.items.length - this.head;
+	}
+
+	push(...items: T[]) {
+		this.items.push(...items);
+	}
+
+	/** Returns the first item without removing it, or undefined if the queue is empty. */
+	peek() {
+		return this.items[this.head];
+	}
+
+	shift() {
+		if (this.head === this.items.length) {
+			return undefined;
+		}
+
+		const item = this.items[this.head];
+		this.items[this.head] = undefined; // So that it can be garbage-collected
+		this.head++;
+
+		if (2 * this.head >= this.items.length) {
+			// Drop the consumed items once they make up half the array, which keeps this amortized O(1)
+			this.items.splice(0, this.head);
+			this.head = 0;
+		}
+
+		return item;
+	}
+}
+
+/** The most bytes to read or write in one file system call (Node rejects 2 GiB or more). */
+export const MAX_FILE_IO_SIZE = 2 ** 30;
+
 export const isU32 = (value: number) => {
 	return value >= 0 && value < 2 ** 32;
 };
@@ -202,18 +250,6 @@ export const readSignedExpGolomb = (bitstream: Bitstream) => {
 		: (codeNum + 1) / 2;
 };
 
-export const writeBits = (bytes: Uint8Array, start: number, end: number, value: number) => {
-	for (let i = start; i < end; i++) {
-		const byteIndex = Math.floor(i / 8);
-		let byte = bytes[byteIndex]!;
-		const bitIndex = 0b111 - (i & 0b111);
-
-		byte &= ~(1 << bitIndex);
-		byte |= ((value & (1 << (end - i - 1))) >> (end - i - 1)) << bitIndex;
-		bytes[byteIndex] = byte;
-	}
-};
-
 export const toUint8Array = (source: AllowSharedBufferSource): Uint8Array => {
 	if (source.constructor === Uint8Array) { // We want a true Uint8Array, not something that extends it like Buffer
 		return source;
@@ -232,6 +268,91 @@ export const toDataView = (source: AllowSharedBufferSource): DataView => {
 	} else {
 		return new DataView(source);
 	}
+};
+
+/**
+ * Whether the value is a Uint8Array, including one created in another realm (an iframe, a Node.js vm context, Jest's
+ * jsdom environment), which `instanceof Uint8Array` doesn't recognize.
+ */
+export const isUint8Array = (value: unknown): value is Uint8Array => {
+	if (value instanceof Uint8Array) {
+		return true;
+	}
+	if (!ArrayBuffer.isView(value)) {
+		return false;
+	}
+
+	// The typed array's internal type name, which an own Symbol.toStringTag can't fake (undefined for a DataView)
+	const typedArrayName: unknown = Object.getOwnPropertyDescriptor(
+		Object.getPrototypeOf(Uint8Array.prototype) as object,
+		Symbol.toStringTag,
+	)!.get!.call(value);
+	return typedArrayName === 'Uint8Array';
+};
+
+/**
+ * Returns a Uint8Array created in another realm as a Uint8Array of this realm over the same memory, so that it passes
+ * `instanceof` checks, here and further down the pipeline. Any other value is returned unchanged.
+ */
+export const uint8ArrayFromOtherRealm = <T>(value: T): T => {
+	if (value instanceof Uint8Array || !isUint8Array(value)) {
+		return value;
+	}
+
+	return new Uint8Array(value.buffer, value.byteOffset, value.byteLength) as T;
+};
+
+/**
+ * Returns an ArrayBuffer created in another realm as a Uint8Array of this realm over the same memory, so that it passes
+ * `instanceof` checks. Any other value is returned unchanged.
+ */
+export const arrayBufferFromOtherRealm = <T>(value: T): T | Uint8Array => {
+	if (
+		typeof value !== 'object'
+		|| value === null
+		|| value instanceof ArrayBuffer
+		|| Object.prototype.toString.call(value) !== '[object ArrayBuffer]'
+	) {
+		return value;
+	}
+
+	try {
+		// The tag can be faked with Symbol.toStringTag, but only an actual ArrayBuffer can back a view
+		new DataView(value as unknown as ArrayBuffer, 0, 0);
+	} catch {
+		return value;
+	}
+
+	return new Uint8Array(value as unknown as ArrayBuffer);
+};
+
+/**
+ * Whether the value is a Blob (or File), including one created in another realm. Those are duck-typed: a Blob of
+ * another implementation (Node.js's Blob in Jest's jsdom environment) fails this realm's brand checks, so it's
+ * recognized by its tag and the members that are used of it.
+ */
+export const isBlob = (value: unknown): value is Blob => {
+	if (typeof Blob !== 'undefined' && value instanceof Blob) {
+		return true;
+	}
+
+	const tag = Object.prototype.toString.call(value);
+	const blob = value as Blob;
+	return (tag === '[object Blob]' || tag === '[object File]')
+		&& typeof blob.size === 'number'
+		&& typeof blob.type === 'string'
+		&& typeof blob.slice === 'function'
+		&& typeof blob.arrayBuffer === 'function'
+		&& typeof blob.stream === 'function';
+};
+
+/**
+ * Whether the value is a ReadableStream, including one created in another realm or by a polyfill. Streams are
+ * recognized by their getReader method, which is all that's used of them.
+ */
+export const isReadableStream = (value: unknown): value is ReadableStream => {
+	return (typeof ReadableStream !== 'undefined' && value instanceof ReadableStream)
+		|| (typeof value === 'object' && value !== null && typeof (value as ReadableStream).getReader === 'function');
 };
 
 // Include a polyfill for environments that don't have TextEncoder (like AudioWorkletGlobalScope)
@@ -278,7 +399,7 @@ export const TextEncoder = typeof globalThis.TextEncoder !== 'undefined'
 	};
 
 // Include a polyfill for environments that don't have TextEncoder (like AudioWorkletGlobalScope)
-export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
+const BaseTextDecoder: typeof globalThis.TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 	? globalThis.TextDecoder
 	: class TextDecoder {
 		readonly encoding: 'utf-8' | 'utf-16le' | 'utf-16be';
@@ -374,6 +495,11 @@ export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 							i += 2;
 						} else {
 							units.push(0xfffd);
+
+							if (next === -1) {
+								// Cut off by the end: like in the WHATWG decoder, a dangling odd byte shares this error
+								i = bytes.length;
+							}
 						}
 					} else if (unit >= 0xdc00 && unit <= 0xdfff) {
 						units.push(0xfffd);
@@ -394,7 +520,41 @@ export const TextDecoder = typeof globalThis.TextDecoder !== 'undefined'
 
 			return result;
 		}
-	};
+	} as unknown as typeof globalThis.TextDecoder;
+
+/**
+ * Whether the value is a SharedArrayBuffer. Also works where SharedArrayBuffer isn't a global: without cross-origin
+ * isolation, shared WebAssembly memory still is one.
+ */
+export const isSharedArrayBuffer = (value: unknown): value is SharedArrayBuffer => {
+	if (Object.prototype.toString.call(value) !== '[object SharedArrayBuffer]') {
+		return false;
+	}
+
+	try {
+		// The brand can be faked with Symbol.toStringTag, but only real buffers can back a DataView
+		new DataView(value as ArrayBufferLike, 0, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+/**
+ * Browsers' TextDecoder rejects views of shared memory ("must not be shared"), while sources accept shared memory, so
+ * shared bytes get copied before decoding.
+ */
+export const TextDecoder = class TextDecoder extends BaseTextDecoder {
+	override decode(input?: AllowSharedBufferSource, options?: TextDecodeOptions) {
+		if (input !== undefined && isSharedArrayBuffer(ArrayBuffer.isView(input) ? input.buffer : input)) {
+			input = ArrayBuffer.isView(input)
+				? new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice()
+				: new Uint8Array(input).slice();
+		}
+
+		return super.decode(input, options);
+	}
+};
 
 export const textDecoder = /* #__PURE__ */ new TextDecoder();
 export const textEncoder = /* #__PURE__ */ new TextEncoder();
@@ -482,7 +642,7 @@ export const EMPTY_COLOR_SPACE: VideoColorSpaceInit = {
 export const isAllowSharedBufferSource = (x: unknown) => {
 	return (
 		x instanceof ArrayBuffer
-		|| (typeof SharedArrayBuffer !== 'undefined' && x instanceof SharedArrayBuffer)
+		|| isSharedArrayBuffer(x)
 		|| ArrayBuffer.isView(x)
 	);
 };
@@ -602,6 +762,41 @@ export const promiseWithResolvers = <T = void>() => {
 	return { promise, resolve: resolve!, reject: reject! };
 };
 
+/**
+ * For waiting on promises that may never settle, like those of user callbacks, until something is disposed: `wait`
+ * settles like the given promise, unless `dispose` comes first, which rejects every wait still pending (and every
+ * later one) with the given error. Waits are let go of once settled, so that a long-lived signal doesn't hold on to
+ * their results.
+ */
+export class DisposalSignal {
+	pendingRejecters = new Set<(error: Error) => void>();
+	/** Set once disposed. */
+	error: Error | null = null;
+
+	wait<T>(promise: PromiseLike<T>) {
+		return new Promise<T>((resolve, reject) => {
+			if (this.error) {
+				reject(this.error);
+				return;
+			}
+
+			this.pendingRejecters.add(reject);
+			void Promise.resolve(promise)
+				.then(resolve, reject)
+				.finally(() => this.pendingRejecters.delete(reject));
+		});
+	}
+
+	dispose(error: Error) {
+		this.error = error;
+
+		for (const reject of this.pendingRejecters) {
+			reject(error);
+		}
+		this.pendingRejecters.clear();
+	}
+}
+
 export const removeItem = <T>(arr: T[], item: T) => {
 	const index = arr.indexOf(item);
 	if (index !== -1) {
@@ -649,7 +844,12 @@ export const toAsyncIterator = async function* <T>(source: AnyIterable<T>): Asyn
 };
 
 export const validateAnyIterable = (iterable: AnyIterable<unknown>) => {
-	if (!(Symbol.iterator in iterable) && !(Symbol.asyncIterator in iterable)) {
+	if (
+		!iterable
+		// Functions can be iterable too
+		|| (typeof iterable !== 'object' && typeof iterable !== 'function')
+		|| (!(Symbol.iterator in iterable) && !(Symbol.asyncIterator in iterable))
+	) {
 		throw new TypeError('Argument must be an iterable or async iterable.');
 	}
 };
@@ -719,11 +919,28 @@ export const setInt64 = (view: DataView, byteOffset: number, value: number, litt
  * Calls a function on each value spat out by an async generator. The reason for writing this manually instead of
  * using a generator function is that the generator function queues return() calls - here, we forward them immediately.
  */
+/**
+ * Makes the iterator serve one next() call at a time, like a generator does: concurrent calls then resolve in order,
+ * each with the value after the previous call's.
+ */
+export const serializeNextCalls = <T>(iterator: AsyncGenerator<T, void, unknown>) => {
+	const next = iterator.next.bind(iterator);
+	let lastCall: Promise<unknown> = Promise.resolve();
+
+	iterator.next = () => {
+		const result = lastCall.then(() => next());
+		lastCall = result.then(() => {}, () => {});
+		return result;
+	};
+
+	return iterator;
+};
+
 export const mapAsyncGenerator = <T, U>(
 	generator: AsyncGenerator<T, void, unknown>,
 	map: (t: T) => U,
 ): AsyncGenerator<U, void, unknown> => {
-	return {
+	return makeAsyncDisposable<U>({
 		async next() {
 			const result = await generator.next();
 			if (result.done) {
@@ -741,7 +958,22 @@ export const mapAsyncGenerator = <T, U>(
 		[Symbol.asyncIterator]() {
 			return this;
 		},
-	};
+	});
+};
+
+/**
+ * Gives a hand-written async generator the `Symbol.asyncDispose` method that native async generators have, which ends
+ * the iteration when the generator was declared with `await using`.
+ */
+export const makeAsyncDisposable = <T>(generator: AsyncGenerator<T, void, unknown>) => {
+	Object.defineProperty(generator, Symbol.asyncDispose, {
+		value: async () => {
+			await generator.return();
+		},
+		writable: true,
+		configurable: true,
+	});
+	return generator;
 };
 
 export const clamp = (value: number, min: number, max: number) => {
@@ -758,11 +990,20 @@ export const modEuclid = (value: number, modulus: number) => {
 
 export const UNDETERMINED_LANGUAGE = 'und';
 
-export const roundIfAlmostInteger = (value: number) => {
+/**
+ * Rounds a value in some time unit to the nearest integer when it's only a float error away from it. Pass how many of
+ * those units make a second when that can be anything (a file's timescale), for the tolerance near zero.
+ */
+export const roundIfAlmostInteger = (value: number, unitsPerSecond?: number) => {
 	const rounded = Math.round(value);
 
-	if (Math.abs(value / rounded - 1) < 10 * Number.EPSILON) {
-		return rounded;
+	// The tolerance is relative to the value, with an absolute floor: near zero (a result of 0, or a small one computed
+	// by cancellation, like the end of a packet that starts before zero: -0.025 + 0.026), a float error exceeds any
+	// tolerance relative to the result. The floor is a picosecond, whatever the unit (a billionth of a unit when it's
+	// unknown), so it's far above the float errors near zero and far below any time difference that matters.
+	const floor = unitsPerSecond !== undefined ? 1e-12 * unitsPerSecond : 1e-9;
+	if (Math.abs(value - rounded) < floor || Math.abs(value / rounded - 1) < 10 * Number.EPSILON) {
+		return rounded === 0 ? 0 : rounded; // Not -0
 	} else {
 		return value;
 	}
@@ -807,6 +1048,42 @@ export const popcount = (value: number) => {
 const ISO_639_2_REGEX = /^[a-z]{3}$/;
 export const isIso639Dash2LanguageCode = (x: string) => {
 	return ISO_639_2_REGEX.test(x);
+};
+
+// ISO 639-1 codes and their ISO 639-2/T equivalents (with the legacy in, iw, ji, jw and mo)
+const ISO_639_1_TO_639_2: Record<string, string> = {
+	aa: 'aar', ab: 'abk', ae: 'ave', af: 'afr', ak: 'aka', am: 'amh', an: 'arg', ar: 'ara', as: 'asm', av: 'ava',
+	ay: 'aym', az: 'aze', ba: 'bak', be: 'bel', bg: 'bul', bh: 'bih', bi: 'bis', bm: 'bam', bn: 'ben', bo: 'bod',
+	br: 'bre', bs: 'bos', ca: 'cat', ce: 'che', ch: 'cha', co: 'cos', cr: 'cre', cs: 'ces', cu: 'chu', cv: 'chv',
+	cy: 'cym', da: 'dan', de: 'deu', dv: 'div', dz: 'dzo', ee: 'ewe', el: 'ell', en: 'eng', eo: 'epo', es: 'spa',
+	et: 'est', eu: 'eus', fa: 'fas', ff: 'ful', fi: 'fin', fj: 'fij', fo: 'fao', fr: 'fra', fy: 'fry', ga: 'gle',
+	gd: 'gla', gl: 'glg', gn: 'grn', gu: 'guj', gv: 'glv', ha: 'hau', he: 'heb', hi: 'hin', ho: 'hmo', hr: 'hrv',
+	ht: 'hat', hu: 'hun', hy: 'hye', hz: 'her', ia: 'ina', id: 'ind', ie: 'ile', ig: 'ibo', ii: 'iii', ik: 'ipk',
+	in: 'ind', io: 'ido', is: 'isl', it: 'ita', iu: 'iku', iw: 'heb', ja: 'jpn', ji: 'yid', jv: 'jav', jw: 'jav',
+	ka: 'kat', kg: 'kon', ki: 'kik', kj: 'kua', kk: 'kaz', kl: 'kal', km: 'khm', kn: 'kan', ko: 'kor', kr: 'kau',
+	ks: 'kas', ku: 'kur', kv: 'kom', kw: 'cor', ky: 'kir', la: 'lat', lb: 'ltz', lg: 'lug', li: 'lim', ln: 'lin',
+	lo: 'lao', lt: 'lit', lu: 'lub', lv: 'lav', mg: 'mlg', mh: 'mah', mi: 'mri', mk: 'mkd', ml: 'mal', mn: 'mon',
+	mo: 'ron', mr: 'mar', ms: 'msa', mt: 'mlt', my: 'mya', na: 'nau', nb: 'nob', nd: 'nde', ne: 'nep', ng: 'ndo',
+	nl: 'nld', nn: 'nno', no: 'nor', nr: 'nbl', nv: 'nav', ny: 'nya', oc: 'oci', oj: 'oji', om: 'orm', or: 'ori',
+	os: 'oss', pa: 'pan', pi: 'pli', pl: 'pol', ps: 'pus', pt: 'por', qu: 'que', rm: 'roh', rn: 'run', ro: 'ron',
+	ru: 'rus', rw: 'kin', sa: 'san', sc: 'srd', sd: 'snd', se: 'sme', sg: 'sag', si: 'sin', sk: 'slk', sl: 'slv',
+	sm: 'smo', sn: 'sna', so: 'som', sq: 'sqi', sr: 'srp', ss: 'ssw', st: 'sot', su: 'sun', sv: 'swe', sw: 'swa',
+	ta: 'tam', te: 'tel', tg: 'tgk', th: 'tha', ti: 'tir', tk: 'tuk', tl: 'tgl', tn: 'tsn', to: 'ton', tr: 'tur',
+	ts: 'tso', tt: 'tat', tw: 'twi', ty: 'tah', ug: 'uig', uk: 'ukr', ur: 'urd', uz: 'uzb', ve: 'ven', vi: 'vie',
+	vo: 'vol', wa: 'wln', wo: 'wol', xh: 'xho', yi: 'yid', yo: 'yor', za: 'zha', zh: 'zho', zu: 'zul',
+};
+
+/**
+ * Gives the ISO 639-2/T code for the language of a BCP 47 tag: its language subtag if that has three letters, the
+ * equivalent of a two-letter (ISO 639-1) one, and 'und' otherwise.
+ */
+export const bcp47ToIso639Dash2LanguageCode = (tag: string) => {
+	const languageSubtag = tag.split('-')[0]!.toLowerCase();
+	if (languageSubtag.length === 2) {
+		return ISO_639_1_TO_639_2[languageSubtag] ?? UNDETERMINED_LANGUAGE;
+	}
+
+	return isIso639Dash2LanguageCode(languageSubtag) ? languageSubtag : UNDETERMINED_LANGUAGE;
 };
 
 // Since the result will be truncated, add a bit of eps to compensate for floating point errors
@@ -882,13 +1159,28 @@ export const normalizeHeaders = (headers: HeadersInit): Record<string, string> =
 	if (Array.isArray(headers)) {
 		const result: Record<string, string> = {};
 		headers.forEach(([key, value]) => {
-			result[key] = value;
+			// Like Headers.append, a name given again (in any case) adds its value to the list. Not for Range though,
+			// which UrlSource maps onto a byte offset and which can't hold more than one range for that
+			const existingKey = key.toLowerCase() === 'range'
+				? undefined
+				: Object.keys(result).find(x => x.toLowerCase() === key.toLowerCase());
+			if (existingKey !== undefined) {
+				result[existingKey] += `, ${value}`;
+			} else {
+				result[key] = value;
+			}
 		});
 		return result;
 	}
 
 	return headers;
 };
+
+/**
+ * HTTP statuses of failures that can go away when the request is made again (server errors, timeouts, rate limiting),
+ * which are retried like network errors.
+ */
+const TRANSIENT_HTTP_STATUSES = [408, 429, 500, 502, 503, 504];
 
 export const retriedFetch = async (
 	fetchFn: typeof fetch,
@@ -900,19 +1192,46 @@ export const retriedFetch = async (
 	let attempts = 0;
 
 	while (true) {
+		let response: Response | null = null;
+
 		try {
-			return await fetchFn(url, requestInit);
+			response = await fetchFn(url, requestInit);
+			if (!TRANSIENT_HTTP_STATUSES.includes(response.status)) {
+				return response;
+			}
+
+			// The status lets retry policies tell this apart from a network error
+			throw Object.assign(
+				new Error(
+					`Error fetching ${url instanceof Request ? url.url : String(url)}: ${response.status}`
+					+ ` ${response.statusText}`,
+				),
+				{ status: response.status },
+			);
 		} catch (error) {
 			if (shouldStop()) {
+				void response?.body?.cancel().catch(() => {});
 				throw error;
 			}
 
 			attempts++;
-			const retryDelayInSeconds = getRetryDelay(attempts, error, url);
+			let retryDelayInSeconds: number | null;
+			try {
+				retryDelayInSeconds = getRetryDelay(attempts, error, url);
+			} catch (policyError) {
+				void response?.body?.cancel().catch(() => {});
+				throw policyError;
+			}
 
 			if (retryDelayInSeconds === null) {
+				if (response) {
+					return response; // The caller reports the failed response
+				}
+
 				throw error;
 			}
+
+			void response?.body?.cancel().catch(() => {}); // Frees the connection
 
 			Logging._error('Retrying failed fetch. Error:', error);
 
@@ -921,7 +1240,7 @@ export const retriedFetch = async (
 			}
 
 			if (retryDelayInSeconds > 0) {
-				await wait(1000 * retryDelayInSeconds);
+				await wait(1000 * retryDelayInSeconds, requestInit.signal);
 			}
 
 			if (shouldStop()) {
@@ -979,7 +1298,11 @@ export class CallSerializer {
 	currentPromise = Promise.resolve();
 
 	call(fn: () => Promise<void> | void) {
-		return this.currentPromise = this.currentPromise.then(fn);
+		const result = this.currentPromise.then(fn);
+		// A failed call must not keep later ones (like close()) from running; its caller sees the error via result
+		this.currentPromise = result.catch(() => {});
+
+		return result;
 	}
 }
 
@@ -1022,6 +1345,16 @@ export const isChromium = () => {
 		// eslint-disable-next-line @typescript-eslint/no-deprecated
 		&& (navigator.vendor?.includes('Google Inc') || /Chrome/.test(navigator.userAgent))
 	);
+};
+
+let isWindowsChromiumCache: boolean | null = null;
+/** Chromium on Windows, whose platform codecs are Media Foundation's. */
+export const isWindowsChromium = () => {
+	if (isWindowsChromiumCache !== null) {
+		return isWindowsChromiumCache;
+	}
+
+	return isWindowsChromiumCache = isChromium() && /Windows/.test(navigator.userAgent);
 };
 
 let chromiumVersionCache: number | null = null;
@@ -1163,11 +1496,24 @@ export const base64ToBytes = (base64: string) => {
 export const bytesToBase64 = (bytes: Uint8Array) => {
 	let string = '';
 
-	for (let i = 0; i < bytes.length; i++) {
-		string += String.fromCharCode(bytes[i]!);
+	// In chunks: a string built one character at a time is a rope of one node per byte until it's flattened, which
+	// takes hundreds of MB for a cover of a few MB
+	for (let i = 0; i < bytes.length; i += 0x8000) {
+		string += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
 	}
 
 	return btoa(string);
+};
+
+export const concatUint8Arrays = (arrays: Uint8Array[]) => {
+	const result = new Uint8Array(arrays.reduce((sum, x) => sum + x.byteLength, 0));
+	let offset = 0;
+	for (const array of arrays) {
+		result.set(array, offset);
+		offset += array.byteLength;
+	}
+
+	return result;
 };
 
 export const uint8ArraysAreEqual = (a: Uint8Array, b: Uint8Array) => {
@@ -1184,10 +1530,32 @@ export const uint8ArraysAreEqual = (a: Uint8Array, b: Uint8Array) => {
 	return true;
 };
 
+// The explicit resource management types the public declarations use (as @types/node declares them), so that they
+// compile without TypeScript's esnext.disposable lib
+declare global {
+	interface SymbolConstructor {
+		readonly dispose: unique symbol;
+	}
+
+	interface Disposable {
+		[Symbol.dispose](): void;
+	}
+}
+
+/** Whether two audio decoder configs describe the same decoding: codec string, sample rate, channels, description. */
+export const audioDecoderConfigsAreEqual = (a: AudioDecoderConfig, b: AudioDecoderConfig) => a.codec === b.codec
+	&& a.sampleRate === b.sampleRate
+	&& a.numberOfChannels === b.numberOfChannels
+	&& (a.description && b.description
+		? uint8ArraysAreEqual(toUint8Array(a.description), toUint8Array(b.description))
+		: !a.description === !b.description);
+
 export const polyfillSymbolDispose = () => {
 	// https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-2.html
 	// @ts-expect-error Readonly
 	Symbol.dispose ??= Symbol('Symbol.dispose');
+	// @ts-expect-error Readonly
+	Symbol.asyncDispose ??= Symbol('Symbol.asyncDispose');
 };
 
 export const isNumber = (x: unknown) => {
@@ -1196,7 +1564,7 @@ export const isNumber = (x: unknown) => {
 
 /**
  * A path to a file. File paths can be relative or absolute, and be local paths or full URLs. Paths must be POSIX-like,
- * using `/` as the separator.
+ * using `/` as the separator. The exception are local paths on Windows, which may also use `\`.
  *
  * Examples of valid paths:
  * - `'video.mp4'`
@@ -1213,10 +1581,84 @@ export const isNumber = (x: unknown) => {
  */
 export type FilePath = string;
 
+const isWindowsPathSeparator = (char: string | undefined) => char === '\\' || char === '/';
+
+/** Splits a Windows path into its device (drive or UNC share), whether it's rooted, and the rest. */
+const splitWindowsPathRoot = (path: string) => {
+	if (isWindowsPathSeparator(path[0]) && isWindowsPathSeparator(path[1])) {
+		const uncRoot = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.exec(path);
+		if (uncRoot) {
+			return { device: uncRoot[0], isRooted: true, rest: path.slice(uncRoot[0].length) };
+		}
+	}
+
+	if (/^[a-zA-Z]:/.test(path)) {
+		return { device: path.slice(0, 2), isRooted: isWindowsPathSeparator(path[2]), rest: path.slice(2) };
+	}
+
+	return { device: '', isRooted: isWindowsPathSeparator(path[0]), rest: path };
+};
+
+/** Joins local paths like Windows resolves them, where both `\` and `/` are separators. */
+const joinWindowsPaths = (basePath: FilePath, relativePath: FilePath) => {
+	const base = splitWindowsPathRoot(basePath);
+	const relative = splitWindowsPathRoot(relativePath);
+
+	let device = base.device;
+	let isRooted = base.isRooted;
+	let path: string;
+
+	// A drive-relative path (C:file) continues from the base path if the base path is on that drive or names none
+	const continuesBasePath = relative.device.length === 2
+		&& !relative.isRooted
+		&& (base.device === '' || relative.device.toLowerCase() === base.device.toLowerCase());
+
+	if (relative.device && !continuesBasePath) {
+		// Drive letters and UNC shares begin a path of their own
+		({ device, isRooted } = relative);
+		path = relative.rest;
+	} else if (relative.isRooted) {
+		// A leading separator refers to the root of the base path's drive or share
+		isRooted = true;
+		path = relative.rest;
+	} else {
+		if (relative.device) {
+			device = relative.device;
+		}
+
+		const lastSeparator = Math.max(base.rest.lastIndexOf('/'), base.rest.lastIndexOf('\\'));
+		path = base.rest.slice(0, lastSeparator + 1) + relative.rest;
+	}
+
+	const segments: string[] = [];
+	for (const segment of path.split(/[\\/]/)) {
+		if (segment === '..') {
+			if (segments.length > 0 && last(segments) !== '..') {
+				segments.pop();
+			} else if (!isRooted) {
+				// A relative path keeps the parts reaching above its start; a rooted one can't go above its root
+				segments.push(segment);
+			}
+		} else if (segment !== '.' && segment !== '') {
+			segments.push(segment);
+		}
+	}
+
+	// Keep the native separator if the paths use it
+	const separator = (basePath + relativePath).includes('\\') ? '\\' : '/';
+	return device + (isRooted ? separator : '') + segments.join(separator);
+};
+
 export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
-	// If relativePath is a full URL with protocol, return it as-is
-	if (relativePath.includes('://')) {
+	// A path that starts with a scheme followed by "//" is absolute already, as are data: and blob: URIs
+	if (/^(?:[a-z][a-z0-9+.-]*:\/\/|(?:data|blob):)/i.test(relativePath)) {
 		return relativePath;
+	}
+
+	// Local paths on Windows (like the ones Node's path module produces there) may use backslashes too
+	const platform = (globalThis as { process?: { platform?: string } }).process?.platform;
+	if (platform === 'win32' && !basePath.includes('://')) {
+		return joinWindowsPaths(basePath, relativePath);
 	}
 
 	// Strip query parameters from URL base paths so their contents don't mess up the join
@@ -1266,7 +1708,12 @@ export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 	const normalized: string[] = [];
 	for (const segment of segments) {
 		if (segment === '..') {
-			normalized.pop();
+			if (!result.startsWith('/') && (normalized.length === 0 || normalized[normalized.length - 1] === '..')) {
+				// A relative path that climbs above its starting point has to keep its leading '..' segments
+				normalized.push(segment);
+			} else {
+				normalized.pop();
+			}
 		} else if (segment !== '.') {
 			normalized.push(segment);
 		}
@@ -1379,6 +1826,37 @@ export const simplifyRational = (rational: Rational): Rational => {
 };
 
 /**
+ * The display aspect for a decoder config of frames with the given coded size and pixel aspect ratio. As Mediabunny's
+ * demuxers always gave it, it's the frame size in square pixels when that's a whole number of pixels. Otherwise, a
+ * rounded size would change the pixel aspect ratio of anything derived from it, such as the pasp box of a remux, so
+ * it's the exact display aspect ratio in its reduced form (WebCodecs defines the two fields as a ratio). That's only
+ * when the ratio is smaller than the frame in both dimensions, which tells it apart from a size in pixels (the HLS
+ * muxer relies on this); the rare ratios that aren't give the rounded size.
+ */
+export const getDisplayAspect = (width: number, height: number, pixelAspectRatio: Rational) => {
+	const { num, den } = pixelAspectRatio;
+	if (!(num > 0 && den > 0) || num === den || !(width > 0 && height > 0)) {
+		return null;
+	}
+
+	const isWhole = num > den ? (width * num) % den === 0 : (height * den) % num === 0;
+	if (!isWhole) {
+		const displayAspectRatio = simplifyRational({ num: width * num, den: height * den });
+		if (displayAspectRatio.num < width && displayAspectRatio.den < height) {
+			return { displayAspectWidth: displayAspectRatio.num, displayAspectHeight: displayAspectRatio.den };
+		}
+	}
+
+	const squarePixelWidth = num > den ? Math.round(width * num / den) : width;
+	const squarePixelHeight = num > den ? height : Math.round(height * den / num);
+	if (squarePixelWidth === width && squarePixelHeight === height) {
+		return null;
+	}
+
+	return { displayAspectWidth: squarePixelWidth, displayAspectHeight: squarePixelHeight };
+};
+
+/**
  * Specifies a rectangular region where all quantities must be non-negative integers.
  * @group Miscellaneous
  * @public
@@ -1432,6 +1910,52 @@ let unthrottledTimerWorker: Worker | undefined;
 let nextUnthrottledTimerId = 1;
 const unthrottledTimeoutCallbacks = new Map<number, () => void>();
 const unthrottledIntervalCallbacks = new Map<number, () => void>();
+const unthrottledTimerDelays = new Map<number, number>();
+/**
+ * Set when the timer worker can't run, for example because a Content Security Policy forbids blob: workers (its error
+ * event fires instead of it ever answering). Timers then use the page's own timers, throttled or not.
+ */
+let unthrottledTimerWorkerFailed = false;
+const fallbackTimerHandles = new Map<number, ReturnType<typeof setTimeout>>();
+
+const startFallbackTimer = (timerId: number) => {
+	const delay = unthrottledTimerDelays.get(timerId) ?? 0;
+	const timeoutCallback = unthrottledTimeoutCallbacks.get(timerId);
+	if (timeoutCallback) {
+		fallbackTimerHandles.set(timerId, setTimeout(() => {
+			fallbackTimerHandles.delete(timerId);
+			unthrottledTimeoutCallbacks.delete(timerId);
+			unthrottledTimerDelays.delete(timerId);
+			timeoutCallback();
+		}, delay));
+		return;
+	}
+
+	const intervalCallback = unthrottledIntervalCallbacks.get(timerId);
+	if (intervalCallback) {
+		fallbackTimerHandles.set(timerId, setInterval(intervalCallback, delay));
+	}
+};
+
+const onUnthrottledTimerWorkerFailure = () => {
+	if (unthrottledTimerWorkerFailed) {
+		return;
+	}
+
+	unthrottledTimerWorkerFailed = true;
+	for (const timerId of [...unthrottledTimeoutCallbacks.keys(), ...unthrottledIntervalCallbacks.keys()]) {
+		startFallbackTimer(timerId);
+	}
+};
+
+const clearFallbackTimer = (timerId: number) => {
+	const handle = fallbackTimerHandles.get(timerId);
+	if (handle !== undefined) {
+		clearTimeout(handle);
+		clearInterval(handle);
+		fallbackTimerHandles.delete(timerId);
+	}
+};
 
 const shouldUseNativeTimers = () => {
 	return typeof window === 'undefined';
@@ -1482,14 +2006,25 @@ const unthrottledTimerWorkerMain = () => {
 };
 
 const getUnthrottledTimerWorker = () => {
+	if (unthrottledTimerWorkerFailed) {
+		return null;
+	}
 	if (unthrottledTimerWorker) {
 		return unthrottledTimerWorker;
 	}
 
 	const workerSource = `(${unthrottledTimerWorkerMain.toString()})();`;
 	const workerURL = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
-	unthrottledTimerWorker = new Worker(workerURL);
+	try {
+		unthrottledTimerWorker = new Worker(workerURL);
+	} catch {
+		// Some browsers throw right away when a Content Security Policy forbids blob: workers
+		URL.revokeObjectURL(workerURL);
+		onUnthrottledTimerWorkerFailure();
+		return null;
+	}
 	URL.revokeObjectURL(workerURL);
+	unthrottledTimerWorker.addEventListener('error', onUnthrottledTimerWorkerFailure);
 
 	unthrottledTimerWorker.onmessage = (event: MessageEvent<UnthrottledTimerEvent>) => {
 		const message = event.data;
@@ -1497,6 +2032,7 @@ const getUnthrottledTimerWorker = () => {
 		const timeoutCallback = unthrottledTimeoutCallbacks.get(message.timerId);
 		if (timeoutCallback) {
 			unthrottledTimeoutCallbacks.delete(message.timerId);
+			unthrottledTimerDelays.delete(message.timerId);
 			timeoutCallback();
 			return;
 		}
@@ -1523,12 +2059,18 @@ export const setTimeoutUnthrottled = (
 	unthrottledTimeoutCallbacks.set(timerId, () => {
 		(callback as () => void)();
 	});
+	unthrottledTimerDelays.set(timerId, delay);
 
-	getUnthrottledTimerWorker().postMessage({
-		type: 'set-timeout',
-		timerId,
-		delay,
-	} satisfies UnthrottledTimerMessage);
+	const worker = getUnthrottledTimerWorker();
+	if (worker) {
+		worker.postMessage({
+			type: 'set-timeout',
+			timerId,
+			delay,
+		} satisfies UnthrottledTimerMessage);
+	} else if (!fallbackTimerHandles.has(timerId)) {
+		startFallbackTimer(timerId);
+	}
 
 	return { id: timerId };
 };
@@ -1541,8 +2083,10 @@ export const clearTimeoutUnthrottled = (timer: UnthrottledTimerHandle) => {
 
 	assert(typeof timer.id === 'number');
 	unthrottledTimeoutCallbacks.delete(timer.id);
+	unthrottledTimerDelays.delete(timer.id);
+	clearFallbackTimer(timer.id);
 
-	getUnthrottledTimerWorker().postMessage({
+	getUnthrottledTimerWorker()?.postMessage({
 		type: 'clear-timeout',
 		timerId: timer.id,
 	} satisfies UnthrottledTimerMessage);
@@ -1561,12 +2105,18 @@ export const setIntervalUnthrottled = (
 	unthrottledIntervalCallbacks.set(timerId, () => {
 		(callback as () => void)();
 	});
+	unthrottledTimerDelays.set(timerId, delay);
 
-	getUnthrottledTimerWorker().postMessage({
-		type: 'set-interval',
-		timerId,
-		delay,
-	} satisfies UnthrottledTimerMessage);
+	const worker = getUnthrottledTimerWorker();
+	if (worker) {
+		worker.postMessage({
+			type: 'set-interval',
+			timerId,
+			delay,
+		} satisfies UnthrottledTimerMessage);
+	} else if (!fallbackTimerHandles.has(timerId)) {
+		startFallbackTimer(timerId);
+	}
 
 	return { id: timerId };
 };
@@ -1579,15 +2129,36 @@ export const clearIntervalUnthrottled = (timer: UnthrottledTimerHandle) => {
 
 	assert(typeof timer.id === 'number');
 	unthrottledIntervalCallbacks.delete(timer.id);
+	unthrottledTimerDelays.delete(timer.id);
+	clearFallbackTimer(timer.id);
 
-	getUnthrottledTimerWorker().postMessage({
+	getUnthrottledTimerWorker()?.postMessage({
 		type: 'clear-interval',
 		timerId: timer.id,
 	} satisfies UnthrottledTimerMessage);
 };
 
-export const wait = (ms: number) => {
-	return new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * Resolves after the given time, or right away once the signal aborts, clearing the timer then so that it doesn't keep
+ * the process alive.
+ */
+export const wait = (ms: number, signal?: AbortSignal | null) => {
+	return new Promise<void>((resolve) => {
+		if (signal?.aborted) {
+			resolve();
+			return;
+		}
+
+		const onAbort = () => {
+			clearTimeout(timeoutId);
+			resolve();
+		};
+		const timeoutId = setTimeout(() => {
+			signal?.removeEventListener('abort', onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener('abort', onAbort, { once: true });
+	});
 };
 
 export const rejectAfter = (ms: number, message = 'Promise rejected') => {
@@ -1631,6 +2202,16 @@ export class EventEmitter<TEvents extends Record<string, unknown>> {
 		listener: (data: TEvents[K]) => unknown,
 		options?: EventListenerOptions,
 	): () => void {
+		if (typeof listener !== 'function') {
+			throw new TypeError('listener must be a function.');
+		}
+		if (options !== undefined && (!options || typeof options !== 'object')) {
+			throw new TypeError('options, when provided, must be an object.');
+		}
+		if (options?.once !== undefined && typeof options.once !== 'boolean') {
+			throw new TypeError('options.once, when provided, must be a boolean.');
+		}
+
 		if (!this._listeners.has(event)) {
 			this._listeners.set(event, new Set());
 		}
@@ -1652,17 +2233,23 @@ export class EventEmitter<TEvents extends Record<string, unknown>> {
 			return;
 		}
 
-		for (const entry of listeners) {
+		// Iterate over a snapshot so that listeners added during this emit only receive the next one
+		for (const entry of [...listeners]) {
+			if (!listeners.has(entry)) {
+				continue;
+			}
+
+			// Remove before calling, so that a re-entrant emit can't call it a second time
+			if (entry.once) {
+				listeners.delete(entry);
+			}
+
 			try {
 				(entry.fn as (data: unknown) => void)(data);
 			} catch (error) {
 				// Deliberately not routed through Logging here: Logging emits via an EventEmitter, so a throwing
 				// log listener would recurse straight back into this handler.
 				console.error(error);
-			}
-
-			if (entry.once) {
-				listeners.delete(entry);
 			}
 		}
 	}
@@ -1690,6 +2277,11 @@ export class ConcurrentRunner {
 	parallelism: number;
 
 	constructor(parallelism: number) {
+		// Fractional values keep working as on main (1.5 lets two functions run at once); NaN fails this check too
+		if (typeof parallelism !== 'number' || !(parallelism > 0)) {
+			throw new TypeError('parallelism must be a positive number or Infinity.');
+		}
+
 		this.parallelism = parallelism;
 	}
 
@@ -1711,15 +2303,20 @@ export class ConcurrentRunner {
 	 * Throws if the runner is errored.
 	 */
 	async run(fn: () => Promise<unknown>) {
+		if (typeof fn !== 'function') {
+			throw new TypeError('fn must be a function.');
+		}
+
 		if (this._errored) {
 			await Promise.race(this._queue); // Will surface the error
 		}
 
-		while (this._queue.length >= this.parallelism) {
+		// Racing an empty queue would never settle, so a free runner always starts the function
+		while (this._queue.length > 0 && this._queue.length >= this.parallelism) {
 			await Promise.race(this._queue);
 		}
 
-		const promise = fn();
+		const promise = Promise.resolve(fn());
 		this._queue.push(promise);
 
 		void promise
@@ -1738,4 +2335,11 @@ export const isRecordStringString = (value: unknown): value is Record<string, st
 		&& typeof value === 'object'
 		&& Object.getPrototypeOf(value) === Object.prototype
 		&& Object.values(value).every(x => typeof x === 'string');
+};
+
+export const createUtcDate = (year: number, monthIndex = 0, day = 1) => {
+	const date = new Date(0);
+	date.setUTCFullYear(year, monthIndex, day);
+
+	return date;
 };

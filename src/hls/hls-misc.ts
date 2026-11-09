@@ -22,11 +22,13 @@ export const TAG_MEDIA_SEQUENCE = '#EXT-X-MEDIA-SEQUENCE:';
 export const TAG_BYTERANGE = '#EXT-X-BYTERANGE:';
 export const TAG_PROGRAM_DATE_TIME = '#EXT-X-PROGRAM-DATE-TIME:';
 export const TAG_DISCONTINUITY = '#EXT-X-DISCONTINUITY';
+export const TAG_GAP = '#EXT-X-GAP';
 export const TAG_DISCONTINUITY_SEQUENCE = '#EXT-X-DISCONTINUITY-SEQUENCE:';
 export const TAG_TARGETDURATION = '#EXT-X-TARGETDURATION:';
 export const TAG_ENDLIST = '#EXT-X-ENDLIST';
 export const TAG_PLAYLIST_TYPE = '#EXT-X-PLAYLIST-TYPE:';
 export const TAG_I_FRAMES_ONLY = '#EXT-X-I-FRAMES-ONLY';
+export const TAG_CONTENT_STEERING = '#EXT-X-CONTENT-STEERING:';
 
 // Owner of the ID3 PRIV frame through which packed audio segments carry the timestamp of their first sample
 // (RFC 8216, Section 3.4)

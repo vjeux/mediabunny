@@ -23,6 +23,17 @@ bun add mediabunny
 
 ::: info
 Requires any JavaScript environment that can run ECMAScript 2021 or later. Mediabunny is expected to be run in modern browsers. For types, TypeScript 5.7 or later is required.
+
+Mediabunny's type declarations use types from TypeScript's `DOM` library (such as `HTMLCanvasElement` and `AudioBuffer`), so include `"DOM"` in your tsconfig's `lib`, also in Node, Bun and Deno projects. Without it, the declarations don't type-check, and enabling `skipLibCheck` instead only hides that: the types that depend on it silently become `any`. In a Web Worker project, use `"WebWorker"` instead of `"DOM"` and enable `skipLibCheck`; DOM-only types such as `HTMLCanvasElement` and `AudioBuffer` then become `any`.
+
+For example:
+```json
+{
+	"compilerOptions": {
+		"lib": ["ES2022", "DOM"]
+	}
+}
+```
 :::
 
 Then, simply import it like this:
@@ -35,9 +46,9 @@ ESM is preferred because it gives you tree shaking.
 
 You can also just include the library using a script tag in your HTML:
 ```html
-<script src="mediabunny.cjs"></script>
+<script src="mediabunny.js"></script>
 ```
 
-This will add a `Mediabunny` object to the global scope. You can provide types for this global using `mediabunny.d.ts`.
+This will add a `Mediabunny` object to the global scope. You can provide types for this global using `mediabunny.d.ts`; unless `skipLibCheck` is enabled, this requires TypeScript 5.8 or later.
 
-You can download a built distribution file from the [releases page](https://github.com/Vanilagy/mediabunny/releases). Use the `*.cjs` builds for normal script tag inclusion, or the `*.mjs` builds for script tags with `type="module"` or direct imports via ESM. Including the `mediabunny.d.ts` declaration file in your TypeScript project will declare a global `Mediabunny` namespace.
+You can download a built distribution file from the [releases page](https://github.com/Vanilagy/mediabunny/releases). Use the `*.js` builds for normal script tag inclusion, or the `*.mjs` builds for script tags with `type="module"` or direct imports via ESM. Including the `mediabunny.d.ts` declaration file in your TypeScript project will declare a global `Mediabunny` namespace.

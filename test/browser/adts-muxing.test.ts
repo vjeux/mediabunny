@@ -5,9 +5,10 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Output } from '../../src/output.js';
-import { StreamTarget, type StreamTargetChunk } from '../../src/target.js';
+import { AppendOnlyStreamTarget, StreamTarget, type StreamTargetChunk } from '../../src/target.js';
 import { AdtsOutputFormat } from '../../src/output-format.js';
 import { assert } from '../../src/misc.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 const createBufferingStreamTarget = () => {
 	const written = new Map<number, Uint8Array>();
@@ -82,6 +83,24 @@ test('ADTS with metadata over StreamTarget', async () => {
 	expect(await outputAudioTrack.getCodec()).toBe('aac');
 });
 
+test('Unrepresentable channel configuration', async () => {
+	const target = createBufferingStreamTarget();
+	const output = new Output({
+		format: new AdtsOutputFormat(),
+		target: new StreamTarget(target.stream),
+	});
+
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	// What FFmpeg's encoder writes for 7.1: channel configuration 12, too large for the 3-bit ADTS field
+	const description = new Uint8Array([0x11, 0xe0, 0x56, 0xe5, 0x00]);
+	await expect(source.add(new EncodedPacket(new Uint8Array(16), 'key', 0, 1024 / 48000), {
+		decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: 8, sampleRate: 48000, description },
+	})).rejects.toThrow('channel configuration 12');
+});
+
 // Previously, write handler rejections were silently swallowed and surfaced as
 // "Cannot write to a closing writable stream" instead of the actual error.
 test('StreamTarget write errors surface directly', async () => {
@@ -127,4 +146,37 @@ test('StreamTarget write errors surface directly', async () => {
 	};
 
 	await expect(run()).rejects.toThrow('OPFS write failed');
+});
+
+test('ADTS output streams into an AppendOnlyStreamTarget whose stream comes from another realm', async () => {
+	const iframe = document.createElement('iframe');
+	document.body.append(iframe);
+	const OtherRealmWritableStream = (iframe.contentWindow as unknown as typeof globalThis).WritableStream;
+	const received: number[] = [];
+	const writable = new OtherRealmWritableStream<Uint8Array>({
+		write: (chunk) => {
+			received.push(...chunk);
+		},
+	});
+	expect(writable instanceof WritableStream).toBe(false); // A real stream, but not this realm's class
+
+	using input = new Input({ source: new UrlSource('/sample3.aac'), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryAudioTrack())!;
+	const output = new Output({ format: new AdtsOutputFormat(), target: new AppendOnlyStreamTarget(writable) });
+	const source = new EncodedAudioPacketSource('aac');
+	output.addAudioTrack(source);
+	await output.start();
+
+	let count = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		await source.add(packet, count === 0 ? { decoderConfig: (await track.getDecoderConfig())! } : undefined);
+		if (++count === 10) {
+			break;
+		}
+	}
+	await output.finalize();
+	iframe.remove();
+
+	expect(received.length).toBeGreaterThan(0);
+	expect(received.slice(0, 2)).toEqual([0xff, 0xf1]); // ADTS sync word, MPEG-4
 });

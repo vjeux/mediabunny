@@ -13,6 +13,7 @@ import {
 	AudioCodec,
 	MediaCodec,
 	NON_PCM_AUDIO_CODECS,
+	OPUS_SAMPLE_RATE,
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
@@ -20,7 +21,10 @@ import {
 	VideoCodec,
 } from './codec';
 import { FlacMuxer } from './flac/flac-muxer';
+import { parseOpusIdentificationHeader } from './codec-data';
+import { EncodedPacket } from './packet';
 import { IsobmffMuxer } from './isobmff/isobmff-muxer';
+import { validateIsobmffVideoSize } from './isobmff/isobmff-misc';
 import { MatroskaMuxer } from './matroska/matroska-muxer';
 import { MediaSource } from './media-source';
 import { Mp3Muxer } from './mp3/mp3-muxer';
@@ -31,8 +35,27 @@ import { MpegTsMuxer } from './mpeg-ts/mpeg-ts-muxer';
 import { WaveMuxer } from './wave/wave-muxer';
 import { HlsMuxer } from './hls/hls-muxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
-import { MaybePromise, FilePath, isNumber, toArray } from './misc';
+import { MaybePromise, FilePath, isNumber, toArray, toUint8Array } from './misc';
 import { Target } from './target';
+import { MP3_DECODER_DELAY } from '../shared/mp3-misc';
+
+const getOpusPreSkipDuration = (decoderConfig: AudioDecoderConfig) => {
+	if (!decoderConfig.description) {
+		return null;
+	}
+
+	return parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip / OPUS_SAMPLE_RATE;
+};
+
+/**
+ * Returns the codec's priming if the given leading duration of a source is that priming. Allows for sources that round
+ * timestamps to the millisecond, like Matroska.
+ */
+const matchPriming = (primingDuration: number, codecPriming: number | null) => {
+	return codecPriming !== null && codecPriming > 0 && Math.abs(primingDuration - codecPriming) <= 0.001
+		? codecPriming
+		: null;
+};
 
 /**
  * Specifies an inclusive range of integers.
@@ -103,6 +126,19 @@ export abstract class OutputFormat {
 	abstract get negativeTimestampSupport(): 'full' | 'prefer-non-negative' | 'none' | null;
 
 	/**
+	 * For a copied audio track whose first packet starts the given number of seconds before zero (where its audible
+	 * part begins): the exact priming duration, in seconds, that this format signals for it (like the Opus pre-skip),
+	 * so that the track can keep that start instead of needing a non-negative one. `null` if it can't.
+	 * @internal
+	 */
+	_getSignalableAudioPriming(
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	): number | null {
+		return null;
+	}
+
+	/**
 	 * Whether this output format, as configured, requires {@link BaseTrackMetadata.maximumPacketCount} to be set in
 	 * the metadata of every track added to it.
 	 */
@@ -137,6 +173,30 @@ export abstract class OutputFormat {
 	/** @internal */
 	_isFragmentedIsobmff() {
 		return false;
+	}
+
+	/**
+	 * Whether this format can mark the given amount of leading audio, in seconds, as encoder priming for a track using
+	 * the given codec, so that players skip it. Lets copy conversions keep audio whose first packet starts early.
+	 * @internal
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
+		return false;
+	}
+
+	/** @internal */
+	// Throws if the format can't hold a track as declared, before the output starts
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_validateTrack(track: OutputTrack) {}
+
+	/**
+	 * How far below zero timestamps can go and still come out non-negative in the file, in seconds: with a
+	 * negativeTimestampSupport other than 'full', conversions copy tracks starting that much before zero as they are.
+	 * @internal
+	 */
+	get _negativeTimestampHeadroom() {
+		return 0;
 	}
 }
 
@@ -237,6 +297,15 @@ export type IsobmffOutputFormatOptions = {
 export abstract class IsobmffOutputFormat extends OutputFormat {
 	/** @internal */
 	_options: IsobmffOutputFormatOptions;
+
+	/** @internal */
+	override _validateTrack(track: OutputTrack) {
+		// A size declared with the track is checked here, so that it can't make the output fail once started
+		const decoderConfig = track.isVideoTrack() ? track.metadata.decoderConfig : undefined;
+		if (decoderConfig?.codedWidth !== undefined && decoderConfig.codedHeight !== undefined) {
+			validateIsobmffVideoSize(decoderConfig.codedWidth, decoderConfig.codedHeight);
+		}
+	}
 
 	/** Internal constructor. */
 	constructor(options: IsobmffOutputFormatOptions = {}) {
@@ -467,6 +536,13 @@ export class MovOutputFormat extends IsobmffOutputFormat {
 		];
 	}
 
+	override getSupportedTrackCounts(): TrackCountLimits {
+		return {
+			...super.getSupportedTrackCounts(),
+			subtitle: { min: 0, max: 0 }, // No subtitle codecs are supported
+		};
+	}
+
 	/** @internal */
 	override _codecUnsupportedHint(codec: MediaCodec) {
 		if (new Mp4OutputFormat().getSupportedCodecs().includes(codec)) {
@@ -507,6 +583,11 @@ export type MkvOutputFormatOptions = {
 	/**
 	 * Will be called once the header part of the Matroska Segment element has been written. The header data includes
 	 * the Segment element and everything inside it, up to (but excluding) the first Matroska Cluster.
+	 *
+	 * Unless `appendOnly` is set, some of the header's values (the Segment's size, the duration and the positions in
+	 * the SeekHead) are only known once the output is finalized. The callback is then called again with the final
+	 * header data, at the same position and with the same length: write it over the first one, or skip it when
+	 * streaming the data in order (for live streaming, use `appendOnly`).
 	 *
 	 * @param data - The raw bytes.
 	 * @param position - The byte offset of the data in the file.
@@ -615,6 +696,14 @@ export class MkvOutputFormat extends OutputFormat {
 	get negativeTimestampSupport() {
 		return 'prefer-non-negative' as const;
 	}
+
+	/** @internal */
+	override _getSignalableAudioPriming(
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	) {
+		// The muxer writes a negative start as the CodecDelay, which for Opus has to be the pre-skip (RFC 9559)
+		return codec === 'opus' ? matchPriming(primingDuration, getOpusPreSkipDuration(decoderConfig)) : null;
+	}
 }
 
 /**
@@ -679,11 +768,15 @@ export type Mp3OutputFormatOptions = {
 	/**
 	 * Controls whether the Xing header, which contains additional metadata as well as an index, is written to the start
 	 * of the MP3 file. When disabled, the writing process becomes append-only. Defaults to `true`.
+	 *
+	 * MP3 segments written for HLS never get a Xing header, regardless of this option: it would describe a single
+	 * segment as if it were a whole file, and players decode it as an extra frame of silence at every segment start.
 	 */
 	xingHeader?: boolean;
 
 	/**
-	 * Will be called once the Xing metadata frame is finalized.
+	 * Will be called once the Xing metadata frame is finalized. Not called when no Xing header is written, which is
+	 * always the case for MP3 segments written for HLS.
 	 *
 	 * @param data - The raw bytes.
 	 * @param position - The byte offset of the data in the file.
@@ -758,6 +851,14 @@ export class Mp3OutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return null;
+	}
+
+	/** @internal */
+	override _canSignalAudioPriming(codec: AudioCodec, primingDuration: number, sampleRate: number) {
+		// The muxer writes the priming into the LAME header's 12-bit encoder delay field, which excludes the decoder
+		// delay
+		const encoderDelay = Math.round(primingDuration * sampleRate) - MP3_DECODER_DELAY;
+		return codec === 'mp3' && this._options.xingHeader !== false && encoderDelay >= 0 && encoderDelay <= 0xfff;
 	}
 }
 
@@ -964,6 +1065,24 @@ export class OggOutputFormat extends OutputFormat {
 	get negativeTimestampSupport() {
 		return 'none' as const;
 	}
+
+	/** @internal */
+	override _getSignalableAudioPriming(
+		codec: AudioCodec, primingDuration: number, firstPacket: EncodedPacket, decoderConfig: AudioDecoderConfig,
+	) {
+		// The muxer puts granule position zero at the end of the pre-skip (Opus), or anywhere within the first packet,
+		// which decodes to nothing (Vorbis)
+		if (codec === 'opus') {
+			return matchPriming(primingDuration, getOpusPreSkipDuration(decoderConfig));
+		} else if (codec === 'vorbis') {
+			// Any start within the first packet, allowing for rounded sources
+			return primingDuration > 0 && primingDuration <= firstPacket.duration + 0.001
+				? Math.min(primingDuration, firstPacket.duration)
+				: null;
+		} else {
+			return null;
+		}
+	}
 }
 
 /**
@@ -1148,7 +1267,11 @@ export type MpegTsOutputFormatOptions = {
 	 * otherwise be negative (caused by audio priming samples or B-frames) positive in the final file, since negative
 	 * timestamps trip up some players. A recommended value is 10 seconds.
 	 *
-	 * Defaults to 0. When writing HLS, prefer {@link HlsOutputFormatOptions.mediaTimestampBase} instead.
+	 * Conversions copy tracks that start no more than this offset before zero, like AAC with encoder priming, instead
+	 * of re-encoding them.
+	 *
+	 * Defaults to 0. Ignored, with a warning, for MPEG-TS segments written for HLS, whose media starts at
+	 * {@link HlsOutputFormatOptions.mediaTimestampBase} like that of the other segment formats.
 	 */
 	timestampOffset?: number;
 
@@ -1218,7 +1341,7 @@ export class MpegTsOutputFormat extends OutputFormat {
 	}
 
 	get mimeType() {
-		return 'video/MP2T';
+		return 'video/mp2t';
 	}
 
 	getSupportedCodecs(): MediaCodec[] {
@@ -1238,6 +1361,12 @@ export class MpegTsOutputFormat extends OutputFormat {
 
 	get negativeTimestampSupport() {
 		return 'prefer-non-negative' as const;
+	}
+
+	/** @internal */
+	override get _negativeTimestampHeadroom() {
+		// The muxer adds the offset to every timestamp
+		return this._options.timestampOffset ?? 0;
 	}
 }
 
@@ -1284,6 +1413,8 @@ export type HlsOutputFormatOptions = {
 	 *
 	 * When an array of formats is specified, for each playlist, the first format that can contain all of the playlist's
 	 * tracks is chosen. This allows you to, for example, package audio into .aac files and video into .ts files.
+	 *
+	 * MP3 segments are written without a Xing header, whatever {@link Mp3OutputFormatOptions.xingHeader} says.
 	 */
 	segmentFormat: OutputFormat | OutputFormat[];
 	/**
@@ -1310,7 +1441,8 @@ export type HlsOutputFormatOptions = {
 	live?: boolean;
 	/**
 	 * When in live mode, this controls the maximum number of segments contained in each playlist. Defaults to
-	 * `Infinity`, meaning playlists continually grow in size.
+	 * `Infinity`, meaning playlists continually grow in size. Playlists keep more segments when fewer wouldn't add up
+	 * to three times the target duration, the minimum length of a live playlist in HLS.
 	 */
 	maxLiveSegmentCount?: number;
 	/**
@@ -1318,6 +1450,9 @@ export type HlsOutputFormatOptions = {
 	 * the first packet added to the output lands on this timestamp, no matter its original timestamp. A positive base
 	 * keeps timestamps positive that would otherwise be negative (caused by audio priming samples, B-frames, or tracks
 	 * starting slightly before the first packet). The timestamps in the playlists are not affected.
+	 *
+	 * With a base of at least 1 second, conversions copy such media as is, since its timestamps stay positive; with a
+	 * smaller one, they treat it like the segment formats do.
 	 *
 	 * Defaults to 10 seconds.
 	 */
@@ -1367,8 +1502,11 @@ export type HlsOutputFormatOptions = {
 	onInit?: (target: Target, info: HlsOutputPlaylistInfo) => unknown;
 	/**
 	 * Called when a media segment is removed from the start of a media playlist due to
-	 * {@link HlsOutputFormatOptions.maxLiveSegmentCount}. Will not be called when
-	 * {@link HlsOutputFormatOptions.singleFilePerPlaylist} is `true`.
+	 * {@link HlsOutputFormatOptions.maxLiveSegmentCount}, once the updated playlist has been written. Will not be
+	 * called when {@link HlsOutputFormatOptions.singleFilePerPlaylist} is `true`.
+	 *
+	 * Clients may still be playing from an earlier playlist, so if you delete the segment's file in response, keep it
+	 * available for the segment's duration plus the playlist's duration first (RFC 8216, Section 6.2.2).
 	 */
 	onSegmentPopped?: (path: string, info: HlsOutputSegmentInfo) => unknown;
 };
@@ -1519,6 +1657,13 @@ export class HlsOutputFormat extends OutputFormat {
 	}
 
 	get negativeTimestampSupport() {
+		if ((this._options.mediaTimestampBase ?? 10) >= 1) {
+			// The muxer moves all media onto the media timestamp base, measured from the first packet, so negative
+			// timestamps that lie less than the base before it (encoder priming, B-frames, tracks starting a bit
+			// earlier) never reach the segments. A copied track starts at most a fraction of a second before zero.
+			return 'full' as const;
+		}
+
 		const formats = toArray(this._options.segmentFormat);
 
 		// Return the lowest baseline across all segment formats
