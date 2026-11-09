@@ -1196,7 +1196,7 @@ export const isNumber = (x: unknown) => {
 
 /**
  * A path to a file. File paths can be relative or absolute, and be local paths or full URLs. Paths must be POSIX-like,
- * using `/` as the separator.
+ * using `/` as the separator. The exception are local paths on Windows, which may also use `\`.
  *
  * Examples of valid paths:
  * - `'video.mp4'`
@@ -1213,10 +1213,84 @@ export const isNumber = (x: unknown) => {
  */
 export type FilePath = string;
 
+const isWindowsPathSeparator = (char: string | undefined) => char === '\\' || char === '/';
+
+/** Splits a Windows path into its device (drive or UNC share), whether it's rooted, and the rest. */
+const splitWindowsPathRoot = (path: string) => {
+	if (isWindowsPathSeparator(path[0]) && isWindowsPathSeparator(path[1])) {
+		const uncRoot = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.exec(path);
+		if (uncRoot) {
+			return { device: uncRoot[0], isRooted: true, rest: path.slice(uncRoot[0].length) };
+		}
+	}
+
+	if (/^[a-zA-Z]:/.test(path)) {
+		return { device: path.slice(0, 2), isRooted: isWindowsPathSeparator(path[2]), rest: path.slice(2) };
+	}
+
+	return { device: '', isRooted: isWindowsPathSeparator(path[0]), rest: path };
+};
+
+/** Joins local paths like Windows resolves them, where both `\` and `/` are separators. */
+const joinWindowsPaths = (basePath: FilePath, relativePath: FilePath) => {
+	const base = splitWindowsPathRoot(basePath);
+	const relative = splitWindowsPathRoot(relativePath);
+
+	let device = base.device;
+	let isRooted = base.isRooted;
+	let path: string;
+
+	// A drive-relative path (C:file) continues from the base path if the base path is on that drive or names none
+	const continuesBasePath = relative.device.length === 2
+		&& !relative.isRooted
+		&& (base.device === '' || relative.device.toLowerCase() === base.device.toLowerCase());
+
+	if (relative.device && !continuesBasePath) {
+		// Drive letters and UNC shares begin a path of their own
+		({ device, isRooted } = relative);
+		path = relative.rest;
+	} else if (relative.isRooted) {
+		// A leading separator refers to the root of the base path's drive or share
+		isRooted = true;
+		path = relative.rest;
+	} else {
+		if (relative.device) {
+			device = relative.device;
+		}
+
+		const lastSeparator = Math.max(base.rest.lastIndexOf('/'), base.rest.lastIndexOf('\\'));
+		path = base.rest.slice(0, lastSeparator + 1) + relative.rest;
+	}
+
+	const segments: string[] = [];
+	for (const segment of path.split(/[\\/]/)) {
+		if (segment === '..') {
+			if (segments.length > 0 && last(segments) !== '..') {
+				segments.pop();
+			} else if (!isRooted) {
+				// A relative path keeps the parts reaching above its start; a rooted one can't go above its root
+				segments.push(segment);
+			}
+		} else if (segment !== '.' && segment !== '') {
+			segments.push(segment);
+		}
+	}
+
+	// Keep the native separator if the paths use it
+	const separator = (basePath + relativePath).includes('\\') ? '\\' : '/';
+	return device + (isRooted ? separator : '') + segments.join(separator);
+};
+
 export const joinPaths = (basePath: FilePath, relativePath: FilePath) => {
 	// If relativePath is a full URL with protocol, return it as-is
 	if (relativePath.includes('://')) {
 		return relativePath;
+	}
+
+	// Local paths on Windows (like the ones Node's path module produces there) may use backslashes too
+	const platform = (globalThis as { process?: { platform?: string } }).process?.platform;
+	if (platform === 'win32' && !basePath.includes('://')) {
+		return joinWindowsPaths(basePath, relativePath);
 	}
 
 	// Strip query parameters from URL base paths so their contents don't mess up the join
