@@ -3,10 +3,16 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
-import { Input, UnsupportedInputFormatError } from '../../src/input.js';
+import { Input, InputDisposedError, UnsupportedInputFormatError } from '../../src/input.js';
 import { ADTS, ALL_FORMATS, InputFormat, MP3, MPEG_TS, FLAC, OGG, WAVE } from '../../src/input-format.js';
 import { EncodedPacketSink, AudioSampleSink } from '../../src/media-sink.js';
-import { BufferSource, ReadableStreamSource, CustomPathedSource, FilePathSource } from '../../src/source.js';
+import {
+	BufferSource,
+	CustomSource,
+	ReadableStreamSource,
+	CustomPathedSource,
+	FilePathSource,
+} from '../../src/source.js';
 import { assert } from '../../src/misc.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { Output } from '../../src/output.js';
@@ -627,4 +633,33 @@ test('Input track types are their literal kind, so they narrow track unions', as
 		const size = track.type === 'video' ? await track.getCodedWidth() : await track.getNumberOfChannels();
 		expect(size).toBeGreaterThan(0);
 	}
+});
+
+test.for([
+	['video', 'demo.webm'],
+	['audio', 'toothsome-dts-esds.mp4'],
+] as const)('canDecode() of a %s track rejects when the input is disposed while it reads', async ([type, file]) => {
+	// The decodability check returned false for a canceled read, so a conversion disposed mid-init blamed the codec
+	// (found by the lane L94 review). These two tracks read the file to know their decoder config.
+	const data = readFileSync(path.join(__dirname, '..', 'public', file));
+	let disposeOnRead = false;
+	const input: Input = new Input({
+		source: new CustomSource({
+			getSize: () => data.byteLength,
+			read: async (start, end) => {
+				await new Promise(resolve => setTimeout(resolve, 5));
+				if (disposeOnRead) {
+					input.dispose();
+				}
+
+				return data.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	const track = type === 'video' ? await input.getPrimaryVideoTrack() : await input.getPrimaryAudioTrack();
+	expect(track).not.toBe(null);
+	disposeOnRead = true;
+	await expect(track!.canDecode()).rejects.toBeInstanceOf(InputDisposedError);
 });
