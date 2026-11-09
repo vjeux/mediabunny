@@ -910,6 +910,11 @@ export const soundSampleDescription = (
 		if (sampleSizeInBits > 16) {
 			version = 1;
 		}
+	} else if (trackData.track.source._codec === 'flac') {
+		// FLAC-in-ISOBMFF requires samplesize to equal the bits per sample in STREAMINFO, which follows the 'fLaC'
+		// marker and the metadata block header in the description. Chromium rejects the track if they differ.
+		const description = toUint8Array(trackData.info.decoderConfig.description!);
+		sampleSizeInBits = (((description[20]! & 0x01) << 4) | (description[21]! >> 4)) + 1;
 	}
 
 	// TrueHD's sample entry is defined on top of version 0, with its own sample rate layout
