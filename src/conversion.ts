@@ -54,7 +54,7 @@ import {
 	Rotation,
 } from './misc';
 import { Output, OutputTrackGroup } from './output';
-import { Mp4OutputFormat, WavOutputFormat } from './output-format';
+import { Mp4OutputFormat, WavOutputFormat, HlsOutputFormat } from './output-format';
 import { EncodedPacket } from './packet';
 import {
 	AudioSample,
@@ -1553,7 +1553,12 @@ export class Conversion {
 	}
 
 	/** @internal */
-	async _processVideoTrack(track: InputVideoTrack, trackOptions: ConversionVideoOptions, outputTrackId: number) {
+	async _processVideoTrack(
+		track: InputVideoTrack,
+		trackOptions: ConversionVideoOptions,
+		outputTrackId: number,
+		allowNegativeTimestamps = false,
+	) {
 		const sourceCodec = await track.getCodec();
 		if (!sourceCodec) {
 			this.discardedTracks.push({
@@ -1658,6 +1663,8 @@ export class Conversion {
 				&& (trackOptions.width === undefined || trackOptions.height === undefined)
 			);
 
+		// Set when the format's preference for non-negative timestamps is all that keeps the track from being copied
+		let couldCopyWithNegativeTimestamps = false;
 		let copyStartPacket: EncodedPacket | null = null;
 
 		if (!needsTranscode) {
@@ -1731,13 +1738,17 @@ export class Conversion {
 					const isValid = shiftedStartTimestamp >= this._startTimestamp
 						|| (
 							this.output.format.negativeTimestampSupport === 'prefer-non-negative'
-							&& this._copyMode === 'forced'
+							&& (this._copyMode === 'forced' || allowNegativeTimestamps)
 						);
 
 					if (isValid) {
 						this._timestampOffset = Math.max(this._timestampOffset, -this._startTimestamp + correction);
 					} else {
 						needsTranscode = true;
+						// Not HLS: its MPEG-TS segments wrap around what the media timestamp base leaves negative
+						couldCopyWithNegativeTimestamps
+							= this.output.format.negativeTimestampSupport === 'prefer-non-negative'
+								&& !(this.output.format instanceof HlsOutputFormat);
 					}
 				}
 			} else if (await this._shrinkingLeavesTooLittle(track)) {
@@ -1878,6 +1889,12 @@ export class Conversion {
 				hardwareAcceleration: trackOptions.hardwareAcceleration,
 			})._canDecode();
 			if (!canDecode) {
+				if (couldCopyWithNegativeTimestamps) {
+					// Transcoding would only have avoided negative timestamps, which the format supports nonetheless
+					await this._processVideoTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'undecodable_source_codec',
@@ -1921,6 +1938,11 @@ export class Conversion {
 			}
 
 			if (!encodableCodec) {
+				if (couldCopyWithNegativeTimestamps) {
+					await this._processVideoTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'no_encodable_target_codec',
@@ -2146,7 +2168,12 @@ export class Conversion {
 	}
 
 	/** @internal */
-	async _processAudioTrack(track: InputAudioTrack, trackOptions: ConversionAudioOptions, outputTrackId: number) {
+	async _processAudioTrack(
+		track: InputAudioTrack,
+		trackOptions: ConversionAudioOptions,
+		outputTrackId: number,
+		allowNegativeTimestamps = false,
+	) {
 		const sourceCodec = await track.getCodec();
 		if (!sourceCodec) {
 			this.discardedTracks.push({
@@ -2194,6 +2221,8 @@ export class Conversion {
 			|| trackOptions.process !== undefined
 			|| trackOptions.sampleFormat !== undefined;
 
+		// Set when the format's preference for non-negative timestamps is all that keeps the track from being copied
+		let couldCopyWithNegativeTimestamps = false;
 		let copyStartPacket: EncodedPacket | null = null;
 		let keptPriming: number | null = null;
 
@@ -2298,13 +2327,17 @@ export class Conversion {
 					const isValid = shiftedStartTimestamp >= this._startTimestamp
 						|| (
 							this.output.format.negativeTimestampSupport === 'prefer-non-negative'
-							&& this._copyMode === 'forced'
+							&& (this._copyMode === 'forced' || allowNegativeTimestamps)
 						);
 
 					if (isValid) {
 						this._timestampOffset = Math.max(this._timestampOffset, -this._startTimestamp + correction);
 					} else {
 						needsTranscode = true;
+						// Not HLS: its MPEG-TS segments wrap around what the media timestamp base leaves negative
+						couldCopyWithNegativeTimestamps
+							= this.output.format.negativeTimestampSupport === 'prefer-non-negative'
+								&& !(this.output.format instanceof HlsOutputFormat);
 					}
 				}
 			} else if (await this._shrinkingLeavesTooLittle(track)) {
@@ -2404,6 +2437,12 @@ export class Conversion {
 
 			const canDecode = await track.canDecode();
 			if (!canDecode) {
+				if (couldCopyWithNegativeTimestamps) {
+					// Transcoding would only have avoided negative timestamps, which the format supports nonetheless
+					await this._processAudioTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'undecodable_source_codec',
@@ -2493,6 +2532,11 @@ export class Conversion {
 			}
 
 			if (outputCodec === null) {
+				if (couldCopyWithNegativeTimestamps) {
+					await this._processAudioTrack(track, trackOptions, outputTrackId, true);
+					return;
+				}
+
 				this.discardedTracks.push({
 					track,
 					reason: 'no_encodable_target_codec',
