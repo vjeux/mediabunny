@@ -2825,6 +2825,9 @@ export class IsobmffDemuxer extends Demuxer {
 					const pattern = readU8(slice);
 					const isProtected = readU8(slice) !== 0;
 					const perSampleIvSize = readU8(slice);
+					if (perSampleIvSize > 16) {
+						throw new Error('Invalid sgpd box: IV size must not exceed 16 bytes.');
+					}
 					const kid = [...readBytes(slice, 16)].map(x => x.toString(16).padStart(2, '0')).join('');
 					let constantIv: Uint8Array | null = null;
 					if (isProtected && perSampleIvSize === 0) {
