@@ -2493,7 +2493,7 @@ class AudioEncoderWrapper {
 								const description = toUint8Array(meta.decoderConfig.description);
 								// The core sample rate accounts for SBR doubling the duration at the output sample rate
 								const { frameLength, coreSampleRate } = parseAacAudioSpecificConfig(description);
-								aacFrameDuration = frameLength / coreSampleRate;
+								aacFrameDuration = frameLength / (coreSampleRate ?? encoderConfig.sampleRate);
 							}
 						}
 
@@ -2832,7 +2832,7 @@ const detectAudioEncoderPrimingShift = (codec: AudioCodec, codecString: string) 
 					const data = new Uint8Array(chunk.byteLength);
 					chunk.copyTo(data);
 					const duration = aacConfig
-						? aacConfig.frameLength / aacConfig.coreSampleRate
+						? aacConfig.frameLength / (aacConfig.coreSampleRate ?? sampleRate)
 						: parseOpusTocByte(data).durationInSamples / OPUS_SAMPLE_RATE;
 					const restampedChunk = new EncodedAudioChunk({
 						type: chunk.type,
