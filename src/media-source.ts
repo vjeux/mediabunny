@@ -1274,7 +1274,8 @@ class VideoEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush());
+					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
+						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder && !this.encodersReclaimed) {
 					// These are wired in series, therefore they must also be flushed in series. An encoder whose
 					// configure() threw is left unconfigured; there's nothing to flush then (it would throw).
@@ -3255,7 +3256,8 @@ class AudioEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush());
+					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
+						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder) {
 					await this.encoder.flush();
 				}
