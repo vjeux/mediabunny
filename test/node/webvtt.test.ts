@@ -179,6 +179,25 @@ test('A WebVTT cue whose timing line ends the text has empty text', () => {
 	expect(parse('WEBVTT\n\n', '00:00.000 --> 00:01.000')).toEqual([[0, 1, '', '']]);
 });
 
+test('WebVTT text starting with a byte order mark is read', async () => {
+	// Windows tools save UTF-8 text with a byte order mark, which reading a file with Node keeps
+	for (const format of [new Mp4OutputFormat(), new MkvOutputFormat()]) {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new TextSubtitleSource('webvtt');
+		output.addSubtitleTrack(source);
+		await output.start();
+
+		// On main, this threw "WebVTT preamble incorrect."
+		await source.add('\uFEFFWEBVTT\n\n00:01.000 --> 00:02.000\nHello\n');
+		await output.finalize();
+
+		const written = new TextDecoder().decode(output.target.buffer!);
+		expect(written).toContain('Hello');
+		expect(written).toContain('WEBVTT');
+		expect(written).not.toContain('\uFEFF'); // Not in the header either
+	}
+});
+
 test('Matroska muxing', async () => {
 	const output = new Output({
 		format: new MkvOutputFormat(),

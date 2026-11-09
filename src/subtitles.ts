@@ -51,6 +51,11 @@ export class SubtitleParser {
 		let match: RegExpMatchArray | null;
 
 		if (!this.preambleText) {
+			if (text.charCodeAt(0) === 0xFEFF) {
+				// Skip the byte order mark the file may start with
+				text = text.slice(1);
+			}
+
 			// The text may also end right after the header, as a file without cues does
 			if (!preambleStartRegex.test(text + '\n\n')) {
 				throw new Error('WebVTT preamble incorrect.');
