@@ -196,6 +196,15 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	}
 
 	/**
+	 * Whether data anywhere in the file can be read without discarding the data before it. False for sources that can
+	 * only be streamed from the start and whose cache can't hold the entire file.
+	 * @internal
+	 */
+	_supportsRandomAccess(): boolean {
+		return true;
+	}
+
+	/**
 	 * Creates a new `SourceRef` pointing to this source. You are expected to call `.free()` on said `SourceRef` when
 	 * you're done with it.
 	 */
@@ -466,6 +475,11 @@ export class CustomPathedSource extends PathedSource {
 		this._root.free();
 		this._root = null;
 		this._releaseRootWhenIdle = false;
+	}
+
+	/** @internal */
+	override _supportsRandomAccess(): boolean {
+		return this._root ? this._root.source._supportsRandomAccess() : true;
 	}
 
 	/** @internal */
@@ -1034,6 +1048,26 @@ export class UrlSource extends PathedSource {
 		}
 
 		return clamp(baseSize - this._offset, 0, this._length ?? Infinity);
+	}
+
+	/** @internal */
+	override _supportsRandomAccess(): boolean {
+		if (!this._sequentialBacking) {
+			return true;
+		}
+
+		// Without range requests, the resource can only be streamed from its start, and data further than the cache
+		// size behind the furthest read gets evicted. So data near the end can only be read without losing data that
+		// reads have yet to get to if all of it fits into the cache, or once the stream has nearly reached the end:
+		// reading the end then only evicts data the reads have passed, keeping at least half the cache before it.
+		const size = this._getFileSize();
+		if (typeof size !== 'number') {
+			return false;
+		}
+
+		const backing = this._sequentialBacking;
+		const end = this._offset + size;
+		return size <= backing._maxCacheSize || end - backing._currentIndex <= backing._maxCacheSize / 2;
 	}
 
 	/** @internal */
@@ -3299,6 +3333,11 @@ export class RangedSource extends Source {
 		}
 
 		return clamp(baseSize - this._offset, 0, this._length ?? Infinity);
+	}
+
+	/** @internal */
+	override _supportsRandomAccess(): boolean {
+		return this._baseSource._supportsRandomAccess();
 	}
 
 	/** @internal */
