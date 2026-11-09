@@ -1407,7 +1407,9 @@ export class MatroskaMuxer extends Muxer {
 			inlineTimestampRegex.lastIndex = 0;
 			bodyText = bodyText.replace(inlineTimestampRegex, (match) => {
 				const time = parseSubtitleTimestamp(match.slice(1, -1));
-				const offsetTime = time - timestampMs;
+				// A timestamp before the cue start (which WebVTT doesn't allow) shows the same as one at its start, and
+				// can't be written as a negative offset
+				const offsetTime = Math.max(time - timestampMs, 0);
 
 				return `<${formatSubtitleTimestamp(offsetTime)}>`;
 			});
