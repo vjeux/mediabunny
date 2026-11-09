@@ -81,7 +81,12 @@ export const centeredTransformationMatrix = (linear: TransformationMatrix, width
  * horizontally", and snapping to the nearest multiple of 90 degrees.
  */
 export const extractRotationFromMatrix = (matrix: TransformationMatrix) => {
-	const [a, b] = matrix;
+	const [a, b, , c, d] = matrix;
+	if (a * d - b * c === 0) {
+		// A singular matrix (like a track matrix shifted by one entry) maps the frame onto a line or a point, so it
+		// holds no rotation. FFmpeg (av_display_rotation_get) and Chromium (VideoTransformation) apply none either.
+		return 0;
+	}
 
 	// (1, 0) projects onto (a, b), so that's all we need. The rotation is applied before flipping though, so we
 	// first need to undo the flip to isolate the rotation.
