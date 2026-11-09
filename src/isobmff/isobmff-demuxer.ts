@@ -72,6 +72,7 @@ import {
 	isThenable,
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
+	missingWebCodecsClassMessage,
 	multiplyMatrices,
 	Rational,
 	textDecoder,
@@ -4336,6 +4337,13 @@ const decryptCtr = async (
 ) => {
 	const counter = new Uint8Array(16);
 	counter.set(sampleEncryption.iv, 0);
+
+	if (typeof crypto === 'undefined' || !crypto.subtle) {
+		// Unlike for cbcs, AES-CTR comes from the Web Crypto API, which insecure contexts (http:// pages) don't have
+		throw new Error(missingWebCodecsClassMessage(
+			'The Web Crypto API (crypto.subtle), which decrypting \'cenc\' and \'cens\' samples needs,',
+		));
+	}
 
 	const cryptoKey = await crypto.subtle.importKey(
 		'raw',
