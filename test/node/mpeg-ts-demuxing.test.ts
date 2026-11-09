@@ -2686,9 +2686,10 @@ test('MPEG-TS with PES packets that have no PTS', async () => {
 	const videoSink = new EncodedPacketSink(videoTrack);
 	const videoPackets = await readAllPackets(videoSink);
 
-	// ffprobe reports PTS 1898214 for the first frame, 1945014 for the 14th, and none for the rest
+	// ffprobe reports PTS 1898214 for the first frame, 1945014 for the 14th, and none for the rest. ffprobe also lists
+	// a 16th frame, which the end of the file cuts short; it wouldn't decode, so Mediabunny drops it (#618).
 	expect(videoPackets.map(x => Math.round(x.timestamp * 90_000))).toEqual(
-		Array.from({ length: 16 }, (_, i) => 1898214 + 3600 * i),
+		Array.from({ length: 15 }, (_, i) => 1898214 + 3600 * i),
 	);
 	expect(videoPackets.every(x => x.duration === 0.04)).toBe(true);
 	await expectLookupsToFindEachPacket(videoSink, videoPackets);
@@ -2894,11 +2895,12 @@ test('MPEG-TS places B-frames without PTS by their picture order', async () => {
 	// The B-frames without PTS follow the one with it, 40 ms apart (FFmpeg's decoder puts them there too)
 	expect(ticks.slice(0, 9)).toEqual([0, 14404, 3600, 7201, 10802, 28807, 18004, 21605, 25206]);
 
-	// In presentation order, the frames are a frame duration apart, give or take the source's jitter
+	// In presentation order, the frames are a frame duration apart, give or take the source's jitter, except where the
+	// last frame in decode order would be: the end of the file cuts it short, so Mediabunny drops it (#618)
 	const sorted = [...ticks].sort((a, b) => a - b);
-	for (let i = 1; i < sorted.length; i++) {
-		expect(Math.abs(sorted[i]! - sorted[i - 1]! - 3600)).toBeLessThanOrEqual(15);
-	}
+	const irregularGaps = sorted.slice(1).map((tick, i) => tick - sorted[i]!).filter(gap => Math.abs(gap - 3600) > 15);
+	expect(irregularGaps).toHaveLength(1);
+	expect(Math.abs(irregularGaps[0]! - 7200)).toBeLessThanOrEqual(15);
 
 	for (const packet of packets) {
 		expect((await sink.getPacket(packet.timestamp))?.sequenceNumber).toBe(packet.sequenceNumber);
@@ -3174,9 +3176,11 @@ test('MPEG-TS with stray bytes between packets', async () => {
 		return packets;
 	};
 
-	// What ffprobe reads after the stray bytes (it merges the key frame with the PES packet holding its parameter sets)
+	// What ffprobe reads after the stray bytes (it merges the key frame with the PES packet holding its parameter
+	// sets). ffprobe also lists the next video frame, which the end of the file cuts short; it wouldn't decode, so
+	// Mediabunny drops it (#618).
 	expect(await readPackets(await input.getPrimaryAudioTrack())).toEqual([[199355326, 360], [199357416, 360]]);
-	expect((await readPackets(await input.getPrimaryVideoTrack()))[1]).toEqual([199367280, 17829]);
+	expect(await readPackets(await input.getPrimaryVideoTrack())).toHaveLength(1);
 });
 
 test('MPEG-TS ignores a PMT that is not in effect yet', async () => {
@@ -4084,4 +4088,68 @@ test('MPEG-TS gives up on private data streams without descriptors that hold no 
 		expect(packet.byteLength).toBeGreaterThan(0);
 	}
 	withFakeAudio.input.dispose();
+});
+
+test('MPEG-TS drops the video frame that the end of the file cuts off', async () => {
+	// From L80's review. A recording stopped mid-write or a partial download ends inside a frame, which fails decoding
+	// (with WebCodecs at the final flush: "EncodingError: Error during flush.", which ends the whole run). Unbounded
+	// PES packets don't say how long they are, but muxers end each one with stuffing in its last TS packet, which a cut
+	// one lacks. 20 frames of a 64x64 x264 stream (SPS and PPS, then stub slices of 600 bytes, so each frame spans
+	// several TS packets).
+	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
+		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
+	const pps = [0x68, 0xef, 0x8f, 0xcb];
+	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
+
+	const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+	const source = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(source, { frameRate: 25 });
+	await output.start();
+	for (let i = 0; i < 20; i++) {
+		const slice = nalUnit([i === 0 ? 0x65 : 0x41, 0x88, ...new Array<number>(600).fill(0x20 + i)]);
+		await source.add(
+			new EncodedPacket(
+				new Uint8Array(i === 0 ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
+				i === 0 ? 'key' : 'delta',
+				i / 25,
+				1 / 25,
+			),
+			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+		);
+	}
+	await output.finalize();
+	const bytes = new Uint8Array(output.target.buffer!);
+
+	const readFrames = async (data: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(data), formats: ALL_FORMATS });
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const frames: Uint8Array[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			frames.push(packet.data);
+		}
+		return frames;
+	};
+
+	const clean = await readFrames(bytes);
+	expect(clean).toHaveLength(20); // Complete PES packets end with stuffing
+
+	// Cut the file two TS packets into the last frame's PES packet, at a TS packet boundary or inside a TS packet
+	const isVideoStart = (pos: number) => !!(bytes[pos + 1]! & 0x40)
+		&& (((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === 0x100;
+	let lastPesStart = bytes.length - 188;
+	while (!isVideoStart(lastPesStart)) {
+		lastPesStart -= 188;
+	}
+	for (const cutPos of [lastPesStart + 2 * 188, lastPesStart + 2 * 188 + 100]) {
+		const frames = await readFrames(bytes.subarray(0, cutPos));
+		expect(frames).toEqual(clean.slice(0, 19));
+	}
+
+	// When the file ends inside the first frame, the track still opens: its SPS and PPS are there
+	let firstPesStart = 0;
+	while (!isVideoStart(firstPesStart)) {
+		firstPesStart += 188;
+	}
+	expect(await readFrames(bytes.subarray(0, firstPesStart + 2 * 188))).toEqual([]);
 });
