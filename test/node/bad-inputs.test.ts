@@ -3015,6 +3015,28 @@ const id3Frame = (id: string, data: Bytes) => concat(ascii(id), synchsafe(data.l
 
 const synchsafe = (value: number) => [(value >> 21) & 0x7f, (value >> 14) & 0x7f, (value >> 7) & 0x7f, value & 0x7f];
 
+test('ADTS: Sample rate rising mid-stream', async () => {
+	// Joined files, or a damaged sampling frequency index: 20 frames at 22.05 kHz, then 20 at 44.1 or 48 kHz. Timed in
+	// their own sample rate, the later frames went back in time, so iterating the packets never ended (at 44.1 kHz,
+	// where a later frame's timestamp equals an earlier one's) or threw.
+	for (const laterSamplingFrequencyIndex of [4, 3]) {
+		const frames = Array.from({ length: 40 }, (_, i) => adtsFrame(20, i < 20 ? 7 : laterSamplingFrequencyIndex));
+		using input = new Input({ source: new BufferSource(concat(...frames)), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryAudioTrack())!;
+
+		const timestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			timestamps.push(packet.timestamp);
+			if (timestamps.length > 40) {
+				break; // Guards against the endless loop
+			}
+		}
+
+		// Since a track has a single sample rate, the stream ends where it changes
+		expect(timestamps).toEqual(Array.from({ length: 20 }, (_, i) => i * 1024 / 22050));
+	}
+});
+
 test('HLS: Billion laughs variable substitution', async () => {
 	let playlist = '#EXTM3U\n#EXT-X-DEFINE:NAME="v0",VALUE="aaaaaaaaaa"\n';
 	for (let i = 1; i <= 9; i++) {
