@@ -363,6 +363,7 @@ export class IsobmffMuxer extends Muxer {
 	private nextFragmentNumber = 1;
 	// Only relevant for fragmented files, to make sure new fragments start with the highest timestamp seen so far
 	private maxWrittenTimestamp = -Infinity;
+	private nextSegmentTimestamps: Map<OutputTrack, number> | null = null;
 	minWrittenTimestamp = Infinity;
 	maxWrittenEndTimestamp = -Infinity;
 	minimumFragmentDuration: number;
@@ -526,6 +527,58 @@ export class IsobmffMuxer extends Muxer {
 		}
 
 		release();
+	}
+
+	override setNextSegmentTimestamps(timestamps: Map<OutputTrack, number>) {
+		this.nextSegmentTimestamps = timestamps;
+	}
+
+	/**
+	 * When this muxer writes a segment of a larger stream, makes each track's last sample end where the next segment,
+	 * which another muxer writes, starts: a fragment's decode time is the sum of all earlier sample durations, so the
+	 * next segment would overlap this one, or leave a hole. To be called for the tracks of a fragment about to be
+	 * written.
+	 */
+	private endBeforeNextSegment(tracks: IsobmffTrackData[]) {
+		for (const trackData of tracks) {
+			const nextSegmentTimestamp = this.nextSegmentTimestamps?.get(trackData.track);
+			const chunk = trackData.currentChunk;
+			if (
+				nextSegmentTimestamp === undefined
+				|| !trackData.closed
+				|| !chunk
+				|| chunk.samples.length === 0
+				|| last(chunk.samples) !== trackData.lastSample
+			) {
+				// Not the fragment with the track's last sample
+				continue;
+			}
+			assert(trackData.startTimestampOffset !== null);
+
+			// In the timescale units the fragments' decode times are written in (rounded, see tfdt)
+			const toWrittenTime = (timestamp: number) => {
+				return intoTimescale(timestamp, trackData.timescale)
+					- intoTimescale(trackData.startTimestampOffset!, trackData.timescale);
+			};
+			let lastSampleStart = toWrittenTime(chunk.startTimestamp);
+			for (let i = 0; i < chunk.samples.length - 1; i++) {
+				lastSampleStart += chunk.samples[i]!.timescaleUnitsToNextSample;
+			}
+
+			const lastSample = last(chunk.samples)!;
+			const duration = lastSample.timescaleUnitsToNextSample;
+			const delta = toWrittenTime(nextSegmentTimestamp) - lastSampleStart;
+			if (delta >= 0 && delta < duration) {
+				lastSample.timescaleUnitsToNextSample = delta;
+			} else if (
+				delta > duration
+				&& delta - duration <= Math.min(trackData.timescale / 1000, duration / 2) + 0.5
+			) {
+				// A gap of up to a millisecond (and half the sample) comes from timestamps rounded more coarsely than
+				// the durations (like Matroska's milliseconds), so close it. Real gaps are kept.
+				lastSample.timescaleUnitsToNextSample = delta;
+			}
+		}
 	}
 
 	private allTracksAreKnown() {
@@ -1844,6 +1897,8 @@ export class IsobmffMuxer extends Muxer {
 
 			return;
 		}
+
+		this.endBeforeNextSegment(tracksInFragment);
 
 		const fragmentNumber = this.nextFragmentNumber++;
 		this.alignWithNextFragments(tracksInFragment);
