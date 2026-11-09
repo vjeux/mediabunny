@@ -17,6 +17,7 @@ import {
 } from './codec';
 import { determineAudioPacketType, determineVideoPacketType } from './codec-data';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
+import { getNativeVideoDecoderConfig } from './decode';
 import { Input, InputDisposedError } from './input';
 import { Logging } from './logging';
 import { EncodedPacketSink, PacketRetrievalOptions, validatePacketRetrievalOptions } from './media-sink';
@@ -961,12 +962,11 @@ export class InputVideoTrack extends InputTrack {
 				return false;
 			}
 
-			const support = await VideoDecoder.isConfigSupported(
+			return (await getNativeVideoDecoderConfig(
 				codec === 'avc' && isChromium()
 					? { ...decoderConfig, codec: toChromiumCompatibleAvcCodecString(decoderConfig.codec) }
 					: decoderConfig,
-			);
-			return support.supported === true;
+			)) !== null;
 		} catch (error) {
 			if (error instanceof InputDisposedError) {
 				throw error; // The check was canceled, which says nothing about decodability
