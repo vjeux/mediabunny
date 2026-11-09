@@ -274,7 +274,7 @@ type InternalTrack = {
 			pixelCrop: [number, number, number, number];
 			displayWidth: number | null;
 			displayHeight: number | null;
-			displayUnit: number | null;
+			displayUnit: number;
 			squarePixelWidth: number;
 			squarePixelHeight: number;
 			/** Exact, unlike the square pixel size */
@@ -1859,22 +1859,30 @@ export class MatroskaDemuxer extends Demuxer {
 						this.currentTrack.info.squarePixelWidth = this.currentTrack.info.width;
 						this.currentTrack.info.squarePixelHeight = this.currentTrack.info.height;
 
-						if (
-							this.currentTrack.info.displayWidth !== null
-							&& this.currentTrack.info.displayHeight !== null
-						) {
-							// The display size applies to the frame after cropping
-							const [cropTop, cropBottom, cropLeft, cropRight] = this.currentTrack.info.pixelCrop;
-							let visibleWidth = this.currentTrack.info.width - cropLeft - cropRight;
-							let visibleHeight = this.currentTrack.info.height - cropTop - cropBottom;
-							if (visibleWidth <= 0 || visibleHeight <= 0) {
-								// Cropping everything away makes no sense
-								visibleWidth = this.currentTrack.info.width;
-								visibleHeight = this.currentTrack.info.height;
-							}
+						// The display size applies to the frame after cropping
+						const [cropTop, cropBottom, cropLeft, cropRight] = this.currentTrack.info.pixelCrop;
+						let visibleWidth = this.currentTrack.info.width - cropLeft - cropRight;
+						let visibleHeight = this.currentTrack.info.height - cropTop - cropBottom;
+						if (visibleWidth <= 0 || visibleHeight <= 0) {
+							// Cropping everything away makes no sense
+							visibleWidth = this.currentTrack.info.width;
+							visibleHeight = this.currentTrack.info.height;
+						}
 
-							const num = this.currentTrack.info.displayWidth * visibleHeight;
-							const den = this.currentTrack.info.displayHeight * visibleWidth;
+						let displayWidth = this.currentTrack.info.displayWidth;
+						let displayHeight = this.currentTrack.info.displayHeight;
+						if (this.currentTrack.info.displayUnit === 0) {
+							displayWidth ??= visibleWidth;
+							displayHeight ??= visibleHeight;
+						}
+
+						if (
+							this.currentTrack.info.displayUnit !== 4 // "unknown"
+							&& displayWidth !== null
+							&& displayHeight !== null
+						) {
+							const num = displayWidth * visibleHeight;
+							const den = displayHeight * visibleWidth;
 
 							if (num > 0 && den > 0) {
 								this.currentTrack.info.pixelAspectRatio = simplifyRational({ num, den });
@@ -2035,7 +2043,7 @@ export class MatroskaDemuxer extends Demuxer {
 						pixelCrop: [0, 0, 0, 0],
 						displayWidth: null,
 						displayHeight: null,
-						displayUnit: null,
+						displayUnit: 0, // Pixels
 						squarePixelWidth: -1,
 						squarePixelHeight: -1,
 						pixelAspectRatio: { num: 1, den: 1 },
