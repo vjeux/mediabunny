@@ -20,6 +20,7 @@ import {
 	iterateHevcNalUnits,
 	parseAvcSps,
 	parseOpusIdentificationHeader,
+	parseOpusTocByte,
 	sanitizeHevcPacketForChromium,
 	serializeAvcDecoderConfigurationRecord,
 } from './codec-data';
@@ -2349,7 +2350,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	currentTimestamp: number | null = null;
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
-	expectedFirstDuration = 0;
+	expectedFirstPacketData: Uint8Array | null = null;
 	timestampOffset = 0;
 	inputTimestampShift: number | null = null; // See getInputTimestampShift
 
@@ -2370,12 +2371,27 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			let sampleTimestamp = unshiftTimestamp(sample.timestamp, this.inputTimestampShift ?? 0);
 
 			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
-				// WebKit's GStreamer decoder keeps the Opus pre-skip, though, which shows as a first sample as long
-				// as its packet
-				const firstPacketFrames = Math.round(this.expectedFirstDuration * decoderConfig.sampleRate);
-				const keptPreSkip = firstPacketFrames > 0 && sample.numberOfFrames >= firstPacketFrames;
-				const preSkip = keptPreSkip ? 0 : opusPreSkip;
-				this.timestampOffset = this.expectedFirstTimestamp + preSkip - sampleTimestamp;
+				if (opusPreSkip > 0 && this.expectedFirstPacketData) {
+					// WebKit's GStreamer decoder keeps the pre-skip, though, which shows as a first sample about as
+					// long as its packet (the packet's own length, since container durations can be rounded, to a
+					// millisecond in Matroska). That only tells it apart from a dropped pre-skip if the pre-skip is
+					// shorter than the packet; otherwise, the first output comes from a later packet either way, and
+					// the decoder is taken to have dropped it. A kept pre-skip is dropped here, as other decoders do.
+					const preSkipFrames = Math.round(opusPreSkip * sample.sampleRate);
+					const firstPacketFrames = parseOpusTocByte(this.expectedFirstPacketData).durationInSamples
+						* sample.sampleRate / OPUS_SAMPLE_RATE;
+					if (
+						preSkipFrames < firstPacketFrames
+						&& sample.numberOfFrames > firstPacketFrames - preSkipFrames / 2
+					) {
+						const trimmed = sample.trim(preSkipFrames);
+						sample.close();
+						sample = trimmed;
+						sampleTimestamp += preSkipFrames / sample.sampleRate;
+					}
+				}
+
+				this.timestampOffset = this.expectedFirstTimestamp + opusPreSkip - sampleTimestamp;
 			}
 
 			sampleTimestamp += this.timestampOffset;
@@ -2477,7 +2493,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			this.inputTimestampShift ??= getInputTimestampShift(packet.timestamp);
 			if (this.expectedFirstTimestamp === null) {
 				this.expectedFirstTimestamp = packet.timestamp;
-				this.expectedFirstDuration = packet.duration;
+				this.expectedFirstPacketData = packet.data;
 			}
 
 			if (this.inputTimestampShift !== 0) {

@@ -36,7 +36,9 @@ test('Audio that starts before zero decodes in order, with no negative timestamp
 	// A 1 kHz tone whose amplitude steps up by 0.02 every 20 ms, for 0.4 s:
 	// ffmpeg -f lavfi -i "aevalsrc='0.02*(1+floor(t/0.02))*sin(2*PI*1000*t)':s=48000:d=0.4" -c:a libopus -b:a 64k
 	//   staircase-tone.ogg (and -c:a aac -b:a 64k -movflags +faststart staircase-tone.m4a, -c:a libmp3lame -b:a 64k
-	//   staircase-tone.mp3). Each starts before zero: the Opus pre-skip, the AAC priming, the LAME delay.
+	//   staircase-tone.mp3, and the Opus remuxed with -c copy into staircase-tone.webm, whose millisecond
+	//   timestamps round the first packet's). Each starts before zero: the Opus pre-skip, the AAC priming, the LAME
+	//   delay.
 	// WebKit's GStreamer decoders (WPE, GTK) play a stream backwards from a negative chunk timestamp
 	const NativeAudioDecoder = globalThis.AudioDecoder;
 	const chunkTimestamps: number[] = [];
@@ -48,7 +50,8 @@ test('Audio that starts before zero decodes in order, with no negative timestamp
 	} as typeof AudioDecoder;
 
 	try {
-		for (const file of ['/staircase-tone.ogg', '/staircase-tone.m4a', '/staircase-tone.mp3']) {
+		const files = ['/staircase-tone.ogg', '/staircase-tone.webm', '/staircase-tone.m4a', '/staircase-tone.mp3'];
+		for (const file of files) {
 			using input = new Input({
 				source: new UrlSource(file),
 				formats: ALL_FORMATS,
@@ -83,11 +86,11 @@ test('Audio that starts before zero decodes in order, with no negative timestamp
 			expect(peakAt(0.05), file).toBeLessThan(0.15);
 			expect(peakAt(0.35), file).toBeGreaterThan(0.25);
 
-			if (file.endsWith('.ogg')) {
-				// The first sample ends where the first packet does, whether the decoder dropped the pre-skip or not
+			if (await track.getCodec() === 'opus') {
+				// The first sample ends where the first packet (one of libopus' 20 ms frames) does, whether the decoder
+				// dropped the pre-skip or not
 				const firstSample = samples[0]!;
-				const firstPacketEnd = firstPacket.timestamp + firstPacket.duration;
-				expect(firstSample.timestamp + firstSample.duration).toBeCloseTo(firstPacketEnd, 6);
+				expect(firstSample.timestamp + firstSample.duration, file).toBeCloseTo(firstPacket.timestamp + 0.02, 6);
 			}
 
 			expect(Math.min(...chunkTimestamps), file).toBeGreaterThanOrEqual(0);
@@ -95,6 +98,34 @@ test('Audio that starts before zero decodes in order, with no negative timestamp
 	} finally {
 		globalThis.AudioDecoder = NativeAudioDecoder;
 	}
+});
+
+test('Opus whose pre-skip is its whole first packet starts at zero, as ffprobe says', async () => {
+	// ffmpeg -f lavfi -i "sine=f=1000:d=0.1" -c:a libopus -frame_duration 2.5 -b:a 64k opus-2.5ms-frames.ogg,
+	// for which libopus writes a pre-skip of 120: exactly the first packet. A decoder that drops it outputs the
+	// second packet first, which is as long as a packet but isn't a kept pre-skip. The 20 ms staircase tone
+	// (pre-skip 312 of 960) is the control. Both as ffprobe -show_frames gives them.
+	const firstSamples = async (file: string) => {
+		using input = new Input({
+			source: new UrlSource(file),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const result: [number, number][] = [];
+		for await (using sample of new AudioSampleSink(track).samples()) {
+			result.push([sample.timestamp, sample.numberOfFrames]);
+			if (result.length === 3) {
+				break;
+			}
+		}
+		return result;
+	};
+
+	expect(await firstSamples('/opus-2.5ms-frames.ogg')).toEqual([[0, 120], [0.0025, 120], [0.005, 120]]);
+	expect(await firstSamples('/staircase-tone.ogg')).toEqual([[0, 648], [0.0135, 960], [0.0335, 960]]);
 });
 
 test('Video that starts before zero decodes fully, with no negative timestamps for the decoder', async () => {
