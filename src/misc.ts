@@ -1564,6 +1564,37 @@ export const simplifyRational = (rational: Rational): Rational => {
 };
 
 /**
+ * The display aspect for a decoder config of frames with the given coded size and pixel aspect ratio. As Mediabunny's
+ * demuxers always gave it, it's the frame size in square pixels when that's a whole number of pixels. Otherwise, a
+ * rounded size would change the pixel aspect ratio of anything derived from it, such as the pasp box of a remux, so
+ * it's the exact display aspect ratio in its reduced form (WebCodecs defines the two fields as a ratio). That's only
+ * when the ratio is smaller than the frame in both dimensions, which tells it apart from a size in pixels (the HLS
+ * muxer relies on this); the rare ratios that aren't give the rounded size.
+ */
+export const getDisplayAspect = (width: number, height: number, pixelAspectRatio: Rational) => {
+	const { num, den } = pixelAspectRatio;
+	if (!(num > 0 && den > 0) || num === den || !(width > 0 && height > 0)) {
+		return null;
+	}
+
+	const isWhole = num > den ? (width * num) % den === 0 : (height * den) % num === 0;
+	if (!isWhole) {
+		const displayAspectRatio = simplifyRational({ num: width * num, den: height * den });
+		if (displayAspectRatio.num < width && displayAspectRatio.den < height) {
+			return { displayAspectWidth: displayAspectRatio.num, displayAspectHeight: displayAspectRatio.den };
+		}
+	}
+
+	const squarePixelWidth = num > den ? Math.round(width * num / den) : width;
+	const squarePixelHeight = num > den ? height : Math.round(height * den / num);
+	if (squarePixelWidth === width && squarePixelHeight === height) {
+		return null;
+	}
+
+	return { displayAspectWidth: squarePixelWidth, displayAspectHeight: squarePixelHeight };
+};
+
+/**
  * Specifies a rectangular region where all quantities must be non-negative integers.
  * @group Miscellaneous
  * @public
