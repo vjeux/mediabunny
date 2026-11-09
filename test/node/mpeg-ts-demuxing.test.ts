@@ -2432,3 +2432,63 @@ test('MPEG-TS with interlaced (field/MBAFF-coded) H.264 reports the full frame h
 	expect(await videoTrack.getDisplayWidth()).toBe(1920);
 	expect(await videoTrack.getDisplayHeight()).toBe(1080);
 });
+
+test('MPEG-TS with AC-3 and E-AC-3 named by a registration descriptor', async () => {
+	// A private data stream (stream_type 0x06) can name its format with a registration descriptor ('AC-3', 'EAC3')
+	// instead of a DVB AC-3 descriptor; ffprobe reads such streams. Made here by giving the audio of ac3.ts and
+	// eac3.ts (PID 0x100) a PMT like that.
+	const crc32 = (bytes: number[]) => {
+		let crc = 0xffffffff;
+		for (const byte of bytes) {
+			crc ^= byte << 24;
+			for (let i = 0; i < 8; i++) {
+				crc = (crc << 1) ^ (crc & 0x80000000 ? 0x04c11db7 : 0);
+			}
+		}
+
+		crc >>>= 0;
+		return [crc >>> 24, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff];
+	};
+	const psiPacket = (pid: number, section: number[]) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, 0x10, 0x00, ...section, ...crc32(section)]);
+		return packet;
+	};
+
+	const readAudio = async (bytes: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(bytes), formats: [MPEG_TS] });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		return { codec: await track.getCodec(), packets };
+	};
+
+	for (const [codec, formatIdentifier] of [['ac3', 'AC-3'], ['eac3', 'EAC3']] as const) {
+		const original = new Uint8Array(await fs.promises.readFile(path.join(__dirname, `../public/${codec}.ts`)));
+		const packets = [
+			psiPacket(0x0000, [0x00, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00]),
+			psiPacket(0x1000, [
+				0x02, 0xb0, 24, 0, 1, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0x00,
+				0x06, 0xe1, 0x00, 0xf0, 6, 0x05, 4, ...[...formatIdentifier].map(x => x.charCodeAt(0)),
+			]),
+		];
+		for (let pos = 0; pos < original.length; pos += 188) {
+			if ((((original[pos + 1]! & 0x1f) << 8) | original[pos + 2]!) === 0x100) {
+				packets.push(original.subarray(pos, pos + 188));
+			}
+		}
+		const bytes = new Uint8Array(188 * packets.length);
+		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+		const expected = await readAudio(original);
+		const actual = await readAudio(bytes);
+		expect(actual.codec).toBe(codec);
+		expect(actual.packets.length).toBeGreaterThan(0);
+		expect(actual.packets.map(x => [x.timestamp, x.byteLength]))
+			.toEqual(expected.packets.map(x => [x.timestamp, x.byteLength]));
+	}
+});
