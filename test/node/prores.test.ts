@@ -133,6 +133,30 @@ test('Custom coder registration', { timeout: 20_000 }, async () => {
 	expect(await videoTrack.canDecode()).toBe(true);
 });
 
+test('ProRes samples take the pixel aspect ratio from the container', async () => {
+	// prores_ks, like Apple's encoders, writes the pixel aspect ratio (here 4:3) only into the pasp box, with
+	// aspect_ratio_information 0 (unknown) in the frame header. Made with (FFmpeg 7.0.2):
+	// ffmpeg -f lavfi -i testsrc2=s=64x32:r=10:d=0.2 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le -vf setsar=4/3 \
+	//   -fflags +bitexact -flags:v +bitexact prores-422hq-64x32-sar4x3.mov
+	registerProresDecoder();
+
+	using input = new Input({
+		source: new FilePathSource('./test/public/prores-422hq-64x32-sar4x3.mov'),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	expect(await videoTrack.getDisplayWidth()).toBe(85);
+	expect(await videoTrack.getDisplayHeight()).toBe(32);
+
+	using sample = await new VideoSampleSink(videoTrack).getSample(0);
+	assert(sample);
+
+	expect(sample.codedWidth).toBe(64);
+	expect(sample.displayWidth).toBe(85);
+	expect(sample.displayHeight).toBe(32);
+});
+
 test('ProRes decoding', { timeout: 20_000 }, async () => {
 	registerProresDecoder();
 
