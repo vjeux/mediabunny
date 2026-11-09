@@ -503,6 +503,22 @@ const NO_HOLES: readonly number[] = Object.freeze([]);
 /** How many PES packets further back a lookup may look when the PES packets it read have no packet it is after */
 const MAX_LOOKUP_WINDOW_EXTENSION = 4;
 
+/**
+ * The length a section's PES packet header promises (PES_packet_length plus the 6 bytes before it), or null for an
+ * unbounded PES packet (or a section that isn't one).
+ */
+const getPromisedPesPacketSize = (chunks: Uint8Array[]) => {
+	const start = chunks[0];
+	if (start && start.length >= 6 && start[0] === 0 && start[1] === 0 && start[2] === 1) {
+		const pesPacketLength = (start[4]! << 8) | start[5]!;
+		if (pesPacketLength > 0) {
+			return 6 + pesPacketLength;
+		}
+	}
+
+	return null;
+};
+
 // Remember them so the warning doesn't get spammed
 const ignoredStreamTypes = new Set<number>();
 
@@ -1857,6 +1873,37 @@ export class MpegTsDemuxer extends Demuxer {
 		return buildMpegTsMimeType(codecStrings);
 	}
 
+	/**
+	 * Whether the end of the file, where a section stops, cuts it short. Only positive evidence counts: a bounded PES
+	 * packet missing bytes, or an unbounded one without stuffing in its last TS packet in a file that ends inside a TS
+	 * packet (a cut recording or download). A PES packet whose data fills its last TS packet exactly needs no
+	 * stuffing, so a file that ends on a TS packet boundary may well be complete: Mediabunny's own output ends like
+	 * that about once in 184 files.
+	 */
+	async isCutByEndOfFile(
+		chunks: Uint8Array[],
+		byteLength: number,
+		lastPacketWithPayload: TsPacket | null,
+		endPos: number,
+	) {
+		const promisedSize = getPromisedPesPacketSize(chunks);
+		if (promisedSize !== null) {
+			return byteLength < promisedSize;
+		}
+
+		if (lastPacketWithPayload && hasStuffing(lastPacketWithPayload)) {
+			return false;
+		}
+
+		// The file ends inside a TS packet
+		let rest = this.reader.requestSliceRange(endPos, 1, this.packetStride);
+		if (isThenable(rest)) {
+			rest = await rest;
+		}
+
+		return !!rest && rest.end - rest.start < this.packetStride;
+	}
+
 	async readSection(startPos: number, full: boolean, contiguous = false): Promise<Section | null> {
 		let endPos = startPos;
 		let currentPos = startPos;
@@ -1891,9 +1938,17 @@ export class MpegTsDemuxer extends Demuxer {
 					this.addGap(firstPacket.pid, endPos, Infinity);
 				}
 
-				if (full && firstPacket && !sectionLooksComplete(chunks, chunksByteLength, lastPacketWithPayload)) {
-					// The file ends before the section does. Since reading the section again stops at its known end,
-					// remember that.
+				if (
+					full
+					&& firstPacket
+					&& await this.isCutByEndOfFile(
+						chunks,
+						chunksByteLength,
+						lastPacketWithPayload,
+						currentPos - this.packetStride,
+					)
+				) {
+					// Since reading the section again stops at its known end, remember that
 					this.cutSectionStarts.add(startPos);
 				}
 
