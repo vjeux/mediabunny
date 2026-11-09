@@ -279,3 +279,34 @@ test('Exact pixel aspect ratios from the SPS, in MP4 and MPEG-TS', async () => {
 		expect(await track.getPixelAspectRatio()).toEqual({ num: 9, den: 16 });
 	}
 });
+
+test.each([true, false])(
+	'Conversion with allowTransformationMetadata %s and a matrix that only scales and translates',
+	async (allowTransformationMetadata) => {
+		// Like a QuickTime track offset and scaled in its tkhd. The scale is uniform, as readers may take an uneven
+		// one as a pixel aspect ratio instead
+		const matrix: TransformationMatrix = [2, 0, 0, 0, 2, 0, 16, 8, 1];
+		const sourceOutput = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('vp8');
+		sourceOutput.addVideoTrack(source, { transformationMatrix: matrix });
+		await sourceOutput.start();
+		for (let i = 0; i < 3; i++) {
+			await source.add(new EncodedPacket(new Uint8Array(1024), i === 0 ? 'key' : 'delta', i * 0.1, 0.1), {
+				decoderConfig: { codec: 'vp8', codedWidth: WIDTH, codedHeight: HEIGHT },
+			});
+		}
+		await sourceOutput.finalize();
+
+		using input = new Input({ source: new BufferSource(sourceOutput.target.buffer!), formats: ALL_FORMATS });
+		expect(await (await input.getPrimaryVideoTrack())!.getTransformationMatrix()).toEqual(matrix);
+
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output, video: { allowTransformationMetadata } });
+		await conversion.execute();
+
+		// false makes sure the output uses no transformation metadata at all
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		expect(await (await result.getPrimaryVideoTrack())!.getTransformationMatrix())
+			.toEqual(allowTransformationMetadata ? matrix : [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+	},
+);
