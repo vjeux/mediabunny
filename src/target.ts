@@ -462,6 +462,19 @@ export class StreamTarget extends Target {
 
 	/** @internal */
 	_writeDataIntoChunks(data: Uint8Array, position: number) {
+		// Chunk by chunk in a loop: recursing once per chunk would overflow the stack for data spanning many chunks (a
+		// big write with a small chunk size)
+		let offset = 0;
+		do {
+			offset += this._writeDataIntoChunk(data.subarray(offset), position + offset);
+		} while (offset < data.byteLength);
+	}
+
+	/**
+	 * Writes the start of the data into its chunk and returns how many bytes were written.
+	 * @internal
+	 */
+	_writeDataIntoChunk(data: Uint8Array, position: number) {
 		// First, find the chunk to write the data into, or create one if none exists
 		let chunkIndex = this._chunks.findIndex(x => x.start <= position && position < x.start + this._chunkSize);
 		if (chunkIndex === -1) chunkIndex = this._createChunk(position);
@@ -493,10 +506,7 @@ export class StreamTarget extends Target {
 			this._tryToFlushChunks();
 		}
 
-		// If the data didn't fit in one chunk, recurse with the remaining data
-		if (toWrite.byteLength < data.byteLength) {
-			this._writeDataIntoChunks(data.subarray(toWrite.byteLength), position + toWrite.byteLength);
-		}
+		return toWrite.byteLength;
 	}
 
 	/** @internal */
