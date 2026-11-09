@@ -2472,3 +2472,110 @@ test('CanvasSink never deduces a canvas dimension of zero', async () => {
 	}
 	expect(sizes).toEqual(['4x2', '1x1', '1x1']); // The first one is the control
 });
+
+test('Decoding avc3 where the browser\'s VideoDecoder only takes avc1 codec strings', async () => {
+	// ffmpeg -f lavfi -i testsrc2=size=64x64:rate=30 -frames:v 10 -c:v libx264 -pix_fmt yuv420p
+	//   -x264-params keyint=5:min-keyint=5:scenecut=0:repeat-headers=1 -tag:v avc3 -movflags +faststart avc3.mp4
+	// (with the parameter sets in-band before each key frame too, as avc3 allows)
+	const decode = async () => {
+		using input = new Input({
+			source: new UrlSource('/avc3.mp4'),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+
+		// The codec string stays exact
+		expect((await track.getDecoderConfig())?.codec).toBe('avc3.64000a');
+		expect(await track.canDecode()).toBe(true);
+
+		const timestamps: number[] = [];
+		for await (using sample of new VideoSampleSink(track).samples()) {
+			timestamps.push(sample.timestamp);
+		}
+		return timestamps.length;
+	};
+
+	expect(await decode()).toBe(10);
+
+	// WebKit's VideoDecoder (Safari, WPE and GTK) rejects avc3 codec strings, as this one does
+	const NativeVideoDecoder = globalThis.VideoDecoder;
+	const configuredCodecs: string[] = [];
+	globalThis.VideoDecoder = class extends NativeVideoDecoder {
+		static override isConfigSupported(config: VideoDecoderConfig) {
+			if (config.codec.startsWith('avc3.')) {
+				return Promise.resolve({ supported: false, config });
+			}
+			return NativeVideoDecoder.isConfigSupported(config);
+		}
+
+		override configure(config: VideoDecoderConfig) {
+			configuredCodecs.push(config.codec);
+			if (config.codec.startsWith('avc3.')) {
+				throw new DOMException('Unsupported codec', 'NotSupportedError');
+			}
+			super.configure(config);
+		}
+	} as typeof VideoDecoder;
+	try {
+		expect(await decode()).toBe(10);
+	} finally {
+		globalThis.VideoDecoder = NativeVideoDecoder;
+	}
+	expect(configuredCodecs).toEqual(['avc1.64000a']);
+});
+
+test('Decoding MPEG-2 AAC where the browser\'s AudioDecoder only takes MPEG-4 AAC codec strings', async () => {
+	// ffmpeg -f lavfi -i sine=frequency=440:sample_rate=44100:duration=0.2 -c:a aac -b:a 48k -ac 1
+	//   -movflags +faststart, then the esds objectTypeIndication changed from 0x40 (MPEG-4 audio) to 0x67
+	//   (MPEG-2 AAC LC)
+	const decode = async () => {
+		using input = new Input({
+			source: new UrlSource('/mpeg2-aac-lc.m4a'),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		// The codec string stays exact
+		expect((await track.getDecoderConfig())?.codec).toBe('mp4a.67');
+		expect(await track.canDecode()).toBe(true);
+
+		let frames = 0;
+		for await (using sample of new AudioSampleSink(track).samples()) {
+			frames += sample.numberOfFrames;
+		}
+		return frames;
+	};
+
+	const frames = await decode();
+	expect(frames).toBeGreaterThan(0);
+
+	// WebKit's AudioDecoder (Safari, WPE and GTK) rejects mp4a.67, as this one does
+	const NativeAudioDecoder = globalThis.AudioDecoder;
+	const configuredCodecs: string[] = [];
+	globalThis.AudioDecoder = class extends NativeAudioDecoder {
+		static override isConfigSupported(config: AudioDecoderConfig) {
+			if (config.codec === 'mp4a.67') {
+				return Promise.resolve({ supported: false, config });
+			}
+			return NativeAudioDecoder.isConfigSupported(config);
+		}
+
+		override configure(config: AudioDecoderConfig) {
+			configuredCodecs.push(config.codec);
+			if (config.codec === 'mp4a.67') {
+				throw new DOMException('Unsupported codec', 'NotSupportedError');
+			}
+			super.configure(config);
+		}
+	} as typeof AudioDecoder;
+	try {
+		expect(await decode()).toBe(frames);
+	} finally {
+		globalThis.AudioDecoder = NativeAudioDecoder;
+	}
+	expect(configuredCodecs).toEqual(['mp4a.40.2']);
+});

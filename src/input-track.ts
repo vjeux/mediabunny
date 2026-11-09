@@ -17,7 +17,7 @@ import {
 } from './codec';
 import { determineAudioPacketType, determineVideoPacketType } from './codec-data';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
-import { getNativeVideoDecoderConfig } from './decode';
+import { getNativeAudioDecoderConfig, getNativeVideoDecoderConfig } from './decode';
 import { Input, InputDisposedError } from './input';
 import { Logging } from './logging';
 import { EncodedPacketSink, PacketRetrievalOptions, validatePacketRetrievalOptions } from './media-sink';
@@ -1300,8 +1300,7 @@ export class InputAudioTrack extends InputTrack {
 					return false;
 				}
 
-				const support = await AudioDecoder.isConfigSupported(decoderConfig);
-				return support.supported === true;
+				return (await getNativeAudioDecoderConfig(decoderConfig)) !== null;
 			}
 		} catch (error) {
 			if (error instanceof InputDisposedError) {

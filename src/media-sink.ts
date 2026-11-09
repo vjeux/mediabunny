@@ -36,7 +36,7 @@ import {
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
-import { nativeShortCodecStrings } from './decode';
+import { nativeCodecStrings, nativeShortCodecStrings } from './decode';
 import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
 import {
 	AnyIterable,
@@ -2809,9 +2809,10 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		// canDecode() may have found that the browser's decoder only takes the codec string's short form (see
 		// getNativeVideoDecoderConfig)
 		const trackDecoderConfig = decoderConfig;
-		const shortCodecString = nativeShortCodecStrings.get(trackDecoderConfig.codec);
-		if (shortCodecString !== undefined && !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))) {
-			decoderConfig = { ...trackDecoderConfig, codec: shortCodecString };
+		const nativeCodecString = nativeShortCodecStrings.get(trackDecoderConfig.codec)
+			?? nativeCodecStrings.get(trackDecoderConfig.codec);
+		if (nativeCodecString !== undefined && !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))) {
+			decoderConfig = { ...trackDecoderConfig, codec: nativeCodecString };
 		}
 
 		return {
@@ -4159,17 +4160,25 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
 		} else {
+			// canDecode() may have found that the browser's decoder only takes an equivalent codec string (see
+			// getNativeAudioDecoderConfig)
+			const nativeCodecString = nativeCodecStrings.get(decoderConfig.codec);
+			const nativeDecoderConfig = nativeCodecString !== undefined
+				&& !customAudioDecoders.some(x => x.supports(codec, decoderConfig))
+				? { ...decoderConfig, codec: nativeCodecString }
+				: decoderConfig;
+
 			const backing = this._track._backing;
 			const decoder = new AudioDecoderWrapper(
 				onSample,
 				onError,
 				codec,
-				decoderConfig,
+				nativeDecoderConfig,
 				packet => (backing.getDecoderConfigForPacket?.(packet) ?? null) as AudioDecoderConfig | null,
 			);
 			if (decoder.decoder) {
 				try {
-					decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, decoderConfig);
+					decoder.discardedPacketSequenceNumber = await getDiscardedPacket(this._track, nativeDecoderConfig);
 				} catch (error) {
 					// The lookup reads the first packet, which fails once the input is disposed. The decoder isn't
 					// handed out yet, so nothing else would close it.
