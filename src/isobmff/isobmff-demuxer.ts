@@ -1895,8 +1895,8 @@ export class IsobmffDemuxer extends Demuxer {
 
 			case 'stbl': {
 				const track = this.currentTrack;
-				if (!track) {
-					break;
+				if (!track || this.currentFragment) {
+					break; // Sample tables don't belong in fragments
 				}
 
 				track.sampleTableByteOffset = startPos;
@@ -2816,7 +2816,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
@@ -2868,7 +2868,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
@@ -2900,7 +2900,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
@@ -2929,7 +2929,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
@@ -2962,7 +2962,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
@@ -3054,7 +3054,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
@@ -3074,7 +3074,7 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				if (!track.sampleTable) {
+				if (!track.sampleTable || this.currentFragment) {
 					break;
 				}
 
