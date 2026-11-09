@@ -1569,6 +1569,35 @@ test('A left-out date can\'t come back through a raw date tag in another letter 
 	}
 });
 
+test('Raw RIFF INFO keys that aren\'t four ASCII characters aren\'t written, WAVE', async () => {
+	const output = new Output({
+		format: new WavOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	output.setMetadataTags({
+		title: 'Title',
+		raw: { IÄRT: 'x', IENG: 'Engineer' }, // 'Ä' takes two bytes in UTF-8
+		artist: 'Artist',
+	});
+
+	const dummyTrack = createDummyAudioTrack('pcm-s16', output);
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	// A five-byte chunk ID would throw off the layout of every INFO chunk after it
+	const readTags = await input.getMetadataTags();
+	expect(readTags.title).toBe('Title');
+	expect(readTags.artist).toBe('Artist');
+	expect(readTags.raw!['IENG']).toBe('Engineer');
+});
+
 test('Conversion metadata tags, default case', async () => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
