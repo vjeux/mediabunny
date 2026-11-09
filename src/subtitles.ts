@@ -29,10 +29,29 @@ type SubtitleParserOptions = {
 };
 
 // Line feeds are WebVTT's only line terminators once carriage returns are normalized, so lines may contain U+2028 and
-// U+2029, which the . of regexes doesn't match
-const cueBlockHeaderRegex = /(?:([^\n]+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
+// U+2029, which the . of regexes doesn't match. An identifier is the whole line before a timing line, so it's only
+// looked for after a line feed or at the start of the text; execCueBlockHeader takes that line feed back out of the
+// match. Started anywhere in a long line instead, the search would reach to the end of that line every time, which is
+// quadratic. (A lookbehind can't be used, as Safari before 16.4 can't parse one, and the ^ of the m flag also matches
+// after U+2028 and U+2029.)
+const cueBlockHeaderRegex
+	= /(?:(?:^|\n)([^\n]+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
 const preambleStartRegex = /^WEBVTT[\s\S]*?\n{2}/;
 export const inlineTimestampRegex = /<(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})>/g;
+
+/**
+ * Finds the next cue block header (an optional identifier line, then a timing line) from the regex's lastIndex on. The
+ * match starts at the identifier, without the line feed before it.
+ */
+const execCueBlockHeader = (text: string) => {
+	const match = cueBlockHeaderRegex.exec(text);
+	if (match?.[0].startsWith('\n')) {
+		match.index++;
+		match[0] = match[0].slice(1);
+	}
+
+	return match;
+};
 
 export class SubtitleParser {
 	private options: SubtitleParserOptions;
@@ -54,7 +73,7 @@ export class SubtitleParser {
 				throw new Error('WebVTT preamble incorrect.');
 			}
 
-			match = cueBlockHeaderRegex.exec(text);
+			match = execCueBlockHeader(text);
 			const preamble = text.slice(0, match?.index ?? text.length).trimEnd();
 
 			if (!preamble) {
@@ -69,7 +88,7 @@ export class SubtitleParser {
 			}
 		}
 
-		while ((match = cueBlockHeaderRegex.exec(text))) {
+		while ((match = execCueBlockHeader(text))) {
 			const notes = text.slice(0, match.index);
 			const cueIdentifier = match[1];
 			const matchEnd = match.index! + match[0].length;
