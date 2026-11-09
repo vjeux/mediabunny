@@ -5379,8 +5379,10 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 
 	// A server that ignores range requests makes a UrlSource read in order too, though it knows the size. Looking up
 	// the end, for the duration, reads past the stream's start before the frame duration is measured there; the last
-	// packet then takes the duration before it (found in L15's "sized but not seekable" check). 4 seconds of frames
-	// of 60 kB, more than one seek chunk, read through a 1 MiB cache.
+	// packet then takes the frame duration measured on the packets at hand (found in L15's "sized but not seekable"
+	// checks: polsat_1080i_hevc.ts, whose last key frame follows a gap of 0.3 s, ended 0.28 s late). 4 seconds of
+	// frames of 60 kB with two B-frames per P-frame, then a key frame after a gap of 9 frames, more than one seek
+	// chunk, read through a 1 MiB cache.
 	const nalUnit = (bytes: number[]) => [0, 0, 0, 1, ...bytes];
 	const sps = [0x67, 0x64, 0x00, 0x0a, 0xac, 0xd3, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00,
 		0x03, 0x03, 0x20, 0xf1, 0x22, 0x53, 0x80];
@@ -5389,21 +5391,32 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 	const source = new EncodedVideoPacketSource('avc');
 	output.addVideoTrack(source, { frameRate: 25 });
 	await output.start();
-	for (let i = 0; i < 100; i++) {
-		const isKey = i % 25 === 0;
-		const slice = nalUnit([isKey ? 0x65 : 0x41, 0x88, ...new Array<number>(60_000).fill(0x20 + i % 50)]);
+	// I0 P3 B1 B2 P6 B4 B5 ... P96 B94 B95, then I105
+	const decodeOrder = [0];
+	for (let anchor = 3; anchor <= 96; anchor += 3) {
+		decodeOrder.push(anchor, anchor - 2, anchor - 1);
+	}
+	decodeOrder.push(105);
+	for (const frame of decodeOrder) {
+		const isKey = frame === 0 || frame === 105;
+		const header = isKey ? 0x65 : frame % 3 === 0 ? 0x41 : 0x01;
+		const slice = nalUnit([header, 0x88, ...new Array<number>(60_000).fill(0x20 + frame % 50)]);
 		await source.add(
 			new EncodedPacket(
 				new Uint8Array(isKey ? [...nalUnit(sps), ...nalUnit(pps), ...slice] : slice),
 				isKey ? 'key' : 'delta',
-				i / 25,
+				frame / 25,
 				1 / 25,
 			),
-			i === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
+			frame === 0 ? { decoderConfig: { codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 } } : undefined,
 		);
 	}
 	await output.finalize();
 	const bytes = new Uint8Array(output.target.buffer!);
+	const sizedInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const sizedDuration = await (await sizedInput.getPrimaryVideoTrack())!.computeDuration();
+	sizedInput.dispose();
+	expect(sizedDuration).toBeCloseTo(106 / 25);
 	const server = http.createServer((request, response) => {
 		response.writeHead(200, { 'Content-Length': bytes.byteLength });
 		response.end(bytes);
@@ -5421,7 +5434,7 @@ test('MPEG-TS read from a stream larger than the source cache reads to its last 
 		});
 		const urlTrack = await urlInput.getPrimaryVideoTrack();
 		assert(urlTrack);
-		expect(await urlTrack.computeDuration()).toBeCloseTo(4);
+		expect(await urlTrack.computeDuration()).toBeCloseTo(sizedDuration);
 	} finally {
 		server.closeAllConnections();
 		server.close();
@@ -5928,4 +5941,77 @@ test('MPEG-TS seeks ahead in a stream read past its cache', async () => {
 		server.closeAllConnections();
 		server.close();
 	}
+});
+
+test('MPEG-TS falls back to a program with CA descriptors in a stream whose start is gone', async () => {
+	// From L04's review of the r26 integration. A capture whose only PMT, with a CA descriptor (often left in
+	// recordings that aren't scrambled), comes 1.5 MiB in, after clear PES packets of its stream, and a PAT listing a
+	// program that never shows up. The fallback to that program goes back to the start of the file for the stream's
+	// first PES packet, which a ReadableStreamSource with a 1 MiB cache no longer holds: the stream is then read from
+	// the first data still there after the PMT. (From a buffer, from the start of the file.)
+	const packets: Uint8Array[] = [];
+	const counters = new Map<number, number>();
+	const pushPacket = (pid: number, payload: number[]) => {
+		const packet = new Uint8Array(188).fill(0xff);
+		const counter = counters.get(pid) ?? 0;
+		counters.set(pid, (counter + 1) & 0xf);
+		const stuffing = 184 - payload.length;
+		packet.set([0x47, 0x40 | (pid >> 8), pid & 0xff, (stuffing > 0 ? 0x30 : 0x10) | counter]);
+		if (stuffing > 0) {
+			packet.set([stuffing - 1, ...(stuffing > 1 ? [0x00] : [])], 4);
+		}
+		packet.set(payload, 4 + stuffing);
+		packets.push(packet);
+	};
+	const section = (bytes: number[]) => [0x00, ...bytes, 0, 0, 0, 0];
+	const pat = section([0x00, 0xb0, 0x11, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0x00, 0, 2, 0xf0, 0x01]);
+	const caDescriptor = [0x09, 0x04, 0x0b, 0x00, 0xff, 0xf0];
+	const pmtBody = [
+		0, 1, 0xc1, 0, 0, 0xe1, 0x01, 0xf0, caDescriptor.length, ...caDescriptor, 0x0f, 0xe1, 0x01, 0xf0, 0x00,
+	];
+	const pmt = section([0x02, 0xb0, pmtBody.length + 4, ...pmtBody]);
+	const adtsPesPacket = (pts: number) => [
+		0, 0, 1, 0xc0, 0, 8 + 39, 0x84, 0x80, 5,
+		0x21 | ((pts >> 29) & 0x0e), (pts >> 22) & 0xff, ((pts >> 14) & 0xfe) | 1,
+		(pts >> 7) & 0xff, ((pts << 1) & 0xfe) | 1,
+		0xff, 0xf1, 0x4c, 0x80, 0x04, 0xff, 0xfc, ...new Array<number>(32).fill(0),
+	];
+	pushPacket(0, pat);
+	const packetCount = Math.floor(3 * 2 ** 20 / 188);
+	const firstPmtIndex = Math.floor(1.5 * 2 ** 20 / 188);
+	for (let i = 0; i < packetCount; i++) {
+		if (i >= firstPmtIndex && (i - firstPmtIndex) % 500 === 0) {
+			pushPacket(0x1000, pmt);
+		}
+		pushPacket(0x101, adtsPesPacket(1920 * i));
+	}
+	const bytes = new Uint8Array(188 * packets.length);
+	packets.forEach((packet, i) => bytes.set(packet, 188 * i));
+
+	using bufferInput = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const bufferTracks = await bufferInput.getTracks();
+	expect(bufferTracks.map(track => track.id)).toEqual([0x101]);
+	expect(await bufferTracks[0]!.getFirstTimestamp()).toBe(0);
+
+	let offset = 0;
+	const stream = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			if (offset >= bytes.length) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(bytes.slice(offset, offset + 2 ** 16));
+			offset += 2 ** 16;
+		},
+	});
+	using streamInput = new Input({
+		source: new ReadableStreamSource(stream, { maxCacheSize: 2 ** 20 }),
+		formats: ALL_FORMATS,
+	});
+	const streamTracks = await streamInput.getTracks();
+	expect(streamTracks.map(track => track.id)).toEqual([0x101]);
+	const firstTimestamp = await streamTracks[0]!.getFirstTimestamp();
+	// After the PMT (1.5 MiB in: 8,367 packets of 1920 ticks), within what the cache holds
+	expect(firstTimestamp).toBeGreaterThanOrEqual(8367 * 1920 / 90_000);
+	expect(firstTimestamp).toBeLessThan(8367 * 1920 / 90_000 + 5);
 });

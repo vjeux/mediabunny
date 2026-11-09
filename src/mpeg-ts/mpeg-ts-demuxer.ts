@@ -1058,6 +1058,48 @@ export class MpegTsDemuxer extends Demuxer {
 			const firstPesPacketScrambling = new Map<number, boolean>();
 			let hasReadableFallbackProgram = false;
 
+			// When going back for the packets before the PMT: where to read on from and what to restore, should some of
+			// that data be gone after all (a source that only keeps what its cache holds evicts as it reads on)
+			let goingBack: {
+				resumePos: number;
+				streams: {
+					stream: ElementaryStream;
+					state: Pick<
+						ElementaryStream,
+						'initialized' | 'firstSection' | 'canBeTrustedWithKeyPackets' | 'info' | 'codecFromPayload'
+					>;
+				}[];
+				timestampWrapInfo: TimestampWrapInfo | null;
+			} | null = null;
+			// The state to go back with: the streams as they are now, to read on from the given position with
+			const goBackFrom = (resumePos: number): NonNullable<typeof goingBack> => ({
+				resumePos,
+				streams: this.elementaryStreams.map(stream => ({
+					stream,
+					state: {
+						initialized: stream.initialized,
+						firstSection: stream.firstSection,
+						canBeTrustedWithKeyPackets: stream.canBeTrustedWithKeyPackets,
+						info: { ...stream.info },
+						codecFromPayload: stream.codecFromPayload,
+					},
+				})),
+				timestampWrapInfo: this.timestampWrapInfo,
+			});
+			const readOnFromPmt = (going: NonNullable<typeof goingBack>) => {
+				this.elementaryStreams.length = 0;
+				for (const { stream, state } of going.streams) {
+					this.elementaryStreams.push(Object.assign(stream, state));
+				}
+				this.timestampWrapInfo = going.timestampWrapInfo;
+				currentPos = going.resumePos;
+				goingBack = null;
+				readsOnFromPmt = true;
+			};
+			// Set when reading on from the PMT after all, which the cache may not hold anymore either (reading a
+			// stream's first frame can read far ahead)
+			let readsOnFromPmt = false;
+
 			// Uses the given program. Without a program, sections were read as contiguous, which cuts PES packets
 			// short at the first packet of another PID, so the section ends recorded since can't be trusted.
 			const useProgram = (program: FallbackProgram, goBack: boolean) => {
@@ -1067,7 +1109,10 @@ export class MpegTsDemuxer extends Demuxer {
 				this.sectionEndPositions.clear();
 
 				if (goBack) {
-					// Read its streams' first PES packets from the start of the file (they can come before the PMT)
+					// Read its streams' first PES packets from the start of the file (they can come before the PMT).
+					// Should some of that be gone (a source that only keeps what its cache holds), they're read from
+					// its PMT on instead, or from the first data still there after it.
+					goingBack = goBackFrom(program.pmtPos);
 					currentPos = this.packetOffset;
 				}
 			};
@@ -1096,33 +1141,6 @@ export class MpegTsDemuxer extends Demuxer {
 
 			const hasSeenAllPrograms = () => hasProgramAssociationTable
 				&& [...programMapPids].every(pid => seenProgramMapPids.has(pid));
-
-			// When going back for the packets before the PMT: where to read on from and what to restore, should some of
-			// that data be gone after all (a source that only keeps what its cache holds evicts as it reads on)
-			let goingBack: {
-				resumePos: number;
-				streams: {
-					stream: ElementaryStream;
-					state: Pick<
-						ElementaryStream,
-						'initialized' | 'firstSection' | 'canBeTrustedWithKeyPackets' | 'info' | 'codecFromPayload'
-					>;
-				}[];
-				timestampWrapInfo: TimestampWrapInfo | null;
-			} | null = null;
-			const readOnFromPmt = (going: NonNullable<typeof goingBack>) => {
-				this.elementaryStreams.length = 0;
-				for (const { stream, state } of going.streams) {
-					this.elementaryStreams.push(Object.assign(stream, state));
-				}
-				this.timestampWrapInfo = going.timestampWrapInfo;
-				currentPos = going.resumePos;
-				goingBack = null;
-				readsOnFromPmt = true;
-			};
-			// Set when reading on from the PMT after all, which the cache may not hold anymore either (reading a
-			// stream's first frame can read far ahead)
-			let readsOnFromPmt = false;
 
 			while (true) {
 				if (privateDataProbeEndPos !== null && currentPos >= privateDataProbeEndPos) {
@@ -1670,20 +1688,7 @@ export class MpegTsDemuxer extends Demuxer {
 							this.elementaryStreams.some(x => !x.initialized)
 							&& await this.canReadAgain(this.packetOffset, currentPos)
 						) {
-							goingBack = {
-								resumePos: currentPos + this.packetStride,
-								streams: this.elementaryStreams.map(stream => ({
-									stream,
-									state: {
-										initialized: stream.initialized,
-										firstSection: stream.firstSection,
-										canBeTrustedWithKeyPackets: stream.canBeTrustedWithKeyPackets,
-										info: { ...stream.info },
-										codecFromPayload: stream.codecFromPayload,
-									},
-								})),
-								timestampWrapInfo: this.timestampWrapInfo,
-							};
+							goingBack = goBackFrom(currentPos + this.packetStride);
 							currentPos = this.packetOffset;
 							continue;
 						}
@@ -2389,10 +2394,13 @@ export class MpegTsDemuxer extends Demuxer {
 		};
 	}
 
-	/** Returns the first position from the given one on, in steps of TS packets, whose data can still be read. */
+	/**
+	 * Returns the first position from the given one on, in steps of TS packets, whose packet can still be read, with
+	 * the one before it (which reading a packet header checks too).
+	 */
 	async findReadablePos(pos: number) {
 		const step = 64 * this.packetStride;
-		while (!await this.canReadAgain(pos, pos + 1)) {
+		while (!await this.canReadAgain(Math.max(pos - this.packetStride, 0), pos + this.packetStride)) {
 			pos += step;
 		}
 
@@ -5858,6 +5866,20 @@ class PacketBuffer {
 		assert(this.reorderSize >= 0);
 	}
 
+	/** The median time between the buffered packets in presentation order, if there are any two. */
+	getBufferedFrameDuration() {
+		const gaps: number[] = [];
+		for (let i = 1; i < this.presentationOrderPackets.length; i++) {
+			const gap = this.presentationOrderPackets[i]!.pts - this.presentationOrderPackets[i - 1]!.pts;
+			if (gap > 0) {
+				gaps.push(gap);
+			}
+		}
+
+		gaps.sort((a, b) => a - b);
+		return gaps[Math.floor((gaps.length - 1) / 2)] ?? null;
+	}
+
 	async readNext(): Promise<{ packet: TimedSuppliedPacket; duration: number } | null> {
 		if (this.decodeOrderPackets.length === 0) {
 			// We need the next packet
@@ -5880,11 +5902,13 @@ class PacketBuffer {
 			// The packet has no known successor (or isn't even placed yet when timestamps are messed up). For video,
 			// whose frames may be reordered, the packets around it depend on where reading started, so use the
 			// track's frame duration (unless the stream's start, where it's measured, can't be read anymore, as from a
-			// source that keeps only what its cache holds and was read further first: then it's the heuristic). For
-			// audio, without a previous duration either (a lookup that only found this packet), take the one its data
-			// implies.
+			// source that keeps only what its cache holds and was read further first: then it's measured on the
+			// packets at hand, which a gap before the packet doesn't throw off as the last duration would). For audio,
+			// without a previous duration either (a lookup that only found this packet), take the one its data implies.
 			duration = this.backing.elementaryStream.info.type === 'video'
-				? await this.backing.getFrameDuration().catch(() => this.lastDuration || packet.intrinsicDuration)
+				? await this.backing.getFrameDuration().catch(() => {
+					return this.getBufferedFrameDuration() ?? (this.lastDuration || packet.intrinsicDuration);
+				})
 				: this.lastDuration || packet.intrinsicDuration; // Reasonable heuristic
 		} else {
 			const nextPacket = this.presentationOrderPackets[presentationIndex + 1]!;
