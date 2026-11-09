@@ -54,7 +54,6 @@ import {
 	parsePcmCodec,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
-	SubtitleCodec,
 	validateAudioChunkMetadata,
 	validateSubtitleMetadata,
 	validateVideoChunkMetadata,
@@ -603,12 +602,11 @@ export class IsobmffMuxer extends Muxer {
 			} else if (trackData.type === 'audio') {
 				return trackData.info.decoderConfig.codec;
 			} else {
-				const map: Record<SubtitleCodec, string> = {
-					webvtt: 'wvtt',
-				};
-				return map[trackData.track.source._codec];
+				// Subtitle codecs (like 'wvtt') stay out of the file's MIME type, as when reading it: Media Source
+				// Extensions, which the type is meant for, reject a type listing them
+				return null;
 			}
-		});
+		}).filter((x): x is string => x !== null);
 
 		return buildIsobmffMimeType({
 			isQuickTime: this.isQuickTime,

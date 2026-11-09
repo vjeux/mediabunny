@@ -1157,6 +1157,38 @@ test('At least one track is enabled even if all are added disabled', async () =>
 	expect((await tracks[1]!.getDisposition()).default).toBe(false);
 });
 
+test('MIME type leaves subtitle tracks out', async () => {
+	const getMimeType = async (withVideo: boolean) => {
+		const output = new Output({
+			format: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+			target: new BufferTarget(),
+		});
+
+		const video = new EncodedVideoPacketSource('vp9');
+		if (withVideo) {
+			output.addVideoTrack(video);
+		}
+		const subtitles = new TextSubtitleSource('webvtt');
+		output.addSubtitleTrack(subtitles);
+		await output.start();
+
+		if (withVideo) {
+			const packet = new EncodedPacket(new Uint8Array(1), 'key', 0, 1);
+			await video.add(packet, { decoderConfig: { codec: 'vp09.00.10.08', codedWidth: 64, codedHeight: 64 } });
+		}
+		await subtitles.add('WEBVTT\n\n00:00.200 --> 00:00.800\nHello\n');
+		await output.finalize();
+
+		return output.getMimeType();
+	};
+
+	// The type is meant for Media Source Extensions' addSourceBuffer(), which rejects a codecs list naming a subtitle
+	// track (Chrome: NotSupportedError), while it plays the same bytes, ignoring the track, without it. Reading the
+	// file back gives the type without it too.
+	expect(await getMimeType(true)).toBe('video/mp4; codecs="vp09.00.10.08"');
+	expect(await getMimeType(false)).toBe('application/mp4');
+});
+
 test('btrt boxes computed from packet sizes, regular MP4', async () => {
 	const bytes = await copyVideoMp4(new Mp4OutputFormat());
 	const boxes = findBtrtBoxes(bytes);
