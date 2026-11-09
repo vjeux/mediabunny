@@ -1240,3 +1240,44 @@ test('MOV reports that it takes no subtitle tracks', () => {
 		'MOV does not support subtitle tracks.',
 	);
 });
+
+test('ftyp lists the brands that AV1 tracks and roll sample groups require', async () => {
+	const getCompatibleBrands = async (fastStart: false | 'fragmented') => {
+		const target = new BufferTarget();
+		const output = new Output({ target, format: new Mp4OutputFormat({ fastStart }) });
+
+		const videoSource = new EncodedVideoPacketSource('av1');
+		output.addVideoTrack(videoSource);
+		const audioSource = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(audioSource);
+		await output.start();
+
+		await videoSource.add(new EncodedPacket(new Uint8Array(10), 'key', 0, 1), {
+			decoderConfig: { codec: 'av01.0.04M.08', codedWidth: 320, codedHeight: 240 },
+		});
+		for (let i = 0; i < 3; i++) {
+			await audioSource.add(new EncodedPacket(new Uint8Array([0xfc, 0, 0]), 'key', i * 0.02, 0.02), {
+				decoderConfig: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000 },
+			});
+		}
+		await output.finalize();
+
+		const view = toDataView(target.buffer!);
+		const size = view.getUint32(0);
+		const brands: string[] = [];
+		for (let pos = 16; pos < size; pos += 4) {
+			brands.push(String.fromCharCode(...new Uint8Array(target.buffer!, pos, 4)));
+		}
+		return brands;
+	};
+
+	// AV1-ISOBMFF: "It SHALL have the av01 brand among the compatible brands array of the FileTypeBox"
+	// Opus-in-ISOBMFF: roll groups need a brand supporting them, such as 'iso2'
+	const regular = await getCompatibleBrands(false);
+	expect(regular).toContain('av01');
+	expect(regular).toContain('iso2');
+
+	const fragmented = await getCompatibleBrands('fragmented');
+	expect(fragmented).toContain('av01');
+	expect(fragmented).toContain('iso6'); // Includes sample group support
+});
