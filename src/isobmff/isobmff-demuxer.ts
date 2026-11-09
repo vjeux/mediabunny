@@ -6054,7 +6054,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 					|| !vp9CodecInfoHasColorInfo(this.internalTrack.info.vp9CodecInfo)
 				)
 			) {
-				const firstPacket = await this.getFirstPacket({});
+				const firstPacket = await this.getFirstPacketForCodecInfo(!!this.internalTrack.info.vp9CodecInfo);
 				const packetInfo = firstPacket && extractVp9CodecInfoFromPacket(firstPacket.data);
 
 				if (packetInfo) {
@@ -6076,7 +6076,7 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 					)
 				)
 			) {
-				const firstPacket = await this.getFirstPacket({});
+				const firstPacket = await this.getFirstPacketForCodecInfo(!!this.internalTrack.info.av1CodecInfo);
 				const packetInfo = firstPacket && extractAv1CodecInfoFromPacket(firstPacket.data);
 
 				if (packetInfo) {
