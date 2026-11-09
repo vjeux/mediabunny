@@ -172,7 +172,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.pixelFormat = pixelFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, 1e6);
 		codecContext.gopSize = 60;
-		codecContext.framerate = new NodeAv.Rational(Math.round(this.config.framerate ?? 0) || 30, 1);
+		// SVT-AV1 refuses frame rates above 240 fps. The frame rate only informs rate control here (the timestamps come
+		// from the frames), so faster footage, like slow-motion recordings, is encoded as if at 240 fps
+		const frameRate = Math.round(this.config.framerate ?? 0) || 30;
+		codecContext.framerate = new NodeAv.Rational(
+			this.avCodec.name === 'libsvtav1' ? Math.min(frameRate, 240) : frameRate,
+			1,
+		);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate
 		// control mode
 		codecContext.bitRate = this.config.bitrateMode === 'quantizer'
