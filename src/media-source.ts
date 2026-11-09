@@ -2024,7 +2024,7 @@ export class VideoSampleSource extends VideoSource {
 		validateVideoEncodingConfig(encodingConfig);
 
 		super(encodingConfig.codec);
-		this._encoder = new VideoEncoderWrapper(this, encodingConfig);
+		this._encoder = new VideoEncoderWrapper(this, copyEncodingConfig(encodingConfig));
 	}
 
 	/**
@@ -2073,7 +2073,7 @@ export class CanvasSource extends VideoSource {
 		validateVideoEncodingConfig(encodingConfig);
 
 		super(encodingConfig.codec);
-		this._encoder = new VideoEncoderWrapper(this, encodingConfig);
+		this._encoder = new VideoEncoderWrapper(this, copyEncodingConfig(encodingConfig));
 		this._canvas = canvas;
 	}
 
@@ -2240,13 +2240,13 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 		}
 
 		encodingConfig = {
-			...encodingConfig,
+			...copyEncodingConfig(encodingConfig),
 			latencyMode: 'realtime',
 		};
 
 		super(encodingConfig.codec);
 
-		this._options = options;
+		this._options = { ...options };
 		this._encoder = new VideoEncoderWrapper(this, encodingConfig);
 		this._track = track;
 	}
@@ -2641,6 +2641,19 @@ export abstract class AudioSource extends MediaSource {
 		this._codec = codec;
 	}
 }
+
+/**
+ * Copies an encoding config along with its transform, so that sources built from one reused config keep their own
+ * settings, and changes made after the source validated it can't bypass the validation.
+ */
+const copyEncodingConfig = <T extends VideoEncodingConfig | AudioEncodingConfig>(config: T): T => {
+	const transform = config.transform && { ...config.transform };
+	if (transform && 'crop' in transform && transform.crop) {
+		transform.crop = { ...transform.crop };
+	}
+
+	return { ...config, transform };
+};
 
 /**
  * The most basic audio source; can be used to directly pipe encoded packets into the output file.
@@ -3767,7 +3780,7 @@ export class AudioSampleSource extends AudioSource {
 		validateAudioEncodingConfig(encodingConfig);
 
 		super(encodingConfig.codec);
-		this._encoder = new AudioEncoderWrapper(this, encodingConfig);
+		this._encoder = new AudioEncoderWrapper(this, copyEncodingConfig(encodingConfig));
 	}
 
 	/**
@@ -3829,7 +3842,7 @@ export class AudioBufferSource extends AudioSource {
 		}
 
 		super(encodingConfig.codec);
-		this._encoder = new AudioEncoderWrapper(this, encodingConfig);
+		this._encoder = new AudioEncoderWrapper(this, copyEncodingConfig(encodingConfig));
 		this._accumulatedTime = options.startTimestamp ?? 0;
 	}
 
@@ -3967,8 +3980,8 @@ export class MediaStreamAudioTrackSource extends AudioSource {
 		}
 
 		super(encodingConfig.codec);
-		this._options = options;
-		this._encoder = new AudioEncoderWrapper(this, encodingConfig);
+		this._options = { ...options };
+		this._encoder = new AudioEncoderWrapper(this, copyEncodingConfig(encodingConfig));
 		this._track = track;
 	}
 

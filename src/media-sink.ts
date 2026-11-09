@@ -2795,7 +2795,7 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		super();
 
 		this._track = videoTrack;
-		this._decoderOptions = decoderOptions;
+		this._decoderOptions = { ...decoderOptions }; // Copied, like CanvasSink's options
 	}
 
 	/** @internal */
@@ -3182,7 +3182,9 @@ export class CanvasSink {
 
 		this._videoTrack = videoTrack;
 		this._alpha = options.alpha ?? false;
-		this._options = options;
+		// Copied, so that sinks built from one reused options object keep their own settings, and later changes can't
+		// bypass the validation (the decoder options are copied by the VideoSampleSink)
+		this._options = { ...options, crop: options.crop && { ...options.crop } };
 		this._fit = options.fit ?? 'fill';
 		this._videoSampleSink = new VideoSampleSink(videoTrack, options.decoderOptions);
 		// The pool fills up as canvases are created, so a large pool size doesn't allocate anything up front
