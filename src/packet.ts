@@ -219,7 +219,10 @@ export class EncodedPacket {
 		chunk: EncodedVideoChunk | EncodedAudioChunk,
 		sideData?: EncodedPacketSideData,
 	): EncodedPacket {
-		if (!(chunk instanceof EncodedVideoChunk || chunk instanceof EncodedAudioChunk)) {
+		if (
+			!(typeof EncodedVideoChunk !== 'undefined' && chunk instanceof EncodedVideoChunk)
+			&& !(typeof EncodedAudioChunk !== 'undefined' && chunk instanceof EncodedAudioChunk)
+		) {
 			throw new TypeError('chunk must be an EncodedVideoChunk or EncodedAudioChunk.');
 		}
 
