@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_FORMATS, Input, FilePathSource } from '../../src/index.js';
+import { ALL_FORMATS, BufferSource, Input, FilePathSource } from '../../src/index.js';
 import { assert } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -126,4 +126,73 @@ test('MP3 duration metadata', async () => {
 	const audioTrack = await input.getPrimaryAudioTrack();
 	assert(audioTrack);
 	expect(await audioTrack.getDurationFromMetadata()).toBe(expectedDuration);
+});
+
+test('MP3 priming from an iTunes gapless comment', async () => {
+	// Apple's encoders write no LAME tag, but an iTunSMPB comment holding the priming (including the decoder delay),
+	// the end padding and the sample count, in hex
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const comment = [
+		0, // ISO-8859-1
+		...ascii('eng'),
+		...ascii('iTunSMPB'), 0,
+		...ascii(' 00000000 00000210 000003E0 0000000000002710'),
+	];
+	const frame = [...ascii('COMM'), 0, 0, 0, comment.length, 0, 0, ...comment];
+	const tag = [...ascii('ID3'), 3, 0, 0, 0, 0, 0, frame.length, ...frame];
+
+	// 10 silent MPEG-1 Layer III frames, 128 kbps at 44.1 kHz
+	const bytes = new Uint8Array(tag.length + 10 * 417);
+	bytes.set(tag);
+	for (let i = 0; i < 10; i++) {
+		bytes.set([0xff, 0xfb, 0x90, 0x00], tag.length + i * 417);
+	}
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	expect(await audioTrack.getFirstTimestamp()).toBe(-528 / 44100);
+	expect(await input.computeDuration()).toBe((10 * 1152 - 528) / 44100);
+});
+
+test('MP3 priming from an iTunes gapless comment in an ID3v2.4 tag with plain frame sizes', async () => {
+	// iTunes writes ID3v2.4 tags whose frame sizes aren't synchsafe. With a frame of 128 bytes or more (like cover art)
+	// in front of the iTunSMPB comment, reading its size as synchsafe would step into the middle of the frame.
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const picture = [0, ...ascii('image/png'), 0, 3, 0, ...Array.from({ length: 1000 }, (_, i) => (i * 7) & 0x7f)];
+	const comment = [
+		0, // ISO-8859-1
+		...ascii('eng'),
+		...ascii('iTunSMPB'), 0,
+		...ascii(' 00000000 00000210 000003E0 0000000000002710'),
+	];
+	const frames = [
+		...ascii('APIC'), ...u32(picture.length), 0, 0, ...picture,
+		...ascii('COMM'), ...u32(comment.length), 0, 0, ...comment,
+	];
+	const synchsafeSize = [
+		(frames.length >> 21) & 0x7f, (frames.length >> 14) & 0x7f, (frames.length >> 7) & 0x7f, frames.length & 0x7f,
+	];
+	const tag = [...ascii('ID3'), 4, 0, 0, ...synchsafeSize, ...frames];
+
+	// 10 silent MPEG-1 Layer III frames, 128 kbps at 44.1 kHz
+	const bytes = new Uint8Array(tag.length + 10 * 417);
+	bytes.set(tag);
+	for (let i = 0; i < 10; i++) {
+		bytes.set([0xff, 0xfb, 0x90, 0x00], tag.length + i * 417);
+	}
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(audioTrack);
+	expect(await audioTrack.getFirstTimestamp()).toBe(-528 / 44100);
 });
