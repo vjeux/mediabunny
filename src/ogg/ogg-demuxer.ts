@@ -636,7 +636,13 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			assert(firstPacketDurationInSamples !== null);
 
 			const startInSamples = firstEndPage.granulePosition - totalDurationInSamples;
-			if (firstEndPage.granulePosition !== -1 && !(firstEndPage.headerType & 0x04)) {
+			// A granule position of 0 isn't start trimming, though: some muxers write it on pages holding audio (FFmpeg
+			// trac #3710)
+			if (
+				firstEndPage.granulePosition !== -1
+				&& firstEndPage.granulePosition !== 0
+				&& !(firstEndPage.headerType & 0x04)
+			) {
 				return defaultTimestampInSamples + startInSamples;
 			}
 

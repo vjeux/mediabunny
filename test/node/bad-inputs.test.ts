@@ -1621,6 +1621,26 @@ test('Ogg: Start trimming in the first audio page\'s granule position', async ()
 	expect(trimmed.timestamps[100]).toBeCloseTo(original.timestamps[100]! - 0.5, 9);
 	expect(trimmed.end).toBeCloseTo(original.end - 0.5, 9);
 	expect(trimmed.duration).toBeCloseTo(trimmed.end, 9);
+
+	// A first audio page with granule position 0 isn't start trimming, though: some muxers write 0 on pages holding
+	// audio (FFmpeg trac #3710)
+	const zeroed = file.slice();
+	const zeroedView = new DataView(zeroed.buffer);
+	for (let pos = 0; pos < zeroed.length;) {
+		const segmentCount = zeroed[pos + 26]!;
+		const size = 27 + segmentCount + zeroed.subarray(pos + 27, pos + 27 + segmentCount).reduce((a, b) => a + b, 0);
+		if (zeroedView.getBigInt64(pos + 6, true) > 0n) {
+			zeroedView.setBigInt64(pos + 6, 0n, true);
+			zeroedView.setUint32(pos + 22, 0, true);
+			zeroedView.setUint32(pos + 22, oggCrc(zeroed.subarray(pos, pos + size)), true);
+			break;
+		}
+		pos += size;
+	}
+
+	const zeroedRead = await read(zeroed);
+	expect(zeroedRead.timestamps[0]).toBeGreaterThan(-0.01);
+	expect(zeroedRead.end).toBeCloseTo(original.end, 2);
 });
 
 const opusHead = () => concat(ascii('OpusHead'), [1, 2], u16le(312), u32le(48000), u16le(0), [0]);
