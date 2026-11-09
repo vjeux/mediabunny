@@ -211,8 +211,13 @@ test.each([
 	// The codec string stays exact, but decoding mustn't depend on the browser knowing every color value in it
 	expect((await track.getDecoderConfig())!.codec).toBe(codecString);
 	expect(await track.canDecode()).toBe(true);
-	expect(await canDecodeVideo((await track.getCodec())!, { codec: codecString, codedWidth: 64, codedHeight: 64 }))
-		.toBe(true);
+	const codec = (await track.getCodec())!;
+	expect(await canDecodeVideo(codec, { codec: codecString, codedWidth: 64, codedHeight: 64 })).toBe(true);
+
+	// But a codec string the browser rejects for something else (here an extra field) stays rejected
+	const malformed = { codec: `${codecString}.0`, codedWidth: 64, codedHeight: 64 };
+	const support = await VideoDecoder.isConfigSupported(malformed);
+	expect(await canDecodeVideo(codec, malformed)).toBe(!!support.supported);
 
 	let count = 0;
 	for await (using sample of new VideoSampleSink(track).samples()) {

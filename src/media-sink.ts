@@ -13,7 +13,7 @@ import {
 	VideoCodec,
 	AudioCodec,
 	OPUS_SAMPLE_RATE,
-	shortenAv1OrVp9CodecString,
+	setAv1OrVp9ColorsToBt709,
 } from './codec';
 import {
 	addAvcBitstreamRestriction,
@@ -1940,10 +1940,11 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 
 		const trackDecoderConfig = decoderConfig;
 		if (
-			shortenAv1OrVp9CodecString(trackDecoderConfig.codec) !== null
+			setAv1OrVp9ColorsToBt709(trackDecoderConfig.codec) !== null
 			&& !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))
 		) {
-			// The browser's decoder may only take the codec string's short form (see getNativeVideoDecoderConfig)
+			// The browser's decoder may only take the short form of a codec string with color values other than
+			// BT.709's (see getNativeVideoDecoderConfig)
 			decoderConfig = (await getNativeVideoDecoderConfig(trackDecoderConfig)) ?? trackDecoderConfig;
 		}
 

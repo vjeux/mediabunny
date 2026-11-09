@@ -745,6 +745,21 @@ export const shortenAv1OrVp9CodecString = (codecString: string) => {
 	return (fields[0] === 'av01' || fields[0] === 'vp09') && fields.length > 4 ? fields.slice(0, 4).join('.') : null;
 };
 
+/**
+ * An AV1 or VP9 codec string with ITU-R BT.709's color primaries, transfer characteristics and matrix coefficients in
+ * place of its own, or null if it has none or they're BT.709's already.
+ */
+export const setAv1OrVp9ColorsToBt709 = (codecString: string) => {
+	const fields = codecString.split('.');
+	const primariesIndex = fields[0] === 'av01' ? 6 : fields[0] === 'vp09' ? 5 : null; // Transfer and matrix follow
+	if (primariesIndex === null) {
+		return null;
+	}
+
+	const result = fields.map((field, i) => i >= primariesIndex && i < primariesIndex + 3 ? '01' : field).join('.');
+	return result === codecString ? null : result;
+};
+
 export const buildAudioCodecString = (codec: AudioCodec, numberOfChannels: number, sampleRate: number) => {
 	if (codec === 'aac') {
 		// If stereo or higher channels and lower sample rate, likely using HE-AAC v2 with PS
