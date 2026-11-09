@@ -739,28 +739,10 @@ export const extractColorSpace = (info: {
 	};
 };
 
-/**
- * Chromium rejects AV1 and VP9 codec strings whose color fields hold a value missing from its color space tables (see
- * VideoColorSpace::GetPrimaryID, GetTransferID and GetMatrixID in media/base/video_color_space.cc): of the values
- * ISO/IEC 23091-2 defines, primaries 0, 3 and 13 to 21, transfer characteristics 0 and 3, and matrix coefficients 10
- * (BT.2020 constant luminance) and 12 to 14 (chromaticity-derived and ICtCp). Its decoders take the color space from
- * the bitstream and the decoder config anyway, so for Chromium, such a codec string drops its optional fields.
- */
-export const toChromiumCompatibleColorCodecString = (codecString: string) => {
+/** The short form of an AV1 or VP9 codec string (its first four fields, up to the bit depth), or null if it is one. */
+export const shortenAv1OrVp9CodecString = (codecString: string) => {
 	const fields = codecString.split('.');
-	const primariesIndex = fields[0] === 'av01' ? 6 : fields[0] === 'vp09' ? 5 : null; // Transfer and matrix follow
-	if (primariesIndex === null || fields.length < primariesIndex + 3) {
-		return codecString;
-	}
-
-	const primaries = Number(fields[primariesIndex]);
-	const transfer = Number(fields[primariesIndex + 1]);
-	const matrix = Number(fields[primariesIndex + 2]);
-	const supported = ((primaries >= 1 && primaries <= 12 && primaries !== 3) || primaries === 22)
-		&& transfer >= 1 && transfer <= 18 && transfer !== 3
-		&& matrix >= 0 && matrix <= 11 && matrix !== 3 && matrix !== 10;
-
-	return supported ? codecString : fields.slice(0, 4).join('.');
+	return (fields[0] === 'av01' || fields[0] === 'vp09') && fields.length > 4 ? fields.slice(0, 4).join('.') : null;
 };
 
 export const buildAudioCodecString = (codec: AudioCodec, numberOfChannels: number, sampleRate: number) => {

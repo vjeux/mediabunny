@@ -11,6 +11,7 @@ import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack } from '../../src/input-track.js';
+import { canDecodeVideo } from '../../src/decode.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -200,7 +201,7 @@ test.each([
 	// The same with -vf format=yuv420p,setparams=colorspace=bt2020c:color_primaries=bt2020:color_trc=bt2020-10:range=tv
 	//   -c:v libvpx-vp9 -b:v 100k -colorspace bt2020c -color_primaries bt2020 -color_trc bt2020-10 vp9-bt2020-cl.mp4
 	['/vp9-bt2020-cl.mp4', 'vp09.00.10.08.01.09.14.10.00'], // BT.2020 constant-luminance matrix (10)
-])('Decoding %s, whose codec string has a color value Chromium rejects', async (path, codecString) => {
+])('Decoding %s, whose codec string has a color value browsers reject', async (path, codecString) => {
 	using input = new Input({
 		source: new UrlSource(path),
 		formats: ALL_FORMATS,
@@ -210,6 +211,8 @@ test.each([
 	// The codec string stays exact, but decoding mustn't depend on the browser knowing every color value in it
 	expect((await track.getDecoderConfig())!.codec).toBe(codecString);
 	expect(await track.canDecode()).toBe(true);
+	expect(await canDecodeVideo((await track.getCodec())!, { codec: codecString, codedWidth: 64, codedHeight: 64 }))
+		.toBe(true);
 
 	let count = 0;
 	for await (using sample of new VideoSampleSink(track).samples()) {

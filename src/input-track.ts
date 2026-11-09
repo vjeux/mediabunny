@@ -12,18 +12,17 @@ import {
 	getAudioPreRollDuration,
 	MediaCodec,
 	PCM_AUDIO_CODECS,
-	toChromiumCompatibleColorCodecString,
 	VideoCodec,
 } from './codec';
 import { determineAudioPacketType, determineVideoPacketType } from './codec-data';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
+import { getNativeVideoDecoderConfig } from './decode';
 import { Input } from './input';
 import { Logging } from './logging';
 import { EncodedPacketSink, PacketRetrievalOptions } from './media-sink';
 import {
 	assert,
 	extractRotationFromMatrix,
-	isChromium,
 	isNumber,
 	isThenable,
 	matrixIsFlipped,
@@ -877,12 +876,7 @@ export class InputVideoTrack extends InputTrack {
 				return false;
 			}
 
-			const support = await VideoDecoder.isConfigSupported(
-				isChromium()
-					? { ...decoderConfig, codec: toChromiumCompatibleColorCodecString(decoderConfig.codec) }
-					: decoderConfig,
-			);
-			return support.supported === true;
+			return (await getNativeVideoDecoderConfig(decoderConfig)) !== null;
 		} catch (error) {
 			Logging._error('Error during decodability check:', error);
 			return false;

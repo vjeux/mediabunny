@@ -13,7 +13,7 @@ import {
 	VideoCodec,
 	AudioCodec,
 	OPUS_SAMPLE_RATE,
-	toChromiumCompatibleColorCodecString,
+	shortenAv1OrVp9CodecString,
 } from './codec';
 import {
 	addAvcBitstreamRestriction,
@@ -33,6 +33,7 @@ import {
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
+import { getNativeVideoDecoderConfig } from './decode';
 import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
 import {
 	AnyIterable,
@@ -1073,11 +1074,6 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 						},
 					};
 				}
-
-				this.decoderConfig = {
-					...this.decoderConfig,
-					codec: toChromiumCompatibleColorCodecString(this.decoderConfig.codec),
-				};
 			}
 
 			const stack = new Error('Decoding error').stack;
@@ -1941,6 +1937,15 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		let decoderConfig = await this._track.getDecoderConfig();
 		const timeResolution = await this._track.getTimeResolution();
 		assert(codec && decoderConfig);
+
+		const trackDecoderConfig = decoderConfig;
+		if (
+			shortenAv1OrVp9CodecString(trackDecoderConfig.codec) !== null
+			&& !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))
+		) {
+			// The browser's decoder may only take the codec string's short form (see getNativeVideoDecoderConfig)
+			decoderConfig = (await getNativeVideoDecoderConfig(trackDecoderConfig)) ?? trackDecoderConfig;
+		}
 
 		decoderConfig = {
 			...decoderConfig,

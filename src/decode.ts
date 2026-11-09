@@ -16,6 +16,7 @@ import {
 	inferCodecFromCodecString,
 	MediaCodec,
 	PCM_AUDIO_CODECS,
+	shortenAv1OrVp9CodecString,
 	VIDEO_CODECS,
 	VideoCodec,
 } from './codec';
@@ -122,6 +123,29 @@ export const canDecode = (codec: MediaCodec) => {
 };
 
 /**
+ * The decoder config to give the browser's VideoDecoder, or null if it doesn't decode it. Browsers reject AV1 and VP9
+ * codec strings whose optional fields hold color values they don't know (Chromium: primaries 0, 3 and 13 to 21,
+ * transfer characteristics 0 and 3, and matrix coefficients 10 and 12 to 14; Firefox: VP9's matrix coefficients 12 and
+ * 14), though their decoders decode such streams, taking the color space from the bitstream and the decoder config.
+ * So when the browser rejects such a codec string but takes its short form, the decoder gets the short form.
+ */
+export const getNativeVideoDecoderConfig = async (decoderConfig: VideoDecoderConfig) => {
+	if ((await VideoDecoder.isConfigSupported(decoderConfig)).supported === true) {
+		return decoderConfig;
+	}
+
+	const shortCodecString = shortenAv1OrVp9CodecString(decoderConfig.codec);
+	if (shortCodecString !== null) {
+		const shortDecoderConfig = { ...decoderConfig, codec: shortCodecString };
+		if ((await VideoDecoder.isConfigSupported(shortDecoderConfig)).supported === true) {
+			return shortDecoderConfig;
+		}
+	}
+
+	return null;
+};
+
+/**
  * Checks if the browser is able to decode the given video codec with the given parameters.
  * @group Decoding
  * @public
@@ -158,8 +182,7 @@ export const canDecodeVideo = async (
 			return false;
 		}
 
-		const support = await VideoDecoder.isConfigSupported(resolvedOptions);
-		return support.supported === true;
+		return (await getNativeVideoDecoderConfig(resolvedOptions)) !== null;
 	})();
 	canDecodeVideoMemo.set(key, promise);
 
