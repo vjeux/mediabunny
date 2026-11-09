@@ -800,8 +800,9 @@ export class HlsDemuxer extends Demuxer {
 		assert(this.internalTracks);
 
 		// Prefer the cheapest video track, since video timestamps are straightforward and its segments are
-		// cheap to load
-		const candidates = this.internalTracks.filter(x => !x.hasOnlyKeyPackets);
+		// cheap to load. I-frame variants are a last resort.
+		const regularTracks = this.internalTracks.filter(x => !x.hasOnlyKeyPackets);
+		const candidates = regularTracks.length > 0 ? regularTracks : this.internalTracks;
 		const videoCandidates = candidates.filter(x => x.info.type === 'video');
 		const pool = videoCandidates.length > 0 ? videoCandidates : candidates;
 		const index = arrayArgmin(pool, x => x.peakBitrate ?? Infinity);
