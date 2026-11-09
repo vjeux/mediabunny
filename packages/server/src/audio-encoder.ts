@@ -46,6 +46,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 	inputParametersKey: string | null = null;
 	resamplerInputSampleRate: number | null = null;
 	nextResamplerPts: bigint | null = null;
+	inputEndPts: bigint | null = null;
 	packetEmitted = false;
 	adtsHeaderTemplate: AdtsHeaderTemplate | null = null;
 
@@ -280,8 +281,19 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			return;
 		}
 
+		let durationInSamples = Number(this.packet.duration);
+		if (this.inputEndPts !== null) {
+			// Leave out the silence that filled up the last frame
+			const samplesInInput = Number(this.inputEndPts - this.packet.pts);
+			if (samplesInInput <= 0) {
+				return;
+			}
+
+			durationInSamples = Math.min(durationInSamples, samplesInInput);
+		}
+
 		const timestamp = Number(this.packet.pts) / this.codecContext.sampleRate;
-		const duration = Number(this.packet.duration) / this.codecContext.sampleRate;
+		const duration = durationInSamples / this.codecContext.sampleRate;
 
 		let data: Uint8Array = this.packet.data;
 
@@ -374,6 +386,8 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 		outer:
 		if (this.resampler) {
 			assert(this.resamplerInputSampleRate !== null);
+			assert(this.dstFrame);
+			assert(this.nextResamplerPts !== null);
 
 			const currentOutSamples = this.resampler.getOutSamples(0);
 			if (currentOutSamples === 0) {
@@ -382,6 +396,44 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 			const frameSize = this.codecContext.frameSize || FRAME_SIZE_FALLBACK;
 			assert(currentOutSamples < frameSize); // Because if it's more, it would've already been retrieved
+
+			// Silence filling up the last frame would become part of the decoded audio, so the encoder gets a
+			// shorter last frame instead. Unless the whole track is one frame of fewer than 16 samples: FLAC doesn't
+			// allow blocks that short (RFC 9639, section 8.2), and FFmpeg rejects such a stream.
+			const isLossless = this.codec === 'flac' || this.codec === 'truehd';
+			if (
+				isLossless
+				&& this.avCodec.capabilities & NodeAv.AV_CODEC_CAP_SMALL_LAST_FRAME
+				&& (this.packetEmitted || currentOutSamples >= 16)
+			) {
+				while (true) {
+					const samples = await this.resampler.convert(this.dstFrame.data, frameSize, null, 0);
+					NodeAv.FFmpegError.throwIfError(samples, 'convert');
+					if (samples === 0) {
+						break;
+					}
+
+					this.dstFrame.nbSamples = samples;
+					this.dstFrame.duration = BigInt(samples);
+					this.dstFrame.pts = this.nextResamplerPts;
+
+					await this.sendFrameAndReceivePackets(this.dstFrame);
+					this.nextResamplerPts += BigInt(samples);
+
+					if (samples < frameSize) {
+						break;
+					}
+				}
+
+				break outer;
+			}
+
+			// The silence that fills up the last frame isn't part of the audio, so the packets must end where the
+			// input does. Except when no packet has come out yet: such a short track could end up as one shortened
+			// packet, whose audio FFmpeg misplaces in MP4.
+			if (this.packetEmitted) {
+				this.inputEndPts = this.nextResamplerPts + BigInt(currentOutSamples);
+			}
 
 			const inputSamplesNeeded = Math.ceil(
 				((frameSize - currentOutSamples) / this.codecContext.sampleRate) * this.resamplerInputSampleRate,
@@ -395,6 +447,7 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 
 		this.codecContext.freeContext();
 		this.codecContext = null;
+		this.inputEndPts = null;
 		this.packetEmitted = false;
 		this.adtsHeaderTemplate = null;
 
