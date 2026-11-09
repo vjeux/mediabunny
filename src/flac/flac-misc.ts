@@ -153,7 +153,7 @@ export const readSampleRate = (
 	}
 
 	if (sampleRateOrUncommon === 'uncommon-u8') {
-		return readU8(slice);
+		return 1000 * readU8(slice);
 	}
 
 	if (typeof sampleRateOrUncommon === 'number') {
