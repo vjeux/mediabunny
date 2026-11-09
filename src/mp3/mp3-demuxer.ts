@@ -204,7 +204,10 @@ export class Mp3Demuxer extends Demuxer {
 					this.reader,
 					this.lastLoadedPos,
 					this.searchEndPos,
-					this.firstFrameHeader,
+					// A Xing/Info frame is a frame of the stream, so the first audio frame has to match it. Otherwise a
+					// damaged first frame whose data looks like a frame of other parameters would make every real
+					// frame not match.
+					this.firstFrameHeader ?? this.xingFrameHeader,
 				)
 				: await readFirstMp3FrameHeader(
 					this.reader,
