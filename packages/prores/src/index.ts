@@ -239,6 +239,17 @@ class ProresDecoder extends CustomVideoDecoder {
 			bytesPerSample * (lumaVisiblePixels + chromaVisiblePixels),
 		);
 
+		if (result.pixelFormat.includes('A')) {
+			// A
+			result.frameData.set(
+				result.frameData.subarray(
+					bytesPerSample * (lumaCodedPixels + 2 * chromaCodedPixels),
+					bytesPerSample * (2 * lumaCodedPixels + 2 * chromaCodedPixels),
+				),
+				bytesPerSample * (lumaVisiblePixels + 2 * chromaVisiblePixels),
+			);
+		}
+
 		result.codedHeight = result.visibleHeight;
 	}
 
