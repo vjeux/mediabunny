@@ -683,6 +683,7 @@ const source = new UrlSource('https://example.com/bigbuckbunny.mp4', {
 Not setting `getRetryDelay` will lead to the default being used:
 - Exponential backoff pattern, capped at 16 seconds: indefinitely when `fetch()` rejects, and up to 5 times for a request answered with an HTTP status that may be transient (408, 429, 500, 502, 503 or 504; the error passed to `getRetryDelay` then has a `status` property).  
 - If a CORS error is suspected (`fetch()` did reject even though `navigator.onLine` is true and origin is different), no further retries will be made.
+- Requests for `blob:`, `data:` and `file:` URLs are never retried, since they don't touch the network and retrying can't fix their failures (such as a revoked object URL).
 
 ::: warning
 The default only compares the origin of the URL you pass with your own. If a URL of the same origin redirects to another origin whose server doesn't allow cross-origin requests (a presigned object storage URL, say), `fetch()` fails just like it does on a network error, and the default keeps retrying forever. If your URLs may redirect like that, pass a `getRetryDelay` that gives up after some failed attempts:
