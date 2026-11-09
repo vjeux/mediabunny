@@ -294,16 +294,21 @@ export class MatroskaMuxer extends Muxer {
 						},
 					] }
 				: null,
-			{ id: EBMLId.Seek, data: [
-				{ id: EBMLId.SeekID, data: kaxCues },
-				{
-					id: EBMLId.SeekPosition,
-					size: 5,
-					data: writeOffsets
-						? this.ebmlWriter.offsets.get(this.cues!)! - this.segmentDataOffset
-						: 0,
-				},
-			] },
+			writeOffsets && !this.ebmlWriter.offsets.has(this.cues!)
+				// No Cues were written (no block was), so their entry becomes a Void element of the same size, keeping
+				// the SeekHead's size: 21 bytes (a 1-byte ID, a 4-byte size and 16 bytes, where the entry has a 2-byte
+				// ID, a 4-byte size and 15 bytes)
+				? { id: EBMLId.Void, size: 4, data: new Uint8Array(16) }
+				: { id: EBMLId.Seek, data: [
+						{ id: EBMLId.SeekID, data: kaxCues },
+						{
+							id: EBMLId.SeekPosition,
+							size: 5,
+							data: writeOffsets
+								? this.ebmlWriter.offsets.get(this.cues!)! - this.segmentDataOffset
+								: 0,
+						},
+					] },
 		] };
 		this.seekHead = seekHead;
 	}
@@ -1484,12 +1489,18 @@ export class MatroskaMuxer extends Muxer {
 		// Flush any remaining queued chunks to the file
 		await this.interleaveChunks(true);
 
-		if (this.currentClusterStartMsTimestamp !== null) {
-			this.writeCurrentCluster();
+		if (this.currentClusterStartMsTimestamp === null) {
+			// Without any block (like when all cues of a subtitle track were dropped), an empty cluster is written:
+			// readers like FFmpeg's read the segment up to its first cluster and fail to open a file without one
+			this.startNewCluster(0);
 		}
+		this.writeCurrentCluster();
 
 		assert(this.cues);
-		this.ebmlWriter.writeEBML(this.cues);
+		if ((this.cues.data as EBML[]).length > 0) {
+			// A Cues element must hold at least one CuePoint, so there's none without blocks
+			this.ebmlWriter.writeEBML(this.cues);
+		}
 
 		if (!this.format._options.appendOnly) {
 			// Write the Segment size

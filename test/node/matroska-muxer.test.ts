@@ -7,7 +7,7 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource, TextSubtitleSource } from '../../src/media-source.js';
@@ -288,4 +288,79 @@ test('WebVTT cues that don\'t end after they start aren\'t written to Matroska',
 		[1000, 1000, 'A'],
 		[4000, 1000, 'B'],
 	]);
+});
+
+test('Matroska output whose subtitle cues were all dropped is still a valid file', async () => {
+	// The level-1 elements of a Matroska file: [ID, position in the segment, children's IDs]
+	const readSegment = (bytes: Uint8Array) => {
+		const readVint = (pos: number, keepMarker: boolean) => {
+			const first = bytes[pos]!;
+			const length = Math.clz32(first) - 23;
+			let value = keepMarker ? first : first & (0xff >> length);
+			for (let i = 1; i < length; i++) {
+				value = value * 256 + bytes[pos + i]!;
+			}
+			// An all-ones size is unknown, running to the end of the parent
+			const unknown = !keepMarker && value === 2 ** (7 * length) - 1;
+			return { value: unknown ? Infinity : value, length };
+		};
+		const children = (start: number, end: number) => {
+			const result: { id: number; start: number; dataStart: number; end: number }[] = [];
+			for (let pos = start; pos < end;) {
+				const id = readVint(pos, true);
+				const size = readVint(pos + id.length, false);
+				const dataStart = pos + id.length + size.length;
+				result.push({ id: id.value, start: pos, dataStart, end: Math.min(dataStart + size.value, end) });
+				pos = Math.min(dataStart + size.value, end);
+			}
+			return result;
+		};
+
+		const readUint = (element: { dataStart: number; end: number }) => {
+			return bytes.subarray(element.dataStart, element.end).reduce((value, byte) => value * 256 + byte, 0);
+		};
+
+		const segment = children(0, bytes.length).find(x => x.id === EBMLId.Segment)!;
+		return children(segment.dataStart, segment.end).map((element) => {
+			const childIds = element.id === EBMLId.Cluster && element.end === bytes.length
+				? [] // Unknown-size cluster at the end (appendOnly)
+				: children(element.dataStart, element.end).map(x => x.id);
+			const seekTargets = element.id === EBMLId.SeekHead
+				? children(element.dataStart, element.end).filter(x => x.id === EBMLId.Seek).map((seek) => {
+						const [seekId, seekPosition] = children(seek.dataStart, seek.end);
+						return [readUint(seekId!), segment.dataStart + readUint(seekPosition!)];
+					})
+				: [];
+			return { id: element.id, start: element.start, childIds, seekTargets };
+		});
+	};
+
+	for (const format of [new MkvOutputFormat(), new WebMOutputFormat(), new MkvOutputFormat({ appendOnly: true })]) {
+		const output = new Output({ format, target: new BufferTarget() });
+		const source = new TextSubtitleSource('webvtt');
+		output.addSubtitleTrack(source);
+		await output.start();
+		await source.add('WEBVTT\n\n00:01.000 --> 00:01.000\nZero\n');
+		source.close();
+		await output.finalize();
+
+		const bytes = new Uint8Array(output.target.buffer!);
+		const elements = readSegment(bytes);
+
+		// The track is described although it has no blocks
+		expect(elements.find(x => x.id === EBMLId.Tracks)!.childIds).toEqual([EBMLId.TrackEntry]);
+		// Readers like FFmpeg's read the segment up to its first cluster, and fail to open a file without one
+		expect(elements.some(x => x.id === EBMLId.Cluster)).toBe(true);
+		// A Cues element must hold at least one CuePoint
+		for (const cues of elements.filter(x => x.id === EBMLId.Cues)) {
+			expect(cues.childIds.length).toBeGreaterThan(0);
+		}
+		// Every SeekHead entry points at an element with its ID
+		for (const [seekId, position] of elements.flatMap(x => x.seekTargets)) {
+			expect(elements.find(x => x.start === position)?.id).toBe(seekId);
+		}
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		expect(await input.getMimeType()).toMatch(/x-matroska|webm/);
+	}
 });
