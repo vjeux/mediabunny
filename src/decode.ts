@@ -138,6 +138,7 @@ export const getNativeVideoDecoderConfig = async (decoderConfig: VideoDecoderCon
 		if (record && record.sequenceParameterSets.length > 0 && record.pictureParameterSets.length > 0) {
 			const avc1DecoderConfig = { ...decoderConfig, codec: 'avc1' + decoderConfig.codec.slice(4) };
 			if ((await VideoDecoder.isConfigSupported(avc1DecoderConfig)).supported === true) {
+				nativeCodecStrings.set(decoderConfig.codec, avc1DecoderConfig.codec);
 				return avc1DecoderConfig;
 			}
 		}
@@ -159,12 +160,20 @@ export const getNativeAudioDecoderConfig = async (decoderConfig: AudioDecoderCon
 	if (decoderConfig.codec === 'mp4a.67') {
 		const mpeg4DecoderConfig = { ...decoderConfig, codec: 'mp4a.40.2' };
 		if ((await AudioDecoder.isConfigSupported(mpeg4DecoderConfig)).supported === true) {
+			nativeCodecStrings.set(decoderConfig.codec, mpeg4DecoderConfig.codec);
 			return mpeg4DecoderConfig;
 		}
 	}
 
 	return null;
 };
+
+/**
+ * The codec strings for which getNativeVideoDecoderConfig() or getNativeAudioDecoderConfig() gave an equivalent one,
+ * with that one, so that the decoder for a track whose decodability was checked can take it without asking the browser
+ * again.
+ */
+export const nativeCodecStrings = new Map<string, string>();
 
 /**
  * Checks if the browser is able to decode the given video codec with the given parameters.
