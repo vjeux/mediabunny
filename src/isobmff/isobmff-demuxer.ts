@@ -48,6 +48,9 @@ import {
 	extractHevcDecoderConfigurationRecord,
 	deserializeAvcDecoderConfigurationRecord,
 	deserializeHevcDecoderConfigurationRecord,
+	extractNalUnitTypeForHevc,
+	iterateHevcNalUnits,
+	serializeHevcDecoderConfigurationRecord,
 	HevcNalUnitType,
 	parseAvcSps,
 	parseHevcSps,
@@ -3747,6 +3750,51 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				const firstPacket = await this.getFirstPacket({});
 				this.internalTrack.info.hevcCodecInfo
 					= firstPacket && extractHevcDecoderConfigurationRecord(firstPacket.data);
+			} else if (this.internalTrack.info.codec === 'hevc') {
+				// 'hev1' tracks may carry their parameter sets in-band only, with none in the hvcC box (ISO/IEC
+				// 14496-15), but decoders want them in the description, or else they can only start decoding at a
+				// sample that has them, and the color space comes from the SPS. So the kinds the hvcC box lacks are
+				// taken from the first sample.
+				const description = this.internalTrack.info.codecDescription!;
+				const record = deserializeHevcDecoderConfigurationRecord(description);
+				const parameterSetTypes = [HevcNalUnitType.VPS_NUT, HevcNalUnitType.SPS_NUT, HevcNalUnitType.PPS_NUT];
+				const missingTypes = parameterSetTypes.filter(
+					type => !record?.arrays.some(x => x.nalUnitType === type && x.nalUnits.length > 0),
+				);
+
+				if (record && missingTypes.length > 0) {
+					const firstPacket = await this.getFirstPacketForCodecInfo(true);
+					const data = firstPacket?.data ?? new Uint8Array(0);
+					const addedArrays = missingTypes.map(nalUnitType => ({
+						arrayCompleteness: 0, // More of them can follow in-band
+						nalUnitType: nalUnitType as number,
+						nalUnits: [] as Uint8Array[],
+					}));
+
+					for (const { offset, length } of iterateHevcNalUnits(data, { codec: 'hev1', description })) {
+						const nalUnit = data.subarray(offset, offset + length);
+						const type = extractNalUnitTypeForHevc(nalUnit[0] ?? 0);
+						const array = addedArrays.find(x => x.nalUnitType === type);
+						if (array && array.nalUnits.length < 0xffff) {
+							array.nalUnits.push(nalUnit);
+						}
+					}
+
+					if (addedArrays.every(x => x.nalUnits.length > 0)) {
+						// The parameter sets first, in the usual order, then the rest (such as SEI) as they were
+						const rank = (type: number) => {
+							const index = parameterSetTypes.indexOf(type);
+							return index === -1 ? parameterSetTypes.length : index;
+						};
+						const arrays = [
+							...record.arrays.filter(x => !missingTypes.includes(x.nalUnitType)),
+							...addedArrays,
+						].sort((a, b) => rank(a.nalUnitType) - rank(b.nalUnitType));
+
+						this.internalTrack.info.codecDescription
+							= serializeHevcDecoderConfigurationRecord({ ...record, arrays });
+					}
+				}
 			} else if (
 				this.internalTrack.info.codec === 'vp9'
 				&& (
@@ -3817,6 +3865,23 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 
 			return config;
 		})();
+	}
+
+	/**
+	 * The first packet, from which the codec info of the sample entry is completed or refined. An encrypted track's
+	 * packets can't be read without its key: then, if the sample entry has codec info (hasCodecInfo), null is
+	 * returned, and that info is used as it is, as metadata calls don't need the key.
+	 */
+	private async getFirstPacketForCodecInfo(hasCodecInfo: boolean) {
+		try {
+			return await this.getFirstPacket({});
+		} catch (error) {
+			if (hasCodecInfo && this.internalTrack.encryptionInfo) {
+				return null;
+			}
+
+			throw error;
+		}
 	}
 }
 
