@@ -83,6 +83,7 @@ export class SubtitleParser {
 			text = this.pendingText + text;
 		}
 
+		const cues: SubtitleCue[] = [];
 		while ((match = cueBlockHeaderRegex.exec(text))) {
 			const notes = text.slice(0, match.index);
 			const cueIdentifier = match[1];
@@ -123,7 +124,15 @@ export class SubtitleParser {
 				settings: cueSettings,
 				notes,
 			};
+			cues.push(cue);
+		}
 
+		// The WebVTT parser takes cues in any order, but outputs need them in order of their start times. Each cue
+		// lies within one chunk of text, so its cues can be put in order; the sort is stable, so cues starting at the
+		// same time keep their order.
+		cues.sort((a, b) => a.timestamp - b.timestamp);
+
+		for (const cue of cues) {
 			const meta: SubtitleMetadata = {};
 			if (!this.preambleEmitted) {
 				meta.config = {
