@@ -516,6 +516,13 @@ export class OggDemuxer extends Demuxer {
 		};
 	}
 
+	/**
+	 * For the end positions of pages after which the next page of the same bitstream comes only much later (or never),
+	 * that next page. A bitstream that ends before the others (or pauses) would otherwise make every lookup past its
+	 * end scan all the pages of the other bitstreams in between again.
+	 */
+	nextPagesAfterGaps = new Map<number, Page | null>();
+
 	async findNextPacketStart(lastPacket: Packet) {
 		let position = await this.findNextPacketStartIncludingHeaders(lastPacket);
 
@@ -573,12 +580,19 @@ export class OggDemuxer extends Demuxer {
 		}
 
 		// Otherwise, search for the next page belonging to the same bitstream
-		const nextPage = await this.readNextPage(lastPacket.endPage);
-		if (!nextPage) {
-			return null;
+		const startPos = lastPacket.endPage.headerStartPos + lastPacket.endPage.totalSize;
+		let nextPage = this.nextPagesAfterGaps.get(startPos);
+		if (nextPage === undefined) {
+			nextPage = await this.readNextPage(lastPacket.endPage);
+
+			// Only the long scans are remembered, which keeps this small
+			const scanEnd = nextPage?.headerStartPos ?? this.reader.fileSize ?? startPos;
+			if (scanEnd - startPos > MAX_PAGE_SIZE) {
+				this.nextPagesAfterGaps.set(startPos, nextPage);
+			}
 		}
 
-		return { startPage: nextPage, startSegmentIndex: 0 };
+		return nextPage && { startPage: nextPage, startSegmentIndex: 0 };
 	}
 
 	/** Whether the page's checksum matches. Only checked where reading on past garbage, as that's rare. */
