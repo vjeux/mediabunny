@@ -28,7 +28,10 @@ type SubtitleParserOptions = {
 	output: (cue: SubtitleCue, metadata: SubtitleMetadata) => unknown;
 };
 
-const cueBlockHeaderRegex = /(?:(.+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/g;
+// An identifier is the line before a timing line, so it's only looked for at the start of a line (multiline ^).
+// Otherwise, every position of a long line of text before a cue would start an identifier reaching to the end of that
+// line, which makes the search quadratic.
+const cueBlockHeaderRegex = /(?:^(.+?)\n)?((?:\d{2}:)?\d{2}:\d{2}.\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}.\d{3})/gm;
 const preambleStartRegex = /^WEBVTT(.|\n)*?\n{2}/;
 export const inlineTimestampRegex = /<(?:(\d{2}):)?(\d{2}):(\d{2}).(\d{3})>/g;
 
