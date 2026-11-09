@@ -330,3 +330,51 @@ test('AAC whose esds box has no AudioSpecificConfig', async () => {
 	});
 	expect(await input.getMimeType()).toBe('audio/mp4; codecs="mp4a.40.2"');
 });
+
+test('An AAC esds whose AudioSpecificConfig is a single byte doesn\'t make the file unreadable', async () => {
+	// The DecoderSpecificInfo holds 1 byte (an AudioSpecificConfig needs at least 2): getTracks() threw. The track is
+	// read with the sample entry's parameters, like an esds without an AudioSpecificConfig. Found by L101.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	// ES_Descriptor (ES_ID 1) > DecoderConfigDescriptor (AAC, audio stream) > DecoderSpecificInfo (1 byte), SLConfig
+	const esds = box('esds', zeros(4), [
+		0x03, 25, 0, 1, 0,
+		0x04, 15, 0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0x05, 1, 0x12,
+		0x06, 1, 0x02,
+	]);
+	const mp4a = box('mp4a', zeros(6), [0, 1], zeros(8), [0, 2, 0, 16], zeros(4), [0xac, 0x44, 0, 0], esds);
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(1000), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(0), u32(0)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(44100), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('soun'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), mp4a),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+	);
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([...box('ftyp', ascii('isom'), u32(0)), ...moov])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.getCodec()).toBe('aac');
+	expect(await track.getDecoderConfig()).toEqual({
+		codec: 'mp4a.40.2',
+		numberOfChannels: 2,
+		sampleRate: 44100,
+		description: new Uint8Array([0x12, 0x10]), // AAC-LC, 44.1 kHz, stereo
+	});
+});
