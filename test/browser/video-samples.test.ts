@@ -605,6 +605,29 @@ test('draw with flip', () => {
 	expect(pixelAt(pixels, 4, 0, 3)).toEqual([3, 3]);
 });
 
+test('ArrayBuffer-backed samples reject a visible rect outside the coded size', () => {
+	const init = { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 } as const;
+	const outside = [
+		{ left: 2, top: 0, width: 2, height: 2 },
+		{ left: 0, top: 1, width: 2, height: 2 },
+		{ left: 1, top: 0, width: 2, height: 1 },
+	];
+	for (const visibleRect of outside) {
+		const { left: x, top: y, width, height } = visibleRect;
+		expect(() => new VideoFrame(new Uint8Array(16), { ...init, visibleRect: { x, y, width, height } }))
+			.toThrow(TypeError);
+		expect(() => new VideoSample(new Uint8Array(16), { ...init, visibleRect }), JSON.stringify(visibleRect))
+			.toThrow(TypeError);
+	}
+
+	// One inside the coded size is fine, and so is cloning a sample with it
+	using sample = new VideoSample(new Uint8Array(16), {
+		...init, visibleRect: { left: 1, top: 1, width: 1, height: 1 },
+	});
+	using clone = sample.clone();
+	expect(clone.visibleRect).toEqual({ left: 1, top: 1, width: 1, height: 1 });
+});
+
 test('draw with rotation then flip', () => {
 	using sample = makeCoordinateSample({ rotation: 90, flip: true });
 	const pixels = drawToPixels(sample, 4, 4);
