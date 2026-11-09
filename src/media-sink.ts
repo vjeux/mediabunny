@@ -25,6 +25,7 @@ import {
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
+import { getNativeAudioDecoderConfig, getNativeVideoDecoderConfig } from './decode';
 import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
 import {
 	AnyIterable,
@@ -1929,6 +1930,15 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		const timeResolution = await this._track.getTimeResolution();
 		assert(codec && decoderConfig);
 
+		const trackDecoderConfig = decoderConfig;
+		if (
+			trackDecoderConfig.codec.startsWith('avc3.')
+			&& !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))
+		) {
+			// The browser's decoder may only take the avc1 form (see getNativeVideoDecoderConfig)
+			decoderConfig = (await getNativeVideoDecoderConfig(trackDecoderConfig)) ?? trackDecoderConfig;
+		}
+
 		decoderConfig = {
 			...decoderConfig,
 			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
@@ -2695,14 +2705,23 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		}
 
 		const codec = await this._track.getCodec();
-		const decoderConfig = await this._track.getDecoderConfig();
+		let decoderConfig = await this._track.getDecoderConfig();
 		assert(codec && decoderConfig);
 
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
-		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
 		}
+
+		const trackDecoderConfig = decoderConfig;
+		if (
+			trackDecoderConfig.codec === 'mp4a.67'
+			&& !customAudioDecoders.some(x => x.supports(codec, trackDecoderConfig))
+		) {
+			// The browser's decoder may only take the MPEG-4 form (see getNativeAudioDecoderConfig)
+			decoderConfig = (await getNativeAudioDecoderConfig(trackDecoderConfig)) ?? trackDecoderConfig;
+		}
+
+		return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
 	}
 
 	/** @internal */
