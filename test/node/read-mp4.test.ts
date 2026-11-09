@@ -267,6 +267,66 @@ test('AAC channel configurations 11 to 14 give the channel count', async () => {
 	}
 });
 
+test('Key frames of HEVC whose slices follow start codes inside a length (Android 8)', async () => {
+	// Android 8's MPEG4Writer only turned the start codes within a frame's first 64 bytes into lengths, so a slice
+	// after more than that (here, a 69-byte prefix SEI) stays behind a start code inside the SEI's length
+	const u32 = (value: number) => [value >>> 24, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+	// The hvcC of ffmpeg -f lavfi -i testsrc2=size=64x64 -frames:v 1 -c:v libx265 -x265-params info=0 -tag:v hvc1
+	const hvcC = new Uint8Array([
+		'0101600000009000000000001ef000fcfdf8f800000f03a00001001840010c01ffff01600000030090000003000003001e',
+		'959809a10001002842010101600000030090000003000003001ea020810596566924caf0168080000003008000000f04a2',
+		'000100074401c172b42240',
+	].join('').match(/../g)!.map(x => parseInt(x, 16)));
+	const prefixSei = [0x4e, 0x01, 0x05, 0x40, ...Array.from({ length: 64 }, (_, i) => 0x10 + i), 0x80];
+	const idrSlice = [0x26, 0x01, 0xaf, 0x09, 0x40, 0xff]; // IDR_W_RADL
+	const trailSlice = [0x02, 0x01, 0xd0, 0x09, 0x40, 0xff]; // TRAIL_R
+	const lengthPrefixed = (...nalUnits: number[][]) => nalUnits.flatMap(x => [...u32(x.length), ...x]);
+
+	const readPacketTypes = async (frames: number[][]) => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new EncodedVideoPacketSource('hevc');
+		output.addVideoTrack(source);
+		await output.start();
+		for (let i = 0; i < frames.length; i++) {
+			await source.add(new EncodedPacket(new Uint8Array(frames[i]!), 'key', i / 30, 1 / 30), i === 0
+				? { decoderConfig: { codec: 'hvc1.1.6.L30.90', codedWidth: 64, codedHeight: 64, description: hvcC } }
+				: undefined);
+		}
+		await output.finalize();
+
+		using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+		const sink = new EncodedPacketSink(track);
+		const types: (string | null)[] = [];
+		for await (const packet of sink.packets()) {
+			types.push(await track.determinePacketType(packet));
+		}
+
+		const verifiedKeyPacket = await sink.getKeyPacket(frames.length / 30, { verifyKeyPackets: true });
+		return { types, verifiedKeyTimestamp: verifiedKeyPacket?.timestamp ?? null };
+	};
+
+	const android8 = (slice: number[]) => {
+		return [...u32(prefixSei.length + 4 + slice.length), ...prefixSei, 0, 0, 0, 1, ...slice];
+	};
+	expect(await readPacketTypes([android8(idrSlice), android8(trailSlice)]))
+		.toEqual({ types: ['key', 'delta'], verifiedKeyTimestamp: 0 });
+	// One length per NAL unit, as it should be
+	expect(await readPacketTypes([lengthPrefixed(prefixSei, idrSlice), lengthPrefixed(prefixSei, trailSlice)]))
+		.toEqual({ types: ['key', 'delta'], verifiedKeyTimestamp: 0 });
+
+	// The slices only count where the lengths cover the frame and none of them is a slice already: not for a start code
+	// that a writer failed to escape in an SEI before a slice, nor in the bytes that a broken length runs into
+	const seiPayload = [...Array.from({ length: 11 }, (_, i) => 0x10 + i), 0, 0, 1, 0x26, 0x01];
+	const unescapedSei = [0x4e, 0x01, 0x05, seiPayload.length, ...seiPayload, 0x80];
+	const brokenLength = [...u32(0x5dc72a9a), 0x4e, 0x01, 0, 0, 1, ...idrSlice];
+	expect(await readPacketTypes([
+		lengthPrefixed(idrSlice),
+		lengthPrefixed(unescapedSei, trailSlice),
+		[...lengthPrefixed(prefixSei), ...brokenLength],
+	])).toEqual({ types: ['key', 'delta', 'delta'], verifiedKeyTimestamp: 0 });
+});
+
 test('PCM track with stsc not starting at the first chunk', async () => {
 	// The stsc box's first entry starts at the second chunk, leaving three chunks of PCM audio
 	const filePath = path.join(__dirname, '..', 'public/pcm-stsc-not-first-chunk.mp4');

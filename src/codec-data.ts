@@ -1111,6 +1111,45 @@ export const extractNalUnitTypeForHevc = (byte: number) => {
 	return (byte >> 1) & 0x3F;
 };
 
+/**
+ * Yields the given length-prefixed NAL units, splitting each at the start codes inside it. Some writers leave start
+ * codes in place: Android 8's MPEG4Writer only turned those within a frame's first 64 bytes into lengths, so when the
+ * NAL units before a frame's slice take up more (a long SEI, in-band parameter sets), the slice follows a start code
+ * inside an earlier NAL unit's length. Emulation prevention keeps start codes out of NAL units, so each one begins a
+ * new NAL unit.
+ */
+const splitNalUnitsAtStartCodes = function* (
+	packetData: Uint8Array,
+	lengthPrefixedNalUnits: Iterable<NalUnitLocation>,
+): Generator<NalUnitLocation> {
+	for (const loc of lengthPrefixedNalUnits) {
+		const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
+		let foundStartCode = false;
+
+		for (const embeddedLoc of iterateNalUnitsInAnnexB(nalUnit)) {
+			if (!foundStartCode) {
+				foundStartCode = true;
+
+				// The NAL unit before the first start code. Zero bytes right before a start code are never part of a
+				// NAL unit (they belong to a 4-byte start code or are trailing zeros).
+				let length = embeddedLoc.offset - 3;
+				while (length > 0 && nalUnit[length - 1] === 0) {
+					length--;
+				}
+				if (length > 0) {
+					yield { offset: loc.offset, length };
+				}
+			}
+
+			yield { offset: loc.offset + embeddedLoc.offset, length: embeddedLoc.length };
+		}
+
+		if (!foundStartCode) {
+			yield loc;
+		}
+	}
+};
+
 /** Parses an HEVC SPS (Sequence Parameter Set) to extract video information. */
 export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 	try {
@@ -3030,7 +3069,32 @@ export const determineVideoPacketType = (
 		};
 
 		case 'hevc': {
-			for (const loc of iterateHevcNalUnits(packetData, decoderConfig)) {
+			// Only a frame whose length-prefixed NAL units cover it exactly, but without any VCL NAL unit among them,
+			// hides its slices behind start codes. Elsewhere, a start code that a writer failed to escape (say, in an
+			// SEI payload before the slice), or one in the bytes that a broken length runs into, mustn't decide the
+			// type.
+			let lookBehindStartCodes = false;
+			if (decoderConfig.description) {
+				let hasLengthPrefixedVclNalUnit = false;
+				let end = 0;
+
+				for (const loc of iterateHevcNalUnits(packetData, decoderConfig)) {
+					if (extractNalUnitTypeForHevc(packetData[loc.offset]!) <= 31) {
+						hasLengthPrefixedVclNalUnit = true;
+						break;
+					}
+
+					end = loc.offset + loc.length;
+				}
+
+				lookBehindStartCodes = !hasLengthPrefixedVclNalUnit && end === packetData.byteLength;
+			}
+
+			const nalUnits = lookBehindStartCodes
+				? splitNalUnitsAtStartCodes(packetData, iterateHevcNalUnits(packetData, decoderConfig))
+				: iterateHevcNalUnits(packetData, decoderConfig);
+
+			for (const loc of nalUnits) {
 				const type = extractNalUnitTypeForHevc(packetData[loc.offset]!);
 				if (type < HevcNalUnitType.BLA_W_LP) {
 					return 'delta';
