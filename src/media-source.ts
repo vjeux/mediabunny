@@ -3508,6 +3508,9 @@ export class TextSubtitleSource extends SubtitleSource {
 	/** @internal */
 	override async _flushAndClose(forceClose: boolean) {
 		if (!forceClose) {
+			// The last cues may still be on their way to the muxer when add() wasn't awaited, and an error they hit has
+			// to fail the close too. (A forced close, for a cancel, doesn't wait on the muxer.)
+			await this._lastMuxerPromise;
 			this._checkForError();
 		}
 	}
