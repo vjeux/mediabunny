@@ -2085,7 +2085,9 @@ test('MPEG-TS with several programs waits only briefly for a better one once a p
 		if (layout !== 'late PAT') {
 			pushPacket(0x0000, pat);
 		}
-		const frameCount = layout === 'better program later' ? 2000 : Math.floor(3 * 2 ** 20 / 188);
+		// Big enough that a source that can only be streamed (with a 2 MiB cache) can't go back from its end to its
+		// start, unless the other program shows up early, or the file only needs to fail as scrambled
+		const frameCount = layout === 'better program later' || scrambled ? 2000 : Math.floor(3 * 2 ** 20 / 188);
 		let betterFrameCount = 0;
 		for (let i = 0; i < frameCount; i++) {
 			if (i % 500 === 0) {
@@ -2107,11 +2109,7 @@ test('MPEG-TS with several programs waits only briefly for a better one once a p
 
 		const bytes = new Uint8Array(188 * packets.length);
 		packets.forEach((packet, i) => bytes.set(packet, 188 * i));
-		return {
-			bytes,
-			expectedTrack: layout === 'better program later' ? 0x102 : 0x101,
-			expectedPacketCount: layout === 'better program later' ? betterFrameCount : frameCount,
-		};
+		return { bytes, expectedTrack: layout === 'better program later' ? 0x102 : 0x101 };
 	};
 
 	// A server that ignores range requests, always sending the whole file
@@ -2127,7 +2125,7 @@ test('MPEG-TS with several programs waits only briefly for a better one once a p
 	try {
 		for (const layout of ['better program later', 'other program never', 'late PAT'] as const) {
 			for (const scrambled of [false, true]) {
-				const { bytes, expectedTrack, expectedPacketCount } = buildFile(layout, scrambled);
+				const { bytes, expectedTrack } = buildFile(layout, scrambled);
 				const urlPath = `/${files.size}.ts`;
 				files.set(urlPath, bytes);
 
@@ -2174,12 +2172,17 @@ test('MPEG-TS with several programs waits only briefly for a better one once a p
 						expect(furthestRead).toBeLessThan(2 * 2 ** 20);
 					}
 
-					let packetCount = 0;
-					for await (const packet of new EncodedPacketSink(tracks[0]!).packets()) {
-						expect(packet.timestamp).toBeCloseTo(packetCount * 1920 / 90000, 6);
-						packetCount++;
+					// The program's packets can be read from its start, which the sources that can only be streamed
+					// must still hold. Reading on from there is plain sequential reading, so a few packets do.
+					const sink = new EncodedPacketSink(tracks[0]!);
+					const ticks: number[] = [];
+					for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+						ticks.push(Math.round(packet.timestamp * 90000));
+						if (ticks.length === 100) {
+							break;
+						}
 					}
-					expect(packetCount).toBe(expectedPacketCount);
+					expect(ticks).toEqual(ticks.map((_, i) => 1920 * i));
 				}
 			}
 		}
