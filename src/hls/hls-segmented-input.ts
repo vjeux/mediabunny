@@ -83,7 +83,8 @@ export type HlsEncryptionInfo = {
 	keyFormat: string;
 } | {
 	method: 'SAMPLE-AES' | 'SAMPLE-AES-CTR';
-	psshBox: PsshBox | null;
+	/** From the keys of all KEYFORMATs that apply */
+	psshBoxes: PsshBox[];
 };
 
 type ResolveKeyId = NonNullable<NonNullable<InputFormatOptions['isobmff']>['resolveKeyId']>;
@@ -290,6 +291,18 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 			if (!usableKey && error) {
 				throw error;
+			}
+
+			if (usableKey && usableKey.method !== 'AES-128') {
+				// The SAMPLE-AES keys of different KEYFORMATs (one per DRM system) apply together (RFC 8216, 4.3.2.4)
+				const psshBoxes: PsshBox[] = [];
+				for (const key of currentKeys.values()) {
+					if (!(key instanceof Error) && key.method !== 'AES-128') {
+						psshBoxes.push(...key.psshBoxes);
+					}
+				}
+
+				return { method: usableKey.method, psshBoxes };
 			}
 
 			return usableKey;
@@ -633,7 +646,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						)
 						: {
 								method,
-								psshBox,
+								psshBoxes: psshBox ? [psshBox] : [],
 							});
 				} else {
 					setCurrentKey(keyFormat, new Error(
@@ -920,19 +933,18 @@ export class HlsSegmentedInput extends SegmentedInput {
 							hlsSegment.encryption.method === 'SAMPLE-AES'
 							|| hlsSegment.encryption.method === 'SAMPLE-AES-CTR'
 						)
-						|| !hlsSegment.encryption.psshBox
 					) {
 						return this.input._formatOptions.isobmff!.resolveKeyId!(options);
 					}
 
 					let psshBoxes = options.psshBoxes;
-					const { psshBox } = hlsSegment.encryption;
-
-					if (
-						(psshBox.keyIds === null || psshBox.keyIds.includes(options.keyId))
-						&& !psshBoxes.some(x => psshBoxesAreEqual(x, psshBox))
-					) {
-						psshBoxes = [...psshBoxes, psshBox];
+					for (const psshBox of hlsSegment.encryption.psshBoxes) {
+						if (
+							(psshBox.keyIds === null || psshBox.keyIds.includes(options.keyId))
+							&& !psshBoxes.some(x => psshBoxesAreEqual(x, psshBox))
+						) {
+							psshBoxes = [...psshBoxes, psshBox];
+						}
 					}
 
 					return this.input._formatOptions.isobmff!.resolveKeyId!({ ...options, psshBoxes });
