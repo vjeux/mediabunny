@@ -27,6 +27,8 @@ export const KILOBIT_RATES = [
 export const XING = 0x58696e67;
 /** 'Info' */
 export const INFO = 0x496e666f;
+/** 'VBRI' */
+export const VBRI = 0x56425249;
 
 export type Mp3FrameHeader = {
 	totalSize: number;
