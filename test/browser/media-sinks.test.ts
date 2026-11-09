@@ -98,6 +98,32 @@ test('No B-frames are skipped when software-decoding AVC, Annex B edition', asyn
 	expect(count).toBe(48);
 });
 
+test('High-profile AVC at level 1b can be decoded', async () => {
+	// x264 picks level_idc 9 (level 1b in the High profiles) on its own for this one:
+	// ffmpeg -f lavfi -i testsrc=size=64x48:rate=10:duration=0.3 -c:v libx264 -profile:v high -pix_fmt yuv420p \
+	//   -b:v 100k -maxrate 100k -bufsize 200k avc-high-level-1b.mp4
+	using input = new Input({
+		source: new UrlSource('/avc-high-level-1b.mp4'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	expect(await track.getCodecParameterString()).toBe('avc1.640009');
+	expect(await track.canDecode()).toBe(true);
+
+	const sink = new VideoSampleSink(track);
+	let count = 0;
+
+	for await (using sample of sink.samples()) {
+		expect(sample.displayWidth).toBe(64);
+		count++;
+	}
+
+	expect(count).toBe(3);
+});
+
 test('Fallback sample past the end survives iterator return', async () => {
 	using input = new Input({
 		source: new UrlSource('/video.mp4'),
