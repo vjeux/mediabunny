@@ -19,8 +19,9 @@ import {
 	VIDEO_CODECS,
 	VideoCodec,
 } from './codec';
+import { deserializeAvcDecoderConfigurationRecord } from './codec-data';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
-import { isAllowSharedBufferSource, SetOptional } from './misc';
+import { isAllowSharedBufferSource, SetOptional, toUint8Array } from './misc';
 
 export const canDecodeVideoMemo = new Map<string, Promise<boolean>>();
 export const canDecodeAudioMemo = new Map<string, Promise<boolean>>();
@@ -122,6 +123,59 @@ export const canDecode = (codec: MediaCodec) => {
 };
 
 /**
+ * The decoder config to give the browser's VideoDecoder, or null if it doesn't decode it. WebKit's VideoDecoder
+ * (Safari, WPE and GTK) only takes avc1 codec strings for AVC, though it decodes avc3 tracks. Once the description
+ * holds the parameter sets, avc3 only differs from avc1 in also allowing them in-band, which decoders read either way.
+ * So when the browser rejects an avc3 codec string but takes its avc1 form, the decoder gets the avc1 form.
+ */
+export const getNativeVideoDecoderConfig = async (decoderConfig: VideoDecoderConfig) => {
+	if ((await VideoDecoder.isConfigSupported(decoderConfig)).supported === true) {
+		return decoderConfig;
+	}
+
+	if (decoderConfig.codec.startsWith('avc3.') && decoderConfig.description) {
+		const record = deserializeAvcDecoderConfigurationRecord(toUint8Array(decoderConfig.description));
+		if (record && record.sequenceParameterSets.length > 0 && record.pictureParameterSets.length > 0) {
+			const avc1DecoderConfig = { ...decoderConfig, codec: 'avc1' + decoderConfig.codec.slice(4) };
+			if ((await VideoDecoder.isConfigSupported(avc1DecoderConfig)).supported === true) {
+				nativeCodecStrings.set(decoderConfig.codec, avc1DecoderConfig.codec);
+				return avc1DecoderConfig;
+			}
+		}
+	}
+
+	return null;
+};
+
+/**
+ * The decoder config to give the browser's AudioDecoder, or null if it doesn't decode it. WebKit's AudioDecoder only
+ * takes MPEG-4 codec strings for AAC, though MPEG-2 AAC LC (mp4a.67) is the same bitstream as MPEG-4 AAC LC
+ * (mp4a.40.2). So when the browser rejects mp4a.67 but takes mp4a.40.2, the decoder gets mp4a.40.2.
+ */
+export const getNativeAudioDecoderConfig = async (decoderConfig: AudioDecoderConfig) => {
+	if ((await AudioDecoder.isConfigSupported(decoderConfig)).supported === true) {
+		return decoderConfig;
+	}
+
+	if (decoderConfig.codec === 'mp4a.67') {
+		const mpeg4DecoderConfig = { ...decoderConfig, codec: 'mp4a.40.2' };
+		if ((await AudioDecoder.isConfigSupported(mpeg4DecoderConfig)).supported === true) {
+			nativeCodecStrings.set(decoderConfig.codec, mpeg4DecoderConfig.codec);
+			return mpeg4DecoderConfig;
+		}
+	}
+
+	return null;
+};
+
+/**
+ * The codec strings for which getNativeVideoDecoderConfig() or getNativeAudioDecoderConfig() gave an equivalent one,
+ * with that one, so that the decoder for a track whose decodability was checked can take it without asking the browser
+ * again.
+ */
+export const nativeCodecStrings = new Map<string, string>();
+
+/**
  * Checks if the browser is able to decode the given video codec with the given parameters.
  * @group Decoding
  * @public
@@ -158,8 +212,7 @@ export const canDecodeVideo = async (
 			return false;
 		}
 
-		const support = await VideoDecoder.isConfigSupported(resolvedOptions);
-		return support.supported === true;
+		return (await getNativeVideoDecoderConfig(resolvedOptions)) !== null;
 	})();
 	canDecodeVideoMemo.set(key, promise);
 
@@ -214,8 +267,7 @@ export const canDecodeAudio = async (
 			return false;
 		}
 
-		const support = await AudioDecoder.isConfigSupported(resolvedOptions);
-		return support.supported === true;
+		return (await getNativeAudioDecoderConfig(resolvedOptions)) !== null;
 	})();
 	canDecodeAudioMemo.set(key, promise);
 

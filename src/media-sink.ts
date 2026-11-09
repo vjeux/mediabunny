@@ -25,6 +25,7 @@ import {
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
+import { nativeCodecStrings } from './decode';
 import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
 import {
 	AnyIterable,
@@ -1929,6 +1930,14 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		const timeResolution = await this._track.getTimeResolution();
 		assert(codec && decoderConfig);
 
+		// canDecode() may have found that the browser's decoder only takes an equivalent codec string (see
+		// getNativeVideoDecoderConfig)
+		const trackDecoderConfig = decoderConfig;
+		const nativeCodecString = nativeCodecStrings.get(trackDecoderConfig.codec);
+		if (nativeCodecString !== undefined && !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))) {
+			decoderConfig = { ...trackDecoderConfig, codec: nativeCodecString };
+		}
+
 		decoderConfig = {
 			...decoderConfig,
 			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
@@ -2695,14 +2704,22 @@ export class AudioSampleSink extends BaseMediaSampleSink<AudioSample> {
 		}
 
 		const codec = await this._track.getCodec();
-		const decoderConfig = await this._track.getDecoderConfig();
+		let decoderConfig = await this._track.getDecoderConfig();
 		assert(codec && decoderConfig);
 
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {
 			return new PcmAudioDecoderWrapper(onSample, onError, decoderConfig);
-		} else {
-			return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
 		}
+
+		// canDecode() may have found that the browser's decoder only takes an equivalent codec string (see
+		// getNativeAudioDecoderConfig)
+		const trackDecoderConfig = decoderConfig;
+		const nativeCodecString = nativeCodecStrings.get(trackDecoderConfig.codec);
+		if (nativeCodecString !== undefined && !customAudioDecoders.some(x => x.supports(codec, trackDecoderConfig))) {
+			decoderConfig = { ...trackDecoderConfig, codec: nativeCodecString };
+		}
+
+		return new AudioDecoderWrapper(onSample, onError, codec, decoderConfig);
 	}
 
 	/** @internal */
