@@ -508,8 +508,9 @@ export abstract class BaseMediaSampleSink<
 		let tolerance = 0;
 		// Decoding sessions time samples from different packets, whose rounded timestamps can move a sample by up to
 		// the tolerance. For a sample shorter than twice that, this can't tell it from its neighbors, so lookups stay
-		// exact there.
-		const toleranceFor = (sample: MediaSample) => sample.duration >= 2 * tolerance ? tolerance : 0;
+		// exact there. The comparison allows for rounding, so that a sample of exactly two ticks keeps the tolerance
+		// despite its epsilon.
+		const toleranceFor = (sample: MediaSample) => sample.duration + 1e-9 >= 2 * tolerance ? tolerance : 0;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
@@ -706,8 +707,9 @@ export abstract class BaseMediaSampleSink<
 		let tolerance = 0;
 		// Decoding sessions time samples from different packets, whose rounded timestamps can move a sample by up to
 		// the tolerance. For a sample shorter than twice that, this can't tell it from its neighbors, so lookups stay
-		// exact there.
-		const toleranceFor = (sample: MediaSample) => sample.duration >= 2 * tolerance ? tolerance : 0;
+		// exact there. The comparison allows for rounding, so that a sample of exactly two ticks keeps the tolerance
+		// despite its epsilon.
+		const toleranceFor = (sample: MediaSample) => sample.duration + 1e-9 >= 2 * tolerance ? tolerance : 0;
 
 		// This stores errors that are "out of band" in the sense that they didn't occur in the normal flow of this
 		// method but instead in a different context. This error should not go unnoticed and must be bubbled up to
