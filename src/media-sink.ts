@@ -13,7 +13,6 @@ import {
 	VideoCodec,
 	AudioCodec,
 	OPUS_SAMPLE_RATE,
-	setAv1OrVp9ColorsToBt709,
 } from './codec';
 import {
 	addAvcBitstreamRestriction,
@@ -33,7 +32,7 @@ import {
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
-import { getNativeVideoDecoderConfig } from './decode';
+import { nativeShortCodecStrings } from './decode';
 import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
 import {
 	AnyIterable,
@@ -1938,14 +1937,12 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		const timeResolution = await this._track.getTimeResolution();
 		assert(codec && decoderConfig);
 
+		// canDecode() may have found that the browser's decoder only takes the codec string's short form (see
+		// getNativeVideoDecoderConfig)
 		const trackDecoderConfig = decoderConfig;
-		if (
-			setAv1OrVp9ColorsToBt709(trackDecoderConfig.codec) !== null
-			&& !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))
-		) {
-			// The browser's decoder may only take the short form of a codec string with color values other than
-			// BT.709's (see getNativeVideoDecoderConfig)
-			decoderConfig = (await getNativeVideoDecoderConfig(trackDecoderConfig)) ?? trackDecoderConfig;
+		const shortCodecString = nativeShortCodecStrings.get(trackDecoderConfig.codec);
+		if (shortCodecString !== undefined && !customVideoDecoders.some(x => x.supports(codec, trackDecoderConfig))) {
+			decoderConfig = { ...trackDecoderConfig, codec: shortCodecString };
 		}
 
 		decoderConfig = {

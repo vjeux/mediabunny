@@ -141,11 +141,19 @@ export const getNativeVideoDecoderConfig = async (decoderConfig: VideoDecoderCon
 		bt709CodecString !== null
 		&& (await VideoDecoder.isConfigSupported({ ...decoderConfig, codec: bt709CodecString })).supported === true
 	) {
-		return { ...decoderConfig, codec: shortenAv1OrVp9CodecString(decoderConfig.codec)! };
+		const shortCodecString = shortenAv1OrVp9CodecString(decoderConfig.codec)!;
+		nativeShortCodecStrings.set(decoderConfig.codec, shortCodecString);
+		return { ...decoderConfig, codec: shortCodecString };
 	}
 
 	return null;
 };
+
+/**
+ * The codec strings for which getNativeVideoDecoderConfig() gave the short form, with that short form, so that the
+ * decoder for a track whose decodability was checked can take it without asking the browser again.
+ */
+export const nativeShortCodecStrings = new Map<string, string>();
 
 /**
  * Checks if the browser is able to decode the given video codec with the given parameters.
