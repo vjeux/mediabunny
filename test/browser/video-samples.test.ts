@@ -244,6 +244,92 @@ test('copyTo and plane layouts', async () => {
 	}
 });
 
+test('copyTo with odd dimensions keeps the last chroma column', async () => {
+	// Same case as WPT's webcodecs/videoFrame-odd-size.any.js: a 3-wide I420 frame has 2-wide chroma planes
+	const buf = new Uint8Array([
+		1, 2, 3, 4, 5, 6, 7, 8, 9, // Y
+		10, 11, 12, 13, // U
+		14, 15, 16, 17, // V
+	]);
+	using sample = new VideoSample(buf, { format: 'I420', codedWidth: 3, codedHeight: 3, timestamp: 0 });
+
+	expect(sample.allocationSize()).toBe(buf.byteLength);
+	const data = new Uint8Array(buf.byteLength);
+	const layout = await sample.copyTo(data);
+	expect(layout).toEqual([{ offset: 0, stride: 3 }, { offset: 9, stride: 2 }, { offset: 13, stride: 2 }]);
+	expect([...data]).toEqual([...buf]);
+
+	// Planes padded like a decoder's (e.g. the AVFrames @mediabunny/server's samples copy from) come out tightly
+	// packed, with ceil(width / 2) chroma columns. 322x242 is an even-width control.
+	const planeGeometry = { // Width divisor, height divisor, bytes per sample
+		I420: [[1, 1, 1], [2, 2, 1], [2, 2, 1]],
+		I420A: [[1, 1, 1], [2, 2, 1], [2, 2, 1], [1, 1, 1]],
+		I422: [[1, 1, 1], [2, 1, 1], [2, 1, 1]],
+		NV12: [[1, 1, 1], [2, 2, 2]],
+		I420P10: [[1, 1, 2], [2, 2, 2], [2, 2, 2]],
+	} as const;
+	for (const format of Object.keys(planeGeometry) as (keyof typeof planeGeometry)[]) {
+		for (const [width, height] of [[1, 1], [17, 15], [321, 241], [322, 242]] as const) {
+			const planes = planeGeometry[format].map(([widthDivisor, heightDivisor, sampleBytes]) => ({
+				rowBytes: Math.ceil(width / widthDivisor) * sampleBytes,
+				rows: Math.ceil(height / heightDivisor),
+			}));
+
+			let offset = 16;
+			const paddedLayout = planes.map(({ rowBytes, rows }) => {
+				const plane = { offset, stride: Math.ceil(rowBytes / 32) * 32 + 32 };
+				offset += plane.stride * rows + 16;
+				return plane;
+			});
+			const source = new Uint8Array(offset).fill(0xee);
+			const expected: number[] = [];
+			planes.forEach(({ rowBytes, rows }, i) => {
+				for (let row = 0; row < rows; row++) {
+					for (let x = 0; x < rowBytes; x++) {
+						const value = (i * 61 + row * 7 + x * 3) % 239;
+						source[paddedLayout[i]!.offset + row * paddedLayout[i]!.stride + x] = value;
+						expected.push(value);
+					}
+				}
+			});
+
+			const label = `${format} ${width}x${height}`;
+			using padded = new VideoSample(source, {
+				format, codedWidth: width, codedHeight: height, timestamp: 0, layout: paddedLayout,
+			});
+			expect(padded.allocationSize(), label).toBe(expected.length);
+			const copy = new Uint8Array(expected.length);
+			const copyLayout = await padded.copyTo(copy);
+			expect(copyLayout.map(plane => plane.stride), label).toEqual(planes.map(plane => plane.rowBytes));
+			expect([...copy], label).toEqual(expected);
+		}
+	}
+
+	// Same as what VideoFrame does with the same data, including for cropped rects
+	const cases = [
+		['I420', 5, 3], ['I422', 5, 3], ['NV12', 5, 3], ['I420', 321, 241],
+	] as const;
+	for (const [format, codedWidth, codedHeight] of cases) {
+		const init = { format, codedWidth, codedHeight, timestamp: 0 };
+		const probe = new VideoFrame(new Uint8Array(codedWidth * codedHeight * 3), init);
+		const pixels = Uint8Array.from({ length: probe.allocationSize() }, (_, i) => i % 251);
+		probe.close();
+
+		using reference = new VideoSample(new VideoFrame(pixels, init));
+		using bufferSample = new VideoSample(pixels, init);
+
+		for (const options of [{}, { rect: { x: 2, y: 0, width: 3, height: 1 } }]) {
+			const expected = new Uint8Array(reference.allocationSize(options));
+			const expectedLayout = await reference.copyTo(expected, options);
+
+			expect(bufferSample.allocationSize(options)).toBe(expected.byteLength);
+			const actual = new Uint8Array(expected.byteLength);
+			expect(await bufferSample.copyTo(actual, options)).toEqual(expectedLayout);
+			expect([...actual]).toEqual([...expected]);
+		}
+	}
+});
+
 test('RGB conversion for ArrayBuffer-backed data', async () => {
 	// 2x2 RGBA image with distinct, easily-verifiable pixels
 	const src = new Uint8Array([
