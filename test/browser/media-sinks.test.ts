@@ -32,6 +32,114 @@ test('Negative audio timestamps are preserved', async () => {
 	}
 });
 
+test('Audio that starts before zero decodes in order, with no negative timestamps for the decoder', async () => {
+	// A 1 kHz tone whose amplitude steps up by 0.02 every 20 ms, for 0.4 s:
+	// ffmpeg -f lavfi -i "aevalsrc='0.02*(1+floor(t/0.02))*sin(2*PI*1000*t)':s=48000:d=0.4" -c:a libopus -b:a 64k
+	//   staircase-tone.ogg (and -c:a aac -b:a 64k -movflags +faststart staircase-tone.m4a, -c:a libmp3lame -b:a 64k
+	//   staircase-tone.mp3). Each starts before zero: the Opus pre-skip, the AAC priming, the LAME delay.
+	// WebKit's GStreamer decoders (WPE, GTK) play a stream backwards from a negative chunk timestamp
+	const NativeAudioDecoder = globalThis.AudioDecoder;
+	const chunkTimestamps: number[] = [];
+	globalThis.AudioDecoder = class extends NativeAudioDecoder {
+		override decode(chunk: EncodedAudioChunk) {
+			chunkTimestamps.push(chunk.timestamp);
+			super.decode(chunk);
+		}
+	} as typeof AudioDecoder;
+
+	try {
+		for (const file of ['/staircase-tone.ogg', '/staircase-tone.m4a', '/staircase-tone.mp3']) {
+			using input = new Input({
+				source: new UrlSource(file),
+				formats: ALL_FORMATS,
+			});
+
+			const track = await input.getPrimaryAudioTrack();
+			assert(track);
+			const firstPacket = await new EncodedPacketSink(track).getFirstPacket();
+			assert(firstPacket);
+			expect(firstPacket.timestamp, file).toBeLessThan(0);
+
+			chunkTimestamps.length = 0;
+			const samples: { timestamp: number; duration: number; peak: number }[] = [];
+			for await (using sample of new AudioSampleSink(track).samples()) {
+				const data = new Float32Array(sample.numberOfFrames);
+				sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
+				samples.push({
+					timestamp: sample.timestamp,
+					duration: sample.duration,
+					peak: data.reduce((max, x) => Math.max(max, Math.abs(x)), 0),
+				});
+			}
+
+			for (let i = 1; i < samples.length; i++) {
+				expect(samples[i]!.timestamp, file).toBeGreaterThan(samples[i - 1]!.timestamp);
+			}
+
+			// The tone gets louder over time
+			const peakAt = (time: number) => {
+				return samples.find(x => x.timestamp <= time && time < x.timestamp + x.duration)!.peak;
+			};
+			expect(peakAt(0.05), file).toBeLessThan(0.15);
+			expect(peakAt(0.35), file).toBeGreaterThan(0.25);
+
+			if (file.endsWith('.ogg')) {
+				// The first sample ends where the first packet does, whether the decoder dropped the pre-skip or not
+				const firstSample = samples[0]!;
+				const firstPacketEnd = firstPacket.timestamp + firstPacket.duration;
+				expect(firstSample.timestamp + firstSample.duration).toBeCloseTo(firstPacketEnd, 6);
+			}
+
+			expect(Math.min(...chunkTimestamps), file).toBeGreaterThanOrEqual(0);
+		}
+	} finally {
+		globalThis.AudioDecoder = NativeAudioDecoder;
+	}
+});
+
+test('Video that starts before zero decodes fully, with no negative timestamps for the decoder', async () => {
+	// ffmpeg -f lavfi -i testsrc2=size=64x64:rate=30 -frames:v 40 -c:v libx264 -pix_fmt yuv420p -crf 40
+	//   -x264-params keyint=20:min-keyint=20:scenecut=0 src.mp4, trimmed the usual way:
+	// ffmpeg -ss 0.4 -i src.mp4 -c copy -movflags +faststart trimmed-mid-gop.mp4
+	// That keeps the whole first GOP, which the edit list times from -0.4 s.
+	// WebKit's GStreamer decoders (WPE, GTK) lose the frames after a negative chunk timestamp
+	const NativeVideoDecoder = globalThis.VideoDecoder;
+	const chunkTimestamps: number[] = [];
+	globalThis.VideoDecoder = class extends NativeVideoDecoder {
+		override decode(chunk: EncodedVideoChunk) {
+			chunkTimestamps.push(chunk.timestamp);
+			super.decode(chunk);
+		}
+	} as typeof VideoDecoder;
+
+	try {
+		using input = new Input({
+			source: new UrlSource('/trimmed-mid-gop.mp4'),
+			formats: ALL_FORMATS,
+		});
+
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		expect(await track.getFirstTimestamp()).toBeCloseTo(-0.4, 10);
+
+		const packetTimestamps: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packetTimestamps.push(packet.timestamp);
+		}
+		packetTimestamps.sort((a, b) => a - b);
+
+		const timestamps: number[] = [];
+		for await (using sample of new VideoSampleSink(track).samples()) {
+			timestamps.push(sample.timestamp);
+		}
+
+		expect(timestamps).toEqual(packetTimestamps);
+		expect(Math.min(...chunkTimestamps)).toBeGreaterThanOrEqual(0);
+	} finally {
+		globalThis.VideoDecoder = NativeVideoDecoder;
+	}
+});
+
 test('No B-frames are skipped when software-decoding AVC', async () => {
 	using input = new Input({
 		source: new UrlSource('/missing-reorder-metadata-v1.mp4'),
