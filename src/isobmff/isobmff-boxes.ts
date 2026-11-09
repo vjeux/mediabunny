@@ -585,7 +585,11 @@ export const edts = (trackData: IsobmffTrackData) => {
 /** Media Box: Describes and define a track's media type and sample data. */
 export const mdia = (trackData: IsobmffTrackData, creationTime: number) => box('mdia', undefined, [
 	mdhd(trackData, creationTime),
-	hdlr(true, TRACK_TYPE_TO_COMPONENT_SUBTYPE[trackData.type], TRACK_TYPE_TO_HANDLER_NAME[trackData.type]),
+	hdlr(
+		trackData.muxer.isQuickTime, // ISOBMFF requires pre_defined = 0 where QuickTime has the component type
+		TRACK_TYPE_TO_COMPONENT_SUBTYPE[trackData.type],
+		TRACK_TYPE_TO_HANDLER_NAME[trackData.type],
+	),
 	minf(trackData),
 ]);
 
