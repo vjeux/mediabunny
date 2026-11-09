@@ -13,6 +13,7 @@ import {
 	isIso639Dash2LanguageCode,
 	isThenable,
 	MaybePromise,
+	promiseWithResolvers,
 	Rotation,
 	toArray,
 	toUint8Array,
@@ -28,7 +29,7 @@ import {
 import { Muxer } from './muxer';
 import { OutputFormat } from './output-format';
 import { AudioSource, MediaSource, SubtitleSource, VideoSource } from './media-source';
-import { PathedTarget, Target, TargetRequest } from './target';
+import { NullTarget, PathedTarget, Target, TargetRequest } from './target';
 import { Writer } from './writer';
 import { Logging } from './logging';
 import { EncodedPacket } from './packet';
@@ -462,6 +463,20 @@ export type OutputEvents = {
 	};
 };
 
+/** Discards everything and fails to finalize: what the muxer writes to when its target couldn't be had. */
+class UnavailableTarget extends NullTarget {
+	_error: unknown;
+
+	constructor(error: unknown) {
+		super();
+		this._error = error;
+	}
+
+	override async _finalize() {
+		throw this._error;
+	}
+}
+
 /**
  * Main class orchestrating the creation of new media files.
  * @group Output files
@@ -496,12 +511,18 @@ export class Output<
 	_muxer: Muxer;
 	/** @internal */
 	_unfinalizedTargets = new Set<Target>();
+	/** @internal Set when a target that the muxer needed at start couldn't be had (see _waitForTarget). */
+	_targetFailure: { error: unknown } | null = null;
+	/** @internal Ends the wait for each target request in progress once the output is canceled. */
+	_targetWaits: Set<() => void> | null = null;
 	/** @internal */
 	_rootWriterPromise: Promise<Writer> | null = null;
 	/** @internal */
 	_startPromise: Promise<void> | null = null;
 	/** @internal */
 	_cancelPromise: Promise<void> | null = null;
+	/** @internal */
+	_canceled = promiseWithResolvers();
 	/** @internal */
 	_finalizePromise: Promise<void> | null = null;
 	/** @internal */
@@ -609,8 +630,23 @@ export class Output<
 		}
 	}
 
+	/**
+	 * Gets the target for a request the muxer makes as it runs (HLS segments and playlists), which it waits for while
+	 * holding its mutex. Once the output is canceled, the muxer gets a target discarding everything instead, rather
+	 * than waiting for one that may never come, so that the adds and the finalization waiting on it can finish. A
+	 * request that fails still fails as before.
+	 * @internal
+	 */
+	_getTarget(request: TargetRequest): Promise<Target> {
+		if (this.state === 'canceled') {
+			return Promise.resolve(new NullTarget());
+		}
+
+		return this._targetUnlessCanceled(this._requestTarget(request));
+	}
+
 	/** @internal */
-	async _getTarget(request: TargetRequest) {
+	async _requestTarget(request: TargetRequest) {
 		assert(this._target instanceof PathedTarget);
 
 		const target = await this._getTargetValidated(request);
@@ -632,7 +668,12 @@ export class Output<
 	}
 
 	/** @internal */
-	async _getInitTarget(): Promise<T> {
+	_getInitTarget() {
+		return this._waitForTarget(this._requestInitTarget());
+	}
+
+	/** @internal */
+	async _requestInitTarget(): Promise<T> {
 		assert(this._initTarget !== null);
 
 		if (this._initTarget instanceof Target) {
@@ -702,12 +743,61 @@ export class Output<
 	/** @internal */
 	_getRootWriter(isMonotonic: boolean | ((target: Target) => boolean)) {
 		return this._rootWriterPromise ??= (async () => {
-			const target = await this._getRootTarget();
+			const target = await this._waitForTarget(this._getRootTarget());
 
 			const writer = new Writer(target, typeof isMonotonic === 'boolean' ? isMonotonic : isMonotonic(target));
 			writer.start();
 			return writer;
 		})();
+	}
+
+	/**
+	 * Waits for a target that the muxer is about to write to as it starts, while holding its mutex. A cancel doesn't
+	 * wait for the target (which may never come), and a target may fail to come. In both cases, the muxer gets a target
+	 * discarding everything instead: its start then finishes and releases the mutex, rather than leaving the adds and
+	 * the finalization waiting on it forever. A target arriving after a cancel is closed and never written to, and one
+	 * that couldn't be had makes start() reject with its error, and the finalization too.
+	 * @internal
+	 */
+	async _waitForTarget(target: MaybePromise<Target>): Promise<Target> {
+		try {
+			return await this._targetUnlessCanceled(target);
+		} catch (error) {
+			this._targetFailure ??= { error };
+			return new UnavailableTarget(error);
+		}
+	}
+
+	/** Resolves with the target, or with one discarding everything if the output is canceled before it comes. */
+	async _targetUnlessCanceled(target: MaybePromise<Target>): Promise<Target> {
+		if (this.state === 'canceled') {
+			// A target still to come gets closed as it arrives (see _requestTarget)
+			void Promise.resolve(target).catch(() => {});
+			return new NullTarget();
+		}
+
+		if (!this._targetWaits) {
+			// A single reaction to the cancel, rather than one per request: those would pile up for as long as the
+			// output lives (one per HLS segment)
+			const targetWaits = this._targetWaits = new Set();
+			void this._canceled.promise.then(() => {
+				for (const endWait of targetWaits) {
+					endWait();
+				}
+				targetWaits.clear();
+			});
+		}
+
+		const canceled = promiseWithResolvers<null>();
+		const endWait = () => canceled.resolve(null);
+		this._targetWaits.add(endWait);
+
+		try {
+			const result = await Promise.race([target, canceled.promise]);
+			return result && (this.state as Output['state']) !== 'canceled' ? result : new NullTarget();
+		} finally {
+			this._targetWaits.delete(endWait);
+		}
 	}
 
 	/** Adds a video track to the output with the given source. Can only be called before the output is started. */
@@ -991,7 +1081,19 @@ export class Output<
 			let startError: unknown = null;
 
 			try {
-				await this._muxer.start();
+				// The muxer may have to wait for its target (an async PathedTarget or initTarget callback, which might
+				// never settle). A cancel must not wait behind that: it ends the start (which resolves, as when the
+				// cancel comes after the start), and a target that still arrives afterwards gets closed and isn't
+				// written to (see _getRootTarget and _getRootWriter)
+				const muxerStartPromise = this._muxer.start();
+				muxerStartPromise.catch(() => {}); // It fails on a target arriving after the cancel
+				await Promise.race([muxerStartPromise, this._canceled.promise]);
+				if ((this.state as Output['state']) === 'canceled') {
+					return;
+				}
+				if (this._targetFailure) {
+					throw this._targetFailure.error;
+				}
 
 				const promises = this.tracks.map(track => track.source._start());
 				await Promise.all(promises);
@@ -1054,6 +1156,7 @@ export class Output<
 
 		return this._cancelPromise = (async () => {
 			this.state = 'canceled';
+			this._canceled.resolve();
 
 			// Closing a source, or a pending add, can be stuck on a StreamTarget whose sink stopped completing writes;
 			// the target gives up on its stream then
