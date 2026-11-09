@@ -4919,6 +4919,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		if (options.metadataOnly) {
 			data = PLACEHOLDER_DATA;
 		} else {
+			assertProtectionSchemeIsSupported(this.internalTrack);
+
 			let slice = this.internalTrack.demuxer.reader.requestSlice(
 				sampleInfo.sampleOffset,
 				sampleInfo.sampleSize,
@@ -5016,6 +5018,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		if (options.metadataOnly) {
 			data = PLACEHOLDER_DATA;
 		} else {
+			assertProtectionSchemeIsSupported(this.internalTrack);
+
 			let slice = this.internalTrack.demuxer.reader.requestSlice(
 				fragmentSample.byteOffset,
 				fragmentSample.byteSize,
@@ -6858,6 +6862,23 @@ const getDefaultSampleEncryption = (encryptionInfo: TrackEncryptionInfo): Sample
 		iv: encryptionInfo.defaultConstantIv,
 		subsamples: null,
 	};
+};
+
+/**
+ * Throws for a track whose samples are all encrypted (encv/enca) but not with a scheme we can decrypt, or without a
+ * scheme at all, rather than letting the ciphertext pass as media data. Tracks that also have clear sample
+ * descriptions (clear lead) are left alone.
+ */
+const assertProtectionSchemeIsSupported = (track: InternalTrack) => {
+	if (
+		track.encryptionInfo === null
+		&& track.encryptedSampleDescriptions.length > 0
+		&& !track.encryptedSampleDescriptions.includes(false)
+	) {
+		throw new Error(
+			'Encrypted media samples use an unsupported protection scheme; only cenc, cens and cbcs can be decrypted.',
+		);
+	}
 };
 
 const decryptSample = async (
