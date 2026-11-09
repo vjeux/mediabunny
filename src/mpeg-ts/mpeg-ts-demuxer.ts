@@ -110,6 +110,22 @@ import {
 } from './mpeg-ts-misc';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
+import { ReadableStreamSource, UrlSource } from '../source';
+
+/**
+ * How far reading can go past a position and still come back to it. Sources that only keep what their cache holds (a
+ * ReadableStreamSource, or a UrlSource whose server ignores range requests) can go half their cache, which stays clear
+ * of what gets evicted; the others, anywhere.
+ */
+const getReadBackDistance = (reader: Reader) => {
+	const source = reader.source;
+	const sequentialSource = source instanceof ReadableStreamSource
+		? source
+		: source instanceof UrlSource
+			? source._sequentialBacking
+			: null;
+	return sequentialSource ? sequentialSource._maxCacheSize / 2 : Infinity;
+};
 
 // Resources:
 // ISO/IEC 13818-1
@@ -599,8 +615,7 @@ const MAX_PSI_SECTION_SCAN_PACKETS = 1000;
 // seconds (ETSI TR 101 290), so we stop once the media has progressed by a few seconds, or after a few more damaged
 // copies (the muxer writes bad CRCs). FFmpeg only takes damaged sections after 10 of them in a row on a PID.
 const MAX_PSI_SECTION_REPETITION_DISTANCE = 4 * 1024 * 1024;
-// The same for sources of unknown size, which may not be able to go back that far to read on after the section once
-// the search is done (a ReadableStreamSource only keeps what its cache holds)
+// The same for sources of unknown size
 const MAX_STREAMED_PSI_SECTION_REPETITION_DISTANCE = 1024 * 1024;
 const MAX_PSI_SECTION_REPETITION_DELAY = 2 * MPEG_TS_TIMESCALE;
 const MAX_DAMAGED_PSI_SECTION_COPY_COUNT = 2;
@@ -2485,10 +2500,13 @@ export class MpegTsDemuxer extends Demuxer {
 			return section;
 		}
 
-		const endPos = section.startPos + (
+		// Reading goes back to the section after the search, so sources that only keep what their cache holds look only
+		// as far as they can still come back from
+		const endPos = section.startPos + Math.min(
 			this.reader.fileSizeNonStrict === null
 				? MAX_STREAMED_PSI_SECTION_REPETITION_DISTANCE
-				: MAX_PSI_SECTION_REPETITION_DISTANCE
+				: MAX_PSI_SECTION_REPETITION_DISTANCE,
+			getReadBackDistance(this.reader),
 		);
 		const firstPtsByPid = new Map<number, number>();
 		let damagedCopyCount = 0;
