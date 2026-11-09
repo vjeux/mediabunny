@@ -147,11 +147,14 @@ export abstract class MediaSource {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async _flushAndClose(forceClose: boolean) {}
 	/**
-	 * Called when the output is canceled while finalizing: stops waiting for the samples added before finalizing to
-	 * be processed (a process function that never settles would hold finalization up forever) and drops them.
+	 * Stops waiting for the samples added so far to be processed and drops them, so that a process function call or an
+	 * encoder initialization that never settles can't hold finalization or a graceful close up forever. Called when
+	 * the output is canceled while finalizing, where it only applies with such a call or initialization in flight, and
+	 * with `always` when a graceful close is under way as the output gets canceled.
 	 * @internal
 	 */
-	_cancelPendingAdds() {}
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_cancelPendingAdds(always = false) {}
 
 	/**
 	 * Closes this source. This prevents future samples from being added and signals to the output file that no further
@@ -193,6 +196,12 @@ export abstract class MediaSource {
 	async _flushOrWaitForOngoingClose(forceClose: boolean) {
 		if (forceClose) {
 			this._forceCloseSignal.resolve();
+		}
+		if (forceClose && this._closingPromise) {
+			// A graceful close under way (from close()) waits for the samples added before it, which a process function
+			// call or an encoder initialization that never settles would hold up forever. The output is being canceled,
+			// so stop waiting for them.
+			this._cancelPendingAdds(true);
 		}
 
 		return this._closingPromise ??= (async () => {
@@ -360,6 +369,54 @@ const copyVideoSampleIntoMemory = async (videoSample: VideoSample) => {
 /** What waiting for a process function's result gives when the output got canceled first. */
 const PROCESS_CANCELED: unique symbol = Symbol('process canceled');
 
+/** What a wait cut short by `ReleasableWaits.release()` gives. */
+const WAIT_RELEASED: unique symbol = Symbol('wait released');
+
+/**
+ * Waits that can all be cut short at once. Unlike racing each wait against a promise that only settles on release, a
+ * wait leaves nothing behind once it's over: such a race keeps a reaction on that promise until it settles, so with one
+ * per sample, memory would grow for as long as the source is used.
+ */
+class ReleasableWaits {
+	private released = false;
+	private onRelease = new Set<() => void>();
+
+	/** How many waits are going on. */
+	get size() {
+		return this.onRelease.size;
+	}
+
+	/** Cuts short every wait, current and future. */
+	release() {
+		this.released = true;
+		for (const callback of this.onRelease) {
+			callback();
+		}
+		this.onRelease.clear();
+	}
+
+	/** Resolves like `promise`, or with `WAIT_RELEASED` once released, whichever comes first. */
+	wait<T>(promise: PromiseLike<T>) {
+		return new Promise<T | typeof WAIT_RELEASED>((resolve, reject) => {
+			if (this.released) {
+				resolve(WAIT_RELEASED);
+				return;
+			}
+
+			const callback = () => resolve(WAIT_RELEASED);
+			this.onRelease.add(callback);
+			promise.then((value) => {
+				this.onRelease.delete(callback);
+				resolve(value);
+			}, (error: unknown) => {
+				this.onRelease.delete(callback);
+				// eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+				reject(error);
+			});
+		});
+	}
+}
+
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
 	/**
@@ -443,6 +500,11 @@ class VideoEncoderWrapper {
 	private addQueue: Promise<void> = Promise.resolve();
 	/** How many added samples are waiting for their turn or being processed. */
 	private queuedAddCount = 0;
+	/**
+	 * Released once the wrapper is closed or the queued samples get dropped, so that neither a process function call
+	 * that never settles nor the adds queued behind it are waited for.
+	 */
+	private releasableWaits = new ReleasableWaits();
 	/** Set when the output is canceled while finalizing; see `cancelPendingAdds()`. */
 	private pendingAddsCanceled = false;
 	private pendingAddsCanceledSignal = promiseWithResolvers();
@@ -493,8 +555,7 @@ class VideoEncoderWrapper {
 		}
 
 		this.queuedAddCount++;
-		const turn = Promise.race([this.addQueue, this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
-		const added = turn.then(async () => {
+		const added = this.releasableWaits.wait(this.addQueue).then(async () => {
 			const sample = copy ? await copy : videoSample;
 			await this.addInOrder(sample, shouldClose, encodeOptions);
 		});
@@ -696,16 +757,14 @@ class VideoEncoderWrapper {
 			if (isThenable(processed)) {
 				// Don't wait past the output being canceled (a call that never settles would hold everything up)
 				const pending = processed;
-				const canceled = Promise.race([this.closedSignal.promise, this.pendingAddsCanceledSignal.promise]);
-				const whenCanceled = canceled.then((): typeof PROCESS_CANCELED => PROCESS_CANCELED);
 				this.processCallsInFlight++;
 				let result;
 				try {
-					result = await Promise.race([pending, whenCanceled]);
+					result = await this.releasableWaits.wait(pending);
 				} finally {
 					this.processCallsInFlight--;
 				}
-				if (result === PROCESS_CANCELED) {
+				if (result === WAIT_RELEASED) {
 					// Whatever it returns once it does settle is dropped
 					void Promise.resolve(pending).then((late) => {
 						for (const x of Array.isArray(late) ? late : [late]) {
@@ -1492,6 +1551,8 @@ class VideoEncoderWrapper {
 			const forceCloseRequested = await Promise.race([
 				this.ensureEncoderPromise.then(() => false, () => false),
 				this.source._forceCloseSignal.promise.then(() => true),
+				// Likewise when cancel() while finalizing stops waiting for the samples this initialization holds up
+				this.pendingAddsCanceledSignal.promise.then(() => true),
 			]);
 			if (forceCloseRequested && !this.encoderInitialized) {
 				return this.flushAndClose(true);
@@ -1507,8 +1568,9 @@ class VideoEncoderWrapper {
 
 				this.checkForEncoderError();
 
-				// Final frame rate padding: fill remaining frames up to the last sample's original end timestamp
-				if (this.frameRateLastSample) {
+				// Final frame rate padding: fill remaining frames up to the last sample's original end timestamp (not
+				// when the queued samples got dropped, as the padding would wait for the encoder all the same)
+				if (this.frameRateLastSample && !this.pendingAddsCanceled) {
 					const frameRate = this.encodingConfig.transform!.frameRate!;
 					const alignedEnd = floorToFrame(this.frameRateLastEndTimestamp!, frameRate);
 					await this.padFrameRate(alignedEnd);
@@ -1541,6 +1603,7 @@ class VideoEncoderWrapper {
 			// samples, frames and encoders would be left dangling
 			this.closed = true;
 			this.closedSignal.resolve();
+			this.releasableWaits.release();
 
 			this.frameRateLastSample?.close();
 			this.frameRateLastSample = null;
@@ -1573,16 +1636,26 @@ class VideoEncoderWrapper {
 	}
 
 	/**
-	 * Stops waiting for a process function call still in flight, and drops the samples queued behind it. Without one,
-	 * nothing holds them up, so this does nothing and they all still go in.
+	 * Whether the samples added so far are held up by something that may never finish: a process function call or an
+	 * encoder initialization in flight.
 	 */
-	cancelPendingAdds() {
-		if (this.processCallsInFlight === 0) {
+	isHeldUp() {
+		return this.processCallsInFlight > 0 || (this.ensureEncoderPromise !== null && !this.encoderInitialized);
+	}
+
+	/**
+	 * Stops waiting for a process function call or an encoder initialization still in flight, and drops the samples
+	 * queued behind it. Without either, nothing holds them up, so this does nothing and they all still go in, unless
+	 * `always` is set (the output is being canceled).
+	 */
+	cancelPendingAdds(always = false) {
+		if (!always && !this.isHeldUp()) {
 			return;
 		}
 
 		this.pendingAddsCanceled = true;
 		this.pendingAddsCanceledSignal.resolve();
+		this.releasableWaits.release();
 	}
 
 	/**
@@ -2235,8 +2308,8 @@ export class VideoSampleSource extends VideoSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 }
 
@@ -2297,8 +2370,8 @@ export class CanvasSource extends VideoSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 }
 
@@ -2763,8 +2836,8 @@ export class MediaStreamVideoTrackSource extends VideoSource {
 	}
 
 	/** @internal */
-	override _cancelPendingAdds() {
-		this._encoder.cancelPendingAdds();
+	override _cancelPendingAdds(always = false) {
+		this._encoder.cancelPendingAdds(always);
 	}
 
 	/** @internal */
@@ -3650,6 +3723,8 @@ class AudioEncoderWrapper {
 			const forceCloseRequested = await Promise.race([
 				this.ensureEncoderPromise.then(() => false, () => false),
 				this.source._forceCloseSignal.promise.then(() => true),
+				// Likewise when cancel() while finalizing stops waiting for the samples this initialization holds up
+				this.pendingAddsCanceledSignal.promise.then(() => true),
 			]);
 			if (forceCloseRequested && !this.encoderInitialized) {
 				return this.flushAndClose(true);
