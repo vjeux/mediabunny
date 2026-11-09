@@ -535,6 +535,7 @@ export class AudioResampler {
 			numberOfChannels: this.targetNumberOfChannels,
 			timestamp: this.startTime + this.bufferStartFrame / this.targetSampleRate,
 			data: outputData,
+			_doNotCopy: true, // Already a copy
 		});
 
 		await this.onSample(audioSample);
