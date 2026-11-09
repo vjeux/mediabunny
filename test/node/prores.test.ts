@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import { registerProresDecoder } from '@mediabunny/prores';
 import { Input } from '../../src/input.js';
-import { BufferSource, UrlSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { MkvOutputFormat, MovOutputFormat } from '../../src/output-format.js';
@@ -129,6 +129,30 @@ test('Custom coder registration', { timeout: 20_000 }, async () => {
 	registerProresDecoder();
 
 	expect(await videoTrack.canDecode()).toBe(true);
+});
+
+test('Color space signaled only by the container', async () => {
+	registerProresDecoder();
+
+	using input = new Input({
+		source: new FilePathSource('./test/public/prores-container-metadata.mov'),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = (await input.getPrimaryVideoTrack())!;
+	const expectedColorSpace = {
+		primaries: 'bt2020',
+		transfer: 'hlg',
+		matrix: 'bt2020-ncl',
+		fullRange: false,
+	};
+	expect(await videoTrack.getColorSpace()).toEqual(expectedColorSpace);
+
+	const sink = new VideoSampleSink(videoTrack);
+	using sample = (await sink.getSample(await videoTrack.getFirstTimestamp()))!;
+
+	// The ProRes frame headers say "unspecified", so this can only come from the colr box
+	expect(sample.colorSpace.toJSON()).toEqual(expectedColorSpace);
 });
 
 test('ProRes decoding', { timeout: 20_000 }, async () => {
