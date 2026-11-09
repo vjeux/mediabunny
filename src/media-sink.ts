@@ -20,6 +20,7 @@ import {
 	iterateHevcNalUnits,
 	parseAvcSps,
 	parseOpusIdentificationHeader,
+	parseOpusTocByte,
 	sanitizeHevcPacketForChromium,
 	serializeAvcDecoderConfigurationRecord,
 } from './codec-data';
@@ -938,6 +939,22 @@ export abstract class BaseMediaSampleSink<
 	}
 }
 
+/**
+ * How much to shift the timestamps a decoder gets, in seconds, for a run of packets that starts at the given timestamp.
+ * WebKit's GStreamer decoders (WPE, GTK) mishandle negative chunk timestamps: an audio decoder plays the stream
+ * backwards from one, and a video decoder loses the frames after one. So a run that starts before zero gets its
+ * timestamps shifted by whole seconds to start at least a second after zero (which leaves room for leading pictures
+ * timed before the key frame), and the output timestamps are mapped back.
+ */
+const getInputTimestampShift = (runStartTimestamp: number) => {
+	return runStartTimestamp < 0 ? Math.ceil(-runStartTimestamp) + 1 : 0;
+};
+
+/** Maps a timestamp a decoder output back by its input's shift, in whole microseconds like the chunks' timestamps. */
+const unshiftTimestamp = (timestamp: number, shift: number) => {
+	return shift === 0 ? timestamp : (Math.round(timestamp * 1e6) - shift * 1e6) / 1e6;
+};
+
 class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	decoder: VideoDecoder | null = null;
 
@@ -946,6 +963,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	customDecoderQueueSize = 0;
 
 	inputTimestamps: number[] = []; // Timestamps input into the decoder, sorted.
+	inputTimestampShift = 0; // See getInputTimestampShift
 	sampleQueue: VideoSample[] = []; // Safari-specific thing, check usage.
 	currentPacketIndex = 0;
 	raslSkipped = false; // For HEVC stuff
@@ -1127,6 +1145,10 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				insertSorted(this.inputTimestamps, packet.timestamp, x => x);
 			}
 
+			if (this.currentPacketIndex === 0) {
+				this.inputTimestampShift = getInputTimestampShift(packet.timestamp);
+			}
+
 			if (isChromium() && this.currentPacketIndex === 0) {
 				if (this.codec === 'avc') {
 					// Workaround for https://issues.chromium.org/issues/470109459
@@ -1183,8 +1205,11 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				}
 			}
 
-			this.decoder.decode(packet.toEncodedVideoChunk());
-			this.decodeAlphaData(packet);
+			const decoderPacket = this.inputTimestampShift === 0
+				? packet
+				: packet.clone({ timestamp: packet.timestamp + this.inputTimestampShift });
+			this.decoder.decode(decoderPacket.toEncodedVideoChunk());
+			this.decodeAlphaData(decoderPacket);
 		}
 
 		this.currentPacketIndex++;
@@ -1326,6 +1351,9 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	/** Handler for the WebCodecs VideoDecoder for ironing out browser differences. */
 	sampleHandler(sample: VideoSample) {
 		if (isWebKit()) {
+			// The frame has the timestamp of the chunk it came from
+			sample.setTimestamp(unshiftTimestamp(sample.timestamp, this.inputTimestampShift));
+
 			// For correct B-frame handling, we don't just hand over the frames directly but instead add them to
 			// a queue, because we want to ensure frames are emitted in presentation order. We flush the queue
 			// each time we receive a frame with a timestamp larger than the highest we've seen so far, as we
@@ -2321,7 +2349,9 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	currentTimestamp: number | null = null;
 	// Chromium does not respect negative packet timestamps, so we must do the fixin' ourselves
 	expectedFirstTimestamp: number | null = null;
+	expectedFirstPacketData: Uint8Array | null = null;
 	timestampOffset = 0;
+	inputTimestampShift: number | null = null; // See getInputTimestampShift
 
 	constructor(
 		onSample: (sample: AudioSample) => unknown,
@@ -2337,9 +2367,29 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			: 0;
 
 		const sampleHandler = (sample: AudioSample) => {
-			let sampleTimestamp = sample.timestamp;
+			let sampleTimestamp = unshiftTimestamp(sample.timestamp, this.inputTimestampShift ?? 0);
 
 			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
+				if (opusPreSkip > 0 && this.expectedFirstPacketData) {
+					// WebKit's GStreamer decoder keeps the pre-skip, though, which shows as a first sample about as
+					// long as its packet (the packet's own length, since container durations can be rounded, to a
+					// millisecond in Matroska). That only tells it apart from a dropped pre-skip if the pre-skip is
+					// shorter than the packet; otherwise, the first output comes from a later packet either way, and
+					// the decoder is taken to have dropped it. A kept pre-skip is dropped here, as other decoders do.
+					const preSkipFrames = Math.round(opusPreSkip * sample.sampleRate);
+					const firstPacketFrames = parseOpusTocByte(this.expectedFirstPacketData).durationInSamples
+						* sample.sampleRate / OPUS_SAMPLE_RATE;
+					if (
+						preSkipFrames < firstPacketFrames
+						&& sample.numberOfFrames > firstPacketFrames - preSkipFrames / 2
+					) {
+						const trimmed = sample.trim(preSkipFrames);
+						sample.close();
+						sample = trimmed;
+						sampleTimestamp += preSkipFrames / sample.sampleRate;
+					}
+				}
+
 				this.timestampOffset = this.expectedFirstTimestamp + opusPreSkip - sampleTimestamp;
 			}
 
@@ -2439,8 +2489,16 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		} else {
 			assert(this.decoder);
 
-			this.expectedFirstTimestamp ??= packet.timestamp;
-			this.decoder.decode(packet.toEncodedAudioChunk());
+			this.inputTimestampShift ??= getInputTimestampShift(packet.timestamp);
+			if (this.expectedFirstTimestamp === null) {
+				this.expectedFirstTimestamp = packet.timestamp;
+				this.expectedFirstPacketData = packet.data;
+			}
+
+			const decoderPacket = this.inputTimestampShift === 0
+				? packet
+				: packet.clone({ timestamp: packet.timestamp + this.inputTimestampShift });
+			this.decoder.decode(decoderPacket.toEncodedAudioChunk());
 		}
 	}
 
@@ -2455,6 +2513,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		this.currentTimestamp = null;
 		this.expectedFirstTimestamp = null;
 		this.timestampOffset = 0;
+		this.inputTimestampShift = null;
 	}
 
 	close() {
