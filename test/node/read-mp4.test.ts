@@ -5869,3 +5869,127 @@ test('Sample rate from an srat box', async () => {
 	expect(await read(true)).toEqual([96000, 96000, 6 * 960]);
 	expect(await read(false)).toEqual([30464, 30464, 6 * 960]); // All the sample entry has to say
 });
+
+test('avc3 parameter sets only in-band', async () => {
+	// 'avc3' allows the parameter sets to be in the samples only (ISO/IEC 14496-15), here only in the first one. The
+	// decoder config needs them in its description, or decoding can only start at the first sample.
+	const hex = (text: string) => text.match(/../g)!.map(byte => parseInt(byte, 16));
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const lengthPrefixed = (...nalUnits: number[][]) => nalUnits.flatMap(
+		nalUnit => [...u32(nalUnit.length), ...nalUnit],
+	);
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+
+	// A 16x16 gray H.264 stream (x264, baseline), every frame an IDR picture
+	const sps = hex('6742c00addec0440000003004000000503c489e0');
+	const pps = hex('68ce019720');
+	const slices = [hex('6588843a2780'), hex('65888202e89e'), hex('6588843a2780')];
+
+	const read = async (parameterSetsInAvcC: boolean) => {
+		const samples = slices.map((slice, i) => i === 0 && !parameterSetsInAvcC
+			? lengthPrefixed(sps, pps, slice)
+			: lengthPrefixed(slice));
+		const avcC = parameterSetsInAvcC
+			? box('avcC', [1, 0x42, 0xc0, 0x0a, 0xff, 0xe1, 0, sps.length], sps, [1, 0, pps.length], pps)
+			: box('avcC', [1, 0x42, 0xc0, 0x0a, 0xff, 0xe0, 0]);
+		const sampleEntry = box(parameterSetsInAvcC ? 'avc1' : 'avc3', zeros(6), [0, 1], zeros(16), [0, 16, 0, 16],
+			[0, 0x48, 0, 0, 0, 0x48, 0, 0], zeros(4), [0, 1], zeros(32), [0, 0x18, 0xff, 0xff], avcC);
+		const ftyp = box('ftyp', ascii('isom'), u32(0x200), ascii('isom'));
+		const moov = box('moov',
+			box('mvhd', zeros(12), u32(1000), u32(300), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+			box('trak',
+				box('tkhd', u32(3), zeros(8), u32(1), zeros(4), u32(300), zeros(16), matrix, u32(16 << 16),
+					u32(16 << 16)),
+				box('mdia',
+					box('mdhd', zeros(12), u32(10), u32(3), [0x55, 0xc4, 0, 0]),
+					box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+					box('minf', box('stbl',
+						box('stsd', zeros(4), u32(1), sampleEntry),
+						box('stts', zeros(4), u32(1), u32(3), u32(1)),
+						box('stsc', zeros(4), u32(1), u32(1), u32(3), u32(1)),
+						box('stsz', zeros(4), u32(0), u32(3), ...samples.map(sample => u32(sample.length))),
+						box('stco', zeros(4), u32(1), u32(ftyp.length + 8)),
+					)),
+				),
+			),
+		);
+
+		using input = new Input({
+			source: new BufferSource(new Uint8Array([...ftyp, ...box('mdat', samples.flat()), ...moov])),
+			formats: ALL_FORMATS,
+		});
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		const config = await track.getDecoderConfig();
+		assert(config?.description);
+		return [...toUint8Array(config.description)];
+	};
+
+	// The same description as with the parameter sets in the avcC box, like in an avc1 track
+	expect(await read(false)).toEqual(await read(true));
+});
+
+test('Codec string and decoder config of an encrypted avc3 track with an incomplete avcC need no key', async () => {
+	// avc3 with an avcC that has no SPS/PPS; the only sample is CENC-encrypted and no resolveKeyId is given.
+	// Completing the avcC from the first sample must not make the metadata calls fail (they work on main). Found by
+	// L101.
+	const u32 = (value: number) => [value >>> 24, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+	const zeros = (count: number) => new Array<number>(count).fill(0);
+	const ascii = (text: string) => [...text].map(char => char.charCodeAt(0));
+	const box = (type: string, ...contents: number[][]) => {
+		const bytes = contents.flat();
+		return [...u32(8 + bytes.length), ...ascii(type), ...bytes];
+	};
+	const matrix = [...u32(0x10000), ...zeros(12), ...u32(0x10000), ...zeros(12), ...u32(0x40000000)];
+	// SPS + PPS in the clear, the IDR slice's payload "encrypted" (any bytes do: they are never decrypted here)
+	const sample = [
+		...u32(5), 0x67, 0x64, 0x00, 0x0a, 0xac,
+		...u32(3), 0x68, 0xee, 0x3c,
+		...u32(8), 0x65, ...zeros(7).fill(0x5a),
+	];
+	const avcC = box('avcC', [1, 0x64, 0x00, 0x0a, 0xff, 0xe0, 0x00]);
+	const tenc = box('tenc', zeros(4), [0, 0, 1, 8], zeros(16).fill(0xa1));
+	const encv = box('encv', zeros(24), [0, 64, 0, 64], zeros(50), avcC, box('sinf', box('frma', ascii('avc3')),
+		box('schm', zeros(4), ascii('cenc'), u32(0x10000)), box('schi', tenc)));
+	const moov = box('moov',
+		box('mvhd', zeros(12), u32(10), u32(0), u32(0x10000), [1, 0], zeros(10), matrix, zeros(28)),
+		box('trak',
+			box('tkhd', u32(3), zeros(8), u32(1), zeros(24), matrix, u32(64 << 16), u32(64 << 16)),
+			box('mdia',
+				box('mdhd', zeros(12), u32(10), u32(0), [0x55, 0xc4, 0, 0]),
+				box('hdlr', zeros(8), ascii('vide'), zeros(13)),
+				box('minf', box('stbl',
+					box('stsd', u32(0), u32(1), encv),
+					box('stts', zeros(8)), box('stsc', zeros(8)), box('stsz', zeros(12)), box('stco', zeros(8)),
+				)),
+			),
+		),
+		box('mvex', box('trex', u32(0), u32(1), u32(1), u32(1), u32(0), u32(0))),
+	);
+	const traf = (dataOffset: number) => box('traf',
+		box('tfhd', u32(0x020000), u32(1)),
+		box('tfdt', u32(0), u32(0)),
+		box('trun', u32(0x301), u32(1), u32(dataOffset), u32(1), u32(sample.length)),
+		box('senc', u32(2), u32(1), zeros(8).fill(6), [0, 1], [0, 21], u32(7)),
+	);
+	const moofSize = box('moof', box('mfhd', u32(0), u32(1)), traf(0)).length;
+	using input = new Input({
+		source: new BufferSource(new Uint8Array([
+			...box('ftyp', ascii('iso6'), u32(0)),
+			...moov,
+			...box('moof', box('mfhd', u32(0), u32(1)), traf(moofSize + 8)),
+			...box('mdat', sample),
+		])),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	expect(await track.getCodecParameterString()).toBe('avc3.64000a');
+	expect((await track.getDecoderConfig())?.codec).toBe('avc3.64000a');
+});
