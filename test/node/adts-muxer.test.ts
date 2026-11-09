@@ -78,6 +78,48 @@ test('ADTS muxer with raw AAC input', async () => {
 	expect(count).toBe(237);
 });
 
+test('ADTS file holding a single frame', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/sample3.aac')),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({
+		format: new AdtsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	// Shorter than one frame, so only the first frame is written
+	const conversion = await Conversion.init({
+		input,
+		output,
+		trim: { start: 0, end: 0.01 },
+		tags: {},
+		showWarnings: false,
+	});
+	await conversion.execute();
+
+	const bytes = new Uint8Array(output.target.buffer!);
+	const frameLength = ((bytes[3]! & 0b11) << 11) | (bytes[4]! << 3) | (bytes[5]! >> 5);
+	expect(frameLength).toBe(bytes.byteLength);
+
+	// There's no second frame to confirm the first one with, but the file must still be detected
+	using outputAsInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	expect(await outputAsInput.getFormat()).toBe(ADTS);
+
+	const outputTrack = await outputAsInput.getPrimaryAudioTrack();
+	assert(outputTrack);
+
+	const timestamps: number[] = [];
+	for await (const packet of new EncodedPacketSink(outputTrack).packets()) {
+		timestamps.push(packet.timestamp);
+	}
+	expect(timestamps).toEqual([0]);
+});
+
 test('ADTS muxer with ADTS input (passthrough)', { timeout: 15_000 }, async () => {
 	using input = new Input({
 		source: new FilePathSource(path.join(__dirname, '../public/sample3.aac')),
